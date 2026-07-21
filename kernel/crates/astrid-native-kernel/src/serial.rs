@@ -343,6 +343,50 @@ pub fn ev_legible_check_end() {
     emit(format_args!("\"ev\":\"legible.check.end\""));
 }
 
+// ---- M5: audit chain (ADR-K7) — ring-0 order + BLAKE3 rolling root ----------
+
+/// `audit.record`: one canonical audit record at append time (and re-emitted by
+/// `audit_enumerate`). The five integer fields ARE the canonical serialization
+/// the user-space verifier re-hashes (no strings — charter §4.5).
+pub fn ev_audit_record(aseq: u64, kind: u64, a: u64, b: u64, c: u64) {
+    emit(format_args!(
+        "\"ev\":\"audit.record\",\"aseq\":{aseq},\"kind\":{kind},\"a\":{a},\"b\":{b},\"c\":{c}"
+    ));
+}
+
+/// `audit.root`: the 32-byte BLAKE3 rolling root after record `aseq`, delivered
+/// as four little-endian u64 words (a 32-byte value does not fit a register, so
+/// like the legibility snapshots it rides an event). `aseq` is the sequence
+/// number of the last record folded into this root.
+pub fn ev_audit_root(aseq: u64, root: &[u8; 32]) {
+    let word = |i: usize| -> u64 {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&root[i * 8..i * 8 + 8]);
+        u64::from_le_bytes(b)
+    };
+    emit(format_args!(
+        "\"ev\":\"audit.root\",\"aseq\":{aseq},\"root\":[{},{},{},{}]",
+        word(0),
+        word(1),
+        word(2),
+        word(3)
+    ));
+}
+
+/// `audit.overflow`: the bounded audit log hit its cap; appends stop here. Emitted
+/// once. Compaction/wraparound is future work (bounded-by-construction, §6).
+pub fn ev_audit_overflow(dropped_from: usize) {
+    emit(format_args!(
+        "\"ev\":\"audit.overflow\",\"dropped_from\":{dropped_from}"
+    ));
+}
+
+/// `audit.denied`: an unauthorized audit syscall by `domain`. Observability only;
+/// the syscall status is the authority (mirrors `legible.denied`).
+pub fn ev_audit_denied(domain: usize) {
+    emit(format_args!("\"ev\":\"audit.denied\",\"domain\":{domain}"));
+}
+
 pub fn ev_test(name: &'static str, pass: bool) {
     let ev = if pass { "test.pass" } else { "test.fail" };
     emit(format_args!("\"ev\":\"{ev}\",\"name\":\"{name}\""));

@@ -7,7 +7,8 @@
 //!
 //! Syscall ABI: `rax` = number (0 exit, 1 yield, 2 note, 3 cap_rights,
 //! 4 ep_create, 5 send, 6 recv, 7 revoke_tree, 8 legible_schema,
-//! 9 legible_enumerate, 10 legible_subscribe, 11 legible_get, 12 cap_object);
+//! 9 legible_enumerate, 10 legible_subscribe, 11 legible_get, 12 cap_object,
+//! 13 audit_len, 14 audit_root, 15 audit_get, 16 audit_enumerate);
 //! args in `rdi, rsi, rdx, r10`;
 //! returns status in `rax` (0 OK, negative error) and value in `rdx`.
 //! Callee-saved registers (`rbx`, `r12`) survive NON-blocking syscalls, so
@@ -539,6 +540,52 @@ pub extern "C" fn ring3_reasoner() {
         // exit(0).
         "mov rax, 0",
         "mov rdi, 0",
+        "syscall",
+        "2:",
+        "jmp 2b",
+    );
+}
+
+// ---- M5 audit light-tenant payload -----------------------------------------
+
+/// Scenario `audit_light_tenant` auditor: a ring-3 tenant doing the LIGHT
+/// in-guest check it CAN do WITHOUT crypto (full in-guest BLAKE3/ed25519 chain
+/// verification is DEFERRED to a Wasmtime tenant — a ring-3 asm payload cannot
+/// compute those). It holds an `Audit` cap in slot 1. Steps: `audit_len(slot=1)`
+/// → stash the count in callee-saved `rbx` (non-blocking, survives);
+/// `audit_get(slot=1, aseq=0, field=kind)` → confirm the first record's kind is
+/// `AUDIT_DOMAIN_CREATE (0)`; `note(count)`; `exit(0)`. Exit 1 on any mismatch.
+#[unsafe(naked)]
+pub extern "C" fn ring3_audit_tenant() {
+    naked_asm!(
+        // count = audit_len(cap=1); rax=status, rdx=len.
+        "mov rax, 13",
+        "mov rdi, 1",
+        "syscall",
+        "cmp rax, 0",
+        "jne 3f",
+        "mov rbx, rdx", // rbx = count
+        // kind = audit_get(cap=1, aseq=0, field=kind=0); rax=status, rdx=value.
+        "mov rax, 15",
+        "mov rdi, 1",
+        "mov rsi, 0", // aseq = 0
+        "mov rdx, 0", // field = kind
+        "syscall",
+        "cmp rax, 0",
+        "jne 3f",
+        "cmp rdx, 0", // first record's kind == AUDIT_DOMAIN_CREATE (0)
+        "jne 3f",
+        // note(count).
+        "mov rax, 2",
+        "mov rdi, rbx",
+        "syscall",
+        // exit(0).
+        "mov rax, 0",
+        "mov rdi, 0",
+        "syscall",
+        "3:",
+        "mov rax, 0",
+        "mov rdi, 1",
         "syscall",
         "2:",
         "jmp 2b",

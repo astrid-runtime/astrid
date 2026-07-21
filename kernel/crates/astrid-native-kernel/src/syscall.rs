@@ -303,6 +303,24 @@ unsafe extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> SyscallRet {
             let (status, value) = crate::domain::sys_cap_object(f.arg1);
             SyscallRet { status, value }
         },
+        // M5 audit chain (ADR-K7): the read/enumerate surface. Ring 0 orders and
+        // roots; user space verifies. All are capability-gated (Audit class).
+        13 => {
+            let (status, value) = crate::domain::sys_audit_len(f.arg1);
+            SyscallRet { status, value }
+        },
+        14 => {
+            let (status, value) = crate::domain::sys_audit_root(f.arg1);
+            SyscallRet { status, value }
+        },
+        15 => {
+            let (status, value) = crate::domain::sys_audit_get(f.arg1, f.arg2, f.arg3);
+            SyscallRet { status, value }
+        },
+        16 => {
+            let (status, value) = crate::domain::sys_audit_enumerate(f.arg1);
+            SyscallRet { status, value }
+        },
         _ => SyscallRet {
             status: -1,
             value: 0,

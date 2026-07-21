@@ -328,6 +328,11 @@ enum ObjectClass {
     /// object authorizes enumerate/schema/subscribe/get of ALL relations at v0
     /// (per-relation scoping is a future refinement).
     Legible,
+    /// M5: the audit object (ADR-K7). A capability to an `Audit` object holding
+    /// `AUDIT_READ` authorizes reading the ring-0 audit chain (len/root/get/
+    /// enumerate). Distinct from `Legible`: a legibility cap is NOT audit
+    /// authority (per-object-class gating, like the legibility strengthening).
+    Audit,
 }
 
 impl ObjectClass {
@@ -338,6 +343,7 @@ impl ObjectClass {
             ObjectClass::TestArtifact => CLASS_TEST_ARTIFACT,
             ObjectClass::Endpoint(_) => CLASS_ENDPOINT,
             ObjectClass::Legible => CLASS_LEGIBLE,
+            ObjectClass::Audit => CLASS_AUDIT,
         }
     }
 }
@@ -436,6 +442,7 @@ fn revoke_object(idx: u32) {
         obj.generation
     };
     serial::ev_cap_revoked(idx, generation);
+    audit_append(AUDIT_CAP_REVOKE, idx as u64, generation as u64, 0);
     // A generation bump keeps the object occupied: project it as a change to the
     // REL_OBJECT row (single-store delta from the mutation site).
     delta_object_chg(idx);
@@ -455,6 +462,7 @@ fn cap_mint(idx: usize, slot: usize, object_index: u32, rights: u32) {
         };
     }
     delta_cap_add(idx, slot);
+    audit_append(AUDIT_CAP_MINT, idx as u64, slot as u64, object_index as u64);
 }
 
 /// The ADR-K2/K4 check order: (1) index in range else `BadCap`; (2) entry
@@ -682,6 +690,7 @@ fn domain_create(payload: extern "C" fn()) -> Option<usize> {
         };
     }
     serial::ev_domain_create(idx, frames_count);
+    audit_append(AUDIT_DOMAIN_CREATE, idx as u64, frames_count as u64, 0);
     delta_domain_add(idx);
     Some(idx)
 }
@@ -764,6 +773,7 @@ fn finish_domain(idx: usize, outcome: RunOutcome) -> bool {
         RunOutcome::Killed(KillCause::Deadlock) => serial::ev_domain_killed(idx, "deadlock"),
         RunOutcome::QuotaExpired => serial::ev_domain_killed(idx, "quota"),
     }
+    audit_append(AUDIT_DOMAIN_KILL, idx as u64, audit_cause_code(outcome), 0);
     // SAFETY: single hart, domain no longer running.
     let (census_at_create, object) = unsafe {
         (*domain_ptr(idx)).state = State::Dead;
@@ -925,6 +935,7 @@ fn revoke_tree(node: u32) -> usize {
     }
     drop(deriv);
     serial::ev_cap_revoke_tree(node, killed);
+    audit_append(AUDIT_REVOKE_TREE, node as u64, killed as u64, 0);
     killed
 }
 
@@ -1005,6 +1016,12 @@ fn deliver_recv(idx: usize, ep: u8, from: usize, data: u64, cap: Option<XferCap>
             delta_cap_add(idx, recv_slot as usize);
             serial::ev_ipc_recv(ep, idx, data, true);
             serial::ev_cap_transfer(xc.object_index, from, idx, xc.rights, xc.deriv_node);
+            audit_append(
+                AUDIT_CAP_TRANSFER,
+                from as u64,
+                idx as u64,
+                xc.object_index as u64,
+            );
         },
         Some(_) => {
             // A cap rode along but the receiver declined to accept one: drop it.
@@ -1036,6 +1053,7 @@ pub fn sys_ep_create() -> (i64, u64) {
     };
     cap_mint(idx, slot, object, EP_SEND | EP_RECV);
     serial::ev_ep_create(object, ep, idx);
+    audit_append(AUDIT_EP_CREATE, object as u64, ep as u64, 0);
     (OK, slot as u64)
 }
 
@@ -1385,7 +1403,10 @@ fn scheduler_run(parts: &[usize], outcomes: &mut [Option<RunOutcome>]) {
 fn kernel_create_endpoint() -> Option<(u32, u8)> {
     let ep = endpoint_alloc()?;
     match object_alloc(ObjectClass::Endpoint(ep)) {
-        Some(object) => Some((object, ep)),
+        Some(object) => {
+            audit_append(AUDIT_EP_CREATE, object as u64, ep as u64, 0);
+            Some((object, ep))
+        },
         None => {
             endpoint_free(ep);
             None
@@ -1485,6 +1506,7 @@ const CLASS_DOMAIN: u64 = 0;
 const CLASS_TEST_ARTIFACT: u64 = 1;
 const CLASS_ENDPOINT: u64 = 2;
 const CLASS_LEGIBLE: u64 = 3;
+const CLASS_AUDIT: u64 = 4;
 
 /// Delta ops (v0): add/del/chg carry the FULL row (fold simplicity).
 const OP_ADD: u64 = 0;
@@ -1872,6 +1894,273 @@ pub fn sys_legible_get(cap_slot: u64, rel: u64, row_index: u64, col_index: u64) 
 
 pub fn sys_cap_object(cap_slot: u64) -> (i64, u64) {
     cap_object_at(current(), cap_slot)
+}
+
+// ---- M5: audit chain (ADR-K7) ----------------------------------------------
+//
+// Ring 0 owns the ORDER and the ROOT; user space owns the CRYPTO CHAIN. Ring 0
+// assigns a gapless monotonic `audit_seq` to each authority-changing action, and
+// maintains a BLAKE3 rolling root binding every canonical record to its position
+// (`root' = blake3(root || canonical_bytes(record))`). Ring 0 does the hashing —
+// BLAKE3 is streaming, `no_std`, cheap — but ring 0 NEVER signs and NEVER parses
+// a record (charter §2/§7). The user-space verifier (for M5, the ktest host
+// harness — a legitimate ring-0-external stand-in; the real in-guest ring-3
+// cryptographic auditor is DEFERRED to a Wasmtime tenant) reconstructs the chain
+// from the emitted canonical stream, confirms it equals ring 0's root, ed25519-
+// signs/verifies the head, and proves tamper-evidence.
+//
+// The append path is a single atomic-load fast-return unless `AUDIT_ARMED`, so
+// M1–M4 emit nothing new and their serial `seq` stream stays byte-identical.
+// Auditing is armed once at the start of the M5 scenario block (a production
+// kernel arms it at boot); the log is append-only and never reset between M5
+// scenarios, so `audit_seq` is gapless across the whole milestone.
+
+/// Bounded audit log capacity (charter §6: bounded by construction). The M5
+/// scenarios stay well under this; past it, one `audit.overflow` marker is
+/// emitted and appends stop (compaction/wraparound is future work).
+const AUDIT_LOG_CAP: usize = 256;
+
+/// The single audit right: a cap to an `Audit` object holding this bit authorizes
+/// reading the chain (len/root/get/enumerate). Value overlaps `LEGIBLE_READ` but
+/// the object-class gate keeps the two authorities distinct.
+const AUDIT_READ: u32 = 0b1;
+
+/// Frozen audit-kind codes (v0). Exactly the authority-changing / lifecycle
+/// events, so a join of the chain with the legibility `derivation`/`capability`
+/// relations answers "why does domain D hold this authority, and from whom".
+const AUDIT_DOMAIN_CREATE: u64 = 0; // a=domain_id, b=frames,      c=0
+const AUDIT_DOMAIN_KILL: u64 = 1; //   a=domain_id, b=cause_code,  c=0
+const AUDIT_CAP_MINT: u64 = 2; //      a=domain_id, b=cap_slot,    c=object_id
+const AUDIT_CAP_TRANSFER: u64 = 3; //  a=from_dom,  b=to_dom,      c=object_id
+const AUDIT_CAP_REVOKE: u64 = 4; //    a=object_id, b=generation,  c=0
+const AUDIT_REVOKE_TREE: u64 = 5; //   a=root_node, b=killed_count,c=0
+const AUDIT_EP_CREATE: u64 = 6; //     a=object_id, b=ep_slot,     c=0
+
+/// `domain.killed`/`domain.exit` cause codes carried in an `AUDIT_DOMAIN_KILL`
+/// record (the terminal lifecycle event covers a clean exit too).
+const AUDIT_CAUSE_EXIT: u64 = 0;
+const AUDIT_CAUSE_PF: u64 = 1;
+const AUDIT_CAUSE_GP: u64 = 2;
+const AUDIT_CAUSE_QUOTA: u64 = 3;
+const AUDIT_CAUSE_DEADLOCK: u64 = 4;
+
+/// A fixed, little-endian, pointer-free audit record (charter §4.5 serialization-
+/// cleanliness; ADR-K3 "survives serialization"). Serialized field-by-field so
+/// the byte layout is portable regardless of any compiler struct padding.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AuditRecord {
+    audit_seq: u64,
+    kind: u64,
+    a: u64,
+    b: u64,
+    c: u64,
+}
+
+impl AuditRecord {
+    const EMPTY: Self = Self {
+        audit_seq: 0,
+        kind: 0,
+        a: 0,
+        b: 0,
+        c: 0,
+    };
+}
+
+/// The 40-byte canonical serialization: the five u64 fields in order, each
+/// little-endian, concatenated. Field-by-field (never a struct cast) so it is
+/// reproducible on any host — the ktest verifier re-hashes exactly these bytes.
+fn canonical_bytes(record: &AuditRecord) -> [u8; 40] {
+    // A struct with five u64 fields is exactly 40 bytes with no padding; the
+    // field-by-field write below is correct regardless, this asserts the intent.
+    const _: () = assert!(core::mem::size_of::<AuditRecord>() == 40);
+    let mut out = [0u8; 40];
+    out[0..8].copy_from_slice(&record.audit_seq.to_le_bytes());
+    out[8..16].copy_from_slice(&record.kind.to_le_bytes());
+    out[16..24].copy_from_slice(&record.a.to_le_bytes());
+    out[24..32].copy_from_slice(&record.b.to_le_bytes());
+    out[32..40].copy_from_slice(&record.c.to_le_bytes());
+    out
+}
+
+/// The bounded audit log (index == `audit_seq`). Not reached by any interrupt
+/// handler, so a plain spin `Mutex` (matching [`OBJECTS`]) is the correct model.
+static AUDIT_LOG: Mutex<[AuditRecord; AUDIT_LOG_CAP]> =
+    Mutex::new([AuditRecord::EMPTY; AUDIT_LOG_CAP]);
+/// The gapless monotonic order: also the count of records (next `audit_seq`).
+static AUDIT_LEN: AtomicUsize = AtomicUsize::new(0);
+/// The BLAKE3 rolling root over the canonical record stream (genesis at arm).
+static AUDIT_ROOT: Mutex<[u8; 32]> = Mutex::new([0u8; 32]);
+/// M5 gate: false during M1–M4 so nothing is appended (byte-identical output).
+static AUDIT_ARMED: AtomicBool = AtomicBool::new(false);
+/// Latch so the overflow marker is emitted exactly once.
+static AUDIT_OVERFLOW_EMITTED: AtomicBool = AtomicBool::new(false);
+
+/// Arm auditing for the M5 block: set the genesis root
+/// `blake3(b"astrid-audit-v0")`, zero the length/overflow latch, then flip the
+/// gate. Called once, before the first M5 scenario.
+fn audit_arm() {
+    let genesis = *blake3::hash(b"astrid-audit-v0").as_bytes();
+    *AUDIT_ROOT.lock() = genesis;
+    AUDIT_LEN.store(0, Ordering::SeqCst);
+    AUDIT_OVERFLOW_EMITTED.store(false, Ordering::SeqCst);
+    AUDIT_ARMED.store(true, Ordering::SeqCst);
+}
+
+/// Append one canonical record at the SAME site that performs the audited
+/// mutation, so the record cannot diverge from the action. A no-op single
+/// atomic-load fast-return unless armed (preserving byte-identical M1–M4 output).
+/// Advances `audit_seq` gaplessly, folds the record into the rolling root, and
+/// emits the record + running root events.
+fn audit_append(kind: u64, a: u64, b: u64, c: u64) {
+    if !AUDIT_ARMED.load(Ordering::SeqCst) {
+        return;
+    }
+    let s = AUDIT_LEN.load(Ordering::SeqCst);
+    if s >= AUDIT_LOG_CAP {
+        if !AUDIT_OVERFLOW_EMITTED.swap(true, Ordering::SeqCst) {
+            serial::ev_audit_overflow(s);
+        }
+        return;
+    }
+    let record = AuditRecord {
+        audit_seq: s as u64,
+        kind,
+        a,
+        b,
+        c,
+    };
+    AUDIT_LOG.lock()[s] = record;
+    AUDIT_LEN.store(s + 1, Ordering::SeqCst);
+    let bytes = canonical_bytes(&record);
+    // Fold: root' = blake3(prev_root_32 || canonical_bytes_40).
+    let new_root = {
+        let mut root = AUDIT_ROOT.lock();
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&root[..]);
+        hasher.update(&bytes);
+        let out = *hasher.finalize().as_bytes();
+        *root = out;
+        out
+    };
+    serial::ev_audit_record(record.audit_seq, kind, a, b, c);
+    serial::ev_audit_root(record.audit_seq, &new_root);
+}
+
+/// Map a terminal [`RunOutcome`] to its `AUDIT_DOMAIN_KILL` cause code.
+fn audit_cause_code(outcome: RunOutcome) -> u64 {
+    match outcome {
+        RunOutcome::Exited(_) => AUDIT_CAUSE_EXIT,
+        RunOutcome::Killed(KillCause::PageFault) => AUDIT_CAUSE_PF,
+        RunOutcome::Killed(KillCause::GeneralProtection) => AUDIT_CAUSE_GP,
+        RunOutcome::Killed(KillCause::Deadlock) => AUDIT_CAUSE_DEADLOCK,
+        RunOutcome::QuotaExpired => AUDIT_CAUSE_QUOTA,
+    }
+}
+
+/// Emit the CURRENT running root as an `audit.root` event, stamped with the last
+/// record's `audit_seq` (delivery is via the event, like enumerate). On an empty
+/// log the genesis root is emitted with `aseq=0`.
+fn audit_emit_root_event() {
+    let len = AUDIT_LEN.load(Ordering::SeqCst);
+    let last = len.saturating_sub(1) as u64;
+    let root = *AUDIT_ROOT.lock();
+    serial::ev_audit_root(last, &root);
+}
+
+/// The audit-syscall gate: a cap that (1) passes the exact ADR-K2 `check_cap`
+/// order for [`AUDIT_READ`] AND (2) references an `Audit`-class object — a rights
+/// bit alone on any other object (e.g. a `Legible` cap) is not audit authority.
+fn check_audit_cap(idx: usize, cap_slot: u64) -> Result<(), i64> {
+    check_cap(idx, cap_slot, AUDIT_READ)?;
+    // SAFETY: check_cap validated slot in-range + occupied; CapEntry is Copy.
+    let object = unsafe { (*domain_ptr(idx)).caps[cap_slot as usize].object_index };
+    match OBJECTS.lock()[object as usize].class {
+        ObjectClass::Audit => Ok(()),
+        _ => Err(DENIED),
+    }
+}
+
+/// `sys_audit_len`: the number of records (the gapless total order length).
+fn audit_len_at(idx: usize, cap_slot: u64) -> (i64, u64) {
+    if let Err(status) = check_audit_cap(idx, cap_slot) {
+        serial::ev_audit_denied(idx);
+        return (status, 0);
+    }
+    (OK, AUDIT_LEN.load(Ordering::SeqCst) as u64)
+}
+
+/// `sys_audit_root`: emit the current `audit.root` event; return OK (the 32-byte
+/// root does not fit a register — it is delivered via the event, like enumerate).
+fn audit_root_at(idx: usize, cap_slot: u64) -> (i64, u64) {
+    if let Err(status) = check_audit_cap(idx, cap_slot) {
+        serial::ev_audit_denied(idx);
+        return (status, 0);
+    }
+    audit_emit_root_event();
+    (OK, 0)
+}
+
+/// `sys_audit_get`: read one field of record `aseq` (0=kind,1=a,2=b,3=c). O(1)
+/// (indexed log) — unlike `legible_get`'s O(rows) scan. The tenant read path
+/// (light). Silent (no events). `aseq >= len` or a bad field → `BadArg`.
+fn audit_get_at(idx: usize, cap_slot: u64, aseq: u64, field: u64) -> (i64, u64) {
+    if let Err(status) = check_audit_cap(idx, cap_slot) {
+        serial::ev_audit_denied(idx);
+        return (status, 0);
+    }
+    let len = AUDIT_LEN.load(Ordering::SeqCst) as u64;
+    if aseq >= len {
+        return (BAD_ARG, 0);
+    }
+    let record = AUDIT_LOG.lock()[aseq as usize];
+    let value = match field {
+        0 => record.kind,
+        1 => record.a,
+        2 => record.b,
+        3 => record.c,
+        _ => return (BAD_ARG, 0),
+    };
+    (OK, value)
+}
+
+/// `sys_audit_enumerate`: emit every `audit.record` in order (0..len) then one
+/// `audit.root` — the full canonical stream + final root the host verifier folds.
+fn audit_enumerate_at(idx: usize, cap_slot: u64) -> (i64, u64) {
+    if let Err(status) = check_audit_cap(idx, cap_slot) {
+        serial::ev_audit_denied(idx);
+        return (status, 0);
+    }
+    let len = AUDIT_LEN.load(Ordering::SeqCst);
+    for s in 0..len {
+        let record = AUDIT_LOG.lock()[s];
+        serial::ev_audit_record(record.audit_seq, record.kind, record.a, record.b, record.c);
+    }
+    audit_emit_root_event();
+    (OK, len as u64)
+}
+
+/// True iff the rolling root is non-genesis-zero (a real chain exists).
+fn audit_root_nonzero() -> bool {
+    *AUDIT_ROOT.lock() != [0u8; 32]
+}
+
+// ---- audit syscall wrappers (use CURRENT_DOMAIN) ----------------------------
+
+pub fn sys_audit_len(cap_slot: u64) -> (i64, u64) {
+    audit_len_at(current(), cap_slot)
+}
+
+pub fn sys_audit_root(cap_slot: u64) -> (i64, u64) {
+    audit_root_at(current(), cap_slot)
+}
+
+pub fn sys_audit_get(cap_slot: u64, aseq: u64, field: u64) -> (i64, u64) {
+    audit_get_at(current(), cap_slot, aseq, field)
+}
+
+pub fn sys_audit_enumerate(cap_slot: u64) -> (i64, u64) {
+    audit_enumerate_at(current(), cap_slot)
 }
 
 // ---- scenarios -------------------------------------------------------------
@@ -2432,9 +2721,222 @@ fn scenario_legible_reasoner() -> bool {
     report("legible_reasoner", pass)
 }
 
+// ---- M5 audit-chain scenarios ----------------------------------------------
+
+/// Scenario one, `audit_orders_and_roots`: a fixed ring-0 mutation script touches
+/// several audit kinds — create three domains (DOMAIN_CREATE), create an endpoint
+/// (EP_CREATE), mint caps (CAP_MINT), transfer a cap over REAL IPC (CAP_TRANSFER,
+/// reusing the M3 hot path), let both participants exit (DOMAIN_KILL), and revoke
+/// the transfer subtree (REVOKE_TREE) — then `audit_enumerate`. The auditor's
+/// `Audit` cap is minted into a driver domain's slot 1. Domains are created FIRST
+/// so `audit_seq` 0 is a DOMAIN_CREATE (scenario four's light tenant checks it).
+/// Pass iff `audit_len` equals the exact number of audited actions taken, the
+/// enumerate agrees, and the final root is non-zero (`audit_seq` gaplessness is
+/// verified from the emitted stream by the host harness).
+fn scenario_audit_orders_and_roots() -> bool {
+    reset_scenario_state();
+    let start = AUDIT_LEN.load(Ordering::SeqCst);
+    let mut expected = 0u64;
+
+    // The never-run auditor driver is created FIRST so it is the OUTERMOST domain
+    // in the LIFO frame-census nesting: the scheduler finishes the inner IPC
+    // participants (r, s) while `aud` is still live, and `aud` is discarded last,
+    // so every create/reclaim frame balance holds. (audit_seq 0 is still a
+    // DOMAIN_CREATE, as scenario four's light tenant checks — any domain create is
+    // kind 0.)
+    let Some(aud) = domain_create(payloads::ring3_reuse) else {
+        return report("audit_orders_and_roots", false);
+    };
+    expected += 1; // DOMAIN_CREATE (audit_seq 0)
+    let Some(r) = domain_create(payloads::ring3_ipc_r_xfer_check3) else {
+        discard_domain(aud);
+        return report("audit_orders_and_roots", false);
+    };
+    expected += 1; // DOMAIN_CREATE
+    let Some(s) = domain_create(payloads::ring3_ipc_s_xfer3) else {
+        discard_domain(r);
+        discard_domain(aud);
+        return report("audit_orders_and_roots", false);
+    };
+    expected += 1; // DOMAIN_CREATE
+    let Some((ep_obj, ep)) = kernel_create_endpoint() else {
+        discard_domain(s);
+        discard_domain(r);
+        discard_domain(aud);
+        return report("audit_orders_and_roots", false);
+    };
+    expected += 1; // EP_CREATE
+    kernel_mint_ep(r, 0, ep_obj, EP_RECV);
+    expected += 1; // CAP_MINT
+    kernel_mint_ep(s, 0, ep_obj, EP_SEND);
+    expected += 1; // CAP_MINT
+    let Some(ta) = kernel_mint_artifact(s, 10, 0b111) else {
+        discard_domain(s);
+        discard_domain(r);
+        discard_domain(aud);
+        object_release(ep_obj);
+        endpoint_free(ep);
+        return report("audit_orders_and_roots", false);
+    };
+    expected += 1; // CAP_MINT (the transferable artifact)
+    let Some(au) = object_alloc(ObjectClass::Audit) else {
+        discard_domain(s);
+        discard_domain(r);
+        discard_domain(aud);
+        object_release(ta);
+        object_release(ep_obj);
+        endpoint_free(ep);
+        return report("audit_orders_and_roots", false);
+    };
+    cap_mint(aud, 1, au, AUDIT_READ);
+    expected += 1; // CAP_MINT (the auditor's Audit cap)
+
+    // Real IPC transfer: R blocks on recv, S delivers + transfers, both exit.
+    let mut outcomes = [None, None];
+    scheduler_run(&[r, s], &mut outcomes);
+    expected += 1; // CAP_TRANSFER (at delivery)
+    expected += 2; // DOMAIN_KILL x2 (both exit, cause=exit)
+
+    // Scoped revoke of the transfer's derivation subtree (nodes persist until the
+    // teardown pass), before the endpoints/deriv are reclaimed.
+    let revoked_ok = match deriv_find_root(ta) {
+        Some(root) => {
+            revoke_tree(root);
+            expected += 1; // REVOKE_TREE
+            true
+        },
+        None => false,
+    };
+
+    // Emit the full canonical stream + final root (the host verifier folds it).
+    let (enum_status, enum_len) = audit_enumerate_at(aud, 1);
+
+    ipc_scenario_teardown();
+    object_release(ta);
+    object_release(au);
+    discard_domain(aud);
+
+    let taken = (AUDIT_LEN.load(Ordering::SeqCst) - start) as u64;
+    let both_exit = matches!(outcomes[0], Some(RunOutcome::Exited(0)))
+        && matches!(outcomes[1], Some(RunOutcome::Exited(0)));
+    let pass = both_exit
+        && revoked_ok
+        && taken == expected
+        && enum_status == OK
+        && enum_len == taken
+        && audit_root_nonzero();
+    report("audit_orders_and_roots", pass)
+}
+
+/// Scenario two, `audit_gated`: an unauthorized domain (holding a non-`Audit` cap
+/// whose rights include the read bit) is denied `audit_len`/`audit_root`/
+/// `audit_enumerate` — each returns the `check_cap` class-mismatch error and emits
+/// `audit.denied` — then an authorized domain (holding an `Audit` cap) succeeds.
+/// Pass iff every unauthorized call is denied and the authorized calls are OK.
+fn scenario_audit_gated() -> bool {
+    reset_scenario_state();
+    let Some(u) = domain_create(payloads::ring3_reuse) else {
+        return report("audit_gated", false);
+    };
+    let Some(ta) = object_alloc(ObjectClass::TestArtifact) else {
+        discard_domain(u);
+        return report("audit_gated", false);
+    };
+    // Rights include the read bit, but the object is NOT Audit → must be Denied.
+    cap_mint(u, 3, ta, 0b111);
+    let (deny_len, _) = audit_len_at(u, 3);
+    let (deny_root, _) = audit_root_at(u, 3);
+    let (deny_enum, _) = audit_enumerate_at(u, 3);
+
+    let Some(a) = domain_create(payloads::ring3_reuse) else {
+        discard_domain(u);
+        object_release(ta);
+        return report("audit_gated", false);
+    };
+    let Some(au) = object_alloc(ObjectClass::Audit) else {
+        discard_domain(a);
+        discard_domain(u);
+        object_release(ta);
+        return report("audit_gated", false);
+    };
+    cap_mint(a, 1, au, AUDIT_READ);
+    let (ok_len, len_val) = audit_len_at(a, 1);
+    let (ok_enum, _) = audit_enumerate_at(a, 1);
+
+    discard_domain(a);
+    discard_domain(u);
+    object_release(ta);
+    object_release(au);
+
+    let pass = deny_len == DENIED
+        && deny_root == DENIED
+        && deny_enum == DENIED
+        && ok_len == OK
+        && ok_enum == OK
+        && len_val > 0;
+    report("audit_gated", pass)
+}
+
+/// Scenario three, `audit_chain_verifies` (the killer test — the cryptographic
+/// half is HOST-SIDE). Kernel side: an authorized reader `audit_enumerate`s the
+/// full canonical stream + final root. The ktest harness then, in host Rust,
+/// independently reconstructs the BLAKE3 rolling root from the `audit.record`
+/// stream, asserts it equals ring 0's `audit.root`, ed25519-signs/verifies the
+/// head, and flips one record byte to prove the root diverges (tamper-evident).
+/// This kernel scenario passes iff the enumerate emitted a non-empty, self-
+/// consistent stream; the three cryptographic sub-checks gate on the host side.
+fn scenario_audit_chain_verifies() -> bool {
+    reset_scenario_state();
+    let Some(c) = domain_create(payloads::ring3_reuse) else {
+        return report("audit_chain_verifies", false);
+    };
+    let Some(au) = object_alloc(ObjectClass::Audit) else {
+        discard_domain(c);
+        return report("audit_chain_verifies", false);
+    };
+    cap_mint(c, 1, au, AUDIT_READ);
+    let (status, len) = audit_enumerate_at(c, 1);
+    discard_domain(c);
+    object_release(au);
+    let pass = status == OK
+        && len == AUDIT_LEN.load(Ordering::SeqCst) as u64
+        && len > 0
+        && audit_root_nonzero();
+    report("audit_chain_verifies", pass)
+}
+
+/// Scenario four, `audit_light_tenant`: a ring-3 auditor domain (asm payload)
+/// does the LIGHT in-guest check it CAN do WITHOUT crypto — `audit_len` → stash
+/// count; `audit_get(aseq=0, field=kind)` → confirm the first record's kind is
+/// `AUDIT_DOMAIN_CREATE`; `note(count)`. Full in-guest BLAKE3/ed25519 chain
+/// verification is DEFERRED to a Wasmtime tenant (a ring-3 asm payload cannot
+/// compute those); this is NOT cryptographic verification. Pass iff the tenant
+/// exits 0 (its first-kind check held) and the noted count equals the true
+/// `audit_len` snapshotted before the run (its terminal kill is appended after).
+fn scenario_audit_light_tenant() -> bool {
+    reset_scenario_state();
+    let Some(t) = domain_create(payloads::ring3_audit_tenant) else {
+        return report("audit_light_tenant", false);
+    };
+    let Some(au) = object_alloc(ObjectClass::Audit) else {
+        discard_domain(t);
+        return report("audit_light_tenant", false);
+    };
+    cap_mint(t, 1, au, AUDIT_READ);
+    let expected_len = AUDIT_LEN.load(Ordering::SeqCst) as u64;
+    let outcome = run_domain(t);
+    finish_domain(t, outcome);
+    object_release(au);
+    let pass = matches!(outcome, RunOutcome::Exited(0))
+        && NOTE_SEEN.load(Ordering::SeqCst)
+        && NOTE_VALUE.load(Ordering::SeqCst) == expected_len;
+    report("audit_light_tenant", pass)
+}
+
 /// Run every ring-3 scenario in order: the seven M2 single-domain scenarios,
-/// then the seven M3 IPC scenarios, then the five M4 legibility scenarios,
-/// bracketed by pool censuses. Returns `true` iff all passed.
+/// then the seven M3 IPC scenarios, then the five M4 legibility scenarios, then
+/// the four M5 audit-chain scenarios, bracketed by pool censuses. Returns `true`
+/// iff all passed.
 pub fn run_all() -> bool {
     let mut all = true;
     all &= scenario_happy();
@@ -2471,6 +2973,21 @@ pub fn run_all() -> bool {
     all &= scenario_legible_snapshot_delta_consistency();
     all &= scenario_legible_revoked_cap();
     all &= scenario_legible_reasoner();
+
+    emit_census();
+
+    // M5 audit chain (ADR-K7): armed AFTER the M4 census, so the append path stays
+    // a no-op through M1–M4 and their serial `seq` stream is byte-identical. Ring
+    // 0 assigns the gapless order + BLAKE3 root; the ktest host harness (the user-
+    // space verifier stand-in — the real in-guest ring-3 auditor is deferred to a
+    // Wasmtime tenant) reconstructs and ed25519-verifies the chain. Appended AFTER
+    // the M4 scenarios + census (no existing `seq` shifts); each scenario fully
+    // tears down, so the final census still returns to the same baseline.
+    audit_arm();
+    all &= scenario_audit_orders_and_roots();
+    all &= scenario_audit_gated();
+    all &= scenario_audit_chain_verifies();
+    all &= scenario_audit_light_tenant();
 
     emit_census();
     all

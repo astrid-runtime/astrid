@@ -22,3 +22,9 @@ x86_64 = { version = "=0.15.5", default-features = false, features = ["instructi
 linked_list_allocator = { version = "=0.10.6", default-features = false }
 spin = "=0.9.9"
 raw-cpuid = "=11.6.0"
+# BLAKE3 for the ADR-K7 ring-0 audit hash root. `no_std`, alloc-free streaming
+# Hasher. The `pure` feature forces the portable pure-Rust core (the default C/
+# SIMD backends emit x86 intrinsic symbols the SSE-less `x86_64-unknown-none`
+# target cannot link). Ring 0 hashes; it never signs — ed25519 lives in user
+# space (the ktest host verifier).
+blake3 = { version = "=1.8.5", default-features = false, features = ["pure"] }
