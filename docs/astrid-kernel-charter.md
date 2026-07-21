@@ -91,12 +91,28 @@ complete positive obligation set, and additions to it require amendment.
 - IPC endpoints carrying bounded typed messages and explicit handle transfer;
 - interrupt, timer, entropy, IOMMU, DMA mediation, reset, and watchdog;
 - image measurement and verification; audit-root anchoring and attestation;
-- **revocation completeness:** when a domain dies or a handle is revoked,
-  every derived handle, mapping, DMA range, and reservation is reclaimed
-  before the death or revocation is reported complete;
-- **exactly-one death record:** a domain's termination produces one record
-  on its supervisor's fault endpoint, carrying cause, final accounting, and
-  the identity tuple. Restart, backoff, quarantine, and rollback are
+- **revocation completeness, externally atomic:** when a domain dies or a
+  handle is revoked, every derived handle, mapping, DMA range, and
+  reservation is reclaimed before the death or revocation is reported
+  complete. Teardown may be incremental and preemptible internally (the
+  seL4 zombie/preemption-point lesson), but in-progress teardown is an
+  explicit kernel state, no partially-torn-down object is ever observable
+  or invocable, and completion is reported only at the terminal state.
+  Self-referential revocation, where a domain could revoke the authority by
+  which its own teardown proceeds, is excluded by construction: supervision
+  bindings and teardown authority derive from the measured boot plan and
+  are never user-assignable capabilities. seL4 documents these edge cases
+  and tells user space to avoid them; this kernel makes them unrepresentable;
+- **exactly-one death record, capacity reserved at birth:** a domain's
+  termination produces one record on its supervisor's fault endpoint,
+  carrying cause, final accounting, and the identity tuple. The record's
+  delivery slot is reserved from the recovery pool at domain creation, so
+  delivery can never fail for want of capacity. If the supervisor itself is
+  dead, its pending death records re-parent up the supervision tree together
+  with its own death record, terminating at the watchdog path. No surveyed
+  kernel documents this guarantee; it is affordable here only because
+  supervision structure is fixed by the measured plan and pools are
+  pre-sized (section 6). Restart, backoff, quarantine, and rollback remain
   supervisor policy in the init/recovery domain, never kernel behavior;
 - **legibility.** Kernel state is typed facts. The ABI includes, from
   version zero, capability-gated operations to enumerate a domain-visible
@@ -108,6 +124,21 @@ complete positive obligation set, and additions to it require amendment.
   relations are emitted by the kernel because they ARE the kernel's state,
   never scraped from it after the fact. Reasoning over those relations
   happens in tenant capsules only.
+
+  Two constraints from prior art are binding. First, the single-store rule:
+  there is never a second fact base mirroring kernel state. Barrelfish's
+  System Knowledge Base, the one large-scale precedent for reasoning over
+  kernel-emitted facts, maintained an independently-asserted Prolog store
+  beside live system state, and its own retrospective records the ambition
+  as unrealized; the staleness seam between store and state is the failure
+  mode this clause exists to make impossible. Second, the side-channel
+  rule: a typed introspection surface is the same shape of risk as `/proc`,
+  which has an automated-attack literature. Every relation is
+  capability-gated per relation, projections are domain-visible only, and
+  relations carrying timing-correlated counters are rate-limited and
+  quantized by declared policy. The delivery mechanism is typed state push
+  plus signal-driven re-read over bounded buffers, in the shape Genode's
+  report and ROM sessions validated, not an unbounded event stream.
 
 ## 4. ABI ground rules
 
@@ -146,7 +177,24 @@ credible. The execution mode decision is closed:
   code-publication portions of Wasmtime's unstable custom-platform surface,
   preserves ISA portability, and is livable for the first proofs: the Realm
   programme demonstrated that interpreted substrates carry real workloads
-  when the boundary is right.
+  when the boundary is right. Wasmtime's platform documentation confirms
+  the premise: a Pulley-only embedding requires one thread-local pointer
+  and an allocator, while native execution additionally requires the
+  virtual-memory and native-signal hook families, and no_std targets cannot
+  host Cranelift or Winch at all. Expect roughly a 10x slowdown against
+  Cranelift-compiled code, per Wasmtime's own figure.
+- **What Pulley does not buy.** Pulley bytecode is explicitly unstable
+  across Wasmtime versions; a Pulley artifact is no more durable than a
+  native one. Every engine change regenerates and re-verifies all compiled
+  artifacts through the compatibility-hash binding below. Pulley buys
+  platform-surface reduction only, never artifact longevity.
+- **Conformance gate before dependence.** Pulley's Component Model
+  conformance (resources, canonical ABI, async where adopted) is not
+  explicitly documented upstream. Before any bare-metal milestone depends
+  on Pulley, Astrid's component conformance corpus must pass under a
+  Pulley-configured engine on an ordinary host build. If that gate fails,
+  the fallback is AOT-first with the full custom-platform surface, and the
+  decision reopens by amendment with the test evidence attached.
 - **AOT as verified cache, later.** Native AOT artifacts are an
   optimization admitted only behind the binding
   `source component hash + host ABI set + engine compatibility hash +
@@ -166,6 +214,17 @@ holds pre-reserved pool capacity so that teardown, death reporting, and
 supervisor restart can always complete under global exhaustion. Exhaustion
 of any pool is a reportable, attributable event, charged to a domain, and
 visible through the legibility surface.
+
+Pools are typed per object class with fixed-size slots. There is no
+fungible byte-range budget from which kernel objects of varying size are
+carved: Fiasco.OC's quota model documents that an attacker can induce
+fragmentation until a nominally-solvent quota cannot satisfy any
+allocation. Per-class fixed-slot pools make that failure mode
+unrepresentable; exhaustion is always per-class, countable, and exactly
+what the accounting says it is. This is also where the verified-kernel
+evidence points: high-assurance seL4 deployments abandon free-form runtime
+retyping for statically computed object layouts, which is the posture this
+kernel starts from rather than converges to.
 
 ## 7. Fault semantics
 
