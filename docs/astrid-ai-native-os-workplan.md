@@ -153,8 +153,9 @@ not become a ring-0 ABI.
   [Astrid Kernel Threat Model](astrid-kernel-threat-model.md).
 - [x] Create a requirement-to-evidence matrix for every claimed security property:
   [Astrid Kernel Requirement-to-Evidence Matrix](astrid-kernel-evidence-matrix.md).
-- [ ] Record ADRs for protection domains, capability object representation, handle
-  transfer, revocation, fault endpoints, scheduling, and audit ordering.
+- [x] Record ADRs for protection domains, capability object representation, handle
+  transfer, revocation, fault endpoints, scheduling, and audit ordering:
+  [Astrid Kernel Architecture Decision Records](astrid-kernel-adrs.md).
 - [ ] Define the support-policy vocabulary: experimental machine, supported host,
   supported capsule contract, verified claim, and known residual risk.
 
