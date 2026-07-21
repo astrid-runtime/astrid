@@ -28,22 +28,22 @@
 //!
 //! ## Capability gating and fail-secure
 //!
-//! Elicitation is attempted ONLY when the client advertised the elicitation
-//! capability at `initialize` (checked via
-//! [`Peer::supported_elicitation_modes`]). When the client did not, or the
-//! user declines / cancels / the elicit transport errors, we fall through to
-//! a `Deny` decision: the broker publishes `deny`, the parked tool retires
-//! cleanly host-side, and the shim returns the resulting `isError` terminal
-//! reply rather than leaving the tool to time out. Fail secure — the absence
-//! of an explicit approval is never treated as consent.
+//! Prefer wire **form-mode** elicitation when the client advertised it at
+//! `initialize`. Clients with form support never leave that path.
+//!
+//! When the client advertised **no** elicitation modes, fall back to a host
+//! form-shaped multi-choice dialog ([`super::host_dialog`]) for the same
+//! enum of approve verbs. Decline / cancel / dialog error still fall through
+//! to `Deny`: the broker publishes `deny`, the parked tool retires cleanly,
+//! and the shim returns the resulting `isError` terminal reply. Fail secure —
+//! the absence of an explicit approval is never treated as consent.
 //!
 //! ## Never elicit secrets
 //!
 //! The elicited type ([`ApprovalForm`]) is a single constrained-string
 //! `choice` field. No free-form text, no tool argument, and no secret is
-//! ever surfaced to the client or round-tripped back into the tool. The
-//! prompt rendered to the user is built only from the host-sanitized
-//! display fields the flag carries.
+//! ever surfaced to the client or round-tripped back into the tool. Per MCP,
+//! secrets must use URL-mode elicitation, not form mode.
 
 use std::fmt::Write as _;
 
@@ -231,12 +231,13 @@ pub(super) async fn resolve_decision(
 /// Elicit a single [`ApprovalChoice`] from the client, defaulting to
 /// [`ApprovalChoice::Deny`] on every non-accept outcome.
 async fn elicit_choice(peer: &Peer<RoleServer>, request: &ApprovalRequest) -> ApprovalChoice {
-    // Only elicit if the client advertised the capability at initialize.
-    // `elicit` itself also guards this, but checking first lets us log the
-    // precise reason and skip building a prompt the client cannot render.
+    // Spec: only send elicitation/create when the client advertised a mode.
+    // No modes → host form-shaped enum dialog (non-secret), not silent deny.
     if peer.supported_elicitation_modes().is_empty() {
-        debug!("MCP shim: client did not advertise elicitation; defaulting approval to deny");
-        return ApprovalChoice::Deny;
+        debug!(
+            "MCP shim: client did not advertise elicitation; using host form dialog for approval"
+        );
+        return host_form_approval_choice(request).await;
     }
 
     match super::form_elicitation::elicit::<ApprovalForm>(peer, request.prompt()).await {
@@ -256,6 +257,35 @@ async fn elicit_choice(peer: &Peer<RoleServer>, request: &ApprovalRequest) -> Ap
         },
         Err(e) => {
             warn!(error = %e, "MCP shim: elicitation failed; defaulting approval to deny");
+            ApprovalChoice::Deny
+        },
+    }
+}
+
+/// Host form-shaped multi-choice when the MCP client has no elicitation.
+///
+/// Mirrors the wire [`ApprovalForm`] enum only — never free text or secrets.
+async fn host_form_approval_choice(request: &ApprovalRequest) -> ApprovalChoice {
+    let selected = super::host_dialog::enum_form_consent(
+        "Unicity AOS",
+        &request.prompt(),
+        &[
+            ("approve_once", "Approve once"),
+            ("approve_session", "Approve for session"),
+            ("approve_always", "Always allow"),
+            ("deny", "Deny"),
+        ],
+        "deny",
+    )
+    .await;
+
+    match selected.as_deref() {
+        Some("approve_once") => ApprovalChoice::ApproveOnce,
+        Some("approve_session") => ApprovalChoice::ApproveSession,
+        Some("approve_always") => ApprovalChoice::ApproveAlways,
+        Some("deny") | None => ApprovalChoice::Deny,
+        Some(other) => {
+            warn!(choice = other, "MCP shim: unknown host approval choice; denying");
             ApprovalChoice::Deny
         },
     }

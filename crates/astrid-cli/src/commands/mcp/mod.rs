@@ -36,6 +36,7 @@
 mod elicit;
 mod form_elicitation;
 mod grant;
+mod host_dialog;
 mod ingress;
 // Parent-death detection reads `getppid()` (Unix-only); the module and its use
 // site are target-gated so the CLI still compiles on non-Unix targets.

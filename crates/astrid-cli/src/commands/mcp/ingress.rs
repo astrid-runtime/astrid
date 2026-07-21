@@ -29,19 +29,22 @@
 //!
 //! ## Capability gating and fail-secure
 //!
-//! Elicitation is attempted ONLY when the client advertised the elicitation
-//! capability at `initialize` (checked via
-//! [`Peer::supported_elicitation_modes`]). When the client did not, or the
-//! user declines / cancels / the elicit transport errors, we DENY: no
-//! `ingress.respond` is sent, no trust is recorded, and the caller returns an
-//! MCP error to the client. Fail secure — the absence of an explicit accept
-//! is never treated as consent.
+//! Prefer wire **form-mode** elicitation when the client advertised it at
+//! `initialize` ([`Peer::supported_elicitation_modes`]). Clients with form
+//! support (Claude, Codex, …) never leave that path.
 //!
-//! ## Never elicit secrets
+//! When the client advertised **no** elicitation modes (e.g. Grok Build
+//! today), fall back to a **local native system dialog**
+//! ([`super::host_dialog`]) for the same boolean consent. Decline, cancel,
+//! dialog error, or kill-switch still DENY: no `ingress.respond`, no trust
+//! recorded. Fail secure — the absence of an explicit accept is never
+//! treated as consent. Capable clients never see this path.
+//!
+//! ## Never elicit secrets (this flow)
 //!
 //! The elicited type ([`IngressForm`]) is a single boolean `allow` field. No
 //! free-form text, no tool argument, and no secret is surfaced or
-//! round-tripped. The prompt is a fixed string.
+//! round-tripped here.
 
 use std::fmt::Write as _;
 
@@ -136,13 +139,24 @@ impl IngressRequest {
 
 /// Elicit the user's ingress-consent decision from `peer`.
 ///
-/// Returns `true` only on an explicit accept of an `allow:true` form.
-/// Fail-secure: a client without elicitation, a decline / cancel, an empty
-/// response, or any elicit transport error all return `false`.
+/// Returns `true` only on an explicit accept of an `allow:true` form (wire)
+/// or an equivalent host form dialog when the client has no elicitation.
+/// Fail-secure: decline / cancel / empty / transport error / dialog fail all
+/// return `false`.
 pub(super) async fn elicit_consent(peer: &Peer<RoleServer>, request: &IngressRequest) -> bool {
+    // Spec: only send elicitation/create when the client advertised a mode.
+    // No modes → host form-shaped fallback (non-secret boolean), not deny-only.
     if peer.supported_elicitation_modes().is_empty() {
-        debug!("MCP shim: client did not advertise elicitation; denying ingress consent");
-        return false;
+        debug!(
+            "MCP shim: client did not advertise elicitation; using host form dialog for ingress"
+        );
+        return super::host_dialog::binary_form_consent(
+            "Unicity AOS",
+            &request.prompt(),
+            "Allow",
+            "Deny",
+        )
+        .await;
     }
 
     match super::form_elicitation::elicit::<IngressForm>(peer, request.prompt()).await {

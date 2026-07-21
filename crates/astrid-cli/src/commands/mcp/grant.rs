@@ -56,17 +56,21 @@
 //!
 //! ## Capability gating and fail-secure
 //!
-//! Elicitation is attempted ONLY when the client advertised the elicitation
-//! capability at `initialize` (checked via
-//! [`Peer::supported_elicitation_modes`]). When the client did not, or the
-//! user declines / cancels / the elicit transport errors, we DENY. Fail
-//! secure — the absence of an explicit accept is never treated as consent.
+//! Prefer wire **form-mode** elicitation when the client advertised it at
+//! `initialize`. Clients with form support never leave that path.
+//!
+//! When the client advertised **no** elicitation modes, fall back to a host
+//! form-shaped dialog ([`super::host_dialog`]) for the same binary grant
+//! decision. Decline / cancel / dialog error still DENY (and we still
+//! publish a deny respond so the broker marker clears). Fail secure — the
+//! absence of an explicit accept is never treated as consent.
 //!
 //! ## Never elicit secrets
 //!
 //! The elicited type ([`GrantForm`]) is a single boolean `grant` field. No
 //! free-form text, no tool argument, and no secret is surfaced or
-//! round-tripped. The prompt is built only from the display fields.
+//! round-tripped. Per MCP, secrets must use URL-mode elicitation, not form
+//! mode and not a host form dialog.
 
 use std::fmt::Write as _;
 
@@ -224,13 +228,22 @@ pub(super) fn grant_decision(approved: bool) -> &'static str {
 
 /// Elicit the user's grant-on-use decision from `peer`.
 ///
-/// Returns `true` only on an explicit accept of a `grant:true` form.
-/// Fail-secure: a client without elicitation, a decline / cancel, an empty
-/// response, or any elicit transport error all return `false`.
+/// Returns `true` only on an explicit accept of a `grant:true` form (wire)
+/// or an equivalent host form dialog when the client has no elicitation.
+/// Fail-secure: decline / cancel / empty / transport error / dialog fail all
+/// return `false`.
 pub(super) async fn elicit_grant(peer: &Peer<RoleServer>, request: &GrantRequest) -> bool {
     if peer.supported_elicitation_modes().is_empty() {
-        debug!("MCP shim: client did not advertise elicitation; denying grant-on-use");
-        return false;
+        debug!(
+            "MCP shim: client did not advertise elicitation; using host form dialog for grant-on-use"
+        );
+        return super::host_dialog::binary_form_consent(
+            "Unicity AOS",
+            &request.prompt(),
+            "Grant",
+            "Deny",
+        )
+        .await;
     }
 
     match super::form_elicitation::elicit::<GrantForm>(peer, request.prompt()).await {
