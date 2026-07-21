@@ -37,6 +37,21 @@ fn map_error(error: astrid_compute::ComputeError) -> ErrorCode {
     }
 }
 
+fn principal_compute_limits(
+    quotas: &astrid_core::Quotas,
+    resource_exempt: bool,
+) -> astrid_compute::PrincipalComputeLimits {
+    if resource_exempt {
+        return astrid_compute::PrincipalComputeLimits::default();
+    }
+    astrid_compute::PrincipalComputeLimits {
+        max_workers: (quotas.max_compute_workers != 0).then_some(quotas.max_compute_workers),
+        max_memory_bytes: Some(quotas.max_memory_bytes),
+        max_job_fuel: None,
+        max_fuel_per_sec: (quotas.max_cpu_fuel_per_sec != 0).then_some(quotas.max_cpu_fuel_per_sec),
+    }
+}
+
 fn execution_mode(mode: ExecutionMode) -> astrid_compute::ExecutionMode {
     match mode {
         ExecutionMode::Deterministic => astrid_compute::ExecutionMode::Deterministic,
@@ -176,7 +191,11 @@ impl compute::Host for HostState {
             return Err(ErrorCode::NoSuchWorker);
         };
         let principal = self.effective_principal();
-        let group = match runtime.open_group(
+        let principal_limits = principal_compute_limits(
+            &self.effective_profile().quotas,
+            self.invocation_resource_exempt,
+        );
+        let group = match runtime.open_group_with_limits(
             &principal,
             artifact,
             astrid_compute::GroupRequest {
@@ -185,6 +204,7 @@ impl compute::Host for HostState {
                 initial_memory_pages: request.initial_memory_pages,
                 maximum_memory_pages: request.maximum_memory_pages,
             },
+            principal_limits,
         ) {
             Ok(group) => group,
             Err(error) => {
@@ -429,6 +449,26 @@ mod tests {
             initial_memory_pages: 1,
             maximum_memory_pages: 32,
         }
+    }
+
+    #[test]
+    fn profile_compute_worker_quota_delegates_or_clamps() {
+        let mut quotas = astrid_core::Quotas::default();
+        assert_eq!(principal_compute_limits(&quotas, false).max_workers, None);
+        quotas.max_compute_workers = 3;
+        let bounded = principal_compute_limits(&quotas, false);
+        assert_eq!(bounded.max_workers, Some(3));
+        assert_eq!(bounded.max_memory_bytes, Some(quotas.max_memory_bytes));
+        assert_eq!(bounded.max_fuel_per_sec, None);
+        quotas.max_cpu_fuel_per_sec = 9000;
+        assert_eq!(
+            principal_compute_limits(&quotas, false).max_fuel_per_sec,
+            Some(9000)
+        );
+        assert_eq!(
+            principal_compute_limits(&quotas, true),
+            astrid_compute::PrincipalComputeLimits::default()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

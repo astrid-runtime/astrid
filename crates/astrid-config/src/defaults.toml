@@ -451,6 +451,21 @@ timeout_secs = 300
 # not the resting footprint. Run-loop / host_process capsules ignore it.
 # instance_pool_size = 32
 
+# Optional operator ceiling applied to each principal in addition to that
+# principal's own profile. Leave unset for profile-only admission.
+# compute_max_workers_per_principal = 8
+# compute_max_shared_memory_bytes_per_principal = 8589934592
+
+# Daemon-wide compute pool shared by every principal and capsule. Leave unset
+# to use all available host parallelism and physical RAM minus a dynamic safety
+# reserve. Managed hosts can pin either independently.
+# compute_host_max_workers = 16
+# compute_host_max_shared_memory_bytes = 34359738368
+
+# Optional fuel ceiling for one compute job. Principal CPU fuel per second is
+# configured on the principal profile with `astrid quota set`.
+# compute_max_job_fuel = 50000000000
+
 # ============================================================================
 # Spark (Agent Identity)
 # ============================================================================

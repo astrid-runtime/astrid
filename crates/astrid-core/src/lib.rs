@@ -48,7 +48,7 @@ pub use groups::{
 pub use principal::{PrincipalId, PrincipalIdError};
 pub use profile::{
     AuthConfig, AuthMethod, BACKGROUND_PROCESSES_UPPER_BOUND, CURRENT_PROFILE_VERSION,
-    CapabilityPattern, CapsuleGrant, DEFAULT_MAX_BACKGROUND_PROCESSES,
+    CapabilityPattern, CapsuleGrant, DEFAULT_MAX_BACKGROUND_PROCESSES, DEFAULT_MAX_COMPUTE_WORKERS,
     DEFAULT_MAX_IPC_THROUGHPUT_BYTES, DEFAULT_MAX_MEMORY_BYTES, DEFAULT_MAX_STORAGE_BYTES,
     DEFAULT_MAX_TIMEOUT_SECS, DEVICE_KEY_ID_HEX_LEN, DeviceKey, DeviceKeyId, DevicePubkey,
     DeviceScope, GroupName, MAX_GROUP_NAME_LEN, NetworkConfig, PrincipalProfile, ProcessConfig,

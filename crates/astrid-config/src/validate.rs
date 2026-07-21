@@ -329,6 +329,20 @@ fn validate_capsule(config: &Config) -> ConfigResult<()> {
         });
     }
 
+    if c.compute_host_max_workers == Some(0) {
+        return Err(ConfigError::ValidationError {
+            field: "capsule.compute_host_max_workers".to_owned(),
+            message: "compute_host_max_workers must be greater than 0".to_owned(),
+        });
+    }
+
+    if c.compute_host_max_shared_memory_bytes == Some(0) {
+        return Err(ConfigError::ValidationError {
+            field: "capsule.compute_host_max_shared_memory_bytes".to_owned(),
+            message: "compute_host_max_shared_memory_bytes must be greater than 0".to_owned(),
+        });
+    }
+
     Ok(())
 }
 
@@ -428,6 +442,8 @@ mod tests {
         config.capsule.host_io_concurrency = Some(256);
         config.capsule.compute_max_workers_per_principal = Some(8);
         config.capsule.compute_max_shared_memory_bytes_per_principal = Some(8 * 1024 * 1024);
+        config.capsule.compute_host_max_workers = Some(32);
+        config.capsule.compute_host_max_shared_memory_bytes = Some(64 * 1024 * 1024);
         assert!(validate(&config).is_ok());
     }
 
@@ -494,6 +510,24 @@ mod tests {
             err,
             ConfigError::ValidationError { field, .. }
                 if field == "capsule.compute_max_job_fuel"
+        ));
+
+        config.capsule.compute_max_job_fuel = None;
+        config.capsule.compute_host_max_workers = Some(0);
+        let err = validate(&config).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::ValidationError { field, .. }
+                if field == "capsule.compute_host_max_workers"
+        ));
+
+        config.capsule.compute_host_max_workers = None;
+        config.capsule.compute_host_max_shared_memory_bytes = Some(0);
+        let err = validate(&config).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::ValidationError { field, .. }
+                if field == "capsule.compute_host_max_shared_memory_bytes"
         ));
     }
 

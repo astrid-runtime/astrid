@@ -915,7 +915,7 @@ pub(crate) fn resolve_run_loop_budget(
         None
     };
 
-    // Memory cap for a bound run-loop: owner quota (default 64 MiB on
+    // Memory cap for a bound run-loop: owner quota (the profile default on
     // resolve-failure), clamped into usize. Non-bound Stores keep the
     // process default.
     let mem_bytes = if bound_run_loop {
@@ -1462,8 +1462,17 @@ impl ExecutionEngine for WasmEngine {
                 max_job_fuel: self.compute_limits.max_job_fuel,
             };
             Some(Arc::new(
-                astrid_compute::ComputeRuntime::new(self.compute_ledger.clone(), limits)
-                    .map_err(|error| CapsuleError::UnsupportedEntryPoint(error.to_string()))?,
+                astrid_compute::ComputeRuntime::new_accounted_with_host_limits(
+                    self.compute_ledger.clone(),
+                    limits,
+                    astrid_compute::ComputeHostLimits {
+                        max_workers: self.compute_limits.host_max_workers,
+                        max_memory_bytes: self.compute_limits.host_max_shared_memory_bytes,
+                    },
+                    self.fuel_ledger.clone(),
+                    self.fuel_rate.clone(),
+                )
+                .map_err(|error| CapsuleError::UnsupportedEntryPoint(error.to_string()))?,
             ))
         } else {
             None
@@ -2004,6 +2013,7 @@ impl ExecutionEngine for WasmEngine {
                 invocation_secret_store: None,
                 invocation_capsule_log: None,
                 invocation_profile: None,
+                invocation_resource_exempt: false,
                 profile_cache: st_profile_cache.clone(),
                 invocation_env_overlay: None,
                 // Neutral, physically-isolated KV fallback (see the `kv` field
@@ -2730,6 +2740,11 @@ impl ExecutionEngine for WasmEngine {
         // enforcement BYPASS — the chain would carry on as if nothing happened.
         let now = std::time::Instant::now();
         let live_group_config = self.group_config.as_ref().map(|groups| groups.load_full());
+        let invocation_resource_exempt = resolve_exemption(
+            invocation_profile.as_deref(),
+            live_group_config.as_ref().map(Arc::as_ref),
+            &invoking_principal,
+        );
         if let Some(reason) = cpu_rate_deny(
             &self.fuel_rate,
             invocation_profile.as_deref(),
@@ -2878,6 +2893,7 @@ impl ExecutionEngine for WasmEngine {
                     invoking_principal.clone(),
                 );
                 state.invocation_profile = invocation_profile.clone();
+                state.invocation_resource_exempt = invocation_resource_exempt;
                 state.invocation_env_overlay =
                     load_invocation_env_overlay(&invoking_principal, state.capsule_id.as_str());
 
@@ -3120,6 +3136,7 @@ pub async fn run_lifecycle(
         invocation_secret_store: None,
         invocation_capsule_log: None,
         invocation_profile: None,
+        invocation_resource_exempt: false,
         // Lifecycle hooks don't run the per-principal recv loop; no cache needed.
         profile_cache: None,
         invocation_env_overlay: None,
@@ -3588,7 +3605,10 @@ mod tests {
         assert!(b.bound_run_loop);
         // Default profile timeout (300s) clamps to the default window.
         assert_eq!(b.window_ticks, Some(DEFAULT_RUN_LOOP_WINDOW_TICKS));
-        assert_eq!(b.mem_bytes, WASM_MAX_MEMORY_BYTES);
+        assert_eq!(
+            b.mem_bytes,
+            usize::try_from(astrid_core::DEFAULT_MAX_MEMORY_BYTES).unwrap_or(usize::MAX)
+        );
     }
 
     #[test]
@@ -4026,26 +4046,23 @@ mod tests {
     }
 
     #[test]
-    fn rate_gate_no_profile_uses_generous_default_budget() {
-        // No profile (tests / single-tenant) => DEFAULT_MAX_CPU_FUEL_PER_SEC,
-        // still enforced but generous: a principal under the default is
-        // admitted, and one driven past the default is denied. Proves the
-        // default is wired AND enforced.
+    fn rate_gate_no_profile_uses_unlimited_default() {
+        // No profile (tests / owner-operated single-tenant) uses the unlimited
+        // default. Managed principals receive a finite value from their
+        // profile instead.
         let rl = crate::FuelRateLimiter::default();
         let now = std::time::Instant::now();
         let p = pid("anon");
         let g = builtin_groups();
-        // Under the (very large) default: admitted.
         rl.record(&p, 1_000, now);
         assert!(
             cpu_rate_deny(&rl, None, Some(&g), &p, now).is_none(),
-            "a principal under the default budget is admitted"
+            "the default admits ordinary work"
         );
-        // Past the default: denied.
-        rl.record(&p, astrid_core::profile::DEFAULT_MAX_CPU_FUEL_PER_SEC, now);
+        saturate(&rl, &p, now);
         assert!(
-            cpu_rate_deny(&rl, None, Some(&g), &p, now).is_some(),
-            "with no profile the generous DEFAULT budget is still enforced"
+            cpu_rate_deny(&rl, None, Some(&g), &p, now).is_none(),
+            "with no profile the unlimited default must not throttle"
         );
     }
 

@@ -67,14 +67,6 @@ impl Quotas {
                 "quotas.max_storage_bytes must be > 0".into(),
             ));
         }
-        if self.max_cpu_fuel_per_sec == 0 {
-            // Fail-closed: a zero CPU rate would trap every guest instruction
-            // immediately. There is no "unlimited" sentinel — exemption is a
-            // capability (`CAP_RESOURCES_UNBOUNDED`), never a quota value.
-            return Err(ProfileError::Invalid(
-                "quotas.max_cpu_fuel_per_sec must be > 0".into(),
-            ));
-        }
         Ok(())
     }
 }
@@ -239,10 +231,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_zero_cpu_fuel_per_sec() {
+    fn accepts_zero_cpu_fuel_as_unlimited() {
         let mut p = PrincipalProfile::default();
         p.quotas.max_cpu_fuel_per_sec = 0;
-        assert!(matches!(p.validate(), Err(ProfileError::Invalid(_))));
+        p.validate().unwrap();
     }
 
     // ── Auth ──────────────────────────────────────────────────────────

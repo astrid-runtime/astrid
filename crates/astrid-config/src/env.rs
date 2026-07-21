@@ -88,6 +88,14 @@ const ENV_MAPPINGS: &[EnvMapping] = &[
         var_name: "ASTRID_CAPSULE_COMPUTE_MAX_JOB_FUEL",
         field_path: "capsule.compute_max_job_fuel",
     },
+    EnvMapping {
+        var_name: "ASTRID_CAPSULE_COMPUTE_HOST_MAX_WORKERS",
+        field_path: "capsule.compute_host_max_workers",
+    },
+    EnvMapping {
+        var_name: "ASTRID_CAPSULE_COMPUTE_HOST_MAX_SHARED_MEMORY_BYTES",
+        field_path: "capsule.compute_host_max_shared_memory_bytes",
+    },
     // Retry settings.
     EnvMapping {
         var_name: "ASTRID_RETRY_LLM_MAX_ATTEMPTS",
@@ -311,6 +319,8 @@ fn coerce_to_toml_value(path: &str, val: &str) -> toml::Value {
             | "capsule.compute_max_workers_per_principal"
             | "capsule.compute_max_shared_memory_bytes_per_principal"
             | "capsule.compute_max_job_fuel"
+            | "capsule.compute_host_max_workers"
+            | "capsule.compute_host_max_shared_memory_bytes"
             | "retry.llm_max_attempts"
             | "retry.mcp_max_attempts"
     ) && let Ok(i) = val.parse::<i64>()
@@ -409,6 +419,29 @@ mod tests {
     fn test_coerce_integer() {
         let v = coerce_to_toml_value("model.max_tokens", "8192");
         assert_eq!(v.as_integer().unwrap(), 8192);
+    }
+
+    #[test]
+    fn test_compute_host_env_fallbacks_are_integers() {
+        let mut merged: toml::Value = toml::from_str("[capsule]").unwrap();
+        let mut sources = FieldSources::new();
+        let env = make_env(&[
+            ("ASTRID_CAPSULE_COMPUTE_HOST_MAX_WORKERS", "32"),
+            (
+                "ASTRID_CAPSULE_COMPUTE_HOST_MAX_SHARED_MEMORY_BYTES",
+                "68719476736",
+            ),
+        ]);
+
+        assert_eq!(apply_env_fallbacks(&mut merged, &mut sources, &env), 2);
+        assert_eq!(
+            merged["capsule"]["compute_host_max_workers"].as_integer(),
+            Some(32)
+        );
+        assert_eq!(
+            merged["capsule"]["compute_host_max_shared_memory_bytes"].as_integer(),
+            Some(68_719_476_736)
+        );
     }
 
     #[test]

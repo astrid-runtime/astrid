@@ -9,6 +9,7 @@ rust-version.workspace = true
 description = "Principal-scoped shared-memory WebAssembly compute groups for Astrid"
 
 [dependencies]
+astrid-capsule-types = { workspace = true }
 astrid-core = { workspace = true }
 blake3 = { workspace = true }
 thiserror = { workspace = true }

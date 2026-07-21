@@ -127,6 +127,20 @@ pub fn enforce_restrictions(
         &["capsule", "compute_max_job_fuel"],
         "capsule.compute_max_job_fuel",
     );
+    block_workspace_override(
+        merged,
+        baseline,
+        workspace_layer,
+        &["capsule", "compute_host_max_workers"],
+        "capsule.compute_host_max_workers",
+    );
+    block_workspace_override(
+        merged,
+        baseline,
+        workspace_layer,
+        &["capsule", "compute_host_max_shared_memory_bytes"],
+        "capsule.compute_host_max_shared_memory_bytes",
+    );
 
     // workspace.auto_allow_read: cannot expand beyond baseline.
     block_workspace_expansion(

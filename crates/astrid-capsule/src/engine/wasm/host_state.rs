@@ -348,6 +348,10 @@ pub struct HostState {
     /// file resolves to `Some(PrincipalProfile::default())` (a missing file is
     /// not an error — see [`PrincipalProfile::load`](astrid_core::profile::PrincipalProfile::load)).
     pub invocation_profile: Option<Arc<astrid_core::profile::PrincipalProfile>>,
+    /// Whether the verified invoking principal is capability-exempt from
+    /// resource ceilings for this invocation. Computed by the engine from the
+    /// live profile and group policy; capsules cannot set it.
+    pub invocation_resource_exempt: bool,
     /// Shared profile-cache handle, used by the `ipc::recv` path to resolve
     /// the invoking principal's [`PrincipalProfile`](astrid_core::profile::PrincipalProfile)
     /// into [`invocation_profile`](Self::invocation_profile).

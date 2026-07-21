@@ -825,16 +825,20 @@ pub struct CapsuleSection {
     /// `host_process` capsules stay single-Store regardless.)
     pub instance_pool_size: Option<usize>,
     /// Aggregate generic compute workers per principal across all capsules.
-    /// `None` means no Astrid policy cap; physical host admission still
-    /// applies, and `auto` starts from useful host parallelism.
+    /// `None` adds no operator cap; the principal profile still applies.
     pub compute_max_workers_per_principal: Option<u32>,
     /// Aggregate generic compute shared memory per principal, in bytes.
-    /// `None` means no compute-specific Astrid policy cap; physical allocation
-    /// may still fail.
+    /// `None` adds no operator cap; the principal profile still applies.
     pub compute_max_shared_memory_bytes_per_principal: Option<u64>,
     /// Maximum Wasmtime fuel for one generic compute job. `None` leaves jobs
     /// uncapped by Astrid policy; cancellation remains epoch-interruptible.
     pub compute_max_job_fuel: Option<u64>,
+    /// Workers admitted across all principals and capsules in this daemon.
+    /// `None` derives the pool from the host's available parallelism.
+    pub compute_host_max_workers: Option<u32>,
+    /// Shared-memory bytes admitted across all principals and capsules in this
+    /// daemon. `None` derives the pool from host RAM with a safety reserve.
+    pub compute_host_max_shared_memory_bytes: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------

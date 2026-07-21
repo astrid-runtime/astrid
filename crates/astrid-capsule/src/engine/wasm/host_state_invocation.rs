@@ -239,6 +239,9 @@ impl HostState {
                 },
             }
         });
+        // The recv path does not carry the engine's live group-policy snapshot,
+        // so it cannot prove an exemption. Keep compute admission fail-closed.
+        self.invocation_resource_exempt = false;
 
         self.invocation_env_overlay = crate::engine::wasm::load_invocation_env_overlay(
             &profile_principal,

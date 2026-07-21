@@ -26,6 +26,7 @@ astrid-kernel = { workspace = true }
 astrid-telemetry = { workspace = true, features = ["config"] }
 clap = { workspace = true }
 colored = { workspace = true }
+sysinfo = { workspace = true }
 # `signal` (SIGTERM/SIGHUP/ctrl-c shutdown), `rt-multi-thread` (the
 # `Builder::new_multi_thread()` runtime): native-only, no longer in the
 # workspace tokio base.

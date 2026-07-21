@@ -15,8 +15,19 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   Capsules can package hash-pinned worker modules, admit deterministic or
   parallel worker groups over shared memory, and submit cancellable jobs through
   an audited host boundary. Aggregate worker, memory, and optional fuel ceilings
-  are operator-controlled; defaults add no arbitrary Astrid policy cap. The
-  pre-1.0 WIT contract remains deliberately unmerged until Astrid 1.0.
+  are operator-controlled. Omitted daemon limits now derive a host-wide pool
+  from useful parallelism and physical RAM with a safety reserve; `auto` memory
+  requests intersect that pool, the signed worker maximum, live aggregate
+  usage, and the invoking principal profile. Worker fuel joins the ordinary
+  cross-capsule principal CPU ledger and rate limiter. Operators can clamp an
+  individual principal with `astrid quota set --compute-workers` and
+  `--cpu-fuel-per-sec`; the owner-operated CPU-rate default is unlimited, while
+  managed deployments can set a finite rate. The pre-1.0 WIT contract remains
+  deliberately unmerged until Astrid 1.0.
+- **Fresh principal memory admission now defaults to 4 GiB.** This is a virtual
+  ceiling rather than eager allocation, allowing development Realm and compiler
+  workloads to use a normal workstation while host-wide admission remains
+  dynamic. Managed installations can lower the existing per-principal quota.
 - **Principal-bound open-file resources now implement the existing Astrid FS
   contract.** Capsules can perform bounded positional reads and writes, resize
   and sync open files, inspect handle metadata, and atomically rename paths

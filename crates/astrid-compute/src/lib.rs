@@ -21,6 +21,7 @@ use std::sync::{Arc, Condvar, Mutex, Weak, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use astrid_capsule_types::{FuelLedger, FuelRateLimiter};
 use astrid_core::principal::PrincipalId;
 use thiserror::Error;
 use wasmtime::{
@@ -105,6 +106,60 @@ pub struct ComputeLimits {
     pub max_job_fuel: Option<u64>,
 }
 
+/// Process-wide compute capacity contributed by the host/operator.
+///
+/// This is distinct from [`ComputeLimits`]: one principal cannot consume more
+/// than its own intersected policy, and all principals together cannot reserve
+/// more than this host pool. `None` preserves the legacy uncapped constructor
+/// behaviour for embedders; the Astrid daemon always supplies detected limits.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ComputeHostLimits {
+    /// Workers reserved across every principal and compute group.
+    pub max_workers: Option<u32>,
+    /// Shared-memory bytes reserved across every principal and compute group.
+    pub max_memory_bytes: Option<u64>,
+}
+
+/// Effective policy contributed by the verified invoking principal.
+///
+/// The runtime intersects this with its operator/host limits. `None` delegates
+/// that dimension to the outer runtime; it never widens an operator ceiling.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PrincipalComputeLimits {
+    /// Aggregate workers this principal may reserve across compute groups.
+    pub max_workers: Option<u32>,
+    /// Aggregate shared memory this principal may reserve across compute groups.
+    pub max_memory_bytes: Option<u64>,
+    /// Per-job fuel ceiling contributed by the principal policy.
+    pub max_job_fuel: Option<u64>,
+    /// Rolling CPU-rate ceiling. `None` means the principal is policy-exempt.
+    pub max_fuel_per_sec: Option<u64>,
+}
+
+impl ComputeLimits {
+    fn intersect(self, principal: PrincipalComputeLimits) -> Self {
+        Self {
+            max_workers_per_principal: min_option(
+                self.max_workers_per_principal,
+                principal.max_workers,
+            ),
+            max_memory_bytes_per_principal: min_option(
+                self.max_memory_bytes_per_principal,
+                principal.max_memory_bytes,
+            ),
+            max_job_fuel: min_option(self.max_job_fuel, principal.max_job_fuel),
+        }
+    }
+}
+
+fn min_option<T: Ord + Copy>(left: Option<T>, right: Option<T>) -> Option<T> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
 /// Group creation request after WIT/SDK conversion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GroupRequest {
@@ -114,7 +169,8 @@ pub struct GroupRequest {
     pub parallelism: Parallelism,
     /// Initial 64-KiB shared-memory pages.
     pub initial_memory_pages: u32,
-    /// Maximum shared-memory pages.
+    /// Maximum shared-memory pages. Zero asks the host to admit the largest
+    /// value allowed by the signed worker and currently available policy.
     pub maximum_memory_pages: u32,
 }
 
@@ -199,7 +255,13 @@ pub struct PrincipalComputeUsage {
 /// group holds an RAII reservation, so every failure and drop path rolls back.
 #[derive(Debug, Clone, Default)]
 pub struct ComputeLedger {
-    inner: Arc<Mutex<HashMap<PrincipalId, PrincipalComputeUsage>>>,
+    inner: Arc<Mutex<ComputeLedgerState>>,
+}
+
+#[derive(Debug, Default)]
+struct ComputeLedgerState {
+    principals: HashMap<PrincipalId, PrincipalComputeUsage>,
+    total: PrincipalComputeUsage,
 }
 
 impl ComputeLedger {
@@ -209,13 +271,63 @@ impl ComputeLedger {
         self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .principals
             .get(principal)
             .copied()
             .unwrap_or_default()
     }
 
-    fn remaining_workers(&self, principal: &PrincipalId, limit: Option<u32>) -> Option<u64> {
-        limit.map(|max| u64::from(max).saturating_sub(self.usage(principal).workers))
+    /// Return aggregate process-wide reservations.
+    #[must_use]
+    pub fn total_usage(&self) -> PrincipalComputeUsage {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .total
+    }
+
+    fn remaining_workers(
+        &self,
+        principal: &PrincipalId,
+        principal_limit: Option<u32>,
+        host_limit: Option<u32>,
+    ) -> Option<u64> {
+        let state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let principal_used = state
+            .principals
+            .get(principal)
+            .copied()
+            .unwrap_or_default()
+            .workers;
+        min_option(
+            principal_limit.map(|max| u64::from(max).saturating_sub(principal_used)),
+            host_limit.map(|max| u64::from(max).saturating_sub(state.total.workers)),
+        )
+    }
+
+    fn remaining_memory(
+        &self,
+        principal: &PrincipalId,
+        principal_limit: Option<u64>,
+        host_limit: Option<u64>,
+    ) -> Option<u64> {
+        let state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let principal_used = state
+            .principals
+            .get(principal)
+            .copied()
+            .unwrap_or_default()
+            .memory_bytes;
+        min_option(
+            principal_limit.map(|max| max.saturating_sub(principal_used)),
+            host_limit.map(|max| max.saturating_sub(state.total.memory_bytes)),
+        )
     }
 
     fn reserve(
@@ -224,26 +336,42 @@ impl ComputeLedger {
         workers: u32,
         memory_bytes: u64,
         limits: ComputeLimits,
+        host_limits: ComputeHostLimits,
     ) -> Result<ComputeReservation, ComputeError> {
-        let mut map = self
+        let mut state = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let usage = map.entry(principal.clone()).or_default();
+        let usage = state
+            .principals
+            .get(&principal)
+            .copied()
+            .unwrap_or_default();
         let next_workers = usage.workers.saturating_add(u64::from(workers));
         let next_memory = usage.memory_bytes.saturating_add(memory_bytes);
+        let next_total_workers = state.total.workers.saturating_add(u64::from(workers));
+        let next_total_memory = state.total.memory_bytes.saturating_add(memory_bytes);
         if limits
             .max_workers_per_principal
             .is_some_and(|limit| next_workers > u64::from(limit))
             || limits
                 .max_memory_bytes_per_principal
                 .is_some_and(|limit| next_memory > limit)
+            || host_limits
+                .max_workers
+                .is_some_and(|limit| next_total_workers > u64::from(limit))
+            || host_limits
+                .max_memory_bytes
+                .is_some_and(|limit| next_total_memory > limit)
         {
             return Err(ComputeError::Quota);
         }
+        let usage = state.principals.entry(principal.clone()).or_default();
         usage.workers = next_workers;
         usage.memory_bytes = next_memory;
-        drop(map);
+        state.total.workers = next_total_workers;
+        state.total.memory_bytes = next_total_memory;
+        drop(state);
         Ok(ComputeReservation {
             ledger: self.clone(),
             principal,
@@ -254,17 +382,19 @@ impl ComputeLedger {
     }
 
     fn release(&self, principal: &PrincipalId, workers: u64, memory_bytes: u64) {
-        let mut map = self
+        let mut state = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(usage) = map.get_mut(principal) {
+        if let Some(usage) = state.principals.get_mut(principal) {
             usage.workers = usage.workers.saturating_sub(workers);
             usage.memory_bytes = usage.memory_bytes.saturating_sub(memory_bytes);
             if usage.workers == 0 && usage.memory_bytes == 0 {
-                map.remove(principal);
+                state.principals.remove(principal);
             }
         }
+        state.total.workers = state.total.workers.saturating_sub(workers);
+        state.total.memory_bytes = state.total.memory_bytes.saturating_sub(memory_bytes);
     }
 }
 
@@ -407,7 +537,10 @@ pub struct ComputeRuntime {
 struct RuntimeInner {
     engine: Engine,
     ledger: ComputeLedger,
+    fuel_ledger: FuelLedger,
+    fuel_rate: FuelRateLimiter,
     limits: ComputeLimits,
+    host_limits: ComputeHostLimits,
     worker_start_timeout: Duration,
     ticker_stop: Arc<AtomicBool>,
     ticker: Mutex<Option<JoinHandle<()>>>,
@@ -429,12 +562,81 @@ impl ComputeRuntime {
     /// Returns [`ComputeError::WorkerFailed`] if Wasmtime cannot enable the
     /// required proposals or the epoch ticker thread cannot start.
     pub fn new(ledger: ComputeLedger, limits: ComputeLimits) -> Result<Self, ComputeError> {
-        Self::new_with_worker_start_timeout(ledger, limits, WORKER_START_TIMEOUT)
+        Self::new_accounted(
+            ledger,
+            limits,
+            FuelLedger::default(),
+            FuelRateLimiter::default(),
+        )
     }
 
+    /// Construct a runtime whose worker fuel is charged into the kernel's
+    /// ordinary cross-capsule principal CPU account.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ComputeError::WorkerFailed`] if Wasmtime cannot enable the
+    /// required proposals or the epoch ticker thread cannot start.
+    pub fn new_accounted(
+        ledger: ComputeLedger,
+        limits: ComputeLimits,
+        fuel_ledger: FuelLedger,
+        fuel_rate: FuelRateLimiter,
+    ) -> Result<Self, ComputeError> {
+        Self::new_accounted_with_host_limits(
+            ledger,
+            limits,
+            ComputeHostLimits::default(),
+            fuel_ledger,
+            fuel_rate,
+        )
+    }
+
+    /// Construct an accounted runtime with a process-wide admission pool.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ComputeError::WorkerFailed`] if Wasmtime cannot enable the
+    /// required proposals or the epoch ticker thread cannot start.
+    pub fn new_accounted_with_host_limits(
+        ledger: ComputeLedger,
+        limits: ComputeLimits,
+        host_limits: ComputeHostLimits,
+        fuel_ledger: FuelLedger,
+        fuel_rate: FuelRateLimiter,
+    ) -> Result<Self, ComputeError> {
+        Self::new_with_worker_start_timeout_and_accounting(
+            ledger,
+            limits,
+            host_limits,
+            fuel_ledger,
+            fuel_rate,
+            WORKER_START_TIMEOUT,
+        )
+    }
+
+    #[cfg(test)]
     fn new_with_worker_start_timeout(
         ledger: ComputeLedger,
         limits: ComputeLimits,
+        worker_start_timeout: Duration,
+    ) -> Result<Self, ComputeError> {
+        Self::new_with_worker_start_timeout_and_accounting(
+            ledger,
+            limits,
+            ComputeHostLimits::default(),
+            FuelLedger::default(),
+            FuelRateLimiter::default(),
+            worker_start_timeout,
+        )
+    }
+
+    fn new_with_worker_start_timeout_and_accounting(
+        ledger: ComputeLedger,
+        limits: ComputeLimits,
+        host_limits: ComputeHostLimits,
+        fuel_ledger: FuelLedger,
+        fuel_rate: FuelRateLimiter,
         worker_start_timeout: Duration,
     ) -> Result<Self, ComputeError> {
         let mut config = Config::new();
@@ -461,7 +663,10 @@ impl ComputeRuntime {
             inner: Arc::new(RuntimeInner {
                 engine,
                 ledger,
+                fuel_ledger,
+                fuel_rate,
                 limits,
+                host_limits,
                 worker_start_timeout,
                 ticker_stop: stop,
                 ticker: Mutex::new(Some(ticker)),
@@ -482,8 +687,33 @@ impl ComputeRuntime {
         artifact: &WorkerArtifact,
         request: GroupRequest,
     ) -> Result<ComputeGroup, ComputeError> {
+        self.open_group_with_limits(
+            principal,
+            artifact,
+            request,
+            PrincipalComputeLimits::default(),
+        )
+    }
+
+    /// Open a group under the intersection of operator and principal policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when either policy denies admission or the worker
+    /// cannot be compiled, instantiated, or started.
+    pub fn open_group_with_limits(
+        &self,
+        principal: &PrincipalId,
+        artifact: &WorkerArtifact,
+        request: GroupRequest,
+        principal_limits: PrincipalComputeLimits,
+    ) -> Result<ComputeGroup, ComputeError> {
         validate_group_request(request)?;
-        let workers = self.resolve_workers(principal, request)?;
+        let effective_limits = self.inner.limits.intersect(principal_limits);
+        let workers = self.resolve_workers(principal, request, effective_limits)?;
+        let module = Module::from_binary(&self.inner.engine, &artifact.bytes)
+            .map_err(|error| ComputeError::WorkerInvalid(format!("compile module: {error}")))?;
+        let request = self.resolve_memory_request(principal, &module, request, effective_limits)?;
         let initial_bytes = u64::from(request.initial_memory_pages)
             .checked_mul(WASM_PAGE_BYTES)
             .ok_or_else(|| ComputeError::InvalidInput("initial memory overflow".to_owned()))?;
@@ -497,11 +727,9 @@ impl ComputeRuntime {
             principal.clone(),
             workers,
             maximum_bytes,
-            self.inner.limits,
+            effective_limits,
+            self.inner.host_limits,
         )?;
-
-        let module = Module::from_binary(&self.inner.engine, &artifact.bytes)
-            .map_err(|error| ComputeError::WorkerInvalid(format!("compile module: {error}")))?;
         validate_worker_module(&module, request)?;
         let memory = SharedMemory::new(
             &self.inner.engine,
@@ -520,8 +748,12 @@ impl ComputeRuntime {
                 &self.inner.engine,
                 &module,
                 &memory,
-                Arc::clone(&accounting),
-                Arc::clone(&closed),
+                WorkerExecutionContext {
+                    accounting: Arc::clone(&accounting),
+                    closed: Arc::clone(&closed),
+                    fuel_ledger: self.inner.fuel_ledger.clone(),
+                    fuel_rate: self.inner.fuel_rate.clone(),
+                },
                 self.inner.worker_start_timeout,
             ) {
                 Ok(slot) => slots.push(slot),
@@ -552,7 +784,9 @@ impl ComputeRuntime {
                 jobs,
                 accounting,
                 _reservation: reservation,
-                max_job_fuel: self.inner.limits.max_job_fuel,
+                max_job_fuel: effective_limits.max_job_fuel,
+                max_fuel_per_sec: principal_limits.max_fuel_per_sec,
+                fuel_rate: self.inner.fuel_rate.clone(),
             }),
         })
     }
@@ -561,6 +795,7 @@ impl ComputeRuntime {
         &self,
         principal: &PrincipalId,
         request: GroupRequest,
+        limits: ComputeLimits,
     ) -> Result<u32, ComputeError> {
         if request.mode == ExecutionMode::Deterministic {
             if matches!(
@@ -574,7 +809,11 @@ impl ComputeRuntime {
             return self
                 .inner
                 .ledger
-                .remaining_workers(principal, self.inner.limits.max_workers_per_principal)
+                .remaining_workers(
+                    principal,
+                    limits.max_workers_per_principal,
+                    self.inner.host_limits.max_workers,
+                )
                 .is_none_or(|remaining| remaining >= 1)
                 .then_some(1)
                 .ok_or(ComputeError::Quota);
@@ -589,10 +828,11 @@ impl ComputeRuntime {
             },
             Parallelism::Exact(value) | Parallelism::AtMost(value) => value,
         };
-        let remaining = self
-            .inner
-            .ledger
-            .remaining_workers(principal, self.inner.limits.max_workers_per_principal);
+        let remaining = self.inner.ledger.remaining_workers(
+            principal,
+            limits.max_workers_per_principal,
+            self.inner.host_limits.max_workers,
+        );
         match request.parallelism {
             Parallelism::Exact(_) => {
                 if remaining.is_some_and(|left| u64::from(desired) > left) {
@@ -610,6 +850,31 @@ impl ComputeRuntime {
                     .ok_or(ComputeError::Quota)
             },
         }
+    }
+
+    fn resolve_memory_request(
+        &self,
+        principal: &PrincipalId,
+        module: &Module,
+        mut request: GroupRequest,
+        limits: ComputeLimits,
+    ) -> Result<GroupRequest, ComputeError> {
+        if request.maximum_memory_pages != 0 {
+            return Ok(request);
+        }
+        let (_, worker_maximum) = worker_memory_limits(module)?;
+        let available_bytes = self.inner.ledger.remaining_memory(
+            principal,
+            limits.max_memory_bytes_per_principal,
+            self.inner.host_limits.max_memory_bytes,
+        );
+        let available_pages = available_bytes.map_or(u64::MAX, |bytes| bytes / WASM_PAGE_BYTES);
+        let admitted = worker_maximum.min(available_pages).min(u64::from(u32::MAX));
+        request.maximum_memory_pages = u32::try_from(admitted)
+            .ok()
+            .filter(|maximum| *maximum >= request.initial_memory_pages)
+            .ok_or(ComputeError::Quota)?;
+        Ok(request)
     }
 
     /// Shared aggregate ledger.
@@ -639,15 +904,17 @@ fn validate_group_request(request: GroupRequest) -> Result<(), ComputeError> {
             "initial memory pages must be greater than zero".to_owned(),
         ));
     }
-    if request.maximum_memory_pages < request.initial_memory_pages {
+    if request.maximum_memory_pages != 0
+        && request.maximum_memory_pages < request.initial_memory_pages
+    {
         return Err(ComputeError::InvalidInput(
-            "maximum memory pages must be at least initial pages".to_owned(),
+            "maximum memory pages must be zero (auto) or at least initial pages".to_owned(),
         ));
     }
     Ok(())
 }
 
-fn validate_worker_module(module: &Module, request: GroupRequest) -> Result<(), ComputeError> {
+fn worker_memory_limits(module: &Module) -> Result<(u64, u64), ComputeError> {
     let imports: Vec<_> = module.imports().collect();
     if imports.len() != 1
         || imports[0].module() != "astrid_compute"
@@ -667,10 +934,16 @@ fn validate_worker_module(module: &Module, request: GroupRequest) -> Result<(), 
             "worker memory import must be shared and declare a maximum".to_owned(),
         ));
     }
-    if memory.minimum() > u64::from(request.initial_memory_pages)
-        || memory
-            .maximum()
-            .is_some_and(|max| max < u64::from(request.maximum_memory_pages))
+    Ok((
+        memory.minimum(),
+        memory.maximum().expect("checked shared-memory maximum"),
+    ))
+}
+
+fn validate_worker_module(module: &Module, request: GroupRequest) -> Result<(), ComputeError> {
+    let (minimum, maximum) = worker_memory_limits(module)?;
+    if minimum > u64::from(request.initial_memory_pages)
+        || maximum < u64::from(request.maximum_memory_pages)
     {
         return Err(ComputeError::WorkerInvalid(
             "worker memory limits are incompatible with the group request".to_owned(),
@@ -709,6 +982,8 @@ struct GroupInner {
     accounting: Arc<AccountingState>,
     _reservation: ComputeReservation,
     max_job_fuel: Option<u64>,
+    max_fuel_per_sec: Option<u64>,
+    fuel_rate: FuelRateLimiter,
 }
 
 impl ComputeGroup {
@@ -808,6 +1083,13 @@ impl ComputeGroup {
     pub fn submit(&self, descriptor: WorkDescriptor) -> Result<ComputeJob, ComputeError> {
         if self.inner.closed.load(Ordering::Acquire) {
             return Err(ComputeError::Closed);
+        }
+        if self.inner.max_fuel_per_sec.is_some_and(|budget| {
+            self.inner
+                .fuel_rate
+                .over_budget(&self.inner.principal, budget, Instant::now())
+        }) {
+            return Err(ComputeError::Quota);
         }
         validate_descriptor(&self.inner.memory, descriptor)?;
         let job = Arc::new(JobInner::new(
@@ -1144,6 +1426,13 @@ struct WorkerSlot {
     handle: Mutex<Option<JoinHandle<()>>>,
 }
 
+struct WorkerExecutionContext {
+    accounting: Arc<AccountingState>,
+    closed: Arc<AtomicBool>,
+    fuel_ledger: FuelLedger,
+    fuel_rate: FuelRateLimiter,
+}
+
 impl WorkerSlot {
     #[allow(
         clippy::too_many_lines,
@@ -1154,10 +1443,15 @@ impl WorkerSlot {
         engine: &Engine,
         module: &Module,
         memory: &SharedMemory,
-        accounting: Arc<AccountingState>,
-        closed: Arc<AtomicBool>,
+        context: WorkerExecutionContext,
         worker_start_timeout: Duration,
     ) -> Result<Self, ComputeError> {
+        let WorkerExecutionContext {
+            accounting,
+            closed,
+            fuel_ledger,
+            fuel_rate,
+        } = context;
         let (sender, receiver) = mpsc::sync_channel(WORKER_QUEUE_CAPACITY);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let pending = Arc::new(AtomicUsize::new(0));
@@ -1276,6 +1570,8 @@ impl WorkerSlot {
                     };
                     let remaining = store.get_fuel().unwrap_or(0);
                     let consumed = fuel.saturating_sub(remaining);
+                    fuel_ledger.charge(&job.principal, consumed);
+                    fuel_rate.record(&job.principal, consumed, Instant::now());
                     let current_memory = memory.data_size() as u64;
                     accounting.set_memory(current_memory);
                     let _ = atomic_store_u64(&memory, 24, current_memory);

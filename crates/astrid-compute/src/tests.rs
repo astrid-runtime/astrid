@@ -392,6 +392,154 @@ fn operator_job_fuel_is_a_ceiling_and_none_uses_it() {
 }
 
 #[test]
+fn principal_policy_intersects_operator_compute_limits() {
+    let runtime = ComputeRuntime::new(
+        ComputeLedger::default(),
+        ComputeLimits {
+            max_workers_per_principal: Some(4),
+            max_memory_bytes_per_principal: Some(4 * WASM_PAGE_BYTES),
+            max_job_fuel: Some(2_000_000),
+        },
+    )
+    .expect("runtime starts");
+    let principal_limits = PrincipalComputeLimits {
+        max_workers: Some(1),
+        max_memory_bytes: Some(WASM_PAGE_BYTES),
+        max_job_fuel: Some(1_000_000),
+        max_fuel_per_sec: Some(1_000_000),
+    };
+
+    assert!(matches!(
+        runtime.open_group_with_limits(
+            &principal("alice"),
+            &basic_worker(),
+            GroupRequest {
+                maximum_memory_pages: 2,
+                ..request(ExecutionMode::Deterministic, Parallelism::Auto)
+            },
+            principal_limits,
+        ),
+        Err(ComputeError::Quota)
+    ));
+    assert!(matches!(
+        runtime.open_group_with_limits(
+            &principal("alice"),
+            &basic_worker(),
+            GroupRequest {
+                maximum_memory_pages: 1,
+                ..request(ExecutionMode::Parallel, Parallelism::Exact(2))
+            },
+            principal_limits,
+        ),
+        Err(ComputeError::Quota)
+    ));
+
+    let group = runtime
+        .open_group_with_limits(
+            &principal("alice"),
+            &basic_worker(),
+            GroupRequest {
+                maximum_memory_pages: 1,
+                ..request(ExecutionMode::Deterministic, Parallelism::Auto)
+            },
+            principal_limits,
+        )
+        .expect("intersection admits an in-policy group");
+    assert!(matches!(
+        group.submit(WorkDescriptor {
+            offset: ABI_HEADER_BYTES,
+            length: 4,
+            tag: 0,
+            worker_index: None,
+            fuel: Some(1_000_001),
+        }),
+        Err(ComputeError::Quota)
+    ));
+}
+
+#[test]
+fn worker_fuel_joins_the_shared_principal_account() {
+    let fuel_ledger = FuelLedger::default();
+    let alice = principal("alice");
+    let runtime = ComputeRuntime::new_accounted(
+        ComputeLedger::default(),
+        ComputeLimits::default(),
+        fuel_ledger.clone(),
+        FuelRateLimiter::default(),
+    )
+    .expect("runtime starts");
+    let group = runtime
+        .open_group_with_limits(
+            &alice,
+            &basic_worker(),
+            request(ExecutionMode::Deterministic, Parallelism::Auto),
+            PrincipalComputeLimits {
+                max_fuel_per_sec: Some(u64::MAX),
+                ..PrincipalComputeLimits::default()
+            },
+        )
+        .expect("group opens");
+    let result = group
+        .submit(WorkDescriptor {
+            offset: ABI_HEADER_BYTES,
+            length: 4,
+            tag: 0,
+            worker_index: None,
+            fuel: Some(1_000_000),
+        })
+        .expect("job queues")
+        .join()
+        .expect("job completes");
+
+    assert!(result.fuel_consumed > 0);
+    assert_eq!(fuel_ledger.total(&alice), result.fuel_consumed);
+}
+
+#[test]
+fn worker_cpu_rate_denies_the_next_job_for_the_same_principal() {
+    let runtime = ComputeRuntime::new_accounted(
+        ComputeLedger::default(),
+        ComputeLimits::default(),
+        FuelLedger::default(),
+        FuelRateLimiter::default(),
+    )
+    .expect("runtime starts");
+    let group = runtime
+        .open_group_with_limits(
+            &principal("alice"),
+            &basic_worker(),
+            request(ExecutionMode::Deterministic, Parallelism::Auto),
+            PrincipalComputeLimits {
+                max_fuel_per_sec: Some(1),
+                ..PrincipalComputeLimits::default()
+            },
+        )
+        .expect("group opens");
+    group
+        .submit(WorkDescriptor {
+            offset: ABI_HEADER_BYTES,
+            length: 4,
+            tag: 0,
+            worker_index: None,
+            fuel: Some(1_000_000),
+        })
+        .expect("first job is admitted")
+        .join()
+        .expect("first job completes");
+
+    assert!(matches!(
+        group.submit(WorkDescriptor {
+            offset: ABI_HEADER_BYTES,
+            length: 4,
+            tag: 0,
+            worker_index: None,
+            fuel: Some(1_000_000),
+        }),
+        Err(ComputeError::Quota)
+    ));
+}
+
+#[test]
 fn ledger_aggregates_across_runtimes_and_releases_on_drop() {
     let ledger = ComputeLedger::default();
     let limits = ComputeLimits {
@@ -470,6 +618,106 @@ fn principals_do_not_compete_for_each_others_reservation() {
         .expect("bob independently reserves one");
     assert_eq!(alice.parallelism(), 1);
     assert_eq!(bob.parallelism(), 1);
+}
+
+#[test]
+fn host_pool_caps_all_principals_together() {
+    let ledger = ComputeLedger::default();
+    let runtime = ComputeRuntime::new_accounted_with_host_limits(
+        ledger.clone(),
+        ComputeLimits::default(),
+        ComputeHostLimits {
+            max_workers: Some(2),
+            max_memory_bytes: Some(2 * WASM_PAGE_BYTES),
+        },
+        FuelLedger::default(),
+        FuelRateLimiter::default(),
+    )
+    .expect("runtime starts");
+    let alice = runtime
+        .open_group(
+            &principal("alice"),
+            &basic_worker(),
+            GroupRequest {
+                maximum_memory_pages: 1,
+                ..request(ExecutionMode::Deterministic, Parallelism::Auto)
+            },
+        )
+        .expect("Alice reserves half the host pool");
+    let bob = runtime
+        .open_group(
+            &principal("bob"),
+            &basic_worker(),
+            GroupRequest {
+                maximum_memory_pages: 1,
+                ..request(ExecutionMode::Deterministic, Parallelism::Auto)
+            },
+        )
+        .expect("Bob reserves the other half");
+    assert_eq!(
+        ledger.total_usage(),
+        PrincipalComputeUsage {
+            workers: 2,
+            memory_bytes: 2 * WASM_PAGE_BYTES,
+        }
+    );
+    assert!(matches!(
+        runtime.open_group(
+            &principal("carol"),
+            &basic_worker(),
+            GroupRequest {
+                maximum_memory_pages: 1,
+                ..request(ExecutionMode::Deterministic, Parallelism::Auto)
+            },
+        ),
+        Err(ComputeError::Quota)
+    ));
+    drop(alice);
+    let carol = runtime
+        .open_group(
+            &principal("carol"),
+            &basic_worker(),
+            GroupRequest {
+                maximum_memory_pages: 1,
+                ..request(ExecutionMode::Deterministic, Parallelism::Auto)
+            },
+        )
+        .expect("released global capacity is reusable");
+    assert_eq!(carol.parallelism(), 1);
+    drop((bob, carol));
+    assert_eq!(ledger.total_usage(), PrincipalComputeUsage::default());
+}
+
+#[test]
+fn zero_maximum_memory_resolves_to_current_effective_capacity() {
+    let ledger = ComputeLedger::default();
+    let runtime = ComputeRuntime::new_accounted_with_host_limits(
+        ledger.clone(),
+        ComputeLimits {
+            max_memory_bytes_per_principal: Some(8 * WASM_PAGE_BYTES),
+            ..ComputeLimits::default()
+        },
+        ComputeHostLimits {
+            max_workers: None,
+            max_memory_bytes: Some(3 * WASM_PAGE_BYTES),
+        },
+        FuelLedger::default(),
+        FuelRateLimiter::default(),
+    )
+    .expect("runtime starts");
+    let group = runtime
+        .open_group(
+            &principal("alice"),
+            &basic_worker(),
+            GroupRequest {
+                maximum_memory_pages: 0,
+                ..request(ExecutionMode::Deterministic, Parallelism::Auto)
+            },
+        )
+        .expect("auto memory is admitted");
+
+    assert_eq!(group.maximum_memory_pages(), 3);
+    assert_eq!(ledger.total_usage().memory_bytes, 3 * WASM_PAGE_BYTES);
 }
 
 #[test]

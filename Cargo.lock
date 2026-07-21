@@ -545,6 +545,7 @@ dependencies = [
 name = "astrid-compute"
 version = "0.10.4"
 dependencies = [
+ "astrid-capsule-types",
  "astrid-core",
  "blake3",
  "tempfile",
@@ -621,6 +622,7 @@ dependencies = [
  "colored",
  "nix 0.31.3",
  "signal-hook 0.4.4",
+ "sysinfo",
  "tokio",
  "toml 0.9.12+spec-1.1.0",
  "tracing",

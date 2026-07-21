@@ -435,6 +435,7 @@ fn clear_on_return(state: &mut HostState, reset_resources: bool) {
     state.invocation_secret_store = None;
     state.invocation_capsule_log = None;
     state.invocation_profile = None;
+    state.invocation_resource_exempt = false;
     state.invocation_env_overlay = None;
     // A leftover per-principal cancellation token (possibly already cancelled
     // by a view release) must not decide which teardown signal the NEXT

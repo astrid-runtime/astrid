@@ -22,11 +22,13 @@
 //!
 //! # Defaults
 //!
-//! - `max_memory_bytes`         = 64 `MiB`
+//! - `max_memory_bytes`         = 4 `GiB`
 //! - `max_timeout_secs`         = 300  (5 min)
 //! - `max_ipc_throughput_bytes` = 10 `MiB`/s
 //! - `max_background_processes` = 8
+//! - `max_compute_workers`      = 0  (delegate to host pool)
 //! - `max_storage_bytes`        = 1 `GiB`
+//! - `max_cpu_fuel_per_sec`     = 0  (unlimited; operator-tunable)
 //! - `network.egress`           = `[]`  (no outbound)
 //! - `process.allow`            = `[]`  (no spawn)
 
@@ -56,30 +58,39 @@ pub use field::{
 /// be silently truncated to whatever fields this binary understands.
 pub const CURRENT_PROFILE_VERSION: u32 = 1;
 
-/// Default per-principal memory ceiling in bytes (64 `MiB`).
-pub const DEFAULT_MAX_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
+/// Default per-principal memory ceiling in bytes (4 `GiB`).
+///
+/// This is an admission ceiling, not an eager allocation. Runtime-wide host
+/// pools and actual module declarations remain tighter bounds, while operators
+/// can lower it for managed principals with `astrid quota set --memory`.
+pub const DEFAULT_MAX_MEMORY_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// Default per-invocation wall-clock timeout in seconds (5 minutes).
 pub const DEFAULT_MAX_TIMEOUT_SECS: u64 = 300;
 /// Default per-principal IPC throughput ceiling in bytes/sec (10 `MiB`/s).
 pub const DEFAULT_MAX_IPC_THROUGHPUT_BYTES: u64 = 10 * 1024 * 1024;
 /// Default max concurrent background processes per principal.
 pub const DEFAULT_MAX_BACKGROUND_PROCESSES: u32 = 8;
+/// Default aggregate generic-compute workers for one principal.
+///
+/// Zero delegates to the runtime's host-derived pool. A nonzero operator value
+/// is an additional per-principal ceiling; it cannot widen the host pool.
+pub const DEFAULT_MAX_COMPUTE_WORKERS: u32 = 0;
 /// Default per-principal storage ceiling in bytes (1 `GiB`).
 pub const DEFAULT_MAX_STORAGE_BYTES: u64 = 1024 * 1024 * 1024;
 
-/// Default per-principal CPU rate ceiling in wasmtime fuel units per second
-/// (2e9 ≈ a 2 GHz-equivalent guest-instruction budget).
+/// Default per-principal CPU rate ceiling in wasmtime fuel units per second.
 ///
 /// Fuel meters **executed guest instructions** independently of host-call
 /// yields. This per-principal rate is the quota surface for CPU attribution
 /// and future per-invocation budgeting; the capsule engine records the exact
-/// fuel each interceptor call consumes (per-principal ledger) against it. The
+/// fuel each interceptor call consumes (per-principal ledger) against it. Zero
+/// is the explicit unlimited default for an owner-operated machine; managed
+/// deployments can set a nonzero rate per principal. The
 /// run-loop CPU **bound** itself is enforced by the capsule engine's epoch
 /// interrupt (a no-recv spinner is trapped after a few windows, a recv loop
-/// never is), not by this rate directly. Operators tier this up per-principal;
-/// admin is exempt by capability, not by quota value, so there is no
-/// "unlimited" sentinel here.
-pub const DEFAULT_MAX_CPU_FUEL_PER_SEC: u64 = 2_000_000_000;
+/// never is), not by this rate directly. Capability-based resource exemption
+/// remains an independent authority path.
+pub const DEFAULT_MAX_CPU_FUEL_PER_SEC: u64 = 0;
 
 /// Absolute upper bound on [`Quotas::max_timeout_secs`] (24 hours).
 ///
@@ -337,11 +348,16 @@ pub struct Quotas {
     #[serde(default = "default_max_background_processes")]
     pub max_background_processes: u32,
 
+    /// Aggregate generic-compute workers reserved by this principal.
+    /// Zero delegates to the runtime's host-derived pool.
+    #[serde(default = "default_max_compute_workers")]
+    pub max_compute_workers: u32,
+
     /// Maximum persistent storage in bytes. Must be > 0.
     #[serde(default = "default_max_storage_bytes")]
     pub max_storage_bytes: u64,
 
-    /// Maximum CPU rate in wasmtime fuel units per second. Must be > 0.
+    /// Maximum CPU rate in wasmtime fuel units per second. Zero is unlimited.
     ///
     /// Per-principal CPU attribution surface: the capsule engine meters the
     /// exact fuel each interceptor invocation consumes and accumulates it per
@@ -379,6 +395,10 @@ fn default_max_ipc_throughput_bytes() -> u64 {
 
 fn default_max_background_processes() -> u32 {
     DEFAULT_MAX_BACKGROUND_PROCESSES
+}
+
+fn default_max_compute_workers() -> u32 {
+    DEFAULT_MAX_COMPUTE_WORKERS
 }
 
 fn default_max_storage_bytes() -> u64 {
@@ -430,6 +450,7 @@ impl Default for Quotas {
             max_timeout_secs: DEFAULT_MAX_TIMEOUT_SECS,
             max_ipc_throughput_bytes: DEFAULT_MAX_IPC_THROUGHPUT_BYTES,
             max_background_processes: DEFAULT_MAX_BACKGROUND_PROCESSES,
+            max_compute_workers: DEFAULT_MAX_COMPUTE_WORKERS,
             max_storage_bytes: DEFAULT_MAX_STORAGE_BYTES,
             max_cpu_fuel_per_sec: DEFAULT_MAX_CPU_FUEL_PER_SEC,
         }
@@ -463,6 +484,7 @@ mod tests {
             p.quotas.max_background_processes,
             DEFAULT_MAX_BACKGROUND_PROCESSES
         );
+        assert_eq!(p.quotas.max_compute_workers, DEFAULT_MAX_COMPUTE_WORKERS);
         assert_eq!(p.quotas.max_storage_bytes, DEFAULT_MAX_STORAGE_BYTES);
         assert_eq!(p.quotas.max_cpu_fuel_per_sec, DEFAULT_MAX_CPU_FUEL_PER_SEC);
         p.validate().expect("defaults validate");
@@ -511,6 +533,7 @@ mod tests {
                 max_timeout_secs: 600,
                 max_ipc_throughput_bytes: 5 * 1024 * 1024,
                 max_background_processes: 16,
+                max_compute_workers: 6,
                 max_storage_bytes: 2 * 1024 * 1024 * 1024,
                 max_cpu_fuel_per_sec: 4_000_000_000,
             },

@@ -463,6 +463,10 @@ fn openapi_types_kernel_payloads_instead_of_opaque_json() {
         quotas_props.contains_key("max_cpu_fuel_per_sec"),
         "QuotasView must mirror Quotas::max_cpu_fuel_per_sec"
     );
+    assert!(
+        quotas_props.contains_key("max_compute_workers"),
+        "QuotasView must mirror Quotas::max_compute_workers"
+    );
 
     // `ResourceUsageView` must mirror the live `ResourceUsage` payload —
     // the consumed total and the budget it's measured against.
