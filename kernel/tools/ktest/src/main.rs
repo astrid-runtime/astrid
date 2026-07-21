@@ -18,7 +18,7 @@ use wait_timeout::ChildExt;
 /// Frozen machine contract.
 const FIRMWARE_CODE: &str = "/opt/homebrew/share/qemu/edk2-x86_64-code.fd";
 const FIRMWARE_VARS_TEMPLATE: &str = "/opt/homebrew/share/qemu/edk2-i386-vars.fd";
-const QEMU_TIMEOUT_SECS: u64 = 240;
+const QEMU_TIMEOUT_SECS: u64 = 300;
 /// isa-debug-exit success value 0x10 -> QEMU process exit code (0x10<<1)|1.
 const EXPECT_EXIT_CODE: i32 = 33;
 /// Toolchain used to build the host tools. The `bootloader` 0.11 builder runs
@@ -264,6 +264,124 @@ fn ev_name(v: &Value) -> &str {
     v.get("ev").and_then(Value::as_str).unwrap_or("")
 }
 
+fn u64_field(v: &Value, key: &str) -> Option<u64> {
+    v.get(key).and_then(Value::as_u64)
+}
+
+/// Extract an integer `"cols"` array from a legibility event.
+fn cols_of(v: &Value) -> Option<Vec<u64>> {
+    v.get("cols")?
+        .as_array()?
+        .iter()
+        .map(Value::as_u64)
+        .collect()
+}
+
+/// The frozen v0 column-type-code schema for a relation (the harness's own
+/// independent copy of the contract).
+fn frozen_schema(rel: u64) -> &'static [u64] {
+    match rel {
+        0 => &[0, 1],             // REL_DOMAIN
+        1 => &[2, 3, 4],          // REL_OBJECT
+        2 => &[0, 5, 2, 6, 7, 4], // REL_CAPABILITY
+        3 => &[2, 8, 9, 10],      // REL_ENDPOINT
+        4 => &[7, 11, 2, 12],     // REL_DERIVATION
+        _ => &[],
+    }
+}
+
+/// The subject key of a row for delta folding (final, per spec).
+fn subject_key(rel: u64, cols: &[u64]) -> Vec<u64> {
+    match rel {
+        2 => vec![cols[0], cols[1]], // REL_CAPABILITY: (domain_id, cap_slot)
+        _ => vec![cols[0]],          // others key on the subject id
+    }
+}
+
+/// The killer assertion: within the single `legible.check.begin` /
+/// `legible.check.end` window, fold every `legible.delta` (add/del/chg keyed by
+/// relation + subject key) into a model, independently collect the enumerate
+/// `legible.row` snapshot, and require the two row sets EQUAL for every
+/// relation. Divergence is a LEGIBILITY DRIFT failure. The fold is done here in
+/// host Rust so the check is independent of the kernel's own bookkeeping.
+fn snapshot_equals_fold(events: &[Value]) -> bool {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let begin = events
+        .iter()
+        .position(|e| ev_name(e) == "legible.check.begin");
+    let end = events
+        .iter()
+        .position(|e| ev_name(e) == "legible.check.end");
+    let (Some(begin), Some(end)) = (begin, end) else {
+        println!("  LEGIBILITY DRIFT: missing check.begin/check.end bracket");
+        return false;
+    };
+    if begin >= end {
+        println!("  LEGIBILITY DRIFT: check.begin not before check.end");
+        return false;
+    }
+    let window = &events[begin + 1..end];
+
+    // Fold deltas into a per-relation model keyed by subject key.
+    let mut model: BTreeMap<u64, BTreeMap<Vec<u64>, Vec<u64>>> = BTreeMap::new();
+    // Collect the enumerate snapshot rows per relation.
+    let mut snapshot: BTreeMap<u64, BTreeSet<Vec<u64>>> = BTreeMap::new();
+
+    for e in window {
+        match ev_name(e) {
+            "legible.delta" => {
+                let (Some(rel), Some(op), Some(cols)) =
+                    (u64_field(e, "rel"), u64_field(e, "op"), cols_of(e))
+                else {
+                    println!("  LEGIBILITY DRIFT: malformed legible.delta {e}");
+                    return false;
+                };
+                let key = subject_key(rel, &cols);
+                let rel_model = model.entry(rel).or_default();
+                match op {
+                    0 | 2 => {
+                        rel_model.insert(key, cols);
+                    },
+                    1 => {
+                        rel_model.remove(&key);
+                    },
+                    _ => {
+                        println!("  LEGIBILITY DRIFT: bad delta op {op}");
+                        return false;
+                    },
+                }
+            },
+            "legible.row" => {
+                let (Some(rel), Some(cols)) = (u64_field(e, "rel"), cols_of(e)) else {
+                    println!("  LEGIBILITY DRIFT: malformed legible.row {e}");
+                    return false;
+                };
+                snapshot.entry(rel).or_default().insert(cols);
+            },
+            _ => {},
+        }
+    }
+
+    // Compare, per relation (0..=4), the folded model's row set against the
+    // enumerated snapshot's row set.
+    let mut ok = true;
+    for rel in 0u64..=4 {
+        let folded: BTreeSet<Vec<u64>> = model
+            .get(&rel)
+            .map(|m| m.values().cloned().collect())
+            .unwrap_or_default();
+        let snap: BTreeSet<Vec<u64>> = snapshot.get(&rel).cloned().unwrap_or_default();
+        if folded == snap {
+            println!("    rel {rel}: snapshot == fold ({} rows)", snap.len());
+        } else {
+            ok = false;
+            println!("  LEGIBILITY DRIFT rel {rel}: fold={folded:?} snapshot={snap:?}");
+        }
+    }
+    ok
+}
+
 fn assert_events(events: &[Value], exit_code: Option<i32>) -> bool {
     let mut ok = true;
     let mut check = |label: &str, pass: bool| {
@@ -460,6 +578,104 @@ fn assert_events(events: &[Value], exit_code: Option<i32>) -> bool {
             .iter()
             .all(|e| e.get("balance_ok") == Some(&Value::Bool(true)));
     check("every domain.reclaimed balance_ok=true", all_balanced);
+
+    // ---- M4: legibility ABI v0 --------------------------------------------
+
+    // All five M4 legibility scenarios passed (present, never test.fail).
+    let m4_scenarios = [
+        "legible_schema_ok",
+        "legible_enumerate_gated",
+        "legible_snapshot_delta_consistency",
+        "legible_revoked_cap",
+        "legible_reasoner",
+    ];
+    for name in m4_scenarios {
+        let passed = events.iter().any(|e| {
+            ev_name(e) == "test.pass" && e.get("name").and_then(Value::as_str) == Some(name)
+        });
+        let failed = events.iter().any(|e| {
+            ev_name(e) == "test.fail" && e.get("name").and_then(Value::as_str) == Some(name)
+        });
+        check(&format!("test.pass {name}"), passed && !failed);
+    }
+
+    // Every legible.schema event carries the frozen arity + column codes, and at
+    // least one schema per relation was emitted (scenario legible_schema_ok).
+    let schema_ok = |rel: u64| {
+        let frozen = frozen_schema(rel);
+        let matching: Vec<&Value> = events
+            .iter()
+            .filter(|e| ev_name(e) == "legible.schema" && u64_field(e, "rel") == Some(rel))
+            .collect();
+        !matching.is_empty()
+            && matching
+                .iter()
+                .all(|e| u64_field(e, "ver") == Some(0) && cols_of(e).as_deref() == Some(frozen))
+    };
+    for rel in 0u64..=4 {
+        check(
+            &format!(
+                "legible.schema rel={rel} cols+arity frozen (arity {})",
+                frozen_schema(rel).len()
+            ),
+            schema_ok(rel),
+        );
+    }
+
+    // Enumerate framing: every legible.begin has a matching legible.end whose
+    // `rows` equals the legible.row count between them, with the declared arity
+    // matching the frozen table and every row of that width.
+    let mut framing_ok = true;
+    let mut i = 0usize;
+    let mut begins = 0usize;
+    while i < events.len() {
+        if ev_name(&events[i]) == "legible.begin" {
+            begins += 1;
+            let rel = u64_field(&events[i], "rel").unwrap_or(u64::MAX);
+            let arity = u64_field(&events[i], "arity").unwrap_or(u64::MAX);
+            if arity != frozen_schema(rel).len() as u64 {
+                framing_ok = false;
+            }
+            let mut rows = 0u64;
+            let mut j = i + 1;
+            while j < events.len() && ev_name(&events[j]) != "legible.end" {
+                if ev_name(&events[j]) == "legible.row" {
+                    if u64_field(&events[j], "rel") != Some(rel) {
+                        framing_ok = false;
+                    }
+                    if cols_of(&events[j]).map(|c| c.len() as u64) != Some(arity) {
+                        framing_ok = false;
+                    }
+                    rows += 1;
+                }
+                j += 1;
+            }
+            let end_ok = j < events.len()
+                && u64_field(&events[j], "rows") == Some(rows)
+                && u64_field(&events[j], "rel") == Some(rel);
+            if !end_ok {
+                framing_ok = false;
+            }
+            i = j;
+        }
+        i += 1;
+    }
+    check(
+        &format!("legible.begin/end framing well-formed ({begins} snapshots)"),
+        framing_ok && begins > 0,
+    );
+
+    // THE killer invariant: snapshot == fold(deltas) for all five relations.
+    println!("  snapshot==fold(deltas):");
+    check(
+        "snapshot == fold(deltas) [all relations]",
+        snapshot_equals_fold(events),
+    );
+
+    // Capability gating produced an observable denial for the unauthorized
+    // enumerate.
+    let denied = events.iter().any(|e| ev_name(e) == "legible.denied");
+    check("legible.denied present (unauthorized enumerate)", denied);
 
     // Final halt with outcome ok.
     let halt_ok = events
