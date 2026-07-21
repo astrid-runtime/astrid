@@ -110,6 +110,8 @@ fn copy_capsule_dir_excludes_wasm_and_wit() {
     )
     .unwrap();
     std::fs::write(base.join("plugin.wasm"), b"\0asm").unwrap();
+    std::fs::create_dir_all(base.join("assets")).unwrap();
+    std::fs::write(base.join("assets/worker.wasm"), b"\0asm-worker").unwrap();
     std::fs::create_dir_all(base.join("wit")).unwrap();
     std::fs::write(base.join("wit/contract.wit"), "package foo:bar;").unwrap();
 
@@ -119,7 +121,12 @@ fn copy_capsule_dir_excludes_wasm_and_wit() {
     assert!(dst_dir.path().join("Capsule.toml").exists());
     assert!(
         !dst_dir.path().join("plugin.wasm").exists(),
-        "*.wasm must be excluded from per-capsule dir copy"
+        "executable wasm must be excluded from per-capsule dir copy"
+    );
+    assert_eq!(
+        std::fs::read(dst_dir.path().join("assets/worker.wasm")).unwrap(),
+        b"\0asm-worker",
+        "signed worker wasm beneath assets must remain path-addressable"
     );
     assert!(
         !dst_dir.path().join("wit").exists(),

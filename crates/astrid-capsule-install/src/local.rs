@@ -449,7 +449,8 @@ fn install_from_local_path_internal(
             .context("workspace changed before capsule copy")?;
     }
 
-    // Copy non-WASM tree to target. Excludes `*.wasm` and `wit/`.
+    // Copy the runtime tree to target. Excludes executable `*.wasm` and `wit/`
+    // while retaining signed core-Wasm worker objects beneath `assets/`.
     if let Err(e) = copy_capsule_dir(source_dir, &target_dir) {
         rollback(&target_dir, backup_dir.as_deref());
         return Err(e).context("failed to copy capsule source to target");
