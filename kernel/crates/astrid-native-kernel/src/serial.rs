@@ -263,6 +263,86 @@ pub fn ev_pools_census(objects_free: usize, endpoints_free: usize, deriv_free: u
     ));
 }
 
+// ---- M4: legibility ABI v0 (typed, versioned, integer-columned relations) --
+
+/// Emit one event whose body ends in a `"cols":[...]` integer array, rendered
+/// alloc-free from a fixed slice. `head` carries the pre-array fields (already
+/// including the `"ev"` field and any scalars), e.g. `"ev":"legible.row","rel":2`.
+fn emit_cols(head: fmt::Arguments, cols: &[u64]) {
+    without_interrupts(|| {
+        let mut e = EMITTER.lock();
+        let seq = e.seq;
+        e.seq = seq.wrapping_add(1);
+        let _ = write!(e.port, "{{\"seq\":{seq},{head},\"cols\":[");
+        for (i, v) in cols.iter().enumerate() {
+            if i > 0 {
+                let _ = write!(e.port, ",");
+            }
+            let _ = write!(e.port, "{v}");
+        }
+        let _ = writeln!(e.port, "]}}");
+    });
+}
+
+/// `legible.schema`: the frozen column-type-code sequence for relation `rel` at
+/// `LEGIBLE_VERSION`.
+pub fn ev_legible_schema(rel: u64, cols: &[u64]) {
+    emit_cols(
+        format_args!("\"ev\":\"legible.schema\",\"rel\":{rel},\"ver\":0"),
+        cols,
+    );
+}
+
+/// `legible.begin`: opens a bounded enumerate snapshot of relation `rel`.
+pub fn ev_legible_begin(rel: u64, arity: u64) {
+    emit(format_args!(
+        "\"ev\":\"legible.begin\",\"rel\":{rel},\"ver\":0,\"arity\":{arity}"
+    ));
+}
+
+/// `legible.row`: one live fact of relation `rel` (integer columns only).
+pub fn ev_legible_row(rel: u64, cols: &[u64]) {
+    emit_cols(format_args!("\"ev\":\"legible.row\",\"rel\":{rel}"), cols);
+}
+
+/// `legible.end`: closes an enumerate snapshot, carrying the emitted row count.
+pub fn ev_legible_end(rel: u64, rows: u64) {
+    emit(format_args!(
+        "\"ev\":\"legible.end\",\"rel\":{rel},\"rows\":{rows}"
+    ));
+}
+
+/// `legible.delta`: a typed projection of a single table mutation. `op` is
+/// 0=add, 1=del, 2=chg; `cols` is the full row (v0 carries the whole row, not
+/// just changed columns).
+pub fn ev_legible_delta(rel: u64, op: u64, cols: &[u64]) {
+    emit_cols(
+        format_args!("\"ev\":\"legible.delta\",\"rel\":{rel},\"op\":{op}"),
+        cols,
+    );
+}
+
+/// `legible.denied`: an unauthorized (or stale/revoked) legibility access by
+/// `domain` against relation `rel`. Observability only; the syscall status is
+/// the authority.
+pub fn ev_legible_denied(domain: usize, rel: u64) {
+    emit(format_args!(
+        "\"ev\":\"legible.denied\",\"domain\":{domain},\"rel\":{rel}"
+    ));
+}
+
+/// `legible.check.begin`/`legible.check.end`: bracket the single
+/// snapshot==fold(deltas) consistency window so the harness folds only the
+/// deltas and collects only the snapshot rows emitted inside it (other scenarios
+/// also enumerate).
+pub fn ev_legible_check_begin() {
+    emit(format_args!("\"ev\":\"legible.check.begin\""));
+}
+
+pub fn ev_legible_check_end() {
+    emit(format_args!("\"ev\":\"legible.check.end\""));
+}
+
 pub fn ev_test(name: &'static str, pass: bool) {
     let ev = if pass { "test.pass" } else { "test.fail" };
     emit(format_args!("\"ev\":\"{ev}\",\"name\":\"{name}\""));

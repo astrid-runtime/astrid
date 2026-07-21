@@ -62,6 +62,8 @@ const FULL: i64 = -5;
 const REVOKED: i64 = -6;
 /// Any bounded pool (object/endpoint/deriv/cap slot) was exhausted.
 const NO_RESOURCE: i64 = -7;
+/// A legibility syscall argument (relation/row/column index) was out of range.
+const BAD_ARG: i64 = -8;
 
 /// `CURRENT_DOMAIN` sentinel meaning "no domain running".
 const NONE: usize = usize::MAX;
@@ -322,6 +324,22 @@ enum ObjectClass {
     TestArtifact,
     /// A bounded IPC endpoint; the `u8` is its [`ENDPOINTS`] pool slot.
     Endpoint(u8),
+    /// M4: the legibility object (ADR legibility). A capability to a `Legible`
+    /// object authorizes enumerate/schema/subscribe/get of ALL relations at v0
+    /// (per-relation scoping is a future refinement).
+    Legible,
+}
+
+impl ObjectClass {
+    /// Frozen v0 class code (never a string — charter "no strings as authority").
+    fn code(self) -> u64 {
+        match self {
+            ObjectClass::Domain => CLASS_DOMAIN,
+            ObjectClass::TestArtifact => CLASS_TEST_ARTIFACT,
+            ObjectClass::Endpoint(_) => CLASS_ENDPOINT,
+            ObjectClass::Legible => CLASS_LEGIBLE,
+        }
+    }
 }
 
 static OBJECTS: Mutex<[Object; OBJECT_SLOTS]> = Mutex::new([Object::EMPTY; OBJECT_SLOTS]);
@@ -370,20 +388,31 @@ fn find_free_domain() -> Option<usize> {
 // ---- object table + capability table (ADR-K2 / ADR-K4) ---------------------
 
 fn object_alloc(class: ObjectClass) -> Option<u32> {
-    let mut objs = OBJECTS.lock();
-    for (i, obj) in objs.iter_mut().enumerate() {
-        if !obj.occupied {
-            obj.occupied = true;
-            obj.class = class;
-            // Generation is monotonic across reuse, so a stale handle from a
-            // prior tenant of this slot never validates against a new tenant.
-            return Some(i as u32);
+    let allocated = {
+        let mut objs = OBJECTS.lock();
+        let mut found = None;
+        for (i, obj) in objs.iter_mut().enumerate() {
+            if !obj.occupied {
+                obj.occupied = true;
+                obj.class = class;
+                // Generation is monotonic across reuse, so a stale handle from a
+                // prior tenant of this slot never validates against a new tenant.
+                found = Some(i as u32);
+                break;
+            }
         }
+        found
+    };
+    if let Some(idx) = allocated {
+        delta_object_add(idx);
     }
-    None
+    allocated
 }
 
 fn object_release(idx: u32) {
+    // Project the deletion BEFORE the slot is cleared, while the row is still
+    // readable (single-store delta from the mutation site).
+    delta_object_del(idx);
     let mut objs = OBJECTS.lock();
     let obj = &mut objs[idx as usize];
     obj.occupied = false;
@@ -396,12 +425,20 @@ fn revoke_object(idx: u32) {
     let generation = {
         let mut objs = OBJECTS.lock();
         let obj = &mut objs[idx as usize];
-        // M2 only ever revokes the inert TestArtifact object.
-        debug_assert!(matches!(obj.class, ObjectClass::TestArtifact));
+        // M2 revokes the inert TestArtifact object; M4 also revokes the Legible
+        // object (scenario `legible_revoked_cap`) — legibility authority is a
+        // normal capability, revocable by generation bump like any other.
+        debug_assert!(matches!(
+            obj.class,
+            ObjectClass::TestArtifact | ObjectClass::Legible
+        ));
         obj.generation = obj.generation.wrapping_add(1);
         obj.generation
     };
     serial::ev_cap_revoked(idx, generation);
+    // A generation bump keeps the object occupied: project it as a change to the
+    // REL_OBJECT row (single-store delta from the mutation site).
+    delta_object_chg(idx);
     REVOKE_DONE.store(true, Ordering::SeqCst);
 }
 
@@ -417,6 +454,7 @@ fn cap_mint(idx: usize, slot: usize, object_index: u32, rights: u32) {
             deriv_node: NODE_NONE,
         };
     }
+    delta_cap_add(idx, slot);
 }
 
 /// The ADR-K2/K4 check order: (1) index in range else `BadCap`; (2) entry
@@ -644,19 +682,35 @@ fn domain_create(payload: extern "C" fn()) -> Option<usize> {
         };
     }
     serial::ev_domain_create(idx, frames_count);
+    delta_domain_add(idx);
     Some(idx)
 }
 
-/// Create failed to reach a run: reclaim frames + object, return slot to Free.
+/// Reclaim a created-but-never-run domain (a create rollback, or an M4 ring-0
+/// scenario's driver domain): free its frames + object and return the slot to
+/// Free. Emits `domain.reclaimed` with the same balance accounting as
+/// [`finish_domain`] so the create/reclaim census stays paired (callers must
+/// discard in reverse creation order, LIFO, for the balance to hold — mirroring
+/// how the scheduler finishes participants).
 fn discard_domain(idx: usize) {
     // SAFETY: single hart, domain not running.
-    let object = unsafe {
-        reclaim_frames(idx);
-        let object = (*domain_ptr(idx)).domain_object;
-        (*domain_ptr(idx)).state = State::Free;
-        object
+    let (census_at_create, object) = unsafe {
+        (
+            (*domain_ptr(idx)).free_census_at_create,
+            (*domain_ptr(idx)).domain_object,
+        )
     };
+    // SAFETY: single hart, domain not running.
+    let freed = unsafe { reclaim_frames(idx) };
+    let census_after = memory::free_frame_count();
+    let balance_ok = census_after == census_at_create;
+    serial::ev_domain_reclaimed(idx, freed, balance_ok);
+    delta_domain_del(idx);
     object_release(object);
+    // SAFETY: single hart; slot returns to the pool.
+    unsafe {
+        (*domain_ptr(idx)).state = State::Free;
+    }
 }
 
 /// First-run entry: enter the domain at the fixed user VA/stack with zeroed
@@ -679,6 +733,7 @@ fn enter_first(idx: usize) -> u64 {
     CURRENT_DOMAIN.store(idx, Ordering::SeqCst);
     syscall::arm(kstack_top, save_slot);
     serial::ev_domain_enter(idx);
+    delta_domain_chg(idx);
     // SAFETY: `pml4` maps the kernel; `save_slot` is a live u64 in the slot;
     // the user entry VA and stack are mapped RX / RW in that space.
     let tag = unsafe {
@@ -717,12 +772,19 @@ fn finish_domain(idx: usize, outcome: RunOutcome) -> bool {
             (*domain_ptr(idx)).domain_object,
         )
     };
+    delta_domain_chg(idx);
+    // Implicit unsubscribe on the subscriber's death (charter: bounded, no
+    // dangling subscription).
+    if LEGIBLE_SUBSCRIBER.load(Ordering::SeqCst) == idx {
+        legible_clear_subscriber();
+    }
     // SAFETY: single hart, domain not running.
     let freed = unsafe { reclaim_frames(idx) };
     let census_after = memory::free_frame_count();
     let balance_ok = census_after == census_at_create;
     serial::ev_domain_reclaimed(idx, freed, balance_ok);
     object_release(object);
+    delta_domain_del(idx);
     // SAFETY: single hart; slot returns to the pool.
     unsafe {
         (*domain_ptr(idx)).state = State::Free;
@@ -805,6 +867,9 @@ fn deriv_alloc(
                 parent,
                 object_index,
             };
+            // DERIV is locked by the caller: project the add from the local row
+            // (re-locking here would deadlock).
+            delta_emit(REL_DERIVATION, OP_ADD, &deriv_row(i as u32, node));
             return Some(i as u32);
         }
     }
@@ -853,6 +918,9 @@ fn revoke_tree(node: u32) -> usize {
         if in_tree[i] && deriv[i].occupied && deriv[i].alive {
             deriv[i].alive = false;
             killed += 1;
+            // Alive flip → project as a REL_DERIVATION change from the local row
+            // (DERIV is held here).
+            delta_emit(REL_DERIVATION, OP_CHG, &deriv_row(i as u32, &deriv[i]));
         }
     }
     drop(deriv);
@@ -884,6 +952,13 @@ fn make_child_cap(
         Some(c) => c,
         None => {
             if allocated_root {
+                // Undo the lazily-rooted node: project its removal from the
+                // local row before clearing it (DERIV is held here).
+                delta_emit(
+                    REL_DERIVATION,
+                    OP_DEL,
+                    &deriv_row(root, &deriv[root as usize]),
+                );
                 deriv[root as usize] = DerivNode::EMPTY;
             }
             return None;
@@ -895,6 +970,9 @@ fn make_child_cap(
         unsafe {
             (*domain_ptr(idx)).caps[source_slot].deriv_node = root;
         }
+        // The source cap's derivation link changed: project it as a REL_CAPABILITY
+        // change (DERIV is now unlocked).
+        delta_cap_chg(idx, source_slot);
     }
     Some(XferCap {
         object_index,
@@ -924,6 +1002,7 @@ fn deliver_recv(idx: usize, ep: u8, from: usize, data: u64, cap: Option<XferCap>
                     deriv_node: xc.deriv_node,
                 };
             }
+            delta_cap_add(idx, recv_slot as usize);
             serial::ev_ipc_recv(ep, idx, data, true);
             serial::ev_cap_transfer(xc.object_index, from, idx, xc.rights, xc.deriv_node);
         },
@@ -1116,6 +1195,7 @@ pub fn sys_recv(ep_cap_slot: u64, recv_cap_slot: u64, user_rip: u64, user_rsp: u
         (*d).suspended = true;
         (*d).state = State::Blocked;
     }
+    delta_domain_chg(idx);
     serial::ev_ipc_blocked(idx, ep);
     let save_slot = syscall::CURRENT_SAVE_SLOT.load(Ordering::SeqCst) as *mut u64;
     // SAFETY: `save_slot` is the live continuation armed for this run; this
@@ -1192,6 +1272,7 @@ fn resume_domain(idx: usize) -> u64 {
     CURRENT_DOMAIN.store(idx, Ordering::SeqCst);
     syscall::arm(kstack_top, save_slot);
     serial::ev_domain_enter(idx);
+    delta_domain_chg(idx);
     // SAFETY: nothing touched this domain's memory or page table between block
     // and resume; the saved rip/rsp are valid user mappings in `pml4`.
     let tag = unsafe {
@@ -1359,6 +1440,440 @@ fn emit_census() {
     serial::ev_pools_census(objects_free, endpoints_free, deriv_free);
 }
 
+// ---- M4: legibility ABI v0 -------------------------------------------------
+//
+// The kernel serializes its five live object tables as typed, versioned,
+// integer-columned relations (charter §3 legibility). SINGLE STORE (Barrelfish
+// lesson): a relation is NOT a second copy — it is COMPUTED by reading the live
+// tables (`DOMAINS`, `OBJECTS`, `ENDPOINTS`, `DERIV`, per-domain `caps`) at
+// enumerate time, and every delta is a typed projection emitted from the SAME
+// code path that mutates a table, so no relation storage can drift from the
+// tables. There is exactly one legibility subscriber at v0; while it is
+// registered, each instrumented mutation ALSO emits a bounded typed delta.
+//
+// v0 quantization (charter procfs side-channel note): deltas are row-granular,
+// carry NO timestamps, and have NO ordering beyond the existing global `seq` —
+// coarse and timing-free. A scheduled ring-3 subscriber observing high-frequency
+// mutations would need explicit per-subscriber rate-limiting first; deferred.
+// Per-relation capability scoping is also deferred: a `Legible` cap grants ALL
+// relations at v0.
+
+/// Frozen relation ids (v0).
+const REL_DOMAIN: u64 = 0;
+const REL_OBJECT: u64 = 1;
+const REL_CAPABILITY: u64 = 2;
+const REL_ENDPOINT: u64 = 3;
+const REL_DERIVATION: u64 = 4;
+
+/// Frozen column type codes (v0).
+const COL_DOMAIN_ID: u64 = 0;
+const COL_STATE: u64 = 1;
+const COL_OBJECT_ID: u64 = 2;
+const COL_CLASS: u64 = 3;
+const COL_GENERATION: u64 = 4;
+const COL_CAP_SLOT: u64 = 5;
+const COL_RIGHTS: u64 = 6;
+const COL_DERIV_NODE: u64 = 7;
+const COL_EP_SLOT: u64 = 8;
+const COL_QLEN: u64 = 9;
+const COL_WAITING: u64 = 10;
+const COL_PARENT_NODE: u64 = 11;
+const COL_ALIVE: u64 = 12;
+
+/// Frozen object-class codes (v0).
+const CLASS_DOMAIN: u64 = 0;
+const CLASS_TEST_ARTIFACT: u64 = 1;
+const CLASS_ENDPOINT: u64 = 2;
+const CLASS_LEGIBLE: u64 = 3;
+
+/// Delta ops (v0): add/del/chg carry the FULL row (fold simplicity).
+const OP_ADD: u64 = 0;
+const OP_DEL: u64 = 1;
+const OP_CHG: u64 = 2;
+
+/// The one legibility right: a cap to a `Legible` object holding this bit
+/// authorizes schema/enumerate/subscribe/get of ALL relations at v0.
+const LEGIBLE_READ: u32 = 0b1;
+
+/// REL_ENDPOINT `waiting` sentinel: no blocked receiver on this endpoint.
+const NO_DOMAIN: u64 = u64::MAX;
+
+/// The single (bounded) legibility subscriber, or [`NONE`]. While set, mutations
+/// emit typed deltas. Unsubscribed implicitly on the subscriber's death.
+static LEGIBLE_SUBSCRIBER: AtomicUsize = AtomicUsize::new(NONE);
+
+#[inline]
+fn subscribed() -> bool {
+    LEGIBLE_SUBSCRIBER.load(Ordering::SeqCst) != NONE
+}
+
+fn legible_clear_subscriber() {
+    LEGIBLE_SUBSCRIBER.store(NONE, Ordering::SeqCst);
+}
+
+/// Emit a typed delta iff a subscriber is registered (single-store projection).
+fn delta_emit(rel: u64, op: u64, cols: &[u64]) {
+    if subscribed() {
+        serial::ev_legible_delta(rel, op, cols);
+    }
+}
+
+// ---- row builders (read the LIVE tables; the single source of truth) --------
+
+fn state_code(state: State) -> u64 {
+    match state {
+        State::Free => 0,
+        State::Ready => 1,
+        State::Running => 2,
+        State::Blocked => 3,
+        State::Dead => 4,
+    }
+}
+
+fn domain_row(idx: usize) -> [u64; 2] {
+    [idx as u64, state_code(state_of(idx))]
+}
+
+fn object_row(idx: u32) -> [u64; 3] {
+    let obj = OBJECTS.lock()[idx as usize];
+    [idx as u64, obj.class.code(), obj.generation as u64]
+}
+
+fn cap_row(domain: usize, slot: usize) -> [u64; 6] {
+    // SAFETY: single hart; CapEntry is Copy.
+    let e = unsafe { (*domain_ptr(domain)).caps[slot] };
+    [
+        domain as u64,
+        slot as u64,
+        e.object_index as u64,
+        e.rights as u64,
+        e.deriv_node as u64,
+        e.generation as u64,
+    ]
+}
+
+fn endpoint_row(object_idx: u32) -> [u64; 4] {
+    let ep = match OBJECTS.lock()[object_idx as usize].class {
+        ObjectClass::Endpoint(slot) => slot,
+        _ => 0,
+    };
+    let (qlen, waiting) = {
+        let eps = ENDPOINTS.lock();
+        (eps[ep as usize].qlen, eps[ep as usize].waiting_receiver)
+    };
+    let waiting_col = match waiting {
+        Some(d) => d as u64,
+        None => NO_DOMAIN,
+    };
+    [object_idx as u64, ep as u64, qlen as u64, waiting_col]
+}
+
+fn deriv_row(node: u32, n: &DerivNode) -> [u64; 4] {
+    [
+        node as u64,
+        n.parent as u64,
+        n.object_index as u64,
+        u64::from(n.alive),
+    ]
+}
+
+// ---- gated delta wrappers (skip all locking when unsubscribed) --------------
+
+fn delta_domain_add(idx: usize) {
+    if subscribed() {
+        delta_emit(REL_DOMAIN, OP_ADD, &domain_row(idx));
+    }
+}
+fn delta_domain_chg(idx: usize) {
+    if subscribed() {
+        delta_emit(REL_DOMAIN, OP_CHG, &domain_row(idx));
+    }
+}
+fn delta_domain_del(idx: usize) {
+    if subscribed() {
+        delta_emit(REL_DOMAIN, OP_DEL, &domain_row(idx));
+    }
+}
+fn delta_object_add(idx: u32) {
+    if subscribed() {
+        delta_emit(REL_OBJECT, OP_ADD, &object_row(idx));
+    }
+}
+fn delta_object_chg(idx: u32) {
+    if subscribed() {
+        delta_emit(REL_OBJECT, OP_CHG, &object_row(idx));
+    }
+}
+fn delta_object_del(idx: u32) {
+    if subscribed() {
+        delta_emit(REL_OBJECT, OP_DEL, &object_row(idx));
+    }
+}
+fn delta_cap_add(domain: usize, slot: usize) {
+    if subscribed() {
+        delta_emit(REL_CAPABILITY, OP_ADD, &cap_row(domain, slot));
+    }
+}
+fn delta_cap_chg(domain: usize, slot: usize) {
+    if subscribed() {
+        delta_emit(REL_CAPABILITY, OP_CHG, &cap_row(domain, slot));
+    }
+}
+fn delta_cap_del(domain: usize, slot: usize) {
+    if subscribed() {
+        delta_emit(REL_CAPABILITY, OP_DEL, &cap_row(domain, slot));
+    }
+}
+fn delta_endpoint_add(object_idx: u32) {
+    if subscribed() {
+        delta_emit(REL_ENDPOINT, OP_ADD, &endpoint_row(object_idx));
+    }
+}
+fn delta_endpoint_chg(object_idx: u32) {
+    if subscribed() {
+        delta_emit(REL_ENDPOINT, OP_CHG, &endpoint_row(object_idx));
+    }
+}
+fn delta_endpoint_del(object_idx: u32) {
+    if subscribed() {
+        delta_emit(REL_ENDPOINT, OP_DEL, &endpoint_row(object_idx));
+    }
+}
+
+// ---- relation schema + live-row iteration -----------------------------------
+
+/// The frozen v0 column-type-code sequence for `rel` (empty for an unknown id).
+fn relation_schema(rel: u64) -> &'static [u64] {
+    match rel {
+        REL_DOMAIN => &[COL_DOMAIN_ID, COL_STATE],
+        REL_OBJECT => &[COL_OBJECT_ID, COL_CLASS, COL_GENERATION],
+        REL_CAPABILITY => &[
+            COL_DOMAIN_ID,
+            COL_CAP_SLOT,
+            COL_OBJECT_ID,
+            COL_RIGHTS,
+            COL_DERIV_NODE,
+            COL_GENERATION,
+        ],
+        REL_ENDPOINT => &[COL_OBJECT_ID, COL_EP_SLOT, COL_QLEN, COL_WAITING],
+        REL_DERIVATION => &[COL_DERIV_NODE, COL_PARENT_NODE, COL_OBJECT_ID, COL_ALIVE],
+        _ => &[],
+    }
+}
+
+fn relation_arity(rel: u64) -> u64 {
+    relation_schema(rel).len() as u64
+}
+
+/// Apply `f` to every LIVE fact of `rel`, in deterministic ascending subject/
+/// slot order — the row set is bounded by the pool sizes (charter: bounded by
+/// construction). Rows are read from the live tables at call time; there is no
+/// cached relation store.
+fn for_each_row(rel: u64, mut f: impl FnMut(&[u64])) {
+    match rel {
+        REL_DOMAIN => {
+            for i in 0..DOMAIN_SLOTS {
+                if state_of(i) != State::Free {
+                    f(&domain_row(i));
+                }
+            }
+        },
+        REL_OBJECT => {
+            for i in 0..OBJECT_SLOTS {
+                if OBJECTS.lock()[i].occupied {
+                    f(&object_row(i as u32));
+                }
+            }
+        },
+        REL_CAPABILITY => {
+            for d in 0..DOMAIN_SLOTS {
+                if state_of(d) == State::Free {
+                    continue;
+                }
+                for s in 0..CAP_ENTRIES {
+                    // SAFETY: single hart; CapEntry is Copy.
+                    if unsafe { (*domain_ptr(d)).caps[s].occupied } {
+                        f(&cap_row(d, s));
+                    }
+                }
+            }
+        },
+        REL_ENDPOINT => {
+            for i in 0..OBJECT_SLOTS {
+                let obj = OBJECTS.lock()[i];
+                if obj.occupied && matches!(obj.class, ObjectClass::Endpoint(_)) {
+                    f(&endpoint_row(i as u32));
+                }
+            }
+        },
+        REL_DERIVATION => {
+            for n in 0..DERIV_NODES {
+                let node = DERIV.lock()[n];
+                if node.occupied {
+                    f(&deriv_row(n as u32, &node));
+                }
+            }
+        },
+        _ => {},
+    }
+}
+
+// ---- capability gate --------------------------------------------------------
+
+/// A legibility syscall requires a cap that (1) passes the exact ADR-K2
+/// `check_cap` order for [`LEGIBLE_READ`] AND (2) references a `Legible`-class
+/// object — a rights bit alone on any other object is not legibility authority.
+fn check_legible_cap(idx: usize, cap_slot: u64) -> Result<(), i64> {
+    check_cap(idx, cap_slot, LEGIBLE_READ)?;
+    // SAFETY: check_cap validated slot in-range + occupied; CapEntry is Copy.
+    let object = unsafe { (*domain_ptr(idx)).caps[cap_slot as usize].object_index };
+    match OBJECTS.lock()[object as usize].class {
+        ObjectClass::Legible => Ok(()),
+        _ => Err(DENIED),
+    }
+}
+
+// ---- legibility operations (ring-0 core; syscall wrappers below) ------------
+
+/// `sys_legible_schema`: emit the frozen column-code list for `rel` and return
+/// its arity. Capability-checked.
+fn legible_schema_at(idx: usize, cap_slot: u64, rel: u64) -> (i64, u64) {
+    if let Err(status) = check_legible_cap(idx, cap_slot) {
+        serial::ev_legible_denied(idx, rel);
+        return (status, 0);
+    }
+    if rel > REL_DERIVATION {
+        return (BAD_ARG, 0);
+    }
+    serial::ev_legible_schema(rel, relation_schema(rel));
+    (OK, relation_arity(rel))
+}
+
+/// `sys_legible_enumerate`: emit a bounded, framed snapshot of `rel` computed
+/// live from the tables, and return the row count. Capability-checked.
+fn legible_enumerate_at(idx: usize, cap_slot: u64, rel: u64) -> (i64, u64) {
+    if let Err(status) = check_legible_cap(idx, cap_slot) {
+        serial::ev_legible_denied(idx, rel);
+        return (status, 0);
+    }
+    if rel > REL_DERIVATION {
+        return (BAD_ARG, 0);
+    }
+    serial::ev_legible_begin(rel, relation_arity(rel));
+    let mut count = 0u64;
+    for_each_row(rel, |cols| {
+        serial::ev_legible_row(rel, cols);
+        count += 1;
+    });
+    serial::ev_legible_end(rel, count);
+    (OK, count)
+}
+
+/// `sys_legible_get`: read a single relation cell by (row_index, col_index)
+/// without parsing the event stream — the tenant read path. O(rows) at v0 pool
+/// sizes; would need an index at scale. Capability-checked. Silent (no events).
+fn legible_get_at(
+    idx: usize,
+    cap_slot: u64,
+    rel: u64,
+    row_index: u64,
+    col_index: u64,
+) -> (i64, u64) {
+    if let Err(status) = check_legible_cap(idx, cap_slot) {
+        return (status, 0);
+    }
+    if rel > REL_DERIVATION || col_index >= relation_arity(rel) {
+        return (BAD_ARG, 0);
+    }
+    let mut i = 0u64;
+    let mut value = None;
+    for_each_row(rel, |cols| {
+        if i == row_index {
+            value = Some(cols[col_index as usize]);
+        }
+        i += 1;
+    });
+    match value {
+        Some(v) => (OK, v),
+        None => (BAD_ARG, 0),
+    }
+}
+
+/// `sys_legible_subscribe`: register the caller as the single legibility
+/// subscriber and PRIME the fold by replaying the current live snapshot as
+/// `add` deltas (initial-state sync), so a folder that only ever sees deltas
+/// reconstructs the true current state and stays in lockstep thereafter.
+/// A second subscribe returns `Denied`. Capability-checked.
+fn legible_subscribe_at(idx: usize, cap_slot: u64) -> (i64, u64) {
+    if let Err(status) = check_legible_cap(idx, cap_slot) {
+        return (status, 0);
+    }
+    if LEGIBLE_SUBSCRIBER.load(Ordering::SeqCst) != NONE {
+        return (DENIED, 0);
+    }
+    LEGIBLE_SUBSCRIBER.store(idx, Ordering::SeqCst);
+    for rel in [
+        REL_DOMAIN,
+        REL_OBJECT,
+        REL_CAPABILITY,
+        REL_ENDPOINT,
+        REL_DERIVATION,
+    ] {
+        for_each_row(rel, |cols| serial::ev_legible_delta(rel, OP_ADD, cols));
+    }
+    (OK, 0)
+}
+
+/// `sys_cap_object`: return the object id a cap references (legitimate
+/// self-introspection). Capability-checked on the slot (any rights).
+fn cap_object_at(idx: usize, cap_slot: u64) -> (i64, u64) {
+    match check_cap(idx, cap_slot, 0) {
+        Ok(_) => {
+            // SAFETY: check_cap validated slot in-range + occupied; Copy.
+            let object = unsafe { (*domain_ptr(idx)).caps[cap_slot as usize].object_index };
+            (OK, object as u64)
+        },
+        Err(status) => (status, 0),
+    }
+}
+
+/// Clear a capability slot (a real mutation: the "cap slot cleared → del"
+/// projection). Emits the del BEFORE clearing, while the row is still readable.
+fn cap_clear(idx: usize, slot: usize) {
+    // SAFETY: single hart; the domain is not running.
+    let occupied = unsafe { (*domain_ptr(idx)).caps[slot].occupied };
+    if !occupied {
+        return;
+    }
+    delta_cap_del(idx, slot);
+    // SAFETY: single hart; clearing a slot of a not-running domain.
+    unsafe {
+        (*domain_ptr(idx)).caps[slot] = CapEntry::EMPTY;
+    }
+}
+
+// ---- legibility syscall wrappers (use CURRENT_DOMAIN) -----------------------
+
+pub fn sys_legible_schema(cap_slot: u64, rel: u64) -> (i64, u64) {
+    legible_schema_at(current(), cap_slot, rel)
+}
+
+pub fn sys_legible_enumerate(cap_slot: u64, rel: u64) -> (i64, u64) {
+    legible_enumerate_at(current(), cap_slot, rel)
+}
+
+pub fn sys_legible_subscribe(cap_slot: u64) -> (i64, u64) {
+    legible_subscribe_at(current(), cap_slot)
+}
+
+pub fn sys_legible_get(cap_slot: u64, rel: u64, row_index: u64, col_index: u64) -> (i64, u64) {
+    legible_get_at(current(), cap_slot, rel, row_index, col_index)
+}
+
+pub fn sys_cap_object(cap_slot: u64) -> (i64, u64) {
+    cap_object_at(current(), cap_slot)
+}
+
 // ---- scenarios -------------------------------------------------------------
 
 fn reset_scenario_state() {
@@ -1368,6 +1883,7 @@ fn reset_scenario_state() {
     REVOKE_DONE.store(false, Ordering::SeqCst);
     REVOKE_TREE_ON_NOTE.store(0, Ordering::SeqCst);
     REVOKE_TREE_DONE.store(false, Ordering::SeqCst);
+    legible_clear_subscriber();
 }
 
 fn report(name: &'static str, pass: bool) -> bool {
@@ -1670,9 +2186,255 @@ fn scenario_ipc_deadlock_guard() -> bool {
     report("ipc_deadlock_guard", pass)
 }
 
+// ---- M4 legibility scenarios -----------------------------------------------
+
+/// Scenario one, `legible_schema_ok`: a domain with a `Legible` cap reads the
+/// schema of all five relations; each returned arity matches the frozen table
+/// (2,3,6,4,4) and each `legible.schema` event carries the frozen column codes.
+fn scenario_legible_schema_ok() -> bool {
+    reset_scenario_state();
+    let Some(d) = domain_create(payloads::ring3_reuse) else {
+        return report("legible_schema_ok", false);
+    };
+    let Some(l) = object_alloc(ObjectClass::Legible) else {
+        discard_domain(d);
+        return report("legible_schema_ok", false);
+    };
+    cap_mint(d, 1, l, LEGIBLE_READ);
+    let expected = [
+        (REL_DOMAIN, 2u64),
+        (REL_OBJECT, 3),
+        (REL_CAPABILITY, 6),
+        (REL_ENDPOINT, 4),
+        (REL_DERIVATION, 4),
+    ];
+    let mut pass = true;
+    for (rel, arity) in expected {
+        let (status, got) = legible_schema_at(d, 1, rel);
+        pass &= status == OK && got == arity;
+    }
+    discard_domain(d);
+    object_release(l);
+    report("legible_schema_ok", pass)
+}
+
+/// Scenario two, `legible_enumerate_gated`: an unauthorized domain (holding a
+/// non-`Legible` cap whose rights include the read bit) is `Denied` on
+/// enumerate; a domain WITH a `Legible` cap enumerates REL_DOMAIN (rows >= 1).
+fn scenario_legible_enumerate_gated() -> bool {
+    reset_scenario_state();
+    let Some(u) = domain_create(payloads::ring3_reuse) else {
+        return report("legible_enumerate_gated", false);
+    };
+    let Some(ta) = object_alloc(ObjectClass::TestArtifact) else {
+        discard_domain(u);
+        return report("legible_enumerate_gated", false);
+    };
+    // Rights include the read bit, but the object is NOT Legible → must Denied.
+    cap_mint(u, 3, ta, 0b111);
+    let (denied, _) = legible_enumerate_at(u, 3, REL_DOMAIN);
+    let Some(a) = domain_create(payloads::ring3_reuse) else {
+        discard_domain(u);
+        object_release(ta);
+        return report("legible_enumerate_gated", false);
+    };
+    let Some(l) = object_alloc(ObjectClass::Legible) else {
+        discard_domain(a);
+        discard_domain(u);
+        object_release(ta);
+        return report("legible_enumerate_gated", false);
+    };
+    cap_mint(a, 1, l, LEGIBLE_READ);
+    let (ok, count) = legible_enumerate_at(a, 1, REL_DOMAIN);
+    // Discard in reverse creation order (LIFO) so each frame-census balances.
+    discard_domain(a);
+    discard_domain(u);
+    object_release(ta);
+    object_release(l);
+    let pass = denied == DENIED && ok == OK && count >= 1;
+    report("legible_enumerate_gated", pass)
+}
+
+/// The killer mutation script (ring 0, subscribed): touch every relation, leave
+/// a mix of live facts and torn-down parts, then enumerate the live snapshot.
+/// Every mutation rides an already-present state change and emits its typed
+/// delta (single-store projection). Returns the surviving `TestArtifact` object
+/// for the caller to release, or `None` on any pool exhaustion.
+fn legible_consistency_script(d: usize) -> Option<u32> {
+    // Subscribe as D's Legible cap (slot 0): primes the fold with the current
+    // live snapshot, then live deltas keep it in lockstep with the tables.
+    if legible_subscribe_at(d, 0).0 != OK {
+        return None;
+    }
+    // (a,b) a TestArtifact object + a cap to it in D slot 10.
+    let ta = object_alloc(ObjectClass::TestArtifact)?;
+    cap_mint(d, 10, ta, 0b111);
+    // (c) an endpoint object + its REL_ENDPOINT row.
+    let ep = endpoint_alloc()?;
+    let Some(ep_obj) = object_alloc(ObjectClass::Endpoint(ep)) else {
+        endpoint_free(ep);
+        return None;
+    };
+    delta_endpoint_add(ep_obj);
+    // (d) enqueue one message: qlen 0 -> 1 (a REL_ENDPOINT change).
+    {
+        let mut eps = ENDPOINTS.lock();
+        let e = &mut eps[ep as usize];
+        e.queue[0] = Msg {
+            data: 0xABC,
+            cap: None,
+            from: d,
+        };
+        e.qlen = 1;
+    }
+    delta_endpoint_chg(ep_obj);
+    // (e) transfer: derive a child of D slot 10 into D slot 11 (spawns a root +
+    //     child derivation node and changes the source cap's derivation link).
+    let generation = OBJECTS.lock()[ta as usize].generation;
+    let xc = make_child_cap(d, 10, ta, generation, 0b011)?;
+    // SAFETY: single hart; installing the derived cap into D slot 11.
+    unsafe {
+        (*domain_ptr(d)).caps[11] = CapEntry {
+            occupied: true,
+            object_index: xc.object_index,
+            generation: xc.generation,
+            rights: xc.rights,
+            deriv_node: xc.deriv_node,
+        };
+    }
+    delta_cap_add(d, 11);
+    // (f) revoke the subtree rooted at D slot 10's node (flips alive on both).
+    // SAFETY: single hart; reading the source cap's node index.
+    let root = unsafe { (*domain_ptr(d)).caps[10].deriv_node };
+    revoke_tree(root);
+    // (g) tear PARTS down: drop the derived cap and the endpoint (keep the rest).
+    cap_clear(d, 11);
+    delta_endpoint_del(ep_obj);
+    endpoint_free(ep);
+    object_release(ep_obj);
+    // (4) enumerate every relation: the live snapshot the harness folds against.
+    for rel in [
+        REL_DOMAIN,
+        REL_OBJECT,
+        REL_CAPABILITY,
+        REL_ENDPOINT,
+        REL_DERIVATION,
+    ] {
+        legible_enumerate_at(d, 0, rel);
+    }
+    Some(ta)
+}
+
+/// Scenario three, `legible_snapshot_delta_consistency`: the killer invariant.
+/// Bracketed by `legible.check.begin`/`legible.check.end` so the harness folds
+/// only these deltas and collects only this snapshot; it then asserts
+/// snapshot == fold(deltas) for every relation by construction.
+fn scenario_legible_snapshot_delta_consistency() -> bool {
+    reset_scenario_state();
+    let Some(d) = domain_create(payloads::ring3_reuse) else {
+        return report("legible_snapshot_delta_consistency", false);
+    };
+    let Some(l) = object_alloc(ObjectClass::Legible) else {
+        discard_domain(d);
+        return report("legible_snapshot_delta_consistency", false);
+    };
+    cap_mint(d, 0, l, LEGIBLE_READ);
+    serial::ev_legible_check_begin();
+    let ta = legible_consistency_script(d);
+    serial::ev_legible_check_end();
+    legible_clear_subscriber();
+    let pass = ta.is_some();
+    deriv_teardown_all();
+    endpoint_teardown_all();
+    if let Some(ta) = ta {
+        object_release(ta);
+    }
+    discard_domain(d);
+    object_release(l);
+    report("legible_snapshot_delta_consistency", pass)
+}
+
+/// Scenario four, `legible_revoked_cap`: legibility authority is itself
+/// revocable. A domain enumerates OK, then the kernel revokes its `Legible` cap
+/// (generation bump); the next enumerate must return `StaleCap`.
+fn scenario_legible_revoked_cap() -> bool {
+    reset_scenario_state();
+    let Some(d) = domain_create(payloads::ring3_reuse) else {
+        return report("legible_revoked_cap", false);
+    };
+    let Some(l) = object_alloc(ObjectClass::Legible) else {
+        discard_domain(d);
+        return report("legible_revoked_cap", false);
+    };
+    cap_mint(d, 1, l, LEGIBLE_READ);
+    let (pre, _) = legible_enumerate_at(d, 1, REL_DOMAIN);
+    // Revoke the Legible cap by bumping its object's generation (ADR-K4 mass
+    // invalidation) — the exact same path M2 uses for a TestArtifact cap.
+    revoke_object(l);
+    let (post, _) = legible_enumerate_at(d, 1, REL_DOMAIN);
+    discard_domain(d);
+    object_release(l);
+    let pass = pre == OK && post == STALE_CAP;
+    report("legible_revoked_cap", pass)
+}
+
+/// Scenario five, `legible_reasoner`: a ring-3 tenant counts, from relation rows
+/// ALONE, how many capabilities in the system reference its transferred object.
+/// The kernel places exactly two references to object O in the live reasoner
+/// (one via a real IPC derivation transfer from S, one pre-minted), so the true
+/// count is 2; pass iff the reasoner's noted value equals it.
+fn scenario_legible_reasoner() -> bool {
+    reset_scenario_state();
+    let Some((ep_obj, ep)) = kernel_create_endpoint() else {
+        return report("legible_reasoner", false);
+    };
+    let Some(r) = domain_create(payloads::ring3_reasoner) else {
+        object_release(ep_obj);
+        endpoint_free(ep);
+        return report("legible_reasoner", false);
+    };
+    let Some(s) = domain_create(payloads::ring3_reasoner_source) else {
+        discard_domain(r);
+        object_release(ep_obj);
+        endpoint_free(ep);
+        return report("legible_reasoner", false);
+    };
+    kernel_mint_ep(r, 0, ep_obj, EP_RECV);
+    kernel_mint_ep(s, 0, ep_obj, EP_SEND);
+    let Some(o) = object_alloc(ObjectClass::TestArtifact) else {
+        discard_domain(s);
+        discard_domain(r);
+        object_release(ep_obj);
+        endpoint_free(ep);
+        return report("legible_reasoner", false);
+    };
+    // S holds a transferable cap to O; R holds a second, direct reference to O.
+    cap_mint(s, 10, o, 0b111);
+    cap_mint(r, 21, o, 0b100);
+    let Some(lg) = object_alloc(ObjectClass::Legible) else {
+        discard_domain(s);
+        discard_domain(r);
+        object_release(o);
+        object_release(ep_obj);
+        endpoint_free(ep);
+        return report("legible_reasoner", false);
+    };
+    cap_mint(r, 1, lg, LEGIBLE_READ);
+    let mut outcomes = [None, None];
+    scheduler_run(&[r, s], &mut outcomes);
+    ipc_scenario_teardown();
+    object_release(o);
+    object_release(lg);
+    let pass = matches!(outcomes[0], Some(RunOutcome::Exited(0)))
+        && matches!(outcomes[1], Some(RunOutcome::Exited(0)))
+        && NOTE_SEEN.load(Ordering::SeqCst)
+        && NOTE_VALUE.load(Ordering::SeqCst) == 2;
+    report("legible_reasoner", pass)
+}
+
 /// Run every ring-3 scenario in order: the seven M2 single-domain scenarios,
-/// then the seven M3 IPC scenarios, bracketed by a baseline and final pool
-/// census. Returns `true` iff all passed.
+/// then the seven M3 IPC scenarios, then the five M4 legibility scenarios,
+/// bracketed by pool censuses. Returns `true` iff all passed.
 pub fn run_all() -> bool {
     let mut all = true;
     all &= scenario_happy();
@@ -1697,6 +2459,18 @@ pub fn run_all() -> bool {
     all &= scenario_ipc_authority();
     all &= scenario_ipc_ep_full();
     all &= scenario_ipc_deadlock_guard();
+
+    emit_census();
+
+    // M4 legibility ABI v0 (appended AFTER the M3 scenarios + census; no existing
+    // `seq` shifts). Each scenario fully tears down, so the final census below
+    // still returns to the same baseline — proving no leak from the new Legible
+    // objects/caps.
+    all &= scenario_legible_schema_ok();
+    all &= scenario_legible_enumerate_gated();
+    all &= scenario_legible_snapshot_delta_consistency();
+    all &= scenario_legible_revoked_cap();
+    all &= scenario_legible_reasoner();
 
     emit_census();
     all

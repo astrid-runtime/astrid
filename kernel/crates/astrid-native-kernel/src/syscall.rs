@@ -282,6 +282,27 @@ unsafe extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> SyscallRet {
             let (status, value) = crate::domain::sys_revoke_tree(f.arg1);
             SyscallRet { status, value }
         },
+        // M4 legibility ABI v0.
+        8 => {
+            let (status, value) = crate::domain::sys_legible_schema(f.arg1, f.arg2);
+            SyscallRet { status, value }
+        },
+        9 => {
+            let (status, value) = crate::domain::sys_legible_enumerate(f.arg1, f.arg2);
+            SyscallRet { status, value }
+        },
+        10 => {
+            let (status, value) = crate::domain::sys_legible_subscribe(f.arg1);
+            SyscallRet { status, value }
+        },
+        11 => {
+            let (status, value) = crate::domain::sys_legible_get(f.arg1, f.arg2, f.arg3, f.arg4);
+            SyscallRet { status, value }
+        },
+        12 => {
+            let (status, value) = crate::domain::sys_cap_object(f.arg1);
+            SyscallRet { status, value }
+        },
         _ => SyscallRet {
             status: -1,
             value: 0,

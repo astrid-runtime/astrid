@@ -6,7 +6,9 @@
 //! virtual address is sound.
 //!
 //! Syscall ABI: `rax` = number (0 exit, 1 yield, 2 note, 3 cap_rights,
-//! 4 ep_create, 5 send, 6 recv, 7 revoke_tree); args in `rdi, rsi, rdx, r10`;
+//! 4 ep_create, 5 send, 6 recv, 7 revoke_tree, 8 legible_schema,
+//! 9 legible_enumerate, 10 legible_subscribe, 11 legible_get, 12 cap_object);
+//! args in `rdi, rsi, rdx, r10`;
 //! returns status in `rax` (0 OK, negative error) and value in `rdx`.
 //! Callee-saved registers (`rbx`, `r12`) survive NON-blocking syscalls, so
 //! payloads stash intermediate results there. Every payload ends in an infinite
@@ -468,6 +470,93 @@ pub extern "C" fn ring3_ipc_r_deadlock() {
         "mov rax, 6",
         "mov rdi, 0",
         "mov esi, -1",
+        "syscall",
+        "mov rax, 0",
+        "mov rdi, 0",
+        "syscall",
+        "2:",
+        "jmp 2b",
+    );
+}
+
+// ---- M4 legibility reasoner payloads ---------------------------------------
+
+/// Scenario `legible_reasoner` reasoner: a ring-3 tenant that derives a fact
+/// about system authority purely from the kernel's emitted relations. It holds
+/// an EP_RECV cap (slot 0), a `Legible` cap (slot 1), and will receive a
+/// transferred `TestArtifact` cap (into slot 20) plus a second kernel-minted
+/// reference to the same object (slot 21). It computes, from relation rows
+/// ALONE: "how many capabilities in the system reference MY object O?".
+///
+/// Steps: `recv` the transfer (blocks; resumes with only `rax`/`rdx` valid);
+/// `cap_object(20)` → O (stashed in callee-saved `r12`); `legible_enumerate`
+/// REL_CAPABILITY → row count (`r13`); loop `row_index` 0..count reading
+/// `COL_OBJECT_ID` via `legible_get`, incrementing `rbx` on a match with O;
+/// `note(rbx)`; `exit(0)`. `legible_get` is non-blocking so the callee-saved
+/// registers survive the loop.
+#[unsafe(naked)]
+pub extern "C" fn ring3_reasoner() {
+    naked_asm!(
+        // Blocking recv of the transferred cap into slot 20.
+        "mov rax, 6",
+        "mov rdi, 0",
+        "mov rsi, 20",
+        "syscall",
+        // O = cap_object(20).
+        "mov rax, 12",
+        "mov rdi, 20",
+        "syscall",
+        "mov r12, rdx", // r12 = O
+        // count = legible_enumerate(cap=1, REL_CAPABILITY=2).
+        "mov rax, 9",
+        "mov rdi, 1",
+        "mov rsi, 2",
+        "syscall",
+        "mov r13, rdx", // r13 = row count
+        "xor r14, r14", // r14 = row_index
+        "xor rbx, rbx", // rbx = match counter
+        "4:",
+        "cmp r14, r13",
+        "jae 5f",
+        // val = legible_get(cap=1, REL_CAPABILITY=2, row=r14, col=COL_OBJECT_ID=2).
+        "mov rax, 11",
+        "mov rdi, 1",
+        "mov rsi, 2",
+        "mov rdx, r14",
+        "mov r10, 2",
+        "syscall",
+        "cmp rdx, r12",
+        "jne 6f",
+        "inc rbx",
+        "6:",
+        "inc r14",
+        "jmp 4b",
+        "5:",
+        // note(match count).
+        "mov rax, 2",
+        "mov rdi, rbx",
+        "syscall",
+        // exit(0).
+        "mov rax, 0",
+        "mov rdi, 0",
+        "syscall",
+        "2:",
+        "jmp 2b",
+    );
+}
+
+/// Scenario `legible_reasoner` source: holds a `TestArtifact` cap in slot 10 and
+/// transfers it (full mask `0b111`) to the reasoner over the endpoint, creating
+/// the real derivation edge + capability row the reasoner will find, then
+/// `exit(0)`.
+#[unsafe(naked)]
+pub extern "C" fn ring3_reasoner_source() {
+    naked_asm!(
+        "mov rax, 5",
+        "mov rdi, 0",
+        "mov rsi, 0xC0",
+        "mov rdx, 10",
+        "mov r10, 7",
         "syscall",
         "mov rax, 0",
         "mov rdi, 0",
