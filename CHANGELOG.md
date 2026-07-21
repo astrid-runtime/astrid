@@ -9,6 +9,20 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+### Added
+
+- **Native kernel skeleton (`kernel/`, experimental, isolated workspace).** A
+  bare-metal `x86_64-unknown-none` capability microkernel that boots under
+  UEFI/QEMU and proves the charter's design intentions against real hardware
+  behaviour: ring-3 protection domains with per-domain page tables and W^X,
+  the ADR-K2 capability table with generation and derivation-scoped revocation
+  (ADR-K4), bounded IPC with capability transfer by derivation and monotonic
+  rights-shrink (ADR-K3), the legibility ABI v0 emitting the kernel's own
+  object tables as typed relations, and the ADR-K7 audit chain (ring-0 order +
+  BLAKE3 root, host-side chain verification). Everything is asserted by a QEMU
+  serial-event harness (`cargo run -p ktest`). The subtree is its own Cargo
+  workspace and is not built by core CI. No production code path depends on it.
+
 ### Fixed
 
 - **Stable crates publication installs its authenticated-hash prerequisite.**

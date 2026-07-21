@@ -1,0 +1,20 @@
+[package]
+name = "ktest"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "ktest"
+test = false
+bench = false
+
+[dependencies]
+anyhow = "=1.0.104"
+serde_json = "=1.0.151"
+blake3 = "=1.8.5"
+wait-timeout = "=0.2.1"
+# M5 (ADR-K7): the host verifier signs the reconstructed audit head. This is the
+# "user space builds the ed25519 chain" half — a host-tool dependency only; ring
+# 0 never signs.
+ed25519-dalek = "=2.2.0"
