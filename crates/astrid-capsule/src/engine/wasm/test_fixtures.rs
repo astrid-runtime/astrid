@@ -144,6 +144,9 @@ pub(crate) fn minimal_host_state(rt: tokio::runtime::Handle) -> HostState {
         persistent_processes: Arc::new(
             crate::engine::wasm::host::process::PersistentProcessRegistry::new(rt),
         ),
+        net_stream_budget: Arc::new(crate::NetStreamBudget::default()),
+        net_stream_leases: HashMap::new(),
+        net_frame_states: HashMap::new(),
         net_stream_count: 0,
         subscription_count: 0,
         process_count_total: 0,

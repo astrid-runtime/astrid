@@ -300,6 +300,13 @@ fn validate_capsule(config: &Config) -> ConfigResult<()> {
         });
     }
 
+    if c.host_net_streams == Some(0) {
+        return Err(ConfigError::ValidationError {
+            field: "capsule.host_net_streams".to_owned(),
+            message: "host_net_streams must be greater than 0".to_owned(),
+        });
+    }
+
     if c.instance_pool_size == Some(0) {
         return Err(ConfigError::ValidationError {
             field: "capsule.instance_pool_size".to_owned(),
@@ -396,6 +403,7 @@ mod tests {
         let config = Config::default();
         assert!(config.capsule.host_blocking_concurrency.is_none());
         assert!(config.capsule.host_io_concurrency.is_none());
+        assert!(config.capsule.host_net_streams.is_none());
         assert!(validate(&config).is_ok());
     }
 
@@ -404,6 +412,7 @@ mod tests {
         let mut config = Config::default();
         config.capsule.host_blocking_concurrency = Some(4);
         config.capsule.host_io_concurrency = Some(256);
+        config.capsule.host_net_streams = Some(128);
         assert!(validate(&config).is_ok());
     }
 
@@ -440,6 +449,18 @@ mod tests {
             err,
             ConfigError::ValidationError { field, .. }
                 if field == "capsule.instance_pool_size"
+        ));
+    }
+
+    #[test]
+    fn test_capsule_zero_net_streams_rejected() {
+        let mut config = Config::default();
+        config.capsule.host_net_streams = Some(0);
+        let err = validate(&config).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::ValidationError { field, .. }
+                if field == "capsule.host_net_streams"
         ));
     }
 

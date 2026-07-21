@@ -460,6 +460,14 @@ fn clear_on_return(state: &mut HostState, reset_resources: bool) {
         // them to the empty-table baseline so the per-(principal) gates start
         // from zero for the next lease.
         state.active_http_streams.clear();
+        state.net_stream_leases.clear();
+        state.net_frame_states.clear();
+        metrics::gauge!("astrid_capsule_net_streams_active").set(f64::from(
+            u32::try_from(state.net_stream_budget.active()).unwrap_or(u32::MAX),
+        ));
+        metrics::gauge!("astrid_capsule_net_streams_limit").set(f64::from(
+            u32::try_from(state.net_stream_budget.limit()).unwrap_or(u32::MAX),
+        ));
         state.net_stream_count = 0;
         state.subscription_count = 0;
         state.process_count_total = 0;

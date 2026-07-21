@@ -101,6 +101,17 @@ pub fn enforce_restrictions(
     // global config can set `[http]`.
     block_workspace_override(merged, baseline, workspace_layer, &["http"], "http");
 
+    // Process-wide persistent stream capacity is operator-owned. A workspace
+    // may neither widen it toward descriptor exhaustion nor shrink it into a
+    // daemon-wide denial of service for unrelated principals.
+    block_workspace_override(
+        merged,
+        baseline,
+        workspace_layer,
+        &["capsule", "host_net_streams"],
+        "capsule.host_net_streams",
+    );
+
     // workspace.auto_allow_read: cannot expand beyond baseline.
     block_workspace_expansion(
         merged,

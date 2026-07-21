@@ -188,6 +188,10 @@ pub struct Kernel {
     /// `Copy` value — no resolution logic lives here. See
     /// [`CapsuleRuntimeLimits`](astrid_capsule_types::CapsuleRuntimeLimits).
     runtime_limits: astrid_capsule_types::CapsuleRuntimeLimits,
+    /// Process-wide persistent network-stream admission budget. One shared
+    /// handle is forwarded through every loader and engine so capsule count and
+    /// instance-pool size cannot multiply the file-descriptor envelope.
+    net_stream_budget: Arc<astrid_capsule_types::NetStreamBudget>,
     /// Operator-approved per-capsule local-egress allowlist
     /// (`[security.capsule_local_egress]`), keyed by capsule id. Resolved
     /// once from config by the daemon; the kernel only stores it and hands
@@ -341,6 +345,28 @@ impl KernelResources {
 }
 
 impl Kernel {
+    /// Set the process-wide persistent network-stream admission ceiling.
+    /// Existing streams remain valid when the ceiling is lowered; new
+    /// admissions resume after usage falls below the configured limit.
+    pub fn set_net_stream_limit(&self, limit: usize) {
+        self.net_stream_budget.set_limit(limit);
+        metrics::gauge!("astrid_capsule_net_streams_limit").set(f64::from(
+            u32::try_from(self.net_stream_budget.limit()).unwrap_or(u32::MAX),
+        ));
+        metrics::gauge!("astrid_capsule_net_streams_active").set(f64::from(
+            u32::try_from(self.net_stream_budget.active()).unwrap_or(u32::MAX),
+        ));
+    }
+
+    /// Return `(active, limit)` for capacity reporting and telemetry.
+    #[must_use]
+    pub fn net_stream_usage(&self) -> (usize, usize) {
+        (
+            self.net_stream_budget.active(),
+            self.net_stream_budget.limit(),
+        )
+    }
+
     /// Per-project runtime layout selected at boot.
     #[must_use]
     pub fn workspace_layout(&self) -> &WorkspaceLayout {
@@ -732,6 +758,7 @@ impl Kernel {
             fuel_rate: astrid_capsule_types::FuelRateLimiter::default(),
             memory_ledger: astrid_capsule_types::MemoryLedger::default(),
             runtime_limits,
+            net_stream_budget: Arc::new(astrid_capsule_types::NetStreamBudget::default()),
             local_egress,
             http_limits,
             full_reload_in_flight: AtomicBool::new(false),
@@ -985,7 +1012,8 @@ impl Kernel {
             self.memory_ledger.clone(),
             self.runtime_limits,
             self.http_limits,
-        );
+        )
+        .with_net_stream_budget(Arc::clone(&self.net_stream_budget));
         let mut capsule = loader.create_capsule(manifest, dir.to_path_buf())?;
 
         let kv = astrid_storage::ScopedKvStore::new(
@@ -2456,6 +2484,7 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         fuel_rate: astrid_capsule_types::FuelRateLimiter::default(),
         memory_ledger: astrid_capsule_types::MemoryLedger::default(),
         runtime_limits: astrid_capsule_types::CapsuleRuntimeLimits::default(),
+        net_stream_budget: Arc::new(astrid_capsule_types::NetStreamBudget::default()),
         local_egress: std::collections::HashMap::new(),
         http_limits: astrid_capsule_types::HttpLimits::default(),
         full_reload_in_flight: AtomicBool::new(false),

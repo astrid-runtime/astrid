@@ -12,6 +12,7 @@ description = "Engine-agnostic capsule types shared by all Astrid capsule engine
 web-time = "1.1.0"
 astrid-core = { workspace = true }
 dashmap = { workspace = true }
+event-listener = "5.4.1"
 parking_lot = { workspace = true }
 semver = { workspace = true, features = ["serde"] }
 serde = { workspace = true }

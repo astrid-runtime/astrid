@@ -46,7 +46,8 @@ fn write_deadline(stream: &NetStream, data_len: usize) -> Duration {
     }
 }
 use super::{
-    HostState, NetStream, audit_net, map_io_err, net_stream, with_tcp_slot_mut, with_tcp_stream,
+    HostState, NetStream, audit_net, map_io_err, net_stream, record_net_stream_metrics,
+    with_tcp_slot_mut, with_tcp_stream,
 };
 use crate::engine::wasm::bindings::astrid::io::streams::{InputStream, OutputStream};
 use crate::engine::wasm::bindings::astrid::net::host::{
@@ -56,19 +57,21 @@ use crate::engine::wasm::host::util;
 
 impl HostTcpStream for HostState {
     fn read(&mut self, self_: Resource<TcpStream>) -> Result<NetReadStatus, ErrorCode> {
-        let stream = net_stream(&self.resource_table, self_.rep())?;
+        let rep = self_.rep();
+        let stream = net_stream(&self.resource_table, rep)?;
         let rt = self.runtime_handle.clone();
         let sem = self.blocking_semaphore.clone();
         let tok = self.effective_cancel_token();
+        let frame_state = self.net_frame_states.entry(rep).or_default();
         let status = util::bounded_block_on_cancellable(&rt, &sem, &tok, async {
             match stream {
                 NetStream::Unix(arc) => {
                     let mut s = arc.lock().await;
-                    read_frame(&mut *s).await
+                    read_frame(&mut *s, frame_state).await
                 },
                 NetStream::Tcp(slot) => {
                     let mut s = slot.stream.lock().await;
-                    read_frame(&mut *s).await
+                    read_frame(&mut *s, frame_state).await
                 },
             }
         });
@@ -490,12 +493,12 @@ impl HostTcpStream for HostState {
         })
     }
 
-    fn subscribe_readable(&mut self, _self_: Resource<TcpStream>) -> Resource<DynPollable> {
-        // Real pollable wiring (tokio AsyncRead readiness over the
-        // NetStream) lands with the stream-half adapter commit.
-        // Always-ready sentinel until then; guests poll then call
-        // read-bytes which handles real readability internally.
-        super::super::stubs::always_ready_pollable(&mut self.resource_table)
+    fn subscribe_readable(&mut self, self_: Resource<TcpStream>) -> Resource<DynPollable> {
+        wasmtime_wasi::p2::subscribe(
+            &mut self.resource_table,
+            Resource::<NetStream>::new_borrow(self_.rep()),
+        )
+        .unwrap_or_else(|_| Resource::new_own(0))
     }
 
     fn read_stream(&mut self, _self_: Resource<TcpStream>) -> Resource<InputStream> {
@@ -519,6 +522,9 @@ impl HostTcpStream for HostState {
             .is_ok()
         {
             self.net_stream_count = self.net_stream_count.saturating_sub(1);
+            self.net_stream_leases.remove(&table_rep);
+            self.net_frame_states.remove(&table_rep);
+            record_net_stream_metrics(self);
         }
         // Drop any verified per-connection principal binding (issue #45/#852)
         // so the registry does not leak entries for closed connections. A

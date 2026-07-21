@@ -703,6 +703,31 @@ async fn routed_recv_wakes_on_publish() {
 }
 
 #[tokio::test]
+async fn routed_ready_wakes_without_consuming() {
+    let bus = EventBus::new();
+    let mut sub =
+        bus.subscribe_topic_routed(uuid::Uuid::new_v4(), "t.*", "capsule-ready", "test_sub");
+
+    let publisher_bus = bus.clone();
+    let publisher = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        publisher_bus.publish(ipc_evt("t.ready", Some("alice")));
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), sub.ready())
+        .await
+        .expect("readiness should wake");
+    assert!(sub.total_bytes() > 0, "ready must not consume the event");
+    let event = sub.try_recv_one().expect("event remains queued");
+    if let AstridEvent::Ipc { message, .. } = &*event {
+        assert_eq!(message.topic, "t.ready");
+    } else {
+        panic!("expected IPC event");
+    }
+    publisher.await.expect("publisher task");
+}
+
+#[tokio::test]
 async fn routed_recv_timeout_returns_none_when_idle() {
     let bus = EventBus::new();
     let cap_uuid = uuid::Uuid::new_v4();

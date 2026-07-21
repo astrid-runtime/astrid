@@ -73,6 +73,10 @@ const ENV_MAPPINGS: &[EnvMapping] = &[
         field_path: "capsule.host_io_concurrency",
     },
     EnvMapping {
+        var_name: "ASTRID_CAPSULE_HOST_NET_STREAMS",
+        field_path: "capsule.host_net_streams",
+    },
+    EnvMapping {
         var_name: "ASTRID_CAPSULE_INSTANCE_POOL_SIZE",
         field_path: "capsule.instance_pool_size",
     },
@@ -295,6 +299,7 @@ fn coerce_to_toml_value(path: &str, val: &str) -> toml::Value {
             | "subagents.timeout_secs"
             | "capsule.host_blocking_concurrency"
             | "capsule.host_io_concurrency"
+            | "capsule.host_net_streams"
             | "capsule.instance_pool_size"
             | "retry.llm_max_attempts"
             | "retry.mcp_max_attempts"

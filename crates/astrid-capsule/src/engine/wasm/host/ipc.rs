@@ -107,6 +107,13 @@ pub(super) struct SubscriptionEntry {
     pub(super) topic_pattern: String,
 }
 
+#[async_trait::async_trait]
+impl wasmtime_wasi::p2::Pollable for SubscriptionEntry {
+    async fn ready(&mut self) {
+        self.receiver.lock().await.ready().await;
+    }
+}
+
 /// Convert an `AstridEvent::Ipc` arc into the internal message clone the
 /// WIT translation layer expects. Returns `None` for non-IPC events;
 /// the routed demux already filters non-IPC, so this is just defensive.
@@ -665,12 +672,12 @@ impl HostSubscription for HostState {
         result
     }
 
-    fn subscribe_readiness(&mut self, _self_: Resource<Subscription>) -> Resource<DynPollable> {
-        // Real pollable wiring (sourced from the receiver's notify
-        // channel) lands with the dedicated pollable commit. Until
-        // then, hand out an always-ready sentinel so guests get a
-        // clean poll-then-recv loop rather than a host panic.
-        super::stubs::always_ready_pollable(&mut self.resource_table)
+    fn subscribe_readiness(&mut self, self_: Resource<Subscription>) -> Resource<DynPollable> {
+        wasmtime_wasi::p2::subscribe(
+            &mut self.resource_table,
+            Resource::<SubscriptionEntry>::new_borrow(self_.rep()),
+        )
+        .unwrap_or_else(|_| Resource::new_own(0))
     }
 
     fn drop(&mut self, rep: Resource<Subscription>) -> wasmtime::Result<()> {

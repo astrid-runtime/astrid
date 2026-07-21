@@ -11,6 +11,8 @@ pub(super) const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::fro
 /// Host-side cap on a single byte-stream read/peek buffer.
 pub(super) const MAX_BYTES_PER_CALL: usize = 10 * 1024 * 1024;
 
+use crate::engine::wasm::host_state::FrameReadState;
+
 /// Returns true for IO errors that represent a normal peer disconnect.
 pub(super) fn is_peer_disconnect(e: &std::io::Error) -> bool {
     matches!(
@@ -23,44 +25,66 @@ pub(super) fn is_peer_disconnect(e: &std::io::Error) -> bool {
 }
 
 /// Read one length-prefixed frame from `stream`.
-pub(super) async fn read_frame<S>(stream: &mut S) -> Result<NetReadStatus, String>
+pub(super) async fn read_frame<S>(
+    stream: &mut S,
+    state: &mut FrameReadState,
+) -> Result<NetReadStatus, String>
 where
     S: tokio::io::AsyncRead + Unpin,
 {
     use tokio::io::AsyncReadExt;
 
-    let mut len_buf = [0u8; 4];
-    match tokio::time::timeout(
-        std::time::Duration::from_millis(50),
-        stream.read_exact(&mut len_buf),
-    )
-    .await
-    {
+    let header_result = tokio::time::timeout(std::time::Duration::from_millis(50), async {
+        while state.header_read < state.header.len() {
+            let read = stream.read(&mut state.header[state.header_read..]).await?;
+            if read == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+            }
+            state.header_read += read;
+        }
+        Ok::<(), std::io::Error>(())
+    })
+    .await;
+    match header_result {
         Err(_) => return Ok(NetReadStatus::Pending),
         Ok(Err(e)) if is_peer_disconnect(&e) => return Ok(NetReadStatus::Closed),
         Ok(Err(e)) => return Err(format!("socket read error: {e}")),
-        Ok(Ok(_)) => {},
+        Ok(Ok(())) => {},
     }
 
-    let len = u32::from_be_bytes(len_buf) as usize;
-    if len > MAX_BYTES_PER_CALL {
-        return Err("Payload too large (max 10MB)".to_string());
+    if state.payload.is_empty() {
+        let len = u32::from_be_bytes(state.header) as usize;
+        if len > MAX_BYTES_PER_CALL {
+            *state = FrameReadState::default();
+            return Err("Payload too large (max 10MB)".to_string());
+        }
+        state.payload.resize(len, 0);
     }
 
-    let mut payload = vec![0u8; len];
-    let timeout_ms = 5000 + (len as u64 / 1024);
-    match tokio::time::timeout(
-        std::time::Duration::from_millis(timeout_ms),
-        stream.read_exact(&mut payload),
-    )
-    .await
-    {
+    let timeout_ms = 5000 + (state.payload.len() as u64 / 1024);
+    let payload_result =
+        tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), async {
+            while state.payload_read < state.payload.len() {
+                let read = stream
+                    .read(&mut state.payload[state.payload_read..])
+                    .await?;
+                if read == 0 {
+                    return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+                }
+                state.payload_read += read;
+            }
+            Ok::<(), std::io::Error>(())
+        })
+        .await;
+    match payload_result {
         Err(_) => return Err("Payload read timed out".to_string()),
         Ok(Err(e)) if is_peer_disconnect(&e) => return Ok(NetReadStatus::Closed),
         Ok(Err(e)) => return Err(format!("socket payload read error: {e}")),
-        Ok(Ok(_)) => {},
+        Ok(Ok(())) => {},
     }
 
+    let payload = std::mem::take(&mut state.payload);
+    *state = FrameReadState::default();
     Ok(NetReadStatus::Data(payload))
 }
 
@@ -195,7 +219,33 @@ mod tests {
         // and `read_frame` converts it to `NetReadStatus::Closed`.
         let (tx, mut rx) = tokio::io::duplex(64);
         drop(tx);
-        let status = read_frame(&mut rx).await.expect("classified, not error");
+        let status = read_frame(&mut rx, &mut FrameReadState::default())
+            .await
+            .expect("classified, not error");
         assert!(matches!(status, NetReadStatus::Closed));
+    }
+
+    #[tokio::test]
+    async fn read_frame_preserves_fragmented_header_across_pending() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        let mut state = FrameReadState::default();
+        tx.write_all(&[0]).await.expect("first header byte");
+
+        let pending = read_frame(&mut rx, &mut state)
+            .await
+            .expect("partial header is not an error");
+        assert!(matches!(pending, NetReadStatus::Pending));
+        assert_eq!(state.header_read, 1);
+
+        tx.write_all(&[0, 0, 3, b'a', b'b', b'c'])
+            .await
+            .expect("remaining frame");
+        let complete = read_frame(&mut rx, &mut state)
+            .await
+            .expect("fragmented frame completes");
+        assert!(matches!(complete, NetReadStatus::Data(bytes) if bytes == b"abc"));
+        assert_eq!(state.header_read, 0);
     }
 }

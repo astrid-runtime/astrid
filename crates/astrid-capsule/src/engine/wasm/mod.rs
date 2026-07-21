@@ -264,6 +264,10 @@ pub struct WasmEngine {
     /// `blocking_semaphore` / `io_semaphore` at load time. `Default` (all
     /// host-derived) in tests.
     runtime_limits: limits::CapsuleRuntimeLimits,
+    /// Process-wide persistent network-stream budget shared across every
+    /// capsule and pooled Store. Standalone engines receive an isolated
+    /// host-derived budget; the kernel loader replaces it with one global Arc.
+    net_stream_budget: Arc<crate::NetStreamBudget>,
     /// Resolved operator ceilings for the `astrid:http` host. A GLOBAL value
     /// (same for every capsule), resolved once by the daemon from the `[http]`
     /// config section and handed down the loader chain like `runtime_limits`;
@@ -343,11 +347,19 @@ impl WasmEngine {
             fuel_rate,
             group_config: None,
             runtime_limits,
+            net_stream_budget: Arc::new(crate::NetStreamBudget::default()),
             http_limits,
             workspace_cow: None,
             process_tracker: None,
             persistent_processes: None,
         }
+    }
+
+    /// Use the kernel-owned process-wide persistent network-stream budget.
+    #[must_use]
+    pub fn with_net_stream_budget(mut self, budget: Arc<crate::NetStreamBudget>) -> Self {
+        self.net_stream_budget = budget;
+        self
     }
 
     /// Promote/rollback the OS-level copy-on-write workspace behind a QUIESCENCE
@@ -1674,6 +1686,7 @@ impl ExecutionEngine for WasmEngine {
             // One IPC rate limiter shared by every pooled instance, so the
             // per-capsule throughput budget is not multiplied by pool size.
             let ipc_limiter = Arc::new(astrid_events::ipc::IpcRateLimiter::new());
+            let net_stream_budget = Arc::clone(&self.net_stream_budget);
 
             // ── Run-loop resource bound (CPU epoch interrupt + linear memory) ─
             //
@@ -1896,6 +1909,9 @@ impl ExecutionEngine for WasmEngine {
                 identity_store: st_identity_store.clone(),
                 process_tracker: process_tracker.clone(),
                 persistent_processes: persistent_registry.clone(),
+                net_stream_budget: Arc::clone(&net_stream_budget),
+                net_stream_leases: std::collections::HashMap::new(),
+                net_frame_states: std::collections::HashMap::new(),
                 net_stream_count: 0,
                 subscription_count: 0,
                 process_count_total: 0,
@@ -3017,6 +3033,9 @@ pub async fn run_lifecycle(
         persistent_processes: Arc::new(host::process::PersistentProcessRegistry::new(
             tokio::runtime::Handle::current(),
         )),
+        net_stream_budget: Arc::new(crate::NetStreamBudget::default()),
+        net_stream_leases: std::collections::HashMap::new(),
+        net_frame_states: std::collections::HashMap::new(),
         net_stream_count: 0,
         subscription_count: 0,
         process_count_total: 0,
