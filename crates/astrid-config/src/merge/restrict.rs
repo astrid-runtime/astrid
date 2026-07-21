@@ -101,6 +101,33 @@ pub fn enforce_restrictions(
     // global config can set `[http]`.
     block_workspace_override(merged, baseline, workspace_layer, &["http"], "http");
 
+    // capsule.compute_*: operator-only host compute ceilings. A capsule or
+    // project must not choose how many native worker threads or how much
+    // shared memory the daemon may reserve on a principal's behalf. Keep the
+    // absence of a ceiling (`None`) an operator decision as well: otherwise a
+    // workspace could inject a value into an intentionally unset baseline.
+    block_workspace_override(
+        merged,
+        baseline,
+        workspace_layer,
+        &["capsule", "compute_max_workers_per_principal"],
+        "capsule.compute_max_workers_per_principal",
+    );
+    block_workspace_override(
+        merged,
+        baseline,
+        workspace_layer,
+        &["capsule", "compute_max_shared_memory_bytes_per_principal"],
+        "capsule.compute_max_shared_memory_bytes_per_principal",
+    );
+    block_workspace_override(
+        merged,
+        baseline,
+        workspace_layer,
+        &["capsule", "compute_max_job_fuel"],
+        "capsule.compute_max_job_fuel",
+    );
+
     // workspace.auto_allow_read: cannot expand beyond baseline.
     block_workspace_expansion(
         merged,

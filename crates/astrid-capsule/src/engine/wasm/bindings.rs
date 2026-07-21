@@ -62,6 +62,7 @@ wasmtime::component::bindgen!({
             import astrid:sys/host@1.0.0;
             import astrid:process/host@1.0.0;
             import astrid:process/host@1.1.0;
+            import astrid:compute/host@1.0.0;
             import astrid:uplink/host@1.0.0;
             import astrid:elicit/host@1.0.0;
             import astrid:approval/host@1.0.0;
@@ -92,6 +93,8 @@ wasmtime::component::bindgen!({
         "astrid:io/error@1.0.0.error": wasmtime_wasi::p2::IoError,
         "astrid:io/streams@1.0.0.input-stream": wasmtime_wasi::p2::DynInputStream,
         "astrid:io/streams@1.0.0.output-stream": wasmtime_wasi::p2::DynOutputStream,
+        "astrid:compute/host@1.0.0.compute-group": astrid_compute::ComputeGroup,
+        "astrid:compute/host@1.0.0.job": astrid_compute::ComputeJob,
     },
     // Lower the `stream-error` variant to wasmtime-wasi-io's runtime
     // `StreamError` enum (Closed / LastOperationFailed(wasmtime::Error)
@@ -123,6 +126,7 @@ wasmtime::component::bindgen!({
         // Every other import stays synchronous — non-blocking host fns
         // (publish/subscribe/kv/sys/...) gain nothing from async.
         "astrid:ipc/host.[method]subscription.recv": async,
+        "astrid:compute/host.[method]job.join": async,
         // The HTTP host fns that *wait on the network* are the second
         // worker-pin on the orchestration hot path: openai-compat opens an
         // LLM stream (`http-stream-start`), then loops `read-chunk` over the

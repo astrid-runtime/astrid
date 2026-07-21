@@ -18,6 +18,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
+blake3 = { workspace = true }
 cargo_metadata = "0.23.1"
 clap = { workspace = true }
 flate2 = { workspace = true }

@@ -390,7 +390,78 @@ fn build_manifest_content(
         }
     }
 
+    validate_compute_workers(dir, &toml_doc)?;
     Ok(toml_doc.to_string())
+}
+
+fn validate_compute_workers(dir: &Path, manifest: &toml_edit::DocumentMut) -> Result<()> {
+    let Some(components) = manifest
+        .get("component")
+        .and_then(toml_edit::Item::as_array_of_tables)
+    else {
+        return Ok(());
+    };
+    let mut ids = std::collections::HashSet::new();
+    for component in components.iter().filter(|component| {
+        component.get("type").and_then(toml_edit::Item::as_str) == Some("compute-worker")
+    }) {
+        let id = component
+            .get("id")
+            .and_then(toml_edit::Item::as_str)
+            .filter(|id| !id.is_empty())
+            .context("compute-worker requires a non-empty id")?;
+        if !ids.insert(id) {
+            anyhow::bail!("duplicate compute-worker id '{id}'");
+        }
+        let file = component
+            .get("file")
+            .or_else(|| component.get("entrypoint"))
+            .and_then(toml_edit::Item::as_str)
+            .context("compute-worker requires a file path")?;
+        let relative = Path::new(file);
+        if relative.is_absolute()
+            || !relative.starts_with("assets")
+            || relative.components().any(|part| {
+                matches!(
+                    part,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            anyhow::bail!("compute-worker '{id}' file must be a traversal-free path under assets/");
+        }
+        let hash = component
+            .get("hash")
+            .and_then(toml_edit::Item::as_str)
+            .context("compute-worker requires an exact blake3 hash")?;
+        let Some(hex) = hash.strip_prefix("blake3:") else {
+            anyhow::bail!("compute-worker '{id}' hash must use blake3:<lowercase-hex>");
+        };
+        if hex.len() != 64
+            || !hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            anyhow::bail!("compute-worker '{id}' hash must use blake3:<lowercase-hex>");
+        }
+        let path = dir.join(relative);
+        let bytes = fs::read(&path).with_context(|| {
+            format!("failed to read compute-worker '{id}' at {}", path.display())
+        })?;
+        if bytes.len() < 8 || &bytes[..4] != b"\0asm" {
+            anyhow::bail!("compute-worker '{id}' is not WebAssembly");
+        }
+        if bytes[6] == 0x01 {
+            anyhow::bail!("compute-worker '{id}' must remain a core Wasm module, not a Component");
+        }
+        let actual = format!("blake3:{}", blake3::hash(&bytes).to_hex());
+        if actual != hash {
+            anyhow::bail!("compute-worker '{id}' hash mismatch: expected {hash}, got {actual}");
+        }
+    }
+    Ok(())
 }
 
 /// Resolve the output directory, creating it if necessary.
@@ -568,6 +639,64 @@ fn create_default_manifest(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn compute_manifest(file: &str, hash: &str) -> toml_edit::DocumentMut {
+        format!(
+            r#"
+                [[component]]
+                id = "cpu"
+                file = "{file}"
+                type = "compute-worker"
+                hash = "{hash}"
+            "#
+        )
+        .parse()
+        .unwrap()
+    }
+
+    #[test]
+    fn compute_worker_must_be_hash_pinned_core_wasm_under_assets() {
+        let dir = tempfile::tempdir().unwrap();
+        let assets = dir.path().join("assets");
+        fs::create_dir(&assets).unwrap();
+        let bytes = b"\0asm\x01\0\0\0";
+        fs::write(assets.join("cpu.wasm"), bytes).unwrap();
+        let hash = format!("blake3:{}", blake3::hash(bytes).to_hex());
+        let manifest = compute_manifest("assets/cpu.wasm", &hash);
+        validate_compute_workers(dir.path(), &manifest).unwrap();
+
+        let outside = compute_manifest("../cpu.wasm", &hash);
+        assert!(
+            validate_compute_workers(dir.path(), &outside)
+                .unwrap_err()
+                .to_string()
+                .contains("under assets")
+        );
+        let mismatch = compute_manifest("assets/cpu.wasm", &format!("blake3:{}", "0".repeat(64)));
+        assert!(
+            validate_compute_workers(dir.path(), &mismatch)
+                .unwrap_err()
+                .to_string()
+                .contains("hash mismatch")
+        );
+    }
+
+    #[test]
+    fn compute_worker_rejects_component_encoding() {
+        let dir = tempfile::tempdir().unwrap();
+        let assets = dir.path().join("assets");
+        fs::create_dir(&assets).unwrap();
+        let bytes = b"\0asm\x0d\0\x01\0";
+        fs::write(assets.join("cpu.wasm"), bytes).unwrap();
+        let hash = format!("blake3:{}", blake3::hash(bytes).to_hex());
+        let manifest = compute_manifest("assets/cpu.wasm", &hash);
+        assert!(
+            validate_compute_workers(dir.path(), &manifest)
+                .unwrap_err()
+                .to_string()
+                .contains("core Wasm module")
+        );
+    }
 
     fn decode(encoded: &str) -> Vec<String> {
         encoded.split(RUSTFLAGS_SEP).map(str::to_owned).collect()

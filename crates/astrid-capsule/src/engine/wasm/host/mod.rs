@@ -13,6 +13,8 @@ pub(crate) mod approval;
 /// itself lives at [`crate::audit_sink`]).
 #[cfg(test)]
 mod audit_sink_tests;
+/// Generic core-Wasm compute groups.
+pub(crate) mod compute;
 /// Runtime operator-consent for local-egress (transport-origin gated).
 pub(crate) mod consent_egress;
 /// Elicit API (interactive user input collection).

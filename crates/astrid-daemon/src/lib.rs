@@ -53,6 +53,21 @@ pub struct Args {
     /// host-derived value (cores-scaled, replacing the old fixed 16).
     #[arg(long)]
     pub instance_pool_size: Option<usize>,
+
+    /// Override aggregate generic compute workers per principal. Omit for no
+    /// Astrid-specific policy cap.
+    #[arg(long, value_parser = parse_nonzero_u32)]
+    pub compute_max_workers_per_principal: Option<u32>,
+
+    /// Override aggregate generic compute shared memory per principal, in
+    /// bytes. Omit to delegate to principal memory policy.
+    #[arg(long, value_parser = parse_nonzero_u64)]
+    pub compute_max_shared_memory_bytes_per_principal: Option<u64>,
+
+    /// Override the Wasmtime fuel ceiling for one generic compute job. Omit
+    /// for no Astrid-specific job-fuel cap.
+    #[arg(long, value_parser = parse_nonzero_u64)]
+    pub compute_max_job_fuel: Option<u64>,
 }
 
 /// Reject a concurrency ceiling of `0` at CLI parse time. `0` would otherwise
@@ -65,6 +80,22 @@ fn parse_nonzero_concurrency(s: &str) -> Result<usize, String> {
         Ok(0) => Err("must be >= 1 (a concurrency ceiling of 0 would wedge the gate)".to_string()),
         Ok(n) => Ok(n),
         Err(e) => Err(format!("not a valid concurrency value: {e}")),
+    }
+}
+
+fn parse_nonzero_u32(s: &str) -> Result<u32, String> {
+    match s.parse::<u32>() {
+        Ok(0) => Err("must be >= 1".to_owned()),
+        Ok(value) => Ok(value),
+        Err(error) => Err(format!("not a valid positive integer: {error}")),
+    }
+}
+
+fn parse_nonzero_u64(s: &str) -> Result<u64, String> {
+    match s.parse::<u64>() {
+        Ok(0) => Err("must be >= 1".to_owned()),
+        Ok(value) => Ok(value),
+        Err(error) => Err(format!("not a valid positive integer: {error}")),
     }
 }
 
@@ -108,6 +139,23 @@ fn resolve_capsule_limits(
             .or_else(|| capsule_cfg.and_then(|c| c.host_io_concurrency)),
         args.instance_pool_size
             .or_else(|| capsule_cfg.and_then(|c| c.instance_pool_size)),
+    )
+}
+
+/// Resolve independent generic-compute policy without changing the stable
+/// capsule host-call limits type.
+fn resolve_compute_limits(
+    args: &Args,
+    cfg: Option<&astrid_config::Config>,
+) -> astrid_capsule::ComputeRuntimeLimits {
+    let capsule_cfg = cfg.map(|c| &c.capsule);
+    astrid_capsule::ComputeRuntimeLimits::resolve(
+        args.compute_max_workers_per_principal
+            .or_else(|| capsule_cfg.and_then(|c| c.compute_max_workers_per_principal)),
+        args.compute_max_shared_memory_bytes_per_principal
+            .or_else(|| capsule_cfg.and_then(|c| c.compute_max_shared_memory_bytes_per_principal)),
+        args.compute_max_job_fuel
+            .or_else(|| capsule_cfg.and_then(|c| c.compute_max_job_fuel)),
     )
 }
 
@@ -198,6 +246,7 @@ pub async fn run() -> Result<()> {
     // host-derived default); the kernel forwards them to every `WasmEngine`.
     // Done before `args.workspace` is consumed below.
     let runtime_limits = resolve_capsule_limits(&args, unified_cfg.as_ref());
+    let compute_limits = resolve_compute_limits(&args, unified_cfg.as_ref());
 
     // Operator-approved per-capsule local-egress allowlist (SSRF-airlock
     // exemptions). Operator config only — the kernel hands each capsule its
@@ -210,12 +259,13 @@ pub async fn run() -> Result<()> {
     // Operator ceilings for the astrid:http host (global; absent `[http]`
     // config = the host's historical constants). Forwarded to every capsule.
     let http_limits = resolve_http_limits(unified_cfg.as_ref());
-    let kernel = astrid_kernel::Kernel::new_with_workspace_layout(
+    let kernel = astrid_kernel::Kernel::new_with_workspace_layout_and_compute_policy(
         session_id.clone(),
         workspace_root,
         runtime_limits,
         local_egress,
         http_limits,
+        compute_limits,
         workspace_layout,
     )
     .await

@@ -446,6 +446,12 @@ pub struct HostState {
     /// model is principal-scoped, a separate axis), so a snapshot taken once
     /// is correct for the capsule's whole lifetime and across the pool.
     pub capability_names: Vec<String>,
+    /// Generic compute runtime, present only when the signed manifest declares
+    /// the fail-closed `compute` capability.
+    pub compute_runtime: Option<Arc<astrid_compute::ComputeRuntime>>,
+    /// Hash-verified `compute-worker` artifacts declared by this capsule,
+    /// keyed by component id. Workers cannot be supplied dynamically.
+    pub compute_workers: Arc<std::collections::HashMap<String, astrid_compute::WorkerArtifact>>,
     /// Operator-approved local-egress allowlist for THIS capsule, as
     /// `host:port` / `host:*` patterns (from `[security.capsule_local_egress]`,
     /// keyed by capsule id). Endpoints listed here are exempt from the

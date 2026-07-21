@@ -1,0 +1,30 @@
+[package]
+name = "astrid-compute"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Principal-scoped shared-memory WebAssembly compute groups for Astrid"
+
+[dependencies]
+astrid-core = { workspace = true }
+blake3 = { workspace = true }
+thiserror = { workspace = true }
+wasmtime = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+wat = "1"
+
+[lints.rust]
+# Wasmtime exposes shared memory as UnsafeCell and explicitly requires atomic
+# pointer casts for concurrent host access. This crate is the sole reviewed
+# containment boundary for those casts; every consumer receives a safe API.
+unsafe_code = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+arithmetic_side_effects = "deny"

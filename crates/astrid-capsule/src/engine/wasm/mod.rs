@@ -107,6 +107,44 @@ fn resolve_content_addressed_wasm(capsule_dir: &std::path::Path) -> Option<PathB
     }
 }
 
+fn load_compute_workers(
+    manifest: &CapsuleManifest,
+    capsule_dir: &std::path::Path,
+) -> CapsuleResult<Arc<std::collections::HashMap<String, astrid_compute::WorkerArtifact>>> {
+    let mut workers = std::collections::HashMap::new();
+    for component in manifest
+        .components
+        .iter()
+        .filter(|component| component.r#type == "compute-worker")
+    {
+        if component.id.is_empty() {
+            return Err(CapsuleError::UnsupportedEntryPoint(
+                "compute-worker component requires a non-empty id".to_owned(),
+            ));
+        }
+        let hash = component.hash.as_deref().ok_or_else(|| {
+            CapsuleError::UnsupportedEntryPoint(format!(
+                "compute-worker '{}' requires an exact blake3 hash",
+                component.id
+            ))
+        })?;
+        let artifact = astrid_compute::WorkerArtifact::from_capsule_path(
+            component.id.clone(),
+            capsule_dir,
+            &component.path,
+            hash,
+        )
+        .map_err(|error| CapsuleError::UnsupportedEntryPoint(error.to_string()))?;
+        if workers.insert(component.id.clone(), artifact).is_some() {
+            return Err(CapsuleError::UnsupportedEntryPoint(format!(
+                "duplicate compute-worker id '{}'",
+                component.id
+            )));
+        }
+    }
+    Ok(Arc::new(workers))
+}
+
 /// Returns `true` when `workspace_root` sits inside a git work tree.
 ///
 /// A git-managed workspace must NOT use the in-process copy-on-write overlay:
@@ -237,6 +275,10 @@ pub struct WasmEngine {
     /// max across every capsule it drives, filling
     /// `ResourceUsage::memory_bytes_peak_total`. Telemetry only.
     memory_ledger: crate::MemoryLedger,
+    /// Kernel-owned, cross-capsule compute reservation ledger.
+    compute_ledger: astrid_compute::ComputeLedger,
+    /// Operator policy for generic compute groups.
+    compute_limits: limits::ComputeRuntimeLimits,
     /// Shared per-principal CPU-**rate** limiter — the deny side of the budget
     /// (PR2), built on the same shared-handle model as `fuel_ledger`.
     ///
@@ -324,6 +366,62 @@ impl WasmEngine {
         runtime_limits: limits::CapsuleRuntimeLimits,
         http_limits: limits::HttpLimits,
     ) -> Self {
+        Self::new_with_compute(
+            manifest,
+            capsule_dir,
+            fuel_ledger,
+            fuel_rate,
+            memory_ledger,
+            runtime_limits,
+            http_limits,
+            astrid_compute::ComputeLedger::default(),
+        )
+    }
+
+    /// Construct a WASM engine sharing the kernel's compute reservation ledger.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "additive composition-root constructor preserves existing public APIs"
+    )]
+    pub fn new_with_compute(
+        manifest: CapsuleManifest,
+        capsule_dir: PathBuf,
+        fuel_ledger: crate::FuelLedger,
+        fuel_rate: crate::FuelRateLimiter,
+        memory_ledger: crate::MemoryLedger,
+        runtime_limits: limits::CapsuleRuntimeLimits,
+        http_limits: limits::HttpLimits,
+        compute_ledger: astrid_compute::ComputeLedger,
+    ) -> Self {
+        Self::new_with_compute_policy(
+            manifest,
+            capsule_dir,
+            fuel_ledger,
+            fuel_rate,
+            memory_ledger,
+            runtime_limits,
+            http_limits,
+            compute_ledger,
+            limits::ComputeRuntimeLimits::default(),
+        )
+    }
+
+    /// Construct a WASM engine with shared compute accounting and policy.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "additive composition-root constructor preserves existing public APIs"
+    )]
+    pub fn new_with_compute_policy(
+        manifest: CapsuleManifest,
+        capsule_dir: PathBuf,
+        fuel_ledger: crate::FuelLedger,
+        fuel_rate: crate::FuelRateLimiter,
+        memory_ledger: crate::MemoryLedger,
+        runtime_limits: limits::CapsuleRuntimeLimits,
+        http_limits: limits::HttpLimits,
+        compute_ledger: astrid_compute::ComputeLedger,
+        compute_limits: limits::ComputeRuntimeLimits,
+    ) -> Self {
         Self {
             manifest,
             _capsule_dir: capsule_dir,
@@ -340,6 +438,8 @@ impl WasmEngine {
             overlay_registry: None,
             fuel_ledger,
             memory_ledger,
+            compute_ledger,
+            compute_limits,
             fuel_rate,
             group_config: None,
             runtime_limits,
@@ -1315,11 +1415,33 @@ impl ExecutionEngine for WasmEngine {
             "Loading WASM component (Component Model)"
         );
 
-        let component = self.manifest.components.first().ok_or_else(|| {
-            CapsuleError::UnsupportedEntryPoint(
-                "WASM engine requires at least one component definition".into(),
-            )
-        })?;
+        let component = self
+            .manifest
+            .components
+            .iter()
+            .find(|component| component.r#type.is_empty() || component.r#type == "executable")
+            .ok_or_else(|| {
+                CapsuleError::UnsupportedEntryPoint(
+                    "WASM engine requires an executable component definition".into(),
+                )
+            })?;
+
+        let compute_workers = load_compute_workers(&self.manifest, &self._capsule_dir)?;
+        let compute_runtime = if !compute_workers.is_empty() {
+            let limits = astrid_compute::ComputeLimits {
+                max_workers_per_principal: self.compute_limits.max_workers_per_principal,
+                max_memory_bytes_per_principal: self
+                    .compute_limits
+                    .max_shared_memory_bytes_per_principal,
+                max_job_fuel: self.compute_limits.max_job_fuel,
+            };
+            Some(Arc::new(
+                astrid_compute::ComputeRuntime::new(self.compute_ledger.clone(), limits)
+                    .map_err(|error| CapsuleError::UnsupportedEntryPoint(error.to_string()))?,
+            ))
+        } else {
+            None
+        };
 
         let wasm_path = if component.path.is_absolute() {
             component.path.clone()
@@ -1662,7 +1784,11 @@ impl ExecutionEngine for WasmEngine {
             // Snapshot of the capsule's held capability names, fixed at load —
             // backs the infallible `enumerate-capabilities` host fn. Cloned per
             // pooled instance inside the `make_state` closure below.
-            let capability_names = manifest.capabilities.held_names();
+            let mut capability_names = manifest.capabilities.held_names();
+            if !compute_workers.is_empty() {
+                capability_names.push("compute".to_owned());
+                capability_names.sort_unstable();
+            }
             // Operator-approved local-egress allowlist for this capsule,
             // snapshotted from the load context onto every pooled instance
             // (load-time-fixed, like `capability_names`).
@@ -1807,6 +1933,8 @@ impl ExecutionEngine for WasmEngine {
             let client_connections: Arc<
                 dashmap::DashMap<u32, astrid_core::principal::PrincipalId>,
             > = Arc::new(dashmap::DashMap::new());
+            let compute_runtime = compute_runtime.clone();
+            let compute_workers = Arc::clone(&compute_workers);
             let make_state: Arc<dyn Fn() -> HostState + Send + Sync> = Arc::new(move || HostState {
                 wasi_ctx: build_wasi_ctx(),
                 resource_table: wasmtime::component::ResourceTable::new(),
@@ -1873,6 +2001,8 @@ impl ExecutionEngine for WasmEngine {
                 runtime_handle: tokio::runtime::Handle::current(),
                 has_uplink_capability: has_uplink,
                 capability_names: capability_names.clone(),
+                compute_runtime: compute_runtime.clone(),
+                compute_workers: Arc::clone(&compute_workers),
                 local_egress: local_egress.clone(),
                 http_limits,
                 audit_firehose,
@@ -2981,6 +3111,8 @@ pub async fn run_lifecycle(
         // capability introspection is not exposed here (matches the
         // hard-coded `has_uplink_capability: false` above). Fail-closed.
         capability_names: Vec::new(),
+        compute_runtime: None,
+        compute_workers: Arc::new(std::collections::HashMap::new()),
         // Lifecycle (install/upgrade) hooks run briefly and do not carry a
         // local-egress exemption; the SSRF airlock applies in full.
         local_egress: Vec::new(),

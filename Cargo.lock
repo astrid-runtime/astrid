@@ -417,6 +417,7 @@ name = "astrid-build"
 version = "0.10.4"
 dependencies = [
  "anyhow",
+ "blake3",
  "cargo_metadata",
  "clap",
  "flate2",
@@ -456,6 +457,7 @@ dependencies = [
  "astrid-approval",
  "astrid-capabilities",
  "astrid-capsule-types",
+ "astrid-compute",
  "astrid-core",
  "astrid-crypto",
  "astrid-events",
@@ -495,6 +497,7 @@ dependencies = [
  "wasmparser 0.253.0",
  "wasmtime",
  "wasmtime-wasi",
+ "wat",
 ]
 
 [[package]]
@@ -536,6 +539,18 @@ dependencies = [
  "thiserror 2.0.18",
  "toml 0.9.12+spec-1.1.0",
  "web-time",
+]
+
+[[package]]
+name = "astrid-compute"
+version = "0.10.4"
+dependencies = [
+ "astrid-core",
+ "blake3",
+ "tempfile",
+ "thiserror 2.0.18",
+ "wasmtime",
+ "wat",
 ]
 
 [[package]]

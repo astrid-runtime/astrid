@@ -9,6 +9,15 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+### Added
+
+- **Principal-scoped generic compute groups for signed core-Wasm workers.**
+  Capsules can package hash-pinned worker modules, admit deterministic or
+  parallel worker groups over shared memory, and submit cancellable jobs through
+  an audited host boundary. Aggregate worker, memory, and optional fuel ceilings
+  are operator-controlled; defaults add no arbitrary Astrid policy cap. The
+  pre-1.0 WIT contract remains deliberately unmerged until Astrid 1.0.
+
 ### Fixed
 
 - **Stable crates publication installs its authenticated-hash prerequisite.**

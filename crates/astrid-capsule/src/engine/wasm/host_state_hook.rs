@@ -94,6 +94,8 @@ impl HostState {
             // Hooks run outside the manifest/security-gate lifecycle: no held
             // capabilities and no local-egress exemptions (both fail-closed).
             capability_names: Vec::new(),
+            compute_runtime: None,
+            compute_workers: Arc::new(HashMap::new()),
             local_egress: Vec::new(),
             http_limits,
             // Transient hook execution never subscribes to the audit feed;

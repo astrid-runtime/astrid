@@ -103,4 +103,17 @@ pub trait HostAuditSink: Send + Sync {
         event: HostAuditEvent<'_>,
         outcome: HostAuditOutcome<'_>,
     );
+
+    /// Record a generic compute control-plane action. The default preserves
+    /// source compatibility for third-party sinks; the kernel implementation
+    /// persists this as an existing `CapsuleToolCall` audit action.
+    fn record_compute(
+        &self,
+        _principal: &astrid_core::PrincipalId,
+        _capsule_id: &str,
+        _operation: &str,
+        _worker: &str,
+        _outcome: HostAuditOutcome<'_>,
+    ) {
+    }
 }

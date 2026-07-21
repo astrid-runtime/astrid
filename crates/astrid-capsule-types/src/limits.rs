@@ -207,6 +207,42 @@ impl Default for CapsuleRuntimeLimits {
     }
 }
 
+/// Resolved operator policy for generic compute groups.
+///
+/// This is intentionally separate from [`CapsuleRuntimeLimits`] so the compute
+/// surface is additive for downstream crates that construct that public struct
+/// with literals. Every field is an aggregate principal ceiling across all
+/// capsules. `None` means no Astrid-specific policy cap.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ComputeRuntimeLimits {
+    /// Aggregate compute workers per principal.
+    pub max_workers_per_principal: Option<u32>,
+    /// Aggregate compute shared-memory bytes per principal.
+    pub max_shared_memory_bytes_per_principal: Option<u64>,
+    /// Maximum Wasmtime fuel assigned to one compute job.
+    pub max_job_fuel: Option<u64>,
+}
+
+impl ComputeRuntimeLimits {
+    /// Resolve optional operator values while preserving the uncapped default.
+    ///
+    /// Explicit zero is defensively clamped to one here; configuration and CLI
+    /// validation reject it before this boundary.
+    #[must_use]
+    pub fn resolve(
+        max_workers_per_principal: Option<u32>,
+        max_shared_memory_bytes_per_principal: Option<u64>,
+        max_job_fuel: Option<u64>,
+    ) -> Self {
+        Self {
+            max_workers_per_principal: max_workers_per_principal.map(|value| value.max(1)),
+            max_shared_memory_bytes_per_principal: max_shared_memory_bytes_per_principal
+                .map(|value| value.max(1)),
+            max_job_fuel: max_job_fuel.map(|value| value.max(1)),
+        }
+    }
+}
+
 /// Resolved operator HTTP host policy for `astrid:http`, handed from the daemon
 /// down to every `HostState` (mirrors the [`CapsuleRuntimeLimits`] plumbing).
 /// Resolved once from the `[http]` config section; the kernel only stores and
@@ -396,6 +432,18 @@ mod tests {
         assert_eq!(z.blocking_concurrency, 1);
         assert_eq!(z.io_concurrency, 1);
         assert_eq!(z.instance_pool_size, 1);
+
+        let compute = ComputeRuntimeLimits::resolve(
+            Some(8),
+            Some(8 * 1024 * 1024 * 1024),
+            Some(5_000_000_000),
+        );
+        assert_eq!(compute.max_workers_per_principal, Some(8));
+        assert_eq!(
+            compute.max_shared_memory_bytes_per_principal,
+            Some(8 * 1024 * 1024 * 1024)
+        );
+        assert_eq!(compute.max_job_fuel, Some(5_000_000_000));
     }
 
     #[test]

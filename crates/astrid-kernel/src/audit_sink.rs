@@ -220,6 +220,37 @@ impl HostAuditSink for KernelAuditSink {
             );
         }
     }
+
+    fn record_compute(
+        &self,
+        principal: &PrincipalId,
+        capsule_id: &str,
+        operation: &str,
+        worker: &str,
+        outcome: HostAuditOutcome<'_>,
+    ) {
+        let action = AuditAction::CapsuleToolCall {
+            capsule_id: truncate_guest_str(capsule_id),
+            tool: truncate_guest_str(&format!("compute.{operation}:{worker}")),
+            args_hash: ContentHash::zero(),
+        };
+        let (proof, audit_outcome) = Self::to_proof_outcome(outcome);
+        let result = block_on_audit(self.audit_log.append_with_principal(
+            self.session_id.clone(),
+            principal.clone(),
+            action,
+            proof,
+            audit_outcome,
+        ));
+        if let Err(e) = result {
+            warn!(
+                security_event = true,
+                %principal,
+                error = %e,
+                "Failed to persist compute audit entry — continuing"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -278,12 +309,13 @@ mod tests {
             HostAuditEvent::ProcessSpawn { command: "ls" },
             HostAuditOutcome::Denied("not in host_process allowlist"),
         );
+        sink.record_compute(&p, "linux-realm", "open", "vcpu", HostAuditOutcome::Allowed);
 
         let entries = log
             .get_principal_entries(&session, Some(&p))
             .await
             .expect("read principal entries");
-        assert_eq!(entries.len(), 6, "all six events must persist");
+        assert_eq!(entries.len(), 7, "all seven events must persist");
 
         // Every entry is stamped with the acting principal.
         for e in &entries {
@@ -294,6 +326,13 @@ mod tests {
         assert!(matches!(
             (&entries[0].action, &entries[0].outcome),
             (AuditAction::FileRead { path }, AuditOutcome::Success { .. }) if path == "/w/r"
+        ));
+        assert!(matches!(
+            &entries[6].action,
+            AuditAction::CapsuleToolCall { capsule_id, tool, args_hash }
+                if capsule_id == "linux-realm"
+                    && tool == "compute.open:vcpu"
+                    && *args_hash == ContentHash::zero()
         ));
         // FileWrite Failed → Failure + zero content hash placeholder.
         assert!(matches!(

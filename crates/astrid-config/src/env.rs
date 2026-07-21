@@ -76,6 +76,18 @@ const ENV_MAPPINGS: &[EnvMapping] = &[
         var_name: "ASTRID_CAPSULE_INSTANCE_POOL_SIZE",
         field_path: "capsule.instance_pool_size",
     },
+    EnvMapping {
+        var_name: "ASTRID_CAPSULE_COMPUTE_MAX_WORKERS_PER_PRINCIPAL",
+        field_path: "capsule.compute_max_workers_per_principal",
+    },
+    EnvMapping {
+        var_name: "ASTRID_CAPSULE_COMPUTE_MAX_SHARED_MEMORY_BYTES_PER_PRINCIPAL",
+        field_path: "capsule.compute_max_shared_memory_bytes_per_principal",
+    },
+    EnvMapping {
+        var_name: "ASTRID_CAPSULE_COMPUTE_MAX_JOB_FUEL",
+        field_path: "capsule.compute_max_job_fuel",
+    },
     // Retry settings.
     EnvMapping {
         var_name: "ASTRID_RETRY_LLM_MAX_ATTEMPTS",
@@ -296,6 +308,9 @@ fn coerce_to_toml_value(path: &str, val: &str) -> toml::Value {
             | "capsule.host_blocking_concurrency"
             | "capsule.host_io_concurrency"
             | "capsule.instance_pool_size"
+            | "capsule.compute_max_workers_per_principal"
+            | "capsule.compute_max_shared_memory_bytes_per_principal"
+            | "capsule.compute_max_job_fuel"
             | "retry.llm_max_attempts"
             | "retry.mcp_max_attempts"
     ) && let Ok(i) = val.parse::<i64>()

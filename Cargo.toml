@@ -10,6 +10,7 @@ members = [
     "crates/astrid-capsule-types",
     "crates/astrid-cli",
     "crates/astrid-config",
+    "crates/astrid-compute",
     "crates/astrid-daemon",
     "crates/astrid-core",
     "crates/astrid-emit",
@@ -48,6 +49,7 @@ astrid-capsule = { path = "crates/astrid-capsule", version = "0.10.4" }
 astrid-capsule-install = { path = "crates/astrid-capsule-install", version = "0.10.4" }
 astrid-capsule-types = { path = "crates/astrid-capsule-types", version = "0.10.4" }
 astrid-config = { path = "crates/astrid-config", version = "0.10.4" }
+astrid-compute = { path = "crates/astrid-compute", version = "0.10.4" }
 astrid-daemon = { path = "crates/astrid-daemon", version = "0.10.4" }
 astrid-core = { path = "crates/astrid-core", version = "0.10.4" }
 astrid-crypto = { path = "crates/astrid-crypto", version = "0.10.4" }
