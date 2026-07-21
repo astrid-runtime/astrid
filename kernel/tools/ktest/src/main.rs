@@ -18,7 +18,7 @@ use wait_timeout::ChildExt;
 /// Frozen machine contract.
 const FIRMWARE_CODE: &str = "/opt/homebrew/share/qemu/edk2-x86_64-code.fd";
 const FIRMWARE_VARS_TEMPLATE: &str = "/opt/homebrew/share/qemu/edk2-i386-vars.fd";
-const QEMU_TIMEOUT_SECS: u64 = 180;
+const QEMU_TIMEOUT_SECS: u64 = 240;
 /// isa-debug-exit success value 0x10 -> QEMU process exit code (0x10<<1)|1.
 const EXPECT_EXIT_CODE: i32 = 33;
 /// Toolchain used to build the host tools. The `bootloader` 0.11 builder runs
@@ -356,8 +356,7 @@ fn assert_events(events: &[Value], exit_code: Option<i32>) -> bool {
     // At least one domain.killed for each cause literal (the fixed 3-set).
     for cause in ["pf", "gp", "quota"] {
         let present = events.iter().any(|e| {
-            ev_name(e) == "domain.killed"
-                && e.get("cause").and_then(Value::as_str) == Some(cause)
+            ev_name(e) == "domain.killed" && e.get("cause").and_then(Value::as_str) == Some(cause)
         });
         check(&format!("domain.killed cause={cause}"), present);
     }
@@ -366,14 +365,94 @@ fn assert_events(events: &[Value], exit_code: Option<i32>) -> bool {
     let revoked = events.iter().any(|e| ev_name(e) == "cap.revoked");
     check("cap.revoked present", revoked);
 
+    // ---- M3: bounded IPC endpoints + capability transfer by derivation ----
+
+    // All seven M3 IPC scenarios passed (present as test.pass, never test.fail).
+    let m3_scenarios = [
+        "ipc_rendezvous",
+        "ipc_cap_transfer",
+        "ipc_no_widen",
+        "ipc_scoped_revoke",
+        "ipc_authority",
+        "ipc_ep_full",
+        "ipc_deadlock_guard",
+    ];
+    for name in m3_scenarios {
+        let passed = events.iter().any(|e| {
+            ev_name(e) == "test.pass" && e.get("name").and_then(Value::as_str) == Some(name)
+        });
+        let failed = events.iter().any(|e| {
+            ev_name(e) == "test.fail" && e.get("name").and_then(Value::as_str) == Some(name)
+        });
+        check(&format!("test.pass {name}"), passed && !failed);
+    }
+
+    // Rendezvous suspend/resume: a domain blocked on recv, then was woken.
+    let blocked_idx = events.iter().position(|e| ev_name(e) == "ipc.blocked");
+    let wakeup_idx = events.iter().position(|e| ev_name(e) == "ipc.wakeup");
+    check(
+        "ipc.blocked before ipc.wakeup",
+        matches!((blocked_idx, wakeup_idx), (Some(b), Some(w)) if b < w),
+    );
+
+    // Capability transfer by derivation: a full-rights grant (0b011 = 3) and a
+    // no-widen grant (0b001 = 1) each produced a cap.transfer edge.
+    let transfer_with_rights = |r: u64| {
+        events.iter().any(|e| {
+            ev_name(e) == "cap.transfer" && e.get("rights").and_then(Value::as_u64) == Some(r)
+        })
+    };
+    check("cap.transfer rights=3 present", transfer_with_rights(3));
+    check("cap.transfer rights=1 present", transfer_with_rights(1));
+
+    // Scoped subtree revocation killed at least the source + child nodes.
+    let revoke_tree_ok = events.iter().any(|e| {
+        ev_name(e) == "cap.revoke_tree"
+            && e.get("killed")
+                .and_then(Value::as_u64)
+                .is_some_and(|k| k >= 2)
+    });
+    check("cap.revoke_tree killed>=2", revoke_tree_ok);
+
+    // Deadlock liveness guard: the all-blocked set was detected and the victim
+    // killed with the new cause literal.
+    let deadlock_ev = events.iter().any(|e| ev_name(e) == "ipc.deadlock");
+    check("ipc.deadlock present", deadlock_ev);
+    let killed_deadlock = events.iter().any(|e| {
+        ev_name(e) == "domain.killed" && e.get("cause").and_then(Value::as_str) == Some("deadlock")
+    });
+    check("domain.killed cause=deadlock", killed_deadlock);
+
+    // No pool leak across all scenarios: the final census equals the baseline
+    // (fully-free) census captured at kernel start.
+    let census: Vec<&Value> = events
+        .iter()
+        .filter(|e| ev_name(e) == "pools.census")
+        .collect();
+    let census_ok = census.len() >= 2 && {
+        let base = census.first().unwrap();
+        let last = census.last().unwrap();
+        let f = |v: &Value, k: &str| v.get(k).and_then(Value::as_u64);
+        f(base, "objects_free") == f(last, "objects_free")
+            && f(base, "endpoints_free") == f(last, "endpoints_free")
+            && f(base, "deriv_free") == f(last, "deriv_free")
+    };
+    check("pools.census final == baseline (no leak)", census_ok);
+
     // Every domain that was created was reclaimed, and every reclaim balanced.
-    let creates = events.iter().filter(|e| ev_name(e) == "domain.create").count();
+    let creates = events
+        .iter()
+        .filter(|e| ev_name(e) == "domain.create")
+        .count();
     let reclaims: Vec<&Value> = events
         .iter()
         .filter(|e| ev_name(e) == "domain.reclaimed")
         .collect();
     check(
-        &format!("domain.reclaimed count == domain.create count ({})", creates),
+        &format!(
+            "domain.reclaimed count == domain.create count ({})",
+            creates
+        ),
         creates > 0 && reclaims.len() == creates,
     );
     let all_balanced = !reclaims.is_empty()
