@@ -457,17 +457,17 @@ fn test_capsule_local_egress_workspace_cannot_widen_operator_value() {
 #[test]
 fn test_host_net_streams_is_operator_only() {
     let operator: toml::Value = toml::from_str(
-        r#"
+        r"
         [capsule]
         host_net_streams = 64
-        "#,
+        ",
     )
     .unwrap();
     let workspace: toml::Value = toml::from_str(
-        r#"
+        r"
         [capsule]
         host_net_streams = 4096
-        "#,
+        ",
     )
     .unwrap();
 
