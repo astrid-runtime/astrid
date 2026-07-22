@@ -7,8 +7,9 @@ use super::*;
 #[test]
 fn manual_install_vars_parse_once_per_key() {
     let items = vec!["mode=headless".to_string(), "token=a=b".to_string()];
-    let options = ManualInstallOptions::from_cli(true, &items).expect("valid variables");
+    let options = ManualInstallOptions::from_cli(true, false, &items).expect("valid variables");
     assert!(options.yes);
+    assert!(!options.approve_untrusted);
     assert_eq!(
         options.vars.get("mode").map(String::as_str),
         Some("headless")
@@ -17,12 +18,58 @@ fn manual_install_vars_parse_once_per_key() {
 }
 
 #[test]
+fn manual_install_parses_one_shot_untrusted_approval_separately() {
+    let options = ManualInstallOptions::from_cli(true, true, &[]).unwrap();
+    assert!(options.yes);
+    assert!(options.approve_untrusted);
+}
+
+#[test]
+fn headless_yes_does_not_imply_install_authority() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(
+        source.join("Capsule.toml"),
+        "[package]\nname = \"unsigned\"\nversion = \"1.0.0\"\n\
+         [capabilities]\nnet_connect = [\"api.example:443\"]\n",
+    )
+    .unwrap();
+    let home = AstridHome::from_path(temp.path().join("home"));
+    let principal = astrid_core::PrincipalId::new("alice").unwrap();
+    let inspection = inspect_directory_for_principal_with_layout(
+        &source,
+        &home,
+        &principal,
+        false,
+        &astrid_core::dirs::WorkspaceLayout::default(),
+    )
+    .unwrap();
+    let yes_only = ManualInstallOptions {
+        yes: true,
+        approve_untrusted: false,
+        vars: HashMap::new(),
+    };
+    assert!(authority_decision(&inspection, &yes_only).is_err());
+
+    let explicitly_approved = ManualInstallOptions {
+        approve_untrusted: true,
+        ..yes_only
+    };
+    assert!(matches!(
+        authority_decision(&inspection, &explicitly_approved).unwrap(),
+        AuthorityDecision::ExplicitApproval { .. }
+    ));
+}
+
+#[test]
 fn manual_install_vars_reject_malformed_or_duplicate_keys() {
-    assert!(ManualInstallOptions::from_cli(true, &["missing".to_string()]).is_err());
-    assert!(ManualInstallOptions::from_cli(true, &["=value".to_string()]).is_err());
+    assert!(ManualInstallOptions::from_cli(true, false, &["missing".to_string()]).is_err());
+    assert!(ManualInstallOptions::from_cli(true, false, &["=value".to_string()]).is_err());
     assert!(
         ManualInstallOptions::from_cli(
             true,
+            false,
             &["mode=headless".to_string(), "mode=repl".to_string()],
         )
         .is_err()

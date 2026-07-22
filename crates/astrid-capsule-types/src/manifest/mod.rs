@@ -15,7 +15,7 @@ use astrid_core::kernel_api::CommandKind;
 mod capabilities;
 mod topics;
 
-pub use capabilities::CapabilitiesDef;
+pub use capabilities::{CapabilitiesDef, CapabilityExpansion};
 pub use topics::{PublishDef, SubscribeDef};
 /// A capsule manifest loaded from `Capsule.toml`.
 ///

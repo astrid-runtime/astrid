@@ -860,6 +860,13 @@ impl Kernel {
         let manifest_path = dir.join("Capsule.toml");
         let manifest = astrid_capsule::discovery::load_manifest(&manifest_path)
             .map_err(|e| anyhow::anyhow!(e))?;
+        astrid_capsule_install::verify_installed_authority(&self.astrid_home, &dir, &manifest)
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "capsule '{}' exceeds or cannot prove its installed authority: {error:#}",
+                    manifest.package.name
+                )
+            })?;
         self.verify_workspace_component_paths(&dir, &manifest)?;
         let id = astrid_capsule_types::CapsuleId::from_static(&manifest.package.name);
         let wasm_hash = capsule_instance_hash(&manifest, &dir);
@@ -2554,31 +2561,12 @@ async fn open_audit_log(
 ///
 /// The key file is 32 bytes of raw secret key material at `{keys_dir}/runtime.key`.
 fn load_or_generate_runtime_key(keys_dir: &Path) -> std::io::Result<KeyPair> {
-    let key_path = keys_dir.join("runtime.key");
-
-    if key_path.exists() {
-        let bytes = std::fs::read(&key_path)?;
-        KeyPair::from_secret_key(&bytes).map_err(|e| {
-            std::io::Error::other(format!(
-                "invalid runtime key at {}: {e}",
-                key_path.display()
-            ))
-        })
-    } else {
-        let keypair = KeyPair::generate();
-        std::fs::create_dir_all(keys_dir)?;
-        std::fs::write(&key_path, keypair.secret_key_bytes())?;
-
-        // Secure permissions (owner-only) on Unix.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
-        }
-
-        tracing::info!(key_id = %keypair.key_id_hex(), "Generated new runtime signing key");
-        Ok(keypair)
-    }
+    astrid_crypto::load_or_generate_keypair(&keys_dir.join("runtime.key")).map_err(|error| {
+        let message = error
+            .to_string()
+            .replacen("invalid signing key", "invalid runtime key", 1);
+        std::io::Error::new(error.kind(), message)
+    })
 }
 
 /// Spawns a background task that cleanly shuts down the Kernel if there is no activity.

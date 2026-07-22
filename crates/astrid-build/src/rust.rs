@@ -70,6 +70,7 @@ pub(crate) fn build(dir: &Path, output: Option<&str>) -> Result<()> {
         &asset_refs,
         wit_staging.as_deref(),
     )?;
+    crate::artifact::sign_archive_with_runtime_key(&out_file)?;
 
     info!("Successfully built Rust capsule: {}", out_file.display());
     Ok(())

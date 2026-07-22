@@ -60,6 +60,7 @@
 #![allow(clippy::must_use_candidate)]
 
 pub mod archive;
+pub mod authority;
 pub mod contracts;
 pub mod copy;
 pub mod github_source;
@@ -73,10 +74,20 @@ pub mod wasm;
 pub mod wit;
 
 pub use archive::{
-    unpack_and_install, unpack_and_install_checked_for_principal,
-    unpack_and_install_checked_for_principal_with_layout, unpack_and_install_for_principal,
-    unpack_and_install_for_principal_in_workspace, unpack_and_install_for_principal_with_layout,
-    unpack_and_install_with_layout,
+    unpack_and_install, unpack_and_install_authorized_for_principal_in_workspace,
+    unpack_and_install_authorized_for_principal_with_layout,
+    unpack_and_install_checked_authorized_for_principal_in_workspace,
+    unpack_and_install_checked_authorized_for_principal_with_layout,
+    unpack_and_install_checked_for_principal, unpack_and_install_checked_for_principal_with_layout,
+    unpack_and_install_for_principal, unpack_and_install_for_principal_in_workspace,
+    unpack_and_install_for_principal_with_layout, unpack_and_install_with_layout,
+};
+pub use authority::{
+    ArtifactProvenance, AuthorityDecision, AuthoritySource, InstallInspection, InstalledAuthority,
+    authorize_install, inspect_archive_for_principal_in_workspace,
+    inspect_archive_for_principal_with_layout, inspect_directory_for_principal_in_workspace,
+    inspect_directory_for_principal_with_layout, read_installed_authority,
+    remove_installed_authority, verify_installed_authority,
 };
 pub use contracts::{
     CONTRACTS_WIT_BASENAME, ContractsSkew, canonical_contracts_b3, canonical_contracts_path,
@@ -86,6 +97,10 @@ pub use contracts::{
 pub use copy::copy_capsule_dir;
 pub use local::{
     InstallOptions, InstallOutput, InstallPhase, install_from_local_path,
+    install_from_local_path_authorized_for_principal_in_workspace,
+    install_from_local_path_authorized_for_principal_with_layout,
+    install_from_local_path_checked_authorized_for_principal_in_workspace,
+    install_from_local_path_checked_authorized_for_principal_with_layout,
     install_from_local_path_checked_for_principal,
     install_from_local_path_checked_for_principal_with_layout,
     install_from_local_path_for_principal, install_from_local_path_for_principal_in_workspace,
@@ -110,5 +125,7 @@ pub use paths::{
 pub use principal_introspection::materialize_principal_introspection;
 pub use wit::{content_address_wit, materialize_wit_mirror};
 
+#[cfg(test)]
+mod authority_tests;
 #[cfg(test)]
 mod checked_tests;

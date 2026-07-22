@@ -102,6 +102,7 @@ pub(crate) fn convert(dir: &Path, json_filename: &str, output: Option<&str>) -> 
         .collect();
 
     pack_capsule_archive(&out_file, &toml, None, dir, &refs, None)?;
+    crate::artifact::sign_archive_with_runtime_key(&out_file)?;
 
     info!("Successfully converted to capsule: {}", out_file.display());
     Ok(())

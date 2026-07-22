@@ -340,6 +340,7 @@ async fn dispatch_capsule(command: crate::cli::CapsuleCommands) -> Result<ExitCo
             capsule,
             workspace,
             yes,
+            approve_untrusted,
             vars,
         } => {
             commands::capsule::install::install_capsule_with_options(
@@ -347,6 +348,7 @@ async fn dispatch_capsule(command: crate::cli::CapsuleCommands) -> Result<ExitCo
                 capsule.as_deref(),
                 workspace,
                 yes,
+                approve_untrusted,
                 &vars,
             )
             .await?;

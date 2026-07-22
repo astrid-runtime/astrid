@@ -375,6 +375,10 @@ pub(crate) enum CapsuleCommands {
         /// Resolve configuration from vars, environment, or defaults without stdin.
         #[arg(short = 'y', long)]
         yes: bool,
+        /// Approve this exact foreign-signed or unsigned artifact once.
+        /// Does not trust its signer for future installs.
+        #[arg(long)]
+        approve_untrusted: bool,
         /// Pre-supply a value; prefer `ASTRID_VAR_<KEY>` for secrets (repeatable).
         #[arg(long = "var", value_name = "KEY=VALUE")]
         vars: Vec<String>,

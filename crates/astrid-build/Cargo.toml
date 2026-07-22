@@ -18,10 +18,14 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
+astrid-core = { workspace = true }
+astrid-crypto = { workspace = true }
+blake3 = { workspace = true }
 cargo_metadata = "0.23.1"
 clap = { workspace = true }
 flate2 = { workspace = true }
 serde_json = { workspace = true }
+serde = { workspace = true }
 tar = { workspace = true }
 tempfile = { workspace = true }
 toml_edit = "0.25.3"

@@ -39,6 +39,10 @@ use astrid_core::PrincipalId;
 use astrid_core::dirs::{AstridHome, WorkspaceLayout};
 use astrid_events::EventBus;
 
+use crate::authority::{
+    AuthorityDecision, AuthorityReceiptTransaction, InstalledAuthority,
+    authority_for_install_source, authorize_install, inspect_directory_for_principal_in_workspace,
+};
 use crate::contracts::seed_canonical_contracts_if_absent;
 use crate::copy::copy_capsule_dir;
 use crate::lifecycle::run_lifecycle;
@@ -144,6 +148,11 @@ impl InstallPhase {
 /// Install a capsule from `source_dir` (a directory containing
 /// `Capsule.toml`).
 ///
+/// This is a privileged embedding API: calling it treats the caller as the
+/// local operator and records the exact artifact as operator-authorized. Code
+/// handling an untrusted user or network source should inspect it and call an
+/// `*_authorized_*` variant with an explicit [`AuthorityDecision`].
+///
 /// # Errors
 ///
 /// Propagates manifest-parse errors, content-addressing failures,
@@ -238,6 +247,7 @@ pub fn install_from_local_path_for_principal_in_workspace(
             layout: workspace_layout,
         },
         None,
+        None,
     )
 }
 
@@ -313,17 +323,176 @@ pub(crate) fn install_from_local_path_checked_for_principal_in_workspace(
         target_principal,
         workspace,
         Some(expected),
+        None,
+    )
+}
+
+/// Install a local capsule directory after enforcing one digest-bound
+/// authority decision.
+///
+/// # Errors
+///
+/// Returns an error when provenance is invalid, the decision does not accept
+/// this exact artifact, or ordinary installation fails.
+#[allow(clippy::needless_pass_by_value)]
+pub fn install_from_local_path_authorized_for_principal_with_layout(
+    source_dir: &Path,
+    home: &AstridHome,
+    options: InstallOptions,
+    target_principal: &PrincipalId,
+    decision: &AuthorityDecision,
+    workspace_layout: &WorkspaceLayout,
+) -> anyhow::Result<InstallOutput> {
+    let workspace_root = std::env::current_dir().ok();
+    install_from_local_path_authorized_for_principal_in_workspace(
+        source_dir,
+        home,
+        options,
+        target_principal,
+        workspace_root.as_deref(),
+        decision,
+        workspace_layout,
+    )
+}
+
+/// Authorized local install using explicit workspace inputs.
+///
+/// # Errors
+///
+/// Returns an error when provenance is invalid, the decision does not accept
+/// this exact artifact, or ordinary installation fails.
+#[allow(clippy::needless_pass_by_value)]
+pub fn install_from_local_path_authorized_for_principal_in_workspace(
+    source_dir: &Path,
+    home: &AstridHome,
+    options: InstallOptions,
+    target_principal: &PrincipalId,
+    workspace_root: Option<&Path>,
+    decision: &AuthorityDecision,
+    workspace_layout: &WorkspaceLayout,
+) -> anyhow::Result<InstallOutput> {
+    let inspection = inspect_directory_for_principal_in_workspace(
+        source_dir,
+        home,
+        target_principal,
+        options.workspace,
+        workspace_root,
+        workspace_layout,
+    )?;
+    let authority = authorize_install(&inspection, decision)?;
+    install_from_local_path_internal(
+        source_dir,
+        home,
+        options,
+        target_principal,
+        InstallWorkspace {
+            root: workspace_root,
+            layout: workspace_layout,
+        },
+        None,
+        Some(authority),
+    )
+}
+
+/// Checked-identity variant of
+/// [`install_from_local_path_authorized_for_principal_with_layout`].
+///
+/// # Errors
+///
+/// Also fails when the inspected manifest identity or version differs from
+/// the caller's expected release.
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
+pub fn install_from_local_path_checked_authorized_for_principal_with_layout(
+    source_dir: &Path,
+    home: &AstridHome,
+    options: InstallOptions,
+    target_principal: &PrincipalId,
+    expected: &CapsuleId,
+    expected_version: Option<&str>,
+    decision: &AuthorityDecision,
+    workspace_layout: &WorkspaceLayout,
+) -> anyhow::Result<InstallOutput> {
+    let workspace_root = std::env::current_dir().ok();
+    install_from_local_path_checked_authorized_for_principal_in_workspace(
+        source_dir,
+        home,
+        options,
+        target_principal,
+        expected,
+        expected_version,
+        workspace_root.as_deref(),
+        decision,
+        workspace_layout,
+    )
+}
+
+/// Checked authorized local install using explicit workspace inputs.
+///
+/// # Errors
+///
+/// Returns an error for rejected provenance, identity/version mismatch, or an
+/// ordinary installation failure.
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
+pub fn install_from_local_path_checked_authorized_for_principal_in_workspace(
+    source_dir: &Path,
+    home: &AstridHome,
+    options: InstallOptions,
+    target_principal: &PrincipalId,
+    expected: &CapsuleId,
+    expected_version: Option<&str>,
+    workspace_root: Option<&Path>,
+    decision: &AuthorityDecision,
+    workspace_layout: &WorkspaceLayout,
+) -> anyhow::Result<InstallOutput> {
+    let inspection = inspect_directory_for_principal_in_workspace(
+        source_dir,
+        home,
+        target_principal,
+        options.workspace,
+        workspace_root,
+        workspace_layout,
+    )?;
+    if inspection.capsule_id != *expected {
+        bail!(
+            "capsule identity mismatch: expected '{expected}', manifest declares '{}'",
+            inspection.capsule_id
+        );
+    }
+    if let Some(expected_version) = expected_version
+        && inspection.version != expected_version
+    {
+        bail!(
+            "capsule version mismatch for '{expected}': expected '{expected_version}', manifest declares '{}'",
+            inspection.version
+        );
+    }
+    let authority = authorize_install(&inspection, decision)?;
+    install_from_local_path_internal(
+        source_dir,
+        home,
+        options,
+        target_principal,
+        InstallWorkspace {
+            root: workspace_root,
+            layout: workspace_layout,
+        },
+        Some(ExpectedCapsuleIdentity {
+            id: expected,
+            version: expected_version,
+        }),
+        Some(authority),
     )
 }
 
 #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
-fn install_from_local_path_internal(
+pub(crate) fn install_from_local_path_internal(
     source_dir: &Path,
     home: &AstridHome,
     options: InstallOptions,
     target_principal: &PrincipalId,
     workspace: InstallWorkspace<'_>,
     expected: Option<ExpectedCapsuleIdentity<'_>>,
+    installed_authority: Option<InstalledAuthority>,
 ) -> anyhow::Result<InstallOutput> {
     let checked_workspace = if options.workspace {
         let root = workspace
@@ -360,6 +529,12 @@ fn install_from_local_path_internal(
             "capsule version mismatch for '{id}': expected '{expected_version}', manifest declares '{installed_version}'"
         );
     }
+
+    // Re-verify the exact source immediately before any target mutation. This
+    // closes the gap between pre-install approval and the transactional copy,
+    // including provenance-envelope swaps that leave content bytes unchanged.
+    let installed_authority =
+        authority_for_install_source(source_dir, &manifest, installed_authority)?;
 
     // Pre-flight checks — pure reads, no target mutation.
     let export_conflicts = check_export_conflicts_in_workspace(
@@ -411,6 +586,12 @@ fn install_from_local_path_internal(
         .context("failed to content-address WASM binary")?;
     let wit_files =
         content_address_wit(home, source_dir).context("failed to content-address WIT files")?;
+
+    // The pending marker lives outside capsule-writable VFS roots. If the
+    // process dies during target replacement, load fails closed until the
+    // interrupted authority transaction is inspected and repaired.
+    let authority_transaction =
+        AuthorityReceiptTransaction::stage(home, &target_dir, &installed_authority)?;
 
     // Backup the existing install (rename to .bak). Any failure from
     // this point onward must restore the backup over target_dir.
@@ -506,12 +687,23 @@ fn install_from_local_path_internal(
         return Err(e);
     }
     if let Some(selection) = &checked_workspace {
-        selection
-            .resolve_directory(Path::new("capsules").join(id.as_str()))
-            .context("workspace capsule target changed during install")?;
-        selection
-            .verify_tree("capsules")
-            .context("workspace capsule tree changed during install")?;
+        let validation = (|| {
+            selection
+                .resolve_directory(Path::new("capsules").join(id.as_str()))
+                .context("workspace capsule target changed during install")?;
+            selection
+                .verify_tree("capsules")
+                .context("workspace capsule tree changed during install")?;
+            Ok::<(), anyhow::Error>(())
+        })();
+        if let Err(error) = validation {
+            rollback(&target_dir, backup_dir.as_deref());
+            return Err(error);
+        }
+    }
+    if let Err(e) = authority_transaction.commit() {
+        rollback(&target_dir, backup_dir.as_deref());
+        return Err(e);
     }
 
     // Mirror the capsule's WIT into the principal's `home://wit/` so the
