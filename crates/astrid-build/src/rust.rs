@@ -3,6 +3,7 @@
 use crate::archiver::{discover_opaque_assets, pack_capsule_archive};
 use anyhow::{Context, Result, bail};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
@@ -401,6 +402,13 @@ fn validate_compute_workers(dir: &Path, manifest: &toml_edit::DocumentMut) -> Re
     else {
         return Ok(());
     };
+    for component in components.iter().filter(|component| {
+        component.get("type").and_then(toml_edit::Item::as_str) != Some("compute-worker")
+    }) {
+        if component.get("asset").is_some() {
+            anyhow::bail!("immutable worker assets are valid only on compute-worker components");
+        }
+    }
     let mut ids = std::collections::HashSet::new();
     for component in components.iter().filter(|component| {
         component.get("type").and_then(toml_edit::Item::as_str) == Some("compute-worker")
@@ -432,6 +440,7 @@ fn validate_compute_workers(dir: &Path, manifest: &toml_edit::DocumentMut) -> Re
         {
             anyhow::bail!("compute-worker '{id}' file must be a traversal-free path under assets/");
         }
+        reject_symlink_components(dir, relative, &format!("compute-worker '{id}'"))?;
         let hash = component
             .get("hash")
             .and_then(toml_edit::Item::as_str)
@@ -460,8 +469,132 @@ fn validate_compute_workers(dir: &Path, manifest: &toml_edit::DocumentMut) -> Re
         if actual != hash {
             anyhow::bail!("compute-worker '{id}' hash mismatch: expected {hash}, got {actual}");
         }
+
+        validate_compute_worker_assets(dir, id, component)?;
     }
     Ok(())
+}
+
+fn validate_compute_worker_assets(
+    dir: &Path,
+    id: &str,
+    component: &toml_edit::Table,
+) -> Result<()> {
+    let Some(assets) = component
+        .get("asset")
+        .and_then(toml_edit::Item::as_array_of_tables)
+    else {
+        return Ok(());
+    };
+    if assets.len() > 16 {
+        anyhow::bail!("compute-worker '{id}' declares more than 16 immutable assets");
+    }
+    let mut asset_ids = std::collections::HashSet::new();
+    for asset in assets {
+        let asset_id = asset
+            .get("id")
+            .and_then(toml_edit::Item::as_str)
+            .filter(|value| {
+                !value.is_empty()
+                    && value.len() <= 64
+                    && value.bytes().all(|byte| {
+                        byte.is_ascii_lowercase()
+                            || byte.is_ascii_digit()
+                            || matches!(byte, b'-' | b'_' | b'.')
+                    })
+            })
+            .context("compute-worker asset requires a lowercase traversal-free id")?;
+        if !asset_ids.insert(asset_id) {
+            anyhow::bail!("compute-worker '{id}' has duplicate asset id '{asset_id}'");
+        }
+        let file = asset
+            .get("file")
+            .and_then(toml_edit::Item::as_str)
+            .context("compute-worker asset requires a file path")?;
+        let relative = Path::new(file);
+        if relative.is_absolute()
+            || !relative.starts_with("assets")
+            || relative.components().any(|part| {
+                matches!(
+                    part,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            anyhow::bail!(
+                "compute-worker '{id}' asset '{asset_id}' must be a traversal-free path under assets/"
+            );
+        }
+        let label = format!("compute-worker '{id}' asset '{asset_id}'");
+        reject_symlink_components(dir, relative, &label)?;
+        let hash = asset
+            .get("hash")
+            .and_then(toml_edit::Item::as_str)
+            .context("compute-worker asset requires an exact blake3 hash")?;
+        let Some(hex) = hash.strip_prefix("blake3:") else {
+            anyhow::bail!("{label} hash must use blake3:<lowercase-hex>");
+        };
+        if hex.len() != 64
+            || !hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            anyhow::bail!("{label} hash must use blake3:<lowercase-hex>");
+        }
+        let path = dir.join(relative);
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("failed to inspect {label} at {}", path.display()))?;
+        if !metadata.is_file() || metadata.len() == 0 {
+            anyhow::bail!("{label} must be a non-empty regular file");
+        }
+        let actual = blake3_file(&path)
+            .with_context(|| format!("failed to hash {label} at {}", path.display()))?;
+        if actual != hash {
+            anyhow::bail!("{label} hash mismatch: expected {hash}, got {actual}");
+        }
+    }
+    Ok(())
+}
+
+fn reject_symlink_components(root: &Path, relative: &Path, label: &str) -> Result<()> {
+    let canonical_root = root
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize capsule root for {label}"))?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(part) = component else {
+            continue;
+        };
+        current.push(part);
+        let metadata = fs::symlink_metadata(&current)
+            .with_context(|| format!("failed to inspect {label} path component"))?;
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!("{label} path may not contain symlinks");
+        }
+    }
+    let canonical = current
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize {label} path"))?;
+    if !canonical.starts_with(canonical_root) {
+        anyhow::bail!("{label} path escaped the capsule root");
+    }
+    Ok(())
+}
+
+fn blake3_file(path: &Path) -> Result<String> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("blake3:{}", hasher.finalize().to_hex()))
 }
 
 /// Resolve the output directory, creating it if necessary.
@@ -654,6 +787,25 @@ mod tests {
         .unwrap()
     }
 
+    fn compute_manifest_with_assets(
+        worker_hash: &str,
+        asset_tables: &str,
+    ) -> toml_edit::DocumentMut {
+        format!(
+            r#"
+                [[component]]
+                id = "cpu"
+                file = "assets/cpu.wasm"
+                type = "compute-worker"
+                hash = "{worker_hash}"
+
+                {asset_tables}
+            "#
+        )
+        .parse()
+        .unwrap()
+    }
+
     #[test]
     fn compute_worker_must_be_hash_pinned_core_wasm_under_assets() {
         let dir = tempfile::tempdir().unwrap();
@@ -695,6 +847,123 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("core Wasm module")
+        );
+    }
+
+    #[test]
+    fn compute_worker_assets_are_hash_pinned_and_structurally_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let assets = dir.path().join("assets");
+        fs::create_dir(&assets).unwrap();
+        let worker = b"\0asm\x01\0\0\0";
+        let system = b"immutable-system-image";
+        fs::write(assets.join("cpu.wasm"), worker).unwrap();
+        fs::write(assets.join("system.img"), system).unwrap();
+        let worker_hash = format!("blake3:{}", blake3::hash(worker).to_hex());
+        let system_hash = format!("blake3:{}", blake3::hash(system).to_hex());
+        let valid = compute_manifest_with_assets(
+            &worker_hash,
+            &format!(
+                r#"[[component.asset]]
+                id = "system"
+                file = "assets/system.img"
+                hash = "{system_hash}""#
+            ),
+        );
+        validate_compute_workers(dir.path(), &valid).unwrap();
+
+        let mismatch = compute_manifest_with_assets(
+            &worker_hash,
+            &format!(
+                r#"[[component.asset]]
+                id = "system"
+                file = "assets/system.img"
+                hash = "blake3:{}""#,
+                "0".repeat(64)
+            ),
+        );
+        assert!(
+            validate_compute_workers(dir.path(), &mismatch)
+                .unwrap_err()
+                .to_string()
+                .contains("hash mismatch")
+        );
+
+        let duplicate = compute_manifest_with_assets(
+            &worker_hash,
+            &format!(
+                r#"[[component.asset]]
+                id = "system"
+                file = "assets/system.img"
+                hash = "{system_hash}"
+
+                [[component.asset]]
+                id = "system"
+                file = "assets/system.img"
+                hash = "{system_hash}""#
+            ),
+        );
+        assert!(
+            validate_compute_workers(dir.path(), &duplicate)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate asset id")
+        );
+    }
+
+    #[test]
+    fn non_compute_components_cannot_declare_private_compute_assets() {
+        let manifest: toml_edit::DocumentMut = r#"
+            [[component]]
+            id = "controller"
+            file = "controller.wasm"
+            type = "executable"
+
+            [[component.asset]]
+            id = "system"
+            file = "assets/system.img"
+            hash = "blake3:0000000000000000000000000000000000000000000000000000000000000000"
+        "#
+        .parse()
+        .unwrap();
+        assert!(
+            validate_compute_workers(Path::new("."), &manifest)
+                .unwrap_err()
+                .to_string()
+                .contains("only on compute-worker")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compute_worker_assets_reject_symlinked_path_components() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let assets = dir.path().join("assets");
+        fs::create_dir(&assets).unwrap();
+        let worker = b"\0asm\x01\0\0\0";
+        let system = b"outside-system-image";
+        fs::write(assets.join("cpu.wasm"), worker).unwrap();
+        fs::write(outside.path().join("system.img"), system).unwrap();
+        symlink(outside.path(), assets.join("linked")).unwrap();
+        let worker_hash = format!("blake3:{}", blake3::hash(worker).to_hex());
+        let system_hash = format!("blake3:{}", blake3::hash(system).to_hex());
+        let manifest = compute_manifest_with_assets(
+            &worker_hash,
+            &format!(
+                r#"[[component.asset]]
+                id = "system"
+                file = "assets/linked/system.img"
+                hash = "{system_hash}""#
+            ),
+        );
+        assert!(
+            validate_compute_workers(dir.path(), &manifest)
+                .unwrap_err()
+                .to_string()
+                .contains("may not contain symlinks")
         );
     }
 

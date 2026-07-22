@@ -23,7 +23,12 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   individual principal with `astrid quota set --compute-workers` and
   `--cpu-fuel-per-sec`; the owner-operated CPU-rate default is unlimited, while
   managed deployments can set a finite rate. The pre-1.0 WIT contract remains
-  deliberately unmerged until Astrid 1.0.
+  deliberately unmerged until Astrid 1.0. Compute workers may also declare a
+  bounded set of immutable, BLAKE3-pinned package assets. The runtime verifies
+  and maps each file read-only once, shares those pages across principal-bound
+  worker Stores, and exposes only metered 64-KiB reads during admitted jobs;
+  workers receive neither host paths nor filesystem authority, and startup code
+  cannot use the asset path to bypass principal CPU accounting.
 - **Fresh principal memory admission now defaults to 4 GiB.** This is a virtual
   ceiling rather than eager allocation, allowing development Realm and compiler
   workloads to use a normal workstation while host-wide admission remains

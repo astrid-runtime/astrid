@@ -8,8 +8,9 @@
 //!
 //! The only `unsafe` code in this crate converts Wasmtime's
 //! `SharedMemory::data()` `UnsafeCell<u8>` elements into aligned atomic views,
-//! exactly as required by Wasmtime's API. It is isolated in four small helper
-//! functions. All public shared-region access is safe and atomic.
+//! exactly as required by Wasmtime's API. It is isolated in small helper
+//! functions. The other unsafe operation creates a read-only file mapping in
+//! one documented helper. All public shared-region and asset access is safe.
 
 #![deny(unreachable_pub)]
 #![deny(clippy::all)]
@@ -25,7 +26,8 @@ use astrid_capsule_types::{FuelLedger, FuelRateLimiter};
 use astrid_core::principal::PrincipalId;
 use thiserror::Error;
 use wasmtime::{
-    Config, Engine, ExternType, Instance, MemoryType, Module, SharedMemory, Store, UpdateDeadline,
+    Caller, Config, Engine, ExternType, Linker, MemoryType, Module, SharedMemory, Store,
+    UpdateDeadline, ValType,
 };
 
 /// ABI version returned by `astrid_compute_abi_version`.
@@ -48,6 +50,24 @@ const EPOCH_INTERVAL: Duration = Duration::from_millis(25);
 /// kernel image) before their first job. Startup has no hidden fuel ceiling,
 /// but must still be interruptible if a malformed start function never exits.
 const WORKER_START_TIMEOUT: Duration = Duration::from_secs(30);
+/// Maximum immutable files attached to one signed worker.
+pub const MAX_WORKER_ASSETS: usize = 16;
+/// Maximum bytes copied from an immutable asset by one host call.
+pub const MAX_ASSET_READ_BYTES: u64 = 64 * 1024;
+const ASSET_READ_BASE_FUEL: u64 = 64;
+const ASSET_READ_FUEL_PER_BYTE: u64 = 1;
+/// `asset_read` completed successfully.
+pub const ASSET_OK: i32 = 0;
+/// `asset_size` or `asset_read` received an unknown asset index.
+pub const ASSET_ERR_INDEX: i32 = -1;
+/// `asset_read` received a negative, overflowing, or out-of-bounds range.
+pub const ASSET_ERR_RANGE: i32 = -2;
+/// `asset_read` exceeded [`MAX_ASSET_READ_BYTES`].
+pub const ASSET_ERR_LENGTH: i32 = -3;
+/// `asset_read` could not charge its fuel cost.
+pub const ASSET_ERR_FUEL: i32 = -4;
+/// `asset_read` was invoked outside an admitted worker job.
+pub const ASSET_ERR_PHASE: i32 = -5;
 
 /// Typed failure returned by the engine-agnostic compute mechanism.
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
@@ -422,6 +442,25 @@ pub struct WorkerArtifact {
     id: String,
     bytes: Arc<[u8]>,
     digest: String,
+    assets: Arc<[WorkerAsset]>,
+}
+
+/// Hash-pinned immutable file attached to one compute worker declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerAssetSpec {
+    /// Stable worker-local identifier.
+    pub id: String,
+    /// Traversal-free path beneath the installed capsule root.
+    pub relative_path: PathBuf,
+    /// Exact BLAKE3 identity.
+    pub expected_hash: String,
+}
+
+#[derive(Debug, Clone)]
+struct WorkerAsset {
+    id: String,
+    bytes: Arc<memmap2::Mmap>,
+    digest: String,
 }
 
 impl WorkerArtifact {
@@ -440,6 +479,26 @@ impl WorkerArtifact {
         capsule_root: &Path,
         relative_path: &Path,
         expected_hash: &str,
+    ) -> Result<Self, ComputeError> {
+        Self::from_capsule_path_with_assets(id, capsule_root, relative_path, expected_hash, &[])
+    }
+
+    /// Validate a worker and its private immutable assets beneath one capsule.
+    ///
+    /// Asset files are hash-verified from read-only mappings. Their pages are
+    /// shared by every principal using this loaded artifact and remain outside
+    /// worker linear memory until a bounded compute-ABI read copies bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ComputeError::WorkerInvalid`] for an unsafe path, duplicate or
+    /// malformed asset identity, non-regular file, empty asset, or hash drift.
+    pub fn from_capsule_path_with_assets(
+        id: impl Into<String>,
+        capsule_root: &Path,
+        relative_path: &Path,
+        expected_hash: &str,
+        assets: &[WorkerAssetSpec],
     ) -> Result<Self, ComputeError> {
         if relative_path.is_absolute()
             || relative_path.components().any(|part| {
@@ -468,7 +527,31 @@ impl WorkerArtifact {
         }
         let bytes = std::fs::read(&canonical)
             .map_err(|error| ComputeError::WorkerInvalid(format!("read worker: {error}")))?;
-        Self::from_bytes(id, bytes, expected_hash)
+        let mut artifact = Self::from_bytes(id, bytes, expected_hash)?;
+        if assets.len() > MAX_WORKER_ASSETS {
+            return Err(ComputeError::WorkerInvalid(format!(
+                "worker declares more than {MAX_WORKER_ASSETS} immutable assets"
+            )));
+        }
+        let mut loaded = Vec::with_capacity(assets.len());
+        let mut ids = std::collections::HashSet::with_capacity(assets.len());
+        for asset in assets {
+            if !valid_asset_id(&asset.id) {
+                return Err(ComputeError::WorkerInvalid(format!(
+                    "invalid worker asset id {:?}",
+                    asset.id
+                )));
+            }
+            if !ids.insert(asset.id.as_str()) {
+                return Err(ComputeError::WorkerInvalid(format!(
+                    "duplicate worker asset id {:?}",
+                    asset.id
+                )));
+            }
+            loaded.push(load_worker_asset(capsule_root, asset)?);
+        }
+        artifact.assets = loaded.into();
+        Ok(artifact)
     }
 
     /// Build from bytes while enforcing the manifest hash.
@@ -493,6 +576,7 @@ impl WorkerArtifact {
             id: id.into(),
             bytes: bytes.into(),
             digest: actual,
+            assets: Arc::new([]),
         })
     }
 
@@ -507,6 +591,109 @@ impl WorkerArtifact {
     pub fn digest(&self) -> &str {
         &self.digest
     }
+
+    /// Number of verified immutable assets attached to this worker.
+    #[must_use]
+    pub fn asset_count(&self) -> usize {
+        self.assets.len()
+    }
+
+    /// Sum of the declared immutable asset byte lengths.
+    #[must_use]
+    pub fn asset_bytes(&self) -> u64 {
+        self.assets.iter().fold(0_u64, |total, asset| {
+            total.saturating_add(u64::try_from(asset.bytes.len()).unwrap_or(u64::MAX))
+        })
+    }
+
+    /// Worker-local id of one immutable asset by manifest order.
+    #[must_use]
+    pub fn asset_id(&self, index: usize) -> Option<&str> {
+        self.assets.get(index).map(|asset| asset.id.as_str())
+    }
+
+    /// Verified digest of one immutable asset by manifest order.
+    #[must_use]
+    pub fn asset_digest(&self, index: usize) -> Option<&str> {
+        self.assets.get(index).map(|asset| asset.digest.as_str())
+    }
+}
+
+fn valid_asset_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_' | b'.')
+        })
+}
+
+fn load_worker_asset(root: &Path, spec: &WorkerAssetSpec) -> Result<WorkerAsset, ComputeError> {
+    let relative = &spec.relative_path;
+    if relative.is_absolute()
+        || !relative.starts_with("assets")
+        || relative.components().any(|part| {
+            matches!(
+                part,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(ComputeError::WorkerInvalid(format!(
+            "worker asset {:?} must be a traversal-free path under assets/",
+            spec.id
+        )));
+    }
+    reject_symlink_components(root, relative)?;
+    let canonical_root = root.canonicalize().map_err(|error| {
+        ComputeError::WorkerInvalid(format!("canonicalize capsule root: {error}"))
+    })?;
+    let canonical = root.join(relative).canonicalize().map_err(|error| {
+        ComputeError::WorkerInvalid(format!("canonicalize worker asset {:?}: {error}", spec.id))
+    })?;
+    if !canonical.starts_with(canonical_root) {
+        return Err(ComputeError::WorkerInvalid(format!(
+            "worker asset {:?} escaped the capsule root",
+            spec.id
+        )));
+    }
+    let file = std::fs::File::open(&canonical).map_err(|error| {
+        ComputeError::WorkerInvalid(format!("open worker asset {:?}: {error}", spec.id))
+    })?;
+    let metadata = file.metadata().map_err(|error| {
+        ComputeError::WorkerInvalid(format!("inspect worker asset {:?}: {error}", spec.id))
+    })?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > i64::MAX.unsigned_abs() {
+        return Err(ComputeError::WorkerInvalid(format!(
+            "worker asset {:?} must be a non-empty addressable regular file",
+            spec.id
+        )));
+    }
+    let bytes = map_read_only_asset(&file).map_err(|error| {
+        ComputeError::WorkerInvalid(format!("map worker asset {:?}: {error}", spec.id))
+    })?;
+    let actual = format!("blake3:{}", blake3::hash(&bytes).to_hex());
+    if spec.expected_hash != actual {
+        return Err(ComputeError::WorkerInvalid(format!(
+            "worker asset {:?} hash mismatch: expected {}, got {actual}",
+            spec.id, spec.expected_hash
+        )));
+    }
+    Ok(WorkerAsset {
+        id: spec.id.clone(),
+        bytes: Arc::new(bytes),
+        digest: actual,
+    })
+}
+
+#[allow(
+    unsafe_code,
+    reason = "immutable assets use an owned read-only mmap and are never exposed mutably"
+)]
+fn map_read_only_asset(file: &std::fs::File) -> std::io::Result<memmap2::Mmap> {
+    // SAFETY: the mapping is read-only and remains owned for its entire use.
+    // The installed capsule tree is outside capsule write authority; the
+    // exact bytes are verified from this same mapping before it is accepted.
+    unsafe { memmap2::MmapOptions::new().map(file) }
 }
 
 fn reject_symlink_components(root: &Path, relative: &Path) -> Result<(), ComputeError> {
@@ -753,6 +940,7 @@ impl ComputeRuntime {
                     closed: Arc::clone(&closed),
                     fuel_ledger: self.inner.fuel_ledger.clone(),
                     fuel_rate: self.inner.fuel_rate.clone(),
+                    assets: Arc::clone(&artifact.assets),
                 },
                 self.inner.worker_start_timeout,
             ) {
@@ -915,18 +1103,57 @@ fn validate_group_request(request: GroupRequest) -> Result<(), ComputeError> {
 }
 
 fn worker_memory_limits(module: &Module) -> Result<(u64, u64), ComputeError> {
-    let imports: Vec<_> = module.imports().collect();
-    if imports.len() != 1
-        || imports[0].module() != "astrid_compute"
-        || imports[0].name() != "memory"
-    {
-        return Err(ComputeError::WorkerInvalid(
-            "worker must import exactly astrid_compute.memory".to_owned(),
-        ));
+    let mut memory = None;
+    let mut asset_count = false;
+    let mut asset_size = false;
+    let mut asset_read = false;
+    for import in module.imports() {
+        if import.module() != "astrid_compute" {
+            return Err(ComputeError::WorkerInvalid(format!(
+                "worker imports unsupported module {:?}",
+                import.module()
+            )));
+        }
+        match import.name() {
+            "memory" if memory.is_none() => {
+                let ExternType::Memory(imported) = import.ty() else {
+                    return Err(ComputeError::WorkerInvalid(
+                        "astrid_compute.memory import is not a memory".to_owned(),
+                    ));
+                };
+                memory = Some(imported);
+            },
+            "asset_count"
+                if !asset_count && import_signature(&import.ty(), &[], &[ValType::I32]) =>
+            {
+                asset_count = true;
+            },
+            "asset_size"
+                if !asset_size
+                    && import_signature(&import.ty(), &[ValType::I32], &[ValType::I64]) =>
+            {
+                asset_size = true;
+            },
+            "asset_read"
+                if !asset_read
+                    && import_signature(
+                        &import.ty(),
+                        &[ValType::I32, ValType::I64, ValType::I64, ValType::I64],
+                        &[ValType::I32],
+                    ) =>
+            {
+                asset_read = true;
+            },
+            name => {
+                return Err(ComputeError::WorkerInvalid(format!(
+                    "worker has unsupported or malformed astrid_compute.{name} import"
+                )));
+            },
+        }
     }
-    let ExternType::Memory(memory) = imports[0].ty() else {
+    let Some(memory) = memory else {
         return Err(ComputeError::WorkerInvalid(
-            "astrid_compute.memory import is not a memory".to_owned(),
+            "worker must import astrid_compute.memory".to_owned(),
         ));
     };
     if !memory.is_shared() || memory.maximum().is_none() {
@@ -938,6 +1165,22 @@ fn worker_memory_limits(module: &Module) -> Result<(u64, u64), ComputeError> {
         memory.minimum(),
         memory.maximum().expect("checked shared-memory maximum"),
     ))
+}
+
+fn import_signature(import: &ExternType, params: &[ValType], results: &[ValType]) -> bool {
+    let ExternType::Func(function) = import else {
+        return false;
+    };
+    val_types_match(function.params(), params) && val_types_match(function.results(), results)
+}
+
+fn val_types_match(actual: impl Iterator<Item = ValType>, expected: &[ValType]) -> bool {
+    let actual = actual.collect::<Vec<_>>();
+    actual.len() == expected.len()
+        && actual
+            .iter()
+            .zip(expected)
+            .all(|(actual, expected)| actual.matches(expected))
 }
 
 fn validate_worker_module(module: &Module, request: GroupRequest) -> Result<(), ComputeError> {
@@ -1402,6 +1645,9 @@ struct JobRecord {
 struct WorkerStoreState {
     cancel: Arc<AtomicBool>,
     group_closed: Arc<AtomicBool>,
+    memory: SharedMemory,
+    assets: Arc<[WorkerAsset]>,
+    job_active: bool,
 }
 
 enum WorkerCommand {
@@ -1431,6 +1677,91 @@ struct WorkerExecutionContext {
     closed: Arc<AtomicBool>,
     fuel_ledger: FuelLedger,
     fuel_rate: FuelRateLimiter,
+    assets: Arc<[WorkerAsset]>,
+}
+
+fn link_asset_imports(linker: &mut Linker<WorkerStoreState>) -> Result<(), ComputeError> {
+    linker
+        .func_wrap(
+            "astrid_compute",
+            "asset_count",
+            |caller: Caller<'_, WorkerStoreState>| -> i32 {
+                i32::try_from(caller.data().assets.len()).unwrap_or(i32::MAX)
+            },
+        )
+        .map_err(|error| {
+            ComputeError::WorkerInvalid(format!("link asset_count import: {error}"))
+        })?;
+    linker
+        .func_wrap(
+            "astrid_compute",
+            "asset_size",
+            |caller: Caller<'_, WorkerStoreState>, index: i32| -> i64 {
+                usize::try_from(index)
+                    .ok()
+                    .and_then(|index| caller.data().assets.get(index))
+                    .and_then(|asset| i64::try_from(asset.bytes.len()).ok())
+                    .unwrap_or(i64::from(ASSET_ERR_INDEX))
+            },
+        )
+        .map_err(|error| ComputeError::WorkerInvalid(format!("link asset_size import: {error}")))?;
+    linker
+        .func_wrap(
+            "astrid_compute",
+            "asset_read",
+            |mut caller: Caller<'_, WorkerStoreState>,
+             index: i32,
+             asset_offset: i64,
+             destination: i64,
+             length: i64|
+             -> i32 {
+                if !caller.data().job_active {
+                    return ASSET_ERR_PHASE;
+                }
+                let Ok(index) = usize::try_from(index) else {
+                    return ASSET_ERR_INDEX;
+                };
+                let (Ok(asset_offset), Ok(destination), Ok(length)) = (
+                    usize::try_from(asset_offset),
+                    u64::try_from(destination),
+                    usize::try_from(length),
+                ) else {
+                    return ASSET_ERR_RANGE;
+                };
+                let length_u64 = u64::try_from(length).unwrap_or(u64::MAX);
+                if length_u64 > MAX_ASSET_READ_BYTES {
+                    return ASSET_ERR_LENGTH;
+                }
+                let Some(asset) = caller.data().assets.get(index) else {
+                    return ASSET_ERR_INDEX;
+                };
+                let source = Arc::clone(&asset.bytes);
+                let Some(end) = asset_offset.checked_add(length) else {
+                    return ASSET_ERR_RANGE;
+                };
+                let Some(bytes) = source.get(asset_offset..end) else {
+                    return ASSET_ERR_RANGE;
+                };
+                let charge = ASSET_READ_BASE_FUEL
+                    .saturating_add(length_u64.saturating_mul(ASSET_READ_FUEL_PER_BYTE));
+                let Ok(remaining) = caller.get_fuel() else {
+                    return ASSET_ERR_FUEL;
+                };
+                if remaining < charge {
+                    return ASSET_ERR_FUEL;
+                }
+                if caller.set_fuel(remaining.saturating_sub(charge)).is_err() {
+                    return ASSET_ERR_FUEL;
+                }
+                let memory = caller.data().memory.clone();
+                if atomic_write_bytes(&memory, destination, bytes).is_err() {
+                    return ASSET_ERR_RANGE;
+                }
+                ASSET_OK
+            },
+        )
+        .map_err(|error| ComputeError::WorkerInvalid(format!("link asset_read import: {error}")))?;
+    Ok(())
 }
 
 impl WorkerSlot {
@@ -1451,6 +1782,7 @@ impl WorkerSlot {
             closed,
             fuel_ledger,
             fuel_rate,
+            assets,
         } = context;
         let (sender, receiver) = mpsc::sync_channel(WORKER_QUEUE_CAPACITY);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -1470,6 +1802,9 @@ impl WorkerSlot {
                     WorkerStoreState {
                         cancel: startup_cancel_for_thread,
                         group_closed: Arc::clone(&closed),
+                        memory: memory.clone(),
+                        assets,
+                        job_active: false,
                     },
                 );
                 // Initialization may materialize large signed data segments.
@@ -1493,10 +1828,18 @@ impl WorkerSlot {
                     }
                 });
                 let startup = (|| {
-                    let instance = Instance::new(&mut store, &module, &[memory.clone().into()])
+                    let mut linker = Linker::new(&engine);
+                    linker
+                        .define(&mut store, "astrid_compute", "memory", memory.clone())
                         .map_err(|error| {
-                            ComputeError::WorkerInvalid(format!("instantiate worker: {error:#}"))
+                            ComputeError::WorkerInvalid(format!(
+                                "link worker shared memory: {error:#}"
+                            ))
                         })?;
+                    link_asset_imports(&mut linker)?;
+                    let instance = linker.instantiate(&mut store, &module).map_err(|error| {
+                        ComputeError::WorkerInvalid(format!("instantiate worker: {error:#}"))
+                    })?;
                     let abi = instance
                         .get_typed_func::<(), i32>(&mut store, "astrid_compute_abi_version")
                         .map_err(|error| {
@@ -1560,6 +1903,7 @@ impl WorkerSlot {
                     let offset = i64::try_from(descriptor.offset);
                     let length = i64::try_from(descriptor.length);
                     let tag = i64::from_ne_bytes(descriptor.tag.to_ne_bytes());
+                    store.data_mut().job_active = true;
                     let call = match (offset, length) {
                         (Ok(offset), Ok(length)) => {
                             run.call(&mut store, (index.cast_signed(), offset, length, tag))
@@ -1568,6 +1912,7 @@ impl WorkerSlot {
                             "descriptor does not fit ABI-1 memory32 arguments",
                         )),
                     };
+                    store.data_mut().job_active = false;
                     let remaining = store.get_fuel().unwrap_or(0);
                     let consumed = fuel.saturating_sub(remaining);
                     fuel_ledger.charge(&job.principal, consumed);

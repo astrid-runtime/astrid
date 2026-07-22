@@ -12,6 +12,7 @@ description = "Principal-scoped shared-memory WebAssembly compute groups for Ast
 astrid-capsule-types = { workspace = true }
 astrid-core = { workspace = true }
 blake3 = { workspace = true }
+memmap2 = { workspace = true }
 thiserror = { workspace = true }
 wasmtime = { workspace = true }
 

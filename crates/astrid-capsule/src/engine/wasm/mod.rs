@@ -107,10 +107,99 @@ fn resolve_content_addressed_wasm(capsule_dir: &std::path::Path) -> Option<PathB
     }
 }
 
+/// Private manifest extension for immutable compute-worker assets.
+///
+/// This deliberately does not extend the public `CapsuleManifest` Rust type or
+/// the WIT contract. The build and runtime paths consume the signed, installed
+/// `Capsule.toml` directly until the compute ABI is ready for a public contract.
+#[derive(serde::Deserialize)]
+struct ComputeAssetManifest {
+    #[serde(default)]
+    component: Vec<ComputeAssetComponent>,
+}
+
+#[derive(serde::Deserialize)]
+struct ComputeAssetComponent {
+    #[serde(default)]
+    id: String,
+    #[serde(default, rename = "type")]
+    component_type: String,
+    #[serde(default, rename = "asset")]
+    assets: Vec<ComputeAsset>,
+}
+
+#[derive(serde::Deserialize)]
+struct ComputeAsset {
+    id: String,
+    #[serde(rename = "file")]
+    path: PathBuf,
+    hash: String,
+}
+
+fn load_compute_asset_specs(
+    capsule_dir: &std::path::Path,
+) -> CapsuleResult<std::collections::HashMap<String, Vec<astrid_compute::WorkerAssetSpec>>> {
+    let manifest_path = capsule_dir.join("Capsule.toml");
+    let manifest_source = std::fs::read_to_string(&manifest_path).map_err(|error| {
+        CapsuleError::UnsupportedEntryPoint(format!(
+            "failed to read compute asset declarations from '{}': {error}",
+            manifest_path.display()
+        ))
+    })?;
+    let manifest: ComputeAssetManifest = toml::from_str(&manifest_source).map_err(|error| {
+        CapsuleError::UnsupportedEntryPoint(format!(
+            "failed to parse compute asset declarations from '{}': {error}",
+            manifest_path.display()
+        ))
+    })?;
+
+    let mut assets_by_worker = std::collections::HashMap::new();
+    let mut compute_worker_ids = std::collections::HashSet::new();
+    for component in manifest.component {
+        if component.component_type != "compute-worker" {
+            if !component.assets.is_empty() {
+                return Err(CapsuleError::UnsupportedEntryPoint(format!(
+                    "component '{}' declares immutable assets but is not a compute-worker",
+                    component.id
+                )));
+            }
+            continue;
+        }
+        if !compute_worker_ids.insert(component.id.clone()) {
+            return Err(CapsuleError::UnsupportedEntryPoint(format!(
+                "duplicate compute-worker id '{}'",
+                component.id
+            )));
+        }
+        assets_by_worker.insert(
+            component.id,
+            component
+                .assets
+                .into_iter()
+                .map(|asset| astrid_compute::WorkerAssetSpec {
+                    id: asset.id,
+                    relative_path: asset.path,
+                    expected_hash: asset.hash,
+                })
+                .collect(),
+        );
+    }
+    Ok(assets_by_worker)
+}
+
 fn load_compute_workers(
     manifest: &CapsuleManifest,
     capsule_dir: &std::path::Path,
 ) -> CapsuleResult<Arc<std::collections::HashMap<String, astrid_compute::WorkerArtifact>>> {
+    let has_compute_workers = manifest
+        .components
+        .iter()
+        .any(|component| component.r#type == "compute-worker");
+    let mut assets_by_worker = if has_compute_workers {
+        load_compute_asset_specs(capsule_dir)?
+    } else {
+        std::collections::HashMap::new()
+    };
     let mut workers = std::collections::HashMap::new();
     for component in manifest
         .components
@@ -128,11 +217,13 @@ fn load_compute_workers(
                 component.id
             ))
         })?;
-        let artifact = astrid_compute::WorkerArtifact::from_capsule_path(
+        let assets = assets_by_worker.remove(&component.id).unwrap_or_default();
+        let artifact = astrid_compute::WorkerArtifact::from_capsule_path_with_assets(
             component.id.clone(),
             capsule_dir,
             &component.path,
             hash,
+            &assets,
         )
         .map_err(|error| CapsuleError::UnsupportedEntryPoint(error.to_string()))?;
         if workers.insert(component.id.clone(), artifact).is_some() {
@@ -3493,6 +3584,81 @@ mod tests {
                 reset_resources_on_return: false,
             }
         );
+    }
+
+    #[test]
+    fn compute_worker_loader_attaches_verified_immutable_assets() {
+        let root = tempfile::tempdir().expect("capsule root");
+        let assets = root.path().join("assets");
+        std::fs::create_dir(&assets).expect("assets directory");
+        let worker = wat::parse_str(
+            r#"(module
+                (memory (import "astrid_compute" "memory") 1 32 shared)
+                (func (export "astrid_compute_abi_version") (result i32) i32.const 1)
+                (func (export "astrid_compute_run")
+                    (param i32 i64 i64 i64) (result i32) i32.const 0))"#,
+        )
+        .expect("worker WAT parses");
+        let system = b"verified-system-image";
+        std::fs::write(assets.join("worker.wasm"), &worker).expect("worker writes");
+        std::fs::write(assets.join("system.img"), system).expect("asset writes");
+        let worker_hash = format!("blake3:{}", blake3::hash(&worker).to_hex());
+        let system_hash = format!("blake3:{}", blake3::hash(system).to_hex());
+        let manifest_source = format!(
+            r#"
+                [package]
+                name = "asset-loader"
+                version = "1.0.0"
+
+                [[component]]
+                id = "vcpu"
+                file = "assets/worker.wasm"
+                type = "compute-worker"
+                hash = "{worker_hash}"
+
+                [[component.asset]]
+                id = "system"
+                file = "assets/system.img"
+                hash = "{system_hash}"
+            "#
+        );
+        std::fs::write(root.path().join("Capsule.toml"), &manifest_source)
+            .expect("manifest writes");
+        let manifest: CapsuleManifest = toml::from_str(&manifest_source).expect("manifest parses");
+
+        let workers = load_compute_workers(&manifest, root.path()).expect("workers load");
+        let artifact = workers.get("vcpu").expect("worker exists");
+        assert_eq!(artifact.asset_count(), 1);
+        assert_eq!(artifact.asset_id(0), Some("system"));
+        assert_eq!(artifact.asset_bytes(), 21);
+        assert_eq!(artifact.asset_digest(0), Some(system_hash.as_str()));
+    }
+
+    #[test]
+    fn private_compute_asset_manifest_rejects_non_worker_attachments() {
+        let root = tempfile::tempdir().expect("capsule root");
+        std::fs::write(
+            root.path().join("Capsule.toml"),
+            r#"
+                [package]
+                name = "asset-loader"
+                version = "1.0.0"
+
+                [[component]]
+                id = "controller"
+                file = "controller.wasm"
+                type = "executable"
+
+                [[component.asset]]
+                id = "system"
+                file = "assets/system.img"
+                hash = "blake3:0000000000000000000000000000000000000000000000000000000000000000"
+            "#,
+        )
+        .expect("manifest writes");
+
+        let error = load_compute_asset_specs(root.path()).expect_err("attachment is rejected");
+        assert!(error.to_string().contains("is not a compute-worker"));
     }
 
     // ── git-managed workspace detection (gitoxide work-tree discovery) ──

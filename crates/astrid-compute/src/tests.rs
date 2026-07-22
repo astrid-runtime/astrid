@@ -174,6 +174,75 @@ fn principal(name: &str) -> PrincipalId {
     PrincipalId::new(name).expect("valid test principal")
 }
 
+fn artifact_with_asset(asset_bytes: &[u8]) -> (tempfile::TempDir, WorkerArtifact) {
+    artifact_with_worker_and_asset(
+        r#"(module
+            (memory (import "astrid_compute" "memory") 1 32 shared)
+            (func (export "astrid_compute_abi_version") (result i32) i32.const 1)
+            (func (export "astrid_compute_run")
+                (param i32 i64 i64 i64) (result i32) i32.const 0))"#,
+        asset_bytes,
+    )
+}
+
+fn artifact_with_worker_and_asset(
+    wat_source: &str,
+    asset_bytes: &[u8],
+) -> (tempfile::TempDir, WorkerArtifact) {
+    let root = tempfile::tempdir().expect("temp capsule root");
+    let assets = root.path().join("assets");
+    std::fs::create_dir(&assets).expect("asset directory created");
+    let worker = artifact("asset-worker", wat_source);
+    std::fs::write(assets.join("worker.wasm"), worker.bytes.as_ref()).expect("worker written");
+    std::fs::write(assets.join("system.img"), asset_bytes).expect("asset written");
+    let asset_hash = format!("blake3:{}", blake3::hash(asset_bytes).to_hex());
+    let artifact = WorkerArtifact::from_capsule_path_with_assets(
+        "asset-worker",
+        root.path(),
+        Path::new("assets/worker.wasm"),
+        worker.digest(),
+        &[WorkerAssetSpec {
+            id: "system".to_owned(),
+            relative_path: PathBuf::from("assets/system.img"),
+            expected_hash: asset_hash,
+        }],
+    )
+    .expect("asset-bearing artifact loads");
+    (root, artifact)
+}
+
+fn asset_host_store(
+    artifact: &WorkerArtifact,
+    job_active: bool,
+) -> (
+    Store<WorkerStoreState>,
+    Linker<WorkerStoreState>,
+    SharedMemory,
+) {
+    let mut config = Config::new();
+    config
+        .wasm_threads(true)
+        .shared_memory(true)
+        .consume_fuel(true);
+    let engine = Engine::new(&config).expect("test engine starts");
+    let memory =
+        SharedMemory::new(&engine, MemoryType::shared(1, 1)).expect("test shared memory allocates");
+    let mut store = Store::new(
+        &engine,
+        WorkerStoreState {
+            cancel: Arc::new(AtomicBool::new(false)),
+            group_closed: Arc::new(AtomicBool::new(false)),
+            memory: memory.clone(),
+            assets: Arc::clone(&artifact.assets),
+            job_active,
+        },
+    );
+    store.set_fuel(1_000_000).expect("test fuel seeds");
+    let mut linker = Linker::new(&engine);
+    link_asset_imports(&mut linker).expect("asset imports link");
+    (store, linker, memory)
+}
+
 #[test]
 fn deterministic_jobs_share_memory_and_preserve_queue_order() {
     let runtime = ComputeRuntime::new(ComputeLedger::default(), ComputeLimits::default())
@@ -201,6 +270,255 @@ fn deterministic_jobs_share_memory_and_preserve_queue_order() {
         group.read(ABI_HEADER_BYTES, 4).expect("memory reads"),
         2_u32.to_le_bytes()
     );
+}
+
+#[test]
+fn immutable_asset_host_calls_are_bounded_metered_and_phase_gated() {
+    let asset_bytes = b"0123456789abcdef";
+    let (_root, artifact) = artifact_with_asset(asset_bytes);
+    assert_eq!(artifact.asset_count(), 1);
+    assert_eq!(artifact.asset_bytes(), 16);
+    assert_eq!(artifact.asset_id(0), Some("system"));
+    assert_eq!(
+        artifact.asset_digest(0),
+        Some(format!("blake3:{}", blake3::hash(asset_bytes).to_hex()).as_str())
+    );
+
+    let (mut store, linker, memory) = asset_host_store(&artifact, true);
+    let count = linker
+        .get(&mut store, "astrid_compute", "asset_count")
+        .expect("count is linked")
+        .into_func()
+        .expect("count is a function")
+        .typed::<(), i32>(&store)
+        .expect("count signature matches");
+    let size = linker
+        .get(&mut store, "astrid_compute", "asset_size")
+        .expect("size is linked")
+        .into_func()
+        .expect("size is a function")
+        .typed::<i32, i64>(&store)
+        .expect("size signature matches");
+    let read = linker
+        .get(&mut store, "astrid_compute", "asset_read")
+        .expect("read is linked")
+        .into_func()
+        .expect("read is a function")
+        .typed::<(i32, i64, i64, i64), i32>(&store)
+        .expect("read signature matches");
+
+    assert_eq!(count.call(&mut store, ()).expect("count returns"), 1);
+    assert_eq!(size.call(&mut store, 0).expect("size returns"), 16);
+    assert_eq!(
+        size.call(&mut store, -1).expect("bad size returns"),
+        i64::from(ASSET_ERR_INDEX)
+    );
+
+    let before = store.get_fuel().expect("fuel reads");
+    assert_eq!(
+        read.call(&mut store, (0, 4, 128, 6))
+            .expect("valid read returns"),
+        ASSET_OK
+    );
+    let consumed = before.saturating_sub(store.get_fuel().expect("fuel reads"));
+    assert_eq!(consumed, ASSET_READ_BASE_FUEL + 6);
+    assert_eq!(
+        atomic_read_bytes(&memory, 128, 6).expect("copied bytes read"),
+        b"456789"
+    );
+
+    assert_eq!(
+        read.call(&mut store, (-1, 0, 128, 1))
+            .expect("bad index returns"),
+        ASSET_ERR_INDEX
+    );
+    assert_eq!(
+        read.call(&mut store, (0, -1, 128, 1))
+            .expect("negative source returns"),
+        ASSET_ERR_RANGE
+    );
+    assert_eq!(
+        read.call(&mut store, (0, 15, 128, 2))
+            .expect("source overflow returns"),
+        ASSET_ERR_RANGE
+    );
+    assert_eq!(
+        read.call(&mut store, (0, 0, -1, 1))
+            .expect("negative destination returns"),
+        ASSET_ERR_RANGE
+    );
+    assert_eq!(
+        read.call(&mut store, (0, 0, 128, -1))
+            .expect("negative length returns"),
+        ASSET_ERR_RANGE
+    );
+    assert_eq!(
+        read.call(
+            &mut store,
+            (0, 0, 128, i64::try_from(MAX_ASSET_READ_BYTES + 1).unwrap())
+        )
+        .expect("oversized length returns"),
+        ASSET_ERR_LENGTH
+    );
+    assert_eq!(
+        read.call(
+            &mut store,
+            (0, 0, i64::try_from(WASM_PAGE_BYTES).unwrap(), 1)
+        )
+        .expect("destination overflow returns"),
+        ASSET_ERR_RANGE
+    );
+
+    store.set_fuel(ASSET_READ_BASE_FUEL).expect("low fuel sets");
+    assert_eq!(
+        read.call(&mut store, (0, 0, 128, 1))
+            .expect("fuel denial returns"),
+        ASSET_ERR_FUEL
+    );
+    assert_eq!(
+        store.get_fuel().expect("fuel remains"),
+        ASSET_READ_BASE_FUEL
+    );
+
+    store.data_mut().job_active = false;
+    store.set_fuel(1_000_000).expect("fuel resets");
+    assert_eq!(
+        read.call(&mut store, (0, 0, 128, 1))
+            .expect("phase denial returns"),
+        ASSET_ERR_PHASE
+    );
+}
+
+#[test]
+fn scheduled_worker_reads_verified_asset_into_shared_memory() {
+    let (_root, artifact) = artifact_with_worker_and_asset(
+        r#"(module
+            (memory (import "astrid_compute" "memory") 1 32 shared)
+            (func $read (import "astrid_compute" "asset_read")
+                (param i32 i64 i64 i64) (result i32))
+            (func (export "astrid_compute_abi_version") (result i32) i32.const 1)
+            (func (export "astrid_compute_run")
+                (param $worker i32) (param $destination i64)
+                (param $length i64) (param $asset_offset i64) (result i32)
+                i32.const 0
+                local.get $asset_offset
+                local.get $destination
+                local.get $length
+                call $read))"#,
+        b"0123456789abcdef",
+    );
+    let runtime = ComputeRuntime::new(ComputeLedger::default(), ComputeLimits::default())
+        .expect("runtime starts");
+    let group = runtime
+        .open_group(
+            &principal("alice"),
+            &artifact,
+            request(ExecutionMode::Deterministic, Parallelism::Auto),
+        )
+        .expect("asset worker opens");
+    let result = group
+        .submit(WorkDescriptor {
+            offset: ABI_HEADER_BYTES,
+            length: 6,
+            tag: 4,
+            worker_index: None,
+            fuel: Some(1_000_000),
+        })
+        .expect("asset job queues")
+        .join()
+        .expect("asset job completes");
+    assert_eq!(result.worker_status, ASSET_OK);
+    assert!(result.fuel_consumed >= ASSET_READ_BASE_FUEL + 6);
+    assert_eq!(
+        group.read(ABI_HEADER_BYTES, 6).expect("asset bytes read"),
+        b"456789"
+    );
+}
+
+#[test]
+fn worker_start_function_cannot_read_assets_outside_principal_accounting() {
+    let (_root, artifact) = artifact_with_worker_and_asset(
+        r#"(module
+            (memory (import "astrid_compute" "memory") 1 32 shared)
+            (func $read (import "astrid_compute" "asset_read")
+                (param i32 i64 i64 i64) (result i32))
+            (global $startup_status (mut i32) (i32.const 0))
+            (func $start
+                i32.const 0
+                i64.const 0
+                i64.const 128
+                i64.const 1
+                call $read
+                global.set $startup_status)
+            (start $start)
+            (func (export "astrid_compute_abi_version") (result i32) i32.const 1)
+            (func (export "astrid_compute_run")
+                (param i32 i64 i64 i64) (result i32)
+                global.get $startup_status))"#,
+        b"secret",
+    );
+    let runtime = ComputeRuntime::new(ComputeLedger::default(), ComputeLimits::default())
+        .expect("runtime starts");
+    let group = runtime
+        .open_group(
+            &principal("alice"),
+            &artifact,
+            request(ExecutionMode::Deterministic, Parallelism::Auto),
+        )
+        .expect("phase-gated worker opens");
+    let result = group
+        .submit(WorkDescriptor {
+            offset: ABI_HEADER_BYTES,
+            length: 0,
+            tag: 0,
+            worker_index: None,
+            fuel: Some(1_000_000),
+        })
+        .expect("status job queues")
+        .join()
+        .expect("status job completes");
+    assert_eq!(result.worker_status, ASSET_ERR_PHASE);
+    assert_eq!(
+        group.read(128, 1).expect("destination reads"),
+        [0],
+        "startup must not materialize asset bytes"
+    );
+}
+
+#[test]
+fn malformed_and_duplicate_asset_imports_fail_closed() {
+    let malformed = [
+        r#"(func (import "astrid_compute" "asset_count") (result i64))"#,
+        r#"(func (import "astrid_compute" "asset_size") (param i64) (result i64))"#,
+        r#"(func (import "astrid_compute" "asset_read") (param i32 i64 i64) (result i32))"#,
+        r#"(global (import "astrid_compute" "asset_count") i32)"#,
+        r#"(func (import "astrid_compute" "unknown") (result i32))"#,
+        r#"(func $one (import "astrid_compute" "asset_count") (result i32))
+            (func $two (import "astrid_compute" "asset_count") (result i32))"#,
+    ];
+    let runtime = ComputeRuntime::new(ComputeLedger::default(), ComputeLimits::default())
+        .expect("runtime starts");
+    for import in malformed {
+        let worker = artifact(
+            "malformed-asset-import",
+            &format!(
+                r#"(module
+                    (memory (import "astrid_compute" "memory") 1 32 shared)
+                    {import}
+                    (func (export "astrid_compute_abi_version") (result i32) i32.const 1)
+                    (func (export "astrid_compute_run")
+                        (param i32 i64 i64 i64) (result i32) i32.const 0))"#
+            ),
+        );
+        let error = runtime
+            .open_group(
+                &principal("alice"),
+                &worker,
+                request(ExecutionMode::Deterministic, Parallelism::Auto),
+            )
+            .expect_err("malformed import is rejected");
+        assert!(matches!(error, ComputeError::WorkerInvalid(_)));
+    }
 }
 
 #[test]
@@ -861,6 +1179,108 @@ fn worker_paths_reject_symlinks_and_escape() {
             root.path(),
             Path::new("../worker.wasm"),
             "blake3:00"
+        ),
+        Err(ComputeError::WorkerInvalid(_))
+    ));
+}
+
+#[test]
+fn worker_assets_reject_untrusted_specs_at_runtime() {
+    let root = tempfile::tempdir().expect("temp root");
+    let assets = root.path().join("assets");
+    std::fs::create_dir(&assets).expect("assets directory");
+    let worker = basic_worker();
+    std::fs::write(assets.join("worker.wasm"), worker.bytes.as_ref()).expect("worker writes");
+    std::fs::write(assets.join("system.img"), b"system").expect("asset writes");
+    std::fs::write(assets.join("empty.img"), []).expect("empty asset writes");
+    let system_hash = format!("blake3:{}", blake3::hash(b"system").to_hex());
+    let valid = WorkerAssetSpec {
+        id: "system".to_owned(),
+        relative_path: PathBuf::from("assets/system.img"),
+        expected_hash: system_hash,
+    };
+    let load = |specs: &[WorkerAssetSpec]| {
+        WorkerArtifact::from_capsule_path_with_assets(
+            "worker",
+            root.path(),
+            Path::new("assets/worker.wasm"),
+            worker.digest(),
+            specs,
+        )
+    };
+
+    let mut invalid_id = valid.clone();
+    invalid_id.id = "SYSTEM".to_owned();
+    assert!(matches!(
+        load(&[invalid_id]),
+        Err(ComputeError::WorkerInvalid(_))
+    ));
+
+    let mut bad_hash = valid.clone();
+    bad_hash.expected_hash = format!("blake3:{}", "0".repeat(64));
+    assert!(matches!(
+        load(&[bad_hash]),
+        Err(ComputeError::WorkerInvalid(_))
+    ));
+
+    let mut traversal = valid.clone();
+    traversal.relative_path = PathBuf::from("assets/../outside.img");
+    assert!(matches!(
+        load(&[traversal]),
+        Err(ComputeError::WorkerInvalid(_))
+    ));
+
+    let mut empty = valid.clone();
+    empty.relative_path = PathBuf::from("assets/empty.img");
+    empty.expected_hash = format!("blake3:{}", blake3::hash(&[]).to_hex());
+    assert!(matches!(
+        load(&[empty]),
+        Err(ComputeError::WorkerInvalid(_))
+    ));
+
+    assert!(matches!(
+        load(&[valid.clone(), valid.clone()]),
+        Err(ComputeError::WorkerInvalid(_))
+    ));
+
+    let too_many = (0..=MAX_WORKER_ASSETS)
+        .map(|index| WorkerAssetSpec {
+            id: format!("asset-{index}"),
+            ..valid.clone()
+        })
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        load(&too_many),
+        Err(ComputeError::WorkerInvalid(_))
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn worker_assets_reject_symlinked_files_at_runtime() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().expect("temp root");
+    let assets = root.path().join("assets");
+    std::fs::create_dir(&assets).expect("assets directory");
+    let worker = basic_worker();
+    std::fs::write(assets.join("worker.wasm"), worker.bytes.as_ref()).expect("worker writes");
+    let outside = tempfile::NamedTempFile::new().expect("outside file");
+    std::fs::write(outside.path(), b"outside").expect("outside bytes write");
+    symlink(outside.path(), assets.join("system.img")).expect("asset symlink creates");
+    let spec = WorkerAssetSpec {
+        id: "system".to_owned(),
+        relative_path: PathBuf::from("assets/system.img"),
+        expected_hash: format!("blake3:{}", blake3::hash(b"outside").to_hex()),
+    };
+
+    assert!(matches!(
+        WorkerArtifact::from_capsule_path_with_assets(
+            "worker",
+            root.path(),
+            Path::new("assets/worker.wasm"),
+            worker.digest(),
+            &[spec],
         ),
         Err(ComputeError::WorkerInvalid(_))
     ));

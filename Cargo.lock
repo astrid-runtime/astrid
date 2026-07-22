@@ -548,6 +548,7 @@ dependencies = [
  "astrid-capsule-types",
  "astrid-core",
  "blake3",
+ "memmap2",
  "tempfile",
  "thiserror 2.0.18",
  "wasmtime",
