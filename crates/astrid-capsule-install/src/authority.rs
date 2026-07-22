@@ -242,12 +242,20 @@ impl AuthorityReceiptTransaction {
                 paths.pending.display()
             )
         })?;
-        pending
-            .write_all(&json)
-            .context("failed to write capsule authority receipt")?;
-        pending
-            .sync_all()
-            .context("failed to sync capsule authority receipt")?;
+        let write_result = (|| {
+            pending
+                .write_all(&json)
+                .context("failed to write capsule authority receipt")?;
+            pending
+                .sync_all()
+                .context("failed to sync capsule authority receipt")?;
+            Ok::<(), anyhow::Error>(())
+        })();
+        if let Err(error) = write_result {
+            drop(pending);
+            let _ = std::fs::remove_file(&paths.pending);
+            return Err(error);
+        }
 
         Ok(Self {
             active: paths.active,
