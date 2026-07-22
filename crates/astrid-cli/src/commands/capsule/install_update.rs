@@ -17,7 +17,7 @@ use astrid_capsule_install::{
 };
 use astrid_core::dirs::AstridHome;
 
-use super::install::install_capsule;
+use super::install::install_capsule_with_options;
 use super::meta::{CapsuleMeta, read_meta};
 
 /// Result of checking a remote source for a newer capsule version.
@@ -112,7 +112,11 @@ pub(super) async fn check_remote_version(
 /// recorded source. If `None`, check all installed capsules for newer
 /// versions and only update those where the remote version is
 /// strictly newer (semver comparison).
-pub(crate) async fn update_capsule(target: Option<&str>, workspace: bool) -> anyhow::Result<()> {
+pub(crate) async fn update_capsule(
+    target: Option<&str>,
+    workspace: bool,
+    approve_untrusted: bool,
+) -> anyhow::Result<()> {
     let home = AstridHome::resolve()?;
     let principal = crate::principal::current();
 
@@ -147,9 +151,17 @@ pub(crate) async fn update_capsule(target: Option<&str>, workspace: bool) -> any
         // monorepo release that ships several `.capsule` assets, pass `name`
         // as the selector so update refreshes only that one — not every
         // capsule the release contains.
-        install_capsule(&source, Some(name), workspace).await
+        install_capsule_with_options(
+            &source,
+            Some(name),
+            workspace,
+            false,
+            approve_untrusted,
+            &[],
+        )
+        .await
     } else {
-        update_all_capsules(&home, &principal, workspace).await
+        update_all_capsules(&home, &principal, workspace, approve_untrusted).await
     }
 }
 
@@ -158,6 +170,7 @@ async fn update_all_capsules(
     home: &AstridHome,
     principal: &astrid_core::PrincipalId,
     workspace: bool,
+    approve_untrusted: bool,
 ) -> anyhow::Result<()> {
     let capsules: Vec<(String, Option<CapsuleMeta>)> = filter_update_scope(
         scan_installed_capsules_in_home_for_with_layout(
@@ -229,7 +242,16 @@ async fn update_all_capsules(
         eprintln!("Updating {name} from {source}...");
         // Selector = the capsule being updated, so a monorepo source refreshes
         // only this one (see the single-target update above).
-        if let Err(e) = install_capsule(source, Some(name), workspace).await {
+        if let Err(e) = install_capsule_with_options(
+            source,
+            Some(name),
+            workspace,
+            false,
+            approve_untrusted,
+            &[],
+        )
+        .await
+        {
             eprintln!("  Failed to update {name}: {e}");
             install_failed = install_failed.saturating_add(1);
         } else {

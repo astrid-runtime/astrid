@@ -354,8 +354,17 @@ async fn dispatch_capsule(command: crate::cli::CapsuleCommands) -> Result<ExitCo
             .await?;
             Ok(ExitCode::SUCCESS)
         },
-        CapsuleCommands::Update { target, workspace } => {
-            commands::capsule::install::update_capsule(target.as_deref(), workspace).await?;
+        CapsuleCommands::Update {
+            target,
+            workspace,
+            approve_untrusted,
+        } => {
+            commands::capsule::install::update_capsule(
+                target.as_deref(),
+                workspace,
+                approve_untrusted,
+            )
+            .await?;
             Ok(ExitCode::SUCCESS)
         },
         CapsuleCommands::List { verbose } => {

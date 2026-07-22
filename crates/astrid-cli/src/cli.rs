@@ -390,6 +390,10 @@ pub(crate) enum CapsuleCommands {
         /// Update workspace capsules instead of user-level
         #[arg(long)]
         workspace: bool,
+        /// Approve each exact foreign-signed or unsigned update artifact once.
+        /// Does not trust its signer for future updates.
+        #[arg(long)]
+        approve_untrusted: bool,
     },
     /// List all installed capsules with capability metadata
     List {
@@ -649,6 +653,29 @@ mod tests {
         // `help` is injected by clap, not a declared variant, but is a real
         // reserved word — assert it is covered too.
         assert!(astrid_core::kernel_api::RESERVED_CAPSULE_VERBS.contains(&"help"));
+    }
+
+    #[test]
+    fn capsule_update_parses_one_shot_untrusted_approval() {
+        let cli = Cli::try_parse_from([
+            "astrid",
+            "capsule",
+            "update",
+            "example",
+            "--approve-untrusted",
+        ])
+        .expect("update should accept an explicit one-shot authority grant");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Capsule {
+                command: CapsuleCommands::Update {
+                    target: Some(ref target),
+                    workspace: false,
+                    approve_untrusted: true,
+                },
+            }) if target == "example"
+        ));
     }
 
     /// An unrecognised root token (and everything after it, including
