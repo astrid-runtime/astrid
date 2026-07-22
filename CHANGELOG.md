@@ -42,6 +42,12 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Fixed
 
+- **Capsule CLI commands no longer inherit a hidden 70-second transport
+  deadline.** The foreground result wait now defaults to 310 seconds, just
+  beyond the ordinary principal invocation budget, and operators can set
+  `ASTRID_CAPSULE_COMMAND_TIMEOUT_SECS` from 1 through 86,700 seconds for
+  deliberately longer principal budgets. Expiry now warns that cancellation
+  is not yet propagated instead of implying that the target stopped.
 - **Filesystem metadata now distinguishes `stat` from `lstat`.** Following
   metadata resolves a final symlink, while `fs-stat-symlink` inspects the link
   entry itself without granting authority over an escaping target. This lets

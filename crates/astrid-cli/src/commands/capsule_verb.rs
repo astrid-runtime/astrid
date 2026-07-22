@@ -29,10 +29,34 @@ use crate::commands::daemon;
 use crate::socket_client::SocketClient;
 use crate::theme::Theme;
 
-/// Wall-clock budget for a capsule to respond on the result topic.
-const RESULT_TIMEOUT_SECS: u64 = 70;
-const RESULT_TIMEOUT: Duration = Duration::from_secs(RESULT_TIMEOUT_SECS);
+/// Default wall-clock budget for a capsule to respond on the result topic.
+///
+/// This deliberately exceeds the default five-minute principal invocation
+/// timeout by ten seconds so the kernel remains the execution authority and
+/// the CLI has time to receive its terminal result.
+const DEFAULT_RESULT_TIMEOUT_SECS: u64 = 310;
+/// Five minutes beyond the maximum 24-hour principal invocation timeout.
+const MAX_RESULT_TIMEOUT_SECS: u64 = 86_700;
+const RESULT_TIMEOUT_ENV: &str = "ASTRID_CAPSULE_COMMAND_TIMEOUT_SECS";
+const RESULT_TIMEOUT_ERROR: &str = "must be an integer from 1 through 86700 seconds";
 const CAPSULES_LOADED_TOPIC: &str = "astrid.v1.capsules_loaded";
+
+fn parse_result_timeout_secs(raw: Option<&str>) -> Result<u64, &'static str> {
+    let Some(raw) = raw else {
+        return Ok(DEFAULT_RESULT_TIMEOUT_SECS);
+    };
+    raw.parse::<u64>()
+        .ok()
+        .filter(|seconds| (1..=MAX_RESULT_TIMEOUT_SECS).contains(seconds))
+        .ok_or(RESULT_TIMEOUT_ERROR)
+}
+
+fn configured_result_timeout_secs() -> Result<u64, &'static str> {
+    match std::env::var_os(RESULT_TIMEOUT_ENV) {
+        None => Ok(DEFAULT_RESULT_TIMEOUT_SECS),
+        Some(raw) => parse_result_timeout_secs(raw.to_str().ok_or(RESULT_TIMEOUT_ERROR).map(Some)?),
+    }
+}
 
 /// Outcome of resolving a verb against the daemon's command registry.
 ///
@@ -203,6 +227,17 @@ async fn resolve_commands() -> Result<Vec<CommandInfo>> {
 
 /// Publish the run request and await + render the result.
 async fn execute(provider: &str, verb: &str, args: &[String]) -> Result<ExitCode> {
+    let result_timeout_secs = match configured_result_timeout_secs() {
+        Ok(seconds) => seconds,
+        Err(error) => {
+            eprintln!(
+                "{}",
+                Theme::error(&format!("{RESULT_TIMEOUT_ENV} {error}."))
+            );
+            return Ok(ExitCode::from(1));
+        },
+    };
+    let result_timeout = Duration::from_secs(result_timeout_secs);
     let session = astrid_core::SessionId::from_uuid(Uuid::new_v4());
     let source_id = session.0;
     // Bind the connection to the active principal so the capsule verb runs
@@ -249,7 +284,7 @@ async fn execute(provider: &str, verb: &str, args: &[String]) -> Result<ExitCode
         result_topic.as_str(),
         provider,
         caller.as_str(),
-        RESULT_TIMEOUT,
+        result_timeout,
     )
     .await
     {
@@ -267,7 +302,7 @@ async fn execute(provider: &str, verb: &str, args: &[String]) -> Result<ExitCode
             eprintln!(
                 "{}",
                 Theme::error(&format!(
-                    "Capsule '{provider}' did not respond within {RESULT_TIMEOUT_SECS}s."
+                    "Capsule '{provider}' did not respond within {result_timeout_secs}s. The transport wait ended, but cancellation is not yet propagated; the command may continue until its principal timeout."
                 ))
             );
             Ok(ExitCode::from(1))
@@ -483,6 +518,25 @@ mod tests {
                 providers: vec!["ops".to_string(), "infra".to_string()],
             }
         );
+    }
+
+    #[test]
+    fn capsule_command_timeout_defaults_and_is_strictly_bounded() {
+        assert_eq!(
+            parse_result_timeout_secs(None),
+            Ok(DEFAULT_RESULT_TIMEOUT_SECS)
+        );
+        assert_eq!(parse_result_timeout_secs(Some("1")), Ok(1));
+        assert_eq!(
+            parse_result_timeout_secs(Some("86700")),
+            Ok(MAX_RESULT_TIMEOUT_SECS)
+        );
+        for invalid in ["", "0", "70s", "86701", "-1", " 310"] {
+            assert!(
+                parse_result_timeout_secs(Some(invalid)).is_err(),
+                "{invalid}"
+            );
+        }
     }
 
     #[test]
