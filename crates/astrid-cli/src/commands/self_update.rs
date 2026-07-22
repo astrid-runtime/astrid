@@ -673,7 +673,7 @@ async fn sync_distro_and_capsules() -> anyhow::Result<()> {
     }
 
     // Update individual capsules (checks GitHub releases for newer versions).
-    if let Err(e) = super::capsule::install::update_capsule(None, false).await {
+    if let Err(e) = super::capsule::install::update_capsule(None, false, false).await {
         println!("{}", Theme::warning(&format!("Capsule update: {e}")));
     }
 

@@ -33,7 +33,11 @@ use astrid_capsule::capsule::CapsuleId;
 use astrid_capsule_install::github_source::{
     capsule_assets, extract_github_org_repo, parse_github_source, pick_capsule,
 };
-use astrid_capsule_install::{InstallOptions, resolve_target_dir_for_with_layout};
+use astrid_capsule_install::{
+    ArtifactProvenance, AuthorityDecision, InstallInspection, InstallOptions,
+    inspect_archive_for_principal_with_layout, inspect_directory_for_principal_with_layout,
+    resolve_target_dir_for_with_layout,
+};
 use astrid_core::dirs::AstridHome;
 
 use super::install_finish::{finish_install, run_with_elicit};
@@ -63,11 +67,12 @@ struct InstallContext<'a> {
 #[derive(Debug, Clone, Default)]
 pub(super) struct ManualInstallOptions {
     pub(super) yes: bool,
+    pub(super) approve_untrusted: bool,
     pub(super) vars: HashMap<String, String>,
 }
 
 impl ManualInstallOptions {
-    fn from_cli(yes: bool, items: &[String]) -> anyhow::Result<Self> {
+    fn from_cli(yes: bool, approve_untrusted: bool, items: &[String]) -> anyhow::Result<Self> {
         let mut vars = HashMap::new();
         for item in items {
             let (key, value) = item
@@ -80,7 +85,11 @@ impl ManualInstallOptions {
                 bail!("--var '{key}' was supplied more than once");
             }
         }
-        Ok(Self { yes, vars })
+        Ok(Self {
+            yes,
+            approve_untrusted,
+            vars,
+        })
     }
 }
 
@@ -146,7 +155,7 @@ pub(crate) async fn install_capsule(
     capsule: Option<&str>,
     workspace: bool,
 ) -> anyhow::Result<()> {
-    install_capsule_with_options(source, capsule, workspace, false, &[]).await
+    install_capsule_with_options(source, capsule, workspace, false, false, &[]).await
 }
 
 /// Manual install with explicit non-interactive configuration inputs.
@@ -155,10 +164,11 @@ pub(crate) async fn install_capsule_with_options(
     capsule: Option<&str>,
     workspace: bool,
     yes: bool,
+    approve_untrusted: bool,
     vars: &[String],
 ) -> anyhow::Result<()> {
     let principal = crate::principal::current();
-    let prompt = ManualInstallOptions::from_cli(yes, vars)?;
+    let prompt = ManualInstallOptions::from_cli(yes, approve_untrusted, vars)?;
     let (installed, _resolved) = install_capsule_inner(
         source,
         capsule,
@@ -725,9 +735,13 @@ pub(crate) fn install_from_local_path(
     workspace: bool,
     home: &AstridHome,
     original_source: Option<&str>,
+    approve_untrusted: bool,
 ) -> anyhow::Result<String> {
     let principal = crate::principal::current();
-    let prompt = ManualInstallOptions::default();
+    let prompt = ManualInstallOptions {
+        approve_untrusted,
+        ..Default::default()
+    };
     install_from_local_path_for_principal(
         source_dir,
         workspace,
@@ -749,6 +763,14 @@ fn install_from_local_path_for_principal(
     expected: Option<ExpectedCapsule<'_>>,
     prompt: &ManualInstallOptions,
 ) -> anyhow::Result<InstalledCapsuleOutcome> {
+    let inspection = inspect_directory_for_principal_with_layout(
+        source_dir,
+        home,
+        principal,
+        workspace,
+        crate::workspace_layout::current(),
+    )?;
+    let authority = authority_decision(&inspection, prompt)?;
     let opts = InstallOptions {
         workspace,
         original_source: original_source.map(String::from),
@@ -762,21 +784,23 @@ fn install_from_local_path_for_principal(
         };
         match expected {
             Some(expected) => {
-                astrid_capsule_install::install_from_local_path_checked_for_principal_with_layout(
+                astrid_capsule_install::install_from_local_path_checked_authorized_for_principal_with_layout(
                     source_dir,
                     home,
                     opts,
                     principal,
                     expected.id,
                     expected.version,
+                    &authority,
                     crate::workspace_layout::current(),
                 )
             },
-            None => astrid_capsule_install::install_from_local_path_for_principal_with_layout(
+            None => astrid_capsule_install::install_from_local_path_authorized_for_principal_with_layout(
                 source_dir,
                 home,
                 opts,
                 principal,
+                &authority,
                 crate::workspace_layout::current(),
             ),
         }
@@ -850,6 +874,14 @@ fn unpack_via_lib(
     expected: Option<ExpectedCapsule<'_>>,
     prompt: &ManualInstallOptions,
 ) -> anyhow::Result<InstalledCapsuleOutcome> {
+    let inspection = inspect_archive_for_principal_with_layout(
+        archive,
+        home,
+        principal,
+        workspace,
+        crate::workspace_layout::current(),
+    )?;
+    let authority = authority_decision(&inspection, prompt)?;
     let opts = InstallOptions {
         workspace,
         original_source: original_source.map(String::from),
@@ -863,26 +895,88 @@ fn unpack_via_lib(
         };
         match expected {
             Some(expected) => {
-                astrid_capsule_install::unpack_and_install_checked_for_principal_with_layout(
+                astrid_capsule_install::unpack_and_install_checked_authorized_for_principal_with_layout(
                     archive,
                     home,
                     opts,
                     principal,
                     expected.id,
                     expected.version,
+                    &authority,
                     crate::workspace_layout::current(),
                 )
             },
-            None => astrid_capsule_install::unpack_and_install_for_principal_with_layout(
+            None => astrid_capsule_install::unpack_and_install_authorized_for_principal_with_layout(
                 archive,
                 home,
                 opts,
                 principal,
+                &authority,
                 crate::workspace_layout::current(),
             ),
         }
     })?;
     finish_install(&output, home, principal, prompt)
+}
+
+fn authority_decision(
+    inspection: &InstallInspection,
+    prompt: &ManualInstallOptions,
+) -> anyhow::Result<AuthorityDecision> {
+    if matches!(
+        inspection.provenance,
+        ArtifactProvenance::LocalRuntime { .. }
+    ) {
+        return Ok(AuthorityDecision::Automatic);
+    }
+    if BATCH_MODE.load(Ordering::Relaxed) {
+        return Ok(AuthorityDecision::OperatorDistribution {
+            content_digest: inspection.content_digest.clone(),
+        });
+    }
+    if prompt.approve_untrusted {
+        return Ok(AuthorityDecision::ExplicitApproval {
+            content_digest: inspection.content_digest.clone(),
+        });
+    }
+    if prompt.yes {
+        bail!(
+            "capsule '{}' is {}; --yes configures values but does not approve install authority. Re-run with --approve-untrusted after reviewing the artifact",
+            inspection.capsule_id,
+            inspection.provenance.label()
+        );
+    }
+
+    eprintln!();
+    eprintln!(
+        "Capsule {} {} is {}.",
+        inspection.capsule_id,
+        inspection.version,
+        inspection.provenance.label()
+    );
+    if let Some(signer) = inspection.provenance.signer() {
+        eprintln!("  Signer: {signer}");
+    }
+    eprintln!("  Content: {}", inspection.content_digest);
+    if inspection.capability_expansions.is_empty() {
+        eprintln!("  New host capabilities: none");
+    } else {
+        eprintln!("  New host capabilities:");
+        for expansion in &inspection.capability_expansions {
+            eprintln!("    {}: {}", expansion.name, expansion.added.join(", "));
+        }
+    }
+    eprint!("Approve this exact install once? [y/N] ");
+    std::io::Write::flush(&mut std::io::stderr())?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        Ok(AuthorityDecision::ExplicitApproval {
+            content_digest: inspection.content_digest.clone(),
+        })
+    } else {
+        bail!("capsule install authority was not approved")
+    }
 }
 
 // ---------------------------------------------------------------------------

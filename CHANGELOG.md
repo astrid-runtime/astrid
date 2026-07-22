@@ -9,6 +9,16 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+### Added
+
+- **Capsule provenance is now bound to local install authority.**
+  `astrid-build` signs canonical capsule content with the installation's
+  runtime key. Same-runtime builds and operator-owned distributions retain a
+  low-friction path, while foreign-signed or unsigned manual installs require
+  an exact, digest-bound approval that displays capability expansion.
+  Installed authority snapshots prevent later manifest edits from silently
+  acquiring additional host capabilities. Closes #1318.
+
 ### Fixed
 
 - **Stable crates publication installs its authenticated-hash prerequisite.**

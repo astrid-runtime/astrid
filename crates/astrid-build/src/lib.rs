@@ -13,6 +13,8 @@
 use clap::Parser;
 
 mod archiver;
+/// Capsule artifact signing and verification.
+pub mod artifact;
 mod build;
 mod mcp;
 mod rust;

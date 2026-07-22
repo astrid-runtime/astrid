@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 /// A collection of capabilities the capsule requests from the OS.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct CapabilitiesDef {
     /// Whether the capsule acts as a long-lived uplink/daemon (e.g. the CLI proxy).
     /// When true, the WASM execution timeout is disabled.
@@ -82,6 +82,15 @@ pub struct CapabilitiesDef {
     pub allow_prompt_injection: bool,
 }
 
+/// One exact expansion from a previously accepted capability snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityExpansion {
+    /// Manifest capability field (`net_connect`, `fs_write`, and so on).
+    pub name: String,
+    /// Newly requested allowlist values, or `"enabled"` for a boolean flag.
+    pub added: Vec<String>,
+}
+
 impl CapabilitiesDef {
     /// Whether a serialized capability field counts as HELD: a non-empty
     /// allowlist (`Vec` → JSON array) or an enabled flag (`bool` → JSON
@@ -141,6 +150,60 @@ impl CapabilitiesDef {
         };
         fields.get(name).is_some_and(Self::value_is_held)
     }
+
+    /// Return the exact authority this set adds beyond `approved`.
+    ///
+    /// The comparison is derived from the serialized struct so a newly-added
+    /// capability field cannot be omitted from install review by a parallel
+    /// hand-maintained field list. Boolean flags report `enabled`; allowlists
+    /// report only new values. Unknown future JSON shapes fail conservatively
+    /// by reporting the complete changed value when it is held.
+    #[must_use]
+    pub fn expansions_from(&self, approved: &Self) -> Vec<CapabilityExpansion> {
+        let serde_json::Value::Object(requested) =
+            serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
+        else {
+            return Vec::new();
+        };
+        let serde_json::Value::Object(previous) =
+            serde_json::to_value(approved).unwrap_or(serde_json::Value::Null)
+        else {
+            return Vec::new();
+        };
+
+        let mut expansions = Vec::new();
+        for (name, value) in requested {
+            let old = previous.get(&name).unwrap_or(&serde_json::Value::Null);
+            let added = match &value {
+                serde_json::Value::Bool(true) if old != &serde_json::Value::Bool(true) => {
+                    vec!["enabled".to_string()]
+                },
+                serde_json::Value::Array(values) => {
+                    let old_values = old.as_array().map_or(&[][..], Vec::as_slice);
+                    values
+                        .iter()
+                        .filter(|candidate| !old_values.contains(candidate))
+                        .map(display_value)
+                        .collect()
+                },
+                other if Self::value_is_held(other) && other != old => {
+                    vec![display_value(other)]
+                },
+                _ => Vec::new(),
+            };
+            if !added.is_empty() {
+                expansions.push(CapabilityExpansion { name, added });
+            }
+        }
+        expansions.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+        expansions
+    }
+}
+
+fn display_value(value: &serde_json::Value) -> String {
+    value
+        .as_str()
+        .map_or_else(|| value.to_string(), ToString::to_string)
 }
 
 #[cfg(test)]
@@ -234,5 +297,47 @@ mod tests {
         assert!(!caps.has(""));
         assert!(caps.has("host_process"));
         assert_eq!(caps.held_names(), vec!["host_process".to_string()]);
+    }
+
+    #[test]
+    fn expansions_report_exact_new_values_and_flags() {
+        let approved = CapabilitiesDef {
+            fs_read: vec!["/existing".into()],
+            net_connect: vec!["api.example:443".into()],
+            ..Default::default()
+        };
+        let requested = CapabilitiesDef {
+            fs_read: vec!["/existing".into(), "/new".into()],
+            net_connect: vec!["api.example:443".into()],
+            allow_prompt_injection: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            requested.expansions_from(&approved),
+            vec![
+                CapabilityExpansion {
+                    name: "allow_prompt_injection".into(),
+                    added: vec!["enabled".into()],
+                },
+                CapabilityExpansion {
+                    name: "fs_read".into(),
+                    added: vec!["/new".into()],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn reductions_do_not_count_as_expansion() {
+        let approved = CapabilitiesDef {
+            net_connect: vec!["*:*".into(), "api.example:443".into()],
+            allow_persistent: true,
+            ..Default::default()
+        };
+        let requested = CapabilitiesDef {
+            net_connect: vec!["api.example:443".into()],
+            ..Default::default()
+        };
+        assert!(requested.expansions_from(&approved).is_empty());
     }
 }

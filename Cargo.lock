@@ -417,9 +417,13 @@ name = "astrid-build"
 version = "0.10.4"
 dependencies = [
  "anyhow",
+ "astrid-core",
+ "astrid-crypto",
+ "blake3",
  "cargo_metadata",
  "clap",
  "flate2",
+ "serde",
  "serde_json",
  "tar",
  "tempfile",
@@ -506,6 +510,7 @@ dependencies = [
  "astrid-capsule",
  "astrid-config",
  "astrid-core",
+ "astrid-crypto",
  "astrid-events",
  "astrid-storage",
  "astrid-types",

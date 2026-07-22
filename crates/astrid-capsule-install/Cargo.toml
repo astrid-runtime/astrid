@@ -18,6 +18,7 @@ astrid-build = { workspace = true }
 astrid-capsule = { workspace = true }
 astrid-config = { workspace = true }
 astrid-core = { workspace = true }
+astrid-crypto = { workspace = true }
 astrid-events = { workspace = true }
 astrid-storage = { workspace = true }
 astrid-types = { workspace = true }

@@ -15,14 +15,23 @@ use astrid_core::dirs::{AstridHome, WorkspaceLayout};
 
 use astrid_core::PrincipalId;
 
+use crate::authority::{
+    AuthorityDecision, InstalledAuthority, authorize_install,
+    inspect_archive_for_principal_in_workspace,
+};
 use crate::local::{
     ExpectedCapsuleIdentity, InstallOptions, InstallOutput, InstallWorkspace,
     install_from_local_path_checked_for_principal_in_workspace,
-    install_from_local_path_for_principal_in_workspace,
+    install_from_local_path_for_principal_in_workspace, install_from_local_path_internal,
 };
 
 /// Unpack `archive_path` (a gzipped tar) into a tempdir, then install
 /// from there.
+///
+/// This is a privileged embedding API: calling it treats the caller as the
+/// local operator and records the exact artifact as operator-authorized. Code
+/// handling an untrusted user or network source should use an
+/// `*_authorized_*` variant with an explicit [`AuthorityDecision`].
 ///
 /// # Errors
 ///
@@ -109,6 +118,7 @@ pub fn unpack_and_install_for_principal_in_workspace(
             layout: workspace_layout,
         },
         None,
+        None,
     )
 }
 
@@ -163,6 +173,162 @@ pub fn unpack_and_install_checked_for_principal_with_layout(
             id: expected,
             version: expected_version,
         }),
+        None,
+    )
+}
+
+/// Unpack and install an archive only after enforcing a digest-bound authority
+/// decision.
+///
+/// # Errors
+///
+/// Returns an error for invalid provenance, an unaccepted artifact, unsafe
+/// archive content, or any ordinary installation failure.
+pub fn unpack_and_install_authorized_for_principal_with_layout(
+    archive_path: &Path,
+    home: &AstridHome,
+    options: InstallOptions,
+    target_principal: &PrincipalId,
+    decision: &AuthorityDecision,
+    workspace_layout: &WorkspaceLayout,
+) -> anyhow::Result<InstallOutput> {
+    let workspace_root = std::env::current_dir().ok();
+    unpack_and_install_authorized_for_principal_in_workspace(
+        archive_path,
+        home,
+        options,
+        target_principal,
+        workspace_root.as_deref(),
+        decision,
+        workspace_layout,
+    )
+}
+
+/// Authorized archive install using explicit workspace inputs.
+///
+/// # Errors
+///
+/// Returns an error for invalid provenance, an unaccepted artifact, unsafe
+/// archive content, or any ordinary installation failure.
+pub fn unpack_and_install_authorized_for_principal_in_workspace(
+    archive_path: &Path,
+    home: &AstridHome,
+    options: InstallOptions,
+    target_principal: &PrincipalId,
+    workspace_root: Option<&Path>,
+    decision: &AuthorityDecision,
+    workspace_layout: &WorkspaceLayout,
+) -> anyhow::Result<InstallOutput> {
+    let inspection = inspect_archive_for_principal_in_workspace(
+        archive_path,
+        home,
+        target_principal,
+        options.workspace,
+        workspace_root,
+        workspace_layout,
+    )?;
+    let authority = authorize_install(&inspection, decision)?;
+    unpack_and_install_internal(
+        archive_path,
+        home,
+        options,
+        target_principal,
+        InstallWorkspace {
+            root: workspace_root,
+            layout: workspace_layout,
+        },
+        None,
+        Some(authority),
+    )
+}
+
+/// Checked-identity variant of
+/// [`unpack_and_install_authorized_for_principal_with_layout`].
+///
+/// # Errors
+///
+/// Also fails when the inspected identity or version differs from the
+/// caller's expected released artifact.
+#[allow(clippy::too_many_arguments)]
+pub fn unpack_and_install_checked_authorized_for_principal_with_layout(
+    archive_path: &Path,
+    home: &AstridHome,
+    options: InstallOptions,
+    target_principal: &PrincipalId,
+    expected: &CapsuleId,
+    expected_version: Option<&str>,
+    decision: &AuthorityDecision,
+    workspace_layout: &WorkspaceLayout,
+) -> anyhow::Result<InstallOutput> {
+    let workspace_root = std::env::current_dir().ok();
+    unpack_and_install_checked_authorized_for_principal_in_workspace(
+        archive_path,
+        home,
+        options,
+        target_principal,
+        expected,
+        expected_version,
+        workspace_root.as_deref(),
+        decision,
+        workspace_layout,
+    )
+}
+
+/// Checked authorized archive install using explicit workspace inputs.
+///
+/// # Errors
+///
+/// Returns an error for rejected provenance, identity/version mismatch,
+/// unsafe archive content, or any ordinary installation failure.
+#[allow(clippy::too_many_arguments)]
+pub fn unpack_and_install_checked_authorized_for_principal_in_workspace(
+    archive_path: &Path,
+    home: &AstridHome,
+    options: InstallOptions,
+    target_principal: &PrincipalId,
+    expected: &CapsuleId,
+    expected_version: Option<&str>,
+    workspace_root: Option<&Path>,
+    decision: &AuthorityDecision,
+    workspace_layout: &WorkspaceLayout,
+) -> anyhow::Result<InstallOutput> {
+    let inspection = inspect_archive_for_principal_in_workspace(
+        archive_path,
+        home,
+        target_principal,
+        options.workspace,
+        workspace_root,
+        workspace_layout,
+    )?;
+    if inspection.capsule_id != *expected {
+        bail!(
+            "capsule identity mismatch: expected '{expected}', manifest declares '{}'",
+            inspection.capsule_id
+        );
+    }
+    if let Some(expected_version) = expected_version
+        && inspection.version != expected_version
+    {
+        bail!(
+            "capsule version mismatch for '{expected}': expected '{expected_version}', manifest declares '{}'",
+            inspection.version
+        );
+    }
+    let authority = authorize_install(&inspection, decision)?;
+    unpack_and_install_internal(
+        archive_path,
+        home,
+        options,
+        target_principal,
+        InstallWorkspace {
+            root: workspace_root,
+            layout: workspace_layout,
+        },
+        Some(ExpectedCapsuleIdentity {
+            id: expected,
+            version: expected_version,
+        }),
+        Some(authority),
     )
 }
 
@@ -173,6 +339,7 @@ fn unpack_and_install_internal(
     target_principal: &PrincipalId,
     workspace: InstallWorkspace<'_>,
     expected: Option<ExpectedCapsuleIdentity<'_>>,
+    installed_authority: Option<InstalledAuthority>,
 ) -> anyhow::Result<InstallOutput> {
     let tmp_dir = tempfile::tempdir().context("failed to create temp dir for unpacking")?;
     let unpack_dir = tmp_dir.path();
@@ -218,22 +385,33 @@ fn unpack_and_install_internal(
             .with_context(|| format!("Failed to unpack file: {}", out_path.display()))?;
     }
 
-    match expected {
-        Some(expected) => install_from_local_path_checked_for_principal_in_workspace(
+    match installed_authority {
+        Some(authority) => install_from_local_path_internal(
             unpack_dir,
             home,
             options,
             target_principal,
             workspace,
             expected,
+            Some(authority),
         ),
-        None => install_from_local_path_for_principal_in_workspace(
-            unpack_dir,
-            home,
-            options,
-            target_principal,
-            workspace.root,
-            workspace.layout,
-        ),
+        None => match expected {
+            Some(expected) => install_from_local_path_checked_for_principal_in_workspace(
+                unpack_dir,
+                home,
+                options,
+                target_principal,
+                workspace,
+                expected,
+            ),
+            None => install_from_local_path_for_principal_in_workspace(
+                unpack_dir,
+                home,
+                options,
+                target_principal,
+                workspace.root,
+                workspace.layout,
+            ),
+        },
     }
 }

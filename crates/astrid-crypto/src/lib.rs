@@ -42,11 +42,13 @@ pub mod prelude;
 mod error;
 mod hash;
 mod identifier;
+mod key_storage;
 mod keypair;
 mod signature;
 
 pub use error::{CryptoError, CryptoResult};
 pub use hash::ContentHash;
 pub use identifier::{IdentifierHash, PublicKeyFingerprint};
+pub use key_storage::load_or_generate_keypair;
 pub use keypair::{KeyPair, PublicKey};
 pub use signature::Signature;

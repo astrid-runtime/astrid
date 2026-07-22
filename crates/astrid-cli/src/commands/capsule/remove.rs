@@ -65,6 +65,8 @@ fn remove_capsule_from_home_for(
     // Remove the capsule directory (metadata, Capsule.toml, config).
     std::fs::remove_dir_all(&target_dir)
         .with_context(|| format!("failed to remove {}", target_dir.display()))?;
+    astrid_capsule_install::remove_installed_authority(home, &target_dir)
+        .context("failed to remove capsule authority receipt")?;
 
     // Only delete user configuration (API keys, env vars) with --purge.
     // By default, env.json is preserved so reinstall skips prompting.
@@ -388,8 +390,14 @@ mod tests {
         )
         .unwrap();
 
-        super::super::install::install_from_local_path(capsule_dir.path(), false, &home, None)
-            .expect("install should succeed");
+        super::super::install::install_from_local_path(
+            capsule_dir.path(),
+            false,
+            &home,
+            None,
+            true,
+        )
+        .expect("install should succeed");
 
         let target =
             astrid_capsule_install::resolve_target_dir(&home, "remove-test", false).unwrap();
@@ -397,6 +405,11 @@ mod tests {
 
         remove_capsule_from_home(&home, "remove-test", false, true, false).unwrap();
         assert!(!target.exists());
+        assert!(
+            astrid_capsule_install::read_installed_authority(&home, &target)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

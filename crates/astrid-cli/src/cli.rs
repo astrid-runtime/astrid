@@ -375,6 +375,10 @@ pub(crate) enum CapsuleCommands {
         /// Resolve configuration from vars, environment, or defaults without stdin.
         #[arg(short = 'y', long)]
         yes: bool,
+        /// Approve this exact foreign-signed or unsigned artifact once.
+        /// Does not trust its signer for future installs.
+        #[arg(long)]
+        approve_untrusted: bool,
         /// Pre-supply a value; prefer `ASTRID_VAR_<KEY>` for secrets (repeatable).
         #[arg(long = "var", value_name = "KEY=VALUE")]
         vars: Vec<String>,
@@ -386,6 +390,10 @@ pub(crate) enum CapsuleCommands {
         /// Update workspace capsules instead of user-level
         #[arg(long)]
         workspace: bool,
+        /// Approve each exact foreign-signed or unsigned update artifact once.
+        /// Does not trust its signer for future updates.
+        #[arg(long)]
+        approve_untrusted: bool,
     },
     /// List all installed capsules with capability metadata
     List {
@@ -583,9 +591,13 @@ pub(crate) enum DistroCommands {
 mod distro_tests;
 
 #[cfg(test)]
+#[path = "cli_capsule_tests.rs"]
+mod capsule_tests;
+
+#[cfg(test)]
 mod tests {
-    use super::{CapsuleCommands, Cli, Commands, InviteCommand};
-    use clap::{CommandFactory, Parser, Subcommand};
+    use super::{Cli, Commands, InviteCommand};
+    use clap::{CommandFactory, Parser};
     use std::collections::BTreeSet;
 
     #[test]
@@ -614,37 +626,6 @@ mod tests {
                 "{value:?} must be rejected"
             );
         }
-    }
-
-    /// Every built-in `astrid capsule` subcommand name must appear in
-    /// [`astrid_core::kernel_api::RESERVED_CAPSULE_VERBS`]. The reserved
-    /// list is what manifest parsing uses to reject a `kind = "cli"`
-    /// command that would shadow a built-in verb; if the two drift, a
-    /// capsule could declare a verb that clap silently shadows (or, worse,
-    /// the reserved list could block a name that is not actually a
-    /// built-in). This test pins them together.
-    ///
-    /// The catch-all `External` external-subcommand variant has no fixed
-    /// clap name (it matches arbitrary verbs), so it is excluded.
-    #[test]
-    fn reserved_verbs_match_clap_subcommands() {
-        let cmd = CapsuleCommands::augment_subcommands(clap::Command::new("capsule"));
-        let clap_names: Vec<String> = cmd
-            .get_subcommands()
-            .map(|s| s.get_name().to_string())
-            .collect();
-
-        for name in &clap_names {
-            assert!(
-                astrid_core::kernel_api::RESERVED_CAPSULE_VERBS.contains(&name.as_str()),
-                "built-in `astrid capsule {name}` is missing from RESERVED_CAPSULE_VERBS \
-                 (add it so a capsule cannot shadow it)"
-            );
-        }
-
-        // `help` is injected by clap, not a declared variant, but is a real
-        // reserved word — assert it is covered too.
-        assert!(astrid_core::kernel_api::RESERVED_CAPSULE_VERBS.contains(&"help"));
     }
 
     /// An unrecognised root token (and everything after it, including

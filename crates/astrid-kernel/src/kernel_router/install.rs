@@ -10,8 +10,9 @@
 //!
 //! 1. Resolve the source string to a local path (rejecting remote shapes
 //!    and `file://` is stripped to a real path).
-//! 2. Hand the path to either [`unpack_and_install`] (for `*.capsule`
-//!    archives) or [`install_from_local_path`] (for directories).
+//! 2. Hand the path to the authorized archive/directory installer. The daemon
+//!    has no human interaction channel here, so only artifacts signed by this
+//!    runtime's build identity are accepted automatically.
 //! 3. On success, content-addressing has populated `bin/<hash>.wasm` /
 //!    `wit/<hash>.wit` and the per-capsule directory now holds the
 //!    manifest + meta. Trigger
@@ -20,13 +21,11 @@
 //! 4. Serialize the [`InstallOutput`] as a flat JSON payload the
 //!    dashboard can render.
 //!
-//! [`unpack_and_install`]: astrid_capsule_install::unpack_and_install
-//! [`install_from_local_path`]: astrid_capsule_install::install_from_local_path
 //! [`InstallOutput`]: astrid_capsule_install::InstallOutput
 
 use std::sync::Arc;
 
-use astrid_capsule_install::{InstallOptions, InstallOutput, InstallPhase};
+use astrid_capsule_install::{AuthorityDecision, InstallOptions, InstallOutput, InstallPhase};
 use astrid_events::kernel_api::KernelResponse;
 
 /// Handle `KernelRequest::InstallCapsule` by delegating to the shared
@@ -96,12 +95,13 @@ pub(super) async fn handle_install_capsule(
         let workspace_layout = kernel.workspace_layout.clone();
         let workspace_root = kernel.workspace_root.clone();
         tokio::task::spawn_blocking(move || {
-            astrid_capsule_install::unpack_and_install_for_principal_in_workspace(
+            astrid_capsule_install::unpack_and_install_authorized_for_principal_in_workspace(
                 &p,
                 &h,
                 opts,
                 &principal,
                 Some(&workspace_root),
+                &AuthorityDecision::Automatic,
                 &workspace_layout,
             )
         })
@@ -113,12 +113,13 @@ pub(super) async fn handle_install_capsule(
         let workspace_layout = kernel.workspace_layout.clone();
         let workspace_root = kernel.workspace_root.clone();
         tokio::task::spawn_blocking(move || {
-            astrid_capsule_install::install_from_local_path_for_principal_in_workspace(
+            astrid_capsule_install::install_from_local_path_authorized_for_principal_in_workspace(
                 &p,
                 &h,
                 opts,
                 &principal,
                 Some(&workspace_root),
+                &AuthorityDecision::Automatic,
                 &workspace_layout,
             )
         })
