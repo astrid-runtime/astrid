@@ -194,7 +194,7 @@ sigstore-verify = { version = "=0.11.0", default-features = false, features = ["
 subtle = "2"
 surrealkv = "0.21"
 surrealdb = { version = "3.0.0-beta.3", default-features = false, features = ["kv-surrealkv", "kv-mem"] }
-syn = { version = "2", features = ["full", "visit"] }
+syn = { version = "3", features = ["full", "visit"] }
 syntect = { version = "5", default-features = false, features = ["parsing", "default-syntaxes", "default-themes", "regex-fancy"] }
 tar = "0.4"
 teloxide = { version = "0.13", default-features = false, features = ["macros", "rustls", "ctrlc_handler"] }
@@ -236,12 +236,12 @@ url = "2"
 utoipa = { version = "5", features = ["axum_extras"] }
 uuid = { version = "1.0", default-features = false, features = ["v4", "v5", "serde", "rng-getrandom"] }
 walkdir = "2.5"
-wasm-encoder = "0.253"
-wasmparser = "0.253"
-wit-component = "0.253"
-wit-parser = "0.253"
-wasmtime = { version = "46", features = ["component-model", "cranelift"] }
-wasmtime-wasi = "46"
+wasm-encoder = "0.254"
+wasmparser = "0.254"
+wit-component = "0.254"
+wit-parser = "0.254"
+wasmtime = { version = "47", features = ["component-model", "cranelift"] }
+wasmtime-wasi = "47"
 unicode-width = "0.2"
 which = "8"
 zeroize = { version = "1.8", features = ["derive"] }
