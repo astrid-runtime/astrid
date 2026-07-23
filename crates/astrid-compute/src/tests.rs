@@ -68,6 +68,41 @@ fn barrier_worker() -> WorkerArtifact {
     )
 }
 
+fn private_stack_worker() -> WorkerArtifact {
+    artifact(
+        "private-stack",
+        r#"(module
+            (memory (import "astrid_compute" "memory") 1 32 shared)
+            (global $__stack_pointer (export "__stack_pointer") (mut i32)
+                i32.const 1024)
+            (func (export "astrid_compute_stack_reserve_bytes") (result i32)
+                i32.const 512)
+            (func (export "astrid_compute_stack_stride_bytes") (result i32)
+                i32.const 256)
+            (func (export "astrid_compute_abi_version") (result i32)
+                i32.const 1)
+            (func (export "astrid_compute_run")
+                (param i32 i64 i64 i64) (result i32)
+                global.get $__stack_pointer)
+        )"#,
+    )
+}
+
+fn incomplete_private_stack_worker() -> WorkerArtifact {
+    artifact(
+        "incomplete-private-stack",
+        r#"(module
+            (memory (import "astrid_compute" "memory") 1 32 shared)
+            (global (export "__stack_pointer") (mut i32) i32.const 1024)
+            (func (export "astrid_compute_abi_version") (result i32)
+                i32.const 1)
+            (func (export "astrid_compute_run")
+                (param i32 i64 i64 i64) (result i32)
+                i32.const 0)
+        )"#,
+    )
+}
+
 fn infinite_worker() -> WorkerArtifact {
     artifact(
         "infinite",
@@ -269,6 +304,54 @@ fn deterministic_jobs_share_memory_and_preserve_queue_order() {
     assert_eq!(
         group.read(ABI_HEADER_BYTES, 4).expect("memory reads"),
         2_u32.to_le_bytes()
+    );
+}
+
+#[test]
+fn optional_worker_stack_arena_assigns_one_disjoint_slot_per_store() {
+    let runtime = ComputeRuntime::new(ComputeLedger::default(), ComputeLimits::default())
+        .expect("runtime starts");
+    let group = runtime
+        .open_group(
+            &principal("private-stacks"),
+            &private_stack_worker(),
+            request(ExecutionMode::Parallel, Parallelism::Exact(2)),
+        )
+        .expect("two private-stack workers open");
+    let descriptor = |worker_index| WorkDescriptor {
+        offset: ABI_HEADER_BYTES,
+        length: 4,
+        tag: 0,
+        worker_index: Some(worker_index),
+        fuel: Some(1_000_000),
+    };
+    let first = group.submit(descriptor(0)).expect("worker zero queues");
+    let second = group.submit(descriptor(1)).expect("worker one queues");
+    assert_eq!(
+        first.join().expect("worker zero completes").worker_status,
+        768
+    );
+    assert_eq!(
+        second.join().expect("worker one completes").worker_status,
+        1024
+    );
+}
+
+#[test]
+fn incomplete_worker_stack_extension_fails_group_admission() {
+    let runtime = ComputeRuntime::new(ComputeLedger::default(), ComputeLimits::default())
+        .expect("runtime starts");
+    let error = runtime
+        .open_group(
+            &principal("incomplete-private-stack"),
+            &incomplete_private_stack_worker(),
+            request(ExecutionMode::Parallel, Parallelism::Exact(2)),
+        )
+        .expect_err("partial stack contract must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("private-stack exports must be declared together")
     );
 }
 

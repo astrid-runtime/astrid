@@ -27,11 +27,17 @@ use astrid_core::principal::PrincipalId;
 use thiserror::Error;
 use wasmtime::{
     Caller, Config, Engine, ExternType, Linker, MemoryType, Module, SharedMemory, Store,
-    UpdateDeadline, ValType,
+    UpdateDeadline, Val, ValType,
 };
 
 /// ABI version returned by `astrid_compute_abi_version`.
 pub const COMPUTE_ABI_VERSION: i32 = 1;
+/// Optional ABI-1 export for a mutable LLVM linear-memory stack pointer.
+pub const COMPUTE_STACK_POINTER_EXPORT: &str = "__stack_pointer";
+/// Optional ABI-1 export returning the total worker-private stack arena.
+pub const COMPUTE_STACK_RESERVE_EXPORT: &str = "astrid_compute_stack_reserve_bytes";
+/// Optional ABI-1 export returning one worker's stack stride.
+pub const COMPUTE_STACK_STRIDE_EXPORT: &str = "astrid_compute_stack_stride_bytes";
 /// Bytes at the start of shared memory reserved for Astrid Compute ABI 1.
 pub const ABI_HEADER_BYTES: u64 = 64;
 const ABI_HEADER_LEN: usize = 64;
@@ -1853,6 +1859,7 @@ impl WorkerSlot {
                             "unsupported ABI version {version}"
                         )));
                     }
+                    configure_worker_stack(&instance, &mut store, index)?;
                     let run = instance
                         .get_typed_func::<(i32, i64, i64, i64), i32>(
                             &mut store,
@@ -2043,6 +2050,76 @@ impl WorkerSlot {
             let _ = handle.join();
         }
     }
+}
+
+fn configure_worker_stack(
+    instance: &wasmtime::Instance,
+    store: &mut Store<WorkerStoreState>,
+    worker_index: u32,
+) -> Result<(), ComputeError> {
+    let stack_pointer = instance.get_global(&mut *store, COMPUTE_STACK_POINTER_EXPORT);
+    let reserve = instance
+        .get_typed_func::<(), i32>(&mut *store, COMPUTE_STACK_RESERVE_EXPORT)
+        .ok();
+    let stride = instance
+        .get_typed_func::<(), i32>(&mut *store, COMPUTE_STACK_STRIDE_EXPORT)
+        .ok();
+    let (stack_pointer, reserve, stride) = match (stack_pointer, reserve, stride) {
+        (None, None, None) => return Ok(()),
+        (Some(stack_pointer), Some(reserve), Some(stride)) => (stack_pointer, reserve, stride),
+        _ => {
+            return Err(ComputeError::WorkerInvalid(
+                "worker private-stack exports must be declared together".to_owned(),
+            ));
+        },
+    };
+
+    let Val::I32(initial_top) = stack_pointer.get(&mut *store) else {
+        return Err(ComputeError::WorkerInvalid(
+            "worker stack pointer must be a mutable i32 global".to_owned(),
+        ));
+    };
+    let reserve = reserve.call(&mut *store, ()).map_err(|error| {
+        ComputeError::WorkerInvalid(format!("read worker stack reserve: {error}"))
+    })?;
+    let stride = stride.call(&mut *store, ()).map_err(|error| {
+        ComputeError::WorkerInvalid(format!("read worker stack stride: {error}"))
+    })?;
+    let initial_top = u32::try_from(initial_top).map_err(|_| {
+        ComputeError::WorkerInvalid("worker stack pointer must be positive".to_owned())
+    })?;
+    let reserve = u32::try_from(reserve).map_err(|_| {
+        ComputeError::WorkerInvalid("worker stack reserve must be positive".to_owned())
+    })?;
+    let stride = u32::try_from(stride).map_err(|_| {
+        ComputeError::WorkerInvalid("worker stack stride must be positive".to_owned())
+    })?;
+    if reserve == 0 || stride == 0 || !reserve.is_multiple_of(stride) {
+        return Err(ComputeError::WorkerInvalid(
+            "worker stack reserve must be a nonzero multiple of its stride".to_owned(),
+        ));
+    }
+    let stack_slots = reserve
+        .checked_div(stride)
+        .expect("nonzero stack stride validated");
+    if worker_index >= stack_slots {
+        return Err(ComputeError::WorkerInvalid(format!(
+            "worker index {worker_index} exceeds {stack_slots} private stack slots"
+        )));
+    }
+    let arena_start = initial_top.checked_sub(reserve).ok_or_else(|| {
+        ComputeError::WorkerInvalid("worker stack reserve begins below linear memory".to_owned())
+    })?;
+    let slot_top = worker_index
+        .checked_add(1)
+        .and_then(|slot| slot.checked_mul(stride))
+        .and_then(|offset| arena_start.checked_add(offset))
+        .ok_or_else(|| ComputeError::WorkerInvalid("worker stack slot overflow".to_owned()))?;
+    stack_pointer
+        .set(&mut *store, Val::I32(slot_top.cast_signed()))
+        .map_err(|error| {
+            ComputeError::WorkerInvalid(format!("relocate worker stack pointer: {error}"))
+        })
 }
 
 struct AccountingState {
