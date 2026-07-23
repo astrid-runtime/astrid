@@ -198,6 +198,7 @@ pub fn peer_is_current_user(stream: &LocalStream) -> io::Result<bool> {
 #[cfg(unix)]
 mod backend {
     use std::io;
+    use std::os::unix::fs::FileTypeExt;
     use std::path::Path;
 
     use super::{ConnectOutcome, LocalListener, LocalReadHalf, LocalStream, LocalWriteHalf};
@@ -240,8 +241,8 @@ mod backend {
     }
 
     pub(super) fn endpoint_is_present(path: &Path) -> io::Result<bool> {
-        match std::fs::metadata(path) {
-            Ok(_) => Ok(true),
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) => Ok(metadata.file_type().is_socket()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(error) => Err(error),
         }
@@ -293,7 +294,11 @@ mod backend {
             },
         };
 
-        if metadata.is_some_and(|metadata| metadata.file_type().is_symlink()) {
+        let Some(metadata) = metadata else {
+            return Ok(());
+        };
+
+        if metadata.file_type().is_symlink() {
             remove_endpoint(path).map_err(|error| {
                 io::Error::other(format!(
                     "Failed to remove symlink at socket path {}: {error}",
@@ -483,6 +488,24 @@ mod tests {
 
         let replacement = bind(&endpoint).expect("stale endpoint should be replaced");
         drop(replacement);
+        remove_endpoint(&endpoint).unwrap();
+    }
+
+    #[tokio::test]
+    async fn endpoint_presence_requires_a_socket_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let regular_file = directory.path().join("regular");
+        std::fs::write(&regular_file, "not a socket").unwrap();
+        assert!(!endpoint_is_present(&regular_file).unwrap());
+
+        let symlink = directory.path().join("symlink.sock");
+        std::os::unix::fs::symlink(&regular_file, &symlink).unwrap();
+        assert!(!endpoint_is_present(&symlink).unwrap());
+
+        let endpoint = directory.path().join("present.sock");
+        let listener = bind(&endpoint).unwrap();
+        assert!(endpoint_is_present(&endpoint).unwrap());
+        drop(listener);
         remove_endpoint(&endpoint).unwrap();
     }
 
