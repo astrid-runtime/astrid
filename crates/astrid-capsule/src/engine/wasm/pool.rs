@@ -299,11 +299,16 @@ impl CapsuleInstancePool {
         let pooled = match warm {
             Some(pooled) => pooled,
             None => {
-                if !self.allow_grow {
-                    // Unreachable for a size-1 carve-out (its instance is
-                    // always warm); fail closed rather than mint a second Store.
+                if self.total_instances.load(Ordering::Acquire) >= self.max {
+                    // Every admitted Store is already leased or being built.
+                    // The permit normally makes this unreachable; keep the
+                    // explicit check fail-closed around instance retirement.
                     return None;
                 }
+                // `allow_grow == false` normally means the one warm Store is
+                // always present. A trap may retire it, reducing the total to
+                // zero; rebuilding that replacement is not pool growth and
+                // must be allowed or one bad call bricks the capsule forever.
                 self.total_instances.fetch_add(1, Ordering::AcqRel);
                 match self.builder.build().await {
                     Ok(pooled) => pooled,
@@ -318,6 +323,7 @@ impl CapsuleInstancePool {
         Some(PoolCheckout {
             pooled: Some(pooled),
             available: Arc::clone(&self.available),
+            total_instances: Arc::clone(&self.total_instances),
             reset_resources_on_return: self.reset_resources_on_return,
             affinity_claim: None,
             affine_claims: Arc::clone(&self.affine_claims),
@@ -418,6 +424,7 @@ impl CapsuleInstancePool {
             return Some(PoolCheckout {
                 pooled: Some(pooled),
                 available: Arc::clone(&self.available),
+                total_instances: Arc::clone(&self.total_instances),
                 reset_resources_on_return: self.reset_resources_on_return,
                 affinity_claim: Some(principal.clone()),
                 affine_claims: Arc::clone(&self.affine_claims),
@@ -503,6 +510,7 @@ fn drain_excess<T>(queue: &mut VecDeque<T>, min_idle: usize) -> Vec<T> {
 pub(super) struct PoolCheckout {
     pooled: Option<PooledInstance>,
     available: Arc<Mutex<VecDeque<PooledInstance>>>,
+    total_instances: Arc<AtomicUsize>,
     /// Mirrors [`CapsuleInstancePool::reset_resources_on_return`]; copied at
     /// checkout so the drop path needs no back-pointer to the pool.
     reset_resources_on_return: bool,
@@ -525,6 +533,30 @@ impl PoolCheckout {
     /// call.
     pub(super) fn store_mut(&mut self) -> &mut Store<HostState> {
         &mut self.pooled.as_mut().expect("active checkout").store
+    }
+
+    /// Permanently discard a trapped or otherwise non-reusable component
+    /// instance instead of returning it to the warm pool.
+    ///
+    /// Wasmtime component instances cannot be entered again after some traps
+    /// (including fuel exhaustion). Retaining one would poison every later
+    /// invocation for the same principal. Durable capsule state lives outside
+    /// the Store, so retiring this evictable execution cache is the safe
+    /// recovery boundary.
+    pub(super) fn retire(&mut self) {
+        let Some(mut pooled) = self.pooled.take() else {
+            return;
+        };
+        clear_on_return(pooled.store.data_mut(), self.reset_resources_on_return);
+        self.total_instances.fetch_sub(1, Ordering::AcqRel);
+        if let Some(principal) = self.affinity_claim.take() {
+            self.affine_claims
+                .lock()
+                .expect("affine claim mutex poisoned")
+                .remove(&principal);
+            self.affine_changed.notify_waiters();
+        }
+        drop(pooled);
     }
 
     #[cfg(test)]
@@ -941,6 +973,59 @@ mod tests {
             .expect("unblocks on return")
             .expect("same instance again");
         drop(c2);
+        cancel.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retired_affine_instance_is_rebuilt_for_the_same_principal() {
+        let cancel = CancellationToken::new();
+        let pool = empty_pool_with_mode(1, 1, true, &cancel).await;
+        let principal = PrincipalId::new("durable-agent").expect("principal");
+
+        let mut trapped = pool.checkout(&principal).await.expect("initial Store");
+        trapped.retire();
+        drop(trapped);
+        assert_eq!(pool.total_instances.load(Ordering::Acquire), 0);
+        assert!(pool.available.lock().expect("pool lock").is_empty());
+        assert!(
+            !pool
+                .affine_claims
+                .lock()
+                .expect("claim lock")
+                .contains(&principal)
+        );
+
+        let replacement =
+            tokio::time::timeout(Duration::from_millis(1000), pool.checkout(&principal))
+                .await
+                .expect("retirement must not wedge the affine waiter")
+                .expect("a fresh replacement Store");
+        assert_eq!(replacement.affinity(), Some(&principal));
+        assert_eq!(pool.total_instances.load(Ordering::Acquire), 1);
+        drop(replacement);
+        cancel.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retired_non_growable_free_instance_is_replaced_not_multiplied() {
+        let cancel = CancellationToken::new();
+        let pool = empty_pool(1, 1, &cancel).await;
+        let principal = PrincipalId::new("caller").expect("principal");
+
+        let mut trapped = pool.checkout(&principal).await.expect("initial Store");
+        trapped.retire();
+        drop(trapped);
+        assert_eq!(pool.total_instances.load(Ordering::Acquire), 0);
+
+        let replacement = pool.checkout(&principal).await.expect("replacement Store");
+        assert_eq!(pool.total_instances.load(Ordering::Acquire), 1);
+        let blocked =
+            tokio::time::timeout(Duration::from_millis(100), pool.checkout(&principal)).await;
+        assert!(
+            blocked.is_err(),
+            "replacement must not bypass the size-one permit"
+        );
+        drop(replacement);
         cancel.cancel();
     }
 

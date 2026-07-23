@@ -42,6 +42,12 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Fixed
 
+- **Long capsule invocations no longer inherit a hidden ten-billion-fuel
+  ceiling.** Interceptor fuel now derives from the invoking principal's
+  configured CPU rate and timeout; a zero rate or resource exemption is
+  genuinely unlimited while the wall-time deadline remains enforced. A
+  trapped component Store is retired and lazily rebuilt instead of poisoning
+  every later invocation for the same principal.
 - **Stateful compute-worker capsules retain one isolated Store per active
   principal.** Same-principal calls serialize on their Store-local resource
   table, unrelated principals can execute concurrently up to the ordinary
