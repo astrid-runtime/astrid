@@ -7,6 +7,8 @@ on:
       - '**.rs'
       - 'scripts/release_manifest.py'
       - 'scripts/test_release_manifest.py'
+      - 'scripts/check_glibc.py'
+      - 'scripts/test_check_glibc.py'
       - 'scripts/release_publication.py'
       - 'scripts/test_release_publication.py'
       - 'scripts/release_draft_recovery.py'
@@ -30,6 +32,8 @@ on:
       - '**.rs'
       - 'scripts/release_manifest.py'
       - 'scripts/test_release_manifest.py'
+      - 'scripts/check_glibc.py'
+      - 'scripts/test_check_glibc.py'
       - 'scripts/release_publication.py'
       - 'scripts/test_release_publication.py'
       - 'scripts/release_draft_recovery.py'
@@ -56,6 +60,73 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  linux-release-smoke:
+    name: Linux release smoke (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+
+      - name: Build against the Linux release baseline
+        env:
+          TARGET: ${{ matrix.target }}
+          # Keep this digest synchronized with release.yml.
+          RUST_BUILD_IMAGE: docker.io/library/rust@sha256:646e8ceea789b00c5cfa339816a3ed44940dbf1651dc167b78f3c0aefcae0025
+        run: |
+          SOURCE_SHA=$(git rev-parse --short=12 HEAD)
+          docker run --rm \
+            --env CARGO_TERM_COLOR=always \
+            --env SOURCE_SHA="$SOURCE_SHA" \
+            --env TARGET \
+            --volume "$PWD:/workspace" \
+            --workdir /workspace \
+            "$RUST_BUILD_IMAGE" \
+            bash -ceu '
+              packages=(cmake)
+              if [[ "$TARGET" == aarch64-unknown-linux-gnu ]]; then
+                rustup target add "$TARGET"
+                packages+=(gcc-aarch64-linux-gnu libc6-dev-arm64-cross)
+                export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+              fi
+              apt-get update
+              apt-get install -y --no-install-recommends "${packages[@]}"
+              git config --global --add safe.directory /workspace
+              [[ "$(git rev-parse --short=12 HEAD)" == "$SOURCE_SHA" ]]
+              cargo build \
+                --release \
+                --locked \
+                --target "$TARGET" \
+                --target-dir target/glibc-2.31 \
+                -p astrid
+            '
+
+      - name: Enforce the Linux glibc compatibility ceiling
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          BINARY_ROOT="target/glibc-2.31/${TARGET}/release"
+          python3 scripts/check_glibc.py --max-version 2.34 \
+            "$BINARY_ROOT/astrid" \
+            "$BINARY_ROOT/astrid-daemon" \
+            "$BINARY_ROOT/astrid-build" \
+            "$BINARY_ROOT/astrid-emit"
+
   check:
     name: Check
     runs-on: ubuntu-latest
@@ -90,6 +161,7 @@ jobs:
       - name: Test release manifest contract
         run: |
           python3 scripts/test_release_manifest.py
+          python3 scripts/test_check_glibc.py
           python3 scripts/test_release_publication.py
           python3 scripts/test_release_draft_recovery.py
           python3 scripts/test_crate_publication.py
