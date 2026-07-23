@@ -1,6 +1,7 @@
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::info;
@@ -707,6 +708,73 @@ const MAX_NO_YIELD_WINDOWS: u32 = 3;
 /// budgets are derived from the principal's configured fuel rate and timeout.
 const UNBOUNDED_FUEL_SEED: u64 = u64::MAX;
 
+/// Refill cadence for an interceptor whose principal CPU policy is unlimited.
+///
+/// Wasmtime's fuel tank is still a finite `u64`, even when Astrid policy says
+/// "unlimited". A long-lived controller can therefore eventually drain
+/// `u64::MAX` and trap despite having no operator CPU ceiling. Replenishing at
+/// the existing epoch boundary makes unlimited a durable policy state instead
+/// of an extremely large but ultimately finite constant. The callback also
+/// yields the async executor and retains the principal's wall-time deadline.
+const UNBOUNDED_FUEL_REFILL_TICKS: u64 = 50;
+
+#[derive(Debug, Clone)]
+struct InvocationFuelMeter {
+    seed: u64,
+    completed_intervals: Arc<AtomicU64>,
+}
+
+impl InvocationFuelMeter {
+    fn consumed(&self, remaining: u64) -> u64 {
+        self.completed_intervals
+            .load(Ordering::Relaxed)
+            .saturating_add(self.seed.saturating_sub(remaining))
+    }
+}
+
+fn saturating_atomic_add(counter: &AtomicU64, value: u64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_add(value))
+    });
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnboundedFuelDeadline {
+    RefillAndYield(u64),
+    Interrupt,
+}
+
+#[derive(Debug)]
+struct UnboundedFuelRefill {
+    ticks_left: u64,
+    interval: u64,
+    completed_intervals: Arc<AtomicU64>,
+}
+
+impl UnboundedFuelRefill {
+    fn new(timeout_ticks: u64, completed_intervals: Arc<AtomicU64>) -> Self {
+        Self {
+            ticks_left: timeout_ticks,
+            interval: UNBOUNDED_FUEL_REFILL_TICKS.min(timeout_ticks),
+            completed_intervals,
+        }
+    }
+
+    fn deadline(&mut self, remaining_fuel: u64) -> UnboundedFuelDeadline {
+        if self.ticks_left <= self.interval {
+            // The final reservoir stays intact so the post-call meter accounts
+            // it exactly once while the epoch interrupt propagates.
+            return UnboundedFuelDeadline::Interrupt;
+        }
+        saturating_atomic_add(
+            &self.completed_intervals,
+            UNBOUNDED_FUEL_SEED.saturating_sub(remaining_fuel),
+        );
+        self.ticks_left -= self.interval;
+        UnboundedFuelDeadline::RefillAndYield(self.interval.min(self.ticks_left))
+    }
+}
+
 /// Derive one interceptor's total fuel allowance from existing principal
 /// policy instead of imposing a hidden fixed cap.
 ///
@@ -724,6 +792,50 @@ fn interceptor_fuel_budget(
     } else {
         rate.saturating_mul(profile.quotas.max_timeout_secs.max(1))
     }
+}
+
+/// Seed and arm one interceptor Store from the applied principal policy.
+///
+/// Finite CPU policies retain one deterministic fuel reservoir and the
+/// wall-time epoch interrupt. An unlimited policy gets a periodic epoch
+/// callback which accounts the completed reservoir, refills it, cooperatively
+/// yields, and decrements the same wall-time allowance. This is necessary
+/// because Wasmtime exposes no literal infinite-fuel mode.
+fn configure_invocation_fuel<T: Send + 'static>(
+    store: &mut Store<T>,
+    fuel_budget: u64,
+    timeout_ticks: u64,
+) -> CapsuleResult<InvocationFuelMeter> {
+    let timeout_ticks = timeout_ticks.max(1);
+    store.set_fuel(fuel_budget).map_err(|error| {
+        CapsuleError::WasmError(format!("failed to seed invocation fuel: {error}"))
+    })?;
+
+    let completed_intervals = Arc::new(AtomicU64::new(0));
+    if fuel_budget == UNBOUNDED_FUEL_SEED {
+        let mut refill = UnboundedFuelRefill::new(timeout_ticks, Arc::clone(&completed_intervals));
+        store.set_epoch_deadline(refill.interval);
+        store.epoch_deadline_callback(move |mut context| {
+            let remaining = context.get_fuel().unwrap_or(0);
+            match refill.deadline(remaining) {
+                UnboundedFuelDeadline::Interrupt => Ok(wasmtime::UpdateDeadline::Interrupt),
+                UnboundedFuelDeadline::RefillAndYield(next_ticks) => {
+                    context.set_fuel(UNBOUNDED_FUEL_SEED)?;
+                    Ok(wasmtime::UpdateDeadline::Yield(next_ticks))
+                },
+            }
+        });
+    } else {
+        store.set_epoch_deadline(timeout_ticks);
+        // Replace any refill callback retained from this pooled Store's prior
+        // unlimited lease. A finite principal must never inherit replenishment.
+        store.epoch_deadline_callback(|_context| Ok(wasmtime::UpdateDeadline::Interrupt));
+    }
+
+    Ok(InvocationFuelMeter {
+        seed: fuel_budget,
+        completed_intervals,
+    })
 }
 
 /// Register every Astrid host interface on `linker`. Single source of
@@ -2973,24 +3085,34 @@ impl ExecutionEngine for WasmEngine {
             });
         let invocation_fuel_budget =
             interceptor_fuel_budget(&applied_profile, invocation_resource_exempt);
+        let invocation_timeout_ticks = if is_daemon {
+            EFFECTIVELY_UNBOUNDED_EPOCH_TICKS
+        } else {
+            applied_profile.quotas.max_timeout_secs.saturating_mul(1000)
+                / EPOCH_TICK_INTERVAL.as_millis() as u64
+        };
+        tracing::debug!(
+            principal = %invoking_principal,
+            capsule = %self.manifest.package.name,
+            action,
+            fuel_budget = invocation_fuel_budget,
+            timeout_ticks = invocation_timeout_ticks,
+            resource_exempt = invocation_resource_exempt,
+            "configuring interceptor execution envelope"
+        );
+        let invocation_fuel_meter;
         let result: CapsuleResult<HookTriggerResult> = {
             let s = checkout.store_mut();
             // ── Phase 1: SET ──────────────────────────────────────
-            if !is_daemon {
-                let deadline = applied_profile.quotas.max_timeout_secs.saturating_mul(1000)
-                    / EPOCH_TICK_INTERVAL.as_millis() as u64;
-                s.set_epoch_deadline(deadline);
-            }
-
             // Per-invocation CPU: fuel is engine-wide, so re-seed the leased
             // Store to the budget derived from this principal's fuel-rate and
             // timeout policy. A zero rate deliberately seeds `u64::MAX`; there
-            // is no hidden ten-billion-fuel cap beneath an operator's unlimited
-            // setting. The known seed still makes `seed - get_fuel()` the exact
-            // deterministic count for this invocation.
-            s.set_fuel(invocation_fuel_budget).map_err(|error| {
-                CapsuleError::WasmError(format!("failed to seed invocation fuel: {error}"))
-            })?;
+            // is no hidden ten-billion-fuel cap beneath an operator's
+            // unlimited setting. Because even `u64::MAX` is finite, unlimited
+            // invocations periodically account and replenish that reservoir
+            // at an epoch yield until their wall-time deadline.
+            invocation_fuel_meter =
+                configure_invocation_fuel(s, invocation_fuel_budget, invocation_timeout_ticks)?;
 
             {
                 let state = s.data_mut();
@@ -3072,7 +3194,7 @@ impl ExecutionEngine for WasmEngine {
         // ENFORCED by the epoch interrupt mechanism, not fuel; windowed
         // deny/throttle on this aggregate is the deliberate follow-up).
         let fuel_after = checkout.store_mut().get_fuel().unwrap_or(0);
-        let fuel_used = invocation_fuel_budget.saturating_sub(fuel_after);
+        let fuel_used = invocation_fuel_meter.consumed(fuel_after);
         self.fuel_ledger.charge(&invoking_principal, fuel_used);
         // Feed this call's fuel into the CPU-rate window stamped at the moment
         // the burn FINISHED, not `invoke_start`. The gate at the top reads the
@@ -4278,6 +4400,104 @@ mod tests {
         assert_eq!(
             interceptor_fuel_budget(&profile, false),
             UNBOUNDED_FUEL_SEED
+        );
+    }
+
+    #[test]
+    fn unlimited_interceptor_refills_across_epoch_windows_and_counts_once() {
+        let completed = Arc::new(AtomicU64::new(0));
+        let meter = InvocationFuelMeter {
+            seed: UNBOUNDED_FUEL_SEED,
+            completed_intervals: Arc::clone(&completed),
+        };
+        let mut refill = UnboundedFuelRefill::new(125, completed);
+
+        assert_eq!(refill.interval, 50);
+        assert_eq!(
+            refill.deadline(UNBOUNDED_FUEL_SEED - 10),
+            UnboundedFuelDeadline::RefillAndYield(50)
+        );
+        assert_eq!(
+            refill.deadline(UNBOUNDED_FUEL_SEED - 20),
+            UnboundedFuelDeadline::RefillAndYield(25)
+        );
+        assert_eq!(
+            refill.deadline(UNBOUNDED_FUEL_SEED - 30),
+            UnboundedFuelDeadline::Interrupt,
+            "the principal wall-time deadline still terminates unlimited CPU"
+        );
+        assert_eq!(
+            meter.consumed(UNBOUNDED_FUEL_SEED - 30),
+            60,
+            "two replenished intervals and the final reservoir are each counted once"
+        );
+    }
+
+    #[test]
+    fn unlimited_interceptor_refill_accounting_saturates() {
+        let completed = Arc::new(AtomicU64::new(u64::MAX - 5));
+        let meter = InvocationFuelMeter {
+            seed: UNBOUNDED_FUEL_SEED,
+            completed_intervals: Arc::clone(&completed),
+        };
+        let mut refill = UnboundedFuelRefill::new(100, completed);
+
+        assert_eq!(
+            refill.deadline(UNBOUNDED_FUEL_SEED - 10),
+            UnboundedFuelDeadline::RefillAndYield(50)
+        );
+        assert_eq!(meter.consumed(UNBOUNDED_FUEL_SEED - 1), u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn unlimited_interceptor_epoch_callback_refills_a_real_store() {
+        let mut config = wasmtime::Config::new();
+        config.consume_fuel(true);
+        config.epoch_interruption(true);
+        let engine = wasmtime::Engine::new(&config).expect("engine");
+        let module = wasmtime::Module::new(
+            &engine,
+            r#"(module
+                (func (export "burn") (param i32)
+                    (block $done
+                        (loop $again
+                            local.get 0
+                            i32.eqz
+                            br_if $done
+                            local.get 0
+                            i32.const 1
+                            i32.sub
+                            local.set 0
+                            br $again))))"#,
+        )
+        .expect("module");
+        let mut store = wasmtime::Store::new(&engine, ());
+        let meter = configure_invocation_fuel(&mut store, UNBOUNDED_FUEL_SEED, 10_000)
+            .expect("configure unlimited fuel");
+        let instance = wasmtime::Instance::new_async(&mut store, &module, &[])
+            .await
+            .expect("instance");
+        let burn = instance
+            .get_typed_func::<i32, ()>(&mut store, "burn")
+            .expect("burn");
+
+        burn.call_async(&mut store, 10_000)
+            .await
+            .expect("first burn");
+        let ticker = spawn_epoch_ticker_every(&engine, std::time::Duration::from_millis(1));
+        burn.call_async(&mut store, 200_000_000)
+            .await
+            .expect("burn after epoch refill");
+        drop(ticker);
+        let after_refill = store.get_fuel().expect("fuel after refill");
+
+        assert!(
+            meter.completed_intervals.load(Ordering::Relaxed) > 0,
+            "the epoch callback must replenish and account the real Wasmtime Store"
+        );
+        assert!(
+            meter.consumed(after_refill) > 0,
+            "fuel burned before and after replenishment remains observable"
         );
     }
 
