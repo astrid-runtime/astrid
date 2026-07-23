@@ -108,14 +108,38 @@ fn load_capsule_manifest(
     capsule: &CapsuleId,
 ) -> Result<Option<CapsuleManifest>> {
     let home = AstridHome::resolve().context("Failed to resolve Astrid home directory")?;
-    let workspace_root =
-        std::env::current_dir().context("Failed to resolve current workspace directory")?;
-    load_capsule_manifest_from_home_in_workspace(
+    load_capsule_manifest_with_workspace_resolver(
         &home,
         principal,
         capsule,
-        Some(&workspace_root),
         crate::workspace_layout::current(),
+        || std::env::current_dir().context("Failed to resolve current workspace directory"),
+    )
+}
+
+fn load_capsule_manifest_with_workspace_resolver(
+    home: &AstridHome,
+    principal: &PrincipalId,
+    capsule: &CapsuleId,
+    workspace_layout: &WorkspaceLayout,
+    resolve_workspace_root: impl FnOnce() -> Result<PathBuf>,
+) -> Result<Option<CapsuleManifest>> {
+    if let Some(manifest) = load_capsule_manifest_from_home_in_workspace(
+        home,
+        principal,
+        capsule,
+        None,
+        workspace_layout,
+    )? {
+        return Ok(Some(manifest));
+    }
+    let workspace_root = resolve_workspace_root()?;
+    load_capsule_manifest_from_home_in_workspace(
+        home,
+        principal,
+        capsule,
+        Some(&workspace_root),
+        workspace_layout,
     )
 }
 
@@ -509,16 +533,22 @@ fn run_list(args: &ListArgs) -> Result<ExitCode> {
             let Some(stem) = file_name.strip_suffix(".env.json") else {
                 continue;
             };
-            let capsule = CapsuleId::new(stem)
-                .with_context(|| format!("Invalid capsule env file name: {file_name}"))?;
             let env = read_env(&p)?;
             // Cross-reference the manifest if this is a capsule-
             // scoped file (stem matches an installed capsule name).
+            // `default.env.json` is the ungated shared-config sentinel,
+            // not a capsule, so it deliberately has no manifest.
             // I/O errors propagate — a stale-on-disk env file paired
             // with a manifest read failure must not get silently
             // classified as `EnvJson` (non-secret) when it might be a
             // legacy plaintext secret.
-            let manifest = load_capsule_manifest(&principal, &capsule)?;
+            let manifest = if stem == "default" {
+                None
+            } else {
+                let capsule = CapsuleId::new(stem)
+                    .with_context(|| format!("Invalid capsule env file name: {file_name}"))?;
+                load_capsule_manifest(&principal, &capsule)?
+            };
             for (k, value) in &env {
                 let is_declared_secret = manifest
                     .as_ref()
@@ -732,6 +762,36 @@ mod tests {
             manifest.env["api_key"].description.as_deref(),
             Some("alice manifest")
         );
+    }
+
+    #[test]
+    fn principal_manifest_lookup_does_not_require_a_workspace_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(root.path());
+        let alice = PrincipalId::new("alice").unwrap();
+        let capsule_dir = home.principal_home(&alice).capsules_dir().join("provider");
+        fs::create_dir_all(&capsule_dir).unwrap();
+        fs::write(
+            capsule_dir.join("Capsule.toml"),
+            r#"
+            [package]
+            name = "provider"
+            version = "1.0.0"
+            "#,
+        )
+        .unwrap();
+
+        let manifest = load_capsule_manifest_with_workspace_resolver(
+            &home,
+            &alice,
+            &provider_id(),
+            &WorkspaceLayout::default(),
+            || anyhow::bail!("workspace resolution must remain lazy"),
+        )
+        .unwrap()
+        .expect("principal manifest");
+
+        assert_eq!(manifest.package.name, "provider");
     }
 
     #[test]
