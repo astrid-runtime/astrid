@@ -21,6 +21,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Fixed
 
+- **Gateway env schemas now use the authenticated principal's capsule
+  registry.** Schema reads no longer fall back to `default`, so non-default
+  installs are configurable and a same-named default capsule cannot supply the
+  wrong field contract. Closes #1327.
 - **Stable crates publication installs its authenticated-hash prerequisite.**
   The protected publisher installs the pinned `b3sum` binary before validating
   the exact dev candidate, so BLAKE3 release metadata checks run before any
