@@ -119,7 +119,7 @@ fn kv_prefixed_key_format() {
 }
 
 #[test]
-fn read_through_migrates_legacy_reads_but_writes_only_primary() {
+fn read_through_exists_migrates_legacy_value() {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -135,11 +135,36 @@ fn read_through_migrates_legacy_reads_but_writes_only_primary() {
     let store = ReadThroughSecretStore::new(primary.clone(), legacy.clone());
 
     assert!(store.exists("old").unwrap());
+    assert_eq!(
+        primary.get("old").unwrap().as_deref(),
+        Some("legacy-value"),
+        "observing a legacy value through exists copies it into the primary scope"
+    );
+}
+
+#[test]
+fn read_through_get_migrates_legacy_value_but_writes_only_primary() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let backing = Arc::new(MemoryKvStore::new());
+    let primary: Arc<dyn SecretStore> = Arc::new(KvSecretStore::new(
+        ScopedKvStore::new(backing.clone(), "primary").unwrap(),
+        rt.handle().clone(),
+    ));
+    let legacy: Arc<dyn SecretStore> = Arc::new(KvSecretStore::new(
+        ScopedKvStore::new(backing, "legacy").unwrap(),
+        rt.handle().clone(),
+    ));
+    legacy.set("old", "legacy-value").unwrap();
+    let store = ReadThroughSecretStore::new(primary.clone(), legacy.clone());
+
     assert_eq!(store.get("old").unwrap().as_deref(), Some("legacy-value"));
     assert_eq!(
         primary.get("old").unwrap().as_deref(),
         Some("legacy-value"),
-        "a successful legacy read is copied into the primary scope"
+        "reading a legacy value copies it into the primary scope"
     );
 
     store.set("new", "primary-value").unwrap();

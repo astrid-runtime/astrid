@@ -169,10 +169,11 @@ impl SecretStore for DenySecretStore {
 /// Secret-store compatibility bridge that reads a legacy scope only when the
 /// primary scope has no value.
 ///
-/// Writes always go to `primary`. A legacy value read through [`get`](Self::get)
-/// is copied into `primary` on a best-effort basis, while the legacy copy is
-/// retained for older binaries. Deletes target both stores so a removed legacy
-/// value cannot reappear on the next read.
+/// Writes always go to `primary`. A legacy value observed through
+/// [`exists`](Self::exists) or [`get`](Self::get) is copied into `primary` on a
+/// best-effort basis, while the legacy copy is retained for older binaries.
+/// Deletes target both stores so a removed legacy value cannot reappear on the
+/// next read.
 ///
 /// This type does not decide which principals may use a legacy scope. Callers
 /// must construct it only at the compatibility boundary that owns that policy.

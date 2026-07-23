@@ -28,8 +28,6 @@ install_adversarial_capsule_with_lifecycle_elicit() {
 
   local principal="e2e-lifecycle-home"
   local principal_home="$ASTRID_HOME/home/$principal"
-  local workspace
-  workspace="$(mktemp -d "${TMPDIR:-/tmp}/astrid-lifecycle-workspace.XXXXXX")"
 
   note "checking fresh nondefault workspace lifecycle home mount"
   run_cli agent create "$principal" -y
@@ -37,7 +35,9 @@ install_adversarial_capsule_with_lifecycle_elicit() {
     || fail "refusing to remove lifecycle home outside the generated ASTRID_HOME"
   rm -rf "$principal_home"
   if ! (
-    cd "$workspace"
+    # Workspace-scoped commands must use the same workspace selection as the
+    # running daemon. The harness daemon starts from CORE_DIR.
+    cd "$CORE_DIR"
     printf 'runtime-lifecycle-ok\n' \
       | ASTRID_PRINCIPAL="$principal" "$CORE_DIR/target/debug/astrid" \
         --principal "$principal" capsule install \
@@ -52,7 +52,11 @@ install_adversarial_capsule_with_lifecycle_elicit() {
     || fail "workspace lifecycle guest did not mount the fresh target principal home"
   [[ "$(cat "$principal_home/adversarial-lifecycle-home-mounted")" == "mounted" ]] \
     || fail "workspace lifecycle guest wrote an unexpected home marker"
-  [[ "$workspace" == "${TMPDIR:-/tmp}"/astrid-lifecycle-workspace.* ]] \
-    || fail "refusing to remove lifecycle workspace outside the temporary root"
-  rm -rf "$workspace"
+  (
+    cd "$CORE_DIR"
+    ASTRID_PRINCIPAL="$principal" "$CORE_DIR/target/debug/astrid" \
+      --principal "$principal" capsule remove astrid-capsule-adversarial \
+      --workspace --force
+  ) > "$ARTIFACTS/adversarial-workspace-remove.out" \
+    2> "$ARTIFACTS/adversarial-workspace-remove.err"
 }
