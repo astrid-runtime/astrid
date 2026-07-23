@@ -41,11 +41,11 @@ mod connection_tracker_tests;
 #[cfg(test)]
 mod test_util;
 
-/// Spawns background tasks for the kernel management API and connection tracking.
+/// Spawns the kernel management API and registers connection tracking.
 ///
-/// Two listeners:
-/// 1. `astrid.v1.request.*` - handles management commands (list capsules, reload, etc.)
-/// 2. `client.v1.*` - tracks the active connection count per principal.
+/// Two consumers:
+/// 1. `astrid.v1.request.*` - an async listener for management commands.
+/// 2. `client.v1.*` - a synchronous observer for the active connection count.
 ///
 /// Uplink capsules (e.g. the CLI proxy) publish `client.v1.connect` /
 /// `client.v1.disconnect` carrying the authenticated principal as a socket is
@@ -55,8 +55,9 @@ mod test_util;
 /// `Disconnect` that native producers emit — see [`connection_signal`].
 #[must_use]
 pub(crate) fn spawn_kernel_router(kernel: Arc<crate::Kernel>) -> astrid_runtime::JoinHandle<()> {
-    // Spawn the connection tracker as a sibling task.
-    drop(spawn_connection_tracker(Arc::clone(&kernel)));
+    // Lease accounting is synchronous so bounded broadcast lag cannot hide a
+    // live client and trigger premature ephemeral shutdown.
+    register_connection_tracker(&kernel);
     // Spawn the Layer 6 admin dispatcher as a sibling task (issue #672).
     drop(admin::spawn_admin_router(Arc::clone(&kernel)));
 
@@ -187,24 +188,22 @@ fn connection_signal(topic: &str, payload: &IpcPayload) -> Option<ConnectionSign
     }
 }
 
-/// Tracks client connection lifecycle events.
+/// Register non-lossy client connection lifecycle accounting.
 ///
-/// Listens on `client.v1.*` topics and adjusts the per-principal connection
-/// count via [`connection_signal`] (typed payload or topic).
-fn spawn_connection_tracker(kernel: Arc<crate::Kernel>) -> astrid_runtime::JoinHandle<()> {
-    // Broadcast-path subscriber. See `spawn_kernel_router` for the
-    // rationale on staying on the untargeted subscribe path.
-    let mut receiver = kernel
+/// Connection leases control ephemeral process lifetime, so they cannot ride
+/// the bounded broadcast receiver used for ordinary event consumers. This
+/// synchronous observer performs only atomic bookkeeping and captures a weak
+/// kernel reference to avoid an `EventBus` → `Kernel` → `EventBus` cycle.
+fn register_connection_tracker(kernel: &Arc<crate::Kernel>) {
+    let weak_kernel = Arc::downgrade(kernel);
+    kernel
         .event_bus
-        .subscribe_topic_as("client.v1.*", "connection_tracker");
-
-    astrid_runtime::spawn(async move {
-        while let Some(event) = receiver.recv().await {
-            let astrid_events::AstridEvent::Ipc { message, .. } = &*event else {
-                continue;
+        .observe_permanently("connection_tracker", move |event| {
+            let astrid_events::AstridEvent::Ipc { message, .. } = event else {
+                return;
             };
             let Some(signal) = connection_signal(&message.topic, &message.payload) else {
-                continue;
+                return;
             };
             // Lifecycle messages without a principal belong to the explicit
             // no-authority identity. A malformed principal is not a lifecycle
@@ -219,8 +218,11 @@ fn spawn_connection_tracker(kernel: Arc<crate::Kernel>) -> astrid_runtime::JoinH
                         reason = error.reason(),
                         "Ignored connection lifecycle event with malformed principal"
                     );
-                    continue;
+                    return;
                 },
+            };
+            let Some(kernel) = weak_kernel.upgrade() else {
+                return;
             };
             match signal {
                 ConnectionSignal::Closed { reason } => {
@@ -232,8 +234,7 @@ fn spawn_connection_tracker(kernel: Arc<crate::Kernel>) -> astrid_runtime::JoinH
                     debug!(%principal, topic = %message.topic, "New client connection accepted");
                 },
             }
-        }
-    })
+        });
 }
 
 /// Map a kernel request topic (`astrid.v1.request.<suffix>`) to its correlated

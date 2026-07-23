@@ -21,6 +21,12 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Fixed
 
+- **Ephemeral daemons now shut down when their final client disconnects.**
+  Client leases, rather than loaded uplink capsules or a 30-second idle timer,
+  own ephemeral process liveness. The never-connected fallback starts only
+  after daemon readiness, and lease accounting bypasses the lossy broadcast
+  queue so an event storm cannot hide a live client. Persistent daemons retain
+  their explicit operator-controlled lifetime. Closes #1296.
 - **Capsule lifecycle hooks preserve the target principal.** Explicit-principal
   installs now provision and scope lifecycle `home://`, KV, secrets, and IPC
   identity to the authenticated install target instead of silently executing

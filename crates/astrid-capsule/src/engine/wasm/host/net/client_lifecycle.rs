@@ -3,7 +3,7 @@
 //!
 //! The kernel keeps a per-principal active-connection count: `+1` on a
 //! `client.v1.connect` bus event, `-1` on `client.v1.disconnect`, keyed by the
-//! event's `principal` (see `astrid-kernel`'s `spawn_connection_tracker`).
+//! event's `principal` (see `astrid-kernel`'s connection lifecycle tracker).
 //!
 //! These two events are emitted HERE — by the host that owns the inbound uplink
 //! socket — rather than by the uplink (capsule-cli) proxy. The proxy used to

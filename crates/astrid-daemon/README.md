@@ -15,7 +15,7 @@ The daemon is typically spawned automatically by the CLI (`astrid chat` or `astr
 ### Spawned by CLI (typical)
 
 ```bash
-# Ephemeral — auto-shuts down on idle after last client disconnects
+# Ephemeral — shuts down when the last client disconnects
 astrid
 
 # Persistent — stays running after CLI disconnects
@@ -41,7 +41,7 @@ astrid-daemon --verbose
 |---|---|---|
 | `-s, --session <UUID>` | `00000000-...` (system) | Session ID to bind the daemon to |
 | `-w, --workspace <PATH>` | Current directory | Workspace root directory |
-| `--ephemeral` | `false` | Auto-shutdown on idle after last client disconnects |
+| `--ephemeral` | `false` | Shut down when the last client disconnects |
 | `-v, --verbose` | `false` | Enable debug-level logging |
 
 ## Lifecycle
