@@ -30,7 +30,6 @@ install_adversarial_capsule_with_lifecycle_elicit() {
   local principal_home="$ASTRID_HOME/home/$principal"
 
   note "checking fresh nondefault lifecycle home mount"
-  run_cli agent create "$principal" -y
   [[ "$principal_home" == "$ASTRID_HOME/home/e2e-lifecycle-home" ]] \
     || fail "refusing to remove lifecycle home outside the generated ASTRID_HOME"
   rm -rf "$principal_home"
