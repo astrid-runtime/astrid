@@ -21,6 +21,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Fixed
 
+- **SVG URL sanitization uses the patched `ammonia` release.** The locked
+  transitive dependency is updated to 4.1.4 so crafted animation attributes
+  cannot preserve a `javascript:` URL and the workspace security audit no
+  longer accepts the vulnerable 4.1.3 release. Closes #1336.
 - **Stable crates publication installs its authenticated-hash prerequisite.**
   The protected publisher installs the pinned `b3sum` binary before validating
   the exact dev candidate, so BLAKE3 release metadata checks run before any
