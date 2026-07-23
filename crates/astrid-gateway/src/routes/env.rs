@@ -366,17 +366,19 @@ fn load_env_schema_from_home_in_workspace(
     let workspace = workspace_layout
         .resolve(workspace_root)
         .map_err(|e| GatewayError::Internal(anyhow::anyhow!("resolve selected workspace: {e}")))?;
-    let capsules_dir = workspace.verify_tree("capsules").map_err(|e| {
-        GatewayError::Internal(anyhow::anyhow!("verify workspace capsule directory: {e}"))
+    let manifest_relative = FsPath::new("capsules")
+        .join(capsule_id)
+        .join("Capsule.toml");
+    let workspace_manifest = workspace.resolve_file(&manifest_relative).map_err(|e| {
+        GatewayError::Internal(anyhow::anyhow!("resolve workspace capsule manifest: {e}"))
     })?;
-    let workspace_manifest = capsules_dir.join(capsule_id).join("Capsule.toml");
     if !workspace_manifest.exists() {
         return Err(GatewayError::NotFound);
     }
     let schema = parse_env_schema(&workspace_manifest)?;
-    workspace.verify_tree("capsules").map_err(|e| {
+    workspace.resolve_file(&manifest_relative).map_err(|e| {
         GatewayError::Internal(anyhow::anyhow!(
-            "workspace capsule directory changed while reading its manifest: {e}"
+            "workspace capsule manifest changed while it was being read: {e}"
         ))
     })?;
     Ok(schema)
@@ -777,5 +779,43 @@ mod tests {
         );
 
         assert!(matches!(result, Err(GatewayError::Internal(_))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn env_schema_verifies_only_the_requested_workspace_manifest() {
+        use std::os::unix::fs::symlink;
+
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(home_dir.path());
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let capsules = workspace.path().join(".astrid/capsules");
+        let requested = capsules.join("astrid-capsule-test");
+        std::fs::create_dir_all(&requested).unwrap();
+        std::fs::write(
+            requested.join("Capsule.toml"),
+            r#"
+            [package]
+            name = "astrid-capsule-test"
+            version = "1.0.0"
+
+            [env]
+            api_key = { type = "secret" }
+            "#,
+        )
+        .unwrap();
+        symlink(outside.path(), capsules.join("unrelated-capsule")).unwrap();
+
+        let schema = load_env_schema_from_home_in_workspace(
+            &home,
+            &PrincipalId::new("alice").unwrap(),
+            "astrid-capsule-test",
+            Some(workspace.path()),
+            &WorkspaceLayout::default(),
+        )
+        .expect("an unrelated capsule must not make the requested manifest unsafe");
+
+        assert_eq!(schema["api_key"].env_type, "secret");
     }
 }
