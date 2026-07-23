@@ -21,6 +21,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Fixed
 
+- **Secret commands now read manifests from the selected principal registry or
+  verified workspace.** Secret set, list, and delete no longer fall back to
+  `default`, while workspace-only capsule secrets retain their declared
+  classification and remain out of plaintext env configuration. Closes #1325.
 - **Per-agent CLI commands now inherit the global `--principal`.** A
   command-local target such as `--agent` still wins, but omitting it uses the
   process principal already resolved from the flag, environment, or active
