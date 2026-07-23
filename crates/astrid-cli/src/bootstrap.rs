@@ -161,32 +161,28 @@ pub(crate) async fn run_or_connect(
     let socket_path = socket_client::proxy_socket_path();
     let ready_path = socket_client::readiness_path();
 
-    let mut needs_boot = !socket_path.exists();
-
-    if socket_path.exists() {
-        match tokio::net::UnixStream::connect(&socket_path).await {
-            Ok(_) => {
-                println!(
-                    "{}",
-                    theme::Theme::info("Connecting to existing Astrid daemon...")
-                );
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-                println!(
-                    "{}",
-                    theme::Theme::warning(
-                        "Found dead socket. Cleaning up and restarting daemon..."
-                    )
-                );
-                let _ = std::fs::remove_file(&socket_path);
-                let _ = std::fs::remove_file(&ready_path);
-                needs_boot = true;
-            },
-            Err(e) => {
-                anyhow::bail!("Failed to check socket: {e}");
-            },
-        }
-    }
+    let needs_boot = match astrid_core::local_transport::connect_outcome(&socket_path).await {
+        Ok(astrid_core::local_transport::ConnectOutcome::Connected(stream)) => {
+            drop(stream);
+            println!(
+                "{}",
+                theme::Theme::info("Connecting to existing Astrid daemon...")
+            );
+            false
+        },
+        Ok(astrid_core::local_transport::ConnectOutcome::Absent) => true,
+        Ok(astrid_core::local_transport::ConnectOutcome::Stale) => {
+            println!(
+                "{}",
+                theme::Theme::warning("Found dead socket. Cleaning up and restarting daemon...")
+            );
+            astrid_core::local_transport::remove_stale_endpoint(&socket_path)
+                .context("failed to clean up stale daemon endpoint")?;
+            let _ = std::fs::remove_file(&ready_path);
+            true
+        },
+        Err(error) => anyhow::bail!("Failed to check socket: {error}"),
+    };
 
     let mut daemon_child: Option<std::process::Child> = None;
 

@@ -27,6 +27,7 @@ pub(crate) struct DoctorArgs {
 pub(crate) async fn run(args: DoctorArgs) -> Result<ExitCode> {
     println!("{}", "Astrid health check".bold());
     let mut all_passed = true;
+    let mut daemon_endpoint_present = false;
 
     let home_check = match AstridHome::resolve() {
         Ok(home) => {
@@ -60,20 +61,25 @@ pub(crate) async fn run(args: DoctorArgs) -> Result<ExitCode> {
             );
         }
         let socket = home.socket_path();
-        if socket.exists() {
-            check_pass("Daemon socket", &format!("present at {}", socket.display()));
-        } else {
-            check_warn(
-                "Daemon socket",
-                &format!("missing at {} — run `astrid start`", socket.display()),
-            );
+        match astrid_core::local_transport::endpoint_is_present(&socket) {
+            Ok(true) => {
+                daemon_endpoint_present = true;
+                check_pass("Daemon socket", &format!("present at {}", socket.display()));
+            },
+            Ok(false) => {
+                check_warn(
+                    "Daemon socket",
+                    &format!("missing at {} — run `astrid start`", socket.display()),
+                );
+            },
+            Err(error) => {
+                all_passed = false;
+                check_fail("Daemon endpoint", &error.to_string());
+            },
         }
     }
 
-    if !args.no_daemon
-        && let Some(home) = home_check.as_ref()
-        && home.socket_path().exists()
-    {
+    if !args.no_daemon && daemon_endpoint_present {
         match daemon_roundtrip().await {
             Ok(()) => check_pass("Daemon roundtrip", "GetStatus succeeded"),
             Err(e) => {

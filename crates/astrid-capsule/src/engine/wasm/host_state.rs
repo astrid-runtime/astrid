@@ -11,6 +11,7 @@ use tokio::sync::{Semaphore, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::capsule::CapsuleId;
+use astrid_core::local_transport::{LocalListener, LocalStream};
 use astrid_core::uplink::{InboundMessage, MAX_UPLINKS_PER_CAPSULE, UplinkDescriptor};
 use astrid_storage::ScopedKvStore;
 use astrid_storage::secret::SecretStore;
@@ -27,7 +28,7 @@ use astrid_storage::secret::SecretStore;
 #[non_exhaustive]
 pub enum NetStream {
     /// Inbound Unix-domain socket accepted from the kernel's listener.
-    Unix(Arc<tokio::sync::Mutex<tokio::net::UnixStream>>),
+    Unix(Arc<tokio::sync::Mutex<LocalStream>>),
     /// Outbound TCP connection opened via `net.connect-tcp`.
     Tcp(TcpStreamSlot),
 }
@@ -497,7 +498,7 @@ pub struct HostState {
     /// Uplinks registered by the WASM guest via `astrid_register_uplink`.
     pub registered_uplinks: Vec<UplinkDescriptor>,
     /// Optional natively bound unix listener.
-    pub cli_socket_listener: Option<Arc<tokio::sync::Mutex<tokio::net::UnixListener>>>,
+    pub cli_socket_listener: Option<Arc<tokio::sync::Mutex<LocalListener>>>,
     /// Active lifecycle phase, if any. `None` during normal runtime.
     /// Set to `Some(Install)` or `Some(Upgrade)` during lifecycle dispatch.
     /// Gates the `astrid_elicit` host function.

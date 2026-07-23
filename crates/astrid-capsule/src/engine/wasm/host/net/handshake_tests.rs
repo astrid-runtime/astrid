@@ -1,7 +1,7 @@
 //! Tests for the inbound socket handshake, including the optional
 //! per-connection principal challenge-response (issue #45/#852).
 //!
-//! The end-to-end tests drive a real `tokio::net::UnixStream` socket pair:
+//! The end-to-end tests drive a real host-local stream pair:
 //! one half is fed to [`validate_handshake`] (the server), the other is
 //! driven by a minimal in-test client that mirrors the production framing in
 //! `astrid-uplink`. The claimed principal's profile is written to a
@@ -12,6 +12,7 @@
 use super::*;
 
 use astrid_core::dirs::AstridHome;
+use astrid_core::local_transport::LocalStream;
 use astrid_core::profile::{DeviceKey, DeviceScope};
 use astrid_core::session_token::{
     HandshakeRequest, HandshakeResponse, PROTOCOL_VERSION, principal_auth_challenge_message,
@@ -111,7 +112,7 @@ fn home_with_registered_key(
 
 /// Write one length-prefixed JSON value, then read one back.
 async fn client_send_recv<T: serde::Serialize, R: serde::de::DeserializeOwned>(
-    stream: &mut tokio::net::UnixStream,
+    stream: &mut LocalStream,
     value: &T,
 ) -> R {
     let bytes = serde_json::to_vec(value).unwrap();

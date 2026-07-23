@@ -576,7 +576,8 @@ async fn kernel_and_gateway_boot_against_shared_home() {
     // ── Kernel boot artefacts on disk ───────────────────────────
     let home = astrid_core::dirs::AstridHome::resolve().expect("ASTRID_HOME");
     assert!(
-        home.socket_path().exists(),
+        astrid_core::local_transport::endpoint_is_present(&home.socket_path())
+            .expect("inspect kernel endpoint"),
         "kernel must bind the Unix socket at $ASTRID_HOME/run/system.sock"
     );
     // KV store + audit DB live under the home; presence proves boot

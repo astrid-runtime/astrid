@@ -24,22 +24,24 @@ use axum::response::Response;
 
 use crate::state::GatewayState;
 
-/// `GET /healthz` — 200 if the daemon socket file is reachable,
-/// 503 otherwise. Pure liveness probe; no IPC round-trip so it
-/// stays fast under load.
+/// `GET /healthz` — 200 if the daemon endpoint is present, 503 otherwise.
+///
+/// This deliberately performs a backend presence check, not a connection:
+/// health scrapes are unauthenticated and must not create daemon sessions or
+/// consume work in the local accept loop.
 #[utoipa::path(
     get,
     path = "/healthz",
     tag = "ops",
     security(()),
     responses(
-        (status = 200, description = "Daemon socket reachable. Body is the literal text `ok\\n`.", content_type = "text/plain"),
-        (status = 503, description = "Daemon socket unreachable.", content_type = "text/plain"),
+        (status = 200, description = "Daemon endpoint present. Body is the literal text `ok\\n`.", content_type = "text/plain"),
+        (status = 503, description = "Daemon endpoint unavailable.", content_type = "text/plain"),
     )
 )]
 pub async fn get_healthz(State(_state): State<Arc<GatewayState>>) -> Response {
     let healthy = match AstridHome::resolve() {
-        Ok(home) => home.socket_path().exists(),
+        Ok(home) => daemon_endpoint_present(&home.socket_path()),
         Err(_) => false,
     };
     let (status, body) = if healthy {
@@ -55,6 +57,40 @@ pub async fn get_healthz(State(_state): State<Arc<GatewayState>>) -> Response {
         .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
         .body(body.into())
         .unwrap_or_else(|_| Response::new("ok\n".into()))
+}
+
+fn daemon_endpoint_present(path: &std::path::Path) -> bool {
+    astrid_core::local_transport::endpoint_is_present(path).unwrap_or(false)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::time::Duration;
+
+    use astrid_core::local_transport;
+
+    use super::daemon_endpoint_present;
+
+    #[tokio::test]
+    async fn health_presence_probe_does_not_open_a_daemon_connection() {
+        let directory = tempfile::tempdir().unwrap();
+        let endpoint = directory.path().join("health.sock");
+        let listener = local_transport::bind(&endpoint).unwrap();
+
+        assert!(daemon_endpoint_present(&endpoint));
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(25),
+                local_transport::accept(&listener)
+            )
+            .await
+            .is_err(),
+            "presence-only health probe must not enter the daemon accept queue"
+        );
+
+        drop(listener);
+        local_transport::remove_endpoint(&endpoint).unwrap();
+    }
 }
 
 /// `GET /metrics` — Prometheus text-exposition format.

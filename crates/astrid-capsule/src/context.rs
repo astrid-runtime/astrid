@@ -22,7 +22,8 @@ use crate::schema_catalog::SchemaCatalog;
 /// On native this is exactly the concrete type the kernel binds and hands into
 /// the capsule execution context.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-pub type UplinkListener = std::sync::Arc<tokio::sync::Mutex<tokio::net::UnixListener>>;
+pub type UplinkListener =
+    std::sync::Arc<tokio::sync::Mutex<astrid_core::local_transport::LocalListener>>;
 /// No uplink socket exists on the browser target; this uninhabited type
 /// makes `Option<UplinkListener>` necessarily `None` there.
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]

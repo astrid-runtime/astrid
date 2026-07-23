@@ -173,7 +173,10 @@ pub(crate) async fn try_daemon_unload(capsule_id: &str) -> anyhow::Result<LiveUn
 
 async fn daemon_socket_reachable() -> bool {
     let path = crate::socket_client::proxy_socket_path();
-    path.exists() && tokio::net::UnixStream::connect(path).await.is_ok()
+    matches!(
+        astrid_core::local_transport::connect_outcome(&path).await,
+        Ok(astrid_core::local_transport::ConnectOutcome::Connected(_))
+    )
 }
 
 fn classify_live_client<T>(

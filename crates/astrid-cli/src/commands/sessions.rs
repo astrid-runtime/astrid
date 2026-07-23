@@ -82,7 +82,7 @@ pub(crate) fn session_info(id: &str) -> Result<()> {
 
     // The global daemon socket path — shows daemon health, not session-specific status.
     let sock_path = home.socket_path();
-    if sock_path.exists() {
+    if astrid_core::local_transport::endpoint_is_present(&sock_path)? {
         println!("  Daemon: {}", "Running".green());
     } else {
         println!("  Daemon: {}", "Not Running".yellow());
