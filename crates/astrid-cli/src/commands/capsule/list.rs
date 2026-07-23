@@ -6,7 +6,7 @@ use astrid_capsule_install::mismatching_contracts;
 use astrid_core::dirs::AstridHome;
 use colored::Colorize;
 
-use super::meta::scan_installed_capsules_in_home_with_layout;
+use super::meta::scan_installed_capsules_in_home_for_with_layout;
 use crate::theme::Theme;
 
 /// List all installed capsules with their provides/requires metadata.
@@ -16,8 +16,7 @@ use crate::theme::Theme;
 /// list and install source.
 pub(crate) fn list_capsules(verbose: bool) -> anyhow::Result<()> {
     let home = AstridHome::resolve()?;
-    let capsules =
-        scan_installed_capsules_in_home_with_layout(&home, crate::workspace_layout::current())?;
+    let capsules = installed_capsules_for(&home, &crate::principal::current())?;
 
     if capsules.is_empty() {
         println!("{}", Theme::info("No capsules installed."));
@@ -69,6 +68,17 @@ pub(crate) fn list_capsules(verbose: bool) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+fn installed_capsules_for(
+    home: &AstridHome,
+    principal: &astrid_core::PrincipalId,
+) -> anyhow::Result<Vec<super::meta::InstalledCapsule>> {
+    scan_installed_capsules_in_home_for_with_layout(
+        home,
+        principal,
+        crate::workspace_layout::current(),
+    )
 }
 
 /// Compact: one line per capsule.
@@ -164,5 +174,43 @@ fn print_interface_map(
                 println!("    {ns}/{name} {version}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use astrid_core::PrincipalId;
+    use astrid_core::dirs::AstridHome;
+
+    use super::installed_capsules_for;
+
+    #[test]
+    fn list_scans_the_requested_principal_home() {
+        let root = tempfile::tempdir().expect("temporary Astrid home");
+        let home = AstridHome::from_path(root.path());
+        let default = PrincipalId::default();
+        let alice = PrincipalId::new("alice").expect("principal");
+
+        std::fs::create_dir_all(
+            home.principal_home(&default)
+                .capsules_dir()
+                .join("default-only"),
+        )
+        .expect("default capsule");
+        std::fs::create_dir_all(
+            home.principal_home(&alice)
+                .capsules_dir()
+                .join("alice-only"),
+        )
+        .expect("alice capsule");
+
+        let capsules = installed_capsules_for(&home, &alice).expect("scan Alice capsules");
+        let names = capsules
+            .iter()
+            .map(|capsule| capsule.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"alice-only"));
+        assert!(!names.contains(&"default-only"));
     }
 }
