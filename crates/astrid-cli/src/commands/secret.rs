@@ -37,14 +37,16 @@
 //! OS user account is the trust boundary, and the file mode
 //! enforces the access bound.
 
+use std::collections::HashSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
+use astrid_capsule::capsule::CapsuleId;
 use astrid_capsule::manifest::{CapsuleManifest, EnvDef, EnvScope};
 use astrid_core::PrincipalId;
-use astrid_core::dirs::AstridHome;
+use astrid_core::dirs::{AstridHome, WorkspaceLayout};
 use astrid_storage::{FileSecretStore, SecretStore, SecretStoreError};
 use clap::{Args, Subcommand};
 use colored::Colorize;
@@ -96,37 +98,86 @@ fn secret_store_error(op: &str, e: &SecretStoreError) -> anyhow::Error {
     anyhow::anyhow!("secret {op} failed: {e}")
 }
 
-/// Load the installed manifest for `capsule` from the selected principal's
-/// install registry.
+/// Load the manifest for `capsule` using runtime discovery precedence:
+/// selected-principal install registry first, then the verified workspace.
 /// Returns `None` when the capsule isn't installed — caller falls back
 /// to env JSON, and the load-time migration handles the value on
 /// install.
 fn load_capsule_manifest(
     principal: &PrincipalId,
-    capsule: &str,
+    capsule: &CapsuleId,
 ) -> Result<Option<CapsuleManifest>> {
     let home = AstridHome::resolve().context("Failed to resolve Astrid home directory")?;
-    load_capsule_manifest_from_home(&home, principal, capsule)
+    let workspace_root =
+        std::env::current_dir().context("Failed to resolve current workspace directory")?;
+    load_capsule_manifest_from_home_in_workspace(
+        &home,
+        principal,
+        capsule,
+        Some(&workspace_root),
+        crate::workspace_layout::current(),
+    )
 }
 
 fn load_capsule_manifest_from_home(
     home: &AstridHome,
     principal: &PrincipalId,
-    capsule: &str,
+    capsule: &CapsuleId,
 ) -> Result<Option<CapsuleManifest>> {
-    let manifest_path = home
+    load_capsule_manifest_from_home_in_workspace(
+        home,
+        principal,
+        capsule,
+        None,
+        &WorkspaceLayout::default(),
+    )
+}
+
+fn load_capsule_manifest_from_home_in_workspace(
+    home: &AstridHome,
+    principal: &PrincipalId,
+    capsule: &CapsuleId,
+    workspace_root: Option<&Path>,
+    workspace_layout: &WorkspaceLayout,
+) -> Result<Option<CapsuleManifest>> {
+    let principal_manifest = home
         .principal_home(principal)
         .capsules_dir()
-        .join(capsule)
+        .join(capsule.as_str())
         .join("Capsule.toml");
-    if !manifest_path.exists() {
+    if principal_manifest.exists() {
+        return read_capsule_manifest(&principal_manifest).map(Some);
+    }
+
+    let Some(workspace_root) = workspace_root else {
+        return Ok(None);
+    };
+    let workspace = workspace_layout
+        .resolve(workspace_root)
+        .context("Failed to resolve the selected workspace")?;
+    let capsules_dir = workspace
+        .verify_tree("capsules")
+        .context("Workspace capsule directory is unsafe")?;
+    let workspace_manifest = capsules_dir.join(capsule.as_str()).join("Capsule.toml");
+    if !workspace_manifest.exists() {
+        workspace.verify_tree("capsules").map_err(|e| {
+            anyhow::anyhow!("Workspace capsule directory changed during manifest lookup: {e}")
+        })?;
         return Ok(None);
     }
-    let contents = fs::read_to_string(&manifest_path)
+    let manifest = read_capsule_manifest(&workspace_manifest)?;
+    workspace
+        .verify_tree("capsules")
+        .context("Workspace capsule directory changed while reading its manifest")?;
+    Ok(Some(manifest))
+}
+
+fn read_capsule_manifest(manifest_path: &Path) -> Result<CapsuleManifest> {
+    let contents = fs::read_to_string(manifest_path)
         .with_context(|| format!("Failed to read {}", manifest_path.display()))?;
     let manifest: CapsuleManifest = toml::from_str(&contents)
         .with_context(|| format!("Failed to parse {}", manifest_path.display()))?;
-    Ok(Some(manifest))
+    Ok(manifest)
 }
 
 /// Returns `Some(EnvDef)` when the manifest declares `key` AND
@@ -232,10 +283,17 @@ fn env_dir(principal: &PrincipalId) -> Result<PathBuf> {
     Ok(home.principal_home(principal).env_dir())
 }
 
-fn env_file(principal: &PrincipalId, capsule: Option<&str>) -> Result<PathBuf> {
+fn env_file(principal: &PrincipalId, capsule: Option<&CapsuleId>) -> Result<PathBuf> {
     let dir = env_dir(principal)?;
-    let name = capsule.unwrap_or("default");
+    let name = capsule.map_or("default", CapsuleId::as_str);
     Ok(dir.join(format!("{name}.env.json")))
+}
+
+fn validate_optional_capsule(capsule: Option<&str>) -> Result<Option<CapsuleId>> {
+    capsule
+        .map(CapsuleId::new)
+        .transpose()
+        .context("invalid capsule name")
 }
 
 fn read_env(path: &std::path::Path) -> Result<Map<String, Value>> {
@@ -293,11 +351,64 @@ fn classify_env_storage(is_declared_secret: bool, value: &Value) -> Option<Secre
     Some(SecretStorage::EnvJsonLegacy)
 }
 
+fn collect_declared_file_secrets(
+    home: &AstridHome,
+    principal: &PrincipalId,
+) -> Result<Vec<SecretKey>> {
+    let installed = astrid_capsule_install::scan_installed_capsules_in_home_for_with_layout(
+        home,
+        principal,
+        crate::workspace_layout::current(),
+    )?;
+    let workspace_root =
+        std::env::current_dir().context("Failed to resolve current workspace directory")?;
+    let mut keys = Vec::new();
+    let mut seen = HashSet::new();
+    for installed_capsule in installed {
+        let capsule = CapsuleId::new(installed_capsule.name)
+            .context("installed capsule has an invalid name")?;
+        if !seen.insert(capsule.clone()) {
+            continue;
+        }
+        let Some(manifest) = load_capsule_manifest_from_home_in_workspace(
+            home,
+            principal,
+            &capsule,
+            Some(&workspace_root),
+            crate::workspace_layout::current(),
+        )?
+        else {
+            continue;
+        };
+        for (key, decl) in &manifest.env {
+            if !decl.env_type.eq_ignore_ascii_case("secret") {
+                continue;
+            }
+            // Scope is operator-decided at set time, not manifest-declared.
+            // Probe both slots because a per-agent override and a host-wide
+            // fall-through can coexist.
+            for scope in [EnvScope::Agent, EnvScope::Shared] {
+                let store = open_secret_store(home, principal, capsule.as_str(), scope);
+                if store.exists(key).unwrap_or(false) {
+                    keys.push(SecretKey {
+                        capsule: capsule.to_string(),
+                        key: key.clone(),
+                        storage: SecretStorage::File,
+                        scope: Some(scope),
+                    });
+                }
+            }
+        }
+    }
+    Ok(keys)
+}
+
 fn run_set(args: &SetArgs) -> Result<ExitCode> {
     if args.key.is_empty() {
         anyhow::bail!("invalid key: must not be empty");
     }
     let principal = context::resolve_agent(args.agent.as_deref())?;
+    let capsule = validate_optional_capsule(args.capsule.as_deref())?;
 
     // --scope only applies to secrets. Reject it on a non-secret key
     // up front so an operator who's confused about which knob does
@@ -309,13 +420,12 @@ fn run_set(args: &SetArgs) -> Result<ExitCode> {
         );
     }
 
-    let manifest = match args.capsule.as_deref() {
+    let manifest = match capsule.as_ref() {
         Some(c) => load_capsule_manifest(&principal, c)?,
         None => None,
     };
-    let secret_decl = args
-        .capsule
-        .as_deref()
+    let secret_decl = capsule
+        .as_ref()
         .and_then(|_| lookup_secret_decl(manifest.as_ref(), &args.key));
 
     if args.scope.is_some() && secret_decl.is_none() {
@@ -339,12 +449,11 @@ fn run_set(args: &SetArgs) -> Result<ExitCode> {
         // to mark their own credentials as host-shared (privilege
         // escalation vector — bot tokens, OAuth bindings).
         let scope: EnvScope = args.scope.map_or(EnvScope::Agent, EnvScope::from);
-        let capsule = args
-            .capsule
-            .as_deref()
+        let capsule = capsule
+            .as_ref()
             .expect("capsule name required to route a secret-typed key — the loader above already gates on Some(manifest), which requires args.capsule");
         let home = AstridHome::resolve().context("Failed to resolve Astrid home directory")?;
-        let store = open_secret_store(&home, &principal, capsule, scope);
+        let store = open_secret_store(&home, &principal, capsule.as_str(), scope);
         store
             .set(&args.key, &args.value)
             .map_err(|e| secret_store_error("set", &e))?;
@@ -359,7 +468,7 @@ fn run_set(args: &SetArgs) -> Result<ExitCode> {
     } else {
         // Non-secret (or no manifest for the capsule): env JSON
         // path. Same behaviour as pre-#19.
-        let path = env_file(&principal, args.capsule.as_deref())?;
+        let path = env_file(&principal, capsule.as_ref())?;
         let mut env = read_env(&path)?;
         env.insert(args.key.clone(), Value::String(args.value.clone()));
         write_env(&path, &env)?;
@@ -369,8 +478,8 @@ fn run_set(args: &SetArgs) -> Result<ExitCode> {
                 "Stored '{}' for agent '{}'{}",
                 args.key,
                 principal,
-                args.capsule
-                    .as_deref()
+                capsule
+                    .as_ref()
                     .map_or_else(String::new, |c| format!(" (capsule {c})"))
             ))
         );
@@ -400,6 +509,8 @@ fn run_list(args: &ListArgs) -> Result<ExitCode> {
             let Some(stem) = file_name.strip_suffix(".env.json") else {
                 continue;
             };
+            let capsule = CapsuleId::new(stem)
+                .with_context(|| format!("Invalid capsule env file name: {file_name}"))?;
             let env = read_env(&p)?;
             // Cross-reference the manifest if this is a capsule-
             // scoped file (stem matches an installed capsule name).
@@ -407,7 +518,7 @@ fn run_list(args: &ListArgs) -> Result<ExitCode> {
             // with a manifest read failure must not get silently
             // classified as `EnvJson` (non-secret) when it might be a
             // legacy plaintext secret.
-            let manifest = load_capsule_manifest(&principal, stem)?;
+            let manifest = load_capsule_manifest(&principal, &capsule)?;
             for (k, value) in &env {
                 let is_declared_secret = manifest
                     .as_ref()
@@ -433,40 +544,7 @@ fn run_list(args: &ListArgs) -> Result<ExitCode> {
     //    declared secrets (capability boundary: stale on-disk files
     //    from a removed capsule don't appear here).
     if let Ok(home) = AstridHome::resolve() {
-        let capsules_dir = home.principal_home(&principal).capsules_dir();
-        if capsules_dir.is_dir() {
-            for entry in fs::read_dir(&capsules_dir)
-                .with_context(|| format!("Failed to read {}", capsules_dir.display()))?
-            {
-                let entry = entry?;
-                let capsule = entry.file_name().to_string_lossy().into_owned();
-                let Some(manifest) = load_capsule_manifest_from_home(&home, &principal, &capsule)?
-                else {
-                    continue;
-                };
-                for (key, decl) in &manifest.env {
-                    if !decl.env_type.eq_ignore_ascii_case("secret") {
-                        continue;
-                    }
-                    // Scope is operator-decided at set time, not
-                    // manifest-declared — probe both slots and
-                    // report whichever is populated. A value can
-                    // exist in either or both (per-agent override
-                    // alongside a host-wide fall-through).
-                    for scope in [EnvScope::Agent, EnvScope::Shared] {
-                        let store = open_secret_store(&home, &principal, &capsule, scope);
-                        if store.exists(key).unwrap_or(false) {
-                            keys.push(SecretKey {
-                                capsule: capsule.clone(),
-                                key: key.clone(),
-                                storage: SecretStorage::File,
-                                scope: Some(scope),
-                            });
-                        }
-                    }
-                }
-            }
-        }
+        keys.extend(collect_declared_file_secrets(&home, &principal)?);
     }
 
     keys.sort_by(|a, b| a.capsule.cmp(&b.capsule).then_with(|| a.key.cmp(&b.key)));
@@ -503,6 +581,7 @@ fn run_list(args: &ListArgs) -> Result<ExitCode> {
 
 fn run_delete(args: &DeleteArgs) -> Result<ExitCode> {
     let principal = context::resolve_agent(args.agent.as_deref())?;
+    let capsule = validate_optional_capsule(args.capsule.as_deref())?;
 
     // Try the file secret store first if the manifest declares this
     // key secret. Try BOTH per-agent and host-wide slots — the
@@ -510,13 +589,13 @@ fn run_delete(args: &DeleteArgs) -> Result<ExitCode> {
     // be unambiguous regardless of where the value landed. The
     // env-JSON path is still hit afterwards in case the value
     // pre-dates the load-time strip.
-    if let Some(capsule) = args.capsule.as_deref() {
+    if let Some(capsule) = capsule.as_ref() {
         let manifest = load_capsule_manifest(&principal, capsule)?;
         if lookup_secret_decl(manifest.as_ref(), &args.key).is_some() {
             let home = AstridHome::resolve().context("Failed to resolve Astrid home directory")?;
             let mut removed = false;
             for scope in [EnvScope::Agent, EnvScope::Shared] {
-                let store = open_secret_store(&home, &principal, capsule, scope);
+                let store = open_secret_store(&home, &principal, capsule.as_str(), scope);
                 match store.delete(&args.key) {
                     Ok(true) => removed = true,
                     Ok(false) => {},
@@ -537,7 +616,7 @@ fn run_delete(args: &DeleteArgs) -> Result<ExitCode> {
         }
     }
 
-    let path = env_file(&principal, args.capsule.as_deref())?;
+    let path = env_file(&principal, capsule.as_ref())?;
     let mut env = read_env(&path)?;
     if env.remove(&args.key).is_none() {
         eprintln!("{}", Theme::warning(&format!("'{}' not set", args.key)));
@@ -598,6 +677,23 @@ pub(crate) enum SecretStorage {
 mod tests {
     use super::*;
 
+    fn provider_id() -> CapsuleId {
+        CapsuleId::new("provider").unwrap()
+    }
+
+    #[test]
+    fn capsule_names_are_validated_before_path_construction() {
+        assert!(validate_optional_capsule(Some("../../outside")).is_err());
+        assert!(validate_optional_capsule(Some("Provider")).is_err());
+        assert_eq!(
+            validate_optional_capsule(Some("safe-provider"))
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            "safe-provider"
+        );
+    }
+
     #[test]
     fn manifest_lookup_is_scoped_to_the_requested_principal() {
         let root = tempfile::tempdir().unwrap();
@@ -629,13 +725,123 @@ mod tests {
             .unwrap();
         }
 
-        let manifest = load_capsule_manifest_from_home(&home, &alice, "provider")
+        let manifest = load_capsule_manifest_from_home(&home, &alice, &provider_id())
             .unwrap()
             .expect("Alice manifest");
         assert_eq!(
             manifest.env["api_key"].description.as_deref(),
             Some("alice manifest")
         );
+    }
+
+    #[test]
+    fn manifest_lookup_falls_back_to_the_verified_workspace() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(home_dir.path());
+        let workspace = tempfile::tempdir().unwrap();
+        let capsule_dir = workspace.path().join(".astrid/capsules/provider");
+        fs::create_dir_all(&capsule_dir).unwrap();
+        fs::write(
+            capsule_dir.join("Capsule.toml"),
+            r#"
+            [package]
+            name = "provider"
+            version = "1.0.0"
+
+            [env.api_key]
+            type = "secret"
+            description = "workspace manifest"
+            "#,
+        )
+        .unwrap();
+
+        let manifest = load_capsule_manifest_from_home_in_workspace(
+            &home,
+            &PrincipalId::new("alice").unwrap(),
+            &provider_id(),
+            Some(workspace.path()),
+            &WorkspaceLayout::default(),
+        )
+        .unwrap()
+        .expect("workspace manifest");
+
+        assert_eq!(
+            lookup_secret_decl(Some(&manifest), "api_key")
+                .and_then(|decl| decl.description.as_deref()),
+            Some("workspace manifest")
+        );
+    }
+
+    #[test]
+    fn principal_manifest_takes_precedence_over_workspace_manifest() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(home_dir.path());
+        let workspace = tempfile::tempdir().unwrap();
+        let principal = PrincipalId::new("alice").unwrap();
+        let principal_capsule = home
+            .principal_home(&principal)
+            .capsules_dir()
+            .join("provider");
+        let workspace_capsule = workspace.path().join(".astrid/capsules/provider");
+        for (capsule_dir, description) in [
+            (&principal_capsule, "principal manifest"),
+            (&workspace_capsule, "workspace manifest"),
+        ] {
+            fs::create_dir_all(capsule_dir).unwrap();
+            fs::write(
+                capsule_dir.join("Capsule.toml"),
+                format!(
+                    r#"
+                    [package]
+                    name = "provider"
+                    version = "1.0.0"
+
+                    [env.api_key]
+                    type = "secret"
+                    description = "{description}"
+                    "#
+                ),
+            )
+            .unwrap();
+        }
+
+        let manifest = load_capsule_manifest_from_home_in_workspace(
+            &home,
+            &principal,
+            &provider_id(),
+            Some(workspace.path()),
+            &WorkspaceLayout::default(),
+        )
+        .unwrap()
+        .expect("principal manifest");
+
+        assert_eq!(
+            manifest.env["api_key"].description.as_deref(),
+            Some("principal manifest")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_lookup_rejects_redirected_workspace_capsules() {
+        use std::os::unix::fs::symlink;
+
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(home_dir.path());
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir(workspace.path().join(".astrid")).unwrap();
+        symlink(outside.path(), workspace.path().join(".astrid/capsules")).unwrap();
+
+        let result = load_capsule_manifest_from_home_in_workspace(
+            &home,
+            &PrincipalId::new("alice").unwrap(),
+            &provider_id(),
+            Some(workspace.path()),
+            &WorkspaceLayout::default(),
+        );
+
+        assert!(result.is_err());
     }
 
     #[test]
