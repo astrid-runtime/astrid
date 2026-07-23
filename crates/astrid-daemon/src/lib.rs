@@ -147,6 +147,18 @@ fn provides_cli_socket_uplink(manifest: &astrid_capsule::manifest::CapsuleManife
         })
 }
 
+fn write_readiness_then_arm_ephemeral<T, E>(
+    ephemeral: bool,
+    write_readiness: impl FnOnce() -> Result<T, E>,
+    arm_ephemeral_fallback: impl FnOnce(),
+) -> Result<T, E> {
+    let result = write_readiness()?;
+    if ephemeral {
+        arm_ephemeral_fallback();
+    }
+    Ok(result)
+}
+
 /// Run the Astrid daemon with the given arguments.
 ///
 /// This is the shared entry point used by both the standalone `astrid-daemon`
@@ -268,16 +280,28 @@ pub async fn run() -> Result<()> {
     // Signal readiness AFTER the default CLI/system view is loaded and
     // accepting connections. The CLI polls for this file to avoid connecting
     // before the handshake accept loop is running.
-    astrid_kernel::socket::write_readiness_file_for_workspace(
-        &kernel.workspace_root,
-        kernel.workspace_layout(),
-    )
-    .map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to write readiness file \
-             (daemon is useless without it): {e}"
-        )
-    })?;
+    write_readiness_then_arm_ephemeral(
+        args.ephemeral,
+        || {
+            astrid_kernel::socket::write_readiness_file_for_workspace(
+                &kernel.workspace_root,
+                kernel.workspace_layout(),
+            )
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to write readiness file \
+                     (daemon is useless without it): {e}"
+                )
+            })
+        },
+        || {
+            // Only now can a spawning client connect. Starting this timer
+            // during Kernel construction lets a cold capsule boot consume
+            // the entire grace period and makes the daemon advertise
+            // readiness after shutdown was already requested.
+            kernel.arm_ephemeral_startup_fallback();
+        },
+    )?;
 
     tracing::info!(
         session = %session_id.0,
@@ -427,8 +451,9 @@ fn spawn_gateway(
 
 #[cfg(test)]
 mod tests {
-    use super::provides_cli_socket_uplink;
+    use super::{provides_cli_socket_uplink, write_readiness_then_arm_ephemeral};
     use astrid_capsule::manifest::CapsuleManifest;
+    use std::sync::Mutex;
 
     fn manifest(name: &str, uplink: bool, net_bind: &[&str]) -> CapsuleManifest {
         let mut manifest = CapsuleManifest::default();
@@ -460,5 +485,32 @@ mod tests {
                 manifest.package.name
             );
         }
+    }
+
+    #[test]
+    fn ephemeral_fallback_is_armed_only_after_readiness_succeeds() {
+        let steps = Mutex::new(Vec::new());
+        write_readiness_then_arm_ephemeral(
+            true,
+            || {
+                steps.lock().unwrap().push("ready");
+                Ok::<_, ()>(())
+            },
+            || steps.lock().unwrap().push("armed"),
+        )
+        .unwrap();
+        assert_eq!(*steps.lock().unwrap(), ["ready", "armed"]);
+
+        let steps = Mutex::new(Vec::new());
+        let result = write_readiness_then_arm_ephemeral(
+            true,
+            || {
+                steps.lock().unwrap().push("ready-failed");
+                Err::<(), _>("failed")
+            },
+            || steps.lock().unwrap().push("armed"),
+        );
+        assert_eq!(result, Err("failed"));
+        assert_eq!(*steps.lock().unwrap(), ["ready-failed"]);
     }
 }

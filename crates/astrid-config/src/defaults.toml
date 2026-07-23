@@ -358,10 +358,6 @@ health_interval_secs = 30
 # Grace period in seconds for clean shutdown before force-kill
 shutdown_timeout_secs = 30
 
-# Idle shutdown grace period (seconds) for ephemeral mode.
-# When all clients disconnect and the daemon stays idle this long, it shuts down.
-idle_shutdown_secs = 30
-
 # Interval (seconds) between stale session cleanup sweeps.
 session_cleanup_interval_secs = 60
 

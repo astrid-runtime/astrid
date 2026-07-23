@@ -32,9 +32,13 @@ The kernel router listens on `astrid.v1.request.*` and handles requests like `Li
 
 `ApproveCapability` is defined in the protocol but not yet implemented (it returns an error).
 
-## Idle auto-shutdown
+## Daemon lifetime
 
-Tracks active connections via `AtomicUsize` plus `EventBus::subscriber_count()` as a secondary signal. Shuts down after `ASTRID_IDLE_TIMEOUT_SECS` (default 300) of zero effective connections and no daemon/cron capsules running.
+Ephemeral daemons use authenticated client lifecycle leases and shut down when
+the final client disconnects. Lease accounting uses a synchronous, non-lossy
+observer rather than the bounded broadcast queue used for ordinary events.
+Persistent daemons remain running unless the operator explicitly configures
+`ASTRID_IDLE_TIMEOUT_SECS`.
 
 ## Socket security
 

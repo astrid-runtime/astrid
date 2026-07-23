@@ -51,7 +51,7 @@ astrid chat
 | `astrid status` | Show daemon PID, uptime, connected clients, loaded capsules. |
 | `astrid stop` | Gracefully shut down the running daemon. |
 
-When you run `astrid chat` without a running daemon, an **ephemeral** daemon is spawned automatically. It shuts down on idle after the last client disconnects. Use `astrid start` for a persistent daemon that serves multiple frontends (CLI, Discord, web).
+When you run `astrid chat` without a running daemon, an **ephemeral** daemon is spawned automatically. It shuts down immediately after the last client disconnects. Use `astrid start` for a persistent daemon that serves multiple frontends (CLI, Discord, web).
 
 ### Capsule management
 

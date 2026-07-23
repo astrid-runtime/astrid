@@ -11,7 +11,25 @@ use crate::route::{
     MAX_SUBSCRIPTION_BUDGET_BYTES, PrincipalKey, RouteEntry, RouteKey, RoutedEventReceiver,
     SubscriptionRepAllocator, TopicMatcher,
 };
-use crate::subscriber::SubscriberRegistry;
+use crate::subscriber::{EventSubscriber, SubscriberRegistry};
+
+struct PermanentObserver<F> {
+    name: &'static str,
+    callback: F,
+}
+
+impl<F> EventSubscriber for PermanentObserver<F>
+where
+    F: Fn(&AstridEvent) + Send + Sync,
+{
+    fn on_event(&self, event: &AstridEvent, _bus: &EventBus) {
+        (self.callback)(event);
+    }
+
+    fn name(&self) -> &str {
+        self.name
+    }
+}
 
 /// Default channel capacity for the event bus.
 pub(crate) const DEFAULT_CHANNEL_CAPACITY: usize = 1024;
@@ -63,6 +81,10 @@ pub struct EventBus {
     capacity: usize,
     /// Monotonic sequence counter for IPC message ordering.
     ipc_seq: Arc<AtomicU64>,
+    /// Serializes sequence assignment, broadcast delivery, and synchronous
+    /// observation across concurrent publishers. The mutex is reentrant
+    /// because a synchronous subscriber may publish a follow-up event.
+    publish_order: Arc<parking_lot::ReentrantMutex<()>>,
     /// Per-(capsule, topic, principal) routing table for guest
     /// subscriptions. Demand-allocated entries; an idle principal has
     /// zero entries even when the bus has 5000 active subscribers (#813).
@@ -91,9 +113,25 @@ impl EventBus {
             registry: Arc::new(SubscriberRegistry::new()),
             capacity,
             ipc_seq: Arc::new(AtomicU64::new(1)),
+            publish_order: Arc::new(parking_lot::ReentrantMutex::new(())),
             routes: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             next_subscription_rep: Arc::new(SubscriptionRepAllocator::default()),
         }
+    }
+
+    /// Register a lightweight observer that runs synchronously for every
+    /// published event and remains registered for the lifetime of the bus.
+    ///
+    /// This is reserved for correctness-critical bookkeeping that cannot
+    /// tolerate broadcast lag. The callback must return quickly and must not
+    /// capture a strong [`EventBus`] reference; use a `Weak` owner reference
+    /// when the owner also stores this bus.
+    pub fn observe_permanently<F>(&self, name: &'static str, callback: F)
+    where
+        F: Fn(&AstridEvent) + Send + Sync + 'static,
+    {
+        self.registry
+            .register(Arc::new(PermanentObserver { name, callback }));
     }
 
     /// Publish an event to all subscribers.
@@ -103,6 +141,13 @@ impl EventBus {
     ///
     /// Returns the number of async receivers that received the event.
     pub fn publish(&self, mut event: AstridEvent) -> usize {
+        // A lifecycle observer may control process lifetime. Keep sequence
+        // assignment, transport publication, and synchronous observation in
+        // one total order so a later disconnect can never overtake an earlier
+        // connect from another publisher. Reentrancy preserves the existing
+        // ability for synchronous subscribers to publish follow-up events.
+        let publish_guard = self.publish_order.lock();
+
         // Stamp IPC messages with a monotonic sequence number for ordered delivery.
         if let AstridEvent::Ipc {
             ref mut message, ..
@@ -137,6 +182,8 @@ impl EventBus {
 
         // Notify synchronous subscribers
         self.registry.notify(&event, self);
+
+        drop(publish_guard);
 
         // Fan out to routed subscriptions AFTER broadcast::send so a
         // slow routed enqueue can never delay untargeted consumers
@@ -395,6 +442,7 @@ impl Clone for EventBus {
             registry: Arc::clone(&self.registry),
             capacity: self.capacity,
             ipc_seq: Arc::clone(&self.ipc_seq),
+            publish_order: Arc::clone(&self.publish_order),
             routes: Arc::clone(&self.routes),
             next_subscription_rep: Arc::clone(&self.next_subscription_rep),
         }

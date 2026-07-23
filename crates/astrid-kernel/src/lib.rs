@@ -2094,11 +2094,21 @@ impl Kernel {
         self.ephemeral.store(val, Ordering::Relaxed);
     }
 
+    /// Arm the never-connected fallback after the daemon has published
+    /// readiness and clients are able to establish lifecycle leases.
+    pub fn arm_ephemeral_startup_fallback(self: &Arc<Self>) {
+        drop(spawn_ephemeral_startup_fallback(
+            Arc::clone(self),
+            EPHEMERAL_STARTUP_GRACE,
+        ));
+    }
+
     fn request_ephemeral_shutdown_if_idle(&self) {
-        if self.ephemeral.load(Ordering::Relaxed) && self.total_connection_count() == 0 {
-            tracing::info!("Last client disconnected, shutting down ephemeral kernel");
-            self.shutdown_tx.send_replace(true);
+        if !self.ephemeral.load(Ordering::Relaxed) || self.total_connection_count() != 0 {
+            return;
         }
+        tracing::info!("Last client disconnected, shutting down ephemeral kernel");
+        self.shutdown_tx.send_replace(true);
     }
 
     /// Total number of active client connections across all principals.
@@ -2580,15 +2590,15 @@ fn load_or_generate_runtime_key(keys_dir: &Path) -> std::io::Result<KeyPair> {
     })
 }
 
-/// Spawns a background task that cleanly shuts down the Kernel if there is no activity.
+/// Spawns the persistent-daemon idle monitor.
 ///
-/// Ephemeral shutdown is requested directly when the last client disconnects.
-/// This monitor supplies the startup fallback: an ephemeral daemon that never
-/// receives a connection exits after the initial boot grace. Persistent mode
-/// remains idle-shutdown-free unless `ASTRID_IDLE_TIMEOUT_SECS` is set.
+/// Ephemeral shutdown is driven by reliable connection lifecycle accounting;
+/// its never-connected fallback is armed by the daemon only after readiness.
+/// Persistent mode remains idle-shutdown-free unless
+/// `ASTRID_IDLE_TIMEOUT_SECS` is set.
 /// Number of permanent internal event bus subscribers that are not client
 /// connections: `KernelRouter` (`kernel.request.*`), `AdminRouter`
-/// (`kernel.admin.*`), `ConnectionTracker` (`client.*`),
+/// (`kernel.admin.*`), the synchronous `ConnectionTracker` (`client.*`),
 /// `EventDispatcher` (all events), the bus activity monitor (all events,
 /// storm diagnostics — see [`bus_monitor::spawn_bus_activity_monitor`]), and
 /// the grant-on-first-use observer (`astrid.v1.approval` — see
@@ -2616,7 +2626,10 @@ const METRIC_CONNECTIONS_CLOSED_TOTAL: &str = "astrid_daemon_connections_closed_
 /// [`bus_monitor`], hence `pub(crate)`.
 pub(crate) const METRIC_BACKGROUND_TICKS_TOTAL: &str = "astrid_daemon_background_ticks_total";
 
-/// Initial grace period before idle checking begins.
+/// Post-readiness grace for an ephemeral daemon whose spawning client never
+/// establishes a connection.
+const EPHEMERAL_STARTUP_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+/// Initial grace before checking the persistent-daemon idle policy.
 const IDLE_INITIAL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 /// Additional grace for non-ephemeral daemons to let capsules fully initialize.
 const IDLE_NON_EPHEMERAL_GRACE: std::time::Duration = std::time::Duration::from_secs(25);
@@ -2625,14 +2638,11 @@ const IDLE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 fn spawn_idle_monitor(kernel: Arc<Kernel>) -> astrid_runtime::JoinHandle<()> {
     astrid_runtime::spawn(async move {
-        // Initial grace period — wait for capsules to boot and first client
-        // to connect before checking idle status.
+        // The daemon sets ephemeral mode after Kernel construction. Once set,
+        // its lifecycle is handled by connection closes plus the explicitly
+        // post-readiness fallback, never by this construction-time monitor.
         astrid_runtime::time::sleep(IDLE_INITIAL_GRACE).await;
-
-        // Read ephemeral flag after grace period (set by daemon after boot).
-        let ephemeral = kernel.ephemeral.load(Ordering::Relaxed);
-        if ephemeral {
-            kernel.request_ephemeral_shutdown_if_idle();
+        if kernel.ephemeral.load(Ordering::Relaxed) {
             return;
         }
 
@@ -2704,6 +2714,16 @@ fn spawn_idle_monitor(kernel: Arc<Kernel>) -> astrid_runtime::JoinHandle<()> {
                 idle_since = None;
             }
         }
+    })
+}
+
+fn spawn_ephemeral_startup_fallback(
+    kernel: Arc<Kernel>,
+    grace: std::time::Duration,
+) -> astrid_runtime::JoinHandle<()> {
+    astrid_runtime::spawn(async move {
+        astrid_runtime::time::sleep(grace).await;
+        kernel.request_ephemeral_shutdown_if_idle();
     })
 }
 
@@ -4211,6 +4231,28 @@ mod tests {
         kernel.connection_closed(&alice);
 
         assert!(!*shutdown.borrow());
+    }
+
+    #[tokio::test]
+    async fn never_connected_fallback_starts_only_when_explicitly_armed() {
+        let root = tempfile::tempdir().unwrap();
+        let home = astrid_core::dirs::AstridHome::from_path(root.path());
+        let kernel = super::test_kernel_with_home(home).await;
+        let shutdown = kernel.shutdown_tx.subscribe();
+
+        kernel.set_ephemeral(true);
+        astrid_runtime::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(
+            !*shutdown.borrow(),
+            "Kernel construction must not consume the daemon's startup grace"
+        );
+
+        drop(spawn_ephemeral_startup_fallback(
+            Arc::clone(&kernel),
+            std::time::Duration::from_millis(1),
+        ));
+        astrid_runtime::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(*shutdown.borrow());
     }
 
     /// Mirrors the `connection_closed(&principal)` logic: only `Ok(1)`

@@ -23,8 +23,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 - **Ephemeral daemons now shut down when their final client disconnects.**
   Client leases, rather than loaded uplink capsules or a 30-second idle timer,
-  own ephemeral process liveness. Persistent daemons retain their explicit
-  operator-controlled lifetime. Closes #1296.
+  own ephemeral process liveness. The never-connected fallback starts only
+  after daemon readiness, and lease accounting bypasses the lossy broadcast
+  queue so an event storm cannot hide a live client. Persistent daemons retain
+  their explicit operator-controlled lifetime. Closes #1296.
 - **Stable crates publication installs its authenticated-hash prerequisite.**
   The protected publisher installs the pinned `b3sum` binary before validating
   the exact dev candidate, so BLAKE3 release metadata checks run before any
