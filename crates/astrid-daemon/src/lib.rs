@@ -15,6 +15,8 @@ use clap::Parser;
 
 mod signal;
 
+const DAEMON_LOG_TARGET_ENV: &str = "ASTRID_DAEMON_LOG_TARGET";
+
 /// Astrid Daemon - Background kernel process
 #[derive(Parser)]
 #[command(name = "astrid-daemon")]
@@ -68,29 +70,54 @@ fn parse_nonzero_concurrency(s: &str) -> Result<usize, String> {
     }
 }
 
-fn init_logging(verbose: bool, unified_cfg: Option<&astrid_config::Config>) {
-    let log_config = if let Some(cfg) = unified_cfg {
+fn daemon_log_config(
+    verbose: bool,
+    unified_cfg: Option<&astrid_config::Config>,
+    astrid_home: &astrid_core::dirs::AstridHome,
+    target_override: Option<&std::ffi::OsStr>,
+) -> Result<astrid_telemetry::LogConfig> {
+    let mut log_config = if let Some(cfg) = unified_cfg {
         let mut lc = astrid_telemetry::log_config_from(cfg);
         if verbose {
             "debug".clone_into(&mut lc.level);
         }
-        if let Ok(home) = astrid_core::dirs::AstridHome::resolve() {
-            lc.target = astrid_telemetry::LogTarget::File(home.log_dir());
-        }
         lc
     } else {
         let level = if verbose { "debug" } else { "info" };
-        let mut lc = astrid_telemetry::LogConfig::new(level)
-            .with_format(astrid_telemetry::LogFormat::Compact);
-        if let Ok(home) = astrid_core::dirs::AstridHome::resolve() {
-            lc.target = astrid_telemetry::LogTarget::File(home.log_dir());
-        }
-        lc
+        astrid_telemetry::LogConfig::new(level).with_format(astrid_telemetry::LogFormat::Compact)
     };
+
+    log_config.target = match target_override {
+        None => astrid_telemetry::LogTarget::File(astrid_home.log_dir()),
+        Some(target) if target == std::ffi::OsStr::new("file") => {
+            astrid_telemetry::LogTarget::File(astrid_home.log_dir())
+        },
+        Some(target) if target == std::ffi::OsStr::new("stderr") => {
+            log_config.ansi = false;
+            astrid_telemetry::LogTarget::Stderr
+        },
+        Some(target) => {
+            anyhow::bail!(
+                "{DAEMON_LOG_TARGET_ENV} must be exactly 'file' or 'stderr', got {}",
+                std::path::Path::new(target).display()
+            )
+        },
+    };
+    Ok(log_config)
+}
+
+fn init_logging(
+    verbose: bool,
+    unified_cfg: Option<&astrid_config::Config>,
+    astrid_home: &astrid_core::dirs::AstridHome,
+    target_override: Option<&std::ffi::OsStr>,
+) -> Result<()> {
+    let log_config = daemon_log_config(verbose, unified_cfg, astrid_home, target_override)?;
 
     if let Err(e) = astrid_telemetry::setup_logging(&log_config) {
         eprintln!("Failed to initialize logging: {e}");
     }
+    Ok(())
 }
 
 /// Resolve the capsule host-call concurrency ceilings from CLI flags, the
@@ -199,7 +226,13 @@ pub async fn run() -> Result<()> {
     .ok()
     .map(|r| r.config);
 
-    init_logging(args.verbose, unified_cfg.as_ref());
+    let daemon_log_target = std::env::var_os(DAEMON_LOG_TARGET_ENV);
+    init_logging(
+        args.verbose,
+        unified_cfg.as_ref(),
+        &astrid_home,
+        daemon_log_target.as_deref(),
+    )?;
 
     let session_id = astrid_core::SessionId::from_uuid(
         uuid::Uuid::parse_str(&args.session)
@@ -451,7 +484,10 @@ fn spawn_gateway(
 
 #[cfg(test)]
 mod tests {
-    use super::{provides_cli_socket_uplink, write_readiness_then_arm_ephemeral};
+    use super::{
+        DAEMON_LOG_TARGET_ENV, daemon_log_config, provides_cli_socket_uplink,
+        write_readiness_then_arm_ephemeral,
+    };
     use astrid_capsule::manifest::CapsuleManifest;
     use std::sync::Mutex;
 
@@ -485,6 +521,60 @@ mod tests {
                 manifest.package.name
             );
         }
+    }
+
+    #[test]
+    fn daemon_log_target_unset_defaults_to_file() {
+        let home = astrid_core::dirs::AstridHome::from_path("/var/lib/astrid");
+        let config = daemon_log_config(false, None, &home, None).expect("default target resolves");
+        assert_eq!(
+            config.target,
+            astrid_telemetry::LogTarget::File(home.log_dir())
+        );
+        assert!(
+            config.ansi,
+            "the existing file-log default must be preserved"
+        );
+    }
+
+    #[test]
+    fn daemon_log_target_explicit_file_preserves_default() {
+        let home = astrid_core::dirs::AstridHome::from_path("/var/lib/astrid");
+        let config = daemon_log_config(false, None, &home, Some(std::ffi::OsStr::new("file")))
+            .expect("file target resolves");
+        assert_eq!(
+            config.target,
+            astrid_telemetry::LogTarget::File(home.log_dir())
+        );
+        assert!(
+            config.ansi,
+            "explicit file logging must preserve its format"
+        );
+    }
+
+    #[test]
+    fn daemon_log_target_stderr_disables_ansi() {
+        let home = astrid_core::dirs::AstridHome::from_path("/var/lib/astrid");
+        let config = daemon_log_config(false, None, &home, Some(std::ffi::OsStr::new("stderr")))
+            .expect("stderr target resolves");
+        assert_eq!(config.target, astrid_telemetry::LogTarget::Stderr);
+        assert!(
+            !config.ansi,
+            "supervisor logs must not contain ANSI escapes"
+        );
+    }
+
+    #[test]
+    fn daemon_log_target_rejects_invalid_value() {
+        let home = astrid_core::dirs::AstridHome::from_path("/var/lib/astrid");
+        let error = daemon_log_config(false, None, &home, Some(std::ffi::OsStr::new("stdout")))
+            .expect_err("stdout is not a supported daemon target");
+        assert!(
+            error.to_string().contains(&format!(
+                "{DAEMON_LOG_TARGET_ENV} must be exactly 'file' or 'stderr'"
+            )),
+            "unexpected target error: {error}"
+        );
     }
 
     #[test]

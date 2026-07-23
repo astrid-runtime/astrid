@@ -11,6 +11,11 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Added
 
+- **Foreground daemon logs can be routed to standard error.**
+  `ASTRID_DAEMON_LOG_TARGET=stderr` sends ANSI-free daemon diagnostics to the
+  process supervisor's standard-error stream. The strict override also accepts
+  `file`; when unset, the unchanged default continues to write rotating logs
+  beneath `$ASTRID_HOME/log`. Closes #1340.
 - **Capsule provenance is now bound to local install authority.**
   `astrid-build` signs canonical capsule content with the installation's
   runtime key. Same-runtime builds and operator-owned distributions retain a
