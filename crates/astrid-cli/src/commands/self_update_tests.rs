@@ -5,6 +5,39 @@
 use super::*;
 
 #[test]
+fn platform_target_selects_linux_libc_at_compile_time_boundary() {
+    assert_eq!(
+        platform_target_for("linux", "x86_64", "gnu").unwrap(),
+        "x86_64-unknown-linux-gnu"
+    );
+    assert_eq!(
+        platform_target_for("linux", "x86_64", "musl").unwrap(),
+        "x86_64-unknown-linux-musl"
+    );
+    assert_eq!(
+        platform_target_for("linux", "aarch64", "gnu").unwrap(),
+        "aarch64-unknown-linux-gnu"
+    );
+    assert_eq!(
+        platform_target_for("linux", "aarch64", "musl").unwrap(),
+        "aarch64-unknown-linux-musl"
+    );
+    assert_eq!(
+        platform_target_for("macos", "aarch64", "").unwrap(),
+        "aarch64-apple-darwin"
+    );
+    for unsupported in ["", "uclibc", "newlib"] {
+        assert!(
+            platform_target_for("linux", "x86_64", unsupported)
+                .unwrap_err()
+                .to_string()
+                .contains("target environment")
+        );
+    }
+    assert!(platform_target_for("linux", "riscv64", "musl").is_err());
+}
+
+#[test]
 fn installed_distro_lock_selects_skip_without_a_remote_source() {
     assert_eq!(
         distro_refresh_action(true),

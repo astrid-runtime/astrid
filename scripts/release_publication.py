@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 import release_manifest
+import musl_release_manifest
 
 
 FIXED_PAYLOADS = ("BLAKE3SUMS.txt", "SHA256SUMS.txt")
@@ -68,6 +69,40 @@ def validate_release_assets(
 
     archives = {target["asset"] for target in metadata["targets"]}
     payloads = archives | set(FIXED_PAYLOADS) | {metadata_name}
+    musl_metadata_name = musl_release_manifest.metadata_name(version)
+    musl_archives = {
+        release_manifest.expected_asset(version, target)
+        for target in release_manifest.MUSL_TARGETS
+    }
+    musl_markers = {musl_metadata_name, *musl_archives}
+    musl_markers |= {f"{name}.sigstore.json" for name in musl_markers}
+    checksum_assets = set(
+        release_manifest.read_checksums(
+            directory / "BLAKE3SUMS.txt", "BLAKE3"
+        )
+    ) | set(
+        release_manifest.read_checksums(
+            directory / "SHA256SUMS.txt", "SHA-256"
+        )
+    )
+    has_musl_extension = bool(
+        ({path.name for path in entries} & musl_markers)
+        or (checksum_assets & musl_archives)
+    )
+    musl_metadata = None
+    if has_musl_extension:
+        musl_metadata_path = directory / musl_metadata_name
+        musl_metadata = musl_release_manifest.load_manifest(musl_metadata_path)
+        musl_release_manifest.validate_manifest(
+            musl_metadata,
+            legacy_manifest=metadata,
+            legacy_manifest_blake3=release_manifest.blake3_file(metadata_path),
+            artifacts=directory,
+            verify_artifacts=True,
+            require_bundles=True,
+        )
+        payloads |= musl_archives | {musl_metadata_name}
+
     expected = payloads | {f"{name}.sigstore.json" for name in payloads}
     actual = {path.name for path in entries}
     require(
@@ -82,7 +117,25 @@ def validate_release_assets(
     release_manifest.validate_checksum_manifest(
         metadata, directory / "SHA256SUMS.txt", "sha256"
     )
-    for target in metadata["targets"]:
+    targets = list(metadata["targets"])
+    if musl_metadata is not None:
+        targets.extend(musl_metadata["targets"])
+        for algorithm, checksum_name in (
+            ("blake3", "BLAKE3SUMS.txt"),
+            ("sha256", "SHA256SUMS.txt"),
+        ):
+            checksums = release_manifest.read_checksums(
+                directory / checksum_name,
+                "BLAKE3" if algorithm == "blake3" else "SHA-256",
+            )
+            expected_checksums = {
+                target["asset"]: target[algorithm] for target in targets
+            }
+            require(
+                checksums == expected_checksums,
+                f"{checksum_name} does not match the combined authenticated release metadata",
+            )
+    for target in targets:
         archive = directory / target["asset"]
         require(
             sha256_file(archive) == target["sha256"],

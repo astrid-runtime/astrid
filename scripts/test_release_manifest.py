@@ -94,8 +94,24 @@ class ReleaseManifestTests(unittest.TestCase):
     def test_rejects_missing_or_extra_checksum_assets(self) -> None:
         path = self.artifacts / "BLAKE3SUMS.txt"
         path.write_text(path.read_text() + f"{'f' * 64}  extra.tar.gz\n")
-        with self.assertRaisesRegex(ValueError, "exactly the four"):
+        with self.assertRaisesRegex(ValueError, "exactly the four legacy"):
             self.manifest()
+
+    def test_legacy_manifest_shape_is_unchanged_with_combined_checksums(self) -> None:
+        legacy = self.manifest()
+        legacy_rendered = release_manifest.render_manifest(legacy)
+        b3 = self.artifacts / "BLAKE3SUMS.txt"
+        sha = self.artifacts / "SHA256SUMS.txt"
+        for index, target in enumerate(release_manifest.MUSL_TARGETS, 20):
+            name = release_manifest.expected_asset(VERSION, target)
+            (self.artifacts / name).write_bytes(bytes([index]) * index)
+            with b3.open("a") as output:
+                output.write(f"{index:064x}  {name}\n")
+            with sha.open("a") as output:
+                output.write(f"{index + 8:064x}  {name}\n")
+        combined = self.manifest()
+        self.assertEqual(combined, legacy)
+        self.assertEqual(release_manifest.render_manifest(combined), legacy_rendered)
 
     def test_rejects_duplicate_target(self) -> None:
         manifest = self.manifest()

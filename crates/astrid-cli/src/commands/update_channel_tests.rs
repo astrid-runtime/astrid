@@ -26,6 +26,28 @@ fn targets() -> Vec<TargetMetadata> {
         .collect()
 }
 
+fn musl_targets() -> Vec<TargetMetadata> {
+    MUSL_TARGETS
+        .iter()
+        .enumerate()
+        .map(|(index, triple)| {
+            let ordinal = index.checked_add(30).expect("target ordinal fits usize");
+            let checksum_ordinal = index
+                .checked_add(40)
+                .expect("target checksum ordinal fits usize");
+            let asset = format!("astrid-{VERSION}-{triple}.tar.gz");
+            TargetMetadata {
+                triple: (*triple).to_owned(),
+                asset: asset.clone(),
+                size: i64::try_from(ordinal).expect("target ordinal fits i64"),
+                blake3: format!("{ordinal:064x}"),
+                sha256: format!("{checksum_ordinal:064x}"),
+                sigstore_bundle: format!("{asset}.sigstore.json"),
+            }
+        })
+        .collect()
+}
+
 fn release_manifest() -> Vec<u8> {
     toml::to_string(&ReleaseManifest {
         schema_version: 1,
@@ -76,6 +98,26 @@ fn pointer(channel: UpdateChannel, generation: i64) -> ChannelPointer {
         },
         targets: targets(),
     }
+}
+
+fn musl_extension(pointer: &ChannelPointer, legacy_manifest: &[u8]) -> Vec<u8> {
+    toml::to_string(&MuslReleaseExtension {
+        schema_version: 1,
+        kind: "astrid-release-musl-extension".to_owned(),
+        product: PRODUCT.to_owned(),
+        repository: REPOSITORY.to_owned(),
+        version: pointer.release.version.clone(),
+        tag: pointer.release.tag.clone(),
+        source_commit: pointer.release.source_commit.clone(),
+        release_workflow_identity: pointer.release.release_workflow_identity.clone(),
+        legacy_release: LegacyReleaseBinding {
+            metadata_asset: pointer.release.metadata_asset.clone(),
+            metadata_blake3: blake3::hash(legacy_manifest).to_hex().to_string(),
+        },
+        targets: musl_targets(),
+    })
+    .unwrap()
+    .into_bytes()
 }
 
 fn nightly_pointer(generation: i64) -> ChannelPointer {
@@ -284,4 +326,245 @@ fn generation_rollback_and_same_generation_equivocation_are_rejected() {
     enforce_continuity_values(&previous, &previous_bytes, &previous, &previous_bytes).unwrap();
     let advanced = pointer(UpdateChannel::Stable, 6);
     enforce_continuity_values(&advanced, &encoded(&advanced), &previous, &previous_bytes).unwrap();
+}
+
+struct RecordingMuslMetadataSource {
+    extension: Vec<u8>,
+    bundle: Vec<u8>,
+    downloads: std::sync::Mutex<Vec<String>>,
+    authentications: std::sync::atomic::AtomicUsize,
+}
+
+impl MuslMetadataSource for RecordingMuslMetadataSource {
+    async fn download(&self, url: &str, _limit: usize, _label: &str) -> anyhow::Result<Vec<u8>> {
+        self.downloads.lock().unwrap().push(url.to_owned());
+        if url.ends_with(".sigstore.json") {
+            Ok(self.bundle.clone())
+        } else {
+            Ok(self.extension.clone())
+        }
+    }
+
+    fn authenticate(
+        &self,
+        bytes: Vec<u8>,
+        bundle: &[u8],
+        version: &str,
+    ) -> anyhow::Result<Vec<u8>> {
+        assert_eq!(bundle, self.bundle);
+        assert_eq!(version, VERSION);
+        self.authentications
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(bytes)
+    }
+}
+
+#[tokio::test]
+async fn target_resolver_fetches_and_authenticates_extension_only_for_musl() {
+    let legacy = release_manifest();
+    let value = pointer(UpdateChannel::Stable, 1);
+    let extension = musl_extension(&value, &legacy);
+    let metadata_name = musl_metadata_asset(VERSION);
+    let metadata_url = format!("https://release.example/{metadata_name}");
+    let bundle_url = format!("{metadata_url}.sigstore.json");
+    let release = serde_json::json!({
+        "assets": [
+            {
+                "name": metadata_name.clone(),
+                "browser_download_url": metadata_url.clone()
+            },
+            {
+                "name": format!("{metadata_name}.sigstore.json"),
+                "browser_download_url": bundle_url.clone()
+            }
+        ]
+    });
+    let source = RecordingMuslMetadataSource {
+        extension,
+        bundle: b"authenticated-bundle".to_vec(),
+        downloads: std::sync::Mutex::new(Vec::new()),
+        authentications: std::sync::atomic::AtomicUsize::new(0),
+    };
+
+    let gnu_target = TARGETS[1];
+    assert_eq!(
+        resolve_target_blake3(
+            &source,
+            &serde_json::Value::Null,
+            &legacy,
+            &value,
+            gnu_target
+        )
+        .await
+        .unwrap(),
+        value.target(gnu_target).unwrap().blake3
+    );
+    assert!(source.downloads.lock().unwrap().is_empty());
+    assert_eq!(
+        source
+            .authentications
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+
+    let musl_target = MUSL_TARGETS[0];
+    assert_eq!(
+        resolve_target_blake3(&source, &release, &legacy, &value, musl_target)
+            .await
+            .unwrap(),
+        musl_targets()[0].blake3
+    );
+    assert_eq!(
+        *source.downloads.lock().unwrap(),
+        vec![metadata_url, bundle_url]
+    );
+    assert_eq!(
+        source
+            .authentications
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+}
+
+#[test]
+fn legacy_channel_and_release_documents_stay_exactly_four_target_only() {
+    let mut value = pointer(UpdateChannel::Stable, 1);
+    value.targets.extend(musl_targets());
+    assert!(
+        parse_channel(&encoded(&value), UpdateChannel::Stable, validation_time())
+            .unwrap_err()
+            .to_string()
+            .contains("exactly 4 targets")
+    );
+
+    let pointer = pointer(UpdateChannel::Stable, 1);
+    let mut manifest: ReleaseManifest =
+        toml::from_str(std::str::from_utf8(&release_manifest()).unwrap()).unwrap();
+    manifest.targets.extend(musl_targets());
+    let bytes = toml::to_string(&manifest).unwrap();
+    let mut rebound = pointer.clone();
+    rebound.release.metadata_blake3 = blake3::hash(bytes.as_bytes()).to_hex().to_string();
+    assert!(
+        verify_release_manifest(bytes.as_bytes(), &rebound)
+            .unwrap_err()
+            .to_string()
+            .contains("exactly 4 targets")
+    );
+}
+
+#[test]
+fn musl_extension_accepts_exactly_two_targets_and_selects_requested_digest() {
+    let legacy = release_manifest();
+    let value = pointer(UpdateChannel::Stable, 1);
+    let extension = musl_extension(&value, &legacy);
+    for target in musl_targets() {
+        assert_eq!(
+            verify_musl_extension(&extension, &legacy, &value, &target.triple).unwrap(),
+            target.blake3
+        );
+    }
+}
+
+#[test]
+fn musl_extension_rejects_missing_duplicate_and_unexpected_targets() {
+    let legacy = release_manifest();
+    let value = pointer(UpdateChannel::Stable, 1);
+    let extension = musl_extension(&value, &legacy);
+    let parsed: MuslReleaseExtension =
+        toml::from_str(std::str::from_utf8(&extension).unwrap()).unwrap();
+
+    let mut missing = parsed.clone();
+    missing.targets.pop();
+    assert!(
+        verify_musl_extension(
+            toml::to_string(&missing).unwrap().as_bytes(),
+            &legacy,
+            &value,
+            MUSL_TARGETS[0]
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("exactly 2 targets")
+    );
+
+    let mut duplicate = parsed.clone();
+    duplicate.targets[1] = duplicate.targets[0].clone();
+    assert!(
+        verify_musl_extension(
+            toml::to_string(&duplicate).unwrap().as_bytes(),
+            &legacy,
+            &value,
+            MUSL_TARGETS[0]
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("target set")
+    );
+
+    let mut unexpected = parsed;
+    unexpected.targets[0].triple = TARGETS[0].to_owned();
+    assert!(
+        verify_musl_extension(
+            toml::to_string(&unexpected).unwrap().as_bytes(),
+            &legacy,
+            &value,
+            MUSL_TARGETS[1]
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("target set")
+    );
+}
+
+#[test]
+fn musl_extension_rejects_release_identity_and_legacy_binding_mismatches() {
+    let legacy = release_manifest();
+    let value = pointer(UpdateChannel::Stable, 1);
+    let extension = musl_extension(&value, &legacy);
+    let parsed: MuslReleaseExtension =
+        toml::from_str(std::str::from_utf8(&extension).unwrap()).unwrap();
+
+    let mut wrong_source = parsed.clone();
+    wrong_source.source_commit = "cccccccccccccccccccccccccccccccccccccccc".to_owned();
+    assert!(
+        verify_musl_extension(
+            toml::to_string(&wrong_source).unwrap().as_bytes(),
+            &legacy,
+            &value,
+            MUSL_TARGETS[0]
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("does not match")
+    );
+
+    let mut wrong_identity = parsed.clone();
+    wrong_identity.release_workflow_identity =
+        "https://github.com/astrid-runtime/astrid/.github/workflows/release.yml@refs/heads/main"
+            .to_owned();
+    assert!(
+        verify_musl_extension(
+            toml::to_string(&wrong_identity).unwrap().as_bytes(),
+            &legacy,
+            &value,
+            MUSL_TARGETS[0]
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("does not match")
+    );
+
+    let mut wrong_digest = parsed;
+    wrong_digest.legacy_release.metadata_blake3 = "f".repeat(64);
+    assert!(
+        verify_musl_extension(
+            toml::to_string(&wrong_digest).unwrap().as_bytes(),
+            &legacy,
+            &value,
+            MUSL_TARGETS[0]
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("does not bind")
+    );
 }

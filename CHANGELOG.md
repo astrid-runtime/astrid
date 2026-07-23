@@ -16,6 +16,13 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   process supervisor's standard-error stream. The strict override also accepts
   `file`; when unset, the unchanged default continues to write rotating logs
   beneath `$ASTRID_HOME/log`. Closes #1340.
+- **Linux musl releases use a backward-compatible signed metadata extension.**
+  The legacy release manifest and mutable channel pointer remain fixed at their
+  exact four-target schema, while musl builds authenticate a separately signed
+  two-target manifest from the same immutable tag. The extension binds the
+  exact legacy manifest digest and release identity, and interrupted release
+  publication validates and recovers its metadata, bundle, and archives
+  without replacing uploaded assets. Closes #1339.
 - **Capsule provenance is now bound to local install authority.**
   `astrid-build` signs canonical capsule content with the installation's
   runtime key. Same-runtime builds and operator-owned distributions retain a
