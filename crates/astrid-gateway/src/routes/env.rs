@@ -39,11 +39,14 @@
 //! the gateway to publish to so the kernel can persist the trail).
 
 use std::collections::HashMap;
+use std::path::Path as FsPath;
 use std::sync::Arc;
 
-use astrid_core::dirs::AstridHome;
+use astrid_core::PrincipalId;
+use astrid_core::dirs::{AstridHome, WorkspaceLayout};
 use astrid_core::kernel_api::{KernelRequest, KernelResponse};
 use astrid_storage::{FileSecretStore, SecretStore};
+use axum::Extension;
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{Request, StatusCode};
@@ -51,8 +54,8 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::error::{ErrorBody, GatewayError, GatewayResult};
-use crate::routes::daemon_kernel_error;
 use crate::routes::principals::caller_from;
+use crate::routes::{WorkspaceContext, daemon_kernel_error};
 use crate::state::GatewayState;
 
 /// Subset of `Capsule.toml [env.<field>]` surfaced to the dashboard.
@@ -107,9 +110,27 @@ pub async fn get_env_schema(
     Path(capsule_id): Path<String>,
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<EnvSchemaResponse>> {
+    get_env_schema_inner(state, &WorkspaceContext::default(), capsule_id, req).await
+}
+
+pub(crate) async fn get_env_schema_with_workspace(
+    State(state): State<Arc<GatewayState>>,
+    Extension(workspace): Extension<WorkspaceContext>,
+    Path(capsule_id): Path<String>,
+    req: Request<axum::body::Body>,
+) -> GatewayResult<Json<EnvSchemaResponse>> {
+    get_env_schema_inner(state, &workspace, capsule_id, req).await
+}
+
+async fn get_env_schema_inner(
+    state: Arc<GatewayState>,
+    workspace: &WorkspaceContext,
+    capsule_id: String,
+    req: Request<axum::body::Body>,
+) -> GatewayResult<Json<EnvSchemaResponse>> {
     let caller = caller_from(&req)?.clone();
     ensure_capsule_visible(&state, &caller, &capsule_id).await?;
-    let schema = load_env_schema(&capsule_id)?;
+    let schema = load_env_schema(&caller.principal, &capsule_id, workspace)?;
     Ok(Json(EnvSchemaResponse {
         capsule_id,
         fields: schema,
@@ -139,6 +160,25 @@ pub async fn write_env(
     Path((capsule_id, field)): Path<(String, String)>,
     req: Request<axum::body::Body>,
 ) -> GatewayResult<StatusCode> {
+    write_env_inner(state, &WorkspaceContext::default(), capsule_id, field, req).await
+}
+
+pub(crate) async fn write_env_with_workspace(
+    State(state): State<Arc<GatewayState>>,
+    Extension(workspace): Extension<WorkspaceContext>,
+    Path((capsule_id, field)): Path<(String, String)>,
+    req: Request<axum::body::Body>,
+) -> GatewayResult<StatusCode> {
+    write_env_inner(state, &workspace, capsule_id, field, req).await
+}
+
+async fn write_env_inner(
+    state: Arc<GatewayState>,
+    workspace: &WorkspaceContext,
+    capsule_id: String,
+    field: String,
+    req: Request<axum::body::Body>,
+) -> GatewayResult<StatusCode> {
     let caller = caller_from(&req)?.clone();
     ensure_capsule_visible(&state, &caller, &capsule_id).await?;
     if !is_safe_field_name(&field) {
@@ -147,7 +187,7 @@ pub async fn write_env(
         )));
     }
     let body: EnvWriteRequest = crate::routes::principals::read_json_body(req).await?;
-    let schema = load_env_schema(&capsule_id)?;
+    let schema = load_env_schema(&caller.principal, &capsule_id, workspace)?;
     let def = schema.get(&field).ok_or(GatewayError::NotFound)?;
 
     let home = AstridHome::resolve()
@@ -259,12 +299,17 @@ fn ensure_capsule_visible_from_response(
     }
 }
 
-/// Parse `[env]` from the local install target's `Capsule.toml`.
+/// Parse `[env]` from the caller's principal install or verified workspace
+/// `Capsule.toml`, in runtime discovery precedence.
 ///
 /// The gateway intentionally does NOT take a dep on
 /// `astrid-capsule` (which would drag in wasmtime); a minimal TOML
 /// read of just the `[env]` subtable is enough.
-fn load_env_schema(capsule_id: &str) -> GatewayResult<HashMap<String, EnvFieldSchema>> {
+fn load_env_schema(
+    principal: &PrincipalId,
+    capsule_id: &str,
+    workspace: &WorkspaceContext,
+) -> GatewayResult<HashMap<String, EnvFieldSchema>> {
     if !is_safe_field_name(capsule_id) {
         return Err(GatewayError::BadRequest(format!(
             "invalid capsule id {capsule_id:?}"
@@ -272,25 +317,75 @@ fn load_env_schema(capsule_id: &str) -> GatewayResult<HashMap<String, EnvFieldSc
     }
     let home = AstridHome::resolve()
         .map_err(|e| GatewayError::Internal(anyhow::anyhow!("resolve ASTRID_HOME: {e}")))?;
-    load_env_schema_from_home(&home, capsule_id)
+    load_env_schema_from_home_in_workspace(
+        &home,
+        principal,
+        capsule_id,
+        Some(&workspace.root),
+        &workspace.layout,
+    )
 }
 
+#[cfg(test)]
 fn load_env_schema_from_home(
     home: &AstridHome,
+    principal: &PrincipalId,
     capsule_id: &str,
 ) -> GatewayResult<HashMap<String, EnvFieldSchema>> {
-    // Installed capsule manifests live under the local install target, not
-    // `$ASTRID_HOME/capsules/` (that path doesn't exist on disk). This reads
-    // the manifest only after `ensure_capsule_visible` has confirmed the
-    // caller's principal is allowed to see the capsule; it does not grant
-    // visibility to default's capsule set.
-    let principal = astrid_capsule_install::paths::install_principal();
-    let manifest_path = home
-        .principal_home(&principal)
+    load_env_schema_from_home_in_workspace(
+        home,
+        principal,
+        capsule_id,
+        None,
+        &WorkspaceLayout::default(),
+    )
+}
+
+fn load_env_schema_from_home_in_workspace(
+    home: &AstridHome,
+    principal: &PrincipalId,
+    capsule_id: &str,
+    workspace_root: Option<&FsPath>,
+    workspace_layout: &WorkspaceLayout,
+) -> GatewayResult<HashMap<String, EnvFieldSchema>> {
+    // Principal installs override workspace capsules, matching runtime
+    // discovery. The manifest is read only after `ensure_capsule_visible` has
+    // confirmed that the same principal is allowed to see the capsule.
+    let principal_manifest = home
+        .principal_home(principal)
         .capsules_dir()
         .join(capsule_id)
         .join("Capsule.toml");
-    let text = match std::fs::read_to_string(&manifest_path) {
+    if principal_manifest.exists() {
+        return parse_env_schema(&principal_manifest);
+    }
+
+    let Some(workspace_root) = workspace_root else {
+        return Err(GatewayError::NotFound);
+    };
+    let workspace = workspace_layout
+        .resolve(workspace_root)
+        .map_err(|e| GatewayError::Internal(anyhow::anyhow!("resolve selected workspace: {e}")))?;
+    let manifest_relative = FsPath::new("capsules")
+        .join(capsule_id)
+        .join("Capsule.toml");
+    let workspace_manifest = workspace.resolve_file(&manifest_relative).map_err(|e| {
+        GatewayError::Internal(anyhow::anyhow!("resolve workspace capsule manifest: {e}"))
+    })?;
+    if !workspace_manifest.exists() {
+        return Err(GatewayError::NotFound);
+    }
+    let schema = parse_env_schema(&workspace_manifest)?;
+    workspace.resolve_file(&manifest_relative).map_err(|e| {
+        GatewayError::Internal(anyhow::anyhow!(
+            "workspace capsule manifest changed while it was being read: {e}"
+        ))
+    })?;
+    Ok(schema)
+}
+
+fn parse_env_schema(manifest_path: &FsPath) -> GatewayResult<HashMap<String, EnvFieldSchema>> {
+    let text = match std::fs::read_to_string(manifest_path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err(GatewayError::NotFound);
@@ -537,13 +632,53 @@ mod tests {
     }
 
     #[test]
-    fn env_schema_loads_from_install_principal_capsule_manifest() {
+    fn env_schema_loads_from_the_requested_principal_capsule_manifest() {
         let home_dir = tempfile::tempdir().unwrap();
         let home = AstridHome::from_path(home_dir.path());
-        let manifest_dir = home
-            .principal_home(&astrid_capsule_install::paths::install_principal())
-            .capsules_dir()
-            .join("astrid-capsule-test");
+        let default = PrincipalId::default();
+        let alice = PrincipalId::new("alice").unwrap();
+        for (principal, description) in [(&default, "default API key"), (&alice, "Alice API key")] {
+            let manifest_dir = home
+                .principal_home(principal)
+                .capsules_dir()
+                .join("astrid-capsule-test");
+            std::fs::create_dir_all(&manifest_dir).unwrap();
+            std::fs::write(
+                manifest_dir.join("Capsule.toml"),
+                format!(
+                    r#"
+                    [package]
+                    name = "astrid-capsule-test"
+                    version = "1.0.0"
+
+                    [env]
+                    api_key = {{ type = "secret", description = "{description}" }}
+                    region = {{ type = "select", enum_values = ["us", "eu"] }}
+                    "#
+                ),
+            )
+            .unwrap();
+        }
+
+        let schema = load_env_schema_from_home(&home, &alice, "astrid-capsule-test").unwrap();
+
+        assert_eq!(schema["api_key"].env_type, "secret");
+        assert_eq!(
+            schema["api_key"].description.as_deref(),
+            Some("Alice API key")
+        );
+        assert_eq!(schema["region"].env_type, "select");
+        assert_eq!(schema["region"].enum_values, ["us", "eu"]);
+    }
+
+    #[test]
+    fn env_schema_falls_back_to_the_verified_workspace_manifest() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(home_dir.path());
+        let workspace = tempfile::tempdir().unwrap();
+        let manifest_dir = workspace
+            .path()
+            .join(".alternate-runtime/capsules/astrid-capsule-test");
         std::fs::create_dir_all(&manifest_dir).unwrap();
         std::fs::write(
             manifest_dir.join("Capsule.toml"),
@@ -553,17 +688,134 @@ mod tests {
             version = "1.0.0"
 
             [env]
-            api_key = { type = "secret", description = "API key" }
-            region = { type = "select", enum_values = ["us", "eu"] }
+            api_key = { type = "secret", description = "Workspace API key" }
             "#,
         )
         .unwrap();
 
-        let schema = load_env_schema_from_home(&home, "astrid-capsule-test").unwrap();
+        let schema = load_env_schema_from_home_in_workspace(
+            &home,
+            &PrincipalId::new("alice").unwrap(),
+            "astrid-capsule-test",
+            Some(workspace.path()),
+            &WorkspaceLayout::new(".alternate-runtime").unwrap(),
+        )
+        .unwrap();
 
         assert_eq!(schema["api_key"].env_type, "secret");
-        assert_eq!(schema["api_key"].description.as_deref(), Some("API key"));
-        assert_eq!(schema["region"].env_type, "select");
-        assert_eq!(schema["region"].enum_values, ["us", "eu"]);
+        assert_eq!(
+            schema["api_key"].description.as_deref(),
+            Some("Workspace API key")
+        );
+    }
+
+    #[test]
+    fn principal_env_schema_takes_precedence_over_workspace_manifest() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(home_dir.path());
+        let workspace = tempfile::tempdir().unwrap();
+        let principal = PrincipalId::new("alice").unwrap();
+        let principal_manifest = home
+            .principal_home(&principal)
+            .capsules_dir()
+            .join("astrid-capsule-test");
+        let workspace_manifest = workspace
+            .path()
+            .join(".astrid/capsules/astrid-capsule-test");
+        for (manifest_dir, description) in [
+            (&principal_manifest, "Principal API key"),
+            (&workspace_manifest, "Workspace API key"),
+        ] {
+            std::fs::create_dir_all(manifest_dir).unwrap();
+            std::fs::write(
+                manifest_dir.join("Capsule.toml"),
+                format!(
+                    r#"
+                    [package]
+                    name = "astrid-capsule-test"
+                    version = "1.0.0"
+
+                    [env]
+                    api_key = {{ type = "secret", description = "{description}" }}
+                    "#
+                ),
+            )
+            .unwrap();
+        }
+
+        let schema = load_env_schema_from_home_in_workspace(
+            &home,
+            &principal,
+            "astrid-capsule-test",
+            Some(workspace.path()),
+            &WorkspaceLayout::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            schema["api_key"].description.as_deref(),
+            Some("Principal API key")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn env_schema_rejects_redirected_workspace_capsules() {
+        use std::os::unix::fs::symlink;
+
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(home_dir.path());
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(workspace.path().join(".astrid")).unwrap();
+        symlink(outside.path(), workspace.path().join(".astrid/capsules")).unwrap();
+
+        let result = load_env_schema_from_home_in_workspace(
+            &home,
+            &PrincipalId::new("alice").unwrap(),
+            "astrid-capsule-test",
+            Some(workspace.path()),
+            &WorkspaceLayout::default(),
+        );
+
+        assert!(matches!(result, Err(GatewayError::Internal(_))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn env_schema_verifies_only_the_requested_workspace_manifest() {
+        use std::os::unix::fs::symlink;
+
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(home_dir.path());
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let capsules = workspace.path().join(".astrid/capsules");
+        let requested = capsules.join("astrid-capsule-test");
+        std::fs::create_dir_all(&requested).unwrap();
+        std::fs::write(
+            requested.join("Capsule.toml"),
+            r#"
+            [package]
+            name = "astrid-capsule-test"
+            version = "1.0.0"
+
+            [env]
+            api_key = { type = "secret" }
+            "#,
+        )
+        .unwrap();
+        symlink(outside.path(), capsules.join("unrelated-capsule")).unwrap();
+
+        let schema = load_env_schema_from_home_in_workspace(
+            &home,
+            &PrincipalId::new("alice").unwrap(),
+            "astrid-capsule-test",
+            Some(workspace.path()),
+            &WorkspaceLayout::default(),
+        )
+        .expect("an unrelated capsule must not make the requested manifest unsafe");
+
+        assert_eq!(schema["api_key"].env_type, "secret");
     }
 }
