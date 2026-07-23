@@ -33,6 +33,9 @@ astrid-daemon --ephemeral --workspace /path/to/project
 
 # With verbose logging
 astrid-daemon --verbose
+
+# Foreground supervisor/container logs on standard error
+ASTRID_DAEMON_LOG_TARGET=stderr astrid-daemon --workspace /path/to/project
 ```
 
 ## Flags
@@ -44,9 +47,22 @@ astrid-daemon --verbose
 | `--ephemeral` | `false` | Shut down when the last client disconnects |
 | `-v, --verbose` | `false` | Enable debug-level logging |
 
+## Environment
+
+| Variable | Default | Description |
+|---|---|---|
+| `ASTRID_DAEMON_LOG_TARGET` | `file` | Daemon log destination. Accepted values are exactly `file` and `stderr`; every other value prevents startup. `stderr` disables ANSI escapes for process-supervisor and container log collectors. |
+
 ## Lifecycle
 
-1. Resolves `~/.astrid/` home directory, initializes logging to `~/.astrid/log/`.
+The directly invoked `astrid-daemon` process remains in the foreground in both
+modes. Persistent mode is the default and continues running after clients
+disconnect. `--ephemeral` changes only lifetime ownership: the daemon shuts down
+as soon as its final client disconnects. `ASTRID_DAEMON_LOG_TARGET` changes only
+where diagnostics are written; it never changes process lifetime.
+
+1. Resolves `~/.astrid/` home directory, then initializes logging to
+   `~/.astrid/log/` (`file`) or standard error (`stderr`).
 2. Boots the kernel: event bus, KV store, capability store, audit log, VFS, MCP servers.
 3. Binds Unix socket at `~/.astrid/run/system.sock`, generates session token at `~/.astrid/run/system.token`.
 4. Loads all capsules from `~/.astrid/home/{principal}/.local/capsules/` and `.astrid/capsules/` (workspace).
