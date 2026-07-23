@@ -21,6 +21,7 @@ const TARGETS: &[&str] = &[
     "x86_64-apple-darwin",
     "x86_64-unknown-linux-gnu",
 ];
+const MUSL_TARGETS: &[&str] = &["aarch64-unknown-linux-musl", "x86_64-unknown-linux-musl"];
 const MAX_RELEASE_METADATA_BYTES: usize = 2 * 1024 * 1024;
 const MAX_BUNDLE_BYTES: usize = 256 * 1024;
 const MAX_MANIFEST_BYTES: usize = 256 * 1024;
@@ -53,6 +54,37 @@ pub(super) struct ResolvedChannelRelease {
     pub(super) version: String,
     pub(super) release: serde_json::Value,
     pub(super) target_blake3: String,
+}
+
+trait MuslMetadataSource {
+    async fn download(&self, url: &str, limit: usize, label: &str) -> anyhow::Result<Vec<u8>>;
+
+    fn authenticate(&self, bytes: Vec<u8>, bundle: &[u8], version: &str)
+    -> anyhow::Result<Vec<u8>>;
+}
+
+struct ProductionMuslMetadataSource<'a> {
+    client: &'a reqwest::Client,
+    authenticator: &'a MetadataAuthenticator,
+}
+
+impl MuslMetadataSource for ProductionMuslMetadataSource<'_> {
+    async fn download(&self, url: &str, limit: usize, label: &str) -> anyhow::Result<Vec<u8>> {
+        download_bounded(self.client, url, limit, label).await
+    }
+
+    fn authenticate(
+        &self,
+        bytes: Vec<u8>,
+        bundle: &[u8],
+        version: &str,
+    ) -> anyhow::Result<Vec<u8>> {
+        let authenticated = self
+            .authenticator
+            .authenticate_release_manifest(bytes, bundle, version)
+            .map_err(anyhow::Error::new)?;
+        Ok(authenticated.into_bytes())
+    }
 }
 
 async fn fetch_release_by_tag(
@@ -145,7 +177,12 @@ pub(super) async fn resolve_signed_channel(
         .map_err(anyhow::Error::new)?
         .into_bytes();
     verify_release_manifest(&manifest, &parsed)?;
-    let target_blake3 = parsed.target(target)?.blake3.clone();
+    let metadata_source = ProductionMuslMetadataSource {
+        client,
+        authenticator: &authenticator,
+    };
+    let target_blake3 =
+        resolve_target_blake3(&metadata_source, &release, &manifest, &parsed, target).await?;
 
     // Accept only a pointer whose immutable release manifest independently
     // authenticates and matches every content-bound field.
@@ -216,6 +253,28 @@ struct ReleaseManifest {
     targets: Vec<TargetMetadata>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+struct LegacyReleaseBinding {
+    metadata_asset: String,
+    metadata_blake3: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+struct MuslReleaseExtension {
+    schema_version: i64,
+    kind: String,
+    product: String,
+    repository: String,
+    version: String,
+    tag: String,
+    source_commit: String,
+    release_workflow_identity: String,
+    legacy_release: LegacyReleaseBinding,
+    targets: Vec<TargetMetadata>,
+}
+
 impl ChannelPointer {
     pub(super) fn version(&self) -> &str {
         &self.release.version
@@ -272,16 +331,23 @@ fn canonical_time(value: &str, label: &str) -> anyhow::Result<DateTime<Utc>> {
     Ok(parsed)
 }
 
-fn validate_targets(targets: &[TargetMetadata], version: &str) -> anyhow::Result<()> {
+fn validate_targets_for(
+    targets: &[TargetMetadata],
+    expected_targets: &[&str],
+    version: &str,
+    label: &str,
+) -> anyhow::Result<()> {
     ensure!(
-        targets.len() == TARGETS.len(),
-        "signed metadata must contain exactly four targets"
+        targets.len() == expected_targets.len(),
+        "{label} must contain exactly {} targets",
+        expected_targets.len()
     );
     let mut seen = HashSet::new();
     for target in targets {
         ensure!(
-            TARGETS.contains(&target.triple.as_str()) && seen.insert(target.triple.as_str()),
-            "signed metadata target set is invalid"
+            expected_targets.contains(&target.triple.as_str())
+                && seen.insert(target.triple.as_str()),
+            "{label} target set is invalid"
         );
         let expected_asset = format!("astrid-{version}-{}.tar.gz", target.triple);
         ensure!(
@@ -300,10 +366,54 @@ fn validate_targets(targets: &[TargetMetadata], version: &str) -> anyhow::Result
         );
     }
     ensure!(
-        seen.len() == TARGETS.len(),
-        "signed metadata target set is incomplete"
+        seen.len() == expected_targets.len(),
+        "{label} target set is incomplete"
     );
     Ok(())
+}
+
+fn validate_targets(targets: &[TargetMetadata], version: &str) -> anyhow::Result<()> {
+    validate_targets_for(targets, TARGETS, version, "signed metadata")
+}
+
+fn musl_metadata_asset(version: &str) -> String {
+    format!("astrid-{version}-musl-release.toml")
+}
+
+async fn resolve_target_blake3(
+    source: &impl MuslMetadataSource,
+    release: &serde_json::Value,
+    legacy_manifest: &[u8],
+    pointer: &ChannelPointer,
+    target: &str,
+) -> anyhow::Result<String> {
+    if TARGETS.contains(&target) {
+        return Ok(pointer.target(target)?.blake3.clone());
+    }
+    if !MUSL_TARGETS.contains(&target) {
+        bail!("signed release metadata does not support target '{target}'");
+    }
+
+    let extension_asset = musl_metadata_asset(pointer.version());
+    let extension_url = exact_asset_url(release, &extension_asset)?.to_owned();
+    let extension_bundle_url =
+        exact_asset_url(release, &format!("{extension_asset}.sigstore.json"))?.to_owned();
+    let extension = source
+        .download(
+            &extension_url,
+            MAX_MANIFEST_BYTES,
+            "immutable musl release metadata",
+        )
+        .await?;
+    let extension_bundle = source
+        .download(
+            &extension_bundle_url,
+            MAX_BUNDLE_BYTES,
+            "musl release metadata authentication bundle",
+        )
+        .await?;
+    let extension = source.authenticate(extension, &extension_bundle, pointer.version())?;
+    verify_musl_extension(&extension, legacy_manifest, pointer, target)
 }
 
 pub(super) fn parse_channel(
@@ -463,6 +573,56 @@ pub(super) fn verify_release_manifest(
         "release manifest targets do not match the signed channel pointer"
     );
     Ok(())
+}
+
+fn verify_musl_extension(
+    bytes: &[u8],
+    legacy_manifest_bytes: &[u8],
+    pointer: &ChannelPointer,
+    target: &str,
+) -> anyhow::Result<String> {
+    ensure!(
+        MUSL_TARGETS.contains(&target),
+        "musl release metadata does not support target '{target}'"
+    );
+    let text = std::str::from_utf8(bytes).context("musl release metadata is not UTF-8")?;
+    let extension: MuslReleaseExtension =
+        toml::from_str(text).context("musl release metadata is invalid TOML")?;
+    ensure!(
+        extension.schema_version == 1
+            && extension.kind == "astrid-release-musl-extension"
+            && extension.product == PRODUCT
+            && extension.repository == REPOSITORY,
+        "musl release metadata identity is invalid"
+    );
+    canonical_version(&extension.version)?;
+    ensure!(
+        extension.version == pointer.release.version
+            && extension.tag == pointer.release.tag
+            && extension.source_commit == pointer.release.source_commit
+            && extension.release_workflow_identity == pointer.release.release_workflow_identity,
+        "musl release metadata does not match the authenticated legacy release"
+    );
+    ensure!(
+        extension.legacy_release.metadata_asset == pointer.release.metadata_asset
+            && extension.legacy_release.metadata_blake3 == pointer.release.metadata_blake3
+            && blake3::hash(legacy_manifest_bytes).to_hex().as_str()
+                == extension.legacy_release.metadata_blake3,
+        "musl release metadata does not bind the authenticated legacy release manifest"
+    );
+    validate_targets_for(
+        &extension.targets,
+        MUSL_TARGETS,
+        &extension.version,
+        "musl release metadata",
+    )?;
+    Ok(extension
+        .targets
+        .iter()
+        .find(|entry| entry.triple == target)
+        .context("musl release metadata target set is incomplete")?
+        .blake3
+        .clone())
 }
 
 fn state_paths(channel: UpdateChannel) -> anyhow::Result<(PathBuf, PathBuf)> {

@@ -22,6 +22,10 @@ TARGETS = (
     "x86_64-apple-darwin",
     "x86_64-unknown-linux-gnu",
 )
+MUSL_TARGETS = (
+    "aarch64-unknown-linux-musl",
+    "x86_64-unknown-linux-musl",
+)
 ROOT_KEYS = {
     "schema-version",
     "kind",
@@ -105,6 +109,17 @@ def expected_asset(version: str, target: str) -> str:
     return f"astrid-{version}-{target}.tar.gz"
 
 
+def validate_release_checksum_names(entries: dict[str, str], version: str, label: str) -> None:
+    """Keep the legacy four-target manifest compatible with combined checksums."""
+    legacy = {expected_asset(version, target) for target in TARGETS}
+    combined = legacy | {expected_asset(version, target) for target in MUSL_TARGETS}
+    if set(entries) not in (legacy, combined):
+        fail(
+            f"{label} must contain exactly the four legacy release archives, "
+            "optionally plus the two supported musl archives"
+        )
+
+
 def blake3_file(path: pathlib.Path) -> str:
     try:
         result = subprocess.run(
@@ -143,11 +158,8 @@ def build_manifest(
 
     blake3 = read_checksums(artifacts / "BLAKE3SUMS.txt", "BLAKE3")
     sha256 = read_checksums(artifacts / "SHA256SUMS.txt", "SHA-256")
-    names = {expected_asset(version, target) for target in TARGETS}
-    if set(blake3) != names:
-        fail("BLAKE3SUMS.txt must contain exactly the four release archives")
-    if set(sha256) != names:
-        fail("SHA256SUMS.txt must contain exactly the four release archives")
+    validate_release_checksum_names(blake3, version, "BLAKE3SUMS.txt")
+    validate_release_checksum_names(sha256, version, "SHA256SUMS.txt")
 
     targets: list[dict[str, object]] = []
     for target in TARGETS:
@@ -286,7 +298,8 @@ def validate_checksum_manifest(
         target["asset"]: target[algorithm]
         for target in manifest["targets"]
     }
-    if actual != expected:
+    validate_release_checksum_names(actual, manifest["version"], checksum_path.name)
+    if {asset: actual[asset] for asset in expected} != expected:
         fail(f"{checksum_path.name} does not match the authenticated release manifest")
 
 

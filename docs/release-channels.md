@@ -72,6 +72,14 @@ commits, release-workflow identity, and the size, BLAKE3 digest, SHA-256 package
 manager compatibility digest, and Sigstore bundle name for all four platform
 archives.
 
+Linux musl archives are described separately by
+`astrid-<version>-musl-release.toml`. This immutable, tag-signed extension
+contains exactly the x86_64 and ARM64 musl targets and binds the unchanged
+four-target manifest by canonical asset name and BLAKE3 digest, in addition to
+repeating its release identity. The mutable channel document remains at schema
+1 with exactly four targets, so older clients can keep following channel
+generations without encountering a new document shape.
+
 Each channel is hosted at the GitHub release tag `channel-<channel>` and exposes
 `channel.toml` plus `channel.toml.sigstore.json`. The pointer is signed only by:
 
@@ -117,8 +125,10 @@ The updater authenticates, in order:
 1. `channel.toml` against the exact promotion-workflow identity on `main`.
 2. The immutable release manifest against the exact release workflow at the
    selected version tag.
-3. The selected archive against the same tag-bound release identity.
-4. The archive's BLAKE3 digest against both the immutable release manifest and
+3. On musl, the canonical extension against the same tag-bound workflow,
+   authenticated legacy release identity, and exact legacy-manifest digest.
+4. The selected archive against the same tag-bound release identity.
+5. The archive's BLAKE3 digest against the authenticated metadata and
    `BLAKE3SUMS.txt`.
 
 It stores the accepted pointer and bundle under Astrid's runtime state. A lower

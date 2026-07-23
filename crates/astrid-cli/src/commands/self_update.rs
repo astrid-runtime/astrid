@@ -71,12 +71,35 @@ fn astrid_bin_dir() -> anyhow::Result<PathBuf> {
 
 /// Map the current platform to the GitHub release asset target triple.
 fn platform_target() -> anyhow::Result<&'static str> {
-    match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("macos", "aarch64") => Ok("aarch64-apple-darwin"),
-        ("macos", "x86_64") => Ok("x86_64-apple-darwin"),
-        ("linux", "x86_64") => Ok("x86_64-unknown-linux-gnu"),
-        ("linux", "aarch64") => Ok("aarch64-unknown-linux-gnu"),
-        (os, arch) => bail!("Unsupported platform: {os}/{arch}"),
+    platform_target_for(
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        compile_time_target_env(),
+    )
+}
+
+const fn compile_time_target_env() -> &'static str {
+    if cfg!(target_env = "gnu") {
+        "gnu"
+    } else if cfg!(target_env = "musl") {
+        "musl"
+    } else {
+        ""
+    }
+}
+
+fn platform_target_for(os: &str, arch: &str, target_env: &str) -> anyhow::Result<&'static str> {
+    match (os, arch, target_env) {
+        ("macos", "aarch64", _) => Ok("aarch64-apple-darwin"),
+        ("macos", "x86_64", _) => Ok("x86_64-apple-darwin"),
+        ("linux", "x86_64", "musl") => Ok("x86_64-unknown-linux-musl"),
+        ("linux", "aarch64", "musl") => Ok("aarch64-unknown-linux-musl"),
+        ("linux", "x86_64", "gnu") => Ok("x86_64-unknown-linux-gnu"),
+        ("linux", "aarch64", "gnu") => Ok("aarch64-unknown-linux-gnu"),
+        ("linux", "x86_64" | "aarch64", env) => {
+            bail!("Unsupported Linux target environment: {env}")
+        },
+        _ => bail!("Unsupported platform: {os}/{arch}"),
     }
 }
 

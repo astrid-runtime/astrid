@@ -71,6 +71,43 @@ class ReleaseDraftRecoveryTests(unittest.TestCase):
                 self.candidate, self.existing, self.payloads
             )
 
+    def test_recovers_partial_musl_metadata_and_archives_without_replacement(self) -> None:
+        musl_payloads = [
+            "astrid-1.2.3-musl-release.toml",
+            "astrid-1.2.3-aarch64-unknown-linux-musl.tar.gz",
+            "astrid-1.2.3-x86_64-unknown-linux-musl.tar.gz",
+        ]
+        for name in musl_payloads:
+            (self.candidate / name).write_bytes(f"payload:{name}".encode())
+            (self.candidate / f"{name}.sigstore.json").write_bytes(
+                f"bundle:{name}".encode()
+            )
+        payloads = [*self.payloads, *musl_payloads]
+        existing_names = [
+            "astrid-1.2.3-musl-release.toml",
+            "astrid-1.2.3-musl-release.toml.sigstore.json",
+            "astrid-1.2.3-aarch64-unknown-linux-musl.tar.gz",
+        ]
+        for name in existing_names:
+            (self.existing / name).write_bytes((self.candidate / name).read_bytes())
+
+        missing, bundles = release_draft_recovery.plan_recovery(
+            self.candidate, self.existing, payloads
+        )
+
+        self.assertIn(
+            "astrid-1.2.3-aarch64-unknown-linux-musl.tar.gz.sigstore.json",
+            missing,
+        )
+        self.assertIn(
+            "astrid-1.2.3-x86_64-unknown-linux-musl.tar.gz",
+            missing,
+        )
+        self.assertEqual(
+            bundles,
+            ["astrid-1.2.3-musl-release.toml.sigstore.json"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
