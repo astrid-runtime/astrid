@@ -44,6 +44,8 @@ class StaticElfTests(unittest.TestCase):
     def test_rejects_glibc_symbol_version(self) -> None:
         with self.assertRaisesRegex(ValueError, "glibc"):
             self.validate(versions="Name: GLIBC_2.34")
+        with self.assertRaisesRegex(ValueError, "glibc"):
+            self.validate(versions="Name: GLIBC_PRIVATE")
 
     def test_rejects_unknown_architecture(self) -> None:
         with self.assertRaisesRegex(ValueError, "unsupported ELF architecture"):

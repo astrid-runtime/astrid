@@ -13,7 +13,7 @@ MACHINES = {
     "x86_64": "Advanced Micro Devices X86-64",
     "aarch64": "AArch64",
 }
-GLIBC_VERSION = re.compile(r"\bGLIBC_[0-9]+\.[0-9]+")
+GLIBC_SYMBOL_VERSION = re.compile(r"\bGLIBC_[A-Za-z0-9_.]+")
 
 
 def validate_readelf(
@@ -42,7 +42,7 @@ def validate_readelf(
         raise ValueError("ELF has a program interpreter and is not static")
     if "(NEEDED)" in dynamic_section:
         raise ValueError("ELF has dynamic shared-library dependencies")
-    if GLIBC_VERSION.search(version_info):
+    if GLIBC_SYMBOL_VERSION.search(version_info):
         raise ValueError("ELF contains a glibc symbol-version requirement")
 
 
