@@ -29,34 +29,27 @@ install_adversarial_capsule_with_lifecycle_elicit() {
   local principal="e2e-lifecycle-home"
   local principal_home="$ASTRID_HOME/home/$principal"
 
-  note "checking fresh nondefault workspace lifecycle home mount"
+  note "checking fresh nondefault lifecycle home mount"
   run_cli agent create "$principal" -y
   [[ "$principal_home" == "$ASTRID_HOME/home/e2e-lifecycle-home" ]] \
     || fail "refusing to remove lifecycle home outside the generated ASTRID_HOME"
   rm -rf "$principal_home"
-  if ! (
-    # Workspace-scoped commands must use the same workspace selection as the
-    # running daemon. The harness daemon starts from CORE_DIR.
-    cd "$CORE_DIR"
-    printf 'runtime-lifecycle-ok\n' \
-      | ASTRID_PRINCIPAL="$principal" "$CORE_DIR/target/debug/astrid" \
-        --principal "$principal" capsule install \
-        "$CORE_DIR/e2e/fixtures/astrid-capsule-adversarial" --workspace
-  ) > "$ARTIFACTS/adversarial-workspace-install.out" \
-    2> "$ARTIFACTS/adversarial-workspace-install.err"; then
-    cat "$ARTIFACTS/adversarial-workspace-install.out" >&2 || true
-    cat "$ARTIFACTS/adversarial-workspace-install.err" >&2 || true
-    fail "fresh nondefault workspace lifecycle install failed"
+  if ! printf 'runtime-lifecycle-ok\n' \
+    | ASTRID_PRINCIPAL="$principal" "$CORE_DIR/target/debug/astrid" \
+      --principal "$principal" capsule install \
+      "$CORE_DIR/e2e/fixtures/astrid-capsule-adversarial" \
+      > "$ARTIFACTS/adversarial-principal-install.out" \
+      2> "$ARTIFACTS/adversarial-principal-install.err"; then
+    cat "$ARTIFACTS/adversarial-principal-install.out" >&2 || true
+    cat "$ARTIFACTS/adversarial-principal-install.err" >&2 || true
+    fail "fresh nondefault lifecycle install failed"
   fi
   [[ -f "$principal_home/adversarial-lifecycle-home-mounted" ]] \
-    || fail "workspace lifecycle guest did not mount the fresh target principal home"
+    || fail "lifecycle guest did not mount the fresh target principal home"
   [[ "$(cat "$principal_home/adversarial-lifecycle-home-mounted")" == "mounted" ]] \
-    || fail "workspace lifecycle guest wrote an unexpected home marker"
-  (
-    cd "$CORE_DIR"
-    ASTRID_PRINCIPAL="$principal" "$CORE_DIR/target/debug/astrid" \
-      --principal "$principal" capsule remove astrid-capsule-adversarial \
-      --workspace --force
-  ) > "$ARTIFACTS/adversarial-workspace-remove.out" \
-    2> "$ARTIFACTS/adversarial-workspace-remove.err"
+    || fail "lifecycle guest wrote an unexpected home marker"
+  ASTRID_PRINCIPAL="$principal" "$CORE_DIR/target/debug/astrid" \
+    --principal "$principal" capsule remove astrid-capsule-adversarial --force \
+    > "$ARTIFACTS/adversarial-principal-remove.out" \
+    2> "$ARTIFACTS/adversarial-principal-remove.err"
 }
