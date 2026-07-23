@@ -27,12 +27,12 @@ pub(crate) async fn run() -> Result<ExitCode> {
         .checked_add(Duration::from_secs(5))
         .unwrap_or_else(Instant::now);
     let socket = socket_client::proxy_socket_path();
-    while socket.exists() && Instant::now() < deadline {
+    while astrid_core::local_transport::endpoint_is_present(&socket)? && Instant::now() < deadline {
         sleep(Duration::from_millis(100)).await;
     }
     // Best-effort cleanup if the daemon was wedged on shutdown.
-    if socket.exists() {
-        let _ = std::fs::remove_file(&socket);
+    if astrid_core::local_transport::endpoint_is_present(&socket)? {
+        let _ = astrid_core::local_transport::remove_endpoint(&socket);
         let _ = std::fs::remove_file(socket_client::readiness_path());
         eprintln!(
             "{}",

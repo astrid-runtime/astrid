@@ -567,6 +567,7 @@ dependencies = [
  "chrono",
  "getrandom 0.4.3",
  "hex",
+ "nix 0.31.3",
  "rand 0.10.2",
  "serde",
  "serde_json",

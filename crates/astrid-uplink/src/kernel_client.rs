@@ -476,21 +476,20 @@ mod tests {
 
     // ── inactivity / keepalive `request()` loop ──────────────────────────────
     //
-    // These drive `KernelClient::request` over a loopback `UnixStream` pair. The
+    // These drive `KernelClient::request` over a loopback local-stream pair. The
     // client side is a real `KernelClient`; the "kernel" side is the raw server
     // half, onto which the test writes framed IPC responses (a length-prefixed
     // JSON `IpcMessage` carrying a `RawJson(KernelResponse)` payload) on the
     // request's correlated response topic — exactly the shape the daemon emits.
 
+    use astrid_core::local_transport::{self, LocalReadHalf, LocalStream, LocalWriteHalf};
     use std::io::Result as IoResult;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::UnixStream;
-    use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
     /// Read one length-prefixed frame off the server half and return the
     /// `IpcMessage`-shaped JSON so the test can learn the request's response
     /// topic (the correlated `astrid.v1.response.<suffix>` the client awaits).
-    async fn read_request_frame(read: &mut OwnedReadHalf) -> serde_json::Value {
+    async fn read_request_frame(read: &mut LocalReadHalf) -> serde_json::Value {
         let mut len_buf = [0u8; 4];
         read.read_exact(&mut len_buf)
             .await
@@ -504,7 +503,7 @@ mod tests {
     /// Write a `KernelResponse` on `response_topic` as the daemon would: a
     /// length-prefixed `IpcMessage` with a `RawJson` payload.
     async fn write_response(
-        write: &mut OwnedWriteHalf,
+        write: &mut LocalWriteHalf,
         response_topic: &str,
         resp: &KernelResponse,
     ) -> IoResult<()> {
@@ -533,7 +532,7 @@ mod tests {
         format!("astrid.v1.response.{suffix}")
     }
 
-    fn test_client(client_stream: UnixStream, timeout: Duration) -> KernelClient {
+    fn test_client(client_stream: LocalStream, timeout: Duration) -> KernelClient {
         let caller = PrincipalId::new("alice").unwrap();
         let inner = SocketClient::from_stream_for_test(
             client_stream,
@@ -548,8 +547,8 @@ mod tests {
     /// window rather than being surfaced.
     #[tokio::test]
     async fn working_frames_are_swallowed_then_terminal_returned() {
-        let (client_stream, server_stream) = UnixStream::pair().unwrap();
-        let (mut srv_read, mut srv_write) = server_stream.into_split();
+        let (client_stream, server_stream) = tokio::net::UnixStream::pair().unwrap();
+        let (mut srv_read, mut srv_write) = local_transport::split(server_stream);
 
         let server = tokio::spawn(async move {
             let req = read_request_frame(&mut srv_read).await;
@@ -585,8 +584,8 @@ mod tests {
     /// deadline would have failed.
     #[tokio::test]
     async fn keepalives_extend_beyond_total_inactivity_timeout() {
-        let (client_stream, server_stream) = UnixStream::pair().unwrap();
-        let (mut srv_read, mut srv_write) = server_stream.into_split();
+        let (client_stream, server_stream) = tokio::net::UnixStream::pair().unwrap();
+        let (mut srv_read, mut srv_write) = local_transport::split(server_stream);
 
         let server = tokio::spawn(async move {
             let req = read_request_frame(&mut srv_read).await;
@@ -619,7 +618,7 @@ mod tests {
     /// gateway maps this to 504).
     #[tokio::test]
     async fn silence_past_timeout_yields_typed_timeout() {
-        let (client_stream, server_stream) = UnixStream::pair().unwrap();
+        let (client_stream, server_stream) = tokio::net::UnixStream::pair().unwrap();
         // Hold the server half open but silent so the client sees inactivity,
         // not a connection loss (EOF).
         let _held = server_stream;
@@ -647,8 +646,8 @@ mod tests {
     /// a dedicated helper so the test doesn't wait 10 minutes.
     #[tokio::test]
     async fn unending_keepalives_are_bounded_by_max_total() {
-        let (client_stream, server_stream) = UnixStream::pair().unwrap();
-        let (mut srv_read, mut srv_write) = server_stream.into_split();
+        let (client_stream, server_stream) = tokio::net::UnixStream::pair().unwrap();
+        let (mut srv_read, mut srv_write) = local_transport::split(server_stream);
 
         // Ping forever, faster than the inactivity window, so only MAX_TOTAL can
         // stop the wait.
@@ -692,8 +691,8 @@ mod tests {
     /// in the chain rather than flattening it to a string.
     #[tokio::test]
     async fn connection_loss_preserves_source() {
-        let (client_stream, server_stream) = UnixStream::pair().unwrap();
-        let (mut srv_read, srv_write) = server_stream.into_split();
+        let (client_stream, server_stream) = tokio::net::UnixStream::pair().unwrap();
+        let (mut srv_read, srv_write) = local_transport::split(server_stream);
 
         // Read (and thus accept) the request so the client's send succeeds, then
         // drop BOTH server halves so the client's next read hits EOF.

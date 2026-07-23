@@ -7,13 +7,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use astrid_core::local_transport;
 use wasmtime::component::Resource;
 use wasmtime_wasi::p2::DynPollable;
 
 use super::client_lifecycle;
-use super::handshake::validate_handshake;
-#[cfg(unix)]
-use super::handshake::verify_peer_credentials;
+use super::handshake::{validate_handshake, verify_peer_credentials};
 use super::{HostState, MAX_ACTIVE_STREAMS, NetStream, UnixListenerSlot, audit_net, map_io_err};
 use crate::engine::wasm::bindings::astrid::net::host::{
     ErrorCode, HostUnixListener, TcpStream, UnixListener,
@@ -59,15 +58,14 @@ impl HostUnixListener for HostState {
                 &cancel_token,
                 async {
                     let l = listener_arc.lock().await;
-                    l.accept().await
+                    local_transport::accept(&l).await
                 },
             );
-            let (stream, _addr) = match accept_result {
+            let stream = match accept_result {
                 Some(result) => result.map_err(map_io_err)?,
                 None => return Err(ErrorCode::Closed),
             };
 
-            #[cfg(unix)]
             if let Err(reason) = verify_peer_credentials(&stream) {
                 tracing::warn!(
                     security_event = true,
@@ -177,18 +175,21 @@ impl HostUnixListener for HostState {
             &cancel_token,
             async {
                 let l = listener_arc.lock().await;
-                tokio::time::timeout(Duration::from_millis(timeout_ms), l.accept()).await
+                tokio::time::timeout(
+                    Duration::from_millis(timeout_ms),
+                    local_transport::accept(&l),
+                )
+                .await
             },
         );
 
-        let (stream, _addr) = match accept_result {
+        let stream = match accept_result {
             None => return Ok(None),
             Some(Err(_)) => return Ok(None),
             Some(Ok(Err(e))) => return Err(map_io_err(e)),
-            Some(Ok(Ok(pair))) => pair,
+            Some(Ok(Ok(stream))) => stream,
         };
 
-        #[cfg(unix)]
         if let Err(reason) = verify_peer_credentials(&stream) {
             tracing::warn!(
                 security_event = true,

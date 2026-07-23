@@ -165,20 +165,23 @@ async fn ensure_daemon_inner(label: &str, announce: bool) -> Result<()> {
     let socket_path = socket_client::proxy_socket_path();
     let ready_path = socket_client::readiness_path();
 
-    let needs_boot = if socket_path.exists() {
-        if tokio::net::UnixStream::connect(&socket_path).await.is_ok() {
+    let needs_boot = match astrid_core::local_transport::connect_outcome(&socket_path).await {
+        Ok(astrid_core::local_transport::ConnectOutcome::Connected(stream)) => {
+            drop(stream);
             ensure_daemon_workspace_matches(None).await?;
             if announce {
                 eprintln!("[{label}] Connected to existing daemon");
             }
             false
-        } else {
-            let _ = std::fs::remove_file(&socket_path);
+        },
+        Ok(astrid_core::local_transport::ConnectOutcome::Absent) => true,
+        Ok(astrid_core::local_transport::ConnectOutcome::Stale) => {
+            astrid_core::local_transport::remove_stale_endpoint(&socket_path)
+                .context("failed to clean up stale daemon endpoint")?;
             let _ = std::fs::remove_file(&ready_path);
             true
-        }
-    } else {
-        true
+        },
+        Err(error) => return Err(error).context("failed to probe daemon endpoint"),
     };
     if needs_boot {
         spawn_daemon_inner(&ready_path, announce, None).await?;
@@ -377,10 +380,13 @@ pub(crate) async fn handle_start() -> Result<()> {
     let ready_path = socket_client::readiness_path();
     let pid_path = socket_client::pid_path();
 
-    let socket_probe = if socket_path.exists() {
-        tokio::net::UnixStream::connect(&socket_path).await.ok()
-    } else {
-        None
+    let socket_probe = match astrid_core::local_transport::connect_outcome(&socket_path).await {
+        Ok(astrid_core::local_transport::ConnectOutcome::Connected(stream)) => Some(stream),
+        Ok(
+            astrid_core::local_transport::ConnectOutcome::Absent
+            | astrid_core::local_transport::ConnectOutcome::Stale,
+        )
+        | Err(_) => None,
     };
     let socket_reachable = socket_probe.is_some();
     let recorded_pid_alive = daemon_control::read_pid_file(&pid_path)
@@ -417,7 +423,7 @@ pub(crate) async fn handle_start() -> Result<()> {
             // Dead/absent recorded PID: a crashed daemon's stale run files. No
             // live process owns them, so clear ALL stale sentinels (socket,
             // readiness, PID) and spawn onto a clean run-dir.
-            let _ = std::fs::remove_file(&socket_path);
+            let _ = astrid_core::local_transport::remove_endpoint(&socket_path);
             let _ = std::fs::remove_file(&ready_path);
             let _ = std::fs::remove_file(&pid_path);
             spawn_persistent_daemon().await
@@ -428,7 +434,9 @@ pub(crate) async fn handle_start() -> Result<()> {
 /// Handle `astrid status`.
 pub(crate) async fn handle_status() -> Result<()> {
     let socket_path = socket_client::proxy_socket_path();
-    if !socket_path.exists() {
+    if !astrid_core::local_transport::endpoint_is_present(&socket_path)
+        .context("failed to inspect daemon endpoint")?
+    {
         println!("{}", theme::Theme::info("No Astrid daemon is running."));
         return Ok(());
     }
@@ -487,7 +495,8 @@ pub(crate) async fn handle_stop() -> Result<()> {
     // on a CLEAN exit, so reading it before shutdown is the only reliable way to
     // keep a handle for confirming exit / signalling a wedged shutdown.
     let recorded = daemon_control::read_pid_file(&pid_path);
-    let socket_present = socket_path.exists();
+    let socket_present = astrid_core::local_transport::endpoint_is_present(&socket_path)
+        .context("failed to inspect daemon endpoint")?;
 
     // Genuinely nothing running: no socket AND no live recorded process.
     let recorded_alive = recorded
@@ -631,7 +640,7 @@ fn report_orphan_stop(
 /// Called only once the daemon is confirmed gone — a dead daemon owns none of
 /// them, so clearing them leaves a clean slate for the next `start`.
 fn remove_runtime_files(pid_path: &Path, socket_path: &Path) {
-    let _ = std::fs::remove_file(socket_path);
+    let _ = astrid_core::local_transport::remove_endpoint(socket_path);
     let _ = std::fs::remove_file(socket_client::readiness_path());
     let _ = std::fs::remove_file(pid_path);
 }

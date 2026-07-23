@@ -633,7 +633,8 @@ async fn download_verify_extract(
 /// After the binary swap: restart a running daemon so the new code takes effect,
 /// update capsules, and warn if the install dir isn't on PATH.
 async fn finish_update(install_dir: &Path) -> anyhow::Result<()> {
-    if crate::socket_client::proxy_socket_path().exists() {
+    if astrid_core::local_transport::endpoint_is_present(&crate::socket_client::proxy_socket_path())?
+    {
         println!(
             "{}",
             Theme::info("Stopping the running daemon so the new version loads on next use...")

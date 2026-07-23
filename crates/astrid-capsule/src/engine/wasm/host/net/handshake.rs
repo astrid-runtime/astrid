@@ -29,6 +29,7 @@
 //! signature FAILS the handshake. A bad signature is an attack, not a
 //! fallback to unauthenticated.
 
+use astrid_core::local_transport::{self, LocalStream};
 use astrid_core::principal::PrincipalId;
 use astrid_core::profile::DeviceKey;
 use astrid_core::session_token::{
@@ -57,7 +58,7 @@ const MAX_HANDSHAKE_SIZE: usize = 4096;
 /// scope), `Ok(None)` for a legacy/unauthenticated handshake, or
 /// `Err(reason)` with a human-readable rejection reason.
 pub(super) async fn validate_handshake(
-    stream: &mut tokio::net::UnixStream,
+    stream: &mut LocalStream,
     expected_token: &SessionToken,
     home: &astrid_core::dirs::AstridHome,
 ) -> Result<Option<(PrincipalId, String)>, String> {
@@ -121,9 +122,7 @@ pub(super) async fn validate_handshake(
 }
 
 /// Read one length-prefixed JSON [`HandshakeRequest`] frame off the stream.
-async fn read_handshake_request(
-    stream: &mut tokio::net::UnixStream,
-) -> Result<HandshakeRequest, String> {
+async fn read_handshake_request(stream: &mut LocalStream) -> Result<HandshakeRequest, String> {
     use tokio::io::AsyncReadExt;
 
     let mut len_buf = [0u8; 4];
@@ -157,7 +156,7 @@ async fn read_handshake_request(
 /// observes a uniform rejection. The `key_id` carries the matched device's
 /// identity forward so the cap-gate can apply that device's scope.
 async fn run_principal_challenge(
-    stream: &mut tokio::net::UnixStream,
+    stream: &mut LocalStream,
     claimed: &str,
     home: &astrid_core::dirs::AstridHome,
 ) -> Result<(PrincipalId, String), String> {
@@ -295,7 +294,7 @@ fn generate_nonce_hex() -> Result<String, String> {
 }
 
 /// Send the uniform `authentication failed` response, logging a write error.
-async fn send_auth_failed(stream: &mut tokio::net::UnixStream) {
+async fn send_auth_failed(stream: &mut LocalStream) {
     if let Err(e) =
         send_handshake_response_timed(stream, &HandshakeResponse::error("authentication failed"))
             .await
@@ -309,7 +308,7 @@ async fn send_auth_failed(stream: &mut tokio::net::UnixStream) {
 /// Wraps [`send_handshake_response`] with a timeout to prevent a stalled
 /// client from holding the accept loop hostage during the response write.
 async fn send_handshake_response_timed(
-    stream: &mut tokio::net::UnixStream,
+    stream: &mut LocalStream,
     response: &HandshakeResponse,
 ) -> Result<(), std::io::Error> {
     tokio::time::timeout(HANDSHAKE_TIMEOUT, send_handshake_response(stream, response))
@@ -319,7 +318,7 @@ async fn send_handshake_response_timed(
 
 /// Send a length-prefixed JSON handshake response.
 async fn send_handshake_response(
-    stream: &mut tokio::net::UnixStream,
+    stream: &mut LocalStream,
     response: &HandshakeResponse,
 ) -> Result<(), std::io::Error> {
     use tokio::io::AsyncWriteExt;
@@ -338,20 +337,10 @@ async fn send_handshake_response(
 /// Verify that the connecting process runs as the same UID as the daemon.
 /// Returns `Err(reason)` if the UID does not match or credentials cannot
 /// be retrieved.
-#[cfg(unix)]
-pub(super) fn verify_peer_credentials(stream: &tokio::net::UnixStream) -> Result<(), String> {
-    match stream.peer_cred() {
-        Ok(cred) => {
-            let peer_uid = cred.uid();
-            let my_uid = nix::unistd::geteuid().as_raw();
-            if peer_uid != my_uid {
-                Err(format!(
-                    "peer UID {peer_uid} does not match daemon UID {my_uid}"
-                ))
-            } else {
-                Ok(())
-            }
-        },
+pub(super) fn verify_peer_credentials(stream: &LocalStream) -> Result<(), String> {
+    match local_transport::peer_is_current_user(stream) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err("peer operating-system user does not match daemon user".to_string()),
         Err(e) => Err(format!("failed to check peer credentials: {e}")),
     }
 }

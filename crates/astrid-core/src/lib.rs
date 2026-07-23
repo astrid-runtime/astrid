@@ -24,6 +24,10 @@ pub mod env_policy;
 pub mod groups;
 pub mod identity;
 pub mod kernel_api;
+// Cross-crate runtime plumbing. Public only because workspace crates are
+// separate Rust packages; this is not a supported external API.
+#[doc(hidden)]
+pub mod local_transport;
 pub mod net;
 pub mod principal;
 pub mod profile;

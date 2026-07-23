@@ -19,7 +19,7 @@ serde_json = { workspace = true }
 blake3 = { workspace = true }
 subtle = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["time", "sync"] }
+tokio = { workspace = true, features = ["time", "sync", "io-util"] }
 # astrid-core exposes toml error types in its public error enums. Keep this
 # crate on the current public dependency until a breaking release can change
 # that API deliberately.
@@ -36,6 +36,10 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 # RUSTFLAGS='--cfg getrandom_backend="wasm_js"' (see scripts/check-wasm-portability.sh).
 [target.'cfg(target_family = "wasm")'.dependencies]
 getrandom = { version = "0.4", features = ["wasm_js"] }
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true }
+tokio = { workspace = true, features = ["net"] }
 
 [lints]
 workspace = true

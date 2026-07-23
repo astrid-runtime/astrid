@@ -2275,7 +2275,7 @@ impl Kernel {
         #[cfg(unix)]
         {
             let socket_path = crate::socket::kernel_socket_path();
-            let _ = std::fs::remove_file(&socket_path);
+            let _ = astrid_core::local_transport::remove_endpoint(&socket_path);
             let _ = std::fs::remove_file(&self.token_path);
             crate::socket::remove_readiness_file();
             crate::socket::remove_pid_file();

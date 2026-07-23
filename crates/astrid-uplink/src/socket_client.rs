@@ -14,13 +14,13 @@
 use anyhow::{Context, Result};
 use astrid_core::PrincipalId;
 use astrid_core::SessionId;
+use astrid_core::local_transport::{self, LocalReadHalf, LocalStream, LocalWriteHalf};
 use astrid_core::session_token::{
     HandshakeRequest, HandshakeResponse, PROTOCOL_VERSION, SessionToken,
 };
 use astrid_types::Topic;
 use astrid_types::ipc::{IpcMessage, IpcPayload};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
 use tracing::warn;
 
 /// Path to the kernel's Unix-domain socket. Falls back to
@@ -134,8 +134,8 @@ impl std::error::Error for ReadError {
 
 /// A client connection to the kernel's Unix-domain socket.
 pub struct SocketClient {
-    read_half: tokio::net::unix::OwnedReadHalf,
-    write_half: tokio::net::unix::OwnedWriteHalf,
+    read_half: LocalReadHalf,
+    write_half: LocalWriteHalf,
     /// The unique identifier for this session.
     pub session_id: SessionId,
     /// The principal this connection acts as. Stamped onto every
@@ -161,22 +161,18 @@ impl SocketClient {
     /// identity for the whole connection.
     ///
     /// # Errors
-    /// Returns an error if the socket file does not exist, connection
+    /// Returns an error if the local endpoint does not exist, connection
     /// fails, or the handshake is rejected.
     pub async fn connect(session_id: SessionId, principal: PrincipalId) -> Result<Self> {
         let path = proxy_socket_path();
 
-        if !path.exists() {
-            anyhow::bail!("Global OS Socket not found at {}", path.display());
-        }
-
-        let mut stream = UnixStream::connect(&path)
+        let mut stream = local_transport::connect(&path)
             .await
             .context("Failed to connect to IPC socket")?;
 
         let authenticated = perform_handshake(&mut stream, &principal).await?;
 
-        let (read_half, write_half) = stream.into_split();
+        let (read_half, write_half) = local_transport::split(stream);
 
         Ok(Self {
             read_half,
@@ -187,17 +183,17 @@ impl SocketClient {
         })
     }
 
-    /// Build a `SocketClient` directly over a connected [`tokio::net::UnixStream`],
+    /// Build a `SocketClient` directly over a connected [`LocalStream`],
     /// bypassing the token handshake. Test-only: lets the crate's own tests drive
-    /// the framed read/write path over a `UnixStream::pair()` loopback without a
+    /// the framed read/write path over a local-stream pair without a
     /// live daemon.
     #[cfg(test)]
     pub(crate) fn from_stream_for_test(
-        stream: tokio::net::UnixStream,
+        stream: LocalStream,
         session_id: SessionId,
         principal: PrincipalId,
     ) -> Self {
-        let (read_half, write_half) = stream.into_split();
+        let (read_half, write_half) = local_transport::split(stream);
         Self {
             read_half,
             write_half,
@@ -494,7 +490,7 @@ fn principal_key_path(principal: &PrincipalId) -> Option<std::path::PathBuf> {
 /// took the legacy single-frame path that the daemon stamps the no-capability
 /// `anonymous`. An outright-rejected handshake (e.g. a bad signature) is an
 /// `Err`, never a silent `false`.
-async fn perform_handshake(stream: &mut UnixStream, principal: &PrincipalId) -> Result<bool> {
+async fn perform_handshake(stream: &mut LocalStream, principal: &PrincipalId) -> Result<bool> {
     let tok_path = token_path()?;
     let token = SessionToken::read_from_file(&tok_path).with_context(|| {
         format!(
@@ -568,7 +564,7 @@ async fn perform_handshake(stream: &mut UnixStream, principal: &PrincipalId) -> 
 /// Write one length-prefixed [`HandshakeRequest`] frame and read the
 /// length-prefixed [`HandshakeResponse`] frame, with per-operation timeouts.
 async fn send_request_read_response(
-    stream: &mut UnixStream,
+    stream: &mut LocalStream,
     request: &HandshakeRequest,
 ) -> Result<HandshakeResponse> {
     let request_bytes =

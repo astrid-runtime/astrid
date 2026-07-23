@@ -23,6 +23,11 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   exact legacy manifest digest and release identity, and interrupted release
   publication validates and recovers its metadata, bundle, and archives
   without replacing uploaded assets. Closes #1339.
+- **Host-local daemon communication now has one transport boundary.** Existing
+  Unix socket construction, acceptance, endpoint presence and stale cleanup,
+  liveness probing, stream splitting, and same-user peer verification route
+  through a shared abstraction while retaining the Unix backend and wire
+  protocol unchanged. Closes #1341.
 - **Capsule provenance is now bound to local install authority.**
   `astrid-build` signs canonical capsule content with the installation's
   runtime key. Same-runtime builds and operator-owned distributions retain a
