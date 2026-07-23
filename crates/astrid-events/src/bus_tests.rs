@@ -139,6 +139,109 @@ async fn test_cloned_bus_synchronous_subscriber() {
     assert_eq!(counter.load(Ordering::SeqCst), 1);
 }
 
+#[test]
+fn concurrent_publishers_cannot_overtake_synchronous_observation() {
+    use std::sync::{Condvar, Mutex, mpsc};
+    use std::time::Duration;
+
+    let bus = EventBus::new();
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let connect_gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let (connect_entered_tx, connect_entered_rx) = mpsc::channel();
+
+    let observed_for_callback = Arc::clone(&observed);
+    let gate_for_callback = Arc::clone(&connect_gate);
+    bus.observe_permanently("ordered_test", move |event| {
+        let AstridEvent::RuntimeStarted { version, .. } = event else {
+            return;
+        };
+        if version == "connect" {
+            connect_entered_tx.send(()).unwrap();
+            let (released, wake) = &*gate_for_callback;
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+        }
+        observed_for_callback.lock().unwrap().push(version.clone());
+    });
+
+    let connect_bus = bus.clone();
+    let connect = std::thread::spawn(move || {
+        connect_bus.publish(AstridEvent::RuntimeStarted {
+            metadata: EventMetadata::new("test"),
+            version: "connect".to_string(),
+        });
+    });
+    connect_entered_rx.recv().unwrap();
+
+    let disconnect_bus = bus.clone();
+    let (disconnect_done_tx, disconnect_done_rx) = mpsc::channel();
+    let disconnect = std::thread::spawn(move || {
+        disconnect_bus.publish(AstridEvent::RuntimeStarted {
+            metadata: EventMetadata::new("test"),
+            version: "disconnect".to_string(),
+        });
+        disconnect_done_tx.send(()).unwrap();
+    });
+
+    assert!(
+        disconnect_done_rx
+            .recv_timeout(Duration::from_millis(50))
+            .is_err(),
+        "later publication overtook the blocked synchronous observer"
+    );
+
+    let (released, wake) = &*connect_gate;
+    *released.lock().unwrap() = true;
+    wake.notify_all();
+    connect.join().unwrap();
+    disconnect.join().unwrap();
+
+    assert_eq!(*observed.lock().unwrap(), ["connect", "disconnect"]);
+}
+
+#[test]
+fn synchronous_observer_can_publish_a_nested_event() {
+    use std::sync::{Mutex, mpsc};
+    use std::time::Duration;
+
+    let bus = Arc::new(EventBus::new());
+    let weak_bus = Arc::downgrade(&bus);
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let observed_for_callback = Arc::clone(&observed);
+    bus.observe_permanently("reentrant_test", move |event| {
+        let AstridEvent::RuntimeStarted { version, .. } = event else {
+            return;
+        };
+        observed_for_callback.lock().unwrap().push(version.clone());
+        if version == "outer" {
+            weak_bus
+                .upgrade()
+                .unwrap()
+                .publish(AstridEvent::RuntimeStarted {
+                    metadata: EventMetadata::new("test"),
+                    version: "inner".to_string(),
+                });
+        }
+    });
+
+    let (done_tx, done_rx) = mpsc::channel();
+    let publisher = std::thread::spawn(move || {
+        bus.publish(AstridEvent::RuntimeStarted {
+            metadata: EventMetadata::new("test"),
+            version: "outer".to_string(),
+        });
+        done_tx.send(()).unwrap();
+    });
+
+    done_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("nested synchronous publish deadlocked");
+    publisher.join().unwrap();
+    assert_eq!(*observed.lock().unwrap(), ["outer", "inner"]);
+}
+
 #[tokio::test]
 async fn test_event_bus_drop_cleans_up_registry() {
     use crate::subscriber::FilterSubscriber;

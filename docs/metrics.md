@@ -355,7 +355,7 @@ Sites here live in **`astrid-kernel`** (`lib.rs`, `kernel_router/mod.rs`) unless
 
 | Name | Type | Labels | Cardinality | Pri | Instrumentation point | What it answers | RFC |
 |---|---|---|---|---|---|---|---|
-| `astrid_daemon_active_connections` | gauge | — | 1 | P0 | `lib.rs::connection_opened`(:605)/`connection_closed`(:623) → `total_connection_count()`(:674); tracker `kernel_router/mod.rs::spawn_connection_tracker`(:92) | Does the daemon think anyone is connected? Gates idle shutdown. Diagnoses no-shutdown (stuck >0) and premature shutdown. | — |
+| `astrid_daemon_active_connections` | gauge | — | 1 | P0 | `lib.rs::connection_opened`/`connection_closed` → `total_connection_count()`; synchronous tracker in `kernel_router/mod.rs` | Does the daemon think anyone is connected? Gates idle shutdown. Diagnoses no-shutdown (stuck >0) and premature shutdown. | — |
 | `astrid_daemon_connections_opened_total` | counter | — | 1 | P0 | `lib.rs::connection_opened`(:605) / tracker Connect arm | `opened − closed` vs the gauge reveals leaked/half-closed connections. | — |
 | `astrid_daemon_connections_closed_total` | counter | — | 1 | P0 | `lib.rs::connection_closed`(:623) / tracker Disconnect arm | Divergence from `opened_total` is the no-shutdown leak signal. | — |
 | `astrid_daemon_socket_accepts_total` *(**site + reasons corrected**)* | counter | result | 4 | P0 | **`host/net/unix_listener.rs::accept`(:22)/`poll_accept`(:115)** — NOT astrid-daemon/lib.rs | Transport front door: `accepted`/`rejected_peer_cred`/`rejected_handshake`/**`quota`** (the `MAX_ACTIVE_STREAMS` early-return at :23, omitted by draft). Climbing `rejected_peer_cred` (100 ms backoff branch :60–69) = the 200–300% idle-CPU spin signature. **§2.5: peer uid/gid/pid MUST NOT become labels.** | — |
@@ -369,7 +369,7 @@ Sites here live in **`astrid-kernel`** (`lib.rs`, `kernel_router/mod.rs`) unless
 | `astrid_ipc_ring_capacity` **(NEW — review)** | gauge | — | 1 | P2 | constant `DEFAULT_CHANNEL_CAPACITY` (1024) | Saturation denominator for the backlog gauge. | — |
 | `astrid_daemon_shutdown_state` | gauge | — | 1 | P2 | `lib.rs::Kernel::shutdown`(:713) set 1; watch `shutdown_tx`(:99) | 0=running / 1=shutdown requested. | — |
 | `astrid_daemon_idle_seconds` | gauge | — | 1 | P2 | `lib.rs::spawn_idle_monitor` loop (:1103–…); from `idle_since`, reset on activity | How far into the idle-timeout window; makes the log-only idle logic observable. | — |
-| `astrid_daemon_active_connections_by_kind` | gauge | uplink_kind | ~4 | P1 | extend `spawn_connection_tracker`(:92) + `connection_opened`/`closed` | "Which frontend holds connections" (`cli`/`web`/`discord`/`other`). **Blocked:** Connect/Disconnect `IpcPayload` carries only principal — no uplink-kind on the wire. Requires new IPC contract surface; collapse unknowns to `other`. | **RFC** |
+| `astrid_daemon_active_connections_by_kind` | gauge | uplink_kind | ~4 | P1 | extend the synchronous connection tracker + `connection_opened`/`closed` | "Which frontend holds connections" (`cli`/`web`/`discord`/`other`). **Blocked:** Connect/Disconnect `IpcPayload` carries only principal — no uplink-kind on the wire. Requires new IPC contract surface; collapse unknowns to `other`. | **RFC** |
 
 > The draft's `astrid_ipc_publish_fanout` histogram is **dropped** — its stated job ("fanout collapsed to 0 while clients connected") is a point-in-time *level* question answered by the `astrid_router_event_receivers` gauge (§4.2), not a per-publish distribution (N4 honesty; review).
 

@@ -674,9 +674,9 @@ pub struct GatewaySection {
     /// Grace period (in seconds) for a clean shutdown before force-killing
     /// child processes.
     pub shutdown_timeout_secs: u64,
-    /// Idle shutdown grace period (in seconds) for ephemeral mode. When all
-    /// clients disconnect and the daemon remains idle for this duration, it
-    /// shuts down automatically.
+    /// Legacy compatibility field. Ephemeral lifetime is connection-owned and
+    /// this value is ignored; it is omitted from serialized configuration.
+    #[serde(skip_serializing)]
     pub idle_shutdown_secs: u64,
     /// Interval (in seconds) between stale session cleanup sweeps.
     pub session_cleanup_interval_secs: u64,

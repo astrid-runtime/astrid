@@ -410,6 +410,15 @@ pub struct HostState {
     /// first and falls through to host-wide regardless of where the
     /// operator stored the value.
     pub secret_env: std::collections::HashSet<String>,
+    /// Injected root for file-per-secret env resolution.
+    ///
+    /// Lifecycle execution sets this from the caller-supplied [`AstridHome`]
+    /// rather than resolving process-global environment. Ordinary shared
+    /// runtimes leave it `None` and retain the existing environment-resolved
+    /// lookup until their load context carries the system home explicitly.
+    ///
+    /// [`AstridHome`]: astrid_core::dirs::AstridHome
+    pub file_secret_root: Option<std::path::PathBuf>,
     /// IPC topic patterns this capsule is allowed to publish to.
     /// Empty means DENY ALL (fail-closed).
     pub ipc_publish_patterns: Vec<String>,

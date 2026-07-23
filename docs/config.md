@@ -209,7 +209,6 @@ hot_reload = true
 watch_plugins = true
 health_interval_secs = 30
 shutdown_timeout_secs = 30
-idle_shutdown_secs = 30
 session_cleanup_interval_secs = 60
 ```
 

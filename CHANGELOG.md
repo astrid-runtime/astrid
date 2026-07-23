@@ -25,6 +25,38 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   x86_64 and ARM64 GNU artifacts are built in a pinned glibc 2.31 environment,
   and release publication rejects binaries whose ELF symbol requirements
   exceed glibc 2.34. Closes #1322.
+- **Ephemeral daemons now shut down when their final client disconnects.**
+  Client leases, rather than loaded uplink capsules or a 30-second idle timer,
+  own ephemeral process liveness. The never-connected fallback starts only
+  after daemon readiness, and lease accounting bypasses the lossy broadcast
+  queue so an event storm cannot hide a live client. Persistent daemons retain
+  their explicit operator-controlled lifetime. Closes #1296.
+- **Capsule lifecycle hooks preserve the target principal.** Explicit-principal
+  installs now provision and scope lifecycle `home://`, KV, secrets, and IPC
+  identity to the authenticated install target instead of silently executing
+  the hook as the bootstrap `default` principal.
+- **Gateway env schemas now use the authenticated principal's capsule registry
+  or verified workspace.** Schema reads no longer fall back to `default`, so
+  non-default and workspace-only installs are configurable and a same-named
+  default capsule cannot supply the wrong field contract. Closes #1327.
+- **Secret commands now read manifests from the selected principal registry or
+  verified workspace.** Secret set, list, and delete no longer fall back to
+  `default`, while workspace-only capsule secrets retain their declared
+  classification and remain out of plaintext env configuration. Closes #1325.
+- **Per-agent CLI commands now inherit the global `--principal`.** A
+  command-local target such as `--agent` still wins, but omitting it uses the
+  process principal already resolved from the flag, environment, or active
+  context instead of re-reading and potentially selecting a different context.
+  Closes #1326.
+- **Capsule registry queries now honor `--principal`.** The `capsule list`,
+  `capsule tree`, and `capsule deps` commands pass the process-wide
+  authenticated principal into capsule discovery instead of falling back to
+  the bootstrap `default` principal, so diagnostics match the capsule view
+  that the daemon loads. Closes #1112.
+- **SVG URL sanitization uses the patched `ammonia` release.** The locked
+  transitive dependency is updated to 4.1.4 so crafted animation attributes
+  cannot preserve a `javascript:` URL and the workspace security audit no
+  longer accepts the vulnerable 4.1.3 release. Closes #1336.
 - **Stable crates publication installs its authenticated-hash prerequisite.**
   The protected publisher installs the pinned `b3sum` binary before validating
   the exact dev candidate, so BLAKE3 release metadata checks run before any

@@ -163,6 +163,79 @@ impl SecretStore for DenySecretStore {
 }
 
 // ---------------------------------------------------------------------------
+// Read-through migration
+// ---------------------------------------------------------------------------
+
+/// Secret-store compatibility bridge that reads a legacy scope only when the
+/// primary scope has no value.
+///
+/// Writes always go to `primary`. A legacy value observed through
+/// [`exists`](Self::exists) or [`get`](Self::get) is copied into `primary` on a
+/// best-effort basis, while the legacy copy is retained for older binaries.
+/// Deletes target both stores so a removed legacy value cannot reappear on the
+/// next read.
+///
+/// This type does not decide which principals may use a legacy scope. Callers
+/// must construct it only at the compatibility boundary that owns that policy.
+#[derive(Debug)]
+pub struct ReadThroughSecretStore {
+    primary: Arc<dyn SecretStore>,
+    legacy: Arc<dyn SecretStore>,
+}
+
+impl ReadThroughSecretStore {
+    /// Create a read-through bridge from `legacy` into `primary`.
+    #[must_use]
+    pub fn new(primary: Arc<dyn SecretStore>, legacy: Arc<dyn SecretStore>) -> Self {
+        Self { primary, legacy }
+    }
+}
+
+impl SecretStore for ReadThroughSecretStore {
+    fn set(&self, key: &str, value: &str) -> Result<(), SecretStoreError> {
+        self.primary.set(key, value)
+    }
+
+    fn exists(&self, key: &str) -> Result<bool, SecretStoreError> {
+        if self.primary.exists(key)? {
+            return Ok(true);
+        }
+        let Some(value) = self.legacy.get(key)? else {
+            return Ok(false);
+        };
+        if let Err(error) = self.primary.set(key, &value) {
+            tracing::warn!(
+                %error,
+                "legacy secret existed but could not be copied into the primary scope"
+            );
+        }
+        Ok(true)
+    }
+
+    fn get(&self, key: &str) -> Result<Option<String>, SecretStoreError> {
+        if let Some(value) = self.primary.get(key)? {
+            return Ok(Some(value));
+        }
+        let Some(value) = self.legacy.get(key)? else {
+            return Ok(None);
+        };
+        if let Err(error) = self.primary.set(key, &value) {
+            tracing::warn!(
+                %error,
+                "legacy secret was readable but could not be copied into the primary scope"
+            );
+        }
+        Ok(Some(value))
+    }
+
+    fn delete(&self, key: &str) -> Result<bool, SecretStoreError> {
+        let primary_deleted = self.primary.delete(key)?;
+        let legacy_deleted = self.legacy.delete(key)?;
+        Ok(primary_deleted || legacy_deleted)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // KV-backed implementation (always available)
 // ---------------------------------------------------------------------------
 

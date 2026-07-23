@@ -45,7 +45,7 @@ use crate::authority::{
 };
 use crate::contracts::seed_canonical_contracts_if_absent;
 use crate::copy::copy_capsule_dir;
-use crate::lifecycle::run_lifecycle;
+use crate::lifecycle::run_lifecycle_for_principal;
 use crate::manifest_check::{
     ExportConflict, MissingImport, check_export_conflicts_in_workspace,
     validate_imports_in_workspace,
@@ -648,10 +648,12 @@ pub(crate) fn install_from_local_path_internal(
 
     // Lifecycle hook — bytes from the content store, not the target.
     if let Some(ref w) = wasm {
-        let lifecycle_result = run_lifecycle(
+        let lifecycle_result = run_lifecycle_for_principal(
             &target_dir,
             w.bytes.clone(),
             &manifest,
+            home,
+            target_principal,
             phase.to_lifecycle(),
             previous_version.as_deref(),
             options.lifecycle_bus.clone(),

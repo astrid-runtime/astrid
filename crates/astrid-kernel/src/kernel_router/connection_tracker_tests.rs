@@ -3,8 +3,6 @@
 //! (native producers) and the `client.v1.connect`/`client.v1.disconnect`
 //! topics (uplink capsules, which can only publish JSON via the SDK).
 
-use std::sync::Arc;
-
 use astrid_events::AstridEvent;
 use astrid_events::EventMetadata;
 use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
@@ -127,7 +125,7 @@ fn malformed_connection_principal_is_ignored_not_defaulted() {
 // ── End-to-end counter balance through the live tracker ──────────────────
 //
 // The classifier tests above are pure. These drive the real
-// `spawn_connection_tracker` task against a live `Kernel` event bus,
+// `register_connection_tracker` observer against a live `Kernel` event bus,
 // publishing the exact `client.v1.connect` / `client.v1.disconnect` shape the
 // HOST now emits (it used to come from the capsule-cli proxy). They guard the
 // connection-tracker leak fix: connect and disconnect for one connection carry
@@ -167,10 +165,19 @@ fn publish_disconnect(kernel: &crate::Kernel, principal: &str) {
     });
 }
 
-/// Poll `cond` until it holds or the attempt budget is exhausted. The tracker
-/// processes events on a spawned task, so the counter updates asynchronously
-/// after a publish; this yields between checks rather than sleeping a fixed
-/// duration.
+fn publish_lifecycle_noise(kernel: &crate::Kernel) {
+    let message = IpcMessage::new(
+        Topic::from_raw("client.v1.heartbeat"),
+        IpcPayload::RawJson(serde_json::json!({})),
+        uuid::Uuid::nil(),
+    );
+    kernel.event_bus.publish(AstridEvent::Ipc {
+        metadata: EventMetadata::new("test").with_session_id(uuid::Uuid::nil()),
+        message,
+    });
+}
+
+/// Poll `cond` until it holds or the attempt budget is exhausted.
 async fn wait_until(mut cond: impl FnMut() -> bool) -> bool {
     for _ in 0..2000 {
         if cond() {
@@ -194,7 +201,7 @@ async fn matched_cycles_balance_to_baseline_for_verified_principal() {
     let dir = tempfile::tempdir().unwrap();
     let home = astrid_core::dirs::AstridHome::from_path(dir.path());
     let kernel = crate::test_kernel_with_home(home).await;
-    drop(super::spawn_connection_tracker(Arc::clone(&kernel)));
+    super::register_connection_tracker(&kernel);
 
     let principal = astrid_core::PrincipalId::new("claude-code").unwrap();
     assert_eq!(kernel.total_connection_count(), 0, "baseline");
@@ -228,11 +235,41 @@ async fn matched_cycles_balance_to_baseline_for_verified_principal() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lifecycle_accounting_is_lossless_under_a_broadcast_storm() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = astrid_core::dirs::AstridHome::from_path(dir.path());
+    let kernel = crate::test_kernel_with_home(home).await;
+    super::register_connection_tracker(&kernel);
+    kernel.set_ephemeral(true);
+    let shutdown = kernel.shutdown_tx.subscribe();
+
+    publish_connect(&kernel, "alice");
+    for _ in 0..2_048 {
+        publish_lifecycle_noise(&kernel);
+    }
+    publish_connect(&kernel, "bob");
+    for _ in 0..2_048 {
+        publish_lifecycle_noise(&kernel);
+    }
+
+    publish_disconnect(&kernel, "alice");
+    assert_eq!(kernel.total_connection_count(), 1);
+    assert!(
+        !*shutdown.borrow(),
+        "Bob's synchronously recorded lease must survive broadcast overflow"
+    );
+
+    publish_disconnect(&kernel, "bob");
+    assert_eq!(kernel.total_connection_count(), 0);
+    assert!(*shutdown.borrow());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn missing_principal_lifecycle_balances_under_anonymous() {
     let dir = tempfile::tempdir().unwrap();
     let home = astrid_core::dirs::AstridHome::from_path(dir.path());
     let kernel = crate::test_kernel_with_home(home).await;
-    drop(super::spawn_connection_tracker(Arc::clone(&kernel)));
+    super::register_connection_tracker(&kernel);
 
     for (topic, expected) in [
         (Topic::client_connect(), 1),
@@ -273,7 +310,7 @@ async fn mismatched_principal_pairing_leaks_as_the_original_bug_did() {
     let dir = tempfile::tempdir().unwrap();
     let home = astrid_core::dirs::AstridHome::from_path(dir.path());
     let kernel = crate::test_kernel_with_home(home).await;
-    drop(super::spawn_connection_tracker(Arc::clone(&kernel)));
+    super::register_connection_tracker(&kernel);
 
     publish_connect(&kernel, "claude-code");
     assert!(
