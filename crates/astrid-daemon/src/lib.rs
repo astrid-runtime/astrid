@@ -493,24 +493,24 @@ mod tests {
         write_readiness_then_arm_ephemeral(
             true,
             || {
-                steps.lock().unwrap().push("ready");
+                steps.lock().expect("steps lock").push("ready");
                 Ok::<_, ()>(())
             },
-            || steps.lock().unwrap().push("armed"),
+            || steps.lock().expect("steps lock").push("armed"),
         )
-        .unwrap();
-        assert_eq!(*steps.lock().unwrap(), ["ready", "armed"]);
+        .expect("readiness succeeds");
+        assert_eq!(*steps.lock().expect("steps lock"), ["ready", "armed"]);
 
         let steps = Mutex::new(Vec::new());
         let result = write_readiness_then_arm_ephemeral(
             true,
             || {
-                steps.lock().unwrap().push("ready-failed");
+                steps.lock().expect("steps lock").push("ready-failed");
                 Err::<(), _>("failed")
             },
-            || steps.lock().unwrap().push("armed"),
+            || steps.lock().expect("steps lock").push("armed"),
         );
         assert_eq!(result, Err("failed"));
-        assert_eq!(*steps.lock().unwrap(), ["ready-failed"]);
+        assert_eq!(*steps.lock().expect("steps lock"), ["ready-failed"]);
     }
 }

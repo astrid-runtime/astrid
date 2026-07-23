@@ -676,7 +676,6 @@ pub struct GatewaySection {
     pub shutdown_timeout_secs: u64,
     /// Legacy compatibility field. Ephemeral lifetime is connection-owned and
     /// this value is ignored; it is omitted from serialized configuration.
-    #[doc(hidden)]
     #[serde(skip_serializing)]
     pub idle_shutdown_secs: u64,
     /// Interval (in seconds) between stale session cleanup sweeps.
