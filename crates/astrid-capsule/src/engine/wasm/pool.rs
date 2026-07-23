@@ -192,12 +192,6 @@ pub(super) struct CapsuleInstancePool {
     total_instances: Arc<AtomicUsize>,
     /// On-demand instance factory for lazy growth.
     builder: Arc<InstanceBuilder>,
-    /// Whether a checkout that finds no warm instance may build one. `false`
-    /// for a size-1 persistent-resource pool (`max == min_idle == 1`): its
-    /// single instance is always warm, so this is belt-and-suspenders — if a
-    /// build were ever reached it would mint a *second* Store and violate the
-    /// carve-out, so we fail closed instead.
-    allow_grow: bool,
     /// Idle-eviction timer; aborted on drop. `None` when the pool cannot grow
     /// (`max == min_idle`) — `available` can then never exceed `min_idle`, so
     /// there is nothing to evict.
@@ -251,7 +245,6 @@ impl CapsuleInstancePool {
             affine_changed: Arc::new(Notify::new()),
             total_instances,
             builder: Arc::new(builder),
-            allow_grow,
             evict_task,
         }
     }
@@ -956,7 +949,6 @@ mod tests {
         let cancel = CancellationToken::new();
         let pool = empty_pool(1, 1, &cancel).await;
         let principal = PrincipalId::new("pool-test").expect("principal");
-        assert!(!pool.allow_grow, "size-1 pool must not be growable");
         assert!(
             pool.evict_task.is_none(),
             "non-growable pool spawns no evictor"
