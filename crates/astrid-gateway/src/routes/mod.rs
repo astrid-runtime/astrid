@@ -325,8 +325,14 @@ fn build_authed_router(state: &Arc<GatewayState>) -> Router<Arc<GatewayState>> {
             "/api/capsules/{id}/topics",
             get(capsules::list_capsule_topics),
         )
-        .route("/api/capsules/{id}/env", get(env::get_env_schema))
-        .route("/api/capsules/{id}/env/{field}", post(env::write_env))
+        .route(
+            "/api/capsules/{id}/env",
+            get(env::get_env_schema_with_workspace),
+        )
+        .route(
+            "/api/capsules/{id}/env/{field}",
+            post(env::write_env_with_workspace),
+        )
         // ── Audit stream ──
         .route("/api/events", get(events::get_events))
         // ── Audit history (paginated) ──
