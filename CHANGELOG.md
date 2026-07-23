@@ -21,6 +21,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Fixed
 
+- **Capsule lifecycle hooks preserve the target principal.** Explicit-principal
+  installs now provision and scope lifecycle `home://`, KV, secrets, and IPC
+  identity to the authenticated install target instead of silently executing
+  the hook as the bootstrap `default` principal.
 - **Gateway env schemas now use the authenticated principal's capsule registry
   or verified workspace.** Schema reads no longer fall back to `default`, so
   non-default and workspace-only installs are configurable and a same-named

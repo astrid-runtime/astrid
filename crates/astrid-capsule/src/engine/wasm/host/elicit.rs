@@ -50,6 +50,28 @@ fn map_to_onboarding_field(req: &ElicitRequest) -> Result<OnboardingField, Error
     })
 }
 
+fn elicit_request_event(
+    request_id: Uuid,
+    capsule_id: String,
+    field: OnboardingField,
+    principal: String,
+) -> AstridEvent {
+    let message = IpcMessage::new(
+        Topic::elicit_request(),
+        IpcPayload::ElicitRequest {
+            request_id,
+            capsule_id,
+            field,
+        },
+        Uuid::nil(), // Kernel-originated
+    )
+    .with_principal(principal);
+    AstridEvent::Ipc {
+        message,
+        metadata: astrid_events::EventMetadata::default(),
+    }
+}
+
 /// The acting principal carried on an `AstridEvent::Ipc`, if any.
 ///
 /// Used by the elicit wait loop (see [`elicit::Host::elicit`]) to authorize a
@@ -163,21 +185,12 @@ impl elicit::Host for HostState {
         // Publish the elicit request to the event bus, stamped with the
         // originating principal so request and reply principals are symmetric
         // (and the request is attributable in the audit trail).
-        let request_payload = IpcPayload::ElicitRequest {
+        event_bus.publish(elicit_request_event(
             request_id,
-            capsule_id: capsule_id.clone(),
+            capsule_id.clone(),
             field,
-        };
-        let message = IpcMessage::new(
-            Topic::elicit_request(),
-            request_payload,
-            Uuid::nil(), // Kernel-originated
-        )
-        .with_principal(originating_principal.clone());
-        event_bus.publish(AstridEvent::Ipc {
-            message,
-            metadata: astrid_events::EventMetadata::default(),
-        });
+            originating_principal.clone(),
+        ));
 
         tracing::debug!(
             capsule = %capsule_id,
@@ -441,6 +454,31 @@ mod tests {
         // No principal stamped → fail-closed, never matches.
         let none = elicit_response_event(request_id, None, Some("v".into()));
         assert!(!response_principal_matches("agent-alice", &none));
+    }
+
+    #[test]
+    fn request_event_is_stamped_with_originating_principal() {
+        let request_id = Uuid::new_v4();
+        let request = make_elicit_request(ElicitType::Text, "name", "", None, None);
+        let field = map_to_onboarding_field(&request).unwrap();
+        let event = elicit_request_event(
+            request_id,
+            "test".to_owned(),
+            field,
+            "agent-alice".to_owned(),
+        );
+
+        assert_eq!(event_principal(&event), Some("agent-alice"));
+        let AstridEvent::Ipc { message, .. } = event else {
+            panic!("elicit request must be an IPC event");
+        };
+        assert!(matches!(
+            message.payload,
+            IpcPayload::ElicitRequest {
+                request_id: id,
+                ..
+            } if id == request_id
+        ));
     }
 
     /// A non-IPC event carries no principal — `event_principal` returns `None`
