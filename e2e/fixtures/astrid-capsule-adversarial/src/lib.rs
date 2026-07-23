@@ -16,6 +16,7 @@ const CLI_ELICIT_COMMAND: &str = "adversarial-elicit";
 const MAX_REQ_ID_LEN: usize = 64;
 const POISON_SESSION_ID: &str = "ASTRID_ADVERSARIAL_POISON_SESSION";
 const LIFECYCLE_EXPECTED_ANSWER: &str = "runtime-lifecycle-ok";
+const LIFECYCLE_HOME_MARKER: &str = "home://adversarial-lifecycle-home-mounted";
 
 static POISON_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -43,6 +44,7 @@ impl Adversarial {
                 "unexpected adversarial lifecycle probe answer".into(),
             ));
         }
+        fs::write(LIFECYCLE_HOME_MARKER, b"mounted")?;
         log::info("adversarial lifecycle install elicit completed");
         Ok(())
     }

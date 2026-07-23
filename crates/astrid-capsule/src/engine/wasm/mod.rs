@@ -1860,6 +1860,7 @@ impl ExecutionEngine for WasmEngine {
                 ipc_limiter: Arc::clone(&ipc_limiter),
                 config: wasm_config.clone(),
                 secret_env: secret_env_set.clone(),
+                file_secret_root: None,
                 ipc_publish_patterns: ipc_publish_v.clone(),
                 ipc_subscribe_patterns: ipc_subscribe_v.clone(),
                 cli_socket_listener: cli_listener.clone(),
@@ -2869,40 +2870,58 @@ pub struct LifecycleConfig {
     pub audit_sink: Option<std::sync::Arc<dyn crate::audit_sink::HostAuditSink>>,
 }
 
-/// Run a capsule's lifecycle hook (install or upgrade).
+/// Principal-scoped inputs for one lifecycle execution.
 ///
-/// Builds a temporary, short-lived component instance with no epoch deadline
-/// (lifecycle hooks involve human interaction via `elicit`). If the WASM binary
-/// does not export the relevant function (`astrid_install` or `astrid_upgrade`),
-/// returns `Ok(())` silently.
-///
-/// # Errors
-///
-/// Returns an error if the WASM component fails to build or the lifecycle hook
-/// returns an error.
-pub async fn run_lifecycle(
-    cfg: LifecycleConfig,
-    phase: LifecyclePhase,
-    previous_version: Option<&str>,
-) -> CapsuleResult<()> {
-    let export_name = match phase {
-        LifecyclePhase::Install => "astrid-install",
-        LifecyclePhase::Upgrade => "astrid-upgrade",
-    };
+/// Kept separate from [`LifecycleConfig`] so existing callers constructing that
+/// public config retain source compatibility. Lifecycle execution is a
+/// one-shot context: this carries identity and filesystem lookup roots, not a
+/// kernel profile, quota ledger, or persistent runtime accounting handle.
+#[derive(Debug, Clone)]
+pub struct LifecyclePrincipalContext {
+    principal: astrid_core::PrincipalId,
+    secret_env: std::collections::HashSet<String>,
+    file_secret_root: Option<PathBuf>,
+}
 
-    // Pre-scan: check if the export exists before expensive compilation.
-    // Lifecycle hooks are optional — most capsules don't have them.
-    let has_export = wasm_exports_contain(export_name, &cfg.wasm_bytes);
-    if !has_export {
-        tracing::debug!(
-            capsule = %cfg.capsule_id,
-            export = export_name,
-            "Capsule does not export lifecycle hook, skipping"
-        );
-        return Ok(());
+impl LifecyclePrincipalContext {
+    /// Create a context for `principal` with no secret-typed env declarations
+    /// and no injected file-secret root.
+    #[must_use]
+    pub fn new(principal: astrid_core::PrincipalId) -> Self {
+        Self {
+            principal,
+            secret_env: std::collections::HashSet::new(),
+            file_secret_root: None,
+        }
     }
 
-    // Build a minimal VFS for workspace
+    /// Supply the manifest-declared secret-typed env key set.
+    #[must_use]
+    pub fn with_secret_env(mut self, secret_env: std::collections::HashSet<String>) -> Self {
+        self.secret_env = secret_env;
+        self
+    }
+
+    /// Supply the injected Astrid home's file-per-secret root.
+    #[must_use]
+    pub fn with_file_secret_root(mut self, root: PathBuf) -> Self {
+        self.file_secret_root = Some(root);
+        self
+    }
+}
+
+async fn build_lifecycle_host_state(
+    cfg: &LifecycleConfig,
+    phase: LifecyclePhase,
+    context: LifecyclePrincipalContext,
+    memory_ledger: crate::MemoryLedger,
+) -> CapsuleResult<HostState> {
+    let LifecyclePrincipalContext {
+        principal,
+        secret_env,
+        file_secret_root,
+    } = context;
+
     let vfs = astrid_vfs::HostVfs::new();
     let root_handle = astrid_capabilities::DirHandle::new();
     vfs.register_dir(root_handle.clone(), cfg.workspace_root.clone())
@@ -2923,25 +2942,26 @@ pub async fn run_lifecycle(
         None => None,
     };
 
-    let host_state = HostState {
+    Ok(HostState {
         wasi_ctx: build_wasi_ctx(),
-        // Lifecycle hooks (install/upgrade) run rarely and briefly; their memory
-        // is not part of per-principal usage reporting, so a throwaway ledger is
-        // fine — the cap is still enforced.
+        // Lifecycle hooks run outside the kernel's target profile and shared
+        // accounting ledgers. The finite cap is enforced with a throwaway
+        // ledger; stamping the target principal preserves attribution inside
+        // this one-shot HostState but does NOT claim persistent quota reporting.
         store_meter: crate::memory_ledger::StoreMemoryMeter::new(
             WASM_MAX_MEMORY_BYTES,
-            astrid_core::PrincipalId::default(),
-            crate::MemoryLedger::default(),
+            principal.clone(),
+            memory_ledger,
         ),
         resource_table: wasmtime::component::ResourceTable::new(),
-        principal: astrid_core::PrincipalId::default(),
+        principal: principal.clone(),
         capsule_uuid: uuid::Uuid::new_v4(),
         caller_context: None,
         interceptor_active: false,
         invocation_kv: None,
         capsule_log: None,
         capsule_id: cfg.capsule_id.clone(),
-        workspace_root: cfg.workspace_root,
+        workspace_root: cfg.workspace_root.clone(),
         // Lifecycle hooks run on a plain HostVfs with no CoW, so nothing to mask.
         spawn_mask_paths: Vec::new(),
         vfs: Arc::new(vfs),
@@ -2964,11 +2984,12 @@ pub async fn run_lifecycle(
         // principal's real store (not the shared-runtime neutral placeholder).
         // `kv_backend` mirrors it for API completeness; overlays are never built.
         kv_backend: cfg.kv.backend(),
-        kv: cfg.kv,
-        event_bus: cfg.event_bus,
+        kv: cfg.kv.clone(),
+        event_bus: cfg.event_bus.clone(),
         ipc_limiter: Arc::new(astrid_events::ipc::IpcRateLimiter::new()),
-        config: cfg.config,
-        secret_env: std::collections::HashSet::new(),
+        config: cfg.config.clone(),
+        secret_env,
+        file_secret_root,
         ipc_publish_patterns: Vec::new(),
         ipc_subscribe_patterns: Vec::new(),
         security: None,
@@ -2997,7 +3018,7 @@ pub async fn run_lifecycle(
         active_http_streams: std::collections::HashMap::new(),
         next_http_stream_id: 1,
         lifecycle_phase: Some(phase),
-        secret_store: cfg.secret_store,
+        secret_store: cfg.secret_store.clone(),
         ready_tx: None,
         blocking_semaphore: HostState::default_blocking_semaphore(),
         io_semaphore: HostState::default_io_semaphore(),
@@ -3039,8 +3060,67 @@ pub async fn run_lifecycle(
         // Per-action audit sink (fs/net/process). The install/upgrade path
         // may thread the kernel sink in; `None` for the standalone install
         // CLI, which has no audit log in scope.
-        audit_sink: cfg.audit_sink,
+        audit_sink: cfg.audit_sink.clone(),
+    })
+}
+
+/// Run a capsule's lifecycle hook (install or upgrade).
+///
+/// Builds a temporary, short-lived component instance with no epoch deadline
+/// (lifecycle hooks involve human interaction via `elicit`). If the WASM binary
+/// does not export the relevant function (`astrid_install` or `astrid_upgrade`),
+/// returns `Ok(())` silently.
+///
+/// # Errors
+///
+/// Returns an error if the WASM component fails to build or the lifecycle hook
+/// returns an error.
+pub async fn run_lifecycle(
+    cfg: LifecycleConfig,
+    phase: LifecyclePhase,
+    previous_version: Option<&str>,
+) -> CapsuleResult<()> {
+    let context = LifecyclePrincipalContext::new(astrid_core::PrincipalId::default());
+    run_lifecycle_for_principal(cfg, phase, previous_version, context).await
+}
+
+/// Run a capsule lifecycle hook under an explicit principal identity.
+///
+/// This additive principal-aware entry point preserves [`run_lifecycle`] as
+/// the default-principal compatibility wrapper while allowing install callers
+/// to keep lifecycle IPC and host identity in the same principal scope as the
+/// target installation. The lifecycle store meter remains finite but uses a
+/// throwaway ledger, not the kernel's persistent per-principal accounting.
+///
+/// # Errors
+///
+/// Returns an error if the WASM component fails to build or the lifecycle hook
+/// returns an error.
+pub async fn run_lifecycle_for_principal(
+    cfg: LifecycleConfig,
+    phase: LifecyclePhase,
+    previous_version: Option<&str>,
+    context: LifecyclePrincipalContext,
+) -> CapsuleResult<()> {
+    let export_name = match phase {
+        LifecyclePhase::Install => "astrid-install",
+        LifecyclePhase::Upgrade => "astrid-upgrade",
     };
+
+    // Pre-scan: check if the export exists before expensive compilation.
+    // Lifecycle hooks are optional — most capsules don't have them.
+    let has_export = wasm_exports_contain(export_name, &cfg.wasm_bytes);
+    if !has_export {
+        tracing::debug!(
+            capsule = %cfg.capsule_id,
+            export = export_name,
+            "Capsule does not export lifecycle hook, skipping"
+        );
+        return Ok(());
+    }
+
+    let host_state =
+        build_lifecycle_host_state(&cfg, phase, context, crate::MemoryLedger::default()).await?;
 
     // Build wasmtime engine and store for lifecycle execution.
     // Lifecycle hooks may block on elicit (human interaction), so use a generous
@@ -3115,6 +3195,91 @@ pub async fn run_lifecycle(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod lifecycle_context_tests {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
+
+    use astrid_storage::{DenySecretStore, FileSecretStore, SecretStore};
+    use wasmtime::ResourceLimiter;
+
+    use super::*;
+    use crate::engine::wasm::bindings::astrid::fs::host::Host as FsHost;
+    use crate::engine::wasm::bindings::astrid::sys::host::Host as SysHost;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn nondefault_lifecycle_context_reaches_real_host_operations() {
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let secret_root = tempfile::tempdir().unwrap();
+        let principal = astrid_core::PrincipalId::new("agent-alice").unwrap();
+        let capsule_id = crate::capsule::CapsuleId::new("test").unwrap();
+        let kv = astrid_storage::ScopedKvStore::new(
+            Arc::new(astrid_storage::MemoryKvStore::new()),
+            "agent-alice:capsule:test",
+        )
+        .unwrap();
+
+        let file_secrets = FileSecretStore::new(
+            secret_root
+                .path()
+                .join(principal.as_str())
+                .join(capsule_id.as_str()),
+        );
+        file_secrets.set("API_KEY", "alice-secret").unwrap();
+
+        let cfg = LifecycleConfig {
+            wasm_bytes: Vec::new(),
+            capsule_id,
+            workspace_root: workspace.path().to_path_buf(),
+            home_root: Some(home.path().to_path_buf()),
+            kv,
+            event_bus: astrid_events::EventBus::with_capacity(16),
+            config: HashMap::new(),
+            secret_store: Arc::new(DenySecretStore::new()),
+            http_limits: limits::HttpLimits::default(),
+            audit_sink: None,
+        };
+        let context = LifecyclePrincipalContext::new(principal.clone())
+            .with_secret_env(HashSet::from(["API_KEY".to_owned()]))
+            .with_file_secret_root(secret_root.path().to_path_buf());
+        let ledger = crate::MemoryLedger::default();
+
+        let mut state =
+            build_lifecycle_host_state(&cfg, LifecyclePhase::Install, context, ledger.clone())
+                .await
+                .unwrap();
+
+        assert_eq!(state.principal, principal);
+        assert_eq!(state.effective_principal(), principal);
+        assert_eq!(state.file_secret_root.as_deref(), Some(secret_root.path()));
+        let canonical_home = home.path().canonicalize().unwrap();
+        assert_eq!(
+            state.effective_home().map(|mount| mount.root.as_path()),
+            Some(canonical_home.as_path())
+        );
+
+        assert!(state.store_meter.memory_growing(0, 4096, None).unwrap());
+        assert_eq!(ledger.peak(&principal), 4096);
+
+        state
+            .write_file("home://lifecycle-mounted".into(), b"alice-home".to_vec())
+            .unwrap();
+        assert_eq!(
+            state.read_file("home://lifecycle-mounted".into()).unwrap(),
+            b"alice-home"
+        );
+        assert_eq!(
+            std::fs::read(home.path().join("lifecycle-mounted")).unwrap(),
+            b"alice-home"
+        );
+        assert_eq!(
+            state.get_config("API_KEY".into()).unwrap().as_deref(),
+            Some("alice-secret")
+        );
+    }
 }
 
 /// Pre-scans a WASM binary's exports for a real `run` implementation. This

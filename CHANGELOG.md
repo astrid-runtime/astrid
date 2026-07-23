@@ -21,6 +21,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Fixed
 
+- **Capsule lifecycle hooks preserve the target principal.** Explicit-principal
+  installs now provision and scope lifecycle `home://`, KV, secrets, and IPC
+  identity to the authenticated install target instead of silently executing
+  the hook as the bootstrap `default` principal.
 - **Stable crates publication installs its authenticated-hash prerequisite.**
   The protected publisher installs the pinned `b3sum` binary before validating
   the exact dev candidate, so BLAKE3 release metadata checks run before any

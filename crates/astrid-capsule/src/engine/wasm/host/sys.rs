@@ -254,17 +254,21 @@ fn resolve_secret(state: &HostState, key: &str) -> String {
     let capsule = state.capsule_id.as_str();
     let principal = state.effective_principal();
 
-    let Ok(home) = astrid_core::dirs::AstridHome::resolve() else {
-        tracing::warn!(
-            security_event = true,
-            %principal,
-            capsule,
-            key,
-            "AstridHome::resolve failed during secret lookup"
-        );
-        return String::new();
+    let secrets_dir = if let Some(root) = state.file_secret_root.as_ref() {
+        root.clone()
+    } else {
+        let Ok(home) = astrid_core::dirs::AstridHome::resolve() else {
+            tracing::warn!(
+                security_event = true,
+                %principal,
+                capsule,
+                key,
+                "AstridHome::resolve failed during secret lookup"
+            );
+            return String::new();
+        };
+        home.secrets_dir()
     };
-    let secrets_dir = home.secrets_dir();
 
     let try_get = |scope: &str| -> Option<String> {
         let store = FileSecretStore::new(secrets_dir.join(scope).join(capsule));
@@ -439,6 +443,8 @@ mod capability_introspection_tests {
 mod get_config_tests {
     use std::collections::HashMap;
 
+    use astrid_storage::{FileSecretStore, SecretStore};
+
     use crate::engine::wasm::bindings::astrid::sys::host::Host as SysHost;
     use crate::engine::wasm::test_fixtures::minimal_host_state;
 
@@ -503,5 +509,23 @@ mod get_config_tests {
 
         let value = state.get_config("model".into()).expect("host call");
         assert_eq!(value.as_deref(), Some("gpt-5.4"));
+    }
+
+    #[tokio::test]
+    async fn secret_env_uses_injected_root_for_custom_home() {
+        let root = tempfile::tempdir().unwrap();
+        let principal = astrid_core::PrincipalId::new("agent-alice").unwrap();
+        let store = FileSecretStore::new(root.path().join(principal.as_str()).join("test"));
+        store.set("API_KEY", "custom-home-secret").unwrap();
+
+        let mut state = make_host_state();
+        state.principal = principal;
+        state.secret_env.insert("API_KEY".into());
+        state.file_secret_root = Some(root.path().to_path_buf());
+
+        assert_eq!(
+            state.get_config("API_KEY".into()).expect("host call"),
+            Some("custom-home-secret".into())
+        );
     }
 }
