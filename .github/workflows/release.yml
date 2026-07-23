@@ -86,15 +86,31 @@ jobs:
           - target: x86_64-apple-darwin
             os: macos-latest
             archive: tar.gz
+            libc: native
           - target: aarch64-apple-darwin
             os: macos-latest
             archive: tar.gz
+            libc: native
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             archive: tar.gz
+            libc: gnu
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             archive: tar.gz
+            libc: gnu
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            archive: tar.gz
+            libc: musl
+            platform: linux/amd64
+            image: docker.io/library/rust@sha256:e98196986adced5602f6e21c54babdbf2a8700400c7a78868324a3630e0c5d15
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            archive: tar.gz
+            libc: musl
+            platform: linux/arm64
+            image: docker.io/library/rust@sha256:594694ee6b07747b63b5c265be2616b62e814180b66227e2c18c6ee85e4136be
     steps:
       - name: Harden Runner
         uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
@@ -150,20 +166,20 @@ jobs:
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        if: ${{ !endsWith(matrix.target, '-linux-gnu') }}
+        if: matrix.libc == 'native'
         with:
           key: ${{ matrix.target }}
 
       - name: Build release binaries (native)
-        if: ${{ !endsWith(matrix.target, '-linux-gnu') }}
+        if: matrix.libc == 'native'
         run: cargo build --release --target ${{ matrix.target }} -p astrid --locked
 
       - name: Select native binary root
-        if: ${{ !endsWith(matrix.target, '-linux-gnu') }}
+        if: matrix.libc == 'native'
         run: echo "BINARY_ROOT=target/${{ matrix.target }}/release" >> "$GITHUB_ENV"
 
       - name: Build Linux binaries against the glibc 2.31 baseline
-        if: ${{ endsWith(matrix.target, '-linux-gnu') }}
+        if: matrix.libc == 'gnu'
         env:
           TARGET: ${{ matrix.target }}
           # Official Rust 1.95.0 Bullseye image, linux/amd64 manifest.
@@ -198,13 +214,68 @@ jobs:
           echo "BINARY_ROOT=target/glibc-2.31/${TARGET}/release" >> "$GITHUB_ENV"
 
       - name: Enforce the Linux glibc compatibility ceiling
-        if: ${{ endsWith(matrix.target, '-linux-gnu') }}
+        if: matrix.libc == 'gnu'
         run: |
           python3 scripts/check_glibc.py --max-version 2.34 \
             "$BINARY_ROOT/astrid" \
             "$BINARY_ROOT/astrid-daemon" \
             "$BINARY_ROOT/astrid-build" \
             "$BINARY_ROOT/astrid-emit"
+
+      - name: Build in the native Linux musl environment
+        if: matrix.libc == 'musl'
+        env:
+          TARGET: ${{ matrix.target }}
+          PLATFORM: ${{ matrix.platform }}
+          # Platform manifest from the official Rust 1.95.0 Alpine 3.23 image.
+          RUST_BUILD_IMAGE: ${{ matrix.image }}
+        run: |
+          SOURCE_SHA=$(git rev-parse --short=12 HEAD)
+          docker run --rm \
+            --platform "$PLATFORM" \
+            --env CARGO_TERM_COLOR=always \
+            --env SOURCE_SHA="$SOURCE_SHA" \
+            --env TARGET \
+            --volume "$PWD:/workspace" \
+            --workdir /workspace \
+            "$RUST_BUILD_IMAGE" \
+            sh -ceu '
+              apk add --no-cache binutils build-base cmake git perl pkgconf python3
+              git config --global --add safe.directory /workspace
+              [ "$(git rev-parse --short=12 HEAD)" = "$SOURCE_SHA" ]
+              cargo build \
+                --release \
+                --locked \
+                --target "$TARGET" \
+                --target-dir target/musl \
+                -p astrid
+              BINARY_ROOT="target/musl/$TARGET/release"
+              ARCHITECTURE="${TARGET%%-*}"
+              python3 scripts/check_static_elf.py --architecture "$ARCHITECTURE" \
+                "$BINARY_ROOT/astrid" \
+                "$BINARY_ROOT/astrid-daemon" \
+                "$BINARY_ROOT/astrid-build" \
+                "$BINARY_ROOT/astrid-emit"
+            '
+          echo "BINARY_ROOT=target/musl/${TARGET}/release" >> "$GITHUB_ENV"
+
+      - name: Exercise the Linux musl binaries
+        if: matrix.libc == 'musl'
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          RUST_BUILD_IMAGE: ${{ matrix.image }}
+        run: |
+          docker run --rm \
+            --platform "$PLATFORM" \
+            --env BINARY_ROOT \
+            --volume "$PWD:/workspace" \
+            --workdir /workspace \
+            "$RUST_BUILD_IMAGE" \
+            sh -ceu '
+              for binary in astrid astrid-daemon astrid-build astrid-emit; do
+                "$BINARY_ROOT/$binary" --version
+              done
+            '
 
       - name: Package binaries
         run: |
@@ -390,6 +461,15 @@ jobs:
             --output "artifacts/astrid-${VERSION}-release.toml"
           python3 scripts/release_manifest.py validate \
             "artifacts/astrid-${VERSION}-release.toml" \
+            --artifacts artifacts \
+            --verify-artifacts
+          python3 scripts/musl_release_manifest.py generate \
+            --artifacts artifacts \
+            --legacy-manifest "artifacts/astrid-${VERSION}-release.toml" \
+            --output "artifacts/astrid-${VERSION}-musl-release.toml"
+          python3 scripts/musl_release_manifest.py validate \
+            "artifacts/astrid-${VERSION}-musl-release.toml" \
+            --legacy-manifest "artifacts/astrid-${VERSION}-release.toml" \
             --artifacts artifacts \
             --verify-artifacts
           {
