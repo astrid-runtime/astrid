@@ -23,7 +23,7 @@ tokio = { workspace = true, features = ["time", "sync", "io-util"] }
 # astrid-core exposes toml error types in its public error enums. Keep this
 # crate on the current public dependency until a breaking release can change
 # that API deliberately.
-toml = "0.8.23"
+toml = "0.9.12"
 uuid = { workspace = true }
 
 [dev-dependencies]
