@@ -149,30 +149,68 @@ jobs:
           toolchain: "1.95.0"
           targets: ${{ matrix.target }}
 
-      - name: Install cross-compilation tools (Linux ARM)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        if: ${{ !endsWith(matrix.target, '-linux-gnu') }}
         with:
           key: ${{ matrix.target }}
 
-      - name: Build release binaries
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+      - name: Build release binaries (native)
+        if: ${{ !endsWith(matrix.target, '-linux-gnu') }}
         run: cargo build --release --target ${{ matrix.target }} -p astrid --locked
+
+      - name: Select native binary root
+        if: ${{ !endsWith(matrix.target, '-linux-gnu') }}
+        run: echo "BINARY_ROOT=target/${{ matrix.target }}/release" >> "$GITHUB_ENV"
+
+      - name: Build Linux binaries against the glibc 2.31 baseline
+        if: ${{ endsWith(matrix.target, '-linux-gnu') }}
+        env:
+          TARGET: ${{ matrix.target }}
+          # Official Rust 1.95.0 Bullseye image, linux/amd64 manifest.
+          RUST_BUILD_IMAGE: docker.io/library/rust@sha256:646e8ceea789b00c5cfa339816a3ed44940dbf1651dc167b78f3c0aefcae0025
+        run: |
+          docker run --rm \
+            --env CARGO_TERM_COLOR=always \
+            --env TARGET \
+            --volume "$PWD:/workspace" \
+            --workdir /workspace \
+            "$RUST_BUILD_IMAGE" \
+            bash -ceu '
+              packages=(cmake)
+              if [[ "$TARGET" == aarch64-unknown-linux-gnu ]]; then
+                rustup target add "$TARGET"
+                packages+=(gcc-aarch64-linux-gnu)
+                export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+              fi
+              apt-get update
+              apt-get install -y --no-install-recommends "${packages[@]}"
+              cargo build \
+                --release \
+                --locked \
+                --target "$TARGET" \
+                --target-dir target/glibc-2.31 \
+                -p astrid
+            '
+          echo "BINARY_ROOT=target/glibc-2.31/${TARGET}/release" >> "$GITHUB_ENV"
+
+      - name: Enforce the Linux glibc compatibility ceiling
+        if: ${{ endsWith(matrix.target, '-linux-gnu') }}
+        run: |
+          python3 scripts/check_glibc.py --max-version 2.34 \
+            "$BINARY_ROOT/astrid" \
+            "$BINARY_ROOT/astrid-daemon" \
+            "$BINARY_ROOT/astrid-build" \
+            "$BINARY_ROOT/astrid-emit"
 
       - name: Package binaries
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           DIR="astrid-${VERSION}-${{ matrix.target }}"
           mkdir "$DIR"
-          cp "target/${{ matrix.target }}/release/astrid" "$DIR/"
-          cp "target/${{ matrix.target }}/release/astrid-daemon" "$DIR/"
-          cp "target/${{ matrix.target }}/release/astrid-build" "$DIR/"
-          cp "target/${{ matrix.target }}/release/astrid-emit" "$DIR/"
+          cp "$BINARY_ROOT/astrid" "$DIR/"
+          cp "$BINARY_ROOT/astrid-daemon" "$DIR/"
+          cp "$BINARY_ROOT/astrid-build" "$DIR/"
+          cp "$BINARY_ROOT/astrid-emit" "$DIR/"
           cp LICENSE* README.md "$DIR/" 2>/dev/null || true
           tar czf "${DIR}.tar.gz" "$DIR"
           echo "ASSET=${DIR}.tar.gz" >> "$GITHUB_ENV"

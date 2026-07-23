@@ -7,6 +7,8 @@ on:
       - '**.rs'
       - 'scripts/release_manifest.py'
       - 'scripts/test_release_manifest.py'
+      - 'scripts/check_glibc.py'
+      - 'scripts/test_check_glibc.py'
       - 'scripts/release_publication.py'
       - 'scripts/test_release_publication.py'
       - 'scripts/release_draft_recovery.py'
@@ -30,6 +32,8 @@ on:
       - '**.rs'
       - 'scripts/release_manifest.py'
       - 'scripts/test_release_manifest.py'
+      - 'scripts/check_glibc.py'
+      - 'scripts/test_check_glibc.py'
       - 'scripts/release_publication.py'
       - 'scripts/test_release_publication.py'
       - 'scripts/release_draft_recovery.py'
@@ -90,6 +94,7 @@ jobs:
       - name: Test release manifest contract
         run: |
           python3 scripts/test_release_manifest.py
+          python3 scripts/test_check_glibc.py
           python3 scripts/test_release_publication.py
           python3 scripts/test_release_draft_recovery.py
           python3 scripts/test_crate_publication.py

@@ -21,6 +21,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Fixed
 
+- **Linux release binaries now run on glibc 2.34 enterprise hosts.** The
+  x86_64 and ARM64 GNU artifacts are built in a pinned glibc 2.31 environment,
+  and release publication rejects binaries whose ELF symbol requirements
+  exceed glibc 2.34. Closes #1322.
 - **Stable crates publication installs its authenticated-hash prerequisite.**
   The protected publisher installs the pinned `b3sum` binary before validating
   the exact dev candidate, so BLAKE3 release metadata checks run before any
