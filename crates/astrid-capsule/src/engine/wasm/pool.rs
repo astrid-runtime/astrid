@@ -19,10 +19,12 @@
 //! *within* a single invocation (subscribe → publish → recv → drop in one
 //! call), so no handle created on one Store is reused on another. The
 //! per-capsule pool-safety audit confirmed this for every pooled capsule;
-//! Capsules that declare intentional cross-invocation resources are carved out
-//! to `size == 1`: `host_process` retains background-process handles, while a
-//! `compute-worker` component retains principal-bound compute groups. Neither
-//! can lease a second Store because wasmtime resources are Store-local.
+//! Capsules that declare intentional cross-invocation resources cannot use
+//! free checkout. `host_process` retains its existing single-Store carve-out.
+//! A `compute-worker` capsule instead uses principal-affine checkout: one
+//! Store per active principal, serialized within that principal and isolated
+//! from every other principal. Idle affine Stores are evictable cache; their
+//! durable state must live behind principal-scoped host storage.
 //!
 //! ## Run-loop capsules are not pooled
 //!
@@ -30,10 +32,13 @@
 //! the run-loop task) and never go through this pool — they receive events
 //! via auto-subscribed IPC inside `run()`, not via `invoke_interceptor`.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use astrid_core::PrincipalId;
+use tokio::sync::Notify;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -56,6 +61,9 @@ const EVICT_INTERVAL: Duration = Duration::from_secs(30);
 pub(super) struct PooledInstance {
     pub(super) store: Store<HostState>,
     pub(super) instance: Instance,
+    /// Persistent-resource Stores are pinned to the principal that first
+    /// leases them. Free-checkout Stores leave this unset.
+    affinity: Option<PrincipalId>,
 }
 
 /// The immutable ingredients to mint a fresh `(Store, Instance)` on demand,
@@ -119,7 +127,11 @@ impl InstanceBuilder {
                     "Failed to instantiate WASM component: {e}"
                 ))
             })?;
-        Ok(PooledInstance { store, instance })
+        Ok(PooledInstance {
+            store,
+            instance,
+            affinity: None,
+        })
     }
 }
 
@@ -162,10 +174,22 @@ pub(super) struct CapsuleInstancePool {
     ///
     /// `false` for persistent-resource capsules (`size == 1`): these
     /// deliberately hold live process or compute handles across invocations,
-    /// so tearing the resource table down on return would close them. They
-    /// never lease a *second* Store; retained compute objects additionally
-    /// enforce their opening principal at every host operation.
+    /// so tearing the resource table down on return would close them.
     reset_resources_on_return: bool,
+    /// Whether each retained Store is permanently affine to its first
+    /// invoking principal. Used by compute-worker capsules whose Store-local
+    /// resource table contains principal-bound compute groups.
+    principal_affine: bool,
+    /// Principals whose affine Store is either being built or currently
+    /// leased. A second invocation for the same principal waits for the first
+    /// instead of forking its state into another Store.
+    affine_claims: Arc<Mutex<HashSet<PrincipalId>>>,
+    /// Wakes affine waiters after a Store is returned or a build fails.
+    affine_changed: Arc<Notify>,
+    /// Warm + leased + in-construction Stores. Affine checkout may need to
+    /// build while unrelated warm Stores exist, so the old "available empty"
+    /// invariant alone cannot bound total instances.
+    total_instances: Arc<AtomicUsize>,
     /// On-demand instance factory for lazy growth.
     builder: Arc<InstanceBuilder>,
     /// Whether a checkout that finds no warm instance may build one. `false`
@@ -195,6 +219,7 @@ impl CapsuleInstancePool {
         max: usize,
         min_idle: usize,
         reset_resources_on_return: bool,
+        principal_affine: bool,
         builder: InstanceBuilder,
         cancel_token: &CancellationToken,
     ) -> Self {
@@ -202,13 +227,18 @@ impl CapsuleInstancePool {
         debug_assert!(min_idle >= 1 && min_idle <= max, "1 <= min_idle <= max");
         debug_assert!(initial.len() <= max, "warm-start cannot exceed max");
 
+        let initial_len = initial.len();
         let available = Arc::new(Mutex::new(VecDeque::from(initial)));
+        let total_instances = Arc::new(AtomicUsize::new(initial_len));
         // Only a pool that can grow above its warm set ever needs reclaiming.
         let allow_grow = max > min_idle;
         let evict_task = allow_grow.then(|| {
             let available = Arc::clone(&available);
+            let total_instances = Arc::clone(&total_instances);
             let cancel = cancel_token.clone();
-            tokio::spawn(async move { evict_loop(available, min_idle, cancel).await })
+            tokio::spawn(async move {
+                evict_loop(available, total_instances, min_idle, cancel).await;
+            })
         });
 
         Self {
@@ -216,6 +246,10 @@ impl CapsuleInstancePool {
             permits: Arc::new(Semaphore::new(max)),
             max,
             reset_resources_on_return,
+            principal_affine,
+            affine_claims: Arc::new(Mutex::new(HashSet::new())),
+            affine_changed: Arc::new(Notify::new()),
+            total_instances,
             builder: Arc::new(builder),
             allow_grow,
             evict_task,
@@ -242,7 +276,15 @@ impl CapsuleInstancePool {
     /// Returns `None` if the semaphore is closed (capsule unloading), if a
     /// lazy build fails, or if a non-growable pool somehow finds no warm
     /// instance — all treated by the caller as "not invocable".
-    pub(super) async fn checkout(&self) -> Option<PoolCheckout> {
+    pub(super) async fn checkout(&self, principal: &PrincipalId) -> Option<PoolCheckout> {
+        if self.principal_affine {
+            self.checkout_affine(principal).await
+        } else {
+            self.checkout_free().await
+        }
+    }
+
+    async fn checkout_free(&self) -> Option<PoolCheckout> {
         let permit = Arc::clone(&self.permits).acquire_owned().await.ok()?;
         // Pop the most-recently-returned instance (the BACK — return pushes
         // back) so we lease the warmest, hottest store for cache locality and
@@ -262,9 +304,11 @@ impl CapsuleInstancePool {
                     // always warm); fail closed rather than mint a second Store.
                     return None;
                 }
+                self.total_instances.fetch_add(1, Ordering::AcqRel);
                 match self.builder.build().await {
                     Ok(pooled) => pooled,
                     Err(e) => {
+                        self.total_instances.fetch_sub(1, Ordering::AcqRel);
                         tracing::error!(error = %e, "failed to grow capsule instance pool");
                         return None;
                     },
@@ -275,8 +319,112 @@ impl CapsuleInstancePool {
             pooled: Some(pooled),
             available: Arc::clone(&self.available),
             reset_resources_on_return: self.reset_resources_on_return,
+            affinity_claim: None,
+            affine_claims: Arc::clone(&self.affine_claims),
+            affine_changed: Arc::clone(&self.affine_changed),
             _permit: permit,
         })
+    }
+
+    /// Lease the one Store that belongs to `principal`, building it lazily
+    /// when this is the principal's first invocation. A simultaneous second
+    /// invocation for the same principal waits for that Store to return;
+    /// another principal may use or build a different Store concurrently.
+    async fn checkout_affine(&self, principal: &PrincipalId) -> Option<PoolCheckout> {
+        loop {
+            // Register before examining the claim set so a return between the
+            // check and `.await` cannot be missed.
+            let changed = self.affine_changed.notified();
+            let permit = Arc::clone(&self.permits).acquire_owned().await.ok()?;
+
+            let mut existing = None;
+            let mut evicted = None;
+            let mut build = false;
+            let mut wait = false;
+            {
+                let mut claims = self
+                    .affine_claims
+                    .lock()
+                    .expect("affine claim mutex poisoned");
+                if claims.contains(principal) {
+                    wait = true;
+                } else {
+                    let mut available =
+                        self.available.lock().expect("instance pool mutex poisoned");
+                    let matching = available
+                        .iter()
+                        .position(|pooled| pooled.affinity.as_ref() == Some(principal));
+                    let unbound = available
+                        .iter()
+                        .position(|pooled| pooled.affinity.is_none());
+                    if let Some(index) = matching.or(unbound) {
+                        existing = available.remove(index);
+                    } else if self.total_instances.load(Ordering::Acquire) < self.max {
+                        // Reserve the slot before dropping the lock. Another
+                        // checkout includes this in-construction Store in its
+                        // own admission decision.
+                        self.total_instances.fetch_add(1, Ordering::AcqRel);
+                        build = true;
+                    } else if let Some(victim) = available.pop_front() {
+                        // At the ceiling, replace the least-recently-returned
+                        // idle principal Store. Its compute state is evictable
+                        // cache; principal home/KV remains durable.
+                        evicted = Some(victim);
+                        build = true;
+                    } else {
+                        // Every admitted Store is leased or being built.
+                        wait = true;
+                    }
+
+                    if !wait {
+                        claims.insert(principal.clone());
+                    }
+                }
+            }
+
+            if wait {
+                drop(permit);
+                changed.await;
+                continue;
+            }
+
+            // Store drop may tear down a large compute group. Keep it outside
+            // both pool mutexes.
+            drop(evicted);
+            let mut pooled = if let Some(pooled) = existing {
+                pooled
+            } else if build {
+                match self.builder.build().await {
+                    Ok(pooled) => pooled,
+                    Err(error) => {
+                        self.total_instances.fetch_sub(1, Ordering::AcqRel);
+                        self.affine_claims
+                            .lock()
+                            .expect("affine claim mutex poisoned")
+                            .remove(principal);
+                        self.affine_changed.notify_waiters();
+                        tracing::error!(
+                            principal = %principal,
+                            error = %error,
+                            "failed to grow principal-affine capsule instance pool"
+                        );
+                        return None;
+                    },
+                }
+            } else {
+                unreachable!("affine checkout selected neither an existing Store nor a build")
+            };
+            pooled.affinity = Some(principal.clone());
+            return Some(PoolCheckout {
+                pooled: Some(pooled),
+                available: Arc::clone(&self.available),
+                reset_resources_on_return: self.reset_resources_on_return,
+                affinity_claim: Some(principal.clone()),
+                affine_claims: Arc::clone(&self.affine_claims),
+                affine_changed: Arc::clone(&self.affine_changed),
+                _permit: permit,
+            });
+        }
     }
 }
 
@@ -298,6 +446,7 @@ impl Drop for CapsuleInstancePool {
 /// reclaims memory only after load genuinely subsides.
 async fn evict_loop(
     available: Arc<Mutex<VecDeque<PooledInstance>>>,
+    total_instances: Arc<AtomicUsize>,
     min_idle: usize,
     cancel: CancellationToken,
 ) {
@@ -314,6 +463,7 @@ async fn evict_loop(
                     drain_excess(&mut q, min_idle)
                 };
                 if !evicted.is_empty() {
+                    total_instances.fetch_sub(evicted.len(), Ordering::AcqRel);
                     tracing::debug!(
                         evicted = evicted.len(),
                         min_idle,
@@ -356,6 +506,11 @@ pub(super) struct PoolCheckout {
     /// Mirrors [`CapsuleInstancePool::reset_resources_on_return`]; copied at
     /// checkout so the drop path needs no back-pointer to the pool.
     reset_resources_on_return: bool,
+    /// Present only for a principal-affine lease. Removed from
+    /// `affine_claims` after the Store is back in `available`.
+    affinity_claim: Option<PrincipalId>,
+    affine_claims: Arc<Mutex<HashSet<PrincipalId>>>,
+    affine_changed: Arc<Notify>,
     _permit: OwnedSemaphorePermit,
 }
 
@@ -371,6 +526,15 @@ impl PoolCheckout {
     pub(super) fn store_mut(&mut self) -> &mut Store<HostState> {
         &mut self.pooled.as_mut().expect("active checkout").store
     }
+
+    #[cfg(test)]
+    fn affinity(&self) -> Option<&PrincipalId> {
+        self.pooled
+            .as_ref()
+            .expect("active checkout")
+            .affinity
+            .as_ref()
+    }
 }
 
 impl Drop for PoolCheckout {
@@ -380,10 +544,24 @@ impl Drop for PoolCheckout {
             // instance returns to the pool so the next lease starts clean.
             // Mirrors the old `ClearOnDrop` guard from the single-Store path.
             clear_on_return(pooled.store.data_mut(), self.reset_resources_on_return);
-            self.available
-                .lock()
-                .expect("instance pool mutex poisoned")
-                .push_back(pooled);
+            if let Some(principal) = self.affinity_claim.take() {
+                let mut claims = self
+                    .affine_claims
+                    .lock()
+                    .expect("affine claim mutex poisoned");
+                self.available
+                    .lock()
+                    .expect("instance pool mutex poisoned")
+                    .push_back(pooled);
+                claims.remove(&principal);
+                drop(claims);
+                self.affine_changed.notify_waiters();
+            } else {
+                self.available
+                    .lock()
+                    .expect("instance pool mutex poisoned")
+                    .push_back(pooled);
+            }
         }
     }
 }
@@ -414,9 +592,10 @@ impl Drop for PoolCheckout {
 ///    a cheap no-op: a fresh `ResourceTable` allocation and a few field writes.
 ///
 /// `reset_resources` is `false` for persistent-resource capsules whose process
-/// or compute handles legitimately persist across invocations. They never
-/// lease a second Store; compute objects remain independently principal-bound
-/// at the host boundary (see [`CapsuleInstancePool`]).
+/// or compute handles legitimately persist across invocations. Host-process
+/// capsules keep one Store; compute-worker capsules keep at most one affine
+/// Store per active principal. Compute objects remain independently
+/// principal-bound at the host boundary (see [`CapsuleInstancePool`]).
 ///
 /// NOTE: the per-Store *owner* state (`vfs`, `kv`, `secret_store`,
 /// `ipc_limiter`, `blocking_semaphore`, `io_semaphore`, `process_tracker`,
@@ -662,6 +841,15 @@ mod tests {
         min_idle: usize,
         cancel: &CancellationToken,
     ) -> CapsuleInstancePool {
+        empty_pool_with_mode(max, min_idle, false, cancel).await
+    }
+
+    async fn empty_pool_with_mode(
+        max: usize,
+        min_idle: usize,
+        principal_affine: bool,
+        cancel: &CancellationToken,
+    ) -> CapsuleInstancePool {
         let engine = super::super::build_wasmtime_engine().expect("engine");
         let component =
             wasmtime::component::Component::new(&engine, "(component)").expect("empty component");
@@ -671,13 +859,27 @@ mod tests {
         let handle = tokio::runtime::Handle::current();
         let make_state: Arc<dyn Fn() -> HostState + Send + Sync> =
             Arc::new(move || minimal_host_state(handle.clone()));
-        let builder = InstanceBuilder::new(engine, instance_pre, make_state, u64::MAX, 1_000_000);
+        let builder = InstanceBuilder::new(
+            engine,
+            instance_pre,
+            make_state,
+            super::super::EFFECTIVELY_UNBOUNDED_EPOCH_TICKS,
+            1_000_000,
+        );
 
         let mut initial = Vec::with_capacity(min_idle);
         for _ in 0..min_idle {
             initial.push(builder.build().await.expect("warm-start build"));
         }
-        CapsuleInstancePool::new(initial, max, min_idle, true, builder, cancel)
+        CapsuleInstancePool::new(
+            initial,
+            max,
+            min_idle,
+            !principal_affine,
+            principal_affine,
+            builder,
+            cancel,
+        )
     }
 
     /// Checkout pops the warm instances first, then grows lazily (building fresh
@@ -687,15 +889,17 @@ mod tests {
     async fn checkout_grows_lazily_then_bounds_at_max() {
         let cancel = CancellationToken::new();
         let pool = empty_pool(4, 2, &cancel).await;
+        let principal = PrincipalId::new("pool-test").expect("principal");
 
         // First two pop the warm set; the next two force a lazy build.
-        let c1 = pool.checkout().await.expect("warm 1");
-        let c2 = pool.checkout().await.expect("warm 2");
-        let c3 = pool.checkout().await.expect("lazy grow 3");
-        let c4 = pool.checkout().await.expect("lazy grow 4");
+        let c1 = pool.checkout(&principal).await.expect("warm 1");
+        let c2 = pool.checkout(&principal).await.expect("warm 2");
+        let c3 = pool.checkout(&principal).await.expect("lazy grow 3");
+        let c4 = pool.checkout(&principal).await.expect("lazy grow 4");
 
         // Five would exceed max=4: the permit wait must not resolve.
-        let blocked = tokio::time::timeout(Duration::from_millis(100), pool.checkout()).await;
+        let blocked =
+            tokio::time::timeout(Duration::from_millis(100), pool.checkout(&principal)).await;
         assert!(
             blocked.is_err(),
             "checkout must block once max are in flight"
@@ -703,7 +907,7 @@ mod tests {
 
         // Returning one frees a permit and a warm instance; the wait resolves.
         drop(c4);
-        let c5 = tokio::time::timeout(Duration::from_millis(1000), pool.checkout())
+        let c5 = tokio::time::timeout(Duration::from_millis(1000), pool.checkout(&principal))
             .await
             .expect("a returned instance must unblock the waiter")
             .expect("checkout after return");
@@ -719,22 +923,61 @@ mod tests {
     async fn carveout_pool_never_grows() {
         let cancel = CancellationToken::new();
         let pool = empty_pool(1, 1, &cancel).await;
+        let principal = PrincipalId::new("pool-test").expect("principal");
         assert!(!pool.allow_grow, "size-1 pool must not be growable");
         assert!(
             pool.evict_task.is_none(),
             "non-growable pool spawns no evictor"
         );
 
-        let c1 = pool.checkout().await.expect("the one instance");
+        let c1 = pool.checkout(&principal).await.expect("the one instance");
         // A second concurrent checkout must block (only one Store ever exists).
-        let blocked = tokio::time::timeout(Duration::from_millis(100), pool.checkout()).await;
+        let blocked =
+            tokio::time::timeout(Duration::from_millis(100), pool.checkout(&principal)).await;
         assert!(blocked.is_err(), "carve-out serialises: no second Store");
         drop(c1);
-        let c2 = tokio::time::timeout(Duration::from_millis(1000), pool.checkout())
+        let c2 = tokio::time::timeout(Duration::from_millis(1000), pool.checkout(&principal))
             .await
             .expect("unblocks on return")
             .expect("same instance again");
         drop(c2);
+        cancel.cancel();
+    }
+
+    /// Stateful compute resources reuse one Store within a principal while
+    /// allowing a different principal to lease an independent Store.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn principal_affine_checkout_serializes_same_principal_and_separates_others() {
+        let cancel = CancellationToken::new();
+        let pool = empty_pool_with_mode(2, 1, true, &cancel).await;
+        let alice = PrincipalId::new("alice").expect("alice");
+        let bob = PrincipalId::new("bob").expect("bob");
+
+        let alice_first = pool.checkout(&alice).await.expect("Alice Store");
+        assert_eq!(alice_first.affinity(), Some(&alice));
+
+        let alice_blocked =
+            tokio::time::timeout(Duration::from_millis(100), pool.checkout(&alice)).await;
+        assert!(
+            alice_blocked.is_err(),
+            "a second Alice call must wait for Alice's retained Store"
+        );
+
+        let bob_first = tokio::time::timeout(Duration::from_millis(1000), pool.checkout(&bob))
+            .await
+            .expect("Bob does not wait for Alice")
+            .expect("Bob Store");
+        assert_eq!(bob_first.affinity(), Some(&bob));
+        assert_eq!(pool.total_instances.load(Ordering::Acquire), 2);
+
+        drop(alice_first);
+        let alice_second = tokio::time::timeout(Duration::from_millis(1000), pool.checkout(&alice))
+            .await
+            .expect("Alice's returned Store is reusable")
+            .expect("Alice Store returns");
+        assert_eq!(alice_second.affinity(), Some(&alice));
+
+        drop((alice_second, bob_first));
         cancel.cancel();
     }
 }

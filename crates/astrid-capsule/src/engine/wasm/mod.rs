@@ -240,15 +240,16 @@ fn load_compute_workers(
 struct InstancePoolPolicy {
     single_store: bool,
     reset_resources_on_return: bool,
+    principal_affine: bool,
 }
 
 /// Decide whether a capsule can use free checkout or must retain one Store.
 ///
-/// A live host resource is a handle into one Store's resource table. Capsules
-/// that deliberately keep such handles between invocations must therefore use
-/// one serialized Store and retain its table. Compute resources remain bound
-/// to their opening principal at every host operation; retaining the table
-/// does not weaken that authority boundary.
+/// A live host resource is a handle into one Store's resource table.
+/// `host_process` keeps the existing one-Store carve-out. Compute-worker
+/// capsules instead retain one Store per active principal: this preserves
+/// Store-local compute handles without forcing unrelated principals through
+/// the same stateful component instance.
 fn instance_pool_policy(
     has_run_export: bool,
     has_host_process: bool,
@@ -256,8 +257,9 @@ fn instance_pool_policy(
 ) -> InstancePoolPolicy {
     let retains_resources = has_host_process || has_compute_workers;
     InstancePoolPolicy {
-        single_store: has_run_export || retains_resources,
+        single_store: has_run_export || has_host_process,
         reset_resources_on_return: !retains_resources,
+        principal_affine: has_compute_workers && !has_run_export && !has_host_process,
     }
 }
 
@@ -675,6 +677,15 @@ const WASM_MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 /// is derived per-capsule from the owner quota `max_timeout_secs` (clamped to
 /// this default) in [`resolve_run_loop_budget`]; this const is the fail-safe.
 const DEFAULT_RUN_LOOP_WINDOW_TICKS: u64 = 50;
+
+/// Effectively unbounded relative epoch deadline for pool instantiation.
+///
+/// `Store::set_epoch_deadline` adds this value to the engine's current epoch.
+/// Passing `u64::MAX` after the epoch ticker has advanced wraps into an
+/// already-expired deadline and makes a lazily-grown Store trap during
+/// instantiation. Half the integer range cannot wrap during any realistic
+/// daemon lifetime (more than 29 billion years at the 100 ms tick).
+const EFFECTIVELY_UNBOUNDED_EPOCH_TICKS: u64 = u64::MAX / 2;
 
 /// Number of consecutive windows a bound run-loop may burn CPU **without**
 /// calling `recv` (i.e. without setting `recv_yielded`) before its epoch
@@ -2182,12 +2193,12 @@ impl ExecutionEngine for WasmEngine {
             // Initial epoch deadline applied to every freshly-instantiated
             // pool Store below. This is a wall-clock placeholder, NOT the
             // bound run-loop CPU mechanism:
-            //  - exempt: u64::MAX at the pool-load default. For an exempt
+            //  - exempt: an effectively unbounded, non-wrapping relative
+            //    deadline at the pool-load default. For an exempt
             //    RUN-LOOP this placeholder is REPLACED below with a finite
             //    yield-always window (`exempt_epoch_action`) so it cooperatively
             //    yields the worker and can never starve the daemon. Exempt
-            //    interceptor POOL Stores keep u64::MAX here (see the STOP-AND-
-            //    REPORT note on the exempt interceptor epoch path).
+            //    interceptor POOL Stores keep that horizon here.
             //  - interceptor pool Stores: the existing finite default; the real
             //    per-invocation epoch is re-applied per call in
             //    `invoke_interceptor` (unchanged).
@@ -2195,7 +2206,7 @@ impl ExecutionEngine for WasmEngine {
             //    Store setup with the per-WINDOW epoch deadline + interrupt
             //    callback (`epoch_decision`).
             let pool_epoch_deadline = if run_budget.exempt {
-                u64::MAX
+                EFFECTIVELY_UNBOUNDED_EPOCH_TICKS
             } else {
                 WASM_CAPSULE_TIMEOUT_SECS * 1000 / EPOCH_TICK_INTERVAL.as_millis() as u64
             };
@@ -2226,12 +2237,12 @@ impl ExecutionEngine for WasmEngine {
                 ))
             })?;
 
-            // Dynamic-pool sizing. Run-loop and persistent-resource capsules are
-            // pinned to a single Store regardless of the configured pool max:
-            // run-loops own their dedicated Store; capsules using `host_process`
-            // or a declared compute worker hold live resource handles across
-            // invocations and must never lease a second Store. Everyone else
-            // gets a dynamic pool that warm-starts
+            // Dynamic-pool sizing. Run-loop and host-process capsules remain
+            // pinned to one Store. Compute-worker capsules get a dynamic,
+            // principal-affine pool: one retained Store per active principal,
+            // bounded by the host pool ceiling and trimmed as evictable cache
+            // when idle. Everyone else gets free checkout from a pool that
+            // warm-starts
             // at `min_idle`, grows lazily toward `instance_pool_size` under
             // load, and is trimmed back to `min_idle` when idle (issue #816,
             // replacing the old fixed `INSTANCE_POOL_SIZE`).
@@ -2247,6 +2258,8 @@ impl ExecutionEngine for WasmEngine {
             );
             let (pool_max, pool_min_idle) = if pool_policy.single_store {
                 (1, 1)
+            } else if pool_policy.principal_affine {
+                (self.runtime_limits.instance_pool_size, 1)
             } else {
                 (
                     self.runtime_limits.instance_pool_size,
@@ -2279,6 +2292,7 @@ impl ExecutionEngine for WasmEngine {
                 has_run = has_run_export,
                 host_process = has_host_process,
                 compute_workers = has_compute_workers,
+                principal_affine = pool_policy.principal_affine,
                 "Instantiated capsule instance pool"
             );
 
@@ -2373,9 +2387,10 @@ impl ExecutionEngine for WasmEngine {
                 // Free-checkout pools tear down each returned instance's
                 // resource table so a cancelled/panicked invocation can't leak
                 // a live handle into the next (possibly different-principal)
-                // lease. Persistent-resource capsules are the exception: they
-                // hold process or compute handles across invocations and never
-                // lease a second Store, so their table must persist. Compute
+                // lease. Persistent-resource capsules are the exception: their
+                // table must persist. Compute-worker pools additionally pin
+                // each Store to its first invoking principal; host-process
+                // capsules retain the existing one-Store carve-out. Compute
                 // handles are still principal-checked by every host operation.
                 // See `pool::clear_on_return`.
                 pool_opt = Some(pool::CapsuleInstancePool::new(
@@ -2383,6 +2398,7 @@ impl ExecutionEngine for WasmEngine {
                     pool_max,
                     pool_min_idle,
                     pool_policy.reset_resources_on_return,
+                    pool_policy.principal_affine,
                     builder,
                     &cancel_token,
                 ));
@@ -2856,8 +2872,8 @@ impl ExecutionEngine for WasmEngine {
         }
 
         // Is the capsule a daemon (uplink / long-lived)? Daemons keep their
-        // load-time `u64::MAX` epoch deadline; only non-daemon capsules
-        // accept a per-invocation timeout from the profile.
+        // load-time effectively-unbounded epoch deadline; only non-daemon
+        // capsules accept a per-invocation timeout from the profile.
         let is_daemon = !self.manifest.uplinks.is_empty() || self.manifest.capabilities.uplink;
 
         // Layer 4 (#668): resolve the per-principal overlay VFS. The
@@ -2924,7 +2940,7 @@ impl ExecutionEngine for WasmEngine {
         // borrowing the store mutably for the SET/CALL block; `PoolCheckout`
         // clears the invocation state and returns the instance on drop.
         let checkout_start = std::time::Instant::now();
-        let mut checkout = pool.checkout().await.ok_or_else(|| {
+        let mut checkout = pool.checkout(&invoking_principal).await.ok_or_else(|| {
             // `checkout` returns `None` for any of: the capsule is unloading
             // (semaphore closed), a lazy pool-grow instantiation failed, or a
             // size-1 carve-out found no warm instance. The true cause is logged
@@ -3560,17 +3576,19 @@ mod tests {
             InstancePoolPolicy {
                 single_store: false,
                 reset_resources_on_return: true,
+                principal_affine: false,
             }
         );
     }
 
     #[test]
-    fn compute_workers_retain_one_store_and_its_resource_table() {
+    fn compute_workers_retain_one_store_per_principal() {
         assert_eq!(
             instance_pool_policy(false, false, true),
             InstancePoolPolicy {
-                single_store: true,
+                single_store: false,
                 reset_resources_on_return: false,
+                principal_affine: true,
             }
         );
     }
@@ -3582,6 +3600,7 @@ mod tests {
             InstancePoolPolicy {
                 single_store: true,
                 reset_resources_on_return: false,
+                principal_affine: false,
             }
         );
     }
@@ -5262,8 +5281,9 @@ mod tests {
 #[cfg(test)]
 mod epoch_integration_tests {
     use super::{
-        EpochAction, INTERCEPTOR_FUEL_BUDGET, MAX_NO_YIELD_WINDOWS, build_wasmtime_engine,
-        epoch_decision, exempt_epoch_action, spawn_epoch_ticker, spawn_epoch_ticker_every,
+        EFFECTIVELY_UNBOUNDED_EPOCH_TICKS, EpochAction, INTERCEPTOR_FUEL_BUDGET,
+        MAX_NO_YIELD_WINDOWS, build_wasmtime_engine, epoch_decision, exempt_epoch_action,
+        spawn_epoch_ticker, spawn_epoch_ticker_every,
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -5566,6 +5586,23 @@ mod epoch_integration_tests {
             .instantiate_async(&mut store, &ok)
             .await
             .expect("a within-cap initial memory MUST instantiate");
+    }
+
+    /// A lazily-grown Store is created after the shared engine epoch ticker
+    /// has advanced. Its placeholder deadline must remain in the future;
+    /// `u64::MAX` as a relative delta wraps and traps immediately.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lazy_store_epoch_seed_does_not_wrap_after_engine_advances() {
+        let engine = build_wasmtime_engine().expect("engine");
+        engine.increment_epoch();
+        let module = unit_module(&engine, "(module)");
+        let mut store = Store::new(&engine, ());
+        store.set_fuel(INTERCEPTOR_FUEL_BUDGET).expect("fuel");
+        store.set_epoch_deadline(EFFECTIVELY_UNBOUNDED_EPOCH_TICKS);
+        Linker::new(&engine)
+            .instantiate_async(&mut store, &module)
+            .await
+            .expect("late lazy Store must not inherit an expired epoch");
     }
 
     /// KEPT interceptor MEASUREMENT: the per-invocation fuel delta

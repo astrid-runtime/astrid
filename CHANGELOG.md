@@ -42,6 +42,13 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Fixed
 
+- **Stateful compute-worker capsules retain one isolated Store per active
+  principal.** Same-principal calls serialize on their Store-local resource
+  table, unrelated principals can execute concurrently up to the ordinary
+  instance-pool ceiling, and idle Stores remain evictable cache backed by
+  principal-scoped durable storage. Lazily grown Stores also use a non-wrapping
+  epoch horizon, preventing an already-advanced engine epoch from trapping a
+  newly admitted principal during component instantiation.
 - **Capsule CLI commands no longer inherit a hidden 70-second transport
   deadline.** The foreground result wait now defaults to 310 seconds, just
   beyond the ordinary principal invocation budget, and operators can set
