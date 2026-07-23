@@ -2635,6 +2635,10 @@ const IDLE_INITIAL_GRACE: std::time::Duration = std::time::Duration::from_secs(5
 const IDLE_NON_EPHEMERAL_GRACE: std::time::Duration = std::time::Duration::from_secs(25);
 /// How often the idle monitor polls when running in persistent mode.
 const IDLE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+fn persistent_idle_monitor_enabled(ephemeral: &AtomicBool) -> bool {
+    !ephemeral.load(Ordering::Relaxed)
+}
+
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 fn spawn_idle_monitor(kernel: Arc<Kernel>) -> astrid_runtime::JoinHandle<()> {
     astrid_runtime::spawn(async move {
@@ -2642,7 +2646,7 @@ fn spawn_idle_monitor(kernel: Arc<Kernel>) -> astrid_runtime::JoinHandle<()> {
         // its lifecycle is handled by connection closes plus the explicitly
         // post-readiness fallback, never by this construction-time monitor.
         astrid_runtime::time::sleep(IDLE_INITIAL_GRACE).await;
-        if kernel.ephemeral.load(Ordering::Relaxed) {
+        if !persistent_idle_monitor_enabled(&kernel.ephemeral) {
             return;
         }
 
@@ -2663,10 +2667,16 @@ fn spawn_idle_monitor(kernel: Arc<Kernel>) -> astrid_runtime::JoinHandle<()> {
         // Give capsules time to initialize before applying an explicitly
         // configured persistent-daemon idle timeout.
         astrid_runtime::time::sleep(IDLE_NON_EPHEMERAL_GRACE).await;
+        if !persistent_idle_monitor_enabled(&kernel.ephemeral) {
+            return;
+        }
         let mut idle_since: Option<astrid_runtime::time::Instant> = None;
 
         loop {
             astrid_runtime::time::sleep(IDLE_CHECK_INTERVAL).await;
+            if !persistent_idle_monitor_enabled(&kernel.ephemeral) {
+                return;
+            }
             metrics::counter!(METRIC_BACKGROUND_TICKS_TOTAL, "loop" => "idle").increment(1);
 
             let connections = kernel.total_connection_count();
@@ -3691,6 +3701,18 @@ mod tests {
     use astrid_capsule_types::CapsuleId;
     use astrid_capsule_types::error::CapsuleResult;
     use astrid_capsule_types::manifest::CapsuleManifest;
+
+    #[test]
+    fn persistent_idle_monitor_stops_after_ephemeral_mode_is_enabled() {
+        let ephemeral = AtomicBool::new(false);
+        assert!(persistent_idle_monitor_enabled(&ephemeral));
+
+        ephemeral.store(true, Ordering::Relaxed);
+        assert!(
+            !persistent_idle_monitor_enabled(&ephemeral),
+            "every post-grace and polling-loop check must observe ephemeral mode"
+        );
+    }
 
     struct CancellableTestCapsule {
         id: CapsuleId,
