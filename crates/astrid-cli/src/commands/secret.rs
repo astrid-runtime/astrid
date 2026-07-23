@@ -96,16 +96,26 @@ fn secret_store_error(op: &str, e: &SecretStoreError) -> anyhow::Error {
     anyhow::anyhow!("secret {op} failed: {e}")
 }
 
-/// Load the installed manifest for `capsule` from
-/// `~/.astrid/home/default/.local/capsules/<capsule>/Capsule.toml`.
+/// Load the installed manifest for `capsule` from the selected principal's
+/// install registry.
 /// Returns `None` when the capsule isn't installed — caller falls back
 /// to env JSON, and the load-time migration handles the value on
-/// install. Capsule manifests are shared across principals (the
-/// shared-capsule model, F-I), so we read from `default`'s home.
-fn load_capsule_manifest(capsule: &str) -> Result<Option<CapsuleManifest>> {
+/// install.
+fn load_capsule_manifest(
+    principal: &PrincipalId,
+    capsule: &str,
+) -> Result<Option<CapsuleManifest>> {
     let home = AstridHome::resolve().context("Failed to resolve Astrid home directory")?;
+    load_capsule_manifest_from_home(&home, principal, capsule)
+}
+
+fn load_capsule_manifest_from_home(
+    home: &AstridHome,
+    principal: &PrincipalId,
+    capsule: &str,
+) -> Result<Option<CapsuleManifest>> {
     let manifest_path = home
-        .principal_home(&PrincipalId::default())
+        .principal_home(principal)
         .capsules_dir()
         .join(capsule)
         .join("Capsule.toml");
@@ -300,7 +310,7 @@ fn run_set(args: &SetArgs) -> Result<ExitCode> {
     }
 
     let manifest = match args.capsule.as_deref() {
-        Some(c) => load_capsule_manifest(c)?,
+        Some(c) => load_capsule_manifest(&principal, c)?,
         None => None,
     };
     let secret_decl = args
@@ -397,7 +407,7 @@ fn run_list(args: &ListArgs) -> Result<ExitCode> {
             // with a manifest read failure must not get silently
             // classified as `EnvJson` (non-secret) when it might be a
             // legacy plaintext secret.
-            let manifest = load_capsule_manifest(stem)?;
+            let manifest = load_capsule_manifest(&principal, stem)?;
             for (k, value) in &env {
                 let is_declared_secret = manifest
                     .as_ref()
@@ -423,14 +433,15 @@ fn run_list(args: &ListArgs) -> Result<ExitCode> {
     //    declared secrets (capability boundary: stale on-disk files
     //    from a removed capsule don't appear here).
     if let Ok(home) = AstridHome::resolve() {
-        let capsules_dir = home.principal_home(&PrincipalId::default()).capsules_dir();
+        let capsules_dir = home.principal_home(&principal).capsules_dir();
         if capsules_dir.is_dir() {
             for entry in fs::read_dir(&capsules_dir)
                 .with_context(|| format!("Failed to read {}", capsules_dir.display()))?
             {
                 let entry = entry?;
                 let capsule = entry.file_name().to_string_lossy().into_owned();
-                let Some(manifest) = load_capsule_manifest(&capsule)? else {
+                let Some(manifest) = load_capsule_manifest_from_home(&home, &principal, &capsule)?
+                else {
                     continue;
                 };
                 for (key, decl) in &manifest.env {
@@ -500,7 +511,7 @@ fn run_delete(args: &DeleteArgs) -> Result<ExitCode> {
     // env-JSON path is still hit afterwards in case the value
     // pre-dates the load-time strip.
     if let Some(capsule) = args.capsule.as_deref() {
-        let manifest = load_capsule_manifest(capsule)?;
+        let manifest = load_capsule_manifest(&principal, capsule)?;
         if lookup_secret_decl(manifest.as_ref(), &args.key).is_some() {
             let home = AstridHome::resolve().context("Failed to resolve Astrid home directory")?;
             let mut removed = false;
@@ -586,6 +597,46 @@ pub(crate) enum SecretStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manifest_lookup_is_scoped_to_the_requested_principal() {
+        let root = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(root.path());
+        let default = PrincipalId::default();
+        let alice = PrincipalId::new("alice").unwrap();
+
+        for (principal, description) in [(&default, "default manifest"), (&alice, "alice manifest")]
+        {
+            let capsule_dir = home
+                .principal_home(principal)
+                .capsules_dir()
+                .join("provider");
+            fs::create_dir_all(&capsule_dir).unwrap();
+            fs::write(
+                capsule_dir.join("Capsule.toml"),
+                format!(
+                    r#"
+                    [package]
+                    name = "provider"
+                    version = "1.0.0"
+
+                    [env.api_key]
+                    type = "secret"
+                    description = "{description}"
+                    "#
+                ),
+            )
+            .unwrap();
+        }
+
+        let manifest = load_capsule_manifest_from_home(&home, &alice, "provider")
+            .unwrap()
+            .expect("Alice manifest");
+        assert_eq!(
+            manifest.env["api_key"].description.as_deref(),
+            Some("alice manifest")
+        );
+    }
 
     #[test]
     fn read_env_handles_missing_file() {

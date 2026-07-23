@@ -21,6 +21,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Fixed
 
+- **Secret commands now read manifests from the selected principal registry.**
+  Secret set, list, and delete no longer fall back to `default`, preventing
+  non-default capsule secrets from being misclassified as plaintext env
+  configuration or omitted from management output. Closes #1325.
 - **Stable crates publication installs its authenticated-hash prerequisite.**
   The protected publisher installs the pinned `b3sum` binary before validating
   the exact dev candidate, so BLAKE3 release metadata checks run before any
