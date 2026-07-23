@@ -21,6 +21,11 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Fixed
 
+- **Capsule registry queries now honor `--principal`.** The `capsule list`,
+  `capsule tree`, and `capsule deps` commands pass the process-wide
+  authenticated principal into capsule discovery instead of falling back to
+  the bootstrap `default` principal, so diagnostics match the capsule view
+  that the daemon loads. Closes #1112.
 - **Stable crates publication installs its authenticated-hash prerequisite.**
   The protected publisher installs the pinned `b3sum` binary before validating
   the exact dev candidate, so BLAKE3 release metadata checks run before any
