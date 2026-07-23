@@ -70,18 +70,25 @@ fn active_agent_from(path: &Path) -> Result<PrincipalId> {
 }
 
 /// Resolve the operating principal for a per-agent command. The
-/// explicit `--agent` flag wins over the active context; an empty flag
-/// falls back to [`active_agent`].
+/// command-local target flag wins; otherwise the process-wide principal
+/// resolved from `--principal`, `ASTRID_PRINCIPAL`, or [`active_agent`]
+/// is used.
 ///
 /// # Errors
 ///
-/// Returns an error if `flag` is present but not a valid
-/// [`PrincipalId`], or if the active context file is malformed.
+/// Returns an error if `flag` is present but not a valid [`PrincipalId`].
 pub(crate) fn resolve_agent(flag: Option<&str>) -> Result<PrincipalId> {
+    resolve_agent_with(flag, crate::principal::current)
+}
+
+fn resolve_agent_with(
+    flag: Option<&str>,
+    process_principal: impl FnOnce() -> PrincipalId,
+) -> Result<PrincipalId> {
     if let Some(s) = flag {
         return PrincipalId::new(s).with_context(|| format!("invalid agent name: {s}"));
     }
-    active_agent()
+    Ok(process_principal())
 }
 
 /// Persist a new active agent into `cli-context.toml`. Creates the
@@ -171,6 +178,12 @@ mod tests {
         // is independent of the per-process AstridHome state.
         let resolved = resolve_agent(Some("bob")).unwrap();
         assert_eq!(resolved.as_str(), "bob");
+    }
+
+    #[test]
+    fn missing_command_target_uses_the_process_principal() {
+        let resolved = resolve_agent_with(None, || PrincipalId::new("alice").unwrap()).unwrap();
+        assert_eq!(resolved.as_str(), "alice");
     }
 
     #[test]

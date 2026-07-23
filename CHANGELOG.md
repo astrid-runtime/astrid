@@ -21,6 +21,11 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Fixed
 
+- **Per-agent CLI commands now inherit the global `--principal`.** A
+  command-local target such as `--agent` still wins, but omitting it uses the
+  process principal already resolved from the flag, environment, or active
+  context instead of re-reading and potentially selecting a different context.
+  Closes #1326.
 - **Capsule registry queries now honor `--principal`.** The `capsule list`,
   `capsule tree`, and `capsule deps` commands pass the process-wide
   authenticated principal into capsule discovery instead of falling back to
