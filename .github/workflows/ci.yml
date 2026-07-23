@@ -11,6 +11,8 @@ on:
       - 'scripts/test_musl_release_manifest.py'
       - 'scripts/check_glibc.py'
       - 'scripts/test_check_glibc.py'
+      - 'scripts/check_static_elf.py'
+      - 'scripts/test_check_static_elf.py'
       - 'scripts/release_publication.py'
       - 'scripts/test_release_publication.py'
       - 'scripts/release_draft_recovery.py'
@@ -38,6 +40,8 @@ on:
       - 'scripts/test_musl_release_manifest.py'
       - 'scripts/check_glibc.py'
       - 'scripts/test_check_glibc.py'
+      - 'scripts/check_static_elf.py'
+      - 'scripts/test_check_static_elf.py'
       - 'scripts/release_publication.py'
       - 'scripts/test_release_publication.py'
       - 'scripts/release_draft_recovery.py'
@@ -66,13 +70,27 @@ env:
 jobs:
   linux-release-smoke:
     name: Linux release smoke (${{ matrix.target }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - x86_64-unknown-linux-gnu
-          - aarch64-unknown-linux-gnu
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            libc: gnu
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            libc: gnu
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            libc: musl
+            platform: linux/amd64
+            image: docker.io/library/rust@sha256:e98196986adced5602f6e21c54babdbf2a8700400c7a78868324a3630e0c5d15
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            libc: musl
+            platform: linux/arm64
+            image: docker.io/library/rust@sha256:594694ee6b07747b63b5c265be2616b62e814180b66227e2c18c6ee85e4136be
     steps:
       - name: Harden Runner
         uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
@@ -88,6 +106,7 @@ jobs:
           python-version: '3.12'
 
       - name: Build against the Linux release baseline
+        if: matrix.libc == 'gnu'
         env:
           TARGET: ${{ matrix.target }}
           # Keep this digest synchronized with release.yml.
@@ -121,6 +140,7 @@ jobs:
             '
 
       - name: Enforce the Linux glibc compatibility ceiling
+        if: matrix.libc == 'gnu'
         env:
           TARGET: ${{ matrix.target }}
         run: |
@@ -130,6 +150,61 @@ jobs:
             "$BINARY_ROOT/astrid-daemon" \
             "$BINARY_ROOT/astrid-build" \
             "$BINARY_ROOT/astrid-emit"
+
+      - name: Build in the native Linux musl environment
+        if: matrix.libc == 'musl'
+        env:
+          TARGET: ${{ matrix.target }}
+          PLATFORM: ${{ matrix.platform }}
+          # Platform manifest from the official Rust 1.95.0 Alpine 3.23 image.
+          RUST_BUILD_IMAGE: ${{ matrix.image }}
+        run: |
+          SOURCE_SHA=$(git rev-parse --short=12 HEAD)
+          docker run --rm \
+            --platform "$PLATFORM" \
+            --env CARGO_TERM_COLOR=always \
+            --env SOURCE_SHA="$SOURCE_SHA" \
+            --env TARGET \
+            --volume "$PWD:/workspace" \
+            --workdir /workspace \
+            "$RUST_BUILD_IMAGE" \
+            sh -ceu '
+              apk add --no-cache binutils build-base cmake git perl pkgconf python3
+              git config --global --add safe.directory /workspace
+              [ "$(git rev-parse --short=12 HEAD)" = "$SOURCE_SHA" ]
+              cargo build \
+                --release \
+                --locked \
+                --target "$TARGET" \
+                --target-dir target/musl \
+                -p astrid
+              BINARY_ROOT="target/musl/$TARGET/release"
+              ARCHITECTURE="${TARGET%%-*}"
+              python3 scripts/check_static_elf.py --architecture "$ARCHITECTURE" \
+                "$BINARY_ROOT/astrid" \
+                "$BINARY_ROOT/astrid-daemon" \
+                "$BINARY_ROOT/astrid-build" \
+                "$BINARY_ROOT/astrid-emit"
+            '
+
+      - name: Exercise the Linux musl binaries
+        if: matrix.libc == 'musl'
+        env:
+          TARGET: ${{ matrix.target }}
+          PLATFORM: ${{ matrix.platform }}
+          RUST_BUILD_IMAGE: ${{ matrix.image }}
+        run: |
+          docker run --rm \
+            --platform "$PLATFORM" \
+            --env TARGET \
+            --volume "$PWD:/workspace" \
+            --workdir /workspace \
+            "$RUST_BUILD_IMAGE" \
+            sh -ceu '
+              for binary in astrid astrid-daemon astrid-build astrid-emit; do
+                "target/musl/$TARGET/release/$binary" --version
+              done
+            '
 
   check:
     name: Check
@@ -167,6 +242,7 @@ jobs:
           python3 scripts/test_release_manifest.py
           python3 scripts/test_musl_release_manifest.py
           python3 scripts/test_check_glibc.py
+          python3 scripts/test_check_static_elf.py
           python3 scripts/test_release_publication.py
           python3 scripts/test_release_draft_recovery.py
           python3 scripts/test_crate_publication.py

@@ -306,7 +306,7 @@ cargo fmt --all -- --check
 
 All crates enforce `#![deny(unsafe_code)]` except `astrid-sys` and `astrid-sdk`, where WASM FFI
 requires it. Clippy runs at pedantic level and integer-overflow arithmetic is a lint error. Release
-binaries for macOS and Linux (x86_64 and aarch64) are built on tag push and signed with keyless
+binaries for macOS and GNU/musl Linux (x86_64 and aarch64) are built on tag push and signed with keyless
 Sigstore. Self-managed updates authenticate the exact archive and its pinned Astrid release-workflow
 identity before independently checking the BLAKE3 manifest and extracting any bytes. Homebrew and
 Cargo remain responsible for updates they install; signed SHA-256 manifests remain available for

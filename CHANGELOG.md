@@ -28,6 +28,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   liveness probing, stream splitting, and same-user peer verification route
   through a shared abstraction while retaining the Unix backend and wire
   protocol unchanged. Closes #1341.
+- **Linux musl is now a native release target on x86_64 and ARM64.** Signed
+  immutable extension metadata covers both musl archives, and CI builds each
+  one in a pinned Alpine toolchain on its native architecture before executing
+  all four release binaries in that environment. Closes #1338.
 - **Capsule provenance is now bound to local install authority.**
   `astrid-build` signs canonical capsule content with the installation's
   runtime key. Same-runtime builds and operator-owned distributions retain a
