@@ -21,6 +21,11 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Fixed
 
+- **Per-agent CLI commands now inherit the global `--principal`.** A
+  command-local target such as `--agent` still wins, but omitting it uses the
+  process principal already resolved from the flag, environment, or active
+  context instead of re-reading and potentially selecting a different context.
+  Closes #1326.
 - **Stable crates publication installs its authenticated-hash prerequisite.**
   The protected publisher installs the pinned `b3sum` binary before validating
   the exact dev candidate, so BLAKE3 release metadata checks run before any
