@@ -28,7 +28,7 @@ pub struct Args {
     #[arg(short, long)]
     pub workspace: Option<std::path::PathBuf>,
 
-    /// Enable ephemeral mode (auto-shutdown on idle timeout after last client disconnects)
+    /// Enable ephemeral mode (shutdown when the last client disconnects)
     #[arg(long)]
     pub ephemeral: bool,
 

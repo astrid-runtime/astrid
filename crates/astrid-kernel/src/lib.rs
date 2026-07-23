@@ -2083,11 +2083,22 @@ impl Kernel {
             self.active_connections
                 .remove_if(principal, |_, count| count.load(Ordering::Relaxed) == 0);
         }
+
+        if result.is_ok() {
+            self.request_ephemeral_shutdown_if_idle();
+        }
     }
 
     /// Enable or disable ephemeral mode (immediate shutdown on last disconnect).
     pub fn set_ephemeral(&self, val: bool) {
         self.ephemeral.store(val, Ordering::Relaxed);
+    }
+
+    fn request_ephemeral_shutdown_if_idle(&self) {
+        if self.ephemeral.load(Ordering::Relaxed) && self.total_connection_count() == 0 {
+            tracing::info!("Last client disconnected, shutting down ephemeral kernel");
+            self.shutdown_tx.send_replace(true);
+        }
     }
 
     /// Total number of active client connections across all principals.
@@ -2571,20 +2582,10 @@ fn load_or_generate_runtime_key(keys_dir: &Path) -> std::io::Result<KeyPair> {
 
 /// Spawns a background task that cleanly shuts down the Kernel if there is no activity.
 ///
-/// Uses dual-signal idle detection:
-/// - **Primary:** explicit `active_connections` counter (incremented on first IPC
-///   message per source, decremented on `Disconnect`).
-/// - **Secondary:** `EventBus::subscriber_count()` minus the kernel router's own
-///   subscription. When a CLI process dies without sending `Disconnect`, its
-///   broadcast receiver is dropped so the subscriber count falls.
-///
-/// Takes the minimum of both signals to handle ungraceful disconnects.
-///
-/// Idle shutdown is on by default in `--ephemeral` mode (30s after the
-/// last client disconnects) and **off by default** in persistent mode
-/// (`astrid start`). Both modes respect `ASTRID_IDLE_TIMEOUT_SECS` —
-/// setting it in persistent mode opts the operator into auto-shutdown,
-/// setting it in ephemeral mode overrides the 30s default.
+/// Ephemeral shutdown is requested directly when the last client disconnects.
+/// This monitor supplies the startup fallback: an ephemeral daemon that never
+/// receives a connection exits after the initial boot grace. Persistent mode
+/// remains idle-shutdown-free unless `ASTRID_IDLE_TIMEOUT_SECS` is set.
 /// Number of permanent internal event bus subscribers that are not client
 /// connections: `KernelRouter` (`kernel.request.*`), `AdminRouter`
 /// (`kernel.admin.*`), `ConnectionTracker` (`client.*`),
@@ -2619,8 +2620,6 @@ pub(crate) const METRIC_BACKGROUND_TICKS_TOTAL: &str = "astrid_daemon_background
 const IDLE_INITIAL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 /// Additional grace for non-ephemeral daemons to let capsules fully initialize.
 const IDLE_NON_EPHEMERAL_GRACE: std::time::Duration = std::time::Duration::from_secs(25);
-/// How often the idle monitor polls when running in ephemeral mode.
-const IDLE_EPHEMERAL_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 /// How often the idle monitor polls when running in persistent mode.
 const IDLE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -2632,54 +2631,32 @@ fn spawn_idle_monitor(kernel: Arc<Kernel>) -> astrid_runtime::JoinHandle<()> {
 
         // Read ephemeral flag after grace period (set by daemon after boot).
         let ephemeral = kernel.ephemeral.load(Ordering::Relaxed);
-        let idle_timeout = if ephemeral {
-            // Give the CLI time to reconnect after brief disconnects (e.g.
-            // during tool execution when the TUI might momentarily drop
-            // the socket). Zero timeout caused premature shutdowns.
-            //
-            // Operators may still override via `ASTRID_IDLE_TIMEOUT_SECS`
-            // when they want a longer ephemeral window (e.g. headless
-            // batch runs that pause between prompts).
-            std::env::var("ASTRID_IDLE_TIMEOUT_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .map_or(
-                    std::time::Duration::from_secs(30),
-                    std::time::Duration::from_secs,
-                )
-        } else {
-            // Persistent (`astrid start`) mode: idle shutdown is opt-in.
-            // The operator explicitly chose persistent — honour that.
-            // Setting `ASTRID_IDLE_TIMEOUT_SECS` switches the monitor on
-            // for housekeeping flows that genuinely want auto-shutdown.
-            // Without it, the monitor task exits immediately and the
-            // daemon stays up until SIGTERM.
-            let Some(secs) = std::env::var("ASTRID_IDLE_TIMEOUT_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-            else {
-                tracing::debug!(
-                    "Non-ephemeral daemon: idle shutdown disabled \
-                     (set ASTRID_IDLE_TIMEOUT_SECS to enable)."
-                );
-                return;
-            };
-            std::time::Duration::from_secs(secs)
-        };
-        let check_interval = if ephemeral {
-            IDLE_EPHEMERAL_CHECK_INTERVAL
-        } else {
-            IDLE_CHECK_INTERVAL
-        };
-
-        // Non-ephemeral: additional grace to let capsules fully initialize.
-        if !ephemeral {
-            astrid_runtime::time::sleep(IDLE_NON_EPHEMERAL_GRACE).await;
+        if ephemeral {
+            kernel.request_ephemeral_shutdown_if_idle();
+            return;
         }
+
+        // Persistent (`astrid start`) mode: idle shutdown is opt-in.
+        // The operator explicitly chose persistent — honour that.
+        let Some(secs) = std::env::var("ASTRID_IDLE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        else {
+            tracing::debug!(
+                "Non-ephemeral daemon: idle shutdown disabled \
+                 (set ASTRID_IDLE_TIMEOUT_SECS to enable)."
+            );
+            return;
+        };
+        let idle_timeout = std::time::Duration::from_secs(secs);
+
+        // Give capsules time to initialize before applying an explicitly
+        // configured persistent-daemon idle timeout.
+        astrid_runtime::time::sleep(IDLE_NON_EPHEMERAL_GRACE).await;
         let mut idle_since: Option<astrid_runtime::time::Instant> = None;
 
         loop {
-            astrid_runtime::time::sleep(check_interval).await;
+            astrid_runtime::time::sleep(IDLE_CHECK_INTERVAL).await;
             metrics::counter!(METRIC_BACKGROUND_TICKS_TOTAL, "loop" => "idle").increment(1);
 
             let connections = kernel.total_connection_count();
@@ -4201,6 +4178,39 @@ mod tests {
         // fetch_update returns Err(0) when the closure returns None (no-op).
         assert!(result.is_err());
         assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn ephemeral_shutdown_waits_for_the_final_client_disconnect() {
+        let root = tempfile::tempdir().unwrap();
+        let home = astrid_core::dirs::AstridHome::from_path(root.path());
+        let kernel = super::test_kernel_with_home(home).await;
+        let alice = astrid_core::PrincipalId::new("alice").unwrap();
+        let bob = astrid_core::PrincipalId::new("bob").unwrap();
+        let shutdown = kernel.shutdown_tx.subscribe();
+
+        kernel.set_ephemeral(true);
+        kernel.connection_opened(&alice);
+        kernel.connection_opened(&bob);
+        kernel.connection_closed(&alice);
+        assert!(!*shutdown.borrow());
+
+        kernel.connection_closed(&bob);
+        assert!(*shutdown.borrow());
+    }
+
+    #[tokio::test]
+    async fn persistent_kernel_does_not_shutdown_on_last_disconnect() {
+        let root = tempfile::tempdir().unwrap();
+        let home = astrid_core::dirs::AstridHome::from_path(root.path());
+        let kernel = super::test_kernel_with_home(home).await;
+        let alice = astrid_core::PrincipalId::new("alice").unwrap();
+        let shutdown = kernel.shutdown_tx.subscribe();
+
+        kernel.connection_opened(&alice);
+        kernel.connection_closed(&alice);
+
+        assert!(!*shutdown.borrow());
     }
 
     /// Mirrors the `connection_closed(&principal)` logic: only `Ok(1)`
