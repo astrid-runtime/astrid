@@ -21,6 +21,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Fixed
 
+- **Gateway env schemas now use the authenticated principal's capsule registry
+  or verified workspace.** Schema reads no longer fall back to `default`, so
+  non-default and workspace-only installs are configurable and a same-named
+  default capsule cannot supply the wrong field contract. Closes #1327.
 - **Secret commands now read manifests from the selected principal registry or
   verified workspace.** Secret set, list, and delete no longer fall back to
   `default`, while workspace-only capsule secrets retain their declared
