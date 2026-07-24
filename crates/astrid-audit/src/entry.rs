@@ -297,14 +297,6 @@ pub enum AuditAction {
         command: String,
     },
 
-    /// Signal requested for an existing child-process tree.
-    ProcessSignal {
-        /// Command or non-reversible process descriptor.
-        process: String,
-        /// Stable signal name.
-        signal: String,
-    },
-
     /// Capability token was created.
     CapabilityCreated {
         /// Token ID.
@@ -474,6 +466,17 @@ pub enum AuditAction {
         /// from the public key); `None` for a full-authority request.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         device_key_id: Option<String>,
+    },
+
+    /// Signal requested for an existing child-process tree.
+    ///
+    /// Keep new variants at the end of this public enum so existing implicit
+    /// discriminants remain stable for downstream consumers.
+    ProcessSignal {
+        /// Command or non-reversible process descriptor.
+        process: String,
+        /// Stable signal name.
+        signal: String,
     },
 }
 
