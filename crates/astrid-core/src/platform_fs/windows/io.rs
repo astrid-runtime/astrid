@@ -452,13 +452,27 @@ pub(super) fn flush_guarded_file(
     boundary_contract: BoundaryContract,
 ) -> io::Result<()> {
     let name = guarded_child_name(guard, path)?;
-    let handle = open_guarded_child_locked(guard, name, GENERIC_WRITE | READ_CONTROL)?;
+    let handle =
+        open_guarded_child_locked(guard, name, GENERIC_WRITE | READ_CONTROL).map_err(|error| {
+            with_context(
+                error,
+                format!(
+                    "could not open handle-relative file for flushing: {}",
+                    path.display()
+                ),
+            )
+        })?;
     validate_file_contract(handle.0, path, file_contract)?;
     let raw = handle.0;
     std::mem::forget(handle);
     // SAFETY: ownership transfers from the forgotten OwnedHandle exactly once.
     let file = unsafe { File::from_raw_handle(raw.cast()) };
-    file.sync_all()?;
+    file.sync_all().map_err(|error| {
+        with_context(
+            error,
+            format!("could not flush handle-relative file: {}", path.display()),
+        )
+    })?;
     validate_file_contract(file.as_raw_handle().cast(), path, file_contract)?;
     guard.verify_contract(boundary_contract)
 }
