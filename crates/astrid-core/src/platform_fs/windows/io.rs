@@ -289,13 +289,42 @@ pub(super) fn stage_unique_bytes(
     bytes: &[u8],
     label: &str,
 ) -> io::Result<PathBuf> {
+    let (temporary, output) =
+        stage_unique_bytes_with_share(guard, parent, bytes, label, FILE_SHARE_READ)?;
+    drop(output);
+    Ok(temporary)
+}
+
+pub(super) fn stage_unique_bytes_retained(
+    guard: &TrustedPathGuard,
+    parent: &Path,
+    bytes: &[u8],
+    label: &str,
+) -> io::Result<(PathBuf, File)> {
+    stage_unique_bytes_with_share(
+        guard,
+        parent,
+        bytes,
+        label,
+        FILE_SHARE_READ | FILE_SHARE_DELETE,
+    )
+}
+
+fn stage_unique_bytes_with_share(
+    guard: &TrustedPathGuard,
+    parent: &Path,
+    bytes: &[u8],
+    label: &str,
+    share_access: u32,
+) -> io::Result<(PathBuf, File)> {
     for _ in 0..16 {
         let temporary = parent.join(format!(".{label}.{}.tmp", uuid::Uuid::new_v4().simple()));
-        let mut output = match create_guarded_private_file(guard, &temporary) {
-            Ok(output) => output,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
-        };
+        let mut output =
+            match create_guarded_private_file_with_share(guard, &temporary, share_access) {
+                Ok(output) => output,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            };
         let write_result = (|| {
             output.write_all(bytes)?;
             output.flush()?;
@@ -306,16 +335,17 @@ pub(super) fn stage_unique_bytes(
                 &temporary.display().to_string(),
             )
         })();
-        drop(output);
         if let Err(error) = write_result {
+            drop(output);
             let _ = remove_guarded_file(guard, &temporary);
             return Err(error);
         }
         if let Err(error) = guard.verify() {
+            drop(output);
             let _ = remove_guarded_file(guard, &temporary);
             return Err(error);
         }
-        return Ok(temporary);
+        return Ok((temporary, output));
     }
     Err(io::Error::new(
         io::ErrorKind::AlreadyExists,
@@ -445,32 +475,14 @@ pub(super) fn read_guarded_regular_file(
     Ok(bytes)
 }
 
-pub(super) fn flush_guarded_file(
+pub(super) fn flush_guarded_open_file(
     guard: &TrustedPathGuard,
     path: &Path,
     file_contract: FileContract,
     boundary_contract: BoundaryContract,
+    file: &File,
 ) -> io::Result<()> {
-    let name = guarded_child_name(guard, path)?;
-    // Keep normal share modes here. The retained handle binds the flush and
-    // both ACL checks to the exact object; denying write/delete sharing can
-    // make a newly published journal unopenable while a Windows filesystem
-    // filter still holds a compatible handle.
-    let handle =
-        open_guarded_child(guard, name, GENERIC_WRITE | READ_CONTROL).map_err(|error| {
-            with_context(
-                error,
-                format!(
-                    "could not open handle-relative file for flushing: {}",
-                    path.display()
-                ),
-            )
-        })?;
-    validate_file_contract(handle.0, path, file_contract)?;
-    let raw = handle.0;
-    std::mem::forget(handle);
-    // SAFETY: ownership transfers from the forgotten OwnedHandle exactly once.
-    let file = unsafe { File::from_raw_handle(raw.cast()) };
+    validate_file_contract(file.as_raw_handle().cast(), path, file_contract)?;
     file.sync_all().map_err(|error| {
         with_context(
             error,

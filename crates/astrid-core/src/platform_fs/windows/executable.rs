@@ -2,11 +2,11 @@
 
 use super::error::with_context;
 use super::io::{
-    FileContract, PreparationCleanup, acquire_named_private_lock, flush_guarded_file,
+    FileContract, PreparationCleanup, acquire_named_private_lock, flush_guarded_open_file,
     guarded_file_exists, hash_guarded_regular_file, move_guarded_file, open_guarded_regular_file,
     read_guarded_regular_file, remove_guarded_file, replace_file_checked, stage_transaction_copy,
-    stage_transaction_copy_authenticated, stage_unique_bytes, test_maybe_interrupt_after_replace,
-    test_maybe_interrupt_before_commit, volume_root,
+    stage_transaction_copy_authenticated, stage_unique_bytes_retained,
+    test_maybe_interrupt_after_replace, test_maybe_interrupt_before_commit, volume_root,
 };
 use super::path::{BoundaryContract, TrustedPathGuard, validate_local_absolute_path};
 use super::prelude::*;
@@ -271,21 +271,25 @@ pub(super) fn write_transaction_journal(
     }
     let bytes = serde_json::to_vec(journal)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let staged = stage_unique_bytes(guard, install_dir, &bytes, "astrid-update-journal")?;
+    let (staged, journal_file) =
+        stage_unique_bytes_retained(guard, install_dir, &bytes, "astrid-update-journal")?;
     #[cfg(test)]
     if let Err(error) = super::io::test_maybe_fail_journal_rename() {
+        drop(journal_file);
         let _ = remove_guarded_file(guard, &staged);
         return Err(error);
     }
     if let Err(error) = move_guarded_file(guard, &staged, &journal_path) {
+        drop(journal_file);
         let _ = remove_guarded_file(guard, &staged);
         return Err(error);
     }
-    flush_guarded_file(
+    flush_guarded_open_file(
         guard,
         &journal_path,
         FileContract::ExactPrivate,
         BoundaryContract::TrustedForCreate,
+        &journal_file,
     )
 }
 
