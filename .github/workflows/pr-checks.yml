@@ -69,7 +69,7 @@ jobs:
           check_section_any "Verification" "Test Plan"
 
           has_traceability_exception_label() {
-            printf '%s\n' "$PR_LABELS" | grep -qiE '^(no-issue|maintenance|docs-only|release|deps|dependencies)$'
+            printf '%s\n' "$PR_LABELS" | grep -qiE '^(no-issue|maintenance|docs-only|release|deps|dependencies|ci-only)$'
           }
 
           LINKED_ISSUE_SECTION="$(section_content "Linked Issue")"
@@ -78,11 +78,11 @@ jobs:
           # labeled exception explains why no issue exists.
           if ! echo "$PR_BODY" | grep -qE '#[0-9]+'; then
             if has_traceability_exception_label; then
-              if ! printf '%s\n' "$LINKED_ISSUE_SECTION" | grep -qiE '(no issue|no tracked issue|not linked|maintenance|docs|release|dependenc|traceability)'; then
-                ERRORS="${ERRORS}Linked Issue must explain the no-issue exception when using no-issue, maintenance, docs-only, release, deps, or dependencies labels\n"
+              if ! printf '%s\n' "$LINKED_ISSUE_SECTION" | grep -qiE '(no issue|no tracked issue|not linked|maintenance|docs|release|dependenc|traceability|ci|workflow)'; then
+                ERRORS="${ERRORS}Linked Issue must explain the no-issue exception when using no-issue, maintenance, docs-only, release, deps, dependencies, or ci-only labels\n"
               fi
             else
-              ERRORS="${ERRORS}Linked Issue must reference an issue number (#N) or use a documented traceability exception label\n"
+              ERRORS="${ERRORS}Linked Issue must reference an issue number (#N) or use a documented traceability exception label (for example: ci-only)\n"
             fi
           fi
 
@@ -389,7 +389,7 @@ jobs:
 
           has_traceability_exception_label() {
             case "$PR_LABELS" in
-              *no-issue*|*maintenance*|*docs-only*|*release*|*deps*|*dependencies*) return 0 ;;
+              *no-issue*|*maintenance*|*docs-only*|*release*|*deps*|*dependencies*|*ci-only*) return 0 ;;
               *) return 1 ;;
             esac
           }
@@ -402,7 +402,7 @@ jobs:
           LINKED_ISSUE_SECTION=$(echo "$PR_BODY" | sed -n '/^## Linked Issue/,/^## /p' | sed '1d' | sed '/^## /d' | sed '/^<!--.*-->$/d' | sed '/^\s*$/d')
 
           if has_traceability_exception_label; then
-            if printf '%s\n' "$LINKED_ISSUE_SECTION" | grep -qiE '(no issue|no tracked issue|not linked|maintenance|docs|release|dependenc|traceability)'; then
+            if printf '%s\n' "$LINKED_ISSUE_SECTION" | grep -qiE '(no issue|no tracked issue|not linked|maintenance|docs|release|dependenc|traceability|ci|workflow)'; then
               echo "PR has a documented traceability exception."
               exit 0
             fi
@@ -411,7 +411,7 @@ jobs:
             exit 1
           fi
 
-          echo "::error::Every PR must be linked to an issue, unless a documented traceability exception applies. Use 'Closes #N' in the PR body, link an issue via the GitHub sidebar, or add one of: no-issue, maintenance, docs-only, release, deps, dependencies."
+          echo "::error::Every PR must be linked to an issue, unless a documented traceability exception applies. Use 'Closes #N' in the PR body, link an issue via the GitHub sidebar, or add one of: no-issue, maintenance, docs-only, release, deps, dependencies, ci-only."
           exit 1
 
   account-age:

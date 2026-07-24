@@ -29,7 +29,7 @@ on:
       - 'release/nightly.toml'
       - '**/Cargo.toml'
       - '**/Cargo.lock'
-      - '.github/workflows/**'
+      - '.github/workflows/ci.yml'
   pull_request:
     branches: [main]
     paths:
@@ -58,7 +58,7 @@ on:
       - 'release/nightly.toml'
       - '**/Cargo.toml'
       - '**/Cargo.lock'
-      - '.github/workflows/**'
+      - '.github/workflows/ci.yml'
 
 permissions:
   contents: read
