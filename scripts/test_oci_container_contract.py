@@ -94,12 +94,17 @@ class WorkflowContractTests(unittest.TestCase):
 
     def test_exact_export_is_built_once_and_bound_to_tested_image(self) -> None:
         build_job = WORKFLOW.split("\n  sign:\n", 1)[0]
+        snapshotter = build_job.index('"containerd-snapshotter": true')
+        build = build_job.index("docker buildx build")
+        load = build_job.index("docker load --input")
+        self.assertLess(snapshotter, build)
+        self.assertLess(build, load)
+        self.assertIn("io.containerd.snapshotter.v1", build_job)
         self.assertEqual(build_job.count("docker buildx build"), 1)
         self.assertEqual(build_job.count("--platform linux/amd64"), 1)
         self.assertIn("type=oci,dest=", build_job)
         self.assertNotIn("type=docker,dest=", build_job)
         self.assertNotIn("--load", build_job)
-        self.assertIn("docker load --input", build_job)
         self.assertIn('echo "BOUND_IMAGE=$IMAGE_REPO_DIGEST"', build_job)
         first_binding = build_job.index("python3 scripts/oci_export_binding.py")
         runtime_test = build_job.index('container/amd64/test.sh "$BOUND_IMAGE"')
