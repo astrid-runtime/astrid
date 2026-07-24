@@ -118,6 +118,8 @@ jobs:
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
+          # Temporary escape hatch while maintainer newcomer approval is paused.
+          # Set back to "true" when the newcomer-approved gate should enforce again.
           ENFORCE_NEWCOMER_APPROVAL: "false"
         run: |
           CONTRIBUTORS_FILE=".github/contributors.yml"
