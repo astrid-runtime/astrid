@@ -41,15 +41,16 @@ use astrid_core::session_token::{
     WorkspaceHandshakeResponse, principal_auth_challenge_message,
     principal_workspace_auth_challenge_message,
 };
+use tokio::io::{AsyncRead, AsyncWrite};
 
 /// Host-verified connection data returned to the accept path.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct VerifiedConnection {
-    pub(super) principal: PrincipalId,
-    pub(super) key_id: String,
+pub(crate) struct VerifiedConnection {
+    pub(crate) principal: PrincipalId,
+    pub(crate) key_id: String,
     /// Already-open, host-only directory capability. It never enters an IPC
     /// message or capsule payload.
-    pub(super) workspace_attachment: Option<crate::workspace_attachment::WorkspaceAttachmentRef>,
+    pub(crate) workspace_attachment: Option<crate::workspace_attachment::WorkspaceAttachmentRef>,
 }
 
 impl VerifiedConnection {
@@ -83,12 +84,15 @@ const MAX_HANDSHAKE_SIZE: usize = 4096;
 /// fingerprint, carried forward so the cap-gate can apply that device's
 /// scope), `Ok(None)` for a legacy/unauthenticated handshake, or
 /// `Err(reason)` with a human-readable rejection reason.
-pub(super) async fn validate_handshake(
-    stream: &mut LocalStream,
+pub(crate) async fn validate_handshake<S>(
+    stream: &mut S,
     expected_token: &SessionToken,
     home: &astrid_core::dirs::AstridHome,
     workspace_attachments: &crate::workspace_attachment::WorkspaceAttachmentRegistry,
-) -> Result<Option<VerifiedConnection>, String> {
+) -> Result<Option<VerifiedConnection>, String>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let request = read_handshake_request(stream).await?;
 
     // 1. Validate protocol version FIRST - this check reveals no information
@@ -173,9 +177,10 @@ pub(super) async fn validate_handshake(
 }
 
 /// Read one length-prefixed JSON [`WorkspaceHandshakeRequest`] frame.
-async fn read_handshake_request(
-    stream: &mut LocalStream,
-) -> Result<WorkspaceHandshakeRequest, String> {
+async fn read_handshake_request<S>(stream: &mut S) -> Result<WorkspaceHandshakeRequest, String>
+where
+    S: AsyncRead + Unpin,
+{
     use tokio::io::AsyncReadExt;
 
     let mut len_buf = [0u8; 4];
@@ -208,13 +213,16 @@ async fn read_handshake_request(
 /// `authentication failed` response before returning an error so the client
 /// observes a uniform rejection. The `key_id` carries the matched device's
 /// identity forward so the cap-gate can apply that device's scope.
-async fn run_principal_challenge(
-    stream: &mut LocalStream,
+async fn run_principal_challenge<S>(
+    stream: &mut S,
     claimed: &str,
     workspace_claim: Option<&str>,
     home: &astrid_core::dirs::AstridHome,
     workspace_attachments: &crate::workspace_attachment::WorkspaceAttachmentRegistry,
-) -> Result<VerifiedConnection, String> {
+) -> Result<VerifiedConnection, String>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     // Validate the principal id shape before touching disk so a malformed
     // claim never reaches the filesystem.
     let principal = match PrincipalId::new(claimed) {
@@ -416,7 +424,10 @@ fn generate_nonce_hex() -> Result<String, String> {
 }
 
 /// Send the uniform `authentication failed` response, logging a write error.
-async fn send_auth_failed(stream: &mut LocalStream) {
+async fn send_auth_failed<S>(stream: &mut S)
+where
+    S: AsyncWrite + Unpin,
+{
     if let Err(e) = send_handshake_response_timed(
         stream,
         &WorkspaceHandshakeResponse::error("authentication failed"),
@@ -431,20 +442,26 @@ async fn send_auth_failed(stream: &mut LocalStream) {
 ///
 /// Wraps [`send_handshake_response`] with a timeout to prevent a stalled
 /// client from holding the accept loop hostage during the response write.
-async fn send_handshake_response_timed(
-    stream: &mut LocalStream,
+async fn send_handshake_response_timed<S>(
+    stream: &mut S,
     response: &WorkspaceHandshakeResponse,
-) -> Result<(), std::io::Error> {
+) -> Result<(), std::io::Error>
+where
+    S: AsyncWrite + Unpin,
+{
     tokio::time::timeout(HANDSHAKE_TIMEOUT, send_handshake_response(stream, response))
         .await
         .map_err(|_| std::io::Error::other("handshake response write timed out (5s)"))?
 }
 
 /// Send a length-prefixed JSON handshake response.
-async fn send_handshake_response(
-    stream: &mut LocalStream,
+async fn send_handshake_response<S>(
+    stream: &mut S,
     response: &WorkspaceHandshakeResponse,
-) -> Result<(), std::io::Error> {
+) -> Result<(), std::io::Error>
+where
+    S: AsyncWrite + Unpin,
+{
     use tokio::io::AsyncWriteExt;
 
     let bytes = serde_json::to_vec(response)

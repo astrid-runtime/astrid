@@ -4,11 +4,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+#[cfg(unix)]
 use std::time::Duration;
 
+#[cfg(unix)]
 use tracing::warn;
 
 /// Grace period between SIGINT and SIGKILL when cancelling processes.
+#[cfg(unix)]
 const SIGKILL_GRACE_PERIOD: Duration = Duration::from_secs(2);
 
 /// Tracks active child process PIDs for cancellation, with optional

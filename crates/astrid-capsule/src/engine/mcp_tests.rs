@@ -6,6 +6,7 @@ mod tests {
     use crate::manifest::{CapabilitiesDef, CapsuleManifest, McpServerDef, PackageDef};
     use std::collections::HashMap;
     use std::fs;
+    #[cfg(unix)]
     use std::path::Path;
     use tempfile::tempdir;
 
@@ -134,6 +135,7 @@ mod tests {
         assert!(err_msg.contains("Security Check Failed"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_fat_binary_resolution() {
         let temp_dir = tempdir().unwrap();

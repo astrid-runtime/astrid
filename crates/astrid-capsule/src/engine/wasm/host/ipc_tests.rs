@@ -568,9 +568,11 @@ async fn publish_rejects_a_revoked_caller_workspace() {
     state.install_recv_invocation_context(&caller);
     state.workspace_attachments.detach(attachment);
 
-    assert_eq!(
-        IpcHost::publish(&mut state, "capsule.v1.ping".to_string(), "{}".to_string()),
-        Err(ErrorCode::CapabilityDenied),
+    assert!(
+        matches!(
+            IpcHost::publish(&mut state, "capsule.v1.ping".to_string(), "{}".to_string()),
+            Err(ErrorCode::CapabilityDenied)
+        ),
         "a disconnected source must not leave a reusable workspace capability"
     );
 }
