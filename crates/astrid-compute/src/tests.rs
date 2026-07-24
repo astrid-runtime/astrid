@@ -196,6 +196,26 @@ fn growing_worker() -> WorkerArtifact {
     )
 }
 
+fn memory64_worker() -> WorkerArtifact {
+    artifact(
+        "memory64",
+        r#"(module
+            (memory (import "astrid_compute" "memory") i64 1 131072 shared)
+            (global $__stack_pointer (export "__stack_pointer") (mut i64)
+                i64.const 1024)
+            (func (export "astrid_compute_stack_reserve_bytes") (result i32)
+                i32.const 512)
+            (func (export "astrid_compute_stack_stride_bytes") (result i32)
+                i32.const 256)
+            (func (export "astrid_compute_abi_version") (result i32)
+                i32.const 1)
+            (func (export "astrid_compute_run")
+                (param i32 i64 i64 i64) (result i32)
+                global.get $__stack_pointer
+                i32.wrap_i64))"#,
+    )
+}
+
 fn request(mode: ExecutionMode, parallelism: Parallelism) -> GroupRequest {
     GroupRequest {
         mode,
@@ -276,6 +296,41 @@ fn asset_host_store(
     let mut linker = Linker::new(&engine);
     link_asset_imports(&mut linker).expect("asset imports link");
     (store, linker, memory)
+}
+
+#[test]
+fn shared_memory64_worker_admits_more_than_the_wasm32_address_space() {
+    let runtime = ComputeRuntime::new(ComputeLedger::default(), ComputeLimits::default())
+        .expect("runtime starts");
+    let maximum_memory_pages = 65_537;
+    let group = runtime
+        .open_group(
+            &principal("memory64"),
+            &memory64_worker(),
+            GroupRequest {
+                mode: ExecutionMode::Deterministic,
+                parallelism: Parallelism::Auto,
+                initial_memory_pages: 1,
+                maximum_memory_pages,
+            },
+        )
+        .expect("memory64 group opens beyond four GiB");
+
+    assert_eq!(group.maximum_memory_pages(), maximum_memory_pages);
+    let job = group
+        .submit(WorkDescriptor {
+            offset: ABI_HEADER_BYTES,
+            length: 1,
+            tag: 0,
+            worker_index: None,
+            fuel: Some(1_000_000),
+        })
+        .expect("memory64 job queues");
+    assert_eq!(
+        job.join().expect("memory64 job completes").worker_status,
+        768,
+        "worker zero receives the first private i64 stack slot"
+    );
 }
 
 #[test]

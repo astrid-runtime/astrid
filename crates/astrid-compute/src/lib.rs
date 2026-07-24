@@ -836,6 +836,7 @@ impl ComputeRuntime {
         config
             .wasm_threads(true)
             .shared_memory(true)
+            .wasm_memory64(true)
             .consume_fuel(true)
             .epoch_interruption(true);
         let engine = Engine::new(&config)
@@ -907,6 +908,7 @@ impl ComputeRuntime {
         let module = Module::from_binary(&self.inner.engine, &artifact.bytes)
             .map_err(|error| ComputeError::WorkerInvalid(format!("compile module: {error}")))?;
         let request = self.resolve_memory_request(principal, &module, request, effective_limits)?;
+        let worker_memory = worker_memory_limits(&module)?;
         let initial_bytes = u64::from(request.initial_memory_pages)
             .checked_mul(WASM_PAGE_BYTES)
             .ok_or_else(|| ComputeError::InvalidInput("initial memory overflow".to_owned()))?;
@@ -924,11 +926,18 @@ impl ComputeRuntime {
             self.inner.host_limits,
         )?;
         validate_worker_module(&module, request)?;
-        let memory = SharedMemory::new(
-            &self.inner.engine,
-            MemoryType::shared(request.initial_memory_pages, request.maximum_memory_pages),
-        )
-        .map_err(|error| ComputeError::WorkerFailed(format!("allocate shared memory: {error}")))?;
+        let memory_type = MemoryType::builder()
+            .memory64(worker_memory.memory64)
+            .shared(true)
+            .min(u64::from(request.initial_memory_pages))
+            .max(Some(u64::from(request.maximum_memory_pages)))
+            .build()
+            .map_err(|error| {
+                ComputeError::WorkerInvalid(format!("build admitted shared memory type: {error}"))
+            })?;
+        let memory = SharedMemory::new(&self.inner.engine, memory_type).map_err(|error| {
+            ComputeError::WorkerFailed(format!("allocate shared memory: {error}"))
+        })?;
         initialize_header(&memory, workers)?;
 
         let accounting = Arc::new(AccountingState::new(workers, initial_bytes));
@@ -1056,7 +1065,7 @@ impl ComputeRuntime {
         if request.maximum_memory_pages != 0 {
             return Ok(request);
         }
-        let (_, worker_maximum) = worker_memory_limits(module)?;
+        let worker_maximum = worker_memory_limits(module)?.maximum;
         let available_bytes = self.inner.ledger.remaining_memory(
             principal,
             limits.max_memory_bytes_per_principal,
@@ -1108,7 +1117,14 @@ fn validate_group_request(request: GroupRequest) -> Result<(), ComputeError> {
     Ok(())
 }
 
-fn worker_memory_limits(module: &Module) -> Result<(u64, u64), ComputeError> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WorkerMemoryLimits {
+    minimum: u64,
+    maximum: u64,
+    memory64: bool,
+}
+
+fn worker_memory_limits(module: &Module) -> Result<WorkerMemoryLimits, ComputeError> {
     let mut memory = None;
     let mut asset_count = false;
     let mut asset_size = false;
@@ -1167,10 +1183,11 @@ fn worker_memory_limits(module: &Module) -> Result<(u64, u64), ComputeError> {
             "worker memory import must be shared and declare a maximum".to_owned(),
         ));
     }
-    Ok((
-        memory.minimum(),
-        memory.maximum().expect("checked shared-memory maximum"),
-    ))
+    Ok(WorkerMemoryLimits {
+        minimum: memory.minimum(),
+        maximum: memory.maximum().expect("checked shared-memory maximum"),
+        memory64: memory.is_64(),
+    })
 }
 
 fn import_signature(import: &ExternType, params: &[ValType], results: &[ValType]) -> bool {
@@ -1190,9 +1207,9 @@ fn val_types_match(actual: impl Iterator<Item = ValType>, expected: &[ValType]) 
 }
 
 fn validate_worker_module(module: &Module, request: GroupRequest) -> Result<(), ComputeError> {
-    let (minimum, maximum) = worker_memory_limits(module)?;
-    if minimum > u64::from(request.initial_memory_pages)
-        || maximum < u64::from(request.maximum_memory_pages)
+    let memory = worker_memory_limits(module)?;
+    if memory.minimum > u64::from(request.initial_memory_pages)
+        || memory.maximum < u64::from(request.maximum_memory_pages)
     {
         return Err(ComputeError::WorkerInvalid(
             "worker memory limits are incompatible with the group request".to_owned(),
@@ -2074,24 +2091,27 @@ fn configure_worker_stack(
         },
     };
 
-    let Val::I32(initial_top) = stack_pointer.get(&mut *store) else {
-        return Err(ComputeError::WorkerInvalid(
-            "worker stack pointer must be a mutable i32 global".to_owned(),
-        ));
-    };
+    let initial_pointer = stack_pointer.get(&mut *store);
+    let initial_top = match &initial_pointer {
+        Val::I32(value) => u32::try_from(*value).map(u64::from),
+        Val::I64(value) => u64::try_from(*value),
+        _ => {
+            return Err(ComputeError::WorkerInvalid(
+                "worker stack pointer must be a mutable i32 or i64 global".to_owned(),
+            ));
+        },
+    }
+    .map_err(|_| ComputeError::WorkerInvalid("worker stack pointer must be positive".to_owned()))?;
     let reserve = reserve.call(&mut *store, ()).map_err(|error| {
         ComputeError::WorkerInvalid(format!("read worker stack reserve: {error}"))
     })?;
     let stride = stride.call(&mut *store, ()).map_err(|error| {
         ComputeError::WorkerInvalid(format!("read worker stack stride: {error}"))
     })?;
-    let initial_top = u32::try_from(initial_top).map_err(|_| {
-        ComputeError::WorkerInvalid("worker stack pointer must be positive".to_owned())
-    })?;
-    let reserve = u32::try_from(reserve).map_err(|_| {
+    let reserve = u64::try_from(reserve).map_err(|_| {
         ComputeError::WorkerInvalid("worker stack reserve must be positive".to_owned())
     })?;
-    let stride = u32::try_from(stride).map_err(|_| {
+    let stride = u64::try_from(stride).map_err(|_| {
         ComputeError::WorkerInvalid("worker stack stride must be positive".to_owned())
     })?;
     if reserve == 0 || stride == 0 || !reserve.is_multiple_of(stride) {
@@ -2102,7 +2122,7 @@ fn configure_worker_stack(
     let stack_slots = reserve
         .checked_div(stride)
         .expect("nonzero stack stride validated");
-    if worker_index >= stack_slots {
+    if u64::from(worker_index) >= stack_slots {
         return Err(ComputeError::WorkerInvalid(format!(
             "worker index {worker_index} exceeds {stack_slots} private stack slots"
         )));
@@ -2110,13 +2130,24 @@ fn configure_worker_stack(
     let arena_start = initial_top.checked_sub(reserve).ok_or_else(|| {
         ComputeError::WorkerInvalid("worker stack reserve begins below linear memory".to_owned())
     })?;
-    let slot_top = worker_index
+    let slot_top = u64::from(worker_index)
         .checked_add(1)
         .and_then(|slot| slot.checked_mul(stride))
         .and_then(|offset| arena_start.checked_add(offset))
         .ok_or_else(|| ComputeError::WorkerInvalid("worker stack slot overflow".to_owned()))?;
+    let stack_value = match initial_pointer {
+        Val::I32(_) => u32::try_from(slot_top)
+            .map(|value| Val::I32(value.cast_signed()))
+            .map_err(|_| {
+                ComputeError::WorkerInvalid(
+                    "worker i32 stack slot exceeds the wasm32 address space".to_owned(),
+                )
+            })?,
+        Val::I64(_) => Val::I64(slot_top.cast_signed()),
+        _ => unreachable!("stack pointer type validated above"),
+    };
     stack_pointer
-        .set(&mut *store, Val::I32(slot_top.cast_signed()))
+        .set(&mut *store, stack_value)
         .map_err(|error| {
             ComputeError::WorkerInvalid(format!("relocate worker stack pointer: {error}"))
         })

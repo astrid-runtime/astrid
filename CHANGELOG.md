@@ -11,6 +11,11 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Added
 
+- **Generic compute admits shared memory64 workers.** Worker-declared memory
+  width now selects the matching Wasmtime shared-memory type, 64-bit private
+  stack pointers receive disjoint worker slots, and the existing host,
+  operator, and principal ledgers remain authoritative for reservations beyond
+  wasm32's 4 GiB address space.
 - **Authenticated MCP sessions can attach their agent workspace per connection.**
   The launching thread's canonical working directory is bound into the
   principal signature, mapped through a revocable host-only event sidecar, and
