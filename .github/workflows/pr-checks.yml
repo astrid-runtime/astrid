@@ -84,9 +84,7 @@ jobs:
 
             while IFS= read -r file; do
               [ "$file" = ".github/workflows/pr-checks.yml" ] || return 1
-            done <<EOF
-$CHANGED_FILES
-EOF
+            done <<< "$CHANGED_FILES"
 
             return 0
           }
@@ -425,9 +423,7 @@ EOF
 
             while IFS= read -r file; do
               [ "$file" = ".github/workflows/pr-checks.yml" ] || return 1
-            done <<EOF
-$CHANGED_FILES
-EOF
+            done <<< "$CHANGED_FILES"
 
             return 0
           }
