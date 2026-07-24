@@ -363,7 +363,15 @@ pub(super) fn move_guarded_file(
 pub(super) fn remove_guarded_file(guard: &TrustedPathGuard, path: &Path) -> io::Result<()> {
     let name = guarded_child_name(guard, path)?;
     let handle = open_guarded_child(guard, name, DELETE | FILE_READ_ATTRIBUTES)?;
-    mark_handle_for_deletion(handle.0)
+    mark_handle_for_deletion(handle.0).map_err(|error| {
+        with_context(
+            error,
+            format!(
+                "could not mark handle-relative file for deletion: {}",
+                path.display()
+            ),
+        )
+    })
 }
 
 pub(super) fn guarded_file_exists(guard: &TrustedPathGuard, path: &Path) -> io::Result<bool> {
