@@ -9,6 +9,7 @@
 //! scheme entirely — capsules cannot reach them no matter what their
 //! manifest declares.
 
+#[cfg(not(windows))]
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -50,7 +51,7 @@ impl PrincipalProfile {
     ///
     /// See [`Self::load`].
     pub fn load_from_path(path: &Path) -> ProfileResult<Self> {
-        let content = match fs::read_to_string(path) {
+        let content = match crate::platform_fs::read_private_file_to_string(path) {
             Ok(c) => c,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 return Ok(Self::default());
@@ -104,6 +105,9 @@ fn write_atomic(path: &Path, data: &[u8]) -> ProfileResult<()> {
             "profile path has no parent directory",
         ))
     })?;
+    #[cfg(windows)]
+    crate::platform_fs::ensure_private_directory(parent)?;
+    #[cfg(not(windows))]
     fs::create_dir_all(parent)?;
 
     #[cfg(unix)]
@@ -133,10 +137,12 @@ fn write_atomic(path: &Path, data: &[u8]) -> ProfileResult<()> {
         }
     }
 
-    // Non-Unix fallback: no atomic rename, no explicit permissions.
-    // Astrid's supported platforms are Unix; this exists only to keep
-    // the crate buildable on Windows.
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        crate::platform_fs::atomic_write_private_file(path, data)?;
+    }
+
+    #[cfg(not(any(unix, windows)))]
     {
         fs::write(path, data)?;
     }
@@ -148,6 +154,7 @@ fn write_atomic(path: &Path, data: &[u8]) -> ProfileResult<()> {
 #[allow(clippy::field_reassign_with_default)] // tests mutate a known-good baseline
 mod tests {
     use super::*;
+    use std::fs;
 
     use crate::profile::CURRENT_PROFILE_VERSION;
 

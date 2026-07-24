@@ -249,7 +249,8 @@ fn reject_parent_traversal(path: &Path, var_name: &str) -> io::Result<()> {
 
 // ── AstridHome (system-level) ────────────────────────────────────────────
 
-/// Global Astrid home directory (`~/.astrid/` or `$ASTRID_HOME`).
+/// Global Astrid home directory (`~/.astrid/`, Windows `LocalAppData`, or
+/// `$ASTRID_HOME`).
 ///
 /// FHS-aligned system layout. Contains config (`etc/`), persistent state
 /// (`var/`), ephemeral runtime (`run/`), logs (`log/`), keys (`keys/`),
@@ -263,19 +264,29 @@ pub struct AstridHome {
 impl AstridHome {
     /// Resolve the home directory.
     ///
-    /// Checks `$ASTRID_HOME` first, then falls back to `$HOME/.astrid/`.
+    /// Checks `$ASTRID_HOME` first. Unix falls back to `$HOME/.astrid/`;
+    /// Windows uses the per-user `LocalAppData` known folder.
     ///
     /// # Errors
     ///
     /// Returns an error if neither `$ASTRID_HOME` nor `$HOME` is set.
     pub fn resolve() -> io::Result<Self> {
         let astrid_home = std::env::var("ASTRID_HOME").ok();
-        let home = if astrid_home.is_none() {
-            std::env::var("HOME").ok()
-        } else {
-            None
-        };
-        Self::resolve_with_env(astrid_home, home)
+        if astrid_home.is_some() {
+            return Self::resolve_with_env(astrid_home, None);
+        }
+
+        #[cfg(windows)]
+        {
+            Ok(Self {
+                root: crate::platform_fs::default_astrid_home_root()?,
+            })
+        }
+
+        #[cfg(not(windows))]
+        {
+            Self::resolve_with_env(None, std::env::var("HOME").ok())
+        }
     }
 
     /// Internal resolver used to mock environment variables in tests securely.
@@ -344,7 +355,14 @@ impl AstridHome {
             self.wit_store_dir(),
             self.home_dir(),
         ];
+
+        #[cfg(windows)]
+        crate::platform_fs::ensure_private_directory(self.root())?;
+
         for dir in &dirs {
+            #[cfg(windows)]
+            crate::platform_fs::ensure_private_directory(dir)?;
+            #[cfg(not(windows))]
             std::fs::create_dir_all(dir)?;
         }
 
@@ -353,6 +371,8 @@ impl AstridHome {
         if !version_path.exists() {
             std::fs::write(&version_path, LAYOUT_VERSION)?;
         }
+        #[cfg(windows)]
+        crate::platform_fs::restrict_private_file(&version_path)?;
 
         #[cfg(unix)]
         {
@@ -361,6 +381,15 @@ impl AstridHome {
             std::fs::set_permissions(self.root(), perms.clone())?;
             for dir in &dirs {
                 std::fs::set_permissions(dir, perms.clone())?;
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            for private_file in [self.runtime_key_path(), self.token_path()] {
+                if private_file.exists() {
+                    crate::platform_fs::validate_private_file(&private_file)?;
+                }
             }
         }
         Ok(())
@@ -627,7 +656,18 @@ impl PrincipalHome {
             self.tmp_dir(),
             self.env_dir(),
         ];
+
+        #[cfg(windows)]
+        {
+            crate::platform_fs::ensure_private_directory(&self.root)?;
+            crate::platform_fs::ensure_private_directory(&self.root.join(".local"))?;
+            crate::platform_fs::ensure_private_directory(&self.root.join(".config"))?;
+        }
+
         for dir in &dirs {
+            #[cfg(windows)]
+            crate::platform_fs::ensure_private_directory(dir)?;
+            #[cfg(not(windows))]
             std::fs::create_dir_all(dir)?;
         }
         #[cfg(unix)]

@@ -565,6 +565,7 @@ dependencies = [
  "base64",
  "blake3",
  "chrono",
+ "directories",
  "getrandom 0.4.3",
  "hex",
  "nix 0.31.3",
@@ -577,6 +578,7 @@ dependencies = [
  "tokio",
  "toml 0.8.23",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
