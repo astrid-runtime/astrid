@@ -9,12 +9,15 @@
 use std::collections::HashSet;
 use std::io::Read as _;
 use std::os::windows::ffi::OsStrExt as _;
+use std::os::windows::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_DELAY_UNTIL_REBOOT, MoveFileExW};
-use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
+use windows_sys::Win32::System::Threading::{
+    CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS, OpenProcess, WaitForSingleObject,
+};
 
 const INTERNAL_MODE: &str = "__complete-windows-update";
 const MAX_TRANSACTION_BYTES: u64 = 64 * 1024;
@@ -151,8 +154,6 @@ pub(super) fn stage_and_launch(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    use std::os::windows::process::CommandExt as _;
-    use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS};
     command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
     let mut child = match command.spawn() {
         Ok(child) => child,
@@ -243,7 +244,9 @@ fn wait_for_parent(parent: &OwnedHandle) -> anyhow::Result<()> {
 }
 
 fn wait_for_helper_armed(child: &mut std::process::Child, armed_path: &Path) -> anyhow::Result<()> {
-    let deadline = std::time::Instant::now() + HELPER_ARM_TIMEOUT;
+    let deadline = std::time::Instant::now()
+        .checked_add(HELPER_ARM_TIMEOUT)
+        .context("Windows update helper arming deadline overflow")?;
     loop {
         if astrid_core::platform_fs::validate_private_file(armed_path).is_ok()
             && std::fs::read(armed_path).is_ok_and(|contents| contents == b"v1\n")
@@ -343,7 +346,7 @@ fn digest_file(path: &Path) -> anyhow::Result<String> {
         path.display()
     );
     let mut hasher = blake3::Hasher::new();
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024];
     loop {
         let read = file.read(&mut buffer)?;
         if read == 0 {

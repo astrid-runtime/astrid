@@ -52,11 +52,7 @@ pub(super) fn is_process_alive(pid: u32) -> bool {
             == i32::try_from(ERROR_ACCESS_DENIED).ok();
     };
     // SAFETY: `handle` remains valid for the duration of this zero-timeout wait.
-    match unsafe { WaitForSingleObject(handle.0, 0) } {
-        WAIT_TIMEOUT => true,
-        WAIT_OBJECT_0 => false,
-        _ => false,
-    }
+    unsafe { WaitForSingleObject(handle.0, 0) == WAIT_TIMEOUT }
 }
 
 pub(super) fn exe_path_of_pid(pid: u32) -> Option<PathBuf> {
@@ -111,7 +107,7 @@ pub(super) fn terminate_verified_process(
             .is_ok_and(|canonical| paths_equal(recorded_exe, &canonical))
     {
         return VerifiedTermination::Unverified;
-    };
+    }
 
     // SAFETY: the same handle used to query and verify the executable is live
     // and carries PROCESS_TERMINATE. Holding it closes the PID-reuse gap.
@@ -125,7 +121,6 @@ pub(super) fn terminate_verified_process(
     // SAFETY: the owned handle stays live throughout the bounded wait.
     match unsafe { WaitForSingleObject(handle.0, millis) } {
         WAIT_OBJECT_0 => VerifiedTermination::Exited,
-        WAIT_TIMEOUT => VerifiedTermination::StillAlive,
         _ => VerifiedTermination::StillAlive,
     }
 }
@@ -137,10 +132,8 @@ pub(super) fn paths_equal(left: &Path, right: &Path) -> bool {
     else {
         return false;
     };
-    let left_ptr = left.first().map_or(null(), |unit| std::ptr::from_ref(unit));
-    let right_ptr = right
-        .first()
-        .map_or(null(), |unit| std::ptr::from_ref(unit));
+    let left_ptr = left.first().map_or(null(), std::ptr::from_ref);
+    let right_ptr = right.first().map_or(null(), std::ptr::from_ref);
     // SAFETY: both pointers address their corresponding immutable UTF-16
     // buffers for exactly the supplied lengths. Empty paths use a null pointer
     // with a zero count, which the API permits.

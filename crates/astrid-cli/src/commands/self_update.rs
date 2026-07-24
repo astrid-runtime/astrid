@@ -572,7 +572,7 @@ pub(crate) async fn run_self_update(args: UpdateArgs) -> anyhow::Result<()> {
                 install_dir.display()
             ))
         );
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(windows))]

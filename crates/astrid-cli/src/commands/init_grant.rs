@@ -314,8 +314,15 @@ fn set_owner_private_dir(path: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn set_owner_private_dir(_path: &std::path::Path) -> anyhow::Result<()> {
+#[cfg(windows)]
+fn set_owner_private_dir(path: &std::path::Path) -> anyhow::Result<()> {
+    astrid_core::platform_fs::ensure_private_directory(path)?;
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn set_owner_private_dir(path: &std::path::Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(path)?;
     Ok(())
 }
 
@@ -326,8 +333,15 @@ fn set_owner_private_file(path: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn set_owner_private_file(_path: &std::path::Path) -> anyhow::Result<()> {
+#[cfg(windows)]
+fn set_owner_private_file(path: &std::path::Path) -> anyhow::Result<()> {
+    astrid_core::platform_fs::restrict_private_file(path)?;
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn set_owner_private_file(path: &std::path::Path) -> anyhow::Result<()> {
+    std::fs::metadata(path)?;
     Ok(())
 }
 

@@ -8,7 +8,7 @@ mod render;
 pub(crate) mod state;
 mod theme;
 
-use std::io::{self, Stdout, Write as _};
+use std::io::{self, Stdout};
 use std::time::{Duration, Instant};
 
 use astrid_core::SessionId;
@@ -834,6 +834,7 @@ fn write_env_file(path: &std::path::Path, contents: &str) -> std::io::Result<()>
     }
     #[cfg(unix)]
     {
+        use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt;
         let mut file = std::fs::OpenOptions::new()
             .write(true)
