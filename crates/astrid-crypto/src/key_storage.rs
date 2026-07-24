@@ -98,6 +98,10 @@ fn sync_parent_directory(parent: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "uniform fallible contract with the Unix durability operation"
+)]
 fn sync_parent_directory(_parent: &Path) -> io::Result<()> {
     Ok(())
 }

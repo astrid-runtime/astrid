@@ -83,6 +83,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Fixed
 
+- **Windows builds retain the cross-platform key persistence contract.** The
+  non-Unix parent-directory sync shim keeps the same fallible interface as the
+  Unix implementation without failing the native ARM64 Clippy gate. Closes
+  #1361.
 - **Linux release binaries now run on glibc 2.34 enterprise hosts.** The
   x86_64 and ARM64 GNU artifacts are built in a pinned glibc 2.31 environment,
   and release publication rejects binaries whose ELF symbol requirements
