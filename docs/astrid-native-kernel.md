@@ -424,6 +424,11 @@ Relevant Wasmtime references:
 
 ### 5.3 Storage strategy
 
+The detailed object, transition, placement, export/import, accounting, and
+evidence contract lives in the
+[Astrid Principal Store](astrid-principal-store.md) design and its
+[evidence plan](astrid-principal-store-evidence.md).
+
 The first runtime domain should use the existing `MemoryKvStore` only to prove
 component execution. The next gate must be durable state; an in-memory success is
 not an Astrid system.
