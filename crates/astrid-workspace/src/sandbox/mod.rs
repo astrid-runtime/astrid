@@ -716,7 +716,7 @@ impl SandboxPolicy {
 pub struct ProcessSandboxConfig {
     /// Root directory the sandboxed process can write to.
     #[cfg_attr(
-        not(any(target_os = "linux", target_os = "macos")),
+        all(not(any(target_os = "linux", target_os = "macos")), not(test)),
         expect(
             dead_code,
             reason = "uniform configuration contract; native backends consume this field"
