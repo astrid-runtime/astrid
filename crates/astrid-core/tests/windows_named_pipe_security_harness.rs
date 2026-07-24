@@ -22,19 +22,22 @@ mod windows {
     use astrid_core::local_transport;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::windows::named_pipe::ClientOptions;
-    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, HANDLE, WAIT_OBJECT_0};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_ACCESS_DENIED, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    };
     use windows_sys::Win32::Security::{
         ImpersonateLoggedOnUser, LOGON32_LOGON_INTERACTIVE, LOGON32_PROVIDER_DEFAULT, LogonUserW,
         RevertToSelf,
     };
     use windows_sys::Win32::Storage::FileSystem::SECURITY_IDENTIFICATION;
     use windows_sys::Win32::System::Threading::{
-        CreateProcessWithLogonW, GetExitCodeProcess, INFINITE, LOGON_WITH_PROFILE,
-        PROCESS_INFORMATION, STARTUPINFOW, WaitForSingleObject,
+        CreateProcessWithLogonW, GetExitCodeProcess, LOGON_WITH_PROFILE, PROCESS_INFORMATION,
+        STARTUPINFOW, TerminateProcess, WaitForSingleObject,
     };
 
     const CHILD_MODE: &str = "cross-user-child";
     const SAME_USER_MODE: &str = "same-user-child";
+    const CHILD_WAIT_TIMEOUT_MS: u32 = 15_000;
 
     async fn wait_until_endpoint_is_absent(endpoint: &Path) {
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -127,23 +130,48 @@ mod windows {
         // its required real pre-read before it impersonates and rejects that
         // token. The listener must already have installed its normal protected
         // replacement and recover for a same-user client.
-        let permissive = std::sync::Arc::new(
+        let mut permissive = Some(std::sync::Arc::new(
             local_transport::bind_permissive_first_instance_for_test(endpoint)
                 .expect("bind permissive effective-token probe instance"),
-        );
+        ));
         let effective_client = spawn_effective_token_thread(&user, &pipe_name);
-        let rejected = local_transport::accept(&permissive)
-            .await
-            .expect_err("alternate effective token must fail closed");
+        let accept_result = tokio::time::timeout(Duration::from_secs(10), {
+            let listener = permissive
+                .as_ref()
+                .expect("effective-token listener remains active");
+            local_transport::accept(listener)
+        })
+        .await;
+        let (rejected, failure) = match accept_result {
+            Ok(Err(error)) => (Some(error), None),
+            Ok(Ok(stream)) => {
+                drop(stream);
+                (
+                    None,
+                    Some("alternate effective token was unexpectedly accepted"),
+                )
+            },
+            Err(_) => (
+                None,
+                Some("effective-token probe did not reach the production accept boundary"),
+            ),
+        };
+        if rejected.is_none() {
+            // Close the namespace before joining so a failed probe cannot leave
+            // its impersonated thread blocked while TestUser cleanup runs.
+            drop(permissive.take());
+        }
+        effective_client
+            .join()
+            .expect("alternate effective-token client thread");
+        let rejected = rejected.unwrap_or_else(|| panic!("{}", failure.expect("failure reason")));
         assert_eq!(rejected.kind(), io::ErrorKind::PermissionDenied);
         assert!(
             rejected.to_string().contains("effective token"),
             "post-read effective-token gate must reject before descriptor or PID checks: \
              {rejected}"
         );
-        effective_client
-            .join()
-            .expect("alternate effective-token client thread");
+        let permissive = permissive.expect("rejected probe keeps listener active");
 
         let executable = std::env::current_exe().expect("security harness executable");
         let mut recovery_child = Command::new(executable)
@@ -241,6 +269,14 @@ mod windows {
         let password = user.password.clone();
         let target_pipe = target_pipe.to_os_string();
         std::thread::spawn(move || {
+            // Derive the process-owned namespace before impersonation. Once the
+            // alternate user is effective, Windows correctly denies that user
+            // TOKEN_QUERY access to the parent process token.
+            let own_pipe =
+                local_transport::endpoint_name_for_test(Path::new(r"C:\ignored\system.sock"))
+                    .expect("process-token pipe name");
+            assert_eq!(own_pipe, target_pipe);
+
             let username = wide_nul(OsStr::new(&username));
             let domain = wide_nul(OsStr::new("."));
             let password = wide_nul(OsStr::new(&password));
@@ -268,14 +304,6 @@ mod windows {
             );
             let impersonation = TestImpersonation { active: true };
 
-            // Endpoint derivation deliberately uses the process token, so this
-            // current-user process still selects the parent's pipe while its
-            // connecting thread presents the alternate effective token.
-            let own_pipe =
-                local_transport::endpoint_name_for_test(Path::new(r"C:\ignored\system.sock"))
-                    .expect("process-token pipe name");
-            assert_eq!(own_pipe, target_pipe);
-
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -292,7 +320,10 @@ mod windows {
                     .expect("effective-token probe write");
                 stream.flush().await.expect("effective-token probe flush");
                 let mut byte = [0_u8; 1];
-                match stream.read(&mut byte).await {
+                match tokio::time::timeout(Duration::from_secs(10), stream.read(&mut byte))
+                    .await
+                    .expect("server must close a rejected effective-token connection")
+                {
                     Ok(0) | Err(_) => {},
                     Ok(_) => panic!("rejected effective-token client received server data"),
                 }
@@ -453,7 +484,27 @@ mod windows {
 
     impl LogonChild {
         fn wait(mut self) -> io::Result<u32> {
-            let wait = unsafe { WaitForSingleObject(self.0, INFINITE) };
+            let wait = unsafe { WaitForSingleObject(self.0, CHILD_WAIT_TIMEOUT_MS) };
+            if wait == WAIT_TIMEOUT {
+                let terminated = unsafe { TerminateProcess(self.0, 124) };
+                let terminate_error = (terminated == 0).then(io::Error::last_os_error);
+                let terminated_wait = unsafe { WaitForSingleObject(self.0, 5_000) };
+                if terminated_wait != WAIT_OBJECT_0 {
+                    return Err(io::Error::other(format!(
+                        "alternate-token child did not terminate after timeout: \
+                         terminate_error={terminate_error:?}, wait={terminated_wait}"
+                    )));
+                }
+                if let Some(error) = terminate_error {
+                    return Err(io::Error::other(format!(
+                        "alternate-token child exited while termination failed: {error}"
+                    )));
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "alternate-token child exceeded the bounded wait",
+                ));
+            }
             if wait != WAIT_OBJECT_0 {
                 return Err(io::Error::other(format!(
                     "alternate-token child wait failed: {wait}"
