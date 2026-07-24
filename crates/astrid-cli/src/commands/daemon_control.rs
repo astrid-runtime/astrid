@@ -256,10 +256,11 @@ pub(crate) enum KillOutcome {
     /// The process did not exit even after platform forced termination.
     /// The caller should surface this — the lock may still be held.
     StillAlive,
-    /// A live process holds the recorded PID, but we could NOT confirm it is the
-    /// Astrid daemon (no recorded exe, unreadable live exe, or a mismatch —
-    /// likely PID reuse). We refuse to signal it; the caller should warn and
-    /// leave the process alone. Carries the PID for the operator message.
+    /// A process may hold the recorded PID, but we could not confirm absence or
+    /// prove it is the Astrid daemon (no recorded exe, unreadable live exe, an
+    /// unexpected liveness error, or a mismatch). We refuse to signal it; the
+    /// caller should warn and leave the process alone. Carries the PID for the
+    /// operator message.
     Unverified(u32),
 }
 
@@ -301,6 +302,7 @@ pub(crate) async fn terminate_orphan(pid_path: &Path) -> KillOutcome {
 pub(crate) async fn terminate_known(pid: u32, recorded_exe: Option<&Path>) -> KillOutcome {
     #[cfg(windows)]
     return match recorded_exe {
+        None if windows::is_process_confirmed_gone(pid) => KillOutcome::NotRunning,
         None => KillOutcome::Unverified(pid),
         Some(recorded) => {
             let recorded = recorded.to_path_buf();

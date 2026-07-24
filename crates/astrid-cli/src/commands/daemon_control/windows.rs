@@ -9,9 +9,7 @@ use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::{Path, PathBuf};
 use std::ptr::null;
 
-use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
-};
+use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, HANDLE, WAIT_OBJECT_0};
 use windows_sys::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
 use windows_sys::Win32::System::Threading::{
     OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, QueryFullProcessImageNameW,
@@ -45,14 +43,22 @@ impl Drop for OwnedHandle {
 }
 
 pub(super) fn is_process_alive(pid: u32) -> bool {
+    !is_process_confirmed_gone(pid)
+}
+
+pub(super) fn is_process_confirmed_gone(pid: u32) -> bool {
+    if pid == 0 {
+        return true;
+    }
     let Some(handle) = OwnedHandle::open(pid, SYNCHRONIZE_ACCESS) else {
-        // Access denied still proves that the process exists. Treat every other
-        // open failure as gone/unactionable.
-        return std::io::Error::last_os_error().raw_os_error()
-            == i32::try_from(ERROR_ACCESS_DENIED).ok();
+        // Only INVALID_PARAMETER proves that no process has this PID. Access
+        // denied proves existence, and every unexpected error stays fail-closed.
+        return std::io::Error::last_os_error()
+            .raw_os_error()
+            .is_some_and(|code| u32::try_from(code).ok() == Some(ERROR_INVALID_PARAMETER));
     };
     // SAFETY: `handle` remains valid for the duration of this zero-timeout wait.
-    unsafe { WaitForSingleObject(handle.0, 0) == WAIT_TIMEOUT }
+    unsafe { WaitForSingleObject(handle.0, 0) == WAIT_OBJECT_0 }
 }
 
 pub(super) fn exe_path_of_pid(pid: u32) -> Option<PathBuf> {

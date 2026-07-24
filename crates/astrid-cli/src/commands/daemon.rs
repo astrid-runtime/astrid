@@ -795,9 +795,9 @@ fn report_orphan_stop(
             eprintln!(
                 "{}",
                 theme::Theme::warning(&format!(
-                    "A process (PID {pid}) holds the recorded daemon PID but I can't confirm \
-                     it's the Astrid daemon (possible PID reuse) — not killing it. If the daemon \
-                     is genuinely stuck, inspect PID {pid} and stop it manually."
+                    "A process may hold the recorded daemon PID {pid}, but I can't confirm either \
+                     its absence or that it's the Astrid daemon — not killing it. If the daemon is \
+                     genuinely stuck, inspect PID {pid} and stop it manually."
                 ))
             );
         },
