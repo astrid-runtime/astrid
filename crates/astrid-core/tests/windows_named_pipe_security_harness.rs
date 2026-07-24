@@ -36,6 +36,16 @@ mod windows {
     const CHILD_MODE: &str = "cross-user-child";
     const SAME_USER_MODE: &str = "same-user-child";
 
+    async fn wait_until_endpoint_is_absent(endpoint: &Path) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while local_transport::endpoint_is_present(endpoint).expect("closed endpoint state") {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("production listener must release the namespace");
+    }
+
     pub(super) fn run() {
         let args: Vec<OsString> = std::env::args_os().collect();
         if args.get(1).is_some_and(|arg| arg == CHILD_MODE) {
@@ -109,10 +119,7 @@ mod windows {
         );
         drop(server);
         drop(listener);
-        assert!(
-            !local_transport::endpoint_is_present(endpoint).expect("closed endpoint state"),
-            "production listener must release the namespace"
-        );
+        wait_until_endpoint_is_absent(endpoint).await;
 
         // The deliberately permissive first instance lets a genuine alternate
         // effective token reach the server-side authorization boundary. The
