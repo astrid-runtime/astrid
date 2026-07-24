@@ -715,6 +715,13 @@ impl SandboxPolicy {
 #[derive(Debug, Clone)]
 pub struct ProcessSandboxConfig {
     /// Root directory the sandboxed process can write to.
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos")),
+        expect(
+            dead_code,
+            reason = "uniform configuration contract; native backends consume this field"
+        )
+    )]
     writable_root: PathBuf,
     /// Additional read-only paths beyond the OS defaults.
     extra_read_paths: Vec<PathBuf>,
