@@ -248,29 +248,41 @@ pub(super) fn spawn_ring_reader<R>(
 /// abort the monitor (dropping its `Child`, the `kill_on_drop` backstop).
 pub(super) fn reap_entry(entry: PersistentEntry) {
     if entry.is_live() {
-        let _ = send_signal(entry.os_pid, nix::sys::signal::Signal::SIGKILL);
+        let _ = send_signal(entry.os_pid, HostSignal::Kill);
     }
     entry.monitor.abort();
 }
 
-/// Map the WIT `process-signal` to a Unix signal.
-pub(super) fn map_signal(sig: ProcessSignal) -> nix::sys::signal::Signal {
-    use nix::sys::signal::Signal;
+/// Platform-neutral signal understood by the persistent-process registry.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum HostSignal {
+    Term,
+    Hup,
+    Usr1,
+    Usr2,
+    Int,
+    Stop,
+    Cont,
+    Kill,
+}
+
+/// Map the WIT `process-signal` to an internal signal.
+pub(super) fn map_signal(sig: ProcessSignal) -> HostSignal {
     match sig {
-        ProcessSignal::Term => Signal::SIGTERM,
-        ProcessSignal::Hup => Signal::SIGHUP,
-        ProcessSignal::Usr1 => Signal::SIGUSR1,
-        ProcessSignal::Usr2 => Signal::SIGUSR2,
-        ProcessSignal::Int => Signal::SIGINT,
-        ProcessSignal::Stop => Signal::SIGSTOP,
-        ProcessSignal::Cont => Signal::SIGCONT,
+        ProcessSignal::Term => HostSignal::Term,
+        ProcessSignal::Hup => HostSignal::Hup,
+        ProcessSignal::Usr1 => HostSignal::Usr1,
+        ProcessSignal::Usr2 => HostSignal::Usr2,
+        ProcessSignal::Int => HostSignal::Int,
+        ProcessSignal::Stop => HostSignal::Stop,
+        ProcessSignal::Cont => HostSignal::Cont,
     }
 }
 
 /// Send a signal to the child's PROCESS GROUP (it is spawned with
 /// `process_group(0)`, so descendants are signalled too), falling back to
 /// the bare pid if the group send fails.
-pub(super) fn send_signal(pid: u32, sig: nix::sys::signal::Signal) -> Result<(), ErrorCode> {
+pub(super) fn send_signal(pid: u32, sig: HostSignal) -> Result<(), ErrorCode> {
     // Refuse pid 0: `killpg(0)` / `kill(0)` target the CALLER's (daemon's) own
     // process group — never the child. A reaped child surfaces pid `None`
     // (stored as 0); guard here as defense-in-depth (spawn also rejects it).
@@ -279,10 +291,22 @@ pub(super) fn send_signal(pid: u32, sig: nix::sys::signal::Signal) -> Result<(),
     }
     #[cfg(unix)]
     {
+        use nix::sys::signal::Signal;
+
         let raw = i32::try_from(pid).map_err(|_| ErrorCode::InvalidInput)?;
         let target = nix::unistd::Pid::from_raw(raw);
-        if nix::sys::signal::killpg(target, sig).is_err() {
-            nix::sys::signal::kill(target, sig)
+        let native = match sig {
+            HostSignal::Term => Signal::SIGTERM,
+            HostSignal::Hup => Signal::SIGHUP,
+            HostSignal::Usr1 => Signal::SIGUSR1,
+            HostSignal::Usr2 => Signal::SIGUSR2,
+            HostSignal::Int => Signal::SIGINT,
+            HostSignal::Stop => Signal::SIGSTOP,
+            HostSignal::Cont => Signal::SIGCONT,
+            HostSignal::Kill => Signal::SIGKILL,
+        };
+        if nix::sys::signal::killpg(target, native).is_err() {
+            nix::sys::signal::kill(target, native)
                 .map_err(|e| ErrorCode::Unknown(format!("signal {sig:?}: {e}")))?;
         }
         Ok(())

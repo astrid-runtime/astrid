@@ -69,8 +69,8 @@ use config::{
     MAX_STDIN_WRITE, MAX_STOP_GRACE, clamp_label, clamp_log_ring, overflow_from_wit, resolve_ttls,
 };
 use entry::{
-    PersistentEntry, Phase, ProcessCore, current_exit, map_signal, reap_entry, send_signal,
-    spawn_monitor, spawn_ring_reader, wait_for_exit,
+    HostSignal, PersistentEntry, Phase, ProcessCore, current_exit, map_signal, reap_entry,
+    send_signal, spawn_monitor, spawn_ring_reader, wait_for_exit,
 };
 use ids::mint_id;
 use ring::{LogRing, Stream, decode_cursor, encode_cursor};
@@ -496,12 +496,12 @@ impl PersistentProcessRegistry {
         let exit = if let Some(e) = current_exit(&r.core) {
             e
         } else {
-            let _ = send_signal(r.os_pid, nix::sys::signal::Signal::SIGTERM);
+            let _ = send_signal(r.os_pid, HostSignal::Term);
             let mut rx = r.exit_rx.clone();
             match tokio::time::timeout(grace, wait_for_exit(&mut rx)).await {
                 Ok(Some(e)) => e,
                 _ => {
-                    let _ = send_signal(r.os_pid, nix::sys::signal::Signal::SIGKILL);
+                    let _ = send_signal(r.os_pid, HostSignal::Kill);
                     let mut rx2 = r.exit_rx.clone();
                     match tokio::time::timeout(MAX_STOP_GRACE, wait_for_exit(&mut rx2)).await {
                         Ok(Some(e)) => e,
@@ -606,7 +606,7 @@ impl PersistentProcessRegistry {
 }
 
 fn reject_spawn(mut p: SpawnParams, err: ErrorCode) -> Result<String, ErrorCode> {
-    let _ = entry::send_signal(p.os_pid, nix::sys::signal::Signal::SIGKILL);
+    let _ = entry::send_signal(p.os_pid, HostSignal::Kill);
     let _ = p.child.start_kill();
     let _ = p.child.try_wait();
     Err(err)

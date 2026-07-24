@@ -1,7 +1,7 @@
 //! Tests for the inbound socket handshake, including the optional
 //! per-connection principal challenge-response (issue #45/#852).
 //!
-//! The end-to-end tests drive a real host-local stream pair:
+//! The protocol tests drive a transport-neutral in-memory byte-stream pair:
 //! one half is fed to [`validate_handshake`] (the server), the other is
 //! driven by a minimal in-test client that mirrors the production framing in
 //! `astrid-uplink`. The claimed principal's profile is written to a
@@ -12,12 +12,11 @@
 use super::*;
 
 use astrid_core::dirs::AstridHome;
-use astrid_core::local_transport::LocalStream;
 use astrid_core::profile::{DeviceKey, DeviceScope};
 use astrid_core::session_token::{
     HandshakeRequest, HandshakeResponse, PROTOCOL_VERSION, principal_auth_challenge_message,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Build a Full-scope [`DeviceKey`] from a keypair's exported public key for
 /// the signature-verification tests (the scope is irrelevant to the pure
@@ -111,10 +110,12 @@ fn home_with_registered_key(
 }
 
 /// Write one length-prefixed JSON value, then read one back.
-async fn client_send_recv<T: serde::Serialize, R: serde::de::DeserializeOwned>(
-    stream: &mut LocalStream,
-    value: &T,
-) -> R {
+async fn client_send_recv<T, R, S>(stream: &mut S, value: &T) -> R
+where
+    T: serde::Serialize,
+    R: serde::de::DeserializeOwned,
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let bytes = serde_json::to_vec(value).unwrap();
     let len = u32::try_from(bytes.len()).unwrap();
     stream.write_all(&len.to_be_bytes()).await.unwrap();
@@ -135,7 +136,7 @@ fn token() -> SessionToken {
 
 #[tokio::test]
 async fn handshake_unsigned_returns_no_principal() {
-    let (mut server, mut client) = tokio::net::UnixStream::pair().unwrap();
+    let (mut server, mut client) = tokio::io::duplex(16 * 1024);
     let tok = token();
     let dir = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(dir.path());
@@ -169,7 +170,7 @@ async fn handshake_signed_returns_verified_principal() {
     let keypair = astrid_crypto::KeyPair::generate();
     let (_dir, home) = home_with_registered_key(&principal, &keypair);
 
-    let (mut server, mut client) = tokio::net::UnixStream::pair().unwrap();
+    let (mut server, mut client) = tokio::io::duplex(16 * 1024);
     let tok = token();
     let tok_hex = tok.to_hex();
     let server_task =
@@ -216,7 +217,7 @@ async fn handshake_bad_signature_fails_closed() {
     let keypair = astrid_crypto::KeyPair::generate();
     let (_dir, home) = home_with_registered_key(&principal, &keypair);
 
-    let (mut server, mut client) = tokio::net::UnixStream::pair().unwrap();
+    let (mut server, mut client) = tokio::io::duplex(16 * 1024);
     let tok = token();
     let tok_hex = tok.to_hex();
     let server_task =
