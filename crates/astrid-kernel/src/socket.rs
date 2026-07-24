@@ -426,9 +426,53 @@ pub fn remove_pid_file() {
 mod tests {
     use super::*;
 
+    struct PrivateTempDir {
+        path: std::path::PathBuf,
+        #[cfg(not(windows))]
+        _temporary: tempfile::TempDir,
+    }
+
+    impl PrivateTempDir {
+        fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for PrivateTempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn private_tempdir() -> PrivateTempDir {
+        #[cfg(windows)]
+        {
+            let runtime_root = astrid_core::platform_fs::default_astrid_home_root()
+                .expect("resolve Windows LocalAppData");
+            let local_app_data = runtime_root
+                .parent()
+                .and_then(std::path::Path::parent)
+                .expect("Astrid runtime root is below Windows LocalAppData");
+            let path = local_app_data.join(format!("AstridTest-{}", uuid::Uuid::new_v4().simple()));
+            astrid_core::platform_fs::ensure_private_directory(&path)
+                .expect("create a private Windows test directory");
+            PrivateTempDir { path }
+        }
+
+        #[cfg(not(windows))]
+        {
+            let temporary = tempfile::tempdir().expect("create test directory");
+            PrivateTempDir {
+                path: temporary.path().to_path_buf(),
+                _temporary: temporary,
+            }
+        }
+    }
+
     #[test]
     fn readiness_metadata_is_published_atomically() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let run_dir = dir.path().join("run");
         let path = run_dir.join("system.ready");
 
@@ -446,7 +490,7 @@ mod tests {
 
     #[test]
     fn readiness_metadata_replaces_a_crashed_daemons_stale_file() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let path = dir.path().join("system.ready");
         publish_readiness_metadata(&path, "v1:stale\n").unwrap();
 
@@ -458,7 +502,7 @@ mod tests {
 
     #[test]
     fn singleton_lock_is_exclusive() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let lock = dir.path().join("system.lock");
 
         // First acquisition holds the lock for the duration of `_first`.
@@ -480,7 +524,7 @@ mod tests {
         // any KV/audit store opens). Acquiring it must create the run dir and,
         // while held, block a second boot with the actionable "already running"
         // error — the loser never reaches (or touches) the shared stores.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let home = astrid_core::dirs::AstridHome::from_path(dir.path());
 
         let first = acquire_boot_singleton_lock(&home).expect("first boot acquires the lock");
@@ -507,7 +551,7 @@ mod tests {
 
     #[test]
     fn singleton_lock_is_released_on_drop() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let lock = dir.path().join("system.lock");
 
         // Acquire and drop — mirrors a daemon exiting and releasing the lock.

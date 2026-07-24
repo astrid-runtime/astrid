@@ -331,12 +331,17 @@ pub(crate) async fn ensure_daemon_workspace_matches(workspace_root: Option<&Path
 }
 
 fn expected_workspace_fingerprint(workspace_root: Option<&Path>) -> Result<String> {
-    let root = workspace_root.map_or_else(
-        || std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-        Path::to_path_buf,
-    );
+    let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    expected_workspace_fingerprint_from(workspace_root, &current_dir)
+}
+
+fn expected_workspace_fingerprint_from(
+    workspace_root: Option<&Path>,
+    current_dir: &Path,
+) -> Result<String> {
+    let root = workspace_root.unwrap_or(current_dir);
     astrid_core::dirs::checked_workspace_selection_fingerprint(
-        &root,
+        root,
         crate::workspace_layout::current(),
     )
     .context("selected workspace state path is unsafe")

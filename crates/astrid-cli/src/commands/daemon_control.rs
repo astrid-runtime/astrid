@@ -424,14 +424,14 @@ mod tests {
 
     #[test]
     fn read_pid_file_missing_is_none() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir();
         let path = dir.path().join("system.pid");
         assert_eq!(read_pid_file(&path), None);
     }
 
     #[test]
     fn read_pid_file_round_trips_pid_only() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir();
         let path = dir.path().join("system.pid");
         write_pid_fixture(&path, "424242");
         assert_eq!(read_pid_file(&path), Some((424_242, None)));
@@ -478,7 +478,7 @@ mod tests {
         // A guaranteed-nonexistent path under a fresh tempdir (never created),
         // standing in for a binary that an upgrade has already unlinked — a
         // unique temp path can't collide with a real install on the test host.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir();
         let gone = dir.path().join("astrid-daemon");
         assert!(!gone.exists(), "test precondition: path must not exist");
         // Recorded == live (both the original exec path) → confirmed our daemon.
@@ -494,7 +494,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn exe_matches_canonicalizes_live_when_file_exists() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir();
         let real = dir.path().join("astrid-daemon");
         std::fs::write(&real, b"#!/bin/true\n").unwrap();
         let recorded = std::fs::canonicalize(&real).unwrap();
@@ -537,7 +537,7 @@ mod tests {
     /// would SIGTERM/SIGKILL the test process — its survival IS the assertion.
     #[tokio::test]
     async fn terminate_orphan_refuses_mismatched_exe_for_live_pid() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir();
         let path = dir.path().join("system.pid");
         let me = std::process::id();
         write_pid_fixture(
@@ -557,7 +557,7 @@ mod tests {
     /// live process is also unconfirmable → `Unverified`, not killed.
     #[tokio::test]
     async fn terminate_orphan_refuses_live_pid_without_recorded_exe() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir();
         let path = dir.path().join("system.pid");
         let me = std::process::id();
         write_pid_fixture(&path, format!("{me}"));
@@ -567,7 +567,7 @@ mod tests {
 
     #[test]
     fn read_pid_file_garbage_is_none() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir();
         let path = dir.path().join("system.pid");
         write_pid_fixture(&path, "garbage\n");
         assert_eq!(read_pid_file(&path), None);
@@ -594,14 +594,14 @@ mod tests {
 
     #[tokio::test]
     async fn terminate_orphan_missing_pidfile_is_notrunning() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir();
         let path = dir.path().join("system.pid");
         assert_eq!(terminate_orphan(&path).await, KillOutcome::NotRunning);
     }
 
     #[tokio::test]
     async fn terminate_orphan_dead_pid_is_notrunning() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir();
         let path = dir.path().join("system.pid");
         write_pid_fixture(&path, "2000000000");
         assert_eq!(terminate_orphan(&path).await, KillOutcome::NotRunning);

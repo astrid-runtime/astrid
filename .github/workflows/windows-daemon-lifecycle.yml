@@ -92,14 +92,77 @@ jobs:
           --
           -D warnings
 
-      - name: Run native daemon lifecycle tests
+      - name: Test native CLI lifecycle decisions
         env:
           TARGET: ${{ matrix.target }}
         shell: pwsh
         run: >-
           cargo test
           -p astrid
+          --locked
+          --target $env:TARGET
+          commands::daemon::tests
+
+      - name: Test native process control
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: >-
+          cargo test
+          -p astrid
+          --locked
+          --target $env:TARGET
+          commands::daemon_control::tests
+
+      - name: Test unconfirmed stop exit status
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: >-
+          cargo test
+          -p astrid
+          --locked
+          --target $env:TARGET
+          dispatch::tests::stop_reports_unconfirmed_exit_to_automation
+
+      - name: Test native self-update transactions
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: >-
+          cargo test
+          -p astrid
+          --locked
+          --target $env:TARGET
+          commands::self_update::windows::tests
+
+      - name: Test shared self-update decisions
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: >-
+          cargo test
+          -p astrid
+          --locked
+          --target $env:TARGET
+          commands::self_update::tests
+
+      - name: Test native daemon runtime
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: >-
+          cargo test
           -p astrid-daemon
+          --locked
+          --target $env:TARGET
+
+      - name: Test native kernel runtime
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: >-
+          cargo test
           -p astrid-kernel
           --locked
           --target $env:TARGET

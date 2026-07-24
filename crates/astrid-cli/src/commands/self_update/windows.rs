@@ -514,7 +514,7 @@ mod tests {
 
     #[test]
     fn two_binary_transaction_swaps_daemon_then_cli_and_keeps_backups() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_support::private_tempdir();
         let install = directory.path();
         let staging = private_staging_dir(install);
         let daemon = install.join("astrid-daemon.exe");
@@ -550,7 +550,7 @@ mod tests {
 
     #[test]
     fn digest_tamper_refuses_before_replacing_any_binary() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_support::private_tempdir();
         let install = directory.path();
         let staging = private_staging_dir(install);
         let daemon = install.join("astrid-daemon.exe");
@@ -588,7 +588,7 @@ mod tests {
 
     #[test]
     fn invalid_second_target_refuses_before_replacing_first() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_support::private_tempdir();
         let install = directory.path();
         let staging = private_staging_dir(install);
         let daemon = install.join("astrid-daemon.exe");
@@ -619,8 +619,8 @@ mod tests {
 
     #[test]
     fn transaction_rejects_staging_directory_outside_install_directory() {
-        let directory = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
+        let directory = crate::test_support::private_tempdir();
+        let outside = crate::test_support::private_tempdir();
         let install = directory.path();
         let staging = outside.path().join(TEST_STAGE_NAME);
         let transaction = Transaction {
@@ -653,7 +653,7 @@ mod tests {
 
     #[test]
     fn transaction_rejects_executable_name_with_parent_traversal() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_support::private_tempdir();
         let install = directory.path();
         let staging = install.join(TEST_STAGE_NAME);
         let transaction = Transaction {
@@ -685,7 +685,7 @@ mod tests {
 
     #[test]
     fn next_invocation_removes_completed_stage_remnants_without_admin_rights() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_support::private_tempdir();
         let install = directory.path();
         let staging = private_staging_dir(install);
         write(&staging.join("helper.exe"), b"old updater");
@@ -697,7 +697,7 @@ mod tests {
 
     #[test]
     fn next_invocation_preserves_an_active_transaction() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_support::private_tempdir();
         let install = directory.path();
         let staging = private_staging_dir(install);
         write(&staging.join("helper.exe"), b"updater");
@@ -710,7 +710,7 @@ mod tests {
 
     #[test]
     fn next_invocation_ignores_unrecognized_stage_directories() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_support::private_tempdir();
         let install = directory.path();
         let staging = install.join(".astrid-update-stage.not-a-uuid");
         std::fs::create_dir(&staging).unwrap();

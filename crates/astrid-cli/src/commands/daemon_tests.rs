@@ -26,12 +26,12 @@ fn daemon_workspace_metadata_rejects_unknown_or_different_selection() {
 
 #[test]
 fn explicit_workspace_selection_wins_over_current_directory() {
-    let current = std::env::current_dir().expect("current directory");
-    let explicit = tempfile::tempdir().expect("explicit workspace");
-    assert_ne!(explicit.path(), current);
+    let explicit = crate::test_support::private_tempdir();
+    let current = crate::test_support::private_tempdir();
+    assert_ne!(explicit.path(), current.path());
 
     assert_eq!(
-        expected_workspace_fingerprint(Some(explicit.path())).unwrap(),
+        expected_workspace_fingerprint_from(Some(explicit.path()), current.path()).unwrap(),
         astrid_core::dirs::checked_workspace_selection_fingerprint(
             explicit.path(),
             crate::workspace_layout::current(),
@@ -39,9 +39,9 @@ fn explicit_workspace_selection_wins_over_current_directory() {
         .unwrap()
     );
     assert_eq!(
-        expected_workspace_fingerprint(None).unwrap(),
+        expected_workspace_fingerprint_from(None, current.path()).unwrap(),
         astrid_core::dirs::checked_workspace_selection_fingerprint(
-            &current,
+            current.path(),
             crate::workspace_layout::current(),
         )
         .unwrap()

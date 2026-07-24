@@ -40,6 +40,8 @@ mod principal;
 mod repl;
 /// The socket client for interacting with the Kernel.
 pub mod socket_client;
+#[cfg(test)]
+mod test_support;
 mod theme;
 mod tui;
 mod value_formatter;
