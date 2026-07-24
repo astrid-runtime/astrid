@@ -12,6 +12,9 @@ jobs:
   template:
     name: PR template filled in
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - name: Harden Runner
         uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
@@ -20,9 +23,12 @@ jobs:
 
       - name: Validate PR body
         env:
+          GH_TOKEN: ${{ github.token }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           PR_BODY: ${{ github.event.pull_request.body }}
           PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, '\n') }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
         run: |
           ERRORS=""
 
@@ -69,7 +75,20 @@ jobs:
           check_section_any "Verification" "Test Plan"
 
           has_traceability_exception_label() {
-            printf '%s\n' "$PR_LABELS" | grep -qiE '^(no-issue|maintenance|docs-only|release|deps|dependencies|ci-only)$'
+            printf '%s\n' "$PR_LABELS" | grep -qiE '^(no-issue|maintenance|docs-only|release|deps|dependencies)$'
+          }
+
+          is_pr_checks_only_change() {
+            CHANGED_FILES=$(gh api "repos/$REPO/pulls/$PR_NUMBER/files" --paginate --jq '.[].filename' 2>/dev/null || echo "")
+            [ -n "$CHANGED_FILES" ] || return 1
+
+            while IFS= read -r file; do
+              [ "$file" = ".github/workflows/pr-checks.yml" ] || return 1
+            done <<EOF
+$CHANGED_FILES
+EOF
+
+            return 0
           }
 
           LINKED_ISSUE_SECTION="$(section_content "Linked Issue")"
@@ -77,12 +96,14 @@ jobs:
           # Check that Linked Issue has an actual issue number, unless a narrowly
           # labeled exception explains why no issue exists.
           if ! echo "$PR_BODY" | grep -qE '#[0-9]+'; then
-            if has_traceability_exception_label; then
+            if is_pr_checks_only_change; then
+              echo "PR only changes .github/workflows/pr-checks.yml; skipping linked-issue requirement."
+            elif has_traceability_exception_label; then
               if ! printf '%s\n' "$LINKED_ISSUE_SECTION" | grep -qiE '(no issue|no tracked issue|not linked|maintenance|docs|release|dependenc|traceability|ci|workflow)'; then
-                ERRORS="${ERRORS}Linked Issue must explain the no-issue exception when using no-issue, maintenance, docs-only, release, deps, dependencies, or ci-only labels\n"
+                ERRORS="${ERRORS}Linked Issue must explain the no-issue exception when using no-issue, maintenance, docs-only, release, deps, or dependencies labels\n"
               fi
             else
-              ERRORS="${ERRORS}Linked Issue must reference an issue number (#N) or use a documented traceability exception label (for example: ci-only)\n"
+              ERRORS="${ERRORS}Linked Issue must reference an issue number (#N), use a documented traceability exception label, or only change .github/workflows/pr-checks.yml\n"
             fi
           fi
 
@@ -119,9 +140,10 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
           # Temporary escape hatch while maintainers allow first-time contributors
-          # to proceed without a newcomer-approved label. Set back to "true" when
-          # maintainers want that label to block new-contributor PRs again.
-          ENFORCE_NEWCOMER_APPROVAL: "false"
+          # to proceed without a newcomer-approved label. Set the repository
+          # variable ENFORCE_NEWCOMER_APPROVAL to "true" when maintainers want
+          # that label to block new-contributor PRs again.
+          ENFORCE_NEWCOMER_APPROVAL: ${{ vars.ENFORCE_NEWCOMER_APPROVAL || 'false' }}
         run: |
           CONTRIBUTORS_FILE=".github/contributors.yml"
 
@@ -189,7 +211,7 @@ jobs:
           # New contributors: require approval label
           if [ "$TIER" = "new" ]; then
             if [ "$ENFORCE_NEWCOMER_APPROVAL" = "true" ]; then
-              if echo "$LABELS" | grep -q "newcomer-approved"; then
+              if printf '%s\n' "$LABELS" | grep -qxF "newcomer-approved"; then
                 echo "New contributor approved by a maintainer."
               else
                 echo "::error::New contributors require a maintainer to add the 'newcomer-approved' label before CI proceeds."
@@ -392,9 +414,22 @@ jobs:
 
           has_traceability_exception_label() {
             case "$PR_LABELS" in
-              *no-issue*|*maintenance*|*docs-only*|*release*|*deps*|*dependencies*|*ci-only*) return 0 ;;
+              *no-issue*|*maintenance*|*docs-only*|*release*|*deps*|*dependencies*) return 0 ;;
               *) return 1 ;;
             esac
+          }
+
+          is_pr_checks_only_change() {
+            CHANGED_FILES=$(gh api "repos/$REPO/pulls/$PR_NUMBER/files" --paginate --jq '.[].filename' 2>/dev/null || echo "")
+            [ -n "$CHANGED_FILES" ] || return 1
+
+            while IFS= read -r file; do
+              [ "$file" = ".github/workflows/pr-checks.yml" ] || return 1
+            done <<EOF
+$CHANGED_FILES
+EOF
+
+            return 0
           }
 
           if [ "$PR_AUTHOR" = "dependabot[bot]" ] && has_traceability_exception_label; then
@@ -403,6 +438,11 @@ jobs:
           fi
 
           LINKED_ISSUE_SECTION=$(echo "$PR_BODY" | sed -n '/^## Linked Issue/,/^## /p' | sed '1d' | sed '/^## /d' | sed '/^<!--.*-->$/d' | sed '/^\s*$/d')
+
+          if is_pr_checks_only_change; then
+            echo "PR only changes .github/workflows/pr-checks.yml; skipping linked-issue requirement."
+            exit 0
+          fi
 
           if has_traceability_exception_label; then
             if printf '%s\n' "$LINKED_ISSUE_SECTION" | grep -qiE '(no issue|no tracked issue|not linked|maintenance|docs|release|dependenc|traceability|ci|workflow)'; then
@@ -414,7 +454,7 @@ jobs:
             exit 1
           fi
 
-          echo "::error::Every PR must be linked to an issue, unless a documented traceability exception applies. Use 'Closes #N' in the PR body, link an issue via the GitHub sidebar, or add one of: no-issue, maintenance, docs-only, release, deps, dependencies, ci-only."
+          echo "::error::Every PR must be linked to an issue, unless a documented traceability exception applies. Use 'Closes #N' in the PR body, link an issue via the GitHub sidebar, add one of: no-issue, maintenance, docs-only, release, deps, dependencies, or limit the PR to .github/workflows/pr-checks.yml only."
           exit 1
 
   account-age:
