@@ -49,6 +49,22 @@ prepare_runtime_dir() {
     sh "$mode"
 }
 
+runtime_path_is_symlink() {
+  local directory=$1
+  local relative=$2
+  # ASTRID_HOME is deliberately 0700 and owned by uid 65532, so the
+  # unprivileged host runner cannot inspect a child directly. Inspect through
+  # a short-lived root helper with the bind mounted read-only.
+  docker run --rm \
+    --platform linux/amd64 \
+    --user 0:0 \
+    --entrypoint /bin/sh \
+    --mount "type=bind,src=$directory,dst=/runtime,readonly" \
+    "$IMAGE" \
+    -ec 'test -L "/runtime/$1"' \
+    sh "$relative"
+}
+
 ARCH=$(docker image inspect "$IMAGE" --format '{{.Architecture}}')
 USER=$(docker image inspect "$IMAGE" --format '{{.Config.User}}')
 ENTRYPOINT=$(docker image inspect "$IMAGE" --format '{{json .Config.Entrypoint}}')
@@ -191,7 +207,7 @@ grep -q "FAKE_DAEMON_STARTED" "$TEST_ROOT/start.out" ||
   fail "valid signed distro did not reach the foreground daemon"
 [[ "$(cat "$run_dir/workspace/probe-victim")" == do-not-truncate ]] ||
   fail "writable-directory probe followed a pre-created symlink"
-[[ -L "$run_dir/state/.astrid-oci-write-probe.1" ]] ||
+runtime_path_is_symlink "$run_dir/state" ".astrid-oci-write-probe.1" ||
   fail "writable-directory probe consumed a pre-created symlink"
 if ! grep -Eq "Offline installation complete|Installation complete|Installed [0-9]+ capsule" "$TEST_ROOT/start.err"; then
   cat "$TEST_ROOT/start.err" >&2
