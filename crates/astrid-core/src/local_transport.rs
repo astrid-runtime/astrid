@@ -339,14 +339,14 @@ mod backend {
         unsupported_backend_error,
     };
 
-    pub(super) async fn connect(path: &Path) -> io::Result<LocalStream> {
+    pub(super) fn connect(path: &Path) -> std::future::Ready<io::Result<LocalStream>> {
         let _ = path;
-        Err(unsupported_backend_error())
+        std::future::ready(Err(unsupported_backend_error()))
     }
 
-    pub(super) async fn connect_outcome(path: &Path) -> io::Result<ConnectOutcome> {
+    pub(super) fn connect_outcome(path: &Path) -> std::future::Ready<io::Result<ConnectOutcome>> {
         let _ = path;
-        Err(unsupported_backend_error())
+        std::future::ready(Err(unsupported_backend_error()))
     }
 
     pub(super) fn bind(path: &Path) -> io::Result<LocalListener> {
@@ -354,9 +354,9 @@ mod backend {
         Err(unsupported_backend_error())
     }
 
-    pub(super) async fn accept(listener: &LocalListener) -> io::Result<LocalStream> {
+    pub(super) fn accept(listener: &LocalListener) -> std::future::Ready<io::Result<LocalStream>> {
         let _ = listener;
-        Err(unsupported_backend_error())
+        std::future::ready(Err(unsupported_backend_error()))
     }
 
     pub(super) fn split(stream: LocalStream) -> (LocalReadHalf, LocalWriteHalf) {

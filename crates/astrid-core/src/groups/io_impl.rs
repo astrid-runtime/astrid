@@ -6,6 +6,7 @@
 //! are serialized — built-ins are baked in and rebuilt on load.
 
 use std::collections::HashMap;
+#[cfg(not(windows))]
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -78,6 +79,9 @@ fn write_atomic(path: &Path, data: &[u8]) -> GroupConfigResult<()> {
             "groups path has no parent directory",
         ))
     })?;
+    #[cfg(windows)]
+    crate::platform_fs::ensure_private_directory(parent)?;
+    #[cfg(not(windows))]
     fs::create_dir_all(parent)?;
 
     #[cfg(unix)]
@@ -103,7 +107,12 @@ fn write_atomic(path: &Path, data: &[u8]) -> GroupConfigResult<()> {
         }
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        crate::platform_fs::atomic_write_private_file(path, data)?;
+    }
+
+    #[cfg(not(any(unix, windows)))]
     {
         fs::write(path, data)?;
     }
@@ -113,7 +122,7 @@ fn write_atomic(path: &Path, data: &[u8]) -> GroupConfigResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::fs;
 
     use crate::groups::{BUILTIN_ADMIN, BUILTIN_AGENT, BUILTIN_RESTRICTED, Group, GroupConfig};
 

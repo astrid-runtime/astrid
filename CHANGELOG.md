@@ -33,6 +33,25 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   archive and binding and signs an evidence manifest covering the tar, binding,
   SBOM, and release receipt without emulation, registry publication, or mutable
   and multi-architecture tags. Closes #1346.
+- **Windows filesystem security now has a fail-closed platform boundary.**
+  Windows builds resolve Astrid state beneath the per-user LocalAppData known
+  folder, protect runtime, workspace-state, and key paths with exact
+  current-user/System/Administrators ACLs, reject reparse-point redirects, and
+  keep trusted directory components identity-checked and locked against path
+  swaps. Self-update staging flushes bytes on the live volume and uses a
+  private transaction journal, OS-backed cross-process lock, identity-bound
+  source handles, and independent rollback copies to recover partial
+  `ReplaceFileW` mutations and interrupted multi-executable sets. Sensitive
+  single-file writes use the same journal-before-mutation rule with an
+  independent rollback, so interrupted session-token, profile, and group
+  writes restore the prior private file on the next operation. Their readers
+  share the transaction lock, recover before opening the live name, and read
+  through an identity-bound handle, so they cannot consume an uncommitted or
+  partially displaced private file.
+  Native x86_64 and ARM64 MSVC tests exercise the prerequisite without enabling
+  self-update, named pipes, daemon lifecycle, sandboxing, packaging, or a
+  Windows support claim.
+  Closes #1348.
 - **Foreground daemon logs can be routed to standard error.**
   `ASTRID_DAEMON_LOG_TARGET=stderr` sends ANSI-free daemon diagnostics to the
   process supervisor's standard-error stream. The strict override also accepts
