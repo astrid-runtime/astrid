@@ -162,8 +162,8 @@ docker build \
   --file "$TEST_ROOT/Dockerfile" \
   "$TEST_ROOT"
 
-mkdir -p "$run_dir/state" "$run_dir/workspace"
-chmod 0777 "$run_dir/state" "$run_dir/workspace"
+prepare_runtime_dir "$run_dir/state"
+prepare_runtime_dir "$run_dir/workspace"
 
 # A predictable-PID probe would truncate this symlink target in a container
 # where the entrypoint is PID 1. Exclusive mktemp probes must leave both alone.
@@ -203,8 +203,8 @@ python3 scripts/create_oci_test_shuttle.py \
 tampered_sha256=$(sha256sum "$TEST_ROOT/fixtures/tampered.shuttle")
 tampered_sha256=${tampered_sha256%% *}
 
-mkdir -p "$TEST_ROOT/tampered-state" "$TEST_ROOT/tampered-workspace"
-chmod 0777 "$TEST_ROOT/tampered-state" "$TEST_ROOT/tampered-workspace"
+prepare_runtime_dir "$TEST_ROOT/tampered-state"
+prepare_runtime_dir "$TEST_ROOT/tampered-workspace"
 if docker run --rm \
   --platform linux/amd64 \
   --read-only \
@@ -224,8 +224,8 @@ fi
 grep -q "distro signature verification failed" "$TEST_ROOT/tampered.err" ||
   fail "tampered signature did not fail at Astrid's internal signature gate"
 
-mkdir -p "$TEST_ROOT/missing-state" "$TEST_ROOT/missing-workspace"
-chmod 0777 "$TEST_ROOT/missing-state" "$TEST_ROOT/missing-workspace"
+prepare_runtime_dir "$TEST_ROOT/missing-state"
+prepare_runtime_dir "$TEST_ROOT/missing-workspace"
 if docker run --rm \
   --platform linux/amd64 \
   --read-only \
@@ -285,9 +285,11 @@ docker build \
   --file "$TEST_ROOT/SwapDockerfile" \
   "$TEST_ROOT"
 
-mkdir -p "$run_dir/swap-source" "$run_dir/swap-state" "$run_dir/swap-workspace"
+mkdir -p "$run_dir/swap-source"
 cp "$TEST_ROOT/fixtures/distro.shuttle" "$run_dir/swap-source/distro.shuttle"
-chmod 0777 "$run_dir/swap-source" "$run_dir/swap-state" "$run_dir/swap-workspace"
+chmod 0777 "$run_dir/swap-source"
+prepare_runtime_dir "$run_dir/swap-state"
+prepare_runtime_dir "$run_dir/swap-workspace"
 chmod 0666 "$run_dir/swap-source/distro.shuttle"
 if ! docker run --rm \
   --platform linux/amd64 \
