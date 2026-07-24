@@ -124,19 +124,22 @@ mod windows {
         drop(listener);
         wait_until_endpoint_is_absent(endpoint).await;
 
-        // The deliberately permissive first instance lets a genuine alternate
-        // effective token reach the server-side authorization boundary. The
-        // client sends bytes first, proving the production accept path performs
-        // its required real pre-read before it impersonates and rejects that
-        // token. The listener must already have installed its normal protected
-        // replacement and recover for a same-user client.
-        let mut permissive = Some(std::sync::Arc::new(
+        prove_effective_token_rejection(endpoint, &pipe_name, &user).await;
+
+        user.delete()
+            .expect("delete alternate-token test user after probes");
+    }
+
+    /// Prove the post-read authorization gate rejects an alternate effective
+    /// token and leaves the protected replacement listener usable.
+    async fn prove_effective_token_rejection(endpoint: &Path, pipe_name: &OsStr, user: &TestUser) {
+        let mut listener = Some(std::sync::Arc::new(
             local_transport::bind_permissive_first_instance_for_test(endpoint)
                 .expect("bind permissive effective-token probe instance"),
         ));
-        let effective_client = spawn_effective_token_thread(&user, &pipe_name);
+        let effective_client = spawn_effective_token_thread(user, pipe_name);
         let accept_result = tokio::time::timeout(Duration::from_secs(10), {
-            let listener = permissive
+            let listener = listener
                 .as_ref()
                 .expect("effective-token listener remains active");
             local_transport::accept(listener)
@@ -159,7 +162,7 @@ mod windows {
         if rejected.is_none() {
             // Close the namespace before joining so a failed probe cannot leave
             // its impersonated thread blocked while TestUser cleanup runs.
-            drop(permissive.take());
+            drop(listener.take());
         }
         effective_client
             .join()
@@ -171,15 +174,15 @@ mod windows {
             "post-read effective-token gate must reject before descriptor or PID checks: \
              {rejected}"
         );
-        let permissive = permissive.expect("rejected probe keeps listener active");
+        let listener = listener.expect("rejected probe keeps listener active");
 
         let executable = std::env::current_exe().expect("security harness executable");
         let mut recovery_child = Command::new(executable)
             .arg(SAME_USER_MODE)
-            .arg(&pipe_name)
+            .arg(pipe_name)
             .spawn()
             .expect("spawn recovery client");
-        let mut recovery_server = local_transport::accept(&permissive)
+        let mut recovery_server = local_transport::accept(&listener)
             .await
             .expect("protected replacement must accept same-user client");
         let mut recovery_bytes = [0_u8; 9];
@@ -197,9 +200,6 @@ mod windows {
             recovery_child.wait().expect("wait for recovery").success(),
             "listener did not recover after effective-token rejection"
         );
-
-        user.delete()
-            .expect("delete alternate-token test user after probes");
     }
 
     fn cross_user_child(target_pipe: &OsStr) {
