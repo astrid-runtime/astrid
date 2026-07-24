@@ -107,6 +107,63 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   transitive dependency is updated to 4.1.4 so crafted animation attributes
   cannot preserve a `javascript:` URL and the workspace security audit no
   longer accepts the vulnerable 4.1.3 release. Closes #1336.
+- **Principal-scoped generic compute groups for signed core-Wasm workers.**
+  Capsules can package hash-pinned worker modules, admit deterministic or
+  parallel worker groups over shared memory, and submit cancellable jobs through
+  an audited host boundary. Aggregate worker, memory, and optional fuel ceilings
+  are operator-controlled. Omitted daemon limits now derive a host-wide pool
+  from useful parallelism and physical RAM with a safety reserve; `auto` memory
+  requests intersect that pool, the signed worker maximum, live aggregate
+  usage, and the invoking principal profile. Worker fuel joins the ordinary
+  cross-capsule principal CPU ledger and rate limiter. Operators can clamp an
+  individual principal with `astrid quota set --compute-workers` and
+  `--cpu-fuel-per-sec`; the owner-operated CPU-rate default is unlimited, while
+  managed deployments can set a finite rate. The pre-1.0 WIT contract remains
+  deliberately unmerged until Astrid 1.0. Compute workers may also declare a
+  bounded set of immutable, BLAKE3-pinned package assets. The runtime verifies
+  and maps each file read-only once, shares those pages across principal-bound
+  worker Stores, and exposes only metered 64-KiB reads during admitted jobs;
+  workers receive neither host paths nor filesystem authority, and startup code
+  cannot use the asset path to bypass principal CPU accounting.
+- **Fresh principal memory admission now defaults to 4 GiB.** This is a virtual
+  ceiling rather than eager allocation, allowing development Realm and compiler
+  workloads to use a normal workstation while host-wide admission remains
+  dynamic. Managed installations can lower the existing per-principal quota.
+- **Principal-bound open-file resources now implement the existing Astrid FS
+  contract.** Capsules can perform bounded positional reads and writes, resize
+  and sync open files, inspect handle metadata, and atomically rename paths
+  within one confined VFS root. Handles are re-authorized on every operation
+  and count against an exact per-Store quota, enabling compiler and VM-backed
+  workloads without whole-file read-modify-write shims.
+
+### Fixed
+
+- **Long capsule invocations no longer inherit a hidden ten-billion-fuel
+  ceiling.** Interceptor fuel now derives from the invoking principal's
+  configured CPU rate and timeout; a zero rate or resource exemption is
+  genuinely unlimited while the wall-time deadline remains enforced. Because
+  Wasmtime's largest fuel tank is still finite, unlimited invocations account
+  and replenish it at cooperative epoch yields instead of eventually trapping.
+  A trapped component Store is retired and lazily rebuilt instead of poisoning
+  every later invocation for the same principal.
+- **Stateful compute-worker capsules retain one isolated Store per active
+  principal.** Same-principal calls serialize on their Store-local resource
+  table, unrelated principals can execute concurrently up to the ordinary
+  instance-pool ceiling, and idle Stores remain evictable cache backed by
+  principal-scoped durable storage. Lazily grown Stores also use a non-wrapping
+  epoch horizon, preventing an already-advanced engine epoch from trapping a
+  newly admitted principal during component instantiation.
+- **Capsule CLI commands no longer inherit a hidden 70-second transport
+  deadline.** The foreground result wait now defaults to 310 seconds, just
+  beyond the ordinary principal invocation budget, and operators can set
+  `ASTRID_CAPSULE_COMMAND_TIMEOUT_SECS` from 1 through 86,700 seconds for
+  deliberately longer principal budgets. Expiry now warns that cancellation
+  is not yet propagated instead of implying that the target stopped.
+- **Filesystem metadata now distinguishes `stat` from `lstat`.** Following
+  metadata resolves a final symlink, while `fs-stat-symlink` inspects the link
+  entry itself without granting authority over an escaping target. This lets
+  Linux-style workspace projections handle symlinks without relying on an
+  accidental VFS implementation detail.
 - **Stable crates publication installs its authenticated-hash prerequisite.**
   The protected publisher installs the pinned `b3sum` binary before validating
   the exact dev candidate, so BLAKE3 release metadata checks run before any

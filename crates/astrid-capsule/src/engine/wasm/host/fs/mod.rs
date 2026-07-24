@@ -1,20 +1,19 @@
 //! `astrid:fs@1.0.0` host implementation.
 //!
 //! Path-based ops route through the workspace / home / tmp VFS bundles
-//! after passing the per-principal security gate. The FileHandle resource
-//! is stubbed in `file_handle.rs` pending the dedicated handle-lifecycle
-//! port-back.
+//! after passing the per-principal security gate. Open files are retained as
+//! principal-bound resources and re-authorized on every operation.
 //!
 //! Live surface (the most-used legacy fns ported to typed errors):
 //!
-//! - fs-exists, fs-mkdir, fs-readdir, fs-stat, fs-unlink, read-file,
-//!   write-file
+//! - fs-open + FileHandle positional I/O, stat, resize, sync and close
+//! - fs-exists, fs-mkdir, fs-readdir, fs-stat, fs-stat-symlink, fs-unlink,
+//!   fs-rename, read-file, write-file
 //!
 //! Stubbed (planned for follow-ups; all return Unknown so capsules can
 //! handle them as transient failures):
 //!
-//! - fs-open + FileHandle resource (positional pread/pwrite, fsync, etc.)
-//! - fs-mkdir-all, fs-stat-symlink, fs-append, fs-copy, fs-rename,
+//! - fs-mkdir-all, fs-append, fs-copy,
 //!   fs-remove-dir-all, fs-canonicalize, fs-read-link, fs-hard-link
 //!
 //! Audit: every path-based op emits `astrid.audit.fs` per call
@@ -26,15 +25,19 @@
 mod file_handle;
 mod resolve;
 
+pub use file_handle::OpenFileHandle;
+
+use std::sync::Arc;
+
 use wasmtime::component::Resource;
 
 use crate::audit_sink::{HostAuditEvent, HostAuditOutcome};
 use crate::engine::wasm::bindings::astrid::fs::host::{
-    self as fs, Datetime, ErrorCode, FileHandle, FileStat, FileType, OpenMode,
+    self as fs, Datetime, ErrorCode, FileStat, FileType, OpenMode,
 };
 use crate::engine::wasm::host::util;
 use crate::engine::wasm::host_state::HostState;
-use resolve::{resolve_path, resolve_vfs};
+use resolve::{resolve_path, resolve_path_symlink, resolve_vfs};
 
 /// Audit envelope for path-based fs operations.
 ///
@@ -43,8 +46,8 @@ use resolve::{resolve_path, resolve_vfs};
 /// is installed, reports a typed event onto the kernel's signed audit chain.
 /// The op string maps to an event class: content/metadata reads →
 /// [`FileRead`], mutations → [`FileWrite`], removals → [`FileDelete`]. Ops
-/// that don't clearly map (e.g. `fs-open`) skip the sink rather than invent a
-/// variant.
+/// that don't clearly map (e.g. `fs-open`, whose effect depends on the open
+/// mode) skip the sink rather than invent a variant.
 pub(crate) fn audit_fs<T, E: std::fmt::Debug>(
     state: &HostState,
     op: &str,
@@ -99,12 +102,10 @@ fn fs_event_for_op<'a>(op: &str, path: &'a str) -> Option<HostAuditEvent<'a>> {
     // forms classify identically.
     let verb = op.rsplit('.').next().unwrap_or(op);
     match verb {
-        "read-file" | "fs-readdir" | "readdir" | "fs-stat" | "stat" | "fs-exists" | "exists" => {
-            Some(HostAuditEvent::FileRead { path })
-        },
-        "write-file" | "fs-mkdir" | "mkdir" | "fs-mkdir-all" => {
-            Some(HostAuditEvent::FileWrite { path })
-        },
+        "read-file" | "read-at" | "fs-readdir" | "readdir" | "fs-stat" | "fs-stat-symlink"
+        | "stat" | "fs-exists" | "exists" => Some(HostAuditEvent::FileRead { path }),
+        "write-file" | "write-at" | "set-len" | "sync-data" | "sync-all" | "fs-mkdir" | "mkdir"
+        | "fs-mkdir-all" | "fs-rename" => Some(HostAuditEvent::FileWrite { path }),
         "fs-unlink" | "unlink" | "remove" | "remove-dir" => {
             Some(HostAuditEvent::FileDelete { path })
         },
@@ -170,6 +171,7 @@ fn map_vfs_err(e: astrid_vfs::VfsError) -> ErrorCode {
 #[cfg(test)]
 mod error_mapping_tests {
     use super::*;
+    use crate::engine::wasm::test_fixtures::minimal_host_state;
 
     #[test]
     fn native_not_found_and_permission_denied_remain_typed() {
@@ -188,6 +190,63 @@ mod error_mapping_tests {
             astrid_vfs::VfsError::Io(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
 
         assert!(matches!(map_vfs_err(error), ErrorCode::Unknown(_)));
+    }
+
+    #[test]
+    fn file_handle_and_rename_operations_map_to_typed_audit_events() {
+        assert!(matches!(
+            fs_event_for_op("astrid:fs/file-handle.read-at", "/workspace/input"),
+            Some(HostAuditEvent::FileRead { .. })
+        ));
+        assert!(matches!(
+            fs_event_for_op("astrid:fs/file-handle.write-at", "/workspace/output"),
+            Some(HostAuditEvent::FileWrite { .. })
+        ));
+        assert!(matches!(
+            fs_event_for_op("astrid:fs/host.fs-rename", "/workspace/renamed"),
+            Some(HostAuditEvent::FileWrite { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fs_stat_follows_but_fs_stat_symlink_preserves_the_final_link() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("root");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(root.path().join("target.txt"), b"inside").expect("inside target");
+        std::fs::write(outside.path().join("outside.txt"), b"outside").expect("outside target");
+        symlink("target.txt", root.path().join("inside-link")).expect("inside symlink");
+        symlink(
+            outside.path().join("outside.txt"),
+            root.path().join("escape-link"),
+        )
+        .expect("escaping symlink");
+
+        let root_handle = astrid_capabilities::DirHandle::new();
+        let vfs = astrid_vfs::HostVfs::with_registered_dir(root_handle.clone(), root.path())
+            .expect("host VFS");
+        let mut state = minimal_host_state(tokio::runtime::Handle::current());
+        state.workspace_root = root.path().to_path_buf();
+        state.vfs = Arc::new(vfs);
+        state.vfs_root_handle = root_handle;
+
+        let followed = <HostState as fs::Host>::fs_stat(&mut state, "inside-link".to_owned())
+            .expect("following stat");
+        assert!(matches!(followed.kind, FileType::Regular));
+        let link = <HostState as fs::Host>::fs_stat_symlink(&mut state, "inside-link".to_owned())
+            .expect("non-following stat");
+        assert!(matches!(link.kind, FileType::Symlink));
+
+        assert!(matches!(
+            <HostState as fs::Host>::fs_stat(&mut state, "escape-link".to_owned()),
+            Err(ErrorCode::BoundaryEscape)
+        ));
+        let escaping_link =
+            <HostState as fs::Host>::fs_stat_symlink(&mut state, "escape-link".to_owned())
+                .expect("the confined link itself remains inspectable");
+        assert!(matches!(escaping_link.kind, FileType::Symlink));
     }
 }
 
@@ -319,19 +378,21 @@ fn to_file_stat(meta: &astrid_vfs::VfsMetadata) -> FileStat {
     }
 }
 
+fn to_symlink_file_stat(meta: &astrid_vfs::VfsSymlinkMetadata) -> FileStat {
+    let mut stat = to_file_stat(&meta.metadata);
+    if meta.is_symlink {
+        stat.kind = FileType::Symlink;
+    }
+    stat
+}
+
 impl fs::Host for HostState {
     fn fs_open(
         &mut self,
-        _path: String,
-        _mode: OpenMode,
-    ) -> Result<Resource<FileHandle>, ErrorCode> {
-        // FileHandle resource lifecycle (positional pread/pwrite, fsync,
-        // set-len) lands in a follow-up. Capsules calling fs-open today
-        // see `unknown("not yet implemented")` and can fall back to
-        // read-file / write-file.
-        Err(ErrorCode::Unknown(
-            "fs-open: FileHandle resource port pending".to_string(),
-        ))
+        path: String,
+        mode: OpenMode,
+    ) -> Result<Resource<OpenFileHandle>, ErrorCode> {
+        file_handle::open(self, path, mode)
     }
 
     fn fs_exists(&mut self, path: String) -> Result<bool, ErrorCode> {
@@ -493,10 +554,27 @@ impl fs::Host for HostState {
         result
     }
 
-    fn fs_stat_symlink(&mut self, _path: String) -> Result<FileStat, ErrorCode> {
-        Err(ErrorCode::Unknown(
-            "fs-stat-symlink: lstat port pending".to_string(),
-        ))
+    fn fs_stat_symlink(&mut self, path: String) -> Result<FileStat, ErrorCode> {
+        let resolved = resolve_path_symlink(self, &path).map_err(map_resolve_err)?;
+        gate_read(self, &resolved.physical)?;
+        let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
+        let result = util::bounded_block_on(
+            &self.runtime_handle,
+            &self.blocking_semaphore,
+            vfs_path.vfs.stat_symlink(
+                &vfs_path.handle,
+                vfs_path.relative.to_string_lossy().as_ref(),
+            ),
+        )
+        .map(|metadata| to_symlink_file_stat(&metadata))
+        .map_err(map_vfs_err);
+        audit_fs(
+            self,
+            "astrid:fs/host.fs-stat-symlink",
+            &resolved.physical.to_string_lossy(),
+            &result,
+        );
+        result
     }
 
     fn fs_unlink(&mut self, path: String) -> Result<(), ErrorCode> {
@@ -635,10 +713,36 @@ impl fs::Host for HostState {
         ))
     }
 
-    fn fs_rename(&mut self, _src: String, _dst: String) -> Result<(), ErrorCode> {
-        Err(ErrorCode::Unknown(
-            "fs-rename: VFS rename port pending".to_string(),
-        ))
+    fn fs_rename(&mut self, src: String, dst: String) -> Result<(), ErrorCode> {
+        let resolved_src = resolve_path(self, &src).map_err(map_resolve_err)?;
+        let resolved_dst = resolve_path(self, &dst).map_err(map_resolve_err)?;
+        if resolved_src.target != resolved_dst.target {
+            return Err(ErrorCode::CrossVfs);
+        }
+        gate_write(self, &resolved_src.physical, WriteKind::Delete)?;
+        gate_write(self, &resolved_dst.physical, WriteKind::Write)?;
+        let src_vfs = resolve_vfs(self, &resolved_src).map_err(map_resolve_err)?;
+        let dst_vfs = resolve_vfs(self, &resolved_dst).map_err(map_resolve_err)?;
+        if src_vfs.handle != dst_vfs.handle || !Arc::ptr_eq(&src_vfs.vfs, &dst_vfs.vfs) {
+            return Err(ErrorCode::CrossVfs);
+        }
+        let result = util::bounded_block_on(
+            &self.runtime_handle,
+            &self.blocking_semaphore,
+            src_vfs.vfs.rename(
+                &src_vfs.handle,
+                src_vfs.relative.to_string_lossy().as_ref(),
+                dst_vfs.relative.to_string_lossy().as_ref(),
+            ),
+        )
+        .map_err(map_vfs_err);
+        audit_fs(
+            self,
+            "astrid:fs/host.fs-rename",
+            &resolved_dst.physical.to_string_lossy(),
+            &result,
+        );
+        result
     }
 
     fn fs_remove_dir_all(&mut self, _path: String) -> Result<u64, ErrorCode> {

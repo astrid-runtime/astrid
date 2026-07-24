@@ -360,6 +360,10 @@ pub struct HostState {
     /// file resolves to `Some(PrincipalProfile::default())` (a missing file is
     /// not an error — see [`PrincipalProfile::load`](astrid_core::profile::PrincipalProfile::load)).
     pub invocation_profile: Option<Arc<astrid_core::profile::PrincipalProfile>>,
+    /// Whether the verified invoking principal is capability-exempt from
+    /// resource ceilings for this invocation. Computed by the engine from the
+    /// live profile and group policy; capsules cannot set it.
+    pub invocation_resource_exempt: bool,
     /// Shared profile-cache handle, used by the `ipc::recv` path to resolve
     /// the invoking principal's [`PrincipalProfile`](astrid_core::profile::PrincipalProfile)
     /// into [`invocation_profile`](Self::invocation_profile).
@@ -471,6 +475,12 @@ pub struct HostState {
     /// model is principal-scoped, a separate axis), so a snapshot taken once
     /// is correct for the capsule's whole lifetime and across the pool.
     pub capability_names: Vec<String>,
+    /// Generic compute runtime, present only when the signed manifest declares
+    /// the fail-closed `compute` capability.
+    pub compute_runtime: Option<Arc<astrid_compute::ComputeRuntime>>,
+    /// Hash-verified `compute-worker` artifacts declared by this capsule,
+    /// keyed by component id. Workers cannot be supplied dynamically.
+    pub compute_workers: Arc<std::collections::HashMap<String, astrid_compute::WorkerArtifact>>,
     /// Operator-approved local-egress allowlist for THIS capsule, as
     /// `host:port` / `host:*` patterns (from `[security.capsule_local_egress]`,
     /// keyed by capsule id). Endpoints listed here are exempt from the
@@ -616,6 +626,10 @@ pub struct HostState {
     /// Monotonic counter for HTTP stream handle IDs.
     /// Starts at 1 (0 reserved as sentinel).
     pub next_http_stream_id: u64,
+    /// Live `astrid:fs` file handles in this Store's resource table.
+    /// Shared with each resource's RAII drop guard so the frozen 16-handle
+    /// contract remains exact even when the entire table is reset.
+    pub open_file_count: Arc<std::sync::atomic::AtomicUsize>,
     /// Tracks active child process PIDs for cancellation.
     ///
     /// Shared with the cancel listener background task. The spawn host function

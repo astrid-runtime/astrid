@@ -63,6 +63,12 @@ pub(crate) struct SetArgs {
     /// Maximum concurrent background processes.
     #[arg(long, value_name = "N")]
     pub processes: Option<u32>,
+    /// Maximum aggregate generic-compute workers. Zero delegates to the host.
+    #[arg(long = "compute-workers", value_name = "N")]
+    pub compute_workers: Option<u32>,
+    /// Maximum Wasmtime fuel charged per second. Zero removes the rate cap.
+    #[arg(long = "cpu-fuel-per-sec", value_name = "FUEL")]
+    pub cpu_fuel_per_sec: Option<u64>,
     /// Maximum IPC throughput (e.g. `10MB/s`, `1MiB`).
     #[arg(long = "ipc-rate", value_name = "RATE")]
     pub ipc_rate: Option<String>,
@@ -92,6 +98,8 @@ pub(crate) struct QuotaRecord {
     pub max_ipc_throughput_bytes: u64,
     /// Maximum concurrent background processes.
     pub max_background_processes: u32,
+    /// Maximum aggregate generic-compute workers. Zero delegates to the host.
+    pub max_compute_workers: u32,
     /// Maximum persistent home-directory storage (bytes).
     pub max_storage_bytes: u64,
     /// Maximum CPU rate in wasmtime fuel units per second.
@@ -105,6 +113,7 @@ fn record(principal: &PrincipalId, q: &Quotas) -> QuotaRecord {
         max_timeout_secs: q.max_timeout_secs,
         max_ipc_throughput_bytes: q.max_ipc_throughput_bytes,
         max_background_processes: q.max_background_processes,
+        max_compute_workers: q.max_compute_workers,
         max_storage_bytes: q.max_storage_bytes,
         max_cpu_fuel_per_sec: q.max_cpu_fuel_per_sec,
     }
@@ -181,6 +190,15 @@ fn print_quotas_pretty(principal: &PrincipalId, q: &Quotas) {
         "  {:<24}  {}",
         "processes".bold(),
         q.max_background_processes
+    );
+    println!(
+        "  {:<24}  {}",
+        "compute-workers".bold(),
+        if q.max_compute_workers == 0 {
+            "auto".to_owned()
+        } else {
+            q.max_compute_workers.to_string()
+        }
     );
     println!(
         "  {:<24}  {}/s",
@@ -276,6 +294,8 @@ async fn run_set(args: SetArgs) -> Result<ExitCode> {
         && args.timeout.is_none()
         && args.storage.is_none()
         && args.processes.is_none()
+        && args.compute_workers.is_none()
+        && args.cpu_fuel_per_sec.is_none()
         && args.ipc_rate.is_none()
     {
         eprintln!("astrid: nothing to do (specify at least one quota flag)");
@@ -311,6 +331,12 @@ async fn run_set(args: SetArgs) -> Result<ExitCode> {
             anyhow::bail!("processes exceeds upper bound ({BACKGROUND_PROCESSES_UPPER_BOUND})");
         }
         quotas.max_background_processes = n;
+    }
+    if let Some(n) = args.compute_workers {
+        quotas.max_compute_workers = n;
+    }
+    if let Some(fuel) = args.cpu_fuel_per_sec {
+        quotas.max_cpu_fuel_per_sec = fuel;
     }
     if let Some(s) = args.ipc_rate.as_deref() {
         quotas.max_ipc_throughput_bytes = parse_bytes(s).context("invalid --ipc-rate")?;
@@ -479,11 +505,14 @@ fn format_fuel(n: u64) -> String {
     }
 }
 
-/// Render a fuel-per-second ceiling. The configured ceiling is always `> 0`
-/// (validation rejects `0` — there is no "unlimited" sentinel; unbounded CPU is
-/// a capability, surfaced separately by the `exempt` flag).
+/// Render a fuel-per-second ceiling. Zero is the owner-operated unlimited
+/// default; capability exemption remains visible separately in usage output.
 fn format_fuel_rate(n: u64) -> String {
-    format!("{}/s", format_fuel(n))
+    if n == 0 {
+        "unlimited".to_owned()
+    } else {
+        format!("{}/s", format_fuel(n))
+    }
 }
 
 /// Render a duration as `1h2m3s` / `5m` / `30s` / `500ms`.
@@ -604,6 +633,7 @@ mod tests {
             max_cpu_fuel_per_sec: 7_777,
             max_memory_bytes: 11,
             max_storage_bytes: 22,
+            max_compute_workers: 3,
             ..Quotas::default()
         };
         let r = record(&p, &q);
@@ -611,6 +641,7 @@ mod tests {
         assert_eq!(r.max_cpu_fuel_per_sec, 7_777);
         assert_eq!(r.max_memory_bytes, 11);
         assert_eq!(r.max_storage_bytes, 22);
+        assert_eq!(r.max_compute_workers, 3);
     }
 
     #[test]
@@ -625,8 +656,7 @@ mod tests {
 
     #[test]
     fn formats_fuel_rate_as_per_second() {
-        // The ceiling is always > 0 (validation rejects 0); unbounded CPU is
-        // the `exempt` flag, never a "0 = unlimited" sentinel here.
+        assert_eq!(format_fuel_rate(0), "unlimited");
         assert_eq!(format_fuel_rate(1_000_000_000), "1.0G/s");
         assert_eq!(format_fuel_rate(500), "500/s");
     }

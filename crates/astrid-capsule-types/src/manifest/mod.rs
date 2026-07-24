@@ -375,7 +375,7 @@ pub struct PackageDef {
     pub metadata: Option<serde_json::Value>,
 }
 
-/// Defines an executable or library component within the capsule.
+/// Defines an executable, library, or compute-worker component in a capsule.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComponentDef {
     /// Unique identifier for this component within the capsule.
@@ -386,7 +386,9 @@ pub struct ComponentDef {
     pub path: PathBuf,
     /// Expected hash for security verification.
     pub hash: Option<String>,
-    /// Type of component: "executable" (default) or "library".
+    /// Type of component: "executable" (default), "library", or
+    /// "compute-worker". Compute workers are hash-pinned core-Wasm modules;
+    /// they are not controller Components.
     #[serde(default)]
     pub r#type: String,
     /// List of component IDs this component dynamically links to.

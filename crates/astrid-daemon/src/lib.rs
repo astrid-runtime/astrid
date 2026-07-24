@@ -55,6 +55,31 @@ pub struct Args {
     /// host-derived value (cores-scaled, replacing the old fixed 16).
     #[arg(long)]
     pub instance_pool_size: Option<usize>,
+
+    /// Override aggregate generic compute workers per principal. Omit to use
+    /// only the invoking principal's profile ceiling.
+    #[arg(long, value_parser = parse_nonzero_u32)]
+    pub compute_max_workers_per_principal: Option<u32>,
+
+    /// Override aggregate generic compute shared memory per principal, in
+    /// bytes. Omit to use only the invoking principal's profile ceiling.
+    #[arg(long, value_parser = parse_nonzero_u64)]
+    pub compute_max_shared_memory_bytes_per_principal: Option<u64>,
+
+    /// Override the Wasmtime fuel ceiling for one generic compute job. Omit
+    /// for no Astrid-specific job-fuel cap.
+    #[arg(long, value_parser = parse_nonzero_u64)]
+    pub compute_max_job_fuel: Option<u64>,
+
+    /// Override the daemon-wide generic compute worker pool. Omit to derive it
+    /// from the host's available parallelism.
+    #[arg(long, value_parser = parse_nonzero_u32)]
+    pub compute_host_max_workers: Option<u32>,
+
+    /// Override daemon-wide generic compute shared memory, in bytes. Omit to
+    /// derive it from host RAM while retaining a dynamic safety reserve.
+    #[arg(long, value_parser = parse_nonzero_u64)]
+    pub compute_host_max_shared_memory_bytes: Option<u64>,
 }
 
 /// Reject a concurrency ceiling of `0` at CLI parse time. `0` would otherwise
@@ -67,6 +92,22 @@ fn parse_nonzero_concurrency(s: &str) -> Result<usize, String> {
         Ok(0) => Err("must be >= 1 (a concurrency ceiling of 0 would wedge the gate)".to_string()),
         Ok(n) => Ok(n),
         Err(e) => Err(format!("not a valid concurrency value: {e}")),
+    }
+}
+
+fn parse_nonzero_u32(s: &str) -> Result<u32, String> {
+    match s.parse::<u32>() {
+        Ok(0) => Err("must be >= 1".to_owned()),
+        Ok(value) => Ok(value),
+        Err(error) => Err(format!("not a valid positive integer: {error}")),
+    }
+}
+
+fn parse_nonzero_u64(s: &str) -> Result<u64, String> {
+    match s.parse::<u64>() {
+        Ok(0) => Err("must be >= 1".to_owned()),
+        Ok(value) => Ok(value),
+        Err(error) => Err(format!("not a valid positive integer: {error}")),
     }
 }
 
@@ -136,6 +177,66 @@ fn resolve_capsule_limits(
         args.instance_pool_size
             .or_else(|| capsule_cfg.and_then(|c| c.instance_pool_size)),
     )
+}
+
+/// Resolve independent generic-compute policy without changing the stable
+/// capsule host-call limits type.
+fn resolve_compute_limits(
+    args: &Args,
+    cfg: Option<&astrid_config::Config>,
+) -> astrid_capsule::ComputeRuntimeLimits {
+    let capsule_cfg = cfg.map(|c| &c.capsule);
+    let configured_workers = args
+        .compute_max_workers_per_principal
+        .or_else(|| capsule_cfg.and_then(|c| c.compute_max_workers_per_principal));
+    let configured_memory = args
+        .compute_max_shared_memory_bytes_per_principal
+        .or_else(|| capsule_cfg.and_then(|c| c.compute_max_shared_memory_bytes_per_principal));
+    let host_workers = args
+        .compute_host_max_workers
+        .or_else(|| capsule_cfg.and_then(|c| c.compute_host_max_workers))
+        .unwrap_or_else(host_compute_workers);
+    let host_memory = args
+        .compute_host_max_shared_memory_bytes
+        .or_else(|| capsule_cfg.and_then(|c| c.compute_host_max_shared_memory_bytes))
+        .unwrap_or_else(host_compute_memory_bytes);
+    astrid_capsule::ComputeRuntimeLimits::resolve_with_host(
+        configured_workers,
+        configured_memory,
+        args.compute_max_job_fuel
+            .or_else(|| capsule_cfg.and_then(|c| c.compute_max_job_fuel)),
+        Some(host_workers),
+        Some(host_memory),
+    )
+}
+
+fn host_compute_workers() -> u32 {
+    std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .ok()
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(1)
+        .max(1)
+}
+
+fn host_compute_memory_bytes() -> u64 {
+    let mut system = sysinfo::System::new();
+    system.refresh_memory();
+    compute_memory_budget(system.total_memory())
+}
+
+/// Leave the host a material safety reserve while making the remaining RAM
+/// available to principal-scoped compute admission. The 1/8 reserve scales on
+/// workstations; the 1 `GiB` floor protects small machines. Detection failure
+/// falls back to a useful but conservative 2 `GiB` envelope.
+fn compute_memory_budget(total: u64) -> u64 {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const FALLBACK: u64 = 2 * GIB;
+    if total == 0 {
+        return FALLBACK;
+    }
+    let reserve = (total / 8).max(GIB).min(total / 2);
+    total.saturating_sub(reserve).max(1)
 }
 
 /// Resolve the `astrid:http` operator host policy from the `[http]` config
@@ -243,6 +344,7 @@ pub async fn run() -> Result<()> {
     // host-derived default); the kernel forwards them to every `WasmEngine`.
     // Done before `args.workspace` is consumed below.
     let runtime_limits = resolve_capsule_limits(&args, unified_cfg.as_ref());
+    let compute_limits = resolve_compute_limits(&args, unified_cfg.as_ref());
 
     // Operator-approved per-capsule local-egress allowlist (SSRF-airlock
     // exemptions). Operator config only — the kernel hands each capsule its
@@ -255,12 +357,13 @@ pub async fn run() -> Result<()> {
     // Operator ceilings for the astrid:http host (global; absent `[http]`
     // config = the host's historical constants). Forwarded to every capsule.
     let http_limits = resolve_http_limits(unified_cfg.as_ref());
-    let kernel = astrid_kernel::Kernel::new_with_workspace_layout(
+    let kernel = astrid_kernel::Kernel::new_with_workspace_layout_and_compute_policy(
         session_id.clone(),
         workspace_root,
         runtime_limits,
         local_egress,
         http_limits,
+        compute_limits,
         workspace_layout,
     )
     .await
@@ -485,10 +588,11 @@ fn spawn_gateway(
 #[cfg(test)]
 mod tests {
     use super::{
-        DAEMON_LOG_TARGET_ENV, daemon_log_config, provides_cli_socket_uplink,
-        write_readiness_then_arm_ephemeral,
+        Args, DAEMON_LOG_TARGET_ENV, compute_memory_budget, daemon_log_config,
+        provides_cli_socket_uplink, resolve_compute_limits, write_readiness_then_arm_ephemeral,
     };
     use astrid_capsule::manifest::CapsuleManifest;
+    use clap::Parser;
     use std::sync::Mutex;
 
     fn manifest(name: &str, uplink: bool, net_bind: &[&str]) -> CapsuleManifest {
@@ -602,5 +706,38 @@ mod tests {
         );
         assert_eq!(result, Err("failed"));
         assert_eq!(*steps.lock().expect("steps lock"), ["ready-failed"]);
+    }
+
+    #[test]
+    fn compute_memory_budget_scales_and_keeps_a_host_reserve() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        assert_eq!(compute_memory_budget(0), 2 * GIB);
+        assert_eq!(compute_memory_budget(4 * GIB), 3 * GIB);
+        assert_eq!(compute_memory_budget(16 * GIB), 14 * GIB);
+        assert_eq!(compute_memory_budget(192 * GIB), 168 * GIB);
+    }
+
+    #[test]
+    fn compute_host_and_principal_overrides_resolve_independently() {
+        let args = Args::try_parse_from([
+            "astrid-daemon",
+            "--compute-max-workers-per-principal",
+            "3",
+            "--compute-max-shared-memory-bytes-per-principal",
+            "1073741824",
+            "--compute-host-max-workers",
+            "12",
+            "--compute-host-max-shared-memory-bytes",
+            "8589934592",
+        ])
+        .unwrap();
+        let limits = resolve_compute_limits(&args, None);
+        assert_eq!(limits.max_workers_per_principal, Some(3));
+        assert_eq!(
+            limits.max_shared_memory_bytes_per_principal,
+            Some(1_073_741_824)
+        );
+        assert_eq!(limits.host_max_workers, Some(12));
+        assert_eq!(limits.host_max_shared_memory_bytes, Some(8_589_934_592));
     }
 }

@@ -78,6 +78,7 @@ impl HostState {
             invocation_secret_store: None,
             invocation_capsule_log: None,
             invocation_profile: None,
+            invocation_resource_exempt: false,
             profile_cache: None,
             invocation_env_overlay: None,
             kv_backend,
@@ -98,6 +99,8 @@ impl HostState {
             // Hooks run outside the manifest/security-gate lifecycle: no held
             // capabilities and no local-egress exemptions (both fail-closed).
             capability_names: Vec::new(),
+            compute_runtime: None,
+            compute_workers: Arc::new(HashMap::new()),
             local_egress: Vec::new(),
             http_limits,
             // Transient hook execution never subscribes to the audit feed;
@@ -108,6 +111,7 @@ impl HostState {
             cli_socket_listener: None,
             active_http_streams: HashMap::new(),
             next_http_stream_id: 1,
+            open_file_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             lifecycle_phase: None,
             secret_store,
             ready_tx: None,

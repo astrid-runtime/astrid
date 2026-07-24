@@ -460,6 +460,7 @@ dependencies = [
  "astrid-approval",
  "astrid-capabilities",
  "astrid-capsule-types",
+ "astrid-compute",
  "astrid-core",
  "astrid-crypto",
  "astrid-events",
@@ -499,6 +500,7 @@ dependencies = [
  "wasmparser 0.253.0",
  "wasmtime",
  "wasmtime-wasi",
+ "wat",
 ]
 
 [[package]]
@@ -541,6 +543,20 @@ dependencies = [
  "thiserror 2.0.18",
  "toml 0.9.12+spec-1.1.0",
  "web-time",
+]
+
+[[package]]
+name = "astrid-compute"
+version = "0.10.4"
+dependencies = [
+ "astrid-capsule-types",
+ "astrid-core",
+ "blake3",
+ "memmap2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "wasmtime",
+ "wat",
 ]
 
 [[package]]
@@ -612,6 +628,7 @@ dependencies = [
  "colored",
  "nix 0.31.3",
  "signal-hook 0.4.4",
+ "sysinfo",
  "tokio",
  "toml 0.9.12+spec-1.1.0",
  "tracing",

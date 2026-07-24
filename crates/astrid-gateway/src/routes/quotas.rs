@@ -45,9 +45,11 @@ pub struct QuotasView {
     pub max_ipc_throughput_bytes: Option<u64>,
     /// Maximum concurrent background processes.
     pub max_background_processes: Option<u32>,
+    /// Maximum aggregate generic-compute workers. Zero delegates to the host.
+    pub max_compute_workers: Option<u32>,
     /// Maximum persistent storage in bytes (> 0).
     pub max_storage_bytes: Option<u64>,
-    /// Maximum CPU rate in wasmtime fuel units per second (> 0).
+    /// Maximum CPU rate in wasmtime fuel units per second. Zero is unlimited.
     pub max_cpu_fuel_per_sec: Option<u64>,
 }
 
@@ -72,9 +74,8 @@ pub struct ResourceUsageView {
     /// units (exact deterministic instruction count, monotonic for the process
     /// lifetime).
     pub cpu_fuel_consumed_total: u64,
-    /// Configured CPU rate ceiling (`max_cpu_fuel_per_sec`), always `> 0`
-    /// (validation rejects `0` — there is no "unlimited" sentinel; unbounded CPU
-    /// is a capability, surfaced by `exempt`).
+    /// Configured CPU rate ceiling (`max_cpu_fuel_per_sec`); zero is unlimited.
+    /// Capability exemption is surfaced independently by `exempt`.
     pub cpu_fuel_per_sec_limit: u64,
     /// Whether the principal is exempt from resource budgets. When `true` the
     /// limit fields are advisory, never enforced.

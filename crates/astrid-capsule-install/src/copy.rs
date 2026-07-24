@@ -3,10 +3,10 @@
 //! The destination ends up holding only what the runtime actually
 //! reads per-capsule: `Capsule.toml`, `meta.json`, `.env.json`, plus
 //! tier-2 resources (`dist/`, `node_modules/`, MCP command scripts).
-//! The capsule's `.wasm` binary and `wit/` directory are
-//! deliberately excluded — those live in the shared content-addressed
-//! stores under `home.bin_dir()` / `home.wit_dir()` and are
-//! referenced from `meta.json` by hash.
+//! The capsule's executable `.wasm` and `wit/` directory are deliberately
+//! excluded — those live in shared content-addressed stores. Core-Wasm worker
+//! objects beneath `assets/` are retained because their manifest-scoped hash
+//! and relative path form a distinct signed capability object.
 //!
 //! ## Symlink posture
 //!
@@ -46,8 +46,8 @@ use anyhow::{Context, bail};
 /// Recursively copy a capsule source tree to its install target.
 ///
 /// Excludes:
-/// * `*.wasm` files at any depth (the binary lives in `bin/`,
-///   content-addressed).
+/// * `*.wasm` files outside the top-level `assets/` tree (the executable lives
+///   in `bin/`, content-addressed). Worker objects under `assets/` are kept.
 /// * The top-level `wit/` directory (content-addressed in `wit/`).
 /// * `.git`, `target`, and the top-level `dist/` directory
 ///   (build/source-control artefacts the runtime never reads).
@@ -64,13 +64,14 @@ use anyhow::{Context, bail};
 pub fn copy_capsule_dir(src: &Path, dst: &Path) -> anyhow::Result<()> {
     let canonical_root = std::fs::canonicalize(src)
         .with_context(|| format!("failed to canonicalize source root {}", src.display()))?;
-    copy_capsule_dir_inner(src, dst, true, &canonical_root)
+    copy_capsule_dir_inner(src, dst, true, false, &canonical_root)
 }
 
 fn copy_capsule_dir_inner(
     src: &Path,
     dst: &Path,
     is_root: bool,
+    under_assets: bool,
     canonical_root: &Path,
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(dst).with_context(|| format!("failed to create {}", dst.display()))?;
@@ -93,10 +94,17 @@ fn copy_capsule_dir_inner(
             {
                 continue;
             }
-            copy_capsule_dir_inner(&src_path, &dst_path, false, canonical_root)?;
+            let child_under_assets = under_assets || (is_root && name == "assets");
+            copy_capsule_dir_inner(
+                &src_path,
+                &dst_path,
+                false,
+                child_under_assets,
+                canonical_root,
+            )?;
         } else if file_type.is_symlink() {
-            handle_symlink(&src_path, &dst_path, canonical_root)?;
-        } else if !is_wasm(&src_path) {
+            handle_symlink(&src_path, &dst_path, under_assets, canonical_root)?;
+        } else if under_assets || !is_wasm(&src_path) {
             std::fs::copy(&src_path, &dst_path)
                 .with_context(|| format!("failed to copy {}", src_path.display()))?;
         }
@@ -108,7 +116,12 @@ fn copy_capsule_dir_inner(
 /// on safe file symlinks (copied) and silently on refused cases that
 /// shouldn't break the install (a dangling symlink, for instance);
 /// returns Err on outright security failures.
-fn handle_symlink(src_path: &Path, dst_path: &Path, canonical_root: &Path) -> anyhow::Result<()> {
+fn handle_symlink(
+    src_path: &Path,
+    dst_path: &Path,
+    under_assets: bool,
+    canonical_root: &Path,
+) -> anyhow::Result<()> {
     // Canonicalize first — resolves the symlink chain to a real path
     // we can reason about. A dangling symlink errors here; we treat
     // that as a hard install failure because a capsule tree with
@@ -151,9 +164,9 @@ fn handle_symlink(src_path: &Path, dst_path: &Path, canonical_root: &Path) -> an
         );
     }
 
-    if is_wasm(src_path) {
-        // Same filter as the regular-file branch — `.wasm` lives in
-        // `bin/<hash>.wasm`, not in the per-capsule dir.
+    if is_wasm(src_path) && !under_assets {
+        // Same filter as the regular-file branch — executable `.wasm` lives
+        // in `bin/<hash>.wasm`; signed workers live below `assets/`.
         return Ok(());
     }
 
