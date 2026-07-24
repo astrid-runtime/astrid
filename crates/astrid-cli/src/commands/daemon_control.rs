@@ -599,11 +599,30 @@ mod tests {
         assert_eq!(terminate_orphan(&path).await, KillOutcome::NotRunning);
     }
 
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn terminate_orphan_dead_pid_is_notrunning() {
         let dir = crate::test_support::private_tempdir();
         let path = dir.path().join("system.pid");
-        write_pid_fixture(&path, "2000000000");
+
+        // A made-up high PID is not portable: Windows can report inaccessible
+        // process identifiers as access denied, which must remain fail-closed.
+        // Reap a real child while retaining its process object instead.
+        #[cfg(unix)]
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        #[cfg(windows)]
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let exited_pid = child.id();
+        assert!(child.wait().unwrap().success());
+        assert!(!is_process_alive(exited_pid));
+
+        write_pid_fixture(&path, exited_pid.to_string());
         assert_eq!(terminate_orphan(&path).await, KillOutcome::NotRunning);
     }
 
