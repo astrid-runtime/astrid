@@ -4,6 +4,16 @@ use windows_sys::Win32::Security::WinAnonymousSid;
 use windows_sys::Win32::Storage::FileSystem::DELETE;
 use windows_sys::Win32::System::SystemServices::ACCESS_SYSTEM_SECURITY;
 
+async fn wait_until_endpoint_is_absent(endpoint: &Path) {
+    tokio::time::timeout(CONNECT_BUSY_TIMEOUT, async {
+        while endpoint_is_present(endpoint).unwrap() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("named-pipe namespace must disappear after its final handle closes");
+}
+
 #[test]
 fn canonical_pipe_full_control_accepts_only_generic_or_mapped_exact_masks() {
     assert!(is_canonical_pipe_full_control(GENERIC_ALL));
@@ -77,7 +87,7 @@ async fn native_backend_bind_instances_shutdown_and_reconnect() {
     drop(reader_two);
     drop(writer_one);
     drop(writer_two);
-    assert!(!endpoint_is_present(endpoint).unwrap());
+    wait_until_endpoint_is_absent(endpoint).await;
 
     let replacement = bind(endpoint).expect("pipe must be reusable after shutdown");
     let mut client = connect(endpoint).await.unwrap();
@@ -86,7 +96,7 @@ async fn native_backend_bind_instances_shutdown_and_reconnect() {
     drop(client);
     drop(server);
     drop(replacement);
-    assert!(!endpoint_is_present(endpoint).unwrap());
+    wait_until_endpoint_is_absent(endpoint).await;
 }
 
 #[tokio::test]
@@ -157,7 +167,7 @@ async fn cancelled_pre_read_preserves_replacement_instance() {
     drop(client);
     drop(server);
     drop(listener);
-    assert!(!endpoint_is_present(endpoint).unwrap());
+    wait_until_endpoint_is_absent(endpoint).await;
 }
 
 #[tokio::test]
