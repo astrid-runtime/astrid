@@ -1,5 +1,6 @@
 //! Recoverable single-file reads and writes for private Astrid state.
 
+use super::error::with_context;
 use super::executable::{acquire_private_file_transaction_lock, recovery_error};
 use super::io::{
     FileContract, PreparationCleanup, flush_guarded_file, guarded_file_exists,
@@ -292,34 +293,69 @@ pub(super) fn finish_private_file_transaction(
     journal: &PrivateFileTransaction,
     guard: &TrustedPathGuard,
 ) -> io::Result<()> {
-    guard.with_verified_mutation(
-        "private-file transaction commit",
-        BoundaryContract::ExactPrivateDirectory,
-        || {
-            let live = parent.join(OsString::from_wide(&journal.target));
-            let staged = parent.join(&journal.staged);
-            if journal.had_live {
-                replace_file_checked(guard, &live, &staged)?;
-            } else {
-                move_guarded_file(guard, &staged, &live)?;
-            }
-            if hash_guarded_regular_file(
-                guard,
-                &live,
-                FileContract::ExactPrivate,
-                BoundaryContract::ExactPrivateDirectory,
-            )? != journal.new_hash
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "installed private file digest changed",
-                ));
-            }
-            remove_guarded_file_if_exists(guard, &staged)
-        },
-    )?;
-    guard.verify_contract(BoundaryContract::ExactPrivateDirectory)?;
-    remove_guarded_file(guard, &parent.join(PRIVATE_FILE_TRANSACTION_JOURNAL))
+    guard
+        .with_verified_mutation(
+            "private-file transaction commit",
+            BoundaryContract::ExactPrivateDirectory,
+            || {
+                let live = parent.join(OsString::from_wide(&journal.target));
+                let staged = parent.join(&journal.staged);
+                if journal.had_live {
+                    replace_file_checked(guard, &live, &staged)?;
+                } else {
+                    move_guarded_file(guard, &staged, &live)?;
+                }
+                if hash_guarded_regular_file(
+                    guard,
+                    &live,
+                    FileContract::ExactPrivate,
+                    BoundaryContract::ExactPrivateDirectory,
+                )
+                .map_err(|error| {
+                    with_context(
+                        error,
+                        format!(
+                            "could not authenticate installed private file: {}",
+                            live.display()
+                        ),
+                    )
+                })? != journal.new_hash
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "installed private file digest changed",
+                    ));
+                }
+                remove_guarded_file_if_exists(guard, &staged).map_err(|error| {
+                    with_context(
+                        error,
+                        format!(
+                            "could not remove staged private file after commit: {}",
+                            staged.display()
+                        ),
+                    )
+                })
+            },
+        )
+        .map_err(|error| with_context(error, "private-file transaction mutation failed"))?;
+    guard
+        .verify_contract(BoundaryContract::ExactPrivateDirectory)
+        .map_err(|error| {
+            with_context(
+                error,
+                "private-file transaction post-commit authority verification failed",
+            )
+        })?;
+    let journal_path = parent.join(PRIVATE_FILE_TRANSACTION_JOURNAL);
+    remove_guarded_file(guard, &journal_path).map_err(|error| {
+        with_context(
+            error,
+            format!(
+                "could not remove committed private-file journal: {}",
+                journal_path.display()
+            ),
+        )
+    })
 }
 
 pub(super) fn recover_private_file_transaction_locked(
