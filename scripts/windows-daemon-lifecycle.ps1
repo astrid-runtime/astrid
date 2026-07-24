@@ -35,9 +35,9 @@ $tokenPath = Join-Path $astridHome "run\system.token"
 $daemonPid = $null
 $daemonProcess = $null
 $completed = $false
+$locationPushed = $false
 $failureArtifacts = Join-Path $env:RUNNER_TEMP ("windows-daemon-lifecycle-" + $Target)
 
-New-Item -ItemType Directory -Path $workspace -Force | Out-Null
 $env:ASTRID_HOME = $astridHome
 $env:ASTRID_WORKSPACE_STATE_DIR = ".astrid-ci"
 
@@ -51,10 +51,13 @@ function Invoke-Astrid {
     return $output
 }
 
-Push-Location $workspace
 try {
     $installOutput = Invoke-Astrid capsule install $CapsuleSource --yes --approve-untrusted
     $installOutput | Write-Host
+    New-Item -ItemType Directory -Path $workspace -Force | Out-Null
+    Push-Location $workspace
+    $locationPushed = $true
+
     $startOutput = Invoke-Astrid start
     if (-not (Test-Path -LiteralPath $pidPath -PathType Leaf)) {
         throw "astrid start returned success without a daemon PID file`n$startOutput"
@@ -144,7 +147,9 @@ finally {
                 Write-Warning "could not preserve lifecycle failure artifacts: $_"
             }
         }
-        Pop-Location
+        if ($locationPushed) {
+            Pop-Location
+        }
         $processGone = $null -eq $daemonProcess -or $daemonProcess.HasExited
         if (
             $processGone -and
