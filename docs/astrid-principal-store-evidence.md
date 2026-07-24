@@ -18,8 +18,9 @@ None substitutes for the others.
 
 ## 1. Abstract model
 
-Let `Ids` be a digest space, `Objects` a set of canonical typed values, and
-`refs(o)` the references encoded by object `o`.
+Let `Ids` be a digest space, `Objects` a set of canonical typed values,
+`refs(o)` the typed references encoded by object `o`, and `owns(o)` the subset
+whose relation is `Owns`.
 
 ```text
 O : Ids -> Objects
@@ -27,6 +28,8 @@ R : Principal -> (Generation, CommitId)
 Pins : PinId -> CommitId
 Leases : LeaseId -> (PlacementEpoch, Set<BlobId>, Expiry)
 P : (PlacementEpoch, BlobId) -> Set<Replica>
+V : (CommitId, Selector) -> (SelectedClosure, InclusionProof)
+W : (BeforeRoot, TypedPatch) -> (AfterRoot, PartialTreeProof)
 ```
 
 Assumptions:
@@ -34,12 +37,16 @@ Assumptions:
 1. `id(o)` is deterministic over canonical bytes, type, domain, and version.
 2. A digest collision is detected on insertion by comparing canonical bytes.
 3. Every admitted object has bounded size and bounded reference count.
-4. Object references form a finite DAG.
+4. Owning object references form a finite DAG.
 5. The root metadata store provides durable compare-and-swap transactions.
 6. Flush establishes the durability guarantee declared by the storage device.
 7. Authorization and signature primitives satisfy their separate contracts.
+8. Reference relation labels, typed selectors, and patches have deterministic,
+   bounded canonical semantics.
+9. Principal-owned state, system authority, external attachments, ephemeral
+   state, and derived state are distinguishable before root construction.
 
-The evidence must test violations of assumptions 2–6 rather than hiding them.
+The evidence must test violations of assumptions 2–9 rather than hiding them.
 
 ## 2. Mathematical obligations
 
@@ -55,9 +62,9 @@ lossless.
 
 ### STO-MATH-2: reconstruction
 
-If a root's reachable graph is finite, acyclic, complete in `O`, and each object
-passes canonical identity validation, deterministic reconstruction yields
-exactly one logical state.
+If a root's graph reachable through `owns(o)` is finite, acyclic, complete in
+`O`, and each object passes canonical identity validation, deterministic
+reconstruction yields exactly one logical state.
 
 **Argument:** induction over DAG height. Leaves decode uniquely by canonical
 grammar. If all children below height `h` decode uniquely, a canonical parent at
@@ -79,6 +86,9 @@ authoritative root remains reconstructable.
 **Argument:** every object needed by reconstruction is, by definition, inside
 the closure and outside the deletion set.
 
+The closure follows owning edges. Evidence, lineage, and derived references are
+retained only when separately rooted or pinned.
+
 ### STO-MATH-5: rebalance observational equivalence
 
 If rebalance changes only `P`, every logical read through unchanged `O` and `R`
@@ -98,6 +108,36 @@ sum over p in Q(o) of s(o) / |Q(o)| = s(o)
 Summing over objects conserves unique object bytes, subject to numeric rounding.
 This establishes a reporting identity, not a stable quota.
 
+### STO-MATH-7: verified-view soundness
+
+If `verify_view(root, selector, closure, proof)` succeeds, every disclosed root
+is selected by the canonical selector from `root`, every disclosed object
+validates against that selected root, and blinded siblings contribute only
+their committed hashes.
+
+**Argument:** reconstruct the source root bottom-up from disclosed nodes and
+blinded sibling hashes, then apply the deterministic selector grammar. Any
+substituted value, path, selector, or sibling changes either canonical selector
+evaluation or the reconstructed source root.
+
+This proves origin and selection, not authorization to generate or read the
+view.
+
+### STO-MATH-8: structural-transition witness
+
+If `verify_transition(before, patch, witness)` succeeds with result `after`, the
+canonical typed patch applied to the concrete paths disclosed by the witness
+reconstructs `after`, while every untouched subtree remains bound by its blinded
+hash.
+
+**Argument:** the witness first reconstructs `before`. Deterministic patch
+evaluation replaces only authenticated paths, and bottom-up rehashing produces
+one resulting root. Requiring that root to equal `after` binds the patch and
+both roots.
+
+This proves a structural storage mutation. It does not prove the semantic
+correctness of the computation that requested it.
+
 ## 3. Model-checking obligations
 
 A compact TLA+ model or exhaustive Rust transition system covers:
@@ -106,7 +146,9 @@ A compact TLA+ model or exhaustive Rust transition system covers:
 - two storage nodes plus one joining or draining node;
 - a small finite object and digest space with deliberate collisions;
 - two root generations;
-- full and thin import;
+- full, thin, and view import;
+- one external workspace attachment that is visible but not principal-owned;
+- bounded state selectors, partial proof trees, and typed patches;
 - root, snapshot, export, and reader pins;
 - crash at every durability boundary;
 - overlapping writer compare-and-swap;
@@ -127,6 +169,11 @@ Required invariants:
 | STO-MOD-8 | Rebalance changes no principal root or logical read |
 | STO-MOD-9 | A source capability or bundle field cannot mint destination authority |
 | STO-MOD-10 | A deleted principal has no live root, key wrap, or unexpired access lease |
+| STO-MOD-11 | Default export/fork/erasure closure contains principal-owned state only |
+| STO-MOD-12 | A verified view is bound to its source root, selector, and disclosed closure |
+| STO-MOD-13 | A verified transition witness is bound to its before root, typed patch, and after root |
+| STO-MOD-14 | A workspace attachment becomes principal-owned only through explicit authorized ingest |
+| STO-MOD-15 | Evidence, lineage, and derived references do not change principal closure, quota, or default export |
 
 Every discovered counterexample becomes a minimized checked-in trace and a Rust
 regression test.
@@ -153,6 +200,15 @@ specification functions.
 | STO-PROP-12 | Random/incompressible unique input reports approximately zero deduplication |
 | STO-PROP-13 | Metadata usage grows with references even when every value deduplicates |
 | STO-PROP-14 | Another principal's import/delete never changes a principal's enforced quota usage |
+| STO-PROP-15 | A full-state view reconstructs the same closure as full export |
+| STO-PROP-16 | Any selector, disclosed value, sibling hash, or source-root substitution invalidates a view proof |
+| STO-PROP-17 | Applying the same typed patch through full state and a valid partial witness yields the same root |
+| STO-PROP-18 | Any patch, before-root, after-root, or partial-tree substitution invalidates a transition witness |
+| STO-PROP-19 | Default export excludes external attachments, operator authority, ephemeral state, and derived indexes |
+| STO-PROP-20 | Explicit workspace ingest copies only the selected observed closure and records its external lineage |
+| STO-PROP-21 | Adding a non-owning reference changes commit identity but not principal-owned closure or usage |
+| STO-PROP-22 | Unpinned evidence can be collected while the referring principal remains reconstructable |
+| STO-PROP-23 | Pinning the same evidence retains it without charging it as principal-owned state |
 
 The deliberate tiny digest model must generate collisions and assert byte
 comparison rejects them. Production collision probability is not a substitute
@@ -250,6 +306,11 @@ stale placement epoch, torn metadata page, and corrupt index rebuild.
 | Decompression bomb | Bounded decode rejection |
 | Same bundle retry | Idempotent result |
 | Destination name collision | Explicit create/fork/replace decision required |
+| Default export while a host workspace is mounted | Workspace bytes and host path excluded |
+| View selector exceeds caller capability | Rejected before object disclosure |
+| View claims a subtree from another source root | Inclusion-proof failure |
+| View omits an object required by its selected closure | Closure failure |
+| External workspace snapshot changes during capture | Retry/fail with no falsely coherent observation root |
 
 Fuzz targets include every frame parser, canonical decoder, tree walker, safe
 materializer, compression decoder, and signature/envelope parser.
@@ -327,12 +388,12 @@ Required checks:
 
 | Gate | Evidence |
 |---|---|
-| Model crate lands | Unit and property tests; `no_std` compile; docs build |
+| Model crate lands | Unit and property tests for ownership, views, witnesses, roots, import, and GC; `no_std` compile; docs build |
 | In-memory engine lands | Model refinement, import/export and GC properties |
 | KV adapter lands | Differential backend suite |
 | Durable engine lands | Crash matrix, corruption recovery, disk-full behavior |
 | Filesystem projection lands | Adversarial path/symlink tests on each supported host |
-| Export/import ships | Parser fuzzing, quota/decompression bounds, authority non-transfer tests |
+| Export/import ships | Full/thin/view parser fuzzing, selector proofs, quota/decompression bounds, ownership and authority non-transfer tests |
 | Rebalance ships | Multi-node epoch/lease/failure matrix and dry-run accounting |
 | Native transport ships | Same conformance suite over the block capability plus power-cut harness |
 

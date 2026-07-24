@@ -33,6 +33,13 @@ root are not. A root hash proves which bytes and typed relationships constitute
 a state; an authorized, signed transition proves who advanced the principal to
 that state. The hash alone is neither authority nor provenance.
 
+The principal root contains only state that the principal owns durably. It does
+not silently absorb operator policy, capability grants, the human's mounted
+workspace, process scratch space, or rebuildable indexes. Those are separate
+authority, attachment, ephemeral, and derived domains. This boundary is
+necessary for an export, rollback, fork, or erasure request to mean what its
+caller thinks it means.
+
 This is deliberately more than replacing SurrealKV with a content-addressed
 backend. It is a principal-state substrate that SurrealKV, the VFS, the audit
 log, the Linux realm, and a future native Astrid system can use without changing
@@ -263,6 +270,32 @@ without learning plaintext or acquiring principal authority.
 ## 7. Logical object model
 
 All references are typed, canonical, length-bounded, versioned, and acyclic.
+Their reachability meaning is also typed:
+
+```text
+ObjectRef {
+    relation,
+    content_id,
+    reachability: Owns | Evidence | Lineage | Derived
+}
+```
+
+- `relation` is the canonical typed edge label: a principal-state field, a
+  directory name, a KV branch/key slot, a chunk position, or another
+  schema-defined relation. Labels are unique and ordered within one object.
+  Multiple labels may intentionally point to the same content.
+- `Owns` is a strong edge. It must resolve for the principal state to be
+  complete and contributes to export, quota, retention, and garbage-collection
+  reachability.
+- `Evidence` binds an observation, receipt, audit checkpoint, or external
+  attachment without silently taking ownership of its closure. The evidence
+  remains available only while its own receipt/retention root pins it.
+- `Lineage` names another commit used to create, fork, import, or merge state.
+  It proves identity/history but does not import that commit's data, authority,
+  quota, or retention.
+- `Derived` names a rebuildable index or materialization and never makes that
+  representation authoritative.
+
 A minimum object family is:
 
 ```text
@@ -278,18 +311,20 @@ PrincipalState(
     home_root,
     capsule_kv_root,
     capsule_state_root,
-    config_root,
-    memory_root?,
-    audit_checkpoint?,
+    principal_memory_root?,
+    principal_preferences_root?,
     schema_set
 )
 Commit(
     principal_id,
-    parent_commit?,
+    primary_parent?,
+    lineage_inputs,
     state_root,
     operation_id,
     actor,
     authority_epoch,
+    attachment_observation_root?,
+    audit_checkpoint?,
     format_version
 )
 ```
@@ -308,6 +343,49 @@ They are never interpreted as host paths while validating an object graph.
 Symlinks are data leaves. A materializer must not follow them while writing an
 export or host projection.
 
+### 7.1 State ownership classes
+
+One root must not become a bag of everything visible to an agent. Astrid uses
+five explicit state classes:
+
+| Class | Examples | Canonical principal export? | Authority |
+|---|---|---:|---|
+| Principal-owned durable state | agent home, capsule KV, capsule durable state, explicit principal memory/preferences | Yes | principal-scoped storage capability |
+| System/operator authority state | profile, group membership, grants, budgets, runtime/device keys, policy | No | operator/kernel authority |
+| External attachment | human workspace, removable volume, remote repository, shared data set | No; explicit ingest or separate export only | mount/resource capability |
+| Ephemeral execution state | `/tmp`, process memory, uncommitted overlay, scheduler state | No; only an explicit checkpoint contract may promote it | invocation/runtime |
+| Derived state | indexes, tensor relations, build cache, search cache, placement index | Rebuildable and excluded by default | derived from a named source root |
+
+`config_root` is intentionally not an undifferentiated field. Principal-owned
+preferences may live under `principal_preferences_root`; operator policy and
+capability state remain outside the principal DAG and are only bound by an
+authority epoch or receipt. Likewise, the audit checkpoint belongs to the
+commit/transition envelope, not to mutable principal-owned content.
+
+The current host workspace selected from the CLI/Codex CWD is an external
+attachment. Astrid may:
+
+- mount it live under a logical name such as `cwd://` or `/workspace`;
+- create an observed snapshot root for one invocation or receipt;
+- ingest an explicitly selected subtree into principal-owned state; or
+- write changes back under the granted workspace capability.
+
+It must not retain, export, fork, or delete the human's whole workspace merely
+because an agent could see it. A workspace capture records source identity,
+selection, before/after observations, and writeback status separately from the
+principal root.
+
+`lineage_inputs` records additional roots used by an authorized,
+subsystem-specific merge or import. `primary_parent` remains the root against
+which the compare-and-swap occurred. Naming another commit as lineage never
+imports its authority, secrets, profile, or principal identity.
+
+`attachment_observation_root`, `audit_checkpoint`, and `lineage_inputs` are
+non-owning references. A complete principal export follows `Owns` edges only
+unless the caller separately selects and is authorized to disclose evidence or
+lineage. This prevents a harmless reference from becoming an accidental
+retention, quota, export, or deletion dependency.
+
 ## 8. Mutable principal root and transition
 
 Let:
@@ -320,7 +398,7 @@ Let:
 A transition from `c_old` to `c_new` is valid when:
 
 1. `c_new.principal_id` names the target principal;
-2. `c_new.parent_commit = c_old`, except for an authorized genesis/import;
+2. `c_new.primary_parent = c_old`, except for an authorized genesis/import;
 3. every object reachable from `c_new.state_root` is durable;
 4. the actor was authorized for the transition at `authority_epoch`;
 5. the expected principal generation still equals the stored generation;
@@ -367,6 +445,94 @@ High-volume file writes need not create a signed record per syscall. A
 transaction or filesystem synchronization boundary can fold many object writes
 into one new state root, while optional detailed audit events remain separately
 chained.
+
+### 9.1 Authenticated structural transition witnesses
+
+A signed transition says an authorized Astrid boundary accepted a root change.
+An optional structural witness lets an independent verifier check the storage
+part of that claim without downloading either complete state.
+
+Conceptually:
+
+```text
+StatePatch {
+    source_commit,
+    typed_operations,
+    operation_id,
+}
+
+TransitionWitness {
+    before_root,
+    after_root,
+    partial_before_tree,
+    patch_digest,
+    proof_format,
+}
+```
+
+The partial tree contains concrete values and branches touched by the canonical
+patch and blinded hashes for untouched subtrees. A verifier:
+
+1. reconstructs `before_root` from the partial tree;
+2. applies the same bounded, deterministic typed operations;
+3. reconstructs the resulting root;
+4. requires it to equal `after_root`;
+5. binds the witness, patch, authority epoch, and operation ID to the signed
+   transition and execution receipt.
+
+File-tree, KV-tree, namespace, and component-root operations have separate
+typed patch grammars. The storage layer must not invent a universal semantic
+mutation language.
+
+The witness proves that the stated structural mutation transforms one committed
+root into another. It does not prove that capsule computation was correct, that
+an input was true, or that the actor should have wanted the result. Those claim
+boundaries remain with authority validation and execution/observation receipts.
+
+Proof generation is optional on ordinary local writes and may occur
+asynchronously while the immutable nodes remain available. The root commit
+cannot depend on a remote proof service. Deployments that require proof-carrying
+commits can make witness durability part of their acknowledgement policy.
+
+### 9.2 Verified state views and causal slices
+
+A `StateView` is a capability-scoped, independently verifiable selection from a
+committed root:
+
+```text
+StateView {
+    source_commit,
+    selector,
+    selected_roots,
+    inclusion_proof,
+    disclosure_profile,
+}
+```
+
+Selectors are typed and bounded, for example:
+
+- one principal-owned component root;
+- a filesystem subtree or explicit path set;
+- one capsule KV namespace or key prefix;
+- a set of objects observed by one execution receipt.
+
+The view contains the selected closure plus enough blinded parent structure to
+prove that the selection came from `source_commit`. It is neither a bearer
+capability nor evidence that the holder may retrieve undisclosed siblings.
+Authorization is checked separately before generation and on every backing
+object read.
+
+A causal slice is a view whose selector is derived from the reads admitted to a
+governed execution. It can package the smallest retained state needed to
+inspect, transfer, or—when the receipt's coverage permits—replay that execution.
+The access trace is untrusted input to view generation; the host verifies every
+selected object against the source root.
+
+Views make partial export, remote execution, receipts, and federation one
+primitive rather than four incompatible bundle formats. They also preserve an
+important ergonomic rule: the agent receives normal files, values, and tool
+results; proof material travels as structured metadata and is requested only by
+verifiers or diagnostic tools.
 
 ## 10. Principal export
 
@@ -422,9 +588,18 @@ The format needs both:
 - **full export**, containing the entire reachable closure;
 - **thin/incremental export**, where the receiver supplies an authenticated
   “have” set or Bloom/filter summary and the sender emits only missing objects.
+- **view export**, containing a typed selected closure plus proof that it was
+  selected from the declared source commit.
 
 A thin export is unusable without its declared base closure. Validation must
-fail closed rather than yield a partial principal.
+fail closed rather than yield a partial principal. A view export is
+intentionally partial and never installs a complete principal unless its
+selector is the canonical full principal-owned state.
+
+Full export means the closure of `PrincipalState`, not everything mounted or
+visible during an invocation. External attachments require a separate,
+explicitly authorized snapshot/export, and system authority must be
+re-established at the destination.
 
 ### 10.3 Secret and authority rules
 
@@ -753,6 +928,9 @@ Live = closure(
 )
 ```
 
+Here `closure` follows `Owns` edges. Evidence, lineage, and derived objects enter
+`Live` only through their own authoritative retention roots or pins.
+
 An object may be collected only when it is outside `Live` for every supported
 placement epoch and the deletion policy permits removal. Reference counts and
 reachability summaries are performance indexes; a rebuild from roots must be
@@ -793,7 +971,8 @@ The native kernel supplies:
 - bounded DMA and memory resources;
 - IPC;
 - monotonic boot/authority epoch inputs;
-- optional compact root or sequence anchoring.
+- optional compact root or sequence anchoring;
+- a bounded verifier path for state views and structural transition witnesses.
 
 The user-space storage service owns:
 
@@ -817,6 +996,8 @@ later Tensor Logic work without making tensor evaluation part of durability.
 - every committed transition can feed a derived relation/index stream;
 - exports carry the schema set needed to rebuild derived indexes;
 - derived tensor indexes name the source commit from which they were built;
+- verified state views expose typed relations without disclosing the rest of a
+  principal state;
 - an index can be discarded and reconstructed from committed state and
   transition records.
 
@@ -828,21 +1009,24 @@ graph and not a prerequisite for reading a file or recovering a principal.
 
 ## 21. Implementation order
 
-1. Land `astrid-storage-model` with canonical identifiers, object grammar,
-   closure validation, accounting definitions, and a small executable state
-   machine.
-2. Run model and property tests for commit, crash, import, GC, and rebalance.
-3. Add an engine prototype over in-memory immutable objects and atomic roots.
-4. Add the principal-store-backed `KvStore` adapter and differential tests
+1. Land `astrid-storage-model` with canonical identifiers, ownership classes,
+   object grammar, closure validation, accounting definitions, and a small
+   executable state machine.
+2. Model typed state views and structural transition witnesses; prove they bind
+   selectors, patches, and both roots without importing authority.
+3. Run model and property tests for commit, crash, view, witness, import, GC,
+   and rebalance.
+4. Add an engine prototype over in-memory immutable objects and atomic roots.
+5. Add the principal-store-backed `KvStore` adapter and differential tests
    against `MemoryKvStore` and `SurrealKvStore`.
-5. Add typed filesystem roots and a safe materializer; integrate Linux-realm
-   home/workspace checkpoints.
-6. Add durable segments, indexes, WAL, fault injection, recovery, compaction,
+6. Add typed filesystem roots and a safe materializer; integrate Linux-realm
+   principal-home checkpoints and explicit external-workspace observations.
+7. Add durable segments, indexes, WAL, fault injection, recovery, compaction,
    and quota enforcement.
-7. Make local clone/fork root-based while preserving explicit secret behavior.
-8. Implement full export and staged import, then thin transfer.
-9. Add placement epochs, repair, operator dry-run, and online rebalance.
-10. Add native block transport only after the same engine passes host
+8. Make local clone/fork root-based while preserving explicit secret behavior.
+9. Implement full/view export and staged import, then thin transfer.
+10. Add placement epochs, repair, operator dry-run, and online rebalance.
+11. Add native block transport only after the same engine passes host
     conformance and power-loss tests.
 
 ## 22. Decisions still requiring measured evidence
@@ -859,6 +1043,10 @@ graph and not a prerequisite for reading a file or recovering a principal.
 - default retention and rollback policy;
 - which principal components are included in standard export;
 - the exact audit checkpoint carried in a portable bundle;
+- canonical selector and proof formats for verified state views;
+- canonical typed patches and witness format for structural root transitions;
+- proof-retention policy and whether a deployment requires a witness before
+  acknowledging selected commit classes;
 - how a running Linux realm exposes application-consistent checkpoint hooks.
 
 These are not invitations to improvise in production code. Each becomes a
@@ -891,9 +1079,54 @@ migration story.
   [content addressing and Merkle DAGs](https://docs.ipfs.tech/concepts/how-ipfs-works/):
   interoperable graph-transfer lessons; Astrid does not inherit IPFS authority
   or networking semantics.
+- Perkeep,
+  [permanodes and signed claims](https://perkeep.org/doc/schema/permanode.md):
+  prior art for mutable named objects over immutable content. Astrid uses atomic
+  principal roots instead of replaying signed claims as its authoritative
+  current-state mechanism.
+- Unison,
+  [content-addressed code](https://www.unison-lang.org/docs/the-big-idea/):
+  evidence that semantic, typed content identity can eliminate name- and
+  text-level churn. Astrid does not require one language or store executable
+  semantics in the storage engine.
+- Irmin,
+  [Merkle tree proofs](https://mirage.github.io/irmin/irmin/Irmin/module-type-S/Tree/Proof/index.html):
+  direct prior art for carrying the minimal partial tree needed to verify a
+  computation from one state root to another.
 - NIST,
   [SP 800-88 Rev. 2](https://csrc.nist.gov/pubs/sp/800/88/r2/final):
   current media sanitization and cryptographic-erasure guidance.
 - Newcombe et al.,
   [How Amazon Web Services Uses Formal Methods](https://cdn.amazon.science/67/f9/92733d574c11ba1a11bd08bfb8ae/how-amazon-web-services-uses-formal-methods.pdf):
   bounded formal models as design and counterexample tools.
+
+## 24. Astrid-specific synthesis
+
+The ingredients are established; their boundary is the opportunity.
+
+- Venti, Git, Borg, and similar stores show immutable content and efficient
+  packing.
+- Fossil, Perkeep, and Irmin show mutable names or branches above immutable
+  history.
+- Unison shows the benefit of content-addressing typed semantic units.
+- Tahoe-LAFS shows that identity, verification, confidentiality, and read/write
+  authority must not be collapsed into one hash.
+- Irmin shows that a state transition can carry only the partial authenticated
+  tree needed to verify it.
+
+Astrid combines these into an agent operating-system contract:
+
+```text
+principal-owned world root
+    + external attachments named but not silently owned
+    + capability-scoped verified view
+    + atomic typed patch and structural witness
+    + signed authority/audit transition
+    + causal execution/observation receipt
+    + ordinary filesystem, KV, and tool projections
+```
+
+The important unit is therefore not a file, disk image, backup archive, event
+log, or database row. It is a governed world transition whose data, authority,
+causal inputs, and resulting state can be independently separated and checked.
+That is the design Astrid should prove before optimizing the chunker.

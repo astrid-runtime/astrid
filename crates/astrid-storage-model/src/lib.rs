@@ -52,6 +52,71 @@ impl ObjectId {
     }
 }
 
+/// Reachability meaning of a reference between immutable objects.
+///
+/// Only [`Self::Owns`] contributes to a principal's durable closure, usage,
+/// default export, and garbage-collection reachability. Other relations bind
+/// identity without silently transferring ownership or retention.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ReferenceKind {
+    /// Strong ownership: the target is required to reconstruct the source.
+    Owns,
+    /// Observation or audit evidence retained under its own root or pin.
+    Evidence,
+    /// Historical/fork/merge lineage that does not import the target closure.
+    Lineage,
+    /// Rebuildable index or materialization.
+    Derived,
+}
+
+/// A typed, labelled reference to another immutable object.
+///
+/// The label identifies the relation inside the source object: for example a
+/// principal-state field, directory name, KV slot, or chunk position.
+/// Different labels may intentionally point to the same target.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ObjectReference {
+    label: Vec<u8>,
+    target: ObjectId,
+    kind: ReferenceKind,
+}
+
+impl ObjectReference {
+    /// Construct a typed object reference.
+    #[must_use]
+    pub const fn new(label: Vec<u8>, target: ObjectId, kind: ReferenceKind) -> Self {
+        Self {
+            label,
+            target,
+            kind,
+        }
+    }
+
+    /// Construct a strong ownership reference.
+    #[must_use]
+    pub const fn owns(label: Vec<u8>, target: ObjectId) -> Self {
+        Self::new(label, target, ReferenceKind::Owns)
+    }
+
+    /// Borrow the canonical relation label.
+    #[must_use]
+    pub fn label(&self) -> &[u8] {
+        &self.label
+    }
+
+    /// Return the referenced object identifier.
+    #[must_use]
+    pub const fn target(&self) -> ObjectId {
+        self.target
+    }
+
+    /// Return the reference's reachability meaning.
+    #[must_use]
+    pub const fn kind(&self) -> ReferenceKind {
+        self.kind
+    }
+}
+
 /// Identity of one encoded physical representation.
 ///
 /// A logical [`ObjectId`] can have more than one blob representation as
@@ -127,7 +192,7 @@ pub enum ObjectClass {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObjectRecord {
     canonical_bytes: Vec<u8>,
-    references: Vec<ObjectId>,
+    references: Vec<ObjectReference>,
     logical_bytes: u64,
     class: ObjectClass,
 }
@@ -135,9 +200,9 @@ pub struct ObjectRecord {
 impl ObjectRecord {
     /// Construct a canonical object record.
     ///
-    /// References must be strictly increasing. Requiring canonical ordering
-    /// makes duplicate references and order-dependent encodings
-    /// unrepresentable in the model.
+    /// References must be strictly increasing by relation label. Requiring one
+    /// target per label makes duplicate relations and order-dependent encodings
+    /// unrepresentable while permitting two labels to share content.
     ///
     /// # Errors
     ///
@@ -145,11 +210,14 @@ impl ObjectRecord {
     /// strictly increasing.
     pub fn new(
         canonical_bytes: Vec<u8>,
-        references: Vec<ObjectId>,
+        references: Vec<ObjectReference>,
         logical_bytes: u64,
         class: ObjectClass,
     ) -> Result<Self, ModelError> {
-        if references.windows(2).any(|pair| pair[0] >= pair[1]) {
+        if references
+            .windows(2)
+            .any(|pair| pair[0].label >= pair[1].label)
+        {
             return Err(ModelError::NonCanonicalReferences);
         }
         Ok(Self {
@@ -168,8 +236,17 @@ impl ObjectRecord {
 
     /// Borrow the object's child references.
     #[must_use]
-    pub fn references(&self) -> &[ObjectId] {
+    pub fn references(&self) -> &[ObjectReference] {
         &self.references
+    }
+
+    /// Iterate over strong ownership references.
+    #[must_use]
+    pub fn owning_references(&self) -> impl DoubleEndedIterator<Item = ObjectId> + '_ {
+        self.references
+            .iter()
+            .filter(|reference| reference.kind == ReferenceKind::Owns)
+            .map(|reference| reference.target)
     }
 
     /// Return the user-visible byte contribution.
@@ -247,7 +324,7 @@ pub enum ModelError {
     BlobCollision(BlobId),
     /// The object graph contains a cycle.
     ObjectCycle(ObjectId),
-    /// Child references were not in strictly increasing canonical order.
+    /// Child reference labels were not in strictly increasing canonical order.
     NonCanonicalReferences,
     /// A principal already exists but genesis creation was requested.
     PrincipalAlreadyExists,
@@ -302,7 +379,7 @@ impl fmt::Display for ModelError {
             Self::BlobCollision(id) => write!(formatter, "blob collision for {id:?}"),
             Self::ObjectCycle(id) => write!(formatter, "object cycle at {id:?}"),
             Self::NonCanonicalReferences => {
-                formatter.write_str("object references are not strictly increasing")
+                formatter.write_str("object reference labels are not strictly increasing")
             },
             Self::PrincipalAlreadyExists => formatter.write_str("principal already exists"),
             Self::PrincipalMissing => formatter.write_str("principal does not exist"),
@@ -812,8 +889,8 @@ fn closure_in(
         let record = objects.get(&id).ok_or(ModelError::MissingObject(id))?;
         marks.insert(id, 1);
         stack.push((id, true));
-        for child in record.references.iter().rev() {
-            stack.push((*child, false));
+        for child in record.owning_references().rev() {
+            stack.push((child, false));
         }
     }
 
@@ -838,6 +915,17 @@ mod tests {
     }
 
     fn metadata(value: u8, references: Vec<ObjectId>) -> ObjectRecord {
+        let references = references
+            .into_iter()
+            .enumerate()
+            .map(|(index, target)| {
+                ObjectReference::owns(vec![u8::try_from(index).unwrap()], target)
+            })
+            .collect();
+        ObjectRecord::new(vec![value], references, 0, ObjectClass::Metadata).unwrap()
+    }
+
+    fn metadata_refs(value: u8, references: Vec<ObjectReference>) -> ObjectRecord {
         ObjectRecord::new(vec![value], references, 0, ObjectClass::Metadata).unwrap()
     }
 
@@ -899,6 +987,107 @@ mod tests {
             Err(ModelError::MissingObject(id(1)))
         );
         assert_eq!(world.root(&"alice"), None);
+    }
+
+    #[test]
+    fn non_owning_reference_does_not_expand_principal_closure() {
+        let mut world = World::<&str>::new();
+        world
+            .insert_object(
+                id(2),
+                metadata_refs(
+                    2,
+                    vec![ObjectReference::new(
+                        vec![0],
+                        id(1),
+                        ReferenceKind::Evidence,
+                    )],
+                ),
+            )
+            .unwrap();
+
+        world.compare_and_swap_root("alice", None, id(2)).unwrap();
+
+        assert_eq!(world.closure(id(2)).unwrap(), BTreeSet::from([id(2)]));
+        assert_eq!(
+            world.principal_usage(&"alice").unwrap(),
+            PrincipalUsage {
+                object_count: 1,
+                logical_bytes: 0,
+                retained_object_bytes: 1,
+                metadata_bytes: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn evidence_requires_its_own_pin_for_retention() {
+        let mut world = World::<&str>::new();
+        world.insert_object(id(1), data(1)).unwrap();
+        world
+            .insert_object(
+                id(2),
+                metadata_refs(
+                    2,
+                    vec![ObjectReference::new(
+                        vec![0],
+                        id(1),
+                        ReferenceKind::Evidence,
+                    )],
+                ),
+            )
+            .unwrap();
+        world.compare_and_swap_root("alice", None, id(2)).unwrap();
+        world.pin(PinId::new(7), id(1)).unwrap();
+
+        assert_eq!(world.collect_garbage().unwrap().objects_removed, 0);
+        world.unpin(PinId::new(7)).unwrap();
+        assert_eq!(
+            world.collect_garbage().unwrap(),
+            GcReport {
+                objects_removed: 1,
+                bytes_removed: 1,
+            }
+        );
+        assert_eq!(world.closure(id(2)).unwrap(), BTreeSet::from([id(2)]));
+    }
+
+    #[test]
+    fn one_label_cannot_have_conflicting_reference_relations() {
+        let references = vec![
+            ObjectReference::owns(vec![0], id(1)),
+            ObjectReference::new(vec![0], id(2), ReferenceKind::Lineage),
+        ];
+
+        assert_eq!(
+            ObjectRecord::new(vec![2], references, 0, ObjectClass::Metadata),
+            Err(ModelError::NonCanonicalReferences)
+        );
+    }
+
+    #[test]
+    fn different_labels_may_share_one_owned_target() {
+        let mut world = World::<&str>::new();
+        world.insert_object(id(1), data(1)).unwrap();
+        world
+            .insert_object(
+                id(2),
+                metadata_refs(
+                    2,
+                    vec![
+                        ObjectReference::owns(vec![0], id(1)),
+                        ObjectReference::owns(vec![1], id(1)),
+                    ],
+                ),
+            )
+            .unwrap();
+        world.compare_and_swap_root("alice", None, id(2)).unwrap();
+
+        assert_eq!(
+            world.closure(id(2)).unwrap(),
+            BTreeSet::from([id(1), id(2)])
+        );
+        assert_eq!(world.principal_usage(&"alice").unwrap().object_count, 2);
     }
 
     #[test]
