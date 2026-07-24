@@ -1,6 +1,9 @@
 param(
     [Parameter(Mandatory = $true)]
-    [string]$Target
+    [string]$Target,
+
+    [Parameter(Mandatory = $true)]
+    [string]$CapsuleSource
 )
 
 Set-StrictMode -Version Latest
@@ -9,11 +12,18 @@ $ErrorActionPreference = "Stop"
 $binaryRoot = Join-Path $env:GITHUB_WORKSPACE "target\$Target\debug"
 $astrid = Join-Path $binaryRoot "astrid.exe"
 $daemon = Join-Path $binaryRoot "astrid-daemon.exe"
+$builder = Join-Path $binaryRoot "astrid-build.exe"
 if (-not (Test-Path -LiteralPath $astrid -PathType Leaf)) {
     throw "missing lifecycle CLI binary: $astrid"
 }
 if (-not (Test-Path -LiteralPath $daemon -PathType Leaf)) {
     throw "missing lifecycle daemon binary: $daemon"
+}
+if (-not (Test-Path -LiteralPath $builder -PathType Leaf)) {
+    throw "missing lifecycle capsule builder: $builder"
+}
+if (-not (Test-Path -LiteralPath $CapsuleSource -PathType Container)) {
+    throw "missing compatible CLI uplink capsule source: $CapsuleSource"
 }
 
 $testRoot = Join-Path $env:LOCALAPPDATA ("AstridLifecycleCi-" + [guid]::NewGuid().ToString("N"))
@@ -24,6 +34,8 @@ $readyPath = Join-Path $astridHome "run\system.ready"
 $tokenPath = Join-Path $astridHome "run\system.token"
 $daemonPid = $null
 $daemonProcess = $null
+$completed = $false
+$failureArtifacts = Join-Path $env:RUNNER_TEMP ("windows-daemon-lifecycle-" + $Target)
 
 New-Item -ItemType Directory -Path $workspace -Force | Out-Null
 $env:ASTRID_HOME = $astridHome
@@ -41,6 +53,8 @@ function Invoke-Astrid {
 
 Push-Location $workspace
 try {
+    $installOutput = Invoke-Astrid capsule install $CapsuleSource --yes --approve-untrusted
+    $installOutput | Write-Host
     $startOutput = Invoke-Astrid start
     if (-not (Test-Path -LiteralPath $pidPath -PathType Leaf)) {
         throw "astrid start returned success without a daemon PID file`n$startOutput"
@@ -87,6 +101,7 @@ try {
     if (-not $stoppedStatus.Contains("No Astrid daemon is running.")) {
         throw "post-stop status did not confirm daemon absence`n$stoppedStatus"
     }
+    $completed = $true
 }
 finally {
     try {
@@ -117,6 +132,18 @@ finally {
         }
     }
     finally {
+        if (-not $completed) {
+            try {
+                $bootLog = Join-Path $astridHome "log\daemon-boot.log"
+                if (Test-Path -LiteralPath $bootLog -PathType Leaf) {
+                    New-Item -ItemType Directory -Path $failureArtifacts -Force | Out-Null
+                    Copy-Item -LiteralPath $bootLog -Destination $failureArtifacts -Force
+                }
+            }
+            catch {
+                Write-Warning "could not preserve lifecycle failure artifacts: $_"
+            }
+        }
         Pop-Location
         $processGone = $null -eq $daemonProcess -or $daemonProcess.HasExited
         if (
