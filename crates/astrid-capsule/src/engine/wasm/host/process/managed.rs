@@ -128,8 +128,9 @@ impl ForegroundProcess {
         #[cfg(windows)]
         let wait_for_root = {
             let tree = Arc::clone(&self.tree);
-            async {
-                let status = self.child.wait().await?;
+            let child = &mut self.child;
+            async move {
+                let status = child.wait().await?;
                 // Descendants may inherit the root's stdout/stderr handles.
                 // Terminate the Job as soon as the root exits, before waiting
                 // for EOF, or pipe draining can wait forever on a descendant.
