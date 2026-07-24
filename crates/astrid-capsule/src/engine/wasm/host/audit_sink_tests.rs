@@ -419,7 +419,7 @@ fn windows_touch_request(sentinel: &std::path::Path) -> process_host::SpawnReque
 fn authenticate_windows_process_state(state: &mut HostState) {
     state.caller_context = Some(
         astrid_events::ipc::IpcMessage::new(
-            astrid_events::Topic::from_raw("test.windows.process"),
+            astrid_events::ipc::Topic::from_raw("test.windows.process"),
             astrid_events::ipc::IpcPayload::RawJson(serde_json::json!({})),
             uuid::Uuid::new_v4(),
         )
@@ -733,12 +733,12 @@ async fn windows_signal_audit_never_persists_guest_arguments() {
     let handle = state.spawn_background(request).expect("background spawn");
     windows_wait_for_file(&heartbeat).await;
 
-    state
-        .signal(
-            Resource::<ProcessHandle>::new_borrow(handle.rep()),
-            ProcessSignal::Term,
-        )
-        .expect("terminate process tree");
+    process_host::HostProcessHandle::signal(
+        &mut state,
+        Resource::<ProcessHandle>::new_borrow(handle.rep()),
+        ProcessSignal::Term,
+    )
+    .expect("terminate process tree");
     <HostState as process_host::HostProcessHandle>::drop(&mut state, handle)
         .expect("drop process handle");
 
@@ -751,7 +751,8 @@ async fn windows_signal_audit_never_persists_guest_arguments() {
     }));
     assert!(records.iter().any(|(_, event, _)| matches!(
         event,
-        CapturedEvent::ProcessSignal(process, "term") if process == &executable
+        CapturedEvent::ProcessSignal(process, signal)
+            if process == &executable && signal == "term"
     )));
 }
 

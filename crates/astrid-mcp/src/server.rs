@@ -1097,6 +1097,23 @@ impl std::fmt::Debug for ServerManager {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn non_utf8_test_path() -> std::path::PathBuf {
+        use std::os::unix::ffi::OsStringExt;
+
+        std::ffi::OsString::from_vec(b"/tmp/\xff\xfe/workspace".to_vec()).into()
+    }
+
+    #[cfg(windows)]
+    fn non_utf8_test_path() -> std::path::PathBuf {
+        use std::os::windows::ffi::OsStringExt;
+
+        // Keep the path absolute so validation reaches the UTF-8 boundary. A
+        // lone UTF-16 surrogate cannot be represented as UTF-8.
+        std::ffi::OsString::from_wide(&[u16::from(b'C'), u16::from(b':'), u16::from(b'\\'), 0xD800])
+            .into()
+    }
+
     #[tokio::test]
     async fn test_server_manager_creation() {
         let configs = ServersConfig::default();
@@ -1643,12 +1660,8 @@ mod tests {
 
     #[test]
     fn test_validate_sandbox_path_rejects_non_utf8() {
-        use std::ffi::OsStr;
-        use std::os::unix::ffi::OsStrExt;
-
-        let bad_bytes: &[u8] = b"/tmp/\xff\xfe/workspace";
-        let bad_path = std::path::Path::new(OsStr::from_bytes(bad_bytes));
-        let result = ServerManager::validate_sandbox_path(bad_path, "test_field");
+        let bad_path = non_utf8_test_path();
+        let result = ServerManager::validate_sandbox_path(&bad_path, "test_field");
         assert!(
             matches!(result, Err(McpError::ConfigError(ref msg)) if msg.contains("not valid UTF-8")),
             "non-UTF-8 path should be rejected, got: {result:?}"
@@ -1674,14 +1687,8 @@ mod tests {
 
     #[test]
     fn test_build_sandboxed_command_rejects_non_utf8_workspace_root() {
-        use std::ffi::OsStr;
-        use std::os::unix::ffi::OsStrExt;
-
-        let bad_bytes: &[u8] = b"/tmp/\xff\xfe/workspace";
-        let bad_path = std::path::PathBuf::from(OsStr::from_bytes(bad_bytes));
-
         let configs = ServersConfig::default();
-        let manager = ServerManager::new(configs).with_workspace_root(bad_path);
+        let manager = ServerManager::new(configs).with_workspace_root(non_utf8_test_path());
 
         let config = ServerConfig::stdio("test", "echo");
         let result = manager.build_sandboxed_command("test", "echo", &config);

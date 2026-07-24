@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::engine::wasm::bindings::astrid::process1_1_0::host::{ErrorCode, SpawnRequest};
 
+#[derive(Debug)]
 pub(super) enum PrepareCommandError {
     Invalid,
     SandboxDenied(String),
@@ -214,14 +215,14 @@ pub(super) fn kill_and_reap(
         // TerminateJobObject is the owned tree operation. Its success—not a
         // racy second start_kill on the root—establishes killed=true.
         tree.terminate(super::platform::Termination::Force)?;
-        return Ok((
+        Ok((
             true,
             child
                 .try_wait()
                 .ok()
                 .flatten()
                 .and_then(|status| status.code()),
-        ));
+        ))
     }
     #[cfg(not(any(unix, windows)))]
     {
