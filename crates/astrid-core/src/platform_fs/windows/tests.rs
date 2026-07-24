@@ -423,7 +423,7 @@ fn handle_relative_move_and_replacement_succeed() {
 }
 
 #[test]
-fn handle_relative_mutation_stays_bound_during_ancestor_move() {
+fn handle_relative_mutation_fails_closed_or_stays_bound_during_ancestor_move() {
     let _serial = serial_test_guard();
     let root = private_temp();
     let ancestor = root.path().join("ancestor");
@@ -449,11 +449,20 @@ fn handle_relative_mutation_stays_bound_during_ancestor_move() {
     );
 
     assert!(result.is_err());
-    assert_eq!(
-        std::fs::read(moved_ancestor.join("guarded").join("destination")).unwrap(),
-        b"authority-bound-content"
-    );
     assert!(!destination.exists());
+    let moved_guarded = moved_ancestor.join("guarded");
+    let outcome = (
+        std::fs::read(moved_guarded.join("source")),
+        std::fs::read(moved_guarded.join("destination")),
+    );
+    let preserved = matches!(&outcome, (Ok(bytes), Err(error))
+        if bytes == b"authority-bound-content" && error.kind() == io::ErrorKind::NotFound);
+    let completed = matches!(&outcome, (Err(error), Ok(bytes))
+        if error.kind() == io::ErrorKind::NotFound && bytes == b"authority-bound-content");
+    assert!(
+        preserved || completed,
+        "ancestor move must preserve the source or complete the bound rename: {outcome:?}"
+    );
 }
 
 #[test]

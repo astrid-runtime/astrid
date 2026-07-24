@@ -362,15 +362,17 @@ pub(super) fn move_guarded_file(
 pub(super) fn remove_guarded_file(guard: &TrustedPathGuard, path: &Path) -> io::Result<()> {
     let name = guarded_child_name(guard, path)?;
     let handle = open_guarded_child(guard, name, DELETE | FILE_READ_ATTRIBUTES)?;
-    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    let disposition = FILE_DISPOSITION_INFO_EX {
+        Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+    };
     // SAFETY: `handle` is live and the fixed-size disposition buffer is valid.
     if unsafe {
         SetFileInformationByHandle(
             handle.0,
-            FileDispositionInfo,
+            FileDispositionInfoEx,
             (&raw const disposition).cast(),
-            u32::try_from(size_of::<FILE_DISPOSITION_INFO>())
-                .expect("FILE_DISPOSITION_INFO fits in u32"),
+            u32::try_from(size_of::<FILE_DISPOSITION_INFO_EX>())
+                .expect("FILE_DISPOSITION_INFO_EX fits in u32"),
         )
     } == 0
     {
@@ -481,13 +483,22 @@ fn rename_guarded_file(
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename buffer overflow"))?;
     // `Vec<usize>` supplies native pointer alignment and zero-initializes the
     // full fixed structure plus the variable-length UTF-16 name bytes required
-    // by `NtSetInformationFile(FileRenameInformation)`.
+    // by `NtSetInformationFile`.
     let mut buffer = vec![0_usize; buffer_bytes.div_ceil(size_of::<usize>())];
     let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+    let information_class = if replace {
+        FileRenameInformationEx
+    } else {
+        FileRenameInformation
+    };
     // SAFETY: the usize buffer is sufficiently aligned and sized for the
     // variable-length FILE_RENAME_INFORMATION followed by the UTF-16 component.
     unsafe {
-        (*info).Anonymous.ReplaceIfExists = replace;
+        if replace {
+            (*info).Anonymous.Flags = FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS;
+        } else {
+            (*info).Anonymous.ReplaceIfExists = false;
+        }
         (*info).RootDirectory = guard.authority_handle();
         (*info).FileNameLength = name_bytes;
         std::ptr::copy_nonoverlapping(
@@ -499,15 +510,16 @@ fn rename_guarded_file(
     let mut status = IO_STATUS_BLOCK::default();
     // SAFETY: source and root-directory handles are live, and the aligned
     // variable-length buffer contains exactly `buffer_bytes` initialized bytes.
-    // The NT information class is used because it explicitly supports resolving
-    // a simple target name against the retained `RootDirectory` handle.
+    // The NT information classes explicitly support resolving a simple target
+    // name against the retained `RootDirectory` handle. Replacement uses POSIX
+    // semantics so an existing target handle cannot force an unsafe fallback.
     let result = unsafe {
         NtSetInformationFile(
             source.0,
             &raw mut status,
             info.cast(),
             u32::try_from(buffer_bytes).expect("rename buffer length fits u32"),
-            FileRenameInformation,
+            information_class,
         )
     };
     if result < 0 {
@@ -598,16 +610,18 @@ pub(super) fn restrict_guarded_private_file(
 }
 
 fn mark_file_for_deletion(handle: HANDLE) -> io::Result<()> {
-    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    let disposition = FILE_DISPOSITION_INFO_EX {
+        Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+    };
     // SAFETY: `handle` is live with DELETE access and the fixed-size
     // disposition buffer remains live for the call.
     if unsafe {
         SetFileInformationByHandle(
             handle,
-            FileDispositionInfo,
+            FileDispositionInfoEx,
             (&raw const disposition).cast(),
-            u32::try_from(size_of::<FILE_DISPOSITION_INFO>())
-                .expect("FILE_DISPOSITION_INFO fits in u32"),
+            u32::try_from(size_of::<FILE_DISPOSITION_INFO_EX>())
+                .expect("FILE_DISPOSITION_INFO_EX fits in u32"),
         )
     } == 0
     {

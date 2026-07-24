@@ -24,16 +24,18 @@ impl Drop for OwnedHandle {
 }
 
 fn mark_directory_for_deletion(handle: HANDLE) -> io::Result<()> {
-    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    let disposition = FILE_DISPOSITION_INFO_EX {
+        Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+    };
     // SAFETY: `handle` is live with DELETE access and the fixed-size
     // disposition buffer remains live for the call.
     if unsafe {
         SetFileInformationByHandle(
             handle,
-            FileDispositionInfo,
+            FileDispositionInfoEx,
             (&raw const disposition).cast(),
-            u32::try_from(size_of::<FILE_DISPOSITION_INFO>())
-                .expect("FILE_DISPOSITION_INFO fits in u32"),
+            u32::try_from(size_of::<FILE_DISPOSITION_INFO_EX>())
+                .expect("FILE_DISPOSITION_INFO_EX fits in u32"),
         )
     } == 0
     {
