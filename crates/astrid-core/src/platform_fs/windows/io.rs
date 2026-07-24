@@ -357,7 +357,16 @@ pub(super) fn move_guarded_file(
     source: &Path,
     destination: &Path,
 ) -> io::Result<()> {
-    rename_guarded_file(guard, source, destination, false)
+    rename_guarded_file(guard, source, destination, false).map_err(|error| {
+        with_context(
+            error,
+            format!(
+                "could not move handle-relative file {} to {}",
+                source.display(),
+                destination.display()
+            ),
+        )
+    })
 }
 
 pub(super) fn remove_guarded_file(guard: &TrustedPathGuard, path: &Path) -> io::Result<()> {

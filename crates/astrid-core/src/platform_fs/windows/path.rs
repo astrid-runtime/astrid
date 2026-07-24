@@ -424,7 +424,11 @@ impl TrustedPathGuard {
         };
         match (result, verification) {
             (Ok(value), Ok(())) => Ok(value),
-            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(error)) => Err(with_context(
+                error,
+                format!("{operation} completed but authority-boundary verification failed"),
+            )),
             (Err(operation_error), Err(verification_error)) => Err(with_context(
                 operation_error,
                 format!(
