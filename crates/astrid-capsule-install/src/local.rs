@@ -9,6 +9,9 @@
 //!
 //! ## Order
 //!
+//! Windows user installs validate or provision the private Astrid and
+//! principal boundaries before any read traverses the principal namespace.
+//!
 //! Pre-flight reads happen before any mutation of `target_dir`:
 //!
 //! 1. Parse manifest.
@@ -19,15 +22,16 @@
 //! If any of those fail we haven't touched `target_dir` and the
 //! existing install is intact. Only then do we:
 //!
-//! 5. Backup existing `target_dir` (rename to `.bak`).
-//! 6. Copy non-WASM tree → `target_dir` (excludes `*.wasm` and
+//! 5. Provision the remaining user or checked-workspace target boundary.
+//! 6. Backup existing `target_dir` (rename to `.bak`).
+//! 7. Copy non-WASM tree → `target_dir` (excludes `*.wasm` and
 //!    `wit/`).
-//! 7. Restore `.env.json` from the backup if present.
-//! 8. Run lifecycle hook with bytes from `bin/`.
-//! 9. Write `meta.json`.
-//! 10. Cleanup backup.
+//! 8. Restore `.env.json` from the backup if present.
+//! 9. Run lifecycle hook with bytes from `bin/`.
+//! 10. Write `meta.json`.
+//! 11. Cleanup backup.
 //!
-//! Failure after step 6 restores the backup over `target_dir`.
+//! Failure after step 7 restores the backup over `target_dir`.
 
 use std::path::{Path, PathBuf};
 
@@ -536,6 +540,20 @@ pub(crate) fn install_from_local_path_internal(
     let installed_authority =
         authority_for_install_source(source_dir, &manifest, installed_authority)?;
 
+    // A user install may scan existing principal capsule metadata below.
+    // Validate or create the Windows boundaries before any read traverses that
+    // namespace. Existing unsafe homes fail closed and are never repaired.
+    #[cfg(windows)]
+    if checked_workspace.is_none() {
+        home.ensure()
+            .context("failed to provision private Astrid home for capsule install")?;
+        home.principal_home(target_principal)
+            .ensure()
+            .with_context(|| {
+                format!("failed to provision private principal home for '{target_principal}'")
+            })?;
+    }
+
     // Pre-flight checks — pure reads, no target mutation.
     let export_conflicts = check_export_conflicts_in_workspace(
         &manifest,
@@ -545,8 +563,9 @@ pub(crate) fn install_from_local_path_internal(
         workspace.layout,
     )?;
 
-    // Resolve target. The parent must exist before we attempt the
-    // backup-rename later; create it now.
+    // Resolve and provision the target boundary before the backup rename.
+    // Windows must create a fresh user/principal tree through the typed home
+    // boundaries so it never inherits an ambient parent ACL.
     let target_dir = resolve_target_dir_for_in_workspace(
         home,
         target_principal,
@@ -555,7 +574,6 @@ pub(crate) fn install_from_local_path_internal(
         workspace.root,
         workspace.layout,
     )?;
-    let parent = target_dir.parent().context("target dir has no parent")?;
     if let Some(selection) = &checked_workspace {
         selection
             .ensure_directory("capsules")
@@ -567,8 +585,12 @@ pub(crate) fn install_from_local_path_internal(
             .verify_tree("capsules")
             .context("workspace capsule tree contains an unsafe redirect")?;
     } else {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
+        #[cfg(not(windows))]
+        {
+            let parent = target_dir.parent().context("target dir has no parent")?;
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
     }
 
     // Phase detection from existing meta (read-only).
