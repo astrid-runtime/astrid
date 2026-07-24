@@ -11,6 +11,15 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Added
 
+- **Windows local transport uses authenticated per-user named pipes.** A pipe
+  name derived only from the caller's operating-system SID replaces
+  filesystem endpoint naming on Windows. Local-only byte-mode instances use a
+  protected current-user and Local System DACL, reject namespace squatting,
+  authenticate the client's effective token, and pin peer process identity
+  before the unchanged session-token and signed-principal handshake. Bounded,
+  cancellable busy-instance retries support probe-then-connect and concurrent
+  clients. Native x86_64 and ARM64 Windows jobs exercise binding, concurrent
+  instances, shutdown, and reconnect behavior. Closes #1349.
 - **Linux amd64 now has a distro-neutral OCI build target.** The image packages
   exact immutable GitHub release bytes only after their tagged release-workflow
   signatures and manifest digests verify, runs the persistent daemon as a

@@ -1,27 +1,29 @@
 //! Internal host-local byte-stream transport.
 //!
 //! This is a cross-crate implementation seam, not a stable public API. The
-//! only live backend is a Unix-domain socket. Unsupported hosts fail with
-//! [`io::ErrorKind::Unsupported`]; no alternate-platform support is implied.
-//! Framing, authentication, daemon lifecycle, and endpoint naming remain above
-//! this module.
+//! live backends are Unix-domain sockets and per-user Windows named pipes.
+//! Unsupported hosts fail with [`io::ErrorKind::Unsupported`].
+//! Framing, authentication, and daemon lifecycle remain above this module;
+//! platform endpoint naming belongs to the backend.
 //!
 //! On Unix, the stream, listener, and owned-half aliases are the exact Tokio
-//! types used before this seam was introduced. The backend owns endpoint
-//! presence checks, stale cleanup, path validation, connection probing, and
-//! same-user peer verification so callers do not assume filesystem sockets.
+//! types used before this seam was introduced. On Windows, the caller's path
+//! is only a portable API token: endpoint naming comes exclusively from the
+//! current process token SID. Backends own endpoint presence checks, stale
+//! cleanup, connection probing, and same-user peer verification so callers do
+//! not assume filesystem sockets.
 
 use std::io;
 use std::path::Path;
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 use std::pin::Pin;
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 use std::task::{Context, Poll};
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-#[cfg(any(test, not(unix)))]
+#[cfg(any(all(test, unix), not(any(unix, windows))))]
 fn unsupported_backend_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::Unsupported,
@@ -33,8 +35,12 @@ fn unsupported_backend_error() -> io::Error {
 #[cfg(unix)]
 pub use tokio::net::UnixStream as LocalStream;
 
+/// A connected Windows named-pipe stream.
+#[cfg(windows)]
+pub use windows_backend::LocalStream;
+
 /// An unconstructable placeholder on hosts without a local transport backend.
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 #[derive(Debug)]
 pub struct LocalStream {
     _private: (),
@@ -44,8 +50,12 @@ pub struct LocalStream {
 #[cfg(unix)]
 pub use tokio::net::UnixListener as LocalListener;
 
+/// A Windows named-pipe listener.
+#[cfg(windows)]
+pub use windows_backend::LocalListener;
+
 /// An unconstructable placeholder on hosts without a local transport backend.
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 #[derive(Debug)]
 pub struct LocalListener {
     _private: (),
@@ -101,8 +111,9 @@ pub async fn connect_outcome(path: &Path) -> io::Result<ConnectOutcome> {
 
 /// Bind a host-local endpoint.
 ///
-/// The backend validates its endpoint representation, removes a stale endpoint
-/// or unexpected symlink, rejects an active listener, and then binds.
+/// The backend validates its endpoint representation and rejects an active
+/// listener. Unix additionally cleans a stale filesystem socket or unexpected
+/// symlink; Windows claims the SID-derived name as the first pipe instance.
 ///
 /// # Errors
 ///
@@ -193,6 +204,30 @@ pub fn remove_stale_endpoint(path: &Path) -> io::Result<bool> {
 /// backend return [`io::ErrorKind::Unsupported`].
 pub fn peer_is_current_user(stream: &LocalStream) -> io::Result<bool> {
     backend::peer_is_current_user(stream)
+}
+
+/// Resolve the backend-owned endpoint name for native security harnesses.
+#[cfg(all(windows, feature = "test-support"))]
+#[doc(hidden)]
+pub fn endpoint_name_for_test(path: &Path) -> io::Result<std::ffi::OsString> {
+    backend::endpoint_name_for_test(path)
+}
+
+/// Bind one deliberately permissive first instance for the privileged native
+/// effective-token rejection harness.
+#[cfg(all(windows, feature = "test-support"))]
+#[doc(hidden)]
+pub fn bind_permissive_first_instance_for_test(path: &Path) -> io::Result<LocalListener> {
+    backend::bind_permissive_first_instance_for_test(path)
+}
+
+/// Query the kernel pipe mode for the native remote-client security harness.
+#[cfg(all(windows, feature = "test-support"))]
+#[doc(hidden)]
+pub async fn listener_rejects_remote_clients_for_test(
+    listener: &LocalListener,
+) -> io::Result<bool> {
+    backend::listener_rejects_remote_clients_for_test(listener).await
 }
 
 #[cfg(unix)]
@@ -329,7 +364,15 @@ mod backend {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+#[allow(unsafe_code)]
+#[path = "local_transport/windows.rs"]
+mod windows_backend;
+
+#[cfg(windows)]
+use windows_backend as backend;
+
+#[cfg(not(any(unix, windows)))]
 mod backend {
     use std::io;
     use std::path::Path;
@@ -389,7 +432,7 @@ mod backend {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 impl AsyncRead for LocalStream {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -401,7 +444,7 @@ impl AsyncRead for LocalStream {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 impl AsyncWrite for LocalStream {
     fn poll_write(
         self: Pin<&mut Self>,
@@ -550,7 +593,7 @@ mod tests {
     use std::path::Path;
 }
 
-#[cfg(all(test, not(unix)))]
+#[cfg(all(test, not(any(unix, windows))))]
 mod unsupported_tests {
     use super::{
         LocalListener, LocalStream, accept, bind, connect, connect_outcome, endpoint_is_present,

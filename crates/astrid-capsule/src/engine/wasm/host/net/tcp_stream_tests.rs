@@ -67,14 +67,13 @@ fn write_frame_err_timed_out_maps_to_unknown() {
 /// `publish-as` override in `host/ipc.rs` consumes `ingress_principal`, so
 /// if this read never populated it the override would silently fall back to
 /// the capsule-supplied (forgeable) name and the self-stamp hole would
-/// reopen — with `publish-as`-level tests still green. A socketpair stands
-/// in for an accepted client connection; it binds no filesystem path, so it
-/// works under the sandbox (unlike a named Unix socket).
+/// reopen — with `publish-as`-level tests still green. A loopback TCP pair
+/// stands in for an accepted client connection without depending on the
+/// platform's host-local transport implementation.
 #[tokio::test(flavor = "multi_thread")]
 async fn framed_read_records_then_clears_verified_ingress_principal() {
     use tokio::io::AsyncWriteExt;
 
-    use crate::engine::wasm::host_state::NetStream;
     use crate::engine::wasm::test_fixtures::minimal_host_state;
 
     let rt = tokio::runtime::Handle::current();
@@ -83,8 +82,9 @@ async fn framed_read_records_then_clears_verified_ingress_principal() {
     // ever binds an entry).
     state.has_uplink_capability = true;
 
-    let (host_end, mut peer) = tokio::net::UnixStream::pair().expect("socketpair");
-    let net = NetStream::Unix(std::sync::Arc::new(tokio::sync::Mutex::new(host_end)));
+    let Some((net, mut peer)) = framed_test_stream_pair().await else {
+        return;
+    };
     let rep = state.resource_table.push(net).expect("push stream").rep();
 
     // The handshake bound this connection to `claude` (Path 2 crypto, or a
@@ -156,7 +156,6 @@ async fn framed_read_records_then_clears_verified_ingress_principal() {
 async fn framed_read_is_inert_without_uplink_capability() {
     use tokio::io::AsyncWriteExt;
 
-    use crate::engine::wasm::host_state::NetStream;
     use crate::engine::wasm::test_fixtures::minimal_host_state;
 
     let rt = tokio::runtime::Handle::current();
@@ -164,8 +163,9 @@ async fn framed_read_is_inert_without_uplink_capability() {
     // No uplink capability — the default.
     assert!(!state.has_uplink_capability);
 
-    let (host_end, mut peer) = tokio::net::UnixStream::pair().expect("socketpair");
-    let net = NetStream::Unix(std::sync::Arc::new(tokio::sync::Mutex::new(host_end)));
+    let Some((net, mut peer)) = framed_test_stream_pair().await else {
+        return;
+    };
     let rep = state.resource_table.push(net).expect("push stream").rep();
     state.bind_connection_principal(
         rep,
@@ -206,7 +206,6 @@ async fn framed_read_is_inert_without_uplink_capability() {
 async fn framed_read_unbound_connection_does_not_earn_local_origin() {
     use tokio::io::AsyncWriteExt;
 
-    use crate::engine::wasm::host_state::NetStream;
     use crate::engine::wasm::test_fixtures::minimal_host_state;
 
     let rt = tokio::runtime::Handle::current();
@@ -215,8 +214,9 @@ async fn framed_read_unbound_connection_does_not_earn_local_origin() {
     // connection is never bound — no `bind_connection_principal` call.
     state.has_uplink_capability = true;
 
-    let (host_end, mut peer) = tokio::net::UnixStream::pair().expect("socketpair");
-    let net = NetStream::Unix(std::sync::Arc::new(tokio::sync::Mutex::new(host_end)));
+    let Some((net, mut peer)) = framed_test_stream_pair().await else {
+        return;
+    };
     let rep = state.resource_table.push(net).expect("push stream").rep();
     // Deliberately NO bind: this is an unbound (unauthenticated) connection.
 
@@ -266,6 +266,24 @@ async fn small_buffer_tcp_pair() -> Option<(tokio::net::TcpStream, tokio::net::T
         .set_recv_buffer_size(4096)
         .ok();
     Some((host, peer))
+}
+
+/// Wrap one side of a cross-platform loopback pair as a host resource.
+async fn framed_test_stream_pair() -> Option<(
+    crate::engine::wasm::host_state::NetStream,
+    tokio::net::TcpStream,
+)> {
+    use crate::engine::wasm::host_state::{NetStream, TcpStreamSlot};
+
+    let (host, peer) = small_buffer_tcp_pair().await?;
+    Some((
+        NetStream::Tcp(TcpStreamSlot {
+            stream: std::sync::Arc::new(tokio::sync::Mutex::new(host)),
+            read_timeout: None,
+            write_timeout: None,
+        }),
+        peer,
+    ))
 }
 
 /// Regression for issue #1144: a connected client that stops draining its
@@ -398,18 +416,21 @@ async fn write_deadline_honours_slot_timeout_else_scales_by_payload() {
     use crate::engine::wasm::host_state::{NetStream, TcpStreamSlot};
 
     // Unix arm: always the default ceiling, scaled by payload size.
-    let (host_end, _peer) = tokio::net::UnixStream::pair().expect("socketpair");
-    let unix = NetStream::Unix(std::sync::Arc::new(tokio::sync::Mutex::new(host_end)));
-    assert_eq!(
-        write_deadline(&unix, 0),
-        Duration::from_millis(5000),
-        "Unix arm with an empty payload uses the 5s base ceiling"
-    );
-    assert_eq!(
-        write_deadline(&unix, 1024 * 1024),
-        Duration::from_millis(5000 + 1024),
-        "Unix arm scales the ceiling by payload size"
-    );
+    #[cfg(unix)]
+    {
+        let (host_end, _peer) = tokio::net::UnixStream::pair().expect("socketpair");
+        let unix = NetStream::Unix(std::sync::Arc::new(tokio::sync::Mutex::new(host_end)));
+        assert_eq!(
+            write_deadline(&unix, 0),
+            Duration::from_millis(5000),
+            "Unix arm with an empty payload uses the 5s base ceiling"
+        );
+        assert_eq!(
+            write_deadline(&unix, 1024 * 1024),
+            Duration::from_millis(5000 + 1024),
+            "Unix arm scales the ceiling by payload size"
+        );
+    }
 
     // Tcp arm needs a real stream; skip if the sandbox blocks the bind.
     let Some((host, _tcp_peer)) = small_buffer_tcp_pair().await else {

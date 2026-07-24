@@ -17,7 +17,7 @@ use crate::profile_cache::PrincipalProfileCache;
 use crate::registry::CapsuleRegistry;
 use crate::schema_catalog::SchemaCatalog;
 
-/// Handle to the kernel-bound uplink (CLI) Unix socket listener.
+/// Handle to the kernel-bound uplink (CLI) local-transport listener.
 ///
 /// On native this is exactly the concrete type the kernel binds and hands into
 /// the capsule execution context.
