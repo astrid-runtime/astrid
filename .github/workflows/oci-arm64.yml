@@ -81,6 +81,12 @@ jobs:
             echo "IMAGE=astrid-runtime:${VERSION}-arm64"
           } >> "$GITHUB_ENV"
 
+      - name: Install pinned fixture toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: '1.95.0'
+          targets: wasm32-unknown-unknown
+
       - name: Install pinned BLAKE3 verifier
         run: cargo install b3sum --version 1.8.5 --locked
 
@@ -114,12 +120,6 @@ jobs:
           ref: 01fd0e8456330f6d781448357397bc895ce2abfb
           path: .oci-fixtures/aos-ce
           persist-credentials: false
-
-      - name: Install pinned fixture toolchain
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-        with:
-          toolchain: '1.95.0'
-          targets: wasm32-unknown-unknown
 
       - name: Build compatible CLI uplink fixture with authenticated arm64 tool
         run: |

@@ -60,7 +60,9 @@ class RuntimeContractTests(unittest.TestCase):
     def test_arm64_wrapper_selects_native_platform_and_architecture(self) -> None:
         self.assertIn("ASTRID_OCI_TEST_PLATFORM=linux/arm64", TEST_WRAPPER)
         self.assertIn("ASTRID_OCI_TEST_ARCHITECTURE=arm64", TEST_WRAPPER)
-        self.assertIn('exec container/amd64/test.sh "$@"', TEST_WRAPPER)
+        self.assertIn('SCRIPT_DIR=$(CDPATH=\'\' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)', TEST_WRAPPER)
+        self.assertIn('REPO_ROOT=$(CDPATH=\'\' cd -- "$SCRIPT_DIR/../.." && pwd)', TEST_WRAPPER)
+        self.assertIn('exec "$REPO_ROOT/container/amd64/test.sh" "$@"', TEST_WRAPPER)
 
     def test_shared_runtime_harness_keeps_amd64_defaults(self) -> None:
         self.assertIn(
