@@ -254,15 +254,22 @@ def verify_archive_structure(path: pathlib.Path, version: str) -> None:
         raise ValueError("release archive is not a valid gzip-compressed tar") from error
     require(1 <= len(members) <= 16, "release archive has an unexpected member count")
     for member in members:
-        pure = pathlib.PurePosixPath(member.name)
+        # GNU tar records an explicitly archived directory as `root/`, while
+        # Python-created fixtures commonly spell the same member as `root`.
+        # Normalize exactly one directory marker before applying the canonical
+        # root and duplicate checks; `root//` remains invalid.
+        canonical_name = (
+            member.name[:-1] if member.isdir() and member.name.endswith("/") else member.name
+        )
+        pure = pathlib.PurePosixPath(canonical_name)
         require(
             not pure.is_absolute() and ".." not in pure.parts and pure.parts,
             f"release archive has unsafe path: {member.name}",
         )
-        require(member.name not in seen, f"release archive has duplicate path: {member.name}")
-        seen.add(member.name)
+        require(canonical_name not in seen, f"release archive has duplicate path: {member.name}")
+        seen.add(canonical_name)
         require(member.mode & 0o7000 == 0, f"release archive has special permission bits: {member.name}")
-        if member.name == expected_root:
+        if canonical_name == expected_root:
             require(member.isdir(), "release archive root is not a directory")
             continue
         require(

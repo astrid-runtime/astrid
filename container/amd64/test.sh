@@ -12,6 +12,15 @@ cleanup() {
   if [[ -n "$REAL_CONTAINER" ]]; then
     docker rm --force "$REAL_CONTAINER" >/dev/null 2>&1 || true
   fi
+  # The real runtime deliberately creates 0700 state as uid 65532. Restore
+  # access only inside this mktemp tree so the unprivileged runner can remove
+  # its own test fixture.
+  docker run --rm \
+    --user 0:0 \
+    --entrypoint /bin/sh \
+    --mount "type=bind,src=$TEST_ROOT,dst=/cleanup" \
+    "$IMAGE" \
+    -c 'chmod -R a+rwX /cleanup' >/dev/null 2>&1 || true
   docker image rm --force "$TEST_IMAGE" >/dev/null 2>&1 || true
   docker image rm --force "$TEST_SWAP_IMAGE" >/dev/null 2>&1 || true
   rm -rf "$TEST_ROOT"
@@ -21,6 +30,21 @@ trap cleanup EXIT
 fail() {
   echo "oci amd64 test: $*" >&2
   exit 1
+}
+
+prepare_runtime_dir() {
+  local directory=$1
+  mkdir -p "$directory"
+  # Astrid secures ASTRID_HOME itself with chmod(0700), so a bind mount that
+  # is merely world-writable is insufficient on Linux: uid 65532 must own the
+  # mount root. Use the already-authenticated image as a local ownership
+  # helper instead of requiring privileged host commands.
+  docker run --rm \
+    --user 0:0 \
+    --entrypoint /bin/sh \
+    --mount "type=bind,src=$directory,dst=/runtime" \
+    "$IMAGE" \
+    -ec 'chown 65532:65532 /runtime; chmod 0700 /runtime'
 }
 
 ARCH=$(docker image inspect "$IMAGE" --format '{{.Architecture}}')
@@ -45,8 +69,8 @@ python3 scripts/create_oci_test_shuttle.py \
   --output "$TEST_ROOT/fixtures/distro.shuttle"
 
 run_dir="$TEST_ROOT/run"
-mkdir -p "$run_dir/real-state" "$run_dir/real-workspace"
-chmod 0777 "$run_dir/real-state" "$run_dir/real-workspace"
+prepare_runtime_dir "$run_dir/real-state"
+prepare_runtime_dir "$run_dir/real-workspace"
 distro_sha256=$(sha256sum "$TEST_ROOT/fixtures/distro.shuttle")
 distro_sha256=${distro_sha256%% *}
 

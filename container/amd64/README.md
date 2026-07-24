@@ -40,10 +40,15 @@ there.
 
 Astrid Runtime intentionally has no default distro. Mount an operator-selected
 signed `.shuttle`, pin its exact SHA-256, and provide writable state and
-workspace mounts:
+workspace mounts. A new named state volume inherits the image's UID/GID
+ownership. A bind-mounted workspace must be prepared for UID/GID `65532`
+(or its user-namespace mapping) because Astrid creates and secures workspace
+state there:
 
 ```sh
 distro_sha256=$(sha256sum ./distro.shuttle | cut -d ' ' -f 1)
+mkdir -p ./workspace
+sudo chown 65532:65532 ./workspace
 
 docker run --rm \
   --read-only \
@@ -71,10 +76,11 @@ The daemon remains PID 1 in persistent foreground mode and routes ANSI-free
 logs to standard error. The image runs as UID/GID `65532`, declares no ports,
 does not need a Docker socket, and is intended to run with all Linux
 capabilities dropped. Bind-mounted state and workspace directories must be
-writable by UID/GID `65532`. Container arguments are restricted to verbosity
-and the three bounded daemon concurrency controls. In particular, callers
-cannot enable ephemeral mode or replace the image-owned workspace/session
-identity.
+owned by UID/GID `65532`, not only world-writable: Astrid deliberately applies
+owner-only permissions to its state root. Container arguments are restricted
+to verbosity and the three bounded daemon concurrency controls. In particular,
+callers cannot enable ephemeral mode or replace the image-owned
+workspace/session identity.
 
 The neutral target does not install `bwrap` or a product shell/tool stack.
 Distros that request native subprocess hosting therefore fail closed at

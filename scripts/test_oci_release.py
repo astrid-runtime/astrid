@@ -49,7 +49,9 @@ def release(assets: list[dict[str, object]]) -> dict[str, object]:
 def write_archive(path: pathlib.Path, *, unsafe: bool = False, omit: str | None = None) -> None:
     root = f"astrid-{VERSION}-{TARGET}"
     with tarfile.open(path, mode="w:gz") as archive:
-        directory = tarfile.TarInfo(root)
+        # Match the top-level directory entry emitted by
+        # `tar czf "$root.tar.gz" "$root"` in the release workflow.
+        directory = tarfile.TarInfo(f"{root}/")
         directory.type = tarfile.DIRTYPE
         directory.mode = 0o755
         archive.addfile(directory)
