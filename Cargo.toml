@@ -134,7 +134,6 @@ keyring = { version = "3", features = [
 landlock = "0.4"
 libc = "0.2"
 nix = { version = "0.31", features = ["process", "signal", "user", "fs", "resource"] }
-windows-sys = { version = "0.61.2" }
 # Async-signal-safe signal handling on a dedicated OS thread. Used by the
 # daemon's SIGTERM/SIGINT/SIGHUP watchdog, which owns those signals off the
 # tokio runtime so the daemon is killable even when every worker is pinned.
