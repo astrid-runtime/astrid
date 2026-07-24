@@ -71,6 +71,18 @@ pub(super) fn identity_capability_satisfies(declared: &[String], required: &str)
 /// to permit or deny the operation.
 #[async_trait]
 pub trait CapsuleSecurityGate: Send + Sync {
+    /// Rebuild this gate for an invocation-scoped workspace root.
+    ///
+    /// The default denies rebasing. Manifest-backed gates override this so
+    /// an authenticated connection attachment can use the capsule's existing
+    /// capability declaration against a different, host-admitted root.
+    fn for_workspace(
+        &self,
+        _workspace_root: std::path::PathBuf,
+    ) -> Option<std::sync::Arc<dyn CapsuleSecurityGate>> {
+        None
+    }
+
     /// Check whether the capsule is allowed to make an HTTP request.
     async fn check_http_request(
         &self,

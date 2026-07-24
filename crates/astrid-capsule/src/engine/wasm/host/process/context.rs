@@ -24,6 +24,10 @@ pub(super) fn prepare_spawn_context(
     const MAX_ENV_VARS: usize = 256;
     const MAX_ENV_VALUE_BYTES: usize = 64 * 1024;
 
+    if !state.workspace_attachment_is_resolved() {
+        return Err(ErrorCode::CapabilityDenied);
+    }
+
     if request.env.len() > MAX_ENV_VARS {
         return Err(ErrorCode::TooLarge);
     }
@@ -67,8 +71,8 @@ pub(super) fn prepare_spawn_context(
             add_home_process_paths(state, &physical, &mut read_paths, &mut write_paths)?;
             physical
         },
-        Some(path) => resolve_workspace_cwd(&state.workspace_root, path)?,
-        None => state.workspace_root.clone(),
+        Some(path) => resolve_workspace_cwd(state.effective_workspace_root(), path)?,
+        None => state.effective_workspace_root().to_path_buf(),
     };
 
     read_paths.sort();
@@ -94,7 +98,7 @@ fn add_home_process_paths(
         return Err(ErrorCode::CapabilityDenied);
     };
     let home = home.canonicalize().unwrap_or(home);
-    let Some(gate) = state.security.as_ref() else {
+    let Some(gate) = state.effective_security() else {
         return Err(ErrorCode::CapabilityDenied);
     };
     for path in gate.process_home_write_paths(&home) {

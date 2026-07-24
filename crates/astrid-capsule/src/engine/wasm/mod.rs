@@ -209,6 +209,8 @@ pub struct WasmEngine {
     /// through the overlay today. `None` in tests and single-tenant
     /// deployments.
     overlay_registry: Option<Arc<astrid_vfs::OverlayVfsRegistry>>,
+    /// Kernel-wide host-only mapping for connection-scoped workspaces.
+    workspace_attachments: Arc<crate::workspace_attachment::WorkspaceAttachmentRegistry>,
     /// Per-principal accumulated interceptor CPU, in wasmtime fuel units
     /// (exact deterministic guest-instruction count).
     ///
@@ -338,6 +340,9 @@ impl WasmEngine {
             profile_cache: None,
             owner_principal: None,
             overlay_registry: None,
+            workspace_attachments: Arc::new(
+                crate::workspace_attachment::WorkspaceAttachmentRegistry::default(),
+            ),
             fuel_ledger,
             memory_ledger,
             fuel_rate,
@@ -348,6 +353,15 @@ impl WasmEngine {
             process_tracker: None,
             persistent_processes: None,
         }
+    }
+
+    #[must_use]
+    pub(crate) fn with_workspace_attachments(
+        mut self,
+        registry: Arc<crate::workspace_attachment::WorkspaceAttachmentRegistry>,
+    ) -> Self {
+        self.workspace_attachments = registry;
+        self
     }
 
     /// Promote/rollback the OS-level copy-on-write workspace behind a QUIESCENCE
@@ -1793,6 +1807,7 @@ impl ExecutionEngine for WasmEngine {
             let st_identity_store = ctx.identity_store.clone();
             let st_profile_cache = ctx.profile_cache.clone();
             let st_audit_sink = ctx.audit_sink.clone();
+            let st_workspace_attachments = self.workspace_attachments.clone();
             // Shared across the whole pool so a verified per-connection
             // principal (issue #45/#852) bound on the accepting instance is
             // visible to whichever pooled instance later serves that
@@ -1846,6 +1861,8 @@ impl ExecutionEngine for WasmEngine {
                 home: None,
                 tmp: None,
                 invocation_home: None,
+                invocation_workspace: None,
+                invocation_workspace_attachment: None,
                 invocation_tmp: None,
                 invocation_secret_store: None,
                 invocation_capsule_log: None,
@@ -1869,6 +1886,7 @@ impl ExecutionEngine for WasmEngine {
                 security: Some(
                     Arc::clone(&security_gate) as Arc<dyn crate::security::CapsuleSecurityGate>
                 ),
+                invocation_security: None,
                 hook_manager: None, // Will be injected by Gateway
                 capsule_registry: st_capsule_registry.clone(),
                 runtime_handle: tokio::runtime::Handle::current(),
@@ -1902,6 +1920,7 @@ impl ExecutionEngine for WasmEngine {
                 process_count_total: 0,
                 process_count_by_principal: std::collections::HashMap::new(),
                 connection_principals: connection_principals.clone(),
+                workspace_attachments: st_workspace_attachments.clone(),
                 client_connections: client_connections.clone(),
                 // No frame in flight at construction; both the ingress
                 // principal and its authenticating device key_id are set per
@@ -1909,6 +1928,7 @@ impl ExecutionEngine for WasmEngine {
                 ingress_principal: None,
                 ingress_device_key_id: None,
                 ingress_origin: None,
+                ingress_workspace_attachment: None,
                 // Run-loop epoch-interrupt state. `recv_yielded` is set true by
                 // the ipc `recv` host fn each time the guest blocks on recv;
                 // the bound run-loop's epoch callback reads + clears it to
@@ -2583,6 +2603,45 @@ impl ExecutionEngine for WasmEngine {
             return Ok(crate::capsule::InterceptResult::Deny { reason });
         }
 
+        let workspace_required =
+            caller.is_some_and(|message| astrid_events::ipc_sequence_has_host_sidecar(message.seq));
+        let invocation_workspace_attachment = caller
+            .filter(|message| astrid_events::ipc_sequence_has_host_sidecar(message.seq))
+            .and_then(|message| {
+                self.workspace_attachments
+                    .attachment_for_message(message.seq)
+            });
+        let invocation_workspace = match invocation_workspace_attachment {
+            Some(attachment) => {
+                let Some(mount) = self
+                    .workspace_attachments
+                    .resolve(attachment, &invoking_principal)
+                else {
+                    return Ok(crate::capsule::InterceptResult::Deny {
+                        reason:
+                            "workspace attachment is missing, stale, or owned by another principal"
+                                .to_string(),
+                    });
+                };
+                Some(mount)
+            },
+            None => None,
+        };
+        if workspace_required && invocation_workspace.is_none() {
+            return Ok(crate::capsule::InterceptResult::Deny {
+                reason: "workspace attachment is missing, stale, or owned by another principal"
+                    .to_string(),
+            });
+        }
+        let invocation_security: Option<Arc<dyn crate::security::CapsuleSecurityGate>> =
+            invocation_workspace.as_ref().map(|mount| {
+                Arc::new(crate::security::ManifestSecurityGate::new(
+                    self.manifest.clone(),
+                    mount.root.clone(),
+                    None,
+                )) as Arc<dyn crate::security::CapsuleSecurityGate>
+            });
+
         // Is the capsule a daemon (uplink / long-lived)? Daemons keep their
         // load-time `u64::MAX` epoch deadline; only non-daemon capsules
         // accept a per-invocation timeout from the profile.
@@ -2694,6 +2753,9 @@ impl ExecutionEngine for WasmEngine {
             {
                 let state = s.data_mut();
                 state.caller_context = caller.cloned();
+                state.invocation_workspace = invocation_workspace.clone();
+                state.invocation_workspace_attachment = invocation_workspace_attachment;
+                state.invocation_security = invocation_security.clone();
                 // Mark the interceptor as active so any nested `ipc::recv`
                 // inside the handler (e.g. prompt-builder waiting on plugin
                 // hook responses) cannot wipe or rewrite `caller_context`
@@ -2969,6 +3031,8 @@ async fn build_lifecycle_host_state(
         home: home_mount,
         tmp: None,
         invocation_home: None,
+        invocation_workspace: None,
+        invocation_workspace_attachment: None,
         invocation_tmp: None,
         invocation_secret_store: None,
         invocation_capsule_log: None,
@@ -2993,6 +3057,7 @@ async fn build_lifecycle_host_state(
         ipc_publish_patterns: Vec::new(),
         ipc_subscribe_patterns: Vec::new(),
         security: None,
+        invocation_security: None,
         hook_manager: None,
         capsule_registry: None,
         runtime_handle: tokio::runtime::Handle::current(),
@@ -3045,6 +3110,9 @@ async fn build_lifecycle_host_state(
         // Lifecycle hooks never accept socket connections; a throwaway
         // registry satisfies the field (issue #45/#852).
         connection_principals: Arc::new(dashmap::DashMap::new()),
+        workspace_attachments: Arc::new(
+            crate::workspace_attachment::WorkspaceAttachmentRegistry::default(),
+        ),
         // Lifecycle hooks never accept inbound uplink connections; a throwaway
         // lifecycle registry satisfies the field.
         client_connections: Arc::new(dashmap::DashMap::new()),
@@ -3053,6 +3121,7 @@ async fn build_lifecycle_host_state(
         ingress_principal: None,
         ingress_device_key_id: None,
         ingress_origin: None,
+        ingress_workspace_attachment: None,
         // Lifecycle hooks are not run loops; the epoch-interrupt run-loop
         // state is inert here but initialised for completeness.
         recv_yielded: false,

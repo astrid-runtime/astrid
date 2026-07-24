@@ -170,6 +170,9 @@ pub struct ConnectionIdentity {
     /// The `key_id` of the device key that verified the challenge, if the
     /// principal authenticated via the keypair challenge.
     pub device_key_id: Option<String>,
+    /// Opaque workspace admitted for this connection, if the authenticated
+    /// client supplied one.
+    pub(crate) workspace_attachment: Option<crate::workspace_attachment::WorkspaceAttachmentRef>,
 }
 
 /// Caller-supplied inputs for [`HostState::for_hook`].
@@ -312,6 +315,14 @@ pub struct HostState {
     /// principal differs from `self.principal`. When set, overrides `home`
     /// for scheme resolution and security gate checks. Cleared on exit.
     pub invocation_home: Option<PrincipalMount>,
+    /// Per-invocation workspace mount resolved from the host-stamped opaque
+    /// connection attachment. When absent, the load-time workspace remains the
+    /// compatibility fallback.
+    pub(crate) invocation_workspace: Option<PrincipalMount>,
+    /// Live opaque attachment backing `invocation_workspace`. Kept host-only;
+    /// the bus carries only a presence bit in its monotonic sequence.
+    pub(crate) invocation_workspace_attachment:
+        Option<crate::workspace_attachment::WorkspaceAttachmentRef>,
     /// Per-invocation tmp mount for the calling principal. Same lifecycle
     /// as `invocation_home`.
     pub invocation_tmp: Option<PrincipalMount>,
@@ -428,6 +439,10 @@ pub struct HostState {
     pub ipc_subscribe_patterns: Vec<String>,
     /// Optional security gate for gated operations (HTTP, file I/O).
     pub security: Option<Arc<dyn CapsuleSecurityGate>>,
+    /// Security gate rebuilt against the invocation workspace root. This keeps
+    /// `cwd://` and wildcard capabilities confined to the same attachment as
+    /// the effective VFS.
+    pub invocation_security: Option<Arc<dyn CapsuleSecurityGate>>,
     /// Hook manager for executing user scripts synchronously via airlock.
     pub hook_manager: Option<Arc<dyn std::any::Any + Send + Sync>>,
     /// Shared capsule registry for `hooks::trigger` fan-out dispatch.
@@ -646,6 +661,10 @@ pub struct HostState {
     /// authenticated it ([`ConnectionIdentity`]) so the cap-gate can apply the
     /// device's scope as an attenuation floor on the principal's authority.
     pub connection_principals: Arc<dashmap::DashMap<u32, ConnectionIdentity>>,
+    /// Kernel-shared host-only attachment registry. IPC carries only a
+    /// fail-closed sidecar-presence marker; this registry is the sole
+    /// path-resolution authority.
+    pub(crate) workspace_attachments: Arc<crate::workspace_attachment::WorkspaceAttachmentRegistry>,
     /// The verified principal of the source connection whose inbound frame is
     /// currently in flight — the ENFORCEMENT side of
     /// [`connection_principals`](Self::connection_principals) (issue #45/#852).
@@ -699,6 +718,10 @@ pub struct HostState {
     /// connection does NOT earn `LocalSocket`, parallel to how an unbound
     /// principal stamps the reserved `anonymous` identity.
     pub ingress_origin: Option<astrid_events::ipc::MessageOrigin>,
+    /// Workspace attachment of the source connection whose frame is currently
+    /// being forwarded by the uplink.
+    pub(crate) ingress_workspace_attachment:
+        Option<crate::workspace_attachment::WorkspaceAttachmentRef>,
     /// Host-verified principal each INBOUND uplink connection was accepted
     /// under, keyed by stream resource rep (`u32`). The lifecycle registry the
     /// kernel connection counter rides on: `net.unix-listener.{accept,

@@ -109,6 +109,9 @@ pub struct Kernel {
     /// visible to Agent B. Native-only (`astrid-vfs` / `cap-std`).
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     pub overlay_registry: Arc<OverlayVfsRegistry>,
+    /// Host-only connection workspace registry shared by every capsule engine.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    workspace_attachments: Arc<astrid_capsule::workspace_attachment::WorkspaceAttachmentRegistry>,
     /// The global physical root handle for the VFS. On native hosts the
     /// composition root registers it as the cap-std workspace root; the
     /// browser profile keeps the handle (it is engine-agnostic) but gates
@@ -663,6 +666,9 @@ impl Kernel {
             workspace_root.clone(),
             root_handle.clone(),
         ));
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        let workspace_attachments =
+            Arc::new(astrid_capsule::workspace_attachment::WorkspaceAttachmentRegistry::default());
 
         let allowance_store = Arc::new(astrid_approval::AllowanceStore::new());
         // Create system-wide identity store backed by the shared KV.
@@ -717,6 +723,8 @@ impl Kernel {
             vfs,
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             overlay_registry,
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+            workspace_attachments,
             vfs_root_handle: root_handle,
             workspace_root,
             workspace_layout,
@@ -992,7 +1000,8 @@ impl Kernel {
             self.memory_ledger.clone(),
             self.runtime_limits,
             self.http_limits,
-        );
+        )
+        .with_workspace_attachments(Arc::clone(&self.workspace_attachments));
         let mut capsule = loader.create_capsule(manifest, dir.to_path_buf())?;
 
         let kv = astrid_storage::ScopedKvStore::new(
@@ -2467,6 +2476,9 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         capabilities,
         vfs: Arc::new(kernel_host_vfs) as Arc<dyn Vfs>,
         overlay_registry,
+        workspace_attachments: Arc::new(
+            astrid_capsule::workspace_attachment::WorkspaceAttachmentRegistry::default(),
+        ),
         vfs_root_handle: root_handle,
         workspace_root: home.root().to_path_buf(),
         workspace_layout: WorkspaceLayout::default(),

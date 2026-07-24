@@ -48,6 +48,19 @@ const YIELD_AFTER_SKIPPED: usize = 32;
 /// `event_kind` (`AstridEvent::event_type`, a closed `&'static str` set).
 pub(crate) const METRIC_BUS_EVENTS_PUBLISHED_TOTAL: &str = "astrid_bus_events_published_total";
 
+const IPC_HOST_SIDECAR_BIT: u64 = 1;
+
+/// Whether the event-bus sequence marks host-only sidecar state.
+///
+/// Sequence values remain monotonically ordered. The low bit is a fail-closed
+/// presence marker; sidecar contents never enter [`crate::ipc::IpcMessage`] or
+/// its serialized wire shape. The sequence itself is an opaque ordering key:
+/// consumers must not assume that adjacent messages have contiguous values.
+#[must_use]
+pub fn ipc_sequence_has_host_sidecar(sequence: u64) -> bool {
+    sequence & IPC_HOST_SIDECAR_BIT != 0
+}
+
 /// Counter: events a receiver dropped by falling behind the sender,
 /// labelled by `subscriber`. A non-zero `rate()` on any subscriber is the
 /// signature of bus backpressure / a feedback storm — the failure mode
@@ -140,7 +153,29 @@ impl EventBus {
     /// notifies all synchronous subscribers in the registry.
     ///
     /// Returns the number of async receivers that received the event.
-    pub fn publish(&self, mut event: AstridEvent) -> usize {
+    pub fn publish(&self, event: AstridEvent) -> usize {
+        self.publish_with_ipc_sidecar(event, false, |_| {})
+    }
+
+    /// Publish an event while binding host-only state to its IPC sequence
+    /// before any receiver can observe it.
+    ///
+    /// `before_delivery` receives the assigned sequence under the publish-order
+    /// lock. Callers use it to populate a private sidecar registry. When
+    /// `sidecar_attached` is true, the sequence's low bit remains set even
+    /// after sidecar revocation, allowing consumers to deny a queued stale
+    /// message instead of silently falling back to ambient state.
+    ///
+    /// Non-IPC events do not invoke the callback.
+    pub fn publish_with_ipc_sidecar<F>(
+        &self,
+        mut event: AstridEvent,
+        sidecar_attached: bool,
+        before_delivery: F,
+    ) -> usize
+    where
+        F: FnOnce(u64),
+    {
         // A lifecycle observer may control process lifetime. Keep sequence
         // assignment, transport publication, and synchronous observation in
         // one total order so a later disconnect can never overtake an earlier
@@ -153,7 +188,10 @@ impl EventBus {
             ref mut message, ..
         } = event
         {
-            message.seq = self.ipc_seq.fetch_add(1, Ordering::Relaxed);
+            let logical_sequence = self.ipc_seq.fetch_add(1, Ordering::Relaxed);
+            message.seq = logical_sequence.wrapping_shl(1)
+                | u64::from(sidecar_attached) * IPC_HOST_SIDECAR_BIT;
+            before_delivery(message.seq);
         }
         let event = Arc::new(event);
 

@@ -72,6 +72,8 @@ impl HostState {
             home: None,
             tmp: None,
             invocation_home: None,
+            invocation_workspace: None,
+            invocation_workspace_attachment: None,
             invocation_tmp: None,
             invocation_secret_store: None,
             invocation_capsule_log: None,
@@ -88,6 +90,7 @@ impl HostState {
             ipc_publish_patterns: vec!["hook.v1.result.*".into()],
             ipc_subscribe_patterns: Vec::new(),
             security: None,
+            invocation_security: None,
             hook_manager: None,
             capsule_registry: None,
             runtime_handle,
@@ -130,6 +133,9 @@ impl HostState {
             // Transient hook execution never accepts socket connections; a
             // throwaway registry satisfies the field (issue #45/#852).
             connection_principals: Self::new_connection_principals(),
+            workspace_attachments: Arc::new(
+                crate::workspace_attachment::WorkspaceAttachmentRegistry::default(),
+            ),
             // Hooks never accept inbound uplink connections, so no client
             // lifecycle events are ever emitted; a throwaway registry satisfies
             // the field. Keyed by the verified principal directly (distinct from
@@ -140,6 +146,7 @@ impl HostState {
             ingress_principal: None,
             ingress_device_key_id: None,
             ingress_origin: None,
+            ingress_workspace_attachment: None,
         }
     }
 }

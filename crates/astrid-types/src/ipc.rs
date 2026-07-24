@@ -88,8 +88,9 @@ pub struct IpcMessage {
     #[cfg_attr(feature = "clock", serde(default = "Utc::now"))]
     #[cfg_attr(not(feature = "clock"), serde(default = "default_unix_epoch"))]
     pub timestamp: DateTime<Utc>,
-    /// Monotonic sequence number assigned by the event bus at publish time.
-    /// Used by the dispatcher to guarantee in-order delivery per capsule.
+    /// Opaque monotonic ordering key assigned by the event bus at publish
+    /// time. Used by the dispatcher to guarantee in-order delivery per
+    /// capsule; consumers must not assume adjacent messages are contiguous.
     #[serde(default)]
     pub seq: u64,
     /// The principal (user identity) this message is acting on behalf of.

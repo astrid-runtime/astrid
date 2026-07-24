@@ -11,6 +11,13 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Added
 
+- **Authenticated MCP sessions can attach their agent workspace per connection.**
+  The launching thread's canonical working directory is bound into the
+  principal signature, mapped through a revocable host-only event sidecar, and
+  mounted as `cwd://` for that invocation. Multiple principals and multiple
+  workspaces can share one daemon without changing public IPC/WIT wire shapes,
+  exposing physical host paths to capsules, or falling back to the daemon's own
+  directory.
 - **Linux amd64 now has a distro-neutral OCI build target.** The image packages
   exact immutable GitHub release bytes only after their tagged release-workflow
   signatures and manifest digests verify, runs the persistent daemon as a

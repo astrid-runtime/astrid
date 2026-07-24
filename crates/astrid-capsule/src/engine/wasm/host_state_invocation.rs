@@ -159,7 +159,29 @@ impl HostState {
             .caller_context
             .as_ref()
             .and_then(|c| c.principal.clone());
-        if new_principal == existing_principal {
+        let existing_workspace = self.invocation_workspace_attachment;
+        let new_workspace = if astrid_events::ipc_sequence_has_host_sidecar(msg.seq) {
+            self.workspace_attachments.attachment_for_message(msg.seq)
+        } else {
+            None
+        };
+        let workspace_is_still_live = match (new_workspace, publisher.as_ref()) {
+            (None, _) => {
+                !astrid_events::ipc_sequence_has_host_sidecar(msg.seq)
+                    && self.invocation_workspace.is_none()
+            },
+            (Some(attachment), Some(principal)) => {
+                self.invocation_workspace.as_ref().is_some_and(|mount| {
+                    self.workspace_attachments
+                        .resolves_to(attachment, principal, &mount.root)
+                })
+            },
+            (Some(_), None) => false,
+        };
+        if new_principal == existing_principal
+            && new_workspace == existing_workspace
+            && workspace_is_still_live
+        {
             // Refresh the caller context so e.g. topic name / payload
             // tracking stays current. Also refresh the env overlay: dashboard
             // onboarding can write config after a capsule is already loaded,
@@ -253,6 +275,7 @@ impl HostState {
             self.invocation_home = None;
             self.invocation_tmp = None;
         }
+        self.install_recv_invocation_workspace(publisher.as_ref(), msg.seq);
     }
 
     /// Build the recv message's home/tmp VFS bundle synchronously. Principal
@@ -280,6 +303,35 @@ impl HostState {
         let bundle = build_recv_vfs_bundle_at(&astrid_home.principal_home(principal));
         self.invocation_home = bundle.home;
         self.invocation_tmp = bundle.tmp;
+    }
+
+    /// Resolve an opaque caller attachment into a workspace VFS and rebase the
+    /// manifest security gate onto that exact root. A failed lookup leaves the
+    /// mount absent; `workspace_attachment_is_resolved` then makes filesystem
+    /// and process entry points deny instead of falling back to the daemon CWD.
+    fn install_recv_invocation_workspace(
+        &mut self,
+        principal: Option<&astrid_core::PrincipalId>,
+        message_sequence: u64,
+    ) {
+        let attachment = astrid_events::ipc_sequence_has_host_sidecar(message_sequence)
+            .then(|| {
+                self.workspace_attachments
+                    .attachment_for_message(message_sequence)
+            })
+            .flatten();
+        self.invocation_workspace_attachment = attachment;
+        self.invocation_workspace = match (principal, attachment) {
+            (Some(principal), Some(attachment)) => {
+                self.workspace_attachments.resolve(attachment, principal)
+            },
+            _ => None,
+        };
+        self.invocation_security = self.invocation_workspace.as_ref().and_then(|mount| {
+            self.security
+                .as_ref()
+                .and_then(|gate| gate.for_workspace(mount.root.clone()))
+        });
     }
 }
 
@@ -321,6 +373,8 @@ fn mount_recv_dir(root: &std::path::Path) -> Option<crate::engine::wasm::Princip
 
 #[cfg(test)]
 mod recv_vfs_tests {
+    use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
+
     #[tokio::test]
     async fn recv_vfs_switches_principals_and_clears_without_one() {
         let root = tempfile::tempdir().expect("runtime home");
@@ -373,5 +427,105 @@ mod recv_vfs_tests {
         state.install_recv_invocation_vfs(None);
         assert!(state.invocation_home.is_none());
         assert!(state.invocation_tmp.is_none());
+    }
+
+    #[tokio::test]
+    async fn recv_workspace_switches_for_same_principal_and_stale_refs_deny() {
+        let first = tempfile::tempdir().expect("first workspace");
+        let second = tempfile::tempdir().expect("second workspace");
+        let alice = astrid_core::PrincipalId::new("alice").expect("alice");
+        let mut state = crate::engine::wasm::test_fixtures::minimal_host_state(
+            tokio::runtime::Handle::current(),
+        );
+        let first_ref = state
+            .workspace_attachments
+            .attach(
+                alice.clone(),
+                first.path().canonicalize().expect("canonical first"),
+            )
+            .expect("attach first workspace");
+        let second_ref = state
+            .workspace_attachments
+            .attach(
+                alice.clone(),
+                second.path().canonicalize().expect("canonical second"),
+            )
+            .expect("attach second workspace");
+        let registry = state.workspace_attachments.clone();
+        let message = |sequence, attachment| {
+            let mut message = IpcMessage::new(
+                Topic::from_raw("tool.v1.request"),
+                IpcPayload::RawJson(serde_json::json!({})),
+                uuid::Uuid::new_v4(),
+            )
+            .with_principal(alice.to_string());
+            assert!(sequence % 2 == 1, "test sequence must carry sidecar marker");
+            message.seq = sequence;
+            assert!(registry.bind_message(message.seq, attachment));
+            message
+        };
+        let first_message = message(3, first_ref);
+        let second_message = message(5, second_ref);
+        let stale_second_message = message(7, second_ref);
+
+        state.install_recv_invocation_context(&first_message);
+        assert_eq!(
+            state.effective_workspace_root(),
+            first.path().canonicalize().unwrap()
+        );
+
+        // Principal equality alone must not activate the fast path: one
+        // principal can reconnect from a different agent CWD.
+        state.install_recv_invocation_context(&second_message);
+        assert_eq!(
+            state.effective_workspace_root(),
+            second.path().canonicalize().unwrap()
+        );
+
+        state.workspace_attachments.detach(second_ref);
+        state.install_recv_invocation_context(&stale_second_message);
+        assert!(
+            !state.workspace_attachment_is_resolved(),
+            "a repeated revoked reference must not reuse the prior mounted workspace"
+        );
+    }
+
+    #[tokio::test]
+    async fn recv_workspace_denies_when_the_security_gate_cannot_rebase() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let alice = astrid_core::PrincipalId::new("alice").expect("alice");
+        let mut state = crate::engine::wasm::test_fixtures::minimal_host_state(
+            tokio::runtime::Handle::current(),
+        );
+        state.security = Some(std::sync::Arc::new(crate::security::DenyAllGate));
+        let attachment = state
+            .workspace_attachments
+            .attach(
+                alice.clone(),
+                workspace
+                    .path()
+                    .canonicalize()
+                    .expect("canonical workspace"),
+            )
+            .expect("attach workspace");
+        let mut message = IpcMessage::new(
+            Topic::from_raw("tool.v1.request"),
+            IpcPayload::RawJson(serde_json::json!({})),
+            uuid::Uuid::new_v4(),
+        )
+        .with_principal(alice.to_string());
+        message.seq = 3;
+        assert!(
+            state
+                .workspace_attachments
+                .bind_message(message.seq, attachment)
+        );
+
+        state.install_recv_invocation_context(&message);
+
+        assert!(
+            !state.workspace_attachment_is_resolved(),
+            "a workspace mount without an equivalently rebased gate must fail closed"
+        );
     }
 }

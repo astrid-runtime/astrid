@@ -12,7 +12,7 @@ use wasmtime::component::Resource;
 use wasmtime_wasi::p2::DynPollable;
 
 use super::client_lifecycle;
-use super::handshake::{validate_handshake, verify_peer_credentials};
+use super::handshake::{VerifiedConnection, validate_handshake, verify_peer_credentials};
 use super::{HostState, MAX_ACTIVE_STREAMS, NetStream, UnixListenerSlot, audit_net, map_io_err};
 use crate::engine::wasm::bindings::astrid::net::host::{
     ErrorCode, HostUnixListener, TcpStream, UnixListener,
@@ -48,10 +48,7 @@ impl HostUnixListener for HostState {
         // The handshake yields `Some((principal, device_key_id))` for a
         // crypto-authenticated connection — the device id rides forward so the
         // cap-gate can scope it — or `None` for a legacy/unauthenticated peer.
-        let (stream, verified_identity): (
-            _,
-            Option<(astrid_core::principal::PrincipalId, String)>,
-        ) = loop {
+        let (stream, verified_identity): (_, Option<VerifiedConnection>) = loop {
             let accept_result = util::bounded_block_on_cancellable(
                 &rt_handle,
                 &blocking_semaphore,
@@ -95,7 +92,7 @@ impl HostUnixListener for HostState {
                     &rt_handle,
                     &blocking_semaphore,
                     &cancel_token,
-                    validate_handshake(&mut stream, token, home),
+                    validate_handshake(&mut stream, token, home, &self.workspace_attachments),
                 );
                 match handshake_result {
                     None => return Err(ErrorCode::Closed),
@@ -116,15 +113,23 @@ impl HostUnixListener for HostState {
         };
 
         if self.net_stream_count >= MAX_ACTIVE_STREAMS {
+            if let Some(identity) = verified_identity.as_ref() {
+                identity.detach_workspace(&self.workspace_attachments);
+            }
             drop(stream);
             return Err(ErrorCode::Quota);
         }
 
         let net_stream = NetStream::Unix(Arc::new(tokio::sync::Mutex::new(stream)));
-        let res = self
-            .resource_table
-            .push(net_stream)
-            .map_err(|e| ErrorCode::Unknown(format!("resource table: {e}")))?;
+        let res = match self.resource_table.push(net_stream) {
+            Ok(resource) => resource,
+            Err(error) => {
+                if let Some(identity) = verified_identity.as_ref() {
+                    identity.detach_workspace(&self.workspace_attachments);
+                }
+                return Err(ErrorCode::Unknown(format!("resource table: {error}")));
+            },
+        };
         self.net_stream_count += 1;
         let rep = res.rep();
         // Record the verified principal AND its authenticating device key_id
@@ -133,9 +138,16 @@ impl HostUnixListener for HostState {
         // the framed read copies both onto the in-flight ingress fields so
         // `publish-as` stamps the device id for cap-gate scoping. The binding
         // is removed when the stream resource drops (see `TcpStream::drop`).
-        let verified_principal = verified_identity.as_ref().map(|(p, _)| p.clone());
-        if let Some((principal, key_id)) = verified_identity {
-            self.bind_connection_principal(rep, principal, Some(key_id));
+        let verified_principal = verified_identity
+            .as_ref()
+            .map(|identity| identity.principal.clone());
+        if let Some(identity) = verified_identity {
+            self.bind_connection_principal(
+                rep,
+                identity.principal,
+                Some(identity.key_id),
+                identity.workspace_attachment,
+            );
         }
         // Emit `client.v1.connect` for the kernel connection tracker, stamped
         // with the host-verified principal — `anonymous` for a legacy /
@@ -201,7 +213,7 @@ impl HostUnixListener for HostState {
         }
 
         let mut stream = stream;
-        let mut verified_identity: Option<(astrid_core::principal::PrincipalId, String)> = None;
+        let mut verified_identity: Option<VerifiedConnection> = None;
         if let Some(ref token) = session_token {
             // See `accept` for why home is resolved here (issue #45/#852).
             let home = match astrid_core::dirs::AstridHome::resolve() {
@@ -220,7 +232,7 @@ impl HostUnixListener for HostState {
                 &rt_handle,
                 &blocking_semaphore,
                 &cancel_token,
-                validate_handshake(&mut stream, token, &home),
+                validate_handshake(&mut stream, token, &home, &self.workspace_attachments),
             );
             match handshake_result {
                 None => return Ok(None),
@@ -238,22 +250,37 @@ impl HostUnixListener for HostState {
         }
 
         if self.net_stream_count >= MAX_ACTIVE_STREAMS {
+            if let Some(identity) = verified_identity.as_ref() {
+                identity.detach_workspace(&self.workspace_attachments);
+            }
             drop(stream);
             return Ok(None);
         }
 
         let net_stream = NetStream::Unix(Arc::new(tokio::sync::Mutex::new(stream)));
-        let res = self
-            .resource_table
-            .push(net_stream)
-            .map_err(|e| ErrorCode::Unknown(format!("resource table: {e}")))?;
+        let res = match self.resource_table.push(net_stream) {
+            Ok(resource) => resource,
+            Err(error) => {
+                if let Some(identity) = verified_identity.as_ref() {
+                    identity.detach_workspace(&self.workspace_attachments);
+                }
+                return Err(ErrorCode::Unknown(format!("resource table: {error}")));
+            },
+        };
         self.net_stream_count += 1;
         let rep = res.rep();
         // Same per-connection principal + device-key binding as `accept`
         // (issue #45/#852).
-        let verified_principal = verified_identity.as_ref().map(|(p, _)| p.clone());
-        if let Some((principal, key_id)) = verified_identity {
-            self.bind_connection_principal(rep, principal, Some(key_id));
+        let verified_principal = verified_identity
+            .as_ref()
+            .map(|identity| identity.principal.clone());
+        if let Some(identity) = verified_identity {
+            self.bind_connection_principal(
+                rep,
+                identity.principal,
+                Some(identity.key_id),
+                identity.workspace_attachment,
+            );
         }
         // Same `client.v1.connect` emission as `accept` — see there for the
         // anonymous-fallback and inbound-only rationale.

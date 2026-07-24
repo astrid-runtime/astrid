@@ -38,6 +38,8 @@ pub mod security;
 pub mod tool_discovery;
 pub mod topic;
 pub mod toposort;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub mod workspace_attachment;
 // The manifest watcher drives hot-reload via the native `notify` crate; an
 // alternate host has no OS filesystem-watch facility.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]

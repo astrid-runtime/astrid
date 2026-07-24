@@ -7,18 +7,22 @@
 //! ## Two-frame principal authentication (additive)
 //!
 //! The base handshake is a single round trip: the client sends a
-//! [`HandshakeRequest`] with the session token, the daemon replies with a
-//! [`HandshakeResponse`]. A client that wants to authenticate as a specific
-//! principal sets [`HandshakeRequest::claimed_principal`] on that first
+//! [`WorkspaceHandshakeRequest`] with the session token, the daemon replies
+//! with a [`WorkspaceHandshakeResponse`]. A client that wants to authenticate
+//! as a specific principal sets the base request's `claimed_principal` on that
+//! first
 //! frame (no signature yet). The daemon then:
 //!
 //! 1. validates protocol version + token on the first frame (unchanged);
 //! 2. if a principal was claimed, generates a random nonce and sends it back
-//!    in [`HandshakeResponse::challenge`] — an intermediate `Ok` response;
-//! 3. reads a SECOND request frame carrying
-//!    [`HandshakeRequest::signature`] over
-//!    `astrid-principal-auth:v1:{principal}:{nonce_hex}`;
-//! 4. verifies the signature against a key registered in the claimed
+//!    as an intermediate `Ok` response carrying a challenge;
+//! 3. when the first frame claims a workspace, advertises that the challenge
+//!    binds that exact path so a new client can distinguish an upgraded
+//!    daemon from an older daemon that ignored the additive request field;
+//! 4. reads a SECOND request frame carrying
+//!    a signature over
+//!    the principal challenge, including the workspace when requested;
+//! 5. verifies the signature against a key registered in the claimed
 //!    principal's `AuthConfig.public_keys`, then sends the final response.
 //!
 //! A first frame WITHOUT `claimed_principal` skips steps 2–4 entirely and
@@ -33,9 +37,31 @@ use astrid_core::local_transport::{self, LocalStream};
 use astrid_core::principal::PrincipalId;
 use astrid_core::profile::DeviceKey;
 use astrid_core::session_token::{
-    HandshakeRequest, HandshakeResponse, PRINCIPAL_AUTH_NONCE_LEN, PROTOCOL_VERSION, SessionToken,
-    principal_auth_challenge_message,
+    PRINCIPAL_AUTH_NONCE_LEN, PROTOCOL_VERSION, SessionToken, WorkspaceHandshakeRequest,
+    WorkspaceHandshakeResponse, principal_auth_challenge_message,
+    principal_workspace_auth_challenge_message,
 };
+
+/// Host-verified connection data returned to the accept path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct VerifiedConnection {
+    pub(super) principal: PrincipalId,
+    pub(super) key_id: String,
+    /// Already-open, host-only directory capability. It never enters an IPC
+    /// message or capsule payload.
+    pub(super) workspace_attachment: Option<crate::workspace_attachment::WorkspaceAttachmentRef>,
+}
+
+impl VerifiedConnection {
+    pub(super) fn detach_workspace(
+        &self,
+        registry: &crate::workspace_attachment::WorkspaceAttachmentRegistry,
+    ) {
+        if let Some(attachment) = self.workspace_attachment {
+            registry.detach(attachment);
+        }
+    }
+}
 
 /// Timeout for individual handshake read/write operations (server-side).
 pub(super) const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -43,9 +69,9 @@ pub(super) const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::f
 /// Maximum allowed size of a handshake request payload (bytes).
 const MAX_HANDSHAKE_SIZE: usize = 4096;
 
-/// Validate the client handshake: read the [`HandshakeRequest`], verify the
+/// Validate the client handshake: read the [`WorkspaceHandshakeRequest`], verify the
 /// token and protocol version, optionally run the principal
-/// challenge-response, then send back a [`HandshakeResponse`].
+/// challenge-response, then send back a [`WorkspaceHandshakeResponse`].
 ///
 /// `home` is where the claimed principal's profile (and its registered
 /// keys) is loaded from — passed in rather than resolved internally so the
@@ -61,7 +87,8 @@ pub(super) async fn validate_handshake(
     stream: &mut LocalStream,
     expected_token: &SessionToken,
     home: &astrid_core::dirs::AstridHome,
-) -> Result<Option<(PrincipalId, String)>, String> {
+    workspace_attachments: &crate::workspace_attachment::WorkspaceAttachmentRegistry,
+) -> Result<Option<VerifiedConnection>, String> {
     let request = read_handshake_request(stream).await?;
 
     // 1. Validate protocol version FIRST - this check reveals no information
@@ -74,7 +101,7 @@ pub(super) async fn validate_handshake(
             request.protocol_version, PROTOCOL_VERSION,
         );
         if let Err(e) =
-            send_handshake_response_timed(stream, &HandshakeResponse::error(&reason)).await
+            send_handshake_response_timed(stream, &WorkspaceHandshakeResponse::error(&reason)).await
         {
             tracing::warn!(error = %e, "Failed to send handshake error response for protocol mismatch");
         }
@@ -97,18 +124,42 @@ pub(super) async fn validate_handshake(
         return Err("invalid session token".to_string());
     }
 
+    if request.workspace_root.is_some() && request.claimed_principal.is_none() {
+        let reason = "workspace attachment requires an authenticated principal".to_string();
+        if let Err(e) =
+            send_handshake_response_timed(stream, &WorkspaceHandshakeResponse::error(&reason)).await
+        {
+            tracing::warn!(error = %e, "Failed to send handshake error response");
+        }
+        return Err(reason);
+    }
+
     // 3. Optional per-connection principal challenge-response. A claimed
     // principal restructures the flow into two frames; absence keeps the
     // legacy single round trip.
     let verified_principal = match request.claimed_principal.clone() {
-        Some(claimed) => Some(run_principal_challenge(stream, &claimed, home).await?),
+        Some(claimed) => Some(
+            run_principal_challenge(
+                stream,
+                &claimed,
+                request.workspace_root.as_deref(),
+                home,
+                workspace_attachments,
+            )
+            .await?,
+        ),
         None => None,
     };
 
     // 4. All checks passed - send the final success response.
-    send_handshake_response_timed(stream, &HandshakeResponse::ok())
-        .await
-        .map_err(|e| format!("failed to send handshake response: {e}"))?;
+    if let Err(error) =
+        send_handshake_response_timed(stream, &WorkspaceHandshakeResponse::ok()).await
+    {
+        if let Some(identity) = verified_principal.as_ref() {
+            identity.detach_workspace(workspace_attachments);
+        }
+        return Err(format!("failed to send handshake response: {error}"));
+    }
 
     // Truncate client_version to prevent log injection from oversized values.
     // Use chars().take() to avoid panicking on multi-byte UTF-8 boundaries.
@@ -121,8 +172,10 @@ pub(super) async fn validate_handshake(
     Ok(verified_principal)
 }
 
-/// Read one length-prefixed JSON [`HandshakeRequest`] frame off the stream.
-async fn read_handshake_request(stream: &mut LocalStream) -> Result<HandshakeRequest, String> {
+/// Read one length-prefixed JSON [`WorkspaceHandshakeRequest`] frame.
+async fn read_handshake_request(
+    stream: &mut LocalStream,
+) -> Result<WorkspaceHandshakeRequest, String> {
     use tokio::io::AsyncReadExt;
 
     let mut len_buf = [0u8; 4];
@@ -158,8 +211,10 @@ async fn read_handshake_request(stream: &mut LocalStream) -> Result<HandshakeReq
 async fn run_principal_challenge(
     stream: &mut LocalStream,
     claimed: &str,
+    workspace_claim: Option<&str>,
     home: &astrid_core::dirs::AstridHome,
-) -> Result<(PrincipalId, String), String> {
+    workspace_attachments: &crate::workspace_attachment::WorkspaceAttachmentRegistry,
+) -> Result<VerifiedConnection, String> {
     // Validate the principal id shape before touching disk so a malformed
     // claim never reaches the filesystem.
     let principal = match PrincipalId::new(claimed) {
@@ -179,13 +234,23 @@ async fn run_principal_challenge(
             return Err(format!("challenge nonce generation failed: {e}"));
         },
     };
-    send_handshake_response_timed(stream, &HandshakeResponse::challenge(nonce_hex.clone()))
+    let challenge = workspace_claim.as_ref().map_or_else(
+        || WorkspaceHandshakeResponse::challenge(nonce_hex.clone()),
+        |_| WorkspaceHandshakeResponse::workspace_challenge(nonce_hex.clone()),
+    );
+    send_handshake_response_timed(stream, &challenge)
         .await
         .map_err(|e| format!("failed to send challenge: {e}"))?;
 
     // Read the second frame carrying the signature.
     let signed = read_handshake_request(stream).await?;
-    let Some(signature_hex) = signed.signature else {
+    if signed.claimed_principal.as_deref() != Some(claimed)
+        || signed.workspace_root.as_deref() != workspace_claim
+    {
+        send_auth_failed(stream).await;
+        return Err("signed handshake frame changed the principal or workspace claim".to_string());
+    }
+    let Some(signature_hex) = signed.handshake.signature else {
         send_auth_failed(stream).await;
         return Err("missing signature in second handshake frame".to_string());
     };
@@ -193,7 +258,13 @@ async fn run_principal_challenge(
     // Verify against a key registered on the claimed principal's profile.
     // On success this yields the matched device's `key_id` so the connection
     // can be scoped to that device at the cap-gate.
-    let key_id = match verify_principal_signature(&principal, &nonce_hex, &signature_hex, home) {
+    let key_id = match verify_principal_signature(
+        &principal,
+        &nonce_hex,
+        workspace_claim,
+        &signature_hex,
+        home,
+    ) {
         Ok(key_id) => key_id,
         Err(reason) => {
             send_auth_failed(stream).await;
@@ -201,7 +272,50 @@ async fn run_principal_challenge(
         },
     };
 
-    Ok((principal, key_id))
+    let workspace_attachment = match workspace_claim {
+        Some(claim) => match validate_workspace_claim(claim) {
+            Ok(path) => match workspace_attachments.attach(principal.clone(), path) {
+                Ok(attachment) => Some(attachment),
+                Err(reason) => {
+                    send_auth_failed(stream).await;
+                    return Err(reason);
+                },
+            },
+            Err(reason) => {
+                send_auth_failed(stream).await;
+                return Err(reason);
+            },
+        },
+        None => None,
+    };
+
+    Ok(VerifiedConnection {
+        principal,
+        key_id,
+        workspace_attachment,
+    })
+}
+
+fn validate_workspace_claim(claim: &str) -> Result<std::path::PathBuf, String> {
+    // The enclosing handshake frame already has one protocol-wide byte cap;
+    // do not add a second arbitrary path limit here.
+    if claim.is_empty() {
+        return Err("workspace claim is empty".to_string());
+    }
+    let path = std::path::Path::new(claim);
+    if !path.is_absolute() {
+        return Err("workspace claim must be an absolute path".to_string());
+    }
+    let canonical = path
+        .canonicalize()
+        .map_err(|error| format!("workspace claim cannot be resolved: {error}"))?;
+    let metadata = canonical
+        .metadata()
+        .map_err(|error| format!("workspace claim cannot be inspected: {error}"))?;
+    if !metadata.is_dir() {
+        return Err("workspace claim is not a directory".to_string());
+    }
+    Ok(canonical)
 }
 
 /// Verify `signature_hex` over the challenge message for `principal` against
@@ -217,6 +331,7 @@ async fn run_principal_challenge(
 fn verify_principal_signature(
     principal: &PrincipalId,
     nonce_hex: &str,
+    workspace_claim: Option<&str>,
     signature_hex: &str,
     home: &astrid_core::dirs::AstridHome,
 ) -> Result<String, String> {
@@ -231,6 +346,7 @@ fn verify_principal_signature(
         principal,
         &profile.auth.public_keys,
         nonce_hex,
+        workspace_claim,
         signature_hex,
     )
 }
@@ -250,12 +366,18 @@ fn verify_signature_against_keys(
     principal: &PrincipalId,
     public_keys: &[DeviceKey],
     nonce_hex: &str,
+    workspace_claim: Option<&str>,
     signature_hex: &str,
 ) -> Result<String, String> {
     let signature = astrid_crypto::Signature::from_hex(signature_hex)
         .map_err(|e| format!("malformed signature: {e}"))?;
 
-    let message = principal_auth_challenge_message(principal.as_str(), nonce_hex);
+    let message = workspace_claim.map_or_else(
+        || principal_auth_challenge_message(principal.as_str(), nonce_hex),
+        |workspace| {
+            principal_workspace_auth_challenge_message(principal.as_str(), nonce_hex, workspace)
+        },
+    );
     let message_bytes = message.as_bytes();
 
     let mut saw_key = false;
@@ -295,9 +417,11 @@ fn generate_nonce_hex() -> Result<String, String> {
 
 /// Send the uniform `authentication failed` response, logging a write error.
 async fn send_auth_failed(stream: &mut LocalStream) {
-    if let Err(e) =
-        send_handshake_response_timed(stream, &HandshakeResponse::error("authentication failed"))
-            .await
+    if let Err(e) = send_handshake_response_timed(
+        stream,
+        &WorkspaceHandshakeResponse::error("authentication failed"),
+    )
+    .await
     {
         tracing::warn!(error = %e, "Failed to send handshake error response");
     }
@@ -309,7 +433,7 @@ async fn send_auth_failed(stream: &mut LocalStream) {
 /// client from holding the accept loop hostage during the response write.
 async fn send_handshake_response_timed(
     stream: &mut LocalStream,
-    response: &HandshakeResponse,
+    response: &WorkspaceHandshakeResponse,
 ) -> Result<(), std::io::Error> {
     tokio::time::timeout(HANDSHAKE_TIMEOUT, send_handshake_response(stream, response))
         .await
@@ -319,7 +443,7 @@ async fn send_handshake_response_timed(
 /// Send a length-prefixed JSON handshake response.
 async fn send_handshake_response(
     stream: &mut LocalStream,
-    response: &HandshakeResponse,
+    response: &WorkspaceHandshakeResponse,
 ) -> Result<(), std::io::Error> {
     use tokio::io::AsyncWriteExt;
 

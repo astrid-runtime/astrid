@@ -43,12 +43,14 @@ impl HostState {
         rep: u32,
         principal: astrid_core::principal::PrincipalId,
         device_key_id: Option<String>,
+        workspace_attachment: Option<crate::workspace_attachment::WorkspaceAttachmentRef>,
     ) {
         self.connection_principals.insert(
             rep,
             ConnectionIdentity {
                 principal,
                 device_key_id,
+                workspace_attachment,
             },
         );
     }
@@ -78,6 +80,10 @@ impl HostState {
     /// stream resource `rep`. Called when the stream resource drops so the
     /// registry does not leak entries for closed connections.
     pub(crate) fn unbind_connection_principal(&self, rep: u32) {
-        self.connection_principals.remove(&rep);
+        if let Some((_, identity)) = self.connection_principals.remove(&rep)
+            && let Some(attachment) = identity.workspace_attachment
+        {
+            self.workspace_attachments.detach(attachment);
+        }
     }
 }

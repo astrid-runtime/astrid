@@ -82,6 +82,81 @@ impl HostState {
         self.invocation_home.as_ref().or(self.home.as_ref())
     }
 
+    /// Return the connection/invocation workspace mount when one was admitted.
+    #[must_use]
+    pub(crate) fn effective_workspace(&self) -> Option<&PrincipalMount> {
+        self.invocation_workspace.as_ref()
+    }
+
+    /// Whether a caller-carried attachment was resolved into a host mount.
+    ///
+    /// A stale, revoked, or wrong-principal opaque reference must never fall
+    /// back to the capsule's daemon-global workspace. Filesystem and process
+    /// entry points check this before resolving any path.
+    #[must_use]
+    pub(crate) fn workspace_attachment_is_resolved(&self) -> bool {
+        let Some(message) = self.caller_context.as_ref() else {
+            return true;
+        };
+        if !astrid_events::ipc_sequence_has_host_sidecar(message.seq) {
+            return true;
+        }
+        let Some(principal) = message
+            .principal
+            .as_deref()
+            .and_then(|raw| astrid_core::PrincipalId::new(raw).ok())
+        else {
+            return false;
+        };
+        let Some(sidecar_attachment) = self
+            .workspace_attachments
+            .attachment_for_message(message.seq)
+        else {
+            return false;
+        };
+        let (Some(invocation_attachment), Some(mount)) = (
+            self.invocation_workspace_attachment,
+            self.invocation_workspace.as_ref(),
+        ) else {
+            return false;
+        };
+        invocation_attachment == sidecar_attachment
+            && self.workspace_attachments.resolves_to(
+                invocation_attachment,
+                &principal,
+                &mount.root,
+            )
+            && (self.security.is_none() || self.invocation_security.is_some())
+    }
+
+    /// Physical workspace root used by host confinement for this invocation.
+    #[must_use]
+    pub(crate) fn effective_workspace_root(&self) -> &std::path::Path {
+        self.effective_workspace()
+            .map_or(self.workspace_root.as_path(), |mount| mount.root.as_path())
+    }
+
+    /// VFS and root handle paired with the effective workspace root.
+    #[must_use]
+    pub(crate) fn effective_workspace_vfs(
+        &self,
+    ) -> (Arc<dyn astrid_vfs::Vfs>, astrid_capabilities::DirHandle) {
+        self.effective_workspace().map_or_else(
+            || (self.vfs.clone(), self.vfs_root_handle.clone()),
+            |mount| (mount.vfs.clone(), mount.handle.clone()),
+        )
+    }
+
+    /// Security gate rooted at the same workspace as the effective VFS.
+    #[must_use]
+    pub(crate) fn effective_security(&self) -> Option<&Arc<dyn CapsuleSecurityGate>> {
+        if self.invocation_workspace.is_some() {
+            self.invocation_security.as_ref()
+        } else {
+            self.security.as_ref()
+        }
+    }
+
     /// Return the effective tmp mount for the current invocation. Same
     /// precedence and same neutral-`None`-on-shared-runtime safety as
     /// [`effective_home`](Self::effective_home).

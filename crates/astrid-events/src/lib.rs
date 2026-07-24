@@ -27,7 +27,7 @@ mod subscriber;
 pub use astrid_core::kernel_api;
 pub use astrid_types::llm;
 
-pub use bus::{EventBus, EventReceiver};
+pub use bus::{EventBus, EventReceiver, ipc_sequence_has_host_sidecar};
 pub use event::{AstridEvent, EventMetadata};
 pub use ipc::IpcMessage;
 pub use ipc::IpcPayload;

@@ -138,8 +138,8 @@ fn build_persistent_child(
 
 impl process::Host for HostState {
     fn spawn(&mut self, request: SpawnRequest) -> Result<ProcessResult, ErrorCode> {
-        let workspace_root = self.workspace_root.clone();
-        let security = self.security.clone();
+        let workspace_root = self.effective_workspace_root().to_path_buf();
+        let security = self.effective_security().cloned();
         let capsule_id = self.capsule_id.as_str().to_owned();
         let handle = self.runtime_handle.clone();
         let semaphore = self.blocking_semaphore.clone();
@@ -314,8 +314,8 @@ impl process::Host for HostState {
             return Err(ErrorCode::Quota);
         }
 
-        let workspace_root = self.workspace_root.clone();
-        let security = self.security.clone();
+        let workspace_root = self.effective_workspace_root().to_path_buf();
+        let security = self.effective_security().cloned();
         let capsule_id = self.capsule_id.as_str().to_owned();
         let handle = self.runtime_handle.clone();
         let semaphore = self.blocking_semaphore.clone();
@@ -533,7 +533,7 @@ impl process::Host for HostState {
         // feasibility checks. Otherwise an ungranted capsule with no caller in
         // scope would observe `persist-unsupported` instead of the capability
         // error.
-        let Some(sec) = self.security.clone() else {
+        let Some(sec) = self.effective_security().cloned() else {
             record_process_denied(
                 self,
                 "astrid:process/host.spawn-persistent",
@@ -626,7 +626,7 @@ impl process::Host for HostState {
         };
 
         let capsule_id_arc: Arc<str> = Arc::from(self.capsule_id.as_str());
-        let workspace_root = self.workspace_root.clone();
+        let workspace_root = self.effective_workspace_root().to_path_buf();
         // Per-principal concurrent cap, SHARED with `spawn-background`: subtract
         // this instance's live ephemeral handles so the registry's own check
         // (`registry-live < effective`) bounds the COMBINED count to the cap.

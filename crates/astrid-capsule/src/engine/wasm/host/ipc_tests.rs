@@ -481,6 +481,137 @@ fn caller_with_origin(origin: astrid_events::ipc::MessageOrigin) -> astrid_event
     .with_origin(origin)
 }
 
+/// Resolve the private workspace sidecar for the first published message.
+fn first_workspace_attachment(
+    receiver: &mut astrid_events::EventReceiver,
+    registry: &crate::workspace_attachment::WorkspaceAttachmentRegistry,
+) -> Option<crate::workspace_attachment::WorkspaceAttachmentRef> {
+    let event = receiver.try_recv().expect("one published message");
+    match &*event {
+        AstridEvent::Ipc { message, .. } => {
+            assert!(
+                astrid_events::ipc_sequence_has_host_sidecar(message.seq),
+                "an attached publish must retain its fail-closed sidecar marker"
+            );
+            let serialized = serde_json::to_value(message).expect("serialize IPC message");
+            assert!(
+                serialized.get("workspace_attachment").is_none(),
+                "workspace identity must never enter the public IPC wire shape"
+            );
+            registry.attachment_for_message(message.seq)
+        },
+        _ => panic!("expected an Ipc event"),
+    }
+}
+
+#[tokio::test]
+async fn publish_inherits_only_the_host_stamped_caller_workspace() {
+    let rt = tokio::runtime::Handle::current();
+    let mut state = minimal_host_state(rt);
+    state.ipc_publish_patterns = vec!["capsule.v1.*".to_string()];
+    let principal = astrid_core::PrincipalId::new("default").unwrap();
+    let workspace = tempfile::tempdir().expect("workspace");
+    let attachment = state
+        .workspace_attachments
+        .attach(
+            principal,
+            workspace
+                .path()
+                .canonicalize()
+                .expect("canonical workspace"),
+        )
+        .expect("attach workspace");
+    let mut caller = caller_with_origin(astrid_events::ipc::MessageOrigin::LocalSocket);
+    caller.seq = 3;
+    assert!(
+        state
+            .workspace_attachments
+            .bind_message(caller.seq, attachment)
+    );
+    state.install_recv_invocation_context(&caller);
+
+    let mut receiver = state.event_bus.subscribe_topic("capsule.v1.ping");
+    IpcHost::publish(&mut state, "capsule.v1.ping".to_string(), "{}".to_string())
+        .expect("publish should succeed");
+
+    assert_eq!(
+        first_workspace_attachment(&mut receiver, &state.workspace_attachments),
+        Some(attachment),
+        "ordinary publish may inherit the private caller sidecar, never choose a path"
+    );
+}
+
+#[tokio::test]
+async fn publish_rejects_a_revoked_caller_workspace() {
+    let rt = tokio::runtime::Handle::current();
+    let mut state = minimal_host_state(rt);
+    state.ipc_publish_patterns = vec!["capsule.v1.*".to_string()];
+    let principal = astrid_core::PrincipalId::new("default").unwrap();
+    let workspace = tempfile::tempdir().expect("workspace");
+    let attachment = state
+        .workspace_attachments
+        .attach(
+            principal,
+            workspace
+                .path()
+                .canonicalize()
+                .expect("canonical workspace"),
+        )
+        .expect("attach workspace");
+    let mut caller = caller_with_origin(astrid_events::ipc::MessageOrigin::LocalSocket);
+    caller.seq = 3;
+    assert!(
+        state
+            .workspace_attachments
+            .bind_message(caller.seq, attachment)
+    );
+    state.install_recv_invocation_context(&caller);
+    state.workspace_attachments.detach(attachment);
+
+    assert_eq!(
+        IpcHost::publish(&mut state, "capsule.v1.ping".to_string(), "{}".to_string()),
+        Err(ErrorCode::CapabilityDenied),
+        "a disconnected source must not leave a reusable workspace capability"
+    );
+}
+
+#[tokio::test]
+async fn publish_as_stamps_the_verified_ingress_workspace() {
+    let rt = tokio::runtime::Handle::current();
+    let mut state = minimal_host_state(rt);
+    state.has_uplink_capability = true;
+    state.ipc_publish_patterns = vec!["client.v1.*".to_string()];
+    let principal = astrid_core::PrincipalId::new("claude").unwrap();
+    let workspace = tempfile::tempdir().expect("workspace");
+    let attachment = state
+        .workspace_attachments
+        .attach(
+            principal.clone(),
+            workspace
+                .path()
+                .canonicalize()
+                .expect("canonical workspace"),
+        )
+        .expect("attach workspace");
+    state.ingress_principal = Some(principal);
+    state.ingress_workspace_attachment = Some(attachment);
+
+    let mut receiver = state.event_bus.subscribe_topic("client.v1.connect");
+    IpcHost::publish_as(
+        &mut state,
+        "client.v1.connect".to_string(),
+        "{}".to_string(),
+        "forged-principal".to_string(),
+    )
+    .expect("publish_as should succeed");
+
+    assert_eq!(
+        first_workspace_attachment(&mut receiver, &state.workspace_attachments),
+        Some(attachment),
+        "uplink forwarding must stamp the attachment recorded by the verified socket read"
+    );
+}
+
 /// THE no-elevation invariant: a fan-out capsule re-publishing on behalf of a
 /// `RemoteGateway`-originated request must PRESERVE that origin — it can never
 /// be silently elevated to `LocalSocket` by the fresh `InternalIpcMessage` the

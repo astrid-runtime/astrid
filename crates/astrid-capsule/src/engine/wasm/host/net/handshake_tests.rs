@@ -15,7 +15,8 @@ use astrid_core::dirs::AstridHome;
 use astrid_core::local_transport::LocalStream;
 use astrid_core::profile::{DeviceKey, DeviceScope};
 use astrid_core::session_token::{
-    HandshakeRequest, HandshakeResponse, PROTOCOL_VERSION, principal_auth_challenge_message,
+    HandshakeRequest, PROTOCOL_VERSION, WorkspaceHandshakeRequest, WorkspaceHandshakeResponse,
+    principal_auth_challenge_message,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -51,6 +52,7 @@ fn challenge_signature_verifies_against_registered_key() {
             &principal,
             std::slice::from_ref(&registered),
             &nonce_hex,
+            None,
             &signature
         )
         .as_deref(),
@@ -62,8 +64,14 @@ fn challenge_signature_verifies_against_registered_key() {
     let other = astrid_crypto::KeyPair::generate();
     let other_registered = full_device(&other);
     assert!(
-        verify_signature_against_keys(&principal, &[other_registered], &nonce_hex, &signature)
-            .is_err(),
+        verify_signature_against_keys(
+            &principal,
+            &[other_registered],
+            &nonce_hex,
+            None,
+            &signature
+        )
+        .is_err(),
         "signature must not verify against a different key"
     );
 
@@ -75,6 +83,7 @@ fn challenge_signature_verifies_against_registered_key() {
             &principal,
             std::slice::from_ref(&registered),
             &tampered_nonce,
+            None,
             &signature
         )
         .is_err(),
@@ -83,8 +92,37 @@ fn challenge_signature_verifies_against_registered_key() {
 
     // No registered ed25519 key at all → reject.
     assert!(
-        verify_signature_against_keys(&principal, &[], &nonce_hex, &signature).is_err(),
+        verify_signature_against_keys(&principal, &[], &nonce_hex, None, &signature).is_err(),
         "a principal with no registered key must reject"
+    );
+
+    let workspace = "/work/alice";
+    let workspace_message = astrid_core::session_token::principal_workspace_auth_challenge_message(
+        principal.as_str(),
+        &nonce_hex,
+        workspace,
+    );
+    let workspace_signature = keypair.sign(workspace_message.as_bytes()).to_hex();
+    assert!(
+        verify_signature_against_keys(
+            &principal,
+            std::slice::from_ref(&registered),
+            &nonce_hex,
+            Some(workspace),
+            &workspace_signature,
+        )
+        .is_ok()
+    );
+    assert!(
+        verify_signature_against_keys(
+            &principal,
+            std::slice::from_ref(&registered),
+            &nonce_hex,
+            Some("/work/bob"),
+            &workspace_signature,
+        )
+        .is_err(),
+        "a signature for one workspace must not authorize another"
     );
 }
 
@@ -133,26 +171,35 @@ fn token() -> SessionToken {
     SessionToken::generate()
 }
 
+fn workspace_registry() -> std::sync::Arc<crate::workspace_attachment::WorkspaceAttachmentRegistry>
+{
+    std::sync::Arc::new(crate::workspace_attachment::WorkspaceAttachmentRegistry::default())
+}
+
 #[tokio::test]
 async fn handshake_unsigned_returns_no_principal() {
     let (mut server, mut client) = tokio::net::UnixStream::pair().unwrap();
     let tok = token();
     let dir = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(dir.path());
+    let registry = workspace_registry();
 
     let tok_hex = tok.to_hex();
     let server_task =
-        tokio::spawn(async move { validate_handshake(&mut server, &tok, &home).await });
+        tokio::spawn(async move { validate_handshake(&mut server, &tok, &home, &registry).await });
 
     // Legacy single-frame client: no claimed_principal, no signature.
-    let request = HandshakeRequest {
-        token: tok_hex,
-        protocol_version: PROTOCOL_VERSION,
-        client_version: "test".to_string(),
-        claimed_principal: None,
-        signature: None,
+    let request = WorkspaceHandshakeRequest {
+        handshake: HandshakeRequest {
+            token: tok_hex,
+            protocol_version: PROTOCOL_VERSION,
+            client_version: "test".to_string(),
+            claimed_principal: None,
+            signature: None,
+        },
+        workspace_root: None,
     };
-    let response: HandshakeResponse = client_send_recv(&mut client, &request).await;
+    let response: WorkspaceHandshakeResponse = client_send_recv(&mut client, &request).await;
     assert!(response.is_ok(), "unauthenticated handshake must succeed");
     assert!(response.challenge.is_none(), "no challenge without a claim");
 
@@ -172,42 +219,162 @@ async fn handshake_signed_returns_verified_principal() {
     let (mut server, mut client) = tokio::net::UnixStream::pair().unwrap();
     let tok = token();
     let tok_hex = tok.to_hex();
+    let registry = workspace_registry();
     let server_task =
-        tokio::spawn(async move { validate_handshake(&mut server, &tok, &home).await });
+        tokio::spawn(async move { validate_handshake(&mut server, &tok, &home, &registry).await });
 
     // Frame 1: claim the principal, no signature → expect a challenge back.
-    let first = HandshakeRequest {
-        token: tok_hex.clone(),
-        protocol_version: PROTOCOL_VERSION,
-        client_version: "test".to_string(),
-        claimed_principal: Some(principal.to_string()),
-        signature: None,
+    let first = WorkspaceHandshakeRequest {
+        handshake: HandshakeRequest {
+            token: tok_hex.clone(),
+            protocol_version: PROTOCOL_VERSION,
+            client_version: "test".to_string(),
+            claimed_principal: Some(principal.to_string()),
+            signature: None,
+        },
+        workspace_root: None,
     };
-    let challenge_resp: HandshakeResponse = client_send_recv(&mut client, &first).await;
+    let challenge_resp: WorkspaceHandshakeResponse = client_send_recv(&mut client, &first).await;
+    assert!(
+        !challenge_resp.workspace_auth,
+        "ordinary principal challenge must retain the original signature domain"
+    );
     let nonce_hex = challenge_resp
+        .handshake
         .challenge
         .expect("daemon must issue a challenge");
 
     // Frame 2: sign the challenge → expect final OK.
     let message = principal_auth_challenge_message(principal.as_str(), &nonce_hex);
     let signature = keypair.sign(message.as_bytes()).to_hex();
-    let second = HandshakeRequest {
-        token: tok_hex,
-        protocol_version: PROTOCOL_VERSION,
-        client_version: "test".to_string(),
-        claimed_principal: Some(principal.to_string()),
-        signature: Some(signature),
+    let second = WorkspaceHandshakeRequest {
+        handshake: HandshakeRequest {
+            token: tok_hex,
+            protocol_version: PROTOCOL_VERSION,
+            client_version: "test".to_string(),
+            claimed_principal: Some(principal.to_string()),
+            signature: Some(signature),
+        },
+        workspace_root: None,
     };
-    let final_resp: HandshakeResponse = client_send_recv(&mut client, &second).await;
+    let final_resp: WorkspaceHandshakeResponse = client_send_recv(&mut client, &second).await;
     assert!(final_resp.is_ok(), "signed handshake must succeed");
 
     let verified = server_task.await.unwrap().expect("handshake ok");
     let expected_key_id = full_device(&keypair).key_id;
     assert_eq!(
         verified,
-        Some((principal, expected_key_id)),
+        Some(VerifiedConnection {
+            principal,
+            key_id: expected_key_id,
+            workspace_attachment: None,
+        }),
         "a valid signed handshake yields the verified principal and matched device key_id"
     );
+}
+
+#[tokio::test]
+async fn handshake_binds_the_exact_signed_workspace_claim() {
+    let principal = PrincipalId::new("alice").expect("valid principal");
+    let keypair = astrid_crypto::KeyPair::generate();
+    let (_dir, home) = home_with_registered_key(&principal, &keypair);
+    let workspace = tempfile::tempdir().expect("workspace");
+    let workspace_claim = workspace.path().to_string_lossy().into_owned();
+
+    let (mut server, mut client) = tokio::net::UnixStream::pair().unwrap();
+    let tok = token();
+    let tok_hex = tok.to_hex();
+    let registry = workspace_registry();
+    let server_registry = std::sync::Arc::clone(&registry);
+    let server_task = tokio::spawn(async move {
+        validate_handshake(&mut server, &tok, &home, &server_registry).await
+    });
+
+    let first = WorkspaceHandshakeRequest {
+        handshake: HandshakeRequest {
+            token: tok_hex.clone(),
+            protocol_version: PROTOCOL_VERSION,
+            client_version: "test".to_string(),
+            claimed_principal: Some(principal.to_string()),
+            signature: None,
+        },
+        workspace_root: Some(workspace_claim.clone()),
+    };
+    let challenge_resp: WorkspaceHandshakeResponse = client_send_recv(&mut client, &first).await;
+    assert!(
+        challenge_resp.workspace_auth,
+        "daemon must explicitly negotiate workspace-bound authentication"
+    );
+    let nonce_hex = challenge_resp
+        .handshake
+        .challenge
+        .expect("daemon must issue a challenge");
+
+    let message = astrid_core::session_token::principal_workspace_auth_challenge_message(
+        principal.as_str(),
+        &nonce_hex,
+        &workspace_claim,
+    );
+    let signature = keypair.sign(message.as_bytes()).to_hex();
+    let second = WorkspaceHandshakeRequest {
+        handshake: HandshakeRequest {
+            token: tok_hex,
+            protocol_version: PROTOCOL_VERSION,
+            client_version: "test".to_string(),
+            claimed_principal: Some(principal.to_string()),
+            signature: Some(signature),
+        },
+        workspace_root: Some(workspace_claim),
+    };
+    let final_resp: WorkspaceHandshakeResponse = client_send_recv(&mut client, &second).await;
+    assert!(final_resp.is_ok(), "signed workspace handshake succeeds");
+
+    let verified = server_task.await.unwrap().expect("handshake ok");
+    let identity = verified.expect("verified connection");
+    assert_eq!(identity.principal, principal);
+    let attachment = identity.workspace_attachment.expect("workspace attachment");
+    assert!(
+        registry.resolves_to(
+            attachment,
+            &principal,
+            &workspace
+                .path()
+                .canonicalize()
+                .expect("canonical workspace"),
+        ),
+        "the verified connection must carry the already-open exact workspace"
+    );
+}
+
+#[tokio::test]
+async fn handshake_rejects_unsigned_workspace_claim() {
+    let (mut server, mut client) = tokio::net::UnixStream::pair().unwrap();
+    let tok = token();
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(dir.path());
+    let workspace = tempfile::tempdir().expect("workspace");
+    let registry = workspace_registry();
+
+    let request = WorkspaceHandshakeRequest {
+        handshake: HandshakeRequest {
+            token: tok.to_hex(),
+            protocol_version: PROTOCOL_VERSION,
+            client_version: "test".to_string(),
+            claimed_principal: None,
+            signature: None,
+        },
+        workspace_root: Some(workspace.path().to_string_lossy().into_owned()),
+    };
+    let server_task =
+        tokio::spawn(async move { validate_handshake(&mut server, &tok, &home, &registry).await });
+    let response: WorkspaceHandshakeResponse = client_send_recv(&mut client, &request).await;
+
+    assert!(!response.is_ok(), "unsigned workspace must be rejected");
+    assert_eq!(
+        response.reason.as_deref(),
+        Some("workspace attachment requires an authenticated principal")
+    );
+    assert!(server_task.await.unwrap().is_err());
 }
 
 #[tokio::test]
@@ -219,18 +386,23 @@ async fn handshake_bad_signature_fails_closed() {
     let (mut server, mut client) = tokio::net::UnixStream::pair().unwrap();
     let tok = token();
     let tok_hex = tok.to_hex();
+    let registry = workspace_registry();
     let server_task =
-        tokio::spawn(async move { validate_handshake(&mut server, &tok, &home).await });
+        tokio::spawn(async move { validate_handshake(&mut server, &tok, &home, &registry).await });
 
-    let first = HandshakeRequest {
-        token: tok_hex.clone(),
-        protocol_version: PROTOCOL_VERSION,
-        client_version: "test".to_string(),
-        claimed_principal: Some(principal.to_string()),
-        signature: None,
+    let first = WorkspaceHandshakeRequest {
+        handshake: HandshakeRequest {
+            token: tok_hex.clone(),
+            protocol_version: PROTOCOL_VERSION,
+            client_version: "test".to_string(),
+            claimed_principal: Some(principal.to_string()),
+            signature: None,
+        },
+        workspace_root: None,
     };
-    let challenge_resp: HandshakeResponse = client_send_recv(&mut client, &first).await;
+    let challenge_resp: WorkspaceHandshakeResponse = client_send_recv(&mut client, &first).await;
     let nonce_hex = challenge_resp
+        .handshake
         .challenge
         .expect("daemon must issue a challenge");
 
@@ -238,14 +410,17 @@ async fn handshake_bad_signature_fails_closed() {
     let attacker = astrid_crypto::KeyPair::generate();
     let message = principal_auth_challenge_message(principal.as_str(), &nonce_hex);
     let bad_signature = attacker.sign(message.as_bytes()).to_hex();
-    let second = HandshakeRequest {
-        token: tok_hex,
-        protocol_version: PROTOCOL_VERSION,
-        client_version: "test".to_string(),
-        claimed_principal: Some(principal.to_string()),
-        signature: Some(bad_signature),
+    let second = WorkspaceHandshakeRequest {
+        handshake: HandshakeRequest {
+            token: tok_hex,
+            protocol_version: PROTOCOL_VERSION,
+            client_version: "test".to_string(),
+            claimed_principal: Some(principal.to_string()),
+            signature: Some(bad_signature),
+        },
+        workspace_root: None,
     };
-    let final_resp: HandshakeResponse = client_send_recv(&mut client, &second).await;
+    let final_resp: WorkspaceHandshakeResponse = client_send_recv(&mut client, &second).await;
     assert!(!final_resp.is_ok(), "bad signature must be rejected");
 
     let result = server_task.await.unwrap();

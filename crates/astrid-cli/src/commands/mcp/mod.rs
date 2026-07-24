@@ -118,6 +118,10 @@ pub(crate) async fn serve(principal: Option<&str>) -> Result<ExitCode> {
             .with_context(|| format!("invalid principal for `astrid mcp serve`: {p}"))?,
         None => crate::principal::current(),
     };
+    let workspace = std::env::current_dir()
+        .context("failed to resolve the launching agent's workspace")?
+        .canonicalize()
+        .context("failed to canonicalize the launching agent's workspace")?;
 
     // `mcp serve` owns stdout for JSON-RPC, so daemon bootstrap must be quiet.
     crate::commands::daemon::ensure_daemon_quiet("mcp-serve")
@@ -129,9 +133,13 @@ pub(crate) async fn serve(principal: Option<&str>) -> Result<ExitCode> {
     // not a chat session; the kernel attributes work via the per-message
     // `principal`, not the session.
     let session = astrid_core::SessionId::from_uuid(Uuid::new_v4());
-    let mut client = crate::socket_client::connect_for_workspace(session, caller.clone(), None)
-        .await
-        .context("Failed to connect to the Astrid daemon socket")?;
+    let mut client = crate::socket_client::SocketClient::connect_with_workspace(
+        session,
+        caller.clone(),
+        Some(&workspace),
+    )
+    .await
+    .context("Failed to connect to the Astrid daemon socket")?;
 
     // The uplink connected, but a non-`anonymous` principal with no keypair is
     // silently stamped `anonymous` by the daemon — every tool call would then
@@ -155,7 +163,7 @@ pub(crate) async fn serve(principal: Option<&str>) -> Result<ExitCode> {
         "astrid mcp serve: uplink established, starting MCP stdio transport"
     );
 
-    tokio::spawn(session_guard::run(caller.clone()));
+    tokio::spawn(session_guard::run(caller.clone(), workspace.clone()));
 
     let server = AstridMcpServer::new(Arc::new(Mutex::new(client)), caller.clone());
 
@@ -177,7 +185,7 @@ pub(crate) async fn serve(principal: Option<&str>) -> Result<ExitCode> {
     // if the watch uplink dies, tool-list pushes simply stop, but the server
     // keeps serving `tools/list`/`tools/call` on demand.
     let peer = running.peer().clone();
-    tokio::spawn(watch::run(peer, caller.to_string()));
+    tokio::spawn(watch::run(peer, caller.to_string(), workspace));
 
     // Race the normal stdin-EOF quit against parent-death. `waiting()` only
     // returns when the client closes stdin; an MCP client that DIES without

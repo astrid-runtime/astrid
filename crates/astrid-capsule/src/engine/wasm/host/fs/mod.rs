@@ -199,7 +199,7 @@ mod error_mapping_tests {
 /// denied read (exactly-once). The audited path is the resolved physical
 /// path the gate evaluated.
 fn gate_read(state: &HostState, physical: &std::path::Path) -> Result<(), ErrorCode> {
-    if let Some(gate) = state.security.clone() {
+    if let Some(gate) = state.effective_security().cloned() {
         let capsule_id = state.capsule_id.as_str().to_owned();
         let p = physical.to_string_lossy().to_string();
         let home = state.effective_home_root_buf();
@@ -246,7 +246,7 @@ fn gate_write(
     physical: &std::path::Path,
     kind: WriteKind,
 ) -> Result<(), ErrorCode> {
-    if let Some(gate) = state.security.clone() {
+    if let Some(gate) = state.effective_security().cloned() {
         let capsule_id = state.capsule_id.as_str().to_owned();
         let p = physical.to_string_lossy().to_string();
         let home = state.effective_home_root_buf();

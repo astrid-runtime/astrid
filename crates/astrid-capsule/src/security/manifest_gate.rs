@@ -167,6 +167,17 @@ impl ManifestSecurityGate {
 
 #[async_trait]
 impl CapsuleSecurityGate for ManifestSecurityGate {
+    fn for_workspace(
+        &self,
+        workspace_root: std::path::PathBuf,
+    ) -> Option<std::sync::Arc<dyn CapsuleSecurityGate>> {
+        Some(std::sync::Arc::new(Self::new(
+            self.manifest.clone(),
+            workspace_root,
+            self.default_home_root.clone(),
+        )))
+    }
+
     async fn check_http_request(
         &self,
         capsule_id: &str,

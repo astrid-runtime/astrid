@@ -125,8 +125,14 @@ pub(super) struct ResolvedVfsPath {
 /// mounts (per-invocation > load-time) so cross-principal calls land in
 /// the right tree.
 pub(super) fn resolve_path(state: &HostState, raw_path: &str) -> Result<ResolvedPath, String> {
+    if !state.workspace_attachment_is_resolved() {
+        return Err(
+            "workspace attachment is missing, stale, or owned by another principal".to_string(),
+        );
+    }
+
     if let Some(stripped) = raw_path.strip_prefix(CWD_SCHEME) {
-        let resolved = resolve_physical_absolute(&state.workspace_root, stripped)?;
+        let resolved = resolve_physical_absolute(state.effective_workspace_root(), stripped)?;
         let relative = resolved
             .physical
             .strip_prefix(&resolved.canonical_root)
@@ -172,7 +178,7 @@ pub(super) fn resolve_path(state: &HostState, raw_path: &str) -> Result<Resolved
             target: VfsTarget::Tmp,
         })
     } else {
-        let resolved = resolve_physical_absolute(&state.workspace_root, raw_path)?;
+        let resolved = resolve_physical_absolute(state.effective_workspace_root(), raw_path)?;
         let relative = resolved
             .physical
             .strip_prefix(&resolved.canonical_root)
@@ -204,11 +210,38 @@ pub(super) fn resolve_vfs(
                 .ok_or_else(|| "/tmp VFS is not mounted".to_string())?;
             (m.vfs.clone(), m.handle.clone())
         },
-        VfsTarget::Workspace => (state.vfs.clone(), state.vfs_root_handle.clone()),
+        VfsTarget::Workspace => state.effective_workspace_vfs(),
     };
     Ok(ResolvedVfsPath {
         relative: resolved.relative.clone(),
         vfs,
         handle,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unresolved_attachment_never_falls_back_to_daemon_workspace() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let mut state = crate::engine::wasm::test_fixtures::minimal_host_state(rt.handle().clone());
+        let mut message = astrid_events::ipc::IpcMessage::new(
+            astrid_events::ipc::Topic::from_raw("tool.v1.request"),
+            astrid_events::ipc::IpcPayload::RawJson(serde_json::json!({})),
+            uuid::Uuid::new_v4(),
+        )
+        .with_principal("alice");
+        message.seq = 3;
+        state.caller_context = Some(message);
+
+        let error = match resolve_path(&state, "cwd://Cargo.toml") {
+            Ok(_) => panic!("an unresolved host reference must deny"),
+            Err(error) => error,
+        };
+        assert!(error.contains("missing, stale, or owned by another principal"));
+    }
 }

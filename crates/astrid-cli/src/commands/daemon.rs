@@ -151,24 +151,30 @@ fn ephemeral_daemon_command(daemon_bin: &Path, workspace_root: &Path) -> std::pr
 /// Checks the socket path, cleans up stale sockets, and spawns a fresh
 /// daemon when no live daemon is reachable.
 pub(crate) async fn ensure_daemon(label: &str) -> Result<()> {
-    ensure_daemon_inner(label, true).await
+    ensure_daemon_inner(label, true, true).await
 }
 
 /// Ensure the daemon is running without writing to stdout.
 ///
 /// Used by `astrid mcp serve`, whose stdout is the MCP JSON-RPC transport.
 pub(crate) async fn ensure_daemon_quiet(label: &str) -> Result<()> {
-    ensure_daemon_inner(label, false).await
+    ensure_daemon_inner(label, false, false).await
 }
 
-async fn ensure_daemon_inner(label: &str, announce: bool) -> Result<()> {
+async fn ensure_daemon_inner(
+    label: &str,
+    announce: bool,
+    require_daemon_workspace_match: bool,
+) -> Result<()> {
     let socket_path = socket_client::proxy_socket_path();
     let ready_path = socket_client::readiness_path();
 
     let needs_boot = match astrid_core::local_transport::connect_outcome(&socket_path).await {
         Ok(astrid_core::local_transport::ConnectOutcome::Connected(stream)) => {
             drop(stream);
-            ensure_daemon_workspace_matches(None).await?;
+            if require_daemon_workspace_match {
+                ensure_daemon_workspace_matches(None).await?;
+            }
             if announce {
                 eprintln!("[{label}] Connected to existing daemon");
             }
@@ -185,7 +191,9 @@ async fn ensure_daemon_inner(label: &str, announce: bool) -> Result<()> {
     };
     if needs_boot {
         spawn_daemon_inner(&ready_path, announce, None).await?;
-        ensure_daemon_workspace_matches(None).await?;
+        if require_daemon_workspace_match {
+            ensure_daemon_workspace_matches(None).await?;
+        }
     }
     Ok(())
 }

@@ -431,11 +431,14 @@ fn clear_on_return(state: &mut HostState, reset_resources: bool) {
     state.interceptor_active = false;
     state.invocation_kv = None;
     state.invocation_home = None;
+    state.invocation_workspace = None;
+    state.invocation_workspace_attachment = None;
     state.invocation_tmp = None;
     state.invocation_secret_store = None;
     state.invocation_capsule_log = None;
     state.invocation_profile = None;
     state.invocation_env_overlay = None;
+    state.invocation_security = None;
     // A leftover per-principal cancellation token (possibly already cancelled
     // by a view release) must not decide which teardown signal the NEXT
     // lease's waits listen to; the next invocation installs its own.
@@ -451,6 +454,7 @@ fn clear_on_return(state: &mut HostState, reset_resources: bool) {
     // and wrongly earn local-egress consent. Cleared to `None` (= `System`,
     // fail-closed) in lockstep.
     state.ingress_origin = None;
+    state.ingress_workspace_attachment = None;
 
     if reset_resources {
         // Drops every entry still in the old table (orphaned subscriptions,
