@@ -209,7 +209,7 @@ jobs:
           # New contributors: require approval label
           if [ "$TIER" = "new" ]; then
             if [ "$ENFORCE_NEWCOMER_APPROVAL" = "true" ]; then
-              if printf '%s\n' "$LABELS" | grep -qixF "newcomer-approved"; then
+              if printf '%s\n' "$LABELS" | grep -qxF "newcomer-approved"; then
                 echo "New contributor approved by a maintainer."
               else
                 echo "::error::New contributors require a maintainer to add the 'newcomer-approved' label before CI proceeds."
