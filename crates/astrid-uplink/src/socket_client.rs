@@ -187,7 +187,7 @@ impl SocketClient {
     /// bypassing the token handshake. Test-only: lets the crate's own tests drive
     /// the framed read/write path over a local-stream pair without a
     /// live daemon.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn from_stream_for_test(
         stream: LocalStream,
         session_id: SessionId,
@@ -466,10 +466,11 @@ const MAX_HANDSHAKE_RESPONSE_SIZE: usize = 4096;
 /// `ASTRID_HOME` resolves. The daemon writes this 0600 file when the
 /// principal's keypair is minted (issue #45/#852); the connecting process,
 /// running as the OS user, can read it to sign a handshake challenge.
-fn principal_key_path(principal: &PrincipalId) -> Option<std::path::PathBuf> {
-    use astrid_core::dirs::AstridHome;
-    let home = AstridHome::resolve().ok()?;
-    Some(home.keys_dir().join(format!("{principal}.key")))
+fn principal_key_path_in(
+    home: &astrid_core::dirs::AstridHome,
+    principal: &PrincipalId,
+) -> std::path::PathBuf {
+    home.keys_dir().join(format!("{principal}.key"))
 }
 
 /// Read the session token from disk and execute the authentication
@@ -491,7 +492,17 @@ fn principal_key_path(principal: &PrincipalId) -> Option<std::path::PathBuf> {
 /// `anonymous`. An outright-rejected handshake (e.g. a bad signature) is an
 /// `Err`, never a silent `false`.
 async fn perform_handshake(stream: &mut LocalStream, principal: &PrincipalId) -> Result<bool> {
-    let tok_path = token_path()?;
+    let home = astrid_core::dirs::AstridHome::resolve()
+        .map_err(|e| anyhow::anyhow!("Failed to resolve ASTRID_HOME for handshake: {e}"))?;
+    perform_handshake_in_home(stream, principal, &home).await
+}
+
+async fn perform_handshake_in_home(
+    stream: &mut LocalStream,
+    principal: &PrincipalId,
+    home: &astrid_core::dirs::AstridHome,
+) -> Result<bool> {
+    let tok_path = home.token_path();
     let token = SessionToken::read_from_file(&tok_path).with_context(|| {
         format!(
             "Failed to read session token from {}. Is the daemon running?",
@@ -500,8 +511,9 @@ async fn perform_handshake(stream: &mut LocalStream, principal: &PrincipalId) ->
     })?;
 
     // Load the signing key only if it exists; absence ⇒ legacy single-frame.
-    let keypair = match principal_key_path(principal) {
-        Some(path) => match std::fs::read(&path) {
+    let keypair = {
+        let path = principal_key_path_in(home, principal);
+        match std::fs::read(&path) {
             Ok(bytes) => Some(
                 astrid_crypto::KeyPair::from_secret_key(&bytes)
                     .with_context(|| format!("invalid principal key at {}", path.display()))?,
@@ -512,8 +524,7 @@ async fn perform_handshake(stream: &mut LocalStream, principal: &PrincipalId) ->
                     format!("failed to read principal key at {}", path.display())
                 });
             },
-        },
-        None => None,
+        }
     };
 
     let claimed_principal = keypair.as_ref().map(|_| principal.to_string());
@@ -559,6 +570,17 @@ async fn perform_handshake(stream: &mut LocalStream, principal: &PrincipalId) ->
     }
 
     Ok(authenticated)
+}
+
+/// Test-only access to the production handshake framing with an explicit home.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub async fn perform_handshake_for_test(
+    stream: &mut LocalStream,
+    principal: &PrincipalId,
+    home: &astrid_core::dirs::AstridHome,
+) -> Result<bool> {
+    perform_handshake_in_home(stream, principal, home).await
 }
 
 /// Write one length-prefixed [`HandshakeRequest`] frame and read the

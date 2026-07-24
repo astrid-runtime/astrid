@@ -1,0 +1,113 @@
+name: Windows local transport
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/astrid-core/**'
+      - 'crates/astrid-capsule/**'
+      - 'crates/astrid-uplink/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/windows-local-transport.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/astrid-core/**'
+      - 'crates/astrid-capsule/**'
+      - 'crates/astrid-uplink/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/windows-local-transport.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  native:
+    name: Native named-pipe tests (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: '1.95'
+          targets: ${{ matrix.target }}
+          components: clippy
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          key: windows-local-transport-${{ matrix.target }}
+          cache-on-failure: true
+
+      - name: Check Windows transport crates
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: >-
+          cargo check
+          -p astrid-core
+          -p astrid-uplink
+          -p astrid-capsule
+          --all-features
+          --locked
+          --target $env:TARGET
+
+      - name: Lint Windows transport and native test targets
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: >-
+          cargo clippy
+          -p astrid-core
+          -p astrid-uplink
+          -p astrid-capsule
+          --all-targets
+          --all-features
+          --locked
+          --target $env:TARGET
+          --no-deps
+          --
+          -D warnings
+
+      - name: Exercise native named-pipe security and lifecycle
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: cargo test -p astrid-core --locked --target $env:TARGET windows_backend -- --test-threads=1
+
+      - name: Reject genuine alternate process and effective tokens
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: cargo test -p astrid-core --features test-support --locked --target $env:TARGET --test windows_named_pipe_security_harness
+
+      - name: Complete production signed-principal handshake
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: cargo test -p astrid-capsule --features test-support --locked --target $env:TARGET --test windows_named_pipe_handshake -- --test-threads=1

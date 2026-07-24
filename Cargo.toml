@@ -236,6 +236,7 @@ url = "2"
 utoipa = { version = "5", features = ["axum_extras"] }
 uuid = { version = "1.0", default-features = false, features = ["v4", "v5", "serde", "rng-getrandom"] }
 walkdir = "2.5"
+windows-sys = "0.61"
 wasm-encoder = "0.253"
 wasmparser = "0.253"
 wit-component = "0.253"

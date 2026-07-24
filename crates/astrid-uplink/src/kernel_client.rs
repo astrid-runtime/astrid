@@ -380,7 +380,7 @@ impl KernelClient {
     /// an explicit inactivity `timeout`. Test-only: lets the crate's tests drive
     /// [`request`](Self::request) over a loopback socket pair with a short
     /// timeout, no live daemon.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn from_socket_for_test(inner: SocketClient, caller: PrincipalId, timeout: Duration) -> Self {
         Self {
             inner,
@@ -482,13 +482,17 @@ mod tests {
     // JSON `IpcMessage` carrying a `RawJson(KernelResponse)` payload) on the
     // request's correlated response topic — exactly the shape the daemon emits.
 
+    #[cfg(unix)]
     use astrid_core::local_transport::{self, LocalReadHalf, LocalStream, LocalWriteHalf};
+    #[cfg(unix)]
     use std::io::Result as IoResult;
+    #[cfg(unix)]
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// Read one length-prefixed frame off the server half and return the
     /// `IpcMessage`-shaped JSON so the test can learn the request's response
     /// topic (the correlated `astrid.v1.response.<suffix>` the client awaits).
+    #[cfg(unix)]
     async fn read_request_frame(read: &mut LocalReadHalf) -> serde_json::Value {
         let mut len_buf = [0u8; 4];
         read.read_exact(&mut len_buf)
@@ -502,6 +506,7 @@ mod tests {
 
     /// Write a `KernelResponse` on `response_topic` as the daemon would: a
     /// length-prefixed `IpcMessage` with a `RawJson` payload.
+    #[cfg(unix)]
     async fn write_response(
         write: &mut LocalWriteHalf,
         response_topic: &str,
@@ -521,6 +526,7 @@ mod tests {
     }
 
     /// Derive the response topic a client awaits from the request frame it sent.
+    #[cfg(unix)]
     fn response_topic_of(req_frame: &serde_json::Value) -> String {
         let request_topic = req_frame
             .get("topic")
@@ -532,6 +538,7 @@ mod tests {
         format!("astrid.v1.response.{suffix}")
     }
 
+    #[cfg(unix)]
     fn test_client(client_stream: LocalStream, timeout: Duration) -> KernelClient {
         let caller = PrincipalId::new("alice").unwrap();
         let inner = SocketClient::from_stream_for_test(
@@ -545,6 +552,7 @@ mod tests {
     /// (a) N `Working` keepalives followed by a terminal `Success` → `request()`
     /// returns the `Success`, proving `Working` is non-terminal and resets the
     /// window rather than being surfaced.
+    #[cfg(unix)]
     #[tokio::test]
     async fn working_frames_are_swallowed_then_terminal_returned() {
         let (client_stream, server_stream) = tokio::net::UnixStream::pair().unwrap();
@@ -582,6 +590,7 @@ mod tests {
     /// inactivity, not a total deadline: with a 120ms inactivity timeout we keep
     /// the request alive for ~300ms via 40ms-spaced pings, which a total 120ms
     /// deadline would have failed.
+    #[cfg(unix)]
     #[tokio::test]
     async fn keepalives_extend_beyond_total_inactivity_timeout() {
         let (client_stream, server_stream) = tokio::net::UnixStream::pair().unwrap();
@@ -616,6 +625,7 @@ mod tests {
     /// (c) Total silence for longer than the inactivity timeout → a typed
     /// [`KernelClientError::Timeout`] with [`TimeoutKind::Inactivity`] (the
     /// gateway maps this to 504).
+    #[cfg(unix)]
     #[tokio::test]
     async fn silence_past_timeout_yields_typed_timeout() {
         let (client_stream, server_stream) = tokio::net::UnixStream::pair().unwrap();
@@ -644,6 +654,7 @@ mod tests {
     /// [`TimeoutKind::Ceiling`], even though the kernel keeps pinging within the
     /// inactivity window forever. Uses a short-lived override of the ceiling via
     /// a dedicated helper so the test doesn't wait 10 minutes.
+    #[cfg(unix)]
     #[tokio::test]
     async fn unending_keepalives_are_bounded_by_max_total() {
         let (client_stream, server_stream) = tokio::net::UnixStream::pair().unwrap();
@@ -689,6 +700,7 @@ mod tests {
     /// — after the request is sent, the peer closing yields an EOF the socket
     /// reader reports as `ConnectionLost`, and the typed error keeps that cause
     /// in the chain rather than flattening it to a string.
+    #[cfg(unix)]
     #[tokio::test]
     async fn connection_loss_preserves_source() {
         let (client_stream, server_stream) = tokio::net::UnixStream::pair().unwrap();

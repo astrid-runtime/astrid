@@ -18,7 +18,7 @@ use astrid_storage::secret::SecretStore;
 
 /// An active network stream owned by a capsule.
 ///
-/// Holds either an inbound Unix-socket connection (accepted from the
+/// Holds either an inbound host-local connection (accepted from the
 /// capsule's pre-provisioned listener) or an outbound TCP connection
 /// (opened via `net.connect-tcp`). The read/write/close host fns
 /// dispatch on the variant; both variants implement
@@ -148,7 +148,7 @@ impl std::fmt::Debug for PrincipalMount {
     }
 }
 
-/// Verified identity bound to an accepted Unix-socket connection.
+/// Verified identity bound to an accepted host-local connection.
 ///
 /// Pairs the handshake-verified [`PrincipalId`](astrid_core::principal::PrincipalId)
 /// with the `key_id` of the [`DeviceKey`](astrid_core::profile::DeviceKey)
@@ -632,7 +632,7 @@ pub struct HostState {
     /// without iterating the whole resource table.
     pub process_count_by_principal:
         std::collections::HashMap<astrid_core::principal::PrincipalId, usize>,
-    /// Verified principal bound to each accepted Unix-socket connection,
+    /// Verified principal bound to each accepted host-local connection,
     /// keyed by the stream resource rep (`u32`). Populated by the
     /// `net.unix-listener.accept` path after a successful per-connection
     /// principal challenge-response (issue #45/#852) and torn down when the

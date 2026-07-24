@@ -466,6 +466,7 @@ dependencies = [
  "astrid-mcp",
  "astrid-runtime",
  "astrid-storage",
+ "astrid-uplink",
  "astrid-vfs",
  "astrid-workspace",
  "async-trait",
@@ -577,6 +578,7 @@ dependencies = [
  "tokio",
  "toml 0.8.23",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

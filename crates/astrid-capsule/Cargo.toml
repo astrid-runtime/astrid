@@ -12,6 +12,7 @@ build = "build.rs"
 [features]
 default = []
 fuzzing = []
+test-support = []
 
 # Engine-agnostic (portable) dependencies. The dispatcher, registry, access
 # resolver, context, trait layer, and manifest analysis share these so an
@@ -101,6 +102,7 @@ wasmtime-wasi = { workspace = true }
 [dev-dependencies]
 astrid-crypto = { workspace = true }
 astrid-mcp = { workspace = true, features = ["test-support"] }
+astrid-uplink = { workspace = true, features = ["test-support"] }
 # Test-only: build a synthetic `reqwest::Response` (via `reqwest::Response::from`)
 # for hermetic stream-quota tests, with no network.
 http = "1"
