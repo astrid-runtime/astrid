@@ -157,7 +157,7 @@ jobs:
           --locked
           --target $env:TARGET
 
-      - name: Test native kernel runtime
+      - name: Test native transport lifecycle
         env:
           TARGET: ${{ matrix.target }}
         shell: pwsh
@@ -166,6 +166,7 @@ jobs:
           -p astrid-kernel
           --locked
           --target $env:TARGET
+          socket::tests
 
       - name: Build native lifecycle binaries
         env:

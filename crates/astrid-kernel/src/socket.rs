@@ -470,6 +470,21 @@ mod tests {
         }
     }
 
+    fn assert_only_readiness_artifacts(directory: &std::path::Path) {
+        let mut actual = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        actual.sort();
+
+        let mut expected = vec![std::ffi::OsString::from("system.ready")];
+        #[cfg(windows)]
+        expected.push(std::ffi::OsString::from(".astrid-private-write.lock"));
+        expected.sort();
+
+        assert_eq!(actual, expected);
+    }
+
     #[test]
     fn readiness_metadata_is_published_atomically() {
         let dir = private_tempdir();
@@ -479,7 +494,7 @@ mod tests {
         publish_readiness_metadata(&path, "v1:selected\n").unwrap();
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "v1:selected\n");
-        assert_eq!(std::fs::read_dir(&run_dir).unwrap().count(), 1);
+        assert_only_readiness_artifacts(&run_dir);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -497,7 +512,7 @@ mod tests {
         publish_readiness_metadata(&path, "v1:current\n").unwrap();
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "v1:current\n");
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert_only_readiness_artifacts(dir.path());
     }
 
     #[test]
