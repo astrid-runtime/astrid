@@ -4,26 +4,18 @@ on:
   push:
     branches: [main]
     paths:
-      - 'crates/astrid-cli/**'
-      - 'crates/astrid-core/**'
-      - 'crates/astrid-uplink/**'
-      - 'crates/astrid-capsule/**'
-      - 'crates/astrid-daemon/**'
-      - 'crates/astrid-kernel/**'
+      - 'crates/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'scripts/windows-daemon-lifecycle.ps1'
       - '.github/workflows/windows-daemon-lifecycle.yml'
   pull_request:
     branches: [main]
     paths:
-      - 'crates/astrid-cli/**'
-      - 'crates/astrid-core/**'
-      - 'crates/astrid-uplink/**'
-      - 'crates/astrid-capsule/**'
-      - 'crates/astrid-daemon/**'
-      - 'crates/astrid-kernel/**'
+      - 'crates/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'scripts/windows-daemon-lifecycle.ps1'
       - '.github/workflows/windows-daemon-lifecycle.yml'
   workflow_dispatch:
 
@@ -111,3 +103,22 @@ jobs:
           -p astrid-kernel
           --locked
           --target $env:TARGET
+
+      - name: Build native lifecycle binaries
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: >-
+          cargo build
+          -p astrid
+          --bin astrid
+          --bin astrid-daemon
+          --all-features
+          --locked
+          --target $env:TARGET
+
+      - name: Exercise authenticated daemon lifecycle
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: ./scripts/windows-daemon-lifecycle.ps1 -Target $env:TARGET

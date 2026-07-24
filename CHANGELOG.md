@@ -28,7 +28,9 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   daemons; status and doctor no longer infer health from a socket pathname.
   Companion discovery and signed self-update also understand `.exe` names and
   transactional Windows replacement with rollback. Native Windows-only process
-  and update-transaction tests run on x64 and ARM64 CI. Closes #1350.
+  and update-transaction tests run on x64 and ARM64 CI, where the built CLI and
+  daemon also complete a real start, authenticated status, stop, and
+  confirmed-process-exit cycle. Closes #1350.
 - **Linux amd64 now has a distro-neutral OCI build target.** The image packages
   exact immutable GitHub release bytes only after their tagged release-workflow
   signatures and manifest digests verify, runs the persistent daemon as a
