@@ -188,7 +188,15 @@ pub(super) fn write_private_file_transaction_journal(
     guard: &TrustedPathGuard,
 ) -> io::Result<()> {
     let journal_path = parent.join(PRIVATE_FILE_TRANSACTION_JOURNAL);
-    if guarded_file_exists(guard, &journal_path)? {
+    if guarded_file_exists(guard, &journal_path).map_err(|error| {
+        with_context(
+            error,
+            format!(
+                "could not inspect private-file journal before publication: {}",
+                journal_path.display()
+            ),
+        )
+    })? {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
             "a private-file write transaction is already pending",
@@ -212,6 +220,15 @@ pub(super) fn write_private_file_transaction_journal(
         FileContract::ExactPrivate,
         BoundaryContract::ExactPrivateDirectory,
     )
+    .map_err(|error| {
+        with_context(
+            error,
+            format!(
+                "could not flush published private-file journal: {}",
+                journal_path.display()
+            ),
+        )
+    })
 }
 
 pub(super) fn read_private_file_transaction_journal(
