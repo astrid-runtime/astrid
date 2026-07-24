@@ -1,6 +1,18 @@
 use super::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use windows_sys::Win32::Security::WinAnonymousSid;
+use windows_sys::Win32::Storage::FileSystem::DELETE;
+use windows_sys::Win32::System::SystemServices::ACCESS_SYSTEM_SECURITY;
+
+#[test]
+fn canonical_pipe_full_control_accepts_only_generic_or_mapped_exact_masks() {
+    assert!(is_canonical_pipe_full_control(GENERIC_ALL));
+    assert!(is_canonical_pipe_full_control(FILE_ALL_ACCESS));
+    assert!(!is_canonical_pipe_full_control(FILE_ALL_ACCESS & !DELETE));
+    assert!(!is_canonical_pipe_full_control(
+        FILE_ALL_ACCESS | ACCESS_SYSTEM_SECURITY
+    ));
+}
 
 #[test]
 fn endpoint_name_is_sid_derived_not_path_derived() {

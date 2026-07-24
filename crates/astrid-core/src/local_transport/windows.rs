@@ -36,7 +36,7 @@ use windows_sys::Win32::Security::{
     RevertToSelf, SECURITY_ATTRIBUTES, SECURITY_MAX_SID_SIZE, TOKEN_QUERY, TOKEN_USER, TokenUser,
     WinLocalSystemSid,
 };
-use windows_sys::Win32::Storage::FileSystem::SECURITY_IDENTIFICATION;
+use windows_sys::Win32::Storage::FileSystem::{FILE_ALL_ACCESS, SECURITY_IDENTIFICATION};
 use windows_sys::Win32::System::Pipes::{
     GetNamedPipeClientProcessId, GetNamedPipeServerProcessId, ImpersonateNamedPipeClient,
     WaitNamedPipeW,
@@ -937,7 +937,7 @@ fn validate_pipe_security(handle: HANDLE) -> io::Result<()> {
                 "named-pipe DACL contains a non-canonical access entry",
             ));
         };
-        if flags != 0 || mask != GENERIC_ALL {
+        if flags != 0 || !is_canonical_pipe_full_control(mask) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "named-pipe DACL contains a non-canonical access entry",
@@ -962,6 +962,13 @@ fn validate_pipe_security(handle: HANDLE) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+fn is_canonical_pipe_full_control(mask: u32) -> bool {
+    // The I/O manager maps generic access bits to the file-object-specific
+    // mask when attaching a descriptor to a named pipe. Accept the exact SDDL
+    // source form and its exact mapped form, but no weaker or augmented mask.
+    mask == GENERIC_ALL || mask == FILE_ALL_ACCESS
 }
 
 fn wide_nul(value: &OsStr) -> Vec<u16> {
