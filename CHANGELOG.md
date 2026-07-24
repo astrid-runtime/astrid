@@ -11,6 +11,17 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Added
 
+- **Linux amd64 now has a distro-neutral OCI build target.** The image packages
+  exact immutable GitHub release bytes only after their tagged release-workflow
+  signatures and manifest digests verify, runs the persistent daemon as a
+  non-root foreground process with logs on standard error, and refuses startup
+  unless an operator supplies an externally pinned, internally signed distro.
+  CI loads one exact OCI export and passes only its content-addressed repository
+  digest to runtime tests, scanning, and SBOM generation. It binds the archive's
+  sole manifest to that digest, then emits signed checksums for the evidence,
+  a per-export provenance attestation, and an exact-archive blob signature
+  without claiming byte reproducibility or publishing mutable or
+  multi-architecture tags. Closes #1344.
 - **Foreground daemon logs can be routed to standard error.**
   `ASTRID_DAEMON_LOG_TARGET=stderr` sends ANSI-free daemon diagnostics to the
   process supervisor's standard-error stream. The strict override also accepts
