@@ -37,6 +37,7 @@ const EXIT_IMPATIENT: i32 = 130;
 /// The action the watchdog takes for a received signal, given whether it is the
 /// first one seen. Pure so the decision is unit-testable without real signals
 /// or a real `process::exit`.
+#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SignalDecision {
     /// First signal: request graceful shutdown and arm the force-exit deadline.
@@ -48,6 +49,7 @@ pub(crate) enum SignalDecision {
 /// Decide what to do for a signal: the first one starts graceful shutdown and
 /// arms the deadline; any later one (the operator hitting Ctrl-C again) forces
 /// an immediate exit.
+#[cfg(unix)]
 #[must_use]
 pub(crate) const fn signal_decision(is_first: bool) -> SignalDecision {
     if is_first {
