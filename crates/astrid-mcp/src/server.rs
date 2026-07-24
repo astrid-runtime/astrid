@@ -51,6 +51,25 @@ impl From<McpError> for ServerConnectionError {
     }
 }
 
+fn classify_sandbox_prefix_error(
+    name: &str,
+    policy: astrid_workspace::SandboxPolicy,
+    source: &std::io::Error,
+) -> ServerConnectionError {
+    let reason = source.to_string();
+    let error = McpError::ServerStartFailed {
+        name: name.to_string(),
+        reason: reason.clone(),
+    };
+    if policy == astrid_workspace::SandboxPolicy::Required
+        && source.kind() == std::io::ErrorKind::Unsupported
+    {
+        ServerConnectionError::SandboxPolicyDenied { reason, error }
+    } else {
+        ServerConnectionError::Other(error)
+    }
+}
+
 /// A running MCP server instance.
 pub(crate) struct RunningServer {
     /// Server configuration.
@@ -617,18 +636,9 @@ impl ServerManager {
         //
         // Under `Off` the call returns `Ok(None)` silently. Either
         // way we don't double-log here.
-        let sandbox_prefix = sandbox_config.sandbox_prefix().map_err(|e| {
-            let reason = e.to_string();
-            let error = McpError::ServerStartFailed {
-                name: name.to_string(),
-                reason: reason.clone(),
-            };
-            if sandbox_policy == SandboxPolicy::Required {
-                ServerConnectionError::SandboxPolicyDenied { reason, error }
-            } else {
-                ServerConnectionError::Other(error)
-            }
-        })?;
+        let sandbox_prefix = sandbox_config
+            .sandbox_prefix()
+            .map_err(|error| classify_sandbox_prefix_error(name, sandbox_policy, &error))?;
 
         // Build the command
         let mut cmd = if let Some(prefix) = sandbox_prefix {
@@ -1094,6 +1104,36 @@ mod tests {
 
         assert!(manager.list_configured().is_empty());
         assert!(manager.list_running().await.is_empty());
+    }
+
+    #[test]
+    fn required_sandbox_unavailability_is_classified_as_policy_denial() {
+        let failure = classify_sandbox_prefix_error(
+            "native",
+            astrid_workspace::SandboxPolicy::Required,
+            &std::io::Error::new(std::io::ErrorKind::Unsupported, "sandbox unavailable"),
+        );
+
+        assert!(matches!(
+            failure,
+            ServerConnectionError::SandboxPolicyDenied { reason, .. }
+                if reason == "sandbox unavailable"
+        ));
+    }
+
+    #[test]
+    fn required_sandbox_configuration_error_is_not_policy_denial() {
+        let failure = classify_sandbox_prefix_error(
+            "native",
+            astrid_workspace::SandboxPolicy::Required,
+            &std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid sandbox path"),
+        );
+
+        assert!(matches!(
+            failure,
+            ServerConnectionError::Other(McpError::ServerStartFailed { name, reason })
+                if name == "native" && reason == "invalid sandbox path"
+        ));
     }
 
     #[tokio::test]

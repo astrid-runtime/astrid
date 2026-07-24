@@ -169,7 +169,7 @@ fn windows_process_config_required_reports_unavailable_not_invalid_path() {
         .with_policy(SandboxPolicy::Required)
         .sandbox_prefix()
         .expect_err("required policy must fail closed");
-    assert_eq!(error.kind(), io::ErrorKind::Other);
+    assert_eq!(error.kind(), io::ErrorKind::Unsupported);
     assert!(
         error.to_string().contains("OS-level sandbox unavailable"),
         "ordinary Windows path was misclassified: {error}"

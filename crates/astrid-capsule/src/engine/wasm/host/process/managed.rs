@@ -242,8 +242,14 @@ pub(super) fn kill_and_reap(
 
 impl Drop for ManagedProcess {
     fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = kill_and_reap(&mut child, &self.tree);
+        if let Some(mut child) = self.child.take()
+            && let Err(error) = kill_and_reap(&mut child, &self.tree)
+        {
+            tracing::warn!(
+                pid = self.tree.pid(),
+                ?error,
+                "failed to terminate managed process tree on drop"
+            );
         }
     }
 }

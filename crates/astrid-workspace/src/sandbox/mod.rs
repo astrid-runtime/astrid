@@ -890,15 +890,18 @@ impl ProcessSandboxConfig {
     ))]
     fn handle_unavailable_sandbox(&self, hint: &str) -> io::Result<Option<SandboxPrefix>> {
         match self.policy {
-            SandboxPolicy::Required => Err(io::Error::other(format!(
-                "OS-level sandbox unavailable and policy is `required` — \
-                 refusing to launch native subprocess capsule without \
-                 containment. {hint} To run without the sandbox anyway \
-                 (trusted dev environments, CI runners where the kernel \
-                 can't be configured), set `ASTRID_SANDBOX_POLICY=off`. \
-                 The `required` default exists to keep the security \
-                 guarantee documented in the README — see issue #655."
-            ))),
+            SandboxPolicy::Required => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "OS-level sandbox unavailable and policy is `required` — \
+                     refusing to launch native subprocess capsule without \
+                     containment. {hint} To run without the sandbox anyway \
+                     (trusted dev environments, CI runners where the kernel \
+                     can't be configured), set `ASTRID_SANDBOX_POLICY=off`. \
+                     The `required` default exists to keep the security \
+                     guarantee documented in the README — see issue #655."
+                ),
+            )),
             // Unreachable: `Off` short-circuits in `sandbox_prefix`.
             SandboxPolicy::Off => Ok(None),
         }
