@@ -367,8 +367,10 @@ impl TrustedPathGuard {
             for (path, handle) in created.iter() {
                 validate_private_acl_handle(handle.0, true, &path.display().to_string())?;
             }
-            TrustedPathGuard::capture(target)?
-                .verify_contract(BoundaryContract::ExactPrivateDirectory)
+            // The retained component handles are the authority proof. Reopening
+            // `target` here would conflict with their DELETE access and
+            // intentionally non-delete-sharing cleanup contract.
+            Ok(())
         })();
 
         match result {

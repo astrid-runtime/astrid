@@ -32,12 +32,11 @@ pub(super) use windows_sys::Win32::Security::Authorization::{
     GetNamedSecurityInfoW, SetNamedSecurityInfoW,
 };
 pub(super) use windows_sys::Win32::Security::{
-    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
-    CONTAINER_INHERIT_ACE, CreateWellKnownSid, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
-    GetAclInformation, GetSecurityDescriptorControl, GetTokenInformation, INHERIT_ONLY_ACE,
-    INHERITED_ACE, InitializeSecurityDescriptor, IsValidSid, OBJECT_INHERIT_ACE,
-    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-    SE_DACL_PROTECTED, SECURITY_DESCRIPTOR, SECURITY_MAX_SID_SIZE, SetSecurityDescriptorControl,
+    ACL, CONTAINER_INHERIT_ACE, CreateWellKnownSid, DACL_SECURITY_INFORMATION, EqualSid,
+    GetSecurityDescriptorControl, GetTokenInformation, INHERIT_ONLY_ACE, INHERITED_ACE,
+    InitializeSecurityDescriptor, IsValidSid, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION,
+    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
+    SECURITY_DESCRIPTOR, SECURITY_MAX_SID_SIZE, SetSecurityDescriptorControl,
     SetSecurityDescriptorDacl, TOKEN_QUERY, TOKEN_USER, TokenUser, WinBuiltinAdministratorsSid,
     WinLocalSystemSid,
 };
@@ -51,9 +50,7 @@ pub(super) use windows_sys::Win32::Storage::FileSystem::{
     SYNCHRONIZE, SetFileInformationByHandle, WRITE_DAC, WRITE_OWNER,
 };
 pub(super) use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
-pub(super) use windows_sys::Win32::System::SystemServices::{
-    ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE, SECURITY_DESCRIPTOR_REVISION,
-};
+pub(super) use windows_sys::Win32::System::SystemServices::SECURITY_DESCRIPTOR_REVISION;
 pub(super) use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 pub(super) use super::super::{

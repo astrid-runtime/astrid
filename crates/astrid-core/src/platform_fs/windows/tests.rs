@@ -457,7 +457,7 @@ fn handle_relative_mutation_stays_bound_during_ancestor_move() {
 }
 
 #[test]
-fn private_directory_creation_stays_bound_during_ancestor_move() {
+fn private_directory_creation_blocks_ancestor_move_and_cleans_partial_child() {
     let _serial = serial_test_guard();
     let root = private_temp();
     let ancestor = root.path().join("ancestor");
@@ -483,23 +483,21 @@ fn private_directory_creation_stays_bound_during_ancestor_move() {
             .is_none(),
         "ancestor-move hook was not exercised"
     );
-    assert!(moved_ancestor.exists(), "ancestor was not moved");
-    assert!(!ancestor.exists());
-    let moved_first = moved_ancestor.join("parent").join("first");
-    let moved_target = moved_first.join("second");
+    assert!(
+        !moved_ancestor.exists(),
+        "ancestor moved despite a retained non-delete-sharing child handle"
+    );
+    assert!(ancestor.exists());
     assert_eq!(
         TEST_DIRECTORY_CREATE_COMPONENTS.load(std::sync::atomic::Ordering::SeqCst),
-        2,
-        "retained handles did not carry creation through the ancestor relocation"
+        1,
+        "ancestor move was not attempted immediately after the first component"
     );
     assert!(
-        !moved_first.exists(),
-        "failed creation left the relocated first component behind"
+        !parent.join("first").exists(),
+        "failed creation left the first component behind"
     );
-    assert!(
-        !moved_target.exists(),
-        "failed creation left the relocated target behind"
-    );
+    assert!(!target.exists(), "failed creation left the target behind");
 }
 
 #[test]

@@ -1,9 +1,13 @@
 //! Windows SID, ownership, and DACL construction and validation.
 
+#[path = "acl/ace.rs"]
+mod ace;
+
 #[cfg(test)]
 use super::path::wide_path;
 use super::path::{OwnedHandle, wide_text};
 use super::prelude::*;
+use ace::{ValidatedAce, ValidatedAcl};
 
 pub(super) const DANGEROUS_PARENT_ACCESS: u32 = FILE_WRITE_DATA
     | FILE_APPEND_DATA
@@ -433,14 +437,26 @@ pub(super) fn validate_private_acl(path: &Path, is_directory: bool) -> io::Resul
         return Err(io::Error::from_raw_os_error(status.cast_signed()));
     }
     let allocation = LocalAllocation(descriptor);
-    let result = validate_private_acl_parts(
-        &required,
-        owner,
-        dacl,
-        descriptor,
-        is_directory,
-        &path.display().to_string(),
-    );
+    let description = path.display().to_string();
+    let result = if dacl.is_null() {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("private Windows path has a null DACL: {description}"),
+        ))
+    } else {
+        // SAFETY: GetNamedSecurityInfoW returned `dacl` inside the descriptor
+        // allocation retained by `allocation`.
+        unsafe { ValidatedAcl::from_raw(dacl, &allocation, &description) }.and_then(|acl| {
+            validate_private_acl_parts(
+                &required,
+                owner,
+                &acl,
+                descriptor,
+                is_directory,
+                &description,
+            )
+        })
+    };
     drop(allocation);
     result
 }
@@ -471,14 +487,25 @@ pub(super) fn validate_private_acl_handle(
         return Err(io::Error::from_raw_os_error(status.cast_signed()));
     }
     let allocation = LocalAllocation(descriptor);
-    let result = validate_private_acl_parts(
-        &required,
-        owner,
-        dacl,
-        descriptor,
-        is_directory,
-        description,
-    );
+    let result = if dacl.is_null() {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("private Windows path has a null DACL: {description}"),
+        ))
+    } else {
+        // SAFETY: GetSecurityInfo returned `dacl` inside the descriptor
+        // allocation retained by `allocation`.
+        unsafe { ValidatedAcl::from_raw(dacl, &allocation, description) }.and_then(|acl| {
+            validate_private_acl_parts(
+                &required,
+                owner,
+                &acl,
+                descriptor,
+                is_directory,
+                description,
+            )
+        })
+    };
     drop(allocation);
     result
 }
@@ -486,18 +513,11 @@ pub(super) fn validate_private_acl_handle(
 fn validate_private_acl_parts(
     required: &RequiredSids,
     owner: PSID,
-    dacl: *mut ACL,
+    acl: &ValidatedAcl<'_>,
     descriptor: PSECURITY_DESCRIPTOR,
     is_directory: bool,
     description: &str,
 ) -> io::Result<()> {
-    if dacl.is_null() {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("private Windows path has a null DACL: {description}"),
-        ));
-    }
-
     let mut control = 0_u16;
     let mut revision = 0_u32;
     // SAFETY: `descriptor` is the live descriptor returned above and both
@@ -509,31 +529,9 @@ fn validate_private_acl_parts(
     let dacl_is_protected = control & SE_DACL_PROTECTED != 0;
     let owner_is_allowed = required.classify(owner) != AclPrincipal::Other;
 
-    let mut info = ACL_SIZE_INFORMATION::default();
-    // SAFETY: `dacl` is non-null and owned by the live descriptor; `info` has
-    // the exact documented output size.
-    if unsafe {
-        GetAclInformation(
-            dacl,
-            (&raw mut info).cast(),
-            u32::try_from(size_of::<ACL_SIZE_INFORMATION>())
-                .expect("ACL_SIZE_INFORMATION fits in u32"),
-            AclSizeInformation,
-        )
-    } == 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-
-    let mut rules = Vec::with_capacity(usize::try_from(info.AceCount).unwrap_or_default());
-    for index in 0..info.AceCount {
-        let mut raw_ace: *mut c_void = null_mut();
-        // SAFETY: `index` is bounded by the ACE count returned for this live
-        // ACL, and `raw_ace` is a valid out-pointer.
-        if unsafe { GetAce(dacl, index, &raw mut raw_ace) } == 0 || raw_ace.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        rules.push(private_acl_rule(required, raw_ace, is_directory));
+    let mut rules = Vec::with_capacity(usize::try_from(acl.ace_count()).unwrap_or_default());
+    for index in 0..acl.ace_count() {
+        rules.push(private_acl_rule(required, acl.ace(index)?, is_directory));
     }
 
     if !acl_rules_are_private(is_directory, dacl_is_protected, owner_is_allowed, &rules) {
@@ -547,39 +545,29 @@ fn validate_private_acl_parts(
     Ok(())
 }
 
-pub(super) fn private_acl_rule(
-    required: &RequiredSids,
-    raw_ace: *mut c_void,
-    is_directory: bool,
-) -> AclRule {
+fn private_acl_rule(required: &RequiredSids, ace: ValidatedAce<'_>, is_directory: bool) -> AclRule {
     let invalid = || AclRule {
         principal: AclPrincipal::Other,
         access: AclAccess::Other,
         inheritance: AclInheritance::InheritedOrOther,
     };
-    // SAFETY: caller obtained a non-null ACE pointer from GetAce.
-    let header = unsafe { &*raw_ace.cast::<ACE_HEADER>() };
-    if u32::from(header.AceType) != ACCESS_ALLOWED_ACE_TYPE {
+    let ValidatedAce::Allow { flags, mask, sid } = ace else {
         return invalid();
-    }
-    // SAFETY: this is a plain ACCESS_ALLOWED_ACE.
-    let ace = unsafe { &*raw_ace.cast::<ACCESS_ALLOWED_ACE>() };
-    let sid = (&raw const ace.SidStart).cast_mut().cast();
-    let ace_flags = u32::from(ace.Header.AceFlags);
+    };
     let expected_flags = if is_directory {
         OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
     } else {
         0
     };
-    let inheritance = match ace_flags {
+    let inheritance = match flags {
         flags if flags != expected_flags => AclInheritance::InheritedOrOther,
         0 => AclInheritance::None,
         flags if flags == OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE => AclInheritance::Children,
         _ => AclInheritance::InheritedOrOther,
     };
     AclRule {
-        principal: required.classify(sid),
-        access: if ace.Mask == FILE_ALL_ACCESS {
+        principal: required.classify(sid.as_ptr()),
+        access: if mask == FILE_ALL_ACCESS {
             AclAccess::AllowFullControl
         } else {
             AclAccess::Other
@@ -633,8 +621,18 @@ fn validate_trusted_parent_acl_handle_with_mask(
         return Err(io::Error::from_raw_os_error(status.cast_signed()));
     }
     let allocation = LocalAllocation(descriptor);
-    let result =
-        validate_trusted_parent_acl_parts(&required, owner, dacl, dangerous_access, description);
+    let result = if dacl.is_null() {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("trusted Windows parent has a null DACL: {description}"),
+        ))
+    } else {
+        // SAFETY: GetSecurityInfo returned `dacl` inside the descriptor
+        // allocation retained by `allocation`.
+        unsafe { ValidatedAcl::from_raw(dacl, &allocation, description) }.and_then(|acl| {
+            validate_trusted_parent_acl_parts(&required, owner, &acl, dangerous_access, description)
+        })
+    };
     drop(allocation);
     result
 }
@@ -642,16 +640,10 @@ fn validate_trusted_parent_acl_handle_with_mask(
 fn validate_trusted_parent_acl_parts(
     required: &RequiredSids,
     owner: PSID,
-    dacl: *mut ACL,
+    acl: &ValidatedAcl<'_>,
     dangerous_access: u32,
     description: &str,
 ) -> io::Result<()> {
-    if dacl.is_null() {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("trusted Windows parent has a null DACL: {description}"),
-        ));
-    }
     if !required.is_trusted(owner) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -659,49 +651,26 @@ fn validate_trusted_parent_acl_parts(
         ));
     }
 
-    let mut info = ACL_SIZE_INFORMATION::default();
-    // SAFETY: `dacl` belongs to the live descriptor and `info` is exact size.
-    if unsafe {
-        GetAclInformation(
-            dacl,
-            (&raw mut info).cast(),
-            u32::try_from(size_of::<ACL_SIZE_INFORMATION>())
-                .expect("ACL_SIZE_INFORMATION fits in u32"),
-            AclSizeInformation,
-        )
-    } == 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-
-    for index in 0..info.AceCount {
-        let mut raw_ace: *mut c_void = null_mut();
-        // SAFETY: `index` is bounded by the returned ACE count.
-        if unsafe { GetAce(dacl, index, &raw mut raw_ace) } == 0 || raw_ace.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: every ACE starts with ACE_HEADER.
-        let header = unsafe { &*raw_ace.cast::<ACE_HEADER>() };
-        if u32::from(header.AceType) == ACCESS_DENIED_ACE_TYPE {
-            continue;
-        }
-        if u32::from(header.AceType) != ACCESS_ALLOWED_ACE_TYPE {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("trusted Windows parent has an unsupported ACE type: {description}"),
-            ));
-        }
-        // SAFETY: this is a plain ACCESS_ALLOWED_ACE.
-        let ace = unsafe { &*raw_ace.cast::<ACCESS_ALLOWED_ACE>() };
-        let flags = u32::from(ace.Header.AceFlags);
-        let sid = (&raw const ace.SidStart).cast_mut().cast();
+    for index in 0..acl.ace_count() {
+        let (flags, mask, sid) = match acl.ace(index)? {
+            ValidatedAce::Allow { flags, mask, sid } => (flags, mask, sid),
+            ValidatedAce::Deny { .. } => continue,
+            ValidatedAce::Unsupported { ace_type, .. } => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "trusted Windows parent has unsupported ACE type {ace_type}: {description}"
+                    ),
+                ));
+            },
+        };
         let applies_to_parent = flags & INHERIT_ONLY_ACE == 0;
         let applies_to_file_child = flags & OBJECT_INHERIT_ACE != 0;
         let applies_to_directory_child = flags & CONTAINER_INHERIT_ACE != 0;
-        let unsafe_for_untrusted = (applies_to_parent && ace.Mask & dangerous_access != 0)
-            || (applies_to_file_child && ace.Mask & DANGEROUS_FILE_ACCESS != 0)
-            || (applies_to_directory_child && ace.Mask & DANGEROUS_PARENT_ACCESS != 0);
-        if !required.is_trusted(sid) && unsafe_for_untrusted {
+        let unsafe_for_untrusted = (applies_to_parent && mask & dangerous_access != 0)
+            || (applies_to_file_child && mask & DANGEROUS_FILE_ACCESS != 0)
+            || (applies_to_directory_child && mask & DANGEROUS_PARENT_ACCESS != 0);
+        if !required.is_trusted(sid.as_ptr()) && unsafe_for_untrusted {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!(
@@ -738,7 +707,17 @@ pub(super) fn validate_trusted_file_acl_handle(
         return Err(io::Error::from_raw_os_error(status.cast_signed()));
     }
     let allocation = LocalAllocation(descriptor);
-    let result = validate_trusted_file_acl_parts(&required, owner, dacl, description);
+    let result = if dacl.is_null() {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("trusted Windows file has an unsafe owner or null DACL: {description}"),
+        ))
+    } else {
+        // SAFETY: GetSecurityInfo returned `dacl` inside the descriptor
+        // allocation retained by `allocation`.
+        unsafe { ValidatedAcl::from_raw(dacl, &allocation, description) }
+            .and_then(|acl| validate_trusted_file_acl_parts(&required, owner, &acl, description))
+    };
     drop(allocation);
     result
 }
@@ -746,63 +725,48 @@ pub(super) fn validate_trusted_file_acl_handle(
 fn validate_trusted_file_acl_parts(
     required: &RequiredSids,
     owner: PSID,
-    dacl: *mut ACL,
+    acl: &ValidatedAcl<'_>,
     description: &str,
 ) -> io::Result<()> {
-    if dacl.is_null() || !required.is_trusted(owner) {
+    if !required.is_trusted(owner) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!("trusted Windows file has an unsafe owner or null DACL: {description}"),
         ));
     }
-    let mut info = ACL_SIZE_INFORMATION::default();
-    // SAFETY: descriptor and DACL remain live and the output buffer is exact.
-    if unsafe {
-        GetAclInformation(
-            dacl,
-            (&raw mut info).cast(),
-            u32::try_from(size_of::<ACL_SIZE_INFORMATION>())
-                .expect("ACL_SIZE_INFORMATION fits in u32"),
-            AclSizeInformation,
-        )
-    } == 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    for index in 0..info.AceCount {
-        let mut raw_ace: *mut c_void = null_mut();
-        // SAFETY: index is bounded by the returned ACE count.
-        if unsafe { GetAce(dacl, index, &raw mut raw_ace) } == 0 || raw_ace.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: every ACE starts with ACE_HEADER.
-        let header = unsafe { &*raw_ace.cast::<ACE_HEADER>() };
-        let flags = u32::from(header.AceFlags);
+    for index in 0..acl.ace_count() {
+        let ace = acl.ace(index)?;
+        let flags = match ace {
+            ValidatedAce::Allow { flags, .. }
+            | ValidatedAce::Deny { flags }
+            | ValidatedAce::Unsupported { flags, .. } => flags,
+        };
         if flags & !(INHERITED_ACE) != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!("trusted Windows file has unexpected ACE flags: {description}"),
             ));
         }
-        if u32::from(header.AceType) == ACCESS_DENIED_ACE_TYPE {
-            continue;
-        }
-        if u32::from(header.AceType) != ACCESS_ALLOWED_ACE_TYPE {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("trusted Windows file has an unsupported ACE type: {description}"),
-            ));
-        }
-        // SAFETY: this is a plain ACCESS_ALLOWED_ACE.
-        let ace = unsafe { &*raw_ace.cast::<ACCESS_ALLOWED_ACE>() };
-        let sid = (&raw const ace.SidStart).cast_mut().cast();
-        if !required.is_trusted(sid) && ace.Mask & DANGEROUS_FILE_ACCESS != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "trusted Windows file is writable by an untrusted principal: {description}"
-                ),
-            ));
+        match ace {
+            ValidatedAce::Deny { .. } => {},
+            ValidatedAce::Unsupported { ace_type, .. } => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "trusted Windows file has unsupported ACE type {ace_type}: {description}"
+                    ),
+                ));
+            },
+            ValidatedAce::Allow { mask, sid, .. } => {
+                if !required.is_trusted(sid.as_ptr()) && mask & DANGEROUS_FILE_ACCESS != 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "trusted Windows file is writable by an untrusted principal: {description}"
+                        ),
+                    ));
+                }
+            },
         }
     }
     Ok(())

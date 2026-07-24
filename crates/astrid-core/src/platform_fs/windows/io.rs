@@ -476,14 +476,12 @@ fn rename_guarded_file(
         .ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "Windows file name is too long")
         })?;
-    let header = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
-    let populated_bytes = header
+    let buffer_bytes = size_of::<FILE_RENAME_INFO>()
         .checked_add(usize::try_from(name_bytes).expect("u32 length fits usize"))
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename buffer overflow"))?;
-    let buffer_bytes = populated_bytes.max(size_of::<FILE_RENAME_INFO>());
     // `Vec<usize>` supplies native pointer alignment and zero-initializes the
-    // full fixed header, including the trailing FileName element/padding that
-    // `size_of::<FILE_RENAME_INFO>()` requires even for a one-unit name.
+    // full fixed structure plus the variable-length UTF-16 name bytes required
+    // by `SetFileInformationByHandle(FileRenameInfo)`.
     let mut buffer = vec![0_usize; buffer_bytes.div_ceil(size_of::<usize>())];
     let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
     // SAFETY: the usize buffer is sufficiently aligned and sized for the
