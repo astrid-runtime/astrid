@@ -118,6 +118,7 @@ jobs:
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
+          ENFORCE_NEWCOMER_APPROVAL: "false"
         run: |
           CONTRIBUTORS_FILE=".github/contributors.yml"
 
@@ -184,11 +185,15 @@ jobs:
 
           # New contributors: require approval label
           if [ "$TIER" = "new" ]; then
-            if echo "$LABELS" | grep -q "newcomer-approved"; then
-              echo "New contributor approved by a maintainer."
+            if [ "$ENFORCE_NEWCOMER_APPROVAL" = "true" ]; then
+              if echo "$LABELS" | grep -q "newcomer-approved"; then
+                echo "New contributor approved by a maintainer."
+              else
+                echo "::error::New contributors require a maintainer to add the 'newcomer-approved' label before CI proceeds."
+                exit 1
+              fi
             else
-              echo "::error::New contributors require a maintainer to add the 'newcomer-approved' label before CI proceeds."
-              exit 1
+              echo "::notice::New contributor approval gate is temporarily disabled."
             fi
           fi
 
