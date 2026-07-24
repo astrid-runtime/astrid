@@ -255,12 +255,7 @@ pub(crate) fn audit_process_signal(
     let reason;
     let outcome = match result {
         Ok(()) => HostAuditOutcome::Allowed,
-        Err(
-            ErrorCode::CapabilityDenied
-            | ErrorCode::NoSuchProcess
-            | ErrorCode::Closed
-            | ErrorCode::PersistUnsupported,
-        ) => {
+        Err(ErrorCode::CapabilityDenied | ErrorCode::NoSuchProcess) => {
             reason = format!("{:?}", result.as_ref().expect_err("matched error"));
             HostAuditOutcome::Denied(&reason)
         },

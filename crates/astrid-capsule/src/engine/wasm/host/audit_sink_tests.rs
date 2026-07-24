@@ -298,6 +298,74 @@ async fn audit_process_reports_spawn_variants() {
 }
 
 #[tokio::test]
+async fn audit_process_signal_closed_is_a_system_failure() {
+    use crate::engine::wasm::bindings::astrid::process1_1_0::host::{ErrorCode, ProcessSignal};
+
+    let (state, sink) = state_with_sink(tokio::runtime::Handle::current());
+    super::process::audit_process_signal(
+        &state,
+        "already-exited",
+        ProcessSignal::Term,
+        &Err(ErrorCode::Closed),
+    );
+
+    let records = sink.snapshot();
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].1,
+        CapturedEvent::ProcessSignal("already-exited".into(), "term".into())
+    );
+    assert_eq!(
+        records[0].2,
+        CapturedOutcome::Failed("ErrorCode::Closed".into())
+    );
+}
+
+#[tokio::test]
+async fn audit_process_signal_unsupported_persistence_is_a_system_failure() {
+    use crate::engine::wasm::bindings::astrid::process1_1_0::host::{ErrorCode, ProcessSignal};
+
+    let (state, sink) = state_with_sink(tokio::runtime::Handle::current());
+    super::process::audit_process_signal(
+        &state,
+        "unsupported-process",
+        ProcessSignal::Term,
+        &Err(ErrorCode::PersistUnsupported),
+    );
+
+    let records = sink.snapshot();
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].2,
+        CapturedOutcome::Failed("ErrorCode::PersistUnsupported".into())
+    );
+}
+
+#[tokio::test]
+async fn audit_process_signal_capability_denial_remains_denied() {
+    use crate::engine::wasm::bindings::astrid::process1_1_0::host::{ErrorCode, ProcessSignal};
+
+    let (state, sink) = state_with_sink(tokio::runtime::Handle::current());
+    super::process::audit_process_signal(
+        &state,
+        "protected-process",
+        ProcessSignal::Term,
+        &Err(ErrorCode::CapabilityDenied),
+    );
+
+    let records = sink.snapshot();
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].1,
+        CapturedEvent::ProcessSignal("protected-process".into(), "term".into())
+    );
+    assert_eq!(
+        records[0].2,
+        CapturedOutcome::Denied("ErrorCode::CapabilityDenied".into())
+    );
+}
+
+#[tokio::test]
 async fn audit_fs_reports_denied() {
     // A security-gate denial must reach the sink as `Denied` — today the
     // gate early-returns before any audit envelope, leaving denials with

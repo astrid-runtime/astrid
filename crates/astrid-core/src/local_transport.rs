@@ -95,7 +95,28 @@ pub enum ConnectOutcome {
 /// its implementation without changing capsule-host policy code.
 #[must_use]
 pub const fn backend_available() -> bool {
-    cfg!(unix)
+    cfg!(any(unix, windows))
+}
+
+#[cfg(test)]
+mod availability_tests {
+    #[cfg(unix)]
+    #[test]
+    fn unix_backend_is_reported_available() {
+        assert!(super::backend_available());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_backend_is_reported_available() {
+        assert!(super::backend_available());
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    #[test]
+    fn unsupported_host_reports_no_backend() {
+        assert!(!super::backend_available());
+    }
 }
 
 /// Connect to a host-local endpoint.
