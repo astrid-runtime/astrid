@@ -484,6 +484,11 @@ File-tree, KV-tree, namespace, and component-root operations have separate
 typed patch grammars. The storage layer must not invent a universal semantic
 mutation language.
 
+The first executable model implements only `ReplaceOwnedSubtree(path,
+expected, replacement)`. Labelled path verification and bottom-up parent
+rehashing prove the common root-rewrite primitive. File/KV-specific patches may
+later prove finer mutation semantics without weakening or replacing it.
+
 The witness proves that the stated structural mutation transforms one committed
 root into another. It does not prove that capsule computation was correct, that
 an input was true, or that the actor should have wanted the result. Those claim
@@ -1093,6 +1098,16 @@ migration story.
   [Merkle tree proofs](https://mirage.github.io/irmin/irmin/Irmin/module-type-S/Tree/Proof/index.html):
   direct prior art for carrying the minimal partial tree needed to verify a
   computation from one state root to another.
+- Nix,
+  [store derivations](https://releases.nixos.org/nix/nix-2.31.1/manual/store/derivation/index.html):
+  prior art for naming how immutable outputs are produced. Astrid keeps that
+  causal execution evidence separate from the content identity and authority
+  of principal-owned state.
+- Borg,
+  [repository internals](https://borgbackup.readthedocs.io/en/stable/internals.html):
+  chunk deduplication, authenticated repositories, and append-oriented segment
+  and compaction lessons. Astrid's authoritative root remains live principal
+  state rather than a backup archive.
 - NIST,
   [SP 800-88 Rev. 2](https://csrc.nist.gov/pubs/sp/800/88/r2/final):
   current media sanitization and cryptographic-erasure guidance.
