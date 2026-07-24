@@ -131,7 +131,8 @@ mod windows {
     }
 
     /// Prove the post-read authorization gate rejects an alternate effective
-    /// token and leaves the protected replacement listener usable.
+    /// token, then releases its deliberately permissive namespace so a fresh
+    /// protected listener can reacquire the production endpoint.
     async fn prove_effective_token_rejection(endpoint: &Path, pipe_name: &OsStr, user: &TestUser) {
         let mut listener = Some(std::sync::Arc::new(
             local_transport::bind_permissive_first_instance_for_test(endpoint)
@@ -175,6 +176,17 @@ mod windows {
              {rejected}"
         );
         let listener = listener.expect("rejected probe keeps listener active");
+        // A named pipe's security descriptor belongs to the pipe object, not
+        // each instance. Replacements created while this deliberately
+        // permissive first instance exists retain its DACL, so close every
+        // instance before reacquiring the production name with a protected
+        // descriptor.
+        drop(listener);
+        wait_until_endpoint_is_absent(endpoint).await;
+        let listener = std::sync::Arc::new(
+            local_transport::bind(endpoint)
+                .expect("bind fresh protected listener after permissive probe"),
+        );
 
         let executable = std::env::current_exe().expect("security harness executable");
         let mut recovery_child = Command::new(executable)
@@ -184,7 +196,7 @@ mod windows {
             .expect("spawn recovery client");
         let mut recovery_server = local_transport::accept(&listener)
             .await
-            .expect("protected replacement must accept same-user client");
+            .expect("fresh protected listener must accept same-user client");
         let mut recovery_bytes = [0_u8; 9];
         recovery_server
             .read_exact(&mut recovery_bytes)
