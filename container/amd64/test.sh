@@ -34,6 +34,7 @@ fail() {
 
 prepare_runtime_dir() {
   local directory=$1
+  local mode=${2:-0700}
   mkdir -p "$directory"
   # Astrid secures ASTRID_HOME itself with chmod(0700), so a bind mount that
   # is merely world-writable is insufficient on Linux: uid 65532 must own the
@@ -44,7 +45,8 @@ prepare_runtime_dir() {
     --entrypoint /bin/sh \
     --mount "type=bind,src=$directory,dst=/runtime" \
     "$IMAGE" \
-    -ec 'chown 65532:65532 /runtime; chmod 0700 /runtime'
+    -ec 'chown 65532:65532 /runtime; chmod "$1" /runtime' \
+    sh "$mode"
 }
 
 ARCH=$(docker image inspect "$IMAGE" --format '{{.Architecture}}')
@@ -70,7 +72,7 @@ python3 scripts/create_oci_test_shuttle.py \
 
 run_dir="$TEST_ROOT/run"
 prepare_runtime_dir "$run_dir/real-state"
-prepare_runtime_dir "$run_dir/real-workspace"
+prepare_runtime_dir "$run_dir/real-workspace" 0755
 distro_sha256=$(sha256sum "$TEST_ROOT/fixtures/distro.shuttle")
 distro_sha256=${distro_sha256%% *}
 
@@ -162,13 +164,13 @@ docker build \
   --file "$TEST_ROOT/Dockerfile" \
   "$TEST_ROOT"
 
-prepare_runtime_dir "$run_dir/state"
-prepare_runtime_dir "$run_dir/workspace"
-
 # A predictable-PID probe would truncate this symlink target in a container
 # where the entrypoint is PID 1. Exclusive mktemp probes must leave both alone.
+mkdir -p "$run_dir/state" "$run_dir/workspace"
 printf 'do-not-truncate\n' >"$run_dir/workspace/probe-victim"
 ln -s /workspace/probe-victim "$run_dir/state/.astrid-oci-write-probe.1"
+prepare_runtime_dir "$run_dir/state"
+prepare_runtime_dir "$run_dir/workspace" 0755
 
 if ! docker run --rm \
   --platform linux/amd64 \
@@ -204,7 +206,7 @@ tampered_sha256=$(sha256sum "$TEST_ROOT/fixtures/tampered.shuttle")
 tampered_sha256=${tampered_sha256%% *}
 
 prepare_runtime_dir "$TEST_ROOT/tampered-state"
-prepare_runtime_dir "$TEST_ROOT/tampered-workspace"
+prepare_runtime_dir "$TEST_ROOT/tampered-workspace" 0755
 if docker run --rm \
   --platform linux/amd64 \
   --read-only \
@@ -225,7 +227,7 @@ grep -q "distro signature verification failed" "$TEST_ROOT/tampered.err" ||
   fail "tampered signature did not fail at Astrid's internal signature gate"
 
 prepare_runtime_dir "$TEST_ROOT/missing-state"
-prepare_runtime_dir "$TEST_ROOT/missing-workspace"
+prepare_runtime_dir "$TEST_ROOT/missing-workspace" 0755
 if docker run --rm \
   --platform linux/amd64 \
   --read-only \
@@ -289,7 +291,7 @@ mkdir -p "$run_dir/swap-source"
 cp "$TEST_ROOT/fixtures/distro.shuttle" "$run_dir/swap-source/distro.shuttle"
 chmod 0777 "$run_dir/swap-source"
 prepare_runtime_dir "$run_dir/swap-state"
-prepare_runtime_dir "$run_dir/swap-workspace"
+prepare_runtime_dir "$run_dir/swap-workspace" 0755
 chmod 0666 "$run_dir/swap-source/distro.shuttle"
 if ! docker run --rm \
   --platform linux/amd64 \
