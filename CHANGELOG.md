@@ -19,8 +19,12 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   design and evidence documents specify the future user-space engine,
   filesystem/KV migration, principal export/import, sysadmin rebalancing,
   privacy and erasure domains, realistic deduplication bounds, and the
-  crash/property/adversarial tests required before production claims. The
-  current persistence backend and public capsule interfaces are unchanged.
+  crash/property/adversarial tests required before production claims. Typed
+  owning, evidence, lineage, and derived references keep retention authority
+  explicit, while capability-scoped state views and structural transition
+  witnesses model independently verifiable root changes without claiming
+  semantic execution proofs. The current persistence backend and public
+  capsule interfaces are unchanged.
 - **Windows local transport uses authenticated per-user named pipes.** A pipe
   name derived only from the caller's operating-system SID replaces
   filesystem endpoint naming on Windows. Local-only byte-mode instances use a
