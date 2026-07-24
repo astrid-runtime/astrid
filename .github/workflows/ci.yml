@@ -279,6 +279,43 @@ jobs:
       - name: Check wasm32 portability of kernel semantics crates
         run: ./scripts/check-wasm-portability.sh
 
+  windows-filesystem-native:
+    name: Windows filesystem native tests (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2025
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: "1.95"
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          key: windows-filesystem-${{ matrix.target }}
+          cache-on-failure: true
+
+      - name: Run the filesystem prerequisite tests natively
+        shell: pwsh
+        run: cargo test --locked --target ${{ matrix.target }} -p astrid-core platform_fs -- --nocapture
+
   fmt:
     name: Format
     runs-on: ubuntu-latest

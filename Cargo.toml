@@ -238,6 +238,7 @@ uuid = { version = "1.0", default-features = false, features = ["v4", "v5", "ser
 walkdir = "2.5"
 wasm-encoder = "0.253"
 wasmparser = "0.253"
+windows-sys = "0.61"
 wit-component = "0.253"
 wit-parser = "0.253"
 wasmtime = { version = "46", features = ["component-model", "cranelift"] }

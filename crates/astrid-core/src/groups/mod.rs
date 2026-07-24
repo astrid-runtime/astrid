@@ -26,7 +26,6 @@
 mod io_impl;
 
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -213,7 +212,7 @@ impl GroupConfig {
     ///
     /// See [`GroupConfigError`].
     pub fn load_from_path(path: &Path) -> GroupConfigResult<Self> {
-        let contents = match fs::read_to_string(path) {
+        let contents = match crate::platform_fs::read_private_file_to_string(path) {
             Ok(c) => c,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 return Ok(Self::builtin_only());
@@ -558,6 +557,7 @@ fn validate_group_capability<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     use tempfile::tempdir;
 

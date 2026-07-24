@@ -29,6 +29,10 @@ pub mod kernel_api;
 #[doc(hidden)]
 pub mod local_transport;
 pub mod net;
+// Cross-crate filesystem plumbing. Public only because workspace crates are
+// separate Rust packages; this is not a supported external API.
+#[doc(hidden)]
+pub mod platform_fs;
 pub mod principal;
 pub mod profile;
 pub mod retry;

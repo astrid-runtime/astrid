@@ -132,11 +132,14 @@ impl SessionToken {
             }
         }
 
-        // Non-Unix fallback: no atomic rename, no explicit permissions.
-        // The token file will inherit the process umask (likely 0o644).
-        // Windows is not a supported daemon platform; this exists only
-        // for compilation and test compatibility.
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            crate::platform_fs::atomic_write_private_file(path, hex.as_bytes())?;
+        }
+
+        // Unsupported non-Unix/non-Windows hosts retain the compilation-only
+        // fallback.
+        #[cfg(not(any(unix, windows)))]
         {
             std::fs::write(path, hex.as_bytes())?;
         }
@@ -150,7 +153,7 @@ impl SessionToken {
     ///
     /// Returns an error if the file cannot be read or contains invalid hex.
     pub fn read_from_file(path: &Path) -> io::Result<Self> {
-        let contents = std::fs::read_to_string(path)?;
+        let contents = crate::platform_fs::read_private_file_to_string(path)?;
         Self::from_hex(contents.trim())
     }
 

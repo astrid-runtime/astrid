@@ -2582,12 +2582,19 @@ async fn open_audit_log(
 ///
 /// The key file is 32 bytes of raw secret key material at `{keys_dir}/runtime.key`.
 fn load_or_generate_runtime_key(keys_dir: &Path) -> std::io::Result<KeyPair> {
-    astrid_crypto::load_or_generate_keypair(&keys_dir.join("runtime.key")).map_err(|error| {
+    astrid_core::platform_fs::ensure_private_directory(keys_dir)?;
+    let key_path = keys_dir.join("runtime.key");
+    if key_path.exists() {
+        astrid_core::platform_fs::validate_private_file(&key_path)?;
+    }
+    let keypair = astrid_crypto::load_or_generate_keypair(&key_path).map_err(|error| {
         let message = error
             .to_string()
             .replacen("invalid signing key", "invalid runtime key", 1);
         std::io::Error::new(error.kind(), message)
-    })
+    })?;
+    astrid_core::platform_fs::restrict_private_file(&key_path)?;
+    Ok(keypair)
 }
 
 /// Spawns the persistent-daemon idle monitor.
