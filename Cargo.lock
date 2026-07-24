@@ -873,6 +873,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "astrid-storage-model"
+version = "0.10.4"
+
+[[package]]
 name = "astrid-telemetry"
 version = "0.10.4"
 dependencies = [

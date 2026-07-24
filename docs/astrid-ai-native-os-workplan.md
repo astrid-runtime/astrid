@@ -189,8 +189,11 @@ capsule behavior accidentally.
   instance, table, and output limits.
 - [x] Package the outer component as an installable capsule with no host-process
   grant and adversarial tests for malformed modules and boundary violations.
-- [ ] Define a principal-bound storage contract with generations, quotas, flush,
-  atomic rename, crash points, snapshots, rollback, deletion, and key revocation.
+- [x] Define a
+  [principal-bound storage contract](astrid-principal-store.md) with generations,
+  quotas, flush, atomic rename, crash points, snapshots, rollback, deletion, key
+  revocation, export/import, and placement-only rebalancing, plus its
+  [falsifiability contract](astrid-principal-store-evidence.md).
 - [ ] Implement the realm VFS over an immutable base, private writable overlay,
   durable `/home/agent`, explicit `/workspace`, ephemeral `/tmp`, and synthetic
   `/proc` and `/dev`.
@@ -464,7 +467,8 @@ recovery paths or silently broaden authority.
 The next bounded tranche is:
 
 1. preserve and review the bounded realm seed in `unicity-aos/aos-ce`;
-2. specify the principal-bound durable storage contract and crash traces;
+2. refine the executable principal-store model into an in-memory engine and run
+   the documented crash traces;
 3. implement the immutable-base/private-overlay VFS and cross-principal tests;
 4. implement process, descriptor, pipe, spawn/exec, wait, and cancellation semantics;
 5. add the first small shell and an AOS Realm base-image recipe;
