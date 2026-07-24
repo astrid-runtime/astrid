@@ -1,0 +1,327 @@
+name: OCI Linux arm64
+
+on:
+  pull_request:
+    paths:
+      - '.dockerignore'
+      - '.github/workflows/oci-arm64.yml'
+      - 'container/arm64/**'
+      - 'container/amd64/entrypoint.sh'
+      - 'container/amd64/test.sh'
+      - 'scripts/oci_release.py'
+      - 'scripts/oci_export_binding.py'
+      - 'scripts/create_oci_test_shuttle.py'
+      - 'scripts/test_oci_release.py'
+      - 'scripts/test_oci_export_binding.py'
+      - 'scripts/test_oci_arm64_container_contract.py'
+      - 'scripts/release_manifest.py'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact immutable Astrid release version
+        required: true
+        type: string
+      source_commit:
+        description: Exact 40-character commit bound by the signed release manifest
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: astrid-oci-arm64-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TEST_VERSION: '0.10.4'
+  TEST_SOURCE_COMMIT: b6bf5d1d579915eb5d3c944857d84e62a4fcc878
+  RELEASE_TARGET: aarch64-unknown-linux-gnu
+
+jobs:
+  build:
+    name: Authenticate, build, and inspect natively
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+
+      - name: Assert native arm64 execution
+        run: |
+          test "$(uname -m)" = aarch64
+          test "$(docker info --format '{{.Architecture}}')" = aarch64
+
+      - name: Select exact release
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            VERSION="$INPUT_VERSION"
+            SOURCE_COMMIT="$INPUT_SOURCE_COMMIT"
+          else
+            VERSION="$TEST_VERSION"
+            SOURCE_COMMIT="$TEST_SOURCE_COMMIT"
+          fi
+          [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          {
+            echo "VERSION=$VERSION"
+            echo "SOURCE_COMMIT=$SOURCE_COMMIT"
+            echo "IMAGE=astrid-runtime:${VERSION}-arm64"
+          } >> "$GITHUB_ENV"
+
+      - name: Install pinned fixture toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: '1.95.0'
+          targets: wasm32-unknown-unknown
+
+      - name: Install pinned BLAKE3 verifier
+        run: cargo install b3sum --version 1.8.5 --locked
+
+      - name: Test acquisition and container contracts
+        run: |
+          python3 scripts/test_oci_release.py
+          python3 scripts/test_oci_export_binding.py
+          python3 scripts/test_oci_arm64_container_contract.py
+          python3 -m py_compile scripts/create_oci_test_shuttle.py
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Authenticate exact immutable arm64 release bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/oci_release.py fetch \
+            --version "$VERSION" \
+            --source-commit "$SOURCE_COMMIT" \
+            --target "$RELEASE_TARGET" \
+            --output dist/oci-arm64
+          ARCHIVE_SHA256=$(python3 -c \
+            'import json; print(json.load(open("dist/oci-arm64/release-receipt.json"))["archive-sha256"])')
+          echo "ARCHIVE_SHA256=$ARCHIVE_SHA256" >> "$GITHUB_ENV"
+
+      - name: Check out pinned compatible uplink fixture
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: unicity-aos/aos-ce
+          ref: 01fd0e8456330f6d781448357397bc895ce2abfb
+          path: .oci-fixtures/aos-ce
+          persist-credentials: false
+
+      - name: Build compatible CLI uplink fixture with authenticated arm64 tool
+        run: |
+          mkdir -p "$RUNNER_TEMP/astrid-release" dist/oci-test
+          tar -xzf dist/oci-arm64/astrid-release.tar.gz \
+            --strip-components=1 \
+            --directory "$RUNNER_TEMP/astrid-release" \
+            "astrid-${VERSION}-${RELEASE_TARGET}/astrid-build"
+          file -b "$RUNNER_TEMP/astrid-release/astrid-build" |
+            grep -q 'ARM aarch64'
+          "$RUNNER_TEMP/astrid-release/astrid-build" \
+            .oci-fixtures/aos-ce/capsules/capsule-cli \
+            --output dist/oci-test
+          test -s dist/oci-test/aos-cli.capsule
+
+      - name: Enable native OCI image loading
+        run: |
+          if sudo test -f /etc/docker/daemon.json; then
+            sudo cp /etc/docker/daemon.json "$RUNNER_TEMP/docker-daemon.json"
+          else
+            printf '{}\n' > "$RUNNER_TEMP/docker-daemon.json"
+          fi
+          jq \
+            '.features = ((.features // {}) + {"containerd-snapshotter": true})' \
+            "$RUNNER_TEMP/docker-daemon.json" \
+            > "$RUNNER_TEMP/docker-daemon-containerd.json"
+          sudo install \
+            -m 0644 \
+            "$RUNNER_TEMP/docker-daemon-containerd.json" \
+            /etc/docker/daemon.json
+          sudo systemctl restart docker
+          docker info --format '{{json .DriverStatus}}' \
+            | grep -Fq 'io.containerd.snapshotter.v1'
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Build one immutable arm64 OCI archive
+        run: |
+          docker buildx build \
+            --platform linux/arm64 \
+            --build-arg "ASTRID_VERSION=$VERSION" \
+            --build-arg "ASTRID_SOURCE_COMMIT=$SOURCE_COMMIT" \
+            --build-arg "ASTRID_ARCHIVE_SHA256=$ARCHIVE_SHA256" \
+            --tag "$IMAGE" \
+            --file container/arm64/Dockerfile \
+            --output "type=oci,dest=dist/astrid-${VERSION}-arm64.oci.tar" \
+            .
+          (
+            cd dist
+            sha256sum "astrid-${VERSION}-arm64.oci.tar" \
+              > "astrid-${VERSION}-arm64.oci.tar.sha256"
+          )
+
+      - name: Load and bind exact exported arm64 image
+        run: |
+          docker load --input "dist/astrid-${VERSION}-arm64.oci.tar"
+          IMAGE_REPO_DIGEST=$(docker image inspect "$IMAGE" --format '{{index .RepoDigests 0}}')
+          IMAGE_MANIFEST_DIGEST=${IMAGE_REPO_DIGEST##*@}
+          echo "BOUND_IMAGE=$IMAGE_REPO_DIGEST" >> "$GITHUB_ENV"
+          python3 scripts/oci_export_binding.py \
+            --oci-archive "dist/astrid-${VERSION}-arm64.oci.tar" \
+            --image-manifest-digest "$IMAGE_MANIFEST_DIGEST" \
+            --architecture arm64 \
+            --output "dist/astrid-${VERSION}-arm64.oci-binding.json"
+
+      - name: Test exact export structure, signed-distro gate, and restricted startup
+        run: container/arm64/test.sh "$BOUND_IMAGE" dist/oci-test/aos-cli.capsule
+
+      - name: Scan image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.BOUND_IMAGE }}
+          format: table
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ${{ env.BOUND_IMAGE }}
+          format: spdx-json
+          output-file: dist/astrid-${{ env.VERSION }}-arm64.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+          dependency-snapshot: false
+
+      - name: Reverify tested and scanned arm64 image binding
+        run: |
+          (
+            cd dist
+            sha256sum --check "astrid-${VERSION}-arm64.oci.tar.sha256"
+          )
+          IMAGE_REPO_DIGEST=$(docker image inspect "$BOUND_IMAGE" --format '{{index .RepoDigests 0}}')
+          test "$IMAGE_REPO_DIGEST" = "$BOUND_IMAGE"
+          IMAGE_MANIFEST_DIGEST=${IMAGE_REPO_DIGEST##*@}
+          python3 scripts/oci_export_binding.py \
+            --oci-archive "dist/astrid-${VERSION}-arm64.oci.tar" \
+            --image-manifest-digest "$IMAGE_MANIFEST_DIGEST" \
+            --architecture arm64 \
+            --output "$RUNNER_TEMP/astrid-${VERSION}-arm64.oci-binding.json"
+          cmp \
+            "dist/astrid-${VERSION}-arm64.oci-binding.json" \
+            "$RUNNER_TEMP/astrid-${VERSION}-arm64.oci-binding.json"
+          (
+            cd dist
+            sha256sum \
+              "astrid-${VERSION}-arm64.oci.tar" \
+              "astrid-${VERSION}-arm64.oci-binding.json" \
+              "astrid-${VERSION}-arm64.spdx.json" \
+              "oci-arm64/release-receipt.json" \
+              > "astrid-${VERSION}-arm64.evidence.sha256"
+            sha256sum --check "astrid-${VERSION}-arm64.evidence.sha256"
+          )
+
+      - name: Upload immutable arm64 build evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: astrid-${{ env.VERSION }}-arm64-oci-build
+          path: |
+            dist/astrid-${{ env.VERSION }}-arm64.oci.tar
+            dist/astrid-${{ env.VERSION }}-arm64.oci.tar.sha256
+            dist/astrid-${{ env.VERSION }}-arm64.oci-binding.json
+            dist/astrid-${{ env.VERSION }}-arm64.evidence.sha256
+            dist/astrid-${{ env.VERSION }}-arm64.spdx.json
+            dist/oci-arm64/release-receipt.json
+          if-no-files-found: error
+          retention-days: 7
+
+  sign:
+    name: Sign and attest exact arm64 OCI archive
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/main' &&
+      github.ref_protected == true &&
+      vars.ASTRID_OCI_SIGNING_ENABLED == 'true'
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    environment:
+      name: oci-signing
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Assert native arm64 signing runner
+        run: test "$(uname -m)" = aarch64
+
+      - name: Download exact build evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: astrid-${{ env.VERSION }}-arm64-oci-build
+          path: dist
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Verify exact exported OCI blob
+        run: |
+          cd dist
+          sha256sum --check "astrid-${VERSION}-arm64.oci.tar.sha256"
+          sha256sum --check "astrid-${VERSION}-arm64.evidence.sha256"
+
+      - name: Sign OCI archive as a blob
+        run: |
+          cosign sign-blob \
+            --yes \
+            --bundle "dist/astrid-${VERSION}-arm64.oci.tar.sigstore.json" \
+            "dist/astrid-${VERSION}-arm64.oci.tar"
+
+      - name: Attest OCI archive provenance
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: dist/astrid-${{ env.VERSION }}-arm64.oci.tar
+
+      - name: Sign exact evidence manifest
+        run: |
+          cosign sign-blob \
+            --yes \
+            --bundle "dist/astrid-${VERSION}-arm64.evidence.sha256.sigstore.json" \
+            "dist/astrid-${VERSION}-arm64.evidence.sha256"
+
+      - name: Upload signed arm64 evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: astrid-${{ env.VERSION }}-arm64-oci-signed
+          path: |
+            dist/astrid-${{ env.VERSION }}-arm64.oci.tar
+            dist/astrid-${{ env.VERSION }}-arm64.oci.tar.sha256
+            dist/astrid-${{ env.VERSION }}-arm64.oci.tar.sigstore.json
+            dist/astrid-${{ env.VERSION }}-arm64.oci-binding.json
+            dist/astrid-${{ env.VERSION }}-arm64.evidence.sha256
+            dist/astrid-${{ env.VERSION }}-arm64.evidence.sha256.sigstore.json
+            dist/astrid-${{ env.VERSION }}-arm64.spdx.json
+            dist/oci-arm64/release-receipt.json
+          if-no-files-found: error
+          retention-days: 7
