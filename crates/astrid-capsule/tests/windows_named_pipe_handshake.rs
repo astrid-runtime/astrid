@@ -9,7 +9,10 @@ use astrid_core::{PrincipalId, PrincipalProfile};
 #[tokio::test]
 async fn native_windows_preread_replays_full_signed_handshake() {
     let directory = tempfile::tempdir().expect("tempdir");
-    let home = AstridHome::from_path(directory.path());
+    // `tempfile` creates the root before Astrid can attach its exact protected
+    // DACL. Use a missing child so the production filesystem boundary creates
+    // the test home atomically with the required Windows descriptor.
+    let home = AstridHome::from_path(directory.path().join("astrid-home"));
     home.ensure().expect("prepare Astrid home");
 
     let principal = PrincipalId::new("windows-e2e").expect("valid principal");
@@ -26,8 +29,6 @@ async fn native_windows_preread_replays_full_signed_handshake() {
     profile.auth.methods.push(AuthMethod::Keypair);
     profile.auth.public_keys.push(device);
     let profile_path = PrincipalProfile::path_for(&home, &principal);
-    std::fs::create_dir_all(profile_path.parent().expect("profile parent"))
-        .expect("create profile directory");
     profile
         .save_to_path(&profile_path)
         .expect("write principal profile");
