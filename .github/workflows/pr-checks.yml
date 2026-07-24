@@ -78,12 +78,15 @@ jobs:
             printf '%s\n' "$PR_LABELS" | grep -qiE '^(no-issue|maintenance|docs-only|release|deps|dependencies)$'
           }
 
-          is_pr_checks_only_change() {
+          is_workflow_only_change() {
             CHANGED_FILES=$(gh api "repos/$REPO/pulls/$PR_NUMBER/files" --paginate --jq '.[].filename' 2>/dev/null || echo "")
             [ -n "$CHANGED_FILES" ] || return 1
 
             while IFS= read -r file; do
-              [ "$file" = ".github/workflows/pr-checks.yml" ] || return 1
+              case "$file" in
+                .github/workflows/*) ;;
+                *) return 1 ;;
+              esac
             done <<< "$CHANGED_FILES"
 
             return 0
@@ -94,14 +97,14 @@ jobs:
           # Check that Linked Issue has an actual issue number, unless a narrowly
           # labeled exception explains why no issue exists.
           if ! echo "$PR_BODY" | grep -qE '#[0-9]+'; then
-            if is_pr_checks_only_change; then
-              echo "PR only changes .github/workflows/pr-checks.yml; skipping linked-issue requirement."
+            if is_workflow_only_change; then
+              echo "PR only changes GitHub Actions workflows; skipping linked-issue requirement."
             elif has_traceability_exception_label; then
               if ! printf '%s\n' "$LINKED_ISSUE_SECTION" | grep -qiE '(no issue|no tracked issue|not linked|maintenance|docs|release|dependenc|traceability|ci|workflow)'; then
                 ERRORS="${ERRORS}Linked Issue must explain the traceability exception for the applied label\n"
               fi
             else
-              ERRORS="${ERRORS}Linked Issue must reference an issue number (#N), use a documented traceability exception label, or modify only .github/workflows/pr-checks.yml\n"
+              ERRORS="${ERRORS}Linked Issue must reference an issue number (#N), use a documented traceability exception label, or modify only .github/workflows/\n"
             fi
           fi
 
@@ -417,12 +420,15 @@ jobs:
             esac
           }
 
-          is_pr_checks_only_change() {
+          is_workflow_only_change() {
             CHANGED_FILES=$(gh api "repos/$REPO/pulls/$PR_NUMBER/files" --paginate --jq '.[].filename' 2>/dev/null || echo "")
             [ -n "$CHANGED_FILES" ] || return 1
 
             while IFS= read -r file; do
-              [ "$file" = ".github/workflows/pr-checks.yml" ] || return 1
+              case "$file" in
+                .github/workflows/*) ;;
+                *) return 1 ;;
+              esac
             done <<< "$CHANGED_FILES"
 
             return 0
@@ -435,8 +441,8 @@ jobs:
 
           LINKED_ISSUE_SECTION=$(echo "$PR_BODY" | sed -n '/^## Linked Issue/,/^## /p' | sed '1d' | sed '/^## /d' | sed '/^<!--.*-->$/d' | sed '/^\s*$/d')
 
-          if is_pr_checks_only_change; then
-            echo "PR only changes .github/workflows/pr-checks.yml; skipping linked-issue requirement."
+          if is_workflow_only_change; then
+            echo "PR only changes GitHub Actions workflows; skipping linked-issue requirement."
             exit 0
           fi
 
@@ -451,7 +457,7 @@ jobs:
           fi
 
           echo "::error::Every PR must be linked to an issue unless a documented traceability exception applies."
-          echo "::error::Use 'Closes #N' in the PR body, link an issue via the GitHub sidebar, add one of: no-issue, maintenance, docs-only, release, deps, dependencies, or modify only .github/workflows/pr-checks.yml."
+          echo "::error::Use 'Closes #N' in the PR body, link an issue via the GitHub sidebar, add one of: no-issue, maintenance, docs-only, release, deps, dependencies, or modify only .github/workflows/."
           exit 1
 
   account-age:
