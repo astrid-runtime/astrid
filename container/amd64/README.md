@@ -106,13 +106,21 @@ deployment rule, then explicitly enable the variable. Pull requests, tags,
 unprotected branches, disabled repositories, and other workflow refs can build
 and inspect evidence but cannot request an OIDC signing token.
 
-The exported OCI tar is an exact per-workflow artifact. Its Sigstore blob
-signature and provenance attestation bind the bytes of that specific export;
-verify them against the downloaded `.oci.tar`, not against a separately
-re-exported image. BuildKit export metadata can vary between runs, so this
-target does not claim byte-for-byte reproducible OCI tar archives. That
-per-export property is also why this first target retains only short-lived
-workflow artifacts and does not publish mutable registry tags.
+One BuildKit invocation emits the exact OCI tar. CI loads that same archive,
+then requires the loaded repository digest to equal its sole OCI manifest
+digest. The restricted runtime test, vulnerability scan, and SBOM therefore all
+apply to the image represented by the unchanged export. A binding receipt
+records the archive, manifest, config, and layer digests, and the workflow
+verifies both that receipt and a separately recorded archive SHA-256 again
+after the tests and scans. A signed evidence checksum manifest covers the
+archive, binding receipt, SBOM, and authenticated release receipt. The separate
+Sigstore archive signature and provenance attestation bind the bytes of that
+specific `.oci.tar`; verify the evidence-manifest signature before trusting its
+metadata, and verify the archive signature against the downloaded tar rather
+than a separately re-exported image. BuildKit export metadata can vary between
+runs, so this target does not claim byte-for-byte reproducible OCI tar
+archives. That per-export property is also why this first target retains only
+short-lived workflow artifacts and does not publish mutable registry tags.
 
 The restricted-runtime CI probe builds the compatible AOS CLI uplink from an
 exact `unicity-aos/aos-ce` source commit, seals it into a test-only signed

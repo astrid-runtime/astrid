@@ -7,8 +7,10 @@ on:
       - '.github/workflows/oci-amd64.yml'
       - 'container/amd64/**'
       - 'scripts/oci_release.py'
+      - 'scripts/oci_export_binding.py'
       - 'scripts/create_oci_test_shuttle.py'
       - 'scripts/test_oci_release.py'
+      - 'scripts/test_oci_export_binding.py'
       - 'scripts/test_oci_container_contract.py'
       - 'scripts/release_manifest.py'
   workflow_dispatch:
@@ -77,6 +79,7 @@ jobs:
       - name: Test acquisition and container contracts
         run: |
           python3 scripts/test_oci_release.py
+          python3 scripts/test_oci_export_binding.py
           python3 scripts/test_oci_container_contract.py
           python3 -m py_compile scripts/create_oci_test_shuttle.py
 
@@ -124,7 +127,7 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
-      - name: Build local amd64 image
+      - name: Build one immutable amd64 OCI archive
         run: |
           docker buildx build \
             --platform linux/amd64 \
@@ -133,16 +136,33 @@ jobs:
             --build-arg "ASTRID_ARCHIVE_SHA256=$ARCHIVE_SHA256" \
             --tag "$IMAGE" \
             --file container/amd64/Dockerfile \
-            --load \
+            --output "type=oci,dest=dist/astrid-${VERSION}-amd64.oci.tar" \
             .
+          (
+            cd dist
+            sha256sum "astrid-${VERSION}-amd64.oci.tar" \
+              > "astrid-${VERSION}-amd64.oci.tar.sha256"
+          )
+
+      - name: Load and bind exact exported amd64 image
+        run: |
+          docker load --input "dist/astrid-${VERSION}-amd64.oci.tar"
+          IMAGE_REPO_DIGEST=$(docker image inspect "$IMAGE" --format '{{index .RepoDigests 0}}')
+          IMAGE_MANIFEST_DIGEST=${IMAGE_REPO_DIGEST##*@}
+          echo "BOUND_IMAGE=$IMAGE_REPO_DIGEST" >> "$GITHUB_ENV"
+          python3 scripts/oci_export_binding.py \
+            --oci-archive "dist/astrid-${VERSION}-amd64.oci.tar" \
+            --image-manifest-digest "$IMAGE_MANIFEST_DIGEST" \
+            --architecture amd64 \
+            --output "dist/astrid-${VERSION}-amd64.oci-binding.json"
 
       - name: Test image structure, signed-distro gate, and restricted startup
-        run: container/amd64/test.sh "$IMAGE" dist/oci-test/aos-cli.capsule
+        run: container/amd64/test.sh "$BOUND_IMAGE" dist/oci-test/aos-cli.capsule
 
       - name: Scan image
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: ${{ env.IMAGE }}
+          image-ref: ${{ env.BOUND_IMAGE }}
           format: table
           severity: HIGH,CRITICAL
           ignore-unfixed: true
@@ -151,23 +171,40 @@ jobs:
       - name: Generate SPDX SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
-          image: ${{ env.IMAGE }}
+          image: ${{ env.BOUND_IMAGE }}
           format: spdx-json
           output-file: dist/astrid-${{ env.VERSION }}-amd64.spdx.json
           upload-artifact: false
           upload-release-assets: false
           dependency-snapshot: false
 
-      - name: Export immutable OCI archive
+      - name: Reverify tested and scanned image binding
         run: |
-          docker buildx build \
-            --platform linux/amd64 \
-            --build-arg "ASTRID_VERSION=$VERSION" \
-            --build-arg "ASTRID_SOURCE_COMMIT=$SOURCE_COMMIT" \
-            --build-arg "ASTRID_ARCHIVE_SHA256=$ARCHIVE_SHA256" \
-            --file container/amd64/Dockerfile \
-            --output "type=oci,dest=dist/astrid-${VERSION}-amd64.oci.tar" \
-            .
+          (
+            cd dist
+            sha256sum --check "astrid-${VERSION}-amd64.oci.tar.sha256"
+          )
+          IMAGE_REPO_DIGEST=$(docker image inspect "$BOUND_IMAGE" --format '{{index .RepoDigests 0}}')
+          test "$IMAGE_REPO_DIGEST" = "$BOUND_IMAGE"
+          IMAGE_MANIFEST_DIGEST=${IMAGE_REPO_DIGEST##*@}
+          python3 scripts/oci_export_binding.py \
+            --oci-archive "dist/astrid-${VERSION}-amd64.oci.tar" \
+            --image-manifest-digest "$IMAGE_MANIFEST_DIGEST" \
+            --architecture amd64 \
+            --output "$RUNNER_TEMP/astrid-${VERSION}-amd64.oci-binding.json"
+          cmp \
+            "dist/astrid-${VERSION}-amd64.oci-binding.json" \
+            "$RUNNER_TEMP/astrid-${VERSION}-amd64.oci-binding.json"
+          (
+            cd dist
+            sha256sum \
+              "astrid-${VERSION}-amd64.oci.tar" \
+              "astrid-${VERSION}-amd64.oci-binding.json" \
+              "astrid-${VERSION}-amd64.spdx.json" \
+              "oci-amd64/release-receipt.json" \
+              > "astrid-${VERSION}-amd64.evidence.sha256"
+            sha256sum --check "astrid-${VERSION}-amd64.evidence.sha256"
+          )
 
       - name: Upload immutable amd64 build evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -175,6 +212,9 @@ jobs:
           name: astrid-${{ env.VERSION }}-amd64-oci-build
           path: |
             dist/astrid-${{ env.VERSION }}-amd64.oci.tar
+            dist/astrid-${{ env.VERSION }}-amd64.oci.tar.sha256
+            dist/astrid-${{ env.VERSION }}-amd64.oci-binding.json
+            dist/astrid-${{ env.VERSION }}-amd64.evidence.sha256
             dist/astrid-${{ env.VERSION }}-amd64.spdx.json
             dist/oci-amd64/release-receipt.json
           if-no-files-found: error
@@ -212,6 +252,12 @@ jobs:
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
+      - name: Verify exact exported OCI blob
+        run: |
+          cd dist
+          sha256sum --check "astrid-${VERSION}-amd64.oci.tar.sha256"
+          sha256sum --check "astrid-${VERSION}-amd64.evidence.sha256"
+
       - name: Sign OCI archive as a blob
         run: |
           cosign sign-blob \
@@ -224,13 +270,24 @@ jobs:
         with:
           subject-path: dist/astrid-${{ env.VERSION }}-amd64.oci.tar
 
+      - name: Sign exact evidence manifest
+        run: |
+          cosign sign-blob \
+            --yes \
+            --bundle "dist/astrid-${VERSION}-amd64.evidence.sha256.sigstore.json" \
+            "dist/astrid-${VERSION}-amd64.evidence.sha256"
+
       - name: Upload signed amd64 evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: astrid-${{ env.VERSION }}-amd64-oci-signed
           path: |
             dist/astrid-${{ env.VERSION }}-amd64.oci.tar
+            dist/astrid-${{ env.VERSION }}-amd64.oci.tar.sha256
             dist/astrid-${{ env.VERSION }}-amd64.oci.tar.sigstore.json
+            dist/astrid-${{ env.VERSION }}-amd64.oci-binding.json
+            dist/astrid-${{ env.VERSION }}-amd64.evidence.sha256
+            dist/astrid-${{ env.VERSION }}-amd64.evidence.sha256.sigstore.json
             dist/astrid-${{ env.VERSION }}-amd64.spdx.json
             dist/oci-amd64/release-receipt.json
           if-no-files-found: error

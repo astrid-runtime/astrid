@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import pathlib
+import re
 import unittest
 
 
@@ -90,6 +91,94 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("repository: unicity-aos/aos-ce", WORKFLOW)
         self.assertRegex(WORKFLOW, r"ref: [0-9a-f]{40}")
         self.assertIn("dist/oci-test/aos-cli.capsule", WORKFLOW)
+
+    def test_exact_export_is_built_once_and_bound_to_tested_image(self) -> None:
+        build_job = WORKFLOW.split("\n  sign:\n", 1)[0]
+        self.assertEqual(build_job.count("docker buildx build"), 1)
+        self.assertEqual(build_job.count("--platform linux/amd64"), 1)
+        self.assertIn("type=oci,dest=", build_job)
+        self.assertNotIn("type=docker,dest=", build_job)
+        self.assertNotIn("--load", build_job)
+        self.assertIn("docker load --input", build_job)
+        self.assertIn('echo "BOUND_IMAGE=$IMAGE_REPO_DIGEST"', build_job)
+        first_binding = build_job.index("python3 scripts/oci_export_binding.py")
+        runtime_test = build_job.index('container/amd64/test.sh "$BOUND_IMAGE"')
+        scan = build_job.index("aquasecurity/trivy-action")
+        sbom = build_job.index("anchore/sbom-action")
+        recheck = build_job.rindex("python3 scripts/oci_export_binding.py")
+        upload = build_job.index("actions/upload-artifact")
+        self.assertLess(first_binding, runtime_test)
+        self.assertLess(runtime_test, scan)
+        self.assertLess(scan, sbom)
+        self.assertLess(sbom, recheck)
+        self.assertLess(recheck, upload)
+        self.assertIn("cmp \\", build_job)
+        self.assertIn("sha256sum --check", build_job)
+        self.assertIn("amd64.oci-binding.json", build_job)
+        self.assertIn("image-ref: ${{ env.BOUND_IMAGE }}", build_job)
+        self.assertIn("image: ${{ env.BOUND_IMAGE }}", build_job)
+        self.assertIn('test "$IMAGE_REPO_DIGEST" = "$BOUND_IMAGE"', build_job)
+
+    def test_signed_manifest_covers_metadata_and_sbom(self) -> None:
+        sign_job = WORKFLOW.split("\n  sign:\n", 1)[1]
+        self.assertIn("amd64.evidence.sha256", sign_job)
+        self.assertIn("amd64.evidence.sha256.sigstore.json", sign_job)
+        self.assertIn('sha256sum --check "astrid-${VERSION}-amd64.evidence.sha256"', sign_job)
+        self.assertIn(
+            '"dist/astrid-${VERSION}-amd64.evidence.sha256"',
+            sign_job,
+        )
+        build_job = WORKFLOW.split("\n  sign:\n", 1)[0]
+        for evidence in (
+            "amd64.oci.tar",
+            "amd64.oci-binding.json",
+            "amd64.spdx.json",
+            "oci-amd64/release-receipt.json",
+        ):
+            with self.subTest(evidence=evidence):
+                self.assertIn(evidence, build_job)
+
+    def test_workflow_never_invokes_registry_publication_tools(self) -> None:
+        lowered = WORKFLOW.lower()
+        self.assertNotIn("docker/login-action", lowered)
+        self.assertNotIn("docker/build-push-action", lowered)
+        self.assertNotRegex(lowered, r"\bdocker\s+(?:image\s+)?push\b")
+        self.assertNotIn("docker login", lowered)
+        self.assertNotIn("--push", lowered)
+        self.assertNotIn("push: true", lowered)
+        self.assertNotIn("type=registry", lowered)
+        self.assertNotIn("docker manifest", lowered)
+        self.assertNotIn("docker buildx imagetools create", lowered)
+        self.assertNotRegex(
+            lowered,
+            r"\b(?:oras|skopeo|crane|regctl)(?:\s|$)",
+        )
+        self.assertNotIn("packages: write", lowered)
+
+    def test_workflow_never_uses_mutable_or_canonical_image_tags(self) -> None:
+        self.assertIsNone(
+            re.search(
+                r"(?i)(?:--tag|tags?:|image[:=])[^\n]*"
+                r"(?:latest|stable|dev|nightly)(?:[^a-z0-9]|$)",
+                WORKFLOW,
+            ),
+        )
+        lowered = WORKFLOW.lower()
+        self.assertNotIn("multiarch", lowered)
+        self.assertNotIn("multi-arch", lowered)
+        self.assertNotIn("canonical tag", lowered)
+
+    def test_workflow_cannot_enable_emulation_or_multi_platform_builds(self) -> None:
+        lowered = WORKFLOW.lower()
+        self.assertNotIn("qemu", lowered)
+        self.assertNotIn("binfmt", lowered)
+        self.assertNotIn("tonistiigi", lowered)
+        self.assertNotIn("multiarch/qemu-user-static", lowered)
+        self.assertNotIn("--privileged", lowered)
+        self.assertEqual(
+            re.findall(r"--platform(?:=|\s+)([^\s\\]+)", lowered),
+            ["linux/amd64"],
+        )
 
 
 if __name__ == "__main__":
