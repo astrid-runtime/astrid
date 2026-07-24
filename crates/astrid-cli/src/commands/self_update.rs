@@ -352,83 +352,19 @@ pub(super) async fn download_bounded(
     Ok(bytes)
 }
 
-/// Back up and atomically swap the named binaries from `extract_dir` into
-/// `install_dir`.
+/// Back up and replace the named binaries from `extract_dir` into `install_dir`.
 ///
 /// Each existing binary is copied to `<name>.bak` first; new binaries are staged
 /// as temp files in `install_dir` (same filesystem) and `rename`d into place —
-/// atomic on Unix, and safe over a running binary (the live process keeps its
-/// old inode). If any rename fails, every binary is restored from its backup so
-/// the install is never left half-swapped. The `.bak` copies are left in place
-/// for manual rollback after a successful update.
+/// atomic per file on Unix. Windows stages and flushes bytes on the live volume,
+/// then uses a recovery journal around handle-relative
+/// `SetFileInformationByHandle(FileRenameInfo)` transitions, each atomic at the
+/// individual name boundary; an interrupted mixed set is restored on the next
+/// attempt. The `.bak` copies are left in place for manual rollback after a
+/// successful update.
 fn backup_and_swap(install_dir: &Path, extract_dir: &Path, names: &[&str]) -> anyhow::Result<()> {
-    // 0. The expected binaries are a SET. A release missing one would otherwise
-    //    leave a version-mismatched pair (new `astrid`, old `astrid-daemon`)
-    //    while still reporting success — require them all before touching disk.
-    for name in names {
-        anyhow::ensure!(
-            extract_dir.join(name).exists(),
-            "release archive is missing '{name}'"
-        );
-    }
-
-    // 1. Back up existing live binaries.
-    let mut backups: Vec<(PathBuf, PathBuf)> = Vec::new(); // (live, bak)
-    for name in names {
-        let live = install_dir.join(name);
-        if live.exists() {
-            let bak = install_dir.join(format!("{name}.bak"));
-            std::fs::copy(&live, &bak)
-                .with_context(|| format!("failed to back up {}", live.display()))?;
-            backups.push((live, bak));
-        }
-    }
-
-    // 2. Stage new binaries as temp files in the install dir (same fs as the
-    //    target, so the rename below is atomic).
-    let mut staged: Vec<(PathBuf, PathBuf)> = Vec::new(); // (tmp, live)
-    for name in names {
-        let tmp = install_dir.join(format!(".{name}.new"));
-        std::fs::copy(extract_dir.join(name), &tmp)
-            .with_context(|| format!("failed to stage {name}"))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
-        }
-        staged.push((tmp, install_dir.join(name)));
-    }
-
-    // 3. Atomically rename each staged binary into place. On the first failure,
-    //    roll every binary back from its backup and clean up the remaining temps.
-    //    Rollback uses `rename` (not `copy`): copying over a binary that is
-    //    currently executing fails with ETXTBSY, whereas renaming swaps the
-    //    directory entry without touching the running inode. A rollback failure
-    //    is surfaced rather than swallowed.
-    for (idx, (tmp, live)) in staged.iter().enumerate() {
-        if let Err(e) = std::fs::rename(tmp, live) {
-            let mut rollback_errs = Vec::new();
-            for (blive, bak) in &backups {
-                if let Err(re) = std::fs::rename(bak, blive) {
-                    rollback_errs.push(format!("{}: {re}", blive.display()));
-                }
-            }
-            for (t, _) in &staged[idx..] {
-                let _ = std::fs::remove_file(t);
-            }
-            let base = format!("failed to install {}", live.display());
-            let msg = if rollback_errs.is_empty() {
-                base
-            } else {
-                format!(
-                    "{base}; ROLLBACK ALSO FAILED ({}) — restore *.bak manually",
-                    rollback_errs.join("; ")
-                )
-            };
-            return Err(e).context(msg);
-        }
-    }
-    Ok(())
+    astrid_core::platform_fs::replace_executable_set(install_dir, extract_dir, names)
+        .context("failed to replace authenticated Astrid executables")
 }
 
 /// Best-effort writability check for a directory: create and drop a uniquely
@@ -466,6 +402,14 @@ fn confirm(prompt: &str, assume_yes: bool) -> anyhow::Result<bool> {
 /// swap the binary in place with rollback, restart the daemon, then update
 /// capsules. Distro refresh requires explicit recorded source provenance and is
 /// deliberately skipped by this path. Homebrew installs are deferred to `brew upgrade`.
+#[cfg(windows)]
+pub(crate) async fn run_self_update(_args: UpdateArgs) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "Astrid self-update is not enabled on Windows; native packaging and code-signing support are not complete"
+    )
+}
+
+#[cfg(not(windows))]
 pub(crate) async fn run_self_update(args: UpdateArgs) -> anyhow::Result<()> {
     let target = platform_target()?;
     let (owner, repo) = resolve_repo(args.source.as_deref())?;

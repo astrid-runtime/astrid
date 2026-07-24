@@ -31,6 +31,7 @@ impl WorkspaceSelection {
                 ),
             )
         })?;
+        crate::platform_fs::verify_no_redirects(&project_root)?;
         if !std::fs::metadata(&project_root)?.is_dir() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -245,6 +246,11 @@ impl WorkspaceSelection {
     /// after creation.
     pub fn ensure_state_dir(&self) -> io::Result<()> {
         self.verify()?;
+        #[cfg(windows)]
+        {
+            crate::platform_fs::ensure_private_directory(&self.state_dir)?;
+        }
+        #[cfg(not(windows))]
         match std::fs::create_dir(&self.state_dir) {
             Ok(()) => {},
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {},
@@ -290,6 +296,8 @@ enum DescendantKind {
 }
 
 fn verify_state_dir_path(project_root: &Path, state_dir: &Path) -> io::Result<()> {
+    crate::platform_fs::verify_no_redirects(project_root)?;
+    crate::platform_fs::verify_no_redirects(state_dir)?;
     let metadata = match std::fs::symlink_metadata(state_dir) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
