@@ -8,16 +8,19 @@
 /// A daemon spawned as a plain child inherits the spawner's session and process
 /// group, so a spawner teardown (a controlling terminal closing → `SIGHUP`, a
 /// harness `killpg`) would kill it BEFORE its own graceful shutdown could run,
-/// leaking stale run files. `setsid(2)` makes it a session leader with no
-/// controlling terminal, immune to that teardown. Kept byte-for-byte in step
-/// with the co-installed `astrid-daemon` binary in `astrid-cli`.
+/// leaking stale run files. `setsid(2)` makes background modes a session leader
+/// with no controlling terminal, immune to that teardown; foreground mode
+/// deliberately remains attached. Kept byte-for-byte in step with the
+/// co-installed `astrid-daemon` binary in `astrid-cli`.
 ///
 /// Best-effort: `setsid` fails only with `EPERM`, which means the process is
 /// already a process-group leader (already detached) — ignoring the result is
 /// correct. Uses the safe `nix` wrapper, not raw `libc`.
 fn main() -> anyhow::Result<()> {
     #[cfg(unix)]
-    let _ = nix::unistd::setsid();
+    if std::env::var_os("ASTRID_DAEMON_FOREGROUND").as_deref() != Some(std::ffi::OsStr::new("1")) {
+        let _ = nix::unistd::setsid();
+    }
 
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()

@@ -4,6 +4,11 @@ use astrid_core::local_transport::{self, LocalListener};
 use astrid_core::session_token::SessionToken;
 use tracing::warn;
 
+#[cfg(windows)]
+#[allow(unsafe_code)]
+#[path = "socket/windows.rs"]
+mod windows;
+
 /// Path to the local Unix Domain Socket for the kernel.
 #[must_use]
 pub(crate) fn kernel_socket_path() -> PathBuf {
@@ -258,7 +263,7 @@ fn publish_readiness_metadata(path: &std::path::Path, metadata: &str) -> std::io
         let _ = std::fs::remove_file(&tmp);
         return Err(error);
     }
-    if let Err(error) = std::fs::rename(&tmp, path) {
+    if let Err(error) = replace_file(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(error);
     }
@@ -353,11 +358,22 @@ pub fn write_pid_file() -> Result<(), std::io::Error> {
         return Err(e);
     }
 
-    if let Err(e) = std::fs::rename(&tmp, &path) {
+    if let Err(e) = replace_file(&tmp, &path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
     Ok(())
+}
+
+fn replace_file(source: &std::path::Path, destination: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        windows::replace_file(source, destination)
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(source, destination)
+    }
 }
 
 /// Remove the daemon PID file (best-effort).
@@ -390,6 +406,18 @@ mod tests {
             let mode = std::fs::metadata(&run_dir).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o700);
         }
+    }
+
+    #[test]
+    fn readiness_metadata_replaces_a_crashed_daemons_stale_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("system.ready");
+        publish_readiness_metadata(&path, "v1:stale\n").unwrap();
+
+        publish_readiness_metadata(&path, "v1:current\n").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "v1:current\n");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]

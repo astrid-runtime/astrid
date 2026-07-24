@@ -20,6 +20,11 @@ use super::update_auth::{
 };
 use super::update_channel;
 
+#[cfg(windows)]
+#[allow(unsafe_code)]
+#[path = "self_update/windows.rs"]
+mod windows;
+
 #[path = "self_update_notice.rs"]
 mod notice;
 pub(crate) use notice::print_update_banner;
@@ -37,7 +42,20 @@ const MAX_RELEASE_ASSETS: usize = 1_024;
 const MAX_BUNDLE_BYTES: usize = 256 * 1024;
 const MAX_MANIFEST_BYTES: usize = 256 * 1024;
 
+#[cfg(not(windows))]
 const MANAGED_BINARIES: &[&str] = &["astrid", "astrid-daemon"];
+#[cfg(windows)]
+const MANAGED_BINARIES: &[&str] = &["astrid.exe", "astrid-daemon.exe"];
+
+#[cfg(windows)]
+pub(crate) fn internal_windows_helper_request() -> Option<anyhow::Result<PathBuf>> {
+    windows::internal_helper_request()
+}
+
+#[cfg(windows)]
+pub(crate) fn complete_windows_update(transaction: &Path) -> anyhow::Result<()> {
+    windows::complete(transaction)
+}
 
 /// GitHub API base URL. `ASTRID_UPDATE_API` overrides it so the flow can be
 /// rehearsed against a local/staging mock server.
@@ -96,6 +114,8 @@ fn platform_target_for(os: &str, arch: &str, target_env: &str) -> anyhow::Result
         ("linux", "aarch64", "musl") => Ok("aarch64-unknown-linux-musl"),
         ("linux", "x86_64", "gnu") => Ok("x86_64-unknown-linux-gnu"),
         ("linux", "aarch64", "gnu") => Ok("aarch64-unknown-linux-gnu"),
+        ("windows", "x86_64", _) => Ok("x86_64-pc-windows-msvc"),
+        ("windows", "aarch64", _) => Ok("aarch64-pc-windows-msvc"),
         ("linux", "x86_64" | "aarch64", env) => {
             bail!("Unsupported Linux target environment: {env}")
         },
@@ -503,16 +523,50 @@ pub(crate) async fn run_self_update(args: UpdateArgs) -> anyhow::Result<()> {
     .await
     .map_err(anyhow::Error::new)?;
 
-    backup_and_swap(&install_dir, &extract_dir, MANAGED_BINARIES)?;
+    #[cfg(windows)]
+    {
+        stop_daemon_before_windows_replacement().await?;
+        finish_update(&install_dir).await?;
+        windows::stage_and_launch(&install_dir, &extract_dir, MANAGED_BINARIES)?;
+        println!(
+            "{}",
+            Theme::success(&format!(
+                "Verified v{version_str}; Windows will replace the executables as this command exits \
+                 (previous binaries remain as *.bak in {}).",
+                install_dir.display()
+            ))
+        );
+        return Ok(());
+    }
+
+    #[cfg(not(windows))]
+    {
+        backup_and_swap(&install_dir, &extract_dir, MANAGED_BINARIES)?;
+        println!(
+            "{}",
+            Theme::success(&format!(
+                "Updated to v{version_str} (previous binaries kept as *.bak in {})",
+                install_dir.display()
+            ))
+        );
+        finish_update(&install_dir).await
+    }
+}
+
+#[cfg(windows)]
+async fn stop_daemon_before_windows_replacement() -> anyhow::Result<()> {
     println!(
         "{}",
-        Theme::success(&format!(
-            "Updated to v{version_str} (previous binaries kept as *.bak in {})",
-            install_dir.display()
-        ))
+        Theme::info("Stopping any running daemon before replacing its executable...")
     );
-
-    finish_update(&install_dir).await
+    let confirmation = super::daemon::handle_stop()
+        .await
+        .context("failed to stop daemon before Windows executable replacement")?;
+    anyhow::ensure!(
+        confirmation == super::daemon::StopConfirmation::ConfirmedGone,
+        "cannot replace Windows executables until the daemon is confirmed stopped"
+    );
+    Ok(())
 }
 
 /// Authenticate, content-check, and extract one platform archive.
@@ -583,13 +637,24 @@ async fn finish_update(install_dir: &Path) -> anyhow::Result<()> {
             "{}",
             Theme::info("Stopping the running daemon so the new version loads on next use...")
         );
-        if let Err(e) = super::daemon::handle_stop().await {
-            println!(
-                "{}",
-                Theme::warning(&format!(
-                    "Could not stop the daemon ({e}); restart it with `astrid restart`."
-                ))
-            );
+        match super::daemon::handle_stop().await {
+            Ok(super::daemon::StopConfirmation::ConfirmedGone) => {},
+            Ok(super::daemon::StopConfirmation::Unconfirmed) => {
+                println!(
+                    "{}",
+                    Theme::warning(
+                        "Could not confirm the daemon exited; inspect it before restarting."
+                    )
+                );
+            },
+            Err(error) => {
+                println!(
+                    "{}",
+                    Theme::warning(&format!(
+                        "Could not stop the daemon ({error}); restart it with `astrid restart`."
+                    ))
+                );
+            },
         }
     }
 

@@ -204,17 +204,16 @@ async fn dispatch_subcommand(
         Some(Commands::Gc(args)) => commands::gc::run(&args),
         Some(Commands::Config { command }) => dispatch_config(command),
         Some(Commands::Session { command }) => dispatch_session(command),
-        Some(Commands::Start) => {
+        Some(Commands::Start(args)) => {
             bootstrap::ensure_global_config().await;
-            commands::daemon::handle_start().await?;
-            Ok(ExitCode::SUCCESS)
+            commands::daemon::handle_start(args.foreground).await
         },
         Some(Commands::Status) => {
             commands::daemon::handle_status().await?;
             Ok(ExitCode::SUCCESS)
         },
         Some(Commands::Stop) => {
-            commands::daemon::handle_stop().await?;
+            let _ = commands::daemon::handle_stop().await?;
             Ok(ExitCode::SUCCESS)
         },
         Some(Commands::Restart) => commands::restart::run().await,

@@ -83,21 +83,30 @@ pub(crate) fn init_logging(cli: &Cli) {
 /// 1. Same directory as the current executable (co-installed)
 /// 2. `PATH` lookup
 pub(crate) fn find_companion_binary(name: &str) -> Result<std::path::PathBuf> {
+    let native_name = companion_binary_name(name, std::env::consts::EXE_SUFFIX);
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {
-        let candidate = dir.join(name);
+        let candidate = dir.join(&native_name);
         if candidate.is_file() {
             return Ok(candidate);
         }
     }
-    if let Ok(path) = which::which(name) {
+    if let Ok(path) = which::which(&native_name) {
         return Ok(path);
     }
     anyhow::bail!(
-        "{name} not found. Ensure it is installed alongside the astrid CLI \
+        "{} not found. Ensure it is installed alongside the astrid CLI \
          or available in PATH."
+        native_name.display()
     )
+}
+
+fn companion_binary_name(name: &str, exe_suffix: &str) -> std::ffi::OsString {
+    if exe_suffix.is_empty() || name.ends_with(exe_suffix) {
+        return name.into();
+    }
+    format!("{name}{exe_suffix}").into()
 }
 
 /// Run the legacy `astrid build` companion binary, used both by the
@@ -234,7 +243,20 @@ pub(crate) async fn run_or_connect(
 
 #[cfg(test)]
 mod tests {
-    use super::selected_workspace_root;
+    use super::{companion_binary_name, selected_workspace_root};
+
+    #[test]
+    fn companion_binary_uses_native_executable_suffix_once() {
+        assert_eq!(
+            companion_binary_name("astrid-daemon", ".exe"),
+            "astrid-daemon.exe"
+        );
+        assert_eq!(
+            companion_binary_name("astrid-daemon.exe", ".exe"),
+            "astrid-daemon.exe"
+        );
+        assert_eq!(companion_binary_name("astrid-daemon", ""), "astrid-daemon");
+    }
 
     #[test]
     fn explicit_workspace_root_wins_over_current_directory() {

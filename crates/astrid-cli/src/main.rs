@@ -47,6 +47,18 @@ mod workspace_layout;
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    #[cfg(windows)]
+    if let Some(request) = commands::self_update::internal_windows_helper_request() {
+        return match request.and_then(|path| commands::self_update::complete_windows_update(&path))
+        {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("Windows update helper failed: {error:#}");
+                ExitCode::from(1)
+            },
+        };
+    }
+
     let parsed = cli::Cli::parse();
     if workspace_layout::initialize(parsed.workspace_state_dir.clone()).is_err() {
         eprintln!("error: workspace layout was already initialized");

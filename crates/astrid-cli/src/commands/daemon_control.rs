@@ -33,6 +33,11 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
+#[allow(unsafe_code)]
+#[path = "daemon_control/windows.rs"]
+mod windows;
+
 /// How long to wait for a signalled daemon to exit before escalating /
 /// giving up. Kept just above the kernel's own graceful-shutdown budget so a
 /// daemon mid-shutdown gets a fair chance to release the lock cleanly.
@@ -104,7 +109,13 @@ pub(crate) fn is_process_alive(pid: u32) -> bool {
     )
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+#[must_use]
+pub(crate) fn is_process_alive(pid: u32) -> bool {
+    windows::is_process_alive(pid)
+}
+
+#[cfg(not(any(unix, windows)))]
 #[must_use]
 pub(crate) fn is_process_alive(_pid: u32) -> bool {
     false
@@ -173,7 +184,7 @@ fn exe_path_of_pid(pid: u32) -> Option<PathBuf> {
     Some(PathBuf::from(path))
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn exe_path_of_pid(_pid: u32) -> Option<PathBuf> {
     None
 }
@@ -192,11 +203,25 @@ fn exe_path_of_pid(_pid: u32) -> Option<PathBuf> {
 /// canonicalizes the live path so a symlinked-prefix normalisation between boot
 /// and now (e.g. macOS `/var` → `/private/var`) still matches. A recycled PID
 /// running a different binary reports a different path and matches neither.
+#[cfg(any(not(windows), test))]
 fn exe_matches(recorded: Option<&Path>, live: Option<&Path>) -> bool {
     let (Some(recorded), Some(live)) = (recorded, live) else {
         return false;
     };
-    recorded == live || std::fs::canonicalize(live).is_ok_and(|c| c == *recorded)
+    paths_equal(recorded, live)
+        || std::fs::canonicalize(live).is_ok_and(|canonical| paths_equal(recorded, &canonical))
+}
+
+#[cfg(any(not(windows), test))]
+fn paths_equal(left: &Path, right: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        windows::paths_equal(left, right)
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
 }
 
 /// Send a signal to `pid`, mapping the outcome to a bool.
@@ -215,23 +240,18 @@ fn signal(pid: u32, sig: nix::sys::signal::Signal) -> bool {
     nix::sys::signal::kill(nix::unistd::Pid::from_raw(raw), sig).is_ok()
 }
 
-#[cfg(not(unix))]
-fn signal(_pid: u32, _sig: ()) -> bool {
-    false
-}
-
 /// Outcome of an orphan-kill attempt, for caller-side messaging.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KillOutcome {
     /// No live process was recorded (missing/garbage/stale-dead PID) — nothing
     /// to do.
     NotRunning,
-    /// The process exited after SIGTERM within the grace window.
+    /// The Unix process exited after SIGTERM within the grace window.
     TermExited,
-    /// The process survived SIGTERM and was escalated to SIGKILL, after which
-    /// it exited.
+    /// The process exited after forced termination (SIGKILL on Unix or
+    /// `TerminateProcess` on Windows).
     KilledExited,
-    /// The process did not exit even after SIGKILL within the grace window.
+    /// The process did not exit even after platform forced termination.
     /// The caller should surface this — the lock may still be held.
     StillAlive,
     /// A live process holds the recorded PID, but we could NOT confirm it is the
@@ -277,47 +297,66 @@ pub(crate) async fn terminate_orphan(pid_path: &Path) -> KillOutcome {
 /// up to [`GRACE`]; if still alive, re-verify identity (grace-window PID-reuse
 /// guard) and escalate to `SIGKILL`, polling up to [`GRACE`] again.
 pub(crate) async fn terminate_known(pid: u32, recorded_exe: Option<&Path>) -> KillOutcome {
-    if !is_process_alive(pid) {
-        return KillOutcome::NotRunning;
-    }
+    #[cfg(windows)]
+    return match recorded_exe {
+        None => KillOutcome::Unverified(pid),
+        Some(recorded) => {
+            let recorded = recorded.to_path_buf();
+            match tokio::task::spawn_blocking(move || {
+                windows::terminate_verified_process(pid, &recorded, GRACE)
+            })
+            .await
+            {
+                Ok(windows::VerifiedTermination::NotRunning) => KillOutcome::NotRunning,
+                Ok(windows::VerifiedTermination::Unverified) => KillOutcome::Unverified(pid),
+                Ok(windows::VerifiedTermination::Exited) => KillOutcome::KilledExited,
+                Ok(windows::VerifiedTermination::StillAlive) | Err(_) => KillOutcome::StillAlive,
+            }
+        },
+    };
 
-    // Identity gate (fail-secure): a live PID is not enough — it may be a
-    // recycled PID now owned by an unrelated process. Only signal when the live
-    // process's executable provably matches the daemon's recorded one. Anything
-    // unconfirmable → leave it alone.
-    let live_exe = exe_path_of_pid(pid);
-    if !exe_matches(recorded_exe, live_exe.as_deref()) {
-        return KillOutcome::Unverified(pid);
-    }
+    #[cfg(not(windows))]
+    {
+        if !is_process_alive(pid) {
+            return KillOutcome::NotRunning;
+        }
 
-    // Politely ask it to exit; it may be wedged but still able to handle the
-    // signal handler and release the lock.
-    #[cfg(unix)]
-    let _ = signal(pid, nix::sys::signal::Signal::SIGTERM);
-    if wait_for_exit(pid, GRACE).await {
-        return KillOutcome::TermExited;
-    }
+        // Identity gate (fail-secure): a live PID is not enough — it may be a
+        // recycled PID now owned by an unrelated process. Only signal when the
+        // live process's executable provably matches the recorded one.
+        let live_exe = exe_path_of_pid(pid);
+        if !exe_matches(recorded_exe, live_exe.as_deref()) {
+            return KillOutcome::Unverified(pid);
+        }
 
-    // Re-verify identity before escalating (fail-secure, grace-window race): the
-    // daemon may have exited cleanly during the grace window and the OS may have
-    // recycled its PID for an unrelated process. In that case `wait_for_exit`
-    // returns false (the recycled PID is alive), but escalating to SIGKILL here
-    // would kill an innocent process. Recompute the live exe and refuse to
-    // signal unless it still provably matches the recorded daemon exe.
-    let live_exe = exe_path_of_pid(pid);
-    if !exe_matches(recorded_exe, live_exe.as_deref()) {
-        return KillOutcome::Unverified(pid);
-    }
+        #[cfg(unix)]
+        {
+            // Politely ask it to exit; it may be wedged but still able to handle
+            // the watchdog and release the lock.
+            let _ = signal(pid, nix::sys::signal::Signal::SIGTERM);
+            if wait_for_exit(pid, GRACE).await {
+                return KillOutcome::TermExited;
+            }
 
-    // Escalate. A truly wedged process (e.g. stuck in uninterruptible IO) may
-    // still survive this, but SIGKILL is the strongest tool we have and frees
-    // the lock the moment the kernel reaps the process.
-    #[cfg(unix)]
-    let _ = signal(pid, nix::sys::signal::Signal::SIGKILL);
-    if wait_for_exit(pid, GRACE).await {
-        KillOutcome::KilledExited
-    } else {
-        KillOutcome::StillAlive
+            // Re-verify identity before escalating (fail-secure, grace-window PID
+            // reuse guard).
+            let live_exe = exe_path_of_pid(pid);
+            if !exe_matches(recorded_exe, live_exe.as_deref()) {
+                return KillOutcome::Unverified(pid);
+            }
+
+            let _ = signal(pid, nix::sys::signal::Signal::SIGKILL);
+            return if wait_for_exit(pid, GRACE).await {
+                KillOutcome::KilledExited
+            } else {
+                KillOutcome::StillAlive
+            };
+        }
+
+        #[cfg(not(unix))]
+        {
+            KillOutcome::StillAlive
+        }
     }
 }
 

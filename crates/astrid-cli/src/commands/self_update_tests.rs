@@ -26,6 +26,14 @@ fn platform_target_selects_linux_libc_at_compile_time_boundary() {
         platform_target_for("macos", "aarch64", "").unwrap(),
         "aarch64-apple-darwin"
     );
+    assert_eq!(
+        platform_target_for("windows", "x86_64", "msvc").unwrap(),
+        "x86_64-pc-windows-msvc"
+    );
+    assert_eq!(
+        platform_target_for("windows", "aarch64", "msvc").unwrap(),
+        "aarch64-pc-windows-msvc"
+    );
     for unsupported in ["", "uclibc", "newlib"] {
         assert!(
             platform_target_for("linux", "x86_64", unsupported)
@@ -394,27 +402,29 @@ fn backup_and_swap_replaces_and_keeps_backup() {
     let extract = dir.path().join("new");
     std::fs::create_dir_all(&install).unwrap();
     std::fs::create_dir_all(&extract).unwrap();
+    let cli = MANAGED_BINARIES[0];
+    let daemon = MANAGED_BINARIES[1];
 
-    std::fs::write(install.join("astrid"), b"OLD").unwrap();
-    std::fs::write(install.join("astrid-daemon"), b"OLD-D").unwrap();
-    std::fs::write(extract.join("astrid"), b"NEW").unwrap();
-    std::fs::write(extract.join("astrid-daemon"), b"NEW-D").unwrap();
+    std::fs::write(install.join(cli), b"OLD").unwrap();
+    std::fs::write(install.join(daemon), b"OLD-D").unwrap();
+    std::fs::write(extract.join(cli), b"NEW").unwrap();
+    std::fs::write(extract.join(daemon), b"NEW-D").unwrap();
 
     backup_and_swap(&install, &extract, MANAGED_BINARIES).unwrap();
 
-    assert_eq!(std::fs::read(install.join("astrid")).unwrap(), b"NEW");
-    assert_eq!(
-        std::fs::read(install.join("astrid-daemon")).unwrap(),
-        b"NEW-D"
-    );
+    assert_eq!(std::fs::read(install.join(cli)).unwrap(), b"NEW");
+    assert_eq!(std::fs::read(install.join(daemon)).unwrap(), b"NEW-D");
     // Previous binaries preserved for manual rollback.
-    assert_eq!(std::fs::read(install.join("astrid.bak")).unwrap(), b"OLD");
     assert_eq!(
-        std::fs::read(install.join("astrid-daemon.bak")).unwrap(),
+        std::fs::read(install.join(format!("{cli}.bak"))).unwrap(),
+        b"OLD"
+    );
+    assert_eq!(
+        std::fs::read(install.join(format!("{daemon}.bak"))).unwrap(),
         b"OLD-D"
     );
     // No staging temps left behind.
-    assert!(!install.join(".astrid.new").exists());
+    assert!(!install.join(format!(".{cli}.new")).exists());
 }
 
 #[test]
@@ -424,21 +434,20 @@ fn backup_and_swap_bails_when_archive_missing_a_binary() {
     let extract = dir.path().join("new");
     std::fs::create_dir_all(&install).unwrap();
     std::fs::create_dir_all(&extract).unwrap();
+    let cli = MANAGED_BINARIES[0];
+    let daemon = MANAGED_BINARIES[1];
 
-    std::fs::write(install.join("astrid"), b"OLD").unwrap();
-    std::fs::write(install.join("astrid-daemon"), b"OLD-D").unwrap();
-    // Archive only ships `astrid`; `astrid-daemon` is absent.
-    std::fs::write(extract.join("astrid"), b"NEW").unwrap();
+    std::fs::write(install.join(cli), b"OLD").unwrap();
+    std::fs::write(install.join(daemon), b"OLD-D").unwrap();
+    // Archive only ships the CLI; the daemon is absent.
+    std::fs::write(extract.join(cli), b"NEW").unwrap();
 
     assert!(backup_and_swap(&install, &extract, MANAGED_BINARIES).is_err());
 
     // The completeness check runs before anything is touched: live binaries
     // are unchanged and no backups or staging temps were created.
-    assert_eq!(std::fs::read(install.join("astrid")).unwrap(), b"OLD");
-    assert_eq!(
-        std::fs::read(install.join("astrid-daemon")).unwrap(),
-        b"OLD-D"
-    );
-    assert!(!install.join("astrid.bak").exists());
-    assert!(!install.join(".astrid.new").exists());
+    assert_eq!(std::fs::read(install.join(cli)).unwrap(), b"OLD");
+    assert_eq!(std::fs::read(install.join(daemon)).unwrap(), b"OLD-D");
+    assert!(!install.join(format!("{cli}.bak")).exists());
+    assert!(!install.join(format!(".{cli}.new")).exists());
 }
