@@ -1,0 +1,8 @@
+**
+!container/
+!container/amd64/
+!container/amd64/entrypoint.sh
+!dist/
+!dist/oci-amd64/
+!dist/oci-amd64/astrid-release.tar.gz
+!dist/oci-amd64/release-receipt.json
