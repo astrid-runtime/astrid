@@ -7,7 +7,7 @@ use astrid_core::PrincipalId;
 use dashmap::DashMap;
 use uuid::Uuid;
 
-use crate::engine::wasm::PrincipalMount;
+use crate::engine::wasm::host_state::PrincipalMount;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct WorkspaceAttachmentRef {
