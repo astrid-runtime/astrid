@@ -338,7 +338,11 @@ mod windows {
     impl TestUser {
         fn create() -> Self {
             let name = format!("AstridP{:08x}", std::process::id());
-            let password = format!("Aa9!{name}x");
+            // Keep the generated password within the legacy `net user`
+            // non-interactive limit. Longer passwords prompt for confirmation
+            // on some native runners and make the harness hang or fail.
+            let password = format!("Aa9!{:08x}", std::process::id());
+            assert!(password.len() <= 14);
 
             let absent = Command::new("net")
                 .args(["user", &name])
