@@ -452,8 +452,12 @@ pub(super) fn flush_guarded_file(
     boundary_contract: BoundaryContract,
 ) -> io::Result<()> {
     let name = guarded_child_name(guard, path)?;
+    // Keep normal share modes here. The retained handle binds the flush and
+    // both ACL checks to the exact object; denying write/delete sharing can
+    // make a newly published journal unopenable while a Windows filesystem
+    // filter still holds a compatible handle.
     let handle =
-        open_guarded_child_locked(guard, name, GENERIC_WRITE | READ_CONTROL).map_err(|error| {
+        open_guarded_child(guard, name, GENERIC_WRITE | READ_CONTROL).map_err(|error| {
             with_context(
                 error,
                 format!(
