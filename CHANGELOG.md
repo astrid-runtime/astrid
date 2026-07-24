@@ -20,6 +20,18 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   cancellable busy-instance retries support probe-then-connect and concurrent
   clients. Native x86_64 and ARM64 Windows jobs exercise binding, concurrent
   instances, shutdown, and reconnect behavior. Closes #1349.
+- **The native process host has a deterministic Windows backend.** Capsule
+  arguments cross the OS boundary as distinct `CreateProcessW` arguments
+  without an implicit command shell; executable resolution, case-insensitive
+  environment handling, working directories, stdin/stdout/stderr, exit status,
+  cancellation, and descendant cleanup are pinned by native x86_64 and ARM64
+  tests. Each child tree is owned by a kill-on-close Windows Job Object, so
+  cancellation and root-first exit cannot strand descendants or chase a reused
+  PID. Explicit sandbox policy `off` permits trusted native execution while
+  `required` fails closed before exec; unsupported signals and untrusted native
+  MCP starts produce signed denial records. Host-local bind support follows the
+  local-transport backend from #1349 rather than adding a process-host-specific
+  transport. Closes #1351.
 - **Linux amd64 now has a distro-neutral OCI build target.** The image packages
   exact immutable GitHub release bytes only after their tagged release-workflow
   signatures and manifest digests verify, runs the persistent daemon as a

@@ -1,0 +1,114 @@
+name: Windows process host
+
+on:
+  push:
+    branches: [main, stream-*]
+    paths:
+      - 'crates/astrid-audit/**'
+      - 'crates/astrid-capsule/**'
+      - 'crates/astrid-core/**'
+      - 'crates/astrid-kernel/**'
+      - 'crates/astrid-mcp/**'
+      - 'crates/astrid-workspace/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/windows-process-host.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/astrid-audit/**'
+      - 'crates/astrid-capsule/**'
+      - 'crates/astrid-core/**'
+      - 'crates/astrid-kernel/**'
+      - 'crates/astrid-mcp/**'
+      - 'crates/astrid-workspace/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/windows-process-host.yml'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  native:
+    name: Native ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: windows-2025
+            host: x86_64-pc-windows-msvc
+          - arch: aarch64
+            runner: windows-11-arm
+            host: aarch64-pc-windows-msvc
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: '1.95.0'
+          components: clippy
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          key: windows-process-${{ matrix.host }}
+          cache-on-failure: true
+
+      - name: Assert native architecture
+        shell: pwsh
+        env:
+          EXPECTED_HOST: ${{ matrix.host }}
+        run: |
+          $actual = (rustc -vV | Select-String '^host: ').Line.Substring(6)
+          if ($actual -ne $env:EXPECTED_HOST) {
+            throw "Expected native Rust host $env:EXPECTED_HOST, got $actual"
+          }
+
+      - name: Check process-host crates
+        run: >-
+          cargo check --locked
+          -p astrid-audit
+          -p astrid-capsule
+          -p astrid-core
+          -p astrid-kernel
+          -p astrid-mcp
+          -p astrid-workspace
+
+      - name: Clippy process-host crates
+        run: >-
+          cargo clippy --locked
+          -p astrid-audit
+          -p astrid-capsule
+          -p astrid-core
+          -p astrid-kernel
+          -p astrid-mcp
+          -p astrid-workspace
+          --all-targets
+          --all-features
+          --
+          -D warnings
+
+      - name: Test Windows process behavior
+        run: cargo test --locked -p astrid-capsule windows_ -- --nocapture
+
+      - name: Test Windows sandbox policy
+        run: cargo test --locked -p astrid-workspace windows_ -- --nocapture
+
+      - name: Test native MCP denial audit
+        run: cargo test --locked -p astrid-mcp windows_ -- --nocapture

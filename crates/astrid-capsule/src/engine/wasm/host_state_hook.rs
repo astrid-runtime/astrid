@@ -65,6 +65,7 @@ impl HostState {
             workspace_root,
             // Hooks run a transient one-shot on a plain HostVfs with no CoW.
             spawn_mask_paths: Vec::new(),
+            process_sandbox_policy: None,
             vfs,
             vfs_root_handle,
             // Hooks intentionally do not support home:// or /tmp access — they run

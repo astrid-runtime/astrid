@@ -297,6 +297,14 @@ pub enum AuditAction {
         command: String,
     },
 
+    /// Signal requested for an existing child-process tree.
+    ProcessSignal {
+        /// Command or non-reversible process descriptor.
+        process: String,
+        /// Stable signal name.
+        signal: String,
+    },
+
     /// Capability token was created.
     CapabilityCreated {
         /// Token ID.
@@ -542,6 +550,9 @@ impl AuditAction {
             },
             Self::ProcessSpawn { command } => {
                 format!("Spawned process {command}")
+            },
+            Self::ProcessSignal { process, signal } => {
+                format!("Signalled process {process} with {signal}")
             },
             Self::CapabilityCreated { resource, .. } => {
                 format!("Created capability for {resource}")

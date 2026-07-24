@@ -85,6 +85,7 @@ fn validate_sandbox_path_rejects_null_byte() {
 
 // --- SandboxCommand::wrap() tests ---
 
+#[cfg(unix)]
 #[test]
 fn test_wrap_rejects_non_utf8_path() {
     use std::ffi::OsStr;
@@ -99,6 +100,79 @@ fn test_wrap_rejects_non_utf8_path() {
     assert!(
         err_msg.contains("not valid UTF-8"),
         "error should mention UTF-8: {err_msg}"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_off_accepts_native_paths_without_sbpl_validation() {
+    let mut command = Command::new(r"C:\Program Files\Astrid\aos.exe");
+    command
+        .arg("capsule")
+        .arg("list")
+        .current_dir(r"C:\Users\Astrid Agent\workspace")
+        .env("ASTRID_TEST_VALUE", "unicode-\u{2603}");
+
+    let direct = SandboxCommand::wrap_with_process_paths_and_policy(
+        &command,
+        Path::new(r"C:\Users\Astrid Agent\workspace"),
+        &[],
+        &[],
+        &[],
+        &[],
+        true,
+        SandboxPolicy::Off,
+    )
+    .expect("explicit off policy should preserve a native Windows command");
+
+    assert_eq!(direct.get_program(), command.get_program());
+    assert_eq!(
+        direct.get_args().collect::<Vec<_>>(),
+        command.get_args().collect::<Vec<_>>()
+    );
+    assert_eq!(direct.get_current_dir(), command.get_current_dir());
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_required_refuses_before_exec() {
+    let command = Command::new(r"C:\Program Files\Astrid\aos.exe");
+    let error = SandboxCommand::wrap_with_process_paths_and_policy(
+        &command,
+        Path::new(r"C:\Users\Astrid Agent\workspace"),
+        &[],
+        &[],
+        &[],
+        &[],
+        true,
+        SandboxPolicy::Required,
+    )
+    .expect_err("required policy must fail closed without a Windows sandbox backend");
+
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_process_config_off_accepts_native_paths() {
+    let prefix = ProcessSandboxConfig::new(r"C:\Users\Astrid Agent\workspace")
+        .with_policy(SandboxPolicy::Off)
+        .sandbox_prefix()
+        .expect("off policy should not apply SBPL validation to Windows paths");
+    assert!(prefix.is_none());
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_process_config_required_reports_unavailable_not_invalid_path() {
+    let error = ProcessSandboxConfig::new(r"C:\Users\Astrid Agent\workspace")
+        .with_policy(SandboxPolicy::Required)
+        .sandbox_prefix()
+        .expect_err("required policy must fail closed");
+    assert_eq!(error.kind(), io::ErrorKind::Other);
+    assert!(
+        error.to_string().contains("OS-level sandbox unavailable"),
+        "ordinary Windows path was misclassified: {error}"
     );
 }
 
@@ -529,6 +603,7 @@ fn test_sandbox_prefix_rejects_relative_writable_root() {
     assert!(config.sandbox_prefix().is_err());
 }
 
+#[cfg(unix)]
 #[test]
 fn test_sandbox_prefix_rejects_non_utf8_writable_root() {
     use std::ffi::OsStr;
@@ -542,6 +617,7 @@ fn test_sandbox_prefix_rejects_non_utf8_writable_root() {
     assert!(result.unwrap_err().to_string().contains("not valid UTF-8"));
 }
 
+#[cfg(unix)]
 #[test]
 fn test_sandbox_prefix_rejects_non_utf8_extra_paths() {
     use std::ffi::OsStr;

@@ -12,6 +12,7 @@ mod seatbelt;
 ///
 /// Rejects relative paths, non-UTF-8, double-quote, backslash, and null byte -
 /// all of which can break or bypass sandbox profile syntax.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn validate_sandbox_str<'a>(path: &'a Path, label: &str) -> io::Result<&'a str> {
     if !path.is_absolute() {
         return Err(io::Error::new(
@@ -251,261 +252,326 @@ impl SandboxCommand {
         extra_write_paths: &[PathBuf],
         clear_env: bool,
     ) -> io::Result<Command> {
-        // Validate on all platforms for defense in depth and API consistency.
-        // On macOS the validated string is needed for SBPL interpolation.
-        // On Linux bwrap passes paths as argv entries (no injection risk),
-        // but we still reject unsafe paths at the API boundary.
-        let _ = validate_sandbox_str(worktree_path, "worktree path")?;
-        for inj in injections {
-            let _ = validate_sandbox_str(&inj.source, "injection source")?;
-            let _ = validate_sandbox_str(&inj.target, "injection target")?;
-        }
-        for path in extra_read_paths {
-            let _ = validate_sandbox_str(path, "process read path")?;
-            if !path.exists() {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("process read path does not exist: {}", path.display()),
-                ));
-            }
-        }
-        for path in extra_write_paths {
-            let _ = validate_sandbox_str(path, "process write path")?;
-            if !path.exists() {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("process write path does not exist: {}", path.display()),
-                ));
-            }
-        }
+        Self::wrap_with_process_paths_and_policy(
+            inner_cmd,
+            worktree_path,
+            injections,
+            extra_masks,
+            extra_read_paths,
+            extra_write_paths,
+            clear_env,
+            SandboxPolicy::Required,
+        )
+    }
 
-        // Every caller-supplied mask names copy-on-write bookkeeping the child
-        // must not reach (the overlayfs upper/work, or the APFS pristine). Each is
-        // validated exactly like the worktree and injection paths — absolute,
-        // UTF-8, SBPL-safe — because on macOS it is interpolated into the Seatbelt
-        // profile; then it must EXIST, since a path that does not exist is a wiring
-        // bug, not a no-op (silently skipping it leaves the child un-denied). The
-        // deny is security-critical, so either failure fails the spawn closed.
-        for masked in extra_masks {
-            let _ = validate_sandbox_str(masked, "workspace CoW mask")?;
-            if !masked.exists() {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!(
-                        "workspace CoW mask path does not exist: {} — refusing to spawn \
-                         a child without the intended copy-on-write deny",
-                        masked.display()
-                    ),
-                ));
-            }
-        }
-        for granted in extra_read_paths.iter().chain(extra_write_paths) {
-            if extra_masks
-                .iter()
-                .any(|masked| paths_overlap(granted, masked))
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!(
-                        "process path {} overlaps a copy-on-write mask",
-                        granted.display()
-                    ),
-                ));
-            }
-        }
-
-        #[cfg(target_os = "linux")]
+    /// Like [`wrap_with_process_paths`](Self::wrap_with_process_paths), with
+    /// an explicit unavailable-sandbox policy.
+    ///
+    /// On platforms without a native sandbox backend, [`SandboxPolicy::Off`]
+    /// returns the original program/arguments/environment as a direct command.
+    /// [`SandboxPolicy::Required`] remains fail-closed. The unsupported-platform
+    /// branch runs before SBPL-specific path validation so ordinary Windows
+    /// paths are not rejected for containing backslashes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error under the same conditions as
+    /// [`wrap_with_process_paths`](Self::wrap_with_process_paths), or when the
+    /// sandbox is unavailable and policy is [`SandboxPolicy::Required`].
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_lines)]
+    pub fn wrap_with_process_paths_and_policy(
+        inner_cmd: &Command,
+        worktree_path: &Path,
+        injections: &[RoInjection],
+        extra_masks: &[PathBuf],
+        extra_read_paths: &[PathBuf],
+        extra_write_paths: &[PathBuf],
+        clear_env: bool,
+        policy: SandboxPolicy,
+    ) -> io::Result<Command> {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
-            // Bubblewrap implementation - paths are passed as separate argv entries (no injection).
-            // The process can only read the root OS, but can only write to the worktree and /tmp.
-            let mut bwrap = Command::new("bwrap");
-            if clear_env {
-                bwrap.env_clear();
+            let _ = (worktree_path, extra_read_paths, extra_write_paths);
+            if policy == SandboxPolicy::Off {
+                if !injections.is_empty() || !extra_masks.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "sandbox policy off cannot enforce injections or copy-on-write masks",
+                    ));
+                }
+                Ok(copy_direct_command(inner_cmd, clear_env))
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    unsupported_os_hint(),
+                ))
             }
-            bwrap
+        }
+
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let _ = policy;
+
+            // Validate on all platforms for defense in depth and API consistency.
+            // On macOS the validated string is needed for SBPL interpolation.
+            // On Linux bwrap passes paths as argv entries (no injection risk),
+            // but we still reject unsafe paths at the API boundary.
+            let _ = validate_sandbox_str(worktree_path, "worktree path")?;
+            for inj in injections {
+                let _ = validate_sandbox_str(&inj.source, "injection source")?;
+                let _ = validate_sandbox_str(&inj.target, "injection target")?;
+            }
+            for path in extra_read_paths {
+                let _ = validate_sandbox_str(path, "process read path")?;
+                if !path.exists() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("process read path does not exist: {}", path.display()),
+                    ));
+                }
+            }
+            for path in extra_write_paths {
+                let _ = validate_sandbox_str(path, "process write path")?;
+                if !path.exists() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("process write path does not exist: {}", path.display()),
+                    ));
+                }
+            }
+
+            // Every caller-supplied mask names copy-on-write bookkeeping the child
+            // must not reach (the overlayfs upper/work, or the APFS pristine). Each is
+            // validated exactly like the worktree and injection paths — absolute,
+            // UTF-8, SBPL-safe — because on macOS it is interpolated into the Seatbelt
+            // profile; then it must EXIST, since a path that does not exist is a wiring
+            // bug, not a no-op (silently skipping it leaves the child un-denied). The
+            // deny is security-critical, so either failure fails the spawn closed.
+            for masked in extra_masks {
+                let _ = validate_sandbox_str(masked, "workspace CoW mask")?;
+                if !masked.exists() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!(
+                            "workspace CoW mask path does not exist: {} — refusing to spawn \
+                         a child without the intended copy-on-write deny",
+                            masked.display()
+                        ),
+                    ));
+                }
+            }
+            for granted in extra_read_paths.iter().chain(extra_write_paths) {
+                if extra_masks
+                    .iter()
+                    .any(|masked| paths_overlap(granted, masked))
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "process path {} overlaps a copy-on-write mask",
+                            granted.display()
+                        ),
+                    ));
+                }
+            }
+
+            #[cfg(target_os = "linux")]
+            {
+                // Bubblewrap implementation - paths are passed as separate argv entries (no injection).
+                // The process can only read the root OS, but can only write to the worktree and /tmp.
+                let mut bwrap = Command::new("bwrap");
+                if clear_env {
+                    bwrap.env_clear();
+                }
+                bwrap
                 .arg("--ro-bind").arg("/").arg("/") // Read-only access to host OS (for binaries like /usr/bin/node)
                 .arg("--dev").arg("/dev")           // Standard dev mounts
                 .arg("--proc").arg("/proc")         // Standard proc mounts
                 .arg("--bind").arg(worktree_path).arg(worktree_path) // Write access to the worktree
                 .arg("--tmpfs").arg("/tmp"); // Disposable tmpfs
 
-            // Read-only file injections: bind each host-owned verified snapshot
-            // at its in-sandbox target. Placed AFTER the writable worktree
-            // --bind so a later bind can't shadow it, and BEFORE --unshare-all
-            // so the ro-bind sits within the namespace setup. The namespace
-            // creates the mount point, so `target` need not exist on the host.
-            for inj in injections {
-                bwrap.arg("--ro-bind").arg(&inj.source).arg(&inj.target);
-            }
-
-            // #856 read-hole fix: the `--ro-bind / /` above mounts the entire
-            // host filesystem read-only, which exposed Astrid's secret/key/state
-            // dirs and the operator's home credential stores to the spawned
-            // process. Shadow each masked path so the agent reads nothing (see
-            // `push_mask_arg`). Placed AFTER the root ro-bind (so it overlays)
-            // and the worktree/injection binds; `run/` (socket+token) and `etc/`
-            // stay reachable for daemon access. Fail-secure: refuse the spawn if
-            // the home is unresolvable.
-            let built_in_masks = Self::masked_paths()?;
-            let home_root = astrid_core::dirs::AstridHome::resolve()?.home_dir();
-            for granted in extra_read_paths.iter().chain(extra_write_paths) {
-                if built_in_masks.iter().any(|masked| {
-                    paths_overlap(granted, masked)
-                        && !(masked == &home_root && granted.starts_with(masked))
-                }) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        format!(
-                            "process path {} overlaps a sensitive runtime path",
-                            granted.display()
-                        ),
-                    ));
+                // Read-only file injections: bind each host-owned verified snapshot
+                // at its in-sandbox target. Placed AFTER the writable worktree
+                // --bind so a later bind can't shadow it, and BEFORE --unshare-all
+                // so the ro-bind sits within the namespace setup. The namespace
+                // creates the mount point, so `target` need not exist on the host.
+                for inj in injections {
+                    bwrap.arg("--ro-bind").arg(&inj.source).arg(&inj.target);
                 }
-            }
-            for masked in &built_in_masks {
-                Self::push_mask_arg(&mut bwrap, masked);
-            }
 
-            // Caller-supplied masks (the CoW upper/work dirs). Same mechanism,
-            // placed after the worktree/injection binds so they overlay; the
-            // CoW dirs live OUTSIDE the worktree, so no writable bind needs to
-            // punch back through. Existence is validated up front (a missing mask
-            // already failed the spawn), so every entry is masked unconditionally.
-            for masked in extra_masks {
-                Self::push_mask_arg(&mut bwrap, masked);
-            }
+                // #856 read-hole fix: the `--ro-bind / /` above mounts the entire
+                // host filesystem read-only, which exposed Astrid's secret/key/state
+                // dirs and the operator's home credential stores to the spawned
+                // process. Shadow each masked path so the agent reads nothing (see
+                // `push_mask_arg`). Placed AFTER the root ro-bind (so it overlays)
+                // and the worktree/injection binds; `run/` (socket+token) and `etc/`
+                // stay reachable for daemon access. Fail-secure: refuse the spawn if
+                // the home is unresolvable.
+                let built_in_masks = Self::masked_paths()?;
+                let home_root = astrid_core::dirs::AstridHome::resolve()?.home_dir();
+                for granted in extra_read_paths.iter().chain(extra_write_paths) {
+                    if built_in_masks.iter().any(|masked| {
+                        paths_overlap(granted, masked)
+                            && !(masked == &home_root && granted.starts_with(masked))
+                    }) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            format!(
+                                "process path {} overlaps a sensitive runtime path",
+                                granted.display()
+                            ),
+                        ));
+                    }
+                }
+                for masked in &built_in_masks {
+                    Self::push_mask_arg(&mut bwrap, masked);
+                }
 
-            // The root filesystem is already read-only, but the entire
-            // cross-principal home container is masked above. Re-bind only the
-            // authorized principal path, then punch through its explicitly
-            // declared writable subpaths.
-            for path in extra_read_paths {
-                bwrap.arg("--ro-bind").arg(path).arg(path);
-            }
-            for path in extra_write_paths {
-                bwrap.arg("--bind").arg(path).arg(path);
-            }
+                // Caller-supplied masks (the CoW upper/work dirs). Same mechanism,
+                // placed after the worktree/injection binds so they overlay; the
+                // CoW dirs live OUTSIDE the worktree, so no writable bind needs to
+                // punch back through. Existence is validated up front (a missing mask
+                // already failed the spawn), so every entry is masked unconditionally.
+                for masked in extra_masks {
+                    Self::push_mask_arg(&mut bwrap, masked);
+                }
 
-            bwrap
+                // The root filesystem is already read-only, but the entire
+                // cross-principal home container is masked above. Re-bind only the
+                // authorized principal path, then punch through its explicitly
+                // declared writable subpaths.
+                for path in extra_read_paths {
+                    bwrap.arg("--ro-bind").arg(path).arg(path);
+                }
+                for path in extra_write_paths {
+                    bwrap.arg("--bind").arg(path).arg(path);
+                }
+
+                bwrap
                 .arg("--unshare-all")               // Drop namespaces (network, pid, etc.)
                 .arg("--share-net")                 // Re-enable network so npm/cargo can fetch
                 .arg("--die-with-parent"); // Prevent orphan processes
 
-            // Extract the original command and args, and append them to bwrap
-            bwrap.arg(inner_cmd.get_program());
-            for arg in inner_cmd.get_args() {
-                bwrap.arg(arg);
-            }
-
-            // Inherit the env and current_dir from the original command
-            for (k, v) in inner_cmd.get_envs() {
-                if let Some(v) = v {
-                    bwrap.env(k, v);
-                } else {
-                    bwrap.env_remove(k);
+                // Extract the original command and args, and append them to bwrap
+                bwrap.arg(inner_cmd.get_program());
+                for arg in inner_cmd.get_args() {
+                    bwrap.arg(arg);
                 }
-            }
-            if let Some(dir) = inner_cmd.get_current_dir() {
-                bwrap.current_dir(dir);
-            }
 
-            Ok(bwrap)
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            // Route through the shared Seatbelt profile builder so this path
-            // and the MCP spawn path (`ProcessSandboxConfig::sandbox_prefix`)
-            // generate one identical profile instead of two divergent ones.
-            // `build_seatbelt_prefix` carries the `(allow mach*)` and
-            // `(allow file-read* (literal "/"))` rules a dynamically-linked
-            // binary such as `node` needs to stat the filesystem root at
-            // startup. The inline profile that used to live here omitted the
-            // root-read rule, so Seatbelt correctly aborted such a process
-            // with SIGABRT — a fail-closed signal that was then mistaken for a
-            // macOS-15+ `sandbox-exec` incompatibility and papered over by
-            // disabling the sandbox entirely. `sandbox-exec` is deprecated but
-            // still enforces on current macOS. See #855.
-            //
-            // Seatbelt has no mount namespace, so the caller has already
-            // materialized the verified snapshot AT `target`; the profile
-            // grants read and a trailing deny-write on that literal path.
-            let mut config = ProcessSandboxConfig::new(worktree_path);
-            for path in extra_read_paths {
-                config = config.with_extra_read(path);
-            }
-            for path in extra_write_paths {
-                config = config.with_extra_write(path);
-            }
-            for inj in injections {
-                config = config.with_ro_inject(&inj.source, &inj.target);
-            }
-            // #856: mask the sensitive Astrid subpaths (see the Linux branch).
-            // macOS seatbelt is already `(deny default)` + an allowlist that
-            // excludes ~/.astrid, so these denies are belt-and-suspenders that
-            // still hold if the allowlist ever widens to include the home.
-            for masked in Self::masked_paths()? {
-                config = config.with_hidden(masked);
-            }
-            // Caller-supplied masks (the CoW pristine workspace / upper dirs).
-            // The Seatbelt deny is last-match-wins, so it holds even where the
-            // masked path is under a broadly-writable location (`/var/folders`,
-            // `/private/tmp`). A masked path that is an ANCESTOR of the writable
-            // root is dropped by `build_seatbelt_prefix` (it would deny lstat on
-            // the writable root's own parents) — the CoW backend never masks an
-            // ancestor of `merged` for exactly this reason.
-            for masked in extra_masks {
-                config = config.with_hidden(masked.clone());
-            }
-            let prefix = config.build_seatbelt_prefix()?;
-
-            let mut sb_cmd = Command::new(&prefix.program);
-            if clear_env {
-                sb_cmd.env_clear();
-            }
-            sb_cmd.args(&prefix.args);
-
-            // Append the original program and its arguments.
-            sb_cmd.arg(inner_cmd.get_program());
-            for arg in inner_cmd.get_args() {
-                sb_cmd.arg(arg);
-            }
-
-            // Inherit env and working directory from the original command.
-            for (k, v) in inner_cmd.get_envs() {
-                if let Some(v) = v {
-                    sb_cmd.env(k, v);
-                } else {
-                    sb_cmd.env_remove(k);
+                // Inherit the env and current_dir from the original command
+                for (k, v) in inner_cmd.get_envs() {
+                    if let Some(v) = v {
+                        bwrap.env(k, v);
+                    } else {
+                        bwrap.env_remove(k);
+                    }
                 }
-            }
-            if let Some(dir) = inner_cmd.get_current_dir() {
-                sb_cmd.current_dir(dir);
+                if let Some(dir) = inner_cmd.get_current_dir() {
+                    bwrap.current_dir(dir);
+                }
+
+                Ok(bwrap)
             }
 
-            Ok(sb_cmd)
-        }
+            #[cfg(target_os = "macos")]
+            {
+                // Route through the shared Seatbelt profile builder so this path
+                // and the MCP spawn path (`ProcessSandboxConfig::sandbox_prefix`)
+                // generate one identical profile instead of two divergent ones.
+                // `build_seatbelt_prefix` carries the `(allow mach*)` and
+                // `(allow file-read* (literal "/"))` rules a dynamically-linked
+                // binary such as `node` needs to stat the filesystem root at
+                // startup. The inline profile that used to live here omitted the
+                // root-read rule, so Seatbelt correctly aborted such a process
+                // with SIGABRT — a fail-closed signal that was then mistaken for a
+                // macOS-15+ `sandbox-exec` incompatibility and papered over by
+                // disabling the sandbox entirely. `sandbox-exec` is deprecated but
+                // still enforces on current macOS. See #855.
+                //
+                // Seatbelt has no mount namespace, so the caller has already
+                // materialized the verified snapshot AT `target`; the profile
+                // grants read and a trailing deny-write on that literal path.
+                let mut config = ProcessSandboxConfig::new(worktree_path);
+                for path in extra_read_paths {
+                    config = config.with_extra_read(path);
+                }
+                for path in extra_write_paths {
+                    config = config.with_extra_write(path);
+                }
+                for inj in injections {
+                    config = config.with_ro_inject(&inj.source, &inj.target);
+                }
+                // #856: mask the sensitive Astrid subpaths (see the Linux branch).
+                // macOS seatbelt is already `(deny default)` + an allowlist that
+                // excludes ~/.astrid, so these denies are belt-and-suspenders that
+                // still hold if the allowlist ever widens to include the home.
+                for masked in Self::masked_paths()? {
+                    config = config.with_hidden(masked);
+                }
+                // Caller-supplied masks (the CoW pristine workspace / upper dirs).
+                // The Seatbelt deny is last-match-wins, so it holds even where the
+                // masked path is under a broadly-writable location (`/var/folders`,
+                // `/private/tmp`). A masked path that is an ANCESTOR of the writable
+                // root is dropped by `build_seatbelt_prefix` (it would deny lstat on
+                // the writable root's own parents) — the CoW backend never masks an
+                // ancestor of `merged` for exactly this reason.
+                for masked in extra_masks {
+                    config = config.with_hidden(masked.clone());
+                }
+                let prefix = config.build_seatbelt_prefix()?;
 
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        {
-            // Without an OS-level sandbox neither the read-only injection
-            // guarantee nor a copy-on-write mask can be enforced; refuse rather
-            // than run a child without the intended deny (fail-secure).
-            let _ = (
-                inner_cmd,
-                injections,
-                extra_masks,
-                extra_read_paths,
-                extra_write_paths,
-            );
-            Err(io::Error::other(
-                "native process execution requires an OS sandbox (bwrap/Seatbelt); \
-                 unavailable on this platform",
-            ))
+                let mut sb_cmd = Command::new(&prefix.program);
+                if clear_env {
+                    sb_cmd.env_clear();
+                }
+                sb_cmd.args(&prefix.args);
+
+                // Append the original program and its arguments.
+                sb_cmd.arg(inner_cmd.get_program());
+                for arg in inner_cmd.get_args() {
+                    sb_cmd.arg(arg);
+                }
+
+                // Inherit env and working directory from the original command.
+                for (k, v) in inner_cmd.get_envs() {
+                    if let Some(v) = v {
+                        sb_cmd.env(k, v);
+                    } else {
+                        sb_cmd.env_remove(k);
+                    }
+                }
+                if let Some(dir) = inner_cmd.get_current_dir() {
+                    sb_cmd.current_dir(dir);
+                }
+
+                Ok(sb_cmd)
+            }
         }
     }
 }
 
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn copy_direct_command(inner: &Command, clear_env: bool) -> Command {
+    let mut direct = Command::new(inner.get_program());
+    direct.args(inner.get_args());
+    if clear_env {
+        direct.env_clear();
+    }
+    for (key, value) in inner.get_envs() {
+        if let Some(value) = value {
+            direct.env(key, value);
+        } else {
+            direct.env_remove(key);
+        }
+    }
+    if let Some(cwd) = inner.get_current_dir() {
+        direct.current_dir(cwd);
+    }
+    direct
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn paths_overlap(left: &Path, right: &Path) -> bool {
     left.starts_with(right) || right.starts_with(left)
 }
@@ -763,43 +829,43 @@ impl ProcessSandboxConfig {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - Any configured path is not valid UTF-8, not absolute, or
-    ///   contains characters that would break sandbox profile syntax
-    ///   (double-quote, backslash, or null byte).
+    /// - On a sandbox-backed platform under [`SandboxPolicy::Required`], any
+    ///   configured path is not valid UTF-8, not absolute, or contains
+    ///   characters that would break sandbox profile syntax.
     /// - The active policy is [`SandboxPolicy::Required`] and the
     ///   OS-level sandbox is unavailable. The error message names the
     ///   most likely cause (`kernel.apparmor_restrict_unprivileged_userns=1`
     ///   on Ubuntu 24.04+) and the remediation (`sysctl` command or
     ///   explicit policy override).
     pub fn sandbox_prefix(&self) -> io::Result<Option<SandboxPrefix>> {
-        // Validate all configured paths up front, regardless of platform.
-        // This ensures the doc contract ("returns Err for non-UTF-8 or
-        // forbidden chars") holds on every OS, not just macOS where SBPL
-        // interpolation makes it exploitable.
-        self.validate_all_paths()?;
-
         // `Off` short-circuits before any probe so the no-warn contract
-        // is honoured: the operator has explicitly opted out of
-        // subprocess containment and shouldn't see diagnostic noise.
+        // is honoured. It also runs before SBPL-specific validation: paths
+        // such as `C:\workspace` are ordinary on Windows and are never
+        // interpolated into a profile when containment is explicitly off.
         if self.policy == SandboxPolicy::Off {
             return Ok(None);
         }
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            if bwrap::bwrap_available() {
-                return Ok(Some(self.build_bwrap_prefix()));
-            }
-            self.handle_unavailable_sandbox(linux_unavailable_hint())
-        }
+            self.validate_all_paths()?;
 
-        #[cfg(target_os = "macos")]
-        {
-            // Seatbelt is shipped with macOS and effectively always
-            // available; a failure here is genuinely exceptional (e.g.
-            // path validation tripping a sub-builder), so it surfaces
-            // through `build_seatbelt_prefix` regardless of policy.
-            self.build_seatbelt_prefix().map(Some)
+            #[cfg(target_os = "linux")]
+            {
+                if bwrap::bwrap_available() {
+                    return Ok(Some(self.build_bwrap_prefix()));
+                }
+                self.handle_unavailable_sandbox(linux_unavailable_hint())
+            }
+
+            #[cfg(target_os = "macos")]
+            {
+                // Seatbelt is shipped with macOS and effectively always
+                // available; a failure here is genuinely exceptional (e.g.
+                // path validation tripping a sub-builder), so it surfaces
+                // through `build_seatbelt_prefix` regardless of policy.
+                self.build_seatbelt_prefix().map(Some)
+            }
         }
 
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -832,6 +898,7 @@ impl ProcessSandboxConfig {
     }
 
     /// Validate all configured paths for safe use in sandbox profiles.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn validate_all_paths(&self) -> io::Result<()> {
         validate_sandbox_str(&self.writable_root, "writable root")?;
         for p in &self.extra_read_paths {

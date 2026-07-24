@@ -88,6 +88,16 @@ pub enum ConnectOutcome {
     Stale,
 }
 
+/// Whether this build has a concrete host-local transport backend.
+///
+/// Callers use this semantic capability check instead of inferring support
+/// from the OS family. A Windows named-pipe backend can switch this alongside
+/// its implementation without changing capsule-host policy code.
+#[must_use]
+pub const fn backend_available() -> bool {
+    cfg!(unix)
+}
+
 /// Connect to a host-local endpoint.
 ///
 /// # Errors

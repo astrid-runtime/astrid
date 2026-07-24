@@ -26,6 +26,31 @@ use tokio::sync::mpsc;
 /// Type alias for a running MCP client service.
 type McpService = RunningService<RoleClient, AstridClientHandler>;
 
+/// Internal connection failure classification.
+///
+/// The public MCP API continues to expose [`McpError`]. Secure callers use
+/// this crate-private wrapper so a fail-closed sandbox-policy rejection can
+/// be distinguished from an ordinary process or protocol failure for audit
+/// authorization semantics.
+pub(crate) enum ServerConnectionError {
+    SandboxPolicyDenied { reason: String, error: McpError },
+    Other(McpError),
+}
+
+impl ServerConnectionError {
+    pub(crate) fn into_mcp_error(self) -> McpError {
+        match self {
+            Self::SandboxPolicyDenied { error, .. } | Self::Other(error) => error,
+        }
+    }
+}
+
+impl From<McpError> for ServerConnectionError {
+    fn from(error: McpError) -> Self {
+        Self::Other(error)
+    }
+}
+
 /// A running MCP server instance.
 pub(crate) struct RunningServer {
     /// Server configuration.
@@ -335,6 +360,17 @@ impl ServerManager {
         handler: Arc<CapabilitiesHandler>,
         notice_tx: Option<mpsc::UnboundedSender<ServerNotice>>,
     ) -> McpResult<()> {
+        self.connect_server_classified(name, handler, notice_tx)
+            .await
+            .map_err(ServerConnectionError::into_mcp_error)
+    }
+
+    pub(crate) async fn connect_server_classified(
+        &self,
+        name: &str,
+        handler: Arc<CapabilitiesHandler>,
+        notice_tx: Option<mpsc::UnboundedSender<ServerNotice>>,
+    ) -> Result<(), ServerConnectionError> {
         let config = {
             let running = self.running.read().await;
             let server = running
@@ -355,7 +391,8 @@ impl ServerManager {
                     "SSE transport not yet supported; enable `transport-streamable-http-client` \
                      feature in rmcp"
                         .to_string(),
-                ));
+                )
+                .into());
             },
         }
 
@@ -369,7 +406,7 @@ impl ServerManager {
         config: &ServerConfig,
         handler: Arc<CapabilitiesHandler>,
         notice_tx: Option<mpsc::UnboundedSender<ServerNotice>>,
-    ) -> McpResult<()> {
+    ) -> Result<(), ServerConnectionError> {
         let command = config.command.as_ref().ok_or_else(|| {
             McpError::ConfigError(format!("No command specified for stdio server {name}"))
         })?;
@@ -377,7 +414,7 @@ impl ServerManager {
         let mut cmd = if config.trusted {
             build_unsandboxed_command(name, command, config)
         } else {
-            self.build_sandboxed_command(name, command, config)?
+            self.build_sandboxed_command_classified(name, command, config)?
         };
 
         // Redirect capsule stderr to a per-capsule daily log file if configured.
@@ -452,14 +489,25 @@ impl ServerManager {
     ///
     /// Applies OS-level sandboxing (bwrap on Linux, sandbox-exec on macOS),
     /// scrubs inherited environment variables, and hides `~/.astrid/`.
-    #[allow(clippy::too_many_lines)]
+    #[cfg(test)]
     fn build_sandboxed_command(
         &self,
         name: &str,
         command: &str,
         config: &ServerConfig,
     ) -> McpResult<tokio::process::Command> {
-        use astrid_workspace::ProcessSandboxConfig;
+        self.build_sandboxed_command_classified(name, command, config)
+            .map_err(ServerConnectionError::into_mcp_error)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn build_sandboxed_command_classified(
+        &self,
+        name: &str,
+        command: &str,
+        config: &ServerConfig,
+    ) -> Result<tokio::process::Command, ServerConnectionError> {
+        use astrid_workspace::{ProcessSandboxConfig, SandboxPolicy};
 
         // config.cwd doubles as both the sandbox writable root and the process CWD.
         // When set, the sandboxed process can write to its own working directory.
@@ -489,12 +537,13 @@ impl ServerManager {
         Self::validate_sandbox_path(&astrid_home, "astrid_home")?;
 
         // Build sandbox config
+        let sandbox_policy = self
+            .sandbox_policy_override
+            .unwrap_or_else(SandboxPolicy::from_env);
         let mut sandbox_config = ProcessSandboxConfig::new(&writable_root)
+            .with_policy(sandbox_policy)
             .with_network(config.allow_network)
             .with_hidden(astrid_home);
-        if let Some(policy) = self.sandbox_policy_override {
-            sandbox_config = sandbox_config.with_policy(policy);
-        }
 
         // Add config-specified extra paths. Validated for:
         // 1. Absolute (avoid ambiguity about which directory they resolve relative to)
@@ -568,13 +617,18 @@ impl ServerManager {
         //
         // Under `Off` the call returns `Ok(None)` silently. Either
         // way we don't double-log here.
-        let sandbox_prefix =
-            sandbox_config
-                .sandbox_prefix()
-                .map_err(|e| McpError::ServerStartFailed {
-                    name: name.to_string(),
-                    reason: e.to_string(),
-                })?;
+        let sandbox_prefix = sandbox_config.sandbox_prefix().map_err(|e| {
+            let reason = e.to_string();
+            let error = McpError::ServerStartFailed {
+                name: name.to_string(),
+                reason: reason.clone(),
+            };
+            if sandbox_policy == SandboxPolicy::Required {
+                ServerConnectionError::SandboxPolicyDenied { reason, error }
+            } else {
+                ServerConnectionError::Other(error)
+            }
+        })?;
 
         // Build the command
         let mut cmd = if let Some(prefix) = sandbox_prefix {

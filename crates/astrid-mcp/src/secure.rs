@@ -16,7 +16,7 @@ use tracing::{debug, warn};
 use crate::client::McpClient;
 use crate::config::ServerConfig;
 use crate::error::{McpError, McpResult};
-use crate::server::ServerManager;
+use crate::server::{ServerConnectionError, ServerManager};
 use crate::types::{ToolDefinition, ToolResult};
 
 /// Authorization result for a tool call.
@@ -65,6 +65,31 @@ impl SecureMcpClient {
             capabilities,
             audit,
             session_id,
+        }
+    }
+
+    async fn audit_server_start(
+        &self,
+        name: &str,
+        transport: String,
+        authorization: AuthorizationProof,
+        outcome: AuditOutcome,
+    ) {
+        if let Err(error) = self
+            .audit
+            .append(
+                self.session_id.clone(),
+                AuditAction::ServerStarted {
+                    name: name.to_string(),
+                    transport,
+                    binary_hash: None,
+                },
+                authorization,
+                outcome,
+            )
+            .await
+        {
+            warn!(server = name, error = %error, "Failed to audit server connection");
         }
     }
 
@@ -280,34 +305,46 @@ impl SecureMcpClient {
     ///
     /// Returns an error if the server cannot be connected.
     pub async fn connect(&self, server_name: &str) -> McpResult<()> {
-        self.client.connect(server_name).await?;
-
-        // Get the actual transport type for logging
         let transport = self
             .client
             .server_manager()
             .get_config(server_name)
             .map_or_else(|| "unknown".to_string(), |c| c.transport.to_string());
-
-        // Log server start
-        if let Err(e) = self
-            .audit
-            .append(
-                self.session_id.clone(),
-                AuditAction::ServerStarted {
-                    name: server_name.to_string(),
-                    transport,
-                    binary_hash: None,
-                },
-                AuthorizationProof::System {
-                    reason: "server connection".to_string(),
-                },
-                AuditOutcome::success(),
+        if let Err(failure) = self.client.connect_classified(server_name).await {
+            let (authorization, reason, error) = match failure {
+                ServerConnectionError::SandboxPolicyDenied { reason, error } => (
+                    AuthorizationProof::Denied {
+                        reason: reason.clone(),
+                    },
+                    reason,
+                    error,
+                ),
+                ServerConnectionError::Other(error) => (
+                    AuthorizationProof::System {
+                        reason: "server connection failed".to_string(),
+                    },
+                    error.to_string(),
+                    error,
+                ),
+            };
+            self.audit_server_start(
+                server_name,
+                transport,
+                authorization,
+                AuditOutcome::failure(reason),
             )
-            .await
-        {
-            warn!(server = server_name, error = %e, "Failed to audit server connection");
+            .await;
+            return Err(error);
         }
+        self.audit_server_start(
+            server_name,
+            transport,
+            AuthorizationProof::System {
+                reason: "server connection".to_string(),
+            },
+            AuditOutcome::success(),
+        )
+        .await;
 
         Ok(())
     }
@@ -358,26 +395,41 @@ impl SecureMcpClient {
     /// Returns an error if the server is already running or cannot be started.
     pub async fn connect_dynamic(&self, name: &str, config: ServerConfig) -> McpResult<()> {
         let transport = config.transport.to_string();
-        self.client.connect_dynamic(name, config).await?;
-
-        if let Err(e) = self
-            .audit
-            .append(
-                self.session_id.clone(),
-                AuditAction::ServerStarted {
-                    name: name.to_string(),
-                    transport,
-                    binary_hash: None,
-                },
-                AuthorizationProof::System {
-                    reason: "dynamic server connection".to_string(),
-                },
-                AuditOutcome::success(),
+        if let Err(failure) = self.client.connect_dynamic_classified(name, config).await {
+            let (authorization, reason, error) = match failure {
+                ServerConnectionError::SandboxPolicyDenied { reason, error } => (
+                    AuthorizationProof::Denied {
+                        reason: reason.clone(),
+                    },
+                    reason,
+                    error,
+                ),
+                ServerConnectionError::Other(error) => (
+                    AuthorizationProof::System {
+                        reason: "dynamic server connection failed".to_string(),
+                    },
+                    error.to_string(),
+                    error,
+                ),
+            };
+            self.audit_server_start(
+                name,
+                transport,
+                authorization,
+                AuditOutcome::failure(reason),
             )
-            .await
-        {
-            warn!(server = name, error = %e, "Failed to audit dynamic server connection");
+            .await;
+            return Err(error);
         }
+        self.audit_server_start(
+            name,
+            transport,
+            AuthorizationProof::System {
+                reason: "dynamic server connection".to_string(),
+            },
+            AuditOutcome::success(),
+        )
+        .await;
 
         Ok(())
     }
@@ -460,50 +512,25 @@ impl SecureMcpClient {
 
     /// Connect to all auto-start servers.
     ///
-    /// Each successfully started server is audit-logged.
+    /// Every attempted server connection is audit-logged, including
+    /// fail-closed platform denials.
     ///
     /// # Errors
     ///
     /// Returns an error only if refreshing the tools cache fails.
     pub async fn connect_auto_servers(&self) -> McpResult<usize> {
-        // Snapshot before so we only audit newly started servers.
-        let before: std::collections::HashSet<String> =
-            self.client.list_servers().await.into_iter().collect();
-
-        let count = self.client.connect_auto_servers().await?;
-
-        // Log only the servers that were actually started by this call.
-        for name in self.client.list_servers().await {
-            if before.contains(&name) {
-                continue;
-            }
-            let transport = self
-                .client
-                .server_manager()
-                .get_config(&name)
-                .map_or_else(|| "unknown".to_string(), |c| c.transport.to_string());
-
-            if let Err(e) = self
-                .audit
-                .append(
-                    self.session_id.clone(),
-                    AuditAction::ServerStarted {
-                        name: name.clone(),
-                        transport,
-                        binary_hash: None,
-                    },
-                    AuthorizationProof::System {
-                        reason: "auto-start server".to_string(),
-                    },
-                    AuditOutcome::success(),
-                )
-                .await
-            {
-                warn!(server = %name, error = %e, "Failed to audit auto-start server");
+        let names = self.client.server_manager().list_auto_start_names();
+        let mut connected = 0usize;
+        for name in names {
+            match self.connect(&name).await {
+                Ok(()) => connected = connected.saturating_add(1),
+                Err(error) => {
+                    warn!(server = %name, error = %error, "Failed to auto-connect server");
+                },
             }
         }
-
-        Ok(count)
+        self.client.refresh_tools_cache().await?;
+        Ok(connected)
     }
 
     /// Get the underlying MCP client.
@@ -614,6 +641,192 @@ mod tests {
     async fn test_secure_client_creation() {
         let secure = make_secure_client();
         assert!(secure.list_tools().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_native_server_start_is_audited() {
+        let mut config = crate::config::ServersConfig::default();
+        config
+            .add(ServerConfig::stdio(
+                "denied-native",
+                "astrid-definitely-missing-native-server",
+            ))
+            .expect("add server config");
+        let client = McpClient::with_config(config);
+        let capabilities = Arc::new(CapabilityStore::in_memory());
+        let audit = Arc::new(AuditLog::in_memory(KeyPair::generate()));
+        let session_id = SessionId::new();
+        let secure =
+            SecureMcpClient::new(client, capabilities, Arc::clone(&audit), session_id.clone());
+
+        assert!(secure.connect("denied-native").await.is_err());
+        let entries = audit
+            .get_session_entries(&session_id)
+            .await
+            .expect("read audit entries");
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(
+            &entries[0].action,
+            AuditAction::ServerStarted { name, .. } if name == "denied-native"
+        ));
+        assert!(matches!(
+            &entries[0].outcome,
+            AuditOutcome::Failure { error }
+                if error.contains("astrid-definitely-missing-native-server")
+        ));
+        assert!(matches!(
+            &entries[0].authorization,
+            AuthorizationProof::System { reason }
+                if reason == "server connection failed"
+        ));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_untrusted_native_server_denial_is_audited() {
+        let mut config = crate::config::ServersConfig::default();
+        config
+            .add(ServerConfig::stdio(
+                "untrusted-native",
+                std::env::current_exe()
+                    .expect("current test executable")
+                    .to_string_lossy()
+                    .into_owned(),
+            ))
+            .expect("add server config");
+        let manager = ServerManager::new(config)
+            .with_sandbox_policy(astrid_workspace::SandboxPolicy::Required);
+        let client = McpClient::new(manager);
+        let capabilities = Arc::new(CapabilityStore::in_memory());
+        let audit = Arc::new(AuditLog::in_memory(KeyPair::generate()));
+        let session_id = SessionId::new();
+        let secure =
+            SecureMcpClient::new(client, capabilities, Arc::clone(&audit), session_id.clone());
+
+        let error = secure
+            .connect("untrusted-native")
+            .await
+            .expect_err("Windows must deny an untrusted native server without a sandbox");
+        assert!(
+            error.to_string().contains("OS-level sandbox unavailable"),
+            "unexpected denial: {error}"
+        );
+        let entries = audit
+            .get_session_entries(&session_id)
+            .await
+            .expect("read audit entries");
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(
+            (&entries[0].authorization, &entries[0].outcome),
+            (
+                AuthorizationProof::Denied { reason },
+                AuditOutcome::Failure { error }
+            ) if reason.contains("OS-level sandbox unavailable")
+                && reason.contains("policy is `required`")
+                && error == reason
+        ));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_dynamic_native_sandbox_denial_is_audited_as_denied() {
+        let manager = ServerManager::new(crate::config::ServersConfig::default())
+            .with_sandbox_policy(astrid_workspace::SandboxPolicy::Required);
+        let audit = Arc::new(AuditLog::in_memory(KeyPair::generate()));
+        let session_id = SessionId::new();
+        let secure = SecureMcpClient::new(
+            McpClient::new(manager),
+            Arc::new(CapabilityStore::in_memory()),
+            Arc::clone(&audit),
+            session_id.clone(),
+        );
+        let config = ServerConfig::stdio(
+            "dynamic-untrusted",
+            std::env::current_exe()
+                .expect("current test executable")
+                .to_string_lossy()
+                .into_owned(),
+        );
+
+        secure
+            .connect_dynamic("dynamic-untrusted", config)
+            .await
+            .expect_err("required sandbox must deny dynamic native server");
+        let entries = audit
+            .get_session_entries(&session_id)
+            .await
+            .expect("read audit entries");
+        assert!(matches!(
+            (&entries[0].authorization, &entries[0].outcome),
+            (
+                AuthorizationProof::Denied { reason },
+                AuditOutcome::Failure { error }
+            ) if reason.contains("policy is `required`") && error == reason
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_mcp_probe_child() {
+        if let Some(path) = std::env::var_os("ASTRID_WINDOWS_MCP_SENTINEL") {
+            std::fs::write(path, b"started").expect("write MCP probe sentinel");
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_explicit_off_starts_native_server_and_audits_handshake_failure() {
+        let temp = tempfile::tempdir().expect("temp");
+        let sentinel = temp.path().join("mcp-started");
+        let mut server = ServerConfig::stdio(
+            "trusted-dev-native",
+            std::env::current_exe()
+                .expect("current test executable")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        server.args = vec![
+            "windows_mcp_probe_child".to_string(),
+            "--nocapture".to_string(),
+        ];
+        server.env.insert(
+            "ASTRID_WINDOWS_MCP_SENTINEL".to_string(),
+            sentinel.to_string_lossy().into_owned(),
+        );
+        let mut config = crate::config::ServersConfig::default();
+        config.add(server).expect("add server config");
+        let manager =
+            ServerManager::new(config).with_sandbox_policy(astrid_workspace::SandboxPolicy::Off);
+        let client = McpClient::new(manager);
+        let capabilities = Arc::new(CapabilityStore::in_memory());
+        let audit = Arc::new(AuditLog::in_memory(KeyPair::generate()));
+        let session_id = SessionId::new();
+        let secure =
+            SecureMcpClient::new(client, capabilities, Arc::clone(&audit), session_id.clone());
+
+        secure
+            .connect("trusted-dev-native")
+            .await
+            .expect_err("probe is not an MCP server");
+        assert_eq!(
+            std::fs::read(&sentinel).expect("MCP process started"),
+            b"started"
+        );
+        let entries = audit
+            .get_session_entries(&session_id)
+            .await
+            .expect("read audit entries");
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(
+            &entries[0].action,
+            AuditAction::ServerStarted { name, .. } if name == "trusted-dev-native"
+        ));
+        assert!(matches!(&entries[0].outcome, AuditOutcome::Failure { .. }));
+        assert!(matches!(
+            &entries[0].authorization,
+            AuthorizationProof::System { reason }
+                if reason == "server connection failed"
+        ));
     }
 
     #[tokio::test]
