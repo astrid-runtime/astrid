@@ -15,7 +15,8 @@ pub(super) use serde::{Deserialize, Serialize};
 pub(super) use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 pub(super) use windows_sys::Wdk::Storage::FileSystem::{
     FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT,
-    FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+    FILE_RENAME_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT, FileRenameInformation, NtCreateFile,
+    NtSetInformationFile,
 };
 pub(super) use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, GENERIC_ALL, GENERIC_READ,
@@ -44,10 +45,10 @@ pub(super) use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateFileW, DELETE, FILE_ALL_ACCESS, FILE_APPEND_DATA,
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD,
     FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA, FileDispositionInfo,
-    FileRenameInfo, GetFileInformationByHandle, GetVolumePathNameW, OPEN_EXISTING, READ_CONTROL,
-    SYNCHRONIZE, SetFileInformationByHandle, WRITE_DAC, WRITE_OWNER,
+    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
+    FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA, FileDispositionInfo,
+    GetFileInformationByHandle, GetVolumePathNameW, OPEN_EXISTING, READ_CONTROL, SYNCHRONIZE,
+    SetFileInformationByHandle, WRITE_DAC, WRITE_OWNER,
 };
 pub(super) use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 pub(super) use windows_sys::Win32::System::SystemServices::SECURITY_DESCRIPTOR_REVISION;

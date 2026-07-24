@@ -476,16 +476,16 @@ fn rename_guarded_file(
         .ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "Windows file name is too long")
         })?;
-    let buffer_bytes = size_of::<FILE_RENAME_INFO>()
+    let buffer_bytes = size_of::<FILE_RENAME_INFORMATION>()
         .checked_add(usize::try_from(name_bytes).expect("u32 length fits usize"))
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename buffer overflow"))?;
     // `Vec<usize>` supplies native pointer alignment and zero-initializes the
     // full fixed structure plus the variable-length UTF-16 name bytes required
-    // by `SetFileInformationByHandle(FileRenameInfo)`.
+    // by `NtSetInformationFile(FileRenameInformation)`.
     let mut buffer = vec![0_usize; buffer_bytes.div_ceil(size_of::<usize>())];
-    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
     // SAFETY: the usize buffer is sufficiently aligned and sized for the
-    // variable-length FILE_RENAME_INFO followed by the UTF-16 component.
+    // variable-length FILE_RENAME_INFORMATION followed by the UTF-16 component.
     unsafe {
         (*info).Anonymous.ReplaceIfExists = replace;
         (*info).RootDirectory = guard.authority_handle();
@@ -496,18 +496,24 @@ fn rename_guarded_file(
             destination_wide.len(),
         );
     }
+    let mut status = IO_STATUS_BLOCK::default();
     // SAFETY: source and root-directory handles are live, and the aligned
     // variable-length buffer contains exactly `buffer_bytes` initialized bytes.
-    if unsafe {
-        SetFileInformationByHandle(
+    // The NT information class is used because it explicitly supports resolving
+    // a simple target name against the retained `RootDirectory` handle.
+    let result = unsafe {
+        NtSetInformationFile(
             source.0,
-            FileRenameInfo,
+            &raw mut status,
             info.cast(),
             u32::try_from(buffer_bytes).expect("rename buffer length fits u32"),
+            FileRenameInformation,
         )
-    } == 0
-    {
-        return Err(io::Error::last_os_error());
+    };
+    if result < 0 {
+        // SAFETY: conversion is defined for the NTSTATUS returned by the call.
+        let code = unsafe { RtlNtStatusToDosError(result) };
+        return Err(io::Error::from_raw_os_error(code.cast_signed()));
     }
     Ok(())
 }
