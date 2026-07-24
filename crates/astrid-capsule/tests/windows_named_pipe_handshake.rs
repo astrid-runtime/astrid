@@ -3,7 +3,8 @@
 use astrid_core::dirs::AstridHome;
 use astrid_core::local_transport;
 use astrid_core::profile::{AuthMethod, DeviceKey, DeviceScope};
-use astrid_core::{PrincipalId, PrincipalProfile, SessionToken};
+use astrid_core::session_token::SessionToken;
+use astrid_core::{PrincipalId, PrincipalProfile};
 
 #[tokio::test]
 async fn native_windows_preread_replays_full_signed_handshake() {
