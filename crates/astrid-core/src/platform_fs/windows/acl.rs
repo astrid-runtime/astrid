@@ -1,6 +1,8 @@
 //! Windows SID, ownership, and DACL construction and validation.
 
-use super::path::{OwnedHandle, wide_path, wide_text};
+#[cfg(test)]
+use super::path::wide_path;
+use super::path::{OwnedHandle, wide_text};
 use super::prelude::*;
 
 pub(super) const DANGEROUS_PARENT_ACCESS: u32 = FILE_WRITE_DATA
@@ -34,6 +36,90 @@ impl Drop for LocalAllocation {
                 LocalFree(self.0);
             }
         }
+    }
+}
+
+/// Owns the exact protected DACL and absolute descriptor passed at creation.
+///
+/// The ACL allocation must outlive `NtCreateFile`, because the absolute
+/// descriptor stores a pointer to it rather than embedding the ACL bytes.
+pub(super) struct PrivateSecurityDescriptor {
+    _acl: LocalAllocation,
+    descriptor: SECURITY_DESCRIPTOR,
+}
+
+impl PrivateSecurityDescriptor {
+    pub(super) fn new(is_directory: bool) -> io::Result<Self> {
+        let required = RequiredSids::get()?;
+        let inheritance = if is_directory {
+            OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
+        } else {
+            0
+        };
+        let mut entries = [
+            explicit_access(required.current_user.as_ptr(), TRUSTEE_IS_USER, inheritance),
+            explicit_access(
+                required.local_system.as_ptr(),
+                TRUSTEE_IS_WELL_KNOWN_GROUP,
+                inheritance,
+            ),
+            explicit_access(
+                required.administrators.as_ptr(),
+                TRUSTEE_IS_WELL_KNOWN_GROUP,
+                inheritance,
+            ),
+        ];
+        let mut acl: *mut ACL = null_mut();
+        // SAFETY: all three entries point at live SID buffers and the ACL
+        // out-pointer is valid. SetEntriesInAclW copies the SID bytes into the
+        // allocation returned through `acl`.
+        let status = unsafe {
+            SetEntriesInAclW(
+                u32::try_from(entries.len()).expect("three ACL entries fit in u32"),
+                entries.as_mut_ptr(),
+                null(),
+                &raw mut acl,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(status.cast_signed()));
+        }
+
+        let allocation = LocalAllocation(acl.cast());
+        let mut descriptor = SECURITY_DESCRIPTOR::default();
+        // SAFETY: `descriptor` is an aligned, writable descriptor buffer.
+        if unsafe {
+            InitializeSecurityDescriptor((&raw mut descriptor).cast(), SECURITY_DESCRIPTOR_REVISION)
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `descriptor` is initialized and `acl` is a live ACL
+        // allocation retained by the returned value.
+        if unsafe { SetSecurityDescriptorDacl((&raw mut descriptor).cast(), 1, acl, 0) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `descriptor` is initialized and both masks contain only the
+        // documented DACL protection control bit.
+        if unsafe {
+            SetSecurityDescriptorControl(
+                (&raw mut descriptor).cast(),
+                SE_DACL_PROTECTED,
+                SE_DACL_PROTECTED,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(Self {
+            _acl: allocation,
+            descriptor,
+        })
+    }
+
+    pub(super) fn as_ptr(&self) -> *const SECURITY_DESCRIPTOR {
+        &raw const self.descriptor
     }
 }
 
@@ -195,6 +281,7 @@ impl RequiredSids {
     }
 }
 
+#[cfg(test)]
 pub(super) fn apply_private_acl(path: &Path, is_directory: bool) -> io::Result<()> {
     let required = RequiredSids::get()?;
     let inheritance = if is_directory {
@@ -251,6 +338,61 @@ pub(super) fn apply_private_acl(path: &Path, is_directory: bool) -> io::Result<(
     Ok(())
 }
 
+pub(super) fn apply_private_acl_to_handle(handle: HANDLE, is_directory: bool) -> io::Result<()> {
+    let required = RequiredSids::get()?;
+    let inheritance = if is_directory {
+        OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
+    } else {
+        0
+    };
+    let mut entries = [
+        explicit_access(required.current_user.as_ptr(), TRUSTEE_IS_USER, inheritance),
+        explicit_access(
+            required.local_system.as_ptr(),
+            TRUSTEE_IS_WELL_KNOWN_GROUP,
+            inheritance,
+        ),
+        explicit_access(
+            required.administrators.as_ptr(),
+            TRUSTEE_IS_WELL_KNOWN_GROUP,
+            inheritance,
+        ),
+    ];
+    let mut acl: *mut ACL = null_mut();
+    // SAFETY: all three entries point at live SID buffers and the ACL
+    // out-pointer is valid. A successful allocation is owned below.
+    let status = unsafe {
+        SetEntriesInAclW(
+            u32::try_from(entries.len()).expect("three ACL entries fit in u32"),
+            entries.as_mut_ptr(),
+            null(),
+            &raw mut acl,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(io::Error::from_raw_os_error(status.cast_signed()));
+    }
+    let allocation = LocalAllocation(acl.cast());
+    // SAFETY: `handle` is a live file handle with WRITE_DAC and the ACL
+    // allocation remains live for the call.
+    let status = unsafe {
+        SetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            acl,
+            null(),
+        )
+    };
+    drop(allocation);
+    if status != ERROR_SUCCESS {
+        return Err(io::Error::from_raw_os_error(status.cast_signed()));
+    }
+    Ok(())
+}
+
 pub(super) fn explicit_access(sid: PSID, trustee_type: i32, inheritance: u32) -> EXPLICIT_ACCESS_W {
     EXPLICIT_ACCESS_W {
         grfAccessPermissions: FILE_ALL_ACCESS,
@@ -266,6 +408,7 @@ pub(super) fn explicit_access(sid: PSID, trustee_type: i32, inheritance: u32) ->
     }
 }
 
+#[cfg(test)]
 pub(super) fn validate_private_acl(path: &Path, is_directory: bool) -> io::Result<()> {
     let required = RequiredSids::get()?;
     let wide = wide_path(path)?;
@@ -290,10 +433,68 @@ pub(super) fn validate_private_acl(path: &Path, is_directory: bool) -> io::Resul
         return Err(io::Error::from_raw_os_error(status.cast_signed()));
     }
     let allocation = LocalAllocation(descriptor);
+    let result = validate_private_acl_parts(
+        &required,
+        owner,
+        dacl,
+        descriptor,
+        is_directory,
+        &path.display().to_string(),
+    );
+    drop(allocation);
+    result
+}
+
+pub(super) fn validate_private_acl_handle(
+    handle: HANDLE,
+    is_directory: bool,
+    description: &str,
+) -> io::Result<()> {
+    let required = RequiredSids::get()?;
+    let mut owner: PSID = null_mut();
+    let mut dacl: *mut ACL = null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+    // SAFETY: `handle` is live and all output pointers are valid.
+    let status = unsafe {
+        GetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &raw mut owner,
+            null_mut(),
+            &raw mut dacl,
+            null_mut(),
+            &raw mut descriptor,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(io::Error::from_raw_os_error(status.cast_signed()));
+    }
+    let allocation = LocalAllocation(descriptor);
+    let result = validate_private_acl_parts(
+        &required,
+        owner,
+        dacl,
+        descriptor,
+        is_directory,
+        description,
+    );
+    drop(allocation);
+    result
+}
+
+fn validate_private_acl_parts(
+    required: &RequiredSids,
+    owner: PSID,
+    dacl: *mut ACL,
+    descriptor: PSECURITY_DESCRIPTOR,
+    is_directory: bool,
+    description: &str,
+) -> io::Result<()> {
     if dacl.is_null() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            format!("private Windows path has a null DACL: {}", path.display()),
+            format!("private Windows path has a null DACL: {description}"),
         ));
     }
 
@@ -332,16 +533,14 @@ pub(super) fn validate_private_acl(path: &Path, is_directory: bool) -> io::Resul
         if unsafe { GetAce(dacl, index, &raw mut raw_ace) } == 0 || raw_ace.is_null() {
             return Err(io::Error::last_os_error());
         }
-        rules.push(private_acl_rule(&required, raw_ace, is_directory));
+        rules.push(private_acl_rule(required, raw_ace, is_directory));
     }
-    drop(allocation);
 
     if !acl_rules_are_private(is_directory, dacl_is_protected, owner_is_allowed, &rules) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
-                "private Windows path ACL is not restricted to the current user and required system principals: {}",
-                path.display()
+                "private Windows path ACL is not restricted to the current user and required system principals: {description}"
             ),
         ));
     }
@@ -389,27 +588,38 @@ pub(super) fn private_acl_rule(
     }
 }
 
-pub(super) fn validate_trusted_parent_acl(path: &Path) -> io::Result<()> {
-    validate_trusted_parent_acl_with_mask(path, DANGEROUS_EXISTING_PARENT_ACCESS)
+pub(super) fn validate_trusted_parent_acl_handle(
+    handle: HANDLE,
+    description: &str,
+) -> io::Result<()> {
+    validate_trusted_parent_acl_handle_with_mask(
+        handle,
+        DANGEROUS_EXISTING_PARENT_ACCESS,
+        description,
+    )
 }
 
-pub(super) fn validate_trusted_parent_acl_for_create(path: &Path) -> io::Result<()> {
-    validate_trusted_parent_acl_with_mask(path, DANGEROUS_PARENT_ACCESS)
+pub(super) fn validate_trusted_parent_acl_for_create_handle(
+    handle: HANDLE,
+    description: &str,
+) -> io::Result<()> {
+    validate_trusted_parent_acl_handle_with_mask(handle, DANGEROUS_PARENT_ACCESS, description)
 }
 
-pub(super) fn validate_trusted_parent_acl_with_mask(
-    path: &Path,
+fn validate_trusted_parent_acl_handle_with_mask(
+    handle: HANDLE,
     dangerous_access: u32,
+    description: &str,
 ) -> io::Result<()> {
     let required = RequiredSids::get()?;
-    let wide = wide_path(path)?;
     let mut owner: PSID = null_mut();
     let mut dacl: *mut ACL = null_mut();
     let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
-    // SAFETY: all out-pointers are valid and `wide` is NUL terminated.
+    // SAFETY: `handle` is live with READ_CONTROL and all output pointers are
+    // valid for the duration of the call.
     let status = unsafe {
-        GetNamedSecurityInfoW(
-            wide.as_ptr(),
+        GetSecurityInfo(
+            handle,
             SE_FILE_OBJECT,
             OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
             &raw mut owner,
@@ -422,20 +632,30 @@ pub(super) fn validate_trusted_parent_acl_with_mask(
     if status != ERROR_SUCCESS {
         return Err(io::Error::from_raw_os_error(status.cast_signed()));
     }
-    let _allocation = LocalAllocation(descriptor);
+    let allocation = LocalAllocation(descriptor);
+    let result =
+        validate_trusted_parent_acl_parts(&required, owner, dacl, dangerous_access, description);
+    drop(allocation);
+    result
+}
+
+fn validate_trusted_parent_acl_parts(
+    required: &RequiredSids,
+    owner: PSID,
+    dacl: *mut ACL,
+    dangerous_access: u32,
+    description: &str,
+) -> io::Result<()> {
     if dacl.is_null() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            format!("trusted Windows parent has a null DACL: {}", path.display()),
+            format!("trusted Windows parent has a null DACL: {description}"),
         ));
     }
     if !required.is_trusted(owner) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            format!(
-                "trusted Windows parent has an untrusted owner: {}",
-                path.display()
-            ),
+            format!("trusted Windows parent has an untrusted owner: {description}"),
         ));
     }
 
@@ -468,10 +688,7 @@ pub(super) fn validate_trusted_parent_acl_with_mask(
         if u32::from(header.AceType) != ACCESS_ALLOWED_ACE_TYPE {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                format!(
-                    "trusted Windows parent has an unsupported ACE type: {}",
-                    path.display()
-                ),
+                format!("trusted Windows parent has an unsupported ACE type: {description}"),
             ));
         }
         // SAFETY: this is a plain ACCESS_ALLOWED_ACE.
@@ -488,8 +705,7 @@ pub(super) fn validate_trusted_parent_acl_with_mask(
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!(
-                    "trusted Windows parent grants write or delete authority to an untrusted principal: {}",
-                    path.display()
+                    "trusted Windows parent grants write or delete authority to an untrusted principal: {description}"
                 ),
             ));
         }
@@ -497,16 +713,18 @@ pub(super) fn validate_trusted_parent_acl_with_mask(
     Ok(())
 }
 
-pub(super) fn validate_trusted_file_acl(path: &Path) -> io::Result<()> {
+pub(super) fn validate_trusted_file_acl_handle(
+    handle: HANDLE,
+    description: &str,
+) -> io::Result<()> {
     let required = RequiredSids::get()?;
-    let wide = wide_path(path)?;
     let mut owner: PSID = null_mut();
     let mut dacl: *mut ACL = null_mut();
     let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
-    // SAFETY: all output pointers are valid and `wide` is NUL terminated.
+    // SAFETY: `handle` is live with READ_CONTROL and all outputs are valid.
     let status = unsafe {
-        GetNamedSecurityInfoW(
-            wide.as_ptr(),
+        GetSecurityInfo(
+            handle,
             SE_FILE_OBJECT,
             OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
             &raw mut owner,
@@ -519,14 +737,22 @@ pub(super) fn validate_trusted_file_acl(path: &Path) -> io::Result<()> {
     if status != ERROR_SUCCESS {
         return Err(io::Error::from_raw_os_error(status.cast_signed()));
     }
-    let _allocation = LocalAllocation(descriptor);
+    let allocation = LocalAllocation(descriptor);
+    let result = validate_trusted_file_acl_parts(&required, owner, dacl, description);
+    drop(allocation);
+    result
+}
+
+fn validate_trusted_file_acl_parts(
+    required: &RequiredSids,
+    owner: PSID,
+    dacl: *mut ACL,
+    description: &str,
+) -> io::Result<()> {
     if dacl.is_null() || !required.is_trusted(owner) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            format!(
-                "trusted Windows file has an unsafe owner or null DACL: {}",
-                path.display()
-            ),
+            format!("trusted Windows file has an unsafe owner or null DACL: {description}"),
         ));
     }
     let mut info = ACL_SIZE_INFORMATION::default();
@@ -555,10 +781,7 @@ pub(super) fn validate_trusted_file_acl(path: &Path) -> io::Result<()> {
         if flags & !(INHERITED_ACE) != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                format!(
-                    "trusted Windows file has unexpected ACE flags: {}",
-                    path.display()
-                ),
+                format!("trusted Windows file has unexpected ACE flags: {description}"),
             ));
         }
         if u32::from(header.AceType) == ACCESS_DENIED_ACE_TYPE {
@@ -567,10 +790,7 @@ pub(super) fn validate_trusted_file_acl(path: &Path) -> io::Result<()> {
         if u32::from(header.AceType) != ACCESS_ALLOWED_ACE_TYPE {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                format!(
-                    "trusted Windows file has an unsupported ACE type: {}",
-                    path.display()
-                ),
+                format!("trusted Windows file has an unsupported ACE type: {description}"),
             ));
         }
         // SAFETY: this is a plain ACCESS_ALLOWED_ACE.
@@ -580,8 +800,7 @@ pub(super) fn validate_trusted_file_acl(path: &Path) -> io::Result<()> {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!(
-                    "trusted Windows file is writable by an untrusted principal: {}",
-                    path.display()
+                    "trusted Windows file is writable by an untrusted principal: {description}"
                 ),
             ));
         }

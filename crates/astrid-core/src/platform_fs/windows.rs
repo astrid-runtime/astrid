@@ -2,6 +2,8 @@
 
 #[path = "windows/acl.rs"]
 mod acl;
+#[path = "windows/error.rs"]
+mod error;
 #[path = "windows/executable.rs"]
 mod executable;
 #[path = "windows/io.rs"]

@@ -4,10 +4,7 @@ use std::io::BufRead as _;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::process::Stdio;
 
-use windows_sys::Win32::Foundation::{
-    ERROR_SHARING_VIOLATION, ERROR_UNABLE_TO_MOVE_REPLACEMENT, ERROR_UNABLE_TO_MOVE_REPLACEMENT_2,
-    ERROR_UNABLE_TO_REMOVE_REPLACED,
-};
+use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
 use windows_sys::Win32::Security::{
     DACL_SECURITY_INFORMATION, NO_PROPAGATE_INHERIT_ACE, PROTECTED_DACL_SECURITY_INFORMATION,
     UNPROTECTED_DACL_SECURITY_INFORMATION, WinWorldSid,
@@ -15,6 +12,7 @@ use windows_sys::Win32::Security::{
 use windows_sys::Win32::Storage::FileSystem::{FILE_ALL_ACCESS, FILE_GENERIC_READ};
 
 use super::acl::*;
+use super::error::*;
 use super::executable::*;
 use super::io::*;
 use super::path::*;
@@ -68,6 +66,23 @@ fn assert_old_set(install: &Path) {
         b"old-daemon"
     );
     assert!(!install.join(TRANSACTION_JOURNAL).exists());
+}
+
+fn assert_no_executable_transaction_artifacts(install: &Path) {
+    let mut unexpected = Vec::new();
+    for entry in std::fs::read_dir(install).unwrap() {
+        let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+        if !matches!(
+            name.as_str(),
+            "astrid.exe" | "astrid-daemon.exe" | TRANSACTION_LOCK
+        ) {
+            unexpected.push(name);
+        }
+    }
+    assert!(
+        unexpected.is_empty(),
+        "unexpected transaction artifacts: {unexpected:?}"
+    );
 }
 
 fn abort_private_write(file: &Path) {
@@ -172,6 +187,55 @@ fn set_required_directory_acl_flags(path: &Path, extra_flags: u32) {
     assert_eq!(status, ERROR_SUCCESS);
 }
 
+fn set_trusted_directory_acl_with_world_read_inheritance(path: &Path) {
+    let required = RequiredSids::get().unwrap();
+    let world = WellKnownSid::get(WinWorldSid).unwrap();
+    let inheritance = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
+    let mut entries = [
+        explicit_access(required.current_user.as_ptr(), TRUSTEE_IS_USER, inheritance),
+        explicit_access(
+            required.local_system.as_ptr(),
+            TRUSTEE_IS_WELL_KNOWN_GROUP,
+            inheritance,
+        ),
+        explicit_access(
+            required.administrators.as_ptr(),
+            TRUSTEE_IS_WELL_KNOWN_GROUP,
+            inheritance,
+        ),
+        explicit_access(world.as_ptr(), TRUSTEE_IS_WELL_KNOWN_GROUP, inheritance),
+    ];
+    entries[3].grfAccessPermissions = FILE_GENERIC_READ;
+    let mut acl: *mut ACL = null_mut();
+    // SAFETY: every entry points to live SID storage and the out pointer is
+    // valid. SetEntriesInAclW copies the SID bytes into the returned ACL.
+    let status = unsafe {
+        SetEntriesInAclW(
+            u32::try_from(entries.len()).unwrap(),
+            entries.as_mut_ptr(),
+            null(),
+            &raw mut acl,
+        )
+    };
+    assert_eq!(status, ERROR_SUCCESS);
+    let allocation = LocalAllocation(acl.cast());
+    let mut wide = wide_path(path).unwrap();
+    // SAFETY: the NUL-terminated path and ACL remain live for the call.
+    let status = unsafe {
+        SetNamedSecurityInfoW(
+            wide.as_mut_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            acl,
+            null(),
+        )
+    };
+    drop(allocation);
+    assert_eq!(status, ERROR_SUCCESS);
+}
+
 #[test]
 fn private_create_and_atomic_write_are_acl_validated() {
     let _serial = serial_test_guard();
@@ -182,6 +246,71 @@ fn private_create_and_atomic_write_are_acl_validated() {
     atomic_write_private_file(&file, b"secret").unwrap();
     validate_private_file(&file).unwrap();
     assert_eq!(std::fs::read(file).unwrap(), b"secret");
+}
+
+#[test]
+fn private_objects_are_exact_at_namespace_creation() {
+    let _serial = serial_test_guard();
+    let root = private_temp();
+    set_trusted_directory_acl_with_world_read_inheritance(root.path());
+    let guard = TrustedPathGuard::capture(root.path()).unwrap();
+    guard
+        .verify_contract(BoundaryContract::TrustedForCreate)
+        .unwrap();
+    assert!(
+        guard
+            .verify_contract(BoundaryContract::ExactPrivateDirectory)
+            .is_err(),
+        "test parent unexpectedly has the exact private ACL"
+    );
+
+    let child = root.path().join("child");
+    TEST_PROBE_DIR_CREATE_ACL.store(true, std::sync::atomic::Ordering::SeqCst);
+    ensure_private_directory(&child).unwrap();
+    assert!(TEST_SAW_DIR_CREATE_ACL.swap(false, std::sync::atomic::Ordering::SeqCst));
+    validate_private_acl(&child, true).unwrap();
+
+    TEST_PROBE_FILE_CREATE_ACL.store(true, std::sync::atomic::Ordering::SeqCst);
+    let _lock = acquire_private_file_transaction_lock(root.path(), &guard).unwrap();
+    assert!(TEST_SAW_FILE_CREATE_ACL.swap(false, std::sync::atomic::Ordering::SeqCst));
+}
+
+#[test]
+fn failed_private_directory_sequence_removes_partial_descendants() {
+    let _serial = serial_test_guard();
+    let root = private_temp();
+    let first = root.path().join("first");
+    let target = first.join("second");
+    TEST_DIRECTORY_CREATE_COMPONENTS.store(0, std::sync::atomic::Ordering::SeqCst);
+    *TEST_FAIL_DIRECTORY_CREATE_AFTER_COMPONENT.lock().unwrap() = Some(0);
+
+    let error = ensure_private_directory(&target).unwrap_err();
+
+    assert_eq!(native_error_code(&error), Some(5));
+    assert!(
+        TEST_FAIL_DIRECTORY_CREATE_AFTER_COMPONENT
+            .lock()
+            .unwrap()
+            .is_none(),
+        "directory-create fault hook was not exercised"
+    );
+    assert_eq!(
+        TEST_DIRECTORY_CREATE_COMPONENTS.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert!(!first.exists(), "partial first component was not removed");
+    assert!(!target.exists(), "partial target was not removed");
+}
+
+#[test]
+fn private_reader_revalidates_exact_file_acl_on_its_open_handle() {
+    let _serial = serial_test_guard();
+    let root = private_temp();
+    let file = root.path().join("token");
+    atomic_write_private_file(&file, b"secret").unwrap();
+    set_world_entry(&file, FILE_GENERIC_READ, true);
+
+    assert!(read_private_file_to_string(&file).is_err());
 }
 
 #[test]
@@ -239,10 +368,264 @@ fn trusted_parent_lock_blocks_path_swap() {
 }
 
 #[test]
+fn handle_relative_mutation_cannot_be_redirected_by_boundary_swap() {
+    let _serial = serial_test_guard();
+    let root = private_temp();
+    let guarded = root.path().join("guarded");
+    std::fs::create_dir(&guarded).unwrap();
+    apply_private_acl(&guarded, true).unwrap();
+    let source = guarded.join("source");
+    let destination = guarded.join("destination");
+    std::fs::write(&source, b"locked-content").unwrap();
+    apply_private_acl(&source, false).unwrap();
+    let guard = TrustedPathGuard::capture(&guarded).unwrap();
+    let moved = root.path().join("moved");
+
+    guard
+        .with_verified_mutation(
+            "handle-relative rename test",
+            BoundaryContract::ExactPrivateDirectory,
+            || {
+                assert!(std::fs::rename(&guarded, &moved).is_err());
+                move_guarded_file(&guard, &source, &destination)
+            },
+        )
+        .unwrap();
+    assert_eq!(std::fs::read(destination).unwrap(), b"locked-content");
+    assert!(!moved.exists());
+}
+
+#[test]
+fn handle_relative_move_and_replacement_succeed() {
+    let _serial = serial_test_guard();
+    let root = private_temp();
+    let moved_source = root.path().join("move-source");
+    let moved_destination = root.path().join("move-destination");
+    let live = root.path().join("live");
+    let replacement = root.path().join("replacement");
+    for (path, bytes) in [
+        (&moved_source, b"moved".as_slice()),
+        (&live, b"old".as_slice()),
+        (&replacement, b"new".as_slice()),
+    ] {
+        std::fs::write(path, bytes).unwrap();
+        apply_private_acl(path, false).unwrap();
+    }
+    let guard = TrustedPathGuard::capture(root.path()).unwrap();
+
+    move_guarded_file(&guard, &moved_source, &moved_destination).unwrap();
+    assert_eq!(std::fs::read(&moved_destination).unwrap(), b"moved");
+    assert!(!moved_source.exists());
+
+    replace_file_checked(&guard, &live, &replacement).unwrap();
+    assert_eq!(std::fs::read(&live).unwrap(), b"new");
+    assert!(!replacement.exists());
+}
+
+#[test]
+fn handle_relative_mutation_stays_bound_during_ancestor_move() {
+    let _serial = serial_test_guard();
+    let root = private_temp();
+    let ancestor = root.path().join("ancestor");
+    let guarded = ancestor.join("guarded");
+    std::fs::create_dir(&ancestor).unwrap();
+    std::fs::create_dir(&guarded).unwrap();
+    apply_private_acl(&ancestor, true).unwrap();
+    apply_private_acl(&guarded, true).unwrap();
+    let source = guarded.join("source");
+    let destination = guarded.join("destination");
+    std::fs::write(&source, b"authority-bound-content").unwrap();
+    apply_private_acl(&source, false).unwrap();
+    let guard = TrustedPathGuard::capture(&guarded).unwrap();
+    let moved_ancestor = root.path().join("moved-ancestor");
+
+    let result = guard.with_verified_mutation(
+        "ancestor-move handle-relative test",
+        BoundaryContract::ExactPrivateDirectory,
+        || {
+            std::fs::rename(&ancestor, &moved_ancestor)?;
+            move_guarded_file(&guard, &source, &destination)
+        },
+    );
+
+    assert!(result.is_err());
+    assert_eq!(
+        std::fs::read(moved_ancestor.join("guarded").join("destination")).unwrap(),
+        b"authority-bound-content"
+    );
+    assert!(!destination.exists());
+}
+
+#[test]
+fn private_directory_creation_stays_bound_during_ancestor_move() {
+    let _serial = serial_test_guard();
+    let root = private_temp();
+    let ancestor = root.path().join("ancestor");
+    let parent = ancestor.join("parent");
+    std::fs::create_dir(&ancestor).unwrap();
+    std::fs::create_dir(&parent).unwrap();
+    apply_private_acl(&ancestor, true).unwrap();
+    apply_private_acl(&parent, true).unwrap();
+
+    let target = parent.join("first").join("second");
+    let moved_ancestor = root.path().join("moved-ancestor");
+    TEST_DIRECTORY_CREATE_COMPONENTS.store(0, std::sync::atomic::Ordering::SeqCst);
+    *TEST_MOVE_ANCESTOR_DURING_DIRECTORY_CREATE.lock().unwrap() =
+        Some((ancestor.clone(), moved_ancestor.clone()));
+
+    let result = ensure_private_directory(&target);
+
+    assert!(result.is_err());
+    assert!(
+        TEST_MOVE_ANCESTOR_DURING_DIRECTORY_CREATE
+            .lock()
+            .unwrap()
+            .is_none(),
+        "ancestor-move hook was not exercised"
+    );
+    assert!(moved_ancestor.exists(), "ancestor was not moved");
+    assert!(!ancestor.exists());
+    let moved_first = moved_ancestor.join("parent").join("first");
+    let moved_target = moved_first.join("second");
+    assert_eq!(
+        TEST_DIRECTORY_CREATE_COMPONENTS.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "retained handles did not carry creation through the ancestor relocation"
+    );
+    assert!(
+        !moved_first.exists(),
+        "failed creation left the relocated first component behind"
+    );
+    assert!(
+        !moved_target.exists(),
+        "failed creation left the relocated target behind"
+    );
+}
+
+#[test]
+fn verified_mutation_checks_success_error_and_panic_paths() {
+    let _serial = serial_test_guard();
+    let root = private_temp();
+    apply_private_acl(root.path(), true).unwrap();
+    let guard = TrustedPathGuard::capture(root.path()).unwrap();
+
+    assert_eq!(
+        guard
+            .with_verified_mutation(
+                "successful test mutation",
+                BoundaryContract::ExactPrivateDirectory,
+                || Ok(17),
+            )
+            .unwrap(),
+        17
+    );
+
+    let error = guard
+        .with_verified_mutation(
+            "failing test mutation",
+            BoundaryContract::ExactPrivateDirectory,
+            || Err::<(), _>(io::Error::from_raw_os_error(5)),
+        )
+        .unwrap_err();
+    assert_eq!(native_error_code(&error), Some(5));
+
+    let panic = catch_unwind(AssertUnwindSafe(|| {
+        let _: io::Result<()> = guard.with_verified_mutation(
+            "panicking test mutation",
+            BoundaryContract::ExactPrivateDirectory,
+            || panic!("original mutation panic"),
+        );
+    }));
+    assert!(panic.is_err());
+    guard
+        .verify_contract(BoundaryContract::ExactPrivateDirectory)
+        .unwrap();
+}
+
+#[test]
+fn verified_mutation_retains_commit_record_when_contract_changes() {
+    let _serial = serial_test_guard();
+    let root = private_temp();
+    apply_private_acl(root.path(), true).unwrap();
+    let journal = root.path().join(PRIVATE_FILE_TRANSACTION_JOURNAL);
+    std::fs::write(&journal, b"commit-record").unwrap();
+    apply_private_acl(&journal, false).unwrap();
+    let guard = TrustedPathGuard::capture(root.path()).unwrap();
+
+    let result = guard.with_verified_mutation(
+        "contract-changing test mutation",
+        BoundaryContract::ExactPrivateDirectory,
+        || {
+            set_world_entry(root.path(), FILE_ALL_ACCESS, true);
+            Ok(())
+        },
+    );
+    assert!(result.is_err());
+    assert!(journal.exists());
+
+    apply_private_acl(root.path(), true).unwrap();
+    std::fs::remove_file(journal).unwrap();
+}
+
+#[test]
+fn verified_mutation_preserves_native_error_when_postcheck_also_fails() {
+    let _serial = serial_test_guard();
+    let root = private_temp();
+    apply_private_acl(root.path(), true).unwrap();
+    let guard = TrustedPathGuard::capture(root.path()).unwrap();
+
+    let error = guard
+        .with_verified_mutation(
+            "native-error contract-changing mutation",
+            BoundaryContract::ExactPrivateDirectory,
+            || {
+                set_world_entry(root.path(), FILE_ALL_ACCESS, true);
+                Err::<(), _>(io::Error::from_raw_os_error(5))
+            },
+        )
+        .unwrap_err();
+    assert_eq!(native_error_code(&error), Some(5));
+    assert!(
+        error
+            .to_string()
+            .contains("authority-boundary verification also failed")
+    );
+
+    apply_private_acl(root.path(), true).unwrap();
+}
+
+#[test]
+fn verified_mutation_resumes_original_panic_after_failed_postcheck() {
+    let _serial = serial_test_guard();
+    let root = private_temp();
+    apply_private_acl(root.path(), true).unwrap();
+    let guard = TrustedPathGuard::capture(root.path()).unwrap();
+
+    let panic = catch_unwind(AssertUnwindSafe(|| {
+        let _: io::Result<()> = guard.with_verified_mutation(
+            "panicking contract-changing mutation",
+            BoundaryContract::ExactPrivateDirectory,
+            || {
+                set_world_entry(root.path(), FILE_ALL_ACCESS, true);
+                panic!("original mutation panic");
+            },
+        );
+    }))
+    .unwrap_err();
+    assert_eq!(
+        panic.downcast_ref::<&str>(),
+        Some(&"original mutation panic")
+    );
+
+    apply_private_acl(root.path(), true).unwrap();
+}
+
+#[test]
 fn transaction_lock_excludes_a_second_process() {
     let _serial = serial_test_guard();
     let (_root, install, _extract) = update_tree();
-    drop(acquire_transaction_lock(&install).unwrap());
+    let guard = TrustedPathGuard::capture(&install).unwrap();
+    drop(acquire_transaction_lock(&install, &guard).unwrap());
     let lock_path = install.join(TRANSACTION_LOCK);
     let script = concat!(
         "$f=[IO.File]::Open($env:ASTRID_LOCK_TEST_PATH,",
@@ -266,11 +649,11 @@ fn transaction_lock_excludes_a_second_process() {
         .read_line(&mut ready)
         .unwrap();
     assert_eq!(ready.trim(), "ready");
-    let error = acquire_transaction_lock(&install).unwrap_err();
+    let error = acquire_transaction_lock(&install, &guard).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
     child.kill().unwrap();
     child.wait().unwrap();
-    acquire_transaction_lock(&install).unwrap();
+    acquire_transaction_lock(&install, &guard).unwrap();
 }
 
 #[test]
@@ -344,52 +727,75 @@ fn junction_directory_component_is_rejected() {
 }
 
 #[test]
-fn replacefile_documented_partial_failures_restore_complete_old_set() {
-    let _serial = serial_test_guard();
-    for fault in [
-        TestReplaceFault::NoMutation(ERROR_UNABLE_TO_REMOVE_REPLACED),
-        TestReplaceFault::NoMutation(ERROR_UNABLE_TO_MOVE_REPLACEMENT),
-        TestReplaceFault::OldMovedToBackup(ERROR_UNABLE_TO_MOVE_REPLACEMENT_2),
-    ] {
-        let (_root, install, extract) = update_tree();
-        *TEST_REPLACE_FAULT.lock().unwrap() = Some(fault);
-        assert!(
-            replace_executable_set(&install, &extract, &["astrid.exe", "astrid-daemon.exe"])
-                .is_err()
-        );
-        assert_old_set(&install);
-    }
-}
-
-#[test]
-fn private_write_partial_replace_failure_restores_old_file() {
-    let _serial = serial_test_guard();
-    for fault in [
-        TestReplaceFault::NoMutation(ERROR_UNABLE_TO_REMOVE_REPLACED),
-        TestReplaceFault::NoMutation(ERROR_UNABLE_TO_MOVE_REPLACEMENT),
-        TestReplaceFault::OldMovedToBackup(ERROR_UNABLE_TO_MOVE_REPLACEMENT_2),
-    ] {
-        let root = private_temp();
-        let file = root.path().join("session-token");
-        atomic_write_private_file(&file, b"old-private-value").unwrap();
-        *TEST_REPLACE_FAULT.lock().unwrap() = Some(fault);
-        assert!(atomic_write_private_file(&file, b"new-private-value").is_err());
-        assert_eq!(std::fs::read(&file).unwrap(), b"old-private-value");
-        validate_private_file(&file).unwrap();
-        assert!(!root.path().join(PRIVATE_FILE_TRANSACTION_JOURNAL).exists());
-    }
-}
-
-#[test]
-fn sharing_violation_is_recoverable_and_leaves_no_mixed_set() {
+fn handle_relative_rename_failure_restores_complete_old_set() {
     let _serial = serial_test_guard();
     let (_root, install, extract) = update_tree();
-    *TEST_REPLACE_FAULT.lock().unwrap() =
-        Some(TestReplaceFault::NoMutation(ERROR_SHARING_VIOLATION));
+    *TEST_RENAME_FAULT.lock().unwrap() = Some(ERROR_SHARING_VIOLATION);
     assert!(
         replace_executable_set(&install, &extract, &["astrid.exe", "astrid-daemon.exe"]).is_err()
     );
     assert_old_set(&install);
+}
+
+#[test]
+fn second_entry_preparation_failure_cleans_every_staged_artifact() {
+    let _serial = serial_test_guard();
+    let (_root, install, extract) = update_tree();
+    *TEST_PREPARATION_FAIL_AT_ENTRY.lock().unwrap() = Some(1);
+
+    assert!(
+        replace_executable_set(&install, &extract, &["astrid.exe", "astrid-daemon.exe"]).is_err()
+    );
+    assert_old_set(&install);
+    assert_no_executable_transaction_artifacts(&install);
+}
+
+#[test]
+fn journal_publication_failure_cleans_journal_temp_and_prepared_files() {
+    let _serial = serial_test_guard();
+    let (_root, install, extract) = update_tree();
+    TEST_JOURNAL_RENAME_FAULT.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    assert!(
+        replace_executable_set(&install, &extract, &["astrid.exe", "astrid-daemon.exe"]).is_err()
+    );
+    assert_old_set(&install);
+    assert_no_executable_transaction_artifacts(&install);
+}
+
+#[test]
+fn private_journal_publication_failure_cleans_every_prepared_file() {
+    let _serial = serial_test_guard();
+    let root = private_temp();
+    let file = root.path().join("session-token");
+    atomic_write_private_file(&file, b"old-private-value").unwrap();
+    TEST_JOURNAL_RENAME_FAULT.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    assert!(atomic_write_private_file(&file, b"new-private-value").is_err());
+    assert_eq!(std::fs::read(&file).unwrap(), b"old-private-value");
+    let unexpected = std::fs::read_dir(root.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(".astrid-private") && name != PRIVATE_FILE_TRANSACTION_LOCK)
+        .collect::<Vec<_>>();
+    assert!(
+        unexpected.is_empty(),
+        "unexpected private transaction artifacts: {unexpected:?}"
+    );
+}
+
+#[test]
+fn private_write_rename_failure_restores_old_file() {
+    let _serial = serial_test_guard();
+    let root = private_temp();
+    let file = root.path().join("session-token");
+    atomic_write_private_file(&file, b"old-private-value").unwrap();
+    *TEST_RENAME_FAULT.lock().unwrap() = Some(ERROR_SHARING_VIOLATION);
+    assert!(atomic_write_private_file(&file, b"new-private-value").is_err());
+    assert_eq!(std::fs::read(&file).unwrap(), b"old-private-value");
+    validate_private_file(&file).unwrap();
+    assert!(!root.path().join(PRIVATE_FILE_TRANSACTION_JOURNAL).exists());
 }
 
 #[test]

@@ -40,14 +40,14 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   keep trusted directory components identity-checked and locked against path
   swaps. Self-update staging flushes bytes on the live volume and uses a
   private transaction journal, OS-backed cross-process lock, identity-bound
-  source handles, and independent rollback copies to recover partial
-  `ReplaceFileW` mutations and interrupted multi-executable sets. Sensitive
-  single-file writes use the same journal-before-mutation rule with an
-  independent rollback, so interrupted session-token, profile, and group
+  source handles, and independent rollback copies to recover failed or
+  interrupted multi-executable commit sequences.
+  Sensitive single-file writes use the same journal-before-mutation rule with
+  an independent rollback, so interrupted session-token, profile, and group
   writes restore the prior private file on the next operation. Their readers
   share the transaction lock, recover before opening the live name, and read
   through an identity-bound handle, so they cannot consume an uncommitted or
-  partially displaced private file.
+  incompletely committed private file.
   Native x86_64 and ARM64 MSVC tests exercise the prerequisite without enabling
   self-update, named pipes, daemon lifecycle, sandboxing, packaging, or a
   Windows support claim.

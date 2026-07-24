@@ -1,9 +1,12 @@
 //! Identity-locked Windows paths, handles, and trusted authority boundaries.
 
+#[cfg(test)]
+use super::acl::validate_trusted_file_acl_handle;
 use super::acl::{
-    apply_private_acl, validate_private_acl, validate_trusted_file_acl,
-    validate_trusted_parent_acl, validate_trusted_parent_acl_for_create,
+    PrivateSecurityDescriptor, validate_private_acl_handle,
+    validate_trusted_parent_acl_for_create_handle, validate_trusted_parent_acl_handle,
 };
+use super::error::with_context;
 use super::prelude::*;
 
 pub(super) struct OwnedHandle(pub(super) HANDLE);
@@ -19,6 +22,49 @@ impl Drop for OwnedHandle {
         }
     }
 }
+
+fn mark_directory_for_deletion(handle: HANDLE) -> io::Result<()> {
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    // SAFETY: `handle` is live with DELETE access and the fixed-size
+    // disposition buffer remains live for the call.
+    if unsafe {
+        SetFileInformationByHandle(
+            handle,
+            FileDispositionInfo,
+            (&raw const disposition).cast(),
+            u32::try_from(size_of::<FILE_DISPOSITION_INFO>())
+                .expect("FILE_DISPOSITION_INFO fits in u32"),
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+struct DeleteCreatedDirectoryOnDrop {
+    handle: HANDLE,
+    armed: bool,
+}
+
+impl DeleteCreatedDirectoryOnDrop {
+    fn new(handle: HANDLE, armed: bool) -> Self {
+        Self { handle, armed }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DeleteCreatedDirectoryOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = mark_directory_for_deletion(self.handle);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct FileIdentity {
     pub(super) volume: u32,
@@ -29,26 +75,110 @@ pub(super) struct FileIdentity {
 pub(super) struct LockedPathComponent {
     path: PathBuf,
     identity: FileIdentity,
-    _handle: OwnedHandle,
+    handle: OwnedHandle,
 }
 
-/// Keeps every existing directory component open without delete sharing.
+/// Keeps the caller-selected authority boundary open against rename.
 ///
-/// Windows path APIs are otherwise susceptible to check/use swaps. Holding
-/// these handles prevents rename/delete of checked components for the lifetime
-/// of the operation. Identity comparison before each mutation is defense in
-/// depth and makes a same-user test hook observable; same-user races are
-/// authority-equivalent, while the ACL check rejects write/delete authority
-/// for other principals.
+/// Ancestors are retained as identity handles with delete sharing so opening a
+/// system ancestor does not claim authority the caller does not have. The
+/// boundary handle requests write-attributes access and omits delete sharing:
+/// Windows only grants an effective exclusive directory open when write access
+/// was requested. Identity comparison before and after a namespace mutation is
+/// defense in depth; the ACL check rejects write/delete authority for other
+/// principals.
 pub(super) struct TrustedPathGuard {
     components: Vec<LockedPathComponent>,
     authority_boundary: PathBuf,
 }
 
+#[cfg(test)]
+pub(super) static TEST_MOVE_ANCESTOR_DURING_DIRECTORY_CREATE: std::sync::Mutex<
+    Option<(PathBuf, PathBuf)>,
+> = std::sync::Mutex::new(None);
+#[cfg(test)]
+pub(super) static TEST_FAIL_DIRECTORY_CREATE_AFTER_COMPONENT: std::sync::Mutex<Option<usize>> =
+    std::sync::Mutex::new(None);
+#[cfg(test)]
+pub(super) static TEST_DIRECTORY_CREATE_COMPONENTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+pub(super) static TEST_PROBE_DIR_CREATE_ACL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+pub(super) static TEST_SAW_DIR_CREATE_ACL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+struct CreatedPrivateDirectories {
+    entries: Vec<(PathBuf, OwnedHandle)>,
+    armed: bool,
+}
+
+impl CreatedPrivateDirectories {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            entries: Vec::with_capacity(capacity),
+            armed: true,
+        }
+    }
+
+    fn last_handle(&self) -> Option<HANDLE> {
+        self.entries.last().map(|(_, handle)| handle.0)
+    }
+
+    fn push(&mut self, path: PathBuf, handle: OwnedHandle) {
+        self.entries.push((path, handle));
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &(PathBuf, OwnedHandle)> {
+        self.entries.iter()
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    fn cleanup(&mut self) -> io::Result<()> {
+        self.armed = false;
+        let mut first_error = None;
+        while let Some((path, handle)) = self.entries.pop() {
+            if let Err(error) = mark_directory_for_deletion(handle.0)
+                && first_error.is_none()
+            {
+                first_error = Some(with_context(
+                    error,
+                    format!(
+                        "could not remove partially created private Windows directory {}",
+                        path.display()
+                    ),
+                ));
+            }
+            // Closing the child before processing its parent makes each
+            // directory empty before the parent's delete disposition is set.
+            drop(handle);
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+}
+
+impl Drop for CreatedPrivateDirectories {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.cleanup();
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum BoundaryContract {
+    TrustedForCreate,
+    ExactPrivateDirectory,
+}
+
 impl TrustedPathGuard {
     pub(super) fn capture(path: &Path) -> io::Result<Self> {
         validate_local_absolute_path(path)?;
-        let mut components = Vec::new();
+        let mut components: Vec<LockedPathComponent> = Vec::new();
         let mut current = PathBuf::new();
         let mut rooted = false;
         for component in path.components() {
@@ -74,29 +204,63 @@ impl TrustedPathGuard {
                     ),
                 ));
             }
-            let (handle, identity) = open_locked_directory(&current)?;
+            let (handle, identity) = if let Some(parent) = components.last() {
+                open_directory_identity_relative(
+                    parent.handle.0,
+                    component.as_os_str(),
+                    current == path,
+                )?
+            } else if current == path {
+                open_locked_directory(&current)?
+            } else {
+                open_directory_identity(&current, true)?
+            };
             components.push(LockedPathComponent {
                 path: current.clone(),
                 identity,
-                _handle: handle,
+                handle,
             });
+        }
+        if components.last().map(|component| component.path.as_path()) != Some(path) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "trusted Windows authority boundary does not exist: {}",
+                    path.display()
+                ),
+            ));
         }
         // System ancestors such as the volume root and `Users` deliberately
         // grant limited authority to principals outside Astrid's trust set.
-        // They are still opened without delete sharing and identity-checked,
-        // but the caller-selected owned directory is the ACL authority
-        // boundary. Every security-sensitive caller separately enforces its
-        // stronger exact/private contract there where required.
-        validate_trusted_parent_acl(path)?;
-        Ok(Self {
+        // They remain open as identity handles while the caller-selected owned
+        // directory is the rename-locked ACL authority boundary. Critical
+        // child mutations resolve relative to that boundary handle, so an
+        // ancestor rename cannot redirect the operation into another tree.
+        let result = Self {
             components,
             authority_boundary: path.to_path_buf(),
-        })
+        };
+        validate_trusted_parent_acl_handle(
+            result.authority_handle(),
+            &result.authority_boundary.display().to_string(),
+        )?;
+        Ok(result)
     }
 
     pub(super) fn verify(&self) -> io::Result<()> {
+        let mut parent_handle: Option<OwnedHandle> = None;
         for component in &self.components {
-            let (_, identity) = open_directory_identity(&component.path, true)?;
+            let (handle, identity) = if let Some(parent) = &parent_handle {
+                let name = component.path.file_name().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "captured Windows descendant has no final component",
+                    )
+                })?;
+                open_directory_identity_relative(parent.0, name, false)?
+            } else {
+                open_directory_identity(&component.path, true)?
+            };
             if identity != component.identity {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
@@ -106,9 +270,353 @@ impl TrustedPathGuard {
                     ),
                 ));
             }
+            parent_handle = Some(handle);
         }
-        validate_trusted_parent_acl(&self.authority_boundary)
+        validate_trusted_parent_acl_handle(
+            self.authority_handle(),
+            &self.authority_boundary.display().to_string(),
+        )
     }
+
+    pub(super) fn verify_contract(&self, contract: BoundaryContract) -> io::Result<()> {
+        self.verify()?;
+        match contract {
+            BoundaryContract::TrustedForCreate => validate_trusted_parent_acl_for_create_handle(
+                self.authority_handle(),
+                &self.authority_boundary.display().to_string(),
+            ),
+            BoundaryContract::ExactPrivateDirectory => validate_private_acl_handle(
+                self.authority_handle(),
+                true,
+                &self.authority_boundary.display().to_string(),
+            ),
+        }
+    }
+
+    pub(super) fn authority_boundary(&self) -> &Path {
+        &self.authority_boundary
+    }
+
+    pub(super) fn authority_handle(&self) -> HANDLE {
+        self.components
+            .last()
+            .expect("captured Windows path has an authority component")
+            .handle
+            .0
+    }
+
+    pub(super) fn create_private_descendants(&self, target: &Path) -> io::Result<()> {
+        let relative = target.strip_prefix(&self.authority_boundary).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "private Windows directory is outside its retained authority boundary: {}",
+                    target.display()
+                ),
+            )
+        })?;
+        let names = relative
+            .components()
+            .map(|component| match component {
+                Component::Normal(name) => Ok(name.to_os_string()),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "private Windows directory contains a non-normal component: {}",
+                        target.display()
+                    ),
+                )),
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        if names.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "private Windows directory already exists: {}",
+                    target.display()
+                ),
+            ));
+        }
+
+        let mut created = CreatedPrivateDirectories::with_capacity(names.len());
+        let result = (|| {
+            self.verify_contract(BoundaryContract::TrustedForCreate)?;
+            let mut current = self.authority_boundary.clone();
+            for (index, name) in names.iter().enumerate() {
+                let parent = created
+                    .last_handle()
+                    .unwrap_or_else(|| self.authority_handle());
+                current.push(name);
+                let handle = create_private_directory_relative(parent, name)?;
+                created.push(current.clone(), handle);
+                validate_private_acl_handle(
+                    created
+                        .last_handle()
+                        .expect("created directory handle was just retained"),
+                    true,
+                    &current.display().to_string(),
+                )?;
+
+                #[cfg(test)]
+                after_test_directory_component(index)?;
+                #[cfg(not(test))]
+                let _ = index;
+            }
+
+            self.verify_contract(BoundaryContract::TrustedForCreate)?;
+            for (path, handle) in created.iter() {
+                validate_private_acl_handle(handle.0, true, &path.display().to_string())?;
+            }
+            TrustedPathGuard::capture(target)?
+                .verify_contract(BoundaryContract::ExactPrivateDirectory)
+        })();
+
+        match result {
+            Ok(()) => {
+                created.disarm();
+                Ok(())
+            },
+            Err(error) => match created.cleanup() {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(with_context(
+                    error,
+                    format!(
+                        "private Windows directory creation failed and partial cleanup also failed: {cleanup_error}"
+                    ),
+                )),
+            },
+        }
+    }
+
+    /// Runs a handle-relative mutation while the authority handle stays live.
+    ///
+    /// The caller's full ACL contract and every captured identity are checked
+    /// both before and after the operation. Panics are resumed only after a
+    /// best-effort verification, so test interruptions cannot silently bypass
+    /// the security postcondition or replace the original panic.
+    pub(super) fn with_verified_mutation<T>(
+        &self,
+        operation: &str,
+        contract: BoundaryContract,
+        action: impl FnOnce() -> io::Result<T>,
+    ) -> io::Result<T> {
+        self.verify_contract(contract)?;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(action));
+        let verification = self.verify_contract(contract);
+        let result = match result {
+            Ok(result) => result,
+            Err(payload) => {
+                if let Err(error) = verification {
+                    eprintln!(
+                        "{operation} panicked and Windows authority verification failed: {error}"
+                    );
+                }
+                std::panic::resume_unwind(payload);
+            },
+        };
+        match (result, verification) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+            (Err(operation_error), Err(verification_error)) => Err(with_context(
+                operation_error,
+                format!(
+                    "{operation} failed and authority-boundary verification also failed: {verification_error}"
+                ),
+            )),
+        }
+    }
+}
+
+#[cfg(test)]
+fn after_test_directory_component(index: usize) -> io::Result<()> {
+    TEST_DIRECTORY_CREATE_COMPONENTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let should_fail = {
+        let mut fault = TEST_FAIL_DIRECTORY_CREATE_AFTER_COMPONENT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *fault == Some(index) {
+            *fault = None;
+            true
+        } else {
+            false
+        }
+    };
+    if should_fail {
+        return Err(io::Error::from_raw_os_error(5));
+    }
+
+    if index != 0 {
+        return Ok(());
+    }
+    let move_paths = TEST_MOVE_ANCESTOR_DURING_DIRECTORY_CREATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some((from, to)) = move_paths {
+        std::fs::rename(from, to)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn test_probe_created_directory_acl(handle: HANDLE, disposition: u32) -> io::Result<()> {
+    if disposition == FILE_CREATE
+        && TEST_PROBE_DIR_CREATE_ACL.swap(false, std::sync::atomic::Ordering::SeqCst)
+    {
+        validate_private_acl_handle(handle, true, "newly created private directory")?;
+        TEST_SAW_DIR_CREATE_ACL.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    Ok(())
+}
+
+fn create_private_directory_relative(parent: HANDLE, name: &OsStr) -> io::Result<OwnedHandle> {
+    let security = PrivateSecurityDescriptor::new(true)?;
+    let (handle, _) = open_directory_identity_relative_with_options(
+        parent,
+        name,
+        true,
+        WRITE_DAC | DELETE,
+        FILE_CREATE,
+        Some(&security),
+    )?;
+    Ok(handle)
+}
+
+fn open_directory_identity_relative(
+    parent: HANDLE,
+    name: &OsStr,
+    lock_against_rename: bool,
+) -> io::Result<(OwnedHandle, FileIdentity)> {
+    open_directory_identity_relative_with_access(parent, name, lock_against_rename, 0)
+}
+
+fn open_directory_identity_relative_with_access(
+    parent: HANDLE,
+    name: &OsStr,
+    lock_against_rename: bool,
+    extra_access: u32,
+) -> io::Result<(OwnedHandle, FileIdentity)> {
+    open_directory_identity_relative_with_options(
+        parent,
+        name,
+        lock_against_rename,
+        extra_access,
+        FILE_OPEN,
+        None,
+    )
+}
+
+fn open_directory_identity_relative_with_options(
+    parent: HANDLE,
+    name: &OsStr,
+    lock_against_rename: bool,
+    extra_access: u32,
+    disposition: u32,
+    security_descriptor: Option<&PrivateSecurityDescriptor>,
+) -> io::Result<(OwnedHandle, FileIdentity)> {
+    let mut name = name.encode_wide().collect::<Vec<_>>();
+    if name.is_empty() || name.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid handle-relative Windows directory component",
+        ));
+    }
+    let byte_length = name
+        .len()
+        .checked_mul(size_of::<u16>())
+        .and_then(|length| u16::try_from(length).ok())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Windows directory name is too long",
+            )
+        })?;
+    let unicode = UNICODE_STRING {
+        Length: byte_length,
+        MaximumLength: byte_length,
+        Buffer: name.as_mut_ptr(),
+    };
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: u32::try_from(size_of::<OBJECT_ATTRIBUTES>())
+            .expect("OBJECT_ATTRIBUTES fits in u32"),
+        RootDirectory: parent,
+        ObjectName: &raw const unicode,
+        Attributes: 0x40, // OBJ_CASE_INSENSITIVE
+        SecurityDescriptor: security_descriptor.map_or(null(), PrivateSecurityDescriptor::as_ptr),
+        SecurityQualityOfService: null(),
+    };
+    let mut handle = null_mut();
+    let mut status = IO_STATUS_BLOCK::default();
+    let desired_access = FILE_READ_ATTRIBUTES
+        | READ_CONTROL
+        | SYNCHRONIZE
+        | extra_access
+        | if lock_against_rename {
+            FILE_TRAVERSE | FILE_WRITE_ATTRIBUTES
+        } else {
+            0
+        };
+    let share_access = FILE_SHARE_READ
+        | FILE_SHARE_WRITE
+        | if lock_against_rename {
+            0
+        } else {
+            FILE_SHARE_DELETE
+        };
+    // SAFETY: descriptors and output buffers remain live for the call, and
+    // the component is resolved relative to the retained parent handle.
+    let result = unsafe {
+        NtCreateFile(
+            &raw mut handle,
+            desired_access,
+            &raw const attributes,
+            &raw mut status,
+            null(),
+            0,
+            share_access,
+            disposition,
+            FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            null(),
+            0,
+        )
+    };
+    if result < 0 {
+        let code = unsafe { RtlNtStatusToDosError(result) };
+        return Err(io::Error::from_raw_os_error(code.cast_signed()));
+    }
+    if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+        return Err(io::Error::other(
+            "NtCreateFile returned an invalid relative directory handle",
+        ));
+    }
+    let handle = OwnedHandle(handle);
+    let mut delete_created =
+        DeleteCreatedDirectoryOnDrop::new(handle.0, disposition == FILE_CREATE);
+    #[cfg(test)]
+    test_probe_created_directory_acl(handle.0, disposition)?;
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: handle and output buffer are live.
+    if unsafe { GetFileInformationByHandle(handle.0, &raw mut info) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "trusted Windows descendant is redirected or not a directory",
+        ));
+    }
+    let result = (
+        handle,
+        FileIdentity {
+            volume: info.dwVolumeSerialNumber,
+            index_high: info.nFileIndexHigh,
+            index_low: info.nFileIndexLow,
+        },
+    );
+    delete_created.disarm();
+    Ok(result)
 }
 
 pub(super) fn open_locked_directory(path: &Path) -> io::Result<(OwnedHandle, FileIdentity)> {
@@ -127,12 +635,19 @@ pub(super) fn open_directory_identity(
         } else {
             0
         };
+    let desired_access = FILE_READ_ATTRIBUTES
+        | READ_CONTROL
+        | if allow_delete_sharing {
+            0
+        } else {
+            FILE_TRAVERSE | FILE_WRITE_ATTRIBUTES
+        };
     // SAFETY: the path is NUL terminated; null security/template pointers are
     // permitted. OPEN_REPARSE_POINT prevents following a late redirect.
     let handle = unsafe {
         CreateFileW(
             wide.as_ptr(),
-            FILE_READ_ATTRIBUTES | READ_CONTROL,
+            desired_access,
             share,
             null(),
             OPEN_EXISTING,
@@ -168,11 +683,13 @@ pub(super) fn open_directory_identity(
     ))
 }
 
+#[cfg(test)]
 pub(super) struct LockedRegularFile {
     pub(super) file: File,
     pub(super) identity: FileIdentity,
 }
 
+#[cfg(test)]
 pub(super) fn open_locked_regular_file(path: &Path) -> io::Result<LockedRegularFile> {
     verify_no_redirects(path)?;
     let wide = wide_path(path)?;
@@ -218,7 +735,7 @@ pub(super) fn open_locked_regular_file(path: &Path) -> io::Result<LockedRegularF
     // SAFETY: `handle` is a unique owned file handle and ownership transfers
     // exactly once into `File`.
     let file = unsafe { File::from_raw_handle(handle.cast()) };
-    validate_trusted_file_acl(path)?;
+    validate_trusted_file_acl_handle(handle, &path.display().to_string())?;
     Ok(LockedRegularFile {
         file,
         identity: FileIdentity {
@@ -227,16 +744,6 @@ pub(super) fn open_locked_regular_file(path: &Path) -> io::Result<LockedRegularF
             index_low: info.nFileIndexLow,
         },
     })
-}
-
-pub(super) fn hash_locked_regular_file(path: &Path) -> io::Result<String> {
-    let mut locked = open_locked_regular_file(path)?;
-    hash_open_file(&mut locked.file)
-}
-
-pub(super) fn verify_trusted_regular_file(path: &Path) -> io::Result<()> {
-    let _locked = open_locked_regular_file(path)?;
-    Ok(())
 }
 
 pub(in crate::platform_fs) fn default_astrid_home_root() -> io::Result<PathBuf> {
@@ -258,31 +765,12 @@ pub(in crate::platform_fs) fn ensure_private_directory(path: &Path) -> io::Resul
     validate_local_absolute_path(path)?;
     if path.exists() {
         let guard = TrustedPathGuard::capture(path)?;
-        if !std::fs::metadata(path)?.is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("private path is not a directory: {}", path.display()),
-            ));
-        }
-        validate_private_acl(path, true)?;
-        return guard.verify();
+        return guard.verify_contract(BoundaryContract::ExactPrivateDirectory);
     }
 
     let existing_parent = nearest_existing_ancestor(path)?;
     let guard = TrustedPathGuard::capture(&existing_parent)?;
-    validate_trusted_parent_acl_for_create(&existing_parent)?;
-    std::fs::create_dir_all(path)?;
-    guard.verify()?;
-    verify_no_redirects(path)?;
-    if !std::fs::metadata(path)?.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("private path is not a directory: {}", path.display()),
-        ));
-    }
-    apply_private_acl(path, true)?;
-    validate_private_acl(path, true)?;
-    TrustedPathGuard::capture(path)?.verify()
+    guard.create_private_descendants(path)
 }
 
 pub(in crate::platform_fs) fn restrict_private_file(path: &Path) -> io::Result<()> {
@@ -291,10 +779,7 @@ pub(in crate::platform_fs) fn restrict_private_file(path: &Path) -> io::Result<(
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "private file has no parent"))?;
     let guard = TrustedPathGuard::capture(parent)?;
-    verify_regular_file(path)?;
-    apply_private_acl(path, false)?;
-    validate_private_acl(path, false)?;
-    guard.verify()
+    super::io::restrict_guarded_private_file(&guard, path)
 }
 
 pub(in crate::platform_fs) fn validate_private_file(path: &Path) -> io::Result<()> {
@@ -303,9 +788,12 @@ pub(in crate::platform_fs) fn validate_private_file(path: &Path) -> io::Result<(
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "private file has no parent"))?;
     let guard = TrustedPathGuard::capture(parent)?;
-    verify_regular_file(path)?;
-    validate_private_acl(path, false)?;
-    guard.verify()
+    drop(super::io::open_guarded_regular_file(
+        &guard,
+        path,
+        super::io::FileContract::ExactPrivate,
+    )?);
+    guard.verify_contract(BoundaryContract::ExactPrivateDirectory)
 }
 
 pub(super) fn nearest_existing_ancestor(path: &Path) -> io::Result<PathBuf> {
@@ -395,21 +883,6 @@ pub(super) fn validate_local_absolute_path(path: &Path) -> io::Result<()> {
             io::ErrorKind::InvalidInput,
             format!(
                 "security-sensitive Windows path must use a local absolute volume: {}",
-                path.display()
-            ),
-        ));
-    }
-    Ok(())
-}
-
-pub(super) fn verify_regular_file(path: &Path) -> io::Result<()> {
-    verify_no_redirects(path)?;
-    let metadata = std::fs::symlink_metadata(path)?;
-    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || !metadata.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "private Windows path is redirected or not a regular file: {}",
                 path.display()
             ),
         ));

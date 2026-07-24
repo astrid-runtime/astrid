@@ -357,9 +357,11 @@ pub(super) async fn download_bounded(
 /// Each existing binary is copied to `<name>.bak` first; new binaries are staged
 /// as temp files in `install_dir` (same filesystem) and `rename`d into place —
 /// atomic per file on Unix. Windows stages and flushes bytes on the live volume,
-/// then uses a recovery journal around `ReplaceFileW`; an interrupted mixed set
-/// is restored on the next attempt. The `.bak` copies are left in place for
-/// manual rollback after a successful update.
+/// then uses a recovery journal around handle-relative
+/// `SetFileInformationByHandle(FileRenameInfo)` transitions, each atomic at the
+/// individual name boundary; an interrupted mixed set is restored on the next
+/// attempt. The `.bak` copies are left in place for manual rollback after a
+/// successful update.
 fn backup_and_swap(install_dir: &Path, extract_dir: &Path, names: &[&str]) -> anyhow::Result<()> {
     astrid_core::platform_fs::replace_executable_set(install_dir, extract_dir, names)
         .context("failed to replace authenticated Astrid executables")

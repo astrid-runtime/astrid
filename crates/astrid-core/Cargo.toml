@@ -45,11 +45,14 @@ tokio = { workspace = true, features = ["net"] }
 blake3 = { workspace = true, features = ["prefer_intrinsics"] }
 directories = { workspace = true }
 windows-sys = { workspace = true, features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_Memory",
+    "Win32_System_IO",
     "Win32_System_SystemServices",
     "Win32_System_Threading",
 ] }

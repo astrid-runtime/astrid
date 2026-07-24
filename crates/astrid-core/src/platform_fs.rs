@@ -210,9 +210,9 @@ pub(crate) fn read_private_file_to_string(path: &Path) -> io::Result<String> {
 /// The temporary is created exclusively beside the destination, secured before
 /// it becomes visible under the live name, flushed through the supported file
 /// API, and installed with a same-volume replacement. A private transaction
-/// journal and independent rollback copy restore the prior file after an
-/// interrupted or partially mutating replacement. Existing destinations must
-/// already satisfy the private ACL contract. This does not claim that a
+/// journal and independent rollback copy restore the prior file when a failure
+/// or interruption leaves the transaction uncommitted. Existing destinations
+/// must already satisfy the private ACL contract. This does not claim that a
 /// namespace update survives sudden power loss.
 ///
 /// # Errors
@@ -266,9 +266,12 @@ pub fn verify_no_redirects(path: &Path) -> io::Result<()> {
 /// Staging always occurs beside the live files on the same volume. Unix keeps
 /// the existing copy, `rename`, and rollback behavior. Windows flushes staged
 /// bytes copied from identity-bound source handles, records a private recovery
-/// journal under an OS-backed exclusive process lock, uses `ReplaceFileW` (or
-/// a move for a first install), and retains `<name>.bak`. An interrupted or
-/// partially failed set is restored from independent rollback copies.
+/// journal under an OS-backed exclusive process lock, and performs each
+/// same-directory name transition with
+/// `SetFileInformationByHandle(FileRenameInfo)`. Each rename is atomic at the
+/// individual name boundary; an interrupted or partially failed set is
+/// restored from independent rollback copies. Successful updates retain
+/// `<name>.bak`.
 ///
 /// # Errors
 ///
