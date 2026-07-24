@@ -47,6 +47,13 @@ pub struct CapabilitiesDef {
     /// Unix/TCP socket bind addresses the capsule requires.
     #[serde(default)]
     pub net_bind: Vec<String>,
+    /// Concurrent run-loop workers for a loopback TCP server capsule. Each worker
+    /// is an independent Store running `run()` and accepting on the shared bound
+    /// listener, so N workers serve N connections concurrently. None/1 = today's
+    /// single-instance behavior. Only honored for run-loop capsules that declare
+    /// net_bind and no host_process.
+    #[serde(default)]
+    pub bind_workers: Option<usize>,
     /// Outbound TCP destinations the capsule is allowed to connect to.
     ///
     /// Each entry is a `"host:port"` pattern. The `host` portion is a
@@ -223,6 +230,7 @@ mod tests {
             host_process: vec!["bash".into()],
             allow_persistent: true,
             net_bind: vec!["127.0.0.1:0".into()],
+            bind_workers: None,
             net_connect: vec!["host:443".into()],
             identity: vec!["resolve".into()],
             allow_prompt_injection: true,

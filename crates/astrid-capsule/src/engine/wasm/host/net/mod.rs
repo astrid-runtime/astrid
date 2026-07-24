@@ -62,11 +62,13 @@ pub(super) const MAX_ACTIVE_STREAMS: usize = 8;
 /// capability token that the capsule must hold to call `accept`.
 pub(super) struct UnixListenerSlot;
 
-/// Stamp marking a resource slot as a `TcpListener` for future inbound
-/// TCP server support. Pre-allocated so the type is in scope even though
-/// `bind-tcp` is still a stub.
-#[allow(dead_code)]
-pub(super) struct TcpListenerSlot;
+/// Resource slot holding a bound inbound TCP listener. The
+/// `Resource<TcpListener>` handed to the guest is a token over this slot;
+/// `accept` / `poll-accept` / `local-addr` reach the `tokio` listener
+/// through it, and `Drop` closes the socket.
+pub(super) struct TcpListenerSlot {
+    pub(super) listener: Arc<tokio::net::TcpListener>,
+}
 
 /// Stamp marking a resource slot as a `UdpSocket`. Same reason as above.
 #[allow(dead_code)]
@@ -84,6 +86,20 @@ pub(super) fn validate_host(host: &str) -> Result<(), ErrorCode> {
         return Err(ErrorCode::AddressNotAvailable);
     }
     Ok(())
+}
+
+/// Whether a TCP-bind host names a loopback interface. Capsule-hosted
+/// servers are confined to loopback (see `bind_tcp`): `127.0.0.0/8`, `::1`,
+/// or the literal `localhost`. A hostname other than `localhost` is refused
+/// rather than resolved — binding must name a concrete local interface, and
+/// resolving arbitrary names for a bind target is an SSRF-shaped footgun.
+pub(super) fn is_loopback_bind_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
 }
 
 /// Classify a tokio io::Error into the typed `net::ErrorCode`.
@@ -291,12 +307,91 @@ impl net::Host for HostState {
         Ok(Resource::new_own(res.rep()))
     }
 
-    fn bind_tcp(&mut self, _host: String, _port: u16) -> Result<Resource<TcpListener>, ErrorCode> {
-        // Inbound TCP server hosting — needs a fresh tokio listener +
-        // capability gate (net_tcp_bind allowlist) + per-capsule accept
-        // loop. Lands in a follow-up commit; capsules importing
-        // `bind-tcp` today see CapabilityDenied so they fail closed.
-        Err(ErrorCode::CapabilityDenied)
+    fn bind_tcp(&mut self, host: String, port: u16) -> Result<Resource<TcpListener>, ErrorCode> {
+        validate_host(&host)?;
+        let bind_addr = format!("tcp:{host}:{port}");
+
+        // Capability gate: host:port must match the capsule's `net_bind`
+        // allowlist (TCP entries share that field with unix binds).
+        if let Some(ref gate) = self.security {
+            let capsule_id = self.capsule_id.as_str().to_owned();
+            let host_for_check = host.clone();
+            let gate = gate.clone();
+            let rt = self.runtime_handle.clone();
+            let semaphore = self.blocking_semaphore.clone();
+            let check = util::bounded_block_on(&rt, &semaphore, async move {
+                gate.check_net_tcp_bind(&capsule_id, &host_for_check, port)
+                    .await
+            });
+            if let Err(reason) = check {
+                // Deny path records before the early return (exactly-once).
+                record_net_denied(self, HostAuditEvent::NetBind { addr: &bind_addr }, &reason);
+                return Err(ErrorCode::CapabilityDenied);
+            }
+        }
+
+        // Security rail: capsule-hosted servers are loopback-only. Exposing a
+        // capsule listener beyond loopback is a deliberate future opt-in; this
+        // mirrors `connect-tcp`, which runs its `is_safe_ip` airlock AFTER the
+        // capability gate. A non-loopback bind is refused here, not silently
+        // downgraded.
+        if !is_loopback_bind_host(&host) {
+            let reason = "non-loopback TCP bind refused (capsule servers are loopback-only)";
+            audit_net_bind(self, &bind_addr, HostAuditOutcome::Failed(reason));
+            return Err(ErrorCode::AirlockRejected);
+        }
+
+        // Resolve the listener via the shared registry so a run-loop capsule's
+        // N worker Stores dedupe onto ONE bound socket (Approach B): the first
+        // worker binds, the rest observe the Occupied entry and clone its
+        // `Arc<TcpListener>`. All N then block on `accept()` against the single
+        // OS accept queue, which load-balances (SO_REUSEPORT does NOT on macOS).
+        // The bind runs UNDER the shard lock so racing workers serialize here —
+        // without it a second concurrent bind would fail EADDRINUSE (macOS sets
+        // no SO_REUSEADDR). Quick op — the non-cancellable bounded_block_on is
+        // fine (accept, which blocks indefinitely, uses the cancellable variant).
+        // For a non-run-loop pool `shared_listeners` starts empty and each
+        // instance binds its own address, unchanged from before.
+        let listener: Arc<tokio::net::TcpListener> =
+            match self.shared_listeners.entry((host.clone(), port)) {
+                dashmap::mapref::entry::Entry::Occupied(existing) => Arc::clone(existing.get()),
+                dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                    let rt = self.runtime_handle.clone();
+                    let sem = self.blocking_semaphore.clone();
+                    let host_owned = host.clone();
+                    let bind_result: Result<tokio::net::TcpListener, std::io::Error> =
+                        util::bounded_block_on(&rt, &sem, async move {
+                            tokio::net::TcpListener::bind((host_owned.as_str(), port)).await
+                        });
+                    match bind_result {
+                        Ok(l) => {
+                            let listener = Arc::new(l);
+                            vacant.insert(Arc::clone(&listener));
+                            listener
+                        },
+                        Err(e) => {
+                            let mapped = map_io_err(e);
+                            let reason = format!("{mapped:?}");
+                            audit_net_bind(self, &bind_addr, HostAuditOutcome::Failed(&reason));
+                            return Err(mapped);
+                        },
+                    }
+                },
+            };
+
+        let slot = TcpListenerSlot { listener };
+        let res = match self.resource_table.push(slot) {
+            Ok(res) => res,
+            Err(e) => {
+                // The socket is already bound; the push consumes and drops the
+                // listener here, releasing it. Record the failure.
+                let reason = format!("resource table: {e}");
+                audit_net_bind(self, &bind_addr, HostAuditOutcome::Failed(&reason));
+                return Err(ErrorCode::Unknown(reason));
+            },
+        };
+        audit_net_bind(self, &bind_addr, HostAuditOutcome::Allowed);
+        Ok(Resource::new_own(res.rep()))
     }
 
     fn connect_tcp(&mut self, host: String, port: u16) -> Result<Resource<TcpStream>, ErrorCode> {
@@ -500,5 +595,25 @@ mod tests {
     fn validate_host_accepts_max_length() {
         let max = "a".repeat(255);
         assert!(validate_host(&max).is_ok());
+    }
+
+    #[test]
+    fn loopback_bind_host_accepts_loopback() {
+        assert!(is_loopback_bind_host("127.0.0.1"));
+        assert!(is_loopback_bind_host("127.0.0.5"));
+        assert!(is_loopback_bind_host("::1"));
+        assert!(is_loopback_bind_host("localhost"));
+        assert!(is_loopback_bind_host("LOCALHOST"));
+    }
+
+    #[test]
+    fn loopback_bind_host_rejects_non_loopback() {
+        assert!(!is_loopback_bind_host("0.0.0.0"));
+        assert!(!is_loopback_bind_host("192.168.1.10"));
+        assert!(!is_loopback_bind_host("8.8.8.8"));
+        assert!(!is_loopback_bind_host("::"));
+        // A hostname other than localhost is refused (not resolved).
+        assert!(!is_loopback_bind_host("example.com"));
+        assert!(!is_loopback_bind_host(""));
     }
 }
