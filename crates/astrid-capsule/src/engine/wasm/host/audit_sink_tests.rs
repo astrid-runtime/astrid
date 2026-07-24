@@ -775,7 +775,7 @@ async fn windows_live_handle_kill_reports_true_and_cleans_descendants() {
 #[tokio::test(flavor = "multi_thread")]
 async fn windows_signal_audit_never_persists_guest_arguments() {
     use crate::engine::wasm::bindings::astrid::process1_1_0::host::{
-        Host as _, HostProcessHandle as _, ProcessHandle, ProcessSignal,
+        Host as _, ProcessHandle, ProcessSignal,
     };
     use wasmtime::component::Resource;
 

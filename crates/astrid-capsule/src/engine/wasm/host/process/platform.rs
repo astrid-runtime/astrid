@@ -444,6 +444,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[allow(clippy::zombie_processes)]
     fn windows_process_probe_child() {
         use std::io::{Read as _, Write as _};
         use std::process::Stdio;

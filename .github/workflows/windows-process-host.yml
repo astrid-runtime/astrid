@@ -101,6 +101,7 @@ jobs:
           -p astrid-workspace
           --all-targets
           --all-features
+          --no-deps
           --
           -D warnings
 
