@@ -8,6 +8,10 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Core types and traits for Astrid secure agent runtime"
 
+[features]
+default = []
+test-support = []
+
 [dependencies]
 async-trait = { workspace = true }
 base64 = { workspace = true }
@@ -40,6 +44,24 @@ getrandom = { version = "0.4", features = ["wasm_js"] }
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
 tokio = { workspace = true, features = ["net"] }
+
+[target.'cfg(windows)'.dependencies]
+blake3 = { workspace = true, features = ["pure"] }
+tokio = { workspace = true, features = ["net"] }
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
+
+[[test]]
+name = "windows_named_pipe_security_harness"
+path = "tests/windows_named_pipe_security_harness.rs"
+harness = false
+required-features = ["test-support"]
 
 [lints]
 workspace = true

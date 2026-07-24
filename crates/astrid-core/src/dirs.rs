@@ -468,7 +468,11 @@ impl AstridHome {
         self.root.join("run")
     }
 
-    /// Path to the kernel's Unix domain socket (`run/system.sock`).
+    /// Portable endpoint token for the kernel's host-local transport.
+    ///
+    /// Unix uses this as the domain-socket path (`run/system.sock`). Windows
+    /// derives its named-pipe endpoint from the current process token SID and
+    /// deliberately ignores the filesystem-shaped value.
     #[must_use]
     pub fn socket_path(&self) -> PathBuf {
         self.run_dir().join("system.sock")

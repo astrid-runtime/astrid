@@ -6,7 +6,11 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Shared uplink client (Unix-socket handshake + admin IPC correlation) used by the CLI and the HTTP gateway."
+description = "Shared uplink client (local-transport handshake + admin IPC correlation) used by the CLI and the HTTP gateway."
+
+[features]
+default = []
+test-support = []
 
 [dependencies]
 anyhow = { workspace = true }
@@ -16,7 +20,7 @@ astrid-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-# `net`: Unix-socket/TCP client transport; native-only, not in the tokio base.
+# `net`: host-local/TCP client transport; native-only, not in the tokio base.
 tokio = { workspace = true, features = ["net"] }
 tracing = { workspace = true }
 uuid = { workspace = true }

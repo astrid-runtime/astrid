@@ -52,3 +52,26 @@ pub use memory_ledger::MemoryLedger;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub use memory_ledger::StoreMemoryMeter;
 pub use tool_discovery::{ToolDescriptor, describe_loaded_capsule, tools_missing_execute_route};
+
+/// Test-only access to security boundaries that integration tests must drive
+/// through real operating-system transports.
+#[cfg(all(
+    feature = "test-support",
+    not(all(target_arch = "wasm32", target_os = "unknown"))
+))]
+#[doc(hidden)]
+pub mod test_support {
+    use astrid_core::local_transport::LocalStream;
+    use astrid_core::principal::PrincipalId;
+    use astrid_core::session_token::SessionToken;
+
+    /// Run the production inbound session-token and signed-principal validator.
+    pub async fn validate_local_handshake(
+        stream: &mut LocalStream,
+        expected_token: &SessionToken,
+        home: &astrid_core::dirs::AstridHome,
+    ) -> Result<Option<(PrincipalId, String)>, String> {
+        crate::engine::wasm::host::net::handshake::validate_handshake(stream, expected_token, home)
+            .await
+    }
+}

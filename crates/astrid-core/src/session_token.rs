@@ -1,4 +1,4 @@
-//! Session token for Unix socket authentication.
+//! Session token for host-local transport authentication.
 //!
 //! The daemon generates a random 256-bit token at startup and writes it to
 //! `~/.astrid/run/system.token` with 0o600 permissions. The CLI reads

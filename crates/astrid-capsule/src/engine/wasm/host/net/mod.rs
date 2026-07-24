@@ -41,7 +41,7 @@ use crate::engine::wasm::host::util;
 use crate::engine::wasm::host_state::{HostState, NetStream, TcpStreamSlot};
 
 mod client_lifecycle;
-mod handshake;
+pub(crate) mod handshake;
 mod stream;
 mod tcp_listener;
 mod tcp_stream;
@@ -176,7 +176,7 @@ pub(crate) fn record_net_denied(state: &HostState, event: HostAuditEvent<'_>, re
     }
 }
 
-/// Report a Unix-socket bind outcome (allowed or failed) to the per-action
+/// Report a local-transport bind outcome (allowed or failed) to the per-action
 /// audit sink. The bind path has no host:port, so it carries a fixed
 /// descriptor for the pre-provisioned listener. Mirrors [`audit_net_connect`]
 /// for the listener side; a gate denial uses [`record_net_denied`] instead
