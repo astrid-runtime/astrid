@@ -482,6 +482,11 @@ pub(crate) enum McpCommands {
     /// stream (EOF) or the process is killed. Stdout carries the MCP
     /// JSON-RPC protocol only — all diagnostics go to stderr.
     Serve {
+        /// Directory to attach as this MCP client's invocation-scoped
+        /// `cwd://` root. Defaults to the launching process's current
+        /// directory. This is independent of the daemon's own workspace.
+        #[arg(long, value_name = "PATH")]
+        workspace: Option<std::path::PathBuf>,
         /// Maximum time to await one broker round trip (for example `55s`,
         /// `5m`, or `2h`). Configure this above the broker capsule's tool
         /// execution timeout and below the launching client's own deadline.

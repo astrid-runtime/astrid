@@ -47,7 +47,6 @@ impl Default for WorkspaceAttachmentRegistry {
 
 impl WorkspaceAttachmentRegistry {
     /// Admit a canonical directory for one verified principal.
-    #[must_use]
     pub(crate) fn attach(
         &self,
         owner: PrincipalId,

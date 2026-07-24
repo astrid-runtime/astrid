@@ -99,6 +99,9 @@ pub(crate) struct AstridMcpServer {
     client: Arc<Mutex<SocketClient>>,
     /// Principal stamped on every outbound IPC message.
     principal: PrincipalId,
+    /// Canonical host directory authenticated as this MCP connection's
+    /// invocation-scoped `cwd://` root. Reconnects must preserve it.
+    workspace: std::path::PathBuf,
     /// Upper bound for one publish-and-reply broker round trip. Configured by
     /// `aos mcp serve --request-timeout`; it must sit above the broker
     /// capsule's own result-drain window so terminal broker errors are not
@@ -122,26 +125,32 @@ impl AstridMcpServer {
     pub(crate) fn new(
         client: Arc<Mutex<SocketClient>>,
         principal: PrincipalId,
+        workspace: std::path::PathBuf,
         request_deadline: Duration,
     ) -> Self {
         Self {
             client,
             principal,
+            workspace,
             request_deadline,
             needs_reconnect: AtomicBool::new(false),
         }
     }
 
-    /// Reconnect the held uplink without ever retaining a client authenticated
-    /// to a daemon for another workspace. Every failure leaves the recovery
-    /// flag armed; only a fully checked replacement clears it.
+    /// Reconnect the held uplink while preserving this MCP client's
+    /// authenticated workspace attachment. The daemon's own workspace is an
+    /// independent lifecycle concern: AOS clients from multiple worktrees
+    /// deliberately share one runtime daemon.
+    ///
+    /// Every failure leaves the recovery flag armed; only a fully
+    /// authenticated replacement clears it.
     async fn reconnect(&self, client: &mut SocketClient) -> Result<(), McpError> {
         self.needs_reconnect.store(true, Ordering::Relaxed);
         let principal = self.principal.clone();
-        let result = crate::socket_client::reconnect_for_workspace(
+        let result = crate::socket_client::reconnect_with_workspace_attachment(
             client,
             principal.clone(),
-            None,
+            Some(&self.workspace),
             |replacement| {
                 super::require_authenticated_unless_anonymous(
                     &principal,

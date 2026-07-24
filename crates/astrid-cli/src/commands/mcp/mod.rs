@@ -77,6 +77,15 @@ fn resolve_request_timeout(value: Option<&str>) -> Result<Duration> {
     Ok(timeout)
 }
 
+fn resolve_workspace(workspace: Option<&std::path::Path>) -> Result<std::path::PathBuf> {
+    workspace
+        .map(std::path::Path::to_path_buf)
+        .map_or_else(std::env::current_dir, Ok)
+        .context("failed to resolve the launching agent's workspace")?
+        .canonicalize()
+        .context("failed to canonicalize the launching agent's workspace")
+}
+
 /// Refuse to serve the MCP bridge silently as the no-capability `anonymous`
 /// identity.
 ///
@@ -129,6 +138,7 @@ fn broker_readiness_required(caller: &astrid_core::PrincipalId) -> bool {
 /// is invalid, or the MCP transport fails to initialize.
 pub(crate) async fn serve(
     principal: Option<&str>,
+    workspace: Option<&std::path::Path>,
     request_timeout: Option<&str>,
 ) -> Result<ExitCode> {
     let request_timeout = resolve_request_timeout(request_timeout)?;
@@ -142,10 +152,7 @@ pub(crate) async fn serve(
             .with_context(|| format!("invalid principal for `astrid mcp serve`: {p}"))?,
         None => crate::principal::current(),
     };
-    let workspace = std::env::current_dir()
-        .context("failed to resolve the launching agent's workspace")?
-        .canonicalize()
-        .context("failed to canonicalize the launching agent's workspace")?;
+    let workspace = resolve_workspace(workspace)?;
 
     // `mcp serve` owns stdout for JSON-RPC, so daemon bootstrap must be quiet.
     crate::commands::daemon::ensure_daemon_quiet("mcp-serve")
@@ -192,6 +199,7 @@ pub(crate) async fn serve(
     let server = AstridMcpServer::new(
         Arc::new(Mutex::new(client)),
         caller.clone(),
+        workspace.clone(),
         request_timeout,
     );
 
@@ -248,7 +256,7 @@ pub(crate) async fn serve(
 mod fail_loud_tests {
     use super::{
         DEFAULT_REQUEST_TIMEOUT, MAX_REQUEST_TIMEOUT, broker_readiness_required,
-        require_authenticated_unless_anonymous, resolve_request_timeout,
+        require_authenticated_unless_anonymous, resolve_request_timeout, resolve_workspace,
     };
     use astrid_core::PrincipalId;
     use std::time::Duration;
@@ -274,6 +282,17 @@ mod fail_loud_tests {
         assert!(resolve_request_timeout(Some("0")).is_err());
         assert!(resolve_request_timeout(Some("forever")).is_err());
         assert!(resolve_request_timeout(Some("1d5m1s")).is_err());
+    }
+
+    #[test]
+    fn explicit_mcp_workspace_is_independent_of_process_cwd() {
+        let explicit = tempfile::tempdir().expect("explicit MCP workspace");
+        let resolved = resolve_workspace(Some(explicit.path())).expect("resolve workspace");
+        assert_eq!(
+            resolved,
+            explicit.path().canonicalize().expect("canonical workspace")
+        );
+        assert_ne!(resolved, std::env::current_dir().expect("process cwd"));
     }
 
     #[test]

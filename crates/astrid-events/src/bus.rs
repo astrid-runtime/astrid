@@ -153,6 +153,10 @@ impl EventBus {
     /// notifies all synchronous subscribers in the registry.
     ///
     /// Returns the number of async receivers that received the event.
+    #[allow(
+        clippy::must_use_candidate,
+        reason = "the delivery count is optional diagnostics; publishing is the effect"
+    )]
     pub fn publish(&self, event: AstridEvent) -> usize {
         self.publish_with_ipc_sidecar(event, false, |_| {})
     }
@@ -190,7 +194,7 @@ impl EventBus {
         {
             let logical_sequence = self.ipc_seq.fetch_add(1, Ordering::Relaxed);
             message.seq = logical_sequence.wrapping_shl(1)
-                | u64::from(sidecar_attached) * IPC_HOST_SIDECAR_BIT;
+                | (u64::from(sidecar_attached) * IPC_HOST_SIDECAR_BIT);
             before_delivery(message.seq);
         }
         let event = Arc::new(event);

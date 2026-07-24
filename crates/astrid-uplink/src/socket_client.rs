@@ -177,6 +177,12 @@ impl SocketClient {
     /// The path is canonicalized locally, authenticated by the principal
     /// challenge, canonicalized again by the server, and represented only by
     /// an opaque host-stamped identity after admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the local endpoint is unavailable, the workspace
+    /// cannot be canonicalized, or the authenticated handshake rejects the
+    /// principal or workspace claim.
     pub async fn connect_with_workspace(
         session_id: SessionId,
         principal: PrincipalId,
