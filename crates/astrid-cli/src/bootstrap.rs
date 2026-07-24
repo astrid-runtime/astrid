@@ -98,7 +98,7 @@ pub(crate) fn find_companion_binary(name: &str) -> Result<std::path::PathBuf> {
     anyhow::bail!(
         "{} not found. Ensure it is installed alongside the astrid CLI \
          or available in PATH.",
-        native_name.display()
+        std::path::Path::new(&native_name).display()
     )
 }
 

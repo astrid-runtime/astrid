@@ -282,7 +282,7 @@ pub(crate) enum Commands {
     /// Garbage collect content-addressed stores (WIT, orphaned binaries).
     Gc(GcArgs),
 
-    /// Start the Astrid daemon in persistent mode (detached, no TUI)
+    /// Start the Astrid daemon in persistent mode (detached unless `--foreground`)
     Start(StartArgs),
 
     /// Show daemon status (PID, uptime, connected clients, loaded capsules)

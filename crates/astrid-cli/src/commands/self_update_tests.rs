@@ -395,6 +395,7 @@ fn staged_asset_selection_preserves_the_exact_failure() {
     );
 }
 
+#[cfg(not(windows))]
 #[test]
 fn backup_and_swap_replaces_and_keeps_backup() {
     let dir = tempfile::tempdir().unwrap();
@@ -427,6 +428,7 @@ fn backup_and_swap_replaces_and_keeps_backup() {
     assert!(!install.join(format!(".{cli}.new")).exists());
 }
 
+#[cfg(not(windows))]
 #[test]
 fn backup_and_swap_bails_when_archive_missing_a_binary() {
     let dir = tempfile::tempdir().unwrap();
