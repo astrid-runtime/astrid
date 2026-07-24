@@ -2,7 +2,12 @@
 !container/
 !container/amd64/
 !container/amd64/entrypoint.sh
+!container/arm64/
+!container/arm64/Dockerfile
 !dist/
 !dist/oci-amd64/
 !dist/oci-amd64/astrid-release.tar.gz
 !dist/oci-amd64/release-receipt.json
+!dist/oci-arm64/
+!dist/oci-arm64/astrid-release.tar.gz
+!dist/oci-arm64/release-receipt.json

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Authenticate and stage Astrid's exact Linux amd64 release archive for OCI."""
+"""Authenticate and stage an exact Astrid Linux release archive for OCI."""
 
 from __future__ import annotations
 
@@ -23,6 +23,10 @@ import release_manifest
 
 REPOSITORY = "astrid-runtime/astrid"
 TARGET = "x86_64-unknown-linux-gnu"
+SUPPORTED_TARGETS = (
+    TARGET,
+    "aarch64-unknown-linux-gnu",
+)
 ISSUER = "https://token.actions.githubusercontent.com"
 COMMIT = re.compile(r"[0-9a-f]{40}")
 SAFE_DOWNLOAD_HOSTS = {
@@ -231,7 +235,13 @@ def verify_sigstore(payload: pathlib.Path, bundle: pathlib.Path, *, identity: st
         raise ValueError(f"Sigstore verification failed for {payload.name}") from error
 
 
-def find_target(manifest: dict[str, object], version: str, source_commit: str) -> dict[str, object]:
+def find_target(
+    manifest: dict[str, object],
+    version: str,
+    source_commit: str,
+    *,
+    target: str = TARGET,
+) -> dict[str, object]:
     release_manifest.validate_manifest(manifest)
     require(manifest["version"] == version, "release manifest version differs from requested version")
     require(manifest["tag"] == f"v{version}", "release manifest tag differs from requested version")
@@ -239,13 +249,20 @@ def find_target(manifest: dict[str, object], version: str, source_commit: str) -
         manifest["source-commit"] == source_commit,
         "release manifest source commit differs from requested commit",
     )
-    matches = [entry for entry in manifest["targets"] if entry["triple"] == TARGET]
-    require(len(matches) == 1, f"release manifest has no unique {TARGET} target")
+    require(target in SUPPORTED_TARGETS, f"unsupported OCI release target: {target}")
+    matches = [entry for entry in manifest["targets"] if entry["triple"] == target]
+    require(len(matches) == 1, f"release manifest has no unique {target} target")
     return matches[0]
 
 
-def verify_archive_structure(path: pathlib.Path, version: str) -> None:
-    expected_root = f"astrid-{version}-{TARGET}"
+def verify_archive_structure(
+    path: pathlib.Path,
+    version: str,
+    *,
+    target: str = TARGET,
+) -> None:
+    require(target in SUPPORTED_TARGETS, f"unsupported OCI release target: {target}")
+    expected_root = f"astrid-{version}-{target}"
     seen: set[str] = set()
     try:
         with tarfile.open(path, mode="r:gz") as archive:
@@ -300,9 +317,11 @@ def stage_release(
     output: pathlib.Path,
     *,
     token: str | None,
+    target: str = TARGET,
 ) -> None:
     version = release_manifest.canonical_version(version)
     require(COMMIT.fullmatch(source_commit) is not None, "source commit must be 40 lowercase hexadecimal characters")
+    require(target in SUPPORTED_TARGETS, f"unsupported OCI release target: {target}")
     require(
         not output.exists() or (output.is_dir() and not output.is_symlink() and not any(output.iterdir())),
         "output directory must be absent or empty",
@@ -337,16 +356,21 @@ def stage_release(
         verify_sigstore(manifest_path, manifest_bundle, identity=identity)
 
         manifest = release_manifest.load_manifest(manifest_path)
-        target = find_target(manifest, version, source_commit)
-        archive_name = target["asset"]
-        archive_bundle_name = target["sigstore-bundle"]
+        target_entry = find_target(
+            manifest,
+            version,
+            source_commit,
+            target=target,
+        )
+        archive_name = target_entry["asset"]
+        archive_bundle_name = target_entry["sigstore-bundle"]
         archive_asset = require_asset(assets, archive_name)
         require(
-            archive_asset["size"] == target["size"],
+            archive_asset["size"] == target_entry["size"],
             "archive size differs between GitHub and signed release manifest",
         )
         require(
-            archive_asset["digest"] == f"sha256:{target['sha256']}",
+            archive_asset["digest"] == f"sha256:{target_entry['sha256']}",
             "archive SHA-256 differs between GitHub and signed release manifest",
         )
 
@@ -365,12 +389,15 @@ def stage_release(
             max_bytes=MAX_EVIDENCE_BYTES,
         )
         verify_sigstore(archive_path, archive_bundle, identity=identity)
-        require(sha256_file(archive_path) == target["sha256"], "archive SHA-256 differs from signed manifest")
         require(
-            release_manifest.blake3_file(archive_path) == target["blake3"],
+            sha256_file(archive_path) == target_entry["sha256"],
+            "archive SHA-256 differs from signed manifest",
+        )
+        require(
+            release_manifest.blake3_file(archive_path) == target_entry["blake3"],
             "archive BLAKE3 differs from signed manifest",
         )
-        verify_archive_structure(archive_path, version)
+        verify_archive_structure(archive_path, version, target=target)
 
         manifest_sha256 = sha256_file(manifest_path)
         receipt = {
@@ -379,11 +406,11 @@ def stage_release(
             "version": version,
             "tag": f"v{version}",
             "source-commit": source_commit,
-            "target": TARGET,
+            "target": target,
             "archive": archive_name,
-            "archive-size": target["size"],
-            "archive-sha256": target["sha256"],
-            "archive-blake3": target["blake3"],
+            "archive-size": target_entry["size"],
+            "archive-sha256": target_entry["sha256"],
+            "archive-blake3": target_entry["blake3"],
             "release-manifest": manifest_name,
             "release-manifest-sha256": manifest_sha256,
             "release-workflow-identity": identity,
@@ -402,6 +429,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     fetch = subparsers.add_parser("fetch")
     fetch.add_argument("--version", required=True)
     fetch.add_argument("--source-commit", required=True)
+    fetch.add_argument(
+        "--target",
+        choices=SUPPORTED_TARGETS,
+        default=TARGET,
+        help=f"release target triple (default: {TARGET})",
+    )
     fetch.add_argument("--output", type=pathlib.Path, required=True)
     return parser.parse_args(argv)
 
@@ -414,6 +447,7 @@ def main(argv: list[str] | None = None) -> int:
             args.source_commit,
             args.output,
             token=os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN"),
+            target=args.target,
         )
     return 0
 

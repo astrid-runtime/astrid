@@ -3,6 +3,9 @@ set -euo pipefail
 
 IMAGE=${1:?usage: container/amd64/test.sh IMAGE CLI_UPLINK_CAPSULE}
 CLI_UPLINK_CAPSULE=${2:?usage: container/amd64/test.sh IMAGE CLI_UPLINK_CAPSULE}
+OCI_PLATFORM=${ASTRID_OCI_TEST_PLATFORM:-linux/amd64}
+OCI_ARCHITECTURE=${ASTRID_OCI_TEST_ARCHITECTURE:-amd64}
+OCI_TEST_LABEL=${ASTRID_OCI_TEST_LABEL:-amd64}
 TEST_ROOT=$(mktemp -d)
 TEST_BASE_IMAGE="astrid-oci-bound-base:${RANDOM}-${RANDOM}"
 TEST_IMAGE="astrid-oci-entrypoint-test:${RANDOM}-${RANDOM}"
@@ -30,7 +33,7 @@ cleanup() {
 trap cleanup EXIT
 
 fail() {
-  echo "oci amd64 test: $*" >&2
+  echo "oci $OCI_TEST_LABEL test: $*" >&2
   exit 1
 }
 
@@ -58,7 +61,7 @@ runtime_path_is_symlink() {
   # unprivileged host runner cannot inspect a child directly. Inspect through
   # a short-lived root helper with the bind mounted read-only.
   docker run --rm \
-    --platform linux/amd64 \
+    --platform "$OCI_PLATFORM" \
     --user 0:0 \
     --entrypoint /bin/sh \
     --mount "type=bind,src=$directory,dst=/runtime,readonly" \
@@ -72,7 +75,8 @@ USER=$(docker image inspect "$IMAGE" --format '{{.Config.User}}')
 ENTRYPOINT=$(docker image inspect "$IMAGE" --format '{{json .Config.Entrypoint}}')
 EXPOSED=$(docker image inspect "$IMAGE" --format '{{json .Config.ExposedPorts}}')
 
-[[ "$ARCH" == amd64 ]] || fail "image architecture is $ARCH, expected amd64"
+[[ "$ARCH" == "$OCI_ARCHITECTURE" ]] ||
+  fail "image architecture is $ARCH, expected $OCI_ARCHITECTURE"
 [[ "$USER" == 65532:65532 ]] || fail "image user is $USER, expected 65532:65532"
 [[ "$ENTRYPOINT" == '["/usr/local/bin/astrid-container-entrypoint"]' ]] ||
   fail "unexpected image entrypoint: $ENTRYPOINT"
@@ -104,7 +108,7 @@ distro_sha256=${distro_sha256%% *}
 # an authenticated CLI status round trip must both succeed while the daemon is
 # PID 1 under the deployment restrictions claimed by this image.
 REAL_CONTAINER=$(docker run --detach \
-  --platform linux/amd64 \
+  --platform "$OCI_PLATFORM" \
   --read-only \
   --cap-drop=ALL \
   --security-opt=no-new-privileges \
@@ -147,14 +151,14 @@ for forbidden in \
   "--session 11111111-1111-1111-1111-111111111111" \
   "--unknown-flag"; do
   read -r -a forbidden_args <<<"$forbidden"
-  if docker run --rm --platform linux/amd64 "$IMAGE" "${forbidden_args[@]}" \
+  if docker run --rm --platform "$OCI_PLATFORM" "$IMAGE" "${forbidden_args[@]}" \
     >"$TEST_ROOT/forbidden.out" 2>"$TEST_ROOT/forbidden.err"; then
     fail "forbidden daemon arguments were accepted: $forbidden"
   fi
   grep -Eq "not permitted" "$TEST_ROOT/forbidden.err" ||
     fail "forbidden daemon arguments did not fail at the allowlist: $forbidden"
 done
-if docker run --rm --platform linux/amd64 "$IMAGE" --host-io-concurrency 0 \
+if docker run --rm --platform "$OCI_PLATFORM" "$IMAGE" --host-io-concurrency 0 \
   >"$TEST_ROOT/zero.out" 2>"$TEST_ROOT/zero.err"; then
   fail "zero daemon concurrency was accepted"
 fi
@@ -183,7 +187,7 @@ RUN chmod 0555 /opt/astrid/release/astrid-daemon
 USER 65532:65532
 EOF
 docker build \
-  --platform linux/amd64 \
+  --platform "$OCI_PLATFORM" \
   --tag "$TEST_IMAGE" \
   --file "$TEST_ROOT/Dockerfile" \
   "$TEST_ROOT"
@@ -197,7 +201,7 @@ prepare_runtime_dir "$run_dir/state"
 prepare_runtime_dir "$run_dir/workspace" 0755
 
 if ! docker run --rm \
-  --platform linux/amd64 \
+  --platform "$OCI_PLATFORM" \
   --read-only \
   --cap-drop=ALL \
   --security-opt=no-new-privileges \
@@ -232,7 +236,7 @@ tampered_sha256=${tampered_sha256%% *}
 prepare_runtime_dir "$TEST_ROOT/tampered-state"
 prepare_runtime_dir "$TEST_ROOT/tampered-workspace" 0755
 if docker run --rm \
-  --platform linux/amd64 \
+  --platform "$OCI_PLATFORM" \
   --read-only \
   --cap-drop=ALL \
   --security-opt=no-new-privileges \
@@ -253,7 +257,7 @@ grep -q "distro signature verification failed" "$TEST_ROOT/tampered.err" ||
 prepare_runtime_dir "$TEST_ROOT/missing-state"
 prepare_runtime_dir "$TEST_ROOT/missing-workspace" 0755
 if docker run --rm \
-  --platform linux/amd64 \
+  --platform "$OCI_PLATFORM" \
   --read-only \
   --cap-drop=ALL \
   --security-opt=no-new-privileges \
@@ -306,7 +310,7 @@ RUN chmod 0555 /opt/astrid/release/astrid /opt/astrid/release/astrid-daemon
 USER 65532:65532
 EOF
 docker build \
-  --platform linux/amd64 \
+  --platform "$OCI_PLATFORM" \
   --tag "$TEST_SWAP_IMAGE" \
   --file "$TEST_ROOT/SwapDockerfile" \
   "$TEST_ROOT"
@@ -318,7 +322,7 @@ prepare_runtime_dir "$run_dir/swap-state"
 prepare_runtime_dir "$run_dir/swap-workspace" 0755
 chmod 0666 "$run_dir/swap-source/distro.shuttle"
 if ! docker run --rm \
-  --platform linux/amd64 \
+  --platform "$OCI_PLATFORM" \
   --read-only \
   --cap-drop=ALL \
   --security-opt=no-new-privileges \
@@ -337,4 +341,4 @@ fi
 grep -q "STAGED_DISTRO_SURVIVED_SOURCE_SWAP" "$TEST_ROOT/swap.out" ||
   fail "source pathname swap test did not reach the daemon"
 
-echo "oci amd64 structure, authentication, and restricted startup tests passed"
+echo "oci $OCI_TEST_LABEL structure, authentication, and restricted startup tests passed"

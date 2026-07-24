@@ -22,6 +22,17 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   a per-export provenance attestation, and an exact-archive blob signature
   without claiming byte reproducibility or publishing mutable or
   multi-architecture tags. Closes #1344.
+- **Linux ARM64 now has a native distro-neutral OCI build target.** The image
+  installs the exact authenticated `aarch64-unknown-linux-gnu` release bytes
+  into a platform-specific digest-pinned Ubuntu base, then exercises the real
+  daemon and authenticated status path on a native ARM64 runner under the same
+  rootless, read-only, capability-free, signed-distro contract as amd64. CI
+  binds the export's sole, variant-free `linux/arm64` manifest to the loaded
+  image's repository digest and passes only that content-addressed name to
+  runtime tests, scanning, and SBOM generation. It then re-verifies the
+  archive and binding and signs an evidence manifest covering the tar, binding,
+  SBOM, and release receipt without emulation, registry publication, or mutable
+  and multi-architecture tags. Closes #1346.
 - **Foreground daemon logs can be routed to standard error.**
   `ASTRID_DAEMON_LOG_TARGET=stderr` sends ANSI-free daemon diagnostics to the
   process supervisor's standard-error stream. The strict override also accepts

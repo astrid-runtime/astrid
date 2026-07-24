@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for the Linux amd64 OCI release acquisition contract."""
+"""Tests for the Linux OCI release acquisition contract."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ import release_manifest
 VERSION = "1.2.3"
 COMMIT = "a" * 40
 TARGET = oci_release.TARGET
+ARM64_TARGET = "aarch64-unknown-linux-gnu"
 
 
 def release_asset(name: str, *, size: int = 7, digest: str | None = None) -> dict[str, object]:
@@ -46,8 +47,14 @@ def release(assets: list[dict[str, object]]) -> dict[str, object]:
     }
 
 
-def write_archive(path: pathlib.Path, *, unsafe: bool = False, omit: str | None = None) -> None:
-    root = f"astrid-{VERSION}-{TARGET}"
+def write_archive(
+    path: pathlib.Path,
+    *,
+    target: str = TARGET,
+    unsafe: bool = False,
+    omit: str | None = None,
+) -> None:
+    root = f"astrid-{VERSION}-{target}"
     with tarfile.open(path, mode="w:gz") as archive:
         # Match the top-level directory entry emitted by
         # `tar czf "$root.tar.gz" "$root"` in the release workflow.
@@ -92,6 +99,38 @@ class ArchiveTests(unittest.TestCase):
             archive = pathlib.Path(temporary) / "release.tar.gz"
             write_archive(archive)
             oci_release.verify_archive_structure(archive, VERSION)
+
+    def test_accepts_exact_arm64_release_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            archive = pathlib.Path(temporary) / "release.tar.gz"
+            write_archive(archive, target=ARM64_TARGET)
+            oci_release.verify_archive_structure(
+                archive,
+                VERSION,
+                target=ARM64_TARGET,
+            )
+
+    def test_rejects_target_layout_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            archive = pathlib.Path(temporary) / "release.tar.gz"
+            write_archive(archive)
+            with self.assertRaisesRegex(ValueError, "canonical root"):
+                oci_release.verify_archive_structure(
+                    archive,
+                    VERSION,
+                    target=ARM64_TARGET,
+                )
+
+    def test_rejects_unsupported_oci_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            archive = pathlib.Path(temporary) / "release.tar.gz"
+            write_archive(archive)
+            with self.assertRaisesRegex(ValueError, "unsupported OCI release target"):
+                oci_release.verify_archive_structure(
+                    archive,
+                    VERSION,
+                    target="aarch64-unknown-linux-musl",
+                )
 
     def test_rejects_path_traversal(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -217,6 +256,7 @@ class EndToEndAuthenticationTests(unittest.TestCase):
         self.root = pathlib.Path(self.temp.name)
         self.asset_root = self.root / "assets"
         self.asset_root.mkdir()
+        self.target = TARGET
         self.archive_name = f"astrid-{VERSION}-{TARGET}.tar.gz"
         self.manifest_name = f"astrid-{VERSION}-release.toml"
         self.archive_bundle_name = f"{self.archive_name}.sigstore.json"
@@ -232,7 +272,7 @@ class EndToEndAuthenticationTests(unittest.TestCase):
         targets = []
         for index, triple in enumerate(release_manifest.TARGETS, 1):
             name = release_manifest.expected_asset(VERSION, triple)
-            selected = triple == TARGET
+            selected = triple == self.target
             targets.append(
                 {
                     "triple": triple,
@@ -292,7 +332,7 @@ class EndToEndAuthenticationTests(unittest.TestCase):
             )
         return release(assets)
 
-    def stage(self) -> pathlib.Path:
+    def stage(self, *, target: str = TARGET) -> pathlib.Path:
         output = self.root / "output"
 
         def copy_asset(
@@ -320,7 +360,13 @@ class EndToEndAuthenticationTests(unittest.TestCase):
             mock.patch.object(oci_release, "download_asset", side_effect=copy_asset),
             mock.patch.object(oci_release, "verify_sigstore", side_effect=verify),
         ):
-            oci_release.stage_release(VERSION, COMMIT, output, token="secret")
+            oci_release.stage_release(
+                VERSION,
+                COMMIT,
+                output,
+                token="secret",
+                target=target,
+            )
         return output
 
     def test_accepts_fully_bound_release_evidence(self) -> None:
@@ -329,6 +375,22 @@ class EndToEndAuthenticationTests(unittest.TestCase):
             oci_release.sha256_file(output / "astrid-release.tar.gz"),
             self.archive_sha256,
         )
+
+    def test_accepts_exact_arm64_evidence(self) -> None:
+        self.target = ARM64_TARGET
+        self.archive_name = f"astrid-{VERSION}-{ARM64_TARGET}.tar.gz"
+        self.archive_bundle_name = f"{self.archive_name}.sigstore.json"
+        self.archive_path = self.asset_root / self.archive_name
+        write_archive(self.archive_path, target=ARM64_TARGET)
+        self.archive_sha256 = oci_release.sha256_file(self.archive_path)
+        self.archive_blake3 = release_manifest.blake3_file(self.archive_path)
+        self.manifest = self.make_manifest()
+        self.write_fixture()
+
+        output = self.stage(target=ARM64_TARGET)
+
+        receipt = json.loads((output / "release-receipt.json").read_text())
+        self.assertEqual(receipt["target"], ARM64_TARGET)
 
     def test_rejects_wrong_source_commit_end_to_end(self) -> None:
         self.manifest["source-commit"] = "d" * 40
