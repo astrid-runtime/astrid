@@ -8,8 +8,8 @@
 
 #[cfg(windows)]
 use astrid_capsule_install::{
-    AuthorityDecision, inspect_directory_for_principal_with_layout,
-    install_from_local_path_authorized_for_principal_with_layout,
+    AuthorityDecision, inspect_directory_for_principal_in_workspace,
+    install_from_local_path_authorized_for_principal_in_workspace,
 };
 use astrid_capsule_install::{
     InstallOptions, copy_capsule_dir, install_from_local_path, read_meta,
@@ -104,23 +104,28 @@ fn inspected_user_install_provisions_fresh_private_windows_home() {
     let home = AstridHome::from_path(&fresh.path);
     let principal = PrincipalId::default();
     let layout = WorkspaceLayout::default();
+    // This regression targets fresh user-home provisioning. Workspace-root
+    // validation is covered separately and must keep failing closed.
+    let workspace_root = None;
 
-    let inspection = inspect_directory_for_principal_with_layout(
+    let inspection = inspect_directory_for_principal_in_workspace(
         capsule_dir.path(),
         &home,
         &principal,
         false,
+        workspace_root,
         &layout,
     )
     .expect("inspection should provision the private runtime identity");
     let decision = AuthorityDecision::ExplicitApproval {
         content_digest: inspection.content_digest,
     };
-    install_from_local_path_authorized_for_principal_with_layout(
+    install_from_local_path_authorized_for_principal_in_workspace(
         capsule_dir.path(),
         &home,
         InstallOptions::default(),
         &principal,
+        workspace_root,
         &decision,
         &layout,
     )
