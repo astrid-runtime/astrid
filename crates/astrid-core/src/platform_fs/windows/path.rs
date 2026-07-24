@@ -23,23 +23,27 @@ impl Drop for OwnedHandle {
     }
 }
 
-fn mark_directory_for_deletion(handle: HANDLE) -> io::Result<()> {
-    let disposition = FILE_DISPOSITION_INFO_EX {
-        Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+pub(super) fn mark_handle_for_deletion(handle: HANDLE) -> io::Result<()> {
+    let disposition = FILE_DISPOSITION_INFORMATION_EX {
+        Flags: FILE_DISPOSITION_DELETE | FILE_DISPOSITION_POSIX_SEMANTICS,
     };
+    let mut status = IO_STATUS_BLOCK::default();
     // SAFETY: `handle` is live with DELETE access and the fixed-size
-    // disposition buffer remains live for the call.
-    if unsafe {
-        SetFileInformationByHandle(
+    // disposition and status buffers remain live for the native call.
+    let result = unsafe {
+        NtSetInformationFile(
             handle,
-            FileDispositionInfoEx,
+            &raw mut status,
             (&raw const disposition).cast(),
-            u32::try_from(size_of::<FILE_DISPOSITION_INFO_EX>())
-                .expect("FILE_DISPOSITION_INFO_EX fits in u32"),
+            u32::try_from(size_of::<FILE_DISPOSITION_INFORMATION_EX>())
+                .expect("FILE_DISPOSITION_INFORMATION_EX fits in u32"),
+            FileDispositionInformationEx,
         )
-    } == 0
-    {
-        return Err(io::Error::last_os_error());
+    };
+    if result < 0 {
+        // SAFETY: conversion is defined for the NTSTATUS returned by the call.
+        let code = unsafe { RtlNtStatusToDosError(result) };
+        return Err(io::Error::from_raw_os_error(code.cast_signed()));
     }
     Ok(())
 }
@@ -62,7 +66,7 @@ impl DeleteCreatedDirectoryOnDrop {
 impl Drop for DeleteCreatedDirectoryOnDrop {
     fn drop(&mut self) {
         if self.armed {
-            let _ = mark_directory_for_deletion(self.handle);
+            let _ = mark_handle_for_deletion(self.handle);
         }
     }
 }
@@ -144,7 +148,7 @@ impl CreatedPrivateDirectories {
         self.armed = false;
         let mut first_error = None;
         while let Some((path, handle)) = self.entries.pop() {
-            if let Err(error) = mark_directory_for_deletion(handle.0)
+            if let Err(error) = mark_handle_for_deletion(handle.0)
                 && first_error.is_none()
             {
                 first_error = Some(with_context(

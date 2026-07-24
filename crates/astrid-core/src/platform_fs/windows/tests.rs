@@ -22,6 +22,9 @@ use crate::groups::{BUILTIN_ADMIN, GroupConfig};
 use crate::profile::PrincipalProfile;
 use crate::session_token::SessionToken;
 
+#[path = "tests/authority.rs"]
+mod authority_tests;
+
 static NATIVE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn serial_test_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -420,49 +423,8 @@ fn handle_relative_move_and_replacement_succeed() {
     replace_file_checked(&guard, &live, &replacement).unwrap();
     assert_eq!(std::fs::read(&live).unwrap(), b"new");
     assert!(!replacement.exists());
-}
-
-#[test]
-fn handle_relative_mutation_fails_closed_or_stays_bound_during_ancestor_move() {
-    let _serial = serial_test_guard();
-    let root = private_temp();
-    let ancestor = root.path().join("ancestor");
-    let guarded = ancestor.join("guarded");
-    std::fs::create_dir(&ancestor).unwrap();
-    std::fs::create_dir(&guarded).unwrap();
-    apply_private_acl(&ancestor, true).unwrap();
-    apply_private_acl(&guarded, true).unwrap();
-    let source = guarded.join("source");
-    let destination = guarded.join("destination");
-    std::fs::write(&source, b"authority-bound-content").unwrap();
-    apply_private_acl(&source, false).unwrap();
-    let guard = TrustedPathGuard::capture(&guarded).unwrap();
-    let moved_ancestor = root.path().join("moved-ancestor");
-
-    let result = guard.with_verified_mutation(
-        "ancestor-move handle-relative test",
-        BoundaryContract::ExactPrivateDirectory,
-        || {
-            std::fs::rename(&ancestor, &moved_ancestor)?;
-            move_guarded_file(&guard, &source, &destination)
-        },
-    );
-
-    assert!(result.is_err());
-    assert!(!destination.exists());
-    let moved_guarded = moved_ancestor.join("guarded");
-    let outcome = (
-        std::fs::read(moved_guarded.join("source")),
-        std::fs::read(moved_guarded.join("destination")),
-    );
-    let preserved = matches!(&outcome, (Ok(bytes), Err(error))
-        if bytes == b"authority-bound-content" && error.kind() == io::ErrorKind::NotFound);
-    let completed = matches!(&outcome, (Err(error), Ok(bytes))
-        if error.kind() == io::ErrorKind::NotFound && bytes == b"authority-bound-content");
-    assert!(
-        preserved || completed,
-        "ancestor move must preserve the source or complete the bound rename: {outcome:?}"
-    );
+    remove_guarded_file(&guard, &live).unwrap();
+    assert!(!live.exists());
 }
 
 #[test]

@@ -6,7 +6,8 @@ use super::acl::{
 };
 use super::error::with_context;
 use super::path::{
-    BoundaryContract, OwnedHandle, TrustedPathGuard, file_identity, hash_open_file, wide_path,
+    BoundaryContract, OwnedHandle, TrustedPathGuard, file_identity, hash_open_file,
+    mark_handle_for_deletion, wide_path,
 };
 use super::prelude::*;
 
@@ -362,23 +363,7 @@ pub(super) fn move_guarded_file(
 pub(super) fn remove_guarded_file(guard: &TrustedPathGuard, path: &Path) -> io::Result<()> {
     let name = guarded_child_name(guard, path)?;
     let handle = open_guarded_child(guard, name, DELETE | FILE_READ_ATTRIBUTES)?;
-    let disposition = FILE_DISPOSITION_INFO_EX {
-        Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
-    };
-    // SAFETY: `handle` is live and the fixed-size disposition buffer is valid.
-    if unsafe {
-        SetFileInformationByHandle(
-            handle.0,
-            FileDispositionInfoEx,
-            (&raw const disposition).cast(),
-            u32::try_from(size_of::<FILE_DISPOSITION_INFO_EX>())
-                .expect("FILE_DISPOSITION_INFO_EX fits in u32"),
-        )
-    } == 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    mark_handle_for_deletion(handle.0)
 }
 
 pub(super) fn guarded_file_exists(guard: &TrustedPathGuard, path: &Path) -> io::Result<bool> {
@@ -610,24 +595,7 @@ pub(super) fn restrict_guarded_private_file(
 }
 
 fn mark_file_for_deletion(handle: HANDLE) -> io::Result<()> {
-    let disposition = FILE_DISPOSITION_INFO_EX {
-        Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
-    };
-    // SAFETY: `handle` is live with DELETE access and the fixed-size
-    // disposition buffer remains live for the call.
-    if unsafe {
-        SetFileInformationByHandle(
-            handle,
-            FileDispositionInfoEx,
-            (&raw const disposition).cast(),
-            u32::try_from(size_of::<FILE_DISPOSITION_INFO_EX>())
-                .expect("FILE_DISPOSITION_INFO_EX fits in u32"),
-        )
-    } == 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    mark_handle_for_deletion(handle)
 }
 
 struct DeleteCreatedFileOnDrop {
