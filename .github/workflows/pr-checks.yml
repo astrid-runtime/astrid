@@ -100,10 +100,10 @@ EOF
               echo "PR only changes .github/workflows/pr-checks.yml; skipping linked-issue requirement."
             elif has_traceability_exception_label; then
               if ! printf '%s\n' "$LINKED_ISSUE_SECTION" | grep -qiE '(no issue|no tracked issue|not linked|maintenance|docs|release|dependenc|traceability|ci|workflow)'; then
-                ERRORS="${ERRORS}Linked Issue must explain the no-issue exception when using no-issue, maintenance, docs-only, release, deps, or dependencies labels\n"
+                ERRORS="${ERRORS}Linked Issue must explain the traceability exception for the applied label\n"
               fi
             else
-              ERRORS="${ERRORS}Linked Issue must reference an issue number (#N), use a documented traceability exception label, or only change .github/workflows/pr-checks.yml\n"
+              ERRORS="${ERRORS}Linked Issue must reference an issue number (#N), use a documented traceability exception label, or modify only .github/workflows/pr-checks.yml\n"
             fi
           fi
 
@@ -454,7 +454,8 @@ EOF
             exit 1
           fi
 
-          echo "::error::Every PR must be linked to an issue, unless a documented traceability exception applies. Use 'Closes #N' in the PR body, link an issue via the GitHub sidebar, add one of: no-issue, maintenance, docs-only, release, deps, dependencies, or limit the PR to .github/workflows/pr-checks.yml only."
+          echo "::error::Every PR must be linked to an issue unless a documented traceability exception applies."
+          echo "::error::Use 'Closes #N' in the PR body, link an issue via the GitHub sidebar, add one of: no-issue, maintenance, docs-only, release, deps, dependencies, or modify only .github/workflows/pr-checks.yml."
           exit 1
 
   account-age:
