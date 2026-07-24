@@ -4,6 +4,7 @@ set -euo pipefail
 IMAGE=${1:?usage: container/amd64/test.sh IMAGE CLI_UPLINK_CAPSULE}
 CLI_UPLINK_CAPSULE=${2:?usage: container/amd64/test.sh IMAGE CLI_UPLINK_CAPSULE}
 TEST_ROOT=$(mktemp -d)
+TEST_BASE_IMAGE="astrid-oci-bound-base:${RANDOM}-${RANDOM}"
 TEST_IMAGE="astrid-oci-entrypoint-test:${RANDOM}-${RANDOM}"
 TEST_SWAP_IMAGE="astrid-oci-swap-test:${RANDOM}-${RANDOM}"
 REAL_CONTAINER=
@@ -21,6 +22,7 @@ cleanup() {
     --mount "type=bind,src=$TEST_ROOT,dst=/cleanup" \
     "$IMAGE" \
     -c 'chmod -R a+rwX /cleanup' >/dev/null 2>&1 || true
+  docker image rm --force "$TEST_BASE_IMAGE" >/dev/null 2>&1 || true
   docker image rm --force "$TEST_IMAGE" >/dev/null 2>&1 || true
   docker image rm --force "$TEST_SWAP_IMAGE" >/dev/null 2>&1 || true
   rm -rf "$TEST_ROOT"
@@ -75,6 +77,12 @@ EXPOSED=$(docker image inspect "$IMAGE" --format '{{json .Config.ExposedPorts}}'
 [[ "$ENTRYPOINT" == '["/usr/local/bin/astrid-container-entrypoint"]' ]] ||
   fail "unexpected image entrypoint: $ENTRYPOINT"
 [[ "$EXPOSED" == null ]] || fail "neutral runtime image must not expose product ports"
+
+# Docker's build frontend resolves an unqualified name@digest as a registry
+# source even when that exact digest is already in the local image store.
+# Create a test-only local alias from the verified digest for the two derived
+# negative-test images; all real runtime probes continue to use "$IMAGE".
+docker image tag "$IMAGE" "$TEST_BASE_IMAGE"
 
 mkdir -p "$TEST_ROOT/fixtures"
 chmod 0777 "$TEST_ROOT/fixtures"
@@ -168,7 +176,7 @@ EOF
 chmod 0755 "$TEST_ROOT/fake-daemon"
 
 cat > "$TEST_ROOT/Dockerfile" <<EOF
-FROM $IMAGE
+FROM $TEST_BASE_IMAGE
 USER 0:0
 COPY fake-daemon /opt/astrid/release/astrid-daemon
 RUN chmod 0555 /opt/astrid/release/astrid-daemon
@@ -290,7 +298,7 @@ EOF
 chmod 0755 "$TEST_ROOT/swap-daemon"
 
 cat > "$TEST_ROOT/SwapDockerfile" <<EOF
-FROM $IMAGE
+FROM $TEST_BASE_IMAGE
 USER 0:0
 COPY fake-astrid /opt/astrid/release/astrid
 COPY swap-daemon /opt/astrid/release/astrid-daemon

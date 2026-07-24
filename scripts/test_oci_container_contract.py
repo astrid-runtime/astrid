@@ -11,6 +11,7 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 DOCKERFILE = (ROOT / "container/amd64/Dockerfile").read_text(encoding="utf-8")
 ENTRYPOINT = (ROOT / "container/amd64/entrypoint.sh").read_text(encoding="utf-8")
+TEST_HARNESS = (ROOT / "container/amd64/test.sh").read_text(encoding="utf-8")
 WORKFLOW = (ROOT / ".github/workflows/oci-amd64.yml").read_text(encoding="utf-8")
 
 
@@ -73,6 +74,14 @@ class EntrypointContractTests(unittest.TestCase):
         self.assertIn("--host-blocking-concurrency", ENTRYPOINT)
         self.assertIn("--instance-pool-size", ENTRYPOINT)
         self.assertIn("ASTRID_DAEMON_LOG_TARGET=stderr", ENTRYPOINT)
+
+
+class RuntimeHarnessContractTests(unittest.TestCase):
+    def test_derived_negative_images_alias_the_bound_local_digest(self) -> None:
+        self.assertIn('docker image tag "$IMAGE" "$TEST_BASE_IMAGE"', TEST_HARNESS)
+        self.assertEqual(TEST_HARNESS.count("FROM $TEST_BASE_IMAGE"), 2)
+        self.assertNotIn("FROM $IMAGE", TEST_HARNESS)
+        self.assertIn('docker image rm --force "$TEST_BASE_IMAGE"', TEST_HARNESS)
 
 
 class WorkflowContractTests(unittest.TestCase):
