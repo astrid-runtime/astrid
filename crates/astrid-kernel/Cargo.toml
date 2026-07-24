@@ -66,9 +66,6 @@ astrid-mcp = { workspace = true }
 astrid-vfs = { workspace = true }
 tokio = { workspace = true, features = ["full", "signal"] }
 
-[target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
-
 [dev-dependencies]
 async-trait = { workspace = true }
 

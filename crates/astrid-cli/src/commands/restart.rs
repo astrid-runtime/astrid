@@ -24,7 +24,7 @@ pub(crate) async fn run() -> Result<ExitCode> {
     // race the new daemon against a held lock and fail with "Database … is
     // already locked". Verify the recorded PID is actually gone (terminating it
     // if it survived `handle_stop`'s own kill path) before spawning.
-    let pid_path = socket_client::pid_path();
+    let pid_path = socket_client::try_pid_path()?;
     if let Some((pid, _exe)) = daemon_control::read_pid_file(&pid_path)
         && daemon_control::is_process_alive(pid)
     {

@@ -46,7 +46,7 @@ pub(crate) struct Connection {
 /// Entry point for `astrid who`.
 pub(crate) async fn run(args: WhoArgs) -> Result<ExitCode> {
     let format = ValueFormat::parse(&args.format);
-    let socket_path = crate::socket_client::proxy_socket_path();
+    let socket_path = crate::socket_client::try_proxy_socket_path()?;
     if !astrid_core::local_transport::endpoint_is_present(&socket_path)? {
         if format.is_pretty() {
             println!("{}", Theme::info("No Astrid daemon is running."));

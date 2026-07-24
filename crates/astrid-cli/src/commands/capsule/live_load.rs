@@ -172,7 +172,9 @@ pub(crate) async fn try_daemon_unload(capsule_id: &str) -> anyhow::Result<LiveUn
 }
 
 async fn daemon_socket_reachable() -> bool {
-    let path = crate::socket_client::proxy_socket_path();
+    let Ok(path) = crate::socket_client::try_proxy_socket_path() else {
+        return false;
+    };
     matches!(
         astrid_core::local_transport::connect_outcome(&path).await,
         Ok(astrid_core::local_transport::ConnectOutcome::Connected(_))

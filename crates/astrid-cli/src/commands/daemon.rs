@@ -16,7 +16,6 @@ const DAEMON_READY_TIMEOUT_SECS: u64 = 60;
 const DAEMON_READY_POLL_MILLIS: u64 = 50;
 const DAEMON_READY_POLL: Duration = Duration::from_millis(DAEMON_READY_POLL_MILLIS);
 const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-#[cfg(test)]
 const DAEMON_READY_ATTEMPTS: u64 =
     readiness_attempts(DAEMON_READY_TIMEOUT_SECS, DAEMON_READY_POLL_MILLIS);
 
@@ -34,7 +33,6 @@ pub(crate) enum StopConfirmation {
     Unconfirmed,
 }
 
-#[cfg(test)]
 const fn readiness_attempts(timeout_secs: u64, poll_millis: u64) -> u64 {
     let Some(timeout_millis) = timeout_secs.checked_mul(1_000) else {
         panic!("daemon readiness timeout overflow")
@@ -60,7 +58,7 @@ fn log_hint() -> String {
 fn boot_log_stderr() -> Option<std::process::Stdio> {
     let home = astrid_core::dirs::AstridHome::resolve().ok()?;
     let log_dir = home.log_dir();
-    std::fs::create_dir_all(&log_dir).ok()?;
+    astrid_core::platform_fs::ensure_private_directory(&log_dir).ok()?;
     let path = log_dir.join("daemon-boot.log");
     let mut opts = std::fs::OpenOptions::new();
     opts.create(true).append(true);
@@ -71,7 +69,8 @@ fn boot_log_stderr() -> Option<std::process::Stdio> {
         use std::os::unix::fs::OpenOptionsExt as _;
         opts.mode(0o600);
     }
-    let file = opts.open(path).ok()?;
+    let file = opts.open(&path).ok()?;
+    astrid_core::platform_fs::restrict_private_file(&path).ok()?;
     Some(std::process::Stdio::from(file))
 }
 
@@ -142,7 +141,9 @@ async fn wait_for_readiness_signal(
     child: &mut std::process::Child,
     ready_path: &Path,
 ) -> Result<()> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(DAEMON_READY_TIMEOUT_SECS);
+    let deadline = tokio::time::Instant::now()
+        .checked_add(Duration::from_secs(DAEMON_READY_TIMEOUT_SECS))
+        .context("daemon readiness deadline overflow")?;
     while tokio::time::Instant::now() < deadline {
         if ready_path.exists() {
             return Ok(());
@@ -164,7 +165,9 @@ async fn wait_for_authenticated_readiness(
     ready_path: &Path,
     workspace_root: Option<&Path>,
 ) -> Result<()> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(DAEMON_READY_TIMEOUT_SECS);
+    let deadline = tokio::time::Instant::now()
+        .checked_add(Duration::from_secs(DAEMON_READY_TIMEOUT_SECS))
+        .context("daemon readiness deadline overflow")?;
     let mut last_handshake_error = None;
 
     while tokio::time::Instant::now() < deadline {
@@ -221,7 +224,7 @@ enum DaemonProbe {
 }
 
 async fn probe_authenticated_daemon(workspace_root: Option<&Path>) -> Result<DaemonProbe> {
-    let socket_path = socket_client::proxy_socket_path();
+    let socket_path = socket_client::try_proxy_socket_path()?;
     match astrid_core::local_transport::connect_outcome(&socket_path)
         .await
         .context("failed to probe daemon transport")?
@@ -273,8 +276,8 @@ pub(crate) async fn ensure_daemon_quiet(label: &str) -> Result<()> {
 }
 
 async fn ensure_daemon_inner(label: &str, announce: bool) -> Result<()> {
-    let socket_path = socket_client::proxy_socket_path();
-    let ready_path = socket_client::readiness_path();
+    let socket_path = socket_client::try_proxy_socket_path()?;
+    let ready_path = socket_client::try_readiness_path()?;
 
     let needs_boot = match astrid_core::local_transport::connect_outcome(&socket_path).await {
         Ok(astrid_core::local_transport::ConnectOutcome::Connected(stream)) => {
@@ -303,11 +306,16 @@ async fn ensure_daemon_inner(label: &str, announce: bool) -> Result<()> {
 
 pub(crate) async fn ensure_daemon_workspace_matches(workspace_root: Option<&Path>) -> Result<()> {
     let expected = expected_workspace_fingerprint(workspace_root)?;
-    let ready_path = socket_client::readiness_path();
+    let ready_path = socket_client::try_readiness_path()?;
 
     for _ in 0..DAEMON_READY_ATTEMPTS {
         match std::fs::read_to_string(&ready_path) {
-            Ok(metadata) => return validate_daemon_workspace_metadata(&metadata, &expected),
+            Ok(metadata) => {
+                #[cfg(windows)]
+                astrid_core::platform_fs::validate_private_file(&ready_path)
+                    .context("daemon readiness metadata is not private")?;
+                return validate_daemon_workspace_metadata(&metadata, &expected);
+            },
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 tokio::time::sleep(DAEMON_READY_POLL).await;
             },
@@ -350,7 +358,7 @@ fn validate_daemon_workspace_metadata(metadata: &str, expected: &str) -> Result<
 
 /// Spawn a persistent (non-ephemeral) daemon and wait for readiness.
 pub(crate) async fn spawn_persistent_daemon() -> Result<()> {
-    let ready_path = socket_client::readiness_path();
+    let ready_path = socket_client::try_readiness_path()?;
     println!(
         "{}",
         theme::Theme::info("Starting Astrid daemon (persistent mode)...")
@@ -400,7 +408,7 @@ fn persistent_daemon_command(daemon_bin: &Path, workspace: &Path) -> std::proces
 }
 
 async fn run_foreground_daemon() -> Result<ExitCode> {
-    let ready_path = socket_client::readiness_path();
+    let ready_path = socket_client::try_readiness_path()?;
     let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let daemon_bin = find_companion_binary("astrid-daemon")?;
     let mut command = foreground_daemon_command(&daemon_bin, &workspace);
@@ -521,9 +529,9 @@ fn start_clears_sentinels(action: StartAction) -> bool {
 /// This never removes a live daemon's socket or signals a live process — the
 /// only mutation happens when the recorded daemon is provably gone.
 pub(crate) async fn handle_start(foreground: bool) -> Result<ExitCode> {
-    let socket_path = socket_client::proxy_socket_path();
-    let ready_path = socket_client::readiness_path();
-    let pid_path = socket_client::pid_path();
+    let socket_path = socket_client::try_proxy_socket_path()?;
+    let ready_path = socket_client::try_readiness_path()?;
+    let pid_path = socket_client::try_pid_path()?;
 
     let socket_reachable = matches!(
         probe_authenticated_daemon(None).await?,
@@ -619,8 +627,8 @@ fn status_response(response: KernelResponse) -> Result<DaemonStatus> {
 /// `astrid start`/`restart` still see the recorded PID and give an actionable
 /// message instead of failing on the held lock with a raw DB error.
 pub(crate) async fn handle_stop() -> Result<StopConfirmation> {
-    let socket_path = socket_client::proxy_socket_path();
-    let pid_path = socket_client::pid_path();
+    let socket_path = socket_client::try_proxy_socket_path()?;
+    let pid_path = socket_client::try_pid_path()?;
 
     // Capture the daemon's identity up front: it deletes its own PID file only
     // on a CLEAN exit, so reading it before shutdown is the only reliable way to
@@ -801,7 +809,9 @@ fn report_orphan_stop(
 /// them, so clearing them leaves a clean slate for the next `start`.
 fn remove_runtime_files(pid_path: &Path, socket_path: &Path) {
     let _ = astrid_core::local_transport::remove_endpoint(socket_path);
-    let _ = std::fs::remove_file(socket_client::readiness_path());
+    if let Ok(readiness_path) = socket_client::try_readiness_path() {
+        let _ = std::fs::remove_file(readiness_path);
+    }
     let _ = std::fs::remove_file(pid_path);
 }
 

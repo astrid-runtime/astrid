@@ -6,7 +6,7 @@
 //! (`crate::socket_client::*`) working without churning every caller.
 
 pub(crate) use astrid_uplink::socket_client::{
-    SocketClient, pid_path, proxy_socket_path, readiness_path,
+    SocketClient, try_pid_path, try_proxy_socket_path, try_readiness_path,
 };
 
 use std::future::Future;

@@ -55,6 +55,8 @@ const POLL: Duration = Duration::from_millis(100);
 /// `None` for legacy single-line files or daemons that couldn't resolve their
 /// own path.
 pub(crate) fn read_pid_file(pid_path: &Path) -> Option<(u32, Option<PathBuf>)> {
+    #[cfg(windows)]
+    astrid_core::platform_fs::validate_private_file(pid_path).ok()?;
     let contents = std::fs::read_to_string(pid_path).ok()?;
     parse_pid_file(&contents)
 }
@@ -346,11 +348,11 @@ pub(crate) async fn terminate_known(pid: u32, recorded_exe: Option<&Path>) -> Ki
             }
 
             let _ = signal(pid, nix::sys::signal::Signal::SIGKILL);
-            return if wait_for_exit(pid, GRACE).await {
+            if wait_for_exit(pid, GRACE).await {
                 KillOutcome::KilledExited
             } else {
                 KillOutcome::StillAlive
-            };
+            }
         }
 
         #[cfg(not(unix))]
@@ -384,6 +386,16 @@ pub(crate) async fn wait_for_exit(pid: u32, budget: Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_pid_fixture(path: &Path, contents: impl AsRef<[u8]>) {
+        #[cfg(windows)]
+        {
+            astrid_core::platform_fs::ensure_private_directory(path.parent().unwrap()).unwrap();
+            astrid_core::platform_fs::atomic_write_private_file(path, contents.as_ref()).unwrap();
+        }
+        #[cfg(not(windows))]
+        std::fs::write(path, contents).unwrap();
+    }
 
     #[test]
     fn parse_pid_accepts_plain_integer() {
@@ -421,7 +433,7 @@ mod tests {
     fn read_pid_file_round_trips_pid_only() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("system.pid");
-        std::fs::write(&path, "424242").unwrap();
+        write_pid_fixture(&path, "424242");
         assert_eq!(read_pid_file(&path), Some((424_242, None)));
     }
 
@@ -528,11 +540,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("system.pid");
         let me = std::process::id();
-        std::fs::write(
+        write_pid_fixture(
             &path,
             format!("{me}\n/nonexistent/definitely-not-astrid-daemon"),
-        )
-        .unwrap();
+        );
         assert_eq!(
             terminate_orphan(&path).await,
             KillOutcome::Unverified(me),
@@ -549,7 +560,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("system.pid");
         let me = std::process::id();
-        std::fs::write(&path, format!("{me}")).unwrap();
+        write_pid_fixture(&path, format!("{me}"));
         assert_eq!(terminate_orphan(&path).await, KillOutcome::Unverified(me));
         assert!(is_process_alive(me));
     }
@@ -558,7 +569,7 @@ mod tests {
     fn read_pid_file_garbage_is_none() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("system.pid");
-        std::fs::write(&path, "garbage\n").unwrap();
+        write_pid_fixture(&path, "garbage\n");
         assert_eq!(read_pid_file(&path), None);
     }
 
@@ -592,7 +603,7 @@ mod tests {
     async fn terminate_orphan_dead_pid_is_notrunning() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("system.pid");
-        std::fs::write(&path, "2000000000").unwrap();
+        write_pid_fixture(&path, "2000000000");
         assert_eq!(terminate_orphan(&path).await, KillOutcome::NotRunning);
     }
 

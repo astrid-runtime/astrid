@@ -245,7 +245,6 @@ wasmtime = { version = "46", features = ["component-model", "cranelift"] }
 wasmtime-wasi = "46"
 unicode-width = "0.2"
 which = "8"
-windows-sys = "0.61"
 zeroize = { version = "1.8", features = ["derive"] }
 
 [workspace.lints.rust]

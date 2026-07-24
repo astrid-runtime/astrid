@@ -4,20 +4,20 @@ use astrid_core::local_transport::{self, LocalListener};
 use astrid_core::session_token::SessionToken;
 use tracing::warn;
 
-#[cfg(windows)]
-#[allow(unsafe_code)]
-#[path = "socket/windows.rs"]
-mod windows;
-
-/// Path to the local Unix Domain Socket for the kernel.
+/// Portable path token for the kernel's local transport endpoint.
 #[must_use]
 pub(crate) fn kernel_socket_path() -> PathBuf {
     use astrid_core::dirs::AstridHome;
     match AstridHome::resolve() {
         Ok(home) => home.socket_path(),
         Err(e) => {
-            warn!(error = %e, "Failed to resolve ASTRID_HOME; falling back to /tmp/.astrid/run/system.sock");
-            PathBuf::from("/tmp/.astrid/run/system.sock")
+            #[cfg(windows)]
+            panic!("Failed to resolve the private Windows ASTRID_HOME: {e}");
+            #[cfg(not(windows))]
+            {
+                warn!(error = %e, "Failed to resolve ASTRID_HOME; falling back to /tmp/.astrid/run/system.sock");
+                PathBuf::from("/tmp/.astrid/run/system.sock")
+            }
         },
     }
 }
@@ -31,18 +31,12 @@ pub(crate) fn kernel_socket_path() -> PathBuf {
 /// explicitly. Idempotent — safe to call more than once per boot.
 fn ensure_run_dir(socket_path: &std::path::Path) -> Result<(), std::io::Error> {
     if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
+        astrid_core::platform_fs::ensure_private_directory(parent).map_err(|e| {
             std::io::Error::other(format!(
-                "Failed to create socket parent directory {}: {e}",
+                "Failed to create private socket parent directory {}: {e}",
                 parent.display()
             ))
         })?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
-        }
     }
     Ok(())
 }
@@ -78,18 +72,16 @@ pub(crate) fn acquire_boot_singleton_lock(
     acquire_singleton_lock(&path.with_file_name("system.lock"))
 }
 
-/// Bind the daemon's Unix listener, assuming the singleton lock is ALREADY held
+/// Bind the daemon's local listener, assuming the singleton lock is ALREADY held
 /// (via [`acquire_boot_singleton_lock`]).
 ///
 /// Returns the bound listener for the WASM execution context. This step only
-/// prepares the socket path (stale-socket / symlink cleanup, live-socket
-/// rejection) and binds — it does NOT touch the singleton lock, which the
-/// caller acquired first so it precedes the KV/audit store opens.
+/// prepares the platform endpoint and binds it. It does NOT touch the singleton
+/// lock, which the caller acquired first so it precedes KV/audit store opens.
 ///
 /// # Errors
-/// Returns an error if the socket cannot be bound, the path exceeds the
-/// platform's `sun_path` limit, or another kernel is already listening on the
-/// socket.
+/// Returns an error if the endpoint cannot be bound or another kernel is
+/// already listening on it.
 pub(crate) fn bind_listener(
     home: &astrid_core::dirs::AstridHome,
 ) -> Result<LocalListener, std::io::Error> {
@@ -183,19 +175,38 @@ pub(crate) fn generate_session_token() -> Result<(SessionToken, PathBuf), std::i
 /// NOTE: This is intentionally duplicated in `astrid-cli/src/socket_client.rs`
 /// because the CLI cannot depend on `astrid-kernel`. The canonical path
 /// definition is `AstridHome::ready_path()` in `astrid-core`.
+///
+/// # Panics
+///
+/// On Windows, panics if the private per-user Astrid home cannot be resolved.
+/// Windows never falls back to a shared or drive-relative `/tmp` path.
 #[must_use]
 pub fn readiness_path() -> PathBuf {
-    use astrid_core::dirs::AstridHome;
-    match AstridHome::resolve() {
-        Ok(home) => home.ready_path(),
+    match try_readiness_path() {
+        Ok(path) => path,
         Err(e) => {
-            warn!(
-                error = %e,
-                "Failed to resolve ASTRID_HOME; falling back to /tmp/.astrid/run/system.ready"
-            );
-            PathBuf::from("/tmp/.astrid/run/system.ready")
+            #[cfg(windows)]
+            panic!("Failed to resolve the private Windows ASTRID_HOME: {e}");
+            #[cfg(not(windows))]
+            {
+                warn!(
+                    error = %e,
+                    "Failed to resolve ASTRID_HOME; falling back to /tmp/.astrid/run/system.ready"
+                );
+                PathBuf::from("/tmp/.astrid/run/system.ready")
+            }
         },
     }
+}
+
+/// Resolve the daemon readiness sentinel without a platform fallback.
+///
+/// # Errors
+///
+/// Returns an error when the private per-user Astrid home cannot be resolved.
+pub fn try_readiness_path() -> std::io::Result<PathBuf> {
+    use astrid_core::dirs::AstridHome;
+    AstridHome::resolve().map(|home| home.ready_path())
 }
 
 /// Write the readiness sentinel file to signal that the daemon is fully
@@ -225,7 +236,7 @@ pub fn write_readiness_file_for_workspace(
     workspace_root: &std::path::Path,
     workspace_layout: &astrid_core::dirs::WorkspaceLayout,
 ) -> Result<(), std::io::Error> {
-    let path = readiness_path();
+    let path = try_readiness_path()?;
     let fingerprint = astrid_core::dirs::checked_workspace_selection_fingerprint(
         workspace_root,
         workspace_layout,
@@ -234,40 +245,44 @@ pub fn write_readiness_file_for_workspace(
 }
 
 fn publish_readiness_metadata(path: &std::path::Path, metadata: &str) -> std::io::Result<()> {
-    use std::io::Write as _;
-
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        astrid_core::platform_fs::ensure_private_directory(parent)?;
+    }
+
+    #[cfg(windows)]
+    {
+        astrid_core::platform_fs::atomic_write_private_file(path, metadata.as_bytes())
+    }
+
+    #[cfg(not(windows))]
+    {
+        use std::io::Write as _;
+
+        let tmp = path.with_extension(format!("ready.tmp.{}", std::process::id()));
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
         }
-    }
-    let tmp = path.with_extension(format!("ready.tmp.{}", std::process::id()));
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        opts.mode(0o600);
-    }
 
-    let write_result = (|| -> std::io::Result<()> {
-        let mut file = opts.open(&tmp)?;
-        file.write_all(metadata.as_bytes())?;
-        file.flush()?;
-        file.sync_all()
-    })();
-    if let Err(error) = write_result {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(error);
+        let write_result = (|| -> std::io::Result<()> {
+            let mut file = opts.open(&tmp)?;
+            file.write_all(metadata.as_bytes())?;
+            file.flush()?;
+            file.sync_all()
+        })();
+        if let Err(error) = write_result {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error);
+        }
+        if let Err(error) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error);
+        }
+        Ok(())
     }
-    if let Err(error) = replace_file(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(error);
-    }
-    Ok(())
 }
 
 /// Remove the readiness sentinel file (best-effort).
@@ -276,25 +291,47 @@ fn publish_readiness_metadata(path: &std::path::Path, metadata: &str) -> std::io
 /// ignored - a missing file is not an error, and if removal fails the
 /// CLI's pre-spawn cleanup will handle it on next boot.
 pub fn remove_readiness_file() {
-    let _ = std::fs::remove_file(readiness_path());
+    match try_readiness_path() {
+        Ok(path) => {
+            let _ = std::fs::remove_file(path);
+        },
+        Err(error) => warn!(%error, "Failed to resolve readiness path during cleanup"),
+    }
 }
 
 /// Path to the daemon PID file (`run/system.pid`).
 ///
 /// NOTE: kept here alongside the other run-dir path helpers; the canonical
-/// definition is `AstridHome::pid_path()` in `astrid-core`. Falls back to
-/// the same `/tmp` location as the socket so a dev daemon that can't resolve
-/// `ASTRID_HOME` still records its PID consistently with where the CLI looks.
+/// definition is `AstridHome::pid_path()` in `astrid-core`.
+///
+/// # Panics
+///
+/// On Windows, panics if the private per-user Astrid home cannot be resolved.
+/// Windows never falls back to a shared or drive-relative `/tmp` path.
 #[must_use]
 pub fn pid_path() -> PathBuf {
-    use astrid_core::dirs::AstridHome;
-    match AstridHome::resolve() {
-        Ok(home) => home.pid_path(),
+    match try_pid_path() {
+        Ok(path) => path,
         Err(e) => {
-            warn!(error = %e, "Failed to resolve ASTRID_HOME; falling back to /tmp/.astrid/run/system.pid");
-            PathBuf::from("/tmp/.astrid/run/system.pid")
+            #[cfg(windows)]
+            panic!("Failed to resolve the private Windows ASTRID_HOME: {e}");
+            #[cfg(not(windows))]
+            {
+                warn!(error = %e, "Failed to resolve ASTRID_HOME; falling back to /tmp/.astrid/run/system.pid");
+                PathBuf::from("/tmp/.astrid/run/system.pid")
+            }
         },
     }
+}
+
+/// Resolve the daemon PID file without a platform fallback.
+///
+/// # Errors
+///
+/// Returns an error when the private per-user Astrid home cannot be resolved.
+pub fn try_pid_path() -> std::io::Result<PathBuf> {
+    use astrid_core::dirs::AstridHome;
+    AstridHome::resolve().map(|home| home.pid_path())
 }
 
 /// Write the current process PID to the daemon PID file, atomically.
@@ -313,24 +350,10 @@ pub fn pid_path() -> PathBuf {
 /// file only degrades `stop`/`restart` to socket-only cleanup), so it logs
 /// rather than aborting boot.
 pub fn write_pid_file() -> Result<(), std::io::Error> {
-    use std::io::Write as _;
-
-    let path = pid_path();
+    let path = try_pid_path()?;
 
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    // Write to a uniquely-named temp file in the same directory, then rename
-    // over the target so the swap is atomic on the same filesystem.
-    let tmp = path.with_extension(format!("pid.tmp.{}", std::process::id()));
-
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+        astrid_core::platform_fs::ensure_private_directory(parent)?;
     }
 
     // Resolve our own executable, canonicalized to defeat the launch symlink
@@ -343,36 +366,44 @@ pub fn write_pid_file() -> Result<(), std::io::Error> {
         .ok()
         .and_then(|p| p.to_str().map(str::to_owned));
 
-    let write_result = (|| -> std::io::Result<()> {
-        let mut file = opts.open(&tmp)?;
-        match &exe_line {
-            Some(exe) => write!(file, "{}\n{}", std::process::id(), exe)?,
-            None => write!(file, "{}", std::process::id())?,
-        }
-        file.flush()?;
-        file.sync_all()?;
-        Ok(())
-    })();
-    if let Err(e) = write_result {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
+    let contents = exe_line.map_or_else(
+        || std::process::id().to_string(),
+        |exe| format!("{}\n{exe}", std::process::id()),
+    );
 
-    if let Err(e) = replace_file(&tmp, &path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    Ok(())
-}
-
-fn replace_file(source: &std::path::Path, destination: &std::path::Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
-        windows::replace_file(source, destination)
+        astrid_core::platform_fs::atomic_write_private_file(&path, contents.as_bytes())
     }
+
     #[cfg(not(windows))]
     {
-        std::fs::rename(source, destination)
+        use std::io::Write as _;
+
+        let tmp = path.with_extension(format!("pid.tmp.{}", std::process::id()));
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+
+        let write_result = (|| -> std::io::Result<()> {
+            let mut file = opts.open(&tmp)?;
+            file.write_all(contents.as_bytes())?;
+            file.flush()?;
+            file.sync_all()
+        })();
+        if let Err(error) = write_result {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error);
+        }
+        if let Err(error) = std::fs::rename(&tmp, &path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error);
+        }
+        Ok(())
     }
 }
 
@@ -383,7 +414,12 @@ fn replace_file(source: &std::path::Path, destination: &std::path::Path) -> std:
 /// liveness check (a PID that is dead is treated as already-gone) plus the
 /// pre-spawn cleanup on next boot.
 pub fn remove_pid_file() {
-    let _ = std::fs::remove_file(pid_path());
+    match try_pid_path() {
+        Ok(path) => {
+            let _ = std::fs::remove_file(path);
+        },
+        Err(error) => warn!(%error, "Failed to resolve PID path during cleanup"),
+    }
 }
 
 #[cfg(test)]

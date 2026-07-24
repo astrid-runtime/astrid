@@ -22,7 +22,7 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   instances, shutdown, and reconnect behavior. Closes #1349.
 - **Windows daemon control now uses native process and lifecycle semantics.**
   Start and readiness require an authenticated management roundtrip, persistent
-  daemons are created detached without any idle timeout, and `start
+  daemons are created detached without any implicit idle timeout, and `start
   --foreground` stays attached through daemon exit. Stop and restart retain the
   PID/executable identity gate while using Windows process handles for wedged
   daemons; status and doctor no longer infer health from a socket pathname.

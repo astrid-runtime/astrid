@@ -20,6 +20,8 @@ $testRoot = Join-Path $env:LOCALAPPDATA ("AstridLifecycleCi-" + [guid]::NewGuid(
 $astridHome = Join-Path $testRoot "home"
 $workspace = Join-Path $testRoot "workspace"
 $pidPath = Join-Path $astridHome "run\system.pid"
+$readyPath = Join-Path $astridHome "run\system.ready"
+$tokenPath = Join-Path $astridHome "run\system.token"
 $daemonPid = $null
 $daemonProcess = $null
 
@@ -42,6 +44,12 @@ try {
     $startOutput = Invoke-Astrid start
     if (-not (Test-Path -LiteralPath $pidPath -PathType Leaf)) {
         throw "astrid start returned success without a daemon PID file`n$startOutput"
+    }
+    if (-not (Test-Path -LiteralPath $readyPath -PathType Leaf)) {
+        throw "astrid start returned success without a readiness file`n$startOutput"
+    }
+    if (-not (Test-Path -LiteralPath $tokenPath -PathType Leaf)) {
+        throw "astrid start returned success without a session-token file`n$startOutput"
     }
 
     $daemonPid = [uint32](Get-Content -LiteralPath $pidPath -TotalCount 1).Trim()
@@ -67,6 +75,12 @@ try {
     }
     if (Test-Path -LiteralPath $pidPath) {
         throw "astrid stop left the daemon PID file behind"
+    }
+    if (Test-Path -LiteralPath $readyPath) {
+        throw "astrid stop left the daemon readiness file behind"
+    }
+    if (Test-Path -LiteralPath $tokenPath) {
+        throw "astrid stop left the daemon session-token file behind"
     }
 
     $stoppedStatus = Invoke-Astrid status
@@ -108,6 +122,8 @@ finally {
         if (
             $processGone -and
             -not (Test-Path -LiteralPath $pidPath) -and
+            -not (Test-Path -LiteralPath $readyPath) -and
+            -not (Test-Path -LiteralPath $tokenPath) -and
             (Test-Path -LiteralPath $testRoot)
         ) {
             Remove-Item -LiteralPath $testRoot -Recurse -Force

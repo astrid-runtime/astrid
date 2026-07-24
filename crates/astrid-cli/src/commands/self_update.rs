@@ -382,6 +382,7 @@ pub(super) async fn download_bounded(
 /// individual name boundary; an interrupted mixed set is restored on the next
 /// attempt. The `.bak` copies are left in place for manual rollback after a
 /// successful update.
+#[cfg(not(windows))]
 fn backup_and_swap(install_dir: &Path, extract_dir: &Path, names: &[&str]) -> anyhow::Result<()> {
     astrid_core::platform_fs::replace_executable_set(install_dir, extract_dir, names)
         .context("failed to replace authenticated Astrid executables")
@@ -417,19 +418,67 @@ fn confirm(prompt: &str, assume_yes: bool) -> anyhow::Result<bool> {
     Ok(input.is_empty() || input.eq_ignore_ascii_case("y") || input.eq_ignore_ascii_case("yes"))
 }
 
+struct PreparedInPlaceUpdate {
+    _temp_guard: tempfile::TempDir,
+    payload: PathBuf,
+    install_root: PathBuf,
+}
+
+async fn prepare_in_place_update(
+    client: &reqwest::Client,
+    release: &serde_json::Value,
+    version: &str,
+    target: &str,
+    expected_blake3: &str,
+    exe: &Path,
+    assume_yes: bool,
+) -> anyhow::Result<Option<PreparedInPlaceUpdate>> {
+    let install_dir = exe
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("cannot resolve install directory for {}", exe.display()))?
+        .to_path_buf();
+    if !is_writable_dir(&install_dir) {
+        bail!(
+            "{} is not writable — re-run with elevated permissions, or reinstall via Homebrew/cargo.",
+            install_dir.display()
+        );
+    }
+
+    if !confirm(
+        &format!(
+            "Update Astrid v{CURRENT_VERSION} → v{version} in {}?",
+            install_dir.display()
+        ),
+        assume_yes,
+    )? {
+        println!("{}", Theme::dimmed("Update cancelled."));
+        return Ok(None);
+    }
+
+    let (temp_dir, extract_dir) =
+        download_verify_extract(client, release, version, target, expected_blake3)
+            .await
+            .map_err(anyhow::Error::new)?;
+    Ok(Some(PreparedInPlaceUpdate {
+        _temp_guard: temp_dir,
+        payload: extract_dir,
+        install_root: install_dir,
+    }))
+}
+
+fn update_client() -> anyhow::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .user_agent("astrid-cli")
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .context("failed to build update HTTP client")
+}
+
 /// Run the self-update command — flag → stage → finish:
 /// resolve the signed channel, (for self-managed installs) verify + atomically
 /// swap the binary in place with rollback, restart the daemon, then update
 /// capsules. Distro refresh requires explicit recorded source provenance and is
 /// deliberately skipped by this path. Homebrew installs are deferred to `brew upgrade`.
-#[cfg(windows)]
-pub(crate) async fn run_self_update(_args: UpdateArgs) -> anyhow::Result<()> {
-    anyhow::bail!(
-        "Astrid self-update is not enabled on Windows; native packaging and code-signing support are not complete"
-    )
-}
-
-#[cfg(not(windows))]
 pub(crate) async fn run_self_update(args: UpdateArgs) -> anyhow::Result<()> {
     let target = platform_target()?;
     let (owner, repo) = resolve_repo(args.source.as_deref())?;
@@ -444,10 +493,7 @@ pub(crate) async fn run_self_update(args: UpdateArgs) -> anyhow::Result<()> {
         ))
     );
 
-    let client = reqwest::Client::builder()
-        .user_agent("astrid-cli")
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
+    let client = update_client()?;
 
     let resolved =
         update_channel::resolve_signed_channel(&client, &owner, &repo, args.channel, target)
@@ -491,42 +537,32 @@ pub(crate) async fn run_self_update(args: UpdateArgs) -> anyhow::Result<()> {
         UpdatePlan::ApplyInPlace => {},
     }
 
-    let install_dir = exe
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("cannot resolve install directory for {}", exe.display()))?
-        .to_path_buf();
-    if !is_writable_dir(&install_dir) {
-        bail!(
-            "{} is not writable — re-run with elevated permissions, or reinstall via Homebrew/cargo.",
-            install_dir.display()
-        );
-    }
-
-    if !confirm(
-        &format!(
-            "Update Astrid v{CURRENT_VERSION} → v{version_str} in {}?",
-            install_dir.display()
-        ),
-        args.yes,
-    )? {
-        println!("{}", Theme::dimmed("Update cancelled."));
-        return Ok(());
-    }
-
-    let (_tmp_dir, extract_dir) = download_verify_extract(
+    let Some(prepared) = prepare_in_place_update(
         &client,
         &release,
         &version_str,
         target,
         &resolved.target_blake3,
+        &exe,
+        args.yes,
     )
-    .await
-    .map_err(anyhow::Error::new)?;
+    .await?
+    else {
+        return Ok(());
+    };
+    let PreparedInPlaceUpdate {
+        _temp_guard,
+        payload: extract_dir,
+        install_root: install_dir,
+    } = prepared;
 
     #[cfg(windows)]
     {
-        stop_daemon_before_windows_replacement().await?;
         finish_update(&install_dir).await?;
+        // Capsule synchronization can contact or start the daemon. Make the
+        // strict, confirmed stop the final step before the exit-time helper is
+        // launched so neither executable can still be mapped by a live daemon.
+        stop_daemon_before_windows_replacement().await?;
         windows::stage_and_launch(&install_dir, &extract_dir, MANAGED_BINARIES)?;
         println!(
             "{}",
@@ -631,8 +667,9 @@ async fn download_verify_extract(
 /// After the binary swap: restart a running daemon so the new code takes effect,
 /// update capsules, and warn if the install dir isn't on PATH.
 async fn finish_update(install_dir: &Path) -> anyhow::Result<()> {
-    if astrid_core::local_transport::endpoint_is_present(&crate::socket_client::proxy_socket_path())?
-    {
+    if astrid_core::local_transport::endpoint_is_present(
+        &crate::socket_client::try_proxy_socket_path()?,
+    )? {
         println!(
             "{}",
             Theme::info("Stopping the running daemon so the new version loads on next use...")

@@ -97,7 +97,7 @@ pub(crate) fn find_companion_binary(name: &str) -> Result<std::path::PathBuf> {
     }
     anyhow::bail!(
         "{} not found. Ensure it is installed alongside the astrid CLI \
-         or available in PATH."
+         or available in PATH.",
         native_name.display()
     )
 }
@@ -167,8 +167,8 @@ pub(crate) async fn run_or_connect(
     };
     let workspace_root = selected_workspace_root(workspace);
 
-    let socket_path = socket_client::proxy_socket_path();
-    let ready_path = socket_client::readiness_path();
+    let socket_path = socket_client::try_proxy_socket_path()?;
+    let ready_path = socket_client::try_readiness_path()?;
 
     let needs_boot = match astrid_core::local_transport::connect_outcome(&socket_path).await {
         Ok(astrid_core::local_transport::ConnectOutcome::Connected(stream)) => {

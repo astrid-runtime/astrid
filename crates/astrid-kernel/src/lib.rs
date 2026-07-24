@@ -43,9 +43,9 @@ pub mod kernel_router;
 pub mod pair_token;
 #[cfg(all(test, not(all(target_arch = "wasm32", target_os = "unknown"))))]
 mod runtime_policy_tests;
-/// The Unix Domain Socket manager. Unix-only: binds the `UnixListener` and
-/// acquires the singleton advisory lock.
-#[cfg(unix)]
+/// Native local-transport manager. Binds a Unix-domain socket or per-user
+/// Windows named pipe and acquires the singleton advisory lock.
+#[cfg(any(unix, windows))]
 pub mod socket;
 
 use arc_swap::ArcSwap;
@@ -128,7 +128,7 @@ pub struct Kernel {
     /// Always `Some` in production (boot requires `AstridHome`). Remains
     /// `Option` for compatibility with `CapsuleContext` and test fixtures.
     pub home_root: Option<PathBuf>,
-    /// The natively bound Unix Socket for the CLI proxy.
+    /// The natively bound local-transport listener for the CLI proxy.
     pub cli_socket_listener: Option<astrid_capsule::context::UplinkListener>,
     /// Exclusive advisory lock enforcing a single kernel instance, held for
     /// the daemon's lifetime (see [`socket::acquire_boot_singleton_lock`],
@@ -277,7 +277,7 @@ pub struct Kernel {
 /// Every field here is a facility whose acquisition is platform-specific — the
 /// products of the native side-effects that [`Kernel::new`] performs (resolving
 /// the Astrid home, opening the KV/audit stores, loading the runtime key,
-/// binding the singleton Unix socket, generating the session token). Bundling
+/// binding the singleton local endpoint, generating the session token). Bundling
 /// them into one value inverts resource acquisition out of the constructor: a
 /// native host calls [`Kernel::new`] (which builds this and delegates), while an
 /// alternate host (e.g. a browser WebAssembly build) can supply its own
@@ -302,8 +302,8 @@ pub struct KernelResources {
     /// Path the session token was written to, retained so shutdown reuses the
     /// exact same path (avoids a fallback mismatch if the environment changes).
     pub token_path: PathBuf,
-    /// The natively bound Unix listener for the CLI uplink, or `None` for hosts
-    /// (and test kernels) that do not service a real socket.
+    /// The natively bound local listener for the CLI uplink, or `None` for
+    /// hosts (and test kernels) that do not service a real endpoint.
     pub cli_socket_listener: Option<astrid_capsule::context::UplinkListener>,
     /// Exclusive advisory lock enforcing a single kernel instance, held for the
     /// process lifetime; its `Drop` releases the lock. Independent of
@@ -357,10 +357,10 @@ impl Kernel {
     ///
     /// The native composition root: resolves the Astrid home, opens the
     /// `SurrealKV` store and audit log, loads the runtime key, binds the singleton
-    /// Unix socket, generates the session token, then delegates to the portable
-    /// [`Kernel::with_resources`]. Unix-only — the socket bind and singleton
-    /// flock have no browser-profile analogue; that host builds its own
-    /// [`KernelResources`] and calls `with_resources` directly.
+    /// local endpoint, generates the session token, then delegates to the
+    /// portable [`Kernel::with_resources`]. Available on Unix and Windows;
+    /// browser-profile hosts build their own [`KernelResources`] and call
+    /// `with_resources` directly.
     ///
     /// `runtime_limits` is the resolved per-host capsule concurrency ceiling
     /// pair (blocking vs async-I/O host calls); the daemon resolves it from
@@ -382,10 +382,10 @@ impl Kernel {
     ///
     /// Returns an error if any native resource cannot be acquired — the Astrid
     /// home cannot be resolved, the KV store, runtime key, or audit log cannot
-    /// be opened, the Unix socket cannot be bound (or the singleton lock is
+    /// be opened, the local endpoint cannot be bound (or the singleton lock is
     /// already held), or the session token cannot be generated — or if the
     /// portable wiring in [`Kernel::with_resources`] fails.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub async fn new(
         session_id: SessionId,
         workspace_root: PathBuf,
@@ -410,7 +410,7 @@ impl Kernel {
     ///
     /// Returns an error if the Astrid home or native resources cannot be
     /// acquired, or if portable kernel wiring fails.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub async fn new_with_workspace_layout(
         session_id: SessionId,
         workspace_root: PathBuf,
@@ -457,10 +457,10 @@ impl Kernel {
         let runtime_key = Arc::new(load_or_generate_runtime_key(&home.keys_dir())?);
         let audit_log = open_audit_log(&home, Arc::clone(&runtime_key)).await?;
 
-        // Bind the secure Unix socket (the singleton lock is already held). The
-        // socket is bound here, but not yet listened on. The token is generated
-        // before any capsule can accept connections, preventing a race where a
-        // client connects before the token file exists.
+        // Bind the secure local endpoint (the singleton lock is already held).
+        // The listener is created here, but does not accept until the uplink
+        // capsule runs. Generate the token before any capsule can accept
+        // connections so a client cannot race token publication.
         let listener = socket::bind_listener(&home)?;
         // Record our PID immediately after acquiring the singleton lock, so the
         // PID on disk always belongs to the process that holds the state-db
@@ -2153,7 +2153,7 @@ impl Kernel {
     /// 1. Publish `KernelShutdown` event on the bus.
     /// 2. Drain and unload all capsules (stops MCP child processes, WASM engines).
     /// 3. Flush and close the persistent KV store.
-    /// 4. Remove the Unix socket file.
+    /// 4. Remove local transport and authentication runtime artifacts.
     pub async fn shutdown(&self, reason: Option<String>) {
         tracing::info!(reason = ?reason, "Kernel shutting down");
 
@@ -2265,14 +2265,15 @@ impl Kernel {
             }
         }
 
-        // 4. Remove the socket and token files so stale-socket detection works
-        // on next boot and the auth token doesn't persist on disk after shutdown.
+        // 4. Remove the local endpoint and runtime authentication artifacts so
+        // stale-endpoint detection works on next boot and the auth token does
+        // not persist on disk after shutdown.
         // This runs AFTER the capsule drain, which is the correct order: MCP
-        // child processes communicate via stdio pipes (not this Unix socket), so
+        // child processes communicate via stdio pipes (not this endpoint), so
         // they are already terminated by step 3. The socket is only used for
-        // CLI-to-kernel IPC. Unix-only: the `socket` module (and the on-disk
-        // socket/PID/readiness files it manages) exist only on that profile.
-        #[cfg(unix)]
+        // CLI-to-kernel IPC. Unix uses a socket path; Windows uses a named pipe,
+        // while both profiles persist the token, PID, and readiness metadata.
+        #[cfg(any(unix, windows))]
         {
             let socket_path = crate::socket::kernel_socket_path();
             let _ = astrid_core::local_transport::remove_endpoint(&socket_path);
@@ -2519,7 +2520,7 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
 /// so every resource acquired by the native composition root is rooted in the
 /// same home — re-resolving from the environment here could split the audit
 /// log from the KV/socket paths if `$ASTRID_HOME` changed between calls.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn open_audit_log(
     home: &astrid_core::dirs::AstridHome,
     runtime_key: Arc<astrid_crypto::KeyPair>,
@@ -3564,7 +3565,14 @@ fn mint_default_principal_keypair(
             .open(&key_path)?;
         f.write_all(&keypair.secret_key_bytes())?;
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        astrid_core::platform_fs::atomic_write_private_file(
+            &key_path,
+            &keypair.secret_key_bytes(),
+        )?;
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         std::fs::write(&key_path, keypair.secret_key_bytes())?;
     }
