@@ -26,14 +26,18 @@ use crate::error::{StorageError, StorageResult};
 mod memory;
 mod principal;
 mod scoped;
-#[cfg(feature = "kv")]
+#[cfg(feature = "legacy-surrealkv")]
 mod surreal;
+mod tree;
+#[cfg(test)]
+mod tree_tests;
 
 pub use memory::MemoryKvStore;
-pub use principal::{KvPrincipalResolver, PrincipalKvStore};
+pub use principal::{KvPrincipalResolver, KvQuotaResolver, PrincipalKvStore};
 pub use scoped::ScopedKvStore;
-#[cfg(feature = "kv")]
+#[cfg(feature = "legacy-surrealkv")]
 pub use surreal::SurrealKvStore;
+pub use tree::TreeKvStore;
 
 // ---------------------------------------------------------------------------
 // Validation
@@ -85,7 +89,6 @@ pub(super) fn validate_key(key: &str) -> StorageResult<()> {
 }
 
 /// Build the composite key `"{namespace}\0{key}"` as bytes.
-#[cfg(feature = "kv")]
 pub(super) fn composite_key(namespace: &str, key: &str) -> Vec<u8> {
     let mut buf = Vec::with_capacity(namespace.len().saturating_add(1).saturating_add(key.len()));
     buf.extend_from_slice(namespace.as_bytes());
@@ -95,7 +98,6 @@ pub(super) fn composite_key(namespace: &str, key: &str) -> Vec<u8> {
 }
 
 /// Build the start of the namespace range (inclusive): `"{namespace}\0"`.
-#[cfg(feature = "kv")]
 pub(super) fn namespace_range_start(namespace: &str) -> Vec<u8> {
     let mut buf = Vec::with_capacity(namespace.len().saturating_add(1));
     buf.extend_from_slice(namespace.as_bytes());
@@ -109,7 +111,6 @@ pub(super) fn namespace_range_start(namespace: &str) -> Vec<u8> {
 /// `"{namespace}\0{key}"`. The byte `\x01` immediately follows `\0`,
 /// so the range `["{namespace}\0", "{namespace}\x01")` captures exactly
 /// all keys in the namespace.
-#[cfg(feature = "kv")]
 pub(super) fn namespace_range_end(namespace: &str) -> Vec<u8> {
     let mut buf = Vec::with_capacity(namespace.len().saturating_add(1));
     buf.extend_from_slice(namespace.as_bytes());
@@ -123,7 +124,6 @@ pub(super) fn namespace_range_end(namespace: &str) -> Vec<u8> {
 /// keys starting with "ns\0foo". Works by incrementing the last byte of
 /// the prefix. If the prefix is empty, falls back to the full namespace
 /// range end.
-#[cfg(feature = "kv")]
 pub(super) fn prefix_range_end(namespace: &str, prefix: &str) -> Vec<u8> {
     if prefix.is_empty() {
         return namespace_range_end(namespace);

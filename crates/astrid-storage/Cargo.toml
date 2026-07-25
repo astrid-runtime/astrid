@@ -10,10 +10,10 @@ description = "Unified storage integration for Astrid principal state, raw KV, a
 
 [features]
 default = []
-kv = ["dep:surrealkv"]
+legacy-surrealkv = ["dep:surrealkv"]
 db = ["dep:surrealdb"]
 keychain = ["dep:keyring"]
-full = ["kv", "db"]
+full = ["legacy-surrealkv", "db"]
 
 [dependencies]
 astrid-core = { workspace = true }
@@ -44,6 +44,9 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 # (see scripts/check-wasm-portability.sh).
 [target.'cfg(target_family = "wasm")'.dependencies]
 getrandom = { version = "0.4", features = ["wasm_js"] }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+blake3 = { workspace = true }
 
 [lints]
 workspace = true

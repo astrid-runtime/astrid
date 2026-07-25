@@ -101,6 +101,11 @@ pub fn enforce_restrictions(
     // global config can set `[http]`.
     block_workspace_override(merged, baseline, workspace_layer, &["http"], "http");
 
+    // storage: operator-only authoritative backend and recovery policy. A
+    // project must never select a stale legacy database or raise parser
+    // allocation boundaries for the system daemon.
+    block_workspace_override(merged, baseline, workspace_layer, &["storage"], "storage");
+
     // workspace.auto_allow_read: cannot expand beyond baseline.
     block_workspace_expansion(
         merged,

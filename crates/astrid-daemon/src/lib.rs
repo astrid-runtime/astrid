@@ -161,6 +161,24 @@ fn resolve_http_limits(cfg: Option<&astrid_config::Config>) -> astrid_capsule::H
     )
 }
 
+fn resolve_storage_options(
+    cfg: Option<&astrid_config::Config>,
+) -> astrid_storage::PrincipalStoreOptions {
+    let storage = cfg.map(|config| config.storage).unwrap_or_default();
+    let backend = match storage.backend {
+        astrid_config::StorageBackendConfig::Principal => {
+            astrid_storage::PrincipalStoreBackend::Principal
+        },
+        astrid_config::StorageBackendConfig::LegacySurreal => {
+            astrid_storage::PrincipalStoreBackend::LegacySurreal
+        },
+    };
+    astrid_storage::PrincipalStoreOptions {
+        backend,
+        recovery_max_frame_bytes: storage.recovery_max_frame_bytes,
+    }
+}
+
 /// Whether a loaded capsule can serve the kernel-owned CLI Unix socket.
 ///
 /// Package names are distribution policy. The runtime identifies the bridge
@@ -255,12 +273,14 @@ pub async fn run() -> Result<()> {
     // Operator ceilings for the astrid:http host (global; absent `[http]`
     // config = the host's historical constants). Forwarded to every capsule.
     let http_limits = resolve_http_limits(unified_cfg.as_ref());
-    let kernel = astrid_kernel::Kernel::new_with_workspace_layout(
+    let storage_options = resolve_storage_options(unified_cfg.as_ref());
+    let kernel = astrid_kernel::Kernel::new_with_storage_options_and_workspace_layout(
         session_id.clone(),
         workspace_root,
         runtime_limits,
         local_egress,
         http_limits,
+        storage_options,
         workspace_layout,
     )
     .await

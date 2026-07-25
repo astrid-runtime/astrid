@@ -30,6 +30,7 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   must name typed commits, and placement epochs advance monotonically over
   registered blobs.
   capsule interfaces are unchanged.
+  semantic execution proofs. Public capsule interfaces remain unchanged.
 - **Principal storage has a thread-safe in-memory engine prototype.** The new
   `astrid-storage-engine` validates caller-declared object identities and
   complete immutable closures before publishing linearizable per-principal
@@ -37,9 +38,9 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   identity-bearing, and a principal root must name a typed commit envelope. The
   engine supports consistent closure snapshots, exact compare-and-swap, pins,
   logical accounting, and garbage collection without selecting an on-disk
-  format or changing current storage backends. Bounded transition traces and
-  concurrent-writer tests exercise the engine contract; durability, recovery,
-  encryption, placement, and runtime migration remain explicitly out of scope.
+  format. Bounded transition traces and concurrent-writer tests exercise the
+  engine contract; the native durable realization refines it while encryption
+  and placement remain future work.
 - **Principal storage has an additive KV compatibility bridge.**
   `PrincipalKvStore` implements the existing async `KvStore` contract over
   typed principal roots while requiring an authority-aware
@@ -48,17 +49,29 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   without choosing a production hash or disk encoding. Root conflicts retry
   from a fresh snapshot, non-KV state edges survive KV mutations, and generated
   traces compare every operation and resulting namespace state against both
-  `MemoryKvStore` and `SurrealKvStore`. The adapter is additive: the runtime
-  still opens its current backend and no existing principal is migrated.
+  `MemoryKvStore` and `SurrealKvStore`. The bridge remains the whole-state
+  differential oracle; the runtime hot path uses a bounded persistent tree.
 - **Principal storage has a host-file durability foundation.**
   `DurableEngine` persists immutable object frames before publishing a
   checksummed principal-root journal record, rebuilds its disposable index on
   open, truncates incomplete final frames, and rejects complete corruption.
   An exclusive store lock and poison-on-write-failure behavior prevent
   concurrent-process corruption and stale in-memory reads. Named crash-boundary
-  tests prove recovery to the old or new complete root. This is not a runtime
-  cutover and does not yet claim compaction, quota enforcement, persistent
-  pins, audit/outbox atomicity, or the final logical hash/encoding profile.
+  tests prove recovery to the old or new complete root. Recovery keeps only
+  roots and arena offsets resident, while live reads load and checksum payloads
+  lazily. Compaction, persistent pins, audit/outbox atomicity, and final
+  representation profiles remain future work.
+- **Native kernel state now cuts over to durable principal roots.** Kernel boot
+  migrates the legacy SurrealKV database under the singleton lock, verifies a
+  canonical digest independently per owner, preserves the legacy source, and
+  publishes a versioned completion marker only after a durable flush.
+  `TreeKvStore` keeps point reads and mutations height-bounded through a
+  persistent AVL tree instead of using the linear compatibility projection.
+  System state has its own owner; host-stamped capsule namespaces map to
+  validated principals and share their live, invalidatable profile quota.
+  `[storage]` is operator-only, has no fixed default frame or capacity ceiling,
+  and exposes explicit legacy recovery. The misleading `kv` feature is
+  replaced by temporary `legacy-surrealkv` compatibility.
 - **Windows local transport uses authenticated per-user named pipes.** A pipe
   name derived only from the caller's operating-system SID replaces
   filesystem endpoint naming on Windows. Local-only byte-mode instances use a

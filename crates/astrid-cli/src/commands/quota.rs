@@ -13,7 +13,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use astrid_core::PrincipalId;
 use astrid_core::kernel_api::{AdminRequestKind, AdminResponseBody, ResourceUsage};
-use astrid_core::profile::{BACKGROUND_PROCESSES_UPPER_BOUND, Quotas, TIMEOUT_SECS_UPPER_BOUND};
+use astrid_core::profile::{
+    BACKGROUND_PROCESSES_UPPER_BOUND, DEFAULT_MAX_STORAGE_BYTES, Quotas, TIMEOUT_SECS_UPPER_BOUND,
+};
 use clap::{Args, Subcommand};
 use colored::Colorize;
 use serde::Serialize;
@@ -175,7 +177,7 @@ fn print_quotas_pretty(principal: &PrincipalId, q: &Quotas) {
     println!(
         "  {:<24}  {}",
         "storage".bold(),
-        format_bytes(q.max_storage_bytes)
+        format_storage_limit(q.max_storage_bytes)
     );
     println!(
         "  {:<24}  {}",
@@ -447,6 +449,14 @@ fn format_bytes(b: u64) -> String {
     }
 }
 
+fn format_storage_limit(bytes: u64) -> String {
+    if bytes == DEFAULT_MAX_STORAGE_BYTES {
+        "unlimited".to_owned()
+    } else {
+        format_bytes(bytes)
+    }
+}
+
 /// Render a wasmtime-fuel count with decimal SI suffixes. Fuel is a raw
 /// instruction count, so decimal magnitudes (k/M/G) read more naturally
 /// than the binary units used for bytes.
@@ -636,6 +646,7 @@ mod tests {
         assert_eq!(format_bytes(0), "0 B");
         assert_eq!(format_bytes(2048), "2.0 KiB");
         assert_eq!(format_bytes(64 * 1024 * 1024), "64.0 MiB");
+        assert_eq!(format_storage_limit(DEFAULT_MAX_STORAGE_BYTES), "unlimited");
         assert_eq!(format_duration(Duration::from_secs(0)), "0ms");
         assert_eq!(format_duration(Duration::from_secs(45)), "45s");
         assert_eq!(format_duration(Duration::from_secs(125)), "2m05s");

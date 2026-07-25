@@ -26,7 +26,7 @@
 //! - `max_timeout_secs`         = 300  (5 min)
 //! - `max_ipc_throughput_bytes` = 10 `MiB`/s
 //! - `max_background_processes` = 8
-//! - `max_storage_bytes`        = 1 `GiB`
+//! - `max_storage_bytes`        = unlimited unless an operator sets a budget
 //! - `network.egress`           = `[]`  (no outbound)
 //! - `process.allow`            = `[]`  (no spawn)
 
@@ -64,8 +64,12 @@ pub const DEFAULT_MAX_TIMEOUT_SECS: u64 = 300;
 pub const DEFAULT_MAX_IPC_THROUGHPUT_BYTES: u64 = 10 * 1024 * 1024;
 /// Default max concurrent background processes per principal.
 pub const DEFAULT_MAX_BACKGROUND_PROCESSES: u32 = 8;
-/// Default per-principal storage ceiling in bytes (1 `GiB`).
-pub const DEFAULT_MAX_STORAGE_BYTES: u64 = 1024 * 1024 * 1024;
+/// Default per-principal storage ceiling.
+///
+/// The maximum positive integer representable by TOML is the wire-compatible
+/// unlimited value. The actual host filesystem remains the physical boundary
+/// until an operator assigns a finite per-principal budget.
+pub const DEFAULT_MAX_STORAGE_BYTES: u64 = i64::MAX as u64;
 
 /// Default per-principal CPU rate ceiling in wasmtime fuel units per second
 /// (2e9 ≈ a 2 GHz-equivalent guest-instruction budget).

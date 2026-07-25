@@ -493,6 +493,28 @@ fn test_http_section_cannot_be_set_by_workspace() {
 }
 
 #[test]
+fn test_storage_section_is_operator_only() {
+    let baseline: toml::Value = toml::from_str("[storage]\nbackend = \"principal\"\n").unwrap();
+    let workspace: toml::Value = toml::from_str(
+        "[storage]\nbackend = \"legacy-surreal\"\nrecovery_max_frame_bytes = 999999999\n",
+    )
+    .unwrap();
+    let mut merged = baseline.clone();
+    deep_merge(&mut merged, &workspace);
+    enforce_restrictions(&mut merged, &baseline, &workspace);
+    assert_eq!(merged["storage"], baseline["storage"]);
+
+    let baseline: toml::Value = toml::from_str("[security]\nrequire_signatures = false\n").unwrap();
+    let mut merged = baseline.clone();
+    deep_merge(&mut merged, &workspace);
+    enforce_restrictions(&mut merged, &baseline, &workspace);
+    assert!(
+        merged.as_table().unwrap().get("storage").is_none(),
+        "workspace must not introduce an authoritative storage section"
+    );
+}
+
+#[test]
 fn test_allow_wasm_hooks_cannot_enable() {
     let baseline: toml::Value = toml::from_str(
         r"
