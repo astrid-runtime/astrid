@@ -11,11 +11,10 @@ mod rate_limit;
 mod response;
 mod visibility;
 
-pub(crate) use rate_limit::rate_limit_for_request;
+pub(crate) use rate_limit::{ManagementRateLimiter, rate_limit_for_request};
 pub(crate) use response::{KeepalivePinger, publish_response, workspace_commit_response};
 
-use astrid_runtime::time::Instant;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -102,28 +101,16 @@ pub(crate) fn spawn_kernel_router(kernel: Arc<crate::Kernel>) -> astrid_runtime:
                             continue;
                         },
                     };
-                    let (method, limit) = rate_limit_for_request(&req);
-                    if let Some(max) = limit
-                        && !rate_limiter.check(method, max)
-                    {
-                        warn!(
-                            security_event = true,
-                            method = method,
-                            "Rate limited kernel management request"
-                        );
-                        let response_topic = response_topic_for(&message.topic);
-                        publish_response(
-                            &kernel,
-                            response_topic,
-                            KernelResponse::Error(format!(
-                                "Rate limited: max {max} {method} requests per minute"
-                            )),
-                        );
-                        continue;
-                    }
                     let device_key_id = resolve_device_key_id(message);
-                    handle_request(&kernel, message.topic.clone(), caller, device_key_id, req)
-                        .await;
+                    handle_request(
+                        &kernel,
+                        &mut rate_limiter,
+                        message.topic.clone(),
+                        caller,
+                        device_key_id,
+                        req,
+                    )
+                    .await;
                 },
                 Err(e) => {
                     // The kernel router shares the broadcast
@@ -250,6 +237,7 @@ fn response_topic_for(request_topic: &str) -> Topic {
 #[expect(clippy::too_many_lines)]
 async fn handle_request(
     kernel: &Arc<crate::Kernel>,
+    rate_limiter: &mut ManagementRateLimiter,
     topic: Topic,
     caller: PrincipalId,
     device_key_id: Option<String>,
@@ -266,25 +254,7 @@ async fn handle_request(
     let required_cap = required_capability(&req, scope);
     let authorization =
         match authorize_request(kernel, &caller, device_key_id.as_deref(), required_cap) {
-            Ok(authorization) => {
-                record_admin_audit(
-                    kernel,
-                    AdminAuditEntry {
-                        caller: &caller,
-                        method,
-                        required_cap,
-                        device_key_id: device_key_id.as_deref(),
-                        target_principal: None,
-                        params: None,
-                        authorization: AuthorizationProof::System {
-                            reason: format!("policy allow: {caller} holds {required_cap}"),
-                        },
-                        outcome: AuditOutcome::success(),
-                    },
-                )
-                .await;
-                authorization
-            },
+            Ok(authorization) => authorization,
             Err(e) => {
                 warn!(
                     security_event = true,
@@ -313,6 +283,52 @@ async fn handle_request(
                 return;
             },
         };
+
+    let authorization_proof = AuthorizationProof::System {
+        reason: format!("policy allow: {caller} holds {required_cap}"),
+    };
+    let (rate_method, limit) = rate_limit_for_request(&req);
+    if let Some(max) = limit
+        && !rate_limiter.check(&caller, rate_method, max)
+    {
+        let reason = format!("Rate limited: max {max} {rate_method} requests per minute");
+        warn!(
+            security_event = true,
+            method = rate_method,
+            principal = %caller,
+            "Rate limited authorized kernel management request"
+        );
+        record_admin_audit(
+            kernel,
+            AdminAuditEntry {
+                caller: &caller,
+                method,
+                required_cap,
+                device_key_id: device_key_id.as_deref(),
+                target_principal: None,
+                params: None,
+                authorization: authorization_proof,
+                outcome: AuditOutcome::failure(reason.clone()),
+            },
+        )
+        .await;
+        publish_response(kernel, response_topic, KernelResponse::Error(reason));
+        return;
+    }
+    record_admin_audit(
+        kernel,
+        AdminAuditEntry {
+            caller: &caller,
+            method,
+            required_cap,
+            device_key_id: device_key_id.as_deref(),
+            target_principal: None,
+            params: None,
+            authorization: authorization_proof,
+            outcome: AuditOutcome::success(),
+        },
+    )
+    .await;
 
     // Keepalive pinger: from here until the terminal response is published, emit
     // a `KernelResponse::Working` frame every `KEEPALIVE_INTERVAL` so a waiting
@@ -597,49 +613,6 @@ async fn unregister_failed_capsules(kernel: &crate::Kernel) {
     let mut reg = kernel.capsules.write().await;
     for (principal, id) in failed {
         let _ = reg.unregister_for(&principal, &id);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Management API rate limiting
-// ---------------------------------------------------------------------------
-
-/// Sliding window rate limiter for management API requests.
-/// Tracks per-request timestamps and evicts entries older than 60 seconds,
-/// preventing the 2x burst possible with fixed-window designs.
-/// Single-consumer (owned by the router task), no concurrency concerns.
-struct ManagementRateLimiter {
-    buckets: HashMap<&'static str, VecDeque<Instant>>,
-}
-
-impl ManagementRateLimiter {
-    fn new() -> Self {
-        Self {
-            buckets: HashMap::new(),
-        }
-    }
-
-    /// Check if a request of the given type is within the rate limit.
-    /// Returns `true` if allowed, `false` if rate-limited.
-    fn check(&mut self, method: &'static str, max_per_minute: u32) -> bool {
-        let now = Instant::now();
-        let window = std::time::Duration::from_mins(1);
-        let timestamps = self.buckets.entry(method).or_default();
-
-        // Evict timestamps older than the 60-second sliding window.
-        while let Some(&oldest) = timestamps.front() {
-            if now.saturating_duration_since(oldest) >= window {
-                timestamps.pop_front();
-            } else {
-                break;
-            }
-        }
-
-        if timestamps.len() >= max_per_minute as usize {
-            return false;
-        }
-        timestamps.push_back(now);
-        true
     }
 }
 
