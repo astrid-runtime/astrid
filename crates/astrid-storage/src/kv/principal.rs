@@ -77,10 +77,11 @@ where
 ///
 /// Each successful mutation replaces one principal's typed `kv` component
 /// using exact root compare-and-swap. Root conflicts are retried from a fresh
-/// snapshot, so concurrent mutations do not lose updates. No persistent
-/// encoding, production digest, and migration policy remain selected by the
-/// native composition root. Quota policy is optionally injected and resolved
-/// on every mutation so runtime profile invalidation takes effect immediately.
+/// snapshot, so concurrent mutations do not lose updates. This compatibility
+/// adapter does not itself select a persistent encoding, production digest, or
+/// migration policy; native composition selects [`TreeKvStore`](super::TreeKvStore)
+/// over the durable engine. Quota policy is optionally injected and resolved on
+/// every mutation so runtime profile invalidation takes effect immediately.
 pub struct PrincipalKvStore<P: Ord, I, R, E = InMemoryEngine<P, I>> {
     engine: Arc<E>,
     resolver: R,

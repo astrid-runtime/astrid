@@ -9,14 +9,18 @@ An operating system needs disk. Astrid has a raw key-value contract projected on
 
 ## Why two tiers
 
-Capsules need fast, isolated byte storage. The audit log, capability store, and identity system need relations, graph traversal, and SurrealQL queries. Forcing both through the same interface wastes either simplicity or power. So they get separate tiers with separate backing stores, unified behind one crate.
+Capsules and kernel services need fast, isolated byte storage. Some optional
+services need relations, graph traversal, or richer queries. Forcing both
+shapes through one interface wastes either simplicity or power, so the crate
+keeps the principal-state KV contract separate from the optional query engine.
 
 | Deployment | KV backend | DB backend |
 |---|---|---|
 | Dev / single-agent | Durable principal store | SurrealDB (embedded, SurrealKV) |
-| Production / multi-node | Durable principal store | SurrealDB (over TiKV, Raft) |
+| Production / multi-node | Durable principal store plus future placement execution | Deployment-selected query service |
 
-The multi-node path exists in the type system and connection strings. It has not been deployed in production yet.
+Distributed placement for the principal store remains implementation work; it
+is not exposed as a runtime backend selector.
 
 ## Namespace isolation
 

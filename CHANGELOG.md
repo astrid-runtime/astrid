@@ -23,14 +23,11 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   owning, evidence, lineage, and derived references keep retention authority
   explicit, while capability-scoped state views and structural transition
   witnesses model independently verifiable root changes without claiming
-  semantic execution proofs. The current persistence backend and public
-  capsule interfaces are unchanged. Domain-bearing identifiers, relation
-  labels, root generations, object kinds and non-zero format/replica versions
-  are distinct Rust types; imports reject unrelated records, principal roots
-  must name typed commits, and placement epochs advance monotonically over
-  registered blobs.
-  capsule interfaces are unchanged.
   semantic execution proofs. Public capsule interfaces remain unchanged.
+  Domain-bearing identifiers, relation labels, root generations, object kinds,
+  and non-zero format/replica versions are distinct Rust types; imports reject
+  unrelated records, principal roots must name typed commits, and placement
+  epochs advance monotonically over registered blobs.
 - **Principal storage has a thread-safe in-memory engine prototype.** The new
   `astrid-storage-engine` validates caller-declared object identities and
   complete immutable closures before publishing linearizable per-principal

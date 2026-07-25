@@ -51,25 +51,29 @@ graph and not a prerequisite for reading a file or recovering a principal.
 
 ## 21. Implementation order and current boundary
 
-The current implementation stack completes the model, in-memory compatibility
-adapter, durable segment/root engine, persistent tree projection, quota
-enforcement, and native KV cutover described below. `SurrealKvStore` remains a
-migration oracle and read-only import source, not a configurable runtime
-backend. Typed filesystem roots, portable export/import, placement execution,
-and native block transport remain subsequent work.
+The current implementation stack completes the first six items below.
+`SurrealKvStore` remains a migration oracle and read-only import source, not a
+configurable runtime backend.
 
-1. Land `astrid-storage-model` with canonical identifiers, ownership classes,
+Delivered:
+
+1. `astrid-storage-model` defines canonical identifiers, ownership classes,
    object grammar, closure validation, accounting definitions, and a small
    executable state machine.
-2. Model typed state views and structural transition witnesses; prove they bind
+2. Typed state views and structural transition witnesses bind
    selectors, patches, and both roots without importing authority.
-3. Run model and property tests for commit, crash, view, witness, import, GC,
+3. Model and property tests cover commit, crash, view, witness, import, GC,
    and rebalance.
-4. Add an engine prototype over in-memory immutable objects and atomic roots.
-5. Add the principal-store-backed `KvStore` adapter and differential tests
+4. The engine prototype operates over in-memory immutable objects and atomic
+   roots.
+5. The principal-store-backed `KvStore` adapter has differential tests
    against `MemoryKvStore` and `SurrealKvStore`.
-6. Add durable segments, indexes, WAL, fault injection, recovery, compaction,
-   and quota enforcement.
+6. Durable segments, a disposable index, a checksummed root journal, fault
+   injection, recovery, a persistent tree projection, and quota enforcement
+   support the native KV cutover. Compaction remains future work.
+
+Remaining:
+
 7. Add typed filesystem roots and a safe materializer; integrate Linux-realm
    principal-home checkpoints and explicit external-workspace observations.
 8. Make local clone/fork root-based while preserving explicit secret behavior.

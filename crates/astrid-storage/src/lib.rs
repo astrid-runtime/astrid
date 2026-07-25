@@ -15,7 +15,7 @@
 //! Full **`SurrealDB`** with `SurrealQL` — document-graph database supporting
 //! relations, graph traversal, computed fields, and complex queries.
 //!
-//! Primary use case: system stores (approval, audit, capabilities, memory).
+//! Primary use case: optional relational and query-heavy services.
 //!
 //! Enable with the **`db`** feature.
 //!
@@ -24,9 +24,11 @@
 //! | Deployment | KV backend | DB backend |
 //! |------------|------------|------------|
 //! | Dev / single-agent | Durable principal store | `SurrealDB` (embedded, `SurrealKV`) |
-//! | Production / multi-node | Durable principal store | `SurrealDB` (over `TiKV`, Raft) |
+//! | Production / multi-node | Durable principal store plus future placement execution | Deployment-selected query service |
 //!
-//! Same API at both tiers. Scaling is a config change, not a code change.
+//! Both tiers retain stable interfaces, but distributed placement for the
+//! principal store remains separate implementation work rather than a backend
+//! setting.
 //!
 //! # Feature Flags
 //!
