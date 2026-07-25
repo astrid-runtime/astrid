@@ -873,6 +873,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "astrid-storage-engine"
+version = "0.10.4"
+dependencies = [
+ "astrid-storage-model",
+ "blake3",
+ "parking_lot",
+]
+
+[[package]]
 name = "astrid-storage-model"
 version = "0.10.4"
 

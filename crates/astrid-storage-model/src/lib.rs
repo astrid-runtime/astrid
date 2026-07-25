@@ -71,6 +71,19 @@ pub enum ReferenceKind {
     Derived,
 }
 
+impl ReferenceKind {
+    /// Return the stable identity code for this reachability meaning.
+    #[must_use]
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Owns => 0,
+            Self::Evidence => 1,
+            Self::Lineage => 2,
+            Self::Derived => 3,
+        }
+    }
+}
+
 /// A typed, labelled reference to another immutable object.
 ///
 /// The label identifies the relation inside the source object: for example a
@@ -186,6 +199,93 @@ pub enum ObjectClass {
     Metadata,
 }
 
+impl ObjectClass {
+    /// Return the stable identity code for this accounting class.
+    #[must_use]
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Data => 0,
+            Self::Metadata => 1,
+        }
+    }
+}
+
+/// Versioned semantic kind of one immutable object.
+///
+/// The numeric codes are part of logical identity. Persistent encodings may
+/// use different framing, but must preserve this value when computing
+/// [`ObjectId`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum ObjectKind {
+    /// Raw user-visible bytes.
+    Chunk,
+    /// Ordered tree over large content chunks.
+    ChunkTree,
+    /// File metadata and content root.
+    File,
+    /// Symlink target bytes, never followed during validation.
+    Symlink,
+    /// Canonical directory entries.
+    Directory,
+    /// Canonical key/value leaf.
+    KvLeaf,
+    /// Internal key/value tree branch.
+    KvBranch,
+    /// Capsule namespace to KV-root mapping.
+    NamespaceMap,
+    /// Complete principal-owned durable state.
+    PrincipalState,
+    /// Principal-root transition envelope.
+    Commit,
+    /// Observation, receipt, or audit evidence.
+    Evidence,
+    /// Rebuildable index or materialization.
+    Derived,
+}
+
+impl ObjectKind {
+    /// Return the stable identity code for this kind.
+    #[must_use]
+    pub const fn code(self) -> u16 {
+        match self {
+            Self::Chunk => 0,
+            Self::ChunkTree => 1,
+            Self::File => 2,
+            Self::Symlink => 3,
+            Self::Directory => 4,
+            Self::KvLeaf => 5,
+            Self::KvBranch => 6,
+            Self::NamespaceMap => 7,
+            Self::PrincipalState => 8,
+            Self::Commit => 9,
+            Self::Evidence => 10,
+            Self::Derived => 11,
+        }
+    }
+}
+
+/// Schema version of one [`ObjectKind`].
+///
+/// Versions are scoped to a kind so unrelated object families can evolve
+/// without rewriting every identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ObjectFormatVersion(u16);
+
+impl ObjectFormatVersion {
+    /// Construct an object-format version.
+    #[must_use]
+    pub const fn new(value: u16) -> Self {
+        Self(value)
+    }
+
+    /// Return the numeric schema version.
+    #[must_use]
+    pub const fn get(self) -> u16 {
+        self.0
+    }
+}
+
 /// Canonical object bytes and their typed child references.
 ///
 /// `logical_bytes` is the number of user-visible bytes contributed by this
@@ -193,6 +293,8 @@ pub enum ObjectClass {
 /// remains part of retained and physical accounting regardless of class.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObjectRecord {
+    kind: ObjectKind,
+    format_version: ObjectFormatVersion,
     canonical_bytes: Vec<u8>,
     references: Vec<ObjectReference>,
     logical_bytes: u64,
@@ -211,6 +313,8 @@ impl ObjectRecord {
     /// Returns [`ModelError::NonCanonicalReferences`] when references are not
     /// strictly increasing.
     pub fn new(
+        kind: ObjectKind,
+        format_version: ObjectFormatVersion,
         canonical_bytes: Vec<u8>,
         references: Vec<ObjectReference>,
         logical_bytes: u64,
@@ -223,11 +327,25 @@ impl ObjectRecord {
             return Err(ModelError::NonCanonicalReferences);
         }
         Ok(Self {
+            kind,
+            format_version,
             canonical_bytes,
             references,
             logical_bytes,
             class,
         })
+    }
+
+    /// Return the semantic object kind.
+    #[must_use]
+    pub const fn kind(&self) -> ObjectKind {
+        self.kind
+    }
+
+    /// Return the kind-scoped object schema version.
+    #[must_use]
+    pub const fn format_version(&self) -> ObjectFormatVersion {
+        self.format_version
     }
 
     /// Borrow the canonical bytes used for collision checking.
@@ -317,6 +435,10 @@ impl ObjectRecord {
 /// trait lets the executable model remain `no_std` and hash-agile.
 pub trait ObjectIdentity {
     /// Compute the logical identity of `record`.
+    ///
+    /// Implementations must be deterministic and must encode every
+    /// identity-bearing field. Collision handling remains mandatory even for a
+    /// cryptographic implementation.
     fn identify(&self, record: &ObjectRecord) -> ObjectId;
 }
 
@@ -731,6 +853,13 @@ pub enum ModelError {
     PrincipalAlreadyExists,
     /// A principal does not exist but an update was requested.
     PrincipalMissing,
+    /// A principal root named an object other than a commit envelope.
+    RootNotCommit {
+        /// Object offered as the principal commit.
+        object: ObjectId,
+        /// Actual semantic kind of the object.
+        actual: ObjectKind,
+    },
     /// The caller's expected root does not equal the current root.
     RootConflict {
         /// Root expected by the caller.
@@ -821,6 +950,12 @@ impl fmt::Display for ModelError {
             ),
             Self::PrincipalAlreadyExists => formatter.write_str("principal already exists"),
             Self::PrincipalMissing => formatter.write_str("principal does not exist"),
+            Self::RootNotCommit { object, actual } => {
+                write!(
+                    formatter,
+                    "principal root {object:?} has kind {actual:?}, expected Commit"
+                )
+            },
             Self::RootConflict { expected, actual } => {
                 write!(
                     formatter,
@@ -904,6 +1039,12 @@ impl<P: Ord> World<P> {
     #[must_use]
     pub fn object_count(&self) -> usize {
         self.objects.len()
+    }
+
+    /// Borrow one immutable object by its logical identifier.
+    #[must_use]
+    pub fn object(&self, id: ObjectId) -> Option<&ObjectRecord> {
+        self.objects.get(&id)
     }
 
     /// Return the current root for `principal`.
@@ -991,11 +1132,21 @@ impl<P: Ord> World<P> {
         expected: Option<RootState>,
         commit: ObjectId,
     ) -> Result<RootState, ModelError> {
-        self.closure(commit)?;
         let actual = self.roots.get(&principal).copied();
         if actual != expected {
             return Err(ModelError::RootConflict { expected, actual });
         }
+        let record = self
+            .objects
+            .get(&commit)
+            .ok_or(ModelError::MissingObject(commit))?;
+        if record.kind() != ObjectKind::Commit {
+            return Err(ModelError::RootNotCommit {
+                object: commit,
+                actual: record.kind(),
+            });
+        }
+        self.closure(commit)?;
         let generation = match actual {
             Some(root) => root
                 .generation
@@ -1382,8 +1533,20 @@ mod tests {
         BlobId::new([value; 32])
     }
 
+    fn version() -> ObjectFormatVersion {
+        ObjectFormatVersion::new(1)
+    }
+
     fn data(value: u8) -> ObjectRecord {
-        ObjectRecord::new(vec![value], vec![], 1, ObjectClass::Data).unwrap()
+        ObjectRecord::new(
+            ObjectKind::Chunk,
+            version(),
+            vec![value],
+            vec![],
+            1,
+            ObjectClass::Data,
+        )
+        .unwrap()
     }
 
     fn metadata(value: u8, references: Vec<ObjectId>) -> ObjectRecord {
@@ -1394,11 +1557,27 @@ mod tests {
                 ObjectReference::owns(vec![u8::try_from(index).unwrap()], target)
             })
             .collect();
-        ObjectRecord::new(vec![value], references, 0, ObjectClass::Metadata).unwrap()
+        ObjectRecord::new(
+            ObjectKind::Commit,
+            version(),
+            vec![value],
+            references,
+            0,
+            ObjectClass::Metadata,
+        )
+        .unwrap()
     }
 
     fn metadata_refs(value: u8, references: Vec<ObjectReference>) -> ObjectRecord {
-        ObjectRecord::new(vec![value], references, 0, ObjectClass::Metadata).unwrap()
+        ObjectRecord::new(
+            ObjectKind::Commit,
+            version(),
+            vec![value],
+            references,
+            0,
+            ObjectClass::Metadata,
+        )
+        .unwrap()
     }
 
     #[derive(Clone, Copy)]
@@ -1421,14 +1600,10 @@ mod tests {
                     .to_le_bytes(),
             );
             state = mix(state, record.canonical_bytes());
+            state = mix(state, &record.kind().code().to_le_bytes());
+            state = mix(state, &record.format_version().get().to_le_bytes());
             state = mix(state, &record.logical_bytes().to_le_bytes());
-            state = mix(
-                state,
-                &[match record.class() {
-                    ObjectClass::Data => 0,
-                    ObjectClass::Metadata => 1,
-                }],
-            );
+            state = mix(state, &[record.class().code()]);
             for reference in record.references() {
                 state = mix(
                     state,
@@ -1438,15 +1613,7 @@ mod tests {
                 );
                 state = mix(state, reference.label());
                 state = mix(state, reference.target().as_bytes());
-                state = mix(
-                    state,
-                    &[match reference.kind() {
-                        ReferenceKind::Owns => 0,
-                        ReferenceKind::Evidence => 1,
-                        ReferenceKind::Lineage => 2,
-                        ReferenceKind::Derived => 3,
-                    }],
-                );
+                state = mix(state, &[reference.kind().code()]);
             }
 
             let mut bytes = [0_u8; 32];
@@ -1635,7 +1802,14 @@ mod tests {
         ];
 
         assert_eq!(
-            ObjectRecord::new(vec![2], references, 0, ObjectClass::Metadata),
+            ObjectRecord::new(
+                ObjectKind::Commit,
+                version(),
+                vec![2],
+                references,
+                0,
+                ObjectClass::Metadata,
+            ),
             Err(ModelError::NonCanonicalReferences)
         );
     }

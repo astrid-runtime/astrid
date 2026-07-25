@@ -25,6 +25,16 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   witnesses model independently verifiable root changes without claiming
   semantic execution proofs. The current persistence backend and public
   capsule interfaces are unchanged.
+- **Principal storage has a thread-safe in-memory engine prototype.** The new
+  `astrid-storage-engine` validates caller-declared object identities and
+  complete immutable closures before publishing linearizable per-principal
+  root generations. Semantic object kinds and kind-scoped format versions are
+  identity-bearing, and a principal root must name a typed commit envelope. The
+  engine supports consistent closure snapshots, exact compare-and-swap, pins,
+  logical accounting, and garbage collection without selecting an on-disk
+  format or changing current storage backends. Bounded transition traces and
+  concurrent-writer tests exercise the engine contract; durability, recovery,
+  encryption, placement, and runtime migration remain explicitly out of scope.
 - **Windows local transport uses authenticated per-user named pipes.** A pipe
   name derived only from the caller's operating-system SID replaces
   filesystem endpoint naming on Windows. Local-only byte-mode instances use a

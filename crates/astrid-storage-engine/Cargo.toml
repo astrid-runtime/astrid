@@ -1,0 +1,19 @@
+[package]
+name = "astrid-storage-engine"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "User-space principal-store engine for Astrid"
+
+[dependencies]
+astrid-storage-model = { workspace = true }
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+blake3 = { workspace = true }
+
+[lints]
+workspace = true

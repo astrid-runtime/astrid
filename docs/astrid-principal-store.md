@@ -222,6 +222,28 @@ pins are authoritative. The initial engine remains in memory until the model
 semantics are stable; the first durable implementation must include index
 rebuild and fault injection rather than treating either as later cleanup.
 
+### 5.5 In-memory engine contract
+
+The first `astrid-storage-engine` implementation refines the model behind a
+thread-safe user-space API without selecting a persistent object encoding. It:
+
+- accepts an injected `ObjectIdentity` implementation;
+- binds semantic object kind and kind-scoped format version into identity;
+- recomputes every declared object identifier before admission;
+- stages and validates a complete immutable closure before root publication;
+- rejects roots that do not name a typed `Commit` envelope;
+- rejects known-stale compare-and-swap requests before they consume storage;
+- publishes one linearizable principal-root generation under concurrent
+  writers;
+- captures a root and its deterministic closure under one read lock;
+- preserves roots retained by other principals or explicit pins during garbage
+  collection.
+
+This engine is evidence about transaction semantics, not durability. It does
+not claim recovery, disk atomicity, canonical format stability, encryption,
+quota enforcement, or production placement. Those claims begin only with the
+arena and root-journal backend plus the fault matrix in the evidence document.
+
 ## 6. Three identifiers, not one overloaded hash
 
 The system must not turn possession of a hash into permission to read data.
@@ -681,6 +703,31 @@ This removes the current best-effort partial-copy failure mode:
 old: list keys -> copy key by key -> copy files -> warn and continue
 new: select source root -> authorize selected components -> commit destination root
 ```
+
+### 12.1 Why this matters particularly for agents
+
+Agent workspaces are unusually expensive to copy and unusually valuable to
+checkpoint. A single durable Linux realm may contain a source checkout, Rust
+`target/` trees, package-manager caches, `node_modules/`, toolchains, model
+artifacts, and a long-lived home directory. Most bytes remain unchanged across
+an agent turn even when a build creates thousands of new files.
+
+With immutable content-addressed objects, a warm turn admits only new or
+changed chunks and metadata. Checkpoint publication is one root transition;
+rollback is another root transition; a local fork initially shares the same
+objects; and an incremental transfer sends only objects the receiver does not
+already have. Work therefore scales primarily with the changed state, rather
+than with the total size of the agent's world. This is a structural advantage
+over recursively copying a workspace or serializing a whole VM image for every
+turn.
+
+This is an architectural complexity claim, not a benchmark result for the
+in-memory reference engine. The durable implementation must measure cold
+ingest, warm turn checkpoints, fork, rollback, incremental export, garbage
+collection, and materialization on real Rust projects and persisted Linux
+homes. It may lose on first ingest, tiny stores, cold random reads, or
+high-entropy and independently encrypted data; those results must remain
+visible rather than being averaged away.
 
 ## 13. Sysadmin rebalancing
 
