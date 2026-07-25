@@ -23,8 +23,8 @@
 //!
 //! | Deployment | KV backend | DB backend |
 //! |------------|------------|------------|
-//! | Dev / single-agent | `SurrealKV` (embedded) | `SurrealDB` (embedded, `SurrealKV`) |
-//! | Production / multi-node | `SurrealKV` (embedded) | `SurrealDB` (over `TiKV`, Raft) |
+//! | Dev / single-agent | Durable principal store | `SurrealDB` (embedded, `SurrealKV`) |
+//! | Production / multi-node | Durable principal store | `SurrealDB` (over `TiKV`, Raft) |
 //!
 //! Same API at both tiers. Scaling is a config change, not a code change.
 //!
@@ -32,7 +32,7 @@
 //!
 //! - **`legacy-surrealkv`** — compatibility `SurrealKV` backend and migrator
 //! - **`db`** — `SurrealDB` full query engine
-//! - **`full`** — Both `kv` and `db`
+//! - **`full`** — Both `legacy-surrealkv` and `db`
 
 #![deny(unsafe_code)]
 #![deny(missing_docs)]

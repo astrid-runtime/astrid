@@ -4,13 +4,14 @@
 //! with namespaced keys. Implementations:
 //!
 //! - **In-memory** (always available): For tests and ephemeral data
-//! - **`SurrealKV`** (behind `kv` feature): Persistent, versioned, ACID-compliant
+//! - **Persistent tree** (always available): Content-addressed per-owner state
+//! - **`SurrealKV`** (behind `legacy-surrealkv`): Migration and recovery only
 //!
 //! # Namespacing
 //!
 //! All operations are scoped to a namespace. WASM guests receive a namespace
-//! like `wasm:{plugin_id}` and cannot access keys outside their namespace.
-//! The runtime uses `system:*` namespaces for internal state.
+//! like `{principal}:capsule:{id}` and cannot access keys outside its
+//! host-stamped scope. The runtime uses `system:*` namespaces for kernel state.
 //!
 //! # Ergonomic Access
 //!
