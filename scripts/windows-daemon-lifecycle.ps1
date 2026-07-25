@@ -103,8 +103,13 @@ try {
     }
 
     $stopOutput = Invoke-Astrid stop
-    if (-not $daemonProcess.HasExited) {
+    if (-not $daemonProcess.WaitForExit(15000)) {
+        $daemonProcess.Refresh()
         throw "astrid stop returned success before PID $daemonPid exited`n$stopOutput"
+    }
+    $daemonProcess.Refresh()
+    if (-not $daemonProcess.HasExited) {
+        throw "astrid stop returned success but PID $daemonPid still appears live after WaitForExit`n$stopOutput"
     }
     if (Test-Path -LiteralPath $pidPath) {
         throw "astrid stop left the daemon PID file behind"

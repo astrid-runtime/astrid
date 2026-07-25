@@ -216,7 +216,14 @@ impl SocketClient {
     /// Returns an error if the local endpoint does not exist, connection
     /// fails, or the handshake is rejected.
     pub async fn connect(session_id: SessionId, principal: PrincipalId) -> Result<Self> {
+        #[cfg(windows)]
         let path = try_proxy_socket_path().context("Failed to resolve local transport path")?;
+        // Preserve the historical Unix development fallback when neither
+        // ASTRID_HOME nor HOME resolves. Windows deliberately uses the
+        // fallible path above because a shared fallback would cross the
+        // per-user security boundary.
+        #[cfg(not(windows))]
+        let path = proxy_socket_path();
 
         let mut stream = local_transport::connect(&path)
             .await
