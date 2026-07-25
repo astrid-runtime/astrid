@@ -132,6 +132,17 @@ jobs:
           --target $env:TARGET
           commands::daemon::tests
 
+      - name: Test native background process isolation
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: >-
+          cargo test
+          -p astrid
+          --locked
+          --target $env:TARGET
+          commands::windows_process::tests
+
       - name: Test native process control
         env:
           TARGET: ${{ matrix.target }}

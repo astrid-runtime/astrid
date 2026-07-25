@@ -12,17 +12,23 @@ use std::process::Command;
 ///
 /// Unix performs its historical `setsid` inside the daemon binary. Windows has
 /// no equivalent post-spawn call, so the parent must request a detached process
-/// group when it creates the child.
-pub(super) fn configure_background(command: &mut Command) {
+/// group when it creates the child. Windows also clears inheritance on the
+/// parent's ambient standard handles before `Command::spawn`: stable Rust
+/// otherwise passes every inheritable handle to the daemon in addition to the
+/// command's explicitly configured standard streams.
+pub(super) fn configure_background(command: &mut Command) -> std::io::Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt as _;
 
+        super::windows_process::prevent_ambient_standard_handle_inheritance()?;
         command.creation_flags(background_creation_flags());
     }
 
     #[cfg(not(windows))]
     let _ = command;
+
+    Ok(())
 }
 
 #[cfg(windows)]

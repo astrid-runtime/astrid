@@ -252,6 +252,12 @@ pub(super) fn stage_and_launch(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+    if let Err(error) =
+        crate::commands::windows_process::prevent_ambient_standard_handle_inheritance()
+    {
+        cleanup_unlaunched(&transaction_path, &transaction);
+        return Err(error).context("failed to secure the Windows update helper process boundary");
+    }
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -751,6 +757,8 @@ fn launch_recovery_helper(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+    crate::commands::windows_process::prevent_ambient_standard_handle_inheritance()
+        .context("failed to secure the Windows update recovery process boundary")?;
     let mut child = command
         .spawn()
         .context("failed to launch detached Windows update recovery helper")?;
