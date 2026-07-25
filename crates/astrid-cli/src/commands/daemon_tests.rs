@@ -131,6 +131,27 @@ fn foreground_exit_code_is_propagated() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn unix_detached_child_is_owned_and_waited_by_reaper() {
+    let child = std::process::Command::new("sh")
+        .args(["-c", "sleep 0.1; exit 23"])
+        .spawn()
+        .unwrap();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+
+    handoff_child_to_reaper(child, move |result| {
+        sender.send(result).unwrap();
+    })
+    .unwrap();
+
+    let status = receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("daemon reaper must report completion")
+        .expect("daemon reaper must wait successfully");
+    assert_eq!(status.code(), Some(23));
+}
+
 #[test]
 fn stop_cleans_up_only_when_confirmed_gone() {
     use daemon_control::KillOutcome;

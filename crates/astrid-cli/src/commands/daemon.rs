@@ -72,8 +72,9 @@ fn boot_log_stderr() -> Option<std::process::Stdio> {
 
 /// Spawn the daemon process and wait for it to signal readiness.
 ///
-/// Returns the child process handle on success. The caller must `drop()` it
-/// after a successful handshake (to disown), or `kill()` + `wait()` on failure.
+/// Returns the child process handle on success. The caller must transfer it to
+/// [`detach_running_child`] after connecting, or pass ownership to
+/// [`terminate_child_bounded`] if the connection fails.
 ///
 /// # Errors
 /// Returns an error if the daemon binary is not found, fails to spawn, or
@@ -122,51 +123,181 @@ async fn spawn_daemon_inner(
     // temporary client could make the daemon observe "last client gone" before
     // its owner arrives.
     if let Err(error) = wait_for_readiness_signal(&mut child, ready_path).await {
-        return Err(startup_error_after_cleanup(error, &mut child).await);
+        return Err(startup_error_after_cleanup(error, child).await);
     }
     Ok(child)
 }
 
-pub(crate) async fn terminate_child_bounded(
-    child: &mut std::process::Child,
-) -> std::io::Result<()> {
-    if child.try_wait()?.is_some() {
-        return Ok(());
+pub(crate) async fn terminate_child_bounded(mut child: std::process::Child) -> std::io::Result<()> {
+    if let Err(kill_error) = child.kill() {
+        return match child.try_wait() {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => cleanup_failure_with_owned_child(child, kill_error),
+            Err(probe_error) => cleanup_failure_with_owned_child(
+                child,
+                std::io::Error::new(
+                    kill_error.kind(),
+                    format!(
+                        "failed to terminate daemon child: {kill_error}; exit probe also failed: \
+                         {probe_error}"
+                    ),
+                ),
+            ),
+        };
     }
-    child.kill()?;
-    let deadline = tokio::time::Instant::now()
-        .checked_add(CHILD_CLEANUP_TIMEOUT)
-        .ok_or_else(|| std::io::Error::other("child cleanup deadline overflow"))?;
+    let deadline = match tokio::time::Instant::now().checked_add(CHILD_CLEANUP_TIMEOUT) {
+        Some(deadline) => deadline,
+        None => {
+            return cleanup_failure_with_owned_child(
+                child,
+                std::io::Error::other("child cleanup deadline overflow"),
+            );
+        },
+    };
     loop {
-        if child.try_wait()?.is_some() {
-            return Ok(());
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => {},
+            Err(probe_error) => {
+                return cleanup_failure_with_owned_child(child, probe_error);
+            },
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err(std::io::Error::new(
+            let timeout = std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "timed out reaping the terminated daemon child",
-            ));
+            );
+            return cleanup_failure_with_owned_child(child, timeout);
         }
         tokio::time::sleep(DAEMON_READY_POLL).await;
     }
 }
 
-/// Release the parent-side process handle only after proving the daemon is
-/// still running. Background daemons outlive the short-lived CLI by design;
-/// an already-exited child is a startup failure, while a live detached child
-/// becomes the operating system's responsibility when this CLI exits.
-pub(crate) fn detach_running_child(mut child: std::process::Child) -> Result<()> {
-    anyhow::ensure!(
-        child.try_wait()?.is_none(),
-        "daemon exited before its parent could release the process handle"
-    );
-    drop(child);
+fn cleanup_failure_with_owned_child(
+    child: std::process::Child,
+    primary: std::io::Error,
+) -> std::io::Result<()> {
+    match handoff_child_to_reaper(child, log_reaper_result) {
+        Ok(()) => Err(primary),
+        Err(reaper_error) => Err(std::io::Error::new(
+            primary.kind(),
+            format!("{primary}; failed to retain a child reaper: {reaper_error}"),
+        )),
+    }
+}
+
+fn terminate_and_reap_sync(child: &mut std::process::Child) -> std::io::Result<()> {
+    match child.try_wait() {
+        Ok(Some(_)) => return Ok(()),
+        Ok(None) | Err(_) => {},
+    }
+    if let Err(kill_error) = child.kill() {
+        return match child.try_wait() {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err(kill_error),
+            Err(probe_error) => Err(std::io::Error::new(
+                kill_error.kind(),
+                format!(
+                    "failed to terminate child: {kill_error}; exit probe also failed: {probe_error}"
+                ),
+            )),
+        };
+    }
+    loop {
+        match child.wait() {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {},
+            result => return result.map(|_| ()),
+        }
+    }
+}
+
+fn handoff_child_to_reaper<F>(mut child: std::process::Child, on_reaped: F) -> std::io::Result<()>
+where
+    F: FnOnce(std::io::Result<std::process::ExitStatus>) + Send + 'static,
+{
+    // Start the waiter before transferring the Child so thread-creation
+    // failure leaves ownership here and permits synchronous terminate+reap.
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let reaper = match std::thread::Builder::new()
+        .name("astrid-daemon-reaper".to_owned())
+        .spawn(move || match receiver.recv() {
+            Ok(mut child) => on_reaped(child.wait()),
+            Err(error) => on_reaped(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                format!("daemon reaper handoff channel closed: {error}"),
+            ))),
+        }) {
+        Ok(reaper) => reaper,
+        Err(spawn_error) => {
+            return match terminate_and_reap_sync(&mut child) {
+                Ok(()) => Err(spawn_error),
+                Err(cleanup_error) => Err(std::io::Error::new(
+                    spawn_error.kind(),
+                    format!(
+                        "failed to start daemon reaper: {spawn_error}; synchronous child cleanup \
+                         also failed: {cleanup_error}"
+                    ),
+                )),
+            };
+        },
+    };
+
+    if let Err(std::sync::mpsc::SendError(mut child)) = sender.send(child) {
+        return match terminate_and_reap_sync(&mut child) {
+            Ok(()) => Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "daemon reaper exited before accepting child ownership",
+            )),
+            Err(cleanup_error) => Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                format!(
+                    "daemon reaper exited before accepting child ownership; synchronous child \
+                     cleanup also failed: {cleanup_error}"
+                ),
+            )),
+        };
+    }
+    drop(reaper);
     Ok(())
+}
+
+fn log_reaper_result(result: std::io::Result<std::process::ExitStatus>) {
+    if let Err(error) = result {
+        eprintln!("Astrid daemon reaper failed to wait for its child: {error}");
+    }
+}
+
+/// Release ownership only after proving the daemon is still running.
+///
+/// Unix hands the child to a dedicated waiter so long-lived CLI modes cannot
+/// accumulate zombies. Windows closes only the parent-side process handle; the
+/// detached daemon continues independently.
+pub(crate) fn detach_running_child(mut child: std::process::Child) -> Result<()> {
+    match child.try_wait() {
+        Ok(Some(status)) => {
+            anyhow::bail!("daemon exited before its parent could transfer ownership: {status}")
+        },
+        Ok(None) => {},
+        Err(probe_error) => {
+            return cleanup_failure_with_owned_child(child, probe_error)
+                .map_err(anyhow::Error::from);
+        },
+    }
+    #[cfg(unix)]
+    {
+        handoff_child_to_reaper(child, log_reaper_result)?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        drop(child);
+        Ok(())
+    }
 }
 
 async fn startup_error_after_cleanup(
     error: anyhow::Error,
-    child: &mut std::process::Child,
+    child: std::process::Child,
 ) -> anyhow::Error {
     match terminate_child_bounded(child).await {
         Ok(()) => error,
@@ -459,7 +590,7 @@ pub(crate) async fn spawn_persistent_daemon() -> Result<()> {
     let mut child = cmd.spawn().context("Failed to spawn Astrid daemon")?;
 
     if let Err(error) = wait_for_authenticated_readiness(&mut child, &ready_path, Some(&ws)).await {
-        return Err(startup_error_after_cleanup(error, &mut child).await);
+        return Err(startup_error_after_cleanup(error, child).await);
     }
 
     // Disown the child — it runs independently.
@@ -494,7 +625,7 @@ async fn run_foreground_daemon() -> Result<ExitCode> {
     if let Err(error) =
         wait_for_authenticated_readiness(&mut child, &ready_path, Some(&workspace)).await
     {
-        return Err(startup_error_after_cleanup(error, &mut child).await);
+        return Err(startup_error_after_cleanup(error, child).await);
     }
 
     println!(

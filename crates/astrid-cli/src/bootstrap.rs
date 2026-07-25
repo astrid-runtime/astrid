@@ -215,9 +215,8 @@ pub(crate) async fn run_or_connect(
             c
         },
         Err(e) => {
-            if let Some(mut child) = daemon_child
-                && let Err(cleanup_error) =
-                    commands::daemon::terminate_child_bounded(&mut child).await
+            if let Some(child) = daemon_child
+                && let Err(cleanup_error) = commands::daemon::terminate_child_bounded(child).await
             {
                 return Err(anyhow::Error::new(e).context(format!(
                     "failed to connect to the newly started daemon, and bounded child cleanup \
