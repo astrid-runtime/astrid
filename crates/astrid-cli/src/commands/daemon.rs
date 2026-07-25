@@ -145,14 +145,11 @@ pub(crate) async fn terminate_child_bounded(mut child: std::process::Child) -> s
             ),
         };
     }
-    let deadline = match tokio::time::Instant::now().checked_add(CHILD_CLEANUP_TIMEOUT) {
-        Some(deadline) => deadline,
-        None => {
-            return cleanup_failure_with_owned_child(
-                child,
-                std::io::Error::other("child cleanup deadline overflow"),
-            );
-        },
+    let Some(deadline) = tokio::time::Instant::now().checked_add(CHILD_CLEANUP_TIMEOUT) else {
+        return cleanup_failure_with_owned_child(
+            child,
+            std::io::Error::other("child cleanup deadline overflow"),
+        );
     };
     loop {
         match child.try_wait() {
@@ -187,9 +184,8 @@ fn cleanup_failure_with_owned_child(
 }
 
 fn terminate_and_reap_sync(child: &mut std::process::Child) -> std::io::Result<()> {
-    match child.try_wait() {
-        Ok(Some(_)) => return Ok(()),
-        Ok(None) | Err(_) => {},
+    if let Ok(Some(_)) = child.try_wait() {
+        return Ok(());
     }
     if let Err(kill_error) = child.kill() {
         return match child.try_wait() {
