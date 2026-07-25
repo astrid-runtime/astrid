@@ -176,11 +176,11 @@ pub fn try_acquire_private_file_lock(
 ) -> io::Result<Option<std::fs::File>> {
     #[cfg(windows)]
     {
-        return match windows::acquire_private_file_lock(path, owner_description) {
+        match windows::acquire_private_file_lock(path, owner_description) {
             Ok(file) => Ok(Some(file)),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
             Err(error) => Err(error),
-        };
+        }
     }
 
     #[cfg(unix)]
@@ -200,11 +200,11 @@ pub fn try_acquire_private_file_lock(
             .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
             .open(path)?;
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        return match file.try_lock() {
+        match file.try_lock() {
             Ok(()) => Ok(Some(file)),
             Err(std::fs::TryLockError::WouldBlock) => Ok(None),
             Err(std::fs::TryLockError::Error(error)) => Err(error),
-        };
+        }
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -239,7 +239,7 @@ pub fn try_acquire_private_file_lock(
 pub fn open_private_append_file(path: &Path) -> io::Result<std::fs::File> {
     #[cfg(windows)]
     {
-        return windows::open_private_append_file(path);
+        windows::open_private_append_file(path)
     }
 
     #[cfg(unix)]
@@ -257,7 +257,7 @@ pub fn open_private_append_file(path: &Path) -> io::Result<std::fs::File> {
             .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
             .open(path)?;
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        return Ok(file);
+        Ok(file)
     }
 
     #[cfg(not(any(unix, windows)))]

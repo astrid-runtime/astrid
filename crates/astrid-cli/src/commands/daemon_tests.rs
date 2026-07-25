@@ -134,11 +134,26 @@ fn foreground_exit_code_is_propagated() {
 #[test]
 fn stop_cleans_up_only_when_confirmed_gone() {
     use daemon_control::KillOutcome;
-    assert!(stop_confirmed_gone(KillOutcome::NotRunning));
-    assert!(stop_confirmed_gone(KillOutcome::TermExited));
-    assert!(stop_confirmed_gone(KillOutcome::KilledExited));
-    assert!(!stop_confirmed_gone(KillOutcome::StillAlive));
-    assert!(!stop_confirmed_gone(KillOutcome::Unverified(4242)));
+    assert_eq!(
+        stop_confirmation(KillOutcome::NotRunning, false),
+        StopConfirmation::ConfirmedGone
+    );
+    assert_eq!(
+        stop_confirmation(KillOutcome::TermExited, false),
+        StopConfirmation::ConfirmedGone
+    );
+    assert_eq!(
+        stop_confirmation(KillOutcome::KilledExited, false),
+        StopConfirmation::ConfirmedGone
+    );
+    assert_eq!(
+        stop_confirmation(KillOutcome::StillAlive, false),
+        StopConfirmation::Unconfirmed
+    );
+    assert_eq!(
+        stop_confirmation(KillOutcome::Unverified(4242), false),
+        StopConfirmation::Unconfirmed
+    );
 }
 
 #[test]

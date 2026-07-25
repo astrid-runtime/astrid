@@ -5,7 +5,6 @@
 //! remain package-manager owned. Discovery can use a mirror or mock, but the
 //! accepted Astrid workflow identities and issuer cannot be overridden.
 
-#[cfg(not(windows))]
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 

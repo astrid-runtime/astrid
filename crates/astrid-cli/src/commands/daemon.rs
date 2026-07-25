@@ -618,8 +618,6 @@ async fn finish_already_running_start(
 /// This never removes a live daemon's socket or signals a live process — the
 /// only mutation happens when the recorded daemon is provably gone.
 pub(crate) async fn handle_start(foreground: bool) -> Result<ExitCode> {
-    let socket_path = socket_client::try_proxy_socket_path()?;
-    let ready_path = socket_client::try_readiness_path()?;
     let pid_path = socket_client::try_pid_path()?;
 
     let socket_reachable = matches!(

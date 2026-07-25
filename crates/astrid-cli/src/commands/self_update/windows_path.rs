@@ -12,11 +12,11 @@ use std::path::{Component, Path, PathBuf};
 use std::ptr;
 
 use anyhow::{Context, bail, ensure};
-use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SUCCESS, HKEY};
+use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SUCCESS};
 use windows_sys::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
 use windows_sys::Win32::System::Environment::ExpandEnvironmentStringsW;
 use windows_sys::Win32::System::Registry::{
-    HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_EXPAND_SZ,
+    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_EXPAND_SZ,
     REG_OPTION_NON_VOLATILE, REG_SAM_FLAGS, REG_SZ, REG_VALUE_TYPE, RegCloseKey, RegCreateKeyExW,
     RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
 };
@@ -258,7 +258,7 @@ where
 
 fn append_path(existing: Option<&OsStr>, install_dir: &Path) -> OsString {
     let mut updated = existing.unwrap_or_default().to_os_string();
-    if !updated.is_empty() && updated.encode_wide().next_back() != Some(PATH_SEPARATOR) {
+    if !updated.is_empty() && updated.encode_wide().last() != Some(PATH_SEPARATOR) {
         updated.push(";");
     }
     updated.push(install_dir);

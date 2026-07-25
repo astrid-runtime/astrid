@@ -291,7 +291,7 @@ pub(super) fn valid_stage_name(name: &str) -> bool {
 }
 
 pub(super) fn stage_contains_only_cleanup_remnants(stage: &Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(stage) else {
+    let Ok(mut entries) = std::fs::read_dir(stage) else {
         return false;
     };
     entries.all(|entry| {
@@ -327,5 +327,3 @@ pub(super) fn wide_null(path: &Path) -> Vec<u16> {
         .chain(std::iter::once(0))
         .collect()
 }
-
-use anyhow::Context as _;
