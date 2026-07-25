@@ -15,7 +15,7 @@ use std::sync::Arc;
 use astrid_storage_engine::{KvProjectionEngine, KvProjectionError, RootTransaction};
 use astrid_storage_model::{
     ModelError, ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord,
-    ObjectReference, ReferenceKind, RootState,
+    ObjectReference, ReferenceKind, ReferenceLabel, RootState,
 };
 use async_trait::async_trait;
 
@@ -28,7 +28,10 @@ use super::{
 };
 use crate::error::{StorageError, StorageResult};
 
-const FORMAT_VERSION: ObjectFormatVersion = ObjectFormatVersion::new(2);
+const FORMAT_VERSION: ObjectFormatVersion = match ObjectFormatVersion::new(2) {
+    Some(version) => version,
+    None => unreachable!(),
+};
 const KV_LABEL: &[u8] = b"kv";
 const LEFT_LABEL: &[u8] = b"left";
 const PARENT_LABEL: &[u8] = b"parent";
@@ -375,7 +378,7 @@ where
     if !wrapper.canonical_bytes().is_empty() || wrapper.class() != ObjectClass::Metadata {
         return Err(invalid(wrapper_id, "invalid KV tree root wrapper"));
     }
-    let tree = match wrapper.reference(ROOT_LABEL) {
+    let tree = match wrapper.reference(&ReferenceLabel::new(ROOT_LABEL)) {
         None if wrapper.references().is_empty() => None,
         Some(reference)
             if reference.kind() == ReferenceKind::Owns && wrapper.references().len() == 1 =>
@@ -387,13 +390,16 @@ where
     let preserved_state = state
         .references()
         .iter()
-        .filter(|reference| reference.label() != KV_LABEL)
+        .filter(|reference| reference.label().as_bytes() != KV_LABEL)
         .cloned()
         .collect();
     let preserved_commit = commit
         .references()
         .iter()
-        .filter(|reference| reference.label() != STATE_LABEL && reference.label() != PARENT_LABEL)
+        .filter(|reference| {
+            reference.label().as_bytes() != STATE_LABEL
+                && reference.label().as_bytes() != PARENT_LABEL
+        })
         .cloned()
         .collect();
     Ok(TreeHeader {
@@ -432,7 +438,7 @@ fn require_structural(id: ObjectId, record: &ObjectRecord) -> StorageResult<()> 
 
 fn owned_target(id: ObjectId, record: &ObjectRecord, label: &[u8]) -> StorageResult<ObjectId> {
     let reference = record
-        .reference(label)
+        .reference(&ReferenceLabel::new(label))
         .ok_or_else(|| invalid(id, "required KV tree reference is missing"))?;
     if reference.kind() != ReferenceKind::Owns {
         return Err(invalid(id, "required KV tree reference is not owning"));
@@ -597,12 +603,12 @@ where
         bytes.extend_from_slice(&total.to_le_bytes());
         bytes.extend_from_slice(&value_len.to_le_bytes());
         bytes.extend_from_slice(&key);
-        let mut references = vec![ObjectReference::owns(VALUE_LABEL.to_vec(), value)];
+        let mut references = vec![ObjectReference::owns(VALUE_LABEL.to_vec().into(), value)];
         if let Some(left) = left {
-            references.push(ObjectReference::owns(LEFT_LABEL.to_vec(), left));
+            references.push(ObjectReference::owns(LEFT_LABEL.to_vec().into(), left));
         }
         if let Some(right) = right {
-            references.push(ObjectReference::owns(RIGHT_LABEL.to_vec(), right));
+            references.push(ObjectReference::owns(RIGHT_LABEL.to_vec().into(), right));
         }
         references.sort();
         let record = ObjectRecord::new(
@@ -884,7 +890,7 @@ where
         logical_bytes: u64,
     ) -> StorageResult<RootTransaction<P>> {
         let references = tree
-            .map(|tree| vec![ObjectReference::owns(ROOT_LABEL.to_vec(), tree)])
+            .map(|tree| vec![ObjectReference::owns(ROOT_LABEL.to_vec().into(), tree)])
             .unwrap_or_default();
         let wrapper = ObjectRecord::new(
             ObjectKind::NamespaceMap,
@@ -898,7 +904,7 @@ where
         let wrapper = self.insert(wrapper)?;
 
         let mut state_references = header.preserved_state;
-        state_references.push(ObjectReference::owns(KV_LABEL.to_vec(), wrapper));
+        state_references.push(ObjectReference::owns(KV_LABEL.to_vec().into(), wrapper));
         state_references.sort();
         let state = ObjectRecord::new(
             ObjectKind::PrincipalState,
@@ -914,12 +920,12 @@ where
         let mut commit_references = header.preserved_commit;
         if let Some(previous) = header.root {
             commit_references.push(ObjectReference::new(
-                PARENT_LABEL.to_vec(),
+                PARENT_LABEL.to_vec().into(),
                 previous.commit,
                 ReferenceKind::Lineage,
             ));
         }
-        commit_references.push(ObjectReference::owns(STATE_LABEL.to_vec(), state));
+        commit_references.push(ObjectReference::owns(STATE_LABEL.to_vec().into(), state));
         commit_references.sort();
         let commit = ObjectRecord::new(
             ObjectKind::Commit,
@@ -961,7 +967,7 @@ fn exact_owned_reference(
     label: &[u8],
     required: bool,
 ) -> StorageResult<Option<ObjectId>> {
-    match record.reference(label) {
+    match record.reference(&ReferenceLabel::new(label)) {
         Some(reference) if reference.kind() == ReferenceKind::Owns => Ok(Some(reference.target())),
         Some(_) => Err(invalid(id, "KV tree reference is not owning")),
         None if required => Err(invalid(id, "required KV tree reference is missing")),

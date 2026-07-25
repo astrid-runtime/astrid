@@ -17,7 +17,6 @@ use crate::types::Config;
 pub fn validate(config: &Config) -> ConfigResult<()> {
     validate_model(config)?;
     validate_budget(config)?;
-    validate_storage(config)?;
     validate_workspace(config)?;
     validate_git(config)?;
     validate_servers(config)?;
@@ -26,16 +25,6 @@ pub fn validate(config: &Config) -> ConfigResult<()> {
     validate_subagents(config)?;
     validate_capsule(config)?;
     validate_retry(config)?;
-    Ok(())
-}
-
-fn validate_storage(config: &Config) -> ConfigResult<()> {
-    if config.storage.recovery_max_frame_bytes == Some(0) {
-        return Err(ConfigError::ValidationError {
-            field: "storage.recovery_max_frame_bytes".to_owned(),
-            message: "must be greater than zero when configured".to_owned(),
-        });
-    }
     Ok(())
 }
 
@@ -416,18 +405,6 @@ mod tests {
         config.capsule.host_blocking_concurrency = Some(4);
         config.capsule.host_io_concurrency = Some(256);
         assert!(validate(&config).is_ok());
-    }
-
-    #[test]
-    fn zero_storage_recovery_boundary_is_rejected() {
-        let mut config = Config::default();
-        config.storage.recovery_max_frame_bytes = Some(0);
-        let err = validate(&config).unwrap_err();
-        assert!(matches!(
-            err,
-            ConfigError::ValidationError { field, .. }
-                if field == "storage.recovery_max_frame_bytes"
-        ));
     }
 
     #[test]

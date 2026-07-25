@@ -24,8 +24,8 @@ impl ObjectIdentity for TestIdentity {
         }]);
         hasher.update(&(record.references().len() as u128).to_le_bytes());
         for reference in record.references() {
-            hasher.update(&(reference.label().len() as u128).to_le_bytes());
-            hasher.update(reference.label());
+            hasher.update(&(reference.label().as_bytes().len() as u128).to_le_bytes());
+            hasher.update(reference.label().as_bytes());
             hasher.update(reference.target().as_bytes());
             hasher.update(&[match reference.kind() {
                 ReferenceKind::Owns => 0,

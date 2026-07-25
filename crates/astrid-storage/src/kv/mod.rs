@@ -5,7 +5,8 @@
 //!
 //! - **In-memory** (always available): For tests and ephemeral data
 //! - **Persistent tree** (always available): Content-addressed per-owner state
-//! - **`SurrealKV`** (behind `legacy-surrealkv`): Migration and recovery only
+//! - **`SurrealKV`** (behind `legacy-surrealkv`): Migration reader and
+//!   differential-test oracle only
 //!
 //! # Namespacing
 //!

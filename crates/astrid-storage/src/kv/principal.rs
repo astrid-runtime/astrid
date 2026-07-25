@@ -346,8 +346,8 @@ mod tests {
             }]);
             hasher.update(&(record.references().len() as u128).to_le_bytes());
             for reference in record.references() {
-                hasher.update(&(reference.label().len() as u128).to_le_bytes());
-                hasher.update(reference.label());
+                hasher.update(&(reference.label().as_bytes().len() as u128).to_le_bytes());
+                hasher.update(reference.label().as_bytes());
                 hasher.update(reference.target().as_bytes());
                 hasher.update(&[match reference.kind() {
                     ReferenceKind::Owns => 0,
@@ -583,8 +583,11 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(engine.root(&"alice".to_owned()).unwrap().generation, 1);
-        assert_eq!(engine.root(&"bob".to_owned()).unwrap().generation, 0);
+        assert_eq!(
+            engine.root(&"alice".to_owned()).unwrap().generation.get(),
+            1
+        );
+        assert_eq!(engine.root(&"bob".to_owned()).unwrap().generation.get(), 0);
         assert!(matches!(
             store.get("system:identity", "user").await,
             Err(StorageError::InvalidKey(_))

@@ -14,7 +14,8 @@ use std::sync::Arc;
 
 use astrid_storage_model::{
     ModelError, ObjectClass, ObjectFormatVersion, ObjectId, ObjectIdentity, ObjectKind,
-    ObjectRecord, ObjectReference, PrincipalUsage, ReferenceKind, RootState, World,
+    ObjectRecord, ObjectReference, PrincipalUsage, ReferenceKind, ReferenceLabel, RootGeneration,
+    RootState, World,
 };
 use fs2::FileExt;
 use parking_lot::Mutex;
@@ -31,17 +32,28 @@ const FRAME_HEADER_LEN: u64 = 52;
 const FRAME_HEADER_LEN_USIZE: usize = 52;
 const CHECKSUM_START: usize = 20;
 
-/// Operator-supplied recovery allocation boundary.
+/// Explicit durable-frame parser allocation boundary.
 ///
 /// This is a parser/resource guard, not a principal quota or a file-size cap.
-/// The durable engine intentionally has no hidden default: its embedding
-/// runtime must derive the value from the principal or system resource policy.
+/// Embeddings that do not need a stricter parser guard can use
+/// [`Self::process_addressable`] without creating a hidden deployment quota.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RecoveryLimits {
     max_frame_bytes: u64,
 }
 
 impl RecoveryLimits {
+    /// Use the largest frame representable by this process.
+    ///
+    /// Allocation remains fallible. This is a parser representation boundary,
+    /// not a policy quota or hidden deployment capacity.
+    #[must_use]
+    pub fn process_addressable() -> Self {
+        Self {
+            max_frame_bytes: u64::try_from(usize::MAX).unwrap_or(u64::MAX),
+        }
+    }
+
     /// Construct an explicit frame-allocation ceiling.
     ///
     /// # Errors
@@ -494,7 +506,7 @@ where
         for (declared, record) in &records {
             let computed = self.identify(record);
             if computed != *declared {
-                return Err(ModelError::ProofIdentityMismatch {
+                return Err(ModelError::ObjectIdentityMismatch {
                     declared: *declared,
                     computed,
                 }
@@ -508,9 +520,9 @@ where
         let generation = match actual {
             Some(root) => root
                 .generation
-                .checked_add(1)
+                .checked_next()
                 .ok_or(ModelError::ArithmeticOverflow)?,
-            None => 0,
+            None => RootGeneration::INITIAL,
         };
         let root = RootState {
             generation,

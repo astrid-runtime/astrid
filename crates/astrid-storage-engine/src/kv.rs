@@ -10,14 +10,14 @@ use std::fmt;
 
 use astrid_storage_model::{
     ModelError, ObjectClass, ObjectFormatVersion, ObjectId, ObjectIdentity, ObjectKind,
-    ObjectRecord, ObjectReference, ReferenceKind, RootState,
+    ObjectRecord, ObjectReference, ReferenceKind, ReferenceLabel, RootState,
 };
 
 use crate::{CommitOutcome, InMemoryEngine, RootSnapshot, RootTransaction};
 #[cfg(not(target_family = "wasm"))]
 use crate::{DurableEngine, DurableError, PrincipalCodec};
 
-const FORMAT_VERSION: ObjectFormatVersion = ObjectFormatVersion::new(1);
+const FORMAT_VERSION: ObjectFormatVersion = ObjectFormatVersion::V1;
 const KV_LABEL: &[u8] = b"kv";
 const PARENT_LABEL: &[u8] = b"parent";
 const STATE_LABEL: &[u8] = b"state";
@@ -525,7 +525,7 @@ fn decode_snapshot<P>(
     let commit = typed_record(&records, snapshot.root().commit, ObjectKind::Commit)?;
     require_structural_record(snapshot.root().commit, commit)?;
     if commit
-        .reference(PARENT_LABEL)
+        .reference(&ReferenceLabel::new(PARENT_LABEL))
         .is_some_and(|reference| reference.kind() != ReferenceKind::Lineage)
     {
         return Err(invalid(
@@ -540,17 +540,20 @@ fn decode_snapshot<P>(
     let preserved_components = principal_state
         .references()
         .iter()
-        .filter(|reference| reference.label() != KV_LABEL)
+        .filter(|reference| reference.label().as_bytes() != KV_LABEL)
         .cloned()
         .collect();
     let preserved_commit_references = commit
         .references()
         .iter()
-        .filter(|reference| reference.label() != STATE_LABEL && reference.label() != PARENT_LABEL)
+        .filter(|reference| {
+            reference.label().as_bytes() != STATE_LABEL
+                && reference.label().as_bytes() != PARENT_LABEL
+        })
         .cloned()
         .collect();
 
-    let state = match principal_state.reference(KV_LABEL) {
+    let state = match principal_state.reference(&ReferenceLabel::new(KV_LABEL)) {
         None => KvState::new(),
         Some(reference) if reference.kind() == ReferenceKind::Owns => {
             decode_namespace_map(&records, reference.target())?
@@ -585,7 +588,7 @@ fn decode_namespace_map(
         if namespace_reference.kind() != ReferenceKind::Owns {
             return Err(invalid(map_id, "namespace reference is not owning"));
         }
-        let namespace = decode_label(map_id, namespace_reference.label())?;
+        let namespace = decode_label(map_id, namespace_reference.label().as_bytes())?;
         validate_projection_name(map_id, &namespace, "namespace")?;
         let branch_id = namespace_reference.target();
         let branch = typed_record(records, branch_id, ObjectKind::KvBranch)?;
@@ -595,7 +598,7 @@ fn decode_namespace_map(
             if key_reference.kind() != ReferenceKind::Owns {
                 return Err(invalid(branch_id, "KV key reference is not owning"));
             }
-            let key = decode_label(branch_id, key_reference.label())?;
+            let key = decode_label(branch_id, key_reference.label().as_bytes())?;
             validate_projection_name(branch_id, &key, "key")?;
             let leaf_id = key_reference.target();
             let leaf = typed_record(records, leaf_id, ObjectKind::KvLeaf)?;
@@ -650,7 +653,10 @@ fn encode_transaction<P: Ord, E: KvProjectionEngine<P>>(
                 ObjectClass::Data,
             )?;
             let leaf_id = insert_identified(engine, &mut records, leaf)?;
-            key_references.push(ObjectReference::owns(key.as_bytes().to_vec(), leaf_id));
+            key_references.push(ObjectReference::owns(
+                ReferenceLabel::new(key.as_bytes().to_vec()),
+                leaf_id,
+            ));
         }
         key_references.sort();
         let branch = ObjectRecord::new(
@@ -663,7 +669,7 @@ fn encode_transaction<P: Ord, E: KvProjectionEngine<P>>(
         )?;
         let branch_id = insert_identified(engine, &mut records, branch)?;
         namespace_references.push(ObjectReference::owns(
-            namespace.as_bytes().to_vec(),
+            ReferenceLabel::new(namespace.as_bytes().to_vec()),
             branch_id,
         ));
     }
@@ -679,7 +685,10 @@ fn encode_transaction<P: Ord, E: KvProjectionEngine<P>>(
     )?;
     let namespace_map_id = insert_identified(engine, &mut records, namespace_map)?;
 
-    preserved_components.push(ObjectReference::owns(KV_LABEL.to_vec(), namespace_map_id));
+    preserved_components.push(ObjectReference::owns(
+        ReferenceLabel::new(KV_LABEL.to_vec()),
+        namespace_map_id,
+    ));
     preserved_components.sort();
     let principal_state = ObjectRecord::new(
         ObjectKind::PrincipalState,
@@ -693,13 +702,13 @@ fn encode_transaction<P: Ord, E: KvProjectionEngine<P>>(
 
     if let Some(previous) = root {
         preserved_commit_references.push(ObjectReference::new(
-            PARENT_LABEL.to_vec(),
+            ReferenceLabel::new(PARENT_LABEL.to_vec()),
             previous.commit,
             ReferenceKind::Lineage,
         ));
     }
     preserved_commit_references.push(ObjectReference::owns(
-        STATE_LABEL.to_vec(),
+        ReferenceLabel::new(STATE_LABEL.to_vec()),
         principal_state_id,
     ));
     preserved_commit_references.sort();
@@ -760,7 +769,7 @@ fn owned_target(
     label: &[u8],
 ) -> Result<ObjectId, KvProjectionError> {
     let reference = record
-        .reference(label)
+        .reference(&ReferenceLabel::new(label))
         .ok_or_else(|| invalid(object, "required owned reference is missing"))?;
     if reference.kind() != ReferenceKind::Owns {
         return Err(invalid(object, "required reference is not owning"));

@@ -5,7 +5,7 @@
 
 **The persistence layer. Disk for the OS.**
 
-An operating system needs disk. Astrid has a raw key-value contract projected onto typed, durable per-principal roots, plus an optional query engine. SurrealKV remains available during the compatibility window for migration and standalone legacy stores.
+An operating system needs disk. Astrid has a raw key-value contract projected onto typed, durable per-principal roots, plus an optional query engine. The legacy SurrealKV reader remains available only during the migration window.
 
 ## Why two tiers
 
@@ -42,7 +42,7 @@ The `build_secret_store` convenience constructor picks the best available backen
 
 | Feature | Enables |
 |---|---|
-| `legacy-surrealkv` | Compatibility `SurrealKvStore` backend and migrator |
+| `legacy-surrealkv` | Legacy `SurrealKvStore` reader and migrator |
 | `db` | `Database` (SurrealDB query engine) |
 | `keychain` | `KeychainSecretStore` + `FallbackSecretStore` |
 | `full` | `legacy-surrealkv` + `db` |

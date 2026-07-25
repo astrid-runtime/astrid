@@ -30,33 +30,6 @@ projection=kv-tree-v2\n";
 
 mod migrations;
 
-/// Selects the native kernel's authoritative key/value backend.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum PrincipalStoreBackend {
-    /// Durable typed roots grouped by principal.
-    #[default]
-    Principal,
-    /// The pre-principal `SurrealKV` database.
-    ///
-    /// This is an operator recovery mode. Once the principal store has
-    /// accepted newer writes, the legacy database is a stale migration source
-    /// until an explicit reverse export is performed.
-    LegacySurreal,
-}
-
-/// Native principal-store startup policy.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PrincipalStoreOptions {
-    /// Authoritative backend selected by the operator.
-    pub backend: PrincipalStoreBackend,
-    /// Optional parser/allocation boundary for one durable frame.
-    ///
-    /// This is not a storage quota. `None` uses the process address space and
-    /// fallible allocation as the boundary, so normal installations do not
-    /// inherit a hidden capacity ceiling.
-    pub recovery_max_frame_bytes: Option<u64>,
-}
-
 /// Explicit owner of one durable state root.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StateOwner {
@@ -102,8 +75,8 @@ impl ObjectIdentity for Blake3ObjectIdentityV1 {
         }]);
         hash_length(&mut hasher, record.references().len());
         for reference in record.references() {
-            hash_length(&mut hasher, reference.label().len());
-            hasher.update(reference.label());
+            hash_length(&mut hasher, reference.label().as_bytes().len());
+            hasher.update(reference.label().as_bytes());
             hasher.update(reference.target().as_bytes());
             hasher.update(&[match reference.kind() {
                 ReferenceKind::Owns => 0,
@@ -188,32 +161,16 @@ type RuntimeStore =
 /// durable recovery fails.
 pub async fn open_runtime_kv(
     home: &AstridHome,
-    options: PrincipalStoreOptions,
     quota: Arc<dyn KvQuotaResolver<StateOwner>>,
 ) -> StorageResult<Arc<dyn KvStore>> {
-    if options.backend == PrincipalStoreBackend::LegacySurreal {
-        #[cfg(feature = "legacy-surrealkv")]
-        {
-            return SurrealKvStore::open(home.state_db_path())
-                .map(|store| Arc::new(store) as Arc<dyn KvStore>);
-        }
-        #[cfg(not(feature = "legacy-surrealkv"))]
-        {
-            return Err(StorageError::Connection(
-                "legacy-surreal recovery requires the legacy-surrealkv feature".to_owned(),
-            ));
-        }
-    }
-
     let store_path = home.principal_store_path();
     prepare_destination(&store_path)?;
-    let limit = recovery_limit(options.recovery_max_frame_bytes)?;
     let engine = Arc::new(
         RuntimeEngine::open(
             &store_path,
             Blake3ObjectIdentityV1,
             StateOwnerCodecV1,
-            limit,
+            RecoveryLimits::process_addressable(),
         )
         .map_err(|error| {
             StorageError::Connection(format!("open durable principal store: {error}"))
@@ -229,12 +186,6 @@ pub async fn open_runtime_kv(
         StateOwnerResolver,
         quota,
     )))
-}
-
-fn recovery_limit(configured: Option<u64>) -> StorageResult<RecoveryLimits> {
-    let process_addressable = u64::try_from(usize::MAX).unwrap_or(u64::MAX);
-    RecoveryLimits::new(configured.unwrap_or(process_addressable))
-        .map_err(|error| StorageError::Connection(error.to_string()))
 }
 
 fn prepare_destination(path: &Path) -> StorageResult<()> {
@@ -419,7 +370,7 @@ mod tests {
     fn object_identity_v1_has_a_stable_golden_vector() {
         let record = ObjectRecord::new(
             ObjectKind::KvLeaf,
-            ObjectFormatVersion::new(1),
+            ObjectFormatVersion::V1,
             b"hello".to_vec(),
             Vec::new(),
             0,
@@ -472,9 +423,7 @@ mod tests {
             .unwrap();
         legacy.close().await.unwrap();
 
-        let store = open_runtime_kv(&home, PrincipalStoreOptions::default(), unlimited_quota())
-            .await
-            .unwrap();
+        let store = open_runtime_kv(&home, unlimited_quota()).await.unwrap();
         assert_eq!(
             store.get("system:identity", "root").await.unwrap(),
             Some(b"default".to_vec())
@@ -506,9 +455,7 @@ mod tests {
             .unwrap();
         legacy.close().await.unwrap();
 
-        let reopened = open_runtime_kv(&home, PrincipalStoreOptions::default(), unlimited_quota())
-            .await
-            .unwrap();
+        let reopened = open_runtime_kv(&home, unlimited_quota()).await.unwrap();
         assert_eq!(
             reopened
                 .get("alice:capsule:shell", "legacy-only")
@@ -532,9 +479,7 @@ mod tests {
                 StateOwner::Principal(_) => Some(4),
             })
         });
-        let store = open_runtime_kv(&home, PrincipalStoreOptions::default(), quota)
-            .await
-            .unwrap();
+        let store = open_runtime_kv(&home, quota).await.unwrap();
 
         store
             .set("alice:capsule:shell", "one", b"1234".to_vec())
@@ -565,9 +510,7 @@ mod tests {
         std::fs::create_dir_all(home.principal_store_path()).unwrap();
         std::fs::write(home.principal_store_path().join("partial"), b"incomplete").unwrap();
 
-        let store = open_runtime_kv(&home, PrincipalStoreOptions::default(), unlimited_quota())
-            .await
-            .unwrap();
+        let store = open_runtime_kv(&home, unlimited_quota()).await.unwrap();
         assert!(
             home.var_dir()
                 .join("principal-store.incomplete.0")
@@ -589,12 +532,10 @@ mod tests {
         let home = AstridHome::from_path(directory.path());
         std::fs::create_dir_all(home.state_db_path()).unwrap();
 
-        let error =
-            match open_runtime_kv(&home, PrincipalStoreOptions::default(), unlimited_quota()).await
-            {
-                Err(error) => error,
-                Ok(_) => panic!("legacy source opened without transition support"),
-            };
+        let error = match open_runtime_kv(&home, unlimited_quota()).await {
+            Err(error) => error,
+            Ok(_) => panic!("legacy source opened without transition support"),
+        };
         assert!(
             error
                 .to_string()

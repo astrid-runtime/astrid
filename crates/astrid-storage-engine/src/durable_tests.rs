@@ -19,8 +19,8 @@ impl ObjectIdentity for TestIdentity {
         hasher.update(&[record.class().code()]);
         hasher.update(&(record.references().len() as u128).to_le_bytes());
         for reference in record.references() {
-            hasher.update(&(reference.label().len() as u128).to_le_bytes());
-            hasher.update(reference.label());
+            hasher.update(&(reference.label().as_bytes().len() as u128).to_le_bytes());
+            hasher.update(reference.label().as_bytes());
             hasher.update(reference.target().as_bytes());
             hasher.update(&[reference.kind().code()]);
         }
@@ -65,6 +65,10 @@ fn limits() -> RecoveryLimits {
     RecoveryLimits::new(1024 * 1024).unwrap()
 }
 
+fn label(bytes: &[u8]) -> ReferenceLabel {
+    ReferenceLabel::new(bytes.to_vec())
+}
+
 fn open(path: &Path) -> TestEngine {
     DurableEngine::open(path, TestIdentity, Utf8Codec, limits()).unwrap()
 }
@@ -88,7 +92,7 @@ fn transaction(
     let identity = TestIdentity;
     let leaf = ObjectRecord::new(
         ObjectKind::Chunk,
-        ObjectFormatVersion::new(1),
+        ObjectFormatVersion::V1,
         payload.to_vec(),
         Vec::new(),
         u64::try_from(payload.len()).unwrap(),
@@ -98,9 +102,9 @@ fn transaction(
     let leaf_id = identity.identify(&leaf);
     let commit = ObjectRecord::new(
         ObjectKind::Commit,
-        ObjectFormatVersion::new(1),
+        ObjectFormatVersion::V1,
         payload.to_vec(),
-        vec![ObjectReference::owns(b"state".to_vec(), leaf_id)],
+        vec![ObjectReference::owns(label(b"state"), leaf_id)],
         0,
         ObjectClass::Metadata,
     )
@@ -142,11 +146,19 @@ fn object_frame_round_trips_binary_typed_records() {
     let target = ObjectId::new([9; 32]);
     let record = ObjectRecord::new(
         ObjectKind::PrincipalState,
-        ObjectFormatVersion::new(7),
+        ObjectFormatVersion::new(7).unwrap(),
         vec![0, 255, 19],
         vec![
-            ObjectReference::new(vec![0, 1], target, ReferenceKind::Evidence),
-            ObjectReference::new(vec![255], ObjectId::new([10; 32]), ReferenceKind::Lineage),
+            ObjectReference::new(
+                ReferenceLabel::new(vec![0, 1]),
+                target,
+                ReferenceKind::Evidence,
+            ),
+            ObjectReference::new(
+                ReferenceLabel::new(vec![255]),
+                ObjectId::new([10; 32]),
+                ReferenceKind::Lineage,
+            ),
         ],
         83,
         ObjectClass::Metadata,
@@ -158,6 +170,23 @@ fn object_frame_round_trips_binary_typed_records() {
     let decoded = decode_object_frame(&encoded).unwrap();
 
     assert_eq!(decoded, (id, record));
+}
+
+#[test]
+fn object_frame_rejects_zero_schema_version() {
+    let (_, transaction) = transaction("alice", None, b"versioned");
+    let (id, record) = transaction
+        .records()
+        .iter()
+        .find(|(_, record)| record.kind() == ObjectKind::Commit)
+        .unwrap();
+    let mut encoded = encode_object_frame(*id, record).unwrap();
+    encoded[34..36].copy_from_slice(&0_u16.to_le_bytes());
+
+    assert_eq!(
+        decode_object_frame(&encoded),
+        Err("object-format version must be non-zero")
+    );
 }
 
 #[test]
@@ -231,7 +260,7 @@ fn every_exposed_fault_recovers_old_or_new_complete_root() {
             assert_eq!(
                 visible,
                 RootState {
-                    generation: 1,
+                    generation: RootGeneration::new(1),
                     commit: new_commit,
                 },
                 "point {point:?}"
@@ -349,7 +378,7 @@ fn recovery_reports_root_journal_model_failure_with_offset() {
         b"alice",
         None,
         RootState {
-            generation: 0,
+            generation: RootGeneration::INITIAL,
             commit: ObjectId::new([99; 32]),
         },
     )
@@ -379,7 +408,7 @@ fn recovery_never_accepts_an_identity_collision() {
     drop(open(directory.path()));
     let first = ObjectRecord::new(
         ObjectKind::Chunk,
-        ObjectFormatVersion::new(1),
+        ObjectFormatVersion::V1,
         b"first".to_vec(),
         Vec::new(),
         5,
@@ -388,7 +417,7 @@ fn recovery_never_accepts_an_identity_collision() {
     .unwrap();
     let second = ObjectRecord::new(
         ObjectKind::Chunk,
-        ObjectFormatVersion::new(1),
+        ObjectFormatVersion::V1,
         b"second".to_vec(),
         Vec::new(),
         6,

@@ -6,7 +6,7 @@
 //!
 //! Direct byte-level `get`/`set`/`delete` over an injected backend. Native
 //! Astrid uses the durable principal store; `SurrealKV` remains available only
-//! for compatibility migration and standalone legacy stores.
+//! as a legacy migration reader and differential-test oracle.
 //!
 //! Primary use case: WASM guest storage with scoped namespaces per plugin.
 //!
@@ -30,7 +30,7 @@
 //!
 //! # Feature Flags
 //!
-//! - **`legacy-surrealkv`** — compatibility `SurrealKV` backend and migrator
+//! - **`legacy-surrealkv`** — legacy `SurrealKV` reader and migrator
 //! - **`db`** — `SurrealDB` full query engine
 //! - **`full`** — Both `legacy-surrealkv` and `db`
 
@@ -69,8 +69,7 @@ pub use secret::{FallbackSecretStore, KeychainSecretStore};
 pub use kv::SurrealKvStore;
 #[cfg(not(target_family = "wasm"))]
 pub use principal_state::{
-    Blake3ObjectIdentityV1, PrincipalStoreBackend, PrincipalStoreOptions, StateOwner,
-    StateOwnerCodecV1, StateOwnerResolver, open_runtime_kv,
+    Blake3ObjectIdentityV1, StateOwner, StateOwnerCodecV1, StateOwnerResolver, open_runtime_kv,
 };
 
 #[cfg(feature = "db")]
