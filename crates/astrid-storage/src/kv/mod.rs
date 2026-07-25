@@ -24,11 +24,13 @@ use async_trait::async_trait;
 use crate::error::{StorageError, StorageResult};
 
 mod memory;
+mod principal;
 mod scoped;
 #[cfg(feature = "kv")]
 mod surreal;
 
 pub use memory::MemoryKvStore;
+pub use principal::{KvPrincipalResolver, PrincipalKvStore};
 pub use scoped::ScopedKvStore;
 #[cfg(feature = "kv")]
 pub use surreal::SurrealKvStore;

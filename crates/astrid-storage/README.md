@@ -47,7 +47,11 @@ The `build_secret_store` convenience constructor picks the best available backen
 | `keychain` | `KeychainSecretStore` + `FallbackSecretStore` |
 | `full` | `kv` + `db` |
 
-`MemoryKvStore` and `KvSecretStore` are always available with no feature flags.
+The historical `kv` name gates only the optional SurrealKV backend; it does not
+gate Astrid's KV contract. `KvStore`, `MemoryKvStore`, `ScopedKvStore`,
+`KvSecretStore`, and the principal-store compatibility adapter are always
+available with no feature flags. The durable principal store is intended to
+replace this legacy backend boundary rather than inherit it.
 
 ## Usage
 

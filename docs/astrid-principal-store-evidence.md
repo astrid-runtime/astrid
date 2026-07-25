@@ -227,7 +227,8 @@ Every storage backend runs the same black-box trace suite:
 The suite covers:
 
 - get, set, delete, list, exists, clear, and compare-and-swap;
-- empty keys/values and maximum admitted sizes;
+- invalid namespace/key names, empty values, and configured resource-policy
+  boundaries when present;
 - namespace isolation;
 - concurrent writers;
 - flush, close, reopen, and recovery;
@@ -237,6 +238,15 @@ The suite covers:
 
 The legacy backends need not expose new snapshot/export features. The adapter's
 observable `KvStore` behavior must remain compatible.
+
+The in-memory compatibility gate runs deterministic generated traces against
+`MemoryKvStore`, `SurrealKvStore`, and `PrincipalKvStore`. It compares every
+operation result and reconstructs every exercised namespace after each step.
+It also covers raw-name validation, empty values, principal isolation,
+concurrent insert-if-absent, and concurrent writes to distinct keys. Flush,
+close, reopen, recovery, quota charging, and cancellation remain
+durable-backend obligations; an in-memory adapter cannot provide evidence for
+them.
 
 ## 6. Crash and storage faults
 

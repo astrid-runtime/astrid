@@ -6,7 +6,7 @@
 
 use async_trait::async_trait;
 
-use super::{KvStore, validate_prefix};
+use super::{KvStore, validate_key, validate_namespace, validate_prefix};
 use crate::error::{StorageError, StorageResult};
 
 /// In-memory key-value store for tests and ephemeral data.
@@ -32,6 +32,8 @@ impl MemoryKvStore {
 #[async_trait]
 impl KvStore for MemoryKvStore {
     async fn get(&self, namespace: &str, key: &str) -> StorageResult<Option<Vec<u8>>> {
+        validate_namespace(namespace)?;
+        validate_key(key)?;
         let data = self
             .data
             .read()
@@ -40,6 +42,8 @@ impl KvStore for MemoryKvStore {
     }
 
     async fn set(&self, namespace: &str, key: &str, value: Vec<u8>) -> StorageResult<()> {
+        validate_namespace(namespace)?;
+        validate_key(key)?;
         let mut data = self
             .data
             .write()
@@ -49,6 +53,8 @@ impl KvStore for MemoryKvStore {
     }
 
     async fn delete(&self, namespace: &str, key: &str) -> StorageResult<bool> {
+        validate_namespace(namespace)?;
+        validate_key(key)?;
         let mut data = self
             .data
             .write()
@@ -57,6 +63,8 @@ impl KvStore for MemoryKvStore {
     }
 
     async fn exists(&self, namespace: &str, key: &str) -> StorageResult<bool> {
+        validate_namespace(namespace)?;
+        validate_key(key)?;
         let data = self
             .data
             .read()
@@ -65,6 +73,7 @@ impl KvStore for MemoryKvStore {
     }
 
     async fn list_keys(&self, namespace: &str) -> StorageResult<Vec<String>> {
+        validate_namespace(namespace)?;
         let data = self
             .data
             .read()
@@ -81,6 +90,8 @@ impl KvStore for MemoryKvStore {
         namespace: &str,
         prefix: &str,
     ) -> StorageResult<Vec<String>> {
+        validate_namespace(namespace)?;
+        validate_prefix(prefix)?;
         let data = self
             .data
             .read()
@@ -101,6 +112,8 @@ impl KvStore for MemoryKvStore {
         expected: Option<&[u8]>,
         new: Vec<u8>,
     ) -> StorageResult<bool> {
+        validate_namespace(namespace)?;
+        validate_key(key)?;
         // Single write lock covers read + conditional write. Other
         // capsules calling `set` / `compare_and_swap` block until this
         // returns, so the compare cannot race a concurrent mutation.
@@ -119,6 +132,7 @@ impl KvStore for MemoryKvStore {
     }
 
     async fn clear_namespace(&self, namespace: &str) -> StorageResult<u64> {
+        validate_namespace(namespace)?;
         let mut data = self
             .data
             .write()
@@ -137,6 +151,7 @@ impl KvStore for MemoryKvStore {
     }
 
     async fn clear_prefix(&self, namespace: &str, prefix: &str) -> StorageResult<u64> {
+        validate_namespace(namespace)?;
         validate_prefix(prefix)?;
         let mut data = self
             .data

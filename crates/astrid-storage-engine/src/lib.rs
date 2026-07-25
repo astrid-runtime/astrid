@@ -23,6 +23,10 @@ use astrid_storage_model::{
 };
 use parking_lot::RwLock;
 
+mod kv;
+
+pub use kv::{KvProjectionError, KvState, KvStateSnapshot};
+
 /// A root update and the immutable records required to reconstruct it.
 ///
 /// Record identifiers are untrusted declarations. The engine recomputes every

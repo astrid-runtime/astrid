@@ -35,6 +35,16 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   format or changing current storage backends. Bounded transition traces and
   concurrent-writer tests exercise the engine contract; durability, recovery,
   encryption, placement, and runtime migration remain explicitly out of scope.
+- **Principal storage has an additive KV compatibility bridge.**
+  `PrincipalKvStore` implements the existing async `KvStore` contract over
+  typed principal roots while requiring an authority-aware
+  namespace-to-principal resolver. The version-one logical projection stores
+  KV leaves, branches, namespace maps, principal state, and commit lineage
+  without choosing a production hash or disk encoding. Root conflicts retry
+  from a fresh snapshot, non-KV state edges survive KV mutations, and generated
+  traces compare every operation and resulting namespace state against both
+  `MemoryKvStore` and `SurrealKvStore`. The adapter is additive: the runtime
+  still opens its current backend and no existing principal is migrated.
 - **Windows local transport uses authenticated per-user named pipes.** A pipe
   name derived only from the caller's operating-system SID replaces
   filesystem endpoint naming on Windows. Local-only byte-mode instances use a

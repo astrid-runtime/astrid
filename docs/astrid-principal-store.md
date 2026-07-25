@@ -244,6 +244,63 @@ not claim recovery, disk atomicity, canonical format stability, encryption,
 quota enforcement, or production placement. Those claims begin only with the
 arena and root-journal backend plus the fault matrix in the evidence document.
 
+### 5.6 KV compatibility bridge
+
+`astrid-storage::PrincipalKvStore` implements the existing async `KvStore`
+surface over the in-memory engine without changing current callers. The bridge:
+
+- requires an injected authority-aware resolver from namespace to a
+  domain-bearing principal identifier;
+- never derives authority by splitting an arbitrary namespace string;
+- places every capsule namespace owned by one principal under the same
+  principal root;
+- represents values and indexes as the typed path
+  `KvLeaf -> KvBranch -> NamespaceMap -> PrincipalState -> Commit`;
+- replaces only the `kv` state component and preserves unrelated filesystem,
+  audit, evidence, or future component references;
+- retries exact-root conflicts from a new snapshot so concurrent mutations do
+  not lose updates;
+- keeps empty values distinct from missing keys and omits empty namespaces;
+- accounts repeated visible values logically even when their immutable leaf
+  object is physically shared.
+
+The projection grammar is an internal version-one logical shape. Object
+identity remains injected, and the adapter does not select a production digest,
+serialized object framing, or disk layout.
+
+The initial differential suite runs generated get, set, delete, exists, list,
+prefix, clear, and compare-and-swap traces against `MemoryKvStore`,
+`SurrealKvStore`, and the adapter. Each operation result and the complete
+resulting namespace state must agree. Invalid raw namespaces and keys now have
+the same `InvalidKey` class in the memory and persistent legacy backends.
+
+This is not a runtime cutover. Existing installations continue using
+`SurrealKvStore`. A later integration must quiesce writes for one principal,
+capture all of its known namespaces consistently, install one complete
+principal root, run shadow comparisons, and only then switch the authoritative
+backend. The current `KvStore` API cannot enumerate namespaces or produce an
+atomic cross-namespace legacy snapshot, so a naive live list-and-copy loop is
+not an acceptable migration protocol.
+
+The bridge is a compatibility oracle, not the intended production hot path.
+Each mutation currently reconstructs the complete in-memory KV projection,
+which is linear in that principal's KV state. The durable engine must persist
+immutable objects once and use bounded-fanout persistent trees so it path-copies
+only the affected leaf-to-root path, principal state, and commit. It must not
+reuse the bridge's whole-state snapshot/update loop as its point-operation API.
+Its benchmarks must measure height-bounded write amplification rather than
+treating the bridge's flat maps and full reconstruction as an acceptable
+steady-state cost.
+
+The existing Cargo feature named `kv` gates only the optional `SurrealKvStore`
+dependency; the `KvStore` contract and its memory, scoped, and principal-store
+implementations are already unconditional. The new architecture does not treat
+principal KV state as optional and must not inherit that misleading feature
+boundary. During runtime migration the old backend may be isolated behind an
+explicit `legacy-surrealkv` transition feature. Once migration and rollback
+support no longer require it, remove that backend and transition feature rather
+than making SurrealKV an unconditional dependency.
+
 ## 6. Three identifiers, not one overloaded hash
 
 The system must not turn possession of a hash into permission to read data.
@@ -1071,10 +1128,10 @@ graph and not a prerequisite for reading a file or recovering a principal.
 4. Add an engine prototype over in-memory immutable objects and atomic roots.
 5. Add the principal-store-backed `KvStore` adapter and differential tests
    against `MemoryKvStore` and `SurrealKvStore`.
-6. Add typed filesystem roots and a safe materializer; integrate Linux-realm
-   principal-home checkpoints and explicit external-workspace observations.
-7. Add durable segments, indexes, WAL, fault injection, recovery, compaction,
+6. Add durable segments, indexes, WAL, fault injection, recovery, compaction,
    and quota enforcement.
+7. Add typed filesystem roots and a safe materializer; integrate Linux-realm
+   principal-home checkpoints and explicit external-workspace observations.
 8. Make local clone/fork root-based while preserving explicit secret behavior.
 9. Implement full/view export and staged import, then thin transfer.
 10. Add placement epochs, repair, operator dry-run, and online rebalance.
