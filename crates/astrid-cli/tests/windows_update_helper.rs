@@ -19,6 +19,7 @@ const BINARIES: [&str; 4] = [
 const TEST_PARENT_ENV: &str = "ASTRID_WINDOWS_UPDATE_TEST_PARENT";
 const CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(25);
+static UPDATER_INTEGRATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Serialize)]
 struct Transaction {
@@ -61,6 +62,12 @@ impl Drop for DirectoryGuard {
 struct ChildGuard(std::process::Child);
 
 struct ProcessHandle(HANDLE);
+
+fn updater_integration_guard() -> std::sync::MutexGuard<'static, ()> {
+    UPDATER_INTEGRATION_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 // Exact handle ownership requires one audited Win32 close at this FFI edge.
 #[allow(unsafe_code)]
@@ -311,6 +318,7 @@ fn windows_update_test_parent() {
 
 #[test]
 fn real_hidden_helper_replaces_the_complete_executable_set() {
+    let _serial = updater_integration_guard();
     let (root, _root_guard) = private_test_root();
     let install = root.join("install");
     let transaction_id = uuid::Uuid::new_v4().simple().to_string();
@@ -407,6 +415,7 @@ fn real_hidden_helper_replaces_the_complete_executable_set() {
 
 #[test]
 fn tampered_payload_keeps_all_live_binaries_and_is_reported_by_real_cli() {
+    let _serial = updater_integration_guard();
     let (root, _root_guard) = private_test_root();
     let install = root.join("install");
     let transaction_id = uuid::Uuid::new_v4().simple().to_string();
@@ -504,6 +513,7 @@ fn tampered_payload_keeps_all_live_binaries_and_is_reported_by_real_cli() {
 
 #[test]
 fn ordinary_invocation_never_recovers_a_provisional_handoff() {
+    let _serial = updater_integration_guard();
     let (root, _root_guard) = private_test_root();
     let install = root.join("install");
     let transaction_id = uuid::Uuid::new_v4().simple().to_string();
@@ -561,6 +571,7 @@ fn ordinary_invocation_never_recovers_a_provisional_handoff() {
 
 #[test]
 fn ordinary_invocation_cleans_an_abandoned_provisional_handoff() {
+    let _serial = updater_integration_guard();
     let (root, _root_guard) = private_test_root();
     let install = root.join("install");
     let transaction_id = uuid::Uuid::new_v4().simple().to_string();
@@ -625,6 +636,7 @@ fn ordinary_invocation_cleans_an_abandoned_provisional_handoff() {
 
 #[test]
 fn ordinary_invocation_recovers_an_interrupted_update_before_dispatch() {
+    let _serial = updater_integration_guard();
     let (root, _root_guard) = private_test_root();
     let install = root.join("install");
     let transaction_id = uuid::Uuid::new_v4().simple().to_string();
