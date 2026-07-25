@@ -16,20 +16,19 @@ use std::process::Command;
 /// parent's ambient standard handles before `Command::spawn`: stable Rust
 /// otherwise passes every inheritable handle to the daemon in addition to the
 /// command's explicitly configured standard streams.
+#[cfg(windows)]
 pub(super) fn configure_background(command: &mut Command) -> std::io::Result<()> {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt as _;
+    use std::os::windows::process::CommandExt as _;
 
-        super::windows_process::prevent_ambient_standard_handle_inheritance()?;
-        command.creation_flags(background_creation_flags());
-    }
-
-    #[cfg(not(windows))]
-    let _ = command;
+    super::windows_process::prevent_ambient_standard_handle_inheritance()?;
+    command.creation_flags(background_creation_flags());
 
     Ok(())
 }
+
+/// Preserve the daemon binary's existing Unix-side background policy.
+#[cfg(not(windows))]
+pub(super) fn configure_background(_command: &mut Command) {}
 
 #[cfg(windows)]
 const fn background_creation_flags() -> u32 {

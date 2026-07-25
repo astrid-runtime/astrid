@@ -100,8 +100,11 @@ async fn spawn_daemon_inner(
     );
     let daemon_bin = find_companion_binary("astrid-daemon")?;
     let mut cmd = ephemeral_daemon_command(&daemon_bin, &ws);
+    #[cfg(windows)]
     daemon_process::configure_background(&mut cmd)
         .context("failed to secure the background daemon process boundary")?;
+    #[cfg(not(windows))]
+    daemon_process::configure_background(&mut cmd);
 
     // Capture the daemon's stderr to an append log so a boot failure (lock
     // contention, panic before tracing init) leaves a record instead of
@@ -571,8 +574,11 @@ pub(crate) async fn spawn_persistent_daemon() -> Result<()> {
     let daemon_bin = find_companion_binary("astrid-daemon")?;
 
     let mut cmd = persistent_daemon_command(&daemon_bin, &ws);
+    #[cfg(windows)]
     daemon_process::configure_background(&mut cmd)
         .context("failed to secure the background daemon process boundary")?;
+    #[cfg(not(windows))]
+    daemon_process::configure_background(&mut cmd);
 
     // Capture the daemon's stderr to an append log so a boot failure (lock
     // contention, panic before tracing init) leaves a record instead of
