@@ -47,13 +47,15 @@ where
     }
 }
 
-/// Resolves the current logical storage ceiling for one state owner.
+/// Resolves the current stable storage ceiling for one state owner.
 ///
 /// Quota policy remains outside the engine because the authoritative value can
 /// change while the process is running. `None` means that the owner is exempt
 /// from a principal quota, as is appropriate for kernel-owned system state.
+/// A projection may charge canonical principal-controlled metadata in addition
+/// to user-visible value bytes so zero-length values cannot bypass the ceiling.
 pub trait KvQuotaResolver<P>: Send + Sync {
-    /// Return the owner's current logical-byte ceiling.
+    /// Return the owner's current stable byte ceiling.
     ///
     /// # Errors
     ///

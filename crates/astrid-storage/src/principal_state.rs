@@ -26,7 +26,7 @@ const STORE_METADATA_FILE: &str = "store.meta";
 const STORE_METADATA: &[u8] = b"format=astrid-principal-store-v1\n\
 identity=blake3-object-identity-v1\n\
 principal-codec=state-owner-v1\n\
-projection=kv-tree-v2\n";
+projection=kv-tree-v3\n";
 
 mod migrations;
 
@@ -132,7 +132,9 @@ impl KvPrincipalResolver<StateOwner> for StateOwnerResolver {
             return Ok(StateOwner::System);
         };
         if capsule.is_empty() {
-            return Ok(StateOwner::System);
+            return Err(StorageError::InvalidKey(
+                "host-stamped capsule namespace has an empty capsule identifier".to_owned(),
+            ));
         }
         PrincipalId::new(principal.to_owned())
             .map(StateOwner::Principal)
@@ -387,7 +389,7 @@ mod tests {
     }
 
     #[test]
-    fn namespace_owner_does_not_guess_system_state_is_a_principal() {
+    fn namespace_owner_fails_closed_at_the_host_stamped_boundary() {
         let resolver = StateOwnerResolver;
         assert_eq!(
             resolver.resolve("system:identity").unwrap(),
@@ -397,10 +399,11 @@ mod tests {
             resolver.resolve("alice:capsule:shell").unwrap(),
             StateOwner::Principal(PrincipalId::new("alice").unwrap())
         );
-        assert_eq!(
-            resolver.resolve("alice:capsule:").unwrap(),
-            StateOwner::System
-        );
+        assert!(matches!(
+            resolver.resolve("alice:capsule:"),
+            Err(StorageError::InvalidKey(message))
+                if message.contains("empty capsule identifier")
+        ));
     }
 
     #[cfg(feature = "legacy-surrealkv")]
@@ -476,7 +479,7 @@ mod tests {
         let quota: Arc<dyn KvQuotaResolver<StateOwner>> = Arc::new(|owner: &StateOwner| {
             Ok(match owner {
                 StateOwner::System => None,
-                StateOwner::Principal(_) => Some(4),
+                StateOwner::Principal(_) => Some(27),
             })
         });
         let store = open_runtime_kv(&home, quota).await.unwrap();
@@ -487,16 +490,27 @@ mod tests {
             .unwrap();
         assert!(matches!(
             store.set("alice:capsule:shell", "two", b"5".to_vec()).await,
-            Err(StorageError::QuotaExceeded { used: 5, limit: 4 })
+            Err(StorageError::QuotaExceeded {
+                used: 51,
+                limit: 27
+            })
         ));
         store
             .set("alice:capsule:shell", "one", b"123".to_vec())
             .await
             .unwrap();
+        assert!(store.delete("alice:capsule:shell", "one").await.unwrap());
         store
-            .set("alice:capsule:shell", "two", b"4".to_vec())
+            .set("alice:capsule:shell", "two", b"1234".to_vec())
             .await
             .unwrap();
+        assert!(matches!(
+            store.set("alice:capsule:shell", "empty", Vec::new()).await,
+            Err(StorageError::QuotaExceeded {
+                used: 52,
+                limit: 27
+            })
+        ));
         store
             .set("system:identity", "unmetered", vec![0; 64])
             .await

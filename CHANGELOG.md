@@ -71,8 +71,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   validated principals and share their live, invalidatable profile quota.
   The principal store is an invariant rather than a configurable backend, has
   no fixed frame or capacity ceiling, and derives finite storage budgets from
-  the live principal profile. The misleading `kv` feature is replaced by the
-  temporary `legacy-surrealkv` reader and migrator.
+  the live principal profile. Quota accounting includes canonical namespace/key
+  bytes as well as values, so empty values cannot consume unmetered
+  principal-controlled metadata. The misleading `kv` feature is replaced by
+  the temporary `legacy-surrealkv` reader and migrator.
 - **Windows local transport uses authenticated per-user named pipes.** A pipe
   name derived only from the caller's operating-system SID replaces
   filesystem endpoint naming on Windows. Local-only byte-mode instances use a
