@@ -44,7 +44,7 @@
 pub mod error;
 pub mod identity;
 pub mod kv;
-#[cfg(all(feature = "legacy-surrealkv", not(target_family = "wasm")))]
+#[cfg(not(target_family = "wasm"))]
 pub mod principal_state;
 pub mod secret;
 
@@ -67,7 +67,7 @@ pub use secret::{FallbackSecretStore, KeychainSecretStore};
 
 #[cfg(feature = "legacy-surrealkv")]
 pub use kv::SurrealKvStore;
-#[cfg(all(feature = "legacy-surrealkv", not(target_family = "wasm")))]
+#[cfg(not(target_family = "wasm"))]
 pub use principal_state::{
     Blake3ObjectIdentityV1, PrincipalStoreBackend, PrincipalStoreOptions, StateOwner,
     StateOwnerCodecV1, StateOwnerResolver, open_runtime_kv,
