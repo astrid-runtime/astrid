@@ -166,19 +166,10 @@ pub(crate) fn generate_session_token() -> Result<(SessionToken, PathBuf), std::i
 /// Windows never falls back to a shared or drive-relative `/tmp` path.
 #[must_use]
 pub fn readiness_path() -> PathBuf {
-    match try_readiness_path() {
+    match platform_readiness_path(try_readiness_path()) {
         Ok(path) => path,
         Err(e) => {
-            #[cfg(windows)]
             panic!("Failed to resolve the private Windows ASTRID_HOME: {e}");
-            #[cfg(not(windows))]
-            {
-                warn!(
-                    error = %e,
-                    "Failed to resolve ASTRID_HOME; falling back to /tmp/.astrid/run/system.ready"
-                );
-                PathBuf::from("/tmp/.astrid/run/system.ready")
-            }
         },
     }
 }
@@ -191,6 +182,24 @@ pub fn readiness_path() -> PathBuf {
 pub fn try_readiness_path() -> std::io::Result<PathBuf> {
     use astrid_core::dirs::AstridHome;
     AstridHome::resolve().map(|home| home.ready_path())
+}
+
+fn platform_readiness_path(resolved: std::io::Result<PathBuf>) -> std::io::Result<PathBuf> {
+    #[cfg(windows)]
+    {
+        resolved
+    }
+
+    #[cfg(not(windows))]
+    {
+        Ok(resolved.unwrap_or_else(|error| {
+            warn!(
+                %error,
+                "Failed to resolve ASTRID_HOME; falling back to /tmp/.astrid/run/system.ready"
+            );
+            PathBuf::from("/tmp/.astrid/run/system.ready")
+        }))
+    }
 }
 
 /// Write the readiness sentinel file to signal that the daemon is fully
@@ -220,7 +229,7 @@ pub fn write_readiness_file_for_workspace(
     workspace_root: &std::path::Path,
     workspace_layout: &astrid_core::dirs::WorkspaceLayout,
 ) -> Result<(), std::io::Error> {
-    let path = try_readiness_path()?;
+    let path = platform_readiness_path(try_readiness_path())?;
     let fingerprint = astrid_core::dirs::checked_workspace_selection_fingerprint(
         workspace_root,
         workspace_layout,
@@ -275,7 +284,7 @@ fn publish_readiness_metadata(path: &std::path::Path, metadata: &str) -> std::io
 /// ignored - a missing file is not an error, and if removal fails the
 /// CLI's pre-spawn cleanup will handle it on next boot.
 pub fn remove_readiness_file() {
-    match try_readiness_path() {
+    match platform_readiness_path(try_readiness_path()) {
         Ok(path) => {
             let _ = std::fs::remove_file(path);
         },
@@ -522,6 +531,23 @@ mod tests {
         expected.sort();
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn readiness_publication_preserves_the_platform_resolution_policy() {
+        let unresolved = Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no private home",
+        ));
+        let result = platform_readiness_path(unresolved);
+
+        #[cfg(windows)]
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+        #[cfg(not(windows))]
+        assert_eq!(
+            result.unwrap(),
+            std::path::PathBuf::from("/tmp/.astrid/run/system.ready")
+        );
     }
 
     #[test]
