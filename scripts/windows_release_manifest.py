@@ -8,7 +8,7 @@ import hashlib
 import pathlib
 import sys
 import tomllib
-from typing import Any
+from typing import Any, NoReturn
 
 import release_manifest
 
@@ -29,7 +29,7 @@ ROOT_KEYS = {
 LEGACY_RELEASE_KEYS = {"metadata-asset", "metadata-blake3"}
 
 
-def fail(message: str) -> "NoReturn":
+def fail(message: str) -> NoReturn:
     raise ValueError(message)
 
 

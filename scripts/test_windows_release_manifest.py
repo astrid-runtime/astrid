@@ -8,6 +8,7 @@ import hashlib
 import io
 import pathlib
 import tempfile
+import typing
 import unittest
 from unittest import mock
 
@@ -18,6 +19,12 @@ import windows_release_manifest
 VERSION = "1.2.3"
 COMMIT = "a" * 40
 CONTRACTS_COMMIT = "b" * 40
+
+
+class WindowsReleaseManifestTypingTests(unittest.TestCase):
+    def test_fail_return_annotation_resolves_to_no_return(self) -> None:
+        hints = typing.get_type_hints(windows_release_manifest.fail)
+        self.assertIs(hints["return"], typing.NoReturn)
 
 
 def fake_blake3(path: pathlib.Path) -> str:
