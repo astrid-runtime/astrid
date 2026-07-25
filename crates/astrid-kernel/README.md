@@ -9,13 +9,19 @@ In the OS model, this is `init`. It boots every subsystem, binds the Unix socket
 
 ## What it owns
 
-The `Kernel` struct holds every system-wide resource: `EventBus`, `CapsuleRegistry`, `SecureMcpClient`, `CapabilityStore`, `OverlayVfs`, `SurrealKvStore`, `AuditLog`, `AllowanceStore`, `SessionToken`, and an `IdentityStore`. All fields are `pub`. One struct, one owner, no ambient state.
+The `Kernel` struct holds every system-wide resource: `EventBus`,
+`CapsuleRegistry`, `SecureMcpClient`, `CapabilityStore`, `OverlayVfs`, the
+injected `KvStore`, `AuditLog`, `AllowanceStore`, `SessionToken`, and an
+`IdentityStore`. Native boot injects `TreeKvStore` over the authoritative
+durable principal store. All fields are `pub`. One struct, one owner, no
+ambient state.
 
 ## Boot sequence
 
 `Kernel::new(session_id, workspace_root)` runs the full boot:
 
-1. Resolve `~/.astrid/` (or `$ASTRID_HOME`). Open persistent KV store.
+1. Resolve `~/.astrid/` (or `$ASTRID_HOME`). Open and migrate the authoritative
+   durable principal store.
 2. Initialize the MCP process manager with workspace-scoped sandboxing.
 3. Bootstrap the capability store (ed25519 key pair) and chain-linked audit log.
 4. Mount the copy-on-write VFS overlay. Writes land in a session-scoped `TempDir`. The real workspace is read-only until explicit commit.

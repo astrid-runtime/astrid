@@ -112,12 +112,10 @@ impl kv::Host for HostState {
         expected: Option<Vec<u8>>,
         new: Vec<u8>,
     ) -> Result<(), ErrorCode> {
-        // Atomic compare-and-swap is delegated to the storage layer.
-        // `MemoryKvStore` serializes the read+conditional-write under a
-        // single write lock; `SurrealKvStore` issues one MVCC
-        // transaction and treats commit conflicts as `Ok(false)` so a
-        // concurrent capsule's commit invalidates this caller's
-        // `expected` rather than overwriting the new value.
+        // Atomic compare-and-swap is delegated to the storage layer. Every
+        // `KvStore` implementation must make the comparison and mutation one
+        // linearizable operation. A concurrent capsule's winning commit
+        // invalidates this caller's `expected` rather than being overwritten.
         //
         // The storage layer reports mismatch via `Ok(false)`; the WIT
         // contract surfaces mismatch via `Err(ErrorCode::CasMismatch)`.
