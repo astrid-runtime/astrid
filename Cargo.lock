@@ -571,6 +571,7 @@ dependencies = [
  "directories",
  "getrandom 0.4.3",
  "hex",
+ "libc",
  "nix 0.31.3",
  "rand 0.10.2",
  "serde",
