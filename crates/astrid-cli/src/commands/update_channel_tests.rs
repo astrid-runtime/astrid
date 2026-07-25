@@ -495,7 +495,7 @@ impl ExtensionMetadataSource for RecordingMuslMetadataSource {
 }
 
 #[tokio::test]
-async fn target_resolver_fetches_and_authenticates_only_platform_extensions() {
+async fn target_resolver_avoids_extensions_for_legacy_and_authenticates_musl() {
     let legacy = release_manifest();
     let value = pointer(UpdateChannel::Stable, 1);
     let extension = musl_extension(&value, &legacy);
@@ -559,7 +559,12 @@ async fn target_resolver_fetches_and_authenticates_only_platform_extensions() {
             .load(std::sync::atomic::Ordering::SeqCst),
         1
     );
+}
 
+#[tokio::test]
+async fn target_resolver_fetches_and_authenticates_windows_extension() {
+    let legacy = release_manifest();
+    let value = pointer(UpdateChannel::Stable, 1);
     let windows_metadata_name = windows_metadata_asset(VERSION);
     let windows_metadata_url = format!("https://release.example/{windows_metadata_name}");
     let windows_bundle_url = format!("{windows_metadata_url}.sigstore.json");
