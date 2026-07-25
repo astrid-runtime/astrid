@@ -31,6 +31,7 @@ mod scoped;
 #[cfg(feature = "legacy-surrealkv")]
 mod surreal;
 mod tree;
+mod tree_error;
 #[cfg(test)]
 mod tree_tests;
 

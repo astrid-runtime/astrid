@@ -105,8 +105,11 @@ allocation, so parser safety does not create a hidden deployment quota. The
 same invalidatable `PrincipalProfileCache` supplies capsule runtime and storage
 limits, so admin quota changes affect the next mutation. The default storage
 budget is the largest positive TOML integer—reported as `unlimited`—and finite
-operator budgets reject only growth above the ceiling, allowing an over-budget
-principal to delete or shrink state.
+operator budgets charge user-visible values plus canonical namespace/key bytes.
+This keeps empty values from creating free, unbounded principal-controlled
+metadata. Growth above the ceiling is rejected while an over-budget principal
+may still delete or shrink state; host structural overhead remains governed by
+operator pool capacity and watermarks.
 
 ## First durable host-file realization
 

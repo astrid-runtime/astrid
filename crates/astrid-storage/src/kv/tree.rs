@@ -5,7 +5,6 @@
 //! stores composite namespace/key entries in a persistent AVL tree. A point
 //! mutation copies one search path plus at most a constant number of rotation
 //! nodes, then publishes one principal-root CAS.
-
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -22,13 +21,13 @@ use async_trait::async_trait;
 #[cfg(all(feature = "legacy-surrealkv", not(target_family = "wasm")))]
 use super::KvEntry;
 use super::principal::{KvPrincipalResolver, KvQuotaResolver};
+use super::tree_error::{exact_owned_reference, invalid, map_engine};
 use super::{
     KvStore, composite_key, namespace_range_end, namespace_range_start, prefix_range_end,
     validate_key, validate_namespace, validate_prefix,
 };
 use crate::error::{StorageError, StorageResult};
-
-const FORMAT_VERSION: ObjectFormatVersion = match ObjectFormatVersion::new(2) {
+const FORMAT_VERSION: ObjectFormatVersion = match ObjectFormatVersion::new(3) {
     Some(version) => version,
     None => unreachable!(),
 };
@@ -39,7 +38,7 @@ const RIGHT_LABEL: &[u8] = b"right";
 const ROOT_LABEL: &[u8] = b"root";
 const STATE_LABEL: &[u8] = b"state";
 const VALUE_LABEL: &[u8] = b"value";
-const NODE_FIXED_BYTES: usize = 20;
+const NODE_FIXED_BYTES: usize = 28;
 
 /// Production point-operation KV adapter over a persistent balanced tree.
 pub struct TreeKvStore<P: Ord, I, R, E> {
@@ -127,15 +126,16 @@ where
             if !changed {
                 return Ok(result);
             }
-            let used = context.total(tree)?;
+            let logical_bytes = context.logical_total(tree)?;
+            let used = context.quota_total(tree)?;
             if let Some(quota) = &self.quota
                 && let Some(limit) = quota.max_logical_bytes(owner)?
                 && used > limit
-                && used > header.logical_bytes
+                && used > header.quota_bytes
             {
                 return Err(StorageError::QuotaExceeded { used, limit });
             }
-            let transaction = context.finish(header, tree, used)?;
+            let transaction = context.finish(header, tree, logical_bytes, used)?;
             match self.engine.commit_kv_root(transaction) {
                 Ok(_) => return Ok(result),
                 Err(KvProjectionError::Model(ModelError::RootConflict { .. })) => {},
@@ -346,7 +346,7 @@ struct TreeHeader<P> {
     owner: P,
     root: Option<RootState>,
     tree: Option<ObjectId>,
-    logical_bytes: u64,
+    quota_bytes: u64,
     preserved_state: Vec<ObjectReference>,
     preserved_commit: Vec<ObjectReference>,
 }
@@ -357,7 +357,7 @@ impl<P> TreeHeader<P> {
             owner,
             root: None,
             tree: None,
-            logical_bytes: 0,
+            quota_bytes: 0,
             preserved_state: Vec::new(),
             preserved_commit: Vec::new(),
         }
@@ -366,6 +366,7 @@ impl<P> TreeHeader<P> {
 
 fn decode_header<P, E>(engine: &E, owner: P, root: RootState) -> StorageResult<TreeHeader<P>>
 where
+    P: Ord,
     E: KvProjectionEngine<P>,
 {
     let commit = load_typed(engine, root.commit, ObjectKind::Commit)?;
@@ -375,9 +376,17 @@ where
     require_structural(state_id, &state)?;
     let wrapper_id = owned_target(state_id, &state, KV_LABEL)?;
     let wrapper = load_typed(engine, wrapper_id, ObjectKind::NamespaceMap)?;
-    if !wrapper.canonical_bytes().is_empty() || wrapper.class() != ObjectClass::Metadata {
+    if wrapper.canonical_bytes().len() != std::mem::size_of::<u64>()
+        || wrapper.class() != ObjectClass::Metadata
+    {
         return Err(invalid(wrapper_id, "invalid KV tree root wrapper"));
     }
+    let quota_bytes = u64::from_le_bytes(
+        wrapper
+            .canonical_bytes()
+            .try_into()
+            .map_err(|_| invalid(wrapper_id, "invalid KV tree quota total"))?,
+    );
     let tree = match wrapper.reference(&ReferenceLabel::new(ROOT_LABEL)) {
         None if wrapper.references().is_empty() => None,
         Some(reference)
@@ -387,6 +396,12 @@ where
         },
         _ => return Err(invalid(wrapper_id, "invalid KV tree root reference")),
     };
+    let mut context = TreeContext::<P, E>::new(engine);
+    if context.logical_total(tree)? != wrapper.logical_bytes()
+        || context.quota_total(tree)? != quota_bytes
+    {
+        return Err(invalid(wrapper_id, "KV tree accounting totals disagree"));
+    }
     let preserved_state = state
         .references()
         .iter()
@@ -406,7 +421,7 @@ where
         owner,
         root: Some(root),
         tree,
-        logical_bytes: wrapper.logical_bytes(),
+        quota_bytes,
         preserved_state,
         preserved_commit,
     })
@@ -454,7 +469,8 @@ struct TreeNode {
     left: Option<ObjectId>,
     right: Option<ObjectId>,
     height: u32,
-    total: u64,
+    logical_total: u64,
+    quota_total: u64,
 }
 
 struct TreeContext<'a, P, E> {
@@ -534,13 +550,18 @@ where
                 .try_into()
                 .map_err(|_| invalid(id, "invalid KV node height"))?,
         );
-        let total = u64::from_le_bytes(
+        let logical_total = u64::from_le_bytes(
             bytes[4..12]
                 .try_into()
-                .map_err(|_| invalid(id, "invalid KV node total"))?,
+                .map_err(|_| invalid(id, "invalid KV node logical total"))?,
+        );
+        let quota_total = u64::from_le_bytes(
+            bytes[12..20]
+                .try_into()
+                .map_err(|_| invalid(id, "invalid KV node quota total"))?,
         );
         let value_len = u64::from_le_bytes(
-            bytes[12..20]
+            bytes[20..28]
                 .try_into()
                 .map_err(|_| invalid(id, "invalid KV node value length"))?,
         );
@@ -565,7 +586,8 @@ where
             left,
             right,
             height,
-            total,
+            logical_total,
+            quota_total,
         };
         self.nodes.insert(id, node.clone());
         Ok(node)
@@ -575,8 +597,12 @@ where
         node.map_or(Ok(0), |id| self.node(id).map(|node| node.height))
     }
 
-    fn total(&mut self, node: Option<ObjectId>) -> StorageResult<u64> {
-        node.map_or(Ok(0), |id| self.node(id).map(|node| node.total))
+    fn logical_total(&mut self, node: Option<ObjectId>) -> StorageResult<u64> {
+        node.map_or(Ok(0), |id| self.node(id).map(|node| node.logical_total))
+    }
+
+    fn quota_total(&mut self, node: Option<ObjectId>) -> StorageResult<u64> {
+        node.map_or(Ok(0), |id| self.node(id).map(|node| node.quota_total))
     }
 
     fn make_node(
@@ -592,15 +618,25 @@ where
             .max(self.height(right)?)
             .checked_add(1)
             .ok_or_else(|| StorageError::Internal("KV tree height overflow".to_owned()))?;
-        let left_total = self.total(left)?;
-        let right_total = self.total(right)?;
-        let total = left_total
+        let left_logical = self.logical_total(left)?;
+        let right_logical = self.logical_total(right)?;
+        let logical_total = left_logical
             .checked_add(value_len)
-            .and_then(|sum| sum.checked_add(right_total))
+            .and_then(|sum| sum.checked_add(right_logical))
             .ok_or_else(|| StorageError::Internal("KV tree logical bytes overflow".to_owned()))?;
+        let key_len = u64::try_from(key.len())
+            .map_err(|_| StorageError::Internal("KV tree key length overflow".to_owned()))?;
+        let left_quota = self.quota_total(left)?;
+        let right_quota = self.quota_total(right)?;
+        let quota_total = left_quota
+            .checked_add(value_len)
+            .and_then(|sum| sum.checked_add(key_len))
+            .and_then(|sum| sum.checked_add(right_quota))
+            .ok_or_else(|| StorageError::Internal("KV tree quota bytes overflow".to_owned()))?;
         let mut bytes = Vec::with_capacity(NODE_FIXED_BYTES.saturating_add(key.len()));
         bytes.extend_from_slice(&height.to_le_bytes());
-        bytes.extend_from_slice(&total.to_le_bytes());
+        bytes.extend_from_slice(&logical_total.to_le_bytes());
+        bytes.extend_from_slice(&quota_total.to_le_bytes());
         bytes.extend_from_slice(&value_len.to_le_bytes());
         bytes.extend_from_slice(&key);
         let mut references = vec![ObjectReference::owns(VALUE_LABEL.to_vec().into(), value)];
@@ -630,7 +666,8 @@ where
                 left,
                 right,
                 height,
-                total,
+                logical_total,
+                quota_total,
             },
         );
         Ok(id)
@@ -888,6 +925,7 @@ where
         header: TreeHeader<P>,
         tree: Option<ObjectId>,
         logical_bytes: u64,
+        quota_bytes: u64,
     ) -> StorageResult<RootTransaction<P>> {
         let references = tree
             .map(|tree| vec![ObjectReference::owns(ROOT_LABEL.to_vec().into(), tree)])
@@ -895,7 +933,7 @@ where
         let wrapper = ObjectRecord::new(
             ObjectKind::NamespaceMap,
             FORMAT_VERSION,
-            Vec::new(),
+            quota_bytes.to_le_bytes().to_vec(),
             references,
             logical_bytes,
             ObjectClass::Metadata,
@@ -959,26 +997,4 @@ where
         }
         self.records.retain(|id, _| reachable.contains(id));
     }
-}
-
-fn exact_owned_reference(
-    id: ObjectId,
-    record: &ObjectRecord,
-    label: &[u8],
-    required: bool,
-) -> StorageResult<Option<ObjectId>> {
-    match record.reference(&ReferenceLabel::new(label)) {
-        Some(reference) if reference.kind() == ReferenceKind::Owns => Ok(Some(reference.target())),
-        Some(_) => Err(invalid(id, "KV tree reference is not owning")),
-        None if required => Err(invalid(id, "required KV tree reference is missing")),
-        None => Ok(None),
-    }
-}
-
-fn map_engine(error: &KvProjectionError) -> StorageError {
-    StorageError::Internal(format!("persistent KV tree: {error}"))
-}
-
-fn invalid(id: ObjectId, detail: &'static str) -> StorageError {
-    StorageError::Serialization(format!("invalid persistent KV object {id:?}: {detail}"))
 }
