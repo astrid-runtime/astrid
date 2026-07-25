@@ -3717,6 +3717,59 @@ mod tests {
     use astrid_capsule_types::error::CapsuleResult;
     use astrid_capsule_types::manifest::CapsuleManifest;
 
+    struct PrivateKernelTestHome {
+        home: astrid_core::dirs::AstridHome,
+        #[cfg(not(windows))]
+        _temporary: tempfile::TempDir,
+    }
+
+    impl PrivateKernelTestHome {
+        fn new() -> Self {
+            #[cfg(windows)]
+            {
+                // `%TEMP%` on hosted runners intentionally inherits a broad
+                // ACL. Build the test boundary under LocalAppData so the same
+                // fail-closed home contract used by production can provision
+                // an exact private DACL from a trusted ancestor.
+                let runtime_root = astrid_core::platform_fs::default_astrid_home_root()
+                    .expect("resolve Windows LocalAppData");
+                let local_app_data = runtime_root
+                    .parent()
+                    .and_then(std::path::Path::parent)
+                    .expect("Astrid runtime root is below Windows LocalAppData");
+                let root = local_app_data.join(format!(
+                    "AstridKernelTest-{}",
+                    uuid::Uuid::new_v4().simple()
+                ));
+                astrid_core::platform_fs::ensure_private_directory(&root)
+                    .expect("create private Windows kernel test home");
+                Self {
+                    home: astrid_core::dirs::AstridHome::from_path(root),
+                }
+            }
+
+            #[cfg(not(windows))]
+            {
+                let temporary = tempfile::tempdir().expect("create kernel test home");
+                Self {
+                    home: astrid_core::dirs::AstridHome::from_path(temporary.path()),
+                    _temporary: temporary,
+                }
+            }
+        }
+
+        fn home(&self) -> astrid_core::dirs::AstridHome {
+            self.home.clone()
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for PrivateKernelTestHome {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(self.home.root());
+        }
+    }
+
     #[test]
     fn persistent_idle_monitor_stops_after_ephemeral_mode_is_enabled() {
         let ephemeral = AtomicBool::new(false);
@@ -4239,9 +4292,8 @@ mod tests {
 
     #[tokio::test]
     async fn ephemeral_shutdown_waits_for_the_final_client_disconnect() {
-        let root = tempfile::tempdir().unwrap();
-        let home = astrid_core::dirs::AstridHome::from_path(root.path());
-        let kernel = super::test_kernel_with_home(home).await;
+        let home = PrivateKernelTestHome::new();
+        let kernel = super::test_kernel_with_home(home.home()).await;
         let alice = astrid_core::PrincipalId::new("alice").unwrap();
         let bob = astrid_core::PrincipalId::new("bob").unwrap();
         let shutdown = kernel.shutdown_tx.subscribe();
@@ -4258,9 +4310,8 @@ mod tests {
 
     #[tokio::test]
     async fn persistent_kernel_does_not_shutdown_on_last_disconnect() {
-        let root = tempfile::tempdir().unwrap();
-        let home = astrid_core::dirs::AstridHome::from_path(root.path());
-        let kernel = super::test_kernel_with_home(home).await;
+        let home = PrivateKernelTestHome::new();
+        let kernel = super::test_kernel_with_home(home.home()).await;
         let alice = astrid_core::PrincipalId::new("alice").unwrap();
         let shutdown = kernel.shutdown_tx.subscribe();
 
@@ -4272,9 +4323,8 @@ mod tests {
 
     #[tokio::test]
     async fn never_connected_fallback_starts_only_when_explicitly_armed() {
-        let root = tempfile::tempdir().unwrap();
-        let home = astrid_core::dirs::AstridHome::from_path(root.path());
-        let kernel = super::test_kernel_with_home(home).await;
+        let home = PrivateKernelTestHome::new();
+        let kernel = super::test_kernel_with_home(home.home()).await;
         let shutdown = kernel.shutdown_tx.subscribe();
 
         kernel.set_ephemeral(true);
