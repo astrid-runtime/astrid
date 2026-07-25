@@ -14,6 +14,8 @@ use astrid_storage_model::{
 };
 
 use crate::{CommitOutcome, InMemoryEngine, RootSnapshot, RootTransaction};
+#[cfg(not(target_family = "wasm"))]
+use crate::{DurableEngine, DurableError, PrincipalCodec};
 
 const FORMAT_VERSION: ObjectFormatVersion = ObjectFormatVersion::new(1);
 const KV_LABEL: &[u8] = b"kv";
@@ -142,7 +144,26 @@ impl KvState {
         self.namespaces.is_empty()
     }
 
-    fn logical_bytes(&self) -> Result<u64, KvProjectionError> {
+    /// Iterate over every namespace, key, and value in canonical order.
+    pub fn entries(&self) -> impl Iterator<Item = (&str, &str, &[u8])> {
+        self.namespaces.iter().flat_map(|(namespace, entries)| {
+            entries
+                .iter()
+                .map(move |(key, value)| (namespace.as_str(), key.as_str(), value.as_slice()))
+        })
+    }
+
+    /// Return the user-visible value bytes represented by this state.
+    ///
+    /// Namespace and key metadata are intentionally excluded. The result is
+    /// the same stable quantity recorded on the typed namespace-map object and
+    /// is suitable for enforcing a principal's logical storage budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KvProjectionError::LogicalBytesOverflow`] when the sum cannot
+    /// be represented by the accounting type.
+    pub fn logical_bytes(&self) -> Result<u64, KvProjectionError> {
         self.namespaces
             .values()
             .flat_map(BTreeMap::values)
@@ -220,6 +241,8 @@ pub enum KvProjectionError {
     },
     /// Summed user-visible KV bytes exceeded the accounting type.
     LogicalBytesOverflow,
+    /// The underlying durable engine failed outside the portable model.
+    Engine(String),
 }
 
 impl fmt::Display for KvProjectionError {
@@ -245,6 +268,7 @@ impl fmt::Display for KvProjectionError {
                 )
             },
             Self::LogicalBytesOverflow => formatter.write_str("KV logical-byte total overflowed"),
+            Self::Engine(error) => write!(formatter, "KV projection engine: {error}"),
         }
     }
 }
@@ -257,7 +281,134 @@ impl From<ModelError> for KvProjectionError {
     }
 }
 
-impl<P: Ord, I> InMemoryEngine<P, I> {
+/// Minimal engine contract required by the typed key/value projection.
+///
+/// This keeps the compatibility adapter independent of whether the principal
+/// world is held in memory or reconstructed lazily from a durable arena.
+pub trait KvProjectionEngine<P>: Send + Sync {
+    /// Compute the logical identity of one canonical object.
+    fn identify_kv_object(&self, record: &ObjectRecord) -> ObjectId;
+
+    /// Return the current root of one principal without materializing it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an engine error when the root index is unavailable.
+    fn current_kv_root(&self, principal: &P) -> Result<Option<RootState>, KvProjectionError>;
+
+    /// Load one immutable object by identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an engine or frame error when the object cannot be read.
+    fn load_kv_object(&self, id: ObjectId) -> Result<Option<ObjectRecord>, KvProjectionError>;
+
+    /// Capture one principal's root and owning closure.
+    ///
+    /// # Errors
+    ///
+    /// Returns an engine or graph error when the closure cannot be captured.
+    fn snapshot_kv_root(&self, principal: &P) -> Result<Option<RootSnapshot>, KvProjectionError>;
+
+    /// Atomically publish one encoded key/value transition.
+    ///
+    /// # Errors
+    ///
+    /// Returns an engine, graph, identity, or root-conflict error.
+    fn commit_kv_root(
+        &self,
+        transaction: RootTransaction<P>,
+    ) -> Result<CommitOutcome, KvProjectionError>;
+
+    /// Flush authoritative engine state before the embedding store closes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an engine I/O or recovery-required error.
+    fn flush_kv(&self) -> Result<(), KvProjectionError>;
+}
+
+impl<P, I> KvProjectionEngine<P> for InMemoryEngine<P, I>
+where
+    P: Clone + Ord + Send + Sync,
+    I: ObjectIdentity + Send + Sync,
+{
+    fn identify_kv_object(&self, record: &ObjectRecord) -> ObjectId {
+        self.identify(record)
+    }
+
+    fn current_kv_root(&self, principal: &P) -> Result<Option<RootState>, KvProjectionError> {
+        Ok(self.root(principal))
+    }
+
+    fn load_kv_object(&self, id: ObjectId) -> Result<Option<ObjectRecord>, KvProjectionError> {
+        Ok(self.object(id))
+    }
+
+    fn snapshot_kv_root(&self, principal: &P) -> Result<Option<RootSnapshot>, KvProjectionError> {
+        self.snapshot(principal).map_err(Into::into)
+    }
+
+    fn commit_kv_root(
+        &self,
+        transaction: RootTransaction<P>,
+    ) -> Result<CommitOutcome, KvProjectionError> {
+        self.commit(transaction).map_err(Into::into)
+    }
+
+    fn flush_kv(&self) -> Result<(), KvProjectionError> {
+        Ok(())
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl<P, I, C> KvProjectionEngine<P> for DurableEngine<P, I, C>
+where
+    P: Clone + Ord + Send + Sync,
+    I: ObjectIdentity + Send + Sync,
+    C: PrincipalCodec<P> + Send + Sync,
+{
+    fn identify_kv_object(&self, record: &ObjectRecord) -> ObjectId {
+        self.identify(record)
+    }
+
+    fn current_kv_root(&self, principal: &P) -> Result<Option<RootState>, KvProjectionError> {
+        self.root(principal).map_err(map_durable_error)
+    }
+
+    fn load_kv_object(&self, id: ObjectId) -> Result<Option<ObjectRecord>, KvProjectionError> {
+        self.object(id).map_err(map_durable_error)
+    }
+
+    fn snapshot_kv_root(&self, principal: &P) -> Result<Option<RootSnapshot>, KvProjectionError> {
+        self.snapshot(principal).map_err(map_durable_error)
+    }
+
+    fn commit_kv_root(
+        &self,
+        transaction: RootTransaction<P>,
+    ) -> Result<CommitOutcome, KvProjectionError> {
+        self.commit(transaction).map_err(map_durable_error)
+    }
+
+    fn flush_kv(&self) -> Result<(), KvProjectionError> {
+        self.flush().map_err(map_durable_error)
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn map_durable_error(error: DurableError) -> KvProjectionError {
+    match error {
+        DurableError::Model(model) => KvProjectionError::Model(model),
+        other => KvProjectionError::Engine(other.to_string()),
+    }
+}
+
+impl<P, I> InMemoryEngine<P, I>
+where
+    P: Clone + Ord + Send + Sync,
+    I: ObjectIdentity + Send + Sync,
+{
     /// Decode one principal's current key/value projection under a consistent
     /// root snapshot.
     ///
@@ -266,20 +417,15 @@ impl<P: Ord, I> InMemoryEngine<P, I> {
     /// Returns a graph or typed-format error when the current root cannot be
     /// interpreted as the version-one projection grammar.
     pub fn kv_snapshot(&self, principal: P) -> Result<KvStateSnapshot<P>, KvProjectionError> {
-        let Some(snapshot) = self.snapshot(&principal)? else {
-            return Ok(KvStateSnapshot {
-                principal,
-                root: None,
-                state: KvState::new(),
-                preserved_components: Vec::new(),
-                preserved_commit_references: Vec::new(),
-            });
-        };
-        decode_snapshot(principal, &snapshot)
+        kv_snapshot_with_engine(self, principal)
     }
 }
 
-impl<P: Ord, I: ObjectIdentity> InMemoryEngine<P, I> {
+impl<P, I> InMemoryEngine<P, I>
+where
+    P: Clone + Ord + Send + Sync,
+    I: ObjectIdentity + Send + Sync,
+{
     /// Atomically replace the KV component in a previously captured snapshot.
     ///
     /// The snapshot's exact root is used as the compare-and-swap expectation.
@@ -294,9 +440,81 @@ impl<P: Ord, I: ObjectIdentity> InMemoryEngine<P, I> {
         &self,
         snapshot: KvStateSnapshot<P>,
     ) -> Result<CommitOutcome, KvProjectionError> {
-        let transaction = encode_transaction(self, snapshot)?;
-        self.commit(transaction).map_err(Into::into)
+        commit_kv_with_engine(self, snapshot)
     }
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl<P, I, C> DurableEngine<P, I, C>
+where
+    P: Clone + Ord + Send + Sync,
+    I: ObjectIdentity + Send + Sync,
+    C: PrincipalCodec<P> + Send + Sync,
+{
+    /// Decode one principal's current key/value projection from the durable
+    /// arena under a consistent root snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns a durable-engine, graph, or typed-format error.
+    pub fn kv_snapshot(&self, principal: P) -> Result<KvStateSnapshot<P>, KvProjectionError> {
+        kv_snapshot_with_engine(self, principal)
+    }
+
+    /// Atomically replace the durable key/value component captured by
+    /// `snapshot`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a durable-engine, identity, graph, format, or root-conflict
+    /// error.
+    pub fn commit_kv(
+        &self,
+        snapshot: KvStateSnapshot<P>,
+    ) -> Result<CommitOutcome, KvProjectionError> {
+        commit_kv_with_engine(self, snapshot)
+    }
+}
+
+/// Decode one principal's key/value projection through an arbitrary engine.
+///
+/// # Errors
+///
+/// Returns an engine, graph, or typed-format error.
+pub fn kv_snapshot_with_engine<P, E>(
+    engine: &E,
+    principal: P,
+) -> Result<KvStateSnapshot<P>, KvProjectionError>
+where
+    E: KvProjectionEngine<P>,
+{
+    let Some(snapshot) = engine.snapshot_kv_root(&principal)? else {
+        return Ok(KvStateSnapshot {
+            principal,
+            root: None,
+            state: KvState::new(),
+            preserved_components: Vec::new(),
+            preserved_commit_references: Vec::new(),
+        });
+    };
+    decode_snapshot(principal, &snapshot)
+}
+
+/// Commit a captured key/value projection through an arbitrary engine.
+///
+/// # Errors
+///
+/// Returns an engine, identity, graph, typed-format, or root-conflict error.
+pub fn commit_kv_with_engine<P, E>(
+    engine: &E,
+    snapshot: KvStateSnapshot<P>,
+) -> Result<CommitOutcome, KvProjectionError>
+where
+    P: Ord,
+    E: KvProjectionEngine<P>,
+{
+    let transaction = encode_transaction(engine, snapshot)?;
+    engine.commit_kv_root(transaction)
 }
 
 fn decode_snapshot<P>(
@@ -404,8 +622,8 @@ fn decode_namespace_map(
     Ok(state)
 }
 
-fn encode_transaction<P: Ord, I: ObjectIdentity>(
-    engine: &InMemoryEngine<P, I>,
+fn encode_transaction<P: Ord, E: KvProjectionEngine<P>>(
+    engine: &E,
     snapshot: KvStateSnapshot<P>,
 ) -> Result<RootTransaction<P>, KvProjectionError> {
     let KvStateSnapshot {
@@ -503,12 +721,12 @@ fn encode_transaction<P: Ord, I: ObjectIdentity>(
     ))
 }
 
-fn insert_identified<P: Ord, I: ObjectIdentity>(
-    engine: &InMemoryEngine<P, I>,
+fn insert_identified<P, E: KvProjectionEngine<P>>(
+    engine: &E,
     records: &mut BTreeMap<ObjectId, ObjectRecord>,
     record: ObjectRecord,
 ) -> Result<ObjectId, KvProjectionError> {
-    let id = engine.identify(&record);
+    let id = engine.identify_kv_object(&record);
     match records.get(&id) {
         Some(existing) if existing == &record => {},
         Some(_) => return Err(ModelError::ObjectCollision(id).into()),
@@ -627,326 +845,5 @@ const fn invalid(object: ObjectId, detail: &'static str) -> KvProjectionError {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[derive(Clone, Copy, Debug)]
-    struct TestIdentity;
-
-    impl ObjectIdentity for TestIdentity {
-        fn identify(&self, record: &ObjectRecord) -> ObjectId {
-            let mut hasher =
-                blake3::Hasher::new_derive_key("astrid storage engine KV projection test v1");
-            hasher.update(&record.kind().code().to_le_bytes());
-            hasher.update(&record.format_version().get().to_le_bytes());
-            hasher.update(&(record.canonical_bytes().len() as u128).to_le_bytes());
-            hasher.update(record.canonical_bytes());
-            hasher.update(&record.logical_bytes().to_le_bytes());
-            hasher.update(&[record.class().code()]);
-            hasher.update(&(record.references().len() as u128).to_le_bytes());
-            for reference in record.references() {
-                hasher.update(&(reference.label().len() as u128).to_le_bytes());
-                hasher.update(reference.label());
-                hasher.update(reference.target().as_bytes());
-                hasher.update(&[reference.kind().code()]);
-            }
-            ObjectId::new(*hasher.finalize().as_bytes())
-        }
-    }
-
-    fn identified(
-        engine: &InMemoryEngine<String, TestIdentity>,
-        records: &mut BTreeMap<ObjectId, ObjectRecord>,
-        record: ObjectRecord,
-    ) -> ObjectId {
-        let id = engine.identify(&record);
-        records.insert(id, record);
-        id
-    }
-
-    #[test]
-    fn projection_round_trips_namespaces_and_values() {
-        let engine = InMemoryEngine::new(TestIdentity);
-        let mut snapshot = engine.kv_snapshot("alice".to_owned()).unwrap();
-        snapshot
-            .state_mut()
-            .set(
-                "alice:capsule:build".to_owned(),
-                "toolchain".to_owned(),
-                b"rust".to_vec(),
-            )
-            .unwrap();
-        snapshot
-            .state_mut()
-            .set(
-                "alice:capsule:build".to_owned(),
-                "empty".to_owned(),
-                Vec::new(),
-            )
-            .unwrap();
-        snapshot
-            .state_mut()
-            .set(
-                "alice:capsule:shell".to_owned(),
-                "cwd".to_owned(),
-                b"/workspace".to_vec(),
-            )
-            .unwrap();
-
-        let committed = engine.commit_kv(snapshot).unwrap();
-        let decoded = engine.kv_snapshot("alice".to_owned()).unwrap();
-
-        assert_eq!(decoded.root(), Some(committed.root()));
-        assert_eq!(
-            decoded.state().get("alice:capsule:build", "toolchain"),
-            Some(b"rust".as_slice())
-        );
-        assert_eq!(
-            decoded.state().get("alice:capsule:build", "empty"),
-            Some([].as_slice())
-        );
-        assert_eq!(decoded.state().keys("alice:capsule:shell"), vec!["cwd"]);
-    }
-
-    #[test]
-    fn logical_usage_counts_repeated_visible_values() {
-        let engine = InMemoryEngine::new(TestIdentity);
-        let mut snapshot = engine.kv_snapshot("alice".to_owned()).unwrap();
-        snapshot
-            .state_mut()
-            .set(
-                "alice:capsule:a".to_owned(),
-                "same".to_owned(),
-                b"repeat".to_vec(),
-            )
-            .unwrap();
-        snapshot
-            .state_mut()
-            .set(
-                "alice:capsule:b".to_owned(),
-                "same".to_owned(),
-                b"repeat".to_vec(),
-            )
-            .unwrap();
-        engine.commit_kv(snapshot).unwrap();
-
-        let usage = engine.principal_usage(&"alice".to_owned()).unwrap();
-
-        assert_eq!(usage.logical_bytes, 12);
-        assert_eq!(
-            engine
-                .snapshot(&"alice".to_owned())
-                .unwrap()
-                .unwrap()
-                .records()
-                .iter()
-                .filter(|(_, record)| record.kind() == ObjectKind::KvLeaf)
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    fn kv_commit_preserves_non_kv_components_and_commit_annotations() {
-        let engine = InMemoryEngine::new(TestIdentity);
-        let mut records = BTreeMap::new();
-        let files = ObjectRecord::new(
-            ObjectKind::Directory,
-            FORMAT_VERSION,
-            Vec::new(),
-            Vec::new(),
-            0,
-            ObjectClass::Metadata,
-        )
-        .unwrap();
-        let files_id = identified(&engine, &mut records, files);
-        let namespace_map = ObjectRecord::new(
-            ObjectKind::NamespaceMap,
-            FORMAT_VERSION,
-            Vec::new(),
-            Vec::new(),
-            0,
-            ObjectClass::Metadata,
-        )
-        .unwrap();
-        let namespace_map_id = identified(&engine, &mut records, namespace_map);
-        let principal_state = ObjectRecord::new(
-            ObjectKind::PrincipalState,
-            FORMAT_VERSION,
-            Vec::new(),
-            vec![
-                ObjectReference::owns(b"files".to_vec(), files_id),
-                ObjectReference::owns(KV_LABEL.to_vec(), namespace_map_id),
-            ],
-            0,
-            ObjectClass::Metadata,
-        )
-        .unwrap();
-        let state_id = identified(&engine, &mut records, principal_state);
-        let annotation_target = ObjectId::new([91; 32]);
-        let commit = ObjectRecord::new(
-            ObjectKind::Commit,
-            FORMAT_VERSION,
-            Vec::new(),
-            vec![
-                ObjectReference::new(
-                    b"audit".to_vec(),
-                    annotation_target,
-                    ReferenceKind::Evidence,
-                ),
-                ObjectReference::owns(STATE_LABEL.to_vec(), state_id),
-            ],
-            0,
-            ObjectClass::Metadata,
-        )
-        .unwrap();
-        let commit_id = identified(&engine, &mut records, commit);
-        engine
-            .commit(RootTransaction::new(
-                "alice".to_owned(),
-                None,
-                commit_id,
-                records.into_iter().collect(),
-            ))
-            .unwrap();
-
-        let mut snapshot = engine.kv_snapshot("alice".to_owned()).unwrap();
-        snapshot
-            .state_mut()
-            .set(
-                "alice:capsule:shell".to_owned(),
-                "cwd".to_owned(),
-                b"/workspace".to_vec(),
-            )
-            .unwrap();
-        let outcome = engine.commit_kv(snapshot).unwrap();
-        let root_snapshot = engine.snapshot(&"alice".to_owned()).unwrap().unwrap();
-        let record_map: BTreeMap<_, _> = root_snapshot.records().iter().cloned().collect();
-        let next_commit = record_map.get(&outcome.root().commit).unwrap();
-        let next_state_id = next_commit.reference(STATE_LABEL).unwrap().target();
-        let next_state = record_map.get(&next_state_id).unwrap();
-
-        assert_eq!(next_state.reference(b"files").unwrap().target(), files_id);
-        assert_eq!(
-            next_commit.reference(b"audit").unwrap().target(),
-            annotation_target
-        );
-        assert_eq!(
-            next_commit.reference(PARENT_LABEL).unwrap().target(),
-            commit_id
-        );
-    }
-
-    #[test]
-    fn malformed_state_kind_is_rejected_during_decode() {
-        let engine = InMemoryEngine::new(TestIdentity);
-        let wrong_state = ObjectRecord::new(
-            ObjectKind::Chunk,
-            FORMAT_VERSION,
-            b"not state".to_vec(),
-            Vec::new(),
-            0,
-            ObjectClass::Data,
-        )
-        .unwrap();
-        let wrong_state_id = engine.identify(&wrong_state);
-        let commit = ObjectRecord::new(
-            ObjectKind::Commit,
-            FORMAT_VERSION,
-            Vec::new(),
-            vec![ObjectReference::owns(STATE_LABEL.to_vec(), wrong_state_id)],
-            0,
-            ObjectClass::Metadata,
-        )
-        .unwrap();
-        let commit_id = engine.identify(&commit);
-        engine
-            .commit(RootTransaction::new(
-                "alice".to_owned(),
-                None,
-                commit_id,
-                vec![(wrong_state_id, wrong_state), (commit_id, commit)],
-            ))
-            .unwrap();
-
-        let result = engine.kv_snapshot("alice".to_owned());
-
-        assert!(matches!(
-            result,
-            Err(KvProjectionError::InvalidFormat {
-                object,
-                detail: "object has the wrong semantic kind",
-            }) if object == wrong_state_id
-        ));
-    }
-
-    #[test]
-    fn malformed_parent_edge_is_rejected_during_decode() {
-        let engine = InMemoryEngine::new(TestIdentity);
-        let mut records = BTreeMap::new();
-        let state = ObjectRecord::new(
-            ObjectKind::PrincipalState,
-            FORMAT_VERSION,
-            Vec::new(),
-            Vec::new(),
-            0,
-            ObjectClass::Metadata,
-        )
-        .unwrap();
-        let state_id = identified(&engine, &mut records, state);
-        let commit = ObjectRecord::new(
-            ObjectKind::Commit,
-            FORMAT_VERSION,
-            Vec::new(),
-            vec![
-                ObjectReference::new(
-                    PARENT_LABEL.to_vec(),
-                    ObjectId::new([17; 32]),
-                    ReferenceKind::Evidence,
-                ),
-                ObjectReference::owns(STATE_LABEL.to_vec(), state_id),
-            ],
-            0,
-            ObjectClass::Metadata,
-        )
-        .unwrap();
-        let commit_id = identified(&engine, &mut records, commit);
-        engine
-            .commit(RootTransaction::new(
-                "alice".to_owned(),
-                None,
-                commit_id,
-                records.into_iter().collect(),
-            ))
-            .unwrap();
-
-        assert!(matches!(
-            engine.kv_snapshot("alice".to_owned()),
-            Err(KvProjectionError::InvalidFormat {
-                object,
-                detail: "commit `parent` reference is not lineage",
-            }) if object == commit_id
-        ));
-    }
-
-    #[test]
-    fn invalid_names_cannot_enter_a_snapshot() {
-        let engine = InMemoryEngine::new(TestIdentity);
-        let mut snapshot = engine.kv_snapshot("alice".to_owned()).unwrap();
-
-        assert_eq!(
-            snapshot
-                .state_mut()
-                .set(String::new(), "key".to_owned(), Vec::new()),
-            Err(KvProjectionError::InvalidName { name: "namespace" })
-        );
-        assert_eq!(
-            snapshot
-                .state_mut()
-                .set("namespace".to_owned(), "bad\0key".to_owned(), Vec::new()),
-            Err(KvProjectionError::InvalidName { name: "key" })
-        );
-        assert!(snapshot.state().is_empty());
-        assert!(engine.root(&"alice".to_owned()).is_none());
-    }
-}
+#[path = "kv_tests.rs"]
+mod tests;

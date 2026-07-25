@@ -611,6 +611,7 @@ dependencies = [
  "astrid-core",
  "astrid-gateway",
  "astrid-kernel",
+ "astrid-storage",
  "astrid-telemetry",
  "clap",
  "colored",

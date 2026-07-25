@@ -204,6 +204,21 @@ max_pending_requests = 50
 # on_failure = { max_retries = 5 }
 
 # ============================================================================
+# Kernel State Storage
+# ============================================================================
+# The typed principal store is authoritative by default. `legacy-surreal` is an
+# explicit recovery mode; the old database is preserved during migration, but
+# it does not receive new principal-store writes.
+
+[storage]
+backend = "principal"
+
+# Optional parser/allocation guard for one durable frame. This is not a
+# principal storage quota. When omitted, Astrid uses fallible allocation and
+# the process address space rather than imposing a fixed hidden ceiling.
+# recovery_max_frame_bytes = <operator-defined bytes>
+
+# ============================================================================
 # Audit Configuration
 # ============================================================================
 # Controls the cryptographic audit trail for all agent actions.

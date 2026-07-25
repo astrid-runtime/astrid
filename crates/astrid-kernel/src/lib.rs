@@ -419,6 +419,35 @@ impl Kernel {
         http_limits: astrid_capsule_types::HttpLimits,
         workspace_layout: WorkspaceLayout,
     ) -> Result<Arc<Self>, std::io::Error> {
+        Self::new_with_storage_options_and_workspace_layout(
+            session_id,
+            workspace_root,
+            runtime_limits,
+            local_egress,
+            http_limits,
+            astrid_storage::PrincipalStoreOptions::default(),
+            workspace_layout,
+        )
+        .await
+    }
+
+    /// Boot a kernel with explicit native state-store and workspace policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if native resources, durable state recovery or
+    /// migration, or portable kernel wiring fails.
+    #[cfg(unix)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new_with_storage_options_and_workspace_layout(
+        session_id: SessionId,
+        workspace_root: PathBuf,
+        runtime_limits: astrid_capsule_types::CapsuleRuntimeLimits,
+        local_egress: std::collections::HashMap<String, Vec<String>>,
+        http_limits: astrid_capsule_types::HttpLimits,
+        storage_options: astrid_storage::PrincipalStoreOptions,
+        workspace_layout: WorkspaceLayout,
+    ) -> Result<Arc<Self>, std::io::Error> {
         use astrid_core::dirs::AstridHome;
 
         // Resolve the Astrid home directory. Required for persistent KV store
@@ -438,12 +467,28 @@ impl Kernel {
         // NOT re-acquire the lock — it is already held for the process lifetime.
         let singleton_lock = socket::acquire_boot_singleton_lock(&home)?;
 
-        // Open the persistent KV store (needed by the capability store).
-        let kv_path = home.state_db_path();
-        let kv: Arc<dyn astrid_storage::KvStore> = Arc::new(
-            astrid_storage::SurrealKvStore::open(&kv_path)
-                .map_err(|e| std::io::Error::other(format!("Failed to open KV store: {e}")))?,
-        );
+        // Resolve quota policy before opening state so the durable adapter and
+        // capsule engine share exactly one invalidatable profile cache.
+        let profile_cache = Arc::new(PrincipalProfileCache::with_home(home.clone()));
+        let quota_cache = Arc::clone(&profile_cache);
+        let quota: Arc<dyn astrid_storage::KvQuotaResolver<astrid_storage::StateOwner>> =
+            Arc::new(move |owner: &astrid_storage::StateOwner| match owner {
+                astrid_storage::StateOwner::System => Ok(None),
+                astrid_storage::StateOwner::Principal(principal) => quota_cache
+                    .resolve(principal)
+                    .map(|profile| Some(profile.quotas.max_storage_bytes))
+                    .map_err(|error| {
+                        astrid_storage::StorageError::Internal(format!(
+                            "resolve storage quota for {principal}: {error}"
+                        ))
+                    }),
+            });
+
+        // Open the authoritative state store. First cutover imports and
+        // verifies legacy SurrealKV under the singleton lock before serving.
+        let kv = astrid_storage::open_runtime_kv(&home, storage_options, quota)
+            .await
+            .map_err(|e| std::io::Error::other(format!("Failed to open KV store: {e}")))?;
         // TODO: clear ephemeral keys (e: prefix) on boot when the key
         // lifecycle tier convention is established.
 
@@ -484,7 +529,7 @@ impl Kernel {
             Some(singleton_lock),
         );
 
-        Self::with_resources_and_workspace_layout(
+        Self::with_resources_and_workspace_layout_with_profile_cache(
             session_id,
             workspace_root,
             runtime_limits,
@@ -492,6 +537,7 @@ impl Kernel {
             http_limits,
             resources,
             workspace_layout,
+            Some(profile_cache),
         )
         .await
     }
@@ -561,10 +607,6 @@ impl Kernel {
     ///
     /// Returns an error if VFS mounts, the capability store, group
     /// configuration, or CLI root bootstrap cannot be initialized.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "boot sequence: sequential setup that does not benefit from splitting"
-    )]
     pub async fn with_resources_and_workspace_layout(
         session_id: SessionId,
         workspace_root: PathBuf,
@@ -573,6 +615,34 @@ impl Kernel {
         http_limits: astrid_capsule_types::HttpLimits,
         resources: KernelResources,
         workspace_layout: WorkspaceLayout,
+    ) -> Result<Arc<Self>, std::io::Error> {
+        Self::with_resources_and_workspace_layout_with_profile_cache(
+            session_id,
+            workspace_root,
+            runtime_limits,
+            local_egress,
+            http_limits,
+            resources,
+            workspace_layout,
+            None,
+        )
+        .await
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "boot sequence: sequential setup that does not benefit from splitting"
+    )]
+    #[allow(clippy::too_many_arguments)]
+    async fn with_resources_and_workspace_layout_with_profile_cache(
+        session_id: SessionId,
+        workspace_root: PathBuf,
+        runtime_limits: astrid_capsule_types::CapsuleRuntimeLimits,
+        local_egress: std::collections::HashMap<String, Vec<String>>,
+        http_limits: astrid_capsule_types::HttpLimits,
+        resources: KernelResources,
+        workspace_layout: WorkspaceLayout,
+        profile_cache: Option<Arc<PrincipalProfileCache>>,
     ) -> Result<Arc<Self>, std::io::Error> {
         // The native capsule engine uses `block_in_place`, which requires a
         // multi-thread runtime. The browser profile has no such runtime (and no
@@ -743,7 +813,8 @@ impl Kernel {
             token_path,
             allowance_store,
             identity_store,
-            profile_cache: Arc::new(PrincipalProfileCache::with_home(home.clone())),
+            profile_cache: profile_cache
+                .unwrap_or_else(|| Arc::new(PrincipalProfileCache::with_home(home.clone()))),
             groups,
             astrid_home: home,
             admin_write_lock: Mutex::new(()),

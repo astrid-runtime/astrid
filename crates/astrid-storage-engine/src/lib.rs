@@ -32,7 +32,10 @@ pub use durable::{
     DurableEngine, DurableError, FaultInjector, FaultPoint, NoFaults, PrincipalCodec,
     RecoveryLimits,
 };
-pub use kv::{KvProjectionError, KvState, KvStateSnapshot};
+pub use kv::{
+    KvProjectionEngine, KvProjectionError, KvState, KvStateSnapshot, commit_kv_with_engine,
+    kv_snapshot_with_engine,
+};
 
 /// A root update and the immutable records required to reconstruct it.
 ///

@@ -6,10 +6,14 @@
 //! principal identifier.
 
 use std::fmt;
+use std::marker::PhantomData;
 use std::sync::Arc;
 
-use astrid_storage_engine::{InMemoryEngine, KvProjectionError, KvState};
-use astrid_storage_model::{ModelError, ObjectIdentity};
+use astrid_storage_engine::{
+    InMemoryEngine, KvProjectionEngine, KvProjectionError, KvState, commit_kv_with_engine,
+    kv_snapshot_with_engine,
+};
+use astrid_storage_model::ModelError;
 use async_trait::async_trait;
 
 use super::{KvStore, validate_key, validate_namespace, validate_prefix};
@@ -23,9 +27,9 @@ use crate::error::{StorageError, StorageResult};
 pub trait KvPrincipalResolver<P>: Send + Sync {
     /// Resolve the principal that owns `namespace`.
     ///
-    /// System or otherwise unowned namespaces should return
-    /// [`StorageError::InvalidKey`] rather than being silently assigned to a
-    /// user principal.
+    /// System namespaces should resolve to an explicit domain value distinct
+    /// from every user principal. Otherwise-unowned namespaces should return
+    /// [`StorageError::InvalidKey`] rather than being silently assigned.
     ///
     /// # Errors
     ///
@@ -43,26 +47,88 @@ where
     }
 }
 
+/// Resolves the current logical storage ceiling for one state owner.
+///
+/// Quota policy remains outside the engine because the authoritative value can
+/// change while the process is running. `None` means that the owner is exempt
+/// from a principal quota, as is appropriate for kernel-owned system state.
+pub trait KvQuotaResolver<P>: Send + Sync {
+    /// Return the owner's current logical-byte ceiling.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when policy cannot be resolved. Mutations fail
+    /// closed in that case.
+    fn max_logical_bytes(&self, principal: &P) -> StorageResult<Option<u64>>;
+}
+
+impl<P, F> KvQuotaResolver<P> for F
+where
+    F: Fn(&P) -> StorageResult<Option<u64>> + Send + Sync,
+{
+    fn max_logical_bytes(&self, principal: &P) -> StorageResult<Option<u64>> {
+        self(principal)
+    }
+}
+
 /// Existing [`KvStore`] behavior projected onto atomic principal roots.
 ///
 /// Each successful mutation replaces one principal's typed `kv` component
 /// using exact root compare-and-swap. Root conflicts are retried from a fresh
 /// snapshot, so concurrent mutations do not lose updates. No persistent
-/// encoding, production digest, quota, or migration policy is selected here.
-pub struct PrincipalKvStore<P: Ord, I, R> {
-    engine: Arc<InMemoryEngine<P, I>>,
+/// encoding, production digest, and migration policy remain selected by the
+/// native composition root. Quota policy is optionally injected and resolved
+/// on every mutation so runtime profile invalidation takes effect immediately.
+pub struct PrincipalKvStore<P: Ord, I, R, E = InMemoryEngine<P, I>> {
+    engine: Arc<E>,
     resolver: R,
+    quota: Option<Arc<dyn KvQuotaResolver<P>>>,
+    marker: PhantomData<fn() -> (P, I)>,
 }
 
 impl<P: Ord, I, R> PrincipalKvStore<P, I, R> {
     /// Construct an additive compatibility adapter.
     #[must_use]
     pub const fn new(engine: Arc<InMemoryEngine<P, I>>, resolver: R) -> Self {
-        Self { engine, resolver }
+        Self {
+            engine,
+            resolver,
+            quota: None,
+            marker: PhantomData,
+        }
     }
 }
 
-impl<P: Ord, I, R> fmt::Debug for PrincipalKvStore<P, I, R> {
+impl<P: Ord, I, R, E> PrincipalKvStore<P, I, R, E> {
+    /// Construct an adapter over any engine implementing the typed projection
+    /// contract.
+    #[must_use]
+    pub const fn from_engine(engine: Arc<E>, resolver: R) -> Self {
+        Self {
+            engine,
+            resolver,
+            quota: None,
+            marker: PhantomData,
+        }
+    }
+
+    /// Construct an adapter with live logical-byte quota policy.
+    #[must_use]
+    pub fn from_engine_with_quota(
+        engine: Arc<E>,
+        resolver: R,
+        quota: Arc<dyn KvQuotaResolver<P>>,
+    ) -> Self {
+        Self {
+            engine,
+            resolver,
+            quota: Some(quota),
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<P: Ord, I, R, E> fmt::Debug for PrincipalKvStore<P, I, R, E> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("PrincipalKvStore")
@@ -70,15 +136,14 @@ impl<P: Ord, I, R> fmt::Debug for PrincipalKvStore<P, I, R> {
     }
 }
 
-impl<P, I, R> PrincipalKvStore<P, I, R>
+impl<P, I, R, E> PrincipalKvStore<P, I, R, E>
 where
-    P: Clone + Ord,
-    I: ObjectIdentity,
+    P: Clone + Ord + Send + Sync,
+    E: KvProjectionEngine<P>,
     R: KvPrincipalResolver<P>,
 {
     fn snapshot(&self, principal: &P) -> StorageResult<astrid_storage_engine::KvStateSnapshot<P>> {
-        self.engine
-            .kv_snapshot(principal.clone())
+        kv_snapshot_with_engine(self.engine.as_ref(), principal.clone())
             .map_err(|error| map_projection_error(&error))
     }
 
@@ -88,11 +153,26 @@ where
     {
         loop {
             let mut snapshot = self.snapshot(principal)?;
+            let before = snapshot
+                .state()
+                .logical_bytes()
+                .map_err(|error| map_projection_error(&error))?;
             let (result, changed) = update(snapshot.state_mut())?;
             if !changed {
                 return Ok(result);
             }
-            match self.engine.commit_kv(snapshot) {
+            if let Some(quota) = &self.quota
+                && let Some(limit) = quota.max_logical_bytes(principal)?
+            {
+                let used = snapshot
+                    .state()
+                    .logical_bytes()
+                    .map_err(|error| map_projection_error(&error))?;
+                if used > limit && used > before {
+                    return Err(StorageError::QuotaExceeded { used, limit });
+                }
+            }
+            match commit_kv_with_engine(self.engine.as_ref(), snapshot) {
                 Ok(_) => return Ok(result),
                 Err(KvProjectionError::Model(ModelError::RootConflict { .. })) => {},
                 Err(error) => return Err(map_projection_error(&error)),
@@ -102,12 +182,19 @@ where
 }
 
 #[async_trait]
-impl<P, I, R> KvStore for PrincipalKvStore<P, I, R>
+impl<P, I, R, E> KvStore for PrincipalKvStore<P, I, R, E>
 where
     P: Clone + Ord + Send + Sync + 'static,
-    I: ObjectIdentity + Send + Sync + 'static,
+    I: Send + Sync + 'static,
+    E: KvProjectionEngine<P> + 'static,
     R: KvPrincipalResolver<P> + Send + Sync + 'static,
 {
+    async fn close(&self) -> StorageResult<()> {
+        self.engine
+            .flush_kv()
+            .map_err(|error| map_projection_error(&error))
+    }
+
     async fn get(&self, namespace: &str, key: &str) -> StorageResult<Option<Vec<u8>>> {
         validate_namespace(namespace)?;
         validate_key(key)?;
@@ -512,7 +599,7 @@ mod tests {
         run_differential_trace(&memory, principal.as_ref(), 2_048).await;
     }
 
-    #[cfg(feature = "kv")]
+    #[cfg(feature = "legacy-surrealkv")]
     #[tokio::test]
     async fn generated_trace_matches_surreal_kv() {
         let directory = tempfile::tempdir().unwrap();
@@ -618,7 +705,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "kv")]
+    #[cfg(feature = "legacy-surrealkv")]
     #[tokio::test]
     async fn surreal_kv_rejects_the_same_invalid_raw_names() {
         let directory = tempfile::tempdir().unwrap();

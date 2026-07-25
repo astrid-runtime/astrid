@@ -11,7 +11,7 @@ description = "Capability token system for Astrid secure agent runtime"
 [dependencies]
 astrid-core = { workspace = true }
 astrid-crypto = { workspace = true }
-astrid-storage = { workspace = true, features = ["kv"] }
+astrid-storage = { workspace = true, features = ["legacy-surrealkv"] }
 chrono = { workspace = true, features = ["clock"] }
 globset = { workspace = true }
 serde = { workspace = true }

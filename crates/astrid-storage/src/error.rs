@@ -22,6 +22,16 @@ pub enum StorageError {
     /// The namespace or key is invalid.
     #[error("invalid key: {0}")]
     InvalidKey(String),
+
+    /// A mutation would increase logical principal state beyond its configured
+    /// storage budget.
+    #[error("storage quota exceeded: mutation would use {used} bytes (limit {limit})")]
+    QuotaExceeded {
+        /// Logical bytes after the rejected mutation.
+        used: u64,
+        /// Configured logical-byte ceiling.
+        limit: u64,
+    },
 }
 
 /// Result type for storage operations.

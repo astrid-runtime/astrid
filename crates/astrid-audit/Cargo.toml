@@ -12,7 +12,7 @@ description = "Chain-linked cryptographic audit logging for Astrid"
 astrid-capabilities = { workspace = true }
 astrid-core = { workspace = true }
 astrid-crypto = { workspace = true }
-astrid-storage = { workspace = true, features = ["kv"] }
+astrid-storage = { workspace = true, features = ["legacy-surrealkv"] }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }

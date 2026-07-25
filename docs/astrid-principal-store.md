@@ -246,8 +246,9 @@ arena and root-journal backend plus the fault matrix in the evidence document.
 
 ### 5.6 KV compatibility bridge
 
-`astrid-storage::PrincipalKvStore` implements the existing async `KvStore`
-surface over the in-memory engine without changing current callers. The bridge:
+`astrid-storage::PrincipalKvStore` remains the whole-state compatibility oracle
+used by differential tests. It implements the existing async `KvStore` surface
+without changing callers. The bridge:
 
 - requires an injected authority-aware resolver from namespace to a
   domain-bearing principal identifier;
@@ -274,32 +275,52 @@ prefix, clear, and compare-and-swap traces against `MemoryKvStore`,
 resulting namespace state must agree. Invalid raw namespaces and keys now have
 the same `InvalidKey` class in the memory and persistent legacy backends.
 
-This is not a runtime cutover. Existing installations continue using
-`SurrealKvStore`. A later integration must quiesce writes for one principal,
-capture all of its known namespaces consistently, install one complete
-principal root, run shadow comparisons, and only then switch the authoritative
-backend. The current `KvStore` API cannot enumerate namespaces or produce an
-atomic cross-namespace legacy snapshot, so a naive live list-and-copy loop is
-not an acceptable migration protocol.
-
 The bridge is a compatibility oracle, not the intended production hot path.
 Each mutation currently reconstructs the complete in-memory KV projection,
-which is linear in that principal's KV state. The durable engine must persist
-immutable objects once and use bounded-fanout persistent trees so it path-copies
-only the affected leaf-to-root path, principal state, and commit. It must not
-reuse the bridge's whole-state snapshot/update loop as its point-operation API.
-Its benchmarks must measure height-bounded write amplification rather than
-treating the bridge's flat maps and full reconstruction as an acceptable
-steady-state cost.
+which is linear in that principal's KV state.
 
-The existing Cargo feature named `kv` gates only the optional `SurrealKvStore`
-dependency; the `KvStore` contract and its memory, scoped, and principal-store
-implementations are already unconditional. The new architecture does not treat
-principal KV state as optional and must not inherit that misleading feature
-boundary. During runtime migration the old backend may be isolated behind an
-explicit `legacy-surrealkv` transition feature. Once migration and rollback
-support no longer require it, remove that backend and transition feature rather
-than making SurrealKV an unconditional dependency.
+The native runtime instead uses `TreeKvStore`, a content-addressed persistent
+AVL tree over composite namespace/key bytes. Its fanout is bounded, sorted
+inserts remain height-balanced, point reads touch one search path, and a point
+mutation copies only that path plus a constant number of rotation and root
+envelope objects. A 256-key durable regression constrains one replacement to at
+most 16 new objects, while generated point/range/CAS/clear traces compare the
+tree against an ordered-map oracle. Root conflicts restart from current state,
+so compare-and-swap and quota checks remain linearizable under concurrent
+writers.
+
+The `kv` Cargo feature no longer exists. The KV contract, memory/scoped stores,
+compatibility oracle, and persistent tree are unconditional.
+`legacy-surrealkv` gates only the transition backend and migrator. It can be
+removed when the supported migration window closes.
+
+### 5.6.1 Runtime cutover
+
+Native kernel startup now selects the principal store by default. Under the
+existing process singleton lock it:
+
+1. pins the store, identity, owner-codec, and projection versions in
+   `store.meta`;
+2. imports the read-only legacy database in bounded pages, grouping every
+   host-stamped capsule namespace under its validated principal and all
+   kernel namespaces under an explicit system owner;
+3. verifies a canonical entry digest independently for every owner;
+4. flushes the durable engine and atomically publishes one global completion
+   marker before the kernel can serve requests.
+
+The legacy directory is never mutated. A partial destination is quarantined and
+rebuilt; a completed destination is never re-imported. Migration history,
+supported-version floor, transform, verification rule, and rollback status live
+together in the ordered migration registry. Old executable transforms can move
+to a standalone migrator when the supported floor advances.
+
+The daemon's `[storage]` config is operator-only; workspace config cannot select
+the stale legacy backend or alter recovery allocation policy. The same
+invalidatable `PrincipalProfileCache` supplies capsule runtime and storage
+limits, so admin quota changes affect the next mutation. The default storage
+budget is the largest positive TOML integer—reported as `unlimited`—and finite
+operator budgets reject only growth above the ceiling, allowing an over-budget
+principal to delete or shrink state.
 
 ### 5.7 First durable host-file realization
 
@@ -320,19 +341,19 @@ roots.journal:
 ```
 
 The encoded record is a versioned physical representation of `ObjectRecord`.
-It is not declared to be the final canonical export format and does not choose
-the production `ContentId` hash. `ObjectIdentity` and a canonical
-domain-bearing `PrincipalCodec` remain injected so durability ordering can be
-proven independently of those still-measured format decisions.
+It is not declared to be the final canonical export format. The native runtime
+pins a domain-separated BLAKE3 object identity and canonical tagged
+`System | Principal(PrincipalId)` codec in metadata; generic engines retain
+injected identities/codecs for testing and future explicit transforms.
 
 Commit order is:
 
-1. verify identities, root expectation, complete closure, encoding, and frame
-   resource bounds without writing;
+1. verify identities, root expectation, the newly introduced closure frontier,
+   encoding, and frame resource bounds without writing;
 2. append and flush non-commit immutable object frames;
 3. append and flush the immutable commit frame;
 4. append and flush one root-journal compare-and-swap record;
-5. update the in-memory world and disposable index.
+5. update the in-memory root map, validated frontier, and disposable index.
 
 The root-journal flush is the durable linearization point. An interrupted
 engine is poisoned and refuses both reads and writes until reopen. On reopen,
@@ -340,12 +361,14 @@ the engine:
 
 - takes an exclusive process lock;
 - scans and identity-checks every complete object frame;
-- rebuilds the `ObjectId` index entirely from the arena;
+- rebuilds the `ObjectId`-to-arena-offset index without retaining payloads;
 - truncates only an incomplete final header or payload;
 - rejects a complete checksum, grammar, canonicality, identity, collision, or
   model failure with its file and byte offset;
 - replays root records using the same model compare-and-swap transition and
   verifies the recorded generation;
+- validates every final live root closure and then lazy-loads object payloads
+  for point operations;
 - flushes newly created directory entries on Unix.
 
 `RecoveryLimits` is required from the embedding runtime. It bounds one recovery
@@ -354,12 +377,12 @@ principal, or per-file quota and has no library default. Host-file support is
 excluded from `target_family = "wasm"` while the portable model, in-memory
 engine, and compatibility adapter remain available there.
 
-This slice deliberately has one active arena and an in-memory rebuilt index. It
-does not yet seal arenas, compact garbage, persist pins, remove roots, enforce
-principal quotas, coordinate an audit/outbox record, inject short writes or
-disk-full errors, select `BlobId`/encoding profiles, or replace SurrealKV in the
-runtime. Those claims remain attached to their evidence gates rather than to
-the existence of two durable files.
+This realization deliberately has one active arena and an in-memory rebuilt
+offset index. Runtime KV and live per-principal logical quotas are integrated.
+It does not yet seal arenas, compact unreachable history, persist pins, expose
+root removal, coordinate an audit/outbox record, inject short writes or
+disk-full errors, encrypt erasure domains, or select final export `BlobId`
+profiles. Those claims remain attached to their evidence gates.
 
 ## 6. Three identifiers, not one overloaded hash
 

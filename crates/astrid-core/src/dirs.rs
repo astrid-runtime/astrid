@@ -468,6 +468,12 @@ impl AstridHome {
         self.var_dir().join("state.db")
     }
 
+    /// Path to the typed durable principal store (`var/principal-store/`).
+    #[must_use]
+    pub fn principal_store_path(&self) -> PathBuf {
+        self.var_dir().join("principal-store")
+    }
+
     /// Root directory for OS-level copy-on-write workspace clones (`cow/`).
     ///
     /// Each non-git capsule workspace gets a per-workspace subdirectory here
