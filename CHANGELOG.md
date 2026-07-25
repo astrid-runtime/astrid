@@ -92,6 +92,12 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Fixed
 
+- **Kernel management rate limits no longer cross authorization boundaries.**
+  Requests consume a principal-and-method-scoped action budget only after
+  principal and device-scope authorization succeeds. A restricted caller or
+  device can no longer exhaust another authorized caller's shutdown, reload,
+  install, or workspace-operation allowance; rate-limit rejections are audited
+  as failures, and expired principal buckets are retired. Closes #1378.
 - **Fresh Windows capsule installs provision private runtime and principal
   homes.** Capsule signing and authority inspection now create and validate the
   Astrid directory tree before generating the runtime identity, secure the new

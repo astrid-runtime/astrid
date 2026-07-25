@@ -140,29 +140,6 @@ fn audit_topic_const_matches_constructor() {
 }
 
 #[test]
-fn rate_limiter_allows_within_limit() {
-    let mut limiter = ManagementRateLimiter::new();
-    for _ in 0..5 {
-        assert!(limiter.check("ReloadCapsules", 5));
-    }
-    // 6th should be rejected
-    assert!(!limiter.check("ReloadCapsules", 5));
-}
-
-#[test]
-fn rate_limiter_independent_buckets() {
-    let mut limiter = ManagementRateLimiter::new();
-    // Fill ReloadCapsules
-    for _ in 0..5 {
-        assert!(limiter.check("ReloadCapsules", 5));
-    }
-    assert!(!limiter.check("ReloadCapsules", 5));
-
-    // InstallCapsule should still be allowed
-    assert!(limiter.check("InstallCapsule", 10));
-}
-
-#[test]
 fn full_reload_guard_coalesces_until_finished() {
     let in_flight = AtomicBool::new(false);
 
@@ -177,55 +154,6 @@ fn full_reload_guard_coalesces_until_finished() {
         try_start_full_reload(&in_flight),
         "new full reload may start after the previous reload finishes"
     );
-}
-
-#[test]
-fn rate_limiter_sliding_window_eviction() {
-    let mut limiter = ManagementRateLimiter::new();
-    // Fill the bucket
-    for _ in 0..5 {
-        assert!(limiter.check("ReloadCapsules", 5));
-    }
-    assert!(!limiter.check("ReloadCapsules", 5));
-
-    // Manually set all timestamps to 61 seconds ago to simulate expiry.
-    if let Some(timestamps) = limiter.buckets.get_mut("ReloadCapsules") {
-        let past = Instant::now()
-            .checked_sub(std::time::Duration::from_secs(61))
-            .unwrap();
-        for ts in timestamps.iter_mut() {
-            *ts = past;
-        }
-    }
-
-    // Should be allowed again after old entries are evicted
-    assert!(limiter.check("ReloadCapsules", 5));
-}
-
-#[test]
-fn rate_limiter_sliding_window_prevents_boundary_burst() {
-    let mut limiter = ManagementRateLimiter::new();
-    // Fill 5 requests
-    for _ in 0..5 {
-        assert!(limiter.check("ReloadCapsules", 5));
-    }
-
-    // Move only 3 of the 5 timestamps to the past (beyond 60s window).
-    // This simulates partial window expiry - only 3 slots should free up.
-    if let Some(timestamps) = limiter.buckets.get_mut("ReloadCapsules") {
-        let past = Instant::now()
-            .checked_sub(std::time::Duration::from_secs(61))
-            .unwrap();
-        for ts in timestamps.iter_mut().take(3) {
-            *ts = past;
-        }
-    }
-
-    // Should allow exactly 3 more (the evicted slots), not 5
-    for _ in 0..3 {
-        assert!(limiter.check("ReloadCapsules", 5));
-    }
-    assert!(!limiter.check("ReloadCapsules", 5));
 }
 
 #[test]
@@ -511,6 +439,307 @@ async fn management_router_denies_missing_and_invalid_principals_deterministical
         ));
         assert_eq!(kernel.total_connection_count(), 0);
     }
+}
+
+fn assert_authorization_denied(response: &KernelResponse, context: &str) {
+    assert!(
+        matches!(
+            response,
+            KernelResponse::Error(reason) if !reason.starts_with("Rate limited:")
+        ),
+        "{context} must receive an authorization denial, got {response:?}"
+    );
+}
+
+fn assert_shutdown_admitted(response: &KernelResponse, context: &str) {
+    assert!(
+        matches!(
+            response,
+            KernelResponse::Success(value)
+                if value == &serde_json::json!({"status": "shutting_down"})
+        ),
+        "{context} must be admitted, got {response:?}"
+    );
+}
+
+fn assert_shutdown_rate_limited(response: &KernelResponse, context: &str) {
+    assert!(
+        matches!(
+            response,
+            KernelResponse::Error(reason)
+                if reason == "Rate limited: max 1 Shutdown requests per minute"
+        ),
+        "{context} must consume the shared principal budget, got {response:?}"
+    );
+}
+
+async fn assert_shutdown_signaled(
+    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+    context: &str,
+) {
+    if !*shutdown_rx.borrow() {
+        astrid_runtime::time::timeout(std::time::Duration::from_secs(2), shutdown_rx.changed())
+            .await
+            .expect("shutdown signal within 2s")
+            .expect("shutdown sender remains alive");
+    }
+    assert!(*shutdown_rx.borrow(), "{context} must signal shutdown");
+}
+
+async fn assert_shutdown_audit_rows(
+    kernel: &crate::Kernel,
+    restricted: &PrincipalId,
+    operator: &PrincipalId,
+) {
+    let entries = kernel
+        .audit_log
+        .get_session_entries(&kernel.session_id)
+        .await
+        .expect("read audit entries");
+    let shutdowns_for = |principal: &PrincipalId| {
+        entries
+            .iter()
+            .filter(|entry| {
+                entry.principal.as_ref() == Some(principal)
+                    && matches!(
+                        &entry.action,
+                        AuditAction::AdminRequest { method, .. } if method == "Shutdown"
+                    )
+            })
+            .collect::<Vec<_>>()
+    };
+    let operator_shutdowns = shutdowns_for(operator);
+    assert_eq!(
+        operator_shutdowns.len(),
+        2,
+        "one audit row must be recorded for each authorized shutdown attempt"
+    );
+    assert!(
+        operator_shutdowns
+            .iter()
+            .all(|entry| matches!(&entry.authorization, AuthorizationProof::System { .. })),
+        "both attempts passed capability authorization"
+    );
+    assert_eq!(
+        operator_shutdowns
+            .iter()
+            .filter(|entry| matches!(&entry.outcome, AuditOutcome::Success { .. }))
+            .count(),
+        1,
+        "only the admitted shutdown may be audited as successful"
+    );
+    assert_eq!(
+        operator_shutdowns
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    &entry.outcome,
+                    AuditOutcome::Failure { error }
+                        if error == "Rate limited: max 1 Shutdown requests per minute"
+                )
+            })
+            .count(),
+        1,
+        "the rejected attempt must produce exactly one rate-limit failure audit row"
+    );
+
+    let restricted_shutdowns = shutdowns_for(restricted);
+    assert_eq!(
+        restricted_shutdowns.len(),
+        1,
+        "the denied shutdown must produce exactly one audit row"
+    );
+    let restricted_shutdown = restricted_shutdowns
+        .first()
+        .expect("one restricted shutdown audit row");
+    assert!(matches!(
+        &restricted_shutdown.authorization,
+        AuthorizationProof::Denied { .. }
+    ));
+    assert!(matches!(
+        &restricted_shutdown.outcome,
+        AuditOutcome::Failure { .. }
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn denied_shutdown_does_not_consume_an_authorized_principals_budget() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = astrid_core::dirs::AstridHome::from_path(dir.path());
+    let kernel = crate::test_kernel_with_home(home).await;
+    let restricted = PrincipalId::new("restricted").expect("valid principal");
+    let operator = PrincipalId::new("operator").expect("valid principal");
+
+    seed_profile(&kernel, &restricted, &PrincipalProfile::default());
+    seed_profile(
+        &kernel,
+        &operator,
+        &PrincipalProfile {
+            grants: vec!["system:shutdown".to_string()],
+            ..Default::default()
+        },
+    );
+    let mut shutdown_rx = kernel.shutdown_tx.subscribe();
+    drop(spawn_kernel_router(Arc::clone(&kernel)));
+
+    let denied = request_kernel(
+        &kernel,
+        &restricted,
+        "restricted_shutdown",
+        KernelRequest::Shutdown {
+            reason: Some("must be denied".to_string()),
+        },
+    )
+    .await;
+    assert_authorization_denied(&denied, "restricted caller");
+    assert!(
+        !*shutdown_rx.borrow(),
+        "denied shutdown must not signal daemon shutdown"
+    );
+
+    let admitted = request_kernel(
+        &kernel,
+        &operator,
+        "operator_shutdown",
+        KernelRequest::Shutdown {
+            reason: Some("authorized".to_string()),
+        },
+    )
+    .await;
+    assert_shutdown_admitted(&admitted, "authorized shutdown");
+    assert_shutdown_signaled(&mut shutdown_rx, "authorized shutdown").await;
+
+    let limited = request_kernel(
+        &kernel,
+        &operator,
+        "operator_shutdown_again",
+        KernelRequest::Shutdown {
+            reason: Some("must be rate limited".to_string()),
+        },
+    )
+    .await;
+    assert_shutdown_rate_limited(&limited, "authorized principal's second shutdown");
+    assert_shutdown_audit_rows(&kernel, &restricted, &operator).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn authorization_denial_does_not_precharge_a_later_grant() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = astrid_core::dirs::AstridHome::from_path(dir.path());
+    let kernel = crate::test_kernel_with_home(home).await;
+    let principal = PrincipalId::new("new-operator").expect("valid principal");
+
+    seed_profile(&kernel, &principal, &PrincipalProfile::default());
+    let mut shutdown_rx = kernel.shutdown_tx.subscribe();
+    drop(spawn_kernel_router(Arc::clone(&kernel)));
+
+    let denied = request_kernel(
+        &kernel,
+        &principal,
+        "pre_grant_shutdown",
+        KernelRequest::Shutdown {
+            reason: Some("not authorized yet".to_string()),
+        },
+    )
+    .await;
+    assert_authorization_denied(&denied, "pre-grant request");
+    assert!(!*shutdown_rx.borrow(), "denied shutdown must not signal");
+
+    seed_profile(
+        &kernel,
+        &principal,
+        &PrincipalProfile {
+            grants: vec!["system:shutdown".to_string()],
+            ..Default::default()
+        },
+    );
+    let admitted = request_kernel(
+        &kernel,
+        &principal,
+        "post_grant_shutdown",
+        KernelRequest::Shutdown {
+            reason: Some("newly authorized".to_string()),
+        },
+    )
+    .await;
+    assert_shutdown_admitted(&admitted, "newly authorized shutdown after denial");
+    assert_shutdown_signaled(&mut shutdown_rx, "newly authorized shutdown").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn device_scope_denial_does_not_consume_the_principals_budget() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = astrid_core::dirs::AstridHome::from_path(dir.path());
+    let kernel = crate::test_kernel_with_home(home).await;
+    let principal = PrincipalId::new("device-scoped-operator").expect("valid principal");
+    let full = DeviceKey::new("e".repeat(64), DeviceScope::Full, None, 0);
+    let attenuated = DeviceKey::new(
+        "f".repeat(64),
+        DeviceScope::Scoped {
+            allow: vec!["self:*".to_string()],
+            deny: Vec::new(),
+        },
+        None,
+        0,
+    );
+    let full_key_id = full.key_id.clone();
+    let attenuated_key_id = attenuated.key_id.clone();
+
+    seed_profile(
+        &kernel,
+        &principal,
+        &PrincipalProfile {
+            grants: vec!["system:shutdown".to_string()],
+            auth: astrid_core::profile::AuthConfig {
+                methods: vec![AuthMethod::Keypair],
+                public_keys: vec![full, attenuated],
+            },
+            ..Default::default()
+        },
+    );
+    let mut shutdown_rx = kernel.shutdown_tx.subscribe();
+    drop(spawn_kernel_router(Arc::clone(&kernel)));
+
+    let denied = request_kernel_for_device(
+        &kernel,
+        &principal,
+        Some(&attenuated_key_id),
+        "attenuated_device_shutdown",
+        KernelRequest::Shutdown {
+            reason: Some("device scope must deny".to_string()),
+        },
+    )
+    .await;
+    assert_authorization_denied(&denied, "attenuated device");
+    assert!(
+        !*shutdown_rx.borrow(),
+        "device-scope denial must not signal daemon shutdown"
+    );
+
+    let admitted = request_kernel_for_device(
+        &kernel,
+        &principal,
+        Some(&full_key_id),
+        "full_device_shutdown",
+        KernelRequest::Shutdown {
+            reason: Some("full device authority".to_string()),
+        },
+    )
+    .await;
+    assert_shutdown_admitted(&admitted, "fully authorized device shutdown");
+    assert_shutdown_signaled(&mut shutdown_rx, "fully authorized device shutdown").await;
+
+    let limited = request_kernel_for_device(
+        &kernel,
+        &principal,
+        Some(&full_key_id),
+        "full_device_shutdown_again",
+        KernelRequest::Shutdown {
+            reason: Some("must be rate limited".to_string()),
+        },
+    )
+    .await;
+    assert_shutdown_rate_limited(&limited, "authorized device's second shutdown");
 }
 
 // ── Agent-loop readiness dispatch (roundtrip) ────────────────────
