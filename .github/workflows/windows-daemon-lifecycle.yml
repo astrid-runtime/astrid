@@ -241,6 +241,17 @@ jobs:
           --locked
           --target $env:TARGET
 
+      - name: Test native management router
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: >-
+          cargo test
+          -p astrid-kernel
+          --locked
+          --target $env:TARGET
+          kernel_router::tests
+
       - name: Test native transport lifecycle
         env:
           TARGET: ${{ matrix.target }}
