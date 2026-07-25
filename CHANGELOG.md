@@ -25,9 +25,9 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   daemons are created detached without any implicit idle timeout, and `start
   --foreground` stays attached through daemon exit. Stop and restart retain the
   PID/executable identity gate while using Windows process handles for wedged
-  daemons, including when an authenticated shutdown request fails before an
-  acknowledgement; status and doctor no longer infer health from a socket
-  pathname.
+  daemons, including when the authenticated shutdown transport fails before an
+  acknowledgement; explicit daemon rejections remain fail-closed, and status
+  and doctor no longer infer health from a socket pathname.
   Companion discovery and signed self-update also understand `.exe` names and
   transactional Windows replacement with rollback. Native Windows-only process
   and update-transaction tests run on x64 and ARM64 CI, where the built CLI and

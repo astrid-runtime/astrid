@@ -37,6 +37,7 @@ pub(crate) enum StopConfirmation {
 enum ShutdownRequestOutcome {
     Acknowledged,
     Escalate(String),
+    Rejected(String),
 }
 
 const fn readiness_attempts(timeout_secs: u64, poll_millis: u64) -> u64 {
@@ -685,10 +686,11 @@ pub(crate) async fn handle_stop() -> Result<StopConfirmation> {
                     "{}",
                     theme::Theme::warning(&format!(
                         "Authenticated daemon shutdown failed ({reason}); escalating through the \
-                         recorded process identity."
+                        recorded process identity."
                     ))
                 );
             },
+            ShutdownRequestOutcome::Rejected(reason) => anyhow::bail!("{reason}"),
         }
     }
 
@@ -742,9 +744,9 @@ where
     match response {
         Ok(KernelResponse::Success(_)) => ShutdownRequestOutcome::Acknowledged,
         Ok(KernelResponse::Error(reason)) => {
-            ShutdownRequestOutcome::Escalate(format!("daemon rejected shutdown: {reason}"))
+            ShutdownRequestOutcome::Rejected(format!("daemon rejected shutdown: {reason}"))
         },
-        Ok(other) => ShutdownRequestOutcome::Escalate(format!(
+        Ok(other) => ShutdownRequestOutcome::Rejected(format!(
             "daemon returned an unexpected shutdown response: {other:?}"
         )),
         Err(error) => ShutdownRequestOutcome::Escalate(format!("shutdown request failed: {error}")),

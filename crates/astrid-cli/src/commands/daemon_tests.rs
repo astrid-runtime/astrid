@@ -204,15 +204,24 @@ fn shutdown_acknowledgement_uses_graceful_exit_confirmation() {
 }
 
 #[test]
-fn shutdown_transport_and_response_failures_escalate() {
-    for outcome in [
+fn shutdown_transport_failure_escalates_to_identity_gated_recovery() {
+    assert!(matches!(
         shutdown_request_outcome(Err(anyhow::anyhow!("request timed out"))),
-        shutdown_request_outcome(Ok::<_, anyhow::Error>(KernelResponse::Error("busy".into()))),
+        ShutdownRequestOutcome::Escalate(_)
+    ));
+}
+
+#[test]
+fn shutdown_response_failures_never_bypass_daemon_authorization() {
+    for outcome in [
+        shutdown_request_outcome(Ok::<_, anyhow::Error>(KernelResponse::Error(
+            "denied".into(),
+        ))),
         shutdown_request_outcome(Ok::<_, anyhow::Error>(KernelResponse::Working)),
     ] {
         assert!(
-            matches!(outcome, ShutdownRequestOutcome::Escalate(_)),
-            "every failed authenticated shutdown must reach identity-gated termination"
+            matches!(outcome, ShutdownRequestOutcome::Rejected(_)),
+            "an authenticated daemon response must fail closed without process termination"
         );
     }
 }
