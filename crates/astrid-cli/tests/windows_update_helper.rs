@@ -23,7 +23,8 @@ const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(25);
 #[derive(Serialize)]
 struct Transaction {
     schema_version: u32,
-    transaction_id: String,
+    #[serde(rename = "transaction_id")]
+    id: String,
     target_version: String,
     parent_pid: u32,
     parent_creation_time: u64,
@@ -61,6 +62,8 @@ struct ChildGuard(std::process::Child);
 
 struct ProcessHandle(HANDLE);
 
+// Exact handle ownership requires one audited Win32 close at this FFI edge.
+#[allow(unsafe_code)]
 impl Drop for ProcessHandle {
     fn drop(&mut self) {
         // SAFETY: this guard owns one successful OpenProcess handle.
@@ -79,7 +82,7 @@ fn write_private(path: &Path, bytes: &[u8]) {
 }
 
 fn wait_for_private_marker(path: &Path, expected: &str, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
+    let deadline = deadline_after(timeout);
     loop {
         if astrid_core::platform_fs::read_private_file_to_string(path)
             .is_ok_and(|contents| contents == expected)
@@ -96,7 +99,7 @@ fn wait_for_private_marker(path: &Path, expected: &str, timeout: Duration) {
 }
 
 fn wait_for_child(child: &mut std::process::Child, timeout: Duration) -> std::process::ExitStatus {
-    let deadline = Instant::now() + timeout;
+    let deadline = deadline_after(timeout);
     loop {
         if let Some(status) = child.try_wait().unwrap() {
             return status;
@@ -120,7 +123,7 @@ fn terminate_child_bounded_sync(child: &mut std::process::Child) -> std::io::Res
         return Err(kill_error);
     }
 
-    let deadline = Instant::now() + CHILD_REAP_TIMEOUT;
+    let deadline = deadline_after(CHILD_REAP_TIMEOUT);
     loop {
         if child.try_wait()?.is_some() {
             return Ok(());
@@ -149,6 +152,12 @@ fn private_test_root() -> (PathBuf, DirectoryGuard) {
     (root.clone(), DirectoryGuard(root))
 }
 
+fn deadline_after(duration: Duration) -> Instant {
+    Instant::now()
+        .checked_add(duration)
+        .expect("Windows updater test deadline overflow")
+}
+
 fn read_receipt_state(path: &Path) -> Option<String> {
     let value: serde_json::Value =
         serde_json::from_str(&astrid_core::platform_fs::read_private_file_to_string(path).ok()?)
@@ -162,6 +171,9 @@ fn digest(path: &Path) -> String {
         .to_string()
 }
 
+// This helper is the only test FFI boundary for binding a PID to its creation
+// token; access is query-only and the retained handle owns the entire query.
+#[allow(unsafe_code)]
 fn process_creation_time(process_id: u32) -> u64 {
     // SAFETY: scalar PID and query-only access; a successful handle is owned
     // by ProcessHandle for the duration of GetProcessTimes.
@@ -178,7 +190,15 @@ fn process_creation_time(process_id: u32) -> u64 {
     // SAFETY: the retained handle has query access and every output pointer
     // references initialized FILETIME storage.
     assert_ne!(
-        unsafe { GetProcessTimes(handle.0, &mut creation, &mut exit, &mut kernel, &mut user) },
+        unsafe {
+            GetProcessTimes(
+                handle.0,
+                &raw mut creation,
+                &raw mut exit,
+                &raw mut kernel,
+                &raw mut user,
+            )
+        },
         0,
         "failed to query test process identity"
     );
@@ -266,7 +286,7 @@ fn real_hidden_helper_replaces_the_complete_executable_set() {
     let mut parent = spawn_test_parent();
     let transaction = Transaction {
         schema_version: 2,
-        transaction_id,
+        id: transaction_id,
         target_version: "test-version".to_owned(),
         parent_pid: parent.0.id(),
         parent_creation_time: process_creation_time(parent.0.id()),
@@ -372,7 +392,7 @@ fn tampered_payload_keeps_all_live_binaries_and_is_reported_by_real_cli() {
     let mut parent = spawn_test_parent();
     let transaction = Transaction {
         schema_version: 2,
-        transaction_id,
+        id: transaction_id,
         target_version: "tamper-test".to_owned(),
         parent_pid: parent.0.id(),
         parent_creation_time: process_creation_time(parent.0.id()),
@@ -419,7 +439,7 @@ fn tampered_payload_keeps_all_live_binaries_and_is_reported_by_real_cli() {
     );
     for (name, expected_digest) in original_live_digests {
         assert_eq!(
-            digest(&install.join(name)),
+            digest(&install.join(&name)),
             expected_digest,
             "{name} changed despite pre-mutation authentication failure"
         );
@@ -458,7 +478,7 @@ fn ordinary_invocation_never_recovers_a_provisional_handoff() {
         &pending_path,
         &serde_json::to_vec(&Transaction {
             schema_version: 2,
-            transaction_id,
+            id: transaction_id,
             target_version: "pending-test".to_owned(),
             parent_pid: parent.0.id(),
             parent_creation_time: process_creation_time(parent.0.id()),
@@ -521,7 +541,7 @@ fn ordinary_invocation_cleans_an_abandoned_provisional_handoff() {
         &pending_path,
         &serde_json::to_vec(&Transaction {
             schema_version: 2,
-            transaction_id,
+            id: transaction_id,
             target_version: "abandoned-pending-test".to_owned(),
             parent_pid,
             parent_creation_time,
@@ -584,7 +604,7 @@ fn ordinary_invocation_recovers_an_interrupted_update_before_dispatch() {
 
     let transaction = Transaction {
         schema_version: 2,
-        transaction_id: transaction_id.clone(),
+        id: transaction_id.clone(),
         target_version: "interrupted-test".to_owned(),
         parent_pid: original_parent_pid,
         parent_creation_time: original_parent_creation_time,
@@ -632,7 +652,7 @@ fn ordinary_invocation_recovers_an_interrupted_update_before_dispatch() {
     let status = wait_for_child(&mut blocked.0, Duration::from_secs(15));
     assert!(!status.success(), "interrupted update was not fail-closed");
 
-    let recovery_deadline = Instant::now() + Duration::from_secs(30);
+    let recovery_deadline = deadline_after(Duration::from_secs(30));
     loop {
         if read_receipt_state(&receipt_path).as_deref() == Some("failed_recovered") {
             break;
@@ -644,7 +664,7 @@ fn ordinary_invocation_recovers_an_interrupted_update_before_dispatch() {
         std::thread::sleep(Duration::from_millis(25));
     }
 
-    let cleanup_deadline = Instant::now() + Duration::from_secs(15);
+    let cleanup_deadline = deadline_after(Duration::from_secs(15));
     while staging.exists() {
         let mut invocation = ChildGuard(
             std::process::Command::new(install.join("astrid.exe"))

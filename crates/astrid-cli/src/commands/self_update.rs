@@ -913,7 +913,7 @@ pub(crate) fn ensure_path_setup(yes: bool) -> anyhow::Result<()> {
     #[cfg(windows)]
     {
         let exe = running_binary()?;
-        return windows_path::ensure_path_setup(&exe, InstallMethod::detect(&exe), yes);
+        windows_path::ensure_path_setup(&exe, InstallMethod::detect(&exe), yes)
     }
 
     #[cfg(not(windows))]

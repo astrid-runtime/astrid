@@ -297,12 +297,11 @@ async fn wait_for_existing_daemon_readiness() -> Result<bool> {
     loop {
         match probe_authenticated_daemon(None).await {
             Ok(DaemonProbe::Authenticated(_)) => return Ok(true),
-            Ok(DaemonProbe::Absent | DaemonProbe::Stale) => {},
             Err(error) if is_handshake_rejection(&error) => return Err(error),
             // A daemon that is still composing its uplink can transiently fail
             // the authenticated probe. Keep the wait bounded, then report
             // failure to automation instead of claiming start succeeded.
-            Err(_) => {},
+            Ok(DaemonProbe::Absent | DaemonProbe::Stale) | Err(_) => {},
         }
         if tokio::time::Instant::now() >= deadline {
             return Ok(false);
@@ -358,12 +357,14 @@ async fn ensure_daemon_inner(label: &str, announce: bool) -> Result<()> {
             }
             false
         },
-        Ok(astrid_core::local_transport::ConnectOutcome::Absent) => true,
         // Do not unlink here: another generation could acquire the singleton
         // and publish between this probe and an unguarded cleanup. The spawn
         // path takes the namespace lock and removes stale artifacts while it
         // still owns that lock.
-        Ok(astrid_core::local_transport::ConnectOutcome::Stale) => true,
+        Ok(
+            astrid_core::local_transport::ConnectOutcome::Absent
+            | astrid_core::local_transport::ConnectOutcome::Stale,
+        ) => true,
         Err(error) => return Err(error).context("failed to probe daemon endpoint"),
     };
     if needs_boot {

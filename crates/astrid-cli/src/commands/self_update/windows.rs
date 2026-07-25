@@ -42,7 +42,8 @@ const WINDOWS_MANAGED_BINARIES: [&str; 4] = [
 #[serde(deny_unknown_fields)]
 struct Transaction {
     schema_version: u32,
-    transaction_id: String,
+    #[serde(rename = "transaction_id")]
+    id: String,
     target_version: String,
     parent_pid: u32,
     parent_creation_time: ProcessCreationToken,
@@ -229,7 +230,7 @@ pub(super) fn stage_and_launch(
     let transaction_path = staging_dir.join(PENDING_TRANSACTION);
     let transaction = Transaction {
         schema_version: TRANSACTION_SCHEMA_VERSION,
-        transaction_id: nonce,
+        id: nonce,
         target_version: target_version.to_owned(),
         parent_pid,
         parent_creation_time,
@@ -369,16 +370,14 @@ fn acquire_stage_lock(
         .checked_add(timeout)
         .context("Windows update stage-lock deadline overflow")?;
     loop {
-        match try_acquire_stage_lock(staging_dir)? {
-            Some(file) => return Ok(file),
-            None => {
-                anyhow::ensure!(
-                    std::time::Instant::now() < deadline,
-                    "timed out waiting for the active Windows update helper"
-                );
-                std::thread::sleep(HELPER_ARM_POLL);
-            },
+        if let Some(file) = try_acquire_stage_lock(staging_dir)? {
+            return Ok(file);
         }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for the active Windows update helper"
+        );
+        std::thread::sleep(HELPER_ARM_POLL);
     }
 }
 
@@ -503,17 +502,15 @@ fn stage_for_named_transaction_path<'a>(
     Ok(stage)
 }
 
-pub(super) fn reconcile_previous_update() -> anyhow::Result<bool> {
-    let executable = std::env::current_exe().context("failed to resolve the Astrid executable")?;
-    let install_dir = executable
-        .parent()
-        .context("Astrid executable has no install directory")?;
+type PendingRecovery = (PathBuf, Transaction, std::fs::File);
+
+fn update_stage_paths(install_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let stages = match std::fs::read_dir(install_dir) {
         Ok(stages) => stages,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error).context("failed to inspect Windows update stages"),
     };
-    let mut stage_paths = Vec::new();
+    let mut paths = Vec::new();
     for entry in stages {
         let entry = entry.context("failed to inspect a Windows update stage entry")?;
         if !entry.file_name().to_str().is_some_and(valid_stage_name) {
@@ -526,99 +523,109 @@ pub(super) fn reconcile_previous_update() -> anyhow::Result<bool> {
         );
         astrid_core::platform_fs::verify_no_redirects(&entry.path())
             .context("Windows update stage crosses an untrusted filesystem boundary")?;
-        stage_paths.push(entry.path());
+        paths.push(entry.path());
     }
-    let mut stages = stage_paths;
-    stages.sort();
+    paths.sort();
+    Ok(paths)
+}
 
-    let mut recovery = None;
-    for stage in stages {
-        let stage_lock = match try_acquire_stage_lock(&stage) {
-            Ok(Some(stage_lock)) => stage_lock,
-            Ok(None) => {
-                eprintln!("A Windows update is still being finalized; rerun this command shortly.");
+fn reconcile_stage(stage: &Path, recovery: &mut Option<PendingRecovery>) -> anyhow::Result<bool> {
+    let stage_lock = match try_acquire_stage_lock(stage) {
+        Ok(Some(stage_lock)) => stage_lock,
+        Ok(None) => {
+            eprintln!("A Windows update is still being finalized; rerun this command shortly.");
+            return Ok(true);
+        },
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(false);
+        },
+        Err(error) => return Err(error),
+    };
+    let result_path = stage.join("result.json");
+    let transaction_path = stage.join(TRANSACTION);
+    let pending_path = stage.join(PENDING_TRANSACTION);
+    if pending_path.exists() {
+        anyhow::ensure!(
+            !transaction_path.exists() && !result_path.exists(),
+            "Windows update stage contains conflicting pending and published state: {}",
+            stage.display()
+        );
+        let transaction = read_transaction(&pending_path).with_context(|| {
+            format!(
+                "invalid provisional Windows update transaction at {}",
+                pending_path.display()
+            )
+        })?;
+        validate_pending_transaction(&pending_path, &transaction)?;
+        match recorded_process_state(transaction.parent_pid, transaction.parent_creation_time)? {
+            RecordedProcessState::Alive => {
+                drop(stage_lock);
+                eprintln!(
+                    "A Windows update handoff is still being finalized; rerun this command shortly."
+                );
                 return Ok(true);
             },
-            Err(error)
-                if error
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
-            {
-                continue;
+            RecordedProcessState::Gone => {
+                cleanup_abandoned_pending(&pending_path, &transaction)?;
+                drop(stage_lock);
+                cleanup_stale_stage(stage);
+                return Ok(false);
             },
-            Err(error) => return Err(error),
-        };
-        let result_path = stage.join("result.json");
-        let transaction_path = stage.join(TRANSACTION);
-        let pending_path = stage.join(PENDING_TRANSACTION);
-        if pending_path.exists() {
-            anyhow::ensure!(
-                !transaction_path.exists() && !result_path.exists(),
-                "Windows update stage contains conflicting pending and published state: {}",
-                stage.display()
-            );
-            let transaction = read_transaction(&pending_path).with_context(|| {
-                format!(
-                    "invalid provisional Windows update transaction at {}",
-                    pending_path.display()
-                )
-            })?;
-            validate_pending_transaction(&pending_path, &transaction)?;
-            match recorded_process_state(transaction.parent_pid, transaction.parent_creation_time)?
-            {
-                RecordedProcessState::Alive => {
-                    drop(stage_lock);
-                    eprintln!(
-                        "A Windows update handoff is still being finalized; rerun this command shortly."
-                    );
-                    return Ok(true);
-                },
-                RecordedProcessState::Gone => {
-                    cleanup_abandoned_pending(&pending_path, &transaction)?;
-                    drop(stage_lock);
-                    cleanup_stale_stage(&stage);
-                    continue;
-                },
-            }
         }
-        if result_path.exists() {
-            let receipt = read_receipt(&result_path).with_context(|| {
-                format!(
-                    "invalid Windows update receipt at {}",
-                    result_path.display()
-                )
-            })?;
-            validate_receipt(&stage, &receipt)?;
-            if receipt.state.is_terminal() {
-                report_terminal_receipt(&stage, &result_path, receipt, stage_lock)?;
-                continue;
-            }
-            anyhow::ensure!(
-                transaction_path.exists(),
-                "nonterminal Windows update receipt has no recovery transaction at {}",
-                stage.display()
-            );
+    }
+    if result_path.exists() {
+        let receipt = read_receipt(&result_path).with_context(|| {
+            format!(
+                "invalid Windows update receipt at {}",
+                result_path.display()
+            )
+        })?;
+        validate_receipt(stage, &receipt)?;
+        if receipt.state.is_terminal() {
+            report_terminal_receipt(stage, &result_path, receipt, stage_lock)?;
+            return Ok(false);
         }
-        if transaction_path.exists() {
-            anyhow::ensure!(
-                recovery.is_none(),
-                "multiple interrupted Windows updates require recovery; preserved stages: {} and {}",
-                recovery
-                    .as_ref()
-                    .map(|(path, _, _): &(PathBuf, Transaction, std::fs::File)| {
-                        path.display().to_string()
-                    })
-                    .unwrap_or_default(),
-                stage.display()
-            );
-            let transaction = read_transaction(&transaction_path)?;
-            validate_transaction(&transaction_path, &transaction)?;
-            recovery = Some((transaction_path, transaction, stage_lock));
-        } else if !result_path.exists() {
-            drop(stage_lock);
-            cleanup_stale_stage(&stage);
-        } else {
-            drop(stage_lock);
+        anyhow::ensure!(
+            transaction_path.exists(),
+            "nonterminal Windows update receipt has no recovery transaction at {}",
+            stage.display()
+        );
+    }
+    if transaction_path.exists() {
+        anyhow::ensure!(
+            recovery.is_none(),
+            "multiple interrupted Windows updates require recovery; preserved stages: {} and {}",
+            recovery
+                .as_ref()
+                .map(|(path, _, _)| path.display().to_string())
+                .unwrap_or_default(),
+            stage.display()
+        );
+        let transaction = read_transaction(&transaction_path)?;
+        validate_transaction(&transaction_path, &transaction)?;
+        *recovery = Some((transaction_path, transaction, stage_lock));
+    } else if !result_path.exists() {
+        drop(stage_lock);
+        cleanup_stale_stage(stage);
+    } else {
+        drop(stage_lock);
+    }
+    Ok(false)
+}
+
+pub(super) fn reconcile_previous_update() -> anyhow::Result<bool> {
+    let executable = std::env::current_exe().context("failed to resolve the Astrid executable")?;
+    let install_dir = executable
+        .parent()
+        .context("Astrid executable has no install directory")?;
+    let mut recovery = None;
+    for stage in update_stage_paths(install_dir)? {
+        if reconcile_stage(&stage, &mut recovery)? {
+            return Ok(true);
         }
     }
 
@@ -653,11 +660,14 @@ fn validate_receipt(stage: &Path, receipt: &UpdateReceipt) -> anyhow::Result<()>
         !receipt.target_version.is_empty() && receipt.target_version.len() <= 128,
         "Windows update receipt target version is invalid"
     );
+    let max_detail_bytes = MAX_RECEIPT_DETAIL_BYTES
+        .checked_add('…'.len_utf8())
+        .context("Windows update receipt detail limit overflow")?;
     anyhow::ensure!(
         receipt
             .detail
             .as_ref()
-            .is_none_or(|detail| detail.len() <= MAX_RECEIPT_DETAIL_BYTES + '…'.len_utf8()),
+            .is_none_or(|detail| detail.len() <= max_detail_bytes),
         "Windows update receipt detail is too large"
     );
     Ok(())

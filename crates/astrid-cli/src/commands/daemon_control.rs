@@ -335,23 +335,27 @@ pub(crate) async fn terminate_orphan(pid_path: &Path) -> std::io::Result<KillOut
 pub(crate) async fn terminate_known(identity: &DaemonIdentity) -> KillOutcome {
     let pid = identity.pid;
     #[cfg(windows)]
-    return match (&identity.executable, identity.creation_time) {
-        (_, _) if windows::is_process_confirmed_gone(pid) => KillOutcome::NotRunning,
-        (Some(recorded), Some(creation_time)) => {
-            let recorded = recorded.to_path_buf();
-            match tokio::task::spawn_blocking(move || {
-                windows::terminate_verified_process(pid, &recorded, creation_time, GRACE)
-            })
-            .await
-            {
-                Ok(windows::VerifiedTermination::NotRunning) => KillOutcome::NotRunning,
-                Ok(windows::VerifiedTermination::Unverified) => KillOutcome::Unverified(pid),
-                Ok(windows::VerifiedTermination::Exited) => KillOutcome::KilledExited,
-                Ok(windows::VerifiedTermination::StillAlive) | Err(_) => KillOutcome::StillAlive,
-            }
-        },
-        _ => KillOutcome::Unverified(pid),
-    };
+    {
+        match (&identity.executable, identity.creation_time) {
+            (_, _) if windows::is_process_confirmed_gone(pid) => KillOutcome::NotRunning,
+            (Some(recorded), Some(creation_time)) => {
+                let recorded = recorded.clone();
+                match tokio::task::spawn_blocking(move || {
+                    windows::terminate_verified_process(pid, &recorded, creation_time, GRACE)
+                })
+                .await
+                {
+                    Ok(windows::VerifiedTermination::NotRunning) => KillOutcome::NotRunning,
+                    Ok(windows::VerifiedTermination::Unverified) => KillOutcome::Unverified(pid),
+                    Ok(windows::VerifiedTermination::Exited) => KillOutcome::KilledExited,
+                    Ok(windows::VerifiedTermination::StillAlive) | Err(_) => {
+                        KillOutcome::StillAlive
+                    },
+                }
+            },
+            _ => KillOutcome::Unverified(pid),
+        }
+    }
 
     #[cfg(not(windows))]
     {

@@ -215,15 +215,14 @@ pub(crate) async fn run_or_connect(
             c
         },
         Err(e) => {
-            if let Some(mut child) = daemon_child {
-                if let Err(cleanup_error) =
+            if let Some(mut child) = daemon_child
+                && let Err(cleanup_error) =
                     commands::daemon::terminate_child_bounded(&mut child).await
-                {
-                    return Err(anyhow::Error::new(e).context(format!(
-                        "failed to connect to the newly started daemon, and bounded child cleanup \
-                         also failed: {cleanup_error}"
-                    )));
-                }
+            {
+                return Err(anyhow::Error::new(e).context(format!(
+                    "failed to connect to the newly started daemon, and bounded child cleanup \
+                     also failed: {cleanup_error}"
+                )));
             }
             let log_hint = astrid_core::dirs::AstridHome::resolve().map_or_else(
                 |_| "Failed to connect to daemon".to_string(),

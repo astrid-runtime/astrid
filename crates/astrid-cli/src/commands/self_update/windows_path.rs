@@ -377,8 +377,8 @@ fn open_user_environment() -> anyhow::Result<RegistryKey> {
             REG_OPTION_NON_VOLATILE,
             KEY_QUERY_VALUE | KEY_SET_VALUE,
             ptr::null(),
-            &mut key,
-            &mut disposition,
+            &raw mut key,
+            &raw mut disposition,
         )
     };
     win32_status(status).context("cannot open the persistent User environment")?;
@@ -415,7 +415,7 @@ fn open_key(
     let mut key = ptr::null_mut();
     // SAFETY: `subkey` is a static NUL-terminated string, `key` is writable,
     // and the returned handle is owned by `RegistryKey`.
-    let status = unsafe { RegOpenKeyExW(root, subkey, 0, access, &mut key) };
+    let status = unsafe { RegOpenKeyExW(root, subkey, 0, access, &raw mut key) };
     win32_status(status)?;
     Ok(RegistryKey(key))
 }
@@ -430,9 +430,9 @@ fn read_path_value(key: &RegistryKey) -> anyhow::Result<Option<PathValue>> {
             key.0,
             PATH_VALUE_NAME,
             ptr::null(),
-            &mut kind,
+            &raw mut kind,
             ptr::null_mut(),
-            &mut bytes,
+            &raw mut bytes,
         )
     };
     if status == ERROR_FILE_NOT_FOUND {
@@ -454,8 +454,7 @@ fn read_path_value(key: &RegistryKey) -> anyhow::Result<Option<PathValue>> {
     let initial_bytes = usize::try_from(bytes).context("persistent PATH is too large")?;
     let mut data = vec![0u16; initial_bytes.div_ceil(2).max(1)];
     loop {
-        let mut available =
-            u32::try_from(data.len() * 2).context("persistent PATH is too large")?;
+        let mut available = utf16_byte_len(data.len())?;
         // SAFETY: `data` is writable for `available` bytes and all other
         // pointers reference valid storage.
         let status = unsafe {
@@ -463,9 +462,9 @@ fn read_path_value(key: &RegistryKey) -> anyhow::Result<Option<PathValue>> {
                 key.0,
                 PATH_VALUE_NAME,
                 ptr::null(),
-                &mut kind,
+                &raw mut kind,
                 data.as_mut_ptr().cast(),
-                &mut available,
+                &raw mut available,
             )
         };
         if status == ERROR_MORE_DATA {
@@ -502,7 +501,7 @@ fn write_path_value(key: &RegistryKey, path: &PathValue) -> anyhow::Result<()> {
         "refusing to write a persistent PATH containing an embedded NUL"
     );
     data.push(0);
-    let bytes = u32::try_from(data.len() * 2).context("persistent PATH is too large")?;
+    let bytes = utf16_byte_len(data.len())?;
     ensure!(
         bytes <= MAX_REGISTRY_PATH_BYTES,
         "persistent PATH exceeds the one-megabyte safety limit"
@@ -542,7 +541,7 @@ fn notify_environment_change() -> anyhow::Result<()> {
                     USER_ENVIRONMENT_KEY as isize,
                     SMTO_ABORTIFHUNG | SMTO_BLOCK,
                     BROADCAST_WINDOW_TIMEOUT_MS,
-                    &mut result,
+                    &raw mut result,
                 )
             };
             let outcome = if sent == 0 {
@@ -563,6 +562,13 @@ fn notify_environment_change() -> anyhow::Result<()> {
             bail!("Windows environment-notification worker exited unexpectedly")
         },
     }
+}
+
+fn utf16_byte_len(code_units: usize) -> anyhow::Result<u32> {
+    let bytes = code_units
+        .checked_mul(std::mem::size_of::<u16>())
+        .context("persistent PATH byte length overflow")?;
+    u32::try_from(bytes).context("persistent PATH is too large")
 }
 
 fn win32_status(status: u32) -> anyhow::Result<()> {

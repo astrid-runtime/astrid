@@ -28,7 +28,7 @@ fn blank_entries() -> Vec<Entry> {
 fn transaction(install: &Path, staging: &Path, parent_pid: u32) -> Transaction {
     Transaction {
         schema_version: TRANSACTION_SCHEMA_VERSION,
-        transaction_id: staging
+        id: staging
             .file_name()
             .and_then(std::ffi::OsStr::to_str)
             .and_then(|name| name.strip_prefix(STAGE_PREFIX))
@@ -94,13 +94,40 @@ fn canonical_transaction_replaces_cli_last() {
 }
 
 #[test]
+fn transaction_wire_schema_preserves_transaction_id() {
+    let directory = crate::test_support::private_tempdir();
+    let install = directory.path();
+    let staging = private_staging_dir(install);
+    let expected_id = staging
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .and_then(|name| name.strip_prefix(STAGE_PREFIX))
+        .unwrap();
+    let encoded = serde_json::to_value(transaction(install, &staging, 1)).unwrap();
+
+    assert_eq!(
+        encoded
+            .get("transaction_id")
+            .and_then(serde_json::Value::as_str),
+        Some(expected_id)
+    );
+    assert!(
+        encoded.get("id").is_none(),
+        "internal field name leaked into the durable transaction schema"
+    );
+
+    let decoded: Transaction = serde_json::from_value(encoded).unwrap();
+    assert_eq!(decoded.id, expected_id);
+}
+
+#[test]
 fn transaction_accepts_only_the_versioned_complete_executable_set() {
     let directory = crate::test_support::private_tempdir();
     let install = directory.path();
     let staging = private_staging_dir(install);
     let path = transaction_path(&staging);
-    let transaction = transaction(install, &staging, 1);
-    validate_transaction(&path, &transaction).unwrap();
+    let valid_transaction = transaction(install, &staging, 1);
+    validate_transaction(&path, &valid_transaction).unwrap();
 
     let mut missing = transaction(install, &staging, 1);
     missing.entries.remove(1);

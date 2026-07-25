@@ -43,8 +43,7 @@ pub(super) fn validate_transaction_at(
         "unsupported Windows update transaction schema"
     );
     anyhow::ensure!(
-        transaction.transaction_id.len() == 32
-            && uuid::Uuid::parse_str(&transaction.transaction_id).is_ok(),
+        transaction.id.len() == 32 && uuid::Uuid::parse_str(&transaction.id).is_ok(),
         "invalid Windows update transaction ID"
     );
     anyhow::ensure!(
@@ -75,7 +74,7 @@ pub(super) fn validate_transaction_at(
         transaction.helper == transaction.staging_dir.join("helper.exe"),
         "helper is not the canonical executable in its staging directory"
     );
-    let expected_stage_name = format!("{STAGE_PREFIX}{}", transaction.transaction_id);
+    let expected_stage_name = format!("{STAGE_PREFIX}{}", transaction.id);
     anyhow::ensure!(
         transaction.staging_dir.file_name() == Some(std::ffi::OsStr::new(&expected_stage_name)),
         "staging directory is not bound to the transaction ID"
@@ -172,7 +171,7 @@ pub(super) fn receipt_for(
 ) -> UpdateReceipt {
     UpdateReceipt {
         schema_version: TRANSACTION_SCHEMA_VERSION,
-        transaction_id: transaction.transaction_id.clone(),
+        transaction_id: transaction.id.clone(),
         target_version: transaction.target_version.clone(),
         state,
         detail: detail.map(bounded_detail),

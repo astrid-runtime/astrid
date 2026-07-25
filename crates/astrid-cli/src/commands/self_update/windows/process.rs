@@ -65,7 +65,16 @@ pub(super) fn process_creation_token(
     let mut user = creation;
     // SAFETY: all pointers reference initialized FILETIME storage and the
     // retained handle has PROCESS_QUERY_LIMITED_INFORMATION access.
-    if unsafe { GetProcessTimes(handle.0, &mut creation, &mut exit, &mut kernel, &mut user) } == 0 {
+    if unsafe {
+        GetProcessTimes(
+            handle.0,
+            &raw mut creation,
+            &raw mut exit,
+            &raw mut kernel,
+            &raw mut user,
+        )
+    } == 0
+    {
         return Err(std::io::Error::last_os_error());
     }
     let token = (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
@@ -109,7 +118,7 @@ pub(super) fn recorded_process_state(
 ) -> anyhow::Result<RecordedProcessState> {
     let process = match open_process_identity(process_id) {
         Ok(process) => process,
-        Err(error) if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) => {
+        Err(error) if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER.cast_signed()) => {
             return Ok(RecordedProcessState::Gone);
         },
         Err(error) => {
