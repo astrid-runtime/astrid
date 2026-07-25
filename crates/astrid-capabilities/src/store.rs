@@ -1,7 +1,9 @@
 //! Capability token storage.
 //!
-//! Provides both in-memory (session) and persistent (`SurrealKV`) storage
-//! for capability tokens.
+//! Provides in-memory session storage and persistent storage through an
+//! injected [`KvStore`]. The native kernel injects its authoritative principal
+//! store. [`CapabilityStore::with_persistence`] retains the old standalone
+//! `SurrealKV` constructor for compatibility during the migration window.
 
 use astrid_core::principal::PrincipalId;
 use astrid_core::{Permission, TokenId};
@@ -81,7 +83,11 @@ impl CapabilityStore {
         }
     }
 
-    /// Create a store with persistence.
+    /// Create a store with legacy standalone `SurrealKV` persistence.
+    ///
+    /// Native Astrid composition should inject the authoritative store through
+    /// [`Self::with_kv_store`]. This constructor remains for callers that own a
+    /// standalone legacy store path.
     ///
     /// # Errors
     ///

@@ -224,13 +224,17 @@ for collision-path code coverage.
 
 ## 5. Engine conformance
 
-Every storage backend runs the same black-box trace suite:
+Every applicable conformance target runs the same black-box trace suite:
 
-- `MemoryKvStore`;
-- current `SurrealKvStore`;
-- in-memory principal-store engine;
-- durable segment engine;
-- native block-backed engine.
+- `MemoryKvStore`, as the in-memory behavioral oracle;
+- legacy `SurrealKvStore`, as the migration compatibility oracle;
+- the in-memory principal-store engine;
+- the durable segment engine;
+- the future native block-backed engine.
+
+Only the durable principal-store engine is a selectable native runtime store.
+The legacy implementation is exercised to prove migration compatibility, not
+retained as an operator-selected backend.
 
 The suite covers:
 
@@ -244,8 +248,8 @@ The suite covers:
 - quota charging before visible commit;
 - cancellation at every await point.
 
-The legacy backends need not expose new snapshot/export features. The adapter's
-observable `KvStore` behavior must remain compatible.
+The compatibility oracles need not expose new snapshot/export features. The
+adapter's observable `KvStore` behavior must remain compatible.
 
 The in-memory compatibility gate runs deterministic generated traces against
 `MemoryKvStore`, `SurrealKvStore`, and `PrincipalKvStore`. It compares every
