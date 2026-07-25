@@ -222,6 +222,145 @@ pins are authoritative. The initial engine remains in memory until the model
 semantics are stable; the first durable implementation must include index
 rebuild and fault injection rather than treating either as later cleanup.
 
+### 5.5 In-memory engine contract
+
+The first `astrid-storage-engine` implementation refines the model behind a
+thread-safe user-space API without selecting a persistent object encoding. It:
+
+- accepts an injected `ObjectIdentity` implementation;
+- binds semantic object kind and kind-scoped format version into identity;
+- recomputes every declared object identifier before admission;
+- stages and validates a complete immutable closure before root publication;
+- rejects roots that do not name a typed `Commit` envelope;
+- rejects known-stale compare-and-swap requests before they consume storage;
+- publishes one linearizable principal-root generation under concurrent
+  writers;
+- captures a root and its deterministic closure under one read lock;
+- preserves roots retained by other principals or explicit pins during garbage
+  collection.
+
+This engine is evidence about transaction semantics, not durability. It does
+not claim recovery, disk atomicity, canonical format stability, encryption,
+quota enforcement, or production placement. Those claims begin only with the
+arena and root-journal backend plus the fault matrix in the evidence document.
+
+### 5.6 KV compatibility bridge
+
+`astrid-storage::PrincipalKvStore` implements the existing async `KvStore`
+surface over the in-memory engine without changing current callers. The bridge:
+
+- requires an injected authority-aware resolver from namespace to a
+  domain-bearing principal identifier;
+- never derives authority by splitting an arbitrary namespace string;
+- places every capsule namespace owned by one principal under the same
+  principal root;
+- represents values and indexes as the typed path
+  `KvLeaf -> KvBranch -> NamespaceMap -> PrincipalState -> Commit`;
+- replaces only the `kv` state component and preserves unrelated filesystem,
+  audit, evidence, or future component references;
+- retries exact-root conflicts from a new snapshot so concurrent mutations do
+  not lose updates;
+- keeps empty values distinct from missing keys and omits empty namespaces;
+- accounts repeated visible values logically even when their immutable leaf
+  object is physically shared.
+
+The projection grammar is an internal version-one logical shape. Object
+identity remains injected, and the adapter does not select a production digest,
+serialized object framing, or disk layout.
+
+The initial differential suite runs generated get, set, delete, exists, list,
+prefix, clear, and compare-and-swap traces against `MemoryKvStore`,
+`SurrealKvStore`, and the adapter. Each operation result and the complete
+resulting namespace state must agree. Invalid raw namespaces and keys now have
+the same `InvalidKey` class in the memory and persistent legacy backends.
+
+This is not a runtime cutover. Existing installations continue using
+`SurrealKvStore`. A later integration must quiesce writes for one principal,
+capture all of its known namespaces consistently, install one complete
+principal root, run shadow comparisons, and only then switch the authoritative
+backend. The current `KvStore` API cannot enumerate namespaces or produce an
+atomic cross-namespace legacy snapshot, so a naive live list-and-copy loop is
+not an acceptable migration protocol.
+
+The bridge is a compatibility oracle, not the intended production hot path.
+Each mutation currently reconstructs the complete in-memory KV projection,
+which is linear in that principal's KV state. The durable engine must persist
+immutable objects once and use bounded-fanout persistent trees so it path-copies
+only the affected leaf-to-root path, principal state, and commit. It must not
+reuse the bridge's whole-state snapshot/update loop as its point-operation API.
+Its benchmarks must measure height-bounded write amplification rather than
+treating the bridge's flat maps and full reconstruction as an acceptable
+steady-state cost.
+
+The existing Cargo feature named `kv` gates only the optional `SurrealKvStore`
+dependency; the `KvStore` contract and its memory, scoped, and principal-store
+implementations are already unconditional. The new architecture does not treat
+principal KV state as optional and must not inherit that misleading feature
+boundary. During runtime migration the old backend may be isolated behind an
+explicit `legacy-surrealkv` transition feature. Once migration and rollback
+support no longer require it, remove that backend and transition feature rather
+than making SurrealKV an unconditional dependency.
+
+### 5.7 First durable host-file realization
+
+`astrid-storage-engine::DurableEngine` is the first actual I/O realization of
+the model. It uses one active append-only object arena and a separate
+append-only root journal:
+
+```text
+objects.arena:
+    repeated checksummed { physical_frame_version, object_id, encoded_record }
+
+roots.journal:
+    repeated checksummed {
+        principal_bytes,
+        expected_root,
+        replacement_root
+    }
+```
+
+The encoded record is a versioned physical representation of `ObjectRecord`.
+It is not declared to be the final canonical export format and does not choose
+the production `ContentId` hash. `ObjectIdentity` and a canonical
+domain-bearing `PrincipalCodec` remain injected so durability ordering can be
+proven independently of those still-measured format decisions.
+
+Commit order is:
+
+1. verify identities, root expectation, complete closure, encoding, and frame
+   resource bounds without writing;
+2. append and flush non-commit immutable object frames;
+3. append and flush the immutable commit frame;
+4. append and flush one root-journal compare-and-swap record;
+5. update the in-memory world and disposable index.
+
+The root-journal flush is the durable linearization point. An interrupted
+engine is poisoned and refuses both reads and writes until reopen. On reopen,
+the engine:
+
+- takes an exclusive process lock;
+- scans and identity-checks every complete object frame;
+- rebuilds the `ObjectId` index entirely from the arena;
+- truncates only an incomplete final header or payload;
+- rejects a complete checksum, grammar, canonicality, identity, collision, or
+  model failure with its file and byte offset;
+- replays root records using the same model compare-and-swap transition and
+  verifies the recorded generation;
+- flushes newly created directory entries on Unix.
+
+`RecoveryLimits` is required from the embedding runtime. It bounds one recovery
+allocation and one admitted physical frame; it is not a hidden workspace,
+principal, or per-file quota and has no library default. Host-file support is
+excluded from `target_family = "wasm"` while the portable model, in-memory
+engine, and compatibility adapter remain available there.
+
+This slice deliberately has one active arena and an in-memory rebuilt index. It
+does not yet seal arenas, compact garbage, persist pins, remove roots, enforce
+principal quotas, coordinate an audit/outbox record, inject short writes or
+disk-full errors, select `BlobId`/encoding profiles, or replace SurrealKV in the
+runtime. Those claims remain attached to their evidence gates rather than to
+the existence of two durable files.
+
 ## 6. Three identifiers, not one overloaded hash
 
 The system must not turn possession of a hash into permission to read data.
@@ -697,6 +836,31 @@ This removes the current best-effort partial-copy failure mode:
 old: list keys -> copy key by key -> copy files -> warn and continue
 new: select source root -> authorize selected components -> commit destination root
 ```
+
+### 12.1 Why this matters particularly for agents
+
+Agent workspaces are unusually expensive to copy and unusually valuable to
+checkpoint. A single durable Linux realm may contain a source checkout, Rust
+`target/` trees, package-manager caches, `node_modules/`, toolchains, model
+artifacts, and a long-lived home directory. Most bytes remain unchanged across
+an agent turn even when a build creates thousands of new files.
+
+With immutable content-addressed objects, a warm turn admits only new or
+changed chunks and metadata. Checkpoint publication is one root transition;
+rollback is another root transition; a local fork initially shares the same
+objects; and an incremental transfer sends only objects the receiver does not
+already have. Work therefore scales primarily with the changed state, rather
+than with the total size of the agent's world. This is a structural advantage
+over recursively copying a workspace or serializing a whole VM image for every
+turn.
+
+This is an architectural complexity claim, not a benchmark result for the
+in-memory reference engine. The durable implementation must measure cold
+ingest, warm turn checkpoints, fork, rollback, incremental export, garbage
+collection, and materialization on real Rust projects and persisted Linux
+homes. It may lose on first ingest, tiny stores, cold random reads, or
+high-entropy and independently encrypted data; those results must remain
+visible rather than being averaged away.
 
 ## 13. Sysadmin rebalancing
 

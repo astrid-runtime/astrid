@@ -52,7 +52,9 @@ pub mod db;
 
 pub use error::{StorageError, StorageResult};
 pub use identity::{IdentityError, IdentityStore, KvIdentityStore};
-pub use kv::{KvEntry, KvStore, MemoryKvStore, ScopedKvStore};
+pub use kv::{
+    KvEntry, KvPrincipalResolver, KvStore, MemoryKvStore, PrincipalKvStore, ScopedKvStore,
+};
 pub use secret::{
     DenySecretStore, FileSecretStore, KvSecretStore, ReadThroughSecretStore, SecretStore,
     SecretStoreError, build_secret_store,

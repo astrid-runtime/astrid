@@ -6,7 +6,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Unified storage layer for Astrid - SurrealKV (raw KV) and SurrealDB (query engine)"
+description = "Unified storage integration for Astrid principal state, raw KV, and query storage"
 
 [features]
 default = []
@@ -17,6 +17,8 @@ full = ["kv", "db"]
 
 [dependencies]
 astrid-core = { workspace = true }
+astrid-storage-engine = { workspace = true }
+astrid-storage-model = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true, features = ["clock"] }
 keyring = { workspace = true, optional = true }
@@ -30,6 +32,7 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+blake3 = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 

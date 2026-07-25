@@ -29,6 +29,36 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   are distinct Rust types; imports reject unrelated records, principal roots
   must name typed commits, and placement epochs advance monotonically over
   registered blobs.
+  capsule interfaces are unchanged.
+- **Principal storage has a thread-safe in-memory engine prototype.** The new
+  `astrid-storage-engine` validates caller-declared object identities and
+  complete immutable closures before publishing linearizable per-principal
+  root generations. Semantic object kinds and kind-scoped format versions are
+  identity-bearing, and a principal root must name a typed commit envelope. The
+  engine supports consistent closure snapshots, exact compare-and-swap, pins,
+  logical accounting, and garbage collection without selecting an on-disk
+  format or changing current storage backends. Bounded transition traces and
+  concurrent-writer tests exercise the engine contract; durability, recovery,
+  encryption, placement, and runtime migration remain explicitly out of scope.
+- **Principal storage has an additive KV compatibility bridge.**
+  `PrincipalKvStore` implements the existing async `KvStore` contract over
+  typed principal roots while requiring an authority-aware
+  namespace-to-principal resolver. The version-one logical projection stores
+  KV leaves, branches, namespace maps, principal state, and commit lineage
+  without choosing a production hash or disk encoding. Root conflicts retry
+  from a fresh snapshot, non-KV state edges survive KV mutations, and generated
+  traces compare every operation and resulting namespace state against both
+  `MemoryKvStore` and `SurrealKvStore`. The adapter is additive: the runtime
+  still opens its current backend and no existing principal is migrated.
+- **Principal storage has a host-file durability foundation.**
+  `DurableEngine` persists immutable object frames before publishing a
+  checksummed principal-root journal record, rebuilds its disposable index on
+  open, truncates incomplete final frames, and rejects complete corruption.
+  An exclusive store lock and poison-on-write-failure behavior prevent
+  concurrent-process corruption and stale in-memory reads. Named crash-boundary
+  tests prove recovery to the old or new complete root. This is not a runtime
+  cutover and does not yet claim compaction, quota enforcement, persistent
+  pins, audit/outbox atomicity, or the final logical hash/encoding profile.
 - **Windows local transport uses authenticated per-user named pipes.** A pipe
   name derived only from the caller's operating-system SID replaces
   filesystem endpoint naming on Windows. Local-only byte-mode instances use a
