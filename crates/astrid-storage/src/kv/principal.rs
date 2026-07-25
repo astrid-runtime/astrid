@@ -172,7 +172,7 @@ where
                     .logical_bytes()
                     .map_err(|error| map_projection_error(&error))?;
                 if used > limit && used > before {
-                    return Err(StorageError::QuotaExceeded { used, limit });
+                    return Err(StorageError::quota_exceeded(used, limit));
                 }
             }
             match commit_kv_with_engine(self.engine.as_ref(), snapshot) {

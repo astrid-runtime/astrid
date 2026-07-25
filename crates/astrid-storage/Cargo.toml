@@ -11,9 +11,12 @@ description = "Unified storage integration for Astrid principal state, raw KV, a
 [features]
 default = []
 legacy-surrealkv = ["dep:surrealkv"]
+# Compatibility alias for downstream crates that enabled the former KV gate.
+# Runtime KV is unconditional; this name only keeps the legacy reader visible.
+kv = ["legacy-surrealkv"]
 db = ["dep:surrealdb"]
 keychain = ["dep:keyring"]
-full = ["legacy-surrealkv", "db"]
+full = ["kv", "db"]
 
 [dependencies]
 astrid-core = { workspace = true }

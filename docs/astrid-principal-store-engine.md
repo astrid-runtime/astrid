@@ -73,10 +73,12 @@ tree against an ordered-map oracle. Root conflicts restart from current state,
 so compare-and-swap and quota checks remain linearizable under concurrent
 writers.
 
-The `kv` Cargo feature no longer exists. The KV contract, memory/scoped stores,
-compatibility oracle, and persistent tree are unconditional.
-`legacy-surrealkv` gates only the legacy reader and migrator. It can be
-removed when the supported migration window closes.
+The KV contract, memory/scoped stores, compatibility oracle, and persistent tree
+are unconditional. `legacy-surrealkv` gates only the legacy reader and
+migrator. The former `kv` gate remains as a compatibility alias to
+`legacy-surrealkv`, so existing dependent manifests do not break; it selects no
+runtime backend. Both names can be removed when the supported migration window
+closes.
 
 ## Runtime cutover
 

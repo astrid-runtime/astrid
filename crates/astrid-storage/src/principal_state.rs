@@ -490,10 +490,9 @@ mod tests {
             .unwrap();
         assert!(matches!(
             store.set("alice:capsule:shell", "two", b"5".to_vec()).await,
-            Err(StorageError::QuotaExceeded {
-                used: 51,
-                limit: 27
-            })
+            Err(StorageError::Internal(message))
+                if message
+                    == "storage quota exceeded: mutation would use 51 bytes (limit 27)"
         ));
         store
             .set("alice:capsule:shell", "one", b"123".to_vec())
@@ -506,10 +505,9 @@ mod tests {
             .unwrap();
         assert!(matches!(
             store.set("alice:capsule:shell", "empty", Vec::new()).await,
-            Err(StorageError::QuotaExceeded {
-                used: 52,
-                limit: 27
-            })
+            Err(StorageError::Internal(message))
+                if message
+                    == "storage quota exceeded: mutation would use 52 bytes (limit 27)"
         ));
         store
             .set("system:identity", "unmetered", vec![0; 64])

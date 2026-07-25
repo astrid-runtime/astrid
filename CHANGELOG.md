@@ -70,8 +70,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   no fixed frame or capacity ceiling, and derives finite storage budgets from
   the live principal profile. Quota accounting includes canonical namespace/key
   bytes as well as values, so empty values cannot consume unmetered
-  principal-controlled metadata. The misleading `kv` feature is replaced by
-  the temporary `legacy-surrealkv` reader and migrator.
+  principal-controlled metadata. The misleading `kv` gate is replaced by the
+  temporary `legacy-surrealkv` reader and migrator; its old name remains only
+  as a compatibility alias for dependent manifests and selects no runtime
+  backend.
 - **Windows local transport uses authenticated per-user named pipes.** A pipe
   name derived only from the caller's operating-system SID replaces
   filesystem endpoint naming on Windows. Local-only byte-mode instances use a
