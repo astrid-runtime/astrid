@@ -192,3 +192,27 @@ fn status_error_is_not_reported_as_a_successful_status() {
             .contains("daemon rejected status request: denied")
     );
 }
+
+#[test]
+fn shutdown_acknowledgement_uses_graceful_exit_confirmation() {
+    assert_eq!(
+        shutdown_request_outcome(Ok::<_, anyhow::Error>(KernelResponse::Success(
+            "shutting down".into(),
+        ))),
+        ShutdownRequestOutcome::Acknowledged
+    );
+}
+
+#[test]
+fn shutdown_transport_and_response_failures_escalate() {
+    for outcome in [
+        shutdown_request_outcome(Err(anyhow::anyhow!("request timed out"))),
+        shutdown_request_outcome(Ok::<_, anyhow::Error>(KernelResponse::Error("busy".into()))),
+        shutdown_request_outcome(Ok::<_, anyhow::Error>(KernelResponse::Working)),
+    ] {
+        assert!(
+            matches!(outcome, ShutdownRequestOutcome::Escalate(_)),
+            "every failed authenticated shutdown must reach identity-gated termination"
+        );
+    }
+}

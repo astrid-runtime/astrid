@@ -34,6 +34,10 @@ $readyPath = Join-Path $astridHome "run\system.ready"
 $tokenPath = Join-Path $astridHome "run\system.token"
 $daemonPid = $null
 $daemonProcess = $null
+$ephemeralPid = $null
+$ephemeralDaemonProcess = $null
+$ephemeralClient = $null
+$ephemeralClientStarted = $false
 $completed = $false
 $locationPushed = $false
 $failureArtifacts = Join-Path $env:RUNNER_TEMP ("windows-daemon-lifecycle-" + $Target)
@@ -86,6 +90,18 @@ try {
         throw "authenticated status did not report the started daemon`n$statusOutput"
     }
 
+    # Persistent mode must survive the post-readiness fallback that owns only
+    # auto-spawned ephemeral daemons.
+    Start-Sleep -Seconds 7
+    $daemonProcess.Refresh()
+    if ($daemonProcess.HasExited) {
+        throw "persistent daemon PID $daemonPid exited while idle"
+    }
+    $persistentStatus = Invoke-Astrid status
+    if (-not $persistentStatus.Contains("Astrid daemon (PID $daemonPid")) {
+        throw "persistent daemon did not survive its idle window`n$persistentStatus"
+    }
+
     $stopOutput = Invoke-Astrid stop
     if (-not $daemonProcess.HasExited) {
         throw "astrid stop returned success before PID $daemonPid exited`n$stopOutput"
@@ -104,14 +120,140 @@ try {
     if (-not $stoppedStatus.Contains("No Astrid daemon is running.")) {
         throw "post-stop status did not confirm daemon absence`n$stoppedStatus"
     }
+
+    # Model the real agent integration: `astrid mcp serve` auto-spawns an
+    # ephemeral daemon, holds one authenticated lifecycle lease, then releases
+    # it when its stdio client closes. The daemon must exit promptly on that
+    # final disconnect rather than waiting for an idle timeout.
+    $clientInfo = [Diagnostics.ProcessStartInfo]::new()
+    $clientInfo.FileName = $astrid
+    $clientInfo.WorkingDirectory = $workspace
+    $clientInfo.UseShellExecute = $false
+    $clientInfo.CreateNoWindow = $true
+    $clientInfo.RedirectStandardInput = $true
+    $clientInfo.RedirectStandardOutput = $true
+    $clientInfo.RedirectStandardError = $true
+    $clientInfo.ArgumentList.Add("--principal")
+    $clientInfo.ArgumentList.Add("anonymous")
+    $clientInfo.ArgumentList.Add("mcp")
+    $clientInfo.ArgumentList.Add("serve")
+
+    $ephemeralClient = [Diagnostics.Process]::new()
+    $ephemeralClient.StartInfo = $clientInfo
+    if (-not $ephemeralClient.Start()) {
+        throw "failed to start the ephemeral MCP lifecycle client"
+    }
+    $ephemeralClientStarted = $true
+    $clientErrorTask = $ephemeralClient.StandardError.ReadToEndAsync()
+
+    $ephemeralDeadline = [DateTime]::UtcNow.AddSeconds(60)
+    while (-not (Test-Path -LiteralPath $pidPath -PathType Leaf)) {
+        if ($ephemeralClient.HasExited) {
+            $clientOutput = $ephemeralClient.StandardOutput.ReadToEnd()
+            $clientError = $clientErrorTask.Result
+            throw "ephemeral MCP client exited before daemon readiness (exit $($ephemeralClient.ExitCode))`n$clientOutput`n$clientError"
+        }
+        if ([DateTime]::UtcNow -ge $ephemeralDeadline) {
+            throw "ephemeral daemon did not publish its PID within 60 seconds"
+        }
+        Start-Sleep -Milliseconds 100
+    }
+
+    $ephemeralPid = [uint32](Get-Content -LiteralPath $pidPath -TotalCount 1).Trim()
+    $ephemeralDaemonProcess = Get-Process -Id $ephemeralPid -ErrorAction Stop
+    $null = $ephemeralDaemonProcess.Handle
+    if ($ephemeralDaemonProcess.HasExited) {
+        throw "ephemeral daemon PID $ephemeralPid exited before its MCP client disconnected"
+    }
+
+    $initializeFrame = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"windows-lifecycle-smoke","version":"0"}}}'
+    $initializedFrame = '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+    $clientOutputLines = [System.Collections.Generic.List[string]]::new()
+    $ephemeralClient.StandardInput.WriteLine($initializeFrame)
+    $ephemeralClient.StandardInput.Flush()
+
+    $initializeResponse = $null
+    $initializeDeadline = [DateTime]::UtcNow.AddSeconds(15)
+    while ($null -eq $initializeResponse) {
+        $remaining = [int][Math]::Max(
+            1,
+            ($initializeDeadline - [DateTime]::UtcNow).TotalMilliseconds
+        )
+        $responseTask = $ephemeralClient.StandardOutput.ReadLineAsync()
+        if (-not $responseTask.Wait($remaining)) {
+            throw "ephemeral MCP initialize response timed out"
+        }
+        $line = $responseTask.Result
+        if ($null -eq $line) {
+            throw "ephemeral MCP client closed stdout before initialize completed"
+        }
+        $clientOutputLines.Add($line)
+        $frame = $line | ConvertFrom-Json
+        if ($null -ne $frame.PSObject.Properties["id"] -and $frame.id -eq 1) {
+            $initializeResponse = $frame
+        }
+    }
+    if (
+        $null -eq $initializeResponse -or
+        $null -eq $initializeResponse.PSObject.Properties["result"]
+    ) {
+        throw "ephemeral MCP client did not complete its daemon-backed initialize handshake"
+    }
+
+    $ephemeralClient.StandardInput.WriteLine($initializedFrame)
+    $ephemeralClient.StandardInput.Flush()
+    $ephemeralDaemonProcess.Refresh()
+    if ($ephemeralClient.HasExited -or $ephemeralDaemonProcess.HasExited) {
+        throw "ephemeral daemon did not remain leased after the MCP initialize handshake"
+    }
+
+    # Keep both redirected pipes draining before waiting on process exit.
+    $remainingOutputTask = $ephemeralClient.StandardOutput.ReadToEndAsync()
+    $ephemeralClient.StandardInput.Close()
+    if (-not $ephemeralClient.WaitForExit(15000)) {
+        throw "ephemeral MCP client did not exit after stdin closed"
+    }
+    $remainingOutput = $remainingOutputTask.Result
+    $clientError = $clientErrorTask.Result
+    $clientOutput = ($clientOutputLines -join "`n") + "`n" + $remainingOutput
+    if ($ephemeralClient.ExitCode -ne 0) {
+        throw "ephemeral MCP client failed with exit code $($ephemeralClient.ExitCode)`n$clientOutput`n$clientError"
+    }
+    if (-not $ephemeralDaemonProcess.WaitForExit(10000)) {
+        throw "ephemeral daemon PID $ephemeralPid did not exit promptly after its final client disconnected"
+    }
+    if (Test-Path -LiteralPath $pidPath) {
+        throw "ephemeral daemon left its PID file behind"
+    }
+    if (Test-Path -LiteralPath $readyPath) {
+        throw "ephemeral daemon left its readiness file behind"
+    }
+    if (Test-Path -LiteralPath $tokenPath) {
+        throw "ephemeral daemon left its session-token file behind"
+    }
+
     $completed = $true
 }
 finally {
     try {
+        if ($ephemeralClientStarted -and -not $ephemeralClient.HasExited) {
+            try {
+                $ephemeralClient.StandardInput.Close()
+                if (-not $ephemeralClient.WaitForExit(5000)) {
+                    $ephemeralClient.Kill($true)
+                    $ephemeralClient.WaitForExit()
+                }
+            }
+            catch {
+                Write-Warning "could not stop ephemeral MCP client during cleanup: $_"
+            }
+        }
+
         try {
             if (
                 (Test-Path -LiteralPath $pidPath) -or
-                ($null -ne $daemonProcess -and -not $daemonProcess.HasExited)
+                ($null -ne $daemonProcess -and -not $daemonProcess.HasExited) -or
+                ($null -ne $ephemeralDaemonProcess -and -not $ephemeralDaemonProcess.HasExited)
             ) {
                 & $astrid stop 2>&1 | Out-String | Write-Host
             }
@@ -123,36 +265,70 @@ finally {
         if ($null -ne $daemonProcess -and -not $daemonProcess.HasExited) {
             try {
                 $daemonProcess.Kill($true)
-            }
-            catch {
-                if (-not $daemonProcess.HasExited) {
-                    throw
+                if (-not $daemonProcess.WaitForExit(15000)) {
+                    Write-Warning "forced cleanup did not terminate test daemon PID $daemonPid"
                 }
             }
-            if (-not $daemonProcess.WaitForExit(15000)) {
-                throw "forced cleanup did not terminate test daemon PID $daemonPid"
+            catch {
+                Write-Warning "could not force-clean persistent daemon PID ${daemonPid}: $_"
+            }
+        }
+        if ($null -ne $ephemeralDaemonProcess -and -not $ephemeralDaemonProcess.HasExited) {
+            try {
+                $ephemeralDaemonProcess.Kill($true)
+                if (-not $ephemeralDaemonProcess.WaitForExit(15000)) {
+                    Write-Warning "forced cleanup did not terminate ephemeral daemon PID $ephemeralPid"
+                }
+            }
+            catch {
+                Write-Warning "could not force-clean ephemeral daemon PID ${ephemeralPid}: $_"
             }
         }
     }
-    finally {
-        if (-not $completed) {
-            try {
-                $bootLog = Join-Path $astridHome "log\daemon-boot.log"
-                if (Test-Path -LiteralPath $bootLog -PathType Leaf) {
-                    New-Item -ItemType Directory -Path $failureArtifacts -Force | Out-Null
-                    Copy-Item -LiteralPath $bootLog -Destination $failureArtifacts -Force
-                }
-            }
-            catch {
-                Write-Warning "could not preserve lifecycle failure artifacts: $_"
+    catch {
+        Write-Warning "unexpected lifecycle cleanup failure: $_"
+    }
+
+    if (-not $completed) {
+        try {
+            $bootLog = Join-Path $astridHome "log\daemon-boot.log"
+            if (Test-Path -LiteralPath $bootLog -PathType Leaf) {
+                New-Item -ItemType Directory -Path $failureArtifacts -Force | Out-Null
+                Copy-Item -LiteralPath $bootLog -Destination $failureArtifacts -Force
             }
         }
-        if ($locationPushed) {
+        catch {
+            Write-Warning "could not preserve lifecycle failure artifacts: $_"
+        }
+    }
+    if ($locationPushed) {
+        try {
             Pop-Location
         }
-        $processGone = $null -eq $daemonProcess -or $daemonProcess.HasExited
+        catch {
+            Write-Warning "could not restore the lifecycle test location: $_"
+        }
+    }
+
+    $persistentGone = $true
+    $ephemeralGone = $true
+    try {
+        if ($null -ne $daemonProcess) {
+            $persistentGone = $daemonProcess.HasExited
+        }
+        if ($null -ne $ephemeralDaemonProcess) {
+            $ephemeralGone = $ephemeralDaemonProcess.HasExited
+        }
+    }
+    catch {
+        $persistentGone = $false
+        $ephemeralGone = $false
+        Write-Warning "could not confirm lifecycle process cleanup: $_"
+    }
+    try {
         if (
-            $processGone -and
+            $persistentGone -and
+            $ephemeralGone -and
             -not (Test-Path -LiteralPath $pidPath) -and
             -not (Test-Path -LiteralPath $readyPath) -and
             -not (Test-Path -LiteralPath $tokenPath) -and
@@ -160,5 +336,8 @@ finally {
         ) {
             Remove-Item -LiteralPath $testRoot -Recurse -Force
         }
+    }
+    catch {
+        Write-Warning "could not remove lifecycle test root: $_"
     }
 }

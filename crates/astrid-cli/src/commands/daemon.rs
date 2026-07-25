@@ -33,6 +33,12 @@ pub(crate) enum StopConfirmation {
     Unconfirmed,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ShutdownRequestOutcome {
+    Acknowledged,
+    Escalate(String),
+}
+
 const fn readiness_attempts(timeout_secs: u64, poll_millis: u64) -> u64 {
     let Some(timeout_millis) = timeout_secs.checked_mul(1_000) else {
         panic!("daemon readiness timeout overflow")
@@ -639,18 +645,7 @@ pub(crate) async fn handle_stop() -> Result<StopConfirmation> {
     // on a CLEAN exit, so reading it before shutdown is the only reliable way to
     // keep a handle for confirming exit / terminating a wedged shutdown.
     let recorded = daemon_control::read_pid_file(&pid_path);
-    let endpoint_reachable = match astrid_core::local_transport::connect_outcome(&socket_path).await
-    {
-        Ok(astrid_core::local_transport::ConnectOutcome::Connected(stream)) => {
-            drop(stream);
-            true
-        },
-        Ok(
-            astrid_core::local_transport::ConnectOutcome::Absent
-            | astrid_core::local_transport::ConnectOutcome::Stale,
-        ) => false,
-        Err(_) => true,
-    };
+    let endpoint_reachable = daemon_endpoint_reachable(&socket_path).await;
 
     // Genuinely nothing running: no socket AND no live recorded process.
     let recorded_alive = recorded
@@ -673,19 +668,27 @@ pub(crate) async fn handle_stop() -> Result<StopConfirmation> {
         .await
     {
         let mut client = client.with_timeout(Duration::from_secs(10));
-        match client
-            .request(KernelRequest::Shutdown {
-                reason: Some("astrid stop".to_string()),
-            })
-            .await?
-        {
-            KernelResponse::Success(_) => {
+        match shutdown_request_outcome(
+            client
+                .request(KernelRequest::Shutdown {
+                    reason: Some("astrid stop".to_string()),
+                })
+                .await,
+        ) {
+            ShutdownRequestOutcome::Acknowledged => {
                 // ACK only — confirm the process actually exits before
                 // declaring success, and escalate if it wedged.
                 return Ok(confirm_graceful_stop(recorded, &pid_path, &socket_path).await);
             },
-            KernelResponse::Error(reason) => anyhow::bail!("daemon rejected shutdown: {reason}"),
-            other => anyhow::bail!("unexpected response from daemon shutdown: {other:?}"),
+            ShutdownRequestOutcome::Escalate(reason) => {
+                eprintln!(
+                    "{}",
+                    theme::Theme::warning(&format!(
+                        "Authenticated daemon shutdown failed ({reason}); escalating through the \
+                         recorded process identity."
+                    ))
+                );
+            },
         }
     }
 
@@ -699,12 +702,53 @@ pub(crate) async fn handle_stop() -> Result<StopConfirmation> {
         Some((pid, exe)) => daemon_control::terminate_known(*pid, exe.as_deref()).await,
         None => daemon_control::KillOutcome::NotRunning,
     };
+    // A shutdown may have reached the daemon even when its response was lost.
+    // If no process remains to terminate, refresh the transport observation:
+    // an absent endpoint confirms shutdown, while a connected/indeterminate
+    // endpoint may belong to another live daemon and must remain fail-closed.
+    let endpoint_reachable = if matches!(outcome, daemon_control::KillOutcome::NotRunning) {
+        daemon_endpoint_reachable(&socket_path).await
+    } else {
+        endpoint_reachable
+    };
     Ok(report_orphan_stop(
         outcome,
         endpoint_reachable,
         &pid_path,
         &socket_path,
     ))
+}
+
+async fn daemon_endpoint_reachable(socket_path: &Path) -> bool {
+    match astrid_core::local_transport::connect_outcome(socket_path).await {
+        Ok(astrid_core::local_transport::ConnectOutcome::Connected(stream)) => {
+            drop(stream);
+            true
+        },
+        Ok(
+            astrid_core::local_transport::ConnectOutcome::Absent
+            | astrid_core::local_transport::ConnectOutcome::Stale,
+        ) => false,
+        Err(_) => true,
+    }
+}
+
+fn shutdown_request_outcome<E>(
+    response: std::result::Result<KernelResponse, E>,
+) -> ShutdownRequestOutcome
+where
+    E: std::fmt::Display,
+{
+    match response {
+        Ok(KernelResponse::Success(_)) => ShutdownRequestOutcome::Acknowledged,
+        Ok(KernelResponse::Error(reason)) => {
+            ShutdownRequestOutcome::Escalate(format!("daemon rejected shutdown: {reason}"))
+        },
+        Ok(other) => ShutdownRequestOutcome::Escalate(format!(
+            "daemon returned an unexpected shutdown response: {other:?}"
+        )),
+        Err(error) => ShutdownRequestOutcome::Escalate(format!("shutdown request failed: {error}")),
+    }
 }
 
 /// After a graceful shutdown ACK, confirm the daemon process actually exited —

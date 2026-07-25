@@ -182,6 +182,28 @@ jobs:
           --target $env:TARGET
           socket::tests
 
+      - name: Test native ephemeral daemon lifetime
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: >-
+          cargo test
+          -p astrid-kernel
+          --locked
+          --target $env:TARGET
+          ephemeral_
+
+      - name: Test native persistent daemon lifetime
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: >-
+          cargo test
+          -p astrid-kernel
+          --locked
+          --target $env:TARGET
+          persistent_kernel_does_not_shutdown_on_last_disconnect
+
       - name: Build native lifecycle binaries
         env:
           TARGET: ${{ matrix.target }}
