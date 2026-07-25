@@ -19,9 +19,11 @@ use astrid_storage_model::{
 };
 use async_trait::async_trait;
 
+#[cfg(all(feature = "legacy-surrealkv", not(target_family = "wasm")))]
+use super::KvEntry;
 use super::principal::{KvPrincipalResolver, KvQuotaResolver};
 use super::{
-    KvEntry, KvStore, composite_key, namespace_range_end, namespace_range_start, prefix_range_end,
+    KvStore, composite_key, namespace_range_end, namespace_range_start, prefix_range_end,
     validate_key, validate_namespace, validate_prefix,
 };
 use crate::error::{StorageError, StorageResult};
@@ -139,6 +141,7 @@ where
         }
     }
 
+    #[cfg(all(feature = "legacy-surrealkv", not(target_family = "wasm")))]
     pub(crate) fn import_entries_for_migration(
         &self,
         owner: &P,
@@ -156,6 +159,7 @@ where
         })
     }
 
+    #[cfg(all(feature = "legacy-surrealkv", not(target_family = "wasm")))]
     pub(crate) fn entries_for_migration(&self, owner: &P) -> StorageResult<Vec<KvEntry>> {
         let header = self.header(owner.clone())?;
         let mut context = TreeContext::new(self.engine.as_ref());
@@ -834,6 +838,7 @@ where
         Ok(())
     }
 
+    #[cfg(all(feature = "legacy-surrealkv", not(target_family = "wasm")))]
     fn collect_entries(
         &mut self,
         root: Option<ObjectId>,
