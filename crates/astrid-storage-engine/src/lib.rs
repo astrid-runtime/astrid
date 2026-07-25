@@ -1,14 +1,15 @@
 //! User-space engine for Astrid principal state.
 //!
-//! This first implementation deliberately keeps bytes in memory. It exercises
-//! the production-shaped boundary between immutable object admission,
-//! identity verification, complete-closure validation, and atomic
-//! principal-root publication without prematurely freezing an on-disk format.
+//! The in-memory reference engine and durable host-file engine share the
+//! boundary between immutable object admission, identity verification,
+//! complete-closure validation, and atomic principal-root publication. The
+//! durable realization adds an append-only object arena, checksummed root
+//! journal, recovery, and fault injection without changing those semantics.
 //!
 //! The engine contains no policy decisions, implicit quotas, clocks, principal
 //! parsing, or authorization logic. Callers must authorize a transaction before
-//! submitting it. A later durable backend must preserve this observable
-//! contract while adding arenas, a root journal, recovery, and fault injection.
+//! submitting it. Native composition pins its identity and encoding profile
+//! outside this generic engine boundary.
 
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
@@ -137,9 +138,9 @@ impl RootSnapshot {
 /// Thread-safe in-memory principal-store engine.
 ///
 /// `P` is the integration layer's domain-bearing principal identifier. `I`
-/// supplies the object identity algorithm. Identity remains injected because
-/// the architecture has not yet selected and migration-tested a persistent
-/// canonical object encoding.
+/// supplies the object identity algorithm. Keeping identity injected makes this
+/// engine useful as a reference oracle and permits collision-path tests; native
+/// composition selects and records its production identity profile explicitly.
 #[derive(Debug)]
 pub struct InMemoryEngine<P: Ord, I> {
     identity: I,
