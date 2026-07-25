@@ -46,17 +46,78 @@ $env:ASTRID_HOME = $astridHome
 $env:ASTRID_WORKSPACE_STATE_DIR = ".astrid-ci"
 
 function Invoke-Astrid {
-    param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
+    param(
+        [int]$TimeoutSeconds = 120,
+        [Parameter(ValueFromRemainingArguments = $true)]
+        [string[]]$Arguments
+    )
 
-    $output = & $astrid @Arguments 2>&1 | Out-String
-    if ($LASTEXITCODE -ne 0) {
-        throw "astrid $($Arguments -join ' ') failed with exit code $LASTEXITCODE`n$output"
+    $displayCommand = "astrid $($Arguments -join ' ')"
+    Write-Host "Running $displayCommand"
+
+    $location = Get-Location
+    if ($location.Provider.Name -ne "FileSystem") {
+        throw "$displayCommand requires a filesystem working directory"
     }
-    return $output
+    $processInfo = [Diagnostics.ProcessStartInfo]::new()
+    $processInfo.FileName = $astrid
+    $processInfo.WorkingDirectory = $location.ProviderPath
+    $processInfo.UseShellExecute = $false
+    $processInfo.CreateNoWindow = $true
+    $processInfo.RedirectStandardOutput = $true
+    $processInfo.RedirectStandardError = $true
+    foreach ($argument in $Arguments) {
+        $processInfo.ArgumentList.Add($argument)
+    }
+
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $processInfo
+    try {
+        if (-not $process.Start()) {
+            throw "failed to start $displayCommand"
+        }
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+            try {
+                $process.Kill($true)
+            }
+            catch {
+                throw "$displayCommand timed out after $TimeoutSeconds seconds and could not terminate its process tree: $_"
+            }
+            if (-not $process.WaitForExit(15000)) {
+                throw "$displayCommand timed out after $TimeoutSeconds seconds and did not exit within 15 seconds after Kill(entireProcessTree)"
+            }
+            $streamsDrained = [Threading.Tasks.Task]::WaitAll(
+                [Threading.Tasks.Task[]]@($stdoutTask, $stderrTask),
+                10000
+            )
+            if (-not $streamsDrained) {
+                throw "$displayCommand timed out after $TimeoutSeconds seconds; its process exited after termination, but inherited redirected output handles remained open"
+            }
+            $timeoutOutput = "stdout:`n$($stdoutTask.Result)`nstderr:`n$($stderrTask.Result)"
+            throw "$displayCommand timed out after $TimeoutSeconds seconds`n$timeoutOutput"
+        }
+        if (-not [Threading.Tasks.Task]::WaitAll(
+            [Threading.Tasks.Task[]]@($stdoutTask, $stderrTask),
+            10000
+        )) {
+            throw "$displayCommand exited but inherited redirected output handles remained open"
+        }
+
+        $output = "stdout:`n$($stdoutTask.Result)`nstderr:`n$($stderrTask.Result)"
+        if ($process.ExitCode -ne 0) {
+            throw "$displayCommand failed with exit code $($process.ExitCode)`n$output"
+        }
+        return $output
+    }
+    finally {
+        $process.Dispose()
+    }
 }
 
 try {
-    $installOutput = Invoke-Astrid capsule install $CapsuleSource --yes --approve-untrusted
+    $installOutput = Invoke-Astrid -TimeoutSeconds 600 capsule install $CapsuleSource --yes --approve-untrusted
     $installOutput | Write-Host
     New-Item -ItemType Directory -Path $workspace -Force | Out-Null
     Push-Location $workspace
@@ -285,7 +346,7 @@ finally {
                 ($null -ne $daemonProcess -and -not $daemonProcess.HasExited) -or
                 ($null -ne $ephemeralDaemonProcess -and -not $ephemeralDaemonProcess.HasExited)
             ) {
-                & $astrid stop 2>&1 | Out-String | Write-Host
+                Invoke-Astrid -TimeoutSeconds 30 stop | Write-Host
             }
         }
         catch {
