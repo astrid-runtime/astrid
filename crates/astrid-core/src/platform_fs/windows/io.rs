@@ -98,6 +98,40 @@ pub(super) fn acquire_named_private_lock(
     Ok(file)
 }
 
+pub(super) fn open_guarded_private_append_file(
+    guard: &TrustedPathGuard,
+    path: &Path,
+) -> io::Result<File> {
+    let name = guarded_child_name(guard, path)?;
+    let handle = match open_guarded_child_with_options(
+        guard,
+        name,
+        FILE_APPEND_DATA | READ_CONTROL | WRITE_DAC,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        FILE_CREATE,
+    ) {
+        Ok(handle) => handle,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            open_guarded_child_with_options(
+                guard,
+                name,
+                FILE_APPEND_DATA | READ_CONTROL,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                FILE_OPEN,
+            )?
+        },
+        Err(error) => return Err(error),
+    };
+    validate_private_acl_handle(handle.0, false, &path.display().to_string())?;
+    guard.verify_contract(BoundaryContract::ExactPrivateDirectory)?;
+    let raw = handle.0;
+    std::mem::forget(handle);
+    // SAFETY: ownership transfers from OwnedHandle exactly once. The handle
+    // carries FILE_APPEND_DATA without FILE_WRITE_DATA, so local writes cannot
+    // overwrite existing log bytes even across independent process handles.
+    Ok(unsafe { File::from_raw_handle(raw.cast()) })
+}
+
 #[cfg(test)]
 pub(super) static TEST_RENAME_FAULT: std::sync::Mutex<Option<u32>> = std::sync::Mutex::new(None);
 

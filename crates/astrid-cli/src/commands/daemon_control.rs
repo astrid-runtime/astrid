@@ -9,19 +9,19 @@
 //! (SIGTERM, then SIGKILL after a grace window) so the lock is released before
 //! the socket/readiness/PID files are cleaned up.
 //!
-//! The PID is untrusted on-disk state: it may be missing, garbage, stale
-//! (pointing at a recycled PID owned by an unrelated process), or already dead.
-//! Every read tolerates that — a missing/garbage PID file means "no orphan to
-//! kill", and a dead PID means "already gone".
+//! The identity record is untrusted on-disk state: it may be missing, malformed,
+//! stale (pointing at a recycled PID owned by an unrelated process), or already
+//! dead. Missing records mean "no recorded orphan"; malformed or unreadable
+//! records remain errors so callers never erase evidence on an ambiguous read.
 //!
 //! Liveness alone is NOT sufficient to signal: a recycled PID may now belong to
 //! an unrelated process, and killing it would be a serious fail-open. So the
-//! daemon also records its canonicalized executable path in the PID file, and
-//! we signal ONLY when the live process's executable matches it. If the
-//! recorded exe is absent (old single-line file or a daemon that couldn't
-//! resolve its own path), the live exe is unreadable, or the two differ, we
-//! refuse to signal ([`KillOutcome::Unverified`]) — a stuck lock is recoverable;
-//! killing the wrong process is not.
+//! daemon records its canonicalized executable path in the PID file. Windows
+//! additionally records the process creation timestamp because a recycled PID
+//! can legitimately run the same installed image. We signal ONLY when the live
+//! process matches every platform identity field. Missing legacy fields, an
+//! unreadable live identity, or a mismatch yields [`KillOutcome::Unverified`] —
+//! a stuck lock is recoverable; killing the wrong process is not.
 //!
 //! The identity check is also robust to an in-place upgrade replacing the
 //! running binary: `brew upgrade`/`astrid update` unlinks the old file, but the
@@ -46,32 +46,66 @@ pub(crate) const GRACE: Duration = Duration::from_secs(3);
 /// Poll interval while waiting for a signalled process to exit.
 const POLL: Duration = Duration::from_millis(100);
 
-/// Read and parse the daemon PID (and recorded executable path) from `pid_path`.
-///
-/// Returns `None` when the file is absent, unreadable, or its first line is not
-/// a single positive integer — all of which mean "no recorded daemon to
-/// signal". The optional second line is the daemon's canonicalized executable
-/// path, used to verify the live process's identity before signalling; it is
-/// `None` for legacy single-line files or daemons that couldn't resolve their
-/// own path.
-pub(crate) fn read_pid_file(pid_path: &Path) -> Option<(u32, Option<PathBuf>)> {
-    #[cfg(windows)]
-    astrid_core::platform_fs::validate_private_file(pid_path).ok()?;
-    let contents = std::fs::read_to_string(pid_path).ok()?;
-    parse_pid_file(&contents)
+const CREATION_TIME_PREFIX: &str = "creation_time=";
+
+/// Persisted process identity used to gate daemon termination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DaemonIdentity {
+    pub(crate) pid: u32,
+    pub(crate) executable: Option<PathBuf>,
+    /// Windows `FILETIME` ticks from `GetProcessTimes`.
+    ///
+    /// This remains optional so Unix and legacy records parse without changing
+    /// their wire shape. Windows termination treats absence as unverified.
+    pub(crate) creation_time: Option<u64>,
 }
 
-/// Parse the PID-file body: first line = PID (required), optional second line =
-/// the daemon's recorded executable path. Pure helper, split out for testing.
-pub(crate) fn parse_pid_file(contents: &str) -> Option<(u32, Option<PathBuf>)> {
+/// Read and parse the daemon identity from `pid_path`.
+///
+/// A missing file returns `Ok(None)`. Read, validation, recovery, and parse
+/// failures remain errors: callers must never interpret an unreadable or
+/// malformed identity record as proof that no daemon exists.
+///
+/// The optional second line is the daemon's canonicalized executable path. The
+/// optional third line is `creation_time=<FILETIME ticks>` for Windows.
+pub(crate) fn read_pid_file(pid_path: &Path) -> std::io::Result<Option<DaemonIdentity>> {
+    let contents = match astrid_core::platform_fs::read_private_file_to_string(pid_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    parse_pid_file(&contents).map(Some).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid daemon PID file {}", pid_path.display()),
+        )
+    })
+}
+
+/// Parse the identity-file body. Pure helper, split out for testing.
+pub(crate) fn parse_pid_file(contents: &str) -> Option<DaemonIdentity> {
     let mut lines = contents.lines();
     let pid = parse_pid(lines.next()?)?;
-    let exe = lines
+    let executable = lines
         .next()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(PathBuf::from);
-    Some((pid, exe))
+    let creation_time = match lines.next().map(str::trim) {
+        None | Some("") => None,
+        Some(line) => {
+            let ticks = line.strip_prefix(CREATION_TIME_PREFIX)?.parse().ok()?;
+            Some((ticks != 0).then_some(ticks)?)
+        },
+    };
+    if lines.any(|line| !line.trim().is_empty()) {
+        return None;
+    }
+    Some(DaemonIdentity {
+        pid,
+        executable,
+        creation_time,
+    })
 }
 
 /// Parse a PID from raw file contents. Pure helper, split out for testing.
@@ -245,8 +279,7 @@ fn signal(pid: u32, sig: nix::sys::signal::Signal) -> bool {
 /// Outcome of an orphan-kill attempt, for caller-side messaging.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KillOutcome {
-    /// No live process was recorded (missing/garbage/stale-dead PID) — nothing
-    /// to do.
+    /// No identity was recorded, or its process is confirmed gone.
     NotRunning,
     /// The Unix process exited after SIGTERM within the grace window.
     TermExited,
@@ -257,18 +290,18 @@ pub(crate) enum KillOutcome {
     /// The caller should surface this — the lock may still be held.
     StillAlive,
     /// A process may hold the recorded PID, but we could not confirm absence or
-    /// prove it is the Astrid daemon (no recorded exe, unreadable live exe, an
-    /// unexpected liveness error, or a mismatch). We refuse to signal it; the
-    /// caller should warn and leave the process alone. Carries the PID for the
-    /// operator message.
+    /// prove it is the Astrid daemon (missing identity fields, unreadable live
+    /// identity, an unexpected liveness error, or a mismatch). We refuse to
+    /// signal it; the caller should warn and leave the process alone. Carries
+    /// the PID for the operator message.
     Unverified(u32),
 }
 
 /// Terminate an orphaned daemon identified by the PID in `pid_path`.
 ///
-/// 1. Read the recorded PID; if absent/garbage/dead → [`KillOutcome::NotRunning`].
-/// 2. Confirm the live process is the daemon (its executable matches the one
-///    recorded in the PID file); if not → [`KillOutcome::Unverified`] (no signal).
+/// 1. Read the recorded identity; if absent/dead → [`KillOutcome::NotRunning`].
+/// 2. Confirm the live process matches every required platform identity field;
+///    if not → [`KillOutcome::Unverified`] (no signal).
 /// 3. Send `SIGTERM` and poll up to [`GRACE`] for the process to exit.
 /// 4. If still alive, escalate to `SIGKILL` and poll again up to [`GRACE`].
 ///
@@ -277,37 +310,37 @@ pub(crate) enum KillOutcome {
 /// via the recorded PID, never via the lock directly (the CLI does not open the
 /// state db), so the function is self-contained and unit-testable against any
 /// PID.
-pub(crate) async fn terminate_orphan(pid_path: &Path) -> KillOutcome {
-    let Some((pid, recorded_exe)) = read_pid_file(pid_path) else {
-        return KillOutcome::NotRunning;
+pub(crate) async fn terminate_orphan(pid_path: &Path) -> std::io::Result<KillOutcome> {
+    let Some(identity) = read_pid_file(pid_path)? else {
+        return Ok(KillOutcome::NotRunning);
     };
-    terminate_known(pid, recorded_exe.as_deref()).await
+    Ok(terminate_known(&identity).await)
 }
 
-/// Terminate a daemon whose PID and recorded exe are ALREADY in hand — the
+/// Terminate a daemon whose recorded identity is ALREADY in hand — the
 /// identity-gated `SIGTERM` → `SIGKILL` core shared by two callers:
 ///
-/// - [`terminate_orphan`], the socket-unreachable path, which reads them from
-///   the PID file, and
-/// - `astrid stop`'s graceful path, which captures them from the PID file
+/// - [`terminate_orphan`], the socket-unreachable path, which reads it from the
+///   PID file, and
+/// - `astrid stop`'s graceful path, which captures it from the PID file
 ///   BEFORE requesting shutdown. A shutdown ACK means "shutting down", not
 ///   "exited"; a daemon that wedges AFTER acknowledging would otherwise leak the
 ///   state-db lock with no handle left to signal it (the daemon deletes its own
-///   PID file only on a clean exit). Capturing PID+exe up front keeps the handle
-///   alive so the graceful path can escalate here.
+///   PID file only on a clean exit). Capturing the full identity up front lets
+///   the graceful path escalate here without trusting a later file generation.
 ///
 /// Steps: confirm the PID is a live, identity-matched daemon; `SIGTERM` and poll
 /// up to [`GRACE`]; if still alive, re-verify identity (grace-window PID-reuse
 /// guard) and escalate to `SIGKILL`, polling up to [`GRACE`] again.
-pub(crate) async fn terminate_known(pid: u32, recorded_exe: Option<&Path>) -> KillOutcome {
+pub(crate) async fn terminate_known(identity: &DaemonIdentity) -> KillOutcome {
+    let pid = identity.pid;
     #[cfg(windows)]
-    return match recorded_exe {
-        None if windows::is_process_confirmed_gone(pid) => KillOutcome::NotRunning,
-        None => KillOutcome::Unverified(pid),
-        Some(recorded) => {
+    return match (&identity.executable, identity.creation_time) {
+        (_, _) if windows::is_process_confirmed_gone(pid) => KillOutcome::NotRunning,
+        (Some(recorded), Some(creation_time)) => {
             let recorded = recorded.to_path_buf();
             match tokio::task::spawn_blocking(move || {
-                windows::terminate_verified_process(pid, &recorded, GRACE)
+                windows::terminate_verified_process(pid, &recorded, creation_time, GRACE)
             })
             .await
             {
@@ -317,6 +350,7 @@ pub(crate) async fn terminate_known(pid: u32, recorded_exe: Option<&Path>) -> Ki
                 Ok(windows::VerifiedTermination::StillAlive) | Err(_) => KillOutcome::StillAlive,
             }
         },
+        _ => KillOutcome::Unverified(pid),
     };
 
     #[cfg(not(windows))]
@@ -329,7 +363,7 @@ pub(crate) async fn terminate_known(pid: u32, recorded_exe: Option<&Path>) -> Ki
         // recycled PID now owned by an unrelated process. Only signal when the
         // live process's executable provably matches the recorded one.
         let live_exe = exe_path_of_pid(pid);
-        if !exe_matches(recorded_exe, live_exe.as_deref()) {
+        if !exe_matches(identity.executable.as_deref(), live_exe.as_deref()) {
             return KillOutcome::Unverified(pid);
         }
 
@@ -345,7 +379,7 @@ pub(crate) async fn terminate_known(pid: u32, recorded_exe: Option<&Path>) -> Ki
             // Re-verify identity before escalating (fail-secure, grace-window PID
             // reuse guard).
             let live_exe = exe_path_of_pid(pid);
-            if !exe_matches(recorded_exe, live_exe.as_deref()) {
+            if !exe_matches(identity.executable.as_deref(), live_exe.as_deref()) {
                 return KillOutcome::Unverified(pid);
             }
 
@@ -428,7 +462,7 @@ mod tests {
     fn read_pid_file_missing_is_none() {
         let dir = crate::test_support::private_tempdir();
         let path = dir.path().join("system.pid");
-        assert_eq!(read_pid_file(&path), None);
+        assert_eq!(read_pid_file(&path).unwrap(), None);
     }
 
     #[test]
@@ -436,20 +470,60 @@ mod tests {
         let dir = crate::test_support::private_tempdir();
         let path = dir.path().join("system.pid");
         write_pid_fixture(&path, "424242");
-        assert_eq!(read_pid_file(&path), Some((424_242, None)));
+        assert_eq!(
+            read_pid_file(&path).unwrap(),
+            Some(DaemonIdentity {
+                pid: 424_242,
+                executable: None,
+                creation_time: None,
+            })
+        );
     }
 
     #[test]
-    fn parse_pid_file_two_line_keeps_exe() {
-        let (pid, exe) = parse_pid_file("424242\n/opt/astrid/astrid-daemon\n").unwrap();
-        assert_eq!(pid, 424_242);
-        assert_eq!(exe, Some(PathBuf::from("/opt/astrid/astrid-daemon")));
+    fn parse_pid_file_keeps_executable_and_creation_time() {
+        assert_eq!(
+            parse_pid_file("424242\n/opt/astrid/astrid-daemon\ncreation_time=133700000000000000\n"),
+            Some(DaemonIdentity {
+                pid: 424_242,
+                executable: Some(PathBuf::from("/opt/astrid/astrid-daemon")),
+                creation_time: Some(133_700_000_000_000_000),
+            })
+        );
     }
 
     #[test]
     fn parse_pid_file_one_line_has_no_exe() {
-        assert_eq!(parse_pid_file("424242\n"), Some((424_242, None)));
-        assert_eq!(parse_pid_file("424242\n   \n"), Some((424_242, None)));
+        let legacy = Some(DaemonIdentity {
+            pid: 424_242,
+            executable: None,
+            creation_time: None,
+        });
+        assert_eq!(parse_pid_file("424242\n"), legacy);
+        assert_eq!(
+            parse_pid_file("424242\n   \n"),
+            Some(DaemonIdentity {
+                pid: 424_242,
+                executable: None,
+                creation_time: None,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_pid_file_rejects_malformed_creation_identity() {
+        assert_eq!(
+            parse_pid_file("424242\nC:\\astrid-daemon.exe\ncreation_time=0"),
+            None
+        );
+        assert_eq!(
+            parse_pid_file("424242\nC:\\astrid-daemon.exe\ncreation_time=nope"),
+            None
+        );
+        assert_eq!(
+            parse_pid_file("424242\nC:\\astrid-daemon.exe\ncreation_time=42\nunexpected"),
+            None
+        );
     }
 
     #[test]
@@ -547,7 +621,7 @@ mod tests {
             format!("{me}\n/nonexistent/definitely-not-astrid-daemon"),
         );
         assert_eq!(
-            terminate_orphan(&path).await,
+            terminate_orphan(&path).await.unwrap(),
             KillOutcome::Unverified(me),
             "a live PID with a mismatched exe must not be signalled"
         );
@@ -563,16 +637,22 @@ mod tests {
         let path = dir.path().join("system.pid");
         let me = std::process::id();
         write_pid_fixture(&path, format!("{me}"));
-        assert_eq!(terminate_orphan(&path).await, KillOutcome::Unverified(me));
+        assert_eq!(
+            terminate_orphan(&path).await.unwrap(),
+            KillOutcome::Unverified(me)
+        );
         assert!(is_process_alive(me));
     }
 
     #[test]
-    fn read_pid_file_garbage_is_none() {
+    fn read_pid_file_garbage_is_invalid_data() {
         let dir = crate::test_support::private_tempdir();
         let path = dir.path().join("system.pid");
         write_pid_fixture(&path, "garbage\n");
-        assert_eq!(read_pid_file(&path), None);
+        assert_eq!(
+            read_pid_file(&path).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
     }
 
     #[cfg(unix)]
@@ -598,7 +678,10 @@ mod tests {
     async fn terminate_orphan_missing_pidfile_is_notrunning() {
         let dir = crate::test_support::private_tempdir();
         let path = dir.path().join("system.pid");
-        assert_eq!(terminate_orphan(&path).await, KillOutcome::NotRunning);
+        assert_eq!(
+            terminate_orphan(&path).await.unwrap(),
+            KillOutcome::NotRunning
+        );
     }
 
     #[cfg(any(unix, windows))]
@@ -625,7 +708,10 @@ mod tests {
         assert!(!is_process_alive(exited_pid));
 
         write_pid_fixture(&path, exited_pid.to_string());
-        assert_eq!(terminate_orphan(&path).await, KillOutcome::NotRunning);
+        assert_eq!(
+            terminate_orphan(&path).await.unwrap(),
+            KillOutcome::NotRunning
+        );
     }
 
     /// The SIGKILL escalation is gated by the SAME identity check as the initial

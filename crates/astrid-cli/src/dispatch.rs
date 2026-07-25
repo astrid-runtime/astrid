@@ -201,7 +201,7 @@ async fn dispatch_subcommand(
                 grant_capsules,
             };
             commands::init::run_init(&distro, &opts).await?;
-            commands::self_update::ensure_path_setup()?;
+            commands::self_update::ensure_path_setup(yes)?;
             Ok(ExitCode::SUCCESS)
         },
         Some(Commands::Capsule { command }) => dispatch_capsule(command).await,

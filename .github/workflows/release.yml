@@ -304,6 +304,38 @@ jobs:
           tar czf "${DIR}.tar.gz" "$DIR"
           echo "ASSET=${DIR}.tar.gz" >> "$GITHUB_ENV"
 
+      - name: Exercise the packaged Windows binaries
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = $env:GITHUB_REF_NAME.Substring(1)
+          $archiveRoot = "astrid-$version-${{ matrix.target }}"
+          $extractRoot = Join-Path $env:RUNNER_TEMP "astrid-release-smoke-${{ matrix.target }}"
+
+          New-Item -ItemType Directory -Path $extractRoot -Force | Out-Null
+          tar -xzf $env:ASSET -C $extractRoot
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to extract packaged archive with exit code ${LASTEXITCODE}: $env:ASSET"
+          }
+
+          $binaries = @(
+            (Join-Path $extractRoot "$archiveRoot\astrid.exe"),
+            (Join-Path $extractRoot "$archiveRoot\astrid-daemon.exe"),
+            (Join-Path $extractRoot "$archiveRoot\astrid-build.exe"),
+            (Join-Path $extractRoot "$archiveRoot\astrid-emit.exe")
+          )
+
+          foreach ($binary in $binaries) {
+            if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
+              throw "Packaged binary is missing: $binary"
+            }
+            & $binary --version
+            if ($LASTEXITCODE -ne 0) {
+              throw "Packaged binary failed --version with exit code ${LASTEXITCODE}: $binary"
+            }
+          }
+
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -407,10 +439,38 @@ jobs:
           cat >> "$NOTES" <<'INSTALL'
 
           **Pre-built binaries:**
-          Download the archive for your platform, extract, and add to PATH:
+
+          Unix and macOS:
           ```
           tar xzf astrid-*-$(uname -m)-*.tar.gz
           sudo mv astrid-*/astrid astrid-*/astrid-daemon astrid-*/astrid-build astrid-*/astrid-emit /usr/local/bin/
+          ```
+
+          Windows PowerShell (no administrator privileges required):
+          ```powershell
+          $archive = Get-ChildItem .\astrid-*-pc-windows-msvc.tar.gz | Select-Object -First 1
+          tar -xzf $archive.FullName
+          $source = Get-ChildItem -Directory .\astrid-*-pc-windows-msvc | Select-Object -First 1
+          $bin = Join-Path $env:LOCALAPPDATA 'Astrid\Runtime\bin'
+          New-Item -ItemType Directory -Path $bin -Force | Out-Null
+
+          @('astrid.exe', 'astrid-daemon.exe', 'astrid-build.exe', 'astrid-emit.exe') |
+            ForEach-Object {
+              Copy-Item -LiteralPath (Join-Path $source.FullName $_) -Destination $bin -Force
+            }
+
+          $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+          $pathEntries = @($userPath -split ';' | Where-Object { $_ })
+          if ($pathEntries -notcontains $bin) {
+            [Environment]::SetEnvironmentVariable(
+              'Path',
+              (($pathEntries + $bin) -join ';'),
+              'User'
+            )
+          }
+          if (@($env:Path -split ';') -notcontains $bin) {
+            $env:Path = "$bin;$env:Path"
+          }
           ```
 
           Astrid Runtime does not bundle a product distro. To compose it with a

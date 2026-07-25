@@ -462,14 +462,22 @@ impl Kernel {
         // capsule runs. Generate the token before any capsule can accept
         // connections so a client cannot race token publication.
         let listener = socket::bind_listener(&home)?;
-        // Record our PID immediately after acquiring the singleton lock, so the
-        // PID on disk always belongs to the process that holds the state-db
-        // lock. The CLI reads this to signal a wedged daemon that is no longer
-        // reachable over the socket but still holding the lock (which would
-        // otherwise wedge the next `astrid start`). Best-effort: a write
-        // failure only degrades `stop`/`restart` to socket-only cleanup.
-        if let Err(e) = socket::write_pid_file() {
-            tracing::warn!(error = %e, "Failed to write daemon PID file; stop/restart will fall back to socket-only cleanup");
+        // Publish this process's identity while the singleton lock remains
+        // held, after shared stores and the endpoint are prepared. Use the exact
+        // home captured above rather than re-resolving process-global state.
+        let pid_write = socket::write_pid_file_for_home(&home);
+        #[cfg(windows)]
+        pid_write?;
+        #[cfg(not(windows))]
+        if let Err(error) = pid_write {
+            // Preserve the historical Unix best-effort behavior. Windows
+            // lifecycle recovery cannot safely confirm stop/restart/update
+            // without the private identity record, so publication is
+            // boot-critical there.
+            tracing::warn!(
+                %error,
+                "Failed to write daemon PID file; stop/restart will fall back to socket-only cleanup"
+            );
         }
         let (session_token, token_path) = socket::generate_session_token()?;
 

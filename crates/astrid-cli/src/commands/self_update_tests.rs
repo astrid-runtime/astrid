@@ -198,6 +198,12 @@ fn install_method_is_detected_per_path() {
         InstallMethod::detect(Path::new("/home/jb/.cargo/registry/astrid")),
         SelfManaged
     );
+    #[cfg(windows)]
+    assert_eq!(
+        InstallMethod::detect(Path::new(r"C:\Users\jb\.CaRgO\BiN\astrid.exe")),
+        Cargo,
+        "Windows package-manager detection must follow filesystem case semantics"
+    );
 }
 
 /// REGRESSION (#1121): `--check` must report an available update for EVERY
@@ -403,29 +409,24 @@ fn backup_and_swap_replaces_and_keeps_backup() {
     let extract = dir.path().join("new");
     std::fs::create_dir_all(&install).unwrap();
     std::fs::create_dir_all(&extract).unwrap();
-    let cli = MANAGED_BINARIES[0];
-    let daemon = MANAGED_BINARIES[1];
-
-    std::fs::write(install.join(cli), b"OLD").unwrap();
-    std::fs::write(install.join(daemon), b"OLD-D").unwrap();
-    std::fs::write(extract.join(cli), b"NEW").unwrap();
-    std::fs::write(extract.join(daemon), b"NEW-D").unwrap();
+    for name in MANAGED_BINARIES {
+        std::fs::write(install.join(name), format!("OLD-{name}")).unwrap();
+        std::fs::write(extract.join(name), format!("NEW-{name}")).unwrap();
+    }
 
     backup_and_swap(&install, &extract, MANAGED_BINARIES).unwrap();
 
-    assert_eq!(std::fs::read(install.join(cli)).unwrap(), b"NEW");
-    assert_eq!(std::fs::read(install.join(daemon)).unwrap(), b"NEW-D");
-    // Previous binaries preserved for manual rollback.
-    assert_eq!(
-        std::fs::read(install.join(format!("{cli}.bak"))).unwrap(),
-        b"OLD"
-    );
-    assert_eq!(
-        std::fs::read(install.join(format!("{daemon}.bak"))).unwrap(),
-        b"OLD-D"
-    );
-    // No staging temps left behind.
-    assert!(!install.join(format!(".{cli}.new")).exists());
+    for name in MANAGED_BINARIES {
+        assert_eq!(
+            std::fs::read_to_string(install.join(name)).unwrap(),
+            format!("NEW-{name}")
+        );
+        assert_eq!(
+            std::fs::read_to_string(install.join(format!("{name}.bak"))).unwrap(),
+            format!("OLD-{name}")
+        );
+        assert!(!install.join(format!(".{name}.new")).exists());
+    }
 }
 
 #[cfg(not(windows))]
@@ -436,20 +437,23 @@ fn backup_and_swap_bails_when_archive_missing_a_binary() {
     let extract = dir.path().join("new");
     std::fs::create_dir_all(&install).unwrap();
     std::fs::create_dir_all(&extract).unwrap();
-    let cli = MANAGED_BINARIES[0];
-    let daemon = MANAGED_BINARIES[1];
-
-    std::fs::write(install.join(cli), b"OLD").unwrap();
-    std::fs::write(install.join(daemon), b"OLD-D").unwrap();
-    // Archive only ships the CLI; the daemon is absent.
-    std::fs::write(extract.join(cli), b"NEW").unwrap();
+    for name in MANAGED_BINARIES {
+        std::fs::write(install.join(name), format!("OLD-{name}")).unwrap();
+    }
+    for name in &MANAGED_BINARIES[..MANAGED_BINARIES.len() - 1] {
+        std::fs::write(extract.join(name), format!("NEW-{name}")).unwrap();
+    }
 
     assert!(backup_and_swap(&install, &extract, MANAGED_BINARIES).is_err());
 
     // The completeness check runs before anything is touched: live binaries
     // are unchanged and no backups or staging temps were created.
-    assert_eq!(std::fs::read(install.join(cli)).unwrap(), b"OLD");
-    assert_eq!(std::fs::read(install.join(daemon)).unwrap(), b"OLD-D");
-    assert!(!install.join(format!("{cli}.bak")).exists());
-    assert!(!install.join(format!(".{cli}.new")).exists());
+    for name in MANAGED_BINARIES {
+        assert_eq!(
+            std::fs::read_to_string(install.join(name)).unwrap(),
+            format!("OLD-{name}")
+        );
+        assert!(!install.join(format!("{name}.bak")).exists());
+        assert!(!install.join(format!(".{name}.new")).exists());
+    }
 }

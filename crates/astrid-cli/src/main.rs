@@ -50,15 +50,24 @@ mod workspace_layout;
 #[tokio::main]
 async fn main() -> ExitCode {
     #[cfg(windows)]
-    if let Some(request) = commands::self_update::internal_windows_helper_request() {
-        return match request.and_then(|path| commands::self_update::complete_windows_update(&path))
-        {
+    if let Some(result) = commands::self_update::run_internal_windows_update_helper() {
+        return match result {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("Windows update helper failed: {error:#}");
                 ExitCode::from(1)
             },
         };
+    }
+
+    #[cfg(windows)]
+    match commands::self_update::reconcile_previous_windows_update() {
+        Ok(false) => {},
+        Ok(true) => return ExitCode::from(1),
+        Err(error) => {
+            eprintln!("Windows update recovery failed: {error:#}");
+            return ExitCode::from(1);
+        },
     }
 
     let parsed = cli::Cli::parse();

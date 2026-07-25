@@ -159,6 +159,45 @@ fn reachable_endpoint_without_verified_process_keeps_stop_unconfirmed() {
 }
 
 #[test]
+fn runtime_cleanup_never_deletes_a_new_daemon_generations_files() {
+    let directory = crate::test_support::private_tempdir();
+    let home = astrid_core::dirs::AstridHome::from_path(directory.path());
+    astrid_core::platform_fs::ensure_private_directory(&home.run_dir()).unwrap();
+    let write = |path: &std::path::Path, bytes: &[u8]| {
+        #[cfg(windows)]
+        astrid_core::platform_fs::atomic_write_private_file(path, bytes).unwrap();
+        #[cfg(not(windows))]
+        std::fs::write(path, bytes).unwrap();
+    };
+    write(&home.pid_path(), b"new-generation\n");
+    write(&home.ready_path(), b"v1:new-generation\n");
+    write(&home.token_path(), b"new-generation-token\n");
+
+    let generation = astrid_core::platform_fs::try_acquire_daemon_singleton(&home)
+        .unwrap()
+        .expect("fake daemon generation acquires singleton");
+    assert!(
+        !remove_runtime_files_if_unowned(&home.pid_path(), &home.socket_path()).unwrap(),
+        "cleanup must lose to a newer daemon generation"
+    );
+    assert_eq!(
+        std::fs::read(&home.pid_path()).unwrap(),
+        b"new-generation\n"
+    );
+    assert!(home.ready_path().exists());
+    assert!(home.token_path().exists());
+
+    drop(generation);
+    assert!(
+        remove_runtime_files_if_unowned(&home.pid_path(), &home.socket_path()).unwrap(),
+        "cleanup should proceed once no daemon owns the namespace"
+    );
+    assert!(!home.pid_path().exists());
+    assert!(!home.ready_path().exists());
+    assert!(!home.token_path().exists());
+}
+
+#[test]
 fn start_reachable_daemon_is_already_running() {
     assert_eq!(
         decide_start_action(true, false),

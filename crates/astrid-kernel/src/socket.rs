@@ -47,11 +47,12 @@ fn ensure_run_dir(socket_path: &std::path::Path) -> Result<(), std::io::Error> {
 pub(crate) fn acquire_boot_singleton_lock(
     home: &astrid_core::dirs::AstridHome,
 ) -> Result<std::fs::File, std::io::Error> {
-    let path = home.socket_path();
-    // Both the lockfile and the socket live in the run directory; create it
-    // before acquiring the lock (the lockfile is opened inside it).
-    ensure_run_dir(&path)?;
-    acquire_singleton_lock(&path.with_file_name("system.lock"))
+    astrid_core::platform_fs::try_acquire_daemon_singleton(home)?.ok_or_else(|| {
+        std::io::Error::other(format!(
+            "Another kernel instance is already running (singleton lock held): {}",
+            home.run_dir().join("system.lock").display()
+        ))
+    })
 }
 
 /// Bind the daemon's local listener, assuming the singleton lock is ALREADY held
@@ -88,6 +89,7 @@ pub(crate) fn bind_listener(
 /// is alive — the caller stores it for the daemon's lifetime, and the OS
 /// releases it on process exit (so a crash can't wedge a restart). The
 /// lockfile itself is intentionally left in place between runs.
+#[cfg(test)]
 pub(crate) fn acquire_singleton_lock(
     lock_path: &std::path::Path,
 ) -> Result<std::fs::File, std::io::Error> {
@@ -316,23 +318,34 @@ pub fn try_pid_path() -> std::io::Result<PathBuf> {
     AstridHome::resolve().map(|home| home.pid_path())
 }
 
-/// Write the current process PID to the daemon PID file, atomically.
+/// Write the current process identity to the daemon PID file, atomically.
 ///
-/// Called at boot AFTER the singleton lock is acquired, so the recorded PID
-/// always belongs to the process that holds the state-db lock. The CLI reads
-/// this in `astrid stop`/`astrid restart` to signal a wedged daemon that is
-/// no longer reachable over the socket but is still holding the lock.
+/// Called at boot while the singleton lock is held, so the recorded identity
+/// always belongs to the process that owns the daemon namespace. The CLI reads
+/// this in `astrid stop`/`astrid restart` to signal a wedged daemon that is no
+/// longer reachable over the socket but is still holding the lock.
 ///
 /// Written via temp-file + rename so a reader never observes a half-written
 /// PID, and with 0o600 permissions to match the other run-dir artifacts.
 ///
 /// # Errors
 /// Returns an error if the run directory cannot be created or the file cannot
-/// be written/renamed. The caller treats this as best-effort (a missing PID
-/// file only degrades `stop`/`restart` to socket-only cleanup), so it logs
-/// rather than aborting boot.
+/// be written/renamed. Unix treats this as best-effort. Windows treats it as
+/// boot-critical because safe termination requires its process creation token.
 pub fn write_pid_file() -> Result<(), std::io::Error> {
-    let path = try_pid_path()?;
+    let home = astrid_core::dirs::AstridHome::resolve()?;
+    write_pid_file_for_home(&home)
+}
+
+/// Write daemon identity beneath the exact home captured by the kernel at
+/// boot, without re-resolving process-global environment state.
+///
+/// # Errors
+///
+/// Returns an error when the run directory or private PID file cannot be
+/// created, secured, flushed, or atomically published.
+pub fn write_pid_file_for_home(home: &astrid_core::dirs::AstridHome) -> Result<(), std::io::Error> {
+    let path = home.pid_path();
 
     if let Some(parent) = path.parent() {
         astrid_core::platform_fs::ensure_private_directory(parent)?;
@@ -348,6 +361,7 @@ pub fn write_pid_file() -> Result<(), std::io::Error> {
         .ok()
         .and_then(|p| p.to_str().map(str::to_owned));
 
+    #[cfg(not(windows))]
     let contents = exe_line.map_or_else(
         || std::process::id().to_string(),
         |exe| format!("{}\n{exe}", std::process::id()),
@@ -355,6 +369,12 @@ pub fn write_pid_file() -> Result<(), std::io::Error> {
 
     #[cfg(windows)]
     {
+        let creation_time = current_process_creation_time()?;
+        let contents = format!(
+            "{}\n{}\ncreation_time={creation_time}",
+            std::process::id(),
+            exe_line.unwrap_or_default()
+        );
         astrid_core::platform_fs::atomic_write_private_file(&path, contents.as_bytes())
     }
 
@@ -387,6 +407,43 @@ pub fn write_pid_file() -> Result<(), std::io::Error> {
         }
         Ok(())
     }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn current_process_creation_time() -> std::io::Result<u64> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+
+    let mut creation = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut exit = creation;
+    let mut kernel = creation;
+    let mut user = creation;
+    // SAFETY: `GetCurrentProcess` returns a valid pseudo-handle for this
+    // process. All output pointers refer to live writable `FILETIME` values.
+    let ok = unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &raw mut creation,
+            &raw mut exit,
+            &raw mut kernel,
+            &raw mut user,
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let ticks = (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
+    if ticks == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Windows returned an empty process creation identity",
+        ));
+    }
+    Ok(ticks)
 }
 
 /// Remove the daemon PID file (best-effort).
@@ -495,6 +552,39 @@ mod tests {
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "v1:current\n");
         assert_only_readiness_artifacts(dir.path());
+    }
+
+    #[test]
+    fn pid_record_is_published_under_the_captured_home() {
+        let dir = private_tempdir();
+        let home = astrid_core::dirs::AstridHome::from_path(dir.path());
+
+        write_pid_file_for_home(&home).expect("publish daemon identity");
+
+        let contents = astrid_core::platform_fs::read_private_file_to_string(&home.pid_path())
+            .expect("read protected daemon identity");
+        let mut lines = contents.lines();
+        assert_eq!(
+            lines.next().and_then(|line| line.parse::<u32>().ok()),
+            Some(std::process::id())
+        );
+        let executable = lines.next().unwrap_or_default();
+        assert!(
+            executable.is_empty() || std::path::Path::new(executable).is_absolute(),
+            "recorded executable must be empty or absolute"
+        );
+        #[cfg(windows)]
+        {
+            let creation_time = lines
+                .next()
+                .and_then(|line| line.strip_prefix("creation_time="))
+                .and_then(|ticks| ticks.parse::<u64>().ok());
+            assert!(
+                creation_time.is_some_and(|ticks| ticks != 0),
+                "Windows identity must include a non-zero creation token"
+            );
+        }
+        assert!(lines.next().is_none(), "identity record has extra fields");
     }
 
     #[test]

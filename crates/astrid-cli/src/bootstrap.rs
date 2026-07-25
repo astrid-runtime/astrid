@@ -183,11 +183,10 @@ pub(crate) async fn run_or_connect(
         Ok(astrid_core::local_transport::ConnectOutcome::Stale) => {
             println!(
                 "{}",
-                theme::Theme::warning("Found dead socket. Cleaning up and restarting daemon...")
+                theme::Theme::warning("Found a stale endpoint. Restarting the daemon...")
             );
-            astrid_core::local_transport::remove_stale_endpoint(&socket_path)
-                .context("failed to clean up stale daemon endpoint")?;
-            let _ = std::fs::remove_file(&ready_path);
+            // The spawn path owns cleanup while holding the daemon singleton
+            // lock. Unlinking after this probe would race a newer generation.
             true
         },
         Err(error) => anyhow::bail!("Failed to check socket: {error}"),
@@ -210,13 +209,21 @@ pub(crate) async fn run_or_connect(
     .await
     {
         Ok(c) => {
-            drop(daemon_child);
+            if let Some(child) = daemon_child {
+                commands::daemon::detach_running_child(child)?;
+            }
             c
         },
         Err(e) => {
             if let Some(mut child) = daemon_child {
-                let _ = child.kill();
-                let _ = child.wait();
+                if let Err(cleanup_error) =
+                    commands::daemon::terminate_child_bounded(&mut child).await
+                {
+                    return Err(anyhow::Error::new(e).context(format!(
+                        "failed to connect to the newly started daemon, and bounded child cleanup \
+                         also failed: {cleanup_error}"
+                    )));
+                }
             }
             let log_hint = astrid_core::dirs::AstridHome::resolve().map_or_else(
                 |_| "Failed to connect to daemon".to_string(),

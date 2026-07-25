@@ -88,8 +88,14 @@ which = { workspace = true }
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Globalization",
+    # `RegCreateKeyExW` is gated on Security; a new Windows profile may not
+    # have an HKCU Environment key yet, so PATH setup must be able to create it.
+    "Win32_Security",
     "Win32_Storage_FileSystem",
+    "Win32_System_Environment",
+    "Win32_System_Registry",
     "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [dev-dependencies]

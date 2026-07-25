@@ -7,7 +7,9 @@ on:
       - 'crates/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'rust-toolchain.toml'
       - 'scripts/windows-daemon-lifecycle.ps1'
+      - '.github/workflows/release.yml'
       - '.github/workflows/windows-daemon-lifecycle.yml'
   pull_request:
     branches: [main]
@@ -15,7 +17,9 @@ on:
       - 'crates/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'rust-toolchain.toml'
       - 'scripts/windows-daemon-lifecycle.ps1'
+      - '.github/workflows/release.yml'
       - '.github/workflows/windows-daemon-lifecycle.yml'
   workflow_dispatch:
 
@@ -60,7 +64,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
-          toolchain: '1.95'
+          toolchain: '1.95.0'
           targets: ${{ matrix.target }}
           components: clippy
 
@@ -126,7 +130,7 @@ jobs:
           -p astrid
           --locked
           --target $env:TARGET
-          commands::daemon_control::tests
+          commands::daemon_control
 
       - name: Test unconfirmed stop exit status
         env:
@@ -149,6 +153,41 @@ jobs:
           --locked
           --target $env:TARGET
           commands::self_update::windows::tests
+
+      - name: Test native persistent PATH decisions
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: >-
+          cargo test
+          -p astrid
+          --locked
+          --target $env:TARGET
+          commands::self_update::windows_path::tests
+
+      - name: Test native executable replacement and recovery
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: >-
+          cargo test
+          -p astrid-core
+          --locked
+          --target $env:TARGET
+          platform_fs
+
+      - name: Exercise the real Windows update helper
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: >-
+          cargo test
+          -p astrid
+          --test windows_update_helper
+          --locked
+          --target $env:TARGET
+          --
+          --nocapture
 
       - name: Test shared self-update decisions
         env:

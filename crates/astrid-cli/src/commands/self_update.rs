@@ -5,6 +5,7 @@
 //! remain package-manager owned. Discovery can use a mirror or mock, but the
 //! accepted Astrid workflow identities and issuer cannot be overridden.
 
+#[cfg(not(windows))]
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
@@ -25,6 +26,11 @@ use super::update_channel;
 #[path = "self_update/windows.rs"]
 mod windows;
 
+#[cfg(windows)]
+#[allow(unsafe_code)]
+#[path = "self_update/windows_path.rs"]
+mod windows_path;
+
 #[path = "self_update_notice.rs"]
 mod notice;
 pub(crate) use notice::print_update_banner;
@@ -43,18 +49,16 @@ const MAX_BUNDLE_BYTES: usize = 256 * 1024;
 const MAX_MANIFEST_BYTES: usize = 256 * 1024;
 
 #[cfg(not(windows))]
-const MANAGED_BINARIES: &[&str] = &["astrid", "astrid-daemon"];
-#[cfg(windows)]
-const MANAGED_BINARIES: &[&str] = &["astrid.exe", "astrid-daemon.exe"];
+const MANAGED_BINARIES: &[&str] = &["astrid", "astrid-daemon", "astrid-build", "astrid-emit"];
 
 #[cfg(windows)]
-pub(crate) fn internal_windows_helper_request() -> Option<anyhow::Result<PathBuf>> {
-    windows::internal_helper_request()
+pub(crate) fn run_internal_windows_update_helper() -> Option<anyhow::Result<()>> {
+    windows::internal_helper_request().map(|request| request.and_then(windows::run_helper_request))
 }
 
 #[cfg(windows)]
-pub(crate) fn complete_windows_update(transaction: &Path) -> anyhow::Result<()> {
-    windows::complete(transaction)
+pub(crate) fn reconcile_previous_windows_update() -> anyhow::Result<bool> {
+    windows::reconcile_previous_update()
 }
 
 /// GitHub API base URL. `ASTRID_UPDATE_API` overrides it so the flow can be
@@ -82,6 +86,7 @@ fn resolve_repo(source: Option<&str>) -> anyhow::Result<(String, String)> {
 }
 
 /// The `~/.astrid/bin` directory where `astrid init` puts self-managed binaries.
+#[cfg(not(windows))]
 fn astrid_bin_dir() -> anyhow::Result<PathBuf> {
     let home = astrid_core::dirs::AstridHome::resolve()?;
     Ok(home.root().join("bin"))
@@ -174,21 +179,43 @@ fn cargo_bin_dirs() -> Vec<PathBuf> {
 /// differs.
 fn is_cargo_managed(exe: &Path) -> bool {
     use std::ffi::OsStr;
-    if cargo_bin_dirs().iter().any(|dir| exe.starts_with(dir)) {
+    let parent_matches = |dir: &PathBuf| {
+        #[cfg(windows)]
+        {
+            exe.parent().is_some_and(|parent| {
+                windows_path::paths_equal_case_insensitive(parent.as_os_str(), dir.as_os_str())
+                    .unwrap_or(false)
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            exe.starts_with(dir)
+        }
+    };
+    if cargo_bin_dirs().iter().any(parent_matches) {
         return true;
     }
     let comps: Vec<&OsStr> = exe
         .components()
         .map(std::path::Component::as_os_str)
         .collect();
-    comps
-        .windows(2)
-        .any(|w| w[0] == OsStr::new(".cargo") && w[1] == OsStr::new("bin"))
+    comps.windows(2).any(|w| {
+        #[cfg(windows)]
+        {
+            windows_path::paths_equal_case_insensitive(w[0], OsStr::new(".cargo")).unwrap_or(false)
+                && windows_path::paths_equal_case_insensitive(w[1], OsStr::new("bin"))
+                    .unwrap_or(false)
+        }
+        #[cfg(not(windows))]
+        {
+            w[0] == OsStr::new(".cargo") && w[1] == OsStr::new("bin")
+        }
+    })
 }
 
 /// How the running `astrid` binary is managed. Determines how an update is
 /// APPLIED (and the instruction shown); the version CHECK itself is
-/// install-method-independent — always the GitHub release, on macOS and Linux.
+/// install-method-independent — always the authenticated GitHub release.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InstallMethod {
     /// Homebrew (`…/Cellar/astrid/…`) — updates via `brew upgrade`.
@@ -563,7 +590,7 @@ pub(crate) async fn run_self_update(args: UpdateArgs) -> anyhow::Result<()> {
         // strict, confirmed stop the final step before the exit-time helper is
         // launched so neither executable can still be mapped by a live daemon.
         stop_daemon_before_windows_replacement().await?;
-        windows::stage_and_launch(&install_dir, &extract_dir, MANAGED_BINARIES)?;
+        windows::stage_and_launch(&install_dir, &extract_dir, &version_str)?;
         println!(
             "{}",
             Theme::success(&format!(
@@ -775,6 +802,7 @@ fn is_in_path(dir: &Path) -> bool {
 }
 
 /// Detect the user's shell RC file.
+#[cfg(not(windows))]
 fn detect_shell_rc() -> Option<PathBuf> {
     let home = directories::BaseDirs::new()?.home_dir().to_path_buf();
     let shell = std::env::var("SHELL").unwrap_or_default();
@@ -812,6 +840,7 @@ fn detect_shell_rc() -> Option<PathBuf> {
 /// as "already configured" would silently skip the real PATH setup. Both
 /// match paths in [`rc_configures_path`] consult this so a commented block or
 /// token never counts.
+#[cfg(any(not(windows), test))]
 fn match_is_commented(rc: &str, start: usize) -> bool {
     let line_start = rc[..start].rfind('\n').map_or(0, |nl| nl.saturating_add(1));
     rc[line_start..start].contains('#')
@@ -831,6 +860,7 @@ fn match_is_commented(rc: &str, start: usize) -> bool {
 /// unsure we err toward ADDING the block — a duplicate PATH entry is harmless;
 /// a silent skip is not. Pure over its inputs so the guarantee is
 /// unit-testable without a real shell rc.
+#[cfg(any(not(windows), test))]
 fn rc_configures_path(rc_contents: &str, bin_str: &str, export_line: &str) -> bool {
     // Our exact block is the authoritative "already done" marker — unless it
     // is commented out, in which case it is inert and we must add a live one.
@@ -877,81 +907,90 @@ fn rc_configures_path(rc_contents: &str, bin_str: &str, export_line: &str) -> bo
     false
 }
 
-/// Ensure `~/.astrid/bin` is in PATH. Prompts user if interactive.
+/// Ensure the self-managed Astrid executable directory is persistently in PATH.
 ///
 /// Called by `astrid init` after capsule installation.
-pub(crate) fn ensure_path_setup() -> anyhow::Result<()> {
-    let bin_dir = astrid_bin_dir()?;
-    std::fs::create_dir_all(&bin_dir)?;
-
-    if is_in_path(&bin_dir) {
-        return Ok(());
-    }
-
-    let bin_str = bin_dir.to_string_lossy();
-    let Some(rc_file) = detect_shell_rc() else {
-        println!(
-            "{}",
-            Theme::warning(&format!("Add {bin_str} to your PATH manually."))
-        );
-        return Ok(());
-    };
-
-    let export_line = if rc_file.to_string_lossy().contains("fish") {
-        format!("fish_add_path {bin_str}")
-    } else {
-        format!("export PATH=\"{bin_str}:$PATH\"")
-    };
-
-    // Idempotency: if the rc file already wires the bin dir onto PATH, do
-    // NOT append a second block. `astrid init` (and the first-run auto-init)
-    // calls this on every run, so an unguarded append would accumulate a
-    // duplicate `# Astrid OS` block per invocation.
-    if let Ok(contents) = std::fs::read_to_string(&rc_file)
-        && rc_configures_path(&contents, &bin_str, &export_line)
+pub(crate) fn ensure_path_setup(yes: bool) -> anyhow::Result<()> {
+    #[cfg(windows)]
     {
-        return Ok(()); // Already configured, just not sourced yet
+        let exe = running_binary()?;
+        return windows_path::ensure_path_setup(&exe, InstallMethod::detect(&exe), yes);
     }
 
-    // Prompt if interactive
-    if std::io::stdin().is_terminal() {
-        eprint!(
-            "\n{bin_str} is not in your PATH. Add it to {}? [Y/n] ",
-            rc_file.display()
-        );
-        std::io::Write::flush(&mut std::io::stderr())?;
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-        let input = input.trim();
-        if !input.is_empty() && !input.eq_ignore_ascii_case("y") {
-            println!(
-                "{}",
-                Theme::dimmed(&format!("Skipped. Add manually: {export_line}"))
-            );
+    #[cfg(not(windows))]
+    {
+        let bin_dir = astrid_bin_dir()?;
+        std::fs::create_dir_all(&bin_dir)?;
+
+        if is_in_path(&bin_dir) {
             return Ok(());
         }
+
+        let bin_str = bin_dir.to_string_lossy();
+        let Some(rc_file) = detect_shell_rc() else {
+            println!(
+                "{}",
+                Theme::warning(&format!("Add {bin_str} to your PATH manually."))
+            );
+            return Ok(());
+        };
+
+        let export_line = if rc_file.to_string_lossy().contains("fish") {
+            format!("fish_add_path {bin_str}")
+        } else {
+            format!("export PATH=\"{bin_str}:$PATH\"")
+        };
+
+        // Idempotency: if the rc file already wires the bin dir onto PATH, do
+        // NOT append a second block. `astrid init` (and the first-run auto-init)
+        // calls this on every run, so an unguarded append would accumulate a
+        // duplicate `# Astrid OS` block per invocation.
+        if let Ok(contents) = std::fs::read_to_string(&rc_file)
+            && rc_configures_path(&contents, &bin_str, &export_line)
+        {
+            return Ok(()); // Already configured, just not sourced yet
+        }
+
+        // Prompt if interactive
+        if !yes && std::io::stdin().is_terminal() {
+            eprint!(
+                "\n{bin_str} is not in your PATH. Add it to {}? [Y/n] ",
+                rc_file.display()
+            );
+            std::io::Write::flush(&mut std::io::stderr())?;
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            let input = input.trim();
+            if !input.is_empty() && !input.eq_ignore_ascii_case("y") {
+                println!(
+                    "{}",
+                    Theme::dimmed(&format!("Skipped. Add manually: {export_line}"))
+                );
+                return Ok(());
+            }
+        }
+
+        // Append to RC file
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&rc_file)?;
+        std::io::Write::write_all(
+            &mut file,
+            format!("\n# Astrid OS\n{export_line}\n").as_bytes(),
+        )?;
+
+        println!(
+            "{}",
+            Theme::success(&format!("Added to {}", rc_file.display()))
+        );
+        println!(
+            "  Run: {} (or restart your terminal)",
+            Theme::dimmed(&format!("source {}", rc_file.display()))
+        );
+
+        Ok(())
     }
-
-    // Append to RC file
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&rc_file)?;
-    std::io::Write::write_all(
-        &mut file,
-        format!("\n# Astrid OS\n{export_line}\n").as_bytes(),
-    )?;
-
-    println!(
-        "{}",
-        Theme::success(&format!("Added to {}", rc_file.display()))
-    );
-    println!(
-        "  Run: {} (or restart your terminal)",
-        Theme::dimmed(&format!("source {}", rc_file.display()))
-    );
-
-    Ok(())
 }
 
 #[cfg(test)]

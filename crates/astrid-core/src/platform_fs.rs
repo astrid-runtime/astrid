@@ -136,6 +136,142 @@ pub fn ensure_private_directory(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Try to acquire exclusive ownership of one Astrid home's daemon namespace.
+///
+/// The daemon holds this lock for its entire lifetime. Lifecycle clients use
+/// the same primitive before deleting runtime artifacts, preventing cleanup of
+/// a newer daemon generation that started after an older process exited.
+/// `Ok(None)` means another process currently owns the namespace. The returned
+/// file must remain alive for as long as the caller relies on exclusivity.
+///
+/// # Errors
+///
+/// Returns an error if the private run directory or lock file cannot be
+/// created, validated, opened, or locked.
+pub fn try_acquire_daemon_singleton(
+    home: &crate::dirs::AstridHome,
+) -> io::Result<Option<std::fs::File>> {
+    let run_dir = home.run_dir();
+    ensure_private_directory(&run_dir)?;
+    let lock_path = run_dir.join("system.lock");
+    try_acquire_private_file_lock(&lock_path, "another Astrid daemon")
+}
+
+/// Try to acquire an exclusive lock on a private regular file.
+///
+/// Windows creates or opens the file relative to a retained trusted-directory
+/// handle, applies or validates the private DACL on that exact file handle, and
+/// then calls `LockFileEx` through the standard library. Unix rejects a
+/// symlinked final component, enforces owner-only permissions on the open file,
+/// and takes the corresponding advisory lock. `Ok(None)` means another process
+/// owns the lock.
+///
+/// # Errors
+///
+/// Returns an error when the path boundary, private access contract, file open,
+/// or locking operation cannot be verified.
+pub fn try_acquire_private_file_lock(
+    path: &Path,
+    owner_description: &str,
+) -> io::Result<Option<std::fs::File>> {
+    #[cfg(windows)]
+    {
+        return match windows::acquire_private_file_lock(path, owner_description) {
+            Ok(file) => Ok(Some(file)),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(error),
+        };
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+        let _ = owner_description;
+        if let Some(parent) = path.parent() {
+            ensure_private_directory(parent)?;
+        }
+        verify_no_redirects(path)?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(path)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        return match file.try_lock() {
+            Ok(()) => Ok(Some(file)),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(error)) => Err(error),
+        };
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = owner_description;
+        if let Some(parent) = path.parent() {
+            ensure_private_directory(parent)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(path)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(file)),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(error)) => Err(error),
+        }
+    }
+}
+
+/// Open a private regular file for true append-only writes.
+///
+/// Windows uses an exact handle-relative open with `FILE_APPEND_DATA` and no
+/// `FILE_WRITE_DATA`, preserving append semantics across independent process
+/// handles. Unix uses `O_APPEND` with owner-only permissions.
+///
+/// # Errors
+///
+/// Returns an error when the path boundary, private access contract, or file
+/// open cannot be verified.
+pub fn open_private_append_file(path: &Path) -> io::Result<std::fs::File> {
+    #[cfg(windows)]
+    {
+        return windows::open_private_append_file(path);
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+        if let Some(parent) = path.parent() {
+            ensure_private_directory(parent)?;
+        }
+        verify_no_redirects(path)?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(path)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        return Ok(file);
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        if let Some(parent) = path.parent() {
+            ensure_private_directory(parent)?;
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+    }
+}
+
 /// Enforce and validate private access on an existing regular file.
 ///
 /// Unix retains its caller-owned mode behavior. Windows rejects reparse points
@@ -293,6 +429,49 @@ pub fn replace_executable_set(
     #[cfg(not(windows))]
     {
         replace_executable_set_by_rename(install_dir, extract_dir, names)
+    }
+}
+
+/// Result of checking for an interrupted executable replacement transaction.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutableRecoveryOutcome {
+    /// No journaled executable replacement required recovery.
+    NotNeeded,
+    /// A journaled replacement was restored to its prior executable set.
+    Restored,
+}
+
+/// Recover an interrupted Windows executable replacement transaction.
+///
+/// Recovery is serialized under the same private install-directory lock used
+/// by [`replace_executable_set`]. It restores the prior executable set from the
+/// authenticated rollback copies and removes the committed recovery journal.
+/// Other platforms have no persistent executable transaction journal and
+/// therefore return success without mutation.
+///
+/// # Errors
+///
+/// Returns an error when the install directory is untrusted, recovery is
+/// already active, an executable remains locked, or the authenticated rollback
+/// set cannot be restored completely. Recovery material is retained on error
+/// so a later helper process can retry.
+pub fn recover_executable_set(install_dir: &Path) -> io::Result<ExecutableRecoveryOutcome> {
+    #[cfg(windows)]
+    {
+        windows::recover_executable_transaction(install_dir).map(|restored| {
+            if restored {
+                ExecutableRecoveryOutcome::Restored
+            } else {
+                ExecutableRecoveryOutcome::NotNeeded
+            }
+        })
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = install_dir;
+        Ok(ExecutableRecoveryOutcome::NotNeeded)
     }
 }
 

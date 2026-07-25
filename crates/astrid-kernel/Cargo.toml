@@ -66,6 +66,12 @@ astrid-mcp = { workspace = true }
 astrid-vfs = { workspace = true }
 tokio = { workspace = true, features = ["full", "signal"] }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 async-trait = { workspace = true }
 

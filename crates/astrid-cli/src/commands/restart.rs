@@ -25,9 +25,10 @@ pub(crate) async fn run() -> Result<ExitCode> {
     // already locked". Verify the recorded PID is actually gone (terminating it
     // if it survived `handle_stop`'s own kill path) before spawning.
     let pid_path = socket_client::try_pid_path()?;
-    if let Some((pid, _exe)) = daemon_control::read_pid_file(&pid_path)
-        && daemon_control::is_process_alive(pid)
+    if let Some(identity) = daemon_control::read_pid_file(&pid_path)?
+        && daemon_control::is_process_alive(identity.pid)
     {
+        let pid = identity.pid;
         eprintln!(
             "{}",
             Theme::warning(&format!(
@@ -35,7 +36,7 @@ pub(crate) async fn run() -> Result<ExitCode> {
                  verifying before restart."
             ))
         );
-        match daemon_control::terminate_orphan(&pid_path).await {
+        match daemon_control::terminate_orphan(&pid_path).await? {
             daemon_control::KillOutcome::StillAlive => {
                 anyhow::bail!(
                     "The previous Astrid daemon (PID {pid}) did not exit even after forced termination; \
@@ -54,9 +55,7 @@ pub(crate) async fn run() -> Result<ExitCode> {
                     pid_path.display()
                 );
             },
-            _ => {
-                let _ = std::fs::remove_file(&pid_path);
-            },
+            _ => {},
         }
     }
 

@@ -47,9 +47,10 @@ $env:ASTRID_WORKSPACE_STATE_DIR = ".astrid-ci"
 
 function Invoke-Astrid {
     param(
+        [Parameter(Position = 0, ValueFromRemainingArguments = $true)]
+        [string[]]$Arguments,
         [int]$TimeoutSeconds = 120,
-        [Parameter(ValueFromRemainingArguments = $true)]
-        [string[]]$Arguments
+        [switch]$AllowNonzeroExit
     )
 
     $displayCommand = "astrid $($Arguments -join ' ')"
@@ -106,6 +107,12 @@ function Invoke-Astrid {
         }
 
         $output = "stdout:`n$($stdoutTask.Result)`nstderr:`n$($stderrTask.Result)"
+        if ($AllowNonzeroExit) {
+            return [pscustomobject]@{
+                ExitCode = $process.ExitCode
+                Output = $output
+            }
+        }
         if ($process.ExitCode -ne 0) {
             throw "$displayCommand failed with exit code $($process.ExitCode)`n$output"
         }
@@ -167,8 +174,12 @@ try {
     # kernel denial. The CLI must not reinterpret that denial as a transport
     # failure and enter identity-gated process termination recovery.
     $null = Invoke-Astrid agent create lifecycle-shutdown-denied --group agent -y
-    $deniedStopOutput = & $astrid --principal lifecycle-shutdown-denied stop 2>&1 | Out-String
-    $deniedStopExit = $LASTEXITCODE
+    $deniedStopResult = Invoke-Astrid `
+        -TimeoutSeconds 30 `
+        -AllowNonzeroExit `
+        -Arguments @("--principal", "lifecycle-shutdown-denied", "stop")
+    $deniedStopOutput = $deniedStopResult.Output
+    $deniedStopExit = $deniedStopResult.ExitCode
     if ($deniedStopExit -eq 0) {
         throw "restricted principal unexpectedly stopped daemon PID $daemonPid`n$deniedStopOutput"
     }
@@ -240,7 +251,14 @@ try {
     $ephemeralDeadline = [DateTime]::UtcNow.AddSeconds(60)
     while (-not (Test-Path -LiteralPath $pidPath -PathType Leaf)) {
         if ($ephemeralClient.HasExited) {
-            $clientOutput = $ephemeralClient.StandardOutput.ReadToEnd()
+            $clientOutputTask = $ephemeralClient.StandardOutput.ReadToEndAsync()
+            if (-not [Threading.Tasks.Task]::WaitAll(
+                [Threading.Tasks.Task[]]@($clientOutputTask, $clientErrorTask),
+                10000
+            )) {
+                throw "ephemeral MCP client exited before daemon readiness and inherited redirected output handles remained open"
+            }
+            $clientOutput = $clientOutputTask.Result
             $clientError = $clientErrorTask.Result
             throw "ephemeral MCP client exited before daemon readiness (exit $($ephemeralClient.ExitCode))`n$clientOutput`n$clientError"
         }
@@ -304,6 +322,12 @@ try {
     if (-not $ephemeralClient.WaitForExit(15000)) {
         throw "ephemeral MCP client did not exit after stdin closed"
     }
+    if (-not [Threading.Tasks.Task]::WaitAll(
+        [Threading.Tasks.Task[]]@($remainingOutputTask, $clientErrorTask),
+        10000
+    )) {
+        throw "ephemeral MCP client exited but inherited redirected output handles remained open"
+    }
     $remainingOutput = $remainingOutputTask.Result
     $clientError = $clientErrorTask.Result
     $clientOutput = ($clientOutputLines -join "`n") + "`n" + $remainingOutput
@@ -332,7 +356,9 @@ finally {
                 $ephemeralClient.StandardInput.Close()
                 if (-not $ephemeralClient.WaitForExit(5000)) {
                     $ephemeralClient.Kill($true)
-                    $ephemeralClient.WaitForExit()
+                    if (-not $ephemeralClient.WaitForExit(15000)) {
+                        Write-Warning "forced cleanup did not terminate the ephemeral MCP client"
+                    }
                 }
             }
             catch {
