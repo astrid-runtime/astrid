@@ -13,6 +13,8 @@ use super::{
     Transaction, UpdateReceipt, WINDOWS_MANAGED_BINARIES,
 };
 
+const TRUNCATION_MARKER: &str = "…";
+
 pub(super) fn cleanup_completed_payload(
     transaction_path: &Path,
     transaction: &Transaction,
@@ -157,7 +159,6 @@ pub(super) fn bounded_detail(error: &anyhow::Error) -> String {
     if detail.len() <= MAX_RECEIPT_DETAIL_BYTES {
         return detail;
     }
-    const TRUNCATION_MARKER: &str = "…";
     let mut end = MAX_RECEIPT_DETAIL_BYTES.saturating_sub(TRUNCATION_MARKER.len());
     while !detail.is_char_boundary(end) {
         end = end.saturating_sub(1);

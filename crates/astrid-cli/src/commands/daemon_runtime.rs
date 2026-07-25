@@ -263,8 +263,8 @@ pub(super) fn report_confirmed_cleanup(
             eprintln!(
                 "{}",
                 theme::Theme::warning(
-                    "The stopped daemon exited, but another daemon generation now owns the \
-                     runtime namespace. Its files were left intact."
+                    "Another daemon generation now owns the runtime namespace. Its files were \
+                     left intact."
                 )
             );
             StopConfirmation::Unconfirmed
@@ -273,8 +273,8 @@ pub(super) fn report_confirmed_cleanup(
             eprintln!(
                 "{}",
                 theme::Theme::warning(&format!(
-                    "The stopped daemon exited, but runtime cleanup could not be verified: {error}. \
-                     Runtime files were left for a later recovery."
+                    "Daemon runtime cleanup could not be verified: {error}. Runtime files were \
+                     left for a later recovery."
                 ))
             );
             StopConfirmation::Unconfirmed
