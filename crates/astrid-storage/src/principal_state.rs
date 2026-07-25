@@ -18,7 +18,7 @@ use astrid_storage_engine::{DurableEngine, PrincipalCodec, RecoveryLimits};
 use astrid_storage_model::{ObjectClass, ObjectId, ObjectIdentity, ObjectRecord, ReferenceKind};
 
 use crate::error::{StorageError, StorageResult};
-#[cfg(feature = "legacy-surrealkv")]
+#[cfg(all(test, feature = "legacy-surrealkv"))]
 use crate::kv::SurrealKvStore;
 use crate::kv::{KvPrincipalResolver, KvQuotaResolver, KvStore, TreeKvStore};
 
