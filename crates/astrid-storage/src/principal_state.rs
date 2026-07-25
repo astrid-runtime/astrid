@@ -18,7 +18,9 @@ use astrid_storage_engine::{DurableEngine, PrincipalCodec, RecoveryLimits};
 use astrid_storage_model::{ObjectClass, ObjectId, ObjectIdentity, ObjectRecord, ReferenceKind};
 
 use crate::error::{StorageError, StorageResult};
-use crate::kv::{KvPrincipalResolver, KvQuotaResolver, KvStore, SurrealKvStore, TreeKvStore};
+#[cfg(feature = "legacy-surrealkv")]
+use crate::kv::SurrealKvStore;
+use crate::kv::{KvPrincipalResolver, KvQuotaResolver, KvStore, TreeKvStore};
 
 const STORE_METADATA_FILE: &str = "store.meta";
 const STORE_METADATA: &[u8] = b"format=astrid-principal-store-v1\n\
@@ -190,8 +192,17 @@ pub async fn open_runtime_kv(
     quota: Arc<dyn KvQuotaResolver<StateOwner>>,
 ) -> StorageResult<Arc<dyn KvStore>> {
     if options.backend == PrincipalStoreBackend::LegacySurreal {
-        return SurrealKvStore::open(home.state_db_path())
-            .map(|store| Arc::new(store) as Arc<dyn KvStore>);
+        #[cfg(feature = "legacy-surrealkv")]
+        {
+            return SurrealKvStore::open(home.state_db_path())
+                .map(|store| Arc::new(store) as Arc<dyn KvStore>);
+        }
+        #[cfg(not(feature = "legacy-surrealkv"))]
+        {
+            return Err(StorageError::Connection(
+                "legacy-surreal recovery requires the legacy-surrealkv feature".to_owned(),
+            ));
+        }
     }
 
     let store_path = home.principal_store_path();
@@ -441,6 +452,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "legacy-surrealkv")]
     #[tokio::test]
     async fn first_boot_migrates_verifies_and_preserves_legacy_state() {
         let directory = tempfile::tempdir().unwrap();
@@ -568,6 +580,26 @@ mod tests {
                 .exists()
         );
         drop(store);
+    }
+
+    #[cfg(not(feature = "legacy-surrealkv"))]
+    #[tokio::test]
+    async fn legacy_source_requires_the_transition_feature() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(directory.path());
+        std::fs::create_dir_all(home.state_db_path()).unwrap();
+
+        let error =
+            match open_runtime_kv(&home, PrincipalStoreOptions::default(), unlimited_quota()).await
+            {
+                Err(error) => error,
+                Ok(_) => panic!("legacy source opened without transition support"),
+            };
+        assert!(
+            error
+                .to_string()
+                .contains("rebuild with the legacy-surrealkv feature")
+        );
     }
 
     #[tokio::test]

@@ -5,16 +5,22 @@
 //! migrator while their specifications and golden fixtures remain in source
 //! history.
 
-use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use super::{RuntimeEngine, RuntimeStore, StateOwner, StateOwnerResolver, atomic_write};
+#[cfg(feature = "legacy-surrealkv")]
+use std::collections::BTreeMap;
+
+use super::{RuntimeEngine, atomic_write};
+#[cfg(feature = "legacy-surrealkv")]
+use super::{RuntimeStore, StateOwner, StateOwnerResolver};
 use crate::error::{StorageError, StorageResult};
+#[cfg(feature = "legacy-surrealkv")]
 use crate::kv::{KvPrincipalResolver, SurrealKvStore};
 use astrid_core::dirs::AstridHome;
 
 pub(super) const MIGRATION_MARKER_FILE: &str = "migration.complete";
+#[cfg(feature = "legacy-surrealkv")]
 const MIGRATION_PAGE_ENTRIES: usize = 512;
 const CURRENT_STORE_VERSION: u32 = 1;
 const MINIMUM_SUPPORTED_STORE_VERSION: u32 = 1;
@@ -41,6 +47,13 @@ pub(super) fn is_complete(store_path: &Path) -> bool {
         .is_ok_and(|bytes| bytes == LEGACY_TO_V1_MARKER)
 }
 
+#[cfg_attr(
+    not(feature = "legacy-surrealkv"),
+    expect(
+        clippy::unused_async,
+        reason = "keep one startup API across builds with and without the async legacy migrator"
+    )
+)]
 pub(super) async fn apply_required(
     home: &AstridHome,
     store_path: &Path,
@@ -58,20 +71,28 @@ pub(super) async fn apply_required(
             "principal store migration registry is inconsistent".to_owned(),
         ));
     }
-    migrate_legacy(home, engine).await?;
-    atomic_write(&store_path.join(MIGRATION_MARKER_FILE), LEGACY_TO_V1_MARKER)
-}
-
-async fn migrate_legacy(home: &AstridHome, engine: &Arc<RuntimeEngine>) -> StorageResult<()> {
     let legacy_path = home.state_db_path();
-    if !legacy_path.exists() {
+    let legacy_exists = legacy_path.exists();
+    if legacy_exists {
+        #[cfg(feature = "legacy-surrealkv")]
+        migrate_legacy(&legacy_path, engine).await?;
+        #[cfg(not(feature = "legacy-surrealkv"))]
+        return Err(StorageError::Connection(format!(
+            "legacy state exists at {}; rebuild with the legacy-surrealkv feature to migrate it",
+            legacy_path.display()
+        )));
+    }
+    if !legacy_exists {
         engine
             .flush()
             .map_err(|error| StorageError::Internal(error.to_string()))?;
-        return Ok(());
     }
+    atomic_write(&store_path.join(MIGRATION_MARKER_FILE), LEGACY_TO_V1_MARKER)
+}
 
-    let legacy = SurrealKvStore::open(&legacy_path)?;
+#[cfg(feature = "legacy-surrealkv")]
+async fn migrate_legacy(legacy_path: &Path, engine: &Arc<RuntimeEngine>) -> StorageResult<()> {
+    let legacy = SurrealKvStore::open(legacy_path)?;
     let migration = RuntimeStore::from_engine(Arc::clone(engine), StateOwnerResolver);
     let mut expected = BTreeMap::<StateOwner, MigrationDigest>::new();
     let mut cursor = None;
@@ -91,6 +112,7 @@ async fn migrate_legacy(home: &AstridHome, engine: &Arc<RuntimeEngine>) -> Stora
     Ok(())
 }
 
+#[cfg(feature = "legacy-surrealkv")]
 fn import_page(
     store: &RuntimeStore,
     entries: &[crate::KvEntry],
@@ -114,6 +136,7 @@ fn import_page(
     Ok(())
 }
 
+#[cfg(feature = "legacy-surrealkv")]
 fn verify_migration(
     engine: &Arc<RuntimeEngine>,
     expected: &BTreeMap<StateOwner, MigrationDigest>,
@@ -133,12 +156,14 @@ fn verify_migration(
     Ok(())
 }
 
+#[cfg(feature = "legacy-surrealkv")]
 #[derive(Clone, Debug)]
 struct MigrationDigest {
     count: u64,
     hasher: blake3::Hasher,
 }
 
+#[cfg(feature = "legacy-surrealkv")]
 impl Default for MigrationDigest {
     fn default() -> Self {
         Self {
@@ -150,6 +175,7 @@ impl Default for MigrationDigest {
     }
 }
 
+#[cfg(feature = "legacy-surrealkv")]
 impl MigrationDigest {
     fn add(&mut self, namespace: &str, key: &str, value: &[u8]) -> StorageResult<()> {
         self.count = self
@@ -166,6 +192,7 @@ impl MigrationDigest {
     }
 }
 
+#[cfg(feature = "legacy-surrealkv")]
 fn hash_field(hasher: &mut blake3::Hasher, bytes: &[u8]) -> StorageResult<()> {
     let length = u64::try_from(bytes.len())
         .map_err(|_| StorageError::Internal("migration field length overflow".to_owned()))?;
