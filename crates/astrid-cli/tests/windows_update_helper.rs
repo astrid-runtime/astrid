@@ -1,6 +1,6 @@
 #![cfg(windows)]
 
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -19,6 +19,9 @@ const BINARIES: [&str; 4] = [
 const TEST_PARENT_ENV: &str = "ASTRID_WINDOWS_UPDATE_TEST_PARENT";
 const CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const MAX_DIAGNOSTIC_BYTES: u64 = 16_384;
+const MAX_DIAGNOSTIC_ENTRIES: usize = 64;
+const MAX_DIRECTORY_DIAGNOSTIC_BYTES: usize = 8_192;
 static UPDATER_INTEGRATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Serialize)]
@@ -114,6 +117,139 @@ fn wait_for_child(child: &mut std::process::Child, timeout: Duration) -> std::pr
         if Instant::now() >= deadline {
             let cleanup = terminate_child_bounded_sync(child);
             panic!("timed out waiting for Windows update helper; cleanup result: {cleanup:?}");
+        }
+        std::thread::sleep(CHILD_POLL_INTERVAL);
+    }
+}
+
+fn open_private_stderr(path: &Path) -> std::fs::File {
+    write_private(path, b"");
+    std::fs::OpenOptions::new().append(true).open(path).unwrap()
+}
+
+fn read_bounded_diagnostic(path: &Path) -> String {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) => return format!("<failed to open {}: {error}>", path.display()),
+    };
+    let length = file.metadata().map(|metadata| metadata.len()).ok();
+    let mut bytes = Vec::new();
+    let mut limited = file.take(MAX_DIAGNOSTIC_BYTES);
+    if let Err(error) = limited.read_to_end(&mut bytes) {
+        return format!("<failed to read {}: {error}>", path.display());
+    }
+    let suffix = if length.is_some_and(|length| length > MAX_DIAGNOSTIC_BYTES) {
+        "\n<truncated>"
+    } else {
+        ""
+    };
+    format!("{}{suffix}", String::from_utf8_lossy(&bytes))
+}
+
+fn path_diagnostic(path: &Path) -> String {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            let kind = if file_type.is_file() {
+                "file"
+            } else if file_type.is_dir() {
+                "directory"
+            } else if file_type.is_symlink() {
+                "symlink"
+            } else {
+                "other"
+            };
+            format!("{kind}:{}", metadata.len())
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "missing".to_owned(),
+        Err(error) => format!("metadata-error:{error}"),
+    }
+}
+
+fn directory_diagnostic(path: &Path) -> String {
+    let entries = match std::fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) => return format!("<failed to read {}: {error}>", path.display()),
+    };
+    let mut snapshot = entries
+        .take(MAX_DIAGNOSTIC_ENTRIES.saturating_add(1))
+        .map(|entry| match entry {
+            Ok(entry) => format!(
+                "{}={}",
+                entry.file_name().to_string_lossy(),
+                path_diagnostic(&entry.path())
+            ),
+            Err(error) => format!("<entry-error:{error}>"),
+        })
+        .collect::<Vec<_>>();
+    let truncated_entries = snapshot.len() > MAX_DIAGNOSTIC_ENTRIES;
+    snapshot.truncate(MAX_DIAGNOSTIC_ENTRIES);
+    snapshot.sort_unstable();
+    if truncated_entries {
+        snapshot.push("<entries-truncated>".to_owned());
+    }
+    let mut rendered = snapshot.join(", ");
+    if rendered.len() > MAX_DIRECTORY_DIAGNOSTIC_BYTES {
+        let mut end = MAX_DIRECTORY_DIAGNOSTIC_BYTES;
+        while !rendered.is_char_boundary(end) {
+            end = end.saturating_sub(1);
+        }
+        rendered.truncate(end);
+        rendered.push_str("<output-truncated>");
+    }
+    rendered
+}
+
+fn update_helper_diagnostic(staging: &Path) -> String {
+    let receipt_path = staging.join("result.json");
+    let receipt = read_bounded_diagnostic(&receipt_path);
+    let receipt_summary = match serde_json::from_str::<serde_json::Value>(&receipt) {
+        Ok(value) => format!("state={} detail={}", value["state"], value["detail"]),
+        Err(error) => format!("unparseable:{error}"),
+    };
+    let control_files = [
+        "transaction.pending.json",
+        "transaction.json",
+        "result.json",
+        "armed",
+        "recovery-armed",
+        "helper.lock",
+    ]
+    .map(|name| format!("{name}={}", path_diagnostic(&staging.join(name))))
+    .join(", ");
+    let install = staging.parent().unwrap_or(staging);
+    format!(
+        "receipt=({receipt_summary}) raw-receipt={receipt:?}; \
+         controls=[{control_files}]; staging=[{}]; install=[{}]",
+        directory_diagnostic(staging),
+        directory_diagnostic(install)
+    )
+}
+
+fn wait_for_update_helper(
+    child: &mut std::process::Child,
+    staging: &Path,
+    stderr_path: &Path,
+    timeout: Duration,
+) -> std::process::ExitStatus {
+    let started = Instant::now();
+    let deadline = deadline_after(timeout);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        if Instant::now() >= deadline {
+            let elapsed_at_deadline = started.elapsed();
+            let cleanup = terminate_child_bounded_sync(child);
+            let final_status = child.try_wait();
+            let stderr = read_bounded_diagnostic(stderr_path);
+            let snapshot = update_helper_diagnostic(staging);
+            panic!(
+                "timed out waiting for Windows update helper after {:?}; \
+                 cleanup={cleanup:?}; final-status={final_status:?}; \
+                 stderr={stderr:?}; snapshot={snapshot}",
+                elapsed_at_deadline
+            );
         }
         std::thread::sleep(CHILD_POLL_INTERVAL);
     }
@@ -244,6 +380,33 @@ fn invoke_installed_cli(install: &Path) -> std::process::ExitStatus {
     wait_for_child(&mut invocation.0, Duration::from_secs(15))
 }
 
+fn run_update_helper_after_parent_exit(
+    parent: &mut ChildGuard,
+    helper: &Path,
+    transaction_path: &Path,
+    staging: &Path,
+    stderr_path: &Path,
+) -> std::process::ExitStatus {
+    let mut completion = ChildGuard(
+        std::process::Command::new(helper)
+            .arg("__complete-windows-update")
+            .arg(transaction_path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(open_private_stderr(stderr_path))
+            .spawn()
+            .unwrap(),
+    );
+    wait_for_private_marker(&staging.join("armed"), "v1\n", Duration::from_secs(15));
+    terminate_child_bounded_sync(&mut parent.0).unwrap();
+    wait_for_update_helper(
+        &mut completion.0,
+        staging,
+        stderr_path,
+        Duration::from_secs(30),
+    )
+}
+
 fn assert_complete_executable_set_replaced(
     install: &Path,
     staging: &Path,
@@ -284,10 +447,13 @@ fn wait_for_receipt_state(path: &Path, expected: &str, timeout: Duration) {
         if read_receipt_state(path).as_deref() == Some(expected) {
             return;
         }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for update receipt state {expected}"
-        );
+        if Instant::now() >= deadline {
+            let staging = path.parent().unwrap_or(path);
+            panic!(
+                "timed out waiting for update receipt state {expected}; snapshot={}",
+                update_helper_diagnostic(staging)
+            );
+        }
         std::thread::sleep(Duration::from_millis(25));
     }
 }
@@ -297,12 +463,15 @@ fn wait_for_recovered_stage_cleanup(install: &Path, staging: &Path, timeout: Dur
     while staging.exists() {
         assert!(
             invoke_installed_cli(install).success(),
-            "normal command did not resume after recovery"
+            "normal command did not resume after recovery; snapshot={}",
+            update_helper_diagnostic(staging)
         );
-        assert!(
-            Instant::now() < deadline,
-            "reported recovery stage was not cleaned"
-        );
+        if Instant::now() >= deadline {
+            panic!(
+                "reported recovery stage was not cleaned; snapshot={}",
+                update_helper_diagnostic(staging)
+            );
+        }
         std::thread::sleep(Duration::from_millis(25));
     }
 }
@@ -357,6 +526,7 @@ fn real_hidden_helper_replaces_the_complete_executable_set() {
     let helper = staging.join("helper.exe");
     std::fs::copy(&test_astrid, &helper).unwrap();
     astrid_core::platform_fs::restrict_private_file(&helper).unwrap();
+    let helper_stderr = root.join("success-helper.stderr.log");
 
     let mut parent = spawn_test_parent();
     let transaction = Transaction {
@@ -382,20 +552,19 @@ fn real_hidden_helper_replaces_the_complete_executable_set() {
         &serde_json::to_vec(&transaction).unwrap(),
     );
 
-    let mut completion = ChildGuard(
-        std::process::Command::new(&helper)
-            .arg("__complete-windows-update")
-            .arg(&transaction_path)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap(),
+    let status = run_update_helper_after_parent_exit(
+        &mut parent,
+        &helper,
+        &transaction_path,
+        &staging,
+        &helper_stderr,
     );
-    wait_for_private_marker(&staging.join("armed"), "v1\n", Duration::from_secs(15));
-    terminate_child_bounded_sync(&mut parent.0).unwrap();
-    let status = wait_for_child(&mut completion.0, Duration::from_secs(30));
-    assert!(status.success(), "helper failed with {status}");
+    assert!(
+        status.success(),
+        "helper failed with {status}; stderr={:?}; snapshot={}",
+        read_bounded_diagnostic(&helper_stderr),
+        update_helper_diagnostic(&staging)
+    );
 
     assert_complete_executable_set_replaced(
         &install,
@@ -445,6 +614,7 @@ fn tampered_payload_keeps_all_live_binaries_and_is_reported_by_real_cli() {
     let helper = staging.join("helper.exe");
     std::fs::copy(&test_astrid, &helper).unwrap();
     astrid_core::platform_fs::restrict_private_file(&helper).unwrap();
+    let helper_stderr = root.join("tampered-helper.stderr.log");
 
     let mut parent = spawn_test_parent();
     let transaction = Transaction {
@@ -471,28 +641,27 @@ fn tampered_payload_keeps_all_live_binaries_and_is_reported_by_real_cli() {
     );
     write_private(&staging.join("astrid-build.exe"), b"tampered after signing");
 
-    let mut completion = ChildGuard(
-        std::process::Command::new(&helper)
-            .arg("__complete-windows-update")
-            .arg(&transaction_path)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap(),
+    let status = run_update_helper_after_parent_exit(
+        &mut parent,
+        &helper,
+        &transaction_path,
+        &staging,
+        &helper_stderr,
     );
-    wait_for_private_marker(&staging.join("armed"), "v1\n", Duration::from_secs(15));
-    terminate_child_bounded_sync(&mut parent.0).unwrap();
-    let status = wait_for_child(&mut completion.0, Duration::from_secs(30));
     assert!(
         !status.success(),
-        "tampered update helper unexpectedly succeeded"
+        "tampered update helper unexpectedly succeeded; stderr={:?}; snapshot={}",
+        read_bounded_diagnostic(&helper_stderr),
+        update_helper_diagnostic(&staging)
     );
 
     let receipt_path = staging.join("result.json");
     assert_eq!(
         read_receipt_state(&receipt_path).as_deref(),
-        Some("failed_before_mutation")
+        Some("failed_before_mutation"),
+        "tampered helper failed for the wrong reason; stderr={:?}; snapshot={}",
+        read_bounded_diagnostic(&helper_stderr),
+        update_helper_diagnostic(&staging)
     );
     for (name, expected_digest) in original_live_digests {
         assert_eq!(
