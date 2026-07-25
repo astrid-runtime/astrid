@@ -13,7 +13,9 @@ use std::os::windows::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
 use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_DELAY_UNTIL_REBOOT, MoveFileExW};
 use windows_sys::Win32::System::Threading::{
     CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS, OpenProcess, WaitForSingleObject,
@@ -236,11 +238,17 @@ fn open_parent(parent_pid: u32) -> anyhow::Result<OwnedHandle> {
 
 fn wait_for_parent(parent: &OwnedHandle) -> anyhow::Result<()> {
     // SAFETY: the exact parent handle remains owned for this bounded wait.
-    anyhow::ensure!(
-        unsafe { WaitForSingleObject(parent.0, PARENT_EXIT_TIMEOUT_MS) } == WAIT_OBJECT_0,
-        "timed out waiting for the parent updater to exit"
-    );
-    Ok(())
+    classify_parent_wait_result(unsafe { WaitForSingleObject(parent.0, PARENT_EXIT_TIMEOUT_MS) })
+}
+
+fn classify_parent_wait_result(result: u32) -> anyhow::Result<()> {
+    match result {
+        WAIT_OBJECT_0 => Ok(()),
+        WAIT_TIMEOUT => anyhow::bail!("timed out waiting for the parent updater to exit"),
+        WAIT_FAILED => Err(std::io::Error::last_os_error())
+            .context("failed waiting for the parent updater to exit"),
+        other => anyhow::bail!("unexpected parent updater wait result: {other:#010x}"),
+    }
 }
 
 fn wait_for_helper_armed(child: &mut std::process::Child, armed_path: &Path) -> anyhow::Result<()> {
@@ -511,6 +519,29 @@ mod tests {
         let parent = open_parent(child.id()).unwrap();
         wait_for_parent(&parent).unwrap();
         assert!(child.wait().unwrap().code().is_some());
+    }
+
+    #[test]
+    fn parent_wait_result_distinguishes_timeout_and_api_failure() {
+        assert!(classify_parent_wait_result(WAIT_OBJECT_0).is_ok());
+        assert!(
+            classify_parent_wait_result(WAIT_TIMEOUT)
+                .unwrap_err()
+                .to_string()
+                .contains("timed out")
+        );
+        assert!(
+            classify_parent_wait_result(WAIT_FAILED)
+                .unwrap_err()
+                .to_string()
+                .contains("failed waiting")
+        );
+        assert!(
+            classify_parent_wait_result(7)
+                .unwrap_err()
+                .to_string()
+                .contains("unexpected parent updater wait result")
+        );
     }
 
     #[test]

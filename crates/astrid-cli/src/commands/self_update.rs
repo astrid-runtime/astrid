@@ -664,8 +664,11 @@ async fn download_verify_extract(
         .map_err(UpdateStageError::Preparation)
 }
 
-/// After the binary swap: restart a running daemon so the new code takes effect,
-/// update capsules, and warn if the install dir isn't on PATH.
+/// Complete the update housekeeping around the platform-specific binary swap.
+///
+/// This stops a detected daemon, synchronizes capsules, and warns when the
+/// install directory is not on PATH. Unix calls it after the in-place swap;
+/// Windows calls it before the final confirmed stop and exit-time helper launch.
 async fn finish_update(install_dir: &Path) -> anyhow::Result<()> {
     if astrid_core::local_transport::endpoint_is_present(
         &crate::socket_client::try_proxy_socket_path()?,
