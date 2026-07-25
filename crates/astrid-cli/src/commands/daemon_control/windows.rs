@@ -228,7 +228,9 @@ mod tests {
                 return;
             }
             let _ = self.0.kill();
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let deadline = std::time::Instant::now()
+                .checked_add(std::time::Duration::from_secs(5))
+                .expect("test child reap deadline overflow");
             while self.0.try_wait().ok().flatten().is_none() && std::time::Instant::now() < deadline
             {
                 std::thread::sleep(std::time::Duration::from_millis(20));

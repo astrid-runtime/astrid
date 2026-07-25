@@ -220,8 +220,8 @@ fn spawn_test_parent() -> ChildGuard {
     )
 }
 
-fn invoke_installed_cli(install: &Path) -> std::process::ExitStatus {
-    let mut invocation = ChildGuard(
+fn spawn_installed_cli(install: &Path) -> ChildGuard {
+    ChildGuard(
         std::process::Command::new(install.join("astrid.exe"))
             .arg("--version")
             .stdin(std::process::Stdio::null())
@@ -229,8 +229,75 @@ fn invoke_installed_cli(install: &Path) -> std::process::ExitStatus {
             .stderr(std::process::Stdio::null())
             .spawn()
             .unwrap(),
-    );
+    )
+}
+
+fn invoke_installed_cli(install: &Path) -> std::process::ExitStatus {
+    let mut invocation = spawn_installed_cli(install);
     wait_for_child(&mut invocation.0, Duration::from_secs(15))
+}
+
+fn assert_complete_executable_set_replaced(
+    install: &Path,
+    staging: &Path,
+    original_cli_digest: &str,
+    staged_cli_digest: &str,
+) {
+    let receipt: serde_json::Value = serde_json::from_str(
+        &astrid_core::platform_fs::read_private_file_to_string(&staging.join("result.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(receipt["state"], "succeeded");
+    assert_eq!(receipt["reported"], false);
+
+    for name in BINARIES {
+        if name == "astrid.exe" {
+            assert_eq!(digest(&install.join(name)), staged_cli_digest);
+            assert_eq!(
+                digest(&install.join(format!("{name}.bak"))),
+                original_cli_digest
+            );
+        } else {
+            assert_eq!(
+                std::fs::read(install.join(name)).unwrap(),
+                format!("new {name}").as_bytes()
+            );
+            assert_eq!(
+                std::fs::read(install.join(format!("{name}.bak"))).unwrap(),
+                format!("old {name}").as_bytes()
+            );
+        }
+    }
+}
+
+fn wait_for_receipt_state(path: &Path, expected: &str, timeout: Duration) {
+    let deadline = deadline_after(timeout);
+    loop {
+        if read_receipt_state(path).as_deref() == Some(expected) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for update receipt state {expected}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn wait_for_recovered_stage_cleanup(install: &Path, staging: &Path, timeout: Duration) {
+    let deadline = deadline_after(timeout);
+    while staging.exists() {
+        assert!(
+            invoke_installed_cli(install).success(),
+            "normal command did not resume after recovery"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "reported recovery stage was not cleaned"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 #[test]
@@ -322,31 +389,12 @@ fn real_hidden_helper_replaces_the_complete_executable_set() {
     let status = wait_for_child(&mut completion.0, Duration::from_secs(30));
     assert!(status.success(), "helper failed with {status}");
 
-    let receipt: serde_json::Value = serde_json::from_str(
-        &astrid_core::platform_fs::read_private_file_to_string(&staging.join("result.json"))
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(receipt["state"], "succeeded");
-    assert_eq!(receipt["reported"], false);
-    for name in BINARIES {
-        if name == "astrid.exe" {
-            assert_eq!(digest(&install.join(name)), staged_cli_digest);
-            assert_eq!(
-                digest(&install.join(format!("{name}.bak"))),
-                original_cli_digest
-            );
-        } else {
-            assert_eq!(
-                std::fs::read(install.join(name)).unwrap(),
-                format!("new {name}").as_bytes()
-            );
-            assert_eq!(
-                std::fs::read(install.join(format!("{name}.bak"))).unwrap(),
-                format!("old {name}").as_bytes()
-            );
-        }
-    }
+    assert_complete_executable_set_replaced(
+        &install,
+        &staging,
+        &original_cli_digest,
+        &staged_cli_digest,
+    );
     assert!(
         invoke_installed_cli(&install).success(),
         "installed CLI did not report and reconcile the completed update"
@@ -640,49 +688,10 @@ fn ordinary_invocation_recovers_an_interrupted_update_before_dispatch() {
         .unwrap(),
     );
 
-    let mut blocked = ChildGuard(
-        std::process::Command::new(install.join("astrid.exe"))
-            .arg("--version")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
+    let mut blocked = spawn_installed_cli(&install);
     let status = wait_for_child(&mut blocked.0, Duration::from_secs(15));
     assert!(!status.success(), "interrupted update was not fail-closed");
 
-    let recovery_deadline = deadline_after(Duration::from_secs(30));
-    loop {
-        if read_receipt_state(&receipt_path).as_deref() == Some("failed_recovered") {
-            break;
-        }
-        assert!(
-            Instant::now() < recovery_deadline,
-            "detached recovery did not publish a terminal receipt"
-        );
-        std::thread::sleep(Duration::from_millis(25));
-    }
-
-    let cleanup_deadline = deadline_after(Duration::from_secs(15));
-    while staging.exists() {
-        let mut invocation = ChildGuard(
-            std::process::Command::new(install.join("astrid.exe"))
-                .arg("--version")
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .unwrap(),
-        );
-        assert!(
-            wait_for_child(&mut invocation.0, Duration::from_secs(15)).success(),
-            "normal command did not resume after recovery"
-        );
-        assert!(
-            Instant::now() < cleanup_deadline,
-            "reported recovery stage was not cleaned"
-        );
-        std::thread::sleep(Duration::from_millis(25));
-    }
+    wait_for_receipt_state(&receipt_path, "failed_recovered", Duration::from_secs(30));
+    wait_for_recovered_stage_cleanup(&install, &staging, Duration::from_secs(15));
 }

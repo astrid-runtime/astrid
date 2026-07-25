@@ -195,10 +195,7 @@ fn runtime_cleanup_never_deletes_a_new_daemon_generations_files() {
         !remove_runtime_files_if_unowned(&home.pid_path(), &home.socket_path()).unwrap(),
         "cleanup must lose to a newer daemon generation"
     );
-    assert_eq!(
-        std::fs::read(&home.pid_path()).unwrap(),
-        b"new-generation\n"
-    );
+    assert_eq!(std::fs::read(home.pid_path()).unwrap(), b"new-generation\n");
     assert!(home.ready_path().exists());
     assert!(home.token_path().exists());
 
