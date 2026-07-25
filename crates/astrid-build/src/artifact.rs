@@ -118,8 +118,24 @@ pub fn sign_archive(archive_path: &Path, keypair: &KeyPair) -> anyhow::Result<Ve
 pub fn sign_archive_with_runtime_key(archive_path: &Path) -> anyhow::Result<VerifiedProvenance> {
     let home =
         AstridHome::resolve().context("failed to resolve Astrid home for capsule signing")?;
-    let keypair = astrid_crypto::load_or_generate_keypair(&home.runtime_key_path())
+    sign_archive_with_runtime_key_in_home(archive_path, &home)
+}
+
+fn sign_archive_with_runtime_key_in_home(
+    archive_path: &Path,
+    home: &AstridHome,
+) -> anyhow::Result<VerifiedProvenance> {
+    #[cfg(windows)]
+    home.ensure()
+        .context("failed to provision private Astrid home for capsule signing")?;
+
+    let key_path = home.runtime_key_path();
+    let keypair = astrid_crypto::load_or_generate_keypair(&key_path)
         .context("failed to load the runtime capsule-signing key")?;
+    #[cfg(windows)]
+    astrid_core::platform_fs::restrict_private_file(&key_path)
+        .context("failed to secure the runtime capsule-signing key")?;
+
     sign_archive(archive_path, &keypair)
 }
 
@@ -463,6 +479,34 @@ fn normalize_relative_path(path: &Path) -> anyhow::Result<String> {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    struct FreshWindowsHome {
+        path: std::path::PathBuf,
+    }
+
+    #[cfg(windows)]
+    impl FreshWindowsHome {
+        fn new() -> Self {
+            let runtime_root = astrid_core::platform_fs::default_astrid_home_root()
+                .expect("resolve Windows LocalAppData");
+            let local_app_data = runtime_root
+                .parent()
+                .and_then(Path::parent)
+                .expect("Astrid runtime root is below Windows LocalAppData");
+            let path =
+                local_app_data.join(format!("AstridBuildTest-{}", uuid::Uuid::new_v4().simple()));
+            assert!(!path.exists(), "fresh test home must not exist");
+            Self { path }
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for FreshWindowsHome {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
     fn unsigned_archive(path: &Path, manifest: &[u8], payload: &[u8]) {
         let file = File::create(path).unwrap();
         let encoder = GzEncoder::new(file, Compression::default());
@@ -475,6 +519,59 @@ mod tests {
             tar.append_data(&mut header, name, bytes).unwrap();
         }
         tar.finish().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn runtime_signing_provisions_fresh_private_windows_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("test.capsule");
+        unsigned_archive(
+            &archive,
+            b"[package]\nname='test'\nversion='1.0.0'\n",
+            b"wasm",
+        );
+        let fresh = FreshWindowsHome::new();
+        let home = AstridHome::from_path(&fresh.path);
+
+        sign_archive_with_runtime_key_in_home(&archive, &home)
+            .expect("runtime signing should provision its private home");
+
+        for path in [home.root(), home.keys_dir().as_path()] {
+            astrid_core::platform_fs::ensure_private_directory(path)
+                .expect("runtime signing directory must retain its exact private ACL");
+        }
+        astrid_core::platform_fs::validate_private_file(&home.runtime_key_path())
+            .expect("runtime signing key must retain its exact private ACL");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn runtime_signing_rejects_existing_unsafe_windows_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("test.capsule");
+        unsigned_archive(
+            &archive,
+            b"[package]\nname='test'\nversion='1.0.0'\n",
+            b"wasm",
+        );
+        let fresh = FreshWindowsHome::new();
+        std::fs::create_dir_all(&fresh.path).expect("create inherited-ACL test home");
+        let home = AstridHome::from_path(&fresh.path);
+
+        let error = sign_archive_with_runtime_key_in_home(&archive, &home)
+            .expect_err("runtime signing must reject an existing unsafe home");
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to provision private Astrid home"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            !home.runtime_key_path().exists(),
+            "fail-closed provisioning must not generate a key"
+        );
     }
 
     #[test]

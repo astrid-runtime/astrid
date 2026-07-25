@@ -92,6 +92,13 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Fixed
 
+- **Fresh Windows capsule installs provision private runtime and principal
+  homes.** Capsule signing and authority inspection now create and validate the
+  Astrid directory tree before generating the runtime identity, secure the new
+  key with an exact private file ACL, and provision the selected principal
+  boundary before mutating a capsule target. Existing unsafe homes remain
+  rejected. Unix install behavior is unchanged, and workspace targets continue
+  to use their checked selection path. Closes #1366.
 - **Windows builds retain the cross-platform key persistence contract.** The
   non-Unix parent-directory sync shim keeps the same fallible interface as the
   Unix implementation without failing the native ARM64 Clippy gate. Closes

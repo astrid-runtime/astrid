@@ -33,5 +33,8 @@ tracing = { workspace = true }
 wit-component = { workspace = true }
 wit-parser = { workspace = true }
 
+[dev-dependencies]
+uuid = { workspace = true }
+
 [lints]
 workspace = true

@@ -621,8 +621,17 @@ fn inspect_manifest(
     workspace_root: Option<&Path>,
     workspace_layout: &WorkspaceLayout,
 ) -> anyhow::Result<InstallInspection> {
-    let keypair = astrid_crypto::load_or_generate_keypair(&home.runtime_key_path())
+    #[cfg(windows)]
+    home.ensure()
+        .context("failed to provision private Astrid home for capsule inspection")?;
+
+    let key_path = home.runtime_key_path();
+    let keypair = astrid_crypto::load_or_generate_keypair(&key_path)
         .context("failed to load local runtime identity")?;
+    #[cfg(windows)]
+    astrid_core::platform_fs::restrict_private_file(&key_path)
+        .context("failed to secure local runtime identity")?;
+
     let content_digest = artifact.verification.content_digest().to_string();
     let provenance = match artifact.verification {
         ArtifactVerification::Unsigned { .. } => ArtifactProvenance::Unsigned,

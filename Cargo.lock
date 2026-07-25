@@ -429,6 +429,7 @@ dependencies = [
  "tempfile",
  "toml_edit 0.25.12+spec-1.1.0",
  "tracing",
+ "uuid",
  "wit-component",
  "wit-parser 0.253.0",
 ]

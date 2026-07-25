@@ -6,10 +6,19 @@
 //! inside `astrid-cli/src/commands/capsule/install.rs`; they followed
 //! the install machinery into this crate when it was extracted.
 
+#[cfg(windows)]
+use astrid_capsule_install::{
+    AuthorityDecision, inspect_directory_for_principal_in_workspace,
+    install_from_local_path_authorized_for_principal_in_workspace,
+};
 use astrid_capsule_install::{
     InstallOptions, copy_capsule_dir, install_from_local_path, read_meta,
 };
+#[cfg(windows)]
+use astrid_core::PrincipalId;
 use astrid_core::dirs::AstridHome;
+#[cfg(windows)]
+use astrid_core::dirs::WorkspaceLayout;
 
 /// Resolve the `home://wit/` mirror directory for the install principal.
 ///
@@ -28,6 +37,115 @@ fn write_minimal_capsule(base: &std::path::Path, name: &str, version: &str) {
         format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\n"),
     )
     .unwrap();
+}
+
+#[cfg(windows)]
+struct FreshWindowsHome {
+    path: std::path::PathBuf,
+}
+
+#[cfg(windows)]
+impl FreshWindowsHome {
+    fn new() -> Self {
+        let runtime_root = astrid_core::platform_fs::default_astrid_home_root()
+            .expect("resolve Windows LocalAppData");
+        let local_app_data = runtime_root
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("Astrid runtime root is below Windows LocalAppData");
+        let path = local_app_data.join(format!(
+            "AstridCapsuleInstallTest-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        assert!(!path.exists(), "fresh test home must not exist");
+        Self { path }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for FreshWindowsHome {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn user_install_provisions_fresh_private_windows_home() {
+    let capsule_dir = tempfile::tempdir().unwrap();
+    write_minimal_capsule(capsule_dir.path(), "fresh-windows-home-test", "1.0.0");
+    let fresh = FreshWindowsHome::new();
+    let home = AstridHome::from_path(&fresh.path);
+
+    install_from_local_path(capsule_dir.path(), &home, InstallOptions::default())
+        .expect("fresh Windows user install should provision its private home");
+
+    let principal = home.principal_home(&astrid_core::PrincipalId::default());
+    let installed = principal.capsules_dir().join("fresh-windows-home-test");
+    assert!(installed.join("Capsule.toml").is_file());
+    let capsules_dir = principal.capsules_dir();
+    for path in [home.root(), principal.root(), capsules_dir.as_path()] {
+        astrid_core::platform_fs::ensure_private_directory(path)
+            .expect("installed home boundary must retain its exact private ACL");
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn inspected_user_install_provisions_fresh_private_windows_home() {
+    let capsule_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        capsule_dir.path().join("Capsule.toml"),
+        "[package]\nname = \"fresh-inspected-home-test\"\nversion = \"1.0.0\"\n\
+         [exports.astrid]\nidentity = \"1.0.0\"\n",
+    )
+    .unwrap();
+    let fresh = FreshWindowsHome::new();
+    let home = AstridHome::from_path(&fresh.path);
+    let principal = PrincipalId::default();
+    let layout = WorkspaceLayout::default();
+    // This regression targets fresh user-home provisioning. Workspace-root
+    // validation is covered separately and must keep failing closed.
+    let workspace_root = None;
+
+    let inspection = inspect_directory_for_principal_in_workspace(
+        capsule_dir.path(),
+        &home,
+        &principal,
+        false,
+        workspace_root,
+        &layout,
+    )
+    .expect("inspection should provision the private runtime identity");
+    let decision = AuthorityDecision::ExplicitApproval {
+        content_digest: inspection.content_digest,
+    };
+    install_from_local_path_authorized_for_principal_in_workspace(
+        capsule_dir.path(),
+        &home,
+        InstallOptions::default(),
+        &principal,
+        workspace_root,
+        &decision,
+        &layout,
+    )
+    .expect("authorized install should scan and provision the private principal home");
+
+    let principal_home = home.principal_home(&principal);
+    let capsules_dir = principal_home.capsules_dir();
+    let installed = capsules_dir.join("fresh-inspected-home-test");
+    assert!(installed.join("Capsule.toml").is_file());
+    for path in [
+        home.root(),
+        home.keys_dir().as_path(),
+        principal_home.root(),
+        capsules_dir.as_path(),
+    ] {
+        astrid_core::platform_fs::ensure_private_directory(path)
+            .expect("inspected install directory must retain its exact private ACL");
+    }
+    astrid_core::platform_fs::validate_private_file(&home.runtime_key_path())
+        .expect("inspected install runtime key must retain its exact private ACL");
 }
 
 #[test]
