@@ -217,7 +217,7 @@ where
 {
     // Start the waiter before transferring the Child so thread-creation
     // failure leaves ownership here and permits synchronous terminate+reap.
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<std::process::Child>(1);
     let reaper = match std::thread::Builder::new()
         .name("astrid-daemon-reaper".to_owned())
         .spawn(move || match receiver.recv() {
