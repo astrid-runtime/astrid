@@ -7,7 +7,11 @@ on:
       - 'crates/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - '.cargo/**'
+      - '.gitmodules'
       - 'rust-toolchain.toml'
+      - 'wit'
+      - 'wit/**'
       - 'scripts/windows-daemon-lifecycle.ps1'
       - '.github/workflows/release.yml'
       - '.github/workflows/windows-daemon-lifecycle.yml'
@@ -17,7 +21,11 @@ on:
       - 'crates/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - '.cargo/**'
+      - '.gitmodules'
       - 'rust-toolchain.toml'
+      - 'wit'
+      - 'wit/**'
       - 'scripts/windows-daemon-lifecycle.ps1'
       - '.github/workflows/release.yml'
       - '.github/workflows/windows-daemon-lifecycle.yml'
@@ -52,6 +60,9 @@ jobs:
 
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: recursive
+          persist-credentials: false
 
       - name: Checkout pinned compatible CLI uplink
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -176,19 +187,6 @@ jobs:
           --target $env:TARGET
           platform_fs
 
-      - name: Exercise the real Windows update helper
-        env:
-          TARGET: ${{ matrix.target }}
-        shell: pwsh
-        run: >-
-          cargo test
-          -p astrid
-          --test windows_update_helper
-          --locked
-          --target $env:TARGET
-          --
-          --nocapture
-
       - name: Test shared self-update decisions
         env:
           TARGET: ${{ matrix.target }}
@@ -293,3 +291,100 @@ jobs:
           name: windows-daemon-lifecycle-${{ matrix.target }}
           path: ${{ runner.temp }}/windows-daemon-lifecycle-${{ matrix.target }}
           if-no-files-found: ignore
+
+  updater:
+    name: Native updater lifecycle (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: '1.95.0'
+          targets: ${{ matrix.target }}
+
+      - name: Cache release updater artifacts
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          key: windows-updater-lifecycle-release-${{ matrix.target }}
+          cache-on-failure: true
+
+      - name: Build release executable set
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: >-
+          cargo build
+          --release
+          -p astrid
+          --bins
+          --locked
+          --target $env:TARGET
+
+      - name: Verify release fixture fits the authenticated payload bound
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: |
+          $limit = 100MB
+          $names = @(
+            "astrid-daemon.exe",
+            "astrid-build.exe",
+            "astrid-emit.exe",
+            "astrid.exe"
+          )
+          foreach ($name in $names) {
+            $binary = Join-Path $env:GITHUB_WORKSPACE "target\$env:TARGET\release\$name"
+            $artifact = Get-Item -LiteralPath $binary
+            Write-Host ("Release {0}: {1:N2} MiB" -f $name, ($artifact.Length / 1MB))
+            if ($artifact.Length -gt $limit) {
+              throw "Release $name exceeds the 100 MiB authenticated update payload bound"
+            }
+          }
+
+      - name: Build release updater integration harness
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: >-
+          cargo test
+          --release
+          -p astrid
+          --test windows_update_helper
+          --locked
+          --target $env:TARGET
+          --no-run
+
+      - name: Exercise the real release-profile Windows update helper
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: >-
+          cargo test
+          --release
+          -p astrid
+          --test windows_update_helper
+          --locked
+          --target $env:TARGET
+          --
+          --nocapture
