@@ -612,9 +612,8 @@ async fn assert_shutdown_audit_rows(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn denied_shutdown_does_not_consume_an_authorized_principals_budget() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let home = astrid_core::dirs::AstridHome::from_path(dir.path());
-    let kernel = crate::test_kernel_with_home(home).await;
+    let home = PrivateRouterTestHome::new();
+    let kernel = crate::test_kernel_with_home(home.home()).await;
     let restricted = PrincipalId::new("restricted").expect("valid principal");
     let operator = PrincipalId::new("operator").expect("valid principal");
 
@@ -672,9 +671,8 @@ async fn denied_shutdown_does_not_consume_an_authorized_principals_budget() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn authorization_denial_does_not_precharge_a_later_grant() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let home = astrid_core::dirs::AstridHome::from_path(dir.path());
-    let kernel = crate::test_kernel_with_home(home).await;
+    let home = PrivateRouterTestHome::new();
+    let kernel = crate::test_kernel_with_home(home.home()).await;
     let principal = PrincipalId::new("new-operator").expect("valid principal");
 
     seed_profile(&kernel, &principal, &PrincipalProfile::default());
@@ -716,9 +714,8 @@ async fn authorization_denial_does_not_precharge_a_later_grant() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn device_scope_denial_does_not_consume_the_principals_budget() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let home = astrid_core::dirs::AstridHome::from_path(dir.path());
-    let kernel = crate::test_kernel_with_home(home).await;
+    let home = PrivateRouterTestHome::new();
+    let kernel = crate::test_kernel_with_home(home.home()).await;
     let principal = PrincipalId::new("device-scoped-operator").expect("valid principal");
     let full = DeviceKey::new("e".repeat(64), DeviceScope::Full, None, 0);
     let attenuated = DeviceKey::new(
