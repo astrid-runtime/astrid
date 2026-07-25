@@ -320,7 +320,7 @@ impl<P: Ord, I: ObjectIdentity> InMemoryEngine<P, I> {
         if actual != expected {
             return Err(ModelError::RootConflict { expected, actual });
         }
-        if actual.is_some_and(|root| root.generation == u64::MAX) {
+        if actual.is_some_and(|root| root.generation.checked_next().is_none()) {
             return Err(ModelError::ArithmeticOverflow);
         }
         Self::validate_transaction_root(&world, &records, commit)?;
@@ -353,7 +353,7 @@ impl<P: Ord, I: ObjectIdentity> InMemoryEngine<P, I> {
         for (declared, record) in records {
             let computed = self.identify(record);
             if computed != *declared {
-                return Err(ModelError::ProofIdentityMismatch {
+                return Err(ModelError::ObjectIdentityMismatch {
                     declared: *declared,
                     computed,
                 });
@@ -394,6 +394,7 @@ mod tests {
     use super::*;
     use astrid_storage_model::{
         ObjectClass, ObjectFormatVersion, ObjectKind, ObjectReference, ReferenceKind,
+        ReferenceLabel, RootGeneration,
     };
     use std::sync::{Arc, Barrier};
     use std::thread;
@@ -413,8 +414,8 @@ mod tests {
             hasher.update(&[record.class().code()]);
             hasher.update(&(record.references().len() as u128).to_le_bytes());
             for reference in record.references() {
-                hasher.update(&(reference.label().len() as u128).to_le_bytes());
-                hasher.update(reference.label());
+                hasher.update(&(reference.label().as_bytes().len() as u128).to_le_bytes());
+                hasher.update(reference.label().as_bytes());
                 hasher.update(reference.target().as_bytes());
                 hasher.update(&[reference.kind().code()]);
             }
@@ -431,10 +432,18 @@ mod tests {
         }
     }
 
+    fn label(bytes: &[u8]) -> ReferenceLabel {
+        ReferenceLabel::new(bytes.to_vec())
+    }
+
+    fn version(value: u16) -> ObjectFormatVersion {
+        ObjectFormatVersion::new(value).unwrap()
+    }
+
     fn data(bytes: &[u8]) -> ObjectRecord {
         ObjectRecord::new(
             ObjectKind::Chunk,
-            ObjectFormatVersion::new(1),
+            ObjectFormatVersion::V1,
             bytes.to_vec(),
             Vec::new(),
             u64::try_from(bytes.len()).unwrap(),
@@ -446,7 +455,7 @@ mod tests {
     fn metadata(bytes: &[u8], references: Vec<ObjectReference>) -> ObjectRecord {
         ObjectRecord::new(
             ObjectKind::Commit,
-            ObjectFormatVersion::new(1),
+            ObjectFormatVersion::V1,
             bytes.to_vec(),
             references,
             0,
@@ -463,7 +472,7 @@ mod tests {
         let leaf_id = engine.identify(&leaf);
         let commit = metadata(
             b"commit",
-            vec![ObjectReference::owns(b"state".to_vec(), leaf_id)],
+            vec![ObjectReference::owns(label(b"state"), leaf_id)],
         );
         let commit_id = engine.identify(&commit);
         (commit_id, vec![(leaf_id, leaf), (commit_id, commit)])
@@ -473,7 +482,7 @@ mod tests {
         metadata(
             b"same",
             vec![ObjectReference::new(
-                b"edge".to_vec(),
+                label(b"edge"),
                 target,
                 ReferenceKind::Owns,
             )],
@@ -497,10 +506,10 @@ mod tests {
         let variants = [
             ObjectRecord::new(
                 ObjectKind::PrincipalState,
-                ObjectFormatVersion::new(1),
+                ObjectFormatVersion::V1,
                 b"same".to_vec(),
                 vec![ObjectReference::new(
-                    b"edge".to_vec(),
+                    label(b"edge"),
                     target,
                     ReferenceKind::Owns,
                 )],
@@ -510,10 +519,10 @@ mod tests {
             .unwrap(),
             ObjectRecord::new(
                 ObjectKind::Commit,
-                ObjectFormatVersion::new(2),
+                version(2),
                 b"same".to_vec(),
                 vec![ObjectReference::new(
-                    b"edge".to_vec(),
+                    label(b"edge"),
                     target,
                     ReferenceKind::Owns,
                 )],
@@ -524,17 +533,17 @@ mod tests {
             metadata(
                 b"changed",
                 vec![ObjectReference::new(
-                    b"edge".to_vec(),
+                    label(b"edge"),
                     target,
                     ReferenceKind::Owns,
                 )],
             ),
             ObjectRecord::new(
                 ObjectKind::Commit,
-                ObjectFormatVersion::new(1),
+                ObjectFormatVersion::V1,
                 b"same".to_vec(),
                 vec![ObjectReference::new(
-                    b"edge".to_vec(),
+                    label(b"edge"),
                     target,
                     ReferenceKind::Owns,
                 )],
@@ -544,10 +553,10 @@ mod tests {
             .unwrap(),
             ObjectRecord::new(
                 ObjectKind::Commit,
-                ObjectFormatVersion::new(1),
+                ObjectFormatVersion::V1,
                 b"same".to_vec(),
                 vec![ObjectReference::new(
-                    b"edge".to_vec(),
+                    label(b"edge"),
                     target,
                     ReferenceKind::Owns,
                 )],
@@ -567,10 +576,10 @@ mod tests {
         let variants = [
             ObjectRecord::new(
                 ObjectKind::Commit,
-                ObjectFormatVersion::new(1),
+                ObjectFormatVersion::V1,
                 b"same".to_vec(),
                 vec![ObjectReference::new(
-                    b"other".to_vec(),
+                    label(b"other"),
                     target,
                     ReferenceKind::Owns,
                 )],
@@ -581,7 +590,7 @@ mod tests {
             metadata(
                 b"same",
                 vec![ObjectReference::new(
-                    b"edge".to_vec(),
+                    label(b"edge"),
                     ObjectId::new([8; 32]),
                     ReferenceKind::Owns,
                 )],
@@ -589,7 +598,7 @@ mod tests {
             metadata(
                 b"same",
                 vec![ObjectReference::new(
-                    b"edge".to_vec(),
+                    label(b"edge"),
                     target,
                     ReferenceKind::Evidence,
                 )],
@@ -611,7 +620,7 @@ mod tests {
         assert_eq!(
             outcome.root(),
             RootState {
-                generation: 0,
+                generation: RootGeneration::INITIAL,
                 commit
             }
         );
@@ -640,7 +649,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(repeated.objects_inserted(), 0);
-        assert_eq!(repeated.root().generation, 1);
+        assert_eq!(repeated.root().generation, RootGeneration::new(1));
         assert_eq!(repeated.root().commit, commit);
         assert_eq!(engine.object_count(), 2);
     }
@@ -651,7 +660,7 @@ mod tests {
         let missing = ObjectId::new([9; 32]);
         let commit_record = metadata(
             b"commit",
-            vec![ObjectReference::owns(b"state".to_vec(), missing)],
+            vec![ObjectReference::owns(label(b"state"), missing)],
         );
         let commit = engine.identify(&commit_record);
 
@@ -732,7 +741,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(ModelError::ProofIdentityMismatch { declared, .. }) if declared == forged
+            Err(ModelError::ObjectIdentityMismatch { declared, .. }) if declared == forged
         ));
         assert_eq!(engine.object_count(), 0);
     }
@@ -785,7 +794,7 @@ mod tests {
             .compare_and_swap_root("alice", Some(updated), first)
             .unwrap();
 
-        assert_eq!(rolled_back.generation, 2);
+        assert_eq!(rolled_back.generation, RootGeneration::new(2));
         assert_eq!(rolled_back.commit, first);
         assert_eq!(engine.object_count(), count);
     }
@@ -852,7 +861,7 @@ mod tests {
             1
         );
         let root = engine.root(&"alice").unwrap();
-        assert_eq!(root.generation, 1);
+        assert_eq!(root.generation, RootGeneration::new(1));
         assert!(root.commit == left_id || root.commit == right_id);
     }
 
@@ -878,8 +887,10 @@ mod tests {
                     0 | 1 => {
                         let commit = if action == 0 { first } else { second };
                         let result = engine.compare_and_swap_root("alice", expected_root, commit);
-                        let generation =
-                            expected_root.map_or(0, |root: RootState| root.generation + 1);
+                        let generation = expected_root
+                            .map_or(RootGeneration::INITIAL, |root: RootState| {
+                                root.generation.checked_next().unwrap()
+                            });
                         let next = RootState { generation, commit };
                         assert_eq!(result, Ok(next));
                         expected_root = Some(next);
@@ -888,7 +899,7 @@ mod tests {
                         let result = engine.compare_and_swap_root("alice", None, first);
                         if expected_root.is_none() {
                             let next = RootState {
-                                generation: 0,
+                                generation: RootGeneration::INITIAL,
                                 commit: first,
                             };
                             assert_eq!(result, Ok(next));
@@ -899,7 +910,7 @@ mod tests {
                     },
                     3 => {
                         let stale = RootState {
-                            generation: u64::MAX,
+                            generation: RootGeneration::new(u64::MAX),
                             commit: second,
                         };
                         let result = engine.compare_and_swap_root("alice", Some(stale), second);
@@ -911,7 +922,7 @@ mod tests {
                             expected_root = None;
                         } else {
                             let absent = RootState {
-                                generation: 0,
+                                generation: RootGeneration::INITIAL,
                                 commit: first,
                             };
                             assert!(matches!(
@@ -922,7 +933,7 @@ mod tests {
                     },
                     5 => {
                         let stale = RootState {
-                            generation: u64::MAX,
+                            generation: RootGeneration::new(u64::MAX),
                             commit: first,
                         };
                         assert!(matches!(

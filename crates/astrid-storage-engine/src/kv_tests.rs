@@ -16,8 +16,8 @@ impl ObjectIdentity for TestIdentity {
         hasher.update(&[record.class().code()]);
         hasher.update(&(record.references().len() as u128).to_le_bytes());
         for reference in record.references() {
-            hasher.update(&(reference.label().len() as u128).to_le_bytes());
-            hasher.update(reference.label());
+            hasher.update(&(reference.label().as_bytes().len() as u128).to_le_bytes());
+            hasher.update(reference.label().as_bytes());
             hasher.update(reference.target().as_bytes());
             hasher.update(&[reference.kind().code()]);
         }
@@ -146,8 +146,8 @@ fn kv_commit_preserves_non_kv_components_and_commit_annotations() {
         FORMAT_VERSION,
         Vec::new(),
         vec![
-            ObjectReference::owns(b"files".to_vec(), files_id),
-            ObjectReference::owns(KV_LABEL.to_vec(), namespace_map_id),
+            ObjectReference::owns(ReferenceLabel::new(b"files".to_vec()), files_id),
+            ObjectReference::owns(ReferenceLabel::new(KV_LABEL.to_vec()), namespace_map_id),
         ],
         0,
         ObjectClass::Metadata,
@@ -161,11 +161,11 @@ fn kv_commit_preserves_non_kv_components_and_commit_annotations() {
         Vec::new(),
         vec![
             ObjectReference::new(
-                b"audit".to_vec(),
+                ReferenceLabel::new(b"audit".to_vec()),
                 annotation_target,
                 ReferenceKind::Evidence,
             ),
-            ObjectReference::owns(STATE_LABEL.to_vec(), state_id),
+            ObjectReference::owns(ReferenceLabel::new(STATE_LABEL.to_vec()), state_id),
         ],
         0,
         ObjectClass::Metadata,
@@ -225,7 +225,10 @@ fn malformed_state_kind_is_rejected_during_decode() {
         ObjectKind::Commit,
         FORMAT_VERSION,
         Vec::new(),
-        vec![ObjectReference::owns(STATE_LABEL.to_vec(), wrong_state_id)],
+        vec![ObjectReference::owns(
+            ReferenceLabel::new(STATE_LABEL.to_vec()),
+            wrong_state_id,
+        )],
         0,
         ObjectClass::Metadata,
     )
@@ -271,11 +274,11 @@ fn malformed_parent_edge_is_rejected_during_decode() {
         Vec::new(),
         vec![
             ObjectReference::new(
-                PARENT_LABEL.to_vec(),
+                ReferenceLabel::new(PARENT_LABEL.to_vec()),
                 ObjectId::new([17; 32]),
                 ReferenceKind::Evidence,
             ),
-            ObjectReference::owns(STATE_LABEL.to_vec(), state_id),
+            ObjectReference::owns(ReferenceLabel::new(STATE_LABEL.to_vec()), state_id),
         ],
         0,
         ObjectClass::Metadata,

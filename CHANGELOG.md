@@ -69,9 +69,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   persistent AVL tree instead of using the linear compatibility projection.
   System state has its own owner; host-stamped capsule namespaces map to
   validated principals and share their live, invalidatable profile quota.
-  `[storage]` is operator-only, has no fixed default frame or capacity ceiling,
-  and exposes explicit legacy recovery. The misleading `kv` feature is
-  replaced by temporary `legacy-surrealkv` compatibility.
+  The principal store is an invariant rather than a configurable backend, has
+  no fixed frame or capacity ceiling, and derives finite storage budgets from
+  the live principal profile. The misleading `kv` feature is replaced by the
+  temporary `legacy-surrealkv` reader and migrator.
 - **Windows local transport uses authenticated per-user named pipes.** A pipe
   name derived only from the caller's operating-system SID replaces
   filesystem endpoint naming on Windows. Local-only byte-mode instances use a

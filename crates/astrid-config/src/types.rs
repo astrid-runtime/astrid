@@ -39,8 +39,6 @@ pub struct Config {
     pub servers: HashMap<String, ServerSection>,
     /// Audit log storage configuration.
     pub audit: AuditConfig,
-    /// Authoritative kernel state backend and recovery policy.
-    pub storage: StorageConfig,
     /// Paths to cryptographic key material.
     pub keys: KeysConfig,
     /// Workspace boundary and escape policy.
@@ -69,31 +67,6 @@ pub struct Config {
     pub uplinks: Vec<UplinkConfig>,
     /// Pre-configured platform identity links applied at every startup.
     pub identity: IdentitySection,
-}
-
-/// Authoritative kernel state backend and durable recovery policy.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct StorageConfig {
-    /// Backend selected at native kernel startup.
-    pub backend: StorageBackendConfig,
-    /// Optional maximum allocation for one decoded durable frame.
-    ///
-    /// This is a corruption/resource parser guard rather than a storage quota.
-    /// When absent, the runtime uses fallible allocation and the process
-    /// address space instead of imposing a hidden fixed capacity.
-    pub recovery_max_frame_bytes: Option<u64>,
-}
-
-/// Native kernel state backend.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum StorageBackendConfig {
-    /// Typed, content-addressed state with one authoritative root per owner.
-    #[default]
-    Principal,
-    /// Pre-principal `SurrealKV` backend for explicit operator recovery.
-    LegacySurreal,
 }
 
 // ---------------------------------------------------------------------------
@@ -1145,18 +1118,6 @@ method = "admin"
         let cfg: Config = toml::from_str(toml).unwrap();
         assert!(cfg.uplinks.is_empty());
         assert!(cfg.identity.links.is_empty());
-        assert_eq!(cfg.storage.backend, StorageBackendConfig::Principal);
-        assert_eq!(cfg.storage.recovery_max_frame_bytes, None);
-    }
-
-    #[test]
-    fn storage_section_parses_explicit_legacy_recovery_mode() {
-        let cfg: Config = toml::from_str(
-            "[storage]\nbackend = \"legacy-surreal\"\nrecovery_max_frame_bytes = 4096\n",
-        )
-        .unwrap();
-        assert_eq!(cfg.storage.backend, StorageBackendConfig::LegacySurreal);
-        assert_eq!(cfg.storage.recovery_max_frame_bytes, Some(4096));
     }
 
     #[test]

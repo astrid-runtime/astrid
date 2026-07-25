@@ -5,8 +5,8 @@ use super::{
     FRAME_HEADER_LEN, FRAME_HEADER_LEN_USIZE, FRAME_VERSION, File, ModelError, ObjectClass,
     ObjectFormatVersion, ObjectId, ObjectIdentity, ObjectKind, ObjectRecord, ObjectReference,
     OpenOptions, Path, PrincipalCodec, ROOT_FILE, ROOT_MAGIC, Read, RecoveryLimits, ReferenceKind,
-    RootState, Seek, SeekFrom, Write, io, materialize_closure, recovery_closure_error,
-    validate_commit_closure,
+    ReferenceLabel, RootGeneration, RootState, Seek, SeekFrom, Write, io, materialize_closure,
+    recovery_closure_error, validate_commit_closure,
 };
 pub(super) fn read_indexed_object(
     arena: &mut File,
@@ -207,8 +207,8 @@ where
             });
         }
         let generation = match actual {
-            Some(root) => root.generation.checked_add(1),
-            None => Some(0),
+            Some(root) => root.generation.checked_next(),
+            None => Some(RootGeneration::INITIAL),
         }
         .ok_or(DurableError::RecoveryModel {
             file: ROOT_FILE,
@@ -419,10 +419,10 @@ pub(super) fn encode_object_frame(
     bytes.extend_from_slice(&reference_count.to_le_bytes());
     bytes.extend_from_slice(record.canonical_bytes());
     for reference in record.references() {
-        let label_len =
-            u64::try_from(reference.label().len()).map_err(|_| DurableError::EncodingOverflow)?;
+        let label_len = u64::try_from(reference.label().as_bytes().len())
+            .map_err(|_| DurableError::EncodingOverflow)?;
         bytes.extend_from_slice(&label_len.to_le_bytes());
-        bytes.extend_from_slice(reference.label());
+        bytes.extend_from_slice(reference.label().as_bytes());
         bytes.extend_from_slice(reference.target().as_bytes());
         bytes.push(reference.kind().code());
     }
@@ -433,7 +433,8 @@ pub(super) fn decode_object_frame(bytes: &[u8]) -> Result<(ObjectId, ObjectRecor
     let mut reader = SliceReader::new(bytes);
     let id = ObjectId::new(reader.array_32()?);
     let kind = ObjectKind::from_code(reader.u16()?).ok_or("unknown object-kind code")?;
-    let version = ObjectFormatVersion::new(reader.u16()?);
+    let version =
+        ObjectFormatVersion::new(reader.u16()?).ok_or("object-format version must be non-zero")?;
     let class = ObjectClass::from_code(reader.u8()?).ok_or("unknown object-class code")?;
     let logical_bytes = reader.u64()?;
     let canonical_len = reader.usize_len()?;
@@ -452,7 +453,11 @@ pub(super) fn decode_object_frame(bytes: &[u8]) -> Result<(ObjectId, ObjectRecor
         let target = ObjectId::new(reader.array_32()?);
         let reference_kind =
             ReferenceKind::from_code(reader.u8()?).ok_or("unknown reference-kind code")?;
-        references.push(ObjectReference::new(label, target, reference_kind));
+        references.push(ObjectReference::new(
+            ReferenceLabel::new(label),
+            target,
+            reference_kind,
+        ));
     }
     if reader.remaining() != 0 {
         return Err("trailing object-frame bytes");
@@ -491,7 +496,7 @@ pub(super) fn encode_root_record(
 }
 
 fn encode_root_state(bytes: &mut Vec<u8>, root: RootState) {
-    bytes.extend_from_slice(&root.generation.to_le_bytes());
+    bytes.extend_from_slice(&root.generation.get().to_le_bytes());
     bytes.extend_from_slice(root.commit.as_bytes());
 }
 
@@ -580,7 +585,7 @@ impl<'a> SliceReader<'a> {
 
     fn root_state(&mut self) -> Result<RootState, &'static str> {
         Ok(RootState {
-            generation: self.u64()?,
+            generation: RootGeneration::new(self.u64()?),
             commit: ObjectId::new(self.array_32()?),
         })
     }

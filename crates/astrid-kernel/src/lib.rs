@@ -355,8 +355,8 @@ impl Kernel {
 
     /// Boot a new Kernel instance mounted at the specified directory.
     ///
-    /// The native composition root: resolves the Astrid home, opens the
-    /// `SurrealKV` store and audit log, loads the runtime key, binds the singleton
+    /// The native composition root: resolves the Astrid home, opens the durable
+    /// principal store and audit log, loads the runtime key, binds the singleton
     /// Unix socket, generates the session token, then delegates to the portable
     /// [`Kernel::with_resources`]. Unix-only — the socket bind and singleton
     /// flock have no browser-profile analogue; that host builds its own
@@ -419,35 +419,6 @@ impl Kernel {
         http_limits: astrid_capsule_types::HttpLimits,
         workspace_layout: WorkspaceLayout,
     ) -> Result<Arc<Self>, std::io::Error> {
-        Self::new_with_storage_options_and_workspace_layout(
-            session_id,
-            workspace_root,
-            runtime_limits,
-            local_egress,
-            http_limits,
-            astrid_storage::PrincipalStoreOptions::default(),
-            workspace_layout,
-        )
-        .await
-    }
-
-    /// Boot a kernel with explicit native state-store and workspace policy.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if native resources, durable state recovery or
-    /// migration, or portable kernel wiring fails.
-    #[cfg(unix)]
-    #[allow(clippy::too_many_arguments)]
-    pub async fn new_with_storage_options_and_workspace_layout(
-        session_id: SessionId,
-        workspace_root: PathBuf,
-        runtime_limits: astrid_capsule_types::CapsuleRuntimeLimits,
-        local_egress: std::collections::HashMap<String, Vec<String>>,
-        http_limits: astrid_capsule_types::HttpLimits,
-        storage_options: astrid_storage::PrincipalStoreOptions,
-        workspace_layout: WorkspaceLayout,
-    ) -> Result<Arc<Self>, std::io::Error> {
         use astrid_core::dirs::AstridHome;
 
         // Resolve the Astrid home directory. Required for persistent KV store
@@ -461,8 +432,8 @@ impl Kernel {
         // Acquire the singleton advisory lock as the FIRST fallible boot step —
         // BEFORE opening any shared state store. A boot-race loser then fails
         // here with the actionable "already running (singleton lock held)"
-        // error and never opens (or even touches) the shared surrealkv KV /
-        // audit stores, rather than dying on a raw `LOCK is already locked` from
+        // error and never opens (or even touches) the shared principal or audit
+        // stores, rather than dying on a raw `LOCK is already locked` from
         // the store layer after having opened one. The listener bind below does
         // NOT re-acquire the lock — it is already held for the process lifetime.
         let singleton_lock = socket::acquire_boot_singleton_lock(&home)?;
@@ -486,7 +457,7 @@ impl Kernel {
 
         // Open the authoritative state store. First cutover imports and
         // verifies legacy SurrealKV under the singleton lock before serving.
-        let kv = astrid_storage::open_runtime_kv(&home, storage_options, quota)
+        let kv = astrid_storage::open_runtime_kv(&home, quota)
             .await
             .map_err(|e| std::io::Error::other(format!("Failed to open KV store: {e}")))?;
         // TODO: clear ephemeral keys (e: prefix) on boot when the key
