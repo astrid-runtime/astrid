@@ -157,11 +157,14 @@ pub(super) fn bounded_detail(error: &anyhow::Error) -> String {
     if detail.len() <= MAX_RECEIPT_DETAIL_BYTES {
         return detail;
     }
-    let mut end = MAX_RECEIPT_DETAIL_BYTES;
+    const TRUNCATION_MARKER: &str = "…";
+    let mut end = MAX_RECEIPT_DETAIL_BYTES.saturating_sub(TRUNCATION_MARKER.len());
     while !detail.is_char_boundary(end) {
         end = end.saturating_sub(1);
     }
-    format!("{}…", &detail[..end])
+    let mut bounded = detail[..end].to_owned();
+    bounded.push_str(TRUNCATION_MARKER);
+    bounded
 }
 
 pub(super) fn receipt_for(

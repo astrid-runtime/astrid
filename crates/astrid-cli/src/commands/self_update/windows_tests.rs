@@ -121,6 +121,20 @@ fn transaction_wire_schema_preserves_transaction_id() {
 }
 
 #[test]
+fn receipt_detail_bound_includes_a_utf8_safe_truncation_marker() {
+    let ascii = "x".repeat(MAX_RECEIPT_DETAIL_BYTES.saturating_mul(2));
+    let bounded_ascii = storage::bounded_detail(&anyhow::Error::msg(ascii));
+    let detail = "é".repeat(MAX_RECEIPT_DETAIL_BYTES);
+    let bounded = storage::bounded_detail(&anyhow::Error::msg(detail));
+
+    assert_eq!(bounded_ascii.len(), MAX_RECEIPT_DETAIL_BYTES);
+    assert!(bounded_ascii.ends_with('…'));
+    assert!(bounded.len() <= MAX_RECEIPT_DETAIL_BYTES);
+    assert!(bounded.ends_with('…'));
+    assert!(!bounded.contains(char::REPLACEMENT_CHARACTER));
+}
+
+#[test]
 fn transaction_accepts_only_the_versioned_complete_executable_set() {
     let directory = crate::test_support::private_tempdir();
     let install = directory.path();

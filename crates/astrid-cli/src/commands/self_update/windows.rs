@@ -674,14 +674,11 @@ fn validate_receipt(stage: &Path, receipt: &UpdateReceipt) -> anyhow::Result<()>
         !receipt.target_version.is_empty() && receipt.target_version.len() <= 128,
         "Windows update receipt target version is invalid"
     );
-    let max_detail_bytes = MAX_RECEIPT_DETAIL_BYTES
-        .checked_add('…'.len_utf8())
-        .context("Windows update receipt detail limit overflow")?;
     anyhow::ensure!(
         receipt
             .detail
             .as_ref()
-            .is_none_or(|detail| detail.len() <= max_detail_bytes),
+            .is_none_or(|detail| detail.len() <= MAX_RECEIPT_DETAIL_BYTES),
         "Windows update receipt detail is too large"
     );
     Ok(())
