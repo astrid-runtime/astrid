@@ -84,7 +84,10 @@ def build_manifest(
         expected_six,
         expected_eight,
     ):
-        fail("musl metadata requires checksums for all six legacy/musl archives")
+        fail(
+            "musl metadata requires checksums for exactly all six legacy/musl "
+            "archives or all eight release archives"
+        )
 
     targets = []
     for target in release_manifest.MUSL_TARGETS:
