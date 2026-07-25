@@ -194,16 +194,31 @@ fn kv_commit_preserves_non_kv_components_and_commit_annotations() {
     let root_snapshot = engine.snapshot(&"alice".to_owned()).unwrap().unwrap();
     let record_map: BTreeMap<_, _> = root_snapshot.records().iter().cloned().collect();
     let next_commit = record_map.get(&outcome.root().commit).unwrap();
-    let next_state_id = next_commit.reference(STATE_LABEL).unwrap().target();
+    let next_state_id = next_commit
+        .reference(&ReferenceLabel::new(STATE_LABEL))
+        .unwrap()
+        .target();
     let next_state = record_map.get(&next_state_id).unwrap();
 
-    assert_eq!(next_state.reference(b"files").unwrap().target(), files_id);
     assert_eq!(
-        next_commit.reference(b"audit").unwrap().target(),
+        next_state
+            .reference(&ReferenceLabel::new(b"files".as_slice()))
+            .unwrap()
+            .target(),
+        files_id
+    );
+    assert_eq!(
+        next_commit
+            .reference(&ReferenceLabel::new(b"audit".as_slice()))
+            .unwrap()
+            .target(),
         annotation_target
     );
     assert_eq!(
-        next_commit.reference(PARENT_LABEL).unwrap().target(),
+        next_commit
+            .reference(&ReferenceLabel::new(PARENT_LABEL))
+            .unwrap()
+            .target(),
         commit_id
     );
 }
