@@ -1,8 +1,10 @@
 //! Platform process-spawn policy for the daemon.
 //!
 //! Transport authentication and daemon ownership live elsewhere. This module
-//! only controls whether a child is detached from the invoking console. A
-//! directly-invoked daemon, and `astrid start --foreground`, remain attached.
+//! only controls the parent-side background spawn flags. On Windows,
+//! `astrid start --foreground` and a directly invoked daemon remain attached.
+//! On Unix the daemon binary preserves its historical `setsid` behavior unless
+//! the CLI sets `ASTRID_DAEMON_FOREGROUND=1` for foreground mode.
 
 use std::process::Command;
 

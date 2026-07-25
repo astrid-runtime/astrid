@@ -438,9 +438,10 @@ fn stage_contains_only_cleanup_remnants(stage: &Path) -> bool {
 fn schedule_delete(path: &Path) {
     let path = wide_null(path);
     // SAFETY: source is NUL-terminated; null destination with
-    // DELAY_UNTIL_REBOOT requests deletion after this helper exits. Normal
-    // per-user invocations may be denied this operation, so every ordinary CLI
-    // invocation also removes validated, transaction-free stage remnants.
+    // DELAY_UNTIL_REBOOT requests best-effort deletion at the next reboot.
+    // Per-user invocations may be denied this operation, and Windows does not
+    // guarantee deferred directory removal, so ordinary CLI invocations also
+    // remove validated, transaction-free stage remnants.
     let _ = unsafe { MoveFileExW(path.as_ptr(), std::ptr::null(), MOVEFILE_DELAY_UNTIL_REBOOT) };
 }
 
