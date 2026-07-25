@@ -61,10 +61,10 @@ graph and not a prerequisite for reading a file or recovering a principal.
 4. Add an engine prototype over in-memory immutable objects and atomic roots.
 5. Add the principal-store-backed `KvStore` adapter and differential tests
    against `MemoryKvStore` and `SurrealKvStore`.
-6. Add typed filesystem roots and a safe materializer; integrate Linux-realm
-   principal-home checkpoints and explicit external-workspace observations.
-7. Add durable segments, indexes, WAL, fault injection, recovery, compaction,
+6. Add durable segments, indexes, WAL, fault injection, recovery, compaction,
    and quota enforcement.
+7. Add typed filesystem roots and a safe materializer; integrate Linux-realm
+   principal-home checkpoints and explicit external-workspace observations.
 8. Make local clone/fork root-based while preserving explicit secret behavior.
 9. Implement full/view export and staged import, then thin transfer.
 10. Add placement epochs, repair, operator dry-run, and online rebalance.

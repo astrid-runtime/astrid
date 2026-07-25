@@ -16,6 +16,40 @@ fn label(value: &[u8]) -> ReferenceLabel {
     ReferenceLabel::new(value.to_vec())
 }
 
+#[test]
+fn stable_object_codes_round_trip_and_reject_unknown_values() {
+    for kind in [
+        ObjectKind::Chunk,
+        ObjectKind::ChunkTree,
+        ObjectKind::File,
+        ObjectKind::Symlink,
+        ObjectKind::Directory,
+        ObjectKind::KvLeaf,
+        ObjectKind::KvBranch,
+        ObjectKind::NamespaceMap,
+        ObjectKind::PrincipalState,
+        ObjectKind::Commit,
+        ObjectKind::Evidence,
+        ObjectKind::Derived,
+    ] {
+        assert_eq!(ObjectKind::from_code(kind.code()), Some(kind));
+    }
+    for kind in [
+        ReferenceKind::Owns,
+        ReferenceKind::Evidence,
+        ReferenceKind::Lineage,
+        ReferenceKind::Derived,
+    ] {
+        assert_eq!(ReferenceKind::from_code(kind.code()), Some(kind));
+    }
+    for class in [ObjectClass::Data, ObjectClass::Metadata] {
+        assert_eq!(ObjectClass::from_code(class.code()), Some(class));
+    }
+    assert_eq!(ObjectKind::from_code(u16::MAX), None);
+    assert_eq!(ReferenceKind::from_code(u8::MAX), None);
+    assert_eq!(ObjectClass::from_code(u8::MAX), None);
+}
+
 fn data(value: u8) -> ObjectRecord {
     ObjectRecord::new(
         ObjectKind::Chunk,

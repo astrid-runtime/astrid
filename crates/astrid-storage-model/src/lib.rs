@@ -544,6 +544,10 @@ impl ObjectRecord {
 /// trait lets the executable model remain `no_std` and hash-agile.
 pub trait ObjectIdentity {
     /// Compute the logical identity of `record`.
+    ///
+    /// Implementations must be deterministic and must encode every
+    /// identity-bearing field. Collision handling remains mandatory even for a
+    /// cryptographic implementation.
     fn identify(&self, record: &ObjectRecord) -> ObjectId;
 }
 
