@@ -2275,11 +2275,33 @@ impl Kernel {
         // while both profiles persist the token, PID, and readiness metadata.
         #[cfg(any(unix, windows))]
         {
-            let socket_path = crate::socket::kernel_socket_path();
-            let _ = astrid_core::local_transport::remove_endpoint(&socket_path);
-            let _ = std::fs::remove_file(&self.token_path);
-            crate::socket::remove_readiness_file();
-            crate::socket::remove_pid_file();
+            #[cfg(unix)]
+            {
+                let socket_path = self.astrid_home.socket_path();
+                if let Err(error) = astrid_core::local_transport::remove_endpoint(&socket_path) {
+                    tracing::warn!(
+                        %error,
+                        endpoint = %socket_path.display(),
+                        "Failed to remove local endpoint during shutdown"
+                    );
+                }
+            }
+            for (label, path) in [
+                ("session token", self.token_path.clone()),
+                ("readiness", self.astrid_home.ready_path()),
+                ("PID", self.astrid_home.pid_path()),
+            ] {
+                if let Err(error) = std::fs::remove_file(&path)
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::warn!(
+                        %error,
+                        artifact = label,
+                        path = %path.display(),
+                        "Failed to remove runtime artifact during shutdown"
+                    );
+                }
+            }
         }
 
         tracing::info!("Kernel shutdown complete");

@@ -519,9 +519,27 @@ fn start_clears_sentinels(action: StartAction) -> bool {
     matches!(action, StartAction::HealAndSpawn)
 }
 
+async fn finish_already_running_start(
+    workspace_check: impl std::future::Future<Output = Result<()>>,
+) -> Result<ExitCode> {
+    // The authenticated probe above checks the workspace while connecting, but
+    // the daemon can restart and republish the global endpoint before `start`
+    // reports success. Re-read the readiness metadata at the success boundary
+    // so a daemon now serving another project/layout is never accepted.
+    workspace_check
+        .await
+        .context("running daemon workspace readiness validation failed")?;
+    println!(
+        "{}",
+        theme::Theme::warning("Astrid daemon is already running.")
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
 /// Handle `astrid start`.
 ///
-/// Fast path: a daemon answering on the socket is already running — do nothing.
+/// Fast path: a daemon answering on the socket is already running only after
+/// its readiness metadata is revalidated against the selected workspace.
 ///
 /// Otherwise the socket is absent or unreachable. Two cases, split on whether a
 /// recorded daemon PID is still alive:
@@ -554,11 +572,7 @@ pub(crate) async fn handle_start(foreground: bool) -> Result<ExitCode> {
 
     match decide_start_action(socket_reachable, recorded_pid_alive) {
         StartAction::AlreadyRunning => {
-            println!(
-                "{}",
-                theme::Theme::warning("Astrid daemon is already running.")
-            );
-            Ok(ExitCode::SUCCESS)
+            finish_already_running_start(ensure_daemon_workspace_matches(None)).await
         },
         StartAction::RunningButUnreachable => {
             // A recorded daemon PID is alive but the socket isn't answering. The

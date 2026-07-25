@@ -111,6 +111,19 @@ jobs:
             libc: musl
             platform: linux/arm64
             image: docker.io/library/rust@sha256:594694ee6b07747b63b5c265be2616b62e814180b66227e2c18c6ee85e4136be
+          - target: x86_64-pc-windows-msvc
+            os: windows-2025
+            archive: tar.gz
+            libc: native
+            exe_suffix: .exe
+          - target: aarch64-pc-windows-msvc
+            os: windows-11-arm
+            archive: tar.gz
+            libc: native
+            exe_suffix: .exe
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Harden Runner
         uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
@@ -282,10 +295,11 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           DIR="astrid-${VERSION}-${{ matrix.target }}"
           mkdir "$DIR"
-          cp "$BINARY_ROOT/astrid" "$DIR/"
-          cp "$BINARY_ROOT/astrid-daemon" "$DIR/"
-          cp "$BINARY_ROOT/astrid-build" "$DIR/"
-          cp "$BINARY_ROOT/astrid-emit" "$DIR/"
+          SUFFIX="${{ matrix.exe_suffix }}"
+          cp "$BINARY_ROOT/astrid${SUFFIX}" "$DIR/"
+          cp "$BINARY_ROOT/astrid-daemon${SUFFIX}" "$DIR/"
+          cp "$BINARY_ROOT/astrid-build${SUFFIX}" "$DIR/"
+          cp "$BINARY_ROOT/astrid-emit${SUFFIX}" "$DIR/"
           cp LICENSE* README.md "$DIR/" 2>/dev/null || true
           tar czf "${DIR}.tar.gz" "$DIR"
           echo "ASSET=${DIR}.tar.gz" >> "$GITHUB_ENV"
@@ -469,6 +483,15 @@ jobs:
             --output "artifacts/astrid-${VERSION}-musl-release.toml"
           python3 scripts/musl_release_manifest.py validate \
             "artifacts/astrid-${VERSION}-musl-release.toml" \
+            --legacy-manifest "artifacts/astrid-${VERSION}-release.toml" \
+            --artifacts artifacts \
+            --verify-artifacts
+          python3 scripts/windows_release_manifest.py generate \
+            --artifacts artifacts \
+            --legacy-manifest "artifacts/astrid-${VERSION}-release.toml" \
+            --output "artifacts/astrid-${VERSION}-windows-release.toml"
+          python3 scripts/windows_release_manifest.py validate \
+            "artifacts/astrid-${VERSION}-windows-release.toml" \
             --legacy-manifest "artifacts/astrid-${VERSION}-release.toml" \
             --artifacts artifacts \
             --verify-artifacts

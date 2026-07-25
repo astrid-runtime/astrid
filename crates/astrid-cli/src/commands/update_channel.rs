@@ -1,6 +1,7 @@
 //! Strict signed-channel metadata validation and rollback state.
 
 use std::collections::HashSet;
+#[cfg(not(windows))]
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -22,6 +23,7 @@ const TARGETS: &[&str] = &[
     "x86_64-unknown-linux-gnu",
 ];
 const MUSL_TARGETS: &[&str] = &["aarch64-unknown-linux-musl", "x86_64-unknown-linux-musl"];
+const WINDOWS_TARGETS: &[&str] = &["aarch64-pc-windows-msvc", "x86_64-pc-windows-msvc"];
 const MAX_RELEASE_METADATA_BYTES: usize = 2 * 1024 * 1024;
 const MAX_BUNDLE_BYTES: usize = 256 * 1024;
 const MAX_MANIFEST_BYTES: usize = 256 * 1024;
@@ -56,19 +58,19 @@ pub(super) struct ResolvedChannelRelease {
     pub(super) target_blake3: String,
 }
 
-trait MuslMetadataSource {
+trait ExtensionMetadataSource {
     async fn download(&self, url: &str, limit: usize, label: &str) -> anyhow::Result<Vec<u8>>;
 
     fn authenticate(&self, bytes: Vec<u8>, bundle: &[u8], version: &str)
     -> anyhow::Result<Vec<u8>>;
 }
 
-struct ProductionMuslMetadataSource<'a> {
+struct ProductionExtensionMetadataSource<'a> {
     client: &'a reqwest::Client,
     authenticator: &'a MetadataAuthenticator,
 }
 
-impl MuslMetadataSource for ProductionMuslMetadataSource<'_> {
+impl ExtensionMetadataSource for ProductionExtensionMetadataSource<'_> {
     async fn download(&self, url: &str, limit: usize, label: &str) -> anyhow::Result<Vec<u8>> {
         download_bounded(self.client, url, limit, label).await
     }
@@ -177,7 +179,7 @@ pub(super) async fn resolve_signed_channel(
         .map_err(anyhow::Error::new)?
         .into_bytes();
     verify_release_manifest(&manifest, &parsed)?;
-    let metadata_source = ProductionMuslMetadataSource {
+    let metadata_source = ProductionExtensionMetadataSource {
         client,
         authenticator: &authenticator,
     };
@@ -262,7 +264,7 @@ struct LegacyReleaseBinding {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
-struct MuslReleaseExtension {
+struct ReleaseExtension {
     schema_version: i64,
     kind: String,
     product: String,
@@ -380,8 +382,12 @@ fn musl_metadata_asset(version: &str) -> String {
     format!("astrid-{version}-musl-release.toml")
 }
 
+fn windows_metadata_asset(version: &str) -> String {
+    format!("astrid-{version}-windows-release.toml")
+}
+
 async fn resolve_target_blake3(
-    source: &impl MuslMetadataSource,
+    source: &impl ExtensionMetadataSource,
     release: &serde_json::Value,
     legacy_manifest: &[u8],
     pointer: &ChannelPointer,
@@ -390,11 +396,23 @@ async fn resolve_target_blake3(
     if TARGETS.contains(&target) {
         return Ok(pointer.target(target)?.blake3.clone());
     }
-    if !MUSL_TARGETS.contains(&target) {
+    let (extension_asset, kind, targets, label) = if MUSL_TARGETS.contains(&target) {
+        (
+            musl_metadata_asset(pointer.version()),
+            "astrid-release-musl-extension",
+            MUSL_TARGETS,
+            "musl",
+        )
+    } else if WINDOWS_TARGETS.contains(&target) {
+        (
+            windows_metadata_asset(pointer.version()),
+            "astrid-release-windows-extension",
+            WINDOWS_TARGETS,
+            "Windows",
+        )
+    } else {
         bail!("signed release metadata does not support target '{target}'");
-    }
-
-    let extension_asset = musl_metadata_asset(pointer.version());
+    };
     let extension_url = exact_asset_url(release, &extension_asset)?.to_owned();
     let extension_bundle_url =
         exact_asset_url(release, &format!("{extension_asset}.sigstore.json"))?.to_owned();
@@ -402,18 +420,26 @@ async fn resolve_target_blake3(
         .download(
             &extension_url,
             MAX_MANIFEST_BYTES,
-            "immutable musl release metadata",
+            &format!("immutable {label} release metadata"),
         )
         .await?;
     let extension_bundle = source
         .download(
             &extension_bundle_url,
             MAX_BUNDLE_BYTES,
-            "musl release metadata authentication bundle",
+            &format!("{label} release metadata authentication bundle"),
         )
         .await?;
     let extension = source.authenticate(extension, &extension_bundle, pointer.version())?;
-    verify_musl_extension(&extension, legacy_manifest, pointer, target)
+    verify_release_extension(
+        &extension,
+        legacy_manifest,
+        pointer,
+        target,
+        kind,
+        targets,
+        label,
+    )
 }
 
 pub(super) fn parse_channel(
@@ -575,25 +601,29 @@ pub(super) fn verify_release_manifest(
     Ok(())
 }
 
-fn verify_musl_extension(
+fn verify_release_extension(
     bytes: &[u8],
     legacy_manifest_bytes: &[u8],
     pointer: &ChannelPointer,
     target: &str,
+    kind: &str,
+    targets: &[&str],
+    label: &str,
 ) -> anyhow::Result<String> {
     ensure!(
-        MUSL_TARGETS.contains(&target),
-        "musl release metadata does not support target '{target}'"
+        targets.contains(&target),
+        "{label} release metadata does not support target '{target}'"
     );
-    let text = std::str::from_utf8(bytes).context("musl release metadata is not UTF-8")?;
-    let extension: MuslReleaseExtension =
-        toml::from_str(text).context("musl release metadata is invalid TOML")?;
+    let text = std::str::from_utf8(bytes)
+        .with_context(|| format!("{label} release metadata is not UTF-8"))?;
+    let extension: ReleaseExtension = toml::from_str(text)
+        .with_context(|| format!("{label} release metadata is invalid TOML"))?;
     ensure!(
         extension.schema_version == 1
-            && extension.kind == "astrid-release-musl-extension"
+            && extension.kind == kind
             && extension.product == PRODUCT
             && extension.repository == REPOSITORY,
-        "musl release metadata identity is invalid"
+        "{label} release metadata identity is invalid"
     );
     canonical_version(&extension.version)?;
     ensure!(
@@ -601,26 +631,26 @@ fn verify_musl_extension(
             && extension.tag == pointer.release.tag
             && extension.source_commit == pointer.release.source_commit
             && extension.release_workflow_identity == pointer.release.release_workflow_identity,
-        "musl release metadata does not match the authenticated legacy release"
+        "{label} release metadata does not match the authenticated legacy release"
     );
     ensure!(
         extension.legacy_release.metadata_asset == pointer.release.metadata_asset
             && extension.legacy_release.metadata_blake3 == pointer.release.metadata_blake3
             && blake3::hash(legacy_manifest_bytes).to_hex().as_str()
                 == extension.legacy_release.metadata_blake3,
-        "musl release metadata does not bind the authenticated legacy release manifest"
+        "{label} release metadata does not bind the authenticated legacy release manifest"
     );
     validate_targets_for(
         &extension.targets,
-        MUSL_TARGETS,
+        targets,
         &extension.version,
-        "musl release metadata",
+        &format!("{label} release metadata"),
     )?;
     Ok(extension
         .targets
         .iter()
         .find(|entry| entry.triple == target)
-        .context("musl release metadata target set is incomplete")?
+        .with_context(|| format!("{label} release metadata target set is incomplete"))?
         .blake3
         .clone())
 }
@@ -642,12 +672,24 @@ impl Drop for ChannelLock {
     }
 }
 
+fn ensure_channel_state_dir(dir: &std::path::Path) -> anyhow::Result<()> {
+    #[cfg(windows)]
+    {
+        astrid_core::platform_fs::ensure_private_directory(dir)
+            .context("could not create private channel state directory")
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::create_dir_all(dir).context("could not create channel state directory")
+    }
+}
+
 fn acquire_channel_lock(channel: UpdateChannel) -> anyhow::Result<ChannelLock> {
     let (pointer_path, _) = state_paths(channel)?;
     let dir = pointer_path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("channel state path has no parent"))?;
-    std::fs::create_dir_all(dir).context("could not create channel state directory")?;
+    ensure_channel_state_dir(dir)?;
     let lock_path = dir.join(format!(".{}.lock", channel.as_str()));
     let lock = std::fs::OpenOptions::new()
         .create(true)
@@ -667,7 +709,7 @@ pub(super) fn enforce_continuity(
     candidate_bytes: &[u8],
 ) -> anyhow::Result<()> {
     let (pointer_path, _) = state_paths(channel)?;
-    let previous_bytes = match std::fs::read(&pointer_path) {
+    let previous_bytes = match read_accepted_channel_state(&pointer_path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error).context("could not read accepted channel state"),
@@ -678,6 +720,17 @@ pub(super) fn enforce_continuity(
         toml::from_str(text).context("accepted channel state is invalid TOML")?;
     validate_pointer(&previous, channel, None)?;
     enforce_continuity_values(candidate, candidate_bytes, &previous, &previous_bytes)
+}
+
+fn read_accepted_channel_state(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    #[cfg(windows)]
+    {
+        astrid_core::platform_fs::read_private_file_to_string(path).map(String::into_bytes)
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::read(path)
+    }
 }
 
 fn enforce_continuity_values(
@@ -704,7 +757,7 @@ pub(super) fn persist_accepted(
     let dir = pointer_path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("channel state path has no parent"))?;
-    std::fs::create_dir_all(dir).context("could not create channel state directory")?;
+    ensure_channel_state_dir(dir)?;
     // The pointer is the continuity commit marker and is replaced last. A
     // crash after the bundle write leaves the prior accepted generation in
     // force; the next locked resolution can safely repair the bundle.
@@ -714,20 +767,28 @@ pub(super) fn persist_accepted(
 }
 
 fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
-    let dir = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("channel state path has no parent"))?;
-    let mut temporary = tempfile::NamedTempFile::new_in(dir)?;
-    temporary.write_all(bytes)?;
-    temporary.as_file().sync_all()?;
-    temporary
-        .persist(path)
-        .map_err(|error| error.error)
-        .with_context(|| format!("could not persist {}", path.display()))?;
-    std::fs::File::open(dir)?
-        .sync_all()
-        .with_context(|| format!("could not sync {}", dir.display()))?;
-    Ok(())
+    #[cfg(windows)]
+    {
+        astrid_core::platform_fs::atomic_write_private_file(path, bytes)
+            .with_context(|| format!("could not persist private channel state {}", path.display()))
+    }
+    #[cfg(not(windows))]
+    {
+        let dir = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("channel state path has no parent"))?;
+        let mut temporary = tempfile::NamedTempFile::new_in(dir)?;
+        temporary.write_all(bytes)?;
+        temporary.as_file().sync_all()?;
+        temporary
+            .persist(path)
+            .map_err(|error| error.error)
+            .with_context(|| format!("could not persist {}", path.display()))?;
+        std::fs::File::open(dir)?
+            .sync_all()
+            .with_context(|| format!("could not sync {}", dir.display()))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

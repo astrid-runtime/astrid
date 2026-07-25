@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import release_manifest
 import release_publication
 import musl_release_manifest
+import windows_release_manifest
 
 
 VERSION = "0.10.0"
@@ -92,6 +93,42 @@ class ReleasePublicationTests(unittest.TestCase):
             (root / f"{asset}.sigstore.json").write_text("{}\n")
         (root / f"{musl_path.name}.sigstore.json").write_text("{}\n")
 
+    def add_windows_extension(self, root: Path) -> None:
+        legacy_path = root / f"astrid-{VERSION}-release.toml"
+        for target in release_manifest.WINDOWS_TARGETS:
+            name = release_manifest.expected_asset(VERSION, target)
+            (root / name).write_bytes(f"archive:{target}".encode())
+        all_targets = (
+            *release_manifest.TARGETS,
+            *release_manifest.MUSL_TARGETS,
+            *release_manifest.WINDOWS_TARGETS,
+        )
+        sha_lines = []
+        blake_lines = []
+        for target in all_targets:
+            name = release_manifest.expected_asset(VERSION, target)
+            value = (root / name).read_bytes()
+            sha_lines.append(f"{hashlib.sha256(value).hexdigest()}  {name}")
+            blake_lines.append(
+                f"{hashlib.sha256(b'blake3:' + value).hexdigest()}  {name}"
+            )
+        (root / "SHA256SUMS.txt").write_text("\n".join(sha_lines) + "\n")
+        (root / "BLAKE3SUMS.txt").write_text("\n".join(blake_lines) + "\n")
+        with mock.patch.object(
+            release_manifest,
+            "blake3_file",
+            side_effect=lambda path: hashlib.sha256(
+                b"blake3:" + path.read_bytes()
+            ).hexdigest(),
+        ):
+            windows = windows_release_manifest.build_manifest(root, legacy_path)
+        windows_path = root / windows_release_manifest.metadata_name(VERSION)
+        windows_path.write_text(windows_release_manifest.render_manifest(windows))
+        for target in release_manifest.WINDOWS_TARGETS:
+            asset = release_manifest.expected_asset(VERSION, target)
+            (root / f"{asset}.sigstore.json").write_text("{}\n")
+        (root / f"{windows_path.name}.sigstore.json").write_text("{}\n")
+
     def validate(self, root: Path) -> list[str]:
         with mock.patch.object(
             release_manifest,
@@ -117,6 +154,39 @@ class ReleasePublicationTests(unittest.TestCase):
             self.fixture(root)
             self.add_musl_extension(root)
             self.assertEqual(len(self.validate(root)), 10)
+
+    def test_accepts_exact_eight_target_inventory_with_windows_extension(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.fixture(root)
+            self.add_musl_extension(root)
+            self.add_windows_extension(root)
+            self.assertEqual(len(self.validate(root)), 13)
+
+    def test_rejects_every_partial_windows_extension_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.fixture(root)
+            self.add_musl_extension(root)
+            self.add_windows_extension(root)
+            removals = [
+                windows_release_manifest.metadata_name(VERSION),
+                f"{windows_release_manifest.metadata_name(VERSION)}.sigstore.json",
+                release_manifest.expected_asset(
+                    VERSION, release_manifest.WINDOWS_TARGETS[0]
+                ),
+                (
+                    f"{release_manifest.expected_asset(VERSION, release_manifest.WINDOWS_TARGETS[0])}"
+                    ".sigstore.json"
+                ),
+            ]
+            for name in removals:
+                with self.subTest(name=name):
+                    saved = (root / name).read_bytes()
+                    (root / name).unlink()
+                    with self.assertRaises((ValueError, OSError)):
+                        self.validate(root)
+                    (root / name).write_bytes(saved)
 
     def test_rejects_every_partial_musl_extension_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

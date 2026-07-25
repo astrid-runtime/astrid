@@ -193,7 +193,7 @@ pub fn validate_private_file(path: &Path) -> io::Result<()> {
 ///
 /// Returns an error if recovery is blocked or fails, the file is missing,
 /// redirected, permissive, replaced during validation, or is not valid UTF-8.
-pub(crate) fn read_private_file_to_string(path: &Path) -> io::Result<String> {
+pub fn read_private_file_to_string(path: &Path) -> io::Result<String> {
     #[cfg(windows)]
     {
         windows::read_private_file_to_string(path)

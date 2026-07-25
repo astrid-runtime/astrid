@@ -742,6 +742,50 @@ async fn device_scope_denial_does_not_consume_the_principals_budget() {
     assert_shutdown_rate_limited(&limited, "authorized device's second shutdown");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn management_router_denies_unauthorized_shutdown_without_signaling_exit() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = astrid_core::dirs::AstridHome::from_path(dir.path());
+    let kernel = crate::test_kernel_with_home(home).await;
+    drop(spawn_kernel_router(Arc::clone(&kernel)));
+
+    let caller = PrincipalId::new("status-only").expect("valid principal");
+    seed_profile(
+        &kernel,
+        &caller,
+        &PrincipalProfile {
+            grants: vec!["system:status".to_string()],
+            ..Default::default()
+        },
+    );
+    let shutdown = kernel.shutdown_tx.subscribe();
+
+    let response = request_kernel(
+        &kernel,
+        &caller,
+        "unauthorized_shutdown",
+        KernelRequest::Shutdown {
+            reason: Some("must be denied".to_string()),
+        },
+    )
+    .await;
+
+    assert!(
+        matches!(response, KernelResponse::Error(_)),
+        "unauthorized shutdown must return an explicit error, got {response:?}"
+    );
+    assert!(
+        !*shutdown.borrow(),
+        "authorization denial must not signal the daemon shutdown channel"
+    );
+    assert!(
+        !shutdown
+            .has_changed()
+            .expect("shutdown sender remains alive during router test"),
+        "authorization denial must not publish any shutdown-channel update"
+    );
+}
+
 // ── Agent-loop readiness dispatch (roundtrip) ────────────────────
 
 /// Driving `GetAgentReadiness` through the live management router must

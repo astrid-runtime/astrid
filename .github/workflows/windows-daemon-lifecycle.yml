@@ -161,6 +161,28 @@ jobs:
           --target $env:TARGET
           commands::self_update::tests
 
+      - name: Test private channel state provisioning
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: >-
+          cargo test
+          -p astrid
+          --locked
+          --target $env:TARGET
+          commands::update_channel::tests
+
+      - name: Test fresh-home runtime signing
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: >-
+          cargo test
+          -p astrid-build
+          --locked
+          --target $env:TARGET
+          runtime_signing_provisions_fresh_private_windows_home
+
       - name: Test native daemon runtime
         env:
           TARGET: ${{ matrix.target }}
@@ -211,10 +233,7 @@ jobs:
         run: >-
           cargo build
           -p astrid
-          -p astrid-build
-          --bin astrid
-          --bin astrid-daemon
-          --bin astrid-build
+          --bins
           --all-features
           --locked
           --target $env:TARGET

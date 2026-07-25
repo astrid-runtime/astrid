@@ -100,10 +100,13 @@ jobs:
         run: |
           VERSION="${RELEASE_TAG#v}"
           RELEASE_METADATA="astrid-${VERSION}-release.toml"
+          WINDOWS_METADATA="astrid-${VERSION}-windows-release.toml"
           gh release download "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --pattern "$RELEASE_METADATA" \
-            --pattern "$RELEASE_METADATA.sigstore.json"
+            --pattern "$RELEASE_METADATA.sigstore.json" \
+            --pattern "$WINDOWS_METADATA" \
+            --pattern "$WINDOWS_METADATA.sigstore.json"
           IDENTITY="https://github.com/astrid-runtime/astrid/.github/workflows/release.yml@refs/tags/${RELEASE_TAG}"
           cosign verify-blob \
             --bundle "$RELEASE_METADATA.sigstore.json" \
@@ -112,6 +115,15 @@ jobs:
             --use-signed-timestamps \
             "$RELEASE_METADATA"
           python3 scripts/release_manifest.py validate "$RELEASE_METADATA"
+          cosign verify-blob \
+            --bundle "$WINDOWS_METADATA.sigstore.json" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity "$IDENTITY" \
+            --use-signed-timestamps \
+            "$WINDOWS_METADATA"
+          python3 scripts/windows_release_manifest.py validate \
+            "$WINDOWS_METADATA" \
+            --legacy-manifest "$RELEASE_METADATA"
           SOURCE_COMMIT=$(python3 - "$RELEASE_METADATA" <<'PY'
           import sys
           import tomllib
@@ -154,14 +166,16 @@ jobs:
           gh release view "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --json assets,isDraft,isPrerelease > release.json
-          python3 - "$RELEASE_METADATA" release.json <<'PY'
+          python3 - "$RELEASE_METADATA" "$WINDOWS_METADATA" release.json <<'PY'
           import json
           import sys
           import tomllib
 
           with open(sys.argv[1], "rb") as file:
               metadata = tomllib.load(file)
-          with open(sys.argv[2], encoding="utf-8") as file:
+          with open(sys.argv[2], "rb") as file:
+              windows_metadata = tomllib.load(file)
+          with open(sys.argv[3], encoding="utf-8") as file:
               release = json.load(file)
           if release["isDraft"]:
               raise SystemExit("draft releases cannot be promoted")
@@ -173,8 +187,10 @@ jobs:
               "BLAKE3SUMS.txt.sigstore.json",
               "SHA256SUMS.txt",
               "SHA256SUMS.txt.sigstore.json",
+              sys.argv[2],
+              f"{sys.argv[2]}.sigstore.json",
           }
-          for target in metadata["targets"]:
+          for target in (*metadata["targets"], *windows_metadata["targets"]):
               required.add(target["asset"])
               required.add(target["sigstore-bundle"])
           missing = required - set(names)
@@ -204,18 +220,26 @@ jobs:
             --pattern SHA256SUMS.txt \
             --pattern SHA256SUMS.txt.sigstore.json
           cp "$RELEASE_METADATA" release-assets/
+          cp "$WINDOWS_METADATA" "$WINDOWS_METADATA.sigstore.json" release-assets/
           python3 scripts/release_manifest.py validate \
             "release-assets/$RELEASE_METADATA" \
             --artifacts release-assets \
             --verify-artifacts \
             --require-bundles
-          python3 - "$RELEASE_METADATA" <<'PY' > archive-assets.txt
+          python3 scripts/windows_release_manifest.py validate \
+            "release-assets/$WINDOWS_METADATA" \
+            --legacy-manifest "release-assets/$RELEASE_METADATA" \
+            --artifacts release-assets \
+            --verify-artifacts \
+            --require-bundles
+          python3 - "$RELEASE_METADATA" "$WINDOWS_METADATA" <<'PY' > archive-assets.txt
           import sys
           import tomllib
 
-          with open(sys.argv[1], "rb") as file:
-              for target in tomllib.load(file)["targets"]:
-                  print(target["asset"])
+          for manifest in sys.argv[1:]:
+              with open(manifest, "rb") as file:
+                  for target in tomllib.load(file)["targets"]:
+                      print(target["asset"])
           PY
           while IFS= read -r archive; do
             cosign verify-blob \

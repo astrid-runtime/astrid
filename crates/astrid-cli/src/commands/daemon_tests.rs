@@ -168,6 +168,22 @@ fn start_reachable_daemon_is_already_running() {
     assert!(!start_clears_sentinels(StartAction::AlreadyRunning));
 }
 
+#[tokio::test]
+async fn start_reachable_daemon_revalidates_workspace_before_success() {
+    let expected = "a".repeat(64);
+    let other_workspace = format!("v1:{}", "b".repeat(64));
+    let workspace_check = validate_daemon_workspace_metadata(&other_workspace, &expected);
+    let error = finish_already_running_start(std::future::ready(workspace_check))
+        .await
+        .expect_err("mismatched workspace metadata must reject start success");
+
+    assert!(
+        error
+            .to_string()
+            .contains("running daemon workspace readiness validation failed")
+    );
+}
+
 #[test]
 fn start_unreachable_with_dead_pid_heals_and_spawns() {
     let action = decide_start_action(false, false);

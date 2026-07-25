@@ -102,6 +102,31 @@ try {
         throw "persistent daemon did not survive its idle window`n$persistentStatus"
     }
 
+    # An authenticated principal without system:shutdown must receive a
+    # kernel denial. The CLI must not reinterpret that denial as a transport
+    # failure and enter identity-gated process termination recovery.
+    $null = Invoke-Astrid agent create lifecycle-shutdown-denied --group agent -y
+    $deniedStopOutput = & $astrid --principal lifecycle-shutdown-denied stop 2>&1 | Out-String
+    $deniedStopExit = $LASTEXITCODE
+    if ($deniedStopExit -eq 0) {
+        throw "restricted principal unexpectedly stopped daemon PID $daemonPid`n$deniedStopOutput"
+    }
+    if (-not $deniedStopOutput.Contains("daemon rejected shutdown")) {
+        throw "restricted principal stop did not report an authenticated denial`n$deniedStopOutput"
+    }
+    $daemonProcess.Refresh()
+    if ($daemonProcess.HasExited) {
+        throw "authenticated shutdown denial incorrectly terminated daemon PID $daemonPid"
+    }
+    $recordedPid = [uint32](Get-Content -LiteralPath $pidPath -TotalCount 1).Trim()
+    if ($recordedPid -ne $daemonPid) {
+        throw "authenticated shutdown denial replaced daemon PID $daemonPid with $recordedPid"
+    }
+    $postDenialStatus = Invoke-Astrid status
+    if (-not $postDenialStatus.Contains("Astrid daemon (PID $daemonPid")) {
+        throw "daemon stopped answering after authenticated shutdown denial`n$postDenialStatus"
+    }
+
     $stopOutput = Invoke-Astrid stop
     if (-not $daemonProcess.WaitForExit(15000)) {
         $daemonProcess.Refresh()

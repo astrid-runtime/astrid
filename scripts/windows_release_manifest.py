@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate and validate Astrid's immutable Linux musl metadata extension."""
+"""Generate and validate Astrid's immutable Windows metadata extension."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from typing import Any
 import release_manifest
 
 
-KIND = "astrid-release-musl-extension"
+KIND = "astrid-release-windows-extension"
 ROOT_KEYS = {
     "schema-version",
     "kind",
@@ -34,7 +34,7 @@ def fail(message: str) -> "NoReturn":
 
 
 def metadata_name(version: str) -> str:
-    return f"astrid-{version}-musl-release.toml"
+    return f"astrid-{version}-windows-release.toml"
 
 
 def legacy_metadata_name(version: str) -> str:
@@ -72,26 +72,23 @@ def build_manifest(
     release_manifest.validate_release_checksum_names(
         sha256, version, "SHA256SUMS.txt"
     )
-    expected_six = {
+    expected_all = {
         release_manifest.expected_asset(version, target)
-        for target in (*release_manifest.TARGETS, *release_manifest.MUSL_TARGETS)
+        for target in (
+            *release_manifest.TARGETS,
+            *release_manifest.MUSL_TARGETS,
+            *release_manifest.WINDOWS_TARGETS,
+        )
     }
-    expected_eight = expected_six | {
-        release_manifest.expected_asset(version, target)
-        for target in release_manifest.WINDOWS_TARGETS
-    }
-    if set(blake3) != set(sha256) or set(blake3) not in (
-        expected_six,
-        expected_eight,
-    ):
-        fail("musl metadata requires checksums for all six legacy/musl archives")
+    if set(blake3) != expected_all or set(sha256) != expected_all:
+        fail("Windows metadata requires checksums for exactly all eight release archives")
 
     targets = []
-    for target in release_manifest.MUSL_TARGETS:
+    for target in release_manifest.WINDOWS_TARGETS:
         asset = release_manifest.expected_asset(version, target)
         path = artifacts / asset
         if not path.is_file() or path.is_symlink():
-            fail(f"musl release archive is missing or not a regular file: {asset}")
+            fail(f"Windows release archive is missing or not a regular file: {asset}")
         targets.append(
             {
                 "triple": target,
@@ -133,7 +130,7 @@ def validate_manifest(
     unknown = set(data) - ROOT_KEYS
     if missing or unknown:
         fail(
-            f"musl manifest root keys differ: missing={sorted(missing)}, "
+            f"Windows manifest root keys differ: missing={sorted(missing)}, "
             f"unknown={sorted(unknown)}"
         )
     if (
@@ -143,7 +140,7 @@ def validate_manifest(
         or data["product"] != release_manifest.PRODUCT
         or data["repository"] != release_manifest.REPOSITORY
     ):
-        fail("musl manifest identity is invalid")
+        fail("Windows manifest identity is invalid")
     for key in (
         "kind",
         "product",
@@ -153,73 +150,70 @@ def validate_manifest(
         "release-workflow-identity",
     ):
         if not isinstance(data[key], str):
-            fail(f"musl manifest {key} must be a string")
+            fail(f"Windows manifest {key} must be a string")
     version = release_manifest.canonical_version(data["version"])
     if data["tag"] != f"v{version}":
-        fail("musl manifest tag does not match its version")
+        fail("Windows manifest tag does not match its version")
     if (
         not isinstance(data["source-commit"], str)
         or release_manifest.COMMIT.fullmatch(data["source-commit"]) is None
     ):
-        fail("musl manifest source commit is invalid")
+        fail("Windows manifest source commit is invalid")
     nightly_commit = release_manifest.nightly_source_commit(version)
     if "-nightly." in version and nightly_commit is None:
-        fail("nightly musl manifest version is malformed")
+        fail("nightly Windows manifest version is malformed")
     if nightly_commit is not None and nightly_commit != data["source-commit"]:
-        fail("nightly musl manifest version does not embed its source commit")
+        fail("nightly Windows manifest version does not embed its source commit")
     expected_identity = (
         f"https://github.com/{release_manifest.REPOSITORY}/.github/workflows/"
         f"release.yml@refs/tags/v{version}"
     )
     if data["release-workflow-identity"] != expected_identity:
-        fail("musl manifest release workflow identity is invalid")
+        fail("Windows manifest release workflow identity is invalid")
 
     legacy = data["legacy-release"]
     if not isinstance(legacy, dict) or set(legacy) != LEGACY_RELEASE_KEYS:
-        fail("musl manifest legacy-release table differs from schema")
+        fail("Windows manifest legacy-release table differs from schema")
     if legacy.get("metadata-asset") != legacy_metadata_name(version):
-        fail("musl manifest legacy metadata asset is invalid")
+        fail("Windows manifest legacy metadata asset is invalid")
     if (
         not isinstance(legacy.get("metadata-blake3"), str)
         or release_manifest.HEX_64.fullmatch(legacy["metadata-blake3"]) is None
     ):
-        fail("musl manifest legacy metadata BLAKE3 is invalid")
+        fail("Windows manifest legacy metadata BLAKE3 is invalid")
 
     targets = data["targets"]
     if not isinstance(targets, list) or len(targets) != len(
-        release_manifest.MUSL_TARGETS
+        release_manifest.WINDOWS_TARGETS
     ):
-        fail("musl manifest must contain exactly two target entries")
+        fail("Windows manifest must contain exactly two target entries")
     seen: set[str] = set()
     for entry in targets:
         if not isinstance(entry, dict) or set(entry) != release_manifest.TARGET_KEYS:
-            fail("musl target entry keys differ from schema")
+            fail("Windows target entry keys differ from schema")
         target = entry["triple"]
         if (
             not isinstance(target, str)
-            or target not in release_manifest.MUSL_TARGETS
+            or target not in release_manifest.WINDOWS_TARGETS
             or target in seen
         ):
-            fail("musl manifest target set is invalid")
+            fail("Windows manifest target set is invalid")
         seen.add(target)
         asset = release_manifest.expected_asset(version, target)
         if (
             entry["asset"] != asset
             or entry["sigstore-bundle"] != f"{asset}.sigstore.json"
         ):
-            fail(f"musl manifest asset identity is invalid for {target}")
-        if (
-            type(entry["size"]) is not int
-            or entry["size"] <= 0
-        ):
-            fail(f"musl manifest asset size is invalid for {target}")
+            fail(f"Windows manifest asset identity is invalid for {target}")
+        if type(entry["size"]) is not int or entry["size"] <= 0:
+            fail(f"Windows manifest asset size is invalid for {target}")
         for key in ("blake3", "sha256"):
             value = entry[key]
             if (
                 not isinstance(value, str)
                 or release_manifest.HEX_64.fullmatch(value) is None
             ):
-                fail(f"musl manifest {key} digest is invalid for {target}")
+                fail(f"Windows manifest {key} digest is invalid for {target}")
         if artifacts is not None:
             path = artifacts / asset
             if (
@@ -227,18 +221,18 @@ def validate_manifest(
                 or path.is_symlink()
                 or path.stat().st_size != entry["size"]
             ):
-                fail(f"musl manifest size does not match local archive for {target}")
+                fail(f"Windows manifest size does not match local archive for {target}")
             if verify_artifacts:
                 if sha256_file(path) != entry["sha256"]:
-                    fail(f"musl manifest SHA-256 does not match local archive for {target}")
+                    fail(f"Windows manifest SHA-256 does not match local archive for {target}")
                 if release_manifest.blake3_file(path) != entry["blake3"]:
-                    fail(f"musl manifest BLAKE3 does not match local archive for {target}")
+                    fail(f"Windows manifest BLAKE3 does not match local archive for {target}")
             if require_bundles:
                 bundle = artifacts / entry["sigstore-bundle"]
                 if not bundle.is_file() or bundle.is_symlink():
-                    fail(f"musl manifest Sigstore bundle is missing for {target}")
-    if seen != set(release_manifest.MUSL_TARGETS):
-        fail("musl manifest target set is incomplete")
+                    fail(f"Windows manifest Sigstore bundle is missing for {target}")
+    if seen != set(release_manifest.WINDOWS_TARGETS):
+        fail("Windows manifest target set is incomplete")
 
     if legacy_manifest is not None:
         release_manifest.validate_manifest(legacy_manifest)
@@ -251,12 +245,12 @@ def validate_manifest(
             "release-workflow-identity",
         ):
             if data[key] != legacy_manifest[key]:
-                fail(f"musl manifest {key} differs from the legacy release")
+                fail(f"Windows manifest {key} differs from the legacy release")
         if (
             legacy_manifest_blake3 is None
             or legacy["metadata-blake3"] != legacy_manifest_blake3
         ):
-            fail("musl manifest does not bind the authenticated legacy release")
+            fail("Windows manifest does not bind the authenticated legacy release")
 
 
 def render_manifest(data: dict[str, Any]) -> str:
@@ -299,7 +293,7 @@ def load_manifest(path: pathlib.Path) -> dict[str, Any]:
     except (OSError, tomllib.TOMLDecodeError) as error:
         fail(f"could not parse {path}: {error}")
     if not isinstance(data, dict):
-        fail("musl manifest root must be a TOML table")
+        fail("Windows manifest root must be a TOML table")
     return data
 
 
