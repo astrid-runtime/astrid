@@ -2450,7 +2450,7 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
     // A test helper opening the legacy import source directly would let kernel
     // tests pass against a runtime topology that production cannot select.
     let quota: Arc<dyn astrid_storage::KvQuotaResolver<astrid_storage::StateOwner>> =
-        Arc::new(|_| Ok(None));
+        Arc::new(|_: &astrid_storage::StateOwner| Ok(None));
     let kv = astrid_storage::open_runtime_kv(&home, quota)
         .await
         .expect("test kernel: open authoritative principal store");
