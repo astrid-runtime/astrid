@@ -514,6 +514,32 @@ const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 /// Maximum allowed size of a handshake response payload (bytes).
 const MAX_HANDSHAKE_RESPONSE_SIZE: usize = 4096;
 
+/// An explicit daemon-side rejection of a local transport handshake.
+///
+/// Callers that own process-recovery behavior can distinguish this from a
+/// broken or timed-out transport and must not bypass the daemon's decision by
+/// escalating to an OS-level process signal.
+#[derive(Debug, thiserror::Error)]
+#[error("Daemon rejected connection: {reason}")]
+pub struct HandshakeRejected {
+    reason: String,
+}
+
+impl HandshakeRejected {
+    /// Build a typed rejection while preserving the daemon-provided reason.
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+
+    /// The daemon-provided rejection reason.
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
 /// Path to the per-principal signing key (`keys/<principal>.key`), if
 /// `ASTRID_HOME` resolves. The daemon writes this 0600 file when the
 /// principal's keypair is minted (issue #45/#852); the connecting process,
@@ -618,7 +644,7 @@ async fn perform_handshake_in_home(
         let reason = response
             .reason
             .unwrap_or_else(|| "unknown error".to_string());
-        anyhow::bail!("Daemon rejected connection: {reason}");
+        return Err(HandshakeRejected::new(reason).into());
     }
 
     Ok(authenticated)

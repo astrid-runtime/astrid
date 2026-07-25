@@ -661,13 +661,44 @@ pub(crate) async fn handle_stop() -> Result<StopConfirmation> {
     // Graceful path: the socket is present and serviceable.
     // Deliberately bypass the selected-workspace check: stopping a daemon is
     // the recovery path when that daemon belongs to another project/layout.
-    if endpoint_reachable
-        && let Ok(Ok(client)) = tokio::time::timeout(
+    let recovery_client = if endpoint_reachable {
+        match tokio::time::timeout(
             Duration::from_secs(5),
             socket_client::connect_kernel_for_recovery(),
         )
         .await
-    {
+        {
+            Ok(Ok(client)) => Some(client),
+            Ok(Err(error)) if is_handshake_rejection(&error) => {
+                return Err(error)
+                    .context("daemon rejected the authenticated lifecycle-recovery connection");
+            },
+            Ok(Err(error)) => {
+                eprintln!(
+                    "{}",
+                    theme::Theme::warning(&format!(
+                        "Daemon recovery connection failed ({error:#}); escalating through the \
+                         recorded process identity."
+                    ))
+                );
+                None
+            },
+            Err(_) => {
+                eprintln!(
+                    "{}",
+                    theme::Theme::warning(
+                        "Daemon recovery connection timed out; escalating through the recorded \
+                         process identity."
+                    )
+                );
+                None
+            },
+        }
+    } else {
+        None
+    };
+
+    if let Some(client) = recovery_client {
         let mut client = client.with_timeout(Duration::from_secs(10));
         match shutdown_request_outcome(
             client
@@ -719,6 +750,12 @@ pub(crate) async fn handle_stop() -> Result<StopConfirmation> {
         &pid_path,
         &socket_path,
     ))
+}
+
+fn is_handshake_rejection(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<astrid_uplink::socket_client::HandshakeRejected>()
+        .is_some()
 }
 
 async fn daemon_endpoint_reachable(socket_path: &Path) -> bool {

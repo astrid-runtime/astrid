@@ -225,3 +225,15 @@ fn shutdown_response_failures_never_bypass_daemon_authorization() {
         );
     }
 }
+
+#[test]
+fn handshake_rejection_never_enters_process_recovery() {
+    let error = anyhow::Error::new(astrid_uplink::socket_client::HandshakeRejected::new(
+        "principal denied",
+    ))
+    .context("failed to connect to daemon");
+    assert!(is_handshake_rejection(&error));
+
+    let transport = anyhow::anyhow!("connection reset");
+    assert!(!is_handshake_rejection(&transport));
+}
