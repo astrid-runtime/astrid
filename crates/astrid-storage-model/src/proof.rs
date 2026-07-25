@@ -4,23 +4,23 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
 use super::world::closure_in;
-use super::{ModelError, ObjectId, ObjectIdentity, ObjectRecord, ReferenceKind};
+use super::{ModelError, ObjectId, ObjectIdentity, ObjectRecord, ReferenceKind, ReferenceLabel};
 
 /// Canonical sequence of reference labels from a source root to a selected
 /// owned subtree.
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ReferencePath(Vec<Vec<u8>>);
+pub struct ReferencePath(Vec<ReferenceLabel>);
 
 impl ReferencePath {
     /// Construct a reference path. An empty path selects the source root.
     #[must_use]
-    pub const fn new(labels: Vec<Vec<u8>>) -> Self {
+    pub const fn new(labels: Vec<ReferenceLabel>) -> Self {
         Self(labels)
     }
 
     /// Borrow the ordered relation labels.
     #[must_use]
-    pub fn labels(&self) -> &[Vec<u8>] {
+    pub fn labels(&self) -> &[ReferenceLabel] {
         &self.0
     }
 }
@@ -254,7 +254,7 @@ impl TransitionWitness {
         }
 
         let mut current = self.before;
-        let mut ancestors = Vec::<(ObjectId, ObjectRecord, Vec<u8>, ObjectId)>::new();
+        let mut ancestors = Vec::<(ObjectId, ObjectRecord, ReferenceLabel, ObjectId)>::new();
         let mut used = BTreeSet::new();
         for label in self.patch.path.labels() {
             let record = records
@@ -325,7 +325,7 @@ fn verified_record_map<I: ObjectIdentity>(
     for (declared, record) in records {
         let computed = identity.identify(record);
         if computed != *declared {
-            return Err(ModelError::ProofIdentityMismatch {
+            return Err(ModelError::ObjectIdentityMismatch {
                 declared: *declared,
                 computed,
             });

@@ -226,20 +226,22 @@ rebuild and fault injection rather than treating either as later cleanup.
 
 The system must not turn possession of a hash into permission to read data.
 
-### 6.1 `ContentId`
+### 6.1 `ObjectId`
 
-Logical identity of canonical typed plaintext:
+Logical identity of one canonical typed object:
 
 ```text
-ContentId = H(
-    "astrid-object" ||
-    object_format_version ||
+ObjectId = H(
+    "astrid-object-id-v1" ||
     object_kind ||
-    canonical_plaintext
+    object_format_version ||
+    canonical_object_encoding
 )
 ```
 
-`ContentId` makes object equality and logical roots stable. It can be kept
+The canonical object encoding commits the payload, ordered labelled
+references, reference reachability kinds, logical-byte contribution, and
+accounting class. `ObjectId` makes object equality and logical roots stable. It can be kept
 inside authorized metadata because exposing it leaks equality and permits
 confirmation guesses for predictable content.
 
@@ -256,12 +258,12 @@ BlobId = H(
 ```
 
 Compression, encryption, erasure coding, or a future encoding migration may
-produce a new `BlobId` for the same `ContentId`. Logical roots do not change.
+produce a new `BlobId` for the same `ObjectId`. Logical roots do not change.
 
 ### 6.3 Capabilities and root authority
 
-A capability authorizes an operation on a principal or root. It is not a
-`ContentId` or `BlobId`. Storage backends may be given verify-only access,
+A capability authorizes an operation on a principal or root. It is not an
+`ObjectId` or `BlobId`. Storage backends may be given verify-only access,
 read access, replication access, or deletion access independently.
 
 This distinction lets an untrusted placement node verify stored ciphertext
@@ -269,8 +271,10 @@ without learning plaintext or acquiring principal authority.
 
 ## 7. Logical object model
 
-All references are typed, canonical, length-bounded, versioned, and acyclic.
-Their reachability meaning is also typed:
+All references are typed, canonical, versioned, and acyclic. Persistent
+decoders apply deployment/resource bounds without embedding an arbitrary
+capacity ceiling in the logical model. Their reachability meaning is also
+typed:
 
 ```text
 ObjectRef {
@@ -343,6 +347,18 @@ They are never interpreted as host paths while validating an object graph.
 Symlinks are data leaves. A materializer must not follow them while writing an
 export or host projection.
 
+The executable model reflects these distinctions directly:
+
+- `ObjectId`, `BlobId`, `ReferenceLabel`, `PinId`, `RootGeneration`,
+  `PlacementEpoch`, `StorageNodeId`, `ObjectFormatVersion`, and `ReplicaCount`
+  are separate domain types rather than interchangeable integers or bytes;
+- object format versions and replica requirements are non-zero by
+  construction;
+- a published principal root must name an `ObjectKind::Commit`;
+- closure import rejects both missing and unrelated supplied objects;
+- placement epochs advance monotonically, contain only registered blobs, and
+  cannot silently retire an unknown or active epoch.
+
 ### 7.1 State ownership classes
 
 One root must not become a bag of everything visible to an agent. Astrid uses
@@ -390,7 +406,7 @@ retention, quota, export, or deletion dependency.
 
 Let:
 
-- `O : ContentId -> Object` be the immutable object map;
+- `O : ObjectId -> Object` be the immutable object map;
 - `R : PrincipalId -> (generation, CommitId)` be current roots;
 - `A` be the set of authorized actors and capability epochs;
 - `P : (placement_epoch, BlobId) -> ReplicaSet` be physical placement.
@@ -581,7 +597,7 @@ BundleHeader {
     source_runtime_identity,
 }
 
-ObjectFrame { ContentId, object_kind, canonical_or_encoded_object }
+ObjectFrame { ObjectId, object_kind, canonical_or_encoded_object }
 SecretEnvelopeFrame? { recipient, cipher_suite, encrypted_secret_set }
 ProfileTemplateFrame? { non_authoritative_profile }
 AuditLineageFrame? { checkpoint, selected_transition_proofs }
@@ -635,7 +651,7 @@ The receiver:
 
 1. validates header, versions, algorithms, sizes, and declared limits before
    allocation;
-2. verifies every object frame against its `ContentId` or encoded `BlobId`;
+2. verifies every object frame against its `ObjectId` or encoded `BlobId`;
 3. rejects duplicate IDs with different bytes;
 4. checks object-kind grammar, bounds, ordering, and acyclicity;
 5. computes closure from the declared root and rejects missing or extraneous
@@ -706,7 +722,7 @@ Weighted rendezvous hashing or a CRUSH-like algorithm is a suitable starting
 point. The decision must follow measured movement, availability, and repair
 behavior rather than the algorithm's name.
 
-Placement metadata is not embedded in `ContentId`, `PrincipalState`, or
+Placement metadata is not embedded in `ObjectId`, `PrincipalState`, or
 `Commit`. A root remains identical when a node is added, drained, replaced, or
 reweighted.
 

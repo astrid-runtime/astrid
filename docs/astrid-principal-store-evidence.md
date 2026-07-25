@@ -45,8 +45,11 @@ Assumptions:
    bounded canonical semantics.
 9. Principal-owned state, system authority, external attachments, ephemeral
    state, and derived state are distinguishable before root construction.
+10. Principal roots name typed commit objects, imports admit only the declared
+    owning closure, and published placement epochs advance monotonically using
+    registered blob representations.
 
-The evidence must test violations of assumptions 2–9 rather than hiding them.
+The evidence must test violations of assumptions 2–10 rather than hiding them.
 
 ## 2. Mathematical obligations
 
@@ -174,6 +177,9 @@ Required invariants:
 | STO-MOD-13 | A verified transition witness is bound to its before root, typed patch, and after root |
 | STO-MOD-14 | A workspace attachment becomes principal-owned only through explicit authorized ingest |
 | STO-MOD-15 | Evidence, lineage, and derived references do not change principal closure, quota, or default export |
+| STO-MOD-16 | Every installed principal root names a typed commit object |
+| STO-MOD-17 | Import admits exactly the declared owning closure, never unrelated supplied objects |
+| STO-MOD-18 | Placement epochs advance monotonically and name only registered blob representations |
 
 Every discovered counterexample becomes a minimized checked-in trace and a Rust
 regression test.
@@ -209,6 +215,8 @@ specification functions.
 | STO-PROP-21 | Adding a non-owning reference changes commit identity but not principal-owned closure or usage |
 | STO-PROP-22 | Unpinned evidence can be collected while the referring principal remains reconstructable |
 | STO-PROP-23 | Pinning the same evidence retains it without charging it as principal-owned state |
+| STO-PROP-24 | Adding an unrelated valid object to an import causes atomic rejection rather than hidden admission |
+| STO-PROP-25 | A stale placement epoch or unregistered blob is rejected without changing the active epoch |
 
 The deliberate tiny digest model must generate collisions and assert byte
 comparison rejects them. Production collision probability is not a substitute
@@ -294,6 +302,7 @@ stale placement epoch, torn metadata page, and corrupt index rebuild.
 | Duplicate ID, identical bytes | Accepted once |
 | Duplicate ID, different bytes | Fatal collision/corruption |
 | Missing child | Closure failure |
+| Valid but unrelated object outside the declared owning closure | Atomic import rejection |
 | Reference cycle | Grammar failure |
 | Unsorted or duplicate directory/KV entries | Canonicality failure |
 | Path separators, `..`, NUL, platform special name | Stored only if grammar permits; safe projection rejects/escapes |

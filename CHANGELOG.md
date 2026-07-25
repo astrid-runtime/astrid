@@ -24,7 +24,11 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   explicit, while capability-scoped state views and structural transition
   witnesses model independently verifiable root changes without claiming
   semantic execution proofs. The current persistence backend and public
-  capsule interfaces are unchanged.
+  capsule interfaces are unchanged. Domain-bearing identifiers, relation
+  labels, root generations, object kinds and non-zero format/replica versions
+  are distinct Rust types; imports reject unrelated records, principal roots
+  must name typed commits, and placement epochs advance monotonically over
+  registered blobs.
 - **Windows local transport uses authenticated per-user named pipes.** A pipe
   name derived only from the caller's operating-system SID replaces
   filesystem endpoint naming on Windows. Local-only byte-mode instances use a

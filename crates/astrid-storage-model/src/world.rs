@@ -5,8 +5,9 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::{
-    BlobId, GcReport, InsertOutcome, ModelError, ObjectClass, ObjectId, ObjectRecord, PinId,
-    PlacementEpoch, PrincipalUsage, RepresentationOutcome, RootState, StorageNodeId,
+    BlobId, GcReport, InsertOutcome, ModelError, ObjectClass, ObjectId, ObjectKind, ObjectRecord,
+    PinId, PlacementEpoch, PrincipalUsage, ReplicaCount, RepresentationOutcome, RootGeneration,
+    RootState, StorageNodeId,
 };
 
 /// In-memory reference world for principal-store operations.
@@ -50,6 +51,12 @@ impl<P: Ord> World<P> {
     #[must_use]
     pub fn object_count(&self) -> usize {
         self.objects.len()
+    }
+
+    /// Borrow one immutable object by its logical identifier.
+    #[must_use]
+    pub fn object(&self, id: ObjectId) -> Option<&ObjectRecord> {
+        self.objects.get(&id)
     }
 
     /// Return the current root for `principal`.
@@ -137,17 +144,27 @@ impl<P: Ord> World<P> {
         expected: Option<RootState>,
         commit: ObjectId,
     ) -> Result<RootState, ModelError> {
-        self.closure(commit)?;
         let actual = self.roots.get(&principal).copied();
         if actual != expected {
             return Err(ModelError::RootConflict { expected, actual });
         }
+        let record = self
+            .objects
+            .get(&commit)
+            .ok_or(ModelError::MissingObject(commit))?;
+        if record.kind() != ObjectKind::Commit {
+            return Err(ModelError::RootNotCommit {
+                object: commit,
+                actual: record.kind(),
+            });
+        }
+        self.closure(commit)?;
         let generation = match actual {
             Some(root) => root
                 .generation
-                .checked_add(1)
+                .checked_next()
                 .ok_or(ModelError::ArithmeticOverflow)?,
-            None => 0,
+            None => RootGeneration::INITIAL,
         };
         let next = RootState { generation, commit };
         self.roots.insert(principal, next);
@@ -227,7 +244,14 @@ impl<P: Ord> World<P> {
                 },
             }
         }
-        closure_in(&staged, root)?;
+        let closure = closure_in(&staged, root)?;
+        if let Some(extraneous) = records
+            .iter()
+            .map(|(id, _)| id)
+            .find(|id| !closure.contains(id))
+        {
+            return Err(ModelError::ExtraneousImportObject(*extraneous));
+        }
         self.objects = staged;
         Ok(inserted)
     }
@@ -347,18 +371,26 @@ impl<P: Ord> World<P> {
         &mut self,
         epoch: PlacementEpoch,
         plan: &[(BlobId, Vec<StorageNodeId>)],
-        minimum_replicas: u32,
+        minimum_replicas: ReplicaCount,
     ) -> Result<(), ModelError> {
-        if minimum_replicas == 0 {
-            return Err(ModelError::ZeroReplicaRequirement);
-        }
         if self.placement_epochs.contains(&epoch) {
             return Err(ModelError::PlacementEpochAlreadyExists(epoch));
+        }
+        if let Some(active) = self.active_placement_epoch
+            && epoch <= active
+        {
+            return Err(ModelError::StalePlacementEpoch {
+                proposed: epoch,
+                active,
+            });
         }
 
         let live = self.live_objects()?;
         let mut staged = BTreeMap::<BlobId, BTreeSet<StorageNodeId>>::new();
         for (blob, nodes) in plan {
+            if !self.representations.contains_key(blob) {
+                return Err(ModelError::UnregisteredBlob(*blob));
+            }
             let entry = staged.entry(*blob).or_default();
             entry.extend(nodes.iter().copied());
         }
@@ -386,7 +418,7 @@ impl<P: Ord> World<P> {
             let Some((blob, actual)) = best else {
                 return Err(ModelError::MissingPlacement { epoch, object });
             };
-            if actual < minimum_replicas {
+            if actual < minimum_replicas.get() {
                 return Err(ModelError::InsufficientReplicas {
                     epoch,
                     blob,
@@ -432,6 +464,9 @@ impl<P: Ord> World<P> {
     pub fn retire_placement_epoch(&mut self, epoch: PlacementEpoch) -> Result<(), ModelError> {
         if self.active_placement_epoch == Some(epoch) {
             return Err(ModelError::ActivePlacementEpoch(epoch));
+        }
+        if !self.placement_epochs.contains(&epoch) {
+            return Err(ModelError::PlacementEpochMissing(epoch));
         }
         self.placements
             .retain(|(stored_epoch, _), _| *stored_epoch != epoch);

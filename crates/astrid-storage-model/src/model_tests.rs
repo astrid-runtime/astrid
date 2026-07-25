@@ -12,21 +12,54 @@ fn blob(value: u8) -> BlobId {
     BlobId::new([value; 32])
 }
 
+fn label(value: &[u8]) -> ReferenceLabel {
+    ReferenceLabel::new(value.to_vec())
+}
+
 fn data(value: u8) -> ObjectRecord {
-    ObjectRecord::new(vec![value], vec![], 1, ObjectClass::Data).unwrap()
+    ObjectRecord::new(
+        ObjectKind::Chunk,
+        ObjectFormatVersion::V1,
+        vec![value],
+        vec![],
+        1,
+        ObjectClass::Data,
+    )
+    .unwrap()
 }
 
 fn metadata(value: u8, references: Vec<ObjectId>) -> ObjectRecord {
     let references = references
         .into_iter()
         .enumerate()
-        .map(|(index, target)| ObjectReference::owns(vec![u8::try_from(index).unwrap()], target))
+        .map(|(index, target)| {
+            ObjectReference::owns(
+                ReferenceLabel::new(vec![u8::try_from(index).unwrap()]),
+                target,
+            )
+        })
         .collect();
-    ObjectRecord::new(vec![value], references, 0, ObjectClass::Metadata).unwrap()
+    ObjectRecord::new(
+        ObjectKind::Commit,
+        ObjectFormatVersion::V1,
+        vec![value],
+        references,
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap()
 }
 
 fn metadata_refs(value: u8, references: Vec<ObjectReference>) -> ObjectRecord {
-    ObjectRecord::new(vec![value], references, 0, ObjectClass::Metadata).unwrap()
+    ObjectRecord::new(
+        ObjectKind::Commit,
+        ObjectFormatVersion::V1,
+        vec![value],
+        references,
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap()
 }
 
 #[derive(Clone, Copy)]
@@ -42,39 +75,27 @@ impl ObjectIdentity for TestIdentity {
             state
         }
 
-        let mut state = mix(
-            0xcbf2_9ce4_8422_2325,
+        let mut state = mix(0xcbf2_9ce4_8422_2325, &record.kind().code().to_le_bytes());
+        state = mix(state, &record.format_version().get().to_le_bytes());
+        state = mix(
+            state,
             &u64::try_from(record.canonical_bytes().len())
                 .unwrap()
                 .to_le_bytes(),
         );
         state = mix(state, record.canonical_bytes());
         state = mix(state, &record.logical_bytes().to_le_bytes());
-        state = mix(
-            state,
-            &[match record.class() {
-                ObjectClass::Data => 0,
-                ObjectClass::Metadata => 1,
-            }],
-        );
+        state = mix(state, &[record.class().code()]);
         for reference in record.references() {
             state = mix(
                 state,
-                &u64::try_from(reference.label().len())
+                &u64::try_from(reference.label().as_bytes().len())
                     .unwrap()
                     .to_le_bytes(),
             );
-            state = mix(state, reference.label());
+            state = mix(state, reference.label().as_bytes());
             state = mix(state, reference.target().as_bytes());
-            state = mix(
-                state,
-                &[match reference.kind() {
-                    ReferenceKind::Owns => 0,
-                    ReferenceKind::Evidence => 1,
-                    ReferenceKind::Lineage => 2,
-                    ReferenceKind::Derived => 3,
-                }],
-            );
+            state = mix(state, &[reference.kind().code()]);
         }
 
         let mut bytes = [0_u8; 32];
@@ -103,16 +124,16 @@ fn proof_tree() -> ProofTree {
     let home_record = metadata_refs(
         3,
         vec![
-            ObjectReference::owns(b"a".to_vec(), first),
-            ObjectReference::owns(b"b".to_vec(), second),
+            ObjectReference::owns(label(b"a"), first),
+            ObjectReference::owns(label(b"b"), second),
         ],
     );
     let home = identity.identify(&home_record);
     let root_record = metadata_refs(
         4,
         vec![
-            ObjectReference::new(b"audit".to_vec(), id(99), ReferenceKind::Evidence),
-            ObjectReference::owns(b"home".to_vec(), home),
+            ObjectReference::new(label(b"audit"), id(99), ReferenceKind::Evidence),
+            ObjectReference::owns(label(b"home"), home),
         ],
     );
     let root = identity.identify(&root_record);
@@ -159,6 +180,14 @@ fn identifier_collision_is_never_silently_deduplicated() {
 }
 
 #[test]
+fn format_versions_and_replica_requirements_are_non_zero_by_type() {
+    assert_eq!(ObjectFormatVersion::new(0), None);
+    assert_eq!(ObjectFormatVersion::new(1), Some(ObjectFormatVersion::V1));
+    assert_eq!(ReplicaCount::new(0), None);
+    assert_eq!(ReplicaCount::new(3).unwrap().get(), 3);
+}
+
+#[test]
 fn physical_blob_cannot_alias_different_logical_content() {
     let mut world = World::<&str>::new();
     world.insert_object(id(1), data(1)).unwrap();
@@ -191,6 +220,21 @@ fn incomplete_root_is_not_visible() {
 }
 
 #[test]
+fn principal_root_must_name_a_commit_object() {
+    let mut world = World::<&str>::new();
+    world.insert_object(id(1), data(1)).unwrap();
+
+    assert_eq!(
+        world.compare_and_swap_root("alice", None, id(1)),
+        Err(ModelError::RootNotCommit {
+            object: id(1),
+            actual: ObjectKind::Chunk,
+        })
+    );
+    assert_eq!(world.root(&"alice"), None);
+}
+
+#[test]
 fn non_owning_reference_does_not_expand_principal_closure() {
     let mut world = World::<&str>::new();
     world
@@ -199,7 +243,7 @@ fn non_owning_reference_does_not_expand_principal_closure() {
             metadata_refs(
                 2,
                 vec![ObjectReference::new(
-                    vec![0],
+                    ReferenceLabel::new(vec![0]),
                     id(1),
                     ReferenceKind::Evidence,
                 )],
@@ -231,7 +275,7 @@ fn evidence_requires_its_own_pin_for_retention() {
             metadata_refs(
                 2,
                 vec![ObjectReference::new(
-                    vec![0],
+                    ReferenceLabel::new(vec![0]),
                     id(1),
                     ReferenceKind::Evidence,
                 )],
@@ -256,12 +300,19 @@ fn evidence_requires_its_own_pin_for_retention() {
 #[test]
 fn one_label_cannot_have_conflicting_reference_relations() {
     let references = vec![
-        ObjectReference::owns(vec![0], id(1)),
-        ObjectReference::new(vec![0], id(2), ReferenceKind::Lineage),
+        ObjectReference::owns(ReferenceLabel::new(vec![0]), id(1)),
+        ObjectReference::new(ReferenceLabel::new(vec![0]), id(2), ReferenceKind::Lineage),
     ];
 
     assert_eq!(
-        ObjectRecord::new(vec![2], references, 0, ObjectClass::Metadata),
+        ObjectRecord::new(
+            ObjectKind::Commit,
+            ObjectFormatVersion::V1,
+            vec![2],
+            references,
+            0,
+            ObjectClass::Metadata,
+        ),
         Err(ModelError::NonCanonicalReferences)
     );
 }
@@ -276,8 +327,8 @@ fn different_labels_may_share_one_owned_target() {
             metadata_refs(
                 2,
                 vec![
-                    ObjectReference::owns(vec![0], id(1)),
-                    ObjectReference::owns(vec![1], id(1)),
+                    ObjectReference::owns(ReferenceLabel::new(vec![0]), id(1)),
+                    ObjectReference::owns(ReferenceLabel::new(vec![1]), id(1)),
                 ],
             ),
         )
@@ -292,17 +343,28 @@ fn different_labels_may_share_one_owned_target() {
 }
 
 #[test]
+fn borrowed_reference_label_queries_without_allocation() {
+    let tree = proof_tree();
+    let home = ReferenceLabel::new(b"home".as_slice());
+
+    assert_eq!(
+        tree.root.1.reference(&home).map(ObjectReference::target),
+        Some(tree.home.0)
+    );
+}
+
+#[test]
 fn selector_rejects_empty_duplicate_and_redundant_paths() {
     assert_eq!(
         StateSelector::new(vec![]),
         Err(ModelError::NonCanonicalSelector)
     );
-    let home = ReferencePath::new(vec![b"home".to_vec()]);
+    let home = ReferencePath::new(vec![label(b"home")]);
     assert_eq!(
         StateSelector::new(vec![home.clone(), home.clone()]),
         Err(ModelError::NonCanonicalSelector)
     );
-    let child = ReferencePath::new(vec![b"home".to_vec(), b"a".to_vec()]);
+    let child = ReferencePath::new(vec![label(b"home"), label(b"a")]);
     assert_eq!(
         StateSelector::new(vec![home, child]),
         Err(ModelError::NonCanonicalSelector)
@@ -312,11 +374,8 @@ fn selector_rejects_empty_duplicate_and_redundant_paths() {
 #[test]
 fn view_proof_discloses_only_selected_owned_closure() {
     let tree = proof_tree();
-    let selector = StateSelector::new(vec![ReferencePath::new(vec![
-        b"home".to_vec(),
-        b"a".to_vec(),
-    ])])
-    .unwrap();
+    let selector =
+        StateSelector::new(vec![ReferencePath::new(vec![label(b"home"), label(b"a")])]).unwrap();
     let records = ordered_records(vec![
         tree.root.clone(),
         tree.home.clone(),
@@ -333,11 +392,8 @@ fn view_proof_discloses_only_selected_owned_closure() {
 #[test]
 fn view_proof_rejects_substitution_excess_and_non_owning_path() {
     let tree = proof_tree();
-    let selected_first = StateSelector::new(vec![ReferencePath::new(vec![
-        b"home".to_vec(),
-        b"a".to_vec(),
-    ])])
-    .unwrap();
+    let selected_first =
+        StateSelector::new(vec![ReferencePath::new(vec![label(b"home"), label(b"a")])]).unwrap();
 
     let substituted = ordered_records(vec![
         tree.root.clone(),
@@ -347,7 +403,7 @@ fn view_proof_rejects_substitution_excess_and_non_owning_path() {
     let proof = StateViewProof::new(tree.root.0, selected_first.clone(), substituted).unwrap();
     assert!(matches!(
         proof.verify(&tree.identity),
-        Err(ModelError::ProofIdentityMismatch { .. })
+        Err(ModelError::ObjectIdentityMismatch { .. })
     ));
 
     let excessive = ordered_records(vec![
@@ -363,12 +419,12 @@ fn view_proof_rejects_substitution_excess_and_non_owning_path() {
     );
 
     let audit_selector =
-        StateSelector::new(vec![ReferencePath::new(vec![b"audit".to_vec()])]).unwrap();
+        StateSelector::new(vec![ReferencePath::new(vec![label(b"audit")])]).unwrap();
     let proof = StateViewProof::new(tree.root.0, audit_selector, vec![tree.root.clone()]).unwrap();
     assert_eq!(
         proof.verify(&tree.identity),
         Err(ModelError::ReferenceNotOwned {
-            label: b"audit".to_vec(),
+            label: label(b"audit"),
         })
     );
 }
@@ -376,7 +432,7 @@ fn view_proof_rejects_substitution_excess_and_non_owning_path() {
 #[test]
 fn view_proof_requires_complete_selected_closure() {
     let tree = proof_tree();
-    let selector = StateSelector::new(vec![ReferencePath::new(vec![b"home".to_vec()])]).unwrap();
+    let selector = StateSelector::new(vec![ReferencePath::new(vec![label(b"home")])]).unwrap();
     let records = ordered_records(vec![tree.root.clone(), tree.home.clone()]);
     let proof = StateViewProof::new(tree.root.0, selector, records).unwrap();
 
@@ -395,17 +451,17 @@ fn transition_witness_recomputes_labelled_root_replacement() {
     let next_home_record = tree
         .home
         .1
-        .replace_owned_target(b"a", tree.first.0, replacement)
+        .replace_owned_target(&label(b"a"), tree.first.0, replacement)
         .unwrap();
     let next_home = tree.identity.identify(&next_home_record);
     let next_root_record = tree
         .root
         .1
-        .replace_owned_target(b"home", tree.home.0, next_home)
+        .replace_owned_target(&label(b"home"), tree.home.0, next_home)
         .unwrap();
     let next_root = tree.identity.identify(&next_root_record);
     let patch = OwnedSubtreePatch::new(
-        ReferencePath::new(vec![b"home".to_vec(), b"a".to_vec()]),
+        ReferencePath::new(vec![label(b"home"), label(b"a")]),
         tree.first.0,
         replacement,
     );
@@ -417,7 +473,7 @@ fn transition_witness_recomputes_labelled_root_replacement() {
         tree.root.0,
         id(77),
         OwnedSubtreePatch::new(
-            ReferencePath::new(vec![b"home".to_vec(), b"a".to_vec()]),
+            ReferencePath::new(vec![label(b"home"), label(b"a")]),
             tree.first.0,
             replacement,
         ),
@@ -435,7 +491,7 @@ fn transition_witness_rejects_wrong_target_root_and_extra_records() {
     let tree = proof_tree();
     let replacement = tree.identity.identify(&data(9));
     let wrong_target = OwnedSubtreePatch::new(
-        ReferencePath::new(vec![b"home".to_vec(), b"b".to_vec()]),
+        ReferencePath::new(vec![label(b"home"), label(b"b")]),
         tree.first.0,
         replacement,
     );
@@ -488,7 +544,7 @@ fn compare_and_swap_prevents_lost_update() {
     world.insert_object(id(4), data(4)).unwrap();
 
     let stale = RootState {
-        generation: 99,
+        generation: RootGeneration::new(99),
         commit: id(3),
     };
     assert!(matches!(
@@ -521,6 +577,22 @@ fn failed_import_is_invisible() {
     assert_eq!(
         destination.import_closure(&records, id(3)),
         Err(ModelError::MissingObject(id(1)))
+    );
+    assert_eq!(destination.object_count(), 0);
+}
+
+#[test]
+fn extraneous_import_object_is_rejected_atomically() {
+    let mut source = World::<&str>::new();
+    insert_small_tree(&mut source);
+    source.insert_object(id(9), data(9)).unwrap();
+    let mut records = source.export_closure(id(3)).unwrap();
+    records.push((id(9), data(9)));
+
+    let mut destination = World::<&str>::new();
+    assert_eq!(
+        destination.import_closure(&records, id(3)),
+        Err(ModelError::ExtraneousImportObject(id(9)))
     );
     assert_eq!(destination.object_count(), 0);
 }
@@ -650,7 +722,9 @@ fn placement_epoch_changes_no_logical_root() {
         (blob(2), vec![StorageNodeId::new(1), StorageNodeId::new(2)]),
         (blob(3), vec![StorageNodeId::new(1), StorageNodeId::new(2)]),
     ];
-    world.publish_placement_epoch(first, &plan, 2).unwrap();
+    world
+        .publish_placement_epoch(first, &plan, ReplicaCount::new(2).unwrap())
+        .unwrap();
 
     world.register_representation(id(1), blob(11)).unwrap();
     world.register_representation(id(2), blob(12)).unwrap();
@@ -661,7 +735,9 @@ fn placement_epoch_changes_no_logical_root() {
         (blob(12), vec![StorageNodeId::new(2), StorageNodeId::new(3)]),
         (blob(13), vec![StorageNodeId::new(2), StorageNodeId::new(3)]),
     ];
-    world.publish_placement_epoch(second, &moved, 2).unwrap();
+    world
+        .publish_placement_epoch(second, &moved, ReplicaCount::new(2).unwrap())
+        .unwrap();
 
     assert_eq!(world.root(&"alice"), Some(root));
     assert!(world.replicas(first, blob(1)).is_some());
@@ -687,9 +763,47 @@ fn under_replicated_epoch_is_not_published() {
     ];
 
     assert!(matches!(
-        world.publish_placement_epoch(epoch, &plan, 2),
+        world.publish_placement_epoch(epoch, &plan, ReplicaCount::new(2).unwrap()),
         Err(ModelError::InsufficientReplicas { .. })
     ));
     assert_eq!(world.active_placement_epoch(), None);
     assert!(world.replicas(epoch, blob(1)).is_none());
+}
+
+#[test]
+fn placement_epochs_reject_unknown_blobs_stale_versions_and_missing_retirement() {
+    let mut world = World::<&str>::new();
+    assert_eq!(
+        world.publish_placement_epoch(
+            PlacementEpoch::new(1),
+            &[(blob(9), vec![StorageNodeId::new(1)])],
+            ReplicaCount::new(1).unwrap(),
+        ),
+        Err(ModelError::UnregisteredBlob(blob(9)))
+    );
+
+    insert_small_tree(&mut world);
+    world.compare_and_swap_root("alice", None, id(3)).unwrap();
+    let first = PlacementEpoch::new(2);
+    let plan = vec![
+        (blob(1), vec![StorageNodeId::new(1)]),
+        (blob(2), vec![StorageNodeId::new(1)]),
+        (blob(3), vec![StorageNodeId::new(1)]),
+    ];
+    world
+        .publish_placement_epoch(first, &plan, ReplicaCount::new(1).unwrap())
+        .unwrap();
+
+    let stale = PlacementEpoch::new(1);
+    assert_eq!(
+        world.publish_placement_epoch(stale, &plan, ReplicaCount::new(1).unwrap()),
+        Err(ModelError::StalePlacementEpoch {
+            proposed: stale,
+            active: first,
+        })
+    );
+    assert_eq!(
+        world.retire_placement_epoch(PlacementEpoch::new(99)),
+        Err(ModelError::PlacementEpochMissing(PlacementEpoch::new(99)))
+    );
 }
