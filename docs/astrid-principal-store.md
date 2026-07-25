@@ -94,9 +94,9 @@ This separation is the key alternative to “CAS all the things.” Content obje
 answer **what**. Transition records answer **who changed what, under which
 authority**. Placement records answer **where the recoverable copies are**.
 
-## 4. Current Astrid state and migration constraints
+## 4. Baseline Astrid state and migration constraints
 
-Today:
+At the start of this design:
 
 - `astrid-storage` exposes `KvStore`, `MemoryKvStore`, `SurrealKvStore`,
   `ScopedKvStore`, identity storage, secret storage, and optional SurrealDB.

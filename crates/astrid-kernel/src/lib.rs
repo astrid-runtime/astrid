@@ -2217,9 +2217,10 @@ impl Kernel {
             tracing::warn!(error = %e, "failed to clear capability session on shutdown");
         }
 
-        // 2. Release the persistent-store locks FIRST — BEFORE the best-effort
-        // capsule drain. The audit/KV surrealkv `LOCK` MUST be freed on the
-        // graceful path regardless of how long the drain takes: each capsule's
+        // 2. Release persistent resources FIRST — BEFORE the best-effort
+        // capsule drain. The audit SurrealKV `LOCK` and principal-store file
+        // handles MUST be freed on the graceful path regardless of how long
+        // the drain takes: each capsule's
         // unload is bounded (~1s of `Arc::get_mut` retries) but a large fleet
         // draining sequentially could exceed the OS-thread watchdog's force-exit
         // grace, and a force-exit with the audit `LOCK` still held is the exact
@@ -2445,10 +2446,14 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
     let event_bus = Arc::new(EventBus::new());
     let capsules = Arc::new(RwLock::new(CapsuleRegistry::new()));
 
-    // Persistent KV backing capabilities + identity store.
-    let kv: Arc<dyn astrid_storage::KvStore> = Arc::new(
-        astrid_storage::SurrealKvStore::open(home.state_db_path()).expect("test kernel: open kv"),
-    );
+    // Use the same authoritative principal-store composition as native boot.
+    // A test helper opening the legacy import source directly would let kernel
+    // tests pass against a runtime topology that production cannot select.
+    let quota: Arc<dyn astrid_storage::KvQuotaResolver<astrid_storage::StateOwner>> =
+        Arc::new(|_| Ok(None));
+    let kv = astrid_storage::open_runtime_kv(&home, quota)
+        .await
+        .expect("test kernel: open authoritative principal store");
     let capabilities = Arc::new(
         CapabilityStore::with_kv_store(Arc::clone(&kv))
             .await

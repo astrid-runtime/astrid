@@ -429,9 +429,10 @@ evidence contract lives in the
 [Astrid Principal Store](astrid-principal-store.md) design and its
 [evidence plan](astrid-principal-store-evidence.md).
 
-The first runtime domain should use the existing `MemoryKvStore` only to prove
-component execution. The next gate must be durable state; an in-memory success is
-not an Astrid system.
+The first runtime-domain prototype may use `MemoryKvStore` only to prove
+component execution. The native host now opens `TreeKvStore` over the durable
+principal-store engine for authoritative kernel KV. An in-memory success is not
+an Astrid system.
 
 Prefer a user-space storage service over putting a filesystem or database in ring 0.
 It can expose a block-backed log-structured KV protocol implementing `KvStore`
@@ -445,11 +446,13 @@ Required semantics include:
 - power-loss tests;
 - versioned on-disk format and migration policy.
 
-Audit currently hides its storage trait inside `astrid-audit` and exposes only
-SurrealKV-backed or in-memory constructors. It should gain an additive constructor
-over an injected audit storage/KV surface so capability state and the audit chain can
-use the user-space durable backend without changing public wire formats. Ring 0 can
-anchor a sequence number or root hash; it should not understand log records.
+Capability state already uses the principal store through the kernel's injected
+`KvStore`. Audit still hides its storage trait inside `astrid-audit` and exposes
+only SurrealKV-backed or in-memory constructors. It should gain an additive
+constructor over an injected audit storage/KV surface so the audit chain can
+join the user-space durable backend without changing public wire formats. Ring
+0 can anchor a sequence number or root hash; it should not understand log
+records.
 
 ### 5.4 Networking and ingress
 

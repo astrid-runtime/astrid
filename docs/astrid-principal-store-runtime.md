@@ -49,7 +49,14 @@ outputs, ownership, or historical transitions into sparse relations and
 einsum-like evaluation plans. It is a derived reasoning surface, not a knowledge
 graph and not a prerequisite for reading a file or recovering a principal.
 
-## 21. Implementation order
+## 21. Implementation order and current boundary
+
+The current implementation stack completes the model, in-memory compatibility
+adapter, durable segment/root engine, persistent tree projection, quota
+enforcement, and native KV cutover described below. `SurrealKvStore` remains a
+migration oracle and read-only import source, not a configurable runtime
+backend. Typed filesystem roots, portable export/import, placement execution,
+and native block transport remain subsequent work.
 
 1. Land `astrid-storage-model` with canonical identifiers, ownership classes,
    object grammar, closure validation, accounting definitions, and a small
