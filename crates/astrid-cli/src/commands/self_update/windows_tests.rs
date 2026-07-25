@@ -246,6 +246,112 @@ fn parent_wait_result_distinguishes_timeout_and_api_failure() {
 }
 
 #[test]
+fn later_missing_payload_persists_recovery_pending_and_retry_material() {
+    let directory = crate::test_support::private_tempdir();
+    let install = directory.path();
+    let staging = private_staging_dir(install);
+    let transaction = transaction(install, &staging, 1);
+    let path = transaction_path(&staging);
+    for name in WINDOWS_MANAGED_BINARIES {
+        write(&staging.join(name), format!("retry {name}").as_bytes());
+    }
+    write(&transaction.helper, b"retry helper");
+    write(
+        &install.join(WINDOWS_MANAGED_BINARIES[0]),
+        b"readable prior payload",
+    );
+    write_transaction(&path, &transaction).unwrap();
+    write_receipt(
+        &transaction,
+        &receipt_for(&transaction, ReceiptState::Applying, None),
+    )
+    .unwrap();
+
+    let error = finish_recovery_without_journal(&path, &transaction).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("could not determine the installed payload")
+    );
+    let receipt = read_receipt(&receipt_path(&transaction)).unwrap();
+    assert_eq!(receipt.state, ReceiptState::RecoveryPending);
+    assert!(
+        receipt
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("could not determine the installed payload"))
+    );
+    assert!(
+        path.exists(),
+        "indeterminate recovery discarded its retry transaction"
+    );
+    assert!(
+        staging.exists(),
+        "indeterminate recovery discarded its durable stage"
+    );
+    assert!(
+        transaction.helper.exists(),
+        "indeterminate recovery discarded its retry helper"
+    );
+    for name in WINDOWS_MANAGED_BINARIES {
+        assert!(
+            staging.join(name).exists(),
+            "indeterminate recovery discarded staged {name}"
+        );
+    }
+}
+
+#[test]
+fn complete_prior_payload_is_terminal_before_mutation() {
+    let directory = crate::test_support::private_tempdir();
+    let install = directory.path();
+    let staging = private_staging_dir(install);
+    let transaction = transaction(install, &staging, 1);
+    let path = transaction_path(&staging);
+    for name in WINDOWS_MANAGED_BINARIES {
+        write(&install.join(name), format!("prior {name}").as_bytes());
+    }
+    write_transaction(&path, &transaction).unwrap();
+    write_receipt(
+        &transaction,
+        &receipt_for(&transaction, ReceiptState::Applying, None),
+    )
+    .unwrap();
+
+    finish_recovery_without_journal(&path, &transaction).unwrap();
+
+    let receipt = read_receipt(&receipt_path(&transaction)).unwrap();
+    assert_eq!(receipt.state, ReceiptState::FailedBeforeMutation);
+    assert!(
+        receipt
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("no journaled executable changes"))
+    );
+    assert!(
+        !path.exists(),
+        "terminal pre-mutation transaction survived cleanup"
+    );
+}
+
+#[test]
+fn pending_receipt_failure_preserves_both_error_causes() {
+    let directory = crate::test_support::private_tempdir();
+    let install = directory.path();
+    let staging = private_staging_dir(install);
+    let transaction = transaction(install, &staging, 1);
+    std::fs::create_dir(receipt_path(&transaction)).unwrap();
+
+    let error = preserve_recovery_pending(&transaction, anyhow::anyhow!("inspection sentinel"))
+        .unwrap_err();
+    let chain = format!("{error:#}");
+
+    assert!(chain.contains("failed to persist the pending Windows recovery receipt"));
+    assert!(chain.contains("inspection sentinel"));
+}
+
+#[test]
 fn complete_transaction_swaps_all_binaries_and_keeps_backups() {
     let directory = crate::test_support::private_tempdir();
     let install = directory.path();

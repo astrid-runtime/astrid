@@ -426,23 +426,7 @@ fn recover(
             Ok(())
         },
         Ok(astrid_core::platform_fs::ExecutableRecoveryOutcome::NotNeeded) => {
-            let state = if installed_payload_matches(&transaction)? {
-                ReceiptState::Succeeded
-            } else {
-                ReceiptState::FailedRecovered
-            };
-            let detail = (state == ReceiptState::FailedRecovered).then(|| {
-                anyhow::anyhow!(
-                    "the interrupted Windows update made no journaled executable changes"
-                )
-            });
-            write_receipt(
-                &transaction,
-                &receipt_for(&transaction, state, detail.as_ref()),
-            )?;
-            cleanup_completed_payload(transaction_path, &transaction)
-                .context("failed to clean the completed Windows update payload")?;
-            Ok(())
+            finish_recovery_without_journal(transaction_path, &transaction)
         },
         Ok(outcome) => anyhow::bail!(
             "this Astrid CLI cannot safely interpret executable recovery outcome {outcome:?}"
@@ -450,33 +434,63 @@ fn recover(
         Err(recovery_error) => {
             let error = anyhow::Error::new(recovery_error)
                 .context("Windows executable recovery remains pending");
-            write_receipt(
-                &transaction,
-                &receipt_for(&transaction, ReceiptState::RecoveryPending, Some(&error)),
-            )
-            .context("failed to persist the pending Windows recovery receipt")?;
-            Err(error)
+            preserve_recovery_pending(&transaction, error)
         },
     }
 }
 
+fn finish_recovery_without_journal(
+    transaction_path: &Path,
+    transaction: &Transaction,
+) -> anyhow::Result<()> {
+    let state = match installed_payload_matches(transaction) {
+        Ok(true) => ReceiptState::Succeeded,
+        Ok(false) => ReceiptState::FailedBeforeMutation,
+        Err(error) => {
+            return preserve_recovery_pending(
+                transaction,
+                error.context(
+                    "could not determine the installed payload after Windows update recovery",
+                ),
+            );
+        },
+    };
+    let detail = (state == ReceiptState::FailedBeforeMutation).then(|| {
+        anyhow::anyhow!("the interrupted Windows update made no journaled executable changes")
+    });
+    write_receipt(
+        transaction,
+        &receipt_for(transaction, state, detail.as_ref()),
+    )?;
+    cleanup_completed_payload(transaction_path, transaction)
+        .context("failed to clean the completed Windows update payload")
+}
+
+fn preserve_recovery_pending(
+    transaction: &Transaction,
+    error: anyhow::Error,
+) -> anyhow::Result<()> {
+    if let Err(persistence_error) = write_receipt(
+        transaction,
+        &receipt_for(transaction, ReceiptState::RecoveryPending, Some(&error)),
+    ) {
+        return Err(persistence_error.context(format!(
+            "failed to persist the pending Windows recovery receipt; \
+             original recovery error: {error:#}"
+        )));
+    }
+    Err(error)
+}
+
 fn installed_payload_matches(transaction: &Transaction) -> anyhow::Result<bool> {
+    let mut all_match = true;
     for entry in &transaction.entries {
         let live = transaction.install_dir.join(&entry.name);
-        match digest_file(&live) {
-            Ok(digest) if digest == entry.blake3 => {},
-            Ok(_) => return Ok(false),
-            Err(error)
-                if error
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
-            {
-                return Ok(false);
-            },
-            Err(error) => return Err(error),
+        if digest_file(&live)? != entry.blake3 {
+            all_match = false;
         }
     }
-    Ok(true)
+    Ok(all_match)
 }
 
 fn stage_for_named_transaction_path<'a>(

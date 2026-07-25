@@ -802,7 +802,7 @@ fn ordinary_invocation_cleans_an_abandoned_provisional_handoff() {
 }
 
 #[test]
-fn ordinary_invocation_recovers_an_interrupted_update_before_dispatch() {
+fn ordinary_invocation_reconciles_an_interrupted_update_before_dispatch() {
     let _serial = updater_integration_guard();
     let (root, _root_guard) = private_test_root();
     let install = root.join("install");
@@ -871,6 +871,10 @@ fn ordinary_invocation_recovers_an_interrupted_update_before_dispatch() {
     let status = wait_for_child(&mut blocked.0, Duration::from_secs(15));
     assert!(!status.success(), "interrupted update was not fail-closed");
 
-    wait_for_receipt_state(&receipt_path, "failed_recovered", Duration::from_secs(30));
+    wait_for_receipt_state(
+        &receipt_path,
+        "failed_before_mutation",
+        Duration::from_secs(30),
+    );
     wait_for_recovered_stage_cleanup(&install, &staging, Duration::from_secs(15));
 }
