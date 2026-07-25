@@ -21,9 +21,9 @@ pub(super) use windows_sys::Wdk::Storage::FileSystem::{
     FileRenameInformationEx, NtCreateFile, NtSetInformationFile,
 };
 pub(super) use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, GENERIC_ALL, GENERIC_READ,
-    GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree, RtlNtStatusToDosError,
-    UNICODE_STRING,
+    CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_SHARING_VIOLATION, ERROR_SUCCESS, GENERIC_ALL,
+    GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
+    RtlNtStatusToDosError, UNICODE_STRING,
 };
 pub(super) use windows_sys::Win32::Security::Authorization::{
     ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GetSecurityInfo, NO_MULTIPLE_TRUSTEE,

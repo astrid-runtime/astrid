@@ -70,7 +70,22 @@ pub(super) fn acquire_named_private_lock(
                 GENERIC_READ | GENERIC_WRITE | READ_CONTROL,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 FILE_OPEN,
-            )?;
+            )
+            .map_err(|error| {
+                if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION.cast_signed()) {
+                    // The creator retains DELETE access without sharing delete
+                    // so an owner cannot have its lock path replaced. Windows
+                    // reports a second opener as sharing contention before
+                    // LockFileEx can report WouldBlock; normalize both native
+                    // contention paths to the public lock contract.
+                    with_context(
+                        io::Error::new(io::ErrorKind::WouldBlock, error),
+                        format!("{owner_description} owns {}", path.display()),
+                    )
+                } else {
+                    error
+                }
+            })?;
             validate_private_acl_handle(handle.0, false, &path.display().to_string())?;
             let raw = handle.0;
             std::mem::forget(handle);
