@@ -133,7 +133,7 @@ where
                 && used > limit
                 && used > header.quota_bytes
             {
-                return Err(StorageError::QuotaExceeded { used, limit });
+                return Err(StorageError::quota_exceeded(used, limit));
             }
             let transaction = context.finish(header, tree, logical_bytes, used)?;
             match self.engine.commit_kv_root(transaction) {
