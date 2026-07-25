@@ -106,7 +106,7 @@ pub(super) fn open_guarded_private_append_file(
     let handle = match open_guarded_child_with_options(
         guard,
         name,
-        FILE_APPEND_DATA | READ_CONTROL | WRITE_DAC,
+        FILE_APPEND_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
         FILE_CREATE,
     ) {
@@ -115,7 +115,7 @@ pub(super) fn open_guarded_private_append_file(
             open_guarded_child_with_options(
                 guard,
                 name,
-                FILE_APPEND_DATA | READ_CONTROL,
+                FILE_APPEND_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 FILE_OPEN,
             )?
@@ -127,8 +127,10 @@ pub(super) fn open_guarded_private_append_file(
     let raw = handle.0;
     std::mem::forget(handle);
     // SAFETY: ownership transfers from OwnedHandle exactly once. The handle
-    // carries FILE_APPEND_DATA without FILE_WRITE_DATA, so local writes cannot
-    // overwrite existing log bytes even across independent process handles.
+    // carries FILE_APPEND_DATA without FILE_WRITE_DATA; FILE_READ_ATTRIBUTES is
+    // present only so the exact-handle regular-file validation above can query
+    // its identity. Local writes therefore cannot overwrite existing log bytes
+    // even across independent process handles.
     Ok(unsafe { File::from_raw_handle(raw.cast()) })
 }
 
