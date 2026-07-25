@@ -245,10 +245,9 @@ fn wait_for_update_helper(
             let stderr = read_bounded_diagnostic(stderr_path);
             let snapshot = update_helper_diagnostic(staging);
             panic!(
-                "timed out waiting for Windows update helper after {:?}; \
+                "timed out waiting for Windows update helper after {elapsed_at_deadline:?}; \
                  cleanup={cleanup:?}; final-status={final_status:?}; \
-                 stderr={stderr:?}; snapshot={snapshot}",
-                elapsed_at_deadline
+                 stderr={stderr:?}; snapshot={snapshot}"
             );
         }
         std::thread::sleep(CHILD_POLL_INTERVAL);
@@ -466,12 +465,11 @@ fn wait_for_recovered_stage_cleanup(install: &Path, staging: &Path, timeout: Dur
             "normal command did not resume after recovery; snapshot={}",
             update_helper_diagnostic(staging)
         );
-        if Instant::now() >= deadline {
-            panic!(
-                "reported recovery stage was not cleaned; snapshot={}",
-                update_helper_diagnostic(staging)
-            );
-        }
+        assert!(
+            Instant::now() < deadline,
+            "reported recovery stage was not cleaned; snapshot={}",
+            update_helper_diagnostic(staging)
+        );
         std::thread::sleep(Duration::from_millis(25));
     }
 }
