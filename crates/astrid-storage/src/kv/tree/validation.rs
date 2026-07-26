@@ -18,7 +18,7 @@ pub(in crate::kv) struct TreeValidation {
 }
 
 impl TreeValidation {
-    const EMPTY: Self = Self {
+    pub(in crate::kv) const EMPTY: Self = Self {
         root: None,
         logical_bytes: 0,
         quota_bytes: 0,
