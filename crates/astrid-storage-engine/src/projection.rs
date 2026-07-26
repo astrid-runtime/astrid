@@ -45,18 +45,37 @@ pub trait PrincipalProjectionEngine<P>: Send + Sync {
     fn identify_object(&self, record: &ObjectRecord) -> ObjectId;
 
     /// Return a principal's current root.
+    ///
+    /// # Errors
+    ///
+    /// Returns a projection error when authoritative root state cannot be
+    /// read.
     fn current_root(&self, principal: &P) -> Result<Option<RootState>, PrincipalProjectionError>;
 
     /// Load one immutable object.
+    ///
+    /// # Errors
+    ///
+    /// Returns a projection error when the object arena cannot complete the
+    /// read.
     fn load_object(&self, id: ObjectId) -> Result<Option<ObjectRecord>, PrincipalProjectionError>;
 
     /// Atomically publish one principal-state transition.
+    ///
+    /// # Errors
+    ///
+    /// Returns a projection error when identity, graph, compare-and-swap, or
+    /// durable publication fails.
     fn commit_root(
         &self,
         transaction: RootTransaction<P>,
     ) -> Result<CommitOutcome, PrincipalProjectionError>;
 
     /// Flush authoritative engine state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a projection error when durable state cannot be flushed.
     fn flush_projection(&self) -> Result<(), PrincipalProjectionError>;
 }
 

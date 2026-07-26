@@ -67,6 +67,11 @@ where
     E: PrincipalProjectionEngine<P>,
 {
     /// Store bytes under `name` using Astrid's pinned chunking profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns a content, principal-graph, projection, or quota error without
+    /// publishing a partial root.
     pub fn put(
         &self,
         principal: &P,
@@ -77,6 +82,11 @@ where
     }
 
     /// Store bytes under `name` using an explicit persistent profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns a content, principal-graph, projection, or quota error without
+    /// publishing a partial root.
     pub fn put_with_profile(
         &self,
         principal: &P,
@@ -132,6 +142,11 @@ where
     ///
     /// Immutable chunks remain available while any authoritative root reaches
     /// them and become garbage-collection candidates otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns a principal-graph or projection error without partially
+    /// changing the catalog.
     pub fn delete(&self, principal: &P, name: &ContentName) -> Result<bool, PrincipalContentError> {
         loop {
             let mut header = self.header(principal.clone())?;
@@ -148,12 +163,22 @@ where
     }
 
     /// List a principal's named content in canonical byte order.
+    ///
+    /// # Errors
+    ///
+    /// Returns a principal-graph or projection error when the authoritative
+    /// catalog cannot be decoded.
     pub fn list(&self, principal: &P) -> Result<Vec<ContentEntry>, PrincipalContentError> {
         self.header(principal.clone())
             .map(|header| header.catalog.list())
     }
 
     /// Describe one named value without reading its chunks.
+    ///
+    /// # Errors
+    ///
+    /// Returns a content, principal-graph, or projection error when metadata
+    /// is missing or invalid.
     pub fn describe(
         &self,
         principal: &P,
@@ -176,6 +201,11 @@ where
     }
 
     /// Reconstruct one complete named value.
+    ///
+    /// # Errors
+    ///
+    /// Returns a content, principal-graph, projection, range, or allocation
+    /// error when the value cannot be reconstructed exactly.
     pub fn read(
         &self,
         principal: &P,
@@ -193,6 +223,11 @@ where
     }
 
     /// Reconstruct an exact range of one named value.
+    ///
+    /// # Errors
+    ///
+    /// Returns a content, principal-graph, projection, range, or allocation
+    /// error when the requested bytes cannot be reconstructed exactly.
     pub fn read_range(
         &self,
         principal: &P,
@@ -214,6 +249,10 @@ where
     }
 
     /// Flush authoritative object and root records.
+    ///
+    /// # Errors
+    ///
+    /// Returns a projection error when durable state cannot be flushed.
     pub fn flush(&self) -> Result<(), PrincipalContentError> {
         self.engine.flush_projection().map_err(Into::into)
     }
@@ -364,7 +403,7 @@ where
             0,
             ObjectClass::Metadata,
         )
-        .map_err(|error| PrincipalProjectionError::Model(error))?;
+        .map_err(PrincipalProjectionError::Model)?;
         let state = self.insert(&mut records, state)?;
 
         let mut commit_references = header.preserved_commit;
@@ -388,7 +427,7 @@ where
             0,
             ObjectClass::Metadata,
         )
-        .map_err(|error| PrincipalProjectionError::Model(error))?;
+        .map_err(PrincipalProjectionError::Model)?;
         let commit = self.insert(&mut records, commit)?;
         Ok(RootTransaction::new(
             header.principal,
