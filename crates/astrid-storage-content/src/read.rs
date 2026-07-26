@@ -78,8 +78,10 @@ pub fn read_content<S: ContentSource>(
     source: &S,
     file: ObjectId,
 ) -> Result<Vec<u8>, ContentReadError<S::Error>> {
-    let descriptor = describe_content(source, file)?;
-    read_content_range(source, file, 0, descriptor.logical_bytes())
+    let record = load(source, file)?;
+    let decoded = decode_file(file, &record)?;
+    let logical_bytes = decoded.1;
+    read_decoded_range(source, file, decoded, 0, logical_bytes)
 }
 
 /// Reconstruct an exact byte range while traversing only overlapping chunks.
@@ -95,7 +97,18 @@ pub fn read_content_range<S: ContentSource>(
     length: u64,
 ) -> Result<Vec<u8>, ContentReadError<S::Error>> {
     let record = load(source, file)?;
-    let (_, logical_bytes, chunk_count, content) = decode_file(file, &record)?;
+    let decoded = decode_file(file, &record)?;
+    read_decoded_range(source, file, decoded, offset, length)
+}
+
+fn read_decoded_range<S: ContentSource>(
+    source: &S,
+    file: ObjectId,
+    decoded: (ChunkingProfile, u64, u64, Option<ObjectId>),
+    offset: u64,
+    length: u64,
+) -> Result<Vec<u8>, ContentReadError<S::Error>> {
+    let (profile, logical_bytes, chunk_count, content) = decoded;
     let end = offset
         .checked_add(length)
         .ok_or(ContentError::RangeOutOfBounds {
@@ -130,6 +143,8 @@ pub fn read_content_range<S: ContentSource>(
             logical_bytes,
             chunk_count,
             tree_depth: canonical_tree_depth(chunk_count),
+            profile,
+            ends_file: true,
         },
         RequestedRange { start: offset, end },
         &mut output,
@@ -149,6 +164,8 @@ struct ExpectedShape {
     logical_bytes: u64,
     chunk_count: u64,
     tree_depth: u32,
+    profile: ChunkingProfile,
+    ends_file: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -191,7 +208,10 @@ fn append_range<S: ContentSource>(
             }
             let children = decode_tree(object, &record, shape)?;
             let mut cursor = 0_u64;
-            for (child, child_length, child_chunk_count) in children {
+            let child_count = children.len();
+            for (index, (child, child_length, child_chunk_count)) in
+                children.into_iter().enumerate()
+            {
                 let child_end = cursor
                     .checked_add(child_length)
                     .ok_or(ContentError::LengthOverflow)?;
@@ -203,6 +223,8 @@ fn append_range<S: ContentSource>(
                             logical_bytes: child_length,
                             chunk_count: child_chunk_count,
                             tree_depth: shape.tree_depth.saturating_sub(1),
+                            profile: shape.profile,
+                            ends_file: shape.ends_file && index.saturating_add(1) == child_count,
                         },
                         RequestedRange {
                             start: range.start.saturating_sub(cursor),
@@ -239,6 +261,14 @@ fn decode_file(
     }
     let (profile, logical_bytes, chunk_count) =
         decode_file_header(object, record.canonical_bytes())?;
+    if logical_bytes != 0
+        && (chunk_count == 1) != (logical_bytes <= u64::from(profile.maximum_bytes()))
+    {
+        return Err(ContentError::InvalidObject {
+            object,
+            detail: "file chunk count violates the whole-object threshold",
+        });
+    }
     let label = ReferenceLabel::new(CONTENT_LABEL);
     let content = record.reference(&label);
     match (
@@ -289,6 +319,13 @@ fn validate_chunk(
             detail: "invalid chunk object",
         });
     }
+    validate_profile_bounds(
+        object,
+        actual,
+        shape.chunk_count,
+        shape.profile,
+        shape.ends_file,
+    )?;
     Ok(())
 }
 
@@ -371,6 +408,13 @@ fn decode_tree(
                 detail: "chunk-tree child shape is non-canonical",
             });
         }
+        validate_profile_bounds(
+            object,
+            child_length,
+            child_chunk_count,
+            shape.profile,
+            shape.ends_file && index.saturating_add(1) == count,
+        )?;
         total = total
             .checked_add(child_length)
             .ok_or(ContentError::LengthOverflow)?;
@@ -386,6 +430,39 @@ fn decode_tree(
         });
     }
     Ok(children)
+}
+
+fn validate_profile_bounds(
+    object: ObjectId,
+    logical_bytes: u64,
+    chunk_count: u64,
+    profile: ChunkingProfile,
+    ends_file: bool,
+) -> Result<(), ContentError> {
+    let maximum = u64::from(profile.maximum_bytes());
+    let maximum_total = chunk_count
+        .checked_mul(maximum)
+        .ok_or(ContentError::LengthOverflow)?;
+    let required_full_chunks = if ends_file {
+        chunk_count.saturating_sub(1)
+    } else {
+        chunk_count
+    };
+    let mut minimum_total = required_full_chunks
+        .checked_mul(u64::from(profile.minimum_bytes()))
+        .ok_or(ContentError::LengthOverflow)?;
+    if ends_file {
+        minimum_total = minimum_total
+            .checked_add(1)
+            .ok_or(ContentError::LengthOverflow)?;
+    }
+    if logical_bytes < minimum_total || logical_bytes > maximum_total {
+        return Err(ContentError::InvalidObject {
+            object,
+            detail: "content shape violates the declared chunking profile",
+        });
+    }
+    Ok(())
 }
 
 fn canonical_tree_depth(chunk_count: u64) -> u32 {

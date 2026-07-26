@@ -47,6 +47,11 @@ Version one records:
 - gear seed: zero by default; and
 - chunk-tree fanout: 128.
 
+Content at or below 256 KiB is stored as one whole chunk; FastCDC engages only
+above that threshold. The decoder enforces the same canonical choice, the
+maximum on every chunk, and the minimum on every non-final chunk. A final chunk
+may be shorter than the minimum.
+
 The dependency is exact-pinned because boundaries influence the immutable file
 root. The complete profile is encoded in each `File`, and a deterministic
 one-megabyte fixture pins every expected cut length. A future profile may use a
@@ -56,6 +61,22 @@ without making an existing file undecodable.
 The gear fingerprint is not object identity. The engine's injected,
 domain-separated BLAKE3 identity covers each chunk's complete bytes and every
 typed structural record. Collision checking still compares canonical records.
+
+The pinned sizes are measured rather than speculative. A real FastCDC sweep
+over 5.73 GB of live Astrid state and a 2.45 GB development workspace found:
+
+- whole-file identity alone removed 47.1% of the live-state bytes, collapsing
+  230,080 files to 4,551 unique whole objects;
+- total unique-byte-plus-object cost varied by only 0.5% across 8–256 KiB on
+  state and by 3% on the workspace; and
+- the 64 KiB target was within 0.07% and 1.2% of the respective measured
+  capacity optima while using 3.5–7 times fewer objects than the smaller-chunk
+  alternatives.
+
+Object count therefore governs this profile: every object consumes index,
+closure-validation, and recovery work. The result measures spatial
+deduplication in one snapshot. It must be rerun over version chains once
+temporal content history exists.
 
 ## Canonical objects
 
@@ -124,6 +145,12 @@ Each operation:
 6. publishes all reachable new records and one new principal root atomically;
 7. retries the complete logical mutation if the root CAS conflicts.
 
+The current `build_content` API accepts a complete source slice and copies its
+chunks into a complete pending record set. Peak memory therefore includes both
+the input and the built closure. It is suitable for present catalog-scale
+content, not multi-gigabyte model weights; a streaming builder is required
+before those workloads are enabled.
+
 Deletes remain possible above quota. Growth is rejected when the combined
 post-write total exceeds the live principal budget and exceeds the prior total.
 KV applies the same combined calculation, so mutation order cannot bypass the
@@ -147,11 +174,22 @@ leaks equality to an operator capable of inspecting object identities or
 physical reuse. It does not grant read authority: callers still require
 principal-scoped access to a catalog/root.
 
+Deduplication remains below the guest API line. No capsule-visible result,
+timing class, accounting delta, or admission outcome may reveal whether an
+object was newly inserted or already present. Physical insertion counts remain
+kernel diagnostics and must not appear in a future content WIT.
+
 Randomized client-side encryption prevents equality and therefore prevents
 cross-principal deduplication. Convergent encryption restores deduplication but
 introduces confirmation attacks. This PR does not silently choose either.
 Explicit principal, organization, host, or protected no-dedup domains remain
 future policy and encoding work.
+
+Deduplication and hard erasure are mutually exclusive for the same bytes.
+Erasure in a shared domain means root removal followed by garbage collection of
+only the uniquely owned closure; objects referenced by any other root survive.
+A per-principal hard-erasure domain requires per-principal encryption and
+therefore gives up cross-principal deduplication for that domain.
 
 ## Evidence
 
@@ -183,6 +221,11 @@ This increment does not provide:
 - compaction or online garbage collection;
 - export/import bundle integration; or
 - replication, placement, and rebalancing.
+
+Compaction and a persistent object index are prerequisites for heavy content
+workloads. Until they land, logical quota does not bound append-only disk
+history and store open remains proportional to the entire write history;
+chunking must not be scaled merely because this format is available.
 
 Those features can now consume a stable content primitive without changing the
 authoritative principal-root model.

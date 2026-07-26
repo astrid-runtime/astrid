@@ -90,6 +90,9 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 - **Principal state can retain named, content-defined file DAGs.** The new
   `astrid-storage-content` crate turns bytes into canonical chunk, bounded
   chunk-tree, and file objects using an exact-pinned FastCDC 2020 profile.
+  Files at or below the 256 KiB maximum remain one whole object; larger files
+  enforce the declared minimum/maximum chunk bounds during decode, with only
+  the final chunk exempt from the minimum.
   Full and range reconstruction validate the typed graph and load only
   overlapping chunks. `PrincipalContentStore` publishes named content through
   the same per-principal root CAS and durable object arena as KV, so identical

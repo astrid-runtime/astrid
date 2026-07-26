@@ -59,7 +59,8 @@ struct Child {
 ///
 /// The `FastCDC` gear fingerprint determines boundaries only; cryptographic
 /// object identity is supplied by `identity` and covers every chunk byte and
-/// structural field.
+/// structural field. Non-empty inputs at or below the profile maximum remain
+/// one whole chunk; `FastCDC` engages only above that threshold.
 ///
 /// # Errors
 ///
@@ -76,38 +77,43 @@ pub fn build_content<I: ObjectIdentity>(
     let mut unique_chunks = BTreeSet::new();
 
     if !source.is_empty() {
-        let chunker = FastCDC::with_level_and_seed(
-            source,
-            usize::try_from(profile.minimum_bytes()).map_err(|_| ContentError::LengthOverflow)?,
-            usize::try_from(profile.average_bytes()).map_err(|_| ContentError::LengthOverflow)?,
-            usize::try_from(profile.maximum_bytes()).map_err(|_| ContentError::LengthOverflow)?,
-            Normalization::Level1,
-            profile.gear_seed(),
-        );
-        for chunk in chunker {
-            let end = chunk
-                .offset
-                .checked_add(chunk.length)
-                .ok_or(ContentError::LengthOverflow)?;
-            let bytes = source
-                .get(chunk.offset..end)
-                .ok_or(ContentError::LengthOverflow)?;
-            let record = ObjectRecord::new(
-                ObjectKind::Chunk,
-                FORMAT_VERSION,
-                bytes.to_vec(),
-                Vec::new(),
-                0,
-                ObjectClass::Data,
+        let maximum =
+            usize::try_from(profile.maximum_bytes()).map_err(|_| ContentError::LengthOverflow)?;
+        if source.len() <= maximum {
+            push_chunk(
+                identity,
+                &mut records,
+                &mut chunks,
+                &mut unique_chunks,
+                source,
             )?;
-            let id = insert_record(identity, &mut records, record)?;
-            unique_chunks.insert(id);
-            chunks.push(Child {
-                id,
-                logical_bytes: u64::try_from(bytes.len())
+        } else {
+            let chunker = FastCDC::with_level_and_seed(
+                source,
+                usize::try_from(profile.minimum_bytes())
                     .map_err(|_| ContentError::LengthOverflow)?,
-                chunk_count: 1,
-            });
+                usize::try_from(profile.average_bytes())
+                    .map_err(|_| ContentError::LengthOverflow)?,
+                maximum,
+                Normalization::Level1,
+                profile.gear_seed(),
+            );
+            for chunk in chunker {
+                let end = chunk
+                    .offset
+                    .checked_add(chunk.length)
+                    .ok_or(ContentError::LengthOverflow)?;
+                let bytes = source
+                    .get(chunk.offset..end)
+                    .ok_or(ContentError::LengthOverflow)?;
+                push_chunk(
+                    identity,
+                    &mut records,
+                    &mut chunks,
+                    &mut unique_chunks,
+                    bytes,
+                )?;
+            }
         }
     }
 
@@ -136,6 +142,31 @@ pub fn build_content<I: ObjectIdentity>(
         unique_chunks: u64::try_from(unique_chunks.len())
             .map_err(|_| ContentError::LengthOverflow)?,
     })
+}
+
+fn push_chunk<I: ObjectIdentity>(
+    identity: &I,
+    records: &mut BTreeMap<ObjectId, ObjectRecord>,
+    chunks: &mut Vec<Child>,
+    unique_chunks: &mut BTreeSet<ObjectId>,
+    bytes: &[u8],
+) -> Result<(), ContentError> {
+    let record = ObjectRecord::new(
+        ObjectKind::Chunk,
+        FORMAT_VERSION,
+        bytes.to_vec(),
+        Vec::new(),
+        0,
+        ObjectClass::Data,
+    )?;
+    let id = insert_record(identity, records, record)?;
+    unique_chunks.insert(id);
+    chunks.push(Child {
+        id,
+        logical_bytes: u64::try_from(bytes.len()).map_err(|_| ContentError::LengthOverflow)?,
+        chunk_count: 1,
+    });
+    Ok(())
 }
 
 fn build_tree<I: ObjectIdentity>(

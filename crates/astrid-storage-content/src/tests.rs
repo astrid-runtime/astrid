@@ -5,12 +5,13 @@ use std::convert::Infallible;
 use std::hash::Hasher;
 
 use astrid_storage_model::{
-    ObjectClass, ObjectId, ObjectIdentity, ObjectKind, ObjectRecord, ReferenceKind,
+    ObjectClass, ObjectId, ObjectIdentity, ObjectKind, ObjectRecord, ObjectReference,
+    ReferenceKind, ReferenceLabel,
 };
 
 use crate::{
-    ChunkingProfile, ContentError, ContentReadError, ContentSource, build_content,
-    describe_content, read_content, read_content_range,
+    CONTENT_LABEL, ChunkingProfile, ContentError, ContentReadError, ContentSource, FORMAT_VERSION,
+    build_content, describe_content, encode_file_header, read_content, read_content_range,
 };
 
 #[derive(Clone, Copy)]
@@ -84,6 +85,91 @@ fn deterministic_bytes(length: usize) -> Vec<u8> {
             (state >> 37).to_le_bytes()[0]
         })
         .collect()
+}
+
+fn manual_content(profile: ChunkingProfile, chunks: &[Vec<u8>]) -> (ObjectId, MapSource) {
+    assert!(!chunks.is_empty());
+    assert!(chunks.len() <= 128);
+    let identity = TestIdentity;
+    let mut records = BTreeMap::new();
+    let mut children = Vec::new();
+    for bytes in chunks {
+        let record = ObjectRecord::new(
+            ObjectKind::Chunk,
+            FORMAT_VERSION,
+            bytes.clone(),
+            Vec::new(),
+            0,
+            ObjectClass::Data,
+        )
+        .unwrap();
+        let id = identity.identify(&record);
+        records.insert(id, record);
+        children.push((id, bytes.len() as u64));
+    }
+    let content = if let [(only, _)] = children.as_slice() {
+        *only
+    } else {
+        let logical_bytes = children
+            .iter()
+            .map(|(_, length)| length)
+            .try_fold(0_u64, |total, length| total.checked_add(*length))
+            .unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&u16::try_from(children.len()).unwrap().to_le_bytes());
+        bytes.extend_from_slice(&logical_bytes.to_le_bytes());
+        bytes.extend_from_slice(&(children.len() as u64).to_le_bytes());
+        let references = children
+            .iter()
+            .enumerate()
+            .map(|(index, (id, length))| {
+                bytes.extend_from_slice(&length.to_le_bytes());
+                bytes.extend_from_slice(&1_u64.to_le_bytes());
+                ObjectReference::owns(
+                    ReferenceLabel::new(u16::try_from(index).unwrap().to_be_bytes().to_vec()),
+                    *id,
+                )
+            })
+            .collect();
+        let tree = ObjectRecord::new(
+            ObjectKind::ChunkTree,
+            FORMAT_VERSION,
+            bytes,
+            references,
+            0,
+            ObjectClass::Metadata,
+        )
+        .unwrap();
+        let id = identity.identify(&tree);
+        records.insert(id, tree);
+        id
+    };
+    let logical_bytes = chunks
+        .iter()
+        .map(Vec::len)
+        .try_fold(0_u64, |total, length| total.checked_add(length as u64))
+        .unwrap();
+    let file = ObjectRecord::new(
+        ObjectKind::File,
+        FORMAT_VERSION,
+        encode_file_header(profile, logical_bytes, chunks.len() as u64),
+        vec![ObjectReference::owns(
+            ReferenceLabel::new(CONTENT_LABEL.to_vec()),
+            content,
+        )],
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let file_id = identity.identify(&file);
+    records.insert(file_id, file);
+    (
+        file_id,
+        MapSource {
+            records,
+            loads: Cell::new(0),
+        },
+    )
 }
 
 #[test]
@@ -220,6 +306,64 @@ fn profile_identity_is_deterministic_and_seeded() {
     .unwrap();
     assert_eq!(zeros.descriptor().chunk_count(), 4);
     assert_eq!(zeros.unique_chunks(), 1);
+}
+
+#[test]
+fn whole_object_threshold_matches_the_measured_profile_policy() {
+    let profile = ChunkingProfile::fastcdc_v2020(64, 256, 1024, 0).unwrap();
+    for length in [1, 63, 64, 256, 1024] {
+        let bytes = deterministic_bytes(length);
+        let built = build_content(&TestIdentity, profile, &bytes).unwrap();
+        assert_eq!(built.descriptor().chunk_count(), 1, "length {length}");
+        assert_eq!(
+            built
+                .records()
+                .iter()
+                .filter(|(_, record)| record.kind() == ObjectKind::Chunk)
+                .count(),
+            1,
+            "length {length}"
+        );
+    }
+    let above_threshold =
+        build_content(&TestIdentity, profile, &deterministic_bytes(1025)).unwrap();
+    assert!(above_threshold.descriptor().chunk_count() > 1);
+
+    let (file, source) = manual_content(profile, &[vec![1; 64], vec![2; 64]]);
+    assert!(matches!(
+        describe_content(&source, file),
+        Err(ContentReadError::Content(ContentError::InvalidObject {
+            object,
+            detail: "file chunk count violates the whole-object threshold",
+        })) if object == file
+    ));
+}
+
+#[test]
+fn declared_profile_bounds_reject_adversarial_chunk_shapes() {
+    let profile = ChunkingProfile::fastcdc_v2020(64, 256, 1024, 0).unwrap();
+    for chunks in [
+        vec![vec![1; 63], vec![2; 962]],
+        vec![vec![1; 64], vec![2; 1025]],
+    ] {
+        let (file, source) = manual_content(profile, &chunks);
+        assert!(matches!(
+            read_content(&source, file),
+            Err(ContentReadError::Content(ContentError::InvalidObject {
+                detail: "content shape violates the declared chunking profile",
+                ..
+            }))
+        ));
+        assert_eq!(
+            source.loads.get(),
+            2,
+            "profile-invalid child metadata should fail before loading chunks"
+        );
+    }
+
+    let expected = [vec![1; 1024], vec![2; 1]].concat();
+    let (file, source) = manual_content(profile, &[vec![1; 1024], vec![2; 1]]);
+    assert_eq!(read_content(&source, file).unwrap(), expected);
 }
 
 #[test]
