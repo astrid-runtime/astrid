@@ -65,7 +65,7 @@ impl Catalog {
                         .checked_add(value.logical_bytes)
                         .and_then(|total| total.checked_add(name_bytes))
                         .ok_or(PrincipalContentError::AccountingOverflow)?;
-                    Ok((logical, quota))
+                    Ok::<_, PrincipalContentError>((logical, quota))
                 })?;
         self.logical_bytes = logical;
         self.quota_bytes = quota;
