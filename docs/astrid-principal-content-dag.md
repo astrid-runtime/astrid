@@ -149,7 +149,9 @@ The current `build_content` API accepts a complete source slice and copies its
 chunks into a complete pending record set. Peak memory therefore includes both
 the input and the built closure. It is suitable for present catalog-scale
 content, not multi-gigabyte model weights; a streaming builder is required
-before those workloads are enabled.
+before those workloads are enabled. The read-bound, delta-proportional ingest
+pipeline and its crash marker protocol are tracked in
+[#1392](https://github.com/astrid-runtime/astrid/issues/1392).
 
 Deletes remain possible above quota. Growth is rejected when the combined
 post-write total exceeds the live principal budget and exceeds the prior total.
@@ -190,6 +192,51 @@ Erasure in a shared domain means root removal followed by garbage collection of
 only the uniquely owned closure; objects referenced by any other root survive.
 A per-principal hard-erasure domain requires per-principal encryption and
 therefore gives up cross-principal deduplication for that domain.
+
+### Prior-art lineage and adopted boundaries
+
+| Lineage | Astrid boundary |
+|---|---|
+| 384/Snackabra (Magnusson) — deduplicated blob ledger, edge delivery, 384-bit origin-free universal identifiers | Astrid's boundary: capability-scoped principal roots over the shared store; identity is never an authorization token in the principal store. |
+
+[Snackabra's documented object scheme][snackabra-overview] demonstrates the
+useful middle ground for a future public/shared blob layer: pad plaintext into
+coarse power-of-two buckets, split one SHA-512 result so the first 32 bytes
+contribute the public content name and the other 32 bytes supply key material,
+then encrypt and add a ciphertext hash to the full stored name. That design
+retains deduplication while hiding plaintext from a storage server. It still
+reveals content equality and permits confirmation attacks; padding obscures
+length only within a bucket.
+
+That scheme is acceptable in Astrid only as an explicitly selected
+representation at the `ObjectId`/`BlobId` seam for future public or shared
+content. It is forbidden for capability-scoped principal state:
+[Tahoe-LAFS's convergence-secret design][tahoe-convergence] makes the security
+consequence clear—a guessable content hash must never become the read
+capability. Principal authorization remains a distinct root/capability check
+even when a physical representation is message-locked.
+
+Every admission and recovery replay must recompute identity from the complete
+canonical object and compare it with the caller- or frame-supplied identity.
+This is a security boundary, not an optional integrity check.
+[Snackabra's storage handler][snackabra-storage-handler] is useful adversarial
+evidence: the request path uses the supplied partial image identifier as its
+lookup and allocation key while the intended verification call is disabled.
+That permits a first writer to squat a name unless another trusted boundary
+has already recomputed it. Astrid's engine therefore rejects proposals to skip
+server-side recomputation for throughput.
+
+If a future representation derives encryption keys from full-entropy content
+hash material, it must use a domain-separated HKDF construction, not a
+password-hardening loop. [RFC 5869][rfc5869] distinguishes extraction and
+expansion of strong keying material from deliberately slow password KDFs.
+Applying PBKDF2 for 100,000 iterations to an already unpredictable hash adds
+latency without raising the work factor for guessing the underlying content.
+
+[snackabra-overview]: https://snackabra.readthedocs.io/en/latest/overview.html#image-dedup-encryption-storage
+[snackabra-storage-handler]: https://github.com/snackabra/snackabra-storageserver/blob/fb160601fde815f6ae16a96ed265ee205f4876dc/src/storage.js#L170-L223
+[tahoe-convergence]: https://tahoe-lafs.org/trac/tahoe-lafs/browser/docs/specifications/file-encoding.rst
+[rfc5869]: https://datatracker.ietf.org/doc/html/rfc5869
 
 ## Evidence
 

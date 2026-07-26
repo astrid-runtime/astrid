@@ -10,7 +10,7 @@ use astrid_storage_model::{ModelError, ObjectId, ObjectIdentity, ObjectRecord, R
 
 use crate::{CommitOutcome, InMemoryEngine, RootTransaction};
 #[cfg(not(target_family = "wasm"))]
-use crate::{DurableEngine, DurableError, PrincipalCodec};
+use crate::{DurableEngine, DurableError, PersistentObjectIdentity, PrincipalCodec};
 
 /// Failure at the generic principal projection boundary.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -112,7 +112,7 @@ where
 impl<P, I, C> PrincipalProjectionEngine<P> for DurableEngine<P, I, C>
 where
     P: Clone + Ord + Send + Sync,
-    I: ObjectIdentity + Send + Sync,
+    I: PersistentObjectIdentity + Send + Sync,
     C: PrincipalCodec<P> + Send + Sync,
 {
     fn identify_object(&self, record: &ObjectRecord) -> ObjectId {
