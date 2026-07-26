@@ -48,6 +48,11 @@ pub struct TreeKvStore<P: Ord, I, R, E> {
     marker: PhantomData<fn() -> (P, I)>,
 }
 
+struct BlockingTreeStore<P: Ord, E> {
+    engine: Arc<E>,
+    quota: Option<Arc<dyn KvQuotaResolver<P>>>,
+}
+
 impl<P: Ord, I, R, E> TreeKvStore<P, I, R, E> {
     /// Construct a tree adapter without logical quota policy.
     #[must_use]
@@ -74,6 +79,13 @@ impl<P: Ord, I, R, E> TreeKvStore<P, I, R, E> {
             marker: PhantomData,
         }
     }
+
+    fn blocking_store(&self) -> BlockingTreeStore<P, E> {
+        BlockingTreeStore {
+            engine: Arc::clone(&self.engine),
+            quota: self.quota.clone(),
+        }
+    }
 }
 
 impl<P: Ord, I, R, E> fmt::Debug for TreeKvStore<P, I, R, E> {
@@ -84,11 +96,10 @@ impl<P: Ord, I, R, E> fmt::Debug for TreeKvStore<P, I, R, E> {
     }
 }
 
-impl<P, I, R, E> TreeKvStore<P, I, R, E>
+impl<P, E> BlockingTreeStore<P, E>
 where
     P: Clone + Ord + Send + Sync,
     E: KvProjectionEngine<P>,
-    R: KvPrincipalResolver<P>,
 {
     fn header(&self, owner: P) -> StorageResult<TreeHeader<P>> {
         let Some(root) = self
@@ -144,13 +155,33 @@ where
         }
     }
 
+    fn clear_range(&self, owner: &P, start: &[u8], end: &[u8]) -> StorageResult<u64> {
+        self.mutate(owner, |context, tree| {
+            let keys = context.raw_keys_in_range(tree, start, end)?;
+            let count = u64::try_from(keys.len())
+                .map_err(|_| StorageError::Internal("KV key count overflow".to_owned()))?;
+            let mut updated = tree;
+            for key in &keys {
+                (updated, _) = context.delete(updated, key)?;
+            }
+            Ok((count, updated, count != 0))
+        })
+    }
+}
+
+impl<P, I, R, E> TreeKvStore<P, I, R, E>
+where
+    P: Clone + Ord + Send + Sync,
+    E: KvProjectionEngine<P>,
+    R: KvPrincipalResolver<P>,
+{
     #[cfg(all(feature = "legacy-surrealkv", not(target_family = "wasm")))]
     pub(crate) fn import_entries_for_migration(
         &self,
         owner: &P,
         entries: &[KvEntry],
     ) -> StorageResult<()> {
-        self.mutate(owner, |context, mut tree| {
+        self.blocking_store().mutate(owner, |context, mut tree| {
             for entry in entries {
                 let key = composite_key(&entry.namespace, &entry.key);
                 let value_len = u64::try_from(entry.value.len())
@@ -164,8 +195,9 @@ where
 
     #[cfg(all(feature = "legacy-surrealkv", not(target_family = "wasm")))]
     pub(crate) fn entries_for_migration(&self, owner: &P) -> StorageResult<Vec<KvEntry>> {
-        let header = self.header(owner.clone())?;
-        let mut context = TreeContext::new(self.engine.as_ref());
+        let blocking = self.blocking_store();
+        let header = blocking.header(owner.clone())?;
+        let mut context = TreeContext::new(blocking.engine.as_ref());
         let mut raw = Vec::new();
         context.collect_entries(header.tree, &mut raw)?;
         raw.into_iter()
@@ -201,7 +233,14 @@ where
     R: KvPrincipalResolver<P> + Send + Sync + 'static,
 {
     async fn close(&self) -> StorageResult<()> {
-        self.engine.flush_kv().map_err(|error| map_engine(&error))
+        let blocking = self.blocking_store();
+        run_blocking(move || {
+            blocking
+                .engine
+                .flush_kv()
+                .map_err(|error| map_engine(&error))
+        })
+        .await
     }
 
     async fn get(&self, namespace: &str, key: &str) -> StorageResult<Option<Vec<u8>>> {
@@ -209,7 +248,9 @@ where
         validate_key(key)?;
         let owner = self.resolver.resolve(namespace)?;
         let composite = composite_key(namespace, key);
-        self.read(owner, |context, tree| context.get(tree, &composite))
+        let blocking = self.blocking_store();
+        run_blocking(move || blocking.read(owner, |context, tree| context.get(tree, &composite)))
+            .await
     }
 
     async fn set(&self, namespace: &str, key: &str, value: Vec<u8>) -> StorageResult<()> {
@@ -217,16 +258,20 @@ where
         validate_key(key)?;
         let owner = self.resolver.resolve(namespace)?;
         let composite = composite_key(namespace, key);
-        self.mutate(&owner, |context, tree| {
-            if context.get(tree, &composite)?.as_deref() == Some(value.as_slice()) {
-                return Ok(((), tree, false));
-            }
-            let value_len = u64::try_from(value.len())
-                .map_err(|_| StorageError::Internal("KV value length overflow".to_owned()))?;
-            let leaf = context.make_leaf(value.clone())?;
-            let tree = Some(context.set(tree, composite.clone(), leaf, value_len)?);
-            Ok(((), tree, true))
+        let blocking = self.blocking_store();
+        run_blocking(move || {
+            blocking.mutate(&owner, |context, tree| {
+                if context.get(tree, &composite)?.as_deref() == Some(value.as_slice()) {
+                    return Ok(((), tree, false));
+                }
+                let value_len = u64::try_from(value.len())
+                    .map_err(|_| StorageError::Internal("KV value length overflow".to_owned()))?;
+                let leaf = context.make_leaf(value.clone())?;
+                let tree = Some(context.set(tree, composite.clone(), leaf, value_len)?);
+                Ok(((), tree, true))
+            })
         })
+        .await
     }
 
     async fn delete(&self, namespace: &str, key: &str) -> StorageResult<bool> {
@@ -234,10 +279,14 @@ where
         validate_key(key)?;
         let owner = self.resolver.resolve(namespace)?;
         let composite = composite_key(namespace, key);
-        self.mutate(&owner, |context, tree| {
-            let (tree, removed) = context.delete(tree, &composite)?;
-            Ok((removed, tree, removed))
+        let blocking = self.blocking_store();
+        run_blocking(move || {
+            blocking.mutate(&owner, |context, tree| {
+                let (tree, removed) = context.delete(tree, &composite)?;
+                Ok((removed, tree, removed))
+            })
         })
+        .await
     }
 
     async fn exists(&self, namespace: &str, key: &str) -> StorageResult<bool> {
@@ -249,9 +298,13 @@ where
         let owner = self.resolver.resolve(namespace)?;
         let start = namespace_range_start(namespace);
         let end = namespace_range_end(namespace);
-        self.read(owner, |context, tree| {
-            context.keys_in_range(tree, &start, &end, start.len())
+        let blocking = self.blocking_store();
+        run_blocking(move || {
+            blocking.read(owner, |context, tree| {
+                context.keys_in_range(tree, &start, &end, start.len())
+            })
         })
+        .await
     }
 
     async fn list_keys_with_prefix(
@@ -265,9 +318,13 @@ where
         let start = composite_key(namespace, prefix);
         let end = prefix_range_end(namespace, prefix);
         let strip = namespace.len().saturating_add(1);
-        self.read(owner, |context, tree| {
-            context.keys_in_range(tree, &start, &end, strip)
+        let blocking = self.blocking_store();
+        run_blocking(move || {
+            blocking.read(owner, |context, tree| {
+                context.keys_in_range(tree, &start, &end, strip)
+            })
         })
+        .await
     }
 
     async fn compare_and_swap(
@@ -281,20 +338,25 @@ where
         validate_key(key)?;
         let owner = self.resolver.resolve(namespace)?;
         let composite = composite_key(namespace, key);
-        self.mutate(&owner, |context, tree| {
-            let current = context.get(tree, &composite)?;
-            if current.as_deref() != expected {
-                return Ok((false, tree, false));
-            }
-            if current.as_deref() == Some(new.as_slice()) {
-                return Ok((true, tree, false));
-            }
-            let value_len = u64::try_from(new.len())
-                .map_err(|_| StorageError::Internal("KV value length overflow".to_owned()))?;
-            let leaf = context.make_leaf(new.clone())?;
-            let tree = Some(context.set(tree, composite.clone(), leaf, value_len)?);
-            Ok((true, tree, true))
+        let expected = expected.map(<[u8]>::to_vec);
+        let blocking = self.blocking_store();
+        run_blocking(move || {
+            blocking.mutate(&owner, |context, tree| {
+                let current = context.get(tree, &composite)?;
+                if current.as_deref() != expected.as_deref() {
+                    return Ok((false, tree, false));
+                }
+                if current.as_deref() == Some(new.as_slice()) {
+                    return Ok((true, tree, false));
+                }
+                let value_len = u64::try_from(new.len())
+                    .map_err(|_| StorageError::Internal("KV value length overflow".to_owned()))?;
+                let leaf = context.make_leaf(new.clone())?;
+                let tree = Some(context.set(tree, composite.clone(), leaf, value_len)?);
+                Ok((true, tree, true))
+            })
         })
+        .await
     }
 
     async fn clear_namespace(&self, namespace: &str) -> StorageResult<u64> {
@@ -302,7 +364,8 @@ where
         let owner = self.resolver.resolve(namespace)?;
         let start = namespace_range_start(namespace);
         let end = namespace_range_end(namespace);
-        self.clear_range(&owner, &start, &end)
+        let blocking = self.blocking_store();
+        run_blocking(move || blocking.clear_range(&owner, &start, &end)).await
     }
 
     async fn clear_prefix(&self, namespace: &str, prefix: &str) -> StorageResult<u64> {
@@ -311,7 +374,8 @@ where
         let owner = self.resolver.resolve(namespace)?;
         let start = composite_key(namespace, prefix);
         let end = prefix_range_end(namespace, prefix);
-        self.clear_range(&owner, &start, &end)
+        let blocking = self.blocking_store();
+        run_blocking(move || blocking.clear_range(&owner, &start, &end)).await
     }
 }
 
@@ -321,24 +385,33 @@ where
     E: KvProjectionEngine<P>,
     R: KvPrincipalResolver<P>,
 {
-    fn clear_range(&self, owner: &P, start: &[u8], end: &[u8]) -> StorageResult<u64> {
-        self.mutate(owner, |context, tree| {
-            let keys = context.raw_keys_in_range(tree, start, end)?;
-            let count = u64::try_from(keys.len())
-                .map_err(|_| StorageError::Internal("KV key count overflow".to_owned()))?;
-            let mut updated = tree;
-            for key in &keys {
-                (updated, _) = context.delete(updated, key)?;
-            }
-            Ok((count, updated, count != 0))
-        })
-    }
-
     #[cfg(test)]
     pub(super) fn height_for_test(&self, owner: P) -> StorageResult<u32> {
-        let header = self.header(owner)?;
-        TreeContext::new(self.engine.as_ref()).height(header.tree)
+        let blocking = self.blocking_store();
+        let header = blocking.header(owner)?;
+        TreeContext::new(blocking.engine.as_ref()).height(header.tree)
     }
+}
+
+#[cfg(not(target_family = "wasm"))]
+async fn run_blocking<T, F>(operation: F) -> StorageResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> StorageResult<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(|error| {
+            StorageError::Internal(format!("durable storage worker failed: {error}"))
+        })?
+}
+
+#[cfg(target_family = "wasm")]
+async fn run_blocking<T, F>(operation: F) -> StorageResult<T>
+where
+    F: FnOnce() -> StorageResult<T>,
+{
+    operation()
 }
 
 #[derive(Clone, Debug)]

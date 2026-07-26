@@ -141,6 +141,57 @@ fn append_torn_payload(path: &Path, magic: [u8; 8]) {
     file.sync_data().unwrap();
 }
 
+fn append_orphan_object(path: &Path) -> u64 {
+    let valid_len = std::fs::metadata(path).unwrap().len();
+    let record = ObjectRecord::new(
+        ObjectKind::Chunk,
+        ObjectFormatVersion::V1,
+        b"uncommitted tail".to_vec(),
+        Vec::new(),
+        16,
+        ObjectClass::Data,
+    )
+    .unwrap();
+    let id = TestIdentity.identify(&record);
+    let payload = encode_object_frame(id, &record).unwrap();
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    let location = append_frame(&mut file, ARENA_MAGIC, &payload).unwrap();
+    assert_eq!(location.offset, valid_len);
+    file.sync_data().unwrap();
+    valid_len
+}
+
+fn frame_end(path: &Path, offset: u64) -> u64 {
+    let mut file = File::open(path).unwrap();
+    file.seek(SeekFrom::Start(offset)).unwrap();
+    let mut header = [0_u8; FRAME_HEADER_LEN_USIZE];
+    file.read_exact(&mut header).unwrap();
+    let payload_len = u64::from_le_bytes(header[12..20].try_into().unwrap());
+    offset
+        .checked_add(FRAME_HEADER_LEN)
+        .and_then(|value| value.checked_add(payload_len))
+        .unwrap()
+}
+
+fn flip_byte(path: &Path, offset: u64) {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    file.seek(SeekFrom::Start(offset)).unwrap();
+    let mut byte = [0_u8; 1];
+    file.read_exact(&mut byte).unwrap();
+    byte[0] ^= 0x80;
+    file.seek(SeekFrom::Start(offset)).unwrap();
+    file.write_all(&byte).unwrap();
+    file.sync_data().unwrap();
+}
+
 #[test]
 fn object_frame_round_trips_binary_typed_records() {
     let target = ObjectId::new([9; 32]);
@@ -307,7 +358,93 @@ fn truncated_root_payload_is_removed_without_changing_root() {
 }
 
 #[test]
-fn checksum_corruption_is_fatal_not_silently_truncated() {
+fn complete_magic_corruption_at_tail_is_truncated() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open(directory.path());
+    let (_, transaction) = transaction("alice", None, b"state");
+    let root = engine.commit(transaction).unwrap().root();
+    drop(engine);
+    let arena = directory.path().join(ARENA_FILE);
+    let valid_len = append_orphan_object(&arena);
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&arena)
+        .unwrap();
+    file.seek(SeekFrom::Start(valid_len)).unwrap();
+    file.write_all(&[0]).unwrap();
+    file.sync_data().unwrap();
+    drop(file);
+
+    let recovered = open(directory.path());
+
+    assert_eq!(recovered.root(&"alice".to_owned()).unwrap(), Some(root));
+    assert_eq!(std::fs::metadata(arena).unwrap().len(), valid_len);
+}
+
+#[test]
+fn complete_checksum_corruption_at_tail_is_truncated() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open(directory.path());
+    let (_, transaction) = transaction("alice", None, b"state");
+    let root = engine.commit(transaction).unwrap().root();
+    drop(engine);
+    let arena = directory.path().join(ARENA_FILE);
+    let valid_len = append_orphan_object(&arena);
+    let tail_len = std::fs::metadata(&arena).unwrap().len();
+    flip_byte(&arena, tail_len.saturating_sub(1));
+
+    let recovered = open(directory.path());
+
+    assert_eq!(recovered.root(&"alice".to_owned()).unwrap(), Some(root));
+    assert_eq!(std::fs::metadata(arena).unwrap().len(), valid_len);
+}
+
+#[test]
+fn rooted_checksum_corruption_at_arena_tail_still_fails_closure_validation() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open(directory.path());
+    let (_, transaction) = transaction("alice", None, b"state");
+    let root = engine.commit(transaction).unwrap().root();
+    drop(engine);
+    let arena = directory.path().join(ARENA_FILE);
+    let commit_offset = frame_end(&arena, 0);
+    let tail_len = std::fs::metadata(&arena).unwrap().len();
+    flip_byte(&arena, tail_len.saturating_sub(1));
+
+    assert!(matches!(
+        DurableEngine::open(directory.path(), TestIdentity, Utf8Codec, limits()),
+        Err(DurableError::RecoveryModel {
+            file: ROOT_FILE,
+            source: ModelError::MissingObject(missing),
+            ..
+        }) if missing == root.commit
+    ));
+    assert_eq!(std::fs::metadata(arena).unwrap().len(), commit_offset);
+}
+
+#[test]
+fn invalid_root_journal_tail_rolls_back_to_the_last_durable_root() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open(directory.path());
+    let (_, first) = transaction("alice", None, b"before");
+    let old = engine.commit(first).unwrap().root();
+    let (_, second) = transaction("alice", Some(old), b"after");
+    engine.commit(second).unwrap();
+    drop(engine);
+    let journal = directory.path().join(ROOT_FILE);
+    let second_offset = frame_end(&journal, 0);
+    let tail_len = std::fs::metadata(&journal).unwrap().len();
+    flip_byte(&journal, tail_len.saturating_sub(1));
+
+    let recovered = open(directory.path());
+
+    assert_eq!(recovered.root(&"alice".to_owned()).unwrap(), Some(old));
+    assert_eq!(std::fs::metadata(journal).unwrap().len(), second_offset);
+}
+
+#[test]
+fn interior_checksum_corruption_is_fatal_not_silently_truncated() {
     let directory = tempfile::tempdir().unwrap();
     let engine = open(directory.path());
     let (_, transaction) = transaction("alice", None, b"state");
@@ -336,6 +473,36 @@ fn checksum_corruption_is_fatal_not_silently_truncated() {
             ..
         })
     ));
+}
+
+#[test]
+fn interior_magic_corruption_is_fatal_not_silently_truncated() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open(directory.path());
+    let (_, transaction) = transaction("alice", None, b"state");
+    engine.commit(transaction).unwrap();
+    drop(engine);
+    let arena = directory.path().join(ARENA_FILE);
+    let original_len = std::fs::metadata(&arena).unwrap().len();
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&arena)
+        .unwrap();
+    file.seek(SeekFrom::Start(0)).unwrap();
+    file.write_all(&[0]).unwrap();
+    file.sync_data().unwrap();
+    drop(file);
+
+    assert!(matches!(
+        DurableEngine::open(directory.path(), TestIdentity, Utf8Codec, limits()),
+        Err(DurableError::Corrupt {
+            file: ARENA_FILE,
+            offset: 0,
+            detail: "frame magic mismatch",
+        })
+    ));
+    assert_eq!(std::fs::metadata(arena).unwrap().len(), original_len);
 }
 
 #[test]

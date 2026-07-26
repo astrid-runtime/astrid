@@ -51,8 +51,11 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 - **Principal storage has a host-file durability foundation.**
   `DurableEngine` persists immutable object frames before publishing a
   checksummed principal-root journal record, rebuilds its disposable index on
-  open, truncates incomplete final frames, and rejects complete corruption.
-  An exclusive store lock and poison-on-write-failure behavior prevent
+  open, truncates incomplete or physically invalid uncommitted tails only when
+  no valid frame follows, and rejects interior or semantic corruption. One
+  object-arena flush makes the transaction's complete object batch durable
+  before one root-journal flush publishes it. An exclusive store lock and
+  poison-on-write-failure behavior prevent
   concurrent-process corruption and stale in-memory reads. Named crash-boundary
   tests prove recovery to the old or new complete root. Recovery keeps only
   roots and arena offsets resident, while live reads load and checksum payloads
@@ -64,6 +67,8 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   publishes a versioned completion marker only after a durable flush.
   `TreeKvStore` keeps point reads and mutations height-bounded through a
   persistent AVL tree instead of using the linear compatibility projection.
+  Durable open, arena reads, mutations, and flushes run on the blocking pool
+  rather than parking asynchronous runtime workers during filesystem I/O.
   System state has its own owner; host-stamped capsule namespaces map to
   validated principals and share their live, invalidatable profile quota.
   The principal store is an invariant rather than a configurable backend, has

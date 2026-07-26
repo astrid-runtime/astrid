@@ -1,10 +1,12 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use astrid_storage_engine::InMemoryEngine;
 use astrid_storage_model::{ObjectClass, ObjectId, ObjectIdentity, ObjectRecord, ReferenceKind};
 
-use super::{KvPrincipalResolver, KvStore, TreeKvStore};
+use super::{KvPrincipalResolver, KvQuotaResolver, KvStore, TreeKvStore};
 use crate::{StorageError, StorageResult};
 
 #[derive(Clone, Copy, Debug)]
@@ -47,6 +49,29 @@ impl KvPrincipalResolver<String> for Resolver {
             .split_once(":capsule:")
             .map(|(principal, _)| principal.to_owned())
             .ok_or_else(|| StorageError::InvalidKey("test namespace has no owner".to_owned()))
+    }
+}
+
+struct BlockingQuota {
+    entered: Arc<AtomicBool>,
+    released: Arc<AtomicBool>,
+}
+
+impl KvQuotaResolver<String> for BlockingQuota {
+    fn max_logical_bytes(&self, _principal: &String) -> StorageResult<Option<u64>> {
+        self.entered.store(true, Ordering::Release);
+        let deadline = Instant::now()
+            .checked_add(Duration::from_millis(500))
+            .unwrap();
+        while !self.released.load(Ordering::Acquire) {
+            if Instant::now() >= deadline {
+                return Err(StorageError::Internal(
+                    "async executor stalled behind storage I/O".to_owned(),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        Ok(None)
     }
 }
 
@@ -175,6 +200,32 @@ async fn sorted_inserts_remain_height_bounded() {
         store.height_for_test("alice".to_owned()).unwrap() <= 11,
         "AVL height should remain logarithmic"
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn engine_work_runs_off_the_async_executor() {
+    let entered = Arc::new(AtomicBool::new(false));
+    let released = Arc::new(AtomicBool::new(false));
+    let store = TreeKvStore::<String, TestIdentity, Resolver, _>::from_engine_with_quota(
+        Arc::new(InMemoryEngine::new(TestIdentity)),
+        Resolver,
+        Arc::new(BlockingQuota {
+            entered: Arc::clone(&entered),
+            released: Arc::clone(&released),
+        }),
+    );
+    let release = tokio::spawn(async move {
+        while !entered.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        released.store(true, Ordering::Release);
+    });
+
+    store
+        .set("alice:capsule:build", "executor", b"alive".to_vec())
+        .await
+        .unwrap();
+    release.await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

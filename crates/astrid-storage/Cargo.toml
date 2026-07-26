@@ -30,7 +30,7 @@ serde_json = { workspace = true }
 surrealkv = { workspace = true, optional = true }
 surrealdb = { workspace = true, optional = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["rt", "sync"] }
 tracing = { workspace = true }
 uuid = { workspace = true }
 

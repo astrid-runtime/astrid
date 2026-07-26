@@ -141,10 +141,10 @@ Commit order is:
 
 1. verify identities, root expectation, the newly introduced closure frontier,
    encoding, and frame resource bounds without writing;
-2. append and flush non-commit immutable object frames;
-3. append and flush the immutable commit frame;
-4. append and flush one root-journal compare-and-swap record;
-5. update the in-memory root map, validated frontier, and disposable index.
+2. append every immutable object frame, including the commit frame, then flush
+   the object arena once;
+3. append and flush one root-journal compare-and-swap record;
+4. update the in-memory root map, validated frontier, and disposable index.
 
 The root-journal flush is the durable linearization point. An interrupted
 engine is poisoned and refuses both reads and writes until reopen. On reopen,
@@ -153,9 +153,11 @@ the engine:
 - takes an exclusive process lock;
 - scans and identity-checks every complete object frame;
 - rebuilds the `ObjectId`-to-arena-offset index without retaining payloads;
-- truncates only an incomplete final header or payload;
-- rejects a complete checksum, grammar, canonicality, identity, collision, or
-  model failure with its file and byte offset;
+- truncates an incomplete final frame, or a final frame with invalid physical
+  magic/checksum only when no valid physical frame follows it;
+- rejects invalid interior frames and every unsupported-version, resource,
+  grammar, canonicality, identity, collision, or model failure with its file
+  and byte offset;
 - replays root records using the same model compare-and-swap transition and
   verifies the recorded generation;
 - validates every final live root closure and then lazy-loads object payloads
@@ -169,12 +171,22 @@ or per-file quota. Host-file support is excluded from
 `target_family = "wasm"` while the portable model, in-memory engine, and
 compatibility adapter remain available there.
 
+Native boot recovery and every `TreeKvStore` operation that may read or mutate
+the arena run on Tokio's blocking pool. Filesystem latency and writers waiting
+on the engine mutex therefore consume blocking workers rather than parking the
+asynchronous workers that schedule capsules and IPC.
+
 This realization deliberately has one active arena and an in-memory rebuilt
 offset index. Runtime KV and live per-principal logical quotas are integrated.
 It does not yet seal arenas, compact unreachable history, persist pins, expose
 root removal, coordinate an audit/outbox record, inject short writes or
 disk-full errors, encrypt erasure domains, or select final export `BlobId`
 profiles. Those claims remain attached to their evidence gates.
+
+Until compaction and a persistent index land, live logical quota is not a disk
+quota and open cost remains proportional to the complete append history. Heavy
+content workloads must not be enabled against this realization merely because
+the logical content format exists.
 
 ## Why this matters particularly for agents
 
