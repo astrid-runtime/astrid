@@ -883,7 +883,6 @@ name = "astrid-storage-content"
 version = "0.10.4"
 dependencies = [
  "astrid-storage-model",
- "blake3",
  "fastcdc",
 ]
 

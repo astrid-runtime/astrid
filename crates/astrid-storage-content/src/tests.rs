@@ -1,6 +1,8 @@
 use std::cell::Cell;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
+use std::hash::Hasher;
 
 use astrid_storage_model::{
     ObjectClass, ObjectId, ObjectIdentity, ObjectKind, ObjectRecord, ReferenceKind,
@@ -16,29 +18,36 @@ struct TestIdentity;
 
 impl ObjectIdentity for TestIdentity {
     fn identify(&self, record: &ObjectRecord) -> ObjectId {
-        let mut hasher = blake3::Hasher::new_derive_key("astrid content DAG tests v1");
-        hasher.update(&record.kind().code().to_le_bytes());
-        hasher.update(&record.format_version().get().to_le_bytes());
-        hasher.update(&(record.canonical_bytes().len() as u128).to_le_bytes());
-        hasher.update(record.canonical_bytes());
-        hasher.update(&record.logical_bytes().to_le_bytes());
-        hasher.update(&[match record.class() {
-            ObjectClass::Data => 0,
-            ObjectClass::Metadata => 1,
-        }]);
-        hasher.update(&(record.references().len() as u128).to_le_bytes());
-        for reference in record.references() {
-            hasher.update(&(reference.label().as_bytes().len() as u128).to_le_bytes());
-            hasher.update(reference.label().as_bytes());
-            hasher.update(reference.target().as_bytes());
-            hasher.update(&[match reference.kind() {
-                ReferenceKind::Owns => 0,
-                ReferenceKind::Evidence => 1,
-                ReferenceKind::Lineage => 2,
-                ReferenceKind::Derived => 3,
-            }]);
+        let mut identity = [0_u8; 32];
+        for lane in 0..4_usize {
+            let mut hasher = DefaultHasher::new();
+            hasher.write_usize(lane);
+            hasher.write(&record.kind().code().to_le_bytes());
+            hasher.write(&record.format_version().get().to_le_bytes());
+            hasher.write(&(record.canonical_bytes().len() as u128).to_le_bytes());
+            hasher.write(record.canonical_bytes());
+            hasher.write(&record.logical_bytes().to_le_bytes());
+            hasher.write_u8(match record.class() {
+                ObjectClass::Data => 0,
+                ObjectClass::Metadata => 1,
+            });
+            hasher.write(&(record.references().len() as u128).to_le_bytes());
+            for reference in record.references() {
+                hasher.write(&(reference.label().as_bytes().len() as u128).to_le_bytes());
+                hasher.write(reference.label().as_bytes());
+                hasher.write(reference.target().as_bytes());
+                hasher.write_u8(match reference.kind() {
+                    ReferenceKind::Owns => 0,
+                    ReferenceKind::Evidence => 1,
+                    ReferenceKind::Lineage => 2,
+                    ReferenceKind::Derived => 3,
+                });
+            }
+            let start = lane.saturating_mul(8);
+            identity[start..start.saturating_add(8)]
+                .copy_from_slice(&hasher.finish().to_le_bytes());
         }
-        ObjectId::new(*hasher.finalize().as_bytes())
+        ObjectId::new(identity)
     }
 }
 
@@ -72,7 +81,7 @@ fn deterministic_bytes(length: usize) -> Vec<u8> {
             state = state
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1_442_695_040_888_963_407);
-            (state >> 37) as u8
+            (state >> 37).to_le_bytes()[0]
         })
         .collect()
 }
@@ -106,9 +115,11 @@ fn exact_ranges_cross_chunk_and_tree_boundaries() {
         (2_000_000, 1_000_000),
         (bytes.len() as u64, 0),
     ] {
+        let start = usize::try_from(offset).unwrap();
+        let end = usize::try_from(offset + length).unwrap();
         assert_eq!(
             read_content_range(&source, built.descriptor().file(), offset, length).unwrap(),
-            bytes[offset as usize..(offset + length) as usize]
+            bytes[start..end]
         );
     }
 }
