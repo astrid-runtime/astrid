@@ -115,7 +115,7 @@ Remaining:
   another format with a small `no_std` verifier;
 - additional chunking profiles and corpus-specific selection;
 - segment and pack sizing;
-- hash agility representation;
+- successor identity-algorithm selection and migration timing;
 - local-only versus cluster placement algorithm;
 - replication versus erasure coding thresholds;
 - trusted-local encryption and key-wrap design;
@@ -132,6 +132,21 @@ Remaining:
 These are not invitations to improvise in production code. Each becomes a
 versioned format or policy decision only with a corpus, failure tests, and a
 migration story.
+
+### Explicitly deferred extensions
+
+- Background `doctor` scrubbing may walk arena checksums on a schedule so
+  latent corruption is discovered while independent backups still exist.
+- Critical owning closures may request additional local copies through the
+  existing `ReplicaCount` placement model.
+- Multi-device synchronization will exchange verified closures and publish
+  roots through ordinary compare-and-swap; its product and conflict semantics
+  must be designed when that work is called.
+- Delta compression between near-identical chunks is considered only if the
+  temporal version-chain sweep demonstrates savings beyond content-defined
+  chunk reuse.
+
+None of these extend the current merge scope.
 
 ## 23. Prior art used as evidence, not dependencies
 
