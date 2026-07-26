@@ -78,6 +78,31 @@ closure-validation, and recovery work. The result measures spatial
 deduplication in one snapshot. It must be rerun over version chains once
 temporal content history exists.
 
+Two convergence ratios must not be conflated:
+
+```text
+object-instance convergence
+    = 1 - 4,551 unique whole objects / 230,080 file instances
+    = 98.02%
+
+whole-file byte-capacity convergence
+    = 1 - unique whole-file bytes / logical file bytes
+    = 47.1%
+```
+
+The measured 98.02% object-instance result is evidence that homogeneous agent
+state repeats a very small artifact vocabulary and that per-object overhead is
+an important economic axis. It is not evidence of 98% byte savings: repeated
+small files dominate instance count while unique large files dominate bytes.
+
+Magnusson's 95–98% platform-scale byte-capacity convergence is recorded as a
+scaling hypothesis, not as a benchmark result. Temporal versions, many
+principals, semantic normalization across encodings, and physical compression
+could move marginal unique-byte growth toward it; this snapshot did not measure
+those axes. The measurement protocol in
+[Semantic Representations](astrid-semantic-representations.md) keeps each
+contribution separate.
+
 ## Canonical objects
 
 ### Chunk
@@ -239,11 +264,13 @@ The current DAG recognizes exact byte equality. It deliberately does not
 declare that different encodings contain the same typed value.
 
 [Semantic Representations](astrid-semantic-representations.md) specifies the
-generic extension: immutable equivalence contracts pin one archived reference
-transform, `SemanticId` binds that contract to its canonical stream, and typed
-representations carry provenance and trust class. This can recognize
+generic extension: immutable semantic contracts pin a canonicalizer,
+independently versioned representation contracts pin codec decoders,
+`SemanticId` binds only the stable semantic contract to its canonical stream,
+and typed representations carry provenance and trust class. This can recognize
 pixel-identical images, canonical structured values, directory trees, model
-tensors, or other domain values without placing codec logic in the kernel.
+tensors, or other domain values without placing codec logic in the kernel or
+changing existing identities whenever a codec is added.
 
 The reference-transform pin closes a cross-principal substitution attack:
 arbitrary capsules may advertise transformation routes but cannot mint
@@ -252,8 +279,8 @@ verification or a contract-pinned proof. Similarity remains a relationship
 only, and arbitrary source encodings are never promoted into a shared trusted
 serving pool merely because they produce the same semantic value.
 
-No `SemanticId`, equivalence-contract registry, transform runner, or capsule
-surface is activated by this increment.
+No `SemanticId`, semantic/representation contract registry, transform runner,
+or capsule surface is activated by this increment.
 
 [snackabra-overview]: https://snackabra.readthedocs.io/en/latest/overview.html#image-dedup-encryption-storage
 [snackabra-storage-handler]: https://github.com/snackabra/snackabra-storageserver/blob/fb160601fde815f6ae16a96ed265ee205f4876dc/src/storage.js#L170-L223

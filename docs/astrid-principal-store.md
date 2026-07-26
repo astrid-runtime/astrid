@@ -277,7 +277,7 @@ produce a new `BlobId` for the same `ObjectId`. Logical roots do not change.
 Identity of one value under an immutable, registered equivalence contract:
 
 ```text
-ContractId = ObjectId(EquivalenceContract)
+SemanticContractId = ObjectId(EquivalenceContract)
 
 SemanticId = TaggedIdentity(
     algorithm,
@@ -285,26 +285,30 @@ SemanticId = TaggedIdentity(
     digest_length,
     H(
         "astrid-semantic-identity" ||
-        encode(ContractId) ||
+        encode(SemanticContractId) ||
         canonical_stream
     )
 )
 ```
 
 `SemanticId` is neither exact-byte identity nor a similarity score. The
-contract pins one archived reference transform capsule, its dependency
-closure, deterministic runtime semantics, typed schemas, and canonical stream
-grammar. Alternate transforms may propose results but cannot mint semantic
-identity without complete reference verification or a contract-pinned proof.
-Matching digests remain candidate equality: canonical streams are compared
-before two bindings collapse, preserving the store's collision-detection rule.
+semantic contract pins one archived canonicalizer capsule, its dependency
+closure, deterministic runtime semantics, typed value schema, and canonical
+stream grammar. Independently versioned representation contracts pin decoders
+from exact encodings into that semantic domain. This separation lets a future
+codec converge with existing values without changing their `SemanticId`.
+Alternate transforms may propose results but cannot mint semantic identity
+without complete reference verification or a contract-pinned proof. Matching
+digests remain candidate equality: canonical streams are compared before two
+bindings collapse, preserving the store's collision-detection rule.
 
 Different encodings may share a `SemanticId` while retaining distinct
 `ObjectId` and `BlobId` values. Arbitrary source representations do not become
 safe to serve across principals merely because their canonical values match.
 The complete substitution threat, registration authority, representation trust
-classes, retention choices, and typed transformation graph are specified in
-[Semantic Representations](astrid-semantic-representations.md).
+classes, generic streaming host boundary, image-capsule example, retention
+choices, and typed transformation graph are specified in [Semantic
+Representations](astrid-semantic-representations.md).
 
 ### 6.4 Capabilities and root authority
 

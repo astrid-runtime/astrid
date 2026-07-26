@@ -63,7 +63,7 @@ If Astrid accepts Mallory's claimed result, Mallory can:
 Hashing the claimed output does not prevent this attack. The security boundary
 is the authority to decide which canonical stream follows from an input.
 Semantic reuse across principals is permitted only after that decision has
-been made by the contract's pinned reference transform.
+been made by the registered representation decoder and semantic canonicalizer.
 
 Even a true equivalence claim does not make every source representation safe
 to serve. A crafted image can decode to the expected pixels while exploiting a
@@ -71,35 +71,75 @@ bug in a consumer's metadata parser. Untrusted source encodings therefore do
 not become globally trusted representations merely because their decoded value
 matches.
 
-## Identity construction
+## Two contract layers
 
-An equivalence contract is an immutable canonical object:
+The semantic domain and the source codec cannot be one contract. If
+`canonical-image-pixels/v1` pinned a PNG decoder directly, a WebP decoder would
+produce a different contract identifier and the two formats could never
+converge. Adding AVIF later would also redefine every image identity.
+
+Astrid therefore uses two immutable contract types.
+
+An equivalence contract defines one stable typed value domain:
 
 ```text
 EquivalenceContract {
     format_version
     display_name
-    input_type
-    canonical_output_type
+    canonical_value_type
     canonical_stream_grammar
-    reference_transform
-    reference_transform_closure
+    reference_canonicalizer
+    reference_canonicalizer_closure
     deterministic_runtime_profile
     permitted_imports
-    semantic_input_bounds
+    semantic_value_bounds
     optional_proof_verifier
     frozen_specification
     conformance_fixtures
 }
 
-ContractId = ObjectId(EquivalenceContract)
+SemanticContractId = ObjectId(EquivalenceContract)
 ```
 
-`display_name`, such as `canonical-image-pixels/v1`, is explanatory. It is not
-the identity boundary. `ContractId` binds the complete object, including one
-archived reference transform capsule and everything required to run it.
+A representation contract defines how one exact encoding produces a value in
+that semantic domain:
 
-The resulting identity is:
+```text
+RepresentationContract {
+    format_version
+    source_type
+    semantic_contract: SemanticContractId
+    decoded_value_type
+    reference_decoder
+    reference_decoder_closure
+    deterministic_runtime_profile
+    permitted_imports
+    representation_bounds
+    optional_proof_verifier
+    frozen_specification
+    conformance_fixtures
+}
+
+RepresentationContractId = ObjectId(RepresentationContract)
+```
+
+Display names such as `canonical-image-pixels/v1` and `image/png/v1` are
+explanatory. They are not identity boundaries. Each contract identifier binds
+the complete canonical object, archived reference capsule, and everything
+required to run it.
+
+Admission follows one explicit path:
+
+```text
+exact source bytes
+    -> pinned representation decoder
+    -> typed value stream
+    -> pinned semantic canonicalizer
+    -> canonical stream
+    -> SemanticId
+```
+
+The resulting identity contains only the stable semantic contract:
 
 ```text
 SemanticId = TaggedIdentity(
@@ -108,21 +148,27 @@ SemanticId = TaggedIdentity(
     digest_length,
     H(
         "astrid-semantic-identity" ||
-        encode(ContractId) ||
+        encode(SemanticContractId) ||
         canonical_stream
     )
 )
 ```
+
+PNG, lossless WebP, and a future codec can therefore converge when their
+independently pinned reference decoders produce the same value stream under one
+semantic contract. Adding a representation contract does not change an
+existing `SemanticId`.
 
 Persistent `SemanticId` encodings use the same algorithm-tagged,
 variable-digest envelope as persistent `ObjectId` values. The initial
 construction may use BLAKE3-256, but the wire representation must admit tagged
 384-bit and longer successors.
 
-The contract identifier prevents outputs from two divergent implementations
-or contract revisions from occupying one equivalence domain. A changed
-reference transform, runtime semantic, input grammar, or canonicalization rule
-creates a new `ContractId` and therefore new semantic identities.
+Changing the semantic canonicalizer, runtime semantics, typed value grammar, or
+canonicalization rule creates a new `SemanticContractId` and new semantic
+identities. Correcting one codec creates a new `RepresentationContractId` and
+requires its sources to be reverified, but does not change the semantic domain
+when the corrected decoder emits the same canonical values.
 
 The canonical stream may be hashed incrementally and need not be stored as an
 uncompressed physical object.
@@ -130,69 +176,81 @@ uncompressed physical object.
 As with `ObjectId`, a digest match is only a candidate equality. Admission must
 compare the complete canonical streams before collapsing two bindings. The
 comparison may stream both values without buffering them. If the existing
-stream is not materialized, Astrid reproduces it through the reference
-transform from an authoritative retained representation. A semantic value
-whose canonical stream can no longer be reproduced is not admissible as an
-authoritative binding.
+stream is not materialized, Astrid reproduces it from an authoritative retained
+representation through its pinned decoder and the semantic canonicalizer. A
+semantic value whose canonical stream can no longer be reproduced is not
+admissible as an authoritative binding.
 
-## What the contract pins
+## What the contracts pin
 
-Pinning only the transform's component bytes is insufficient. Its behavior can
-also depend on imports, data tables, decoding profiles, or runtime semantics.
-The contract therefore binds:
+Pinning only a transform's component bytes is insufficient. Behavior can also
+depend on imports, data tables, decoding profiles, or runtime semantics. Each
+contract therefore binds:
 
 - the installable reference capsule's exact object closure;
-- the typed input and canonical-output schemas;
+- typed input and output schemas;
 - the deterministic transform-runtime profile and host ABI;
 - every permitted host import;
 - identity-affecting parameters and semantic acceptance bounds;
-- a byte-exact canonical-stream specification;
+- a byte-exact specification;
 - adversarial and boundary conformance fixtures; and
 - an optional proof verifier and proof grammar.
 
-Reference transforms are pure with respect to identity. They may read the
-supplied source and immutable contract closure and may emit a canonical stream,
-diagnostics, and execution evidence. They may not observe the clock, random
-state, network, mutable principal state, locale, host filesystem, scheduling,
-or undeclared environment values.
+The equivalence contract additionally binds the canonical stream grammar. The
+representation contract binds one source encoding to that semantic contract.
+An approved encoder is registered as a producer from a semantic contract to a
+representation contract; its output is still checked through the pinned
+decoder before publication. It is a representation of the same `SemanticId`
+only when decoding reproduces the exact canonical value. A transform that
+intentionally changes that value creates a new semantic object and a typed
+derivation instead.
+
+Reference decoders and canonicalizers are pure with respect to identity. They
+may read the supplied source and immutable contract closure and may emit a
+typed stream, canonical stream, diagnostics, and execution evidence. They may
+not observe the clock, random state, network, mutable principal state, locale,
+host filesystem, scheduling, or undeclared environment values.
 
 Operational metering remains deployment policy. Running out of fuel, memory,
-or time produces no semantic binding; it never produces a different value.
+or time produces no binding; it never produces a different value.
 Contract-defined input and recursion bounds are identity-bearing when they
-change which inputs the contract accepts.
+change which values the contract accepts.
 
 ## Registration and authority
 
-Possessing or storing an `EquivalenceContract` object does not register it.
+Possessing or storing either contract object does not register it.
 Registration is system/operator authority recorded in a signed, auditable
 registry outside principal-owned state. A principal or arbitrary capsule
-cannot create a store-wide equivalence domain by publishing an object or
-advertising a compatible interface.
+cannot create a store-wide equivalence domain or trusted decoder by publishing
+an object or advertising a compatible interface.
 
 Registration binds:
 
-- the accepted `ContractId`;
-- the authority and authority epoch that admitted it;
-- its permitted privacy/deduplication domains;
+- the accepted semantic and representation contract identifiers;
+- the authority and authority epoch that admitted them;
+- their permitted privacy/deduplication domains;
 - whether semantic source retention may ever replace exact-byte retention;
-- approved representation producers; and
+- approved representation producers and their maximum trust classes; and
 - revocation or deprecation state.
 
-Contract objects are immutable. Corrections create a new contract and a
-separate migration. Recomputing under a successor may record verified lineage
-between old and new identities, but never silently rewrites existing
-`SemanticId` values.
+Contract objects are immutable. Correcting an equivalence contract creates a
+new semantic domain and an explicit migration. Correcting a decoder creates a
+new representation contract and revalidation path. Recomputing under a
+successor may record verified lineage, but never silently rewrites existing
+identities or treats two domains as aliases.
 
 ## Reference transforms and accelerators
 
-Only the pinned reference transform mints a `SemanticId`.
+Only the pinned representation decoder and semantic canonicalizer establish a
+`SemanticId` binding.
 
-An alternate implementation may propose a canonical result as an optimization,
+An alternate implementation may propose an intermediate or canonical result,
 but its result becomes persistent only after:
 
-1. the reference transform fully reproduces and verifies it; or
+1. the relevant pinned reference transform fully reproduces and verifies it;
+   or
 2. the alternate supplies a sound proof accepted by the proof verifier pinned
-   in the contract.
+   in that contract.
 
 Spot checks, conformance suites, signatures from the alternate author, and
 historical agreement are useful monitoring signals but cannot authorize
@@ -203,12 +261,12 @@ This rule does not make accelerators useless. They can reject invalid input
 early, prepare candidate encodings, amortize a reference check through a shared
 verified cache, or use a contract-defined proof system. If an operator intends
 another implementation to be normative without reference verification, it
-must register a new contract that pins that implementation.
+must register a successor contract that pins that implementation.
 
-The reference transform runs as an archived capsule inside Astrid's sandbox.
-The kernel meters it, enforces its imports, and records execution evidence; the
-kernel does not learn its content semantics. The admission service validates
-the result against the registered contract.
+Reference transforms run as archived capsules inside Astrid's sandbox. The
+kernel meters them, enforces their imports, and records execution evidence; the
+kernel does not learn their content semantics. The admission service validates
+the pipeline against the registered contracts.
 
 ## Bindings and representation trust
 
@@ -220,9 +278,11 @@ A verified semantic binding records:
 ```text
 SemanticBinding {
     source: ObjectId
-    contract: ContractId
+    representation_contract: RepresentationContractId
+    semantic_contract: SemanticContractId
     semantic: SemanticId
-    reference_execution: EvidenceId
+    decoder_execution: EvidenceId
+    canonicalizer_execution: EvidenceId
 }
 ```
 
@@ -237,7 +297,7 @@ A representation binding additionally records:
 RepresentationBinding {
     semantic: SemanticId
     representation: ObjectId | BlobId
-    representation_type
+    representation_contract: RepresentationContractId
     encoding_profile
     producer_transform
     derivation_evidence
@@ -293,19 +353,21 @@ does not override those policies.
 
 ## Portability and longevity
 
-An export that relies on semantic retention contains the registered contract
-object, frozen specification, reference transform closure, exact retained
-representation, and required derivation evidence. It does not export the
-source system's registration authority. A destination may preserve and inspect
-the bytes immediately but performs semantic collapse only if local authority
-registers the same contract.
+An export that relies on semantic retention contains the semantic and
+representation contract objects, frozen specifications, reference transform
+closures, exact retained representation, and required derivation evidence. It
+does not export the source system's registration authority. A destination may
+preserve and inspect the bytes immediately but performs semantic collapse only
+if local authority registers the same contracts.
 
-Hash or contract migration creates successor semantic identities by rerunning
-the successor reference transform. Old-to-new mappings are immutable lineage
-or evidence, not identity aliases. The archived reference capsule remains
-normative; the plain-text contract specification and fixtures make independent
-reimplementation and disaster recovery possible without allowing a new
-implementation to redefine existing identities.
+Hash or semantic-contract migration creates successor semantic identities by
+rerunning the successor pipeline. A representation-contract migration
+revalidates affected sources without changing semantic identities when the
+canonical values agree. Old-to-new mappings are immutable lineage or evidence,
+not identity aliases. Archived reference capsules remain normative; plain-text
+specifications and fixtures make independent reimplementation and disaster
+recovery possible without allowing a new implementation to redefine existing
+identities.
 
 ## Typed transformation graph
 
@@ -324,8 +386,8 @@ The graph separates route discovery from identity authority:
 
 - any installed transform may advertise a typed edge;
 - policy determines whether the edge is eligible for one invocation;
-- only a registered contract's reference transform or proof verifier can
-  establish semantic identity; and
+- only registered representation and semantic contracts can establish a
+  binding through their pinned reference transforms or proof verifiers; and
 - only an approved producer can publish a shared trusted representation.
 
 A deterministic planner can initially choose a route by type compatibility,
@@ -338,14 +400,104 @@ Every route has fuel, memory, output-size, fanout, and derivation-depth bounds.
 A planner must detect cycles and cannot turn attacker-influenced transform
 advertisements into unbounded work.
 
+## Activation and host boundary
+
+The feature is automatic from an agent or human's normal file/content view, but
+it is not implementation magic. A content service orchestrates the registered
+capsules behind that view:
+
+1. exact source bytes commit first under their `ObjectId`;
+2. policy chooses whether semantic admission runs immediately, lazily on first
+   use, or as bounded background work;
+3. the service invokes the pinned decoder and canonicalizer;
+4. the host streams and verifies their output, records evidence, and admits the
+   binding;
+5. a representation request uses an existing trusted encoding or invokes an
+   approved producer and verifies its result; and
+6. the caller receives ordinary content bytes, not a deduplication protocol.
+
+No background policy rewrites or deletes the source silently. Exact retention
+remains the default until an explicit retention policy accepts semantic
+preservation.
+
+Current IPC can coordinate those steps but should not carry large content
+buffers. Activation needs one generic, capability-scoped WIT streaming world,
+not media-specific host functions. Conceptually it supplies:
+
+```text
+source resource
+    read bounded byte chunks from one host-selected ObjectId
+
+value/output sink resource
+    accept bounded chunks, apply backpressure, and finalize or abort
+
+transform context
+    names host-selected contract, types, and execution bounds
+
+execution result
+    reports success or diagnostics; never a caller-chosen identity
+```
+
+The host selects the source and contracts, computes identities, compares
+canonical streams, enforces output bounds, and stamps evidence. The capsule
+cannot open arbitrary paths, choose another principal, claim a `SemanticId`, or
+publish directly into the trusted representation pool. Existing fuel, memory,
+deadline, and principal compute accounting apply to the run.
+
+This is a future generic WIT/RFC surface because current contracts are frozen.
+The engine and storage model can first expose equivalent internal Rust traits.
+There is no `decode-png`, `encode-webp`, or codec registry host function, and
+the kernel remains format-blind.
+
 ## Domain examples and limits
 
 ### Images
 
-A contract may canonicalize dimensions, orientation, color space, alpha,
-sample depth, pixels, and animation timing. Pixel-identical encodings may share
-a `SemanticId`. Resized, cropped, or recompressed images with different pixels
-remain distinct even when a perceptual metric relates them.
+An image semantic contract may canonicalize dimensions, orientation, color
+space, alpha, sample depth, pixels, and animation timing. Pixel-identical
+encodings may share a `SemanticId`. Resized, cropped, or recompressed images
+with different pixels remain distinct even when a perceptual metric relates
+them.
+
+The capsule family stays deliberately small and codec-specific:
+
+```text
+image-pixels canonicalizer
+    defines canonical-image-pixels/v1
+
+PNG reference decoder
+    image/png -> canonical-image-pixels/v1
+
+WebP reference decoder
+    image/webp -> canonical-image-pixels/v1
+
+approved lossless WebP/AVIF encoders
+    canonical-image-pixels/v1 -> verified equal representation
+
+lossy WebP/AVIF encoders
+    image SemanticId -> new image SemanticId + lossy-derived-from relation
+
+image similarity analyzer
+    image SemanticId pair -> scored relation only
+
+Metal texture producer
+    canonical-image-pixels/v1 -> device-scoped derived representation
+```
+
+Adding an AVIF decoder adds a representation contract; it does not redefine
+the pixel semantic domain. Decoder libraries remain inside sandboxed capsules
+with no filesystem or network access. Declared dimensions, checked arithmetic,
+fuel, memory, and output accounting contain decompression bombs. Encoders may
+be replaced without changing the image identity, while a new canonical color
+or animation policy intentionally creates a new semantic contract.
+
+Lossy encodings and GPU texture compression do not remain representations of
+the source pixel identity when decoded pixels differ. They receive their own
+`SemanticId` and a typed derivation recording source, profile, and execution
+evidence. A perceptual threshold is a similarity relation, not equivalence:
+tolerance-based equality is generally non-transitive. Metadata omitted by a
+pixel contract remains available through the exact source and may have its own
+typed semantic contract; omission never destroys it implicitly.
 
 ### Structured documents
 
@@ -368,17 +520,72 @@ validated imports/exports, or a reproducible build result under a pinned build
 contract. Similar interfaces may be related without declaring executable
 substitution safe.
 
+## Convergence measurement
+
+One percentage cannot describe the storage result. Every study reports at
+least:
+
+```text
+object-instance convergence
+    1 - unique exact objects / logical object instances
+
+exact-byte capacity convergence
+    1 - unique whole-object bytes / logical bytes
+
+chunk capacity convergence
+    1 - unique chunked bytes / logical bytes
+
+semantic capacity convergence
+    savings added by verified cross-representation equivalence
+
+physical capacity convergence
+    1 - final stored bytes including encoding and metadata / logical bytes
+
+marginal novelty
+    additional unique physical bytes / additional logical bytes
+```
+
+The live Astrid-state sweep measured 230,080 file instances and 4,551 unique
+whole-file objects: 98.02% object-instance convergence. It measured only 47.1%
+whole-file byte-capacity convergence. The first result supports the claim that
+agent state repeats a small vocabulary; it does not convert into a 98% capacity
+claim because large unique objects dominate bytes.
+
+Magnusson's 95–98% platform-scale byte-capacity convergence remains a
+hypothesis. It is plausible only if marginal novelty falls as the corpus gains
+principals and history. Evidence requires a cumulative and marginal curve over:
+
+- increasing principal count;
+- retained version depth;
+- exact whole-object reuse;
+- content-defined chunk reuse;
+- verified semantic normalization by real representation capsules;
+- post-dedup compression and physical metadata; and
+- corpus classes, especially text, dependencies, media, models, encrypted
+  input, and already-compressed input.
+
+Each lever is reported independently before a combined physical number. The
+existing FastCDC sweep can measure the first chunked baseline; temporal and
+semantic runs wait for representative version chains and implemented reference
+capsules. No 95–98% byte result is claimed until that experiment exists.
+
 ## Required evidence before activation
 
 Implementation is gated on tests that demonstrate:
 
-- a capsule cannot register its own equivalence contract;
-- changing any contract field changes `ContractId` and `SemanticId`;
+- a capsule cannot register its own semantic or representation contract;
+- changing an identity-bearing semantic-contract field changes
+  `SemanticContractId` and `SemanticId`;
+- adding or replacing a representation contract changes no existing
+  `SemanticId` when canonical output is equal;
+- each source binding executes its pinned decoder and semantic canonicalizer;
 - an alternate transform cannot persist a binding without complete reference
   verification or an accepted proof;
 - claimed canonical output substitution is rejected;
 - a valid but untrusted source representation is never selected for another
   principal;
+- an encoder whose decoded canonical value differs creates a new semantic
+  identity and derivation rather than an equal representation;
 - exact-byte lookup never returns a merely equivalent representation;
 - a forced semantic-digest collision is detected by canonical-stream
   comparison;
@@ -387,6 +594,10 @@ Implementation is gated on tests that demonstrate:
   equality;
 - transform failure, timeout, exhaustion, and oversized output create no
   binding;
+- transform capsules can access only host-selected stream handles and cannot
+  select a principal, path, contract, or identity;
+- bounded chunk streaming applies backpressure without buffering complete
+  large inputs or outputs;
 - cyclic and over-depth routes terminate within declared bounds; and
 - derived-cache eviction changes no principal root or authoritative read and
   never removes the final representation of semantically retained content.

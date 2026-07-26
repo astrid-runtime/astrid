@@ -105,14 +105,19 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   materialization, capsule WIT access, encryption domains, and arena compaction
   remain separate work. The accompanying semantic-representation design
   separates exact `ObjectId`, contract-scoped `SemanticId`, trusted physical
-  representations, and similarity relations. Equivalence contracts pin one
-  archived reference transform and deterministic execution closure; alternate
-  transforms cannot mint identity without complete reference verification or
-  a contract-pinned proof, and untrusted source encodings never enter the
-  shared trusted serving pool by equivalence alone. The design records the
-  cross-principal substitution adversary, authority-controlled contract
-  registration, bounded typed route planning, explicit source-retention
-  policy, and derived-cache accounting without activating a capsule interface.
+  representations, and similarity relations. Stable semantic contracts pin a
+  canonicalizer, while independently versioned representation contracts pin
+  codec decoders so adding a format does not redefine existing identities.
+  Alternate transforms cannot mint identity without complete reference
+  verification or a contract-pinned proof, and untrusted source encodings never
+  enter the shared trusted serving pool by equivalence alone. The design
+  records the cross-principal substitution adversary, authority-controlled
+  registration, bounded typed route planning, generic future streaming WIT,
+  image-codec capsule decomposition, explicit source-retention policy, and
+  derived-cache accounting without activating a capsule interface. The live
+  corpus measured 98.02% object-instance convergence but 47.1% whole-file byte
+  convergence; the 95–98% platform-scale byte result remains a separately
+  testable hypothesis.
 - **Windows local transport uses authenticated per-user named pipes.** A pipe
   name derived only from the caller's operating-system SID replaces
   filesystem endpoint naming on Windows. Local-only byte-mode instances use a
