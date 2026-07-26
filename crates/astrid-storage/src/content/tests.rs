@@ -46,7 +46,7 @@ fn bytes(length: usize) -> Vec<u8> {
             state = state
                 .wrapping_mul(2_862_933_555_777_941_757)
                 .wrapping_add(3_037_000_493);
-            (state >> 29) as u8
+            (state >> 29).to_le_bytes()[0]
         })
         .collect()
 }
