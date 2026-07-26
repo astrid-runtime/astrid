@@ -83,7 +83,8 @@ file containing one repeated chunk from being charged only once.
 
 Range reads use child lengths to skip non-overlapping subtrees. Identity-bearing
 subtree counts let every traversed path validate byte and chunk cardinality
-without loading unrelated chunks. Full reads validate the complete closure.
+and canonical tree depth without loading unrelated chunks. Full reads validate
+the complete closure.
 
 ### File
 

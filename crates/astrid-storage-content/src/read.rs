@@ -126,10 +126,12 @@ pub fn read_content_range<S: ContentSource>(
     append_range(
         source,
         content,
-        logical_bytes,
-        chunk_count,
-        offset,
-        end,
+        ExpectedShape {
+            logical_bytes,
+            chunk_count,
+            tree_depth: canonical_tree_depth(chunk_count),
+        },
+        RequestedRange { start: offset, end },
         &mut output,
     )?;
     if output.len() != capacity {
@@ -142,21 +144,32 @@ pub fn read_content_range<S: ContentSource>(
     Ok(output)
 }
 
+#[derive(Clone, Copy)]
+struct ExpectedShape {
+    logical_bytes: u64,
+    chunk_count: u64,
+    tree_depth: u32,
+}
+
+#[derive(Clone, Copy)]
+struct RequestedRange {
+    start: u64,
+    end: u64,
+}
+
 fn append_range<S: ContentSource>(
     source: &S,
     object: ObjectId,
-    expected_length: u64,
-    expected_chunk_count: u64,
-    start: u64,
-    end: u64,
+    shape: ExpectedShape,
+    range: RequestedRange,
     output: &mut Vec<u8>,
 ) -> Result<(), ContentReadError<S::Error>> {
     let record = load(source, object)?;
     match record.kind() {
         ObjectKind::Chunk => {
-            validate_chunk(object, &record, expected_length, expected_chunk_count)?;
-            let start = usize::try_from(start).map_err(|_| ContentError::LengthOverflow)?;
-            let end = usize::try_from(end).map_err(|_| ContentError::LengthOverflow)?;
+            validate_chunk(object, &record, shape)?;
+            let start = usize::try_from(range.start).map_err(|_| ContentError::LengthOverflow)?;
+            let end = usize::try_from(range.end).map_err(|_| ContentError::LengthOverflow)?;
             let bytes =
                 record
                     .canonical_bytes()
@@ -169,20 +182,32 @@ fn append_range<S: ContentSource>(
             Ok(())
         },
         ObjectKind::ChunkTree => {
-            let children = decode_tree(object, &record, expected_length, expected_chunk_count)?;
+            if shape.tree_depth == 0 {
+                return Err(ContentError::InvalidObject {
+                    object,
+                    detail: "chunk tree exceeds canonical depth",
+                }
+                .into());
+            }
+            let children = decode_tree(object, &record, shape)?;
             let mut cursor = 0_u64;
             for (child, child_length, child_chunk_count) in children {
                 let child_end = cursor
                     .checked_add(child_length)
                     .ok_or(ContentError::LengthOverflow)?;
-                if start < child_end && end > cursor {
+                if range.start < child_end && range.end > cursor {
                     append_range(
                         source,
                         child,
-                        child_length,
-                        child_chunk_count,
-                        start.saturating_sub(cursor),
-                        end.min(child_end).saturating_sub(cursor),
+                        ExpectedShape {
+                            logical_bytes: child_length,
+                            chunk_count: child_chunk_count,
+                            tree_depth: shape.tree_depth.saturating_sub(1),
+                        },
+                        RequestedRange {
+                            start: range.start.saturating_sub(cursor),
+                            end: range.end.min(child_end).saturating_sub(cursor),
+                        },
                         output,
                     )?;
                 }
@@ -247,8 +272,7 @@ fn decode_file(
 fn validate_chunk(
     object: ObjectId,
     record: &ObjectRecord,
-    expected_length: u64,
-    expected_chunk_count: u64,
+    shape: ExpectedShape,
 ) -> Result<(), ContentError> {
     let actual =
         u64::try_from(record.canonical_bytes().len()).map_err(|_| ContentError::LengthOverflow)?;
@@ -256,8 +280,9 @@ fn validate_chunk(
         || record.class() != ObjectClass::Data
         || record.logical_bytes() != 0
         || !record.references().is_empty()
-        || actual != expected_length
-        || expected_chunk_count != 1
+        || actual != shape.logical_bytes
+        || shape.chunk_count != 1
+        || shape.tree_depth != 0
     {
         return Err(ContentError::InvalidObject {
             object,
@@ -270,8 +295,7 @@ fn validate_chunk(
 fn decode_tree(
     object: ObjectId,
     record: &ObjectRecord,
-    expected_length: u64,
-    expected_chunk_count: u64,
+    shape: ExpectedShape,
 ) -> Result<Vec<(ObjectId, u64, u64)>, ContentError> {
     let bytes = record.canonical_bytes();
     if record.format_version() != FORMAT_VERSION
@@ -303,8 +327,8 @@ fn decode_tree(
         || count > CHUNK_TREE_FANOUT
         || record.references().len() != count
         || bytes.len() != 18_usize.saturating_add(count.saturating_mul(16))
-        || logical_bytes != expected_length
-        || chunk_count != expected_chunk_count
+        || logical_bytes != shape.logical_bytes
+        || chunk_count != shape.chunk_count
     {
         return Err(ContentError::InvalidObject {
             object,
@@ -314,6 +338,7 @@ fn decode_tree(
     let mut children = Vec::with_capacity(count);
     let mut total = 0_u64;
     let mut total_chunks = 0_u64;
+    let child_capacity = tree_capacity(shape.tree_depth.saturating_sub(1));
     for (index, reference) in record.references().iter().enumerate() {
         let expected_label = u16::try_from(index)
             .map_err(|_| ContentError::LengthOverflow)?
@@ -336,10 +361,14 @@ fn decode_tree(
                 .try_into()
                 .map_err(|_| ContentError::LengthOverflow)?,
         );
-        if child_length == 0 || child_chunk_count == 0 {
+        if child_length == 0
+            || child_chunk_count == 0
+            || child_chunk_count > child_capacity
+            || (index.saturating_add(1) < count && child_chunk_count != child_capacity)
+        {
             return Err(ContentError::InvalidObject {
                 object,
-                detail: "chunk-tree child has zero length",
+                detail: "chunk-tree child shape is non-canonical",
             });
         }
         total = total
@@ -357,6 +386,22 @@ fn decode_tree(
         });
     }
     Ok(children)
+}
+
+fn canonical_tree_depth(chunk_count: u64) -> u32 {
+    let mut depth = 0_u32;
+    let mut capacity = 1_u64;
+    while capacity < chunk_count {
+        capacity = capacity.saturating_mul(CHUNK_TREE_FANOUT as u64);
+        depth = depth.saturating_add(1);
+    }
+    depth
+}
+
+fn tree_capacity(depth: u32) -> u64 {
+    (0..depth).fold(1_u64, |capacity, _| {
+        capacity.saturating_mul(CHUNK_TREE_FANOUT as u64)
+    })
 }
 
 fn load<S: ContentSource>(
