@@ -4,7 +4,9 @@ Status: proposed falsifiability contract
 
 Last reviewed: 2026-07-25
 
-Companion: [principal-store architecture](astrid-principal-store.md)
+Companions:
+[principal-store architecture](astrid-principal-store.md) and
+[semantic representations](astrid-semantic-representations.md)
 
 This document separates three kinds of confidence:
 
@@ -30,6 +32,10 @@ Leases : LeaseId -> (PlacementEpoch, Set<BlobId>, Expiry)
 P : (PlacementEpoch, BlobId) -> Set<Replica>
 V : (CommitId, Selector) -> (SelectedClosure, InclusionProof)
 W : (BeforeRoot, TypedPatch) -> (AfterRoot, PartialTreeProof)
+Contracts : ContractId -> (EquivalenceContract, AuthorityEpoch)
+S : (ObjectId, ContractId) -> (SemanticId, EvidenceId)
+Representations :
+    SemanticId -> Set<(ObjectId | BlobId, TrustClass, EvidenceId)>
 ```
 
 Assumptions:
@@ -40,6 +46,12 @@ Assumptions:
 4. Owning object references form a finite DAG.
 5. The root metadata store provides durable compare-and-swap transactions.
 6. Flush establishes the durability guarantee declared by the storage device.
+7. A registered contract's identity binds its reference transform closure and
+   deterministic execution semantics.
+8. A semantic binding is admitted only after reference execution or acceptance
+   by the proof verifier pinned in that contract.
+9. Object, semantic, representation, and evidence identifiers grant no
+   principal authority by themselves.
 7. Authorization and signature primitives satisfy their separate contracts.
 8. Reference relation labels, typed selectors, and patches have deterministic,
    bounded canonical semantics.
@@ -180,6 +192,14 @@ Required invariants:
 | STO-MOD-16 | Every installed principal root names a typed commit object |
 | STO-MOD-17 | Import admits exactly the declared owning closure, never unrelated supplied objects |
 | STO-MOD-18 | Placement epochs advance monotonically and name only registered blob representations |
+| STO-MOD-19 | Only an authority-registered immutable equivalence contract can define a semantic identity domain |
+| STO-MOD-20 | Every semantic binding is reproduced by its contract's pinned reference transform or verified by its pinned proof verifier |
+| STO-MOD-21 | Alternate transforms, conformance results, and spot checks cannot mint semantic identity |
+| STO-MOD-22 | A source representation is never served across principals without a separately approved representation derivation and trust class |
+| STO-MOD-23 | Similarity relations change no identity, authority, ownership, quota, retention, or erasure reachability |
+| STO-MOD-24 | Derived representation eviction changes no principal root or authoritative exact-byte read |
+| STO-MOD-25 | Equal semantic digests collapse only after complete canonical-stream comparison |
+| STO-MOD-26 | Semantic retention always keeps at least one authoritative representation that can reproduce the canonical stream |
 
 Every discovered counterexample becomes a minimized checked-in trace and a Rust
 regression test.
@@ -217,6 +237,14 @@ specification functions.
 | STO-PROP-23 | Pinning the same evidence retains it without charging it as principal-owned state |
 | STO-PROP-24 | Adding an unrelated valid object to an import causes atomic rejection rather than hidden admission |
 | STO-PROP-25 | A stale placement epoch or unregistered blob is rejected without changing the active epoch |
+| STO-PROP-26 | Changing any identity-bearing equivalence-contract field changes its contract and semantic identities |
+| STO-PROP-27 | A claimed canonical stream from an alternate transform is rejected unless the reference reproduces it or the pinned verifier accepts its proof |
+| STO-PROP-28 | An untrusted source encoding that is semantically valid is never selected where another principal requested a trusted representation |
+| STO-PROP-29 | Exact-byte lookup returns the requested object or fails; it never substitutes a semantically equivalent object |
+| STO-PROP-30 | Transform trap, exhaustion, oversized output, and over-depth or cyclic route planning create no semantic binding |
+| STO-PROP-31 | Evicting every derived representation preserves all principal roots and rebuilds the same verified semantic bindings |
+| STO-PROP-32 | A forced semantic-digest collision is rejected when canonical streams differ |
+| STO-PROP-33 | Collection rejects removal of the final authoritative representation of semantically retained content |
 
 The deliberate tiny digest model must generate collisions and assert byte
 comparison rejects them. Production collision probability is not a substitute

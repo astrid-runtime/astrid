@@ -233,6 +233,28 @@ expansion of strong keying material from deliberately slow password KDFs.
 Applying PBKDF2 for 100,000 iterations to an already unpredictable hash adds
 latency without raising the work factor for guessing the underlying content.
 
+### Semantic representation boundary
+
+The current DAG recognizes exact byte equality. It deliberately does not
+declare that different encodings contain the same typed value.
+
+[Semantic Representations](astrid-semantic-representations.md) specifies the
+generic extension: immutable equivalence contracts pin one archived reference
+transform, `SemanticId` binds that contract to its canonical stream, and typed
+representations carry provenance and trust class. This can recognize
+pixel-identical images, canonical structured values, directory trees, model
+tensors, or other domain values without placing codec logic in the kernel.
+
+The reference-transform pin closes a cross-principal substitution attack:
+arbitrary capsules may advertise transformation routes but cannot mint
+semantic identity. Alternate implementations require complete reference
+verification or a contract-pinned proof. Similarity remains a relationship
+only, and arbitrary source encodings are never promoted into a shared trusted
+serving pool merely because they produce the same semantic value.
+
+No `SemanticId`, equivalence-contract registry, transform runner, or capsule
+surface is activated by this increment.
+
 [snackabra-overview]: https://snackabra.readthedocs.io/en/latest/overview.html#image-dedup-encryption-storage
 [snackabra-storage-handler]: https://github.com/snackabra/snackabra-storageserver/blob/fb160601fde815f6ae16a96ed265ee205f4876dc/src/storage.js#L170-L223
 [tahoe-convergence]: https://tahoe-lafs.org/trac/tahoe-lafs/browser/docs/specifications/file-encoding.rst
@@ -265,6 +287,7 @@ This increment does not provide:
 - capsule WIT/host calls before the interface freeze is lifted;
 - streaming ingestion that avoids holding the source slice in memory;
 - encryption and erasure-domain key management;
+- semantic equivalence contracts and trusted representation selection;
 - compaction or online garbage collection;
 - export/import bundle integration; or
 - replication, placement, and rebalancing.
