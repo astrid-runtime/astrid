@@ -17,6 +17,8 @@ use clap::{Args, Subcommand};
 use colored::Colorize;
 use serde::Serialize;
 
+mod spawn;
+
 use crate::admin_client::{AdminClient, into_result};
 use crate::commands::stub::{self, ISSUE_DELEGATION, ISSUE_REMOTE_AUTH};
 use crate::context;
@@ -31,6 +33,9 @@ use crate::value_formatter::{ValueFormat, emit_structured};
 pub(crate) enum AgentCommand {
     /// Provision a new agent.
     Create(CreateArgs),
+    /// Spawn a locked-down, throwaway session that runs one bounded job under
+    /// a derived least-privilege principal, then tears it down (#1217).
+    Spawn(spawn::SpawnArgs),
     /// List agents on this host (and registered remotes when ready).
     List(ListArgs),
     /// Show the active agent context.
@@ -260,6 +265,7 @@ pub(crate) struct StubArgs {
 pub(crate) async fn run(cmd: AgentCommand) -> Result<ExitCode> {
     match cmd {
         AgentCommand::Create(args) => run_create(args).await,
+        AgentCommand::Spawn(args) => spawn::run(args).await,
         AgentCommand::List(args) => run_list(args).await,
         AgentCommand::Current => run_current(),
         AgentCommand::Switch(args) => run_switch(args).await,
