@@ -2,8 +2,31 @@
 
 This companion to [Astrid Principal Store](astrid-principal-store.md) carries
 the runtime boundary, delivery order, remaining evidence questions, and prior
-art. The core data, authority, migration, accounting, and host-projection
-architecture remains in the primary design.
+art. Operational economics, accounting, privacy, and retention are specified
+in [Astrid Principal Store Operations](astrid-principal-store-operations.md).
+
+## 18. Host filesystem projection
+
+The object graph is authoritative. A normal filesystem is a projection and
+ingestion boundary.
+
+For an Astrid-managed workspace:
+
+- a successful write transaction creates a new root;
+- external host changes are ingested through a watcher plus periodic
+  reconciliation;
+- watcher events are hints, never proof of a complete history;
+- deletion becomes a directory entry removal in a new root, while prior roots
+  remain only under explicit retention;
+- materialization occurs in a new directory or file and becomes visible through
+  atomic rename;
+- path resolution uses beneath/no-follow semantics and rejects device nodes,
+  sockets, escaping links, and platform-specific special names; and
+- symlink targets remain uninterpreted bytes during import/export.
+
+On platforms where exact mutation capture is required, Astrid should mount a
+filesystem service or route writes through a mediated interface rather than
+claim provenance from after-the-fact watching.
 
 ## 19. Native Astrid integration
 
