@@ -68,7 +68,7 @@ const ENUMERATE_DEADLINE: Duration = Duration::from_secs(55);
 /// so the kernel scopes discovery to the same identity as the request
 /// handlers. The function owns a freshly-connected [`SocketClient`] and
 /// drives it to EOF; it returns when the daemon closes the watch uplink.
-pub(super) async fn run(peer: Peer<RoleServer>, principal: String) {
+pub(super) async fn run(peer: Peer<RoleServer>, principal: String, workspace: std::path::PathBuf) {
     // The watch uplink's session id is ephemeral — it only keys this
     // transport's frames. Bind the connection to the SAME principal the
     // request handlers use: the proxy pins the first principal it sees per
@@ -84,8 +84,12 @@ pub(super) async fn run(peer: Peer<RoleServer>, principal: String) {
         },
     };
     let session = astrid_core::SessionId::from_uuid(Uuid::new_v4());
-    let mut watch_client = match crate::socket_client::connect_for_workspace(session, caller, None)
-        .await
+    let mut watch_client = match crate::socket_client::SocketClient::connect_with_workspace(
+        session,
+        caller,
+        Some(&workspace),
+    )
+    .await
     {
         Ok(c) => c,
         Err(e) => {

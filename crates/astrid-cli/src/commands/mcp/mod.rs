@@ -48,6 +48,7 @@ mod watch;
 
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use rmcp::ServiceExt;
@@ -56,6 +57,34 @@ use tracing::info;
 use uuid::Uuid;
 
 use server::AstridMcpServer;
+
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(55);
+const MIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
+// The runtime caps one principal invocation at 24 hours. Five minutes of
+// shim-side headroom lets a broker configured near that ceiling still return
+// its terminal timeout reply instead of losing it at the stdio boundary.
+const MAX_REQUEST_TIMEOUT: Duration = Duration::from_mins(1_445);
+
+fn resolve_request_timeout(value: Option<&str>) -> Result<Duration> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_REQUEST_TIMEOUT);
+    };
+    let timeout = crate::commands::quota::parse_duration(value)
+        .with_context(|| format!("invalid --request-timeout value '{value}'"))?;
+    if !(MIN_REQUEST_TIMEOUT..=MAX_REQUEST_TIMEOUT).contains(&timeout) {
+        anyhow::bail!("--request-timeout must be between 1s and 1d5m (received '{value}')");
+    }
+    Ok(timeout)
+}
+
+fn resolve_workspace(workspace: Option<&std::path::Path>) -> Result<std::path::PathBuf> {
+    workspace
+        .map(std::path::Path::to_path_buf)
+        .map_or_else(std::env::current_dir, Ok)
+        .context("failed to resolve the launching agent's workspace")?
+        .canonicalize()
+        .context("failed to canonicalize the launching agent's workspace")
+}
 
 /// Refuse to serve the MCP bridge silently as the no-capability `anonymous`
 /// identity.
@@ -107,7 +136,12 @@ fn broker_readiness_required(caller: &astrid_core::PrincipalId) -> bool {
 ///
 /// Returns an error if the daemon socket is unreachable, the principal
 /// is invalid, or the MCP transport fails to initialize.
-pub(crate) async fn serve(principal: Option<&str>) -> Result<ExitCode> {
+pub(crate) async fn serve(
+    principal: Option<&str>,
+    workspace: Option<&std::path::Path>,
+    request_timeout: Option<&str>,
+) -> Result<ExitCode> {
+    let request_timeout = resolve_request_timeout(request_timeout)?;
     // The subcommand `--principal` is an explicit per-invocation
     // override; when absent, fall back to the process-wide principal
     // (the global `--principal` / `ASTRID_PRINCIPAL`, already validated
@@ -118,6 +152,7 @@ pub(crate) async fn serve(principal: Option<&str>) -> Result<ExitCode> {
             .with_context(|| format!("invalid principal for `astrid mcp serve`: {p}"))?,
         None => crate::principal::current(),
     };
+    let workspace = resolve_workspace(workspace)?;
 
     // `mcp serve` owns stdout for JSON-RPC, so daemon bootstrap must be quiet.
     crate::commands::daemon::ensure_daemon_quiet("mcp-serve")
@@ -129,9 +164,13 @@ pub(crate) async fn serve(principal: Option<&str>) -> Result<ExitCode> {
     // not a chat session; the kernel attributes work via the per-message
     // `principal`, not the session.
     let session = astrid_core::SessionId::from_uuid(Uuid::new_v4());
-    let mut client = crate::socket_client::connect_for_workspace(session, caller.clone(), None)
-        .await
-        .context("Failed to connect to the Astrid daemon socket")?;
+    let mut client = crate::socket_client::SocketClient::connect_with_workspace(
+        session,
+        caller.clone(),
+        Some(&workspace),
+    )
+    .await
+    .context("Failed to connect to the Astrid daemon socket")?;
 
     // The uplink connected, but a non-`anonymous` principal with no keypair is
     // silently stamped `anonymous` by the daemon — every tool call would then
@@ -155,9 +194,14 @@ pub(crate) async fn serve(principal: Option<&str>) -> Result<ExitCode> {
         "astrid mcp serve: uplink established, starting MCP stdio transport"
     );
 
-    tokio::spawn(session_guard::run(caller.clone()));
+    tokio::spawn(session_guard::run(caller.clone(), workspace.clone()));
 
-    let server = AstridMcpServer::new(Arc::new(Mutex::new(client)), caller.clone());
+    let server = AstridMcpServer::new(
+        Arc::new(Mutex::new(client)),
+        caller.clone(),
+        workspace.clone(),
+        request_timeout,
+    );
 
     // `rmcp::transport::stdio()` yields the (stdin, stdout) pair the MCP
     // transport drives. `serve` performs the MCP handshake and spawns the
@@ -177,7 +221,7 @@ pub(crate) async fn serve(principal: Option<&str>) -> Result<ExitCode> {
     // if the watch uplink dies, tool-list pushes simply stop, but the server
     // keeps serving `tools/list`/`tools/call` on demand.
     let peer = running.peer().clone();
-    tokio::spawn(watch::run(peer, caller.to_string()));
+    tokio::spawn(watch::run(peer, caller.to_string(), workspace));
 
     // Race the normal stdin-EOF quit against parent-death. `waiting()` only
     // returns when the client closes stdin; an MCP client that DIES without
@@ -210,8 +254,46 @@ pub(crate) async fn serve(principal: Option<&str>) -> Result<ExitCode> {
 
 #[cfg(test)]
 mod fail_loud_tests {
-    use super::{broker_readiness_required, require_authenticated_unless_anonymous};
+    use super::{
+        DEFAULT_REQUEST_TIMEOUT, MAX_REQUEST_TIMEOUT, broker_readiness_required,
+        require_authenticated_unless_anonymous, resolve_request_timeout, resolve_workspace,
+    };
     use astrid_core::PrincipalId;
+    use std::time::Duration;
+
+    #[test]
+    fn request_timeout_defaults_and_parses_human_durations() {
+        assert_eq!(
+            resolve_request_timeout(None).unwrap(),
+            DEFAULT_REQUEST_TIMEOUT
+        );
+        assert_eq!(
+            resolve_request_timeout(Some("5m")).unwrap(),
+            Duration::from_mins(5)
+        );
+        assert_eq!(
+            resolve_request_timeout(Some("1d5m")).unwrap(),
+            MAX_REQUEST_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn request_timeout_rejects_zero_malformed_and_over_cap_values() {
+        assert!(resolve_request_timeout(Some("0")).is_err());
+        assert!(resolve_request_timeout(Some("forever")).is_err());
+        assert!(resolve_request_timeout(Some("1d5m1s")).is_err());
+    }
+
+    #[test]
+    fn explicit_mcp_workspace_is_independent_of_process_cwd() {
+        let explicit = tempfile::tempdir().expect("explicit MCP workspace");
+        let resolved = resolve_workspace(Some(explicit.path())).expect("resolve workspace");
+        assert_eq!(
+            resolved,
+            explicit.path().canonicalize().expect("canonical workspace")
+        );
+        assert_ne!(resolved, std::env::current_dir().expect("process cwd"));
+    }
 
     #[test]
     fn authenticated_principal_is_allowed() {

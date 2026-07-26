@@ -479,6 +479,56 @@ fn ipc_event(topic: &str) -> AstridEvent {
     }
 }
 
+#[test]
+fn ipc_sidecar_binding_precedes_delivery_and_preserves_order() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    let bus = EventBus::new();
+    let mut receiver = bus.subscribe();
+    let bound_sequence = Arc::new(AtomicU64::new(0));
+    let observer_saw_binding = Arc::new(AtomicBool::new(false));
+    let bound_for_observer = Arc::clone(&bound_sequence);
+    let saw_for_observer = Arc::clone(&observer_saw_binding);
+    bus.observe_permanently("sidecar_order_test", move |event| {
+        let AstridEvent::Ipc { message, .. } = event else {
+            return;
+        };
+        if ipc_sequence_has_host_sidecar(message.seq) {
+            saw_for_observer.store(
+                bound_for_observer.load(Ordering::SeqCst) == message.seq,
+                Ordering::SeqCst,
+            );
+        }
+    });
+
+    bus.publish(ipc_event("test.normal.before"));
+    let bound_for_publish = Arc::clone(&bound_sequence);
+    bus.publish_with_ipc_sidecar(ipc_event("test.attached"), true, move |sequence| {
+        bound_for_publish.store(sequence, Ordering::SeqCst);
+    });
+    bus.publish(ipc_event("test.normal.after"));
+
+    let sequences = (0..3)
+        .map(|_| {
+            let event = receiver.try_recv().expect("published IPC event");
+            let AstridEvent::Ipc { message, .. } = &*event else {
+                panic!("expected IPC event");
+            };
+            message.seq
+        })
+        .collect::<Vec<_>>();
+
+    assert!(sequences.windows(2).all(|pair| pair[0] < pair[1]));
+    assert!(!ipc_sequence_has_host_sidecar(sequences[0]));
+    assert!(ipc_sequence_has_host_sidecar(sequences[1]));
+    assert!(!ipc_sequence_has_host_sidecar(sequences[2]));
+    assert_eq!(bound_sequence.load(Ordering::SeqCst), sequences[1]);
+    assert!(
+        observer_saw_binding.load(Ordering::SeqCst),
+        "the sidecar must be bound before synchronous observation"
+    );
+}
+
 #[tokio::test]
 async fn test_wildcard_matches_multiple_depths() {
     let bus = EventBus::new();

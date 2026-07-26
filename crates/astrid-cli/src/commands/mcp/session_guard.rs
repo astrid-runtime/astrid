@@ -17,10 +17,10 @@ const INITIAL_RETRY_BACKOFF: Duration = Duration::from_secs(2);
 const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 
 /// Run until the MCP process exits and Tokio drops this task.
-pub(super) async fn run(principal: astrid_core::PrincipalId) {
+pub(super) async fn run(principal: astrid_core::PrincipalId, workspace: std::path::PathBuf) {
     let mut retry_backoff = INITIAL_RETRY_BACKOFF;
     loop {
-        match hold_guard_uplink(&principal).await {
+        match hold_guard_uplink(&principal, &workspace).await {
             Ok(never) => match never {},
             Err(e) => {
                 warn!(error = %e, %principal, "MCP session guard: daemon connection unavailable");
@@ -33,13 +33,18 @@ pub(super) async fn run(principal: astrid_core::PrincipalId) {
 
 async fn hold_guard_uplink(
     principal: &astrid_core::PrincipalId,
+    workspace: &std::path::Path,
 ) -> Result<std::convert::Infallible> {
     daemon::ensure_daemon_quiet("mcp-session-guard").await?;
 
     let session = astrid_core::SessionId::from_uuid(Uuid::new_v4());
-    let c = crate::socket_client::connect_for_workspace(session, principal.clone(), None)
-        .await
-        .context("failed to connect guard uplink to daemon")?;
+    let c = crate::socket_client::SocketClient::connect_with_workspace(
+        session,
+        principal.clone(),
+        Some(workspace),
+    )
+    .await
+    .context("failed to connect guard uplink to daemon")?;
 
     validate_guard_auth(principal, c.is_authenticated())?;
 

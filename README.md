@@ -204,7 +204,7 @@ astrid agent create staging --clone production # full profile + state replica
 astrid agent modify ci-bot \
   --add-capsule astrid-capsule-fs              # grant access to a capsule's tools
 astrid caps show ci-bot                        # inspect capability grants
-astrid quota set -a ci-bot --memory 128MB      # per-principal resource limits
+astrid quota set -a ci-bot --memory 2GiB --compute-workers 4  # per-principal limits
 astrid pair-device issue --scope use-only      # scope a device token to a subset
 ```
 

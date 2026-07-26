@@ -64,6 +64,7 @@ uuid = { workspace = true }
 nix = { workspace = true }
 
 [target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
+astrid-compute = { workspace = true }
 astrid-mcp = { workspace = true }
 # `astrid-vfs` is native-only (it uses `cap-std` and tokio's filesystem
 # surface). Only `context.rs`'s `overlay_registry` field references it, behind
@@ -107,6 +108,7 @@ astrid-uplink = { workspace = true, features = ["test-support"] }
 # for hermetic stream-quota tests, with no network.
 http = "1"
 wasm-encoder = { workspace = true }
+wat = "1"
 
 [lints.rust]
 unsafe_code = "deny"

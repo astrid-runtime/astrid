@@ -75,6 +75,19 @@ impl Vfs for WorktreeVfs {
         Ok(meta)
     }
 
+    async fn stat_symlink(
+        &self,
+        handle: &DirHandle,
+        path: &str,
+    ) -> VfsResult<crate::VfsSymlinkMetadata> {
+        if self.boundary.is_ignored(path, false) || self.boundary.is_ignored(path, true) {
+            return Err(VfsError::PermissionDenied(format!(
+                "Path is protected by .astridignore boundary: {path}"
+            )));
+        }
+        self.inner.stat_symlink(handle, path).await
+    }
+
     async fn mkdir(&self, handle: &DirHandle, path: &str) -> VfsResult<()> {
         self.check_access(path, true)?;
         self.inner.mkdir(handle, path).await

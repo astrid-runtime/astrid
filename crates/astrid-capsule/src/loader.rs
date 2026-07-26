@@ -1,6 +1,7 @@
 //! Factory and routing logic for instantiating Composite Capsules.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::capsule::{Capsule, CompositeCapsule};
 use crate::engine::wasm::limits::{CapsuleRuntimeLimits, HttpLimits};
@@ -27,6 +28,10 @@ pub struct CapsuleLoader {
     /// handed to every `WasmEngine` so a principal's memory peak is the max
     /// across all capsules. See [`MemoryLedger`].
     memory_ledger: MemoryLedger,
+    /// Kernel-owned aggregate generic-compute reservation ledger.
+    compute_ledger: astrid_compute::ComputeLedger,
+    /// Operator policy for generic compute groups.
+    compute_limits: crate::ComputeRuntimeLimits,
     /// Host-derived (operator-overridable) concurrency ceilings, resolved once
     /// by the daemon and handed to every `WasmEngine` to size its host-call
     /// semaphores. A plain `Copy` value, not a shared handle. See
@@ -37,6 +42,8 @@ pub struct CapsuleLoader {
     /// config section and handed to every `WasmEngine`. A global `Copy` value.
     /// See [`HttpLimits`].
     http_limits: HttpLimits,
+    /// Host-only mapping shared by every engine loaded into one kernel.
+    workspace_attachments: Arc<crate::workspace_attachment::WorkspaceAttachmentRegistry>,
 }
 
 impl CapsuleLoader {
@@ -60,14 +67,84 @@ impl CapsuleLoader {
         runtime_limits: CapsuleRuntimeLimits,
         http_limits: HttpLimits,
     ) -> Self {
-        Self {
+        Self::new_with_compute(
             mcp_client,
             fuel_ledger,
             fuel_rate,
             memory_ledger,
             runtime_limits,
             http_limits,
+            astrid_compute::ComputeLedger::default(),
+        )
+    }
+
+    /// Create a loader sharing the kernel's aggregate compute ledger.
+    #[must_use]
+    pub fn new_with_compute(
+        mcp_client: SecureMcpClient,
+        fuel_ledger: FuelLedger,
+        fuel_rate: FuelRateLimiter,
+        memory_ledger: MemoryLedger,
+        runtime_limits: CapsuleRuntimeLimits,
+        http_limits: HttpLimits,
+        compute_ledger: astrid_compute::ComputeLedger,
+    ) -> Self {
+        Self::new_with_compute_policy(
+            mcp_client,
+            fuel_ledger,
+            fuel_rate,
+            memory_ledger,
+            runtime_limits,
+            http_limits,
+            compute_ledger,
+            crate::ComputeRuntimeLimits::default(),
+        )
+    }
+
+    /// Create a loader sharing aggregate compute accounting and policy.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "additive composition-root constructor preserves existing public APIs"
+    )]
+    #[must_use]
+    pub fn new_with_compute_policy(
+        mcp_client: SecureMcpClient,
+        fuel_ledger: FuelLedger,
+        fuel_rate: FuelRateLimiter,
+        memory_ledger: MemoryLedger,
+        runtime_limits: CapsuleRuntimeLimits,
+        http_limits: HttpLimits,
+        compute_ledger: astrid_compute::ComputeLedger,
+        compute_limits: crate::ComputeRuntimeLimits,
+    ) -> Self {
+        Self {
+            mcp_client,
+            fuel_ledger,
+            fuel_rate,
+            memory_ledger,
+            compute_ledger,
+            compute_limits,
+            runtime_limits,
+            http_limits,
+            workspace_attachments: Arc::new(
+                crate::workspace_attachment::WorkspaceAttachmentRegistry::default(),
+            ),
         }
+    }
+
+    /// Use one host-only workspace attachment registry for every capsule this
+    /// loader creates.
+    ///
+    /// The default is an isolated registry for compatibility with tests and
+    /// embedders. A kernel supplies its shared instance so an opaque reference
+    /// stamped by the uplink can be resolved by downstream capsule engines.
+    #[must_use]
+    pub fn with_workspace_attachments(
+        mut self,
+        registry: Arc<crate::workspace_attachment::WorkspaceAttachmentRegistry>,
+    ) -> Self {
+        self.workspace_attachments = registry;
+        self
     }
 
     /// Parse a `CapsuleManifest` and build a unified `CompositeCapsule`.
@@ -88,15 +165,20 @@ impl CapsuleLoader {
 
         // 1. WASM Component Engine
         if !manifest.components.is_empty() {
-            composite.add_engine(Box::new(crate::engine::WasmEngine::new(
-                manifest.clone(),
-                capsule_dir.clone(),
-                self.fuel_ledger.clone(),
-                self.fuel_rate.clone(),
-                self.memory_ledger.clone(),
-                self.runtime_limits,
-                self.http_limits,
-            )));
+            composite.add_engine(Box::new(
+                crate::engine::WasmEngine::new_with_compute_policy(
+                    manifest.clone(),
+                    capsule_dir.clone(),
+                    self.fuel_ledger.clone(),
+                    self.fuel_rate.clone(),
+                    self.memory_ledger.clone(),
+                    self.runtime_limits,
+                    self.http_limits,
+                    self.compute_ledger.clone(),
+                    self.compute_limits,
+                )
+                .with_workspace_attachments(Arc::clone(&self.workspace_attachments)),
+            ));
         }
 
         // 2. Legacy Host MCP Engine (The Airlock Override)

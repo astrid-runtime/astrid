@@ -956,6 +956,95 @@ fn test_allow_command_hooks_cannot_enable() {
     assert!(!merged["hooks"]["allow_command_hooks"].as_bool().unwrap());
 }
 
+#[test]
+fn test_workspace_cannot_override_compute_ceilings() {
+    let baseline: toml::Value = toml::from_str(
+        r"
+        [capsule]
+        compute_max_workers_per_principal = 4
+        compute_max_shared_memory_bytes_per_principal = 1073741824
+        compute_max_job_fuel = 5000000000
+        compute_host_max_workers = 8
+        compute_host_max_shared_memory_bytes = 8589934592
+    ",
+    )
+    .unwrap();
+    let workspace: toml::Value = toml::from_str(
+        r"
+        [capsule]
+        compute_max_workers_per_principal = 64
+        compute_max_shared_memory_bytes_per_principal = 17179869184
+        compute_max_job_fuel = 500000000000
+        compute_host_max_workers = 128
+        compute_host_max_shared_memory_bytes = 137438953472
+    ",
+    )
+    .unwrap();
+
+    let mut merged = baseline.clone();
+    deep_merge(&mut merged, &workspace);
+    enforce_restrictions(&mut merged, &baseline, &workspace);
+
+    assert_eq!(
+        merged["capsule"]["compute_max_workers_per_principal"].as_integer(),
+        Some(4)
+    );
+    assert_eq!(
+        merged["capsule"]["compute_max_shared_memory_bytes_per_principal"].as_integer(),
+        Some(1_073_741_824)
+    );
+    assert_eq!(
+        merged["capsule"]["compute_max_job_fuel"].as_integer(),
+        Some(5_000_000_000)
+    );
+    assert_eq!(
+        merged["capsule"]["compute_host_max_workers"].as_integer(),
+        Some(8)
+    );
+    assert_eq!(
+        merged["capsule"]["compute_host_max_shared_memory_bytes"].as_integer(),
+        Some(8_589_934_592)
+    );
+}
+
+#[test]
+fn test_workspace_cannot_introduce_compute_ceilings() {
+    let baseline: toml::Value = toml::from_str("[capsule]").unwrap();
+    let workspace: toml::Value = toml::from_str(
+        r"
+        [capsule]
+        compute_max_workers_per_principal = 2
+        compute_max_shared_memory_bytes_per_principal = 536870912
+        compute_max_job_fuel = 1000000000
+        compute_host_max_workers = 4
+        compute_host_max_shared_memory_bytes = 2147483648
+    ",
+    )
+    .unwrap();
+
+    let mut merged = baseline.clone();
+    deep_merge(&mut merged, &workspace);
+    enforce_restrictions(&mut merged, &baseline, &workspace);
+
+    assert!(
+        merged["capsule"]
+            .get("compute_max_workers_per_principal")
+            .is_none()
+    );
+    assert!(
+        merged["capsule"]
+            .get("compute_max_shared_memory_bytes_per_principal")
+            .is_none()
+    );
+    assert!(merged["capsule"].get("compute_max_job_fuel").is_none());
+    assert!(merged["capsule"].get("compute_host_max_workers").is_none());
+    assert!(
+        merged["capsule"]
+            .get("compute_host_max_shared_memory_bytes")
+            .is_none()
+    );
+}
+
 // ---- Step 7: Robustness ----
 
 #[test]

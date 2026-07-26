@@ -91,7 +91,23 @@ async fn framed_read_records_then_clears_verified_ingress_principal() {
     // Path 1 daemon spawn-binding), with the matched device key_id so the
     // cap-gate can scope it.
     let claude = astrid_core::PrincipalId::new("claude").unwrap();
-    state.bind_connection_principal(rep, claude.clone(), Some("dev-abc123".to_string()));
+    let workspace = tempfile::tempdir().expect("workspace");
+    let attachment = state
+        .workspace_attachments
+        .attach(
+            claude.clone(),
+            workspace
+                .path()
+                .canonicalize()
+                .expect("canonical workspace"),
+        )
+        .expect("attach workspace");
+    state.bind_connection_principal(
+        rep,
+        claude.clone(),
+        Some("dev-abc123".to_string()),
+        Some(attachment),
+    );
 
     // Peer sends one length-prefixed frame (4-byte BE length + payload).
     let payload = br#"{"topic":"client.v1.connect","payload":{}}"#;
@@ -124,6 +140,11 @@ async fn framed_read_records_then_clears_verified_ingress_principal() {
         Some(astrid_events::ipc::MessageOrigin::LocalSocket),
         "a data read on a kernel-BOUND connection must stamp LocalSocket origin"
     );
+    assert_eq!(
+        state.ingress_workspace_attachment,
+        Some(attachment),
+        "a data read must copy the connection's host-admitted workspace reference"
+    );
 
     // A subsequent non-data read (no more frames → pending) clears BOTH, so
     // a stale principal or device id can never leak onto a later forward.
@@ -145,6 +166,10 @@ async fn framed_read_records_then_clears_verified_ingress_principal() {
         state.ingress_origin, None,
         "a non-data read must clear the in-flight LocalSocket origin so a \
              stale local origin can never leak onto a later forward"
+    );
+    assert_eq!(
+        state.ingress_workspace_attachment, None,
+        "a non-data read must clear the in-flight workspace reference"
     );
 }
 
@@ -171,6 +196,7 @@ async fn framed_read_is_inert_without_uplink_capability() {
         rep,
         astrid_core::PrincipalId::new("claude").unwrap(),
         Some("dev-abc123".to_string()),
+        None,
     );
 
     let payload = br#"{"topic":"x","payload":{}}"#;

@@ -1,0 +1,121 @@
+/// Principal-scoped parallel execution of capsule-authored core-Wasm workers.
+///
+/// PRE-1.0 DRAFT. This contract is developed and tested on an unmerged branch
+/// and is not frozen until Astrid 1.0. The host remains algorithm-blind: the
+/// capsule supplies a signed `compute-worker` module; Astrid validates,
+/// schedules, meters, cancels, and accounts for it.
+///
+/// Workers import one shared linear memory and no host functions. Bulk data and
+/// synchronization stay in that memory; this interface is the audited control
+/// plane. Each signed `compute-worker` declaration is an object-scoped grant
+/// for exactly that component id and digest.
+
+package astrid:compute@1.0.0;
+
+interface host {
+    use astrid:io/poll@1.0.0.{pollable};
+
+    variant error-code {
+        capability-denied,
+        invalid-input(string),
+        no-such-worker,
+        worker-invalid(string),
+        quota,
+        busy,
+        cancelled,
+        worker-failed(string),
+        closed,
+        too-large,
+        unknown(string),
+    }
+
+    enum execution-mode {
+        deterministic,
+        parallel,
+    }
+
+    variant parallelism {
+        auto,
+        exact(u32),
+        at-most(u32),
+    }
+
+    record group-request {
+        worker: string,
+        mode: execution-mode,
+        parallelism: parallelism,
+        initial-memory-pages: u32,
+        maximum-memory-pages: u32,
+    }
+
+    record work-descriptor {
+        offset: u64,
+        length: u64,
+        tag: u64,
+        worker-index: option<u32>,
+        /// Optional self-limit. `none` uses the operator maximum when set, or
+        /// remains uncapped by Astrid policy.
+        fuel: option<u64>,
+    }
+
+    enum job-state {
+        queued,
+        running,
+        completed,
+        cancelled,
+        failed,
+    }
+
+    record job-status {
+        state: job-state,
+        worker-index: option<u32>,
+    }
+
+    record job-result {
+        state: job-state,
+        worker-index: u32,
+        worker-status: s32,
+        fuel-consumed: u64,
+        elapsed-ns: u64,
+    }
+
+    record accounting {
+        workers-reserved: u32,
+        memory-bytes-current: u64,
+        memory-bytes-peak: u64,
+        jobs-submitted: u64,
+        jobs-completed: u64,
+        jobs-cancelled: u64,
+        jobs-failed: u64,
+        fuel-consumed: u64,
+    }
+
+    record group-info {
+        worker: string,
+        mode: execution-mode,
+        parallelism: u32,
+        memory-pages: u32,
+        maximum-memory-pages: u32,
+        queued-jobs: u32,
+        running-jobs: u32,
+        usage: accounting,
+    }
+
+    resource job {
+        status: func() -> result<job-status, error-code>;
+        subscribe: func() -> pollable;
+        join: func() -> result<job-result, error-code>;
+        cancel: func() -> result<_, error-code>;
+    }
+
+    resource compute-group {
+        info: func() -> result<group-info, error-code>;
+        read: func(offset: u64, length: u32) -> result<list<u8>, error-code>;
+        write: func(offset: u64, data: list<u8>) -> result<_, error-code>;
+        grow: func(delta-pages: u32) -> result<u32, error-code>;
+        submit: func(descriptor: work-descriptor) -> result<job, error-code>;
+        cancel: func() -> result<_, error-code>;
+    }
+
+    open: func(request: group-request) -> result<compute-group, error-code>;
+}

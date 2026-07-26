@@ -38,19 +38,29 @@ pub mod security;
 pub mod tool_discovery;
 pub mod topic;
 pub mod toposort;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub mod workspace_attachment;
 // The manifest watcher drives hot-reload via the native `notify` crate; an
 // alternate host has no OS filesystem-watch facility.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) mod watcher;
 
 pub use access::CapsuleAccessResolver;
-pub use astrid_capsule_types::limits::{CapsuleRuntimeLimits, HttpLimits};
+pub use astrid_capsule_types::limits::{CapsuleRuntimeLimits, ComputeRuntimeLimits, HttpLimits};
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub use astrid_compute::ComputeLedger;
 pub use audit_sink::{HostAuditEvent, HostAuditOutcome, HostAuditSink};
 pub use fuel_ledger::{FuelLedger, FuelRateLimiter};
 pub use memory_ledger::MemoryLedger;
 // `StoreMemoryMeter` is the Wasmtime `ResourceLimiter`; native-only.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub use memory_ledger::StoreMemoryMeter;
+// Wasmtime's component bindgen requires mapped resource storage types to be
+// publicly reachable from the crate root. This is runtime plumbing, not a
+// capsule-author API.
+#[doc(hidden)]
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub use engine::wasm::host::fs::OpenFileHandle;
 pub use tool_discovery::{ToolDescriptor, describe_loaded_capsule, tools_missing_execute_route};
 
 /// Test-only access to security boundaries that integration tests must drive
@@ -71,7 +81,15 @@ pub mod test_support {
         expected_token: &SessionToken,
         home: &astrid_core::dirs::AstridHome,
     ) -> Result<Option<(PrincipalId, String)>, String> {
-        crate::engine::wasm::host::net::handshake::validate_handshake(stream, expected_token, home)
-            .await
+        let workspace_attachments =
+            crate::workspace_attachment::WorkspaceAttachmentRegistry::default();
+        let verified = crate::engine::wasm::host::net::handshake::validate_handshake(
+            stream,
+            expected_token,
+            home,
+            &workspace_attachments,
+        )
+        .await?;
+        Ok(verified.map(|connection| (connection.principal, connection.key_id)))
     }
 }

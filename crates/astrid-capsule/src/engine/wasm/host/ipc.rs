@@ -231,6 +231,7 @@ fn publish_inner(
     principal_str: String,
     device_key_id: Option<&str>,
     origin: astrid_events::ipc::MessageOrigin,
+    workspace_attachment: Option<crate::workspace_attachment::WorkspaceAttachmentRef>,
 ) -> Result<(), ErrorCode> {
     if topic.len() > 256 {
         return Err(ErrorCode::InvalidInput);
@@ -295,11 +296,23 @@ fn publish_inner(
     if let Some(id) = device_key_id {
         message = message.with_device_key_id(id);
     }
-
-    state.event_bus.publish(AstridEvent::Ipc {
+    let event = AstridEvent::Ipc {
         metadata: EventMetadata::new("wasm_guest").with_session_id(state.capsule_uuid),
         message,
-    });
+    };
+    match workspace_attachment {
+        Some(attachment) => {
+            let registry = Arc::clone(&state.workspace_attachments);
+            state
+                .event_bus
+                .publish_with_ipc_sidecar(event, true, |sequence| {
+                    let _ = registry.bind_message(sequence, attachment);
+                });
+        },
+        None => {
+            state.event_bus.publish(event);
+        },
+    }
     Ok(())
 }
 
@@ -323,9 +336,21 @@ impl ipc::Host for HostState {
             .as_ref()
             .map(|m| m.origin)
             .unwrap_or(astrid_events::ipc::MessageOrigin::System);
+        if !self.workspace_attachment_is_resolved() {
+            return Err(ErrorCode::CapabilityDenied);
+        }
+        let workspace_attachment = self.invocation_workspace_attachment;
         // A capsule's own host calls are never device-scoped: the owner acts at
         // full principal authority, so no device_key_id is stamped here.
-        let result = publish_inner(self, topic, payload, principal_str, None, origin);
+        let result = publish_inner(
+            self,
+            topic,
+            payload,
+            principal_str,
+            None,
+            origin,
+            workspace_attachment,
+        );
         audit_ipc(
             self,
             "astrid:ipc/host.publish",
@@ -374,6 +399,7 @@ impl ipc::Host for HostState {
         let origin = self
             .ingress_origin
             .unwrap_or(astrid_events::ipc::MessageOrigin::System);
+        let workspace_attachment = self.ingress_workspace_attachment;
         let bytes = payload.len() as u64;
         let topic_for_audit = topic.clone();
         let result = publish_inner(
@@ -383,6 +409,7 @@ impl ipc::Host for HostState {
             effective,
             device_key_id.as_deref(),
             origin,
+            workspace_attachment,
         );
         audit_ipc(
             self,

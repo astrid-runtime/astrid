@@ -18,7 +18,7 @@
 //! is a single charset-clean topic segment the broker's egress gate
 //! accepts), mirrors it into the request body, publishes on the request
 //! topic, then awaits the single-segment reply topic
-//! `astrid.v1.response.<req_id>` for up to [`REQUEST_DEADLINE`]. The
+//! `astrid.v1.response.<req_id>` for the configured request deadline. The
 //! broker echoes `req_id` in the body, but the shim correlates purely on
 //! the response topic (unique per request); the body copy exists for the
 //! broker's own logging and is not read back here. Concurrent calls never
@@ -63,11 +63,6 @@ pub(super) const TOOLS_LIST_TOPIC: &str = "astrid.v1.request.mcp.tools.list";
 /// Request topic for the broker `tools/call` front door.
 const TOOL_CALL_TOPIC: &str = "astrid.v1.request.mcp.tool.call";
 
-/// Shim-side deadline for a single broker round trip. The broker bounds
-/// its own tool drain at 50 s; this sits just above that so a slow tool
-/// surfaces as a broker-side `isError` reply rather than a shim timeout.
-const REQUEST_DEADLINE: Duration = Duration::from_secs(55);
-
 /// Upper bound on grant-on-use resolutions the shim will drive within a
 /// SINGLE `tools/call` before failing the call with a terminal error.
 ///
@@ -104,12 +99,20 @@ pub(crate) struct AstridMcpServer {
     client: Arc<Mutex<SocketClient>>,
     /// Principal stamped on every outbound IPC message.
     principal: PrincipalId,
+    /// Canonical host directory authenticated as this MCP connection's
+    /// invocation-scoped `cwd://` root. Reconnects must preserve it.
+    workspace: std::path::PathBuf,
+    /// Upper bound for one publish-and-reply broker round trip. Configured by
+    /// `aos mcp serve --request-timeout`; it must sit above the broker
+    /// capsule's own result-drain window so terminal broker errors are not
+    /// dropped at the stdio boundary.
+    request_deadline: Duration,
     /// Set when a prior round trip ended in a connection-loss condition (a
     /// failed send, or a reply read that hit EOF / reset). The NEXT round trip
     /// re-handshakes (`reconnect()`) before sending, so a request never goes
     /// out on a stale/half-open fd left behind by a daemon restart. A clean
-    /// 55 s deadline against a live-but-slow broker does NOT set this — that is
-    /// not a dead connection.
+    /// configured deadline against a live-but-slow broker does NOT set this —
+    /// that is not a dead connection.
     ///
     /// Every access is made while the `client` mutex is held (see `forward`), so
     /// the flag is already serialized by that lock and needs no inter-thread
@@ -119,24 +122,35 @@ pub(crate) struct AstridMcpServer {
 
 impl AstridMcpServer {
     /// Build a new shim over an established uplink and resolved principal.
-    pub(crate) fn new(client: Arc<Mutex<SocketClient>>, principal: PrincipalId) -> Self {
+    pub(crate) fn new(
+        client: Arc<Mutex<SocketClient>>,
+        principal: PrincipalId,
+        workspace: std::path::PathBuf,
+        request_deadline: Duration,
+    ) -> Self {
         Self {
             client,
             principal,
+            workspace,
+            request_deadline,
             needs_reconnect: AtomicBool::new(false),
         }
     }
 
-    /// Reconnect the held uplink without ever retaining a client authenticated
-    /// to a daemon for another workspace. Every failure leaves the recovery
-    /// flag armed; only a fully checked replacement clears it.
+    /// Reconnect the held uplink while preserving this MCP client's
+    /// authenticated workspace attachment. The daemon's own workspace is an
+    /// independent lifecycle concern: AOS clients from multiple worktrees
+    /// deliberately share one runtime daemon.
+    ///
+    /// Every failure leaves the recovery flag armed; only a fully
+    /// authenticated replacement clears it.
     async fn reconnect(&self, client: &mut SocketClient) -> Result<(), McpError> {
         self.needs_reconnect.store(true, Ordering::Relaxed);
         let principal = self.principal.clone();
-        let result = crate::socket_client::reconnect_for_workspace(
+        let result = crate::socket_client::reconnect_with_workspace_attachment(
             client,
             principal.clone(),
-            None,
+            Some(&self.workspace),
             |replacement| {
                 super::require_authenticated_unless_anonymous(
                     &principal,
@@ -219,7 +233,7 @@ impl AstridMcpServer {
         // daemon died while we waited) apart from a legitimate slow-broker
         // deadline.
         match client
-            .read_until_topic_typed(&reply_topic, REQUEST_DEADLINE)
+            .read_until_topic_typed(&reply_topic, self.request_deadline)
             .await
         {
             Ok(raw) => Ok(unwrap_reply_payload(&raw)),
@@ -247,7 +261,7 @@ impl AstridMcpServer {
                         )
                     })?;
                     let raw = client
-                        .read_until_topic_typed(&reply_topic, REQUEST_DEADLINE)
+                        .read_until_topic_typed(&reply_topic, self.request_deadline)
                         .await
                         .map_err(|re| {
                             // Flag again — the retry's connection may also be dead.

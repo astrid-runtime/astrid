@@ -1,6 +1,7 @@
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::info;
@@ -107,6 +108,162 @@ fn resolve_content_addressed_wasm(capsule_dir: &std::path::Path) -> Option<PathB
     }
 }
 
+/// Private manifest extension for immutable compute-worker assets.
+///
+/// This deliberately does not extend the public `CapsuleManifest` Rust type or
+/// the WIT contract. The build and runtime paths consume the signed, installed
+/// `Capsule.toml` directly until the compute ABI is ready for a public contract.
+#[derive(serde::Deserialize)]
+struct ComputeAssetManifest {
+    #[serde(default)]
+    component: Vec<ComputeAssetComponent>,
+}
+
+#[derive(serde::Deserialize)]
+struct ComputeAssetComponent {
+    #[serde(default)]
+    id: String,
+    #[serde(default, rename = "type")]
+    component_type: String,
+    #[serde(default, rename = "asset")]
+    assets: Vec<ComputeAsset>,
+}
+
+#[derive(serde::Deserialize)]
+struct ComputeAsset {
+    id: String,
+    #[serde(rename = "file")]
+    path: PathBuf,
+    hash: String,
+}
+
+fn load_compute_asset_specs(
+    capsule_dir: &std::path::Path,
+) -> CapsuleResult<std::collections::HashMap<String, Vec<astrid_compute::WorkerAssetSpec>>> {
+    let manifest_path = capsule_dir.join("Capsule.toml");
+    let manifest_source = std::fs::read_to_string(&manifest_path).map_err(|error| {
+        CapsuleError::UnsupportedEntryPoint(format!(
+            "failed to read compute asset declarations from '{}': {error}",
+            manifest_path.display()
+        ))
+    })?;
+    let manifest: ComputeAssetManifest = toml::from_str(&manifest_source).map_err(|error| {
+        CapsuleError::UnsupportedEntryPoint(format!(
+            "failed to parse compute asset declarations from '{}': {error}",
+            manifest_path.display()
+        ))
+    })?;
+
+    let mut assets_by_worker = std::collections::HashMap::new();
+    let mut compute_worker_ids = std::collections::HashSet::new();
+    for component in manifest.component {
+        if component.component_type != "compute-worker" {
+            if !component.assets.is_empty() {
+                return Err(CapsuleError::UnsupportedEntryPoint(format!(
+                    "component '{}' declares immutable assets but is not a compute-worker",
+                    component.id
+                )));
+            }
+            continue;
+        }
+        if !compute_worker_ids.insert(component.id.clone()) {
+            return Err(CapsuleError::UnsupportedEntryPoint(format!(
+                "duplicate compute-worker id '{}'",
+                component.id
+            )));
+        }
+        assets_by_worker.insert(
+            component.id,
+            component
+                .assets
+                .into_iter()
+                .map(|asset| astrid_compute::WorkerAssetSpec {
+                    id: asset.id,
+                    relative_path: asset.path,
+                    expected_hash: asset.hash,
+                })
+                .collect(),
+        );
+    }
+    Ok(assets_by_worker)
+}
+
+fn load_compute_workers(
+    manifest: &CapsuleManifest,
+    capsule_dir: &std::path::Path,
+) -> CapsuleResult<Arc<std::collections::HashMap<String, astrid_compute::WorkerArtifact>>> {
+    let has_compute_workers = manifest
+        .components
+        .iter()
+        .any(|component| component.r#type == "compute-worker");
+    let mut assets_by_worker = if has_compute_workers {
+        load_compute_asset_specs(capsule_dir)?
+    } else {
+        std::collections::HashMap::new()
+    };
+    let mut workers = std::collections::HashMap::new();
+    for component in manifest
+        .components
+        .iter()
+        .filter(|component| component.r#type == "compute-worker")
+    {
+        if component.id.is_empty() {
+            return Err(CapsuleError::UnsupportedEntryPoint(
+                "compute-worker component requires a non-empty id".to_owned(),
+            ));
+        }
+        let hash = component.hash.as_deref().ok_or_else(|| {
+            CapsuleError::UnsupportedEntryPoint(format!(
+                "compute-worker '{}' requires an exact blake3 hash",
+                component.id
+            ))
+        })?;
+        let assets = assets_by_worker.remove(&component.id).unwrap_or_default();
+        let artifact = astrid_compute::WorkerArtifact::from_capsule_path_with_assets(
+            component.id.clone(),
+            capsule_dir,
+            &component.path,
+            hash,
+            &assets,
+        )
+        .map_err(|error| CapsuleError::UnsupportedEntryPoint(error.to_string()))?;
+        if workers.insert(component.id.clone(), artifact).is_some() {
+            return Err(CapsuleError::UnsupportedEntryPoint(format!(
+                "duplicate compute-worker id '{}'",
+                component.id
+            )));
+        }
+    }
+    Ok(Arc::new(workers))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InstancePoolPolicy {
+    single_store: bool,
+    reset_resources_on_return: bool,
+    principal_affine: bool,
+}
+
+/// Decide whether a capsule can use free checkout or must retain one Store.
+///
+/// A live host resource is a handle into one Store's resource table.
+/// `host_process` keeps the existing one-Store carve-out. Compute-worker
+/// capsules instead retain one Store per active principal: this preserves
+/// Store-local compute handles without forcing unrelated principals through
+/// the same stateful component instance.
+fn instance_pool_policy(
+    has_run_export: bool,
+    has_host_process: bool,
+    has_compute_workers: bool,
+) -> InstancePoolPolicy {
+    let retains_resources = has_host_process || has_compute_workers;
+    InstancePoolPolicy {
+        single_store: has_run_export || has_host_process,
+        reset_resources_on_return: !retains_resources,
+        principal_affine: has_compute_workers && !has_run_export && !has_host_process,
+    }
+}
+
 /// Returns `true` when `workspace_root` sits inside a git work tree.
 ///
 /// A git-managed workspace must NOT use the in-process copy-on-write overlay:
@@ -158,9 +315,10 @@ pub struct WasmEngine {
     /// Store owned by `run_handle` and never go through this pool. The pool is
     /// dynamic: it warm-starts at `min_idle`, grows lazily toward the
     /// host-derived (operator-overridable) `instance_pool_size` max under load,
-    /// and idle-evicts back down. Capsules carved out via the `host_process`
-    /// capability are pinned to a single Store (live cross-invocation resource
-    /// handles must never move to a second Store).
+    /// and idle-evicts back down. Capsules that retain live host resources
+    /// between invocations (`host_process` or declared `compute-worker`
+    /// components) are pinned to a single Store because resource handles
+    /// cannot move to a second Store.
     pool: Option<pool::CapsuleInstancePool>,
     inbound_rx: Option<tokio::sync::mpsc::Receiver<astrid_core::InboundMessage>>,
     run_handle: Option<tokio::task::JoinHandle<()>>,
@@ -209,6 +367,8 @@ pub struct WasmEngine {
     /// through the overlay today. `None` in tests and single-tenant
     /// deployments.
     overlay_registry: Option<Arc<astrid_vfs::OverlayVfsRegistry>>,
+    /// Kernel-wide host-only mapping for connection-scoped workspaces.
+    workspace_attachments: Arc<crate::workspace_attachment::WorkspaceAttachmentRegistry>,
     /// Per-principal accumulated interceptor CPU, in wasmtime fuel units
     /// (exact deterministic guest-instruction count).
     ///
@@ -237,6 +397,10 @@ pub struct WasmEngine {
     /// max across every capsule it drives, filling
     /// `ResourceUsage::memory_bytes_peak_total`. Telemetry only.
     memory_ledger: crate::MemoryLedger,
+    /// Kernel-owned, cross-capsule compute reservation ledger.
+    compute_ledger: astrid_compute::ComputeLedger,
+    /// Operator policy for generic compute groups.
+    compute_limits: limits::ComputeRuntimeLimits,
     /// Shared per-principal CPU-**rate** limiter — the deny side of the budget
     /// (PR2), built on the same shared-handle model as `fuel_ledger`.
     ///
@@ -324,6 +488,62 @@ impl WasmEngine {
         runtime_limits: limits::CapsuleRuntimeLimits,
         http_limits: limits::HttpLimits,
     ) -> Self {
+        Self::new_with_compute(
+            manifest,
+            capsule_dir,
+            fuel_ledger,
+            fuel_rate,
+            memory_ledger,
+            runtime_limits,
+            http_limits,
+            astrid_compute::ComputeLedger::default(),
+        )
+    }
+
+    /// Construct a WASM engine sharing the kernel's compute reservation ledger.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "additive composition-root constructor preserves existing public APIs"
+    )]
+    pub fn new_with_compute(
+        manifest: CapsuleManifest,
+        capsule_dir: PathBuf,
+        fuel_ledger: crate::FuelLedger,
+        fuel_rate: crate::FuelRateLimiter,
+        memory_ledger: crate::MemoryLedger,
+        runtime_limits: limits::CapsuleRuntimeLimits,
+        http_limits: limits::HttpLimits,
+        compute_ledger: astrid_compute::ComputeLedger,
+    ) -> Self {
+        Self::new_with_compute_policy(
+            manifest,
+            capsule_dir,
+            fuel_ledger,
+            fuel_rate,
+            memory_ledger,
+            runtime_limits,
+            http_limits,
+            compute_ledger,
+            limits::ComputeRuntimeLimits::default(),
+        )
+    }
+
+    /// Construct a WASM engine with shared compute accounting and policy.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "additive composition-root constructor preserves existing public APIs"
+    )]
+    pub fn new_with_compute_policy(
+        manifest: CapsuleManifest,
+        capsule_dir: PathBuf,
+        fuel_ledger: crate::FuelLedger,
+        fuel_rate: crate::FuelRateLimiter,
+        memory_ledger: crate::MemoryLedger,
+        runtime_limits: limits::CapsuleRuntimeLimits,
+        http_limits: limits::HttpLimits,
+        compute_ledger: astrid_compute::ComputeLedger,
+        compute_limits: limits::ComputeRuntimeLimits,
+    ) -> Self {
         Self {
             manifest,
             _capsule_dir: capsule_dir,
@@ -338,8 +558,13 @@ impl WasmEngine {
             profile_cache: None,
             owner_principal: None,
             overlay_registry: None,
+            workspace_attachments: Arc::new(
+                crate::workspace_attachment::WorkspaceAttachmentRegistry::default(),
+            ),
             fuel_ledger,
             memory_ledger,
+            compute_ledger,
+            compute_limits,
             fuel_rate,
             group_config: None,
             runtime_limits,
@@ -348,6 +573,15 @@ impl WasmEngine {
             process_tracker: None,
             persistent_processes: None,
         }
+    }
+
+    #[must_use]
+    pub(crate) fn with_workspace_attachments(
+        mut self,
+        registry: Arc<crate::workspace_attachment::WorkspaceAttachmentRegistry>,
+    ) -> Self {
+        self.workspace_attachments = registry;
+        self
     }
 
     /// Promote/rollback the OS-level copy-on-write workspace behind a QUIESCENCE
@@ -459,6 +693,15 @@ const WASM_MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 /// this default) in [`resolve_run_loop_budget`]; this const is the fail-safe.
 const DEFAULT_RUN_LOOP_WINDOW_TICKS: u64 = 50;
 
+/// Effectively unbounded relative epoch deadline for pool instantiation.
+///
+/// `Store::set_epoch_deadline` adds this value to the engine's current epoch.
+/// Passing `u64::MAX` after the epoch ticker has advanced wraps into an
+/// already-expired deadline and makes a lazily-grown Store trap during
+/// instantiation. Half the integer range cannot wrap during any realistic
+/// daemon lifetime (more than 29 billion years at the 100 ms tick).
+const EFFECTIVELY_UNBOUNDED_EPOCH_TICKS: u64 = u64::MAX / 2;
+
 /// Number of consecutive windows a bound run-loop may burn CPU **without**
 /// calling `recv` (i.e. without setting `recv_yielded`) before its epoch
 /// callback returns [`UpdateDeadline::Interrupt`](wasmtime::UpdateDeadline) and
@@ -472,18 +715,142 @@ const DEFAULT_RUN_LOOP_WINDOW_TICKS: u64 = 50;
 /// enough to bound a genuine spinner.
 const MAX_NO_YIELD_WINDOWS: u32 = 3;
 
-/// Per-single-invocation fuel budget for a pooled interceptor call (10e9).
+/// Largest Wasmtime fuel seed, used when the principal is explicitly unlimited
+/// and while a fresh Store runs component initialization.
 ///
-/// This is the per-invocation CPU **measurement** seed, NOT the run-loop CPU
-/// bound (that is the epoch mechanism). `invoke_interceptor` re-seeds the
-/// leased Store to this budget before the call and reads `get_fuel()` after;
-/// `INTERCEPTOR_FUEL_BUDGET - get_fuel()` is the exact deterministic
-/// guest-instruction count for the call, accumulated into the per-principal
-/// `fuel_ledger`. The budget sits far above any legitimate one-prompt cost (a
-/// prompt assembly is low-millions of instructions), so it also caps a runaway
-/// single interceptor call. Because fuel is engine-wide, re-seeding per call
-/// means one leaseholder cannot drain a pooled Store for the next.
-const INTERCEPTOR_FUEL_BUDGET: u64 = 10_000_000_000;
+/// This is an arithmetic identity, not a policy ceiling. Finite invocation
+/// budgets are derived from the principal's configured fuel rate and timeout.
+const UNBOUNDED_FUEL_SEED: u64 = u64::MAX;
+
+/// Refill cadence for an interceptor whose principal CPU policy is unlimited.
+///
+/// Wasmtime's fuel tank is still a finite `u64`, even when Astrid policy says
+/// "unlimited". A long-lived controller can therefore eventually drain
+/// `u64::MAX` and trap despite having no operator CPU ceiling. Replenishing at
+/// the existing epoch boundary makes unlimited a durable policy state instead
+/// of an extremely large but ultimately finite constant. The callback also
+/// yields the async executor and retains the principal's wall-time deadline.
+const UNBOUNDED_FUEL_REFILL_TICKS: u64 = 50;
+
+#[derive(Debug, Clone)]
+struct InvocationFuelMeter {
+    seed: u64,
+    completed_intervals: Arc<AtomicU64>,
+}
+
+impl InvocationFuelMeter {
+    fn consumed(&self, remaining: u64) -> u64 {
+        self.completed_intervals
+            .load(Ordering::Relaxed)
+            .saturating_add(self.seed.saturating_sub(remaining))
+    }
+}
+
+fn saturating_atomic_add(counter: &AtomicU64, value: u64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_add(value))
+    });
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnboundedFuelDeadline {
+    RefillAndYield(u64),
+    Interrupt,
+}
+
+#[derive(Debug)]
+struct UnboundedFuelRefill {
+    ticks_left: u64,
+    interval: u64,
+    completed_intervals: Arc<AtomicU64>,
+}
+
+impl UnboundedFuelRefill {
+    fn new(timeout_ticks: u64, completed_intervals: Arc<AtomicU64>) -> Self {
+        Self {
+            ticks_left: timeout_ticks,
+            interval: UNBOUNDED_FUEL_REFILL_TICKS.min(timeout_ticks),
+            completed_intervals,
+        }
+    }
+
+    fn deadline(&mut self, remaining_fuel: u64) -> UnboundedFuelDeadline {
+        if self.ticks_left <= self.interval {
+            // The final reservoir stays intact so the post-call meter accounts
+            // it exactly once while the epoch interrupt propagates.
+            return UnboundedFuelDeadline::Interrupt;
+        }
+        saturating_atomic_add(
+            &self.completed_intervals,
+            UNBOUNDED_FUEL_SEED.saturating_sub(remaining_fuel),
+        );
+        self.ticks_left -= self.interval;
+        UnboundedFuelDeadline::RefillAndYield(self.interval.min(self.ticks_left))
+    }
+}
+
+/// Derive one interceptor's total fuel allowance from existing principal
+/// policy instead of imposing a hidden fixed cap.
+///
+/// A zero fuel rate is the operator-defined unlimited setting. Resource-exempt
+/// principals are likewise unbounded by this meter. Otherwise the most fuel an
+/// invocation may consume is its configured rate over its configured timeout;
+/// the epoch deadline independently enforces the same timeout in wall time.
+fn interceptor_fuel_budget(
+    profile: &astrid_core::profile::PrincipalProfile,
+    resource_exempt: bool,
+) -> u64 {
+    let rate = profile.quotas.max_cpu_fuel_per_sec;
+    if resource_exempt || rate == 0 {
+        UNBOUNDED_FUEL_SEED
+    } else {
+        rate.saturating_mul(profile.quotas.max_timeout_secs.max(1))
+    }
+}
+
+/// Seed and arm one interceptor Store from the applied principal policy.
+///
+/// Finite CPU policies retain one deterministic fuel reservoir and the
+/// wall-time epoch interrupt. An unlimited policy gets a periodic epoch
+/// callback which accounts the completed reservoir, refills it, cooperatively
+/// yields, and decrements the same wall-time allowance. This is necessary
+/// because Wasmtime exposes no literal infinite-fuel mode.
+fn configure_invocation_fuel<T: Send + 'static>(
+    store: &mut Store<T>,
+    fuel_budget: u64,
+    timeout_ticks: u64,
+) -> CapsuleResult<InvocationFuelMeter> {
+    let timeout_ticks = timeout_ticks.max(1);
+    store.set_fuel(fuel_budget).map_err(|error| {
+        CapsuleError::WasmError(format!("failed to seed invocation fuel: {error}"))
+    })?;
+
+    let completed_intervals = Arc::new(AtomicU64::new(0));
+    if fuel_budget == UNBOUNDED_FUEL_SEED {
+        let mut refill = UnboundedFuelRefill::new(timeout_ticks, Arc::clone(&completed_intervals));
+        store.set_epoch_deadline(refill.interval);
+        store.epoch_deadline_callback(move |mut context| {
+            let remaining = context.get_fuel().unwrap_or(0);
+            match refill.deadline(remaining) {
+                UnboundedFuelDeadline::Interrupt => Ok(wasmtime::UpdateDeadline::Interrupt),
+                UnboundedFuelDeadline::RefillAndYield(next_ticks) => {
+                    context.set_fuel(UNBOUNDED_FUEL_SEED)?;
+                    Ok(wasmtime::UpdateDeadline::Yield(next_ticks))
+                },
+            }
+        });
+    } else {
+        store.set_epoch_deadline(timeout_ticks);
+        // Replace any refill callback retained from this pooled Store's prior
+        // unlimited lease. A finite principal must never inherit replenishment.
+        store.epoch_deadline_callback(|_context| Ok(wasmtime::UpdateDeadline::Interrupt));
+    }
+
+    Ok(InvocationFuelMeter {
+        seed: fuel_budget,
+        completed_intervals,
+    })
+}
 
 /// Register every Astrid host interface on `linker`. Single source of
 /// truth shared between the main capsule-load path and the lifecycle-
@@ -564,7 +931,7 @@ fn build_wasmtime_engine() -> CapsuleResult<wasmtime::Engine> {
     // invoking principal in the per-principal fuel ledger. Enabling it
     // engine-wide means EVERY Store starts at 0 fuel and would trap on the
     // first instruction, so every Store-creation site below explicitly fuels
-    // its store: interceptor pools are re-seeded to INTERCEPTOR_FUEL_BUDGET
+    // its store: interceptor pools are re-seeded per principal invocation
     // per call, and run-loop / lifecycle Stores (whose CPU is bounded by the
     // epoch interrupt or are exempt) are fuelled to u64::MAX so fuel never
     // traps them. consume_fuel is incompatible with Winch; this build uses
@@ -789,7 +1156,7 @@ pub(crate) fn resolve_run_loop_budget(
         None
     };
 
-    // Memory cap for a bound run-loop: owner quota (default 64 MiB on
+    // Memory cap for a bound run-loop: owner quota (the profile default on
     // resolve-failure), clamped into usize. Non-bound Stores keep the
     // process default.
     let mem_bytes = if bound_run_loop {
@@ -1315,11 +1682,42 @@ impl ExecutionEngine for WasmEngine {
             "Loading WASM component (Component Model)"
         );
 
-        let component = self.manifest.components.first().ok_or_else(|| {
-            CapsuleError::UnsupportedEntryPoint(
-                "WASM engine requires at least one component definition".into(),
-            )
-        })?;
+        let component = self
+            .manifest
+            .components
+            .iter()
+            .find(|component| component.r#type.is_empty() || component.r#type == "executable")
+            .ok_or_else(|| {
+                CapsuleError::UnsupportedEntryPoint(
+                    "WASM engine requires an executable component definition".into(),
+                )
+            })?;
+
+        let compute_workers = load_compute_workers(&self.manifest, &self._capsule_dir)?;
+        let compute_runtime = if !compute_workers.is_empty() {
+            let limits = astrid_compute::ComputeLimits {
+                max_workers_per_principal: self.compute_limits.max_workers_per_principal,
+                max_memory_bytes_per_principal: self
+                    .compute_limits
+                    .max_shared_memory_bytes_per_principal,
+                max_job_fuel: self.compute_limits.max_job_fuel,
+            };
+            Some(Arc::new(
+                astrid_compute::ComputeRuntime::new_accounted_with_host_limits(
+                    self.compute_ledger.clone(),
+                    limits,
+                    astrid_compute::ComputeHostLimits {
+                        max_workers: self.compute_limits.host_max_workers,
+                        max_memory_bytes: self.compute_limits.host_max_shared_memory_bytes,
+                    },
+                    self.fuel_ledger.clone(),
+                    self.fuel_rate.clone(),
+                )
+                .map_err(|error| CapsuleError::UnsupportedEntryPoint(error.to_string()))?,
+            ))
+        } else {
+            None
+        };
 
         let wasm_path = if component.path.is_absolute() {
             component.path.clone()
@@ -1662,7 +2060,11 @@ impl ExecutionEngine for WasmEngine {
             // Snapshot of the capsule's held capability names, fixed at load —
             // backs the infallible `enumerate-capabilities` host fn. Cloned per
             // pooled instance inside the `make_state` closure below.
-            let capability_names = manifest.capabilities.held_names();
+            let mut capability_names = manifest.capabilities.held_names();
+            if !compute_workers.is_empty() {
+                capability_names.push("compute".to_owned());
+                capability_names.sort_unstable();
+            }
             // Operator-approved local-egress allowlist for this capsule,
             // snapshotted from the load context onto every pooled instance
             // (load-time-fixed, like `capability_names`).
@@ -1793,6 +2195,7 @@ impl ExecutionEngine for WasmEngine {
             let st_identity_store = ctx.identity_store.clone();
             let st_profile_cache = ctx.profile_cache.clone();
             let st_audit_sink = ctx.audit_sink.clone();
+            let st_workspace_attachments = self.workspace_attachments.clone();
             // Shared across the whole pool so a verified per-connection
             // principal (issue #45/#852) bound on the accepting instance is
             // visible to whichever pooled instance later serves that
@@ -1807,6 +2210,8 @@ impl ExecutionEngine for WasmEngine {
             let client_connections: Arc<
                 dashmap::DashMap<u32, astrid_core::principal::PrincipalId>,
             > = Arc::new(dashmap::DashMap::new());
+            let compute_runtime = compute_runtime.clone();
+            let compute_workers = Arc::clone(&compute_workers);
             let make_state: Arc<dyn Fn() -> HostState + Send + Sync> = Arc::new(move || HostState {
                 wasi_ctx: build_wasi_ctx(),
                 resource_table: wasmtime::component::ResourceTable::new(),
@@ -1846,10 +2251,13 @@ impl ExecutionEngine for WasmEngine {
                 home: None,
                 tmp: None,
                 invocation_home: None,
+                invocation_workspace: None,
+                invocation_workspace_attachment: None,
                 invocation_tmp: None,
                 invocation_secret_store: None,
                 invocation_capsule_log: None,
                 invocation_profile: None,
+                invocation_resource_exempt: false,
                 profile_cache: st_profile_cache.clone(),
                 invocation_env_overlay: None,
                 // Neutral, physically-isolated KV fallback (see the `kv` field
@@ -1866,14 +2274,18 @@ impl ExecutionEngine for WasmEngine {
                 cli_socket_listener: cli_listener.clone(),
                 active_http_streams: std::collections::HashMap::new(),
                 next_http_stream_id: 1,
+                open_file_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 security: Some(
                     Arc::clone(&security_gate) as Arc<dyn crate::security::CapsuleSecurityGate>
                 ),
+                invocation_security: None,
                 hook_manager: None, // Will be injected by Gateway
                 capsule_registry: st_capsule_registry.clone(),
                 runtime_handle: tokio::runtime::Handle::current(),
                 has_uplink_capability: has_uplink,
                 capability_names: capability_names.clone(),
+                compute_runtime: compute_runtime.clone(),
+                compute_workers: Arc::clone(&compute_workers),
                 local_egress: local_egress.clone(),
                 http_limits,
                 audit_firehose,
@@ -1902,6 +2314,7 @@ impl ExecutionEngine for WasmEngine {
                 process_count_total: 0,
                 process_count_by_principal: std::collections::HashMap::new(),
                 connection_principals: connection_principals.clone(),
+                workspace_attachments: st_workspace_attachments.clone(),
                 client_connections: client_connections.clone(),
                 // No frame in flight at construction; both the ingress
                 // principal and its authenticating device key_id are set per
@@ -1909,6 +2322,7 @@ impl ExecutionEngine for WasmEngine {
                 ingress_principal: None,
                 ingress_device_key_id: None,
                 ingress_origin: None,
+                ingress_workspace_attachment: None,
                 // Run-loop epoch-interrupt state. `recv_yielded` is set true by
                 // the ipc `recv` host fn each time the guest blocks on recv;
                 // the bound run-loop's epoch callback reads + clears it to
@@ -1925,12 +2339,12 @@ impl ExecutionEngine for WasmEngine {
             // Initial epoch deadline applied to every freshly-instantiated
             // pool Store below. This is a wall-clock placeholder, NOT the
             // bound run-loop CPU mechanism:
-            //  - exempt: u64::MAX at the pool-load default. For an exempt
+            //  - exempt: an effectively unbounded, non-wrapping relative
+            //    deadline at the pool-load default. For an exempt
             //    RUN-LOOP this placeholder is REPLACED below with a finite
             //    yield-always window (`exempt_epoch_action`) so it cooperatively
             //    yields the worker and can never starve the daemon. Exempt
-            //    interceptor POOL Stores keep u64::MAX here (see the STOP-AND-
-            //    REPORT note on the exempt interceptor epoch path).
+            //    interceptor POOL Stores keep that horizon here.
             //  - interceptor pool Stores: the existing finite default; the real
             //    per-invocation epoch is re-applied per call in
             //    `invoke_interceptor` (unchanged).
@@ -1938,7 +2352,7 @@ impl ExecutionEngine for WasmEngine {
             //    Store setup with the per-WINDOW epoch deadline + interrupt
             //    callback (`epoch_decision`).
             let pool_epoch_deadline = if run_budget.exempt {
-                u64::MAX
+                EFFECTIVELY_UNBOUNDED_EPOCH_TICKS
             } else {
                 WASM_CAPSULE_TIMEOUT_SECS * 1000 / EPOCH_TICK_INTERVAL.as_millis() as u64
             };
@@ -1969,18 +2383,29 @@ impl ExecutionEngine for WasmEngine {
                 ))
             })?;
 
-            // Dynamic-pool sizing. Run-loop and `host_process` capsules are
-            // pinned to a single Store regardless of the configured pool max:
-            // run-loops own their dedicated Store; `host_process` capsules hold
-            // live resource handles across invocations and must never lease a
-            // second Store. Everyone else gets a dynamic pool that warm-starts
+            // Dynamic-pool sizing. Run-loop and host-process capsules remain
+            // pinned to one Store. Compute-worker capsules get a dynamic,
+            // principal-affine pool: one retained Store per active principal,
+            // bounded by the host pool ceiling and trimmed as evictable cache
+            // when idle. Everyone else gets free checkout from a pool that
+            // warm-starts
             // at `min_idle`, grows lazily toward `instance_pool_size` under
             // load, and is trimmed back to `min_idle` when idle (issue #816,
             // replacing the old fixed `INSTANCE_POOL_SIZE`).
-            let is_single_store =
-                has_run_export || !manifest.capabilities.host_process.is_empty();
-            let (pool_max, pool_min_idle) = if is_single_store {
+            let has_host_process = !manifest.capabilities.host_process.is_empty();
+            let has_compute_workers = manifest
+                .components
+                .iter()
+                .any(|component| component.r#type == "compute-worker");
+            let pool_policy = instance_pool_policy(
+                has_run_export,
+                has_host_process,
+                has_compute_workers,
+            );
+            let (pool_max, pool_min_idle) = if pool_policy.single_store {
                 (1, 1)
+            } else if pool_policy.principal_affine {
+                (self.runtime_limits.instance_pool_size, 1)
             } else {
                 (
                     self.runtime_limits.instance_pool_size,
@@ -1998,7 +2423,7 @@ impl ExecutionEngine for WasmEngine {
                 instance_pre,
                 Arc::clone(&make_state),
                 pool_epoch_deadline,
-                INTERCEPTOR_FUEL_BUDGET,
+                UNBOUNDED_FUEL_SEED,
             );
             let mut initial_instances: Vec<pool::PooledInstance> =
                 Vec::with_capacity(pool_min_idle);
@@ -2011,7 +2436,9 @@ impl ExecutionEngine for WasmEngine {
                 pool_min_idle,
                 warm = initial_instances.len(),
                 has_run = has_run_export,
-                host_process = !manifest.capabilities.host_process.is_empty(),
+                host_process = has_host_process,
+                compute_workers = has_compute_workers,
+                principal_affine = pool_policy.principal_affine,
                 "Instantiated capsule instance pool"
             );
 
@@ -2029,7 +2456,7 @@ impl ExecutionEngine for WasmEngine {
                 // The run-loop Store's memory cap is already baked into
                 // `store_meter` by `make_state` (pool_size 1 ⇒ this IS the
                 // run-loop Store) and was enforced during `instantiate_async`.
-                // Fuel was seeded to INTERCEPTOR_FUEL_BUDGET above for
+                // Fuel was seeded to UNBOUNDED_FUEL_SEED above for
                 // instantiation; the run loop is NOT fuel-bound, so re-seed it
                 // to effectively-infinite (consume_fuel makes a 0-fuel Store
                 // trap, and we never want a run loop to fuel-out). CPU is
@@ -2106,16 +2533,18 @@ impl ExecutionEngine for WasmEngine {
                 // Free-checkout pools tear down each returned instance's
                 // resource table so a cancelled/panicked invocation can't leak
                 // a live handle into the next (possibly different-principal)
-                // lease. The `host_process` carve-out (size 1) is the sole
-                // exception: it holds `ManagedProcess` handles across
-                // invocations, and never leases a second Store, so its table
-                // must persist. See `pool::clear_on_return`.
-                let reset_resources_on_return = manifest.capabilities.host_process.is_empty();
+                // lease. Persistent-resource capsules are the exception: their
+                // table must persist. Compute-worker pools additionally pin
+                // each Store to its first invoking principal; host-process
+                // capsules retain the existing one-Store carve-out. Compute
+                // handles are still principal-checked by every host operation.
+                // See `pool::clear_on_return`.
                 pool_opt = Some(pool::CapsuleInstancePool::new(
                     initial_instances,
                     pool_max,
                     pool_min_idle,
-                    reset_resources_on_return,
+                    pool_policy.reset_resources_on_return,
+                    pool_policy.principal_affine,
                     builder,
                     &cancel_token,
                 ));
@@ -2564,6 +2993,11 @@ impl ExecutionEngine for WasmEngine {
         // enforcement BYPASS — the chain would carry on as if nothing happened.
         let now = std::time::Instant::now();
         let live_group_config = self.group_config.as_ref().map(|groups| groups.load_full());
+        let invocation_resource_exempt = resolve_exemption(
+            invocation_profile.as_deref(),
+            live_group_config.as_ref().map(Arc::as_ref),
+            &invoking_principal,
+        );
         if let Some(reason) = cpu_rate_deny(
             &self.fuel_rate,
             invocation_profile.as_deref(),
@@ -2583,9 +3017,48 @@ impl ExecutionEngine for WasmEngine {
             return Ok(crate::capsule::InterceptResult::Deny { reason });
         }
 
+        let workspace_required =
+            caller.is_some_and(|message| astrid_events::ipc_sequence_has_host_sidecar(message.seq));
+        let invocation_workspace_attachment = caller
+            .filter(|message| astrid_events::ipc_sequence_has_host_sidecar(message.seq))
+            .and_then(|message| {
+                self.workspace_attachments
+                    .attachment_for_message(message.seq)
+            });
+        let invocation_workspace = match invocation_workspace_attachment {
+            Some(attachment) => {
+                let Some(mount) = self
+                    .workspace_attachments
+                    .resolve(attachment, &invoking_principal)
+                else {
+                    return Ok(crate::capsule::InterceptResult::Deny {
+                        reason:
+                            "workspace attachment is missing, stale, or owned by another principal"
+                                .to_string(),
+                    });
+                };
+                Some(mount)
+            },
+            None => None,
+        };
+        if workspace_required && invocation_workspace.is_none() {
+            return Ok(crate::capsule::InterceptResult::Deny {
+                reason: "workspace attachment is missing, stale, or owned by another principal"
+                    .to_string(),
+            });
+        }
+        let invocation_security: Option<Arc<dyn crate::security::CapsuleSecurityGate>> =
+            invocation_workspace.as_ref().map(|mount| {
+                Arc::new(crate::security::ManifestSecurityGate::new(
+                    self.manifest.clone(),
+                    mount.root.clone(),
+                    None,
+                )) as Arc<dyn crate::security::CapsuleSecurityGate>
+            });
+
         // Is the capsule a daemon (uplink / long-lived)? Daemons keep their
-        // load-time `u64::MAX` epoch deadline; only non-daemon capsules
-        // accept a per-invocation timeout from the profile.
+        // load-time effectively-unbounded epoch deadline; only non-daemon
+        // capsules accept a per-invocation timeout from the profile.
         let is_daemon = !self.manifest.uplinks.is_empty() || self.manifest.capabilities.uplink;
 
         // Layer 4 (#668): resolve the per-principal overlay VFS. The
@@ -2652,7 +3125,7 @@ impl ExecutionEngine for WasmEngine {
         // borrowing the store mutably for the SET/CALL block; `PoolCheckout`
         // clears the invocation state and returns the instance on drop.
         let checkout_start = std::time::Instant::now();
-        let mut checkout = pool.checkout().await.ok_or_else(|| {
+        let mut checkout = pool.checkout(&invoking_principal).await.ok_or_else(|| {
             // `checkout` returns `None` for any of: the capsule is unloading
             // (semaphore closed), a lazy pool-grow instantiation failed, or a
             // size-1 carve-out found no warm instance. The true cause is logged
@@ -2666,34 +3139,47 @@ impl ExecutionEngine for WasmEngine {
         // busy), distinct from a slow guest call.
         let pool_wait_ms = checkout_start.elapsed().as_millis() as u64;
         let typed_instance = checkout.instance();
+        let applied_profile: Arc<astrid_core::profile::PrincipalProfile> =
+            invocation_profile.clone().unwrap_or_else(|| {
+                Arc::new(astrid_core::profile::PrincipalProfile::default_ref().clone())
+            });
+        let invocation_fuel_budget =
+            interceptor_fuel_budget(&applied_profile, invocation_resource_exempt);
+        let invocation_timeout_ticks = if is_daemon {
+            EFFECTIVELY_UNBOUNDED_EPOCH_TICKS
+        } else {
+            applied_profile.quotas.max_timeout_secs.saturating_mul(1000)
+                / EPOCH_TICK_INTERVAL.as_millis() as u64
+        };
+        tracing::debug!(
+            principal = %invoking_principal,
+            capsule = %self.manifest.package.name,
+            action,
+            fuel_budget = invocation_fuel_budget,
+            timeout_ticks = invocation_timeout_ticks,
+            resource_exempt = invocation_resource_exempt,
+            "configuring interceptor execution envelope"
+        );
+        let invocation_fuel_meter;
         let result: CapsuleResult<HookTriggerResult> = {
             let s = checkout.store_mut();
             // ── Phase 1: SET ──────────────────────────────────────
-            let applied_profile: Arc<astrid_core::profile::PrincipalProfile> =
-                invocation_profile.clone().unwrap_or_else(|| {
-                    Arc::new(astrid_core::profile::PrincipalProfile::default_ref().clone())
-                });
-
-            if !is_daemon {
-                let deadline = applied_profile.quotas.max_timeout_secs.saturating_mul(1000)
-                    / EPOCH_TICK_INTERVAL.as_millis() as u64;
-                s.set_epoch_deadline(deadline);
-            }
-
             // Per-invocation CPU: fuel is engine-wide, so re-seed the leased
-            // Store to a known budget before the call. This (a) bounds a
-            // runaway single interceptor call, and (b) makes
-            // `INTERCEPTOR_FUEL_BUDGET - get_fuel()` after the call the EXACT
-            // deterministic instruction count for THIS invocation, attributable
-            // to the invoking principal — independent of whatever the previous
-            // leaseholder of this pooled Store consumed. Errors only if fuel is
-            // disabled (it is not); on the impossible error we leave fuel as-is
-            // (fail-secure: a smaller budget traps sooner).
-            let _ = s.set_fuel(INTERCEPTOR_FUEL_BUDGET);
+            // Store to the budget derived from this principal's fuel-rate and
+            // timeout policy. A zero rate deliberately seeds `u64::MAX`; there
+            // is no hidden ten-billion-fuel cap beneath an operator's
+            // unlimited setting. Because even `u64::MAX` is finite, unlimited
+            // invocations periodically account and replenish that reservoir
+            // at an epoch yield until their wall-time deadline.
+            invocation_fuel_meter =
+                configure_invocation_fuel(s, invocation_fuel_budget, invocation_timeout_ticks)?;
 
             {
                 let state = s.data_mut();
                 state.caller_context = caller.cloned();
+                state.invocation_workspace = invocation_workspace.clone();
+                state.invocation_workspace_attachment = invocation_workspace_attachment;
+                state.invocation_security = invocation_security.clone();
                 // Mark the interceptor as active so any nested `ipc::recv`
                 // inside the handler (e.g. prompt-builder waiting on plugin
                 // hook responses) cannot wipe or rewrite `caller_context`
@@ -2712,6 +3198,7 @@ impl ExecutionEngine for WasmEngine {
                     invoking_principal.clone(),
                 );
                 state.invocation_profile = invocation_profile.clone();
+                state.invocation_resource_exempt = invocation_resource_exempt;
                 state.invocation_env_overlay =
                     load_invocation_env_overlay(&invoking_principal, state.capsule_id.as_str());
 
@@ -2770,7 +3257,7 @@ impl ExecutionEngine for WasmEngine {
         // ENFORCED by the epoch interrupt mechanism, not fuel; windowed
         // deny/throttle on this aggregate is the deliberate follow-up).
         let fuel_after = checkout.store_mut().get_fuel().unwrap_or(0);
-        let fuel_used = INTERCEPTOR_FUEL_BUDGET.saturating_sub(fuel_after);
+        let fuel_used = invocation_fuel_meter.consumed(fuel_after);
         self.fuel_ledger.charge(&invoking_principal, fuel_used);
         // Feed this call's fuel into the CPU-rate window stamped at the moment
         // the burn FINISHED, not `invoke_start`. The gate at the top reads the
@@ -2782,13 +3269,18 @@ impl ExecutionEngine for WasmEngine {
         // in a window that is already stale by the time it returns, so the next
         // invocation's `over_budget` roll discards it — a principal issuing
         // back-to-back >1s calls would never be throttled despite each call
-        // burning up to 5x the per-second budget (INTERCEPTOR_FUEL_BUDGET vs
-        // max_cpu_fuel_per_sec). Stamping at completion places the fuel in the
+        // burning beyond one rate window. Stamping at completion places the fuel in the
         // live window so the next call sees it.
         self.fuel_rate
             .record(&invoking_principal, fuel_used, std::time::Instant::now());
-        // Drop the lease: Phase 3 CLEAR runs and the instance returns to the
-        // pool, so a parallel invocation can lease it with clean state.
+        if result.is_err() {
+            // A trapped component instance may be permanently non-enterable.
+            // Retire the evictable Store so the next call gets a freshly
+            // instantiated component instead of inheriting a poisoned cache.
+            checkout.retire();
+        }
+        // Drop the lease: a reusable instance runs Phase 3 CLEAR and returns to
+        // the pool; a retired one simply releases its permit.
         drop(checkout);
 
         // ── Per-invocation diagnostic span (observability brick #1, #816) ──
@@ -2969,10 +3461,13 @@ async fn build_lifecycle_host_state(
         home: home_mount,
         tmp: None,
         invocation_home: None,
+        invocation_workspace: None,
+        invocation_workspace_attachment: None,
         invocation_tmp: None,
         invocation_secret_store: None,
         invocation_capsule_log: None,
         invocation_profile: None,
+        invocation_resource_exempt: false,
         // Lifecycle hooks don't run the per-principal recv loop; no cache needed.
         profile_cache: None,
         invocation_env_overlay: None,
@@ -2993,6 +3488,7 @@ async fn build_lifecycle_host_state(
         ipc_publish_patterns: Vec::new(),
         ipc_subscribe_patterns: Vec::new(),
         security: None,
+        invocation_security: None,
         hook_manager: None,
         capsule_registry: None,
         runtime_handle: tokio::runtime::Handle::current(),
@@ -3002,6 +3498,8 @@ async fn build_lifecycle_host_state(
         // capability introspection is not exposed here (matches the
         // hard-coded `has_uplink_capability: false` above). Fail-closed.
         capability_names: Vec::new(),
+        compute_runtime: None,
+        compute_workers: Arc::new(std::collections::HashMap::new()),
         // Lifecycle (install/upgrade) hooks run briefly and do not carry a
         // local-egress exemption; the SSRF airlock applies in full.
         local_egress: Vec::new(),
@@ -3017,6 +3515,7 @@ async fn build_lifecycle_host_state(
         cli_socket_listener: None,
         active_http_streams: std::collections::HashMap::new(),
         next_http_stream_id: 1,
+        open_file_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         lifecycle_phase: Some(phase),
         secret_store: cfg.secret_store.clone(),
         ready_tx: None,
@@ -3045,6 +3544,9 @@ async fn build_lifecycle_host_state(
         // Lifecycle hooks never accept socket connections; a throwaway
         // registry satisfies the field (issue #45/#852).
         connection_principals: Arc::new(dashmap::DashMap::new()),
+        workspace_attachments: Arc::new(
+            crate::workspace_attachment::WorkspaceAttachmentRegistry::default(),
+        ),
         // Lifecycle hooks never accept inbound uplink connections; a throwaway
         // lifecycle registry satisfies the field.
         client_connections: Arc::new(dashmap::DashMap::new()),
@@ -3053,6 +3555,7 @@ async fn build_lifecycle_host_state(
         ingress_principal: None,
         ingress_device_key_id: None,
         ingress_origin: None,
+        ingress_workspace_attachment: None,
         // Lifecycle hooks are not run loops; the epoch-interrupt run-loop
         // state is inert here but initialised for completeness.
         recv_yielded: false,
@@ -3440,6 +3943,117 @@ mod tests {
     use super::*;
     use astrid_events::ipc::Topic;
 
+    #[test]
+    fn ordinary_interceptors_keep_free_checkout_and_reset_resources() {
+        assert_eq!(
+            instance_pool_policy(false, false, false),
+            InstancePoolPolicy {
+                single_store: false,
+                reset_resources_on_return: true,
+                principal_affine: false,
+            }
+        );
+    }
+
+    #[test]
+    fn compute_workers_retain_one_store_per_principal() {
+        assert_eq!(
+            instance_pool_policy(false, false, true),
+            InstancePoolPolicy {
+                single_store: false,
+                reset_resources_on_return: false,
+                principal_affine: true,
+            }
+        );
+    }
+
+    #[test]
+    fn host_process_retains_existing_single_store_behavior() {
+        assert_eq!(
+            instance_pool_policy(false, true, false),
+            InstancePoolPolicy {
+                single_store: true,
+                reset_resources_on_return: false,
+                principal_affine: false,
+            }
+        );
+    }
+
+    #[test]
+    fn compute_worker_loader_attaches_verified_immutable_assets() {
+        let root = tempfile::tempdir().expect("capsule root");
+        let assets = root.path().join("assets");
+        std::fs::create_dir(&assets).expect("assets directory");
+        let worker = wat::parse_str(
+            r#"(module
+                (memory (import "astrid_compute" "memory") 1 32 shared)
+                (func (export "astrid_compute_abi_version") (result i32) i32.const 1)
+                (func (export "astrid_compute_run")
+                    (param i32 i64 i64 i64) (result i32) i32.const 0))"#,
+        )
+        .expect("worker WAT parses");
+        let system = b"verified-system-image";
+        std::fs::write(assets.join("worker.wasm"), &worker).expect("worker writes");
+        std::fs::write(assets.join("system.img"), system).expect("asset writes");
+        let worker_hash = format!("blake3:{}", blake3::hash(&worker).to_hex());
+        let system_hash = format!("blake3:{}", blake3::hash(system).to_hex());
+        let manifest_source = format!(
+            r#"
+                [package]
+                name = "asset-loader"
+                version = "1.0.0"
+
+                [[component]]
+                id = "vcpu"
+                file = "assets/worker.wasm"
+                type = "compute-worker"
+                hash = "{worker_hash}"
+
+                [[component.asset]]
+                id = "system"
+                file = "assets/system.img"
+                hash = "{system_hash}"
+            "#
+        );
+        std::fs::write(root.path().join("Capsule.toml"), &manifest_source)
+            .expect("manifest writes");
+        let manifest: CapsuleManifest = toml::from_str(&manifest_source).expect("manifest parses");
+
+        let workers = load_compute_workers(&manifest, root.path()).expect("workers load");
+        let artifact = workers.get("vcpu").expect("worker exists");
+        assert_eq!(artifact.asset_count(), 1);
+        assert_eq!(artifact.asset_id(0), Some("system"));
+        assert_eq!(artifact.asset_bytes(), 21);
+        assert_eq!(artifact.asset_digest(0), Some(system_hash.as_str()));
+    }
+
+    #[test]
+    fn private_compute_asset_manifest_rejects_non_worker_attachments() {
+        let root = tempfile::tempdir().expect("capsule root");
+        std::fs::write(
+            root.path().join("Capsule.toml"),
+            r#"
+                [package]
+                name = "asset-loader"
+                version = "1.0.0"
+
+                [[component]]
+                id = "controller"
+                file = "controller.wasm"
+                type = "executable"
+
+                [[component.asset]]
+                id = "system"
+                file = "assets/system.img"
+                hash = "blake3:0000000000000000000000000000000000000000000000000000000000000000"
+            "#,
+        )
+        .expect("manifest writes");
+
+        let error = load_compute_asset_specs(root.path()).expect_err("attachment is rejected");
+        assert!(error.to_string().contains("is not a compute-worker"));
+    }
+
     // ── git-managed workspace detection (gitoxide work-tree discovery) ──
     //
     // `workspace_is_git_managed` decides whether a capsule's workspace uses the
@@ -3550,7 +4164,10 @@ mod tests {
         assert!(b.bound_run_loop);
         // Default profile timeout (300s) clamps to the default window.
         assert_eq!(b.window_ticks, Some(DEFAULT_RUN_LOOP_WINDOW_TICKS));
-        assert_eq!(b.mem_bytes, WASM_MAX_MEMORY_BYTES);
+        assert_eq!(
+            b.mem_bytes,
+            usize::try_from(astrid_core::DEFAULT_MAX_MEMORY_BYTES).unwrap_or(usize::MAX)
+        );
     }
 
     #[test]
@@ -3988,26 +4605,154 @@ mod tests {
     }
 
     #[test]
-    fn rate_gate_no_profile_uses_generous_default_budget() {
-        // No profile (tests / single-tenant) => DEFAULT_MAX_CPU_FUEL_PER_SEC,
-        // still enforced but generous: a principal under the default is
-        // admitted, and one driven past the default is denied. Proves the
-        // default is wired AND enforced.
+    fn interceptor_fuel_budget_derives_from_principal_policy() {
+        let mut profile = profile_with(&["agent"], &[], &[]);
+        profile.quotas.max_cpu_fuel_per_sec = 2_000;
+        profile.quotas.max_timeout_secs = 30;
+        assert_eq!(interceptor_fuel_budget(&profile, false), 60_000);
+
+        profile.quotas.max_cpu_fuel_per_sec = 0;
+        assert_eq!(
+            interceptor_fuel_budget(&profile, false),
+            UNBOUNDED_FUEL_SEED,
+            "zero rate is the operator-defined unlimited setting"
+        );
+
+        profile.quotas.max_cpu_fuel_per_sec = 2_000;
+        assert_eq!(
+            interceptor_fuel_budget(&profile, true),
+            UNBOUNDED_FUEL_SEED,
+            "resource-exempt principals have no inner fuel ceiling"
+        );
+    }
+
+    #[test]
+    fn interceptor_fuel_budget_saturates_instead_of_wrapping() {
+        let mut profile = profile_with(&["agent"], &[], &[]);
+        profile.quotas.max_cpu_fuel_per_sec = u64::MAX;
+        profile.quotas.max_timeout_secs = u64::MAX;
+        assert_eq!(
+            interceptor_fuel_budget(&profile, false),
+            UNBOUNDED_FUEL_SEED
+        );
+    }
+
+    #[test]
+    fn unlimited_interceptor_refills_across_epoch_windows_and_counts_once() {
+        let completed = Arc::new(AtomicU64::new(0));
+        let meter = InvocationFuelMeter {
+            seed: UNBOUNDED_FUEL_SEED,
+            completed_intervals: Arc::clone(&completed),
+        };
+        let mut refill = UnboundedFuelRefill::new(125, completed);
+
+        assert_eq!(refill.interval, 50);
+        assert_eq!(
+            refill.deadline(UNBOUNDED_FUEL_SEED - 10),
+            UnboundedFuelDeadline::RefillAndYield(50)
+        );
+        assert_eq!(
+            refill.deadline(UNBOUNDED_FUEL_SEED - 20),
+            UnboundedFuelDeadline::RefillAndYield(25)
+        );
+        assert_eq!(
+            refill.deadline(UNBOUNDED_FUEL_SEED - 30),
+            UnboundedFuelDeadline::Interrupt,
+            "the principal wall-time deadline still terminates unlimited CPU"
+        );
+        assert_eq!(
+            meter.consumed(UNBOUNDED_FUEL_SEED - 30),
+            60,
+            "two replenished intervals and the final reservoir are each counted once"
+        );
+    }
+
+    #[test]
+    fn unlimited_interceptor_refill_accounting_saturates() {
+        let completed = Arc::new(AtomicU64::new(u64::MAX - 5));
+        let meter = InvocationFuelMeter {
+            seed: UNBOUNDED_FUEL_SEED,
+            completed_intervals: Arc::clone(&completed),
+        };
+        let mut refill = UnboundedFuelRefill::new(100, completed);
+
+        assert_eq!(
+            refill.deadline(UNBOUNDED_FUEL_SEED - 10),
+            UnboundedFuelDeadline::RefillAndYield(50)
+        );
+        assert_eq!(meter.consumed(UNBOUNDED_FUEL_SEED - 1), u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn unlimited_interceptor_epoch_callback_refills_a_real_store() {
+        let mut config = wasmtime::Config::new();
+        config.consume_fuel(true);
+        config.epoch_interruption(true);
+        let engine = wasmtime::Engine::new(&config).expect("engine");
+        let module = wasmtime::Module::new(
+            &engine,
+            r#"(module
+                (func (export "burn") (param i32)
+                    (block $done
+                        (loop $again
+                            local.get 0
+                            i32.eqz
+                            br_if $done
+                            local.get 0
+                            i32.const 1
+                            i32.sub
+                            local.set 0
+                            br $again))))"#,
+        )
+        .expect("module");
+        let mut store = wasmtime::Store::new(&engine, ());
+        let meter = configure_invocation_fuel(&mut store, UNBOUNDED_FUEL_SEED, 10_000)
+            .expect("configure unlimited fuel");
+        let instance = wasmtime::Instance::new_async(&mut store, &module, &[])
+            .await
+            .expect("instance");
+        let burn = instance
+            .get_typed_func::<i32, ()>(&mut store, "burn")
+            .expect("burn");
+
+        burn.call_async(&mut store, 10_000)
+            .await
+            .expect("first burn");
+        let ticker = spawn_epoch_ticker_every(&engine, std::time::Duration::from_millis(1));
+        burn.call_async(&mut store, 200_000_000)
+            .await
+            .expect("burn after epoch refill");
+        drop(ticker);
+        let after_refill = store.get_fuel().expect("fuel after refill");
+
+        assert!(
+            meter.completed_intervals.load(Ordering::Relaxed) > 0,
+            "the epoch callback must replenish and account the real Wasmtime Store"
+        );
+        assert!(
+            meter.consumed(after_refill) > 0,
+            "fuel burned before and after replenishment remains observable"
+        );
+    }
+
+    #[test]
+    fn rate_gate_no_profile_uses_unlimited_default() {
+        // No profile (tests / owner-operated single-tenant) uses the unlimited
+        // default. Managed principals receive a finite value from their
+        // profile instead.
         let rl = crate::FuelRateLimiter::default();
         let now = std::time::Instant::now();
         let p = pid("anon");
         let g = builtin_groups();
-        // Under the (very large) default: admitted.
         rl.record(&p, 1_000, now);
         assert!(
             cpu_rate_deny(&rl, None, Some(&g), &p, now).is_none(),
-            "a principal under the default budget is admitted"
+            "the default admits ordinary work"
         );
-        // Past the default: denied.
-        rl.record(&p, astrid_core::profile::DEFAULT_MAX_CPU_FUEL_PER_SEC, now);
+        saturate(&rl, &p, now);
         assert!(
-            cpu_rate_deny(&rl, None, Some(&g), &p, now).is_some(),
-            "with no profile the generous DEFAULT budget is still enforced"
+            cpu_rate_deny(&rl, None, Some(&g), &p, now).is_none(),
+            "with no profile the unlimited default must not throttle"
         );
     }
 
@@ -5027,7 +5772,7 @@ mod tests {
 //     calls a recv-marking host import every iteration survives forever.
 //   * memory cap          — `StoreLimitsBuilder::memory_size(cap)` BEFORE
 //     `instantiate_async` (the MEMORY-ORDERING fix — `make_state`).
-//   * fuel-delta meter     — `INTERCEPTOR_FUEL_BUDGET - get_fuel()` after a
+//   * fuel-delta meter     — `invocation_fuel_budget - get_fuel()` after a
 //     call (the kept interceptor measurement).
 //
 // Core modules (not full WIT components) are deliberate: they exercise the
@@ -5041,8 +5786,9 @@ mod tests {
 #[cfg(test)]
 mod epoch_integration_tests {
     use super::{
-        EpochAction, INTERCEPTOR_FUEL_BUDGET, MAX_NO_YIELD_WINDOWS, build_wasmtime_engine,
-        epoch_decision, exempt_epoch_action, spawn_epoch_ticker, spawn_epoch_ticker_every,
+        EFFECTIVELY_UNBOUNDED_EPOCH_TICKS, EpochAction, MAX_NO_YIELD_WINDOWS, UNBOUNDED_FUEL_SEED,
+        build_wasmtime_engine, epoch_decision, exempt_epoch_action, spawn_epoch_ticker,
+        spawn_epoch_ticker_every,
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -5322,7 +6068,7 @@ mod epoch_integration_tests {
             },
         );
         store.limiter(|s| &mut s.limits);
-        store.set_fuel(INTERCEPTOR_FUEL_BUDGET).expect("fuel");
+        store.set_fuel(UNBOUNDED_FUEL_SEED).expect("fuel");
         store.set_epoch_deadline(u64::MAX);
         let linker = Linker::new(&engine);
         let over_res = linker.instantiate_async(&mut store, &over).await;
@@ -5339,7 +6085,7 @@ mod epoch_integration_tests {
             },
         );
         store.limiter(|s| &mut s.limits);
-        store.set_fuel(INTERCEPTOR_FUEL_BUDGET).expect("fuel");
+        store.set_fuel(UNBOUNDED_FUEL_SEED).expect("fuel");
         store.set_epoch_deadline(u64::MAX);
         linker
             .instantiate_async(&mut store, &ok)
@@ -5347,8 +6093,25 @@ mod epoch_integration_tests {
             .expect("a within-cap initial memory MUST instantiate");
     }
 
+    /// A lazily-grown Store is created after the shared engine epoch ticker
+    /// has advanced. Its placeholder deadline must remain in the future;
+    /// `u64::MAX` as a relative delta wraps and traps immediately.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lazy_store_epoch_seed_does_not_wrap_after_engine_advances() {
+        let engine = build_wasmtime_engine().expect("engine");
+        engine.increment_epoch();
+        let module = unit_module(&engine, "(module)");
+        let mut store = Store::new(&engine, ());
+        store.set_fuel(UNBOUNDED_FUEL_SEED).expect("fuel");
+        store.set_epoch_deadline(EFFECTIVELY_UNBOUNDED_EPOCH_TICKS);
+        Linker::new(&engine)
+            .instantiate_async(&mut store, &module)
+            .await
+            .expect("late lazy Store must not inherit an expired epoch");
+    }
+
     /// KEPT interceptor MEASUREMENT: the per-invocation fuel delta
-    /// `INTERCEPTOR_FUEL_BUDGET - get_fuel()` is the exact deterministic
+    /// `fuel_seed - get_fuel()` is the exact deterministic
     /// instruction count, stable across repeated runs of the same deterministic
     /// guest (the property the per-principal ledger relies on). A counting loop
     /// of N iterations costs a fixed, reproducible amount of fuel; N and 2N show
@@ -5372,7 +6135,7 @@ mod epoch_integration_tests {
 
         async fn run_n(engine: &Engine, module: &Module, n: i32) -> (i32, u64) {
             let mut store = Store::new(engine, ());
-            store.set_fuel(INTERCEPTOR_FUEL_BUDGET).expect("fuel");
+            store.set_fuel(UNBOUNDED_FUEL_SEED).expect("fuel");
             store.set_epoch_deadline(u64::MAX);
             let linker = Linker::new(engine);
             let instance = linker
@@ -5384,7 +6147,7 @@ mod epoch_integration_tests {
                 .expect("count export");
             let out = count.call_async(&mut store, n).await.expect("call");
             let after = store.get_fuel().expect("fuel enabled");
-            (out, INTERCEPTOR_FUEL_BUDGET.saturating_sub(after))
+            (out, UNBOUNDED_FUEL_SEED.saturating_sub(after))
         }
 
         let (out_a, used_a1) = run_n(&engine, &module, 1000).await;
@@ -5403,7 +6166,7 @@ mod epoch_integration_tests {
              must exceed used(1000)={used_a1}"
         );
         assert!(
-            used_a1 > 0 && used_a1 < INTERCEPTOR_FUEL_BUDGET,
+            used_a1 > 0 && used_a1 < UNBOUNDED_FUEL_SEED,
             "fuel delta must be a real, bounded count: {used_a1}"
         );
     }

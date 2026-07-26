@@ -72,10 +72,13 @@ impl HostState {
             home: None,
             tmp: None,
             invocation_home: None,
+            invocation_workspace: None,
+            invocation_workspace_attachment: None,
             invocation_tmp: None,
             invocation_secret_store: None,
             invocation_capsule_log: None,
             invocation_profile: None,
+            invocation_resource_exempt: false,
             profile_cache: None,
             invocation_env_overlay: None,
             kv_backend,
@@ -88,6 +91,7 @@ impl HostState {
             ipc_publish_patterns: vec!["hook.v1.result.*".into()],
             ipc_subscribe_patterns: Vec::new(),
             security: None,
+            invocation_security: None,
             hook_manager: None,
             capsule_registry: None,
             runtime_handle,
@@ -95,6 +99,8 @@ impl HostState {
             // Hooks run outside the manifest/security-gate lifecycle: no held
             // capabilities and no local-egress exemptions (both fail-closed).
             capability_names: Vec::new(),
+            compute_runtime: None,
+            compute_workers: Arc::new(HashMap::new()),
             local_egress: Vec::new(),
             http_limits,
             // Transient hook execution never subscribes to the audit feed;
@@ -105,6 +111,7 @@ impl HostState {
             cli_socket_listener: None,
             active_http_streams: HashMap::new(),
             next_http_stream_id: 1,
+            open_file_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             lifecycle_phase: None,
             secret_store,
             ready_tx: None,
@@ -130,6 +137,9 @@ impl HostState {
             // Transient hook execution never accepts socket connections; a
             // throwaway registry satisfies the field (issue #45/#852).
             connection_principals: Self::new_connection_principals(),
+            workspace_attachments: Arc::new(
+                crate::workspace_attachment::WorkspaceAttachmentRegistry::default(),
+            ),
             // Hooks never accept inbound uplink connections, so no client
             // lifecycle events are ever emitted; a throwaway registry satisfies
             // the field. Keyed by the verified principal directly (distinct from
@@ -140,6 +150,7 @@ impl HostState {
             ingress_principal: None,
             ingress_device_key_id: None,
             ingress_origin: None,
+            ingress_workspace_attachment: None,
         }
     }
 }

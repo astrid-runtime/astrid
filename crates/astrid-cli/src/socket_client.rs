@@ -66,6 +66,33 @@ where
     .await
 }
 
+/// Reconnect a long-lived client whose workspace is an authenticated
+/// per-connection attachment rather than the daemon's project selection.
+///
+/// MCP host adapters from multiple worktrees share one AOS daemon. Checking
+/// the attachment against the daemon's workspace fingerprint would conflate
+/// those independent scopes and reject every worktree except the one that
+/// happened to start the daemon. The signed handshake is the authority
+/// boundary here, and the replacement is committed only after caller-supplied
+/// authentication validation succeeds.
+pub(crate) async fn reconnect_with_workspace_attachment<Validate>(
+    client: &mut SocketClient,
+    principal: PrincipalId,
+    workspace_root: Option<&std::path::Path>,
+    validate: Validate,
+) -> WorkspaceConnectionResult<()>
+where
+    Validate: FnOnce(&SocketClient) -> Result<()>,
+{
+    let session = client.session_id.clone();
+    let replacement = SocketClient::connect_with_workspace(session, principal, workspace_root)
+        .await
+        .map_err(WorkspaceConnectionError::Connect)?;
+    validate(&replacement).map_err(WorkspaceConnectionError::Connect)?;
+    *client = replacement;
+    Ok(())
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum WorkspaceConnectionError {
     #[error("{0:#}")]

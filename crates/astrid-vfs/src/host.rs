@@ -8,7 +8,7 @@ use cap_std::fs::Dir;
 use tokio::fs;
 use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 
-use crate::{Vfs, VfsDirEntry, VfsError, VfsMetadata, VfsResult};
+use crate::{Vfs, VfsDirEntry, VfsError, VfsMetadata, VfsResult, VfsSymlinkMetadata};
 
 /// An open file and its associated semaphore permit, tying the FD quota to the struct's lifetime.
 type OpenFileEntry = Arc<RwLock<(fs::File, OwnedSemaphorePermit)>>;
@@ -112,6 +112,12 @@ impl HostVfs {
             self.open_dirs.read().await;
         dirs.get(handle).cloned().ok_or(VfsError::InvalidHandle)
     }
+
+    async fn get_file(&self, handle: &FileHandle) -> VfsResult<OpenFileEntry> {
+        let files: tokio::sync::RwLockReadGuard<'_, HashMap<FileHandle, OpenFileEntry>> =
+            self.open_files.read().await;
+        files.get(handle).cloned().ok_or(VfsError::InvalidHandle)
+    }
 }
 
 impl Default for HostVfs {
@@ -169,7 +175,7 @@ impl Vfs for HostVfs {
             let meta = if safe_path.as_os_str().is_empty() {
                 dir.dir_metadata()
             } else {
-                dir.symlink_metadata(&safe_path)
+                dir.metadata(&safe_path)
             }
             .map_err(classify_io_error)?;
 
@@ -185,6 +191,38 @@ impl Vfs for HostVfs {
                 is_file: meta.is_file(),
                 size: meta.len(),
                 mtime,
+            })
+        })
+        .await
+        .expect("spawn_blocking panicked")
+    }
+
+    async fn stat_symlink(&self, handle: &DirHandle, path: &str) -> VfsResult<VfsSymlinkMetadata> {
+        let dir = self.get_dir(handle).await?;
+        let safe_path = make_relative(path).to_path_buf();
+
+        tokio::task::spawn_blocking(move || {
+            let meta = if safe_path.as_os_str().is_empty() {
+                dir.dir_metadata()
+            } else {
+                dir.symlink_metadata(&safe_path)
+            }
+            .map_err(classify_io_error)?;
+
+            let mtime = meta
+                .modified()
+                .ok()
+                .map(cap_std::time::SystemTime::into_std)
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |duration| duration.as_secs());
+            Ok(VfsSymlinkMetadata {
+                metadata: VfsMetadata {
+                    is_dir: meta.is_dir(),
+                    is_file: meta.is_file(),
+                    size: meta.len(),
+                    mtime,
+                },
+                is_symlink: meta.file_type().is_symlink(),
             })
         })
         .await
@@ -376,6 +414,102 @@ impl Vfs for HostVfs {
         }
         Ok(())
     }
+
+    async fn read_at(
+        &self,
+        handle: &FileHandle,
+        offset: u64,
+        max_bytes: u32,
+    ) -> VfsResult<Vec<u8>> {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+        let file_arc = self.get_file(handle).await?;
+        let mut file_tuple = file_arc.write().await;
+        let file = &mut file_tuple.0;
+        let original = file.stream_position().await.map_err(classify_io_error)?;
+        file.seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(classify_io_error)?;
+        let mut bytes = vec![0; usize::try_from(max_bytes).unwrap_or(usize::MAX)];
+        let read_result = file.read(&mut bytes).await.map_err(classify_io_error);
+        let restore_result = file
+            .seek(std::io::SeekFrom::Start(original))
+            .await
+            .map_err(classify_io_error);
+        let read = read_result?;
+        restore_result?;
+        bytes.truncate(read);
+        Ok(bytes)
+    }
+
+    async fn write_at(&self, handle: &FileHandle, offset: u64, content: &[u8]) -> VfsResult<u32> {
+        use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+
+        let file_arc = self.get_file(handle).await?;
+        let mut file_tuple = file_arc.write().await;
+        let file = &mut file_tuple.0;
+        let original = file.stream_position().await.map_err(classify_io_error)?;
+        file.seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(classify_io_error)?;
+        let write_result = file.write_all(content).await.map_err(classify_io_error);
+        let restore_result = file
+            .seek(std::io::SeekFrom::Start(original))
+            .await
+            .map_err(classify_io_error);
+        write_result?;
+        restore_result?;
+        u32::try_from(content.len())
+            .map_err(|_| VfsError::PermissionDenied("write exceeds u32 length".to_owned()))
+    }
+
+    async fn file_stat(&self, handle: &FileHandle) -> VfsResult<VfsMetadata> {
+        let file_arc = self.get_file(handle).await?;
+        let file_tuple = file_arc.read().await;
+        let metadata = file_tuple.0.metadata().await.map_err(classify_io_error)?;
+        let mtime = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |duration| duration.as_secs());
+        Ok(VfsMetadata {
+            is_dir: metadata.is_dir(),
+            is_file: metadata.is_file(),
+            size: metadata.len(),
+            mtime,
+        })
+    }
+
+    async fn sync_file(&self, handle: &FileHandle, data_only: bool) -> VfsResult<()> {
+        let file_arc = self.get_file(handle).await?;
+        let file_tuple = file_arc.read().await;
+        if data_only {
+            file_tuple.0.sync_data().await.map_err(classify_io_error)
+        } else {
+            file_tuple.0.sync_all().await.map_err(classify_io_error)
+        }
+    }
+
+    async fn set_len(&self, handle: &FileHandle, size: u64) -> VfsResult<()> {
+        let file_arc = self.get_file(handle).await?;
+        let file_tuple = file_arc.write().await;
+        file_tuple.0.set_len(size).await.map_err(classify_io_error)
+    }
+
+    async fn rename(&self, handle: &DirHandle, src: &str, dst: &str) -> VfsResult<()> {
+        let dir = self.get_dir(handle).await?;
+        let src = make_relative(src).to_path_buf();
+        let dst = make_relative(dst).to_path_buf();
+        if src.as_os_str().is_empty() || dst.as_os_str().is_empty() {
+            return Err(VfsError::PermissionDenied(
+                "cannot rename a capability root".to_owned(),
+            ));
+        }
+        tokio::task::spawn_blocking(move || dir.rename(&src, &dir, &dst))
+            .await
+            .expect("spawn_blocking panicked")
+            .map_err(classify_io_error)
+    }
 }
 
 #[cfg(test)]
@@ -410,6 +544,103 @@ mod tests {
             vfs.open(&handle, "missing", false, false).await,
             Err(VfsError::NotFound(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn open_files_support_positional_io_resize_sync_and_rename() {
+        let root = tempfile::tempdir().expect("root");
+        std::fs::write(root.path().join("source.txt"), b"abcdef").expect("fixture");
+        let dir_handle = DirHandle::new();
+        let vfs = HostVfs::with_registered_dir(dir_handle.clone(), root.path()).expect("host VFS");
+        let file_handle = vfs
+            .open(&dir_handle, "source.txt", true, false)
+            .await
+            .expect("open file");
+
+        assert_eq!(
+            vfs.read_at(&file_handle, 2, 2)
+                .await
+                .expect("positional read"),
+            b"cd"
+        );
+        assert_eq!(
+            vfs.write_at(&file_handle, 1, b"XY")
+                .await
+                .expect("positional write"),
+            2
+        );
+        assert_eq!(
+            vfs.read_at(&file_handle, 0, 16)
+                .await
+                .expect("read updated file"),
+            b"aXYdef"
+        );
+
+        vfs.set_len(&file_handle, 4).await.expect("truncate");
+        assert_eq!(
+            vfs.file_stat(&file_handle)
+                .await
+                .expect("open-file stat")
+                .size,
+            4
+        );
+        vfs.sync_file(&file_handle, true).await.expect("sync data");
+        vfs.sync_file(&file_handle, false).await.expect("sync all");
+        vfs.close(&file_handle).await.expect("close file");
+
+        vfs.rename(&dir_handle, "source.txt", "renamed.txt")
+            .await
+            .expect("rename");
+        assert!(!vfs.exists(&dir_handle, "source.txt").await.expect("source"));
+        assert!(
+            vfs.exists(&dir_handle, "renamed.txt")
+                .await
+                .expect("target")
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("renamed.txt")).expect("renamed contents"),
+            b"aXYd"
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_rejects_a_capability_root() {
+        let root = tempfile::tempdir().expect("root");
+        let handle = DirHandle::new();
+        let vfs = HostVfs::with_registered_dir(handle.clone(), root.path()).expect("host VFS");
+
+        assert!(matches!(
+            vfs.rename(&handle, "", "renamed").await,
+            Err(VfsError::PermissionDenied(_))
+        ));
+        assert!(matches!(
+            vfs.rename(&handle, "renamed", "/").await,
+            Err(VfsError::PermissionDenied(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn following_and_non_following_metadata_are_distinct() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("root");
+        std::fs::write(root.path().join("target.txt"), b"target-bytes").expect("target");
+        symlink("target.txt", root.path().join("link.txt")).expect("symlink");
+        let handle = DirHandle::new();
+        let vfs = HostVfs::with_registered_dir(handle.clone(), root.path()).expect("host VFS");
+
+        let followed = vfs.stat(&handle, "link.txt").await.expect("following stat");
+        assert!(followed.is_file);
+        assert_eq!(followed.size, 12);
+
+        let link = vfs
+            .stat_symlink(&handle, "link.txt")
+            .await
+            .expect("non-following stat");
+        assert!(link.is_symlink);
+        assert!(!link.metadata.is_file);
+        assert!(!link.metadata.is_dir);
     }
 
     #[test]

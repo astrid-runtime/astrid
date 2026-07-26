@@ -109,6 +109,9 @@ pub struct Kernel {
     /// visible to Agent B. Native-only (`astrid-vfs` / `cap-std`).
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     pub overlay_registry: Arc<OverlayVfsRegistry>,
+    /// Host-only connection workspace registry shared by every capsule engine.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    workspace_attachments: Arc<astrid_capsule::workspace_attachment::WorkspaceAttachmentRegistry>,
     /// The global physical root handle for the VFS. On native hosts the
     /// composition root registers it as the cap-std workspace root; the
     /// browser profile keeps the handle (it is engine-agnostic) but gates
@@ -182,6 +185,11 @@ pub struct Kernel {
     /// capsules. Telemetry today; fills `ResourceUsage::memory_bytes_peak_total`.
     /// See [`MemoryLedger`](astrid_capsule_types::MemoryLedger).
     memory_ledger: astrid_capsule_types::MemoryLedger,
+    /// Aggregate compute workers and shared-memory reservations by principal.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    compute_ledger: astrid_capsule::ComputeLedger,
+    /// Operator policy for principal-scoped generic compute groups.
+    compute_limits: astrid_capsule_types::ComputeRuntimeLimits,
     /// Host-derived (operator-overridable) concurrency ceilings for capsule
     /// host calls, resolved once by the daemon and forwarded to every
     /// `WasmEngine` via the loader. The kernel only stores and forwards this
@@ -419,6 +427,37 @@ impl Kernel {
         http_limits: astrid_capsule_types::HttpLimits,
         workspace_layout: WorkspaceLayout,
     ) -> Result<Arc<Self>, std::io::Error> {
+        Self::new_with_workspace_layout_and_compute_policy(
+            session_id,
+            workspace_root,
+            runtime_limits,
+            local_egress,
+            http_limits,
+            astrid_capsule_types::ComputeRuntimeLimits::default(),
+            workspace_layout,
+        )
+        .await
+    }
+
+    /// Boot a kernel with explicit workspace layout and generic-compute policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if native resources or portable kernel wiring fail.
+    #[cfg(unix)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "additive composition-root constructor preserves existing public APIs"
+    )]
+    pub async fn new_with_workspace_layout_and_compute_policy(
+        session_id: SessionId,
+        workspace_root: PathBuf,
+        runtime_limits: astrid_capsule_types::CapsuleRuntimeLimits,
+        local_egress: std::collections::HashMap<String, Vec<String>>,
+        http_limits: astrid_capsule_types::HttpLimits,
+        compute_limits: astrid_capsule_types::ComputeRuntimeLimits,
+        workspace_layout: WorkspaceLayout,
+    ) -> Result<Arc<Self>, std::io::Error> {
         use astrid_core::dirs::AstridHome;
 
         // Resolve the Astrid home directory. Required for persistent KV store
@@ -484,12 +523,13 @@ impl Kernel {
             Some(singleton_lock),
         );
 
-        Self::with_resources_and_workspace_layout(
+        Self::with_resources_and_workspace_layout_and_compute_policy(
             session_id,
             workspace_root,
             runtime_limits,
             local_egress,
             http_limits,
+            compute_limits,
             resources,
             workspace_layout,
         )
@@ -561,16 +601,53 @@ impl Kernel {
     ///
     /// Returns an error if VFS mounts, the capability store, group
     /// configuration, or CLI root bootstrap cannot be initialized.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "boot sequence: sequential setup that does not benefit from splitting"
-    )]
     pub async fn with_resources_and_workspace_layout(
         session_id: SessionId,
         workspace_root: PathBuf,
         runtime_limits: astrid_capsule_types::CapsuleRuntimeLimits,
         local_egress: std::collections::HashMap<String, Vec<String>>,
         http_limits: astrid_capsule_types::HttpLimits,
+        resources: KernelResources,
+        workspace_layout: WorkspaceLayout,
+    ) -> Result<Arc<Self>, std::io::Error> {
+        Self::with_resources_and_workspace_layout_and_compute_policy(
+            session_id,
+            workspace_root,
+            runtime_limits,
+            local_egress,
+            http_limits,
+            astrid_capsule_types::ComputeRuntimeLimits::default(),
+            resources,
+            workspace_layout,
+        )
+        .await
+    }
+
+    /// Construct a kernel with injected resources, layout, and compute policy.
+    ///
+    /// # Panics
+    ///
+    /// Panics on native targets when called from a single-threaded Tokio
+    /// runtime because the capsule engine requires `block_in_place`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if portable kernel wiring fails.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "boot sequence: sequential setup that does not benefit from splitting"
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "additive composition-root constructor preserves existing public APIs"
+    )]
+    pub async fn with_resources_and_workspace_layout_and_compute_policy(
+        session_id: SessionId,
+        workspace_root: PathBuf,
+        runtime_limits: astrid_capsule_types::CapsuleRuntimeLimits,
+        local_egress: std::collections::HashMap<String, Vec<String>>,
+        http_limits: astrid_capsule_types::HttpLimits,
+        compute_limits: astrid_capsule_types::ComputeRuntimeLimits,
         resources: KernelResources,
         workspace_layout: WorkspaceLayout,
     ) -> Result<Arc<Self>, std::io::Error> {
@@ -663,6 +740,9 @@ impl Kernel {
             workspace_root.clone(),
             root_handle.clone(),
         ));
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        let workspace_attachments =
+            Arc::new(astrid_capsule::workspace_attachment::WorkspaceAttachmentRegistry::default());
 
         let allowance_store = Arc::new(astrid_approval::AllowanceStore::new());
         // Create system-wide identity store backed by the shared KV.
@@ -717,6 +797,8 @@ impl Kernel {
             vfs,
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             overlay_registry,
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+            workspace_attachments,
             vfs_root_handle: root_handle,
             workspace_root,
             workspace_layout,
@@ -731,6 +813,9 @@ impl Kernel {
             fuel_ledger: astrid_capsule_types::FuelLedger::default(),
             fuel_rate: astrid_capsule_types::FuelRateLimiter::default(),
             memory_ledger: astrid_capsule_types::MemoryLedger::default(),
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+            compute_ledger: astrid_capsule::ComputeLedger::default(),
+            compute_limits,
             runtime_limits,
             local_egress,
             http_limits,
@@ -985,14 +1070,17 @@ impl Kernel {
         self.verify_workspace_capsule_tree(dir)?;
         let load_principal = PrincipalId::default();
 
-        let loader = astrid_capsule::loader::CapsuleLoader::new(
+        let loader = astrid_capsule::loader::CapsuleLoader::new_with_compute_policy(
             self.mcp.clone(),
             self.fuel_ledger.clone(),
             self.fuel_rate.clone(),
             self.memory_ledger.clone(),
             self.runtime_limits,
             self.http_limits,
-        );
+            self.compute_ledger.clone(),
+            self.compute_limits,
+        )
+        .with_workspace_attachments(Arc::clone(&self.workspace_attachments));
         let mut capsule = loader.create_capsule(manifest, dir.to_path_buf())?;
 
         let kv = astrid_storage::ScopedKvStore::new(
@@ -2467,6 +2555,9 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         capabilities,
         vfs: Arc::new(kernel_host_vfs) as Arc<dyn Vfs>,
         overlay_registry,
+        workspace_attachments: Arc::new(
+            astrid_capsule::workspace_attachment::WorkspaceAttachmentRegistry::default(),
+        ),
         vfs_root_handle: root_handle,
         workspace_root: home.root().to_path_buf(),
         workspace_layout: WorkspaceLayout::default(),
@@ -2483,6 +2574,8 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         fuel_ledger: astrid_capsule_types::FuelLedger::default(),
         fuel_rate: astrid_capsule_types::FuelRateLimiter::default(),
         memory_ledger: astrid_capsule_types::MemoryLedger::default(),
+        compute_ledger: astrid_capsule::ComputeLedger::default(),
+        compute_limits: astrid_capsule_types::ComputeRuntimeLimits::default(),
         runtime_limits: astrid_capsule_types::CapsuleRuntimeLimits::default(),
         local_egress: std::collections::HashMap::new(),
         http_limits: astrid_capsule_types::HttpLimits::default(),

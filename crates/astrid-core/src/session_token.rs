@@ -28,6 +28,10 @@ pub const PROTOCOL_VERSION: u8 = 1;
 /// signature minted under one scheme can never be replayed under another.
 pub const PRINCIPAL_AUTH_CHALLENGE_PREFIX: &str = "astrid-principal-auth:v1:";
 
+/// Domain separation for a principal challenge that also binds a local
+/// workspace claim.
+pub const PRINCIPAL_WORKSPACE_AUTH_CHALLENGE_PREFIX: &str = "astrid-principal-workspace-auth:v1:";
+
 /// Length of the principal-auth challenge nonce in bytes.
 pub const PRINCIPAL_AUTH_NONCE_LEN: usize = 32;
 
@@ -41,6 +45,25 @@ pub const PRINCIPAL_AUTH_NONCE_LEN: usize = 32;
 #[must_use]
 pub fn principal_auth_challenge_message(principal: &str, nonce_hex: &str) -> String {
     format!("{PRINCIPAL_AUTH_CHALLENGE_PREFIX}{principal}:{nonce_hex}")
+}
+
+/// Build the challenge message for a connection that attaches a workspace.
+///
+/// Length-prefixing both user-controlled strings makes the signed encoding
+/// unambiguous even when a platform path contains `:`. Connections without a
+/// workspace continue to use [`principal_auth_challenge_message`] byte-for-byte
+/// for compatibility.
+#[must_use]
+pub fn principal_workspace_auth_challenge_message(
+    principal: &str,
+    nonce_hex: &str,
+    workspace_root: &str,
+) -> String {
+    format!(
+        "{PRINCIPAL_WORKSPACE_AUTH_CHALLENGE_PREFIX}{}:{principal}:{nonce_hex}:{}:{workspace_root}",
+        principal.len(),
+        workspace_root.len()
+    )
 }
 
 /// A 256-bit random session token for socket authentication.
@@ -219,6 +242,34 @@ pub struct HandshakeRequest {
     pub signature: Option<String>,
 }
 
+/// Additive wire envelope for an optional authenticated workspace claim.
+///
+/// `#[serde(flatten)]` keeps the JSON shape byte-compatible with
+/// [`HandshakeRequest`] plus one optional field while leaving that public
+/// struct's Rust construction API unchanged.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WorkspaceHandshakeRequest {
+    /// Original stable handshake request.
+    #[serde(flatten)]
+    pub handshake: HandshakeRequest,
+    /// Absolute local directory the client asks the kernel to attach as this
+    /// connection's `cwd://` root.
+    ///
+    /// This claim is authenticated by the signed challenge, canonicalized by
+    /// the host, and never forwarded as a physical path. Legacy clients omit
+    /// it and retain the daemon-selected workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
+}
+
+impl std::ops::Deref for WorkspaceHandshakeRequest {
+    type Target = HandshakeRequest;
+
+    fn deref(&self) -> &Self::Target {
+        &self.handshake
+    }
+}
+
 /// Typed status for handshake responses. Using an enum instead of a raw
 /// string prevents typo-induced mismatches between client and server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -301,6 +352,75 @@ impl HandshakeResponse {
     #[must_use]
     pub fn is_ok(&self) -> bool {
         self.status == HandshakeStatus::Ok
+    }
+}
+
+/// Additive wire envelope advertising workspace-bound authentication support.
+///
+/// Old daemons serialize only [`HandshakeResponse`], which deserializes here
+/// with `workspace_auth == false`. A new client requesting a workspace can
+/// therefore reject an old daemon instead of silently using its ambient CWD,
+/// while the stable response struct remains source-compatible.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WorkspaceHandshakeResponse {
+    /// Original stable handshake response.
+    #[serde(flatten)]
+    pub handshake: HandshakeResponse,
+    /// Whether this challenge binds
+    /// [`WorkspaceHandshakeRequest::workspace_root`] into the signature.
+    #[serde(default, skip_serializing_if = "workspace_auth_not_negotiated")]
+    pub workspace_auth: bool,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's predicate ABI is `fn(&T) -> bool`.
+fn workspace_auth_not_negotiated(workspace_auth: &bool) -> bool {
+    !workspace_auth
+}
+
+impl WorkspaceHandshakeResponse {
+    /// Wrap an ordinary handshake response without workspace negotiation.
+    #[must_use]
+    pub fn plain(handshake: HandshakeResponse) -> Self {
+        Self {
+            handshake,
+            workspace_auth: false,
+        }
+    }
+
+    /// Create an ordinary success response.
+    #[must_use]
+    pub fn ok() -> Self {
+        Self::plain(HandshakeResponse::ok())
+    }
+
+    /// Create an ordinary error response.
+    #[must_use]
+    pub fn error(reason: impl Into<String>) -> Self {
+        Self::plain(HandshakeResponse::error(reason))
+    }
+
+    /// Create an ordinary principal-auth challenge.
+    #[must_use]
+    pub fn challenge(nonce_hex: impl Into<String>) -> Self {
+        Self::plain(HandshakeResponse::challenge(nonce_hex))
+    }
+
+    /// Create a principal-auth challenge that authenticates the exact
+    /// workspace requested in the first frame.
+    #[must_use]
+    pub fn workspace_challenge(nonce_hex: impl Into<String>) -> Self {
+        Self {
+            handshake: HandshakeResponse::challenge(nonce_hex),
+            workspace_auth: true,
+        }
+    }
+}
+
+impl std::ops::Deref for WorkspaceHandshakeResponse {
+    type Target = HandshakeResponse;
+
+    fn deref(&self) -> &Self::Target {
+        &self.handshake
     }
 }
 
@@ -392,6 +512,7 @@ mod tests {
         let json = serde_json::to_value(&resp).expect("serialize");
         assert_eq!(json["status"], "ok");
         assert!(json.get("reason").is_none(), "reason should be skipped");
+        assert!(json.get("workspace_auth").is_none());
     }
 
     #[test]
@@ -411,30 +532,46 @@ mod tests {
         // A frame from a pre-#45 client carries no claimed_principal /
         // signature. `#[serde(default)]` must let it deserialize to `None`.
         let legacy = r#"{"token":"ab","protocol_version":1,"client_version":"0.1.0"}"#;
-        let req: HandshakeRequest = serde_json::from_str(legacy).expect("parse legacy request");
+        let req: WorkspaceHandshakeRequest =
+            serde_json::from_str(legacy).expect("parse legacy request");
         assert_eq!(req.claimed_principal, None);
         assert_eq!(req.signature, None);
+        assert_eq!(req.workspace_root, None);
     }
 
     #[test]
     fn legacy_handshake_response_without_challenge_parses() {
         // A response from a pre-#45 daemon carries no challenge field.
         let legacy = r#"{"status":"ok","protocol_version":1,"server_version":"0.1.0"}"#;
-        let resp: HandshakeResponse = serde_json::from_str(legacy).expect("parse legacy response");
+        let resp: WorkspaceHandshakeResponse =
+            serde_json::from_str(legacy).expect("parse legacy response");
         assert!(resp.is_ok());
         assert_eq!(resp.challenge, None);
+        assert!(!resp.workspace_auth);
     }
 
     #[test]
     fn challenge_response_carries_nonce_and_is_ok() {
         // The intermediate challenge response is status=ok with a nonce — the
         // token is already accepted; the client must still sign the nonce.
-        let resp = HandshakeResponse::challenge("deadbeef");
+        let resp = WorkspaceHandshakeResponse::challenge("deadbeef");
         assert!(resp.is_ok());
         assert_eq!(resp.challenge.as_deref(), Some("deadbeef"));
 
         let json = serde_json::to_value(&resp).expect("serialize");
         assert_eq!(json["challenge"], "deadbeef");
+        assert!(json.get("workspace_auth").is_none());
+    }
+
+    #[test]
+    fn workspace_challenge_explicitly_negotiates_binding() {
+        let resp = WorkspaceHandshakeResponse::workspace_challenge("deadbeef");
+        assert!(resp.is_ok());
+        assert_eq!(resp.challenge.as_deref(), Some("deadbeef"));
+        assert!(resp.workspace_auth);
+
+        let json = serde_json::to_value(&resp).expect("serialize");
+        assert_eq!(json["workspace_auth"], true);
     }
 
     #[test]
@@ -444,5 +581,24 @@ mod tests {
         // Different principal or nonce ⇒ different message (no cross-replay).
         assert_ne!(m, principal_auth_challenge_message("bob", "00ff"));
         assert_ne!(m, principal_auth_challenge_message("alice", "ff00"));
+    }
+
+    #[test]
+    fn workspace_challenge_binds_principal_nonce_and_exact_path() {
+        let message =
+            principal_workspace_auth_challenge_message("alice", "00ff", "/work:a/project");
+        assert_ne!(
+            message,
+            principal_workspace_auth_challenge_message("bob", "00ff", "/work:a/project")
+        );
+        assert_ne!(
+            message,
+            principal_workspace_auth_challenge_message("alice", "ff00", "/work:a/project")
+        );
+        assert_ne!(
+            message,
+            principal_workspace_auth_challenge_message("alice", "00ff", "/work:a/other")
+        );
+        assert!(message.contains("15:/work:a/project"));
     }
 }

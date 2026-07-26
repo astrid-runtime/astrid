@@ -10,6 +10,7 @@ members = [
     "crates/astrid-capsule-types",
     "crates/astrid-cli",
     "crates/astrid-config",
+    "crates/astrid-compute",
     "crates/astrid-daemon",
     "crates/astrid-core",
     "crates/astrid-emit",
@@ -48,6 +49,7 @@ astrid-capsule = { path = "crates/astrid-capsule", version = "0.10.4" }
 astrid-capsule-install = { path = "crates/astrid-capsule-install", version = "0.10.4" }
 astrid-capsule-types = { path = "crates/astrid-capsule-types", version = "0.10.4" }
 astrid-config = { path = "crates/astrid-config", version = "0.10.4" }
+astrid-compute = { path = "crates/astrid-compute", version = "0.10.4" }
 astrid-daemon = { path = "crates/astrid-daemon", version = "0.10.4" }
 astrid-core = { path = "crates/astrid-core", version = "0.10.4" }
 astrid-crypto = { path = "crates/astrid-crypto", version = "0.10.4" }
@@ -93,6 +95,7 @@ axum-server = { version = "0.8", features = ["tls-rustls"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 base64 = "0.22"
 blake3 = "1.5"
+memmap2 = "0.9"
 # `default-features = false` strips chrono's `clock` feature, which on
 # `wasm32-unknown-unknown` would pull in `wasm-bindgen` + `js-sys` and
 # inject `__wbindgen_placeholder__` imports that `wit-component`
@@ -138,6 +141,7 @@ nix = { version = "0.31", features = ["process", "signal", "user", "fs", "resour
 # daemon's SIGTERM/SIGINT/SIGHUP watchdog, which owns those signals off the
 # tokio runtime so the daemon is killable even when every worker is pinned.
 signal-hook = "0.4"
+sysinfo = "0.37"
 # Metric recording facade + Prometheus exporter. The facade decouples
 # recording (`counter!()`, `histogram!()` macros) from export format,
 # so we can swap to OTLP later without touching the call sites. Lives

@@ -16,7 +16,8 @@ use astrid_core::PrincipalId;
 use astrid_core::SessionId;
 use astrid_core::local_transport::{self, LocalReadHalf, LocalStream, LocalWriteHalf};
 use astrid_core::session_token::{
-    HandshakeRequest, HandshakeResponse, PROTOCOL_VERSION, SessionToken,
+    HandshakeRequest, PROTOCOL_VERSION, SessionToken, WorkspaceHandshakeRequest,
+    WorkspaceHandshakeResponse, principal_workspace_auth_challenge_message,
 };
 use astrid_types::Topic;
 use astrid_types::ipc::{IpcMessage, IpcPayload};
@@ -149,6 +150,9 @@ pub struct SocketClient {
     /// (the MCP shim) refuse to serve silently as `anonymous`; see
     /// [`is_authenticated`](Self::is_authenticated).
     authenticated: bool,
+    /// Canonical workspace claim bound into this connection's handshake.
+    /// Retained so reconnect cannot silently fall back to another CWD.
+    workspace_root: Option<std::path::PathBuf>,
 }
 
 impl SocketClient {
@@ -164,13 +168,41 @@ impl SocketClient {
     /// Returns an error if the local endpoint does not exist, connection
     /// fails, or the handshake is rejected.
     pub async fn connect(session_id: SessionId, principal: PrincipalId) -> Result<Self> {
+        Self::connect_with_workspace(session_id, principal, None).await
+    }
+
+    /// Connect and ask the kernel to attach `workspace_root` as this
+    /// connection's invocation-scoped `cwd://` root.
+    ///
+    /// The path is canonicalized locally, authenticated by the principal
+    /// challenge, canonicalized again by the server, and represented only by
+    /// an opaque host-stamped identity after admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the local endpoint is unavailable, the workspace
+    /// cannot be canonicalized, or the authenticated handshake rejects the
+    /// principal or workspace claim.
+    pub async fn connect_with_workspace(
+        session_id: SessionId,
+        principal: PrincipalId,
+        workspace_root: Option<&std::path::Path>,
+    ) -> Result<Self> {
         let path = proxy_socket_path();
 
         let mut stream = local_transport::connect(&path)
             .await
             .context("Failed to connect to IPC socket")?;
 
-        let authenticated = perform_handshake(&mut stream, &principal).await?;
+        let workspace_root = match workspace_root {
+            Some(path) => Some(
+                path.canonicalize()
+                    .with_context(|| format!("Failed to resolve workspace {}", path.display()))?,
+            ),
+            None => None,
+        };
+        let authenticated =
+            perform_handshake(&mut stream, &principal, workspace_root.as_deref()).await?;
 
         let (read_half, write_half) = local_transport::split(stream);
 
@@ -180,6 +212,7 @@ impl SocketClient {
             session_id,
             principal,
             authenticated,
+            workspace_root,
         })
     }
 
@@ -200,6 +233,7 @@ impl SocketClient {
             session_id,
             principal,
             authenticated: true,
+            workspace_root: None,
         }
     }
 
@@ -235,7 +269,12 @@ impl SocketClient {
         // connection's identity, since the proxy pins the first principal it
         // sees per connection and a fresh one bound to a different principal
         // would have this uplink's messages dropped.
-        *self = Self::connect(self.session_id.clone(), self.principal.clone()).await?;
+        *self = Self::connect_with_workspace(
+            self.session_id.clone(),
+            self.principal.clone(),
+            self.workspace_root.as_deref(),
+        )
+        .await?;
         Ok(())
     }
 
@@ -491,16 +530,21 @@ fn principal_key_path_in(
 /// took the legacy single-frame path that the daemon stamps the no-capability
 /// `anonymous`. An outright-rejected handshake (e.g. a bad signature) is an
 /// `Err`, never a silent `false`.
-async fn perform_handshake(stream: &mut LocalStream, principal: &PrincipalId) -> Result<bool> {
+async fn perform_handshake(
+    stream: &mut LocalStream,
+    principal: &PrincipalId,
+    workspace_root: Option<&std::path::Path>,
+) -> Result<bool> {
     let home = astrid_core::dirs::AstridHome::resolve()
         .map_err(|e| anyhow::anyhow!("Failed to resolve ASTRID_HOME for handshake: {e}"))?;
-    perform_handshake_in_home(stream, principal, &home).await
+    perform_handshake_in_home(stream, principal, &home, workspace_root).await
 }
 
 async fn perform_handshake_in_home(
     stream: &mut LocalStream,
     principal: &PrincipalId,
     home: &astrid_core::dirs::AstridHome,
+    workspace_root: Option<&std::path::Path>,
 ) -> Result<bool> {
     let tok_path = home.token_path();
     let token = SessionToken::read_from_file(&tok_path).with_context(|| {
@@ -527,49 +571,99 @@ async fn perform_handshake_in_home(
         }
     };
 
+    if workspace_root.is_some() && keypair.is_none() {
+        anyhow::bail!(
+            "Authenticated workspace attachment requires a registered key for principal \
+             {principal}. Run `astrid principal init {principal}` and retry."
+        );
+    }
+
     let claimed_principal = keypair.as_ref().map(|_| principal.to_string());
-    let request = HandshakeRequest {
-        token: token.to_hex(),
-        protocol_version: PROTOCOL_VERSION,
-        client_version: env!("CARGO_PKG_VERSION").to_string(),
-        claimed_principal,
-        // The signature rides the SECOND frame (after the challenge), never
-        // the first.
-        signature: None,
+    let workspace_claim = workspace_root
+        .map(|path| {
+            path.to_str()
+                .map(str::to_owned)
+                .ok_or_else(|| anyhow::anyhow!("workspace path is not valid UTF-8"))
+        })
+        .transpose()?;
+    let workspace_requested = workspace_claim.is_some();
+    let request = WorkspaceHandshakeRequest {
+        handshake: HandshakeRequest {
+            token: token.to_hex(),
+            protocol_version: PROTOCOL_VERSION,
+            client_version: env!("CARGO_PKG_VERSION").to_string(),
+            claimed_principal,
+            // The signature rides the SECOND frame (after the challenge),
+            // never the first.
+            signature: None,
+        },
+        workspace_root: workspace_claim.clone(),
     };
 
     let response = send_request_read_response(stream, &request).await?;
+    reject_handshake_error(&response)?;
+
+    require_workspace_auth_negotiated(&response, workspace_requested)?;
 
     // Authenticated path: the daemon's first response carries a challenge
     // nonce. Sign it and send a second frame, then read the final response.
     let (response, authenticated) = if let (Some(keypair), Some(nonce_hex)) =
         (keypair.as_ref(), response.challenge.as_deref())
     {
-        let message = astrid_core::session_token::principal_auth_challenge_message(
-            principal.as_str(),
-            nonce_hex,
+        let message = workspace_claim.as_deref().map_or_else(
+            || {
+                astrid_core::session_token::principal_auth_challenge_message(
+                    principal.as_str(),
+                    nonce_hex,
+                )
+            },
+            |workspace| {
+                principal_workspace_auth_challenge_message(principal.as_str(), nonce_hex, workspace)
+            },
         );
         let signature = keypair.sign(message.as_bytes()).to_hex();
-        let signed = HandshakeRequest {
-            token: token.to_hex(),
-            protocol_version: PROTOCOL_VERSION,
-            client_version: env!("CARGO_PKG_VERSION").to_string(),
-            claimed_principal: Some(principal.to_string()),
-            signature: Some(signature),
+        let signed = WorkspaceHandshakeRequest {
+            handshake: HandshakeRequest {
+                token: token.to_hex(),
+                protocol_version: PROTOCOL_VERSION,
+                client_version: env!("CARGO_PKG_VERSION").to_string(),
+                claimed_principal: Some(principal.to_string()),
+                signature: Some(signature),
+            },
+            workspace_root: workspace_claim.clone(),
         };
         (send_request_read_response(stream, &signed).await?, true)
     } else {
         (response, false)
     };
 
-    if !response.is_ok() {
-        let reason = response
-            .reason
-            .unwrap_or_else(|| "unknown error".to_string());
-        anyhow::bail!("Daemon rejected connection: {reason}");
+    reject_handshake_error(&response)?;
+    if workspace_requested && !authenticated {
+        anyhow::bail!("Daemon did not complete authenticated workspace attachment");
     }
 
     Ok(authenticated)
+}
+
+fn require_workspace_auth_negotiated(
+    response: &WorkspaceHandshakeResponse,
+    workspace_requested: bool,
+) -> Result<()> {
+    if workspace_requested && !response.workspace_auth {
+        anyhow::bail!(
+            "The running Astrid daemon does not support authenticated workspace attachments. \
+             Restart it with `astrid restart` and retry."
+        );
+    }
+    Ok(())
+}
+
+fn reject_handshake_error(response: &WorkspaceHandshakeResponse) -> Result<()> {
+    if response.is_ok() {
+        return Ok(());
+    }
+    let reason = response.reason.as_deref().unwrap_or("unknown error");
+    anyhow::bail!("Daemon rejected connection: {reason}");
 }
 
 /// Test-only access to the production handshake framing with an explicit home.
@@ -580,15 +674,15 @@ pub async fn perform_handshake_for_test(
     principal: &PrincipalId,
     home: &astrid_core::dirs::AstridHome,
 ) -> Result<bool> {
-    perform_handshake_in_home(stream, principal, home).await
+    perform_handshake_in_home(stream, principal, home, None).await
 }
 
-/// Write one length-prefixed [`HandshakeRequest`] frame and read the
-/// length-prefixed [`HandshakeResponse`] frame, with per-operation timeouts.
+/// Write one length-prefixed [`WorkspaceHandshakeRequest`] frame and read the
+/// matching [`WorkspaceHandshakeResponse`], with per-operation timeouts.
 async fn send_request_read_response(
     stream: &mut LocalStream,
-    request: &HandshakeRequest,
-) -> Result<HandshakeResponse> {
+    request: &WorkspaceHandshakeRequest,
+) -> Result<WorkspaceHandshakeResponse> {
     let request_bytes =
         serde_json::to_vec(request).context("Failed to serialize handshake request")?;
     let len = u32::try_from(request_bytes.len()).context("Handshake request too large")?;
@@ -621,4 +715,39 @@ async fn send_request_read_response(
         .context("Failed to read handshake response payload")?;
 
     serde_json::from_slice(&resp_payload).context("Failed to parse handshake response")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_request_rejects_legacy_daemon_challenge() {
+        let legacy_json = r#"{
+            "status":"ok",
+            "protocol_version":1,
+            "server_version":"2026.1.3",
+            "challenge":"deadbeef"
+        }"#;
+        let response: WorkspaceHandshakeResponse =
+            serde_json::from_str(legacy_json).expect("legacy response");
+
+        let error = require_workspace_auth_negotiated(&response, true)
+            .expect_err("old daemon must not silently ignore workspace");
+        assert!(error.to_string().contains("astrid restart"));
+    }
+
+    #[test]
+    fn workspace_request_accepts_explicit_binding_capability() {
+        let response = WorkspaceHandshakeResponse::workspace_challenge("deadbeef");
+        require_workspace_auth_negotiated(&response, true)
+            .expect("new daemon explicitly binds workspace");
+    }
+
+    #[test]
+    fn ordinary_connection_remains_compatible_with_legacy_daemon() {
+        let response = WorkspaceHandshakeResponse::challenge("deadbeef");
+        require_workspace_auth_negotiated(&response, false)
+            .expect("connections without a workspace keep old challenge semantics");
+    }
 }

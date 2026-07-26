@@ -56,6 +56,15 @@ pub struct VfsMetadata {
     pub mtime: u64,
 }
 
+/// Metadata returned by a non-following symbolic-link stat.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct VfsSymlinkMetadata {
+    /// Metadata for the directory entry itself.
+    pub metadata: VfsMetadata,
+    /// True when the entry is a symbolic link rather than its resolved target.
+    pub is_symlink: bool,
+}
+
 /// Directory entry returned by readdir.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct VfsDirEntry {
@@ -76,6 +85,17 @@ pub trait Vfs: Send + Sync {
 
     /// Get metadata for a path.
     async fn stat(&self, handle: &DirHandle, path: &str) -> VfsResult<VfsMetadata>;
+
+    /// Get metadata for a path without following its final symbolic link.
+    async fn stat_symlink(
+        &self,
+        _handle: &DirHandle,
+        _path: &str,
+    ) -> VfsResult<VfsSymlinkMetadata> {
+        Err(VfsError::NotSupported(
+            "non-following metadata is not supported by this VFS".to_owned(),
+        ))
+    }
 
     /// Create a new directory.
     async fn mkdir(&self, handle: &DirHandle, path: &str) -> VfsResult<()>;
@@ -111,4 +131,56 @@ pub trait Vfs: Send + Sync {
 
     /// Close a file handle.
     async fn close(&self, handle: &FileHandle) -> VfsResult<()>;
+
+    /// Read bytes at an absolute offset without retaining an implicit cursor.
+    async fn read_at(
+        &self,
+        _handle: &FileHandle,
+        _offset: u64,
+        _max_bytes: u32,
+    ) -> VfsResult<Vec<u8>> {
+        Err(VfsError::NotSupported(
+            "positional file reads are not supported by this VFS".to_owned(),
+        ))
+    }
+
+    /// Write bytes at an absolute offset without retaining an implicit cursor.
+    async fn write_at(
+        &self,
+        _handle: &FileHandle,
+        _offset: u64,
+        _content: &[u8],
+    ) -> VfsResult<u32> {
+        Err(VfsError::NotSupported(
+            "positional file writes are not supported by this VFS".to_owned(),
+        ))
+    }
+
+    /// Get metadata from an already-open file handle.
+    async fn file_stat(&self, _handle: &FileHandle) -> VfsResult<VfsMetadata> {
+        Err(VfsError::NotSupported(
+            "open-file metadata is not supported by this VFS".to_owned(),
+        ))
+    }
+
+    /// Flush an already-open file, optionally including metadata.
+    async fn sync_file(&self, _handle: &FileHandle, _data_only: bool) -> VfsResult<()> {
+        Err(VfsError::NotSupported(
+            "file synchronization is not supported by this VFS".to_owned(),
+        ))
+    }
+
+    /// Truncate or extend an already-open file.
+    async fn set_len(&self, _handle: &FileHandle, _size: u64) -> VfsResult<()> {
+        Err(VfsError::NotSupported(
+            "file resizing is not supported by this VFS".to_owned(),
+        ))
+    }
+
+    /// Atomically rename a path within one directory capability root.
+    async fn rename(&self, _handle: &DirHandle, _src: &str, _dst: &str) -> VfsResult<()> {
+        Err(VfsError::NotSupported(
+            "rename is not supported by this VFS".to_owned(),
+        ))
+    }
 }
