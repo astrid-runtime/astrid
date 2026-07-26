@@ -92,11 +92,11 @@ pub trait PrincipalCodec<P>: Send + Sync {
 pub enum FaultPoint {
     /// Non-commit object frames have been appended but not flushed.
     AfterObjectAppend,
-    /// Non-commit object frames have been flushed.
+    /// The transaction's complete object batch has been flushed.
     AfterObjectFlush,
     /// The transaction's immutable commit frame has been appended.
     AfterCommitAppend,
-    /// The transaction's immutable commit frame has been flushed.
+    /// Compatibility checkpoint after the shared object-batch flush.
     AfterCommitFlush,
     /// All objects are durable but no root-journal frame was appended.
     BeforeRootCas,
@@ -598,12 +598,6 @@ where
             locations.push((*id, location));
         }
         self.fail_if(FaultPoint::AfterObjectAppend)?;
-        inner
-            .arena
-            .sync_data()
-            .map_err(|source| io_error("flush non-commit object frames", source))?;
-        self.fail_if(FaultPoint::AfterObjectFlush)?;
-
         if let Some((id, payload)) = &prepared.commit {
             let location = append_frame(&mut inner.arena, ARENA_MAGIC, payload)?;
             locations.push((*id, location));
@@ -612,7 +606,8 @@ where
         inner
             .arena
             .sync_data()
-            .map_err(|source| io_error("flush commit object frame", source))?;
+            .map_err(|source| io_error("flush transaction object frames", source))?;
+        self.fail_if(FaultPoint::AfterObjectFlush)?;
         self.fail_if(FaultPoint::AfterCommitFlush)?;
         self.fail_if(FaultPoint::BeforeRootCas)?;
 

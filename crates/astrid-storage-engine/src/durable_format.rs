@@ -274,7 +274,12 @@ fn scan_frames(
         file.read_exact(&mut header)
             .map_err(|source| io_error("read durable frame header", source))?;
         if header[..8] != magic {
-            return Err(corrupt(file_name, offset, "frame magic mismatch"));
+            let error = corrupt(file_name, offset, "frame magic mismatch");
+            if valid_frame_follows(file, magic, offset, file_len, limits)? {
+                return Err(error);
+            }
+            truncate_tail(file, offset)?;
+            break;
         }
         let version = u16::from_le_bytes([header[8], header[9]]);
         if version != FRAME_VERSION {
@@ -323,7 +328,12 @@ fn scan_frames(
             .try_into()
             .map_err(|_| DurableError::EncodingOverflow)?;
         if frame_checksum(magic, payload_len, &payload) != checksum {
-            return Err(corrupt(file_name, offset, "frame checksum mismatch"));
+            let error = corrupt(file_name, offset, "frame checksum mismatch");
+            if valid_frame_follows(file, magic, offset, file_len, limits)? {
+                return Err(error);
+            }
+            truncate_tail(file, offset)?;
+            break;
         }
         accept(offset, &payload)?;
         offset = frame_end;
@@ -331,6 +341,127 @@ fn scan_frames(
     file.seek(SeekFrom::End(0))
         .map_err(|source| io_error("seek durable file tail", source))?;
     Ok(())
+}
+
+fn valid_frame_follows(
+    file: &mut File,
+    magic: [u8; 8],
+    invalid_offset: u64,
+    file_len: u64,
+    limits: RecoveryLimits,
+) -> Result<bool, DurableError> {
+    let Some(mut search_offset) = invalid_offset.checked_add(1) else {
+        return Ok(false);
+    };
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(65_543)
+        .map_err(|_| DurableError::EncodingOverflow)?;
+    buffer.resize(65_543, 0);
+    while search_offset < file_len {
+        file.seek(SeekFrom::Start(search_offset))
+            .map_err(|source| io_error("seek durable tail recovery scan", source))?;
+        let remaining = file_len
+            .checked_sub(search_offset)
+            .ok_or(DurableError::EncodingOverflow)?;
+        let wanted = usize::try_from(remaining.min(buffer.len() as u64))
+            .map_err(|_| DurableError::EncodingOverflow)?;
+        let read = file
+            .read(&mut buffer[..wanted])
+            .map_err(|source| io_error("read durable tail recovery scan", source))?;
+        if read < magic.len() {
+            return Ok(false);
+        }
+        for relative in 0..=read.saturating_sub(magic.len()) {
+            let candidate_end = relative
+                .checked_add(magic.len())
+                .ok_or(DurableError::EncodingOverflow)?;
+            if buffer.get(relative..candidate_end) != Some(magic.as_slice()) {
+                continue;
+            }
+            let candidate = search_offset
+                .checked_add(u64::try_from(relative).map_err(|_| DurableError::EncodingOverflow)?)
+                .ok_or(DurableError::EncodingOverflow)?;
+            if physical_frame_is_valid(file, magic, candidate, file_len, limits)? {
+                return Ok(true);
+            }
+        }
+        if read < wanted {
+            return Ok(false);
+        }
+        let overlap = magic.len().saturating_sub(1);
+        search_offset = search_offset
+            .checked_add(
+                u64::try_from(read.saturating_sub(overlap))
+                    .map_err(|_| DurableError::EncodingOverflow)?,
+            )
+            .ok_or(DurableError::EncodingOverflow)?;
+    }
+    Ok(false)
+}
+
+fn physical_frame_is_valid(
+    file: &mut File,
+    magic: [u8; 8],
+    offset: u64,
+    file_len: u64,
+    limits: RecoveryLimits,
+) -> Result<bool, DurableError> {
+    let remaining = file_len
+        .checked_sub(offset)
+        .ok_or(DurableError::EncodingOverflow)?;
+    if remaining < FRAME_HEADER_LEN {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|source| io_error("seek durable recovery candidate", source))?;
+    let mut header = [0_u8; FRAME_HEADER_LEN_USIZE];
+    file.read_exact(&mut header)
+        .map_err(|source| io_error("read durable recovery candidate", source))?;
+    if header[..8] != magic
+        || u16::from_le_bytes([header[8], header[9]]) != FRAME_VERSION
+        || header[10..12] != [0, 0]
+    {
+        return Ok(false);
+    }
+    let payload_len = u64::from_le_bytes(
+        header[12..20]
+            .try_into()
+            .map_err(|_| DurableError::EncodingOverflow)?,
+    );
+    if payload_len > limits.max_frame_bytes {
+        return Ok(false);
+    }
+    let frame_len = FRAME_HEADER_LEN
+        .checked_add(payload_len)
+        .ok_or(DurableError::EncodingOverflow)?;
+    if frame_len > remaining {
+        return Ok(false);
+    }
+    let expected: [u8; 32] = header[CHECKSUM_START..]
+        .try_into()
+        .map_err(|_| DurableError::EncodingOverflow)?;
+    let mut hasher = blake3::Hasher::new_derive_key("astrid durable physical frame checksum v1");
+    hasher.update(&magic);
+    hasher.update(&FRAME_VERSION.to_le_bytes());
+    hasher.update(&payload_len.to_le_bytes());
+    let mut unread = payload_len;
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(65_536)
+        .map_err(|_| DurableError::EncodingOverflow)?;
+    buffer.resize(65_536, 0);
+    while unread != 0 {
+        let chunk = usize::try_from(unread.min(buffer.len() as u64))
+            .map_err(|_| DurableError::EncodingOverflow)?;
+        file.read_exact(&mut buffer[..chunk])
+            .map_err(|source| io_error("read durable recovery candidate payload", source))?;
+        hasher.update(&buffer[..chunk]);
+        unread = unread
+            .checked_sub(u64::try_from(chunk).map_err(|_| DurableError::EncodingOverflow)?)
+            .ok_or(DurableError::EncodingOverflow)?;
+    }
+    Ok(hasher.finalize().as_bytes() == &expected)
 }
 
 fn truncate_tail(file: &mut File, valid_len: u64) -> Result<(), DurableError> {

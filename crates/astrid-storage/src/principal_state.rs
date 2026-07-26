@@ -166,18 +166,24 @@ pub async fn open_runtime_kv(
     quota: Arc<dyn KvQuotaResolver<StateOwner>>,
 ) -> StorageResult<Arc<dyn KvStore>> {
     let store_path = home.principal_store_path();
-    prepare_destination(&store_path)?;
-    let engine = Arc::new(
+    let open_path = store_path.clone();
+    let engine = tokio::task::spawn_blocking(move || {
+        prepare_destination(&open_path)?;
         RuntimeEngine::open(
-            &store_path,
+            &open_path,
             Blake3ObjectIdentityV1,
             StateOwnerCodecV1,
             RecoveryLimits::process_addressable(),
         )
-        .map_err(|error| {
-            StorageError::Connection(format!("open durable principal store: {error}"))
-        })?,
-    );
+        .map_err(|error| StorageError::Connection(format!("open durable principal store: {error}")))
+    })
+    .await
+    .map_err(|error| {
+        StorageError::Connection(format!(
+            "durable principal-store open worker failed: {error}"
+        ))
+    })?
+    .map(Arc::new)?;
 
     if !migrations::is_complete(&store_path) {
         migrations::apply_required(home, &store_path, &engine).await?;
