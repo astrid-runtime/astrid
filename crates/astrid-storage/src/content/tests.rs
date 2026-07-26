@@ -58,7 +58,7 @@ fn named_content_round_trips_lists_ranges_and_deletes() {
     let owner = "alice".to_owned();
     let name = ContentName::new("models/site.bin").unwrap();
     let value = bytes(2 * 1024 * 1024);
-    let outcome = store.put(&owner, name.clone(), &value).unwrap();
+    let outcome = store.put(&owner, &name, &value).unwrap();
     assert!(outcome.objects_inserted() > 3);
     assert_eq!(store.read(&owner, &name).unwrap(), Some(value.clone()));
     assert_eq!(
@@ -86,10 +86,10 @@ fn principals_and_aliases_share_physical_objects_but_not_logical_usage() {
     let alice = "alice".to_owned();
     let bob = "bob".to_owned();
     let first = store
-        .put(&alice, ContentName::new("first").unwrap(), &value)
+        .put(&alice, &ContentName::new("first").unwrap(), &value)
         .unwrap();
     let second = store
-        .put(&bob, ContentName::new("copy").unwrap(), &value)
+        .put(&bob, &ContentName::new("copy").unwrap(), &value)
         .unwrap();
     assert_eq!(first.descriptor().file(), second.descriptor().file());
     assert!(
@@ -100,7 +100,7 @@ fn principals_and_aliases_share_physical_objects_but_not_logical_usage() {
     );
 
     store
-        .put(&alice, ContentName::new("alias").unwrap(), &value)
+        .put(&alice, &ContentName::new("alias").unwrap(), &value)
         .unwrap();
     assert_eq!(
         engine.principal_usage(&alice).unwrap().logical_bytes,
@@ -120,10 +120,10 @@ fn aliases_cannot_turn_deduplication_into_free_quota() {
     let owner = "alice".to_owned();
     let value = vec![7_u8; 100];
     store
-        .put(&owner, ContentName::new("one").unwrap(), &value)
+        .put(&owner, &ContentName::new("one").unwrap(), &value)
         .unwrap();
     assert!(matches!(
-        store.put(&owner, ContentName::new("two").unwrap(), &value),
+        store.put(&owner, &ContentName::new("two").unwrap(), &value),
         Err(PrincipalContentError::QuotaExceeded {
             used: 206,
             limit: 150
@@ -145,7 +145,7 @@ async fn kv_and_content_share_one_principal_quota_and_root() {
     assert!(matches!(
         content.put(
             &"alice".to_owned(),
-            ContentName::new("blob").unwrap(),
+            &ContentName::new("blob").unwrap(),
             &[2_u8; 64]
         ),
         Err(PrincipalContentError::QuotaExceeded { .. })
@@ -154,7 +154,7 @@ async fn kv_and_content_share_one_principal_quota_and_root() {
     content
         .put(
             &"alice".to_owned(),
-            ContentName::new("small").unwrap(),
+            &ContentName::new("small").unwrap(),
             &[3_u8; 16],
         )
         .unwrap();
@@ -180,7 +180,7 @@ async fn kv_growth_accounts_for_existing_content() {
     content
         .put(
             &"alice".to_owned(),
-            ContentName::new("blob").unwrap(),
+            &ContentName::new("blob").unwrap(),
             &[3_u8; 64],
         )
         .unwrap();
@@ -204,7 +204,7 @@ fn concurrent_catalog_updates_retry_the_shared_root_cas() {
             store
                 .put(
                     &"alice".to_owned(),
-                    ContentName::new(format!("blob-{index}")).unwrap(),
+                    &ContentName::new(format!("blob-{index}")).unwrap(),
                     &bytes(128 * 1024 + index),
                 )
                 .unwrap();

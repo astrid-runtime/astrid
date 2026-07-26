@@ -75,7 +75,7 @@ where
     pub fn put(
         &self,
         principal: &P,
-        name: ContentName,
+        name: &ContentName,
         bytes: &[u8],
     ) -> Result<ContentWriteOutcome, PrincipalContentError> {
         self.put_with_profile(principal, name, bytes, ChunkingProfile::ASTRID_V1)
@@ -90,7 +90,7 @@ where
     pub fn put_with_profile(
         &self,
         principal: &P,
-        name: ContentName,
+        name: &ContentName,
         bytes: &[u8],
         profile: ChunkingProfile,
     ) -> Result<ContentWriteOutcome, PrincipalContentError> {
@@ -104,7 +104,7 @@ where
             if header
                 .catalog
                 .entries
-                .get(&name)
+                .get(name)
                 .is_some_and(|entry| entry.file == built.descriptor().file())
             {
                 let root = header.root.ok_or_else(|| {
