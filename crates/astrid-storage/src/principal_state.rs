@@ -14,8 +14,13 @@ use std::sync::Arc;
 
 use astrid_core::dirs::AstridHome;
 use astrid_core::principal::PrincipalId;
-use astrid_storage_engine::{DurableEngine, PrincipalCodec, RecoveryLimits};
-use astrid_storage_model::{ObjectClass, ObjectId, ObjectIdentity, ObjectRecord, ReferenceKind};
+use astrid_storage_engine::{
+    DurableEngine, IdentityScheme, PersistentObjectIdentity, PrincipalCodec, RecoveryLimits,
+};
+use astrid_storage_model::{
+    ObjectClass, ObjectFormatVersion, ObjectId, ObjectIdentity, ObjectKind, ObjectRecord,
+    ReferenceKind,
+};
 
 use crate::error::{StorageError, StorageResult};
 #[cfg(all(test, feature = "legacy-surrealkv"))]
@@ -23,10 +28,8 @@ use crate::kv::SurrealKvStore;
 use crate::kv::{KvPrincipalResolver, KvQuotaResolver, KvStore, TreeKvStore};
 
 const STORE_METADATA_FILE: &str = "store.meta";
-const STORE_METADATA: &[u8] = b"format=astrid-principal-store-v1\n\
-identity=blake3-object-identity-v1\n\
-principal-codec=state-owner-v1\n\
-projection=kv-tree-v3\n";
+const STORE_FORMAT_SPEC: &[u8] =
+    include_bytes!("../../../docs/astrid-principal-store-format-v1.txt");
 
 mod migrations;
 
@@ -60,6 +63,11 @@ impl PartialOrd for StateOwner {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Blake3ObjectIdentityV1;
 
+const BLAKE3_OBJECT_IDENTITY_V1_SCHEME: IdentityScheme = match IdentityScheme::new(1, 1) {
+    Some(scheme) => scheme,
+    None => panic!("the production identity scheme uses non-zero wire codes"),
+};
+
 impl ObjectIdentity for Blake3ObjectIdentityV1 {
     fn identify(&self, record: &ObjectRecord) -> ObjectId {
         let mut hasher =
@@ -86,6 +94,12 @@ impl ObjectIdentity for Blake3ObjectIdentityV1 {
             }]);
         }
         ObjectId::new(*hasher.finalize().as_bytes())
+    }
+}
+
+impl PersistentObjectIdentity for Blake3ObjectIdentityV1 {
+    fn scheme(&self) -> IdentityScheme {
+        BLAKE3_OBJECT_IDENTITY_V1_SCHEME
     }
 }
 
@@ -167,15 +181,46 @@ pub async fn open_runtime_kv(
 ) -> StorageResult<Arc<dyn KvStore>> {
     let store_path = home.principal_store_path();
     let open_path = store_path.clone();
+    let format_spec = format_spec_record()?;
+    let format_spec_id = Blake3ObjectIdentityV1.identify(&format_spec);
+    let metadata = store_metadata(format_spec_id);
     let engine = tokio::task::spawn_blocking(move || {
-        prepare_destination(&open_path)?;
-        RuntimeEngine::open(
+        let existing_complete = prepare_destination(&open_path, &metadata)?;
+        let engine = RuntimeEngine::open(
             &open_path,
             Blake3ObjectIdentityV1,
             StateOwnerCodecV1,
             RecoveryLimits::process_addressable(),
         )
-        .map_err(|error| StorageError::Connection(format!("open durable principal store: {error}")))
+        .map_err(|error| {
+            StorageError::Connection(format!("open durable principal store: {error}"))
+        })?;
+        match engine.object(format_spec_id).map_err(|error| {
+            StorageError::Connection(format!("read in-band store format specification: {error}"))
+        })? {
+            Some(actual) if actual == format_spec => {},
+            Some(_) => {
+                return Err(StorageError::Connection(
+                    "in-band store format specification does not match store.meta".to_owned(),
+                ));
+            },
+            None if existing_complete => {
+                return Err(StorageError::Connection(
+                    "completed principal store is missing its in-band format specification"
+                        .to_owned(),
+                ));
+            },
+            None => {
+                engine
+                    .persist_standalone_object(&format_spec)
+                    .map_err(|error| {
+                        StorageError::Connection(format!(
+                            "persist in-band store format specification: {error}"
+                        ))
+                    })?;
+            },
+        }
+        Ok(engine)
     })
     .await
     .map_err(|error| {
@@ -196,7 +241,48 @@ pub async fn open_runtime_kv(
     )))
 }
 
-fn prepare_destination(path: &Path) -> StorageResult<()> {
+fn format_spec_record() -> StorageResult<ObjectRecord> {
+    ObjectRecord::new(
+        ObjectKind::Evidence,
+        ObjectFormatVersion::V1,
+        STORE_FORMAT_SPEC.to_vec(),
+        Vec::new(),
+        0,
+        ObjectClass::Metadata,
+    )
+    .map_err(|error| {
+        StorageError::Serialization(format!(
+            "construct in-band store format specification: {error}"
+        ))
+    })
+}
+
+fn store_metadata(format_spec: ObjectId) -> Vec<u8> {
+    let digest = object_id_hex(format_spec);
+    format!(
+        "format=astrid-principal-store-v1\n\
+         identity=blake3-object-identity-v1\n\
+         identity-wire=tagged-identity-v1\n\
+         format-spec-object={}:{}:32:{digest}\n\
+         principal-codec=state-owner-v1\n\
+         projection=kv-tree-v3\n",
+        BLAKE3_OBJECT_IDENTITY_V1_SCHEME.algorithm(),
+        BLAKE3_OBJECT_IDENTITY_V1_SCHEME.construction(),
+    )
+    .into_bytes()
+}
+
+fn object_id_hex(id: ObjectId) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut digest = String::with_capacity(64);
+    for byte in id.as_bytes() {
+        digest.push(char::from(HEX[usize::from(byte >> 4)]));
+        digest.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    digest
+}
+
+fn prepare_destination(path: &Path, expected_metadata: &[u8]) -> StorageResult<bool> {
     let mut existing_complete = false;
     if path.exists() {
         if migrations::is_complete(path) {
@@ -219,7 +305,7 @@ fn prepare_destination(path: &Path) -> StorageResult<()> {
                 metadata.display()
             ))
         })?;
-        if actual != STORE_METADATA {
+        if actual != expected_metadata {
             return Err(StorageError::Connection(format!(
                 "principal store metadata at {} selects an unsupported format",
                 metadata.display()
@@ -231,7 +317,7 @@ fn prepare_destination(path: &Path) -> StorageResult<()> {
             path.display()
         )));
     } else {
-        atomic_write(&metadata, STORE_METADATA)?;
+        atomic_write(&metadata, expected_metadata)?;
     }
     if existing_complete {
         for authoritative in ["objects.arena", "roots.journal"] {
@@ -244,7 +330,7 @@ fn prepare_destination(path: &Path) -> StorageResult<()> {
             }
         }
     }
-    Ok(())
+    Ok(existing_complete)
 }
 
 fn quarantine_incomplete(path: &Path) -> StorageResult<()> {
@@ -391,6 +477,148 @@ mod tests {
                 14, 77, 237, 193, 155, 81, 194, 119, 35, 35, 59, 81, 40, 49, 0, 31, 232, 131, 137,
                 111, 27, 237, 250, 91, 151, 7, 135, 21, 99, 27, 128, 55,
             ]
+        );
+    }
+
+    #[test]
+    fn format_specification_has_a_tagged_metadata_identity() {
+        let record = format_spec_record().unwrap();
+        let id = Blake3ObjectIdentityV1.identify(&record);
+        let metadata = String::from_utf8(store_metadata(id)).unwrap();
+
+        assert_eq!(record.kind(), ObjectKind::Evidence);
+        assert_eq!(record.canonical_bytes(), STORE_FORMAT_SPEC);
+        assert!(record.references().is_empty());
+        assert!(metadata.contains("identity-wire=tagged-identity-v1\n"));
+        assert!(metadata.contains(&format!(
+            "format-spec-object=1:1:32:{}\n",
+            object_id_hex(id)
+        )));
+    }
+
+    #[tokio::test]
+    async fn new_store_persists_and_verifies_the_in_band_specification() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(directory.path());
+        let store = open_runtime_kv(&home, unlimited_quota()).await.unwrap();
+        store.close().await.unwrap();
+        drop(store);
+
+        let record = format_spec_record().unwrap();
+        let id = Blake3ObjectIdentityV1.identify(&record);
+        let arena = std::fs::read(home.principal_store_path().join("objects.arena")).unwrap();
+        assert_eq!(&arena[52..54], &1_u16.to_le_bytes());
+        assert_eq!(&arena[54..56], &1_u16.to_le_bytes());
+        assert_eq!(&arena[56..60], &32_u32.to_le_bytes());
+        assert_eq!(&arena[60..92], id.as_bytes());
+
+        let engine = RuntimeEngine::open(
+            home.principal_store_path(),
+            Blake3ObjectIdentityV1,
+            StateOwnerCodecV1,
+            RecoveryLimits::process_addressable(),
+        )
+        .unwrap();
+        assert_eq!(engine.object(id).unwrap(), Some(record));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn independent_reader_accepts_a_rust_produced_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(directory.path());
+        let store = open_runtime_kv(&home, unlimited_quota()).await.unwrap();
+        store
+            .set("alice:capsule:shell", "cwd", b"/workspace".to_vec())
+            .await
+            .unwrap();
+        store.close().await.unwrap();
+        drop(store);
+
+        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/principal_store_v1_reader.py");
+        let output = std::process::Command::new("python3")
+            .arg(script)
+            .arg(home.principal_store_path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "independent reader failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let decoded: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(decoded["roots"]["alice"]["generation"], 0);
+        assert!(
+            decoded["roots"]["alice"]["commit"]
+                .as_str()
+                .unwrap()
+                .starts_with("1:1:32:")
+        );
+        assert!(
+            decoded["objects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|object| object["kind"] == "Evidence")
+        );
+        assert!(
+            decoded["objects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|object| object["kind"] == "Commit")
+        );
+
+        let arena_path = home.principal_store_path().join("objects.arena");
+        let mut arena = std::fs::read(&arena_path).unwrap();
+        arena[100] ^= 0x80;
+        std::fs::write(&arena_path, arena).unwrap();
+        let rejected = std::process::Command::new("python3")
+            .arg(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../scripts/principal_store_v1_reader.py"),
+            )
+            .arg(home.principal_store_path())
+            .output()
+            .unwrap();
+        assert!(
+            !rejected.status.success(),
+            "independent reader accepted a corrupt Rust-produced store"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_store_does_not_self_heal_a_missing_rosetta_object() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(directory.path());
+        let path = home.principal_store_path();
+        std::fs::create_dir_all(&path).unwrap();
+        let record = format_spec_record().unwrap();
+        let id = Blake3ObjectIdentityV1.identify(&record);
+        std::fs::write(path.join(STORE_METADATA_FILE), store_metadata(id)).unwrap();
+        drop(
+            RuntimeEngine::open(
+                &path,
+                Blake3ObjectIdentityV1,
+                StateOwnerCodecV1,
+                RecoveryLimits::process_addressable(),
+            )
+            .unwrap(),
+        );
+        std::fs::write(
+            path.join(migrations::MIGRATION_MARKER_FILE),
+            b"migration=surrealkv-to-principal-store\nfrom=legacy\nto=1\n",
+        )
+        .unwrap();
+
+        let Err(error) = open_runtime_kv(&home, unlimited_quota()).await else {
+            panic!("completed store without its Rosetta object was accepted");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("missing its in-band format specification")
         );
     }
 

@@ -2,16 +2,24 @@
 
 use super::{
     ARENA_FILE, ARENA_MAGIC, ArenaLocation, BTreeMap, BTreeSet, CHECKSUM_START, DurableError,
-    FRAME_HEADER_LEN, FRAME_HEADER_LEN_USIZE, FRAME_VERSION, File, ModelError, ObjectClass,
-    ObjectFormatVersion, ObjectId, ObjectIdentity, ObjectKind, ObjectRecord, ObjectReference,
-    OpenOptions, Path, PrincipalCodec, ROOT_FILE, ROOT_MAGIC, Read, RecoveryLimits, ReferenceKind,
-    ReferenceLabel, RootGeneration, RootState, Seek, SeekFrom, Write, io, materialize_closure,
-    recovery_closure_error, validate_commit_closure,
+    FRAME_HEADER_LEN, FRAME_HEADER_LEN_USIZE, FRAME_VERSION, File, IdentityScheme, ModelError,
+    ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord, ObjectReference,
+    OpenOptions, Path, PersistentObjectIdentity, PrincipalCodec, ROOT_FILE, ROOT_MAGIC, Read,
+    RecoveryLimits, ReferenceKind, ReferenceLabel, RootGeneration, RootState, Seek, SeekFrom,
+    Write, io, materialize_closure, recovery_closure_error, validate_commit_closure,
 };
+
+const IDENTITY_PREFIX_BYTES: usize = 8;
+const CURRENT_DIGEST_BYTES: u32 = 32;
+const CURRENT_DIGEST_BYTES_USIZE: usize = 32;
+const MIN_REFERENCE_WIRE_BYTES: usize =
+    std::mem::size_of::<u64>() + IDENTITY_PREFIX_BYTES + CURRENT_DIGEST_BYTES_USIZE + 1;
+
 pub(super) fn read_indexed_object(
     arena: &mut File,
     expected_id: ObjectId,
     location: ArenaLocation,
+    scheme: IdentityScheme,
     limits: RecoveryLimits,
 ) -> Result<ObjectRecord, DurableError> {
     let payload = read_frame_at(arena, ARENA_FILE, ARENA_MAGIC, location.offset, limits)?;
@@ -25,7 +33,7 @@ pub(super) fn read_indexed_object(
             "indexed frame location no longer matches the arena",
         ));
     }
-    let (id, record) = decode_object_frame(&payload)
+    let (id, record) = decode_object_frame(&payload, scheme)
         .map_err(|detail| corrupt(ARENA_FILE, location.offset, detail))?;
     if id != expected_id {
         return Err(corrupt(
@@ -122,20 +130,21 @@ pub(super) fn io_error(operation: &'static str, source: io::Error) -> DurableErr
     DurableError::Io { operation, source }
 }
 
-pub(super) fn recover_arena<I: ObjectIdentity>(
+pub(super) fn recover_arena<I: PersistentObjectIdentity>(
     arena: &mut File,
     identity: &I,
     limits: RecoveryLimits,
 ) -> Result<BTreeMap<ObjectId, ArenaLocation>, DurableError> {
+    let scheme = identity.scheme();
     let mut index = BTreeMap::<ObjectId, ArenaLocation>::new();
     scan_frames(arena, ARENA_FILE, ARENA_MAGIC, limits, |offset, payload| {
-        let (id, record) =
-            decode_object_frame(payload).map_err(|detail| corrupt(ARENA_FILE, offset, detail))?;
+        let (id, record) = decode_object_frame(payload, scheme)
+            .map_err(|detail| corrupt(ARENA_FILE, offset, detail))?;
         let computed = identity.identify(&record);
         if computed != id {
             return Err(corrupt(ARENA_FILE, offset, "object identity mismatch"));
         }
-        if encode_object_frame(id, &record)? != payload {
+        if encode_object_frame(scheme, id, &record)? != payload {
             return Err(corrupt(ARENA_FILE, offset, "object frame is not canonical"));
         }
         let payload_len =
@@ -172,6 +181,7 @@ pub(super) fn recover_roots<P, C>(
     arena: &mut File,
     index: &BTreeMap<ObjectId, ArenaLocation>,
     codec: &C,
+    scheme: IdentityScheme,
     limits: RecoveryLimits,
 ) -> Result<(BTreeMap<P, RootState>, BTreeSet<ObjectId>), DurableError>
 where
@@ -180,15 +190,21 @@ where
 {
     let mut recovered = BTreeMap::<P, (RootState, u64)>::new();
     scan_frames(roots, ROOT_FILE, ROOT_MAGIC, limits, |offset, payload| {
-        let record =
-            decode_root_record(payload).map_err(|detail| corrupt(ROOT_FILE, offset, detail))?;
+        let record = decode_root_record(payload, scheme)
+            .map_err(|detail| corrupt(ROOT_FILE, offset, detail))?;
         let principal = codec
             .decode(record.principal)
             .ok_or(DurableError::InvalidPrincipal { offset })?;
         if codec.encode(&principal) != record.principal {
             return Err(DurableError::InvalidPrincipal { offset });
         }
-        if encode_root_record(record.principal, record.expected, record.replacement)? != payload {
+        if encode_root_record(
+            scheme,
+            record.principal,
+            record.expected,
+            record.replacement,
+        )? != payload
+        {
             return Err(corrupt(
                 ROOT_FILE,
                 offset,
@@ -228,8 +244,9 @@ where
 
     let mut validated = BTreeSet::new();
     for (root, offset) in recovered.values().copied() {
-        let records = materialize_closure(arena, index, &BTreeMap::new(), root.commit, limits)
-            .map_err(|error| recovery_closure_error(error, offset))?;
+        let records =
+            materialize_closure(arena, index, &BTreeMap::new(), root.commit, scheme, limits)
+                .map_err(|error| recovery_closure_error(error, offset))?;
         validate_commit_closure(&records, root.commit).map_err(|source| {
             DurableError::RecoveryModel {
                 file: ROOT_FILE,
@@ -532,7 +549,15 @@ pub(super) fn ensure_payload_limit(
     Ok(())
 }
 
+fn encode_identity(bytes: &mut Vec<u8>, scheme: IdentityScheme, id: ObjectId) {
+    bytes.extend_from_slice(&scheme.algorithm().to_le_bytes());
+    bytes.extend_from_slice(&scheme.construction().to_le_bytes());
+    bytes.extend_from_slice(&CURRENT_DIGEST_BYTES.to_le_bytes());
+    bytes.extend_from_slice(id.as_bytes());
+}
+
 pub(super) fn encode_object_frame(
+    scheme: IdentityScheme,
     id: ObjectId,
     record: &ObjectRecord,
 ) -> Result<Vec<u8>, DurableError> {
@@ -541,7 +566,7 @@ pub(super) fn encode_object_frame(
     let reference_count =
         u64::try_from(record.references().len()).map_err(|_| DurableError::EncodingOverflow)?;
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(id.as_bytes());
+    encode_identity(&mut bytes, scheme, id);
     bytes.extend_from_slice(&record.kind().code().to_le_bytes());
     bytes.extend_from_slice(&record.format_version().get().to_le_bytes());
     bytes.push(record.class().code());
@@ -554,15 +579,18 @@ pub(super) fn encode_object_frame(
             .map_err(|_| DurableError::EncodingOverflow)?;
         bytes.extend_from_slice(&label_len.to_le_bytes());
         bytes.extend_from_slice(reference.label().as_bytes());
-        bytes.extend_from_slice(reference.target().as_bytes());
+        encode_identity(&mut bytes, scheme, reference.target());
         bytes.push(reference.kind().code());
     }
     Ok(bytes)
 }
 
-pub(super) fn decode_object_frame(bytes: &[u8]) -> Result<(ObjectId, ObjectRecord), &'static str> {
+pub(super) fn decode_object_frame(
+    bytes: &[u8],
+    scheme: IdentityScheme,
+) -> Result<(ObjectId, ObjectRecord), &'static str> {
     let mut reader = SliceReader::new(bytes);
-    let id = ObjectId::new(reader.array_32()?);
+    let id = reader.identity(scheme)?;
     let kind = ObjectKind::from_code(reader.u16()?).ok_or("unknown object-kind code")?;
     let version =
         ObjectFormatVersion::new(reader.u16()?).ok_or("object-format version must be non-zero")?;
@@ -571,7 +599,7 @@ pub(super) fn decode_object_frame(bytes: &[u8]) -> Result<(ObjectId, ObjectRecor
     let canonical_len = reader.usize_len()?;
     let reference_count = reader.usize_len()?;
     let canonical_bytes = reader.take(canonical_len)?.to_vec();
-    if reference_count > reader.remaining() / 41 {
+    if reference_count > reader.remaining() / MIN_REFERENCE_WIRE_BYTES {
         return Err("reference count exceeds frame capacity");
     }
     let mut references = Vec::new();
@@ -581,7 +609,7 @@ pub(super) fn decode_object_frame(bytes: &[u8]) -> Result<(ObjectId, ObjectRecor
     for _ in 0..reference_count {
         let label_len = reader.usize_len()?;
         let label = reader.take(label_len)?.to_vec();
-        let target = ObjectId::new(reader.array_32()?);
+        let target = reader.identity(scheme)?;
         let reference_kind =
             ReferenceKind::from_code(reader.u8()?).ok_or("unknown reference-kind code")?;
         references.push(ObjectReference::new(
@@ -606,6 +634,7 @@ pub(super) fn decode_object_frame(bytes: &[u8]) -> Result<(ObjectId, ObjectRecor
 }
 
 pub(super) fn encode_root_record(
+    scheme: IdentityScheme,
     principal: &[u8],
     expected: Option<RootState>,
     replacement: RootState,
@@ -619,16 +648,16 @@ pub(super) fn encode_root_record(
         None => bytes.push(0),
         Some(root) => {
             bytes.push(1);
-            encode_root_state(&mut bytes, root);
+            encode_root_state(&mut bytes, scheme, root);
         },
     }
-    encode_root_state(&mut bytes, replacement);
+    encode_root_state(&mut bytes, scheme, replacement);
     Ok(bytes)
 }
 
-fn encode_root_state(bytes: &mut Vec<u8>, root: RootState) {
+fn encode_root_state(bytes: &mut Vec<u8>, scheme: IdentityScheme, root: RootState) {
     bytes.extend_from_slice(&root.generation.get().to_le_bytes());
-    bytes.extend_from_slice(root.commit.as_bytes());
+    encode_identity(bytes, scheme, root.commit);
 }
 
 struct DecodedRootRecord<'a> {
@@ -637,16 +666,19 @@ struct DecodedRootRecord<'a> {
     replacement: RootState,
 }
 
-fn decode_root_record(bytes: &[u8]) -> Result<DecodedRootRecord<'_>, &'static str> {
+fn decode_root_record(
+    bytes: &[u8],
+    scheme: IdentityScheme,
+) -> Result<DecodedRootRecord<'_>, &'static str> {
     let mut reader = SliceReader::new(bytes);
     let principal_len = reader.usize_len()?;
     let principal = reader.take(principal_len)?;
     let expected = match reader.u8()? {
         0 => None,
-        1 => Some(reader.root_state()?),
+        1 => Some(reader.root_state(scheme)?),
         _ => return Err("invalid expected-root tag"),
     };
-    let replacement = reader.root_state()?;
+    let replacement = reader.root_state(scheme)?;
     if reader.remaining() != 0 {
         return Err("trailing root-journal bytes");
     }
@@ -696,6 +728,14 @@ impl<'a> SliceReader<'a> {
         ))
     }
 
+    fn u32(&mut self) -> Result<u32, &'static str> {
+        Ok(u32::from_le_bytes(
+            self.take(4)?
+                .try_into()
+                .map_err(|_| "truncated u32 field")?,
+        ))
+    }
+
     fn u64(&mut self) -> Result<u64, &'static str> {
         Ok(u64::from_le_bytes(
             self.take(8)?
@@ -708,16 +748,28 @@ impl<'a> SliceReader<'a> {
         usize::try_from(self.u64()?).map_err(|_| "length is not process-addressable")
     }
 
-    fn array_32(&mut self) -> Result<[u8; 32], &'static str> {
-        self.take(32)?
+    fn identity(&mut self, scheme: IdentityScheme) -> Result<ObjectId, &'static str> {
+        let algorithm = self.u16()?;
+        let construction = self.u16()?;
+        let digest_len =
+            usize::try_from(self.u32()?).map_err(|_| "identity digest length overflow")?;
+        if algorithm == 0 || construction == 0 || digest_len == 0 {
+            return Err("identity tag fields must be non-zero");
+        }
+        let digest = self.take(digest_len)?;
+        if algorithm != scheme.algorithm() || construction != scheme.construction() {
+            return Err("unsupported identity algorithm or construction version");
+        }
+        digest
             .try_into()
-            .map_err(|_| "truncated 32-byte field")
+            .map(ObjectId::new)
+            .map_err(|_| "identity digest length does not match the supported scheme")
     }
 
-    fn root_state(&mut self) -> Result<RootState, &'static str> {
+    fn root_state(&mut self, scheme: IdentityScheme) -> Result<RootState, &'static str> {
         Ok(RootState {
             generation: RootGeneration::new(self.u64()?),
-            commit: ObjectId::new(self.array_32()?),
+            commit: self.identity(scheme)?,
         })
     }
 }

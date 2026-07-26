@@ -59,8 +59,13 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   concurrent-process corruption and stale in-memory reads. Named crash-boundary
   tests prove recovery to the old or new complete root. Recovery keeps only
   roots and arena offsets resident, while live reads load and checksum payloads
-  lazily. Compaction, persistent pins, audit/outbox atomicity, and final
-  representation profiles remain future work.
+  lazily. Every persistent identity occurrence now carries an algorithm,
+  construction version, and variable digest length with capacity for 384-bit
+  successors. Each store persists a frozen, byte-exact plain-text format
+  specification as an immutable object referenced by `store.meta`; an
+  independent Python reader verifies Rust-produced arenas, identities, root
+  chains, and live closures in CI. Compaction, persistent pins, audit/outbox
+  atomicity, and final representation profiles remain future work.
 - **Native kernel state now cuts over to durable principal roots.** Kernel boot
   migrates the legacy SurrealKV database under the singleton lock, verifies a
   canonical digest independently per owner, preserves the legacy source, and

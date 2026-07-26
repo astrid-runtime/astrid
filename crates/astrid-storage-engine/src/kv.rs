@@ -15,7 +15,7 @@ use astrid_storage_model::{
 
 use crate::{CommitOutcome, InMemoryEngine, RootSnapshot, RootTransaction};
 #[cfg(not(target_family = "wasm"))]
-use crate::{DurableEngine, DurableError, PrincipalCodec};
+use crate::{DurableEngine, DurableError, PersistentObjectIdentity, PrincipalCodec};
 
 const FORMAT_VERSION: ObjectFormatVersion = ObjectFormatVersion::V1;
 const KV_LABEL: &[u8] = b"kv";
@@ -365,7 +365,7 @@ where
 impl<P, I, C> KvProjectionEngine<P> for DurableEngine<P, I, C>
 where
     P: Clone + Ord + Send + Sync,
-    I: ObjectIdentity + Send + Sync,
+    I: PersistentObjectIdentity + Send + Sync,
     C: PrincipalCodec<P> + Send + Sync,
 {
     fn identify_kv_object(&self, record: &ObjectRecord) -> ObjectId {
@@ -448,7 +448,7 @@ where
 impl<P, I, C> DurableEngine<P, I, C>
 where
     P: Clone + Ord + Send + Sync,
-    I: ObjectIdentity + Send + Sync,
+    I: PersistentObjectIdentity + Send + Sync,
     C: PrincipalCodec<P> + Send + Sync,
 {
     /// Decode one principal's current key/value projection from the durable

@@ -87,12 +87,15 @@ state, not a configurable backend. Under the existing process singleton lock
 startup:
 
 1. pins the store, identity, owner-codec, and projection versions in
-   `store.meta`;
-2. imports the read-only legacy database in bounded pages, grouping every
+   `store.meta`, including the complete tagged identity of the frozen format
+   specification;
+2. persists that plain-text specification as an immutable `Evidence` object
+   before any principal root and verifies it on every completed-store open;
+3. imports the read-only legacy database in bounded pages, grouping every
    host-stamped capsule namespace under its validated principal and all
    kernel namespaces under an explicit system owner;
-3. verifies a canonical entry digest independently for every owner;
-4. flushes the durable engine and atomically publishes one global completion
+4. verifies a canonical entry digest independently for every owner;
+5. flushes the durable engine and atomically publishes one global completion
    marker before the kernel can serve requests.
 
 The legacy directory is never mutated. A partial destination is quarantined and
@@ -121,21 +124,36 @@ append-only root journal:
 
 ```text
 objects.arena:
-    repeated checksummed { physical_frame_version, object_id, encoded_record }
+    repeated checksummed {
+        physical_frame_version,
+        tagged_object_identity,
+        encoded_record_with_tagged_reference_identities
+    }
 
 roots.journal:
     repeated checksummed {
         principal_bytes,
-        expected_root,
-        replacement_root
+        tagged_expected_root,
+        tagged_replacement_root
     }
 ```
 
 The encoded record is a versioned physical representation of `ObjectRecord`.
-It is not declared to be the final canonical export format. The native runtime
-pins a domain-separated BLAKE3 object identity and canonical tagged
-`System | Principal(PrincipalId)` codec in metadata; generic engines retain
-injected identities/codecs for testing and future explicit transforms.
+Each identity occurrence carries a non-zero algorithm code, non-zero
+construction version, `u32` digest length, and digest bytes. Production
+BLAKE3-256 is registered as `(1, 1, 32)`, while the persistent grammar can
+carry 48-byte and longer successors without changing its frame layout. The
+current engine intentionally supports one configured scheme and a 32-byte
+in-memory `ObjectId`; that is an implementation boundary, not a disk-format
+ceiling.
+
+The arena is not the canonical export format. The durable survival unit is the
+deterministically ordered owning closure plus selected evidence and the in-band
+format-specification object. A live arena is a cache and placement of that
+logical bundle. The native runtime pins a domain-separated BLAKE3 object
+identity and canonical tagged `System | Principal(PrincipalId)` codec in
+metadata; generic engines retain injected identities/codecs for tests and
+future explicit transforms.
 
 Commit order is:
 
@@ -175,6 +193,16 @@ Native boot recovery and every `TreeKvStore` operation that may read or mutate
 the arena run on Tokio's blocking pool. Filesystem latency and writers waiting
 on the engine mutex therefore consume blocking workers rather than parking the
 asynchronous workers that schedule capsules and IPC.
+
+The frozen byte-level specification is
+[`astrid-principal-store-format-v1.txt`](astrid-principal-store-format-v1.txt).
+It defines both frame magics, every field width and byte order, both exact
+BLAKE3 derive-key context strings, all object/reference tags, identity
+construction, current KV/content canonical grammars, and root-journal replay.
+A deliberately primitive Python reader shares no parser or cryptographic code
+with Rust; CI runs it against a Rust-produced store and requires it to verify
+checksums, recompute object identities, replay roots, and validate live
+closures. This is the minimum two-readers rule for any format called durable.
 
 This realization deliberately has one active arena and an in-memory rebuilt
 offset index. Runtime KV and live per-principal logical quotas are integrated.
