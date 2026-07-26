@@ -235,19 +235,27 @@ The system must not turn possession of a hash into permission to read data.
 Logical identity of one canonical typed object:
 
 ```text
-ObjectId = H(
-    "astrid-object-id-v1" ||
+ObjectId = TaggedIdentity(
+    algorithm,
+    construction_version,
+    digest_length,
+    H(
+    construction_domain ||
     object_kind ||
     object_format_version ||
     canonical_object_encoding
+    )
 )
 ```
 
 The canonical object encoding commits the payload, ordered labelled
 references, reference reachability kinds, logical-byte contribution, and
-accounting class. `ObjectId` makes object equality and logical roots stable. It can be kept
-inside authorized metadata because exposing it leaks equality and permits
-confirmation guesses for predictable content.
+accounting class. Every persistent identity occurrence carries its algorithm,
+construction version, and digest length; the format admits 48-byte and longer
+successor digests even while the current in-memory implementation is 32 bytes.
+`ObjectId` makes object equality and logical roots stable. It can be kept inside
+authorized metadata because exposing it leaks equality and permits confirmation
+guesses for predictable content.
 
 ### 6.2 `BlobId`
 
@@ -587,8 +595,9 @@ and not a host directory:
 BundleHeader {
     magic,
     bundle_format_version,
+    format_spec_object,
     source_principal,
-    source_commit,
+    tagged_source_commit,
     export_operation_id,
     schema_set,
     hash_profiles,
@@ -601,12 +610,21 @@ BundleHeader {
     source_runtime_identity,
 }
 
-ObjectFrame { ObjectId, object_kind, canonical_or_encoded_object }
+FormatSpecFrame { tagged_spec_identity, frozen_plain_text_specification }
+ObjectFrame { TaggedIdentity, object_kind, canonical_or_encoded_object }
 SecretEnvelopeFrame? { recipient, cipher_suite, encrypted_secret_set }
 ProfileTemplateFrame? { non_authoritative_profile }
 AuditLineageFrame? { checkpoint, selected_transition_proofs }
 BundleFooter { observed_counts, closure_digest, signature }
 ```
+
+The deterministic full `export_closure` bundle is the canonical unit of
+long-term survival. It is self-contained, self-verifying, and carries the
+frozen byte-level specification needed to decode every included frame. Objects
+have a canonical tagged-identity order independent of arena offsets or
+placement. The live engine, its append history, indexes, and host projections
+are caches of this bundle model; an export must never require the source engine
+to interpret bytes after the bundle has been emitted.
 
 The format needs both:
 

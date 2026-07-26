@@ -304,6 +304,15 @@ Device-fault tests include short writes, reordered completion where the platform
 permits it, checksum mismatch, disk-full during every append, lost replica,
 stale placement epoch, torn metadata page, and corrupt index rebuild.
 
+Named fault points are only landmarks. The stronger crash test records the
+byte-level write trace for a generated workload and reopens copies at every
+write prefix, then at torn and legally reordered tail-block variants. Every
+copy must yield the old complete root, the new complete root, or a typed
+corruption result for a genuinely invalid interior frame. No prefix may yield
+a mixed closure. This ALICE-style enumeration is the acceptance gate for
+future frame, batching, group-commit, and compaction changes; adding a named
+fault point is not a substitute.
+
 ## 7. Concurrency evidence
 
 - `loom` explores root compare-and-swap, pin acquisition, reader leases, and
@@ -417,14 +426,56 @@ Required checks:
 6. the receipt says exactly which scope was completed and which holds or remote
    custody remain.
 
-## 12. CI gates
+## 12. Cryptographic continuity
+
+Object and signature algorithms are replaceable dependencies, not archival
+assumptions. Persistent identities carry algorithm, construction version, and
+digest length at every occurrence. A successor identity migration reconstructs
+each retained owning closure while the old algorithm remains trusted, computes
+successor identities bottom-up, publishes successor-tagged roots, and retains
+old-to-new mappings as independently rooted `Evidence` records with typed
+`Lineage` and `Evidence` relations. Old and new roots overlap through at least
+one independently verified export/import and backup-rotation cycle. The frozen
+format specification gives the byte-exact construction; an implementation
+cannot redefine old bytes by changing only metadata.
+
+Signature continuity uses a separate periodic **re-attestation ceremony**.
+Before a signing algorithm enters its deprecation window, the live system:
+
+1. freezes the current audit chain head, including its principal or system
+   identity, sequence/generation, current corpus-root set, and format-spec
+   identity;
+2. reconstructs the retained canonical export closures and records a
+   successor-tagged hash witness over that corpus;
+3. signs the ceremony statement and audit head with both the still-trusted old
+   signing key and the successor key, when both mechanisms permit it; and
+4. publishes the statement as an immutable `Evidence` object retained by the
+   audit custody root or an explicit legal/archival pin and included in
+   subsequent archival exports.
+
+The overlap begins before deprecation, not after a practical forgery, and lasts
+until every configured verifier accepts the successor, at least one full
+export/import plus independent-reader recovery succeeds, and every protected
+backup tier has crossed one rotation. Policy may retain the old evidence
+forever, but serving authority moves only after those checks. The ceremony
+record names the old and successor algorithm identifiers, keys/certificates,
+audit head, old and successor corpus roots, mapping evidence, policy version,
+sequence, and claimed time. A timestamp alone is not proof; custody comes from
+the overlapping signatures and verified hash lineage.
+
+No special storage kind is needed thirty years in advance: `Evidence` already
+holds the canonical statement, typed non-owning references bind both eras, and
+tagged identities admit the successor digest. The ceremony changes roots and
+evidence; it never reinterprets an old digest or signature in place.
+
+## 13. CI gates
 
 | Gate | Evidence |
 |---|---|
 | Model crate lands | Unit and property tests for ownership, views, witnesses, roots, import, and GC; `no_std` compile; docs build |
 | In-memory engine lands | Model refinement, import/export and GC properties |
 | KV adapter lands | Differential backend suite |
-| Durable engine lands | Crash matrix, corruption recovery, disk-full behavior |
+| Durable engine lands | Crash matrix, write-prefix enumeration, independent reader, corruption recovery, disk-full behavior |
 | Filesystem projection lands | Adversarial path/symlink tests on each supported host |
 | Export/import ships | Full/thin/view parser fuzzing, selector proofs, quota/decompression bounds, ownership and authority non-transfer tests |
 | Rebalance ships | Multi-node epoch/lease/failure matrix and dry-run accounting |

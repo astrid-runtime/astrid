@@ -30,8 +30,8 @@ mod kv;
 
 #[cfg(not(target_family = "wasm"))]
 pub use durable::{
-    DurableEngine, DurableError, FaultInjector, FaultPoint, NoFaults, PrincipalCodec,
-    RecoveryLimits,
+    DurableEngine, DurableError, FaultInjector, FaultPoint, IdentityScheme, NoFaults,
+    PersistentObjectIdentity, PrincipalCodec, RecoveryLimits,
 };
 pub use kv::{
     KvProjectionEngine, KvProjectionError, KvState, KvStateSnapshot, commit_kv_with_engine,

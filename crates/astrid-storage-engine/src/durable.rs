@@ -13,9 +13,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use astrid_storage_model::{
-    ModelError, ObjectClass, ObjectFormatVersion, ObjectId, ObjectIdentity, ObjectKind,
-    ObjectRecord, ObjectReference, PrincipalUsage, ReferenceKind, ReferenceLabel, RootGeneration,
-    RootState, World,
+    InsertOutcome, ModelError, ObjectClass, ObjectFormatVersion, ObjectId, ObjectIdentity,
+    ObjectKind, ObjectRecord, ObjectReference, PrincipalUsage, ReferenceKind, ReferenceLabel,
+    RootGeneration, RootState, World,
 };
 use fs2::FileExt;
 use parking_lot::Mutex;
@@ -85,6 +85,55 @@ pub trait PrincipalCodec<P>: Send + Sync {
 
     /// Decode and validate one principal identifier.
     fn decode(&self, bytes: &[u8]) -> Option<P>;
+}
+
+/// Algorithm and construction version carried beside every durable identity.
+///
+/// Digest length is encoded independently at each wire occurrence. The
+/// current in-memory [`ObjectId`] remains 32 bytes, while the durable grammar
+/// can carry successor digests of different lengths without changing its
+/// framing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IdentityScheme {
+    algorithm: u16,
+    construction: u16,
+}
+
+impl IdentityScheme {
+    /// Construct a non-zero algorithm and identity-construction pair.
+    #[must_use]
+    pub const fn new(algorithm: u16, construction: u16) -> Option<Self> {
+        if algorithm == 0 || construction == 0 {
+            return None;
+        }
+        Some(Self {
+            algorithm,
+            construction,
+        })
+    }
+
+    /// Return the registered digest-algorithm code.
+    #[must_use]
+    pub const fn algorithm(self) -> u16 {
+        self.algorithm
+    }
+
+    /// Return the algorithm-scoped identity-construction version.
+    #[must_use]
+    pub const fn construction(self) -> u16 {
+        self.construction
+    }
+}
+
+/// Logical identity implementation with an explicit durable wire scheme.
+///
+/// A future engine may support several implementations simultaneously. The
+/// first durable engine accepts one scheme per open store but writes the tag
+/// at every identity-bearing location so the format does not impose that
+/// limitation.
+pub trait PersistentObjectIdentity: ObjectIdentity {
+    /// Return the durable algorithm and construction-version tag.
+    fn scheme(&self) -> IdentityScheme;
 }
 
 /// Crash boundary exposed by the first durable engine slice.
@@ -174,6 +223,8 @@ pub enum DurableError {
     },
     /// A length could not be represented by the persistent frame grammar.
     EncodingOverflow,
+    /// A `store.meta` bootstrap object attempted to own principal state.
+    BootstrapObjectOwnsState,
     /// A named crash boundary interrupted the transaction.
     FaultInjected(FaultPoint),
     /// A prior write or injected crash may have diverged memory from disk.
@@ -220,6 +271,9 @@ impl fmt::Display for DurableError {
                 "{file} frame at byte {offset} violates the state model: {source}"
             ),
             Self::EncodingOverflow => formatter.write_str("durable frame length overflow"),
+            Self::BootstrapObjectOwnsState => {
+                formatter.write_str("standalone bootstrap object must not own other objects")
+            },
             Self::FaultInjected(point) => write!(formatter, "fault injected at {point:?}"),
             Self::RequiresRecovery => {
                 formatter.write_str("durable engine must be dropped and reopened")
@@ -287,7 +341,7 @@ impl<P: Ord, I, C> fmt::Debug for DurableEngine<P, I, C> {
 impl<P, I, C> DurableEngine<P, I, C>
 where
     P: Clone + Ord,
-    I: ObjectIdentity,
+    I: PersistentObjectIdentity,
     C: PrincipalCodec<P>,
 {
     /// Open or create a durable store with no injected faults.
@@ -333,9 +387,16 @@ where
         let mut arena = open_rw(&path.join(ARENA_FILE))?;
         let mut roots = open_rw(&path.join(ROOT_FILE))?;
         sync_store_directory(path)?;
+        let scheme = identity.scheme();
         let index = recover_arena(&mut arena, &identity, limits)?;
-        let (roots_by_principal, validated) =
-            recover_roots(&mut roots, &mut arena, &index, &principal_codec, limits)?;
+        let (roots_by_principal, validated) = recover_roots(
+            &mut roots,
+            &mut arena,
+            &index,
+            &principal_codec,
+            scheme,
+            limits,
+        )?;
         arena
             .seek(SeekFrom::End(0))
             .map_err(|source| io_error("seek object arena", source))?;
@@ -388,7 +449,71 @@ where
         let Some(location) = inner.index.get(&id).copied() else {
             return Ok(None);
         };
-        read_indexed_object(&mut inner.arena, id, location, self.limits).map(Some)
+        read_indexed_object(
+            &mut inner.arena,
+            id,
+            location,
+            self.identity.scheme(),
+            self.limits,
+        )
+        .map(Some)
+    }
+
+    /// Persist one standalone immutable object outside a principal root.
+    ///
+    /// This narrow path exists for store-level bootstrap evidence referenced
+    /// by `store.meta`, such as the in-band format specification. The object
+    /// must not own another object; graph publication remains a root
+    /// transaction. Successful insertion flushes the arena before returning.
+    ///
+    /// # Errors
+    ///
+    /// Returns a model, encoding, I/O, recovery-required, or bootstrap-shape
+    /// error. An I/O failure poisons this engine instance.
+    pub fn persist_standalone_object(
+        &self,
+        record: &ObjectRecord,
+    ) -> Result<(ObjectId, InsertOutcome), DurableError> {
+        if record.owning_references().next().is_some() {
+            return Err(DurableError::BootstrapObjectOwnsState);
+        }
+        let id = self.identify(record);
+        let mut inner = self.inner.lock();
+        ensure_usable(&inner)?;
+        if let Some(location) = inner.index.get(&id).copied() {
+            let existing = read_indexed_object(
+                &mut inner.arena,
+                id,
+                location,
+                self.identity.scheme(),
+                self.limits,
+            )?;
+            if &existing != record {
+                return Err(ModelError::ObjectCollision(id).into());
+            }
+            return Ok((id, InsertOutcome::AlreadyPresent));
+        }
+        let payload = encode_object_frame(self.identity.scheme(), id, record)?;
+        ensure_payload_limit(ARENA_FILE, 0, payload.len(), self.limits)?;
+        let persisted = (|| {
+            let location = append_frame(&mut inner.arena, ARENA_MAGIC, &payload)?;
+            inner
+                .arena
+                .sync_data()
+                .map_err(|source| io_error("flush standalone object frame", source))?;
+            Ok(location)
+        })();
+        match persisted {
+            Ok(location) => {
+                inner.index.insert(id, location);
+                inner.validated.insert(id);
+                Ok((id, InsertOutcome::Inserted))
+            },
+            Err(error) => {
+                inner.poisoned = true;
+                Err(error)
+            },
+        }
     }
 
     /// Return the current durable root for one principal.
@@ -414,8 +539,14 @@ where
             return Ok(None);
         };
         let DurableInner { arena, index, .. } = &mut *inner;
-        let records =
-            materialize_closure(arena, index, &BTreeMap::new(), root.commit, self.limits)?;
+        let records = materialize_closure(
+            arena,
+            index,
+            &BTreeMap::new(),
+            root.commit,
+            self.identity.scheme(),
+            self.limits,
+        )?;
         Ok(Some(RootSnapshot { root, records }))
     }
 
@@ -434,8 +565,14 @@ where
             .copied()
             .ok_or(ModelError::PrincipalMissing)?;
         let DurableInner { arena, index, .. } = &mut *inner;
-        let records =
-            materialize_closure(arena, index, &BTreeMap::new(), root.commit, self.limits)?;
+        let records = materialize_closure(
+            arena,
+            index,
+            &BTreeMap::new(),
+            root.commit,
+            self.identity.scheme(),
+            self.limits,
+        )?;
         usage_from_closure(&records, root.commit).map_err(Into::into)
     }
 
@@ -545,6 +682,7 @@ where
             &unique,
             &inner.validated,
             commit_id,
+            self.identity.scheme(),
             self.limits,
         )?;
 
@@ -555,13 +693,19 @@ where
                 continue;
             }
             if let Some(location) = inner.index.get(&id).copied() {
-                let existing = read_indexed_object(&mut inner.arena, id, location, self.limits)?;
+                let existing = read_indexed_object(
+                    &mut inner.arena,
+                    id,
+                    location,
+                    self.identity.scheme(),
+                    self.limits,
+                )?;
                 if existing != record {
                     return Err(ModelError::ObjectCollision(id).into());
                 }
                 continue;
             }
-            let payload = encode_object_frame(id, &record)?;
+            let payload = encode_object_frame(self.identity.scheme(), id, &record)?;
             ensure_payload_limit(ARENA_FILE, 0, payload.len(), self.limits)?;
             if id == commit_id {
                 commit_frame = Some((id, payload));
@@ -570,7 +714,7 @@ where
             }
         }
         let principal_bytes = self.principal_codec.encode(&principal);
-        let journal = encode_root_record(&principal_bytes, expected, root)?;
+        let journal = encode_root_record(self.identity.scheme(), &principal_bytes, expected, root)?;
         ensure_payload_limit(ROOT_FILE, 0, journal.len(), self.limits)?;
 
         Ok(Prepared {
@@ -658,6 +802,7 @@ fn materialize_closure(
     index: &BTreeMap<ObjectId, ArenaLocation>,
     incoming: &BTreeMap<ObjectId, ObjectRecord>,
     root: ObjectId,
+    scheme: IdentityScheme,
     limits: RecoveryLimits,
 ) -> Result<Vec<(ObjectId, ObjectRecord)>, DurableError> {
     let mut records = BTreeMap::new();
@@ -681,7 +826,7 @@ fn materialize_closure(
                 .get(&id)
                 .copied()
                 .ok_or(ModelError::MissingObject(id))?;
-            read_indexed_object(arena, id, location, limits)?
+            read_indexed_object(arena, id, location, scheme, limits)?
         };
         marks.insert(id, 1);
         stack.push((id, true));
@@ -709,6 +854,7 @@ fn validate_incremental_closure(
     incoming: &BTreeMap<ObjectId, ObjectRecord>,
     validated: &BTreeSet<ObjectId>,
     root: ObjectId,
+    scheme: IdentityScheme,
     limits: RecoveryLimits,
 ) -> Result<BTreeSet<ObjectId>, DurableError> {
     let root_record = if let Some(record) = incoming.get(&root) {
@@ -718,7 +864,7 @@ fn validate_incremental_closure(
             .get(&root)
             .copied()
             .ok_or(ModelError::MissingObject(root))?;
-        read_indexed_object(arena, root, location, limits)?
+        read_indexed_object(arena, root, location, scheme, limits)?
     };
     if root_record.kind() != ObjectKind::Commit {
         return Err(ModelError::RootNotCommit {
@@ -752,7 +898,7 @@ fn validate_incremental_closure(
                 .get(&id)
                 .copied()
                 .ok_or(ModelError::MissingObject(id))?;
-            read_indexed_object(arena, id, location, limits)?
+            read_indexed_object(arena, id, location, scheme, limits)?
         };
         reachable.insert(id);
         marks.insert(id, 1);
