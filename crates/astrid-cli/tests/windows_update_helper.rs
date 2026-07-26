@@ -440,16 +440,27 @@ fn assert_complete_executable_set_replaced(
     }
 }
 
-fn wait_for_receipt_state(path: &Path, expected: &str, timeout: Duration) {
+fn wait_for_update_helper_release(staging: &Path, timeout: Duration) {
+    let lock_path = staging.join("helper.lock");
     let deadline = deadline_after(timeout);
     loop {
-        if read_receipt_state(path).as_deref() == Some(expected) {
-            return;
+        match astrid_core::platform_fs::try_acquire_private_file_lock(
+            &lock_path,
+            "Windows update test helper",
+        ) {
+            Ok(Some(lock)) => {
+                drop(lock);
+                return;
+            },
+            Ok(None) => {},
+            Err(error) => panic!(
+                "failed to inspect Windows update helper ownership at {}: {error}",
+                lock_path.display()
+            ),
         }
         if Instant::now() >= deadline {
-            let staging = path.parent().unwrap_or(path);
             panic!(
-                "timed out waiting for update receipt state {expected}; snapshot={}",
+                "timed out waiting for Windows update helper release; snapshot={}",
                 update_helper_diagnostic(staging)
             );
         }
@@ -869,12 +880,19 @@ fn ordinary_invocation_reconciles_an_interrupted_update_before_dispatch() {
 
     let mut blocked = spawn_installed_cli(&install);
     let status = wait_for_child(&mut blocked.0, Duration::from_secs(15));
+    drop(blocked);
     assert!(!status.success(), "interrupted update was not fail-closed");
 
-    wait_for_receipt_state(
-        &receipt_path,
-        "failed_before_mutation",
-        Duration::from_secs(30),
+    // The failed command returns only after the recovery helper has published
+    // its armed marker while owning the stage lock. Observe that lock instead
+    // of polling the receipt's independent private-file transaction lock,
+    // which would contend with the helper's terminal receipt write.
+    wait_for_update_helper_release(&staging, Duration::from_secs(30));
+    assert_eq!(
+        read_receipt_state(&receipt_path).as_deref(),
+        Some("failed_before_mutation"),
+        "Windows update recovery did not publish its terminal receipt; snapshot={}",
+        update_helper_diagnostic(&staging)
     );
     wait_for_recovered_stage_cleanup(&install, &staging, Duration::from_secs(15));
 }
