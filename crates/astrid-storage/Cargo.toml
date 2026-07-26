@@ -20,6 +20,7 @@ full = ["legacy-surrealkv", "db"]
 
 [dependencies]
 astrid-core = { workspace = true }
+astrid-storage-content = { workspace = true }
 astrid-storage-engine = { workspace = true }
 astrid-storage-model = { workspace = true }
 async-trait = { workspace = true }

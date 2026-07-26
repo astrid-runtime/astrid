@@ -1,0 +1,23 @@
+[package]
+name = "astrid-storage-content"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Canonical content-defined chunk DAGs for Astrid principal state"
+
+[features]
+default = ["std"]
+std = ["dep:fastcdc"]
+
+[dependencies]
+astrid-storage-model = { workspace = true }
+fastcdc = { workspace = true, optional = true }
+
+[dev-dependencies]
+blake3 = { workspace = true }
+
+[lints]
+workspace = true

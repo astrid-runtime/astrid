@@ -83,6 +83,24 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   principal-controlled metadata. The misleading `kv` gate is removed; the
   temporary `legacy-surrealkv` feature names only the reader and migrator and
   selects no runtime backend.
+  principal-controlled metadata. The misleading `kv` gate is replaced by the
+  temporary `legacy-surrealkv` reader and migrator; its old name remains only
+  as a compatibility alias for dependent manifests and selects no runtime
+  backend.
+- **Principal state can retain named, content-defined file DAGs.** The new
+  `astrid-storage-content` crate turns bytes into canonical chunk, bounded
+  chunk-tree, and file objects using an exact-pinned FastCDC 2020 profile.
+  Full and range reconstruction validate the typed graph and load only
+  overlapping chunks. `PrincipalContentStore` publishes named content through
+  the same per-principal root CAS and durable object arena as KV, so identical
+  chunks and complete files are physically reused across names and principals
+  without creating a side root. Catalog accounting charges every visible byte
+  and name even when physical objects deduplicate, and KV/content mutations
+  enforce one combined live principal quota in either mutation order. Golden
+  boundaries, insertion-locality, malformed graph, concurrent writer, range,
+  alias, and cross-principal tests pin the behavior. Host filesystem
+  materialization, capsule WIT access, encryption domains, and arena compaction
+  remain separate work.
 - **Windows local transport uses authenticated per-user named pipes.** A pipe
   name derived only from the caller's operating-system SID replaces
   filesystem endpoint naming on Windows. Local-only byte-mode instances use a

@@ -27,6 +27,7 @@ use parking_lot::RwLock;
 #[cfg(not(target_family = "wasm"))]
 mod durable;
 mod kv;
+mod projection;
 
 #[cfg(not(target_family = "wasm"))]
 pub use durable::{
@@ -37,6 +38,7 @@ pub use kv::{
     KvProjectionEngine, KvProjectionError, KvState, KvStateSnapshot, commit_kv_with_engine,
     kv_snapshot_with_engine,
 };
+pub use projection::{PrincipalProjectionEngine, PrincipalProjectionError};
 
 /// A root update and the immutable records required to reconstruct it.
 ///

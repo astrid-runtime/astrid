@@ -74,7 +74,7 @@ graph and not a prerequisite for reading a file or recovering a principal.
 
 ## 21. Implementation order and current boundary
 
-The current implementation stack completes the first six items below.
+The current implementation stack completes the first seven items below.
 `SurrealKvStore` remains a migration oracle and read-only import source, not a
 configurable runtime backend.
 
@@ -94,22 +94,26 @@ Delivered:
 6. Durable segments, a disposable index, a checksummed root journal, fault
    injection, recovery, a persistent tree projection, and quota enforcement
    support the native KV cutover. Compaction remains future work.
+7. A canonical FastCDC content DAG and named principal content catalog share
+   the same object arena, root CAS, and aggregate quota as KV. Full/range reads,
+   alias accounting, cross-principal physical reuse, and concurrent mutations
+   have executable regression coverage.
 
 Remaining:
 
-7. Add typed filesystem roots and a safe materializer; integrate Linux-realm
+8. Add typed filesystem roots and a safe materializer; integrate Linux-realm
    principal-home checkpoints and explicit external-workspace observations.
-8. Make local clone/fork root-based while preserving explicit secret behavior.
-9. Implement full/view export and staged import, then thin transfer.
-10. Add placement epochs, repair, operator dry-run, and online rebalance.
-11. Add native block transport only after the same engine passes host
+9. Make local clone/fork root-based while preserving explicit secret behavior.
+10. Implement full/view export and staged import, then thin transfer.
+11. Add placement epochs, repair, operator dry-run, and online rebalance.
+12. Add native block transport only after the same engine passes host
     conformance and power-loss tests.
 
 ## 22. Decisions still requiring measured evidence
 
 - canonical encoding: a constrained custom binary form, deterministic CBOR, or
   another format with a small `no_std` verifier;
-- chunking algorithm and parameter profiles;
+- additional chunking profiles and corpus-specific selection;
 - segment and pack sizing;
 - hash agility representation;
 - local-only versus cluster placement algorithm;

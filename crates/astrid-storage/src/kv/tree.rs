@@ -24,6 +24,7 @@ use super::KvEntry;
 use super::composite_key;
 use super::principal::{KvPrincipalResolver, KvQuotaResolver};
 use super::tree_error::{exact_owned_reference, invalid, map_engine};
+use crate::content::{CONTENT_COMPONENT_LABEL, catalog_quota};
 use crate::error::{StorageError, StorageResult};
 
 mod adapter;
@@ -153,15 +154,26 @@ where
                 return Ok(result);
             }
             let logical_bytes = context.logical_total(tree)?;
-            let used = context.quota_total(tree)?;
+            let projection_used = context.quota_total(tree)?;
+            let used = projection_used
+                .checked_add(header.other_quota_bytes)
+                .ok_or_else(|| {
+                    StorageError::Internal("principal quota total overflow".to_owned())
+                })?;
+            let previous_used = header
+                .quota_bytes
+                .checked_add(header.other_quota_bytes)
+                .ok_or_else(|| {
+                    StorageError::Internal("principal quota total overflow".to_owned())
+                })?;
             if let Some(quota) = &self.quota
                 && let Some(limit) = quota.max_logical_bytes(owner)?
                 && used > limit
-                && used > header.quota_bytes
+                && used > previous_used
             {
                 return Err(StorageError::quota_exceeded(used, limit));
             }
-            let transaction = context.finish(header, tree, logical_bytes, used)?;
+            let transaction = context.finish(header, tree, logical_bytes, projection_used)?;
             match self.engine.commit_kv_root(transaction) {
                 Ok(_) => {
                     self.validated_trees.lock().insert(
@@ -169,7 +181,7 @@ where
                         TreeValidation {
                             root: tree,
                             logical_bytes,
-                            quota_bytes: used,
+                            quota_bytes: projection_used,
                         },
                     );
                     return Ok(result);
@@ -265,6 +277,7 @@ struct TreeHeader<P> {
     root: Option<RootState>,
     tree: Option<ObjectId>,
     quota_bytes: u64,
+    other_quota_bytes: u64,
     preserved_state: Vec<ObjectReference>,
     preserved_commit: Vec<ObjectReference>,
 }
@@ -276,6 +289,7 @@ impl<P> TreeHeader<P> {
             root: None,
             tree: None,
             quota_bytes: 0,
+            other_quota_bytes: 0,
             preserved_state: Vec::new(),
             preserved_commit: Vec::new(),
         }
@@ -297,28 +311,39 @@ where
     let state_id = owned_target(root.commit, &commit, STATE_LABEL)?;
     let state = load_typed(engine, state_id, ObjectKind::PrincipalState)?;
     require_structural(state_id, &state)?;
-    let wrapper_id = owned_target(state_id, &state, KV_LABEL)?;
-    let wrapper = load_typed(engine, wrapper_id, ObjectKind::NamespaceMap)?;
-    if wrapper.canonical_bytes().len() != std::mem::size_of::<u64>()
-        || wrapper.class() != ObjectClass::Metadata
-    {
-        return Err(invalid(wrapper_id, "invalid KV tree root wrapper"));
-    }
-    let quota_bytes = u64::from_le_bytes(
-        wrapper
-            .canonical_bytes()
-            .try_into()
-            .map_err(|_| invalid(wrapper_id, "invalid KV tree quota total"))?,
-    );
-    let tree = match wrapper.reference(&ReferenceLabel::new(ROOT_LABEL)) {
-        None if wrapper.references().is_empty() => None,
-        Some(reference)
-            if reference.kind() == ReferenceKind::Owns && wrapper.references().len() == 1 =>
-        {
-            Some(reference.target())
-        },
-        _ => return Err(invalid(wrapper_id, "invalid KV tree root reference")),
-    };
+    let (tree, logical_bytes, quota_bytes, wrapper_id) =
+        match state.reference(&ReferenceLabel::new(KV_LABEL)) {
+            None => (None, 0, 0, None),
+            Some(reference) if reference.kind() == ReferenceKind::Owns => {
+                let wrapper_id = reference.target();
+                let wrapper = load_typed(engine, wrapper_id, ObjectKind::NamespaceMap)?;
+                if wrapper.canonical_bytes().len() != std::mem::size_of::<u64>()
+                    || wrapper.class() != ObjectClass::Metadata
+                {
+                    return Err(invalid(wrapper_id, "invalid KV tree root wrapper"));
+                }
+                let quota_bytes = u64::from_le_bytes(
+                    wrapper
+                        .canonical_bytes()
+                        .try_into()
+                        .map_err(|_| invalid(wrapper_id, "invalid KV tree quota total"))?,
+                );
+                let tree = match wrapper.reference(&ReferenceLabel::new(ROOT_LABEL)) {
+                    None if wrapper.references().is_empty() => None,
+                    Some(reference)
+                        if reference.kind() == ReferenceKind::Owns
+                            && wrapper.references().len() == 1 =>
+                    {
+                        Some(reference.target())
+                    },
+                    _ => return Err(invalid(wrapper_id, "invalid KV tree root reference")),
+                };
+                (tree, wrapper.logical_bytes(), quota_bytes, Some(wrapper_id))
+            },
+            Some(_) => {
+                return Err(invalid(state_id, "principal KV component is not owning"));
+            },
+        };
     let cached = validated_trees
         .lock()
         .get(&owner)
@@ -332,16 +357,34 @@ where
         validated_trees.lock().insert(owner.clone(), validation);
         validation
     };
-    if validation.logical_bytes != wrapper.logical_bytes() || validation.quota_bytes != quota_bytes
-    {
-        return Err(invalid(wrapper_id, "KV tree accounting totals disagree"));
+    if validation.logical_bytes != logical_bytes || validation.quota_bytes != quota_bytes {
+        return Err(invalid(
+            wrapper_id.unwrap_or(state_id),
+            "KV tree accounting totals disagree",
+        ));
     }
-    let preserved_state = state
+    let mut preserved_state = Vec::new();
+    let mut other_quota_bytes = 0_u64;
+    for reference in state
         .references()
         .iter()
         .filter(|reference| reference.label().as_bytes() != KV_LABEL)
-        .cloned()
-        .collect();
+    {
+        if reference.label().as_bytes() == CONTENT_COMPONENT_LABEL {
+            let record = engine
+                .load_kv_object(reference.target())
+                .map_err(|error| map_engine(&error))?
+                .ok_or_else(|| map_engine(&ModelError::MissingObject(reference.target()).into()))?;
+            let content_quota = catalog_quota(reference.target(), &record)
+                .map_err(|error| StorageError::Serialization(error.to_string()))?;
+            other_quota_bytes = other_quota_bytes
+                .checked_add(content_quota)
+                .ok_or_else(|| {
+                    StorageError::Internal("principal quota total overflow".to_owned())
+                })?;
+        }
+        preserved_state.push(reference.clone());
+    }
     let preserved_commit = commit
         .references()
         .iter()
@@ -356,6 +399,7 @@ where
         root: Some(root),
         tree,
         quota_bytes,
+        other_quota_bytes,
         preserved_state,
         preserved_commit,
     })
