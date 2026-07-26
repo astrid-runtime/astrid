@@ -489,7 +489,7 @@ fn fingerprint_revoke_input(token: &str) -> String {
 #[must_use]
 pub fn admin_target_principal(req: &AdminRequestKind) -> Option<&PrincipalId> {
     match req {
-        AdminRequestKind::AgentDelete { principal }
+        AdminRequestKind::AgentDelete { principal, .. }
         | AdminRequestKind::AgentEnable { principal }
         | AdminRequestKind::AgentDisable { principal }
         | AdminRequestKind::AgentModify { principal, .. }

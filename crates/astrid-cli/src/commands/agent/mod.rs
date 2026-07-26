@@ -188,6 +188,11 @@ pub(crate) struct DeleteArgs {
     /// Skip the interactive confirmation.
     #[arg(short = 'y', long)]
     pub yes: bool,
+    /// Also reclaim the agent's on-disk footprint — home tree, signing
+    /// key, and secrets. Default delete leaves these behind; use this
+    /// for a throwaway agent you want fully gone.
+    #[arg(long)]
+    pub purge_home: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -660,7 +665,12 @@ fn print_agent_detail(agent: &AgentSummary) {
 async fn run_delete(args: DeleteArgs) -> Result<ExitCode> {
     let principal = PrincipalId::new(&args.name).context("invalid agent name")?;
     if !args.yes {
-        eprint!("Delete agent '{principal}' (home directory is NOT removed) [y/N]? ");
+        let footprint = if args.purge_home {
+            "home directory, signing key, and secrets WILL be removed"
+        } else {
+            "home directory is NOT removed"
+        };
+        eprint!("Delete agent '{principal}' ({footprint}) [y/N]? ");
         std::io::Write::flush(&mut std::io::stderr()).ok();
         let mut buf = String::new();
         std::io::stdin().read_line(&mut buf).ok();
@@ -671,7 +681,10 @@ async fn run_delete(args: DeleteArgs) -> Result<ExitCode> {
     }
     let mut client = crate::admin_client::connect_as_active_agent().await?;
     let body = client
-        .request(AdminRequestKind::AgentDelete { principal })
+        .request(AdminRequestKind::AgentDelete {
+            principal,
+            purge_home: args.purge_home,
+        })
         .await?;
     let _ = into_result(body)?;
     println!(
