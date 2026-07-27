@@ -28,8 +28,8 @@ mod tests;
 
 use format::{StagingIntent, encode_intent};
 use recovery::{
-    load_ready, next_sequence, parse_ready_name, read_directory, ready_name, recover_writing,
-    remove_known_stage_files,
+    ReadyRecoveryState, load_ready, next_sequence, parse_ready_name, read_directory, ready_name,
+    ready_recovery_state, recover_writing, remove_known_stage_files,
 };
 
 const WRITING_DIRECTORY: &str = "writing";
@@ -158,11 +158,13 @@ impl NativeContentStagingArea {
             })?;
             let path = entry.path();
             let (sequence, id) = parse_ready_name(&entry.file_name().to_string_lossy())?;
-            let staged = load_ready(&self.inner.root, path, sequence, id)?;
-            if staged.is_published()? {
-                staged.cleanup()?;
-            } else {
-                ready.push(staged);
+            match ready_recovery_state(&path)? {
+                ReadyRecoveryState::Published | ReadyRecoveryState::Empty => {
+                    cleanup_ready_directory(&path)?;
+                },
+                ReadyRecoveryState::Pending => {
+                    ready.push(load_ready(&self.inner.root, path, sequence, id)?);
+                },
             }
         }
         ready.sort_by_key(|entry| (entry.sequence, entry.id));
@@ -424,26 +426,18 @@ impl ReadyStagedContent {
         self.directory.join(CONTENT_FILE)
     }
 
-    fn is_published(&self) -> StorageResult<bool> {
-        let path = self.directory.join(PUBLISHED_FILE);
-        match std::fs::read(&path) {
-            Ok(marker) => Ok(marker == PUBLISHED_MARKER),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(connection(format!(
-                "read staged publication marker {}: {error}",
-                path.display()
-            ))),
-        }
-    }
-
     fn cleanup(&self) -> StorageResult<()> {
-        remove_known_stage_files(&self.directory)?;
-        sync_directory(
-            self.directory
-                .parent()
-                .ok_or_else(|| connection("ready staging directory has no parent".to_owned()))?,
-        )
+        cleanup_ready_directory(&self.directory)
     }
+}
+
+fn cleanup_ready_directory(directory: &Path) -> StorageResult<()> {
+    remove_known_stage_files(directory)?;
+    sync_directory(
+        directory
+            .parent()
+            .ok_or_else(|| connection("ready staging directory has no parent".to_owned()))?,
+    )
 }
 
 fn closed_writer() -> std::io::Error {

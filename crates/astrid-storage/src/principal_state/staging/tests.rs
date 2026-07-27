@@ -175,22 +175,51 @@ fn corrupt_ready_intent_fails_closed_without_deleting_staged_bytes() {
 }
 
 #[test]
-fn durable_publication_marker_reaps_an_interrupted_cleanup() {
-    let directory = tempfile::tempdir().unwrap();
-    let area = NativeContentStagingArea::open(directory.path()).unwrap();
-    let mut writer = area
-        .begin(
-            owner(),
-            ContentName::new("published").unwrap(),
-            ChunkingProfile::ASTRID_V1,
-        )
-        .unwrap();
-    writer.write_all(b"published bytes").unwrap();
-    let staged = writer.seal().unwrap();
-    atomic_write(&staged.directory.join(PUBLISHED_FILE), PUBLISHED_MARKER).unwrap();
+fn ready_scan_reaps_every_interrupted_cleanup_prefix() {
+    let cleanup_prefixes: &[(&str, &[&str])] = &[
+        ("before-cleanup", &[]),
+        ("after-content-removal", &[CONTENT_FILE]),
+        ("after-intent-removal", &[CONTENT_FILE, INTENT_FILE]),
+        (
+            "after-marker-removal",
+            &[CONTENT_FILE, INTENT_FILE, PUBLISHED_FILE],
+        ),
+    ];
 
-    assert!(area.ready().unwrap().is_empty());
-    assert!(!staged.directory.exists());
+    for (case, removed_files) in cleanup_prefixes {
+        let directory = tempfile::tempdir().unwrap();
+        let area = NativeContentStagingArea::open(directory.path()).unwrap();
+        let mut published_writer = area
+            .begin(
+                owner(),
+                ContentName::new("published").unwrap(),
+                ChunkingProfile::ASTRID_V1,
+            )
+            .unwrap();
+        published_writer.write_all(b"published bytes").unwrap();
+        let published = published_writer.seal().unwrap();
+        atomic_write(&published.directory.join(PUBLISHED_FILE), PUBLISHED_MARKER).unwrap();
+
+        let mut pending_writer = area
+            .begin(
+                owner(),
+                ContentName::new("still-pending").unwrap(),
+                ChunkingProfile::ASTRID_V1,
+            )
+            .unwrap();
+        pending_writer.write_all(b"pending bytes").unwrap();
+        let pending = pending_writer.seal().unwrap();
+
+        for name in *removed_files {
+            std::fs::remove_file(published.directory.join(name)).unwrap();
+        }
+
+        let ready = area.ready().unwrap();
+        assert_eq!(ready.len(), 1, "{case}");
+        assert_eq!(ready[0].id(), pending.id(), "{case}");
+        assert!(!published.directory.exists(), "{case}");
+        assert!(pending.directory.exists(), "{case}");
+    }
 }
 
 #[cfg(unix)]

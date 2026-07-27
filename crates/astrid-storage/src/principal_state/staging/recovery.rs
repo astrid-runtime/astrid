@@ -7,10 +7,17 @@ use uuid::Uuid;
 
 use super::format::load_intent;
 use super::{
-    CONTENT_FILE, INTENT_FILE, PUBLISHED_FILE, ReadyStagedContent, StagedContentId, connection,
+    CONTENT_FILE, INTENT_FILE, PUBLISHED_FILE, PUBLISHED_MARKER, ReadyStagedContent,
+    StagedContentId, connection,
 };
 use crate::error::StorageResult;
 use crate::principal_state::native_io::{sync_directory, validate_private_regular_file};
+
+pub(super) enum ReadyRecoveryState {
+    Published,
+    Empty,
+    Pending,
+}
 
 pub(super) fn recover_writing(
     writing: &Path,
@@ -122,6 +129,41 @@ pub(super) fn load_ready(
         directory,
         intent,
     ))
+}
+
+pub(super) fn ready_recovery_state(directory: &Path) -> StorageResult<ReadyRecoveryState> {
+    ensure_existing_directory(directory)?;
+    let marker_path = directory.join(PUBLISHED_FILE);
+    let marker = match std::fs::symlink_metadata(&marker_path) {
+        Ok(_) => {
+            validate_private_regular_file(&marker_path)?;
+            Some(std::fs::read(&marker_path).map_err(|error| {
+                connection(format!(
+                    "read staged publication marker {}: {error}",
+                    marker_path.display()
+                ))
+            })?)
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(connection(format!(
+                "inspect staged publication marker {}: {error}",
+                marker_path.display()
+            )));
+        },
+    };
+    if marker.as_deref() == Some(PUBLISHED_MARKER) {
+        return Ok(ReadyRecoveryState::Published);
+    }
+
+    match read_directory(directory)?.next() {
+        None => Ok(ReadyRecoveryState::Empty),
+        Some(Ok(_)) => Ok(ReadyRecoveryState::Pending),
+        Some(Err(error)) => Err(connection(format!(
+            "enumerate staging entry {}: {error}",
+            directory.display()
+        ))),
+    }
 }
 
 pub(super) fn ready_name(sequence: u64, id: StagedContentId) -> String {
