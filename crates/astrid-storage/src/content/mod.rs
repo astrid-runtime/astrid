@@ -25,6 +25,32 @@ pub(crate) use catalog::{CONTENT_COMPONENT_LABEL, catalog_quota};
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ContentName(String);
 
+/// Failure to validate a principal content name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ContentNameError {
+    /// The name was empty.
+    Empty,
+    /// The name contained a null byte.
+    ContainsNull,
+    /// Persisted name bytes were not valid UTF-8.
+    InvalidUtf8,
+}
+
+impl fmt::Display for ContentNameError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("principal content name is empty"),
+            Self::ContainsNull => {
+                formatter.write_str("principal content name contains a null byte")
+            },
+            Self::InvalidUtf8 => formatter.write_str("principal content name is not valid UTF-8"),
+        }
+    }
+}
+
+impl std::error::Error for ContentNameError {}
+
 impl ContentName {
     /// Validate a principal content name.
     ///
@@ -33,12 +59,15 @@ impl ContentName {
     ///
     /// # Errors
     ///
-    /// Returns [`PrincipalContentError::InvalidName`] for an empty name or one
-    /// containing a null byte.
-    pub fn new(value: impl Into<String>) -> Result<Self, PrincipalContentError> {
+    /// Returns [`ContentNameError::Empty`] or
+    /// [`ContentNameError::ContainsNull`] when validation fails.
+    pub fn new(value: impl Into<String>) -> Result<Self, ContentNameError> {
         let value = value.into();
-        if value.is_empty() || value.as_bytes().contains(&0) {
-            return Err(PrincipalContentError::InvalidName);
+        if value.is_empty() {
+            return Err(ContentNameError::Empty);
+        }
+        if value.as_bytes().contains(&0) {
+            return Err(ContentNameError::ContainsNull);
         }
         Ok(Self(value))
     }
@@ -49,17 +78,51 @@ impl ContentName {
         &self.0
     }
 
+    /// Consume the name and return its UTF-8 representation.
+    #[must_use]
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+
     pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self, PrincipalContentError> {
         let value = std::str::from_utf8(bytes)
-            .map_err(|_| PrincipalContentError::InvalidName)?
+            .map_err(|_| PrincipalContentError::InvalidName(ContentNameError::InvalidUtf8))?
             .to_owned();
-        Self::new(value)
+        Self::new(value).map_err(PrincipalContentError::InvalidName)
     }
 }
 
 impl AsRef<str> for ContentName {
     fn as_ref(&self) -> &str {
         self.as_str()
+    }
+}
+
+impl fmt::Display for ContentName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ContentName {
+    type Err = ContentNameError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<String> for ContentName {
+    type Error = ContentNameError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<ContentName> for String {
+    fn from(value: ContentName) -> Self {
+        value.into_inner()
     }
 }
 
@@ -147,8 +210,8 @@ impl ContentWriteOutcome {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum PrincipalContentError {
-    /// Content name was empty, non-UTF-8 on decode, or contained a null byte.
-    InvalidName,
+    /// Content name validation failed.
+    InvalidName(ContentNameError),
     /// Canonical content-DAG construction or decoding failed.
     Content(ContentError),
     /// Streaming byte source failed before a complete file was staged.
@@ -178,7 +241,7 @@ pub enum PrincipalContentError {
 impl fmt::Display for PrincipalContentError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidName => formatter.write_str("invalid principal content name"),
+            Self::InvalidName(error) => error.fmt(formatter),
             Self::Content(error) => error.fmt(formatter),
             Self::ContentSource(error) => write!(formatter, "principal content source: {error}"),
             Self::Projection(error) => error.fmt(formatter),
@@ -207,6 +270,7 @@ impl fmt::Display for PrincipalContentError {
 impl std::error::Error for PrincipalContentError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::InvalidName(error) => Some(error),
             Self::Content(error) => Some(error),
             Self::ContentSource(error) => Some(error),
             Self::Projection(error) => Some(error),

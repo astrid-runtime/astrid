@@ -55,8 +55,8 @@ pub mod secret;
 pub mod db;
 
 pub use content::{
-    ChunkingProfile, ContentDescriptor, ContentEntry, ContentName, ContentWriteOutcome,
-    PrincipalContentError, PrincipalContentStore,
+    ChunkingProfile, ContentDescriptor, ContentEntry, ContentName, ContentNameError,
+    ContentWriteOutcome, PrincipalContentError, PrincipalContentStore,
 };
 pub use error::{StorageError, StorageResult};
 pub use identity::{IdentityError, IdentityStore, KvIdentityStore};

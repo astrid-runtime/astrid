@@ -12,7 +12,7 @@ use astrid_storage_model::{
     RootState,
 };
 
-use super::{ContentName, PrincipalContentError, PrincipalContentStore};
+use super::{ContentName, ContentNameError, PrincipalContentError, PrincipalContentStore};
 use crate::kv::{KvStore, TreeKvStore};
 
 #[derive(Clone, Copy)]
@@ -138,6 +138,25 @@ fn bytes(length: usize) -> Vec<u8> {
             (state >> 29).to_le_bytes()[0]
         })
         .collect()
+}
+
+#[test]
+fn content_name_is_a_typed_validation_boundary() {
+    let parsed: ContentName = "models/site.bin".parse().unwrap();
+    assert_eq!(parsed.as_str(), "models/site.bin");
+    assert_eq!(parsed.to_string(), "models/site.bin");
+    assert_eq!(String::from(parsed), "models/site.bin");
+    assert_eq!(ContentName::new(""), Err(ContentNameError::Empty));
+    assert_eq!(
+        ContentName::new("bad\0name"),
+        Err(ContentNameError::ContainsNull)
+    );
+    assert!(matches!(
+        ContentName::from_bytes(&[0xff]),
+        Err(PrincipalContentError::InvalidName(
+            ContentNameError::InvalidUtf8
+        ))
+    ));
 }
 
 struct CountingReader {
