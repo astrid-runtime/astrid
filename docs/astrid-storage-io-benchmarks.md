@@ -2,11 +2,14 @@
 
 Status: executable native-path baseline; mounted-provider measurements pending
 
-Last reviewed: 2026-07-27
+Last reviewed: 2026-07-28
 
 Tracking:
 [#1398](https://github.com/astrid-runtime/astrid/issues/1398),
 [#1399](https://github.com/astrid-runtime/astrid/issues/1399),
+[#1400](https://github.com/astrid-runtime/astrid/issues/1400),
+[#1386](https://github.com/astrid-runtime/astrid/issues/1386),
+[#1388](https://github.com/astrid-runtime/astrid/issues/1388),
 [#1392](https://github.com/astrid-runtime/astrid/issues/1392),
 [#1391](https://github.com/astrid-runtime/astrid/issues/1391), and
 [#1396](https://github.com/astrid-runtime/astrid/issues/1396)
@@ -30,6 +33,25 @@ cached representations, or grouped durability avoid work the conventional path
 performs. Beating the host on raw physical storage requires Astrid to own the
 lower storage path, as in the bare-metal program or a purpose-built raw-device
 backend.
+
+For paired operations, this document reports substrate overhead as:
+
+```text
+Astrid elapsed time / native elapsed time
+```
+
+`1.00×` is hosted parity; a larger value is overhead over the same backing
+filesystem. Ratios are valid only when byte count, cache state, verification,
+and durability contract match. Native close, native `sync_all`, Astrid seal,
+content publication, and root publication are deliberately separate because
+combining unlike acknowledgement contracts manufactures a misleading number.
+
+The current deterministic source is also a deliberate worst case for the
+architecture: it is incompressible-looking, has no repeated content, remains
+fully warm, and most measurements use one writer. It is useful for finding
+fixed per-request and per-byte cliffs. It is not the product-level score for a
+system designed to exploit repetition, version locality, concurrent principals,
+and grouped durability. Both scoreboards are required.
 
 The benchmark never folds background publication into a foreground write
 number. It records:
@@ -70,7 +92,10 @@ specific volume. The path must be absent or empty; the harness refuses to
 overwrite a populated directory. Without it, the harness uses and removes a
 temporary directory. The JSON contains every raw nanosecond sample, the
 median, range, byte or operation count, target OS and architecture, logical CPU
-count, and the exact workload configuration.
+count, and the exact workload configuration. It also records contract-matched
+elapsed-over-substrate ratios and the exact growth in `objects.arena` plus
+`roots.journal` for unique and duplicate publication. That growth is
+authoritative file length appended, not filesystem-allocated block count.
 
 `--samples` applies to unique publication, duplicate publication, engine open
 and reopen, Astrid reads, native writes, seals, and the concurrent workloads.
@@ -107,22 +132,23 @@ harness on:
 - a 512 MiB deterministic source with four-MiB copy buffers and one-MiB
   published range reads.
 
-Large-path medians:
+Large-path medians. The overhead column appears only where the current run has
+a paired native operation with the same byte and verification contract:
 
-| Operation | Median | Throughput |
-|---|---:|---:|
-| Native cached write | 440.27 ms | 1,163 MiB/s |
-| Native sync after write | 13.31 ms | separate durability latency |
-| Astrid cached staging write | 484.47 ms | 1,057 MiB/s |
-| Astrid durable staging seal | 46.13 ms | separate durability latency |
-| Content construction without engine admission | 644.88 ms | 794 MiB/s |
-| Unique background publication | 2,095.42 ms | 244 MiB/s |
-| Cached staging through unique publication | 2,318.57 ms | 221 MiB/s |
-| Duplicate background publication | 1,685.04 ms | 304 MiB/s |
-| Cached staging through duplicate publication | 2,187.49 ms | 234 MiB/s |
-| Native warm verified-by-benchmark read | 315.36 ms | 1,624 MiB/s |
-| Astrid warm one-MiB range reconstruction | 1,540.00 ms | 332 MiB/s |
-| Populated engine reopen | 1,789.85 ms | not a byte-throughput metric |
+| Operation | Median | Throughput | Substrate elapsed |
+|---|---:|---:|---:|
+| Native cached write | 440.27 ms | 1,163 MiB/s | 1.00× |
+| Native sync after write | 13.31 ms | separate durability latency | 1.00× |
+| Astrid cached staging write | 484.47 ms | 1,057 MiB/s | 1.10× |
+| Astrid durable staging seal | 46.13 ms | separate durability latency | different contract |
+| Content construction without engine admission | 644.88 ms | 794 MiB/s | no native pair |
+| Unique background publication | 2,095.42 ms | 244 MiB/s | no native pair |
+| Cached staging through unique publication | 2,318.57 ms | 221 MiB/s | no native pair |
+| Duplicate background publication | 1,685.04 ms | 304 MiB/s | no native pair |
+| Cached staging through duplicate publication | 2,187.49 ms | 234 MiB/s | no native pair |
+| Native warm verified-by-benchmark read | 315.36 ms | 1,624 MiB/s | 1.00× |
+| Astrid warm one-MiB range reconstruction | 1,540.00 ms | 332 MiB/s | 4.88× |
+| Populated engine reopen | 1,789.85 ms | not a byte-throughput metric | no native pair |
 
 Absolute cached-write rates varied with host state between runs, so same-run
 ratios are the useful evidence. Astrid's cached staging write reached 90.9% of
@@ -166,6 +192,43 @@ four readers. This directly exposes the global engine mutex and per-call
 metadata reconstruction that a single-principal benchmark cannot show. The
 publication result similarly establishes the before-number for group commit
 and narrower appender critical sections.
+
+## Measured follow-up gates
+
+Three profiling rounds against the same storage stack turn the bottleneck map
+into quantified acceptance gates:
+
+- Warm range reads fit `0.53 ms/request + 2.41 µs/KiB` with `r² ≈ 0.999`.
+  About 42% of 64 KiB read time was neighbor-chunk loading outside the requested
+  range and another 13% was repeated gear-boundary validation. The
+  `perf/storage-cached-positional-reads` branch moved 64 KiB single-stream reads
+  from 92.9 to 227.7 MiB/s and four-principal aggregate reads from 105.8 to
+  839.0 MiB/s by moving reads outside the write mutex and reusing
+  principal-partitioned verification tokens. The remaining cache and
+  post-reopen work stays tracked in #1399.
+- Durable KV writes measured 8.6 ms, or 117 writes/s for the whole store.
+  Two concurrent writers produced 111 writes/s aggregate and eight produced
+  135 writes/s, confirming that current writers share no durability
+  amortization. Group commit in #1388 owns this gate. Warm KV reads were about
+  20 microseconds and the `spawn_blocking` adapter floor was 3.8 microseconds;
+  neither is an optimization target.
+- Flat-catalog read cost measured 0.26 microseconds per entry per request:
+  88 microseconds at 250 entries and 1,063 microseconds at 4,000. The slope
+  extrapolates, but has not yet been measured, at about 60 milliseconds per
+  range read for the live 230,000-entry agent-state cardinality.
+- Publishing identical 4 KiB files near 2,000 catalog entries appended about
+  110 KiB of metadata per publication despite adding no content bytes. The
+  catalog contributes about 60 bytes times its current cardinality to each
+  write; the slope extrapolates, but has not yet been measured, at about
+  14 MiB appended for one 4 KiB save at 230,000 entries. #1400 replaces this
+  flat object with a persistent path-copy tree.
+- A 128-byte KV set appended 2,883 bytes, or 22× logical value bytes. A probe
+  with 2,400 small commits produced a 153 MiB arena and reopened in 569 ms.
+  Compaction and the persistent index in #1386 must bound that historical
+  amplification.
+
+Physical bytes appended per logical byte and per operation are therefore
+release metrics, not diagnostics.
 
 ## Read-size sensitivity
 
@@ -252,6 +315,28 @@ persistent indexing and compaction, a path-copy catalog, bounded builder
 metadata, group publication, and representation adoption. The benchmark must
 be rerun after each change instead of treating the projection as a promise.
 
+## Product-level workload scoreboard
+
+The synthetic cliff-finder remains mandatory, but performance claims about the
+architecture require a second suite:
+
+- a realistic agent-state corpus with repeated files and temporal version
+  chains;
+- a mixed KV/content workload across multiple principals;
+- a working set larger than RAM, with cache state and any privileged cache
+  eviction procedure recorded explicitly;
+- the same logical create/edit/delete/sync job on native and Astrid;
+- total logical bytes, physical bytes read and appended, fsync count, wall
+  time, CPU, and peak memory;
+- arena growth, fragmentation, and reopen cost over a long-lived mutation
+  trace; and
+- change-detection and sparse-transfer runs where only the delta is absent.
+
+For this scoreboard Astrid may complete faster than a conventional layout by
+avoiding reads, writes, transfers, and durability barriers. The report must
+still show the substrate-overhead matrix separately so avoided work never
+hides a slower primitive.
+
 ## Mounted-provider matrix
 
 Every supported provider eventually runs the same matrix against a native
@@ -265,7 +350,7 @@ filesystem on the same machine and volume:
 | Open handles | rename-over-open, unlink-while-open, daemon/provider restart, upgrade handover |
 | Memory mapping | shared/private mapping, dirty-page writeback, linker, compiler, Wasmtime, executable policy |
 | Publication | acknowledgement latency, queue lag, ingest throughput, root-CAS latency, failure recovery |
-| Accounting | dirty-byte reservation, principal budget exhaustion, ENOSPC recovery |
+| Accounting | dirty-byte reservation, principal budget exhaustion, ENOSPC recovery, physical/logical amplification |
 | Integrity | read verification, doctor projection checks, crash at every write prefix |
 
 Results must name the provider and version: FSKit, WinFsp, libfuse, Realm 9P,

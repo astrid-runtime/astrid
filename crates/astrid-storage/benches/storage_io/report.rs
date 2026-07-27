@@ -15,6 +15,8 @@ pub(super) struct Report {
     logical_cpus: usize,
     config: Config,
     metrics: Vec<Metric>,
+    substrate_comparisons: Vec<SubstrateComparison>,
+    write_amplifications: Vec<WriteAmplification>,
 }
 
 impl Report {
@@ -27,6 +29,8 @@ impl Report {
             logical_cpus: std::thread::available_parallelism().map_or(1, NonZeroUsize::get),
             config,
             metrics: Vec::new(),
+            substrate_comparisons: Vec::new(),
+            write_amplifications: Vec::new(),
         }
     }
 
@@ -44,6 +48,75 @@ impl Report {
             .push(Metric::operations(name, operations, samples));
     }
 
+    pub(super) fn record_substrate_comparison(
+        &mut self,
+        name: &'static str,
+        astrid_metric: &'static str,
+        substrate_metric: &'static str,
+    ) -> Result<(), String> {
+        let astrid_milliseconds = self
+            .metric(astrid_metric)
+            .ok_or_else(|| format!("unknown Astrid comparison metric {astrid_metric:?}"))?
+            .median_milliseconds;
+        let substrate_milliseconds = self
+            .metric(substrate_metric)
+            .ok_or_else(|| format!("unknown substrate comparison metric {substrate_metric:?}"))?
+            .median_milliseconds;
+        if substrate_milliseconds <= 0.0 {
+            return Err(format!(
+                "substrate comparison metric {substrate_metric:?} has zero elapsed time"
+            ));
+        }
+        self.substrate_comparisons.push(SubstrateComparison {
+            name,
+            astrid_metric,
+            substrate_metric,
+            median_elapsed_ratio: astrid_milliseconds / substrate_milliseconds,
+        });
+        Ok(())
+    }
+
+    pub(super) fn record_write_amplification(
+        &mut self,
+        name: &'static str,
+        logical_bytes_per_sample: u64,
+        mut authoritative_bytes_appended: Vec<u64>,
+    ) -> Result<(), String> {
+        if logical_bytes_per_sample == 0 {
+            return Err(format!(
+                "write amplification metric {name:?} has zero logical bytes"
+            ));
+        }
+        if authoritative_bytes_appended.is_empty() {
+            return Err(format!(
+                "write amplification metric {name:?} has no samples"
+            ));
+        }
+        authoritative_bytes_appended.sort_unstable();
+        let minimum = authoritative_bytes_appended
+            .first()
+            .copied()
+            .ok_or_else(|| format!("write amplification metric {name:?} has no minimum"))?;
+        let median = authoritative_bytes_appended
+            .get(authoritative_bytes_appended.len() / 2)
+            .copied()
+            .ok_or_else(|| format!("write amplification metric {name:?} has no median"))?;
+        let maximum = authoritative_bytes_appended
+            .last()
+            .copied()
+            .ok_or_else(|| format!("write amplification metric {name:?} has no maximum"))?;
+        self.write_amplifications.push(WriteAmplification {
+            name,
+            logical_bytes_per_sample,
+            authoritative_bytes_appended,
+            minimum_authoritative_bytes_appended: minimum,
+            median_authoritative_bytes_appended: median,
+            maximum_authoritative_bytes_appended: maximum,
+            median_physical_to_logical_ratio: ratio(median, logical_bytes_per_sample),
+        });
+        Ok(())
+    }
+
     pub(super) fn print_table(&self) {
         println!(
             "{:<38} {:>12} {:>12} {:>12}",
@@ -58,6 +131,35 @@ impl Report {
                 optional_number(metric.median_operations_per_second),
             );
         }
+        if !self.substrate_comparisons.is_empty() {
+            println!();
+            println!("{:<38} {:>18}", "paired operation", "elapsed/substrate");
+            for comparison in &self.substrate_comparisons {
+                println!(
+                    "{:<38} {:>17.3}×",
+                    comparison.name, comparison.median_elapsed_ratio
+                );
+            }
+        }
+        if !self.write_amplifications.is_empty() {
+            println!();
+            println!(
+                "{:<38} {:>18} {:>18}",
+                "publication", "median appended", "appended/logical"
+            );
+            for amplification in &self.write_amplifications {
+                println!(
+                    "{:<38} {:>18} {:>17.3}×",
+                    amplification.name,
+                    amplification.median_authoritative_bytes_appended,
+                    amplification.median_physical_to_logical_ratio
+                );
+            }
+        }
+    }
+
+    fn metric(&self, name: &str) -> Option<&Metric> {
+        self.metrics.iter().find(|metric| metric.name == name)
     }
 }
 
@@ -72,6 +174,25 @@ struct Metric {
     maximum_milliseconds: f64,
     median_mib_per_second: Option<f64>,
     median_operations_per_second: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+struct SubstrateComparison {
+    name: &'static str,
+    astrid_metric: &'static str,
+    substrate_metric: &'static str,
+    median_elapsed_ratio: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct WriteAmplification {
+    name: &'static str,
+    logical_bytes_per_sample: u64,
+    authoritative_bytes_appended: Vec<u64>,
+    minimum_authoritative_bytes_appended: u64,
+    median_authoritative_bytes_appended: u64,
+    maximum_authoritative_bytes_appended: u64,
+    median_physical_to_logical_ratio: f64,
 }
 
 impl Metric {
@@ -127,6 +248,11 @@ fn mib_per_second(bytes: u64, seconds: f64) -> f64 {
 #[allow(clippy::cast_precision_loss)]
 fn operations_per_second(operations: usize, seconds: f64) -> f64 {
     operations as f64 / seconds
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn ratio(numerator: u64, denominator: u64) -> f64 {
+    numerator as f64 / denominator as f64
 }
 
 fn optional_number(value: Option<f64>) -> String {

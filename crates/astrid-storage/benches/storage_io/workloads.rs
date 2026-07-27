@@ -32,7 +32,18 @@ pub(super) async fn run(
     benchmark_content_compute(config, source, report)?;
     benchmark_small_files(config, root, report)?;
     benchmark_runtime(config, root, source, source_digest, report).await?;
-    benchmark_concurrent_principals(config, root, source, source_digest, report).await
+    benchmark_concurrent_principals(config, root, source, source_digest, report).await?;
+    report.record_substrate_comparison(
+        "cached_staging_write",
+        "astrid_stage_write",
+        "native_write",
+    )?;
+    report.record_substrate_comparison(
+        "warm_verified_read",
+        "astrid_read_warm",
+        "native_read_warm",
+    )?;
+    Ok(())
 }
 
 fn benchmark_native_large_writes(
@@ -212,8 +223,11 @@ async fn benchmark_runtime(
         let store = open_store(&home).await?;
         samples.fresh_open.push(started.elapsed());
 
-        let publication = benchmark_publication(config, source, &store, &owner).await?;
+        let publication = benchmark_publication(config, source, &store, &owner, &home).await?;
         samples.unique_publish.push(publication.unique_publish);
+        samples
+            .unique_authoritative_bytes
+            .push(publication.unique_authoritative_bytes);
         samples
             .unique_end_to_end
             .push(publication.unique_end_to_end);
@@ -226,6 +240,9 @@ async fn benchmark_runtime(
         samples
             .duplicate_publish
             .push(publication.duplicate_publish);
+        samples
+            .duplicate_authoritative_bytes
+            .push(publication.duplicate_authoritative_bytes);
         samples
             .duplicate_end_to_end
             .push(publication.duplicate_end_to_end);
@@ -261,7 +278,7 @@ async fn benchmark_runtime(
         )?);
         drop(reopened);
     }
-    samples.record(config, report);
+    samples.record(config, report)?;
     Ok(())
 }
 
@@ -270,12 +287,18 @@ async fn benchmark_publication(
     source: &Path,
     store: &RuntimePrincipalStore,
     owner: &StateOwner,
+    home: &AstridHome,
 ) -> BenchResult<PublicationSample> {
     let (unique_name, unique_staged, stage_write, stage_seal) =
         stage_source(store, source, owner, "large/unique.bin", config.block_bytes)?;
+    let authoritative_before = authoritative_store_bytes(home)?;
     let started = Instant::now();
     black_box(store.publish_staged(unique_staged).await?);
     let unique_publish = started.elapsed();
+    let authoritative_after_unique = authoritative_store_bytes(home)?;
+    let unique_authoritative_bytes = authoritative_after_unique
+        .checked_sub(authoritative_before)
+        .ok_or("authoritative store shrank during unique publication")?;
     let unique_end_to_end = sum_durations(&[stage_write, stage_seal, unique_publish])?;
 
     let (_, duplicate_staged, duplicate_write, duplicate_seal) = stage_source(
@@ -285,16 +308,23 @@ async fn benchmark_publication(
         "large/duplicate.bin",
         config.block_bytes,
     )?;
+    let authoritative_before_duplicate = authoritative_store_bytes(home)?;
     let started = Instant::now();
     black_box(store.publish_staged(duplicate_staged).await?);
     let duplicate_publish = started.elapsed();
+    let authoritative_after_duplicate = authoritative_store_bytes(home)?;
+    let duplicate_authoritative_bytes = authoritative_after_duplicate
+        .checked_sub(authoritative_before_duplicate)
+        .ok_or("authoritative store shrank during duplicate publication")?;
     Ok(PublicationSample {
         unique_name,
         unique_publish,
+        unique_authoritative_bytes,
         unique_end_to_end,
         duplicate_stage_write: duplicate_write,
         duplicate_stage_seal: duplicate_seal,
         duplicate_publish,
+        duplicate_authoritative_bytes,
         duplicate_end_to_end: sum_durations(&[duplicate_write, duplicate_seal, duplicate_publish])?,
     })
 }
@@ -302,10 +332,12 @@ async fn benchmark_publication(
 struct PublicationSample {
     unique_name: ContentName,
     unique_publish: Duration,
+    unique_authoritative_bytes: u64,
     unique_end_to_end: Duration,
     duplicate_stage_write: Duration,
     duplicate_stage_seal: Duration,
     duplicate_publish: Duration,
+    duplicate_authoritative_bytes: u64,
     duplicate_end_to_end: Duration,
 }
 
@@ -313,10 +345,12 @@ struct PublicationSample {
 struct RuntimeSamples {
     fresh_open: Vec<Duration>,
     unique_publish: Vec<Duration>,
+    unique_authoritative_bytes: Vec<u64>,
     unique_end_to_end: Vec<Duration>,
     duplicate_stage_write: Vec<Duration>,
     duplicate_stage_seal: Vec<Duration>,
     duplicate_publish: Vec<Duration>,
+    duplicate_authoritative_bytes: Vec<u64>,
     duplicate_end_to_end: Vec<Duration>,
     read_first: Vec<Duration>,
     read_warm: Vec<Duration>,
@@ -325,9 +359,14 @@ struct RuntimeSamples {
 }
 
 impl RuntimeSamples {
-    fn record(self, config: &Config, report: &mut Report) {
+    fn record(self, config: &Config, report: &mut Report) -> BenchResult<()> {
         report.record_operations("astrid_fresh_open", 1, self.fresh_open);
         report.record_bytes("astrid_publish_unique", config.bytes, self.unique_publish);
+        report.record_write_amplification(
+            "astrid_publish_unique",
+            config.bytes,
+            self.unique_authoritative_bytes,
+        )?;
         report.record_bytes(
             "astrid_unique_end_to_end",
             config.bytes,
@@ -348,6 +387,11 @@ impl RuntimeSamples {
             config.bytes,
             self.duplicate_publish,
         );
+        report.record_write_amplification(
+            "astrid_publish_duplicate",
+            config.bytes,
+            self.duplicate_authoritative_bytes,
+        )?;
         report.record_bytes(
             "astrid_duplicate_end_to_end",
             config.bytes,
@@ -361,7 +405,19 @@ impl RuntimeSamples {
             config.bytes,
             self.read_after_reopen,
         );
+        Ok(())
     }
+}
+
+fn authoritative_store_bytes(home: &AstridHome) -> BenchResult<u64> {
+    ["objects.arena", "roots.journal"]
+        .into_iter()
+        .try_fold(0_u64, |total, file_name| {
+            let bytes = std::fs::metadata(home.principal_store_path().join(file_name))?.len();
+            total
+                .checked_add(bytes)
+                .ok_or_else(|| "authoritative store byte count overflow".into())
+        })
 }
 
 fn benchmark_native_reads(
