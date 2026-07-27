@@ -200,6 +200,7 @@ impl ContentDescriptor {
 
 /// Failure to construct or decode a canonical content DAG.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ContentError {
     /// Chunking parameters are unsupported or internally inconsistent.
     InvalidProfile(&'static str),
@@ -251,7 +252,14 @@ impl fmt::Display for ContentError {
     }
 }
 
-impl core::error::Error for ContentError {}
+impl core::error::Error for ContentError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Model(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 impl From<ModelError> for ContentError {
     fn from(error: ModelError) -> Self {

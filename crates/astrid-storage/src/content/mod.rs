@@ -200,7 +200,15 @@ impl fmt::Display for PrincipalContentError {
     }
 }
 
-impl std::error::Error for PrincipalContentError {}
+impl std::error::Error for PrincipalContentError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Content(error) => Some(error),
+            Self::Projection(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 impl From<ContentError> for PrincipalContentError {
     fn from(error: ContentError) -> Self {

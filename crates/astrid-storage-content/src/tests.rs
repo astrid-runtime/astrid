@@ -5,7 +5,7 @@ use std::convert::Infallible;
 use std::hash::Hasher;
 
 use astrid_storage_model::{
-    ObjectClass, ObjectId, ObjectIdentity, ObjectKind, ObjectRecord, ObjectReference,
+    ModelError, ObjectClass, ObjectId, ObjectIdentity, ObjectKind, ObjectRecord, ObjectReference,
     ReferenceKind, ReferenceLabel,
 };
 
@@ -421,4 +421,18 @@ fn invalid_profiles_and_ranges_are_rejected() {
             ContentError::RangeOutOfBounds { .. }
         ))
     ));
+}
+
+#[test]
+fn content_errors_preserve_typed_sources() {
+    let content = ContentError::Model(ModelError::ArithmeticOverflow);
+    let model_source = core::error::Error::source(&content).unwrap();
+    assert_eq!(
+        model_source.downcast_ref::<ModelError>(),
+        Some(&ModelError::ArithmeticOverflow)
+    );
+
+    let read = ContentReadError::Source(content);
+    let content_source = core::error::Error::source(&read).unwrap();
+    assert!(content_source.downcast_ref::<ContentError>().is_some());
 }

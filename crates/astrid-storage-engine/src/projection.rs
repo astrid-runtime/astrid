@@ -33,7 +33,14 @@ impl fmt::Display for PrincipalProjectionError {
     }
 }
 
-impl std::error::Error for PrincipalProjectionError {}
+impl std::error::Error for PrincipalProjectionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Model(error) => Some(error),
+            Self::Engine(_) => None,
+        }
+    }
+}
 
 impl From<ModelError> for PrincipalProjectionError {
     fn from(error: ModelError) -> Self {

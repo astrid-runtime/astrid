@@ -467,3 +467,20 @@ fn concurrent_catalog_updates_retry_the_shared_root_cas() {
     }
     assert_eq!(store.list(&"alice".to_owned()).unwrap().len(), 8);
 }
+
+#[test]
+fn principal_content_error_preserves_nested_sources() {
+    let error = PrincipalContentError::Content(astrid_storage_content::ContentError::Model(
+        ModelError::ArithmeticOverflow,
+    ));
+    let content_source = std::error::Error::source(&error).unwrap();
+    let content_error = content_source
+        .downcast_ref::<astrid_storage_content::ContentError>()
+        .unwrap();
+    let model_source = std::error::Error::source(content_error).unwrap();
+
+    assert_eq!(
+        model_source.downcast_ref::<ModelError>(),
+        Some(&ModelError::ArithmeticOverflow)
+    );
+}

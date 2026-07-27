@@ -950,4 +950,15 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn projection_model_error_preserves_typed_source() {
+        let error = PrincipalProjectionError::from(ModelError::ArithmeticOverflow);
+        let source = std::error::Error::source(&error).unwrap();
+
+        assert_eq!(
+            source.downcast_ref::<ModelError>(),
+            Some(&ModelError::ArithmeticOverflow)
+        );
+    }
 }

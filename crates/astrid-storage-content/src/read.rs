@@ -42,7 +42,17 @@ impl<E: fmt::Display> fmt::Display for ContentReadError<E> {
     }
 }
 
-impl<E: fmt::Debug + fmt::Display> core::error::Error for ContentReadError<E> {}
+impl<E> core::error::Error for ContentReadError<E>
+where
+    E: core::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Content(error) => Some(error),
+            Self::Source(error) => Some(error),
+        }
+    }
+}
 
 impl<E> From<ContentError> for ContentReadError<E> {
     fn from(error: ContentError) -> Self {
