@@ -129,7 +129,11 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   derived-cache accounting without activating a capsule interface. The live
   corpus measured 98.02% object-instance convergence but 47.1% whole-file byte
   convergence; the 95–98% platform-scale byte result remains a separately
-  testable hypothesis.
+  testable hypothesis. Durable object reads now use positional I/O after a
+  short index lookup instead of seeking under the engine write mutex.
+  Principal-scoped read handles resolve and validate a root generation,
+  catalog entry, and file descriptor once, then preserve that immutable
+  generation across later replacement or deletion of the catalog name.
 - **Windows local transport uses authenticated per-user named pipes.** A pipe
   name derived only from the caller's operating-system SID replaces
   filesystem endpoint naming on Windows. Local-only byte-mode instances use a

@@ -15,7 +15,7 @@ use astrid_storage_engine::PrincipalProjectionError;
 use astrid_storage_model::{ObjectId, RootState};
 
 pub use astrid_storage_content::{ChunkingProfile, ContentDescriptor};
-pub use store::PrincipalContentStore;
+pub use store::{PrincipalContentReadHandle, PrincipalContentStore};
 
 use astrid_storage_content::ContentError;
 

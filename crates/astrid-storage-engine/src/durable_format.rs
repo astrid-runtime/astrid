@@ -16,7 +16,7 @@ const MIN_REFERENCE_WIRE_BYTES: usize =
     std::mem::size_of::<u64>() + IDENTITY_PREFIX_BYTES + CURRENT_DIGEST_BYTES_USIZE + 1;
 
 pub(super) fn read_indexed_object(
-    arena: &mut File,
+    arena: &File,
     expected_id: ObjectId,
     location: ArenaLocation,
     scheme: IdentityScheme,
@@ -46,16 +46,14 @@ pub(super) fn read_indexed_object(
 }
 
 fn read_frame_at(
-    file: &mut File,
+    file: &File,
     file_name: &'static str,
     magic: [u8; 8],
     offset: u64,
     limits: RecoveryLimits,
 ) -> Result<Vec<u8>, DurableError> {
-    file.seek(SeekFrom::Start(offset))
-        .map_err(|source| io_error("seek indexed durable frame", source))?;
     let mut header = [0_u8; FRAME_HEADER_LEN_USIZE];
-    file.read_exact(&mut header)
+    read_exact_at(file, &mut header, offset)
         .map_err(|source| io_error("read indexed durable frame header", source))?;
     if header[..8] != magic {
         return Err(corrupt(file_name, offset, "frame magic mismatch"));
@@ -90,7 +88,10 @@ fn read_frame_at(
         .try_reserve_exact(payload_usize)
         .map_err(|_| DurableError::EncodingOverflow)?;
     payload.resize(payload_usize, 0);
-    file.read_exact(&mut payload)
+    let payload_offset = offset
+        .checked_add(FRAME_HEADER_LEN)
+        .ok_or(DurableError::EncodingOverflow)?;
+    read_exact_at(file, &mut payload, payload_offset)
         .map_err(|source| io_error("read indexed durable frame payload", source))?;
     let checksum: [u8; 32] = header[CHECKSUM_START..]
         .try_into()
@@ -99,6 +100,45 @@ fn read_frame_at(
         return Err(corrupt(file_name, offset, "frame checksum mismatch"));
     }
     Ok(payload)
+}
+
+fn read_exact_at(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<()> {
+    let mut filled = 0_usize;
+    while filled != buffer.len() {
+        let relative = u64::try_from(filled)
+            .map_err(|_| io::Error::other("positional read offset overflow"))?;
+        let position = offset
+            .checked_add(relative)
+            .ok_or_else(|| io::Error::other("positional read offset overflow"))?;
+        let read = positioned_read(file, &mut buffer[filled..], position)?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "positional read reached end of file",
+            ));
+        }
+        filled = filled
+            .checked_add(read)
+            .ok_or_else(|| io::Error::other("positional read length overflow"))?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn positioned_read(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
+    std::os::unix::fs::FileExt::read_at(file, buffer, offset)
+}
+
+#[cfg(windows)]
+fn positioned_read(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
+    std::os::windows::fs::FileExt::seek_read(file, buffer, offset)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn positioned_read(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
+    let mut reader = file.try_clone()?;
+    reader.seek(SeekFrom::Start(offset))?;
+    reader.read(buffer)
 }
 
 pub(super) fn open_rw(path: &Path) -> Result<File, DurableError> {

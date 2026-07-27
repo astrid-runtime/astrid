@@ -56,7 +56,7 @@ pub mod db;
 
 pub use content::{
     ChunkingProfile, ContentDescriptor, ContentEntry, ContentName, ContentNameError,
-    ContentWriteOutcome, PrincipalContentError, PrincipalContentStore,
+    ContentWriteOutcome, PrincipalContentError, PrincipalContentReadHandle, PrincipalContentStore,
 };
 pub use error::{StorageError, StorageResult};
 pub use identity::{IdentityError, IdentityStore, KvIdentityStore};

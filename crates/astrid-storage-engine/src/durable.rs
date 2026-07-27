@@ -336,6 +336,7 @@ pub struct DurableEngine<P: Ord, I, C> {
     principal_codec: C,
     limits: RecoveryLimits,
     faults: Arc<dyn FaultInjector>,
+    arena_reader: File,
     inner: Mutex<DurableInner<P>>,
 }
 
@@ -413,12 +414,16 @@ where
         roots
             .seek(SeekFrom::End(0))
             .map_err(|source| io_error("seek root journal", source))?;
+        let arena_reader = arena
+            .try_clone()
+            .map_err(|source| io_error("clone object arena for positional reads", source))?;
 
         Ok(Self {
             identity,
             principal_codec,
             limits,
             faults,
+            arena_reader,
             inner: Mutex::new(DurableInner {
                 roots_by_principal,
                 index,
@@ -452,14 +457,16 @@ where
     ///
     /// Returns [`DurableError::RequiresRecovery`] after a failed write.
     pub fn object(&self, id: ObjectId) -> Result<Option<ObjectRecord>, DurableError> {
-        let mut inner = self.inner.lock();
-        ensure_usable(&inner)?;
-        let Some(location) = inner.index.get(&id).copied() else {
-            return Ok(None);
+        let location = {
+            let inner = self.inner.lock();
+            ensure_usable(&inner)?;
+            let Some(location) = inner.index.get(&id).copied() else {
+                return Ok(None);
+            };
+            location
         };
-        let files = live_files_mut(&mut inner.files)?;
         read_indexed_object(
-            &mut files.arena,
+            &self.arena_reader,
             id,
             location,
             self.identity.scheme(),

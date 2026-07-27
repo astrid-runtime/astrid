@@ -396,6 +396,40 @@ fn standalone_bootstrap_object_is_durable_and_idempotent() {
 }
 
 #[test]
+fn indexed_object_read_does_not_move_the_append_cursor() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open(directory.path());
+    let record = ObjectRecord::new(
+        ObjectKind::Evidence,
+        ObjectFormatVersion::V1,
+        b"position-independent read".to_vec(),
+        Vec::new(),
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let (id, _) = engine.persist_standalone_object(&record).unwrap();
+    let cursor_before = {
+        let mut inner = engine.inner.lock();
+        let arena = &mut live_files_mut(&mut inner.files).unwrap().arena;
+        arena.seek(SeekFrom::Start(7)).unwrap();
+        arena.stream_position().unwrap()
+    };
+
+    assert_eq!(engine.object(id).unwrap(), Some(record));
+
+    let cursor_after = {
+        let mut inner = engine.inner.lock();
+        live_files_mut(&mut inner.files)
+            .unwrap()
+            .arena
+            .stream_position()
+            .unwrap()
+    };
+    assert_eq!(cursor_after, cursor_before);
+}
+
+#[test]
 fn standalone_bootstrap_object_cannot_own_principal_state() {
     let directory = tempfile::tempdir().unwrap();
     let engine = open(directory.path());

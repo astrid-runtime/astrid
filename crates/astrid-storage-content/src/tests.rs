@@ -11,7 +11,8 @@ use astrid_storage_model::{
 
 use crate::{
     CONTENT_LABEL, ChunkingProfile, ContentError, ContentReadError, ContentSource, FORMAT_VERSION,
-    build_content, describe_content, encode_file_header, read_content, read_content_range,
+    build_content, describe_content, encode_file_header, open_content, read_content,
+    read_content_range, read_opened_content, read_opened_content_range,
 };
 
 #[derive(Clone, Copy)]
@@ -188,6 +189,26 @@ fn empty_small_and_large_content_round_trip() {
             bytes
         );
     }
+}
+
+#[test]
+fn opened_content_reuses_the_validated_file_descriptor() {
+    let built = build_content(&TestIdentity, ChunkingProfile::ASTRID_V1, &[]).unwrap();
+    let source = MapSource::new(built.records());
+    let opened = open_content(&source, built.descriptor().file()).unwrap();
+
+    assert_eq!(source.loads.get(), 1);
+    assert!(read_opened_content(&source, opened).unwrap().is_empty());
+    assert!(
+        read_opened_content_range(&source, opened, 0, 0)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        source.loads.get(),
+        1,
+        "repeated reads must not reload the immutable file descriptor"
+    );
 }
 
 #[test]

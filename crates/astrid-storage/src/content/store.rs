@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use astrid_storage_content::{
     BuiltContent, ChunkingProfile, ContentDescriptor, ContentError, ContentObjectSink,
-    ContentReadError, ContentSource, ContentStreamError, build_content, build_content_streaming,
-    describe_content, read_content, read_content_range,
+    ContentReadError, ContentSource, ContentStreamError, OpenedContent, build_content,
+    build_content_streaming, open_content, read_opened_content, read_opened_content_range,
 };
 use astrid_storage_engine::{PrincipalProjectionEngine, PrincipalProjectionError, RootTransaction};
 use astrid_storage_model::{
@@ -35,6 +35,77 @@ const PRINCIPAL_GRAPH_VERSION: ObjectFormatVersion = match ObjectFormatVersion::
 pub struct PrincipalContentStore<P: Ord, E> {
     engine: Arc<E>,
     quota: Option<Arc<dyn KvQuotaResolver<P>>>,
+}
+
+/// Principal-scoped immutable content handle for repeated verified reads.
+///
+/// The handle captures the root generation and decoded file descriptor that
+/// authorized the open. Later catalog changes do not retarget an existing
+/// handle. The append-only engine keeps its immutable object closure readable;
+/// compaction must preserve that guarantee for open handles.
+pub struct PrincipalContentReadHandle<P: Ord, E> {
+    engine: Arc<E>,
+    opened: OpenedContent,
+    principal_root: RootState,
+    marker: PhantomData<fn() -> P>,
+}
+
+impl<P: Ord, E> fmt::Debug for PrincipalContentReadHandle<P, E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PrincipalContentReadHandle")
+            .field("descriptor", &self.opened.descriptor())
+            .field("principal_root", &self.principal_root)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<P, E> PrincipalContentReadHandle<P, E>
+where
+    P: Ord,
+    E: PrincipalProjectionEngine<P>,
+{
+    /// Return the immutable descriptor validated when the handle was opened.
+    #[must_use]
+    pub const fn descriptor(&self) -> ContentDescriptor {
+        self.opened.descriptor()
+    }
+
+    /// Return the principal root generation that authorized this handle.
+    #[must_use]
+    pub const fn principal_root(&self) -> RootState {
+        self.principal_root
+    }
+
+    /// Reconstruct the complete opened value.
+    ///
+    /// # Errors
+    ///
+    /// Returns a content or projection error when verification or allocation
+    /// fails.
+    pub fn read(&self) -> Result<Vec<u8>, PrincipalContentError> {
+        read_opened_content(
+            &EngineSource::<P, E>::new(self.engine.as_ref()),
+            self.opened,
+        )
+        .map_err(map_read_error)
+    }
+
+    /// Reconstruct an exact range of the opened value.
+    ///
+    /// # Errors
+    ///
+    /// Returns a content, projection, range, or allocation error when the
+    /// requested bytes cannot be reconstructed exactly.
+    pub fn read_range(&self, offset: u64, length: u64) -> Result<Vec<u8>, PrincipalContentError> {
+        read_opened_content_range(
+            &EngineSource::<P, E>::new(self.engine.as_ref()),
+            self.opened,
+            offset,
+            length,
+        )
+        .map_err(map_read_error)
+    }
 }
 
 impl<P: Ord, E> PrincipalContentStore<P, E> {
@@ -252,20 +323,47 @@ where
         principal: &P,
         name: &ContentName,
     ) -> Result<Option<ContentDescriptor>, PrincipalContentError> {
+        self.open_read(principal, name)
+            .map(|handle| handle.map(|handle| handle.descriptor()))
+    }
+
+    /// Open one named value for repeated verified reads.
+    ///
+    /// The principal root, catalog entry, and canonical file descriptor are
+    /// resolved once. The resulting handle continues to address that immutable
+    /// generation when the same catalog name is later replaced or deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns a content, principal-graph, or projection error when metadata
+    /// is missing or invalid.
+    pub fn open_read(
+        &self,
+        principal: &P,
+        name: &ContentName,
+    ) -> Result<Option<PrincipalContentReadHandle<P, E>>, PrincipalContentError> {
         let header = self.header(principal.clone())?;
         let Some(entry) = header.catalog.entries.get(name) else {
             return Ok(None);
         };
-        let descriptor =
-            describe_content(&EngineSource::<P, E>::new(self.engine.as_ref()), entry.file)
-                .map_err(map_read_error)?;
+        let root = header
+            .root
+            .ok_or_else(|| invalid(entry.file, "catalog entry exists without a principal root"))?;
+        let opened = open_content(&EngineSource::<P, E>::new(self.engine.as_ref()), entry.file)
+            .map_err(map_read_error)?;
+        let descriptor = opened.descriptor();
         if descriptor.logical_bytes() != entry.logical_bytes {
             return Err(invalid(
                 entry.file,
                 "catalog and file logical lengths disagree",
             ));
         }
-        Ok(Some(descriptor))
+        Ok(Some(PrincipalContentReadHandle {
+            engine: Arc::clone(&self.engine),
+            opened,
+            principal_root: root,
+            marker: PhantomData,
+        }))
     }
 
     /// Reconstruct one complete named value.
@@ -279,15 +377,10 @@ where
         principal: &P,
         name: &ContentName,
     ) -> Result<Option<Vec<u8>>, PrincipalContentError> {
-        let Some(descriptor) = self.describe(principal, name)? else {
+        let Some(handle) = self.open_read(principal, name)? else {
             return Ok(None);
         };
-        read_content(
-            &EngineSource::<P, E>::new(self.engine.as_ref()),
-            descriptor.file(),
-        )
-        .map(Some)
-        .map_err(map_read_error)
+        handle.read().map(Some)
     }
 
     /// Reconstruct an exact range of one named value.
@@ -303,17 +396,10 @@ where
         offset: u64,
         length: u64,
     ) -> Result<Option<Vec<u8>>, PrincipalContentError> {
-        let Some(descriptor) = self.describe(principal, name)? else {
+        let Some(handle) = self.open_read(principal, name)? else {
             return Ok(None);
         };
-        read_content_range(
-            &EngineSource::<P, E>::new(self.engine.as_ref()),
-            descriptor.file(),
-            offset,
-            length,
-        )
-        .map(Some)
-        .map_err(map_read_error)
+        handle.read_range(offset, length).map(Some)
     }
 
     /// Flush authoritative object and root records.
