@@ -49,7 +49,18 @@ fn shares_one_physical_record_but_charges_each_principal_fully() {
 
     let stats = cache.stats();
     assert_eq!(stats.resident_objects, 1);
-    assert_eq!(stats.resident_bytes, weight);
+    assert_eq!(stats.resident_record_bytes, weight);
+    assert_eq!(stats.resident_associations, 2);
+    assert_eq!(
+        stats.resident_association_bytes,
+        association_weight::<String>().saturating_mul(2)
+    );
+    assert_eq!(
+        stats.resident_bytes,
+        stats
+            .resident_record_bytes
+            .saturating_add(stats.resident_association_bytes)
+    );
     assert_eq!(cache.principal_charge(&"alice".to_owned()), weight);
     assert_eq!(cache.principal_charge(&"bob".to_owned()), weight);
 }
@@ -58,7 +69,8 @@ fn shares_one_physical_record_but_charges_each_principal_fully() {
 fn live_budget_reduction_evicts_without_failing_reads() {
     let first = record(1);
     let weight = cache_weight(&first);
-    let capacity = NonZeroU64::new(weight.saturating_mul(2)).unwrap();
+    let association = association_weight::<String>();
+    let capacity = NonZeroU64::new(weight.saturating_add(association).saturating_mul(2)).unwrap();
     let controller = ObjectCacheController::new(ObjectCacheCapacity::Bounded(capacity));
     let cache = cache(controller.clone(), capacity.get());
     cache.insert(&"alice".to_owned(), object(1), first);
@@ -66,11 +78,33 @@ fn live_budget_reduction_evicts_without_failing_reads() {
     assert_eq!(cache.stats().resident_objects, 2);
 
     controller.set_capacity(ObjectCacheCapacity::Bounded(
-        NonZeroU64::new(weight).unwrap(),
+        NonZeroU64::new(weight.saturating_add(association)).unwrap(),
     ));
     assert!(cache.get(&"alice".to_owned(), object(2)).is_some());
     assert_eq!(cache.stats().resident_objects, 1);
     assert!(cache.stats().evictions >= 1);
+}
+
+#[test]
+fn shared_object_associations_are_bounded_by_the_global_pool() {
+    let value = record(3);
+    let record_weight = cache_weight(&value);
+    let association = association_weight::<String>();
+    let capacity =
+        NonZeroU64::new(record_weight.saturating_add(association.saturating_mul(2))).unwrap();
+    let controller = ObjectCacheController::new(ObjectCacheCapacity::Bounded(capacity));
+    let cache = cache(controller, 1024 * 1024);
+    let id = object(3);
+
+    cache.insert(&"alice".to_owned(), id, value);
+    assert!(cache.get(&"bob".to_owned(), id).is_some());
+    assert!(cache.get(&"charlie".to_owned(), id).is_none());
+
+    let stats = cache.stats();
+    assert_eq!(stats.resident_objects, 1);
+    assert_eq!(stats.resident_associations, 2);
+    assert!(stats.resident_bytes <= capacity.get());
+    assert_eq!(cache.principal_charge(&"charlie".to_owned()), 0);
 }
 
 #[test]

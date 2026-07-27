@@ -135,7 +135,7 @@ where
         read: impl FnOnce(&mut TreeContext<'_, P, E>, Option<ObjectId>) -> StorageResult<T>,
     ) -> StorageResult<T> {
         let header = self.header(owner)?;
-        let mut context = TreeContext::new(self.engine.as_ref());
+        let mut context = TreeContext::new(self.engine.as_ref(), &header.owner);
         read(&mut context, header.tree)
     }
 
@@ -149,7 +149,7 @@ where
     ) -> StorageResult<T> {
         loop {
             let header = self.header(owner.clone())?;
-            let mut context = TreeContext::new(self.engine.as_ref());
+            let mut context = TreeContext::new(self.engine.as_ref(), owner);
             let (result, tree, changed) = mutation(&mut context, header.tree)?;
             if !changed {
                 return Ok(result);
@@ -239,7 +239,7 @@ where
     ) -> StorageResult<()> {
         let blocking = self.blocking_store();
         let header = blocking.header(owner.clone())?;
-        let mut context = TreeContext::new(blocking.engine.as_ref());
+        let mut context = TreeContext::new(blocking.engine.as_ref(), owner);
         context.visit_entries(header.tree, |composite, value| {
             let separator = composite
                 .iter()
@@ -268,7 +268,7 @@ where
     pub(super) fn height_for_test(&self, owner: P) -> StorageResult<u32> {
         let blocking = self.blocking_store();
         let header = blocking.header(owner)?;
-        TreeContext::new(blocking.engine.as_ref()).height(header.tree)
+        TreeContext::new(blocking.engine.as_ref(), &header.owner).height(header.tree)
     }
 }
 
@@ -286,6 +286,7 @@ struct TreeNode {
 
 struct TreeContext<'a, P, E> {
     engine: &'a E,
+    principal: &'a P,
     records: BTreeMap<ObjectId, ObjectRecord>,
     nodes: BTreeMap<ObjectId, TreeNode>,
     marker: PhantomData<fn() -> P>,
@@ -296,9 +297,10 @@ where
     P: Ord,
     E: KvProjectionEngine<P>,
 {
-    fn new(engine: &'a E) -> Self {
+    fn new(engine: &'a E, principal: &'a P) -> Self {
         Self {
             engine,
+            principal,
             records: BTreeMap::new(),
             nodes: BTreeMap::new(),
             marker: PhantomData,
@@ -310,7 +312,7 @@ where
             return Ok(record.clone());
         }
         self.engine
-            .load_kv_object(id)
+            .load_kv_object_for(self.principal, id)
             .map_err(|error| map_engine(&error))?
             .ok_or_else(|| map_engine(&ModelError::MissingObject(id).into()))
     }

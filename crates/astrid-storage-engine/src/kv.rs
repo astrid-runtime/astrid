@@ -311,6 +311,23 @@ pub trait KvProjectionEngine<P>: Send + Sync {
     /// Returns an engine or frame error when the object cannot be read.
     fn load_kv_object(&self, id: ObjectId) -> Result<Option<ObjectRecord>, KvProjectionError>;
 
+    /// Load one immutable object with principal cache attribution.
+    ///
+    /// The default preserves projection engines without a governed object
+    /// cache. Cache policy cannot change the bytes or errors returned by
+    /// [`Self::load_kv_object`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an engine or frame error when the object cannot be read.
+    fn load_kv_object_for(
+        &self,
+        _principal: &P,
+        id: ObjectId,
+    ) -> Result<Option<ObjectRecord>, KvProjectionError> {
+        self.load_kv_object(id)
+    }
+
     /// Capture one principal's root and owning closure.
     ///
     /// # Errors
@@ -399,6 +416,14 @@ where
 
     fn load_kv_object(&self, id: ObjectId) -> Result<Option<ObjectRecord>, KvProjectionError> {
         self.object(id).map_err(map_durable_error)
+    }
+
+    fn load_kv_object_for(
+        &self,
+        principal: &P,
+        id: ObjectId,
+    ) -> Result<Option<ObjectRecord>, KvProjectionError> {
+        self.object_for(principal, id).map_err(map_durable_error)
     }
 
     fn snapshot_kv_root(&self, principal: &P) -> Result<Option<RootSnapshot>, KvProjectionError> {

@@ -49,10 +49,10 @@ where
     P: Clone + Ord,
     E: KvProjectionEngine<P>,
 {
-    let commit = load_typed(engine, root.commit, ObjectKind::Commit)?;
+    let commit = load_typed(engine, &owner, root.commit, ObjectKind::Commit)?;
     require_structural(root.commit, &commit)?;
     let state_id = owned_target(root.commit, &commit, STATE_LABEL)?;
-    let state = load_typed(engine, state_id, ObjectKind::PrincipalState)?;
+    let state = load_typed(engine, &owner, state_id, ObjectKind::PrincipalState)?;
     require_structural(state_id, &state)?;
     let (tree, quota_bytes) = match state.reference(&ReferenceLabel::new(KV_LABEL)) {
         None => {
@@ -83,7 +83,7 @@ where
                 ));
             }
             let record = engine
-                .load_kv_object(reference.target())
+                .load_kv_object_for(&owner, reference.target())
                 .map_err(|error| map_engine(&error))?
                 .ok_or_else(|| map_engine(&ModelError::MissingObject(reference.target()).into()))?;
             let content_quota = catalog_quota(reference.target(), &record)
@@ -126,7 +126,7 @@ where
     P: Clone + Ord,
     E: KvProjectionEngine<P>,
 {
-    let wrapper = load_typed(engine, wrapper_id, ObjectKind::NamespaceMap)?;
+    let wrapper = load_typed(engine, owner, wrapper_id, ObjectKind::NamespaceMap)?;
     if wrapper.canonical_bytes().len() != std::mem::size_of::<u64>()
         || wrapper.class() != ObjectClass::Metadata
     {
@@ -155,7 +155,7 @@ where
     let validation = if let Some(validation) = cached {
         validation
     } else {
-        let mut context = TreeContext::<P, E>::new(engine);
+        let mut context = TreeContext::<P, E>::new(engine, owner);
         let validation = context.validate_tree(tree)?;
         validated_trees.lock().insert(owner.clone(), validation);
         validation
@@ -167,12 +167,17 @@ where
     Ok((tree, quota_bytes))
 }
 
-fn load_typed<P, E>(engine: &E, id: ObjectId, kind: ObjectKind) -> StorageResult<ObjectRecord>
+fn load_typed<P, E>(
+    engine: &E,
+    owner: &P,
+    id: ObjectId,
+    kind: ObjectKind,
+) -> StorageResult<ObjectRecord>
 where
     E: KvProjectionEngine<P>,
 {
     let record = engine
-        .load_kv_object(id)
+        .load_kv_object_for(owner, id)
         .map_err(|error| map_engine(&error))?
         .ok_or_else(|| map_engine(&ModelError::MissingObject(id).into()))?;
     if record.kind() != kind || record.format_version() != FORMAT_VERSION {

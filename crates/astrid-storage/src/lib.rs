@@ -72,6 +72,11 @@ pub use secret::{
 #[cfg(feature = "keychain")]
 pub use secret::{FallbackSecretStore, KeychainSecretStore};
 
+#[cfg(not(target_family = "wasm"))]
+pub use astrid_storage_engine::{
+    ObjectCacheCapacity, ObjectCacheConfig, ObjectCacheController, ObjectCacheStats,
+    PrincipalObjectCacheBudget,
+};
 #[cfg(feature = "legacy-surrealkv")]
 pub use kv::SurrealKvStore;
 #[cfg(not(target_family = "wasm"))]

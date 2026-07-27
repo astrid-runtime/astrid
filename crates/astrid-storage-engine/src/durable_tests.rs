@@ -1179,12 +1179,14 @@ fn governed_object_cache_verifies_once_and_charges_each_principal() {
     assert!(stats.resident_bytes > 0);
     assert_eq!(
         engine.object_cache_principal_charge(&alice),
-        stats.resident_bytes
+        stats.resident_record_bytes
     );
     assert_eq!(
         engine.object_cache_principal_charge(&bob),
-        stats.resident_bytes
+        stats.resident_record_bytes
     );
+    assert_eq!(stats.resident_associations, 2);
+    assert!(stats.resident_association_bytes > 0);
 }
 
 #[test]

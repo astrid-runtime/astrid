@@ -13,8 +13,8 @@ use std::sync::Arc;
 use astrid_core::dirs::AstridHome;
 use astrid_core::principal::PrincipalId;
 use astrid_storage_engine::{
-    DurableEngine, IdentityScheme, ObjectCacheConfig, PersistentObjectIdentity, PrincipalCodec,
-    RecoveryLimits,
+    DurableEngine, IdentityScheme, ObjectCacheConfig, ObjectCacheStats, PersistentObjectIdentity,
+    PrincipalCodec, RecoveryLimits,
 };
 use astrid_storage_model::{
     ObjectClass, ObjectFormatVersion, ObjectId, ObjectIdentity, ObjectKind, ObjectRecord,
@@ -180,12 +180,31 @@ pub type NativePrincipalContentStore = PrincipalContentStore<
 /// Native principal-store projections opened over one durable engine.
 #[derive(Clone)]
 pub struct RuntimePrincipalStore {
+    engine: Arc<RuntimeEngine>,
     kv: Arc<dyn KvStore>,
     content: Arc<NativePrincipalContentStore>,
     staging: Arc<NativeContentStagingArea>,
 }
 
 impl RuntimePrincipalStore {
+    /// Return privileged decoded-object cache diagnostics.
+    ///
+    /// These values are for kernel and operator accounting. Guest surfaces
+    /// must not expose cache residency because it can reveal cross-principal
+    /// reuse.
+    #[must_use]
+    pub fn object_cache_stats(&self) -> ObjectCacheStats {
+        self.engine.object_cache_stats()
+    }
+
+    /// Return one owner's current logical decoded-object cache charge.
+    ///
+    /// The charge is independent of whether physical records are shared.
+    #[must_use]
+    pub fn object_cache_principal_charge(&self, owner: &StateOwner) -> u64 {
+        self.engine.object_cache_principal_charge(owner)
+    }
+
     /// Clone the runtime KV projection.
     #[must_use]
     pub fn kv(&self) -> Arc<dyn KvStore> {
@@ -314,10 +333,12 @@ pub async fn open_runtime_principal_store_with_object_cache(
         Arc::clone(&quota),
     ));
     let content = Arc::new(NativePrincipalContentStore::from_engine_with_quota(
-        engine, quota,
+        Arc::clone(&engine),
+        quota,
     ));
     let staging = Arc::new(NativeContentStagingArea::open(home.content_staging_path())?);
     Ok(RuntimePrincipalStore {
+        engine,
         kv,
         content,
         staging,
@@ -443,7 +464,9 @@ fn quarantine_incomplete(path: &Path) -> StorageResult<()> {
 #[cfg(test)]
 mod tests {
     use std::io::{Seek as _, SeekFrom, Write as _};
+    use std::num::NonZeroU64;
 
+    use astrid_storage_engine::{ObjectCacheCapacity, ObjectCacheController};
     use astrid_storage_model::{ObjectFormatVersion, ObjectKind};
 
     use super::*;
@@ -456,6 +479,40 @@ mod tests {
                 StateOwner::Principal(_) => Some(u64::MAX),
             })
         })
+    }
+
+    #[tokio::test]
+    async fn runtime_reports_principal_attributed_cache_residency() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(directory.path());
+        let capacity = ObjectCacheCapacity::Bounded(NonZeroU64::new(1024 * 1024).unwrap());
+        let store = open_runtime_principal_store_with_object_cache(
+            &home,
+            unlimited_quota(),
+            ObjectCacheConfig::new(
+                ObjectCacheController::new(capacity),
+                Arc::new(move |_: &StateOwner| capacity),
+            ),
+        )
+        .await
+        .unwrap();
+        let owner = StateOwner::Principal(PrincipalId::new("alice").unwrap());
+
+        store
+            .kv()
+            .set("alice:capsule:shell", "cwd", b"/workspace".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(
+            store.kv().get("alice:capsule:shell", "cwd").await.unwrap(),
+            Some(b"/workspace".to_vec())
+        );
+
+        let stats = store.object_cache_stats();
+        assert!(stats.resident_objects > 0);
+        assert!(stats.resident_record_bytes > 0);
+        assert!(stats.resident_association_bytes > 0);
+        assert!(store.object_cache_principal_charge(&owner) > 0);
     }
 
     #[cfg(not(target_os = "windows"))]

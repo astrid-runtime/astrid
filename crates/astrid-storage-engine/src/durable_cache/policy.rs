@@ -159,6 +159,17 @@ pub struct ObjectCacheStats {
     pub evictions: u64,
     /// Current physical record count.
     pub resident_objects: u64,
-    /// Current physical charged bytes.
+    /// Current total charged bytes, including decoded records and
+    /// principal-to-record association payloads.
     pub resident_bytes: u64,
+    /// Current bytes charged for physically shared decoded records.
+    pub resident_record_bytes: u64,
+    /// Current bytes charged for principal-to-record association payloads.
+    ///
+    /// This scales with logical cache users even when they share one physical
+    /// record, preventing sharing metadata from growing outside the cache
+    /// budget.
+    pub resident_association_bytes: u64,
+    /// Current number of principal-to-record associations.
+    pub resident_associations: u64,
 }
