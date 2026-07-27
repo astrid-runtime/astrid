@@ -114,6 +114,24 @@ pub trait PrincipalProjectionEngine<P>: Send + Sync {
     /// read.
     fn load_object(&self, id: ObjectId) -> Result<Option<ObjectRecord>, PrincipalProjectionError>;
 
+    /// Load one immutable object with principal cache attribution.
+    ///
+    /// The default preserves engines without a governed decoded-object cache.
+    /// Cache policy is a performance and resource-accounting concern; it must
+    /// never change the bytes or errors returned by [`Self::load_object`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a projection error when the object arena cannot complete the
+    /// read.
+    fn load_object_for(
+        &self,
+        _principal: &P,
+        id: ObjectId,
+    ) -> Result<Option<ObjectRecord>, PrincipalProjectionError> {
+        self.load_object(id)
+    }
+
     /// Atomically publish one principal-state transition.
     ///
     /// # Errors
@@ -210,6 +228,14 @@ where
 
     fn load_object(&self, id: ObjectId) -> Result<Option<ObjectRecord>, PrincipalProjectionError> {
         self.object(id).map_err(map_durable)
+    }
+
+    fn load_object_for(
+        &self,
+        principal: &P,
+        id: ObjectId,
+    ) -> Result<Option<ObjectRecord>, PrincipalProjectionError> {
+        self.object_for(principal, id).map_err(map_durable)
     }
 
     fn commit_root(

@@ -146,6 +146,19 @@ fn open_with_fault(path: &Path, point: FaultPoint) -> TestEngine {
     .unwrap()
 }
 
+fn open_with_cache(path: &Path, controller: ObjectCacheController) -> TestEngine {
+    let principal_capacity =
+        ObjectCacheCapacity::Bounded(std::num::NonZeroU64::new(1024 * 1024).unwrap());
+    DurableEngine::open_with_object_cache(
+        path,
+        TestIdentity,
+        Utf8Codec,
+        limits(),
+        ObjectCacheConfig::new(controller, Arc::new(move |_: &String| principal_capacity)),
+    )
+    .unwrap()
+}
+
 pub(super) fn transaction(
     principal: &str,
     expected: Option<RootState>,
@@ -1298,6 +1311,44 @@ fn second_writer_cannot_open_the_same_store() {
 
     drop(first);
     assert!(DurableEngine::open(directory.path(), TestIdentity, Utf8Codec, limits()).is_ok());
+}
+
+#[test]
+fn governed_object_cache_verifies_once_and_charges_each_principal() {
+    let directory = tempfile::tempdir().unwrap();
+    let total = ObjectCacheCapacity::Bounded(std::num::NonZeroU64::new(2 * 1024 * 1024).unwrap());
+    let engine = open_with_cache(directory.path(), ObjectCacheController::new(total));
+    let record = ObjectRecord::new(
+        ObjectKind::Evidence,
+        ObjectFormatVersion::V1,
+        b"cacheable evidence".to_vec(),
+        Vec::new(),
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let (id, _) = engine.persist_standalone_object(&record).unwrap();
+    let alice = "alice".to_owned();
+    let bob = "bob".to_owned();
+
+    assert_eq!(engine.object_for(&alice, id).unwrap(), Some(record.clone()));
+    assert_eq!(engine.object_for(&alice, id).unwrap(), Some(record.clone()));
+    assert_eq!(engine.object_for(&bob, id).unwrap(), Some(record));
+
+    let stats = engine.object_cache_stats();
+    assert_eq!(stats.misses, 1);
+    assert_eq!(stats.hits, 2);
+    assert_eq!(stats.insertions, 1);
+    assert_eq!(stats.resident_objects, 1);
+    assert!(stats.resident_bytes > 0);
+    assert_eq!(
+        engine.object_cache_principal_charge(&alice),
+        stats.resident_bytes
+    );
+    assert_eq!(
+        engine.object_cache_principal_charge(&bob),
+        stats.resident_bytes
+    );
 }
 
 #[test]
