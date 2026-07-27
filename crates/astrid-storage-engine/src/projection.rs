@@ -5,6 +5,7 @@
 //! a side root while keeping the engine unaware of projection semantics.
 
 use std::fmt;
+use std::sync::Arc;
 
 use astrid_storage_model::{
     InsertOutcome, ModelError, ObjectId, ObjectIdentity, ObjectRecord, RootState,
@@ -132,6 +133,26 @@ pub trait PrincipalProjectionEngine<P>: Send + Sync {
         self.load_object(id)
     }
 
+    /// Load one immutable object through a shared allocation with principal
+    /// cache attribution.
+    ///
+    /// The default preserves engines that return owned records. Governed
+    /// caching engines should override this method so a hit only increments a
+    /// reference count.
+    ///
+    /// # Errors
+    ///
+    /// Returns a projection error when the object arena cannot complete the
+    /// read.
+    fn load_shared_object_for(
+        &self,
+        principal: &P,
+        id: ObjectId,
+    ) -> Result<Option<Arc<ObjectRecord>>, PrincipalProjectionError> {
+        self.load_object_for(principal, id)
+            .map(|record| record.map(Arc::new))
+    }
+
     /// Load immutable objects in request order with principal cache
     /// attribution.
     ///
@@ -149,6 +170,27 @@ pub trait PrincipalProjectionEngine<P>: Send + Sync {
         ids.iter()
             .map(|id| self.load_object_for(principal, *id))
             .collect()
+    }
+
+    /// Load immutable objects through shared allocations in request order.
+    ///
+    /// The default preserves engines without a shared batch path.
+    ///
+    /// # Errors
+    ///
+    /// Returns a projection error when the object arena cannot complete the
+    /// reads.
+    fn load_shared_objects_for(
+        &self,
+        principal: &P,
+        ids: &[ObjectId],
+    ) -> Result<Vec<Option<Arc<ObjectRecord>>>, PrincipalProjectionError> {
+        self.load_objects_for(principal, ids).map(|records| {
+            records
+                .into_iter()
+                .map(|record| record.map(Arc::new))
+                .collect()
+        })
     }
 
     /// Atomically publish one principal-state transition.
@@ -257,12 +299,28 @@ where
         self.object_for(principal, id).map_err(map_durable)
     }
 
+    fn load_shared_object_for(
+        &self,
+        principal: &P,
+        id: ObjectId,
+    ) -> Result<Option<Arc<ObjectRecord>>, PrincipalProjectionError> {
+        self.shared_object_for(principal, id).map_err(map_durable)
+    }
+
     fn load_objects_for(
         &self,
         principal: &P,
         ids: &[ObjectId],
     ) -> Result<Vec<Option<ObjectRecord>>, PrincipalProjectionError> {
         self.objects_for(principal, ids).map_err(map_durable)
+    }
+
+    fn load_shared_objects_for(
+        &self,
+        principal: &P,
+        ids: &[ObjectId],
+    ) -> Result<Vec<Option<Arc<ObjectRecord>>>, PrincipalProjectionError> {
+        self.shared_objects_for(principal, ids).map_err(map_durable)
     }
 
     fn commit_root(

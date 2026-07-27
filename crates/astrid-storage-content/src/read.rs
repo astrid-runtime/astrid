@@ -1,4 +1,4 @@
-use alloc::vec::Vec;
+use alloc::{sync::Arc, vec::Vec};
 use core::fmt;
 
 use astrid_storage_model::{
@@ -24,6 +24,24 @@ pub trait ContentSource {
     /// complete the read.
     fn load_content_object(&self, id: ObjectId) -> Result<Option<ObjectRecord>, Self::Error>;
 
+    /// Load one immutable object through a shared allocation.
+    ///
+    /// The default preserves existing sources by wrapping their owned result.
+    /// Caching sources should override this method so a hit is only a reference
+    /// count increment.
+    ///
+    /// # Errors
+    ///
+    /// Returns the source-specific error when the backing object arena cannot
+    /// complete the read.
+    fn load_shared_content_object(
+        &self,
+        id: ObjectId,
+    ) -> Result<Option<Arc<ObjectRecord>>, Self::Error> {
+        self.load_content_object(id)
+            .map(|record| record.map(Arc::new))
+    }
+
     /// Load a bounded group of immutable objects in request order.
     ///
     /// The default preserves sources without a batch path. Durable sources may
@@ -39,6 +57,27 @@ pub trait ContentSource {
         ids: &[ObjectId],
     ) -> Result<Vec<Option<ObjectRecord>>, Self::Error> {
         ids.iter().map(|id| self.load_content_object(*id)).collect()
+    }
+
+    /// Load a bounded group through shared allocations in request order.
+    ///
+    /// The default preserves existing sources while allowing caching sources
+    /// to return their resident immutable allocations without cloning them.
+    ///
+    /// # Errors
+    ///
+    /// Returns the source-specific error when the backing object arena cannot
+    /// complete the reads.
+    fn load_shared_content_objects(
+        &self,
+        ids: &[ObjectId],
+    ) -> Result<Vec<Option<Arc<ObjectRecord>>>, Self::Error> {
+        self.load_content_objects(ids).map(|records| {
+            records
+                .into_iter()
+                .map(|record| record.map(Arc::new))
+                .collect()
+        })
     }
 }
 
@@ -355,7 +394,7 @@ struct LoadedChunk {
 
 struct LoadedRecord {
     object: ObjectId,
-    record: ObjectRecord,
+    record: Arc<ObjectRecord>,
 }
 
 impl LoadedChunk {
@@ -577,12 +616,12 @@ fn append_loaded_range<S: ContentSource>(
 fn load_many<S: ContentSource>(
     source: &S,
     objects: &[ObjectId],
-) -> Result<Vec<ObjectRecord>, ContentReadError<S::Error>> {
+) -> Result<Vec<Arc<ObjectRecord>>, ContentReadError<S::Error>> {
     let Some(first) = objects.first().copied() else {
         return Ok(Vec::new());
     };
     let records = source
-        .load_content_objects(objects)
+        .load_shared_content_objects(objects)
         .map_err(ContentReadError::Source)?;
     if records.len() != objects.len() {
         return Err(ContentError::InvalidObject {
@@ -920,9 +959,9 @@ fn tree_capacity(depth: u32) -> u64 {
 fn load<S: ContentSource>(
     source: &S,
     object: ObjectId,
-) -> Result<ObjectRecord, ContentReadError<S::Error>> {
+) -> Result<Arc<ObjectRecord>, ContentReadError<S::Error>> {
     source
-        .load_content_object(object)
+        .load_shared_content_object(object)
         .map_err(ContentReadError::Source)?
         .ok_or_else(|| ContentError::MissingObject(object).into())
 }
