@@ -16,7 +16,7 @@ kv = []
 legacy-surrealkv = ["dep:surrealkv"]
 db = ["dep:surrealdb"]
 keychain = ["dep:keyring"]
-full = ["legacy-surrealkv", "db"]
+full = ["kv", "legacy-surrealkv", "db"]
 
 [dependencies]
 astrid-core = { workspace = true }
