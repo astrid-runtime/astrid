@@ -34,7 +34,9 @@ struct PrincipalPartition {
 struct CacheState<P: Ord> {
     entries: BTreeMap<ObjectId, CachedObject<P>>,
     principals: BTreeMap<P, PrincipalPartition>,
-    resident_bytes: u64,
+    resident_record_bytes: u64,
+    resident_association_bytes: u64,
+    resident_associations: u64,
     clock: u64,
     hits: u64,
     misses: u64,
@@ -48,7 +50,9 @@ impl<P: Ord> Default for CacheState<P> {
         Self {
             entries: BTreeMap::new(),
             principals: BTreeMap::new(),
-            resident_bytes: 0,
+            resident_record_bytes: 0,
+            resident_association_bytes: 0,
+            resident_associations: 0,
             clock: 0,
             hits: 0,
             misses: 0,
@@ -99,7 +103,16 @@ where
             state.bypasses = state.bypasses.saturating_add(1);
             return None;
         }
-        state.attach_principal(principal, object, weight, principal_capacity);
+        if !state.is_attached(principal, object) {
+            let association_weight = association_weight::<P>();
+            state.evict_global_until_fits(association_weight, global_capacity, Some(object));
+            if !state.can_fit_global(association_weight, global_capacity)
+                || !state.attach_principal(principal, object, weight, principal_capacity)
+            {
+                state.bypasses = state.bypasses.saturating_add(1);
+                return None;
+            }
+        }
         let tick = state.tick();
         let record = {
             let entry = state.entries.get_mut(&object)?;
@@ -122,9 +135,11 @@ where
     ) -> Arc<ObjectRecord> {
         let record = Arc::new(record);
         let weight = cache_weight(&record);
+        let association_weight = association_weight::<P>();
         let global_capacity = self.controller.capacity();
         let principal_capacity = self.principal_budget.capacity(principal);
-        if !global_capacity.accepts(weight) || !principal_capacity.accepts(weight) {
+        let initial_weight = weight.saturating_add(association_weight);
+        if !global_capacity.accepts(initial_weight) || !principal_capacity.accepts(weight) {
             return record;
         }
 
@@ -132,7 +147,14 @@ where
         state.trim_global(global_capacity);
         state.trim_principal(principal, principal_capacity);
         if state.entries.contains_key(&object) {
-            state.attach_principal(principal, object, weight, principal_capacity);
+            if !state.is_attached(principal, object) {
+                state.evict_global_until_fits(association_weight, global_capacity, Some(object));
+                if !state.can_fit_global(association_weight, global_capacity)
+                    || !state.attach_principal(principal, object, weight, principal_capacity)
+                {
+                    return record;
+                }
+            }
             let tick = state.tick();
             let cached = state.entries.get_mut(&object).map(|entry| {
                 entry.last_access = tick;
@@ -146,9 +168,9 @@ where
         }
 
         state.evict_principal_until_fits(principal, weight, principal_capacity);
-        state.evict_global_until_fits(weight, global_capacity);
+        state.evict_global_until_fits(initial_weight, global_capacity, None);
         if !state.can_fit_principal(principal, weight, principal_capacity)
-            || !state.can_fit_global(weight, global_capacity)
+            || !state.can_fit_global(initial_weight, global_capacity)
         {
             return record;
         }
@@ -168,7 +190,11 @@ where
         let partition = state.principals.entry(principal.clone()).or_default();
         partition.entries.insert(object, tick);
         partition.charged_bytes = partition.charged_bytes.saturating_add(weight);
-        state.resident_bytes = state.resident_bytes.saturating_add(weight);
+        state.resident_record_bytes = state.resident_record_bytes.saturating_add(weight);
+        state.resident_association_bytes = state
+            .resident_association_bytes
+            .saturating_add(association_weight);
+        state.resident_associations = state.resident_associations.saturating_add(1);
         state.insertions = state.insertions.saturating_add(1);
         record
     }
@@ -182,7 +208,10 @@ where
             insertions: state.insertions,
             evictions: state.evictions,
             resident_objects: u64::try_from(state.entries.len()).unwrap_or(u64::MAX),
-            resident_bytes: state.resident_bytes,
+            resident_bytes: state.resident_bytes(),
+            resident_record_bytes: state.resident_record_bytes,
+            resident_association_bytes: state.resident_association_bytes,
+            resident_associations: state.resident_associations,
         }
     }
 
@@ -204,26 +233,33 @@ where
         self.clock
     }
 
+    fn is_attached(&self, principal: &P, object: ObjectId) -> bool {
+        self.principals
+            .get(principal)
+            .is_some_and(|partition| partition.entries.contains_key(&object))
+    }
+
     fn attach_principal(
         &mut self,
         principal: &P,
         object: ObjectId,
         weight: u64,
         capacity: ObjectCacheCapacity,
-    ) {
-        if self
-            .principals
-            .get(principal)
-            .is_some_and(|partition| partition.entries.contains_key(&object))
-        {
-            return;
+    ) -> bool {
+        if self.is_attached(principal, object) {
+            return true;
         }
         self.evict_principal_until_fits(principal, weight, capacity);
         if !self.can_fit_principal(principal, weight, capacity) {
-            return;
+            return false;
         }
         let partition = self.principals.entry(principal.clone()).or_default();
         partition.charged_bytes = partition.charged_bytes.saturating_add(weight);
+        self.resident_association_bytes = self
+            .resident_association_bytes
+            .saturating_add(association_weight::<P>());
+        self.resident_associations = self.resident_associations.saturating_add(1);
+        true
     }
 
     fn can_fit_principal(&self, principal: &P, weight: u64, capacity: ObjectCacheCapacity) -> bool {
@@ -240,7 +276,7 @@ where
 
     fn can_fit_global(&self, weight: u64, capacity: ObjectCacheCapacity) -> bool {
         capacity.limit().is_none_or(|limit| {
-            self.resident_bytes
+            self.resident_bytes()
                 .checked_add(weight)
                 .is_some_and(|total| total <= limit)
         })
@@ -287,11 +323,17 @@ where
         }
     }
 
-    fn evict_global_until_fits(&mut self, weight: u64, capacity: ObjectCacheCapacity) {
+    fn evict_global_until_fits(
+        &mut self,
+        weight: u64,
+        capacity: ObjectCacheCapacity,
+        protected: Option<ObjectId>,
+    ) {
         while !self.can_fit_global(weight, capacity) {
             let victim = self
                 .entries
                 .iter()
+                .filter(|(object, _)| Some(**object) != protected)
                 .min_by_key(|(_, entry)| entry.last_access)
                 .map(|(object, _)| *object);
             let Some(victim) = victim else {
@@ -304,7 +346,7 @@ where
     fn trim_global(&mut self, capacity: ObjectCacheCapacity) {
         while capacity
             .limit()
-            .is_some_and(|limit| self.resident_bytes > limit)
+            .is_some_and(|limit| self.resident_bytes() > limit)
         {
             let victim = self
                 .entries
@@ -327,6 +369,10 @@ where
             && partition.entries.remove(&object).is_some()
         {
             partition.charged_bytes = partition.charged_bytes.saturating_sub(weight);
+            self.resident_association_bytes = self
+                .resident_association_bytes
+                .saturating_sub(association_weight::<P>());
+            self.resident_associations = self.resident_associations.saturating_sub(1);
         }
         if self
             .principals
@@ -353,6 +399,10 @@ where
                 && partition.entries.remove(&object).is_some()
             {
                 partition.charged_bytes = partition.charged_bytes.saturating_sub(entry.weight);
+                self.resident_association_bytes = self
+                    .resident_association_bytes
+                    .saturating_sub(association_weight::<P>());
+                self.resident_associations = self.resident_associations.saturating_sub(1);
             }
             if self
                 .principals
@@ -362,8 +412,13 @@ where
                 self.principals.remove(&principal);
             }
         }
-        self.resident_bytes = self.resident_bytes.saturating_sub(entry.weight);
+        self.resident_record_bytes = self.resident_record_bytes.saturating_sub(entry.weight);
         self.evictions = self.evictions.saturating_add(1);
+    }
+
+    fn resident_bytes(&self) -> u64 {
+        self.resident_record_bytes
+            .saturating_add(self.resident_association_bytes)
     }
 }
 
@@ -373,6 +428,15 @@ fn cache_weight(record: &ObjectRecord) -> u64 {
         .retained_bytes()
         .unwrap_or(u64::MAX)
         .saturating_add(record_struct)
+}
+
+fn association_weight<P>() -> u64 {
+    u64::try_from(
+        std::mem::size_of::<P>()
+            .saturating_add(std::mem::size_of::<ObjectId>())
+            .saturating_add(std::mem::size_of::<u64>()),
+    )
+    .unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

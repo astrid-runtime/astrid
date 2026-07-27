@@ -274,7 +274,7 @@ where
         let Some(source) = migration_source(engine, owner, root)? else {
             return Ok(false);
         };
-        let mut context = TreeContext::new(engine);
+        let mut context = TreeContext::new(engine, owner);
         let tree = context.build_sorted(source.entries)?;
         let transaction = context.finish(source.header, tree)?;
         match engine.commit_kv_root(transaction) {

@@ -14,8 +14,8 @@ use astrid_core::identity::PrincipalUid;
 use astrid_core::kernel_api::{ProjectionNameDiagnostic, ProjectionNamePolicyPreset};
 use astrid_core::principal::PrincipalId;
 use astrid_storage_engine::{
-    DurableEngine, IdentityScheme, ObjectCacheConfig, PersistentObjectIdentity, PrincipalCodec,
-    RecoveryLimits,
+    DurableEngine, IdentityScheme, ObjectCacheConfig, ObjectCacheStats, PersistentObjectIdentity,
+    PrincipalCodec, RecoveryLimits,
 };
 use astrid_storage_model::{ObjectClass, ObjectId, ObjectIdentity, ObjectRecord, ReferenceKind};
 use parking_lot::Mutex;
@@ -202,6 +202,24 @@ pub struct RuntimePrincipalStore {
 }
 
 impl RuntimePrincipalStore {
+    /// Return privileged decoded-object cache diagnostics.
+    ///
+    /// These values are for kernel and operator accounting. Guest surfaces
+    /// must not expose cache residency because it can reveal cross-principal
+    /// reuse.
+    #[must_use]
+    pub fn object_cache_stats(&self) -> ObjectCacheStats {
+        self.engine.object_cache_stats()
+    }
+
+    /// Return one owner's current logical decoded-object cache charge.
+    ///
+    /// The charge is independent of whether physical records are shared.
+    #[must_use]
+    pub fn object_cache_principal_charge(&self, owner: &StateOwner) -> u64 {
+        self.engine.object_cache_principal_charge(owner)
+    }
+
     /// Clone the runtime KV projection.
     #[must_use]
     pub fn kv(&self) -> Arc<dyn KvStore> {

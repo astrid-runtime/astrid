@@ -288,8 +288,9 @@ mod tests {
         let engine = FixtureEngine {
             objects: BTreeMap::from([(left_id, left), (right_id, right), (root_id, root)]),
         };
+        let principal = "alice".to_owned();
 
-        let error = TreeContext::<String, _>::new(&engine)
+        let error = TreeContext::<String, _>::new(&engine, &principal)
             .validate_tree(Some(root_id))
             .unwrap_err();
         assert!(
@@ -310,8 +311,9 @@ mod tests {
         let engine = FixtureEngine {
             objects: BTreeMap::from([(leaf_id, leaf), (root_id, root)]),
         };
+        let principal = "alice".to_owned();
 
-        let error = TreeContext::<String, _>::new(&engine)
+        let error = TreeContext::<String, _>::new(&engine, &principal)
             .validate_tree(Some(root_id))
             .unwrap_err();
         assert!(error.to_string().contains("reuses a page"), "{error}");
@@ -339,8 +341,9 @@ mod tests {
         let engine = FixtureEngine {
             objects: BTreeMap::from([(root_id, root), (leaf_id, leaf)]),
         };
+        let principal = "alice".to_owned();
 
-        let error = TreeContext::<String, _>::new(&engine)
+        let error = TreeContext::<String, _>::new(&engine, &principal)
             .validate_tree(Some(root_id))
             .unwrap_err();
         assert!(error.to_string().contains("contains a cycle"), "{error}");
