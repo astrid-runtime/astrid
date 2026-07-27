@@ -28,11 +28,13 @@ struct CachedObject<P: Ord> {
 #[derive(Default)]
 struct PrincipalPartition {
     entries: BTreeMap<ObjectId, u64>,
+    lru: BTreeSet<(u64, ObjectId)>,
     charged_bytes: u64,
 }
 
 struct CacheState<P: Ord> {
     entries: BTreeMap<ObjectId, CachedObject<P>>,
+    lru: BTreeSet<(u64, ObjectId)>,
     principals: BTreeMap<P, PrincipalPartition>,
     resident_record_bytes: u64,
     resident_association_bytes: u64,
@@ -49,6 +51,7 @@ impl<P: Ord> Default for CacheState<P> {
     fn default() -> Self {
         Self {
             entries: BTreeMap::new(),
+            lru: BTreeSet::new(),
             principals: BTreeMap::new(),
             resident_record_bytes: 0,
             resident_association_bytes: 0,
@@ -113,16 +116,7 @@ where
                 return None;
             }
         }
-        let tick = state.tick();
-        let record = {
-            let entry = state.entries.get_mut(&object)?;
-            entry.last_access = tick;
-            entry.principals.insert(principal.clone());
-            Arc::clone(&entry.record)
-        };
-        if let Some(partition) = state.principals.get_mut(principal) {
-            partition.entries.insert(object, tick);
-        }
+        let record = state.touch(principal, object)?;
         state.hits = state.hits.saturating_add(1);
         Some(record)
     }
@@ -155,16 +149,7 @@ where
                     return record;
                 }
             }
-            let tick = state.tick();
-            let cached = state.entries.get_mut(&object).map(|entry| {
-                entry.last_access = tick;
-                entry.principals.insert(principal.clone());
-                Arc::clone(&entry.record)
-            });
-            if let Some(partition) = state.principals.get_mut(principal) {
-                partition.entries.insert(object, tick);
-            }
-            return cached.unwrap_or(record);
+            return state.touch(principal, object).unwrap_or(record);
         }
 
         state.evict_principal_until_fits(principal, weight, principal_capacity);
@@ -187,8 +172,10 @@ where
                 principals,
             },
         );
+        state.lru.insert((tick, object));
         let partition = state.principals.entry(principal.clone()).or_default();
         partition.entries.insert(object, tick);
+        partition.lru.insert((tick, object));
         partition.charged_bytes = partition.charged_bytes.saturating_add(weight);
         state.resident_record_bytes = state.resident_record_bytes.saturating_add(weight);
         state.resident_association_bytes = state
@@ -231,6 +218,28 @@ where
     fn tick(&mut self) -> u64 {
         self.clock = self.clock.saturating_add(1);
         self.clock
+    }
+
+    fn touch(&mut self, principal: &P, object: ObjectId) -> Option<Arc<ObjectRecord>> {
+        if !self.entries.contains_key(&object) || !self.principals.contains_key(principal) {
+            return None;
+        }
+        let tick = self.tick();
+        let (previous_tick, record) = {
+            let entry = self.entries.get_mut(&object)?;
+            let previous_tick = entry.last_access;
+            entry.last_access = tick;
+            entry.principals.insert(principal.clone());
+            (previous_tick, Arc::clone(&entry.record))
+        };
+        self.lru.remove(&(previous_tick, object));
+        self.lru.insert((tick, object));
+        let partition = self.principals.get_mut(principal)?;
+        if let Some(previous_tick) = partition.entries.insert(object, tick) {
+            partition.lru.remove(&(previous_tick, object));
+        }
+        partition.lru.insert((tick, object));
+        Some(record)
     }
 
     fn is_attached(&self, principal: &P, object: ObjectId) -> bool {
@@ -289,13 +298,10 @@ where
         capacity: ObjectCacheCapacity,
     ) {
         while !self.can_fit_principal(principal, weight, capacity) {
-            let victim = self.principals.get(principal).and_then(|partition| {
-                partition
-                    .entries
-                    .iter()
-                    .min_by_key(|(_, tick)| *tick)
-                    .map(|(object, _)| *object)
-            });
+            let victim = self
+                .principals
+                .get(principal)
+                .and_then(|partition| partition.lru.first().map(|(_, object)| *object));
             let Some(victim) = victim else {
                 break;
             };
@@ -309,13 +315,10 @@ where
                 .get(principal)
                 .is_some_and(|partition| partition.charged_bytes > limit)
         }) {
-            let victim = self.principals.get(principal).and_then(|partition| {
-                partition
-                    .entries
-                    .iter()
-                    .min_by_key(|(_, tick)| *tick)
-                    .map(|(object, _)| *object)
-            });
+            let victim = self
+                .principals
+                .get(principal)
+                .and_then(|partition| partition.lru.first().map(|(_, object)| *object));
             let Some(victim) = victim else {
                 break;
             };
@@ -331,11 +334,10 @@ where
     ) {
         while !self.can_fit_global(weight, capacity) {
             let victim = self
-                .entries
+                .lru
                 .iter()
-                .filter(|(object, _)| Some(**object) != protected)
-                .min_by_key(|(_, entry)| entry.last_access)
-                .map(|(object, _)| *object);
+                .find(|(_, object)| Some(*object) != protected)
+                .map(|(_, object)| *object);
             let Some(victim) = victim else {
                 break;
             };
@@ -348,11 +350,7 @@ where
             .limit()
             .is_some_and(|limit| self.resident_bytes() > limit)
         {
-            let victim = self
-                .entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.last_access)
-                .map(|(object, _)| *object);
+            let victim = self.lru.first().map(|(_, object)| *object);
             let Some(victim) = victim else {
                 break;
             };
@@ -366,8 +364,9 @@ where
             return;
         };
         if let Some(partition) = self.principals.get_mut(principal)
-            && partition.entries.remove(&object).is_some()
+            && let Some(tick) = partition.entries.remove(&object)
         {
+            partition.lru.remove(&(tick, object));
             partition.charged_bytes = partition.charged_bytes.saturating_sub(weight);
             self.resident_association_bytes = self
                 .resident_association_bytes
@@ -394,10 +393,12 @@ where
         let Some(entry) = self.entries.remove(&object) else {
             return;
         };
+        self.lru.remove(&(entry.last_access, object));
         for principal in entry.principals {
             if let Some(partition) = self.principals.get_mut(&principal)
-                && partition.entries.remove(&object).is_some()
+                && let Some(tick) = partition.entries.remove(&object)
             {
+                partition.lru.remove(&(tick, object));
                 partition.charged_bytes = partition.charged_bytes.saturating_sub(entry.weight);
                 self.resident_association_bytes = self
                     .resident_association_bytes
@@ -423,16 +424,21 @@ where
 }
 
 fn cache_weight(record: &ObjectRecord) -> u64 {
-    let record_struct = u64::try_from(std::mem::size_of::<ObjectRecord>()).unwrap_or(u64::MAX);
+    let resident_metadata = std::mem::size_of::<ObjectRecord>()
+        .saturating_add(std::mem::size_of::<Arc<ObjectRecord>>())
+        .saturating_add(std::mem::size_of::<ObjectId>())
+        .saturating_add(std::mem::size_of::<u64>());
     record
         .retained_bytes()
         .unwrap_or(u64::MAX)
-        .saturating_add(record_struct)
+        .saturating_add(u64::try_from(resident_metadata).unwrap_or(u64::MAX))
 }
 
 fn association_weight<P>() -> u64 {
     u64::try_from(
         std::mem::size_of::<P>()
+            .saturating_add(std::mem::size_of::<ObjectId>())
+            .saturating_add(std::mem::size_of::<u64>())
             .saturating_add(std::mem::size_of::<ObjectId>())
             .saturating_add(std::mem::size_of::<u64>()),
     )

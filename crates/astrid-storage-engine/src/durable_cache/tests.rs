@@ -32,6 +32,24 @@ fn cache(controller: ObjectCacheController, principal_bytes: u64) -> ObjectCache
     ))
 }
 
+fn assert_lru_indexes(cache: &ObjectCache<String>) {
+    let state = cache.state.lock();
+    let expected_global: BTreeSet<_> = state
+        .entries
+        .iter()
+        .map(|(object, entry)| (entry.last_access, *object))
+        .collect();
+    assert_eq!(state.lru, expected_global);
+    for partition in state.principals.values() {
+        let expected: BTreeSet<_> = partition
+            .entries
+            .iter()
+            .map(|(object, tick)| (*tick, *object))
+            .collect();
+        assert_eq!(partition.lru, expected);
+    }
+}
+
 #[test]
 fn shares_one_physical_record_but_charges_each_principal_fully() {
     let controller = ObjectCacheController::new(ObjectCacheCapacity::Unbounded);
@@ -63,6 +81,7 @@ fn shares_one_physical_record_but_charges_each_principal_fully() {
     );
     assert_eq!(cache.principal_charge(&"alice".to_owned()), weight);
     assert_eq!(cache.principal_charge(&"bob".to_owned()), weight);
+    assert_lru_indexes(&cache);
 }
 
 #[test]
@@ -83,6 +102,7 @@ fn live_budget_reduction_evicts_without_failing_reads() {
     assert!(cache.get(&"alice".to_owned(), object(2)).is_some());
     assert_eq!(cache.stats().resident_objects, 1);
     assert!(cache.stats().evictions >= 1);
+    assert_lru_indexes(&cache);
 }
 
 #[test]
@@ -105,6 +125,30 @@ fn shared_object_associations_are_bounded_by_the_global_pool() {
     assert_eq!(stats.resident_associations, 2);
     assert!(stats.resident_bytes <= capacity.get());
     assert_eq!(cache.principal_charge(&"charlie".to_owned()), 0);
+    assert_lru_indexes(&cache);
+}
+
+#[test]
+fn ordered_indexes_evict_the_least_recently_used_object() {
+    let value = record(1);
+    let record_weight = cache_weight(&value);
+    let association = association_weight::<String>();
+    let capacity =
+        NonZeroU64::new(record_weight.saturating_add(association).saturating_mul(2)).unwrap();
+    let controller = ObjectCacheController::new(ObjectCacheCapacity::Bounded(capacity));
+    let cache = cache(controller, record_weight.saturating_mul(2));
+    let alice = "alice".to_owned();
+
+    cache.insert(&alice, object(1), value);
+    cache.insert(&alice, object(2), record(2));
+    assert!(cache.get(&alice, object(1)).is_some());
+    cache.insert(&alice, object(3), record(3));
+
+    assert!(cache.get(&alice, object(1)).is_some());
+    assert!(cache.get(&alice, object(2)).is_none());
+    assert!(cache.get(&alice, object(3)).is_some());
+    assert_eq!(cache.stats().resident_objects, 2);
+    assert_lru_indexes(&cache);
 }
 
 #[test]
