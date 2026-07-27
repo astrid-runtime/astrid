@@ -7,7 +7,7 @@ use astrid_storage_model::{InsertOutcome, ModelError, ObjectId, ObjectRecord};
 use super::{
     ARENA_FILE, ARENA_MAGIC, DurableEngine, DurableError, PersistentObjectIdentity, PrincipalCodec,
     append_frame, append_frames, encode_object_frame, ensure_payload_limit, ensure_usable,
-    read_indexed_object,
+    live_files_mut, read_indexed_object,
 };
 
 impl<P, I, C> DurableEngine<P, I, C>
@@ -41,13 +41,16 @@ where
         let mut inner = self.inner.lock();
         ensure_usable(&inner)?;
         if let Some(location) = inner.index.get(&id).copied() {
-            let existing = read_indexed_object(
-                &mut inner.arena,
-                id,
-                location,
-                self.identity.scheme(),
-                self.limits,
-            )?;
+            let existing = {
+                let files = live_files_mut(&mut inner.files)?;
+                read_indexed_object(
+                    &mut files.arena,
+                    id,
+                    location,
+                    self.identity.scheme(),
+                    self.limits,
+                )?
+            };
             if &existing != record {
                 return Err(ModelError::ObjectCollision(id).into());
             }
@@ -55,7 +58,11 @@ where
         }
         let payload = encode_object_frame(self.identity.scheme(), id, record)?;
         ensure_payload_limit(ARENA_FILE, 0, payload.len(), self.limits)?;
-        match append_frame(&mut inner.arena, ARENA_MAGIC, &payload) {
+        let appended = {
+            let files = live_files_mut(&mut inner.files)?;
+            append_frame(&mut files.arena, ARENA_MAGIC, &payload)
+        };
+        match appended {
             Ok(location) => {
                 inner.index.insert(id, location);
                 Ok((id, InsertOutcome::Inserted))
@@ -106,13 +113,16 @@ where
         let mut already_present = BTreeSet::new();
         for (id, (record, _)) in &incoming {
             if let Some(location) = inner.index.get(id).copied() {
-                let existing = read_indexed_object(
-                    &mut inner.arena,
-                    *id,
-                    location,
-                    self.identity.scheme(),
-                    self.limits,
-                )?;
+                let existing = {
+                    let files = live_files_mut(&mut inner.files)?;
+                    read_indexed_object(
+                        &mut files.arena,
+                        *id,
+                        location,
+                        self.identity.scheme(),
+                        self.limits,
+                    )?
+                };
                 if &existing != record {
                     return Err(ModelError::ObjectCollision(*id).into());
                 }
@@ -152,7 +162,10 @@ where
             ids.push(id);
             payloads.push(payload);
         }
-        let appended = append_frames(&mut inner.arena, ARENA_MAGIC, &payloads);
+        let appended = {
+            let files = live_files_mut(&mut inner.files)?;
+            append_frames(&mut files.arena, ARENA_MAGIC, &payloads)
+        };
         match appended {
             Ok(locations) => {
                 inner.index.extend(ids.into_iter().zip(locations));
