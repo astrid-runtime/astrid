@@ -444,6 +444,44 @@ mod tests {
         })
     }
 
+    #[cfg(not(target_os = "windows"))]
+    fn assert_reader_rejects_substituted_format_specification(home: &AstridHome, script: &Path) {
+        let format_spec_id = Blake3ObjectIdentityV1.identify(&format_spec_record().unwrap());
+        let engine = RuntimeEngine::open(
+            home.principal_store_path(),
+            Blake3ObjectIdentityV1,
+            StateOwnerCodecV1,
+            RecoveryLimits::process_addressable(),
+        )
+        .unwrap();
+        let replacement_spec = ObjectRecord::new(
+            ObjectKind::Evidence,
+            ObjectFormatVersion::V1,
+            b"self-consistent replacement format specification".to_vec(),
+            Vec::new(),
+            0,
+            ObjectClass::Metadata,
+        )
+        .unwrap();
+        let (replacement_id, inserted) =
+            engine.persist_standalone_object(&replacement_spec).unwrap();
+        assert_eq!(inserted, astrid_storage_model::InsertOutcome::Inserted);
+        engine.close().unwrap();
+
+        let metadata = home.principal_store_path().join(STORE_METADATA_FILE);
+        std::fs::write(&metadata, store_metadata(replacement_id)).unwrap();
+        let substituted = std::process::Command::new("python3")
+            .arg(script)
+            .arg(home.principal_store_path())
+            .output()
+            .unwrap();
+        assert!(
+            !substituted.status.success(),
+            "independent reader accepted a substituted format specification"
+        );
+        std::fs::write(metadata, store_metadata(format_spec_id)).unwrap();
+    }
+
     #[test]
     fn owner_codec_round_trips_only_canonical_values() {
         let codec = StateOwnerCodecV1;
@@ -543,7 +581,7 @@ mod tests {
         let script = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../scripts/principal_store_v1_reader.py");
         let output = std::process::Command::new("python3")
-            .arg(script)
+            .arg(&script)
             .arg(home.principal_store_path())
             .output()
             .unwrap();
@@ -575,49 +613,7 @@ mod tests {
                 .any(|object| object["kind"] == "Commit")
         );
 
-        let format_spec_id = Blake3ObjectIdentityV1.identify(&format_spec_record().unwrap());
-        let engine = RuntimeEngine::open(
-            home.principal_store_path(),
-            Blake3ObjectIdentityV1,
-            StateOwnerCodecV1,
-            RecoveryLimits::process_addressable(),
-        )
-        .unwrap();
-        let replacement_spec = ObjectRecord::new(
-            ObjectKind::Evidence,
-            ObjectFormatVersion::V1,
-            b"self-consistent replacement format specification".to_vec(),
-            Vec::new(),
-            0,
-            ObjectClass::Metadata,
-        )
-        .unwrap();
-        let (replacement_id, inserted) =
-            engine.persist_standalone_object(&replacement_spec).unwrap();
-        assert_eq!(inserted, astrid_storage_model::InsertOutcome::Inserted);
-        engine.close().unwrap();
-        std::fs::write(
-            home.principal_store_path().join(STORE_METADATA_FILE),
-            store_metadata(replacement_id),
-        )
-        .unwrap();
-        let substituted = std::process::Command::new("python3")
-            .arg(
-                Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../../scripts/principal_store_v1_reader.py"),
-            )
-            .arg(home.principal_store_path())
-            .output()
-            .unwrap();
-        assert!(
-            !substituted.status.success(),
-            "independent reader accepted a substituted format specification"
-        );
-        std::fs::write(
-            home.principal_store_path().join(STORE_METADATA_FILE),
-            store_metadata(format_spec_id),
-        )
-        .unwrap();
+        assert_reader_rejects_substituted_format_specification(&home, &script);
 
         let arena_path = home.principal_store_path().join("objects.arena");
         let mut arena = std::fs::read(&arena_path).unwrap();

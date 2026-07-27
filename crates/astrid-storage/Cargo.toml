@@ -10,6 +10,9 @@ description = "Unified storage integration for Astrid principal state, raw KV, a
 
 [features]
 default = []
+# Deprecated compatibility alias. KV is always backed by the native object
+# store; this remains only so existing downstream feature selections compile.
+kv = []
 legacy-surrealkv = ["dep:surrealkv"]
 db = ["dep:surrealdb"]
 keychain = ["dep:keyring"]

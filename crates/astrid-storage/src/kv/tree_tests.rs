@@ -115,6 +115,7 @@ fn leaf(
     insert_record(engine, records, record)
 }
 
+#[derive(Clone, Copy)]
 struct BranchSpec<'a> {
     key: &'a [u8],
     value: ObjectId,

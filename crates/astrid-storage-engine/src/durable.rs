@@ -624,60 +624,6 @@ where
         }
     }
 
-    /// Flush both authoritative files.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DurableError::RequiresRecovery`] after a failed write or the
-    /// underlying filesystem error.
-    pub fn flush(&self) -> Result<(), DurableError> {
-        let mut inner = self.inner.lock();
-        ensure_usable(&inner)?;
-        let files = live_files_mut(&mut inner.files)?;
-        if let Err(source) = files.arena.sync_data() {
-            inner.poisoned = true;
-            return Err(io_error("flush object arena", source));
-        }
-        if let Err(source) = files.roots.sync_data() {
-            inner.poisoned = true;
-            return Err(io_error("flush root journal", source));
-        }
-        Ok(())
-    }
-
-    /// Flush, unlock, and close the authoritative store files.
-    ///
-    /// Closing is idempotent. Every other operation returns
-    /// [`DurableError::Closed`] after the first close, even while other
-    /// [`Arc`] references keep this engine value alive.
-    ///
-    /// # Errors
-    ///
-    /// Returns a recovery-required, flush, or unlock error after still
-    /// releasing every owned file handle.
-    pub fn close(&self) -> Result<(), DurableError> {
-        let mut inner = self.inner.lock();
-        if inner.files.is_none() {
-            return Ok(());
-        }
-        let poisoned = inner.poisoned;
-        let files = live_files_mut(&mut inner.files)?;
-        let result = if poisoned {
-            Err(DurableError::RequiresRecovery)
-        } else if let Err(source) = files.arena.sync_data() {
-            Err(io_error("flush object arena while closing", source))
-        } else if let Err(source) = files.roots.sync_data() {
-            Err(io_error("flush root journal while closing", source))
-        } else {
-            Ok(())
-        };
-        let files = inner.files.take().ok_or(DurableError::Closed)?;
-        let unlock = fs2::FileExt::unlock(&files.lock)
-            .map_err(|source| io_error("unlock principal store while closing", source));
-        drop(files);
-        result.and(unlock)
-    }
-
     fn prepare(
         &self,
         inner: &mut DurableInner<P>,
@@ -1009,6 +955,8 @@ fn recovery_closure_error(error: DurableError, root_offset: u64) -> DurableError
 
 #[path = "durable_format.rs"]
 mod format;
+#[path = "durable_lifecycle.rs"]
+mod lifecycle;
 
 use format::{
     append_frame, encode_object_frame, encode_root_record, ensure_payload_limit, io_error, open_rw,
