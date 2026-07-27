@@ -191,6 +191,25 @@ physical_bytes(store) =
     encoded replicas + indexes + WAL + free-space/compaction amplification
 ```
 
+Cost accounting keeps five independent dimensions:
+
+- logical ownership: current state and metadata promised to a principal or
+  trust domain;
+- physical writes: bytes written, rewritten, replicated, or erased by the
+  operator;
+- CPU time: attributed guest execution and host work such as hashing,
+  decoding, verification, ingest, compaction, and reconstruction;
+- resident byte-time: live memory retained for realms, decoded objects,
+  buffers, compiler workers, GPU staging, and other principal-triggered host
+  work;
+- retention byte-time: non-current generations, rollback pins, legal holds,
+  evidence, and other history kept reachable over time.
+
+The dimensions do not substitute for one another. A current 1 GiB root, ten
+pinned 1 GiB generations, and a 1 GiB hot decoded-object cache have different
+causes, lifetimes, and policy controls even when their byte counts happen to
+match.
+
 `size(o)` is the stable logical canonical-record size, not merely the payload
 length and not Rust heap capacity. The executable model charges the fixed
 kind/version/class/length fields, canonical payload bytes, and every
@@ -204,9 +223,23 @@ metadata, not on a moving “fair share” of physical bytes. Alice's permitted
 state must not shrink because Bob deleted his reference or grow because Bob
 imported the same data.
 
+Private-domain billing follows the same rule: no guest-visible price,
+quota/admission result, or bill movement may depend on content equality outside
+the caller's declared trust domain. The first writer does not pay a unique-byte
+surcharge and a later writer does not receive a deduplication discount.
+Principals buy stable logical envelopes; physical convergence is an operator
+efficiency dividend.
+
+An explicitly shared organization or other trust domain may be billed as one
+aggregate account. Allocation among its principals is the customer's concern
+unless the domain explicitly opts into a documented internal allocation
+policy; per-principal splits otherwise recreate bill-fluctuation and equality
+probes inside the organization. Public-content domains may price unique bytes
+because equality is intentionally public there.
+
 Operators additionally enforce pool capacity, replication headroom, temporary
-import/rebalance headroom, and physical watermarks. A proportional shared-byte
-figure may be reported for cost analysis:
+import/rebalance headroom, and physical watermarks. An operator-only
+proportional shared-byte figure may be computed for cost analysis:
 
 ```text
 fair_share(p) = sum(size(o) / number_of_principals_reaching(o))
