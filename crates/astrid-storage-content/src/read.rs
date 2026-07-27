@@ -7,7 +7,7 @@ use astrid_storage_model::{
 
 use crate::{
     CHUNK_TREE_FANOUT, CONTENT_LABEL, ChunkingProfile, ContentDescriptor, ContentError,
-    FORMAT_VERSION,
+    FORMAT_VERSION, OpenedContent,
     boundary::{is_canonical_boundary, is_canonical_final_chunk},
     decode_file_header,
 };
@@ -71,13 +71,26 @@ pub fn describe_content<S: ContentSource>(
     source: &S,
     file: ObjectId,
 ) -> Result<ContentDescriptor, ContentReadError<S::Error>> {
+    open_content(source, file).map(OpenedContent::descriptor)
+}
+
+/// Open one immutable file for repeated reads.
+///
+/// The canonical file descriptor is loaded and validated once. Tree nodes and
+/// chunks remain lazily loaded and verified for each requested range.
+///
+/// # Errors
+///
+/// Returns a source error, missing-object error, or canonical grammar error.
+pub fn open_content<S: ContentSource>(
+    source: &S,
+    file: ObjectId,
+) -> Result<OpenedContent, ContentReadError<S::Error>> {
     let record = load(source, file)?;
-    let (profile, logical_bytes, chunk_count, _) = decode_file(file, &record)?;
-    Ok(ContentDescriptor::new(
-        file,
-        logical_bytes,
-        chunk_count,
-        profile,
+    let (profile, logical_bytes, chunk_count, content) = decode_file(file, &record)?;
+    Ok(OpenedContent::new(
+        ContentDescriptor::new(file, logical_bytes, chunk_count, profile),
+        content,
     ))
 }
 
@@ -90,10 +103,31 @@ pub fn read_content<S: ContentSource>(
     source: &S,
     file: ObjectId,
 ) -> Result<Vec<u8>, ContentReadError<S::Error>> {
-    let record = load(source, file)?;
-    let decoded = decode_file(file, &record)?;
-    let logical_bytes = decoded.1;
-    read_decoded_range(source, file, decoded, 0, logical_bytes)
+    read_opened_content(source, open_content(source, file)?)
+}
+
+/// Reconstruct all bytes from an opened immutable file.
+///
+/// # Errors
+///
+/// Returns a source, allocation, missing-object, or canonical grammar error.
+pub fn read_opened_content<S: ContentSource>(
+    source: &S,
+    opened: OpenedContent,
+) -> Result<Vec<u8>, ContentReadError<S::Error>> {
+    let descriptor = opened.descriptor();
+    read_decoded_range(
+        source,
+        descriptor.file(),
+        (
+            descriptor.profile(),
+            descriptor.logical_bytes(),
+            descriptor.chunk_count(),
+            opened.content(),
+        ),
+        0,
+        descriptor.logical_bytes(),
+    )
 }
 
 /// Reconstruct an exact byte range while traversing only overlapping chunks.
@@ -108,9 +142,34 @@ pub fn read_content_range<S: ContentSource>(
     offset: u64,
     length: u64,
 ) -> Result<Vec<u8>, ContentReadError<S::Error>> {
-    let record = load(source, file)?;
-    let decoded = decode_file(file, &record)?;
-    read_decoded_range(source, file, decoded, offset, length)
+    read_opened_content_range(source, open_content(source, file)?, offset, length)
+}
+
+/// Reconstruct an exact byte range from an opened immutable file.
+///
+/// # Errors
+///
+/// Returns an out-of-bounds, source, allocation, missing-object, or canonical
+/// grammar error.
+pub fn read_opened_content_range<S: ContentSource>(
+    source: &S,
+    opened: OpenedContent,
+    offset: u64,
+    length: u64,
+) -> Result<Vec<u8>, ContentReadError<S::Error>> {
+    let descriptor = opened.descriptor();
+    read_decoded_range(
+        source,
+        descriptor.file(),
+        (
+            descriptor.profile(),
+            descriptor.logical_bytes(),
+            descriptor.chunk_count(),
+            opened.content(),
+        ),
+        offset,
+        length,
+    )
 }
 
 fn read_decoded_range<S: ContentSource>(

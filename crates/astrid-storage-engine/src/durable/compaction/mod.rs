@@ -793,6 +793,10 @@ where
         roots
             .seek(SeekFrom::End(0))
             .map_err(|source| io_error("seek compacted root journal", source))?;
+        let arena_reader = arena
+            .try_clone()
+            .map_err(|source| io_error("clone compacted arena for positional reads", source))?;
+        let arena_generation = inner.arena_generation.wrapping_add(1);
         inner.roots_by_principal = replacement.roots;
         inner.index = replacement.index;
         inner.pending_index_locations.clear();
@@ -804,6 +808,11 @@ where
             arena_len: replacement.arena_len,
             arena_tail: replacement.arena_tail,
         });
+        *self.arena_reader.write() = super::ArenaReader {
+            file: arena_reader,
+            generation: arena_generation,
+        };
+        inner.arena_generation = arena_generation;
         Ok(())
     }
 

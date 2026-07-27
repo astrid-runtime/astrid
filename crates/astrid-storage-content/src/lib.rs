@@ -38,7 +38,8 @@ mod tests;
 #[cfg(feature = "std")]
 pub use build::{BuiltContent, build_content};
 pub use read::{
-    ContentReadError, ContentSource, describe_content, read_content, read_content_range,
+    ContentReadError, ContentSource, describe_content, open_content, read_content,
+    read_content_range, read_opened_content, read_opened_content_range,
 };
 #[cfg(feature = "std")]
 pub use stream::{ContentObjectSink, ContentStreamError, StreamedContent, build_content_streaming};
@@ -196,6 +197,35 @@ impl ContentDescriptor {
     #[must_use]
     pub const fn profile(self) -> ChunkingProfile {
         self.profile
+    }
+}
+
+/// Decoded immutable file metadata reusable across content reads.
+///
+/// Opening validates the canonical file record once. Subsequent reads still
+/// verify every tree node and chunk they load from the backing source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpenedContent {
+    descriptor: ContentDescriptor,
+    content: Option<ObjectId>,
+}
+
+impl OpenedContent {
+    pub(crate) const fn new(descriptor: ContentDescriptor, content: Option<ObjectId>) -> Self {
+        Self {
+            descriptor,
+            content,
+        }
+    }
+
+    /// Return the validated immutable file descriptor.
+    #[must_use]
+    pub const fn descriptor(self) -> ContentDescriptor {
+        self.descriptor
+    }
+
+    pub(crate) const fn content(self) -> Option<ObjectId> {
+        self.content
     }
 }
 

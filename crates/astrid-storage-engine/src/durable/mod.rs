@@ -18,7 +18,7 @@ use astrid_storage_model::{
     RootGeneration, RootState,
 };
 use fs2::FileExt;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 
 use crate::{CommitOutcome, RootSnapshot, RootTransaction};
 
@@ -311,6 +311,7 @@ struct DurableInner<P: Ord> {
     files: Option<DurableFiles>,
     lock: Option<File>,
     poisoned: bool,
+    arena_generation: u64,
 }
 
 #[derive(Debug)]
@@ -320,6 +321,12 @@ struct DurableFiles {
     index_cache: Option<File>,
     arena_len: u64,
     arena_tail: Option<ArenaLocation>,
+}
+
+#[derive(Debug)]
+struct ArenaReader {
+    file: File,
+    generation: u64,
 }
 
 /// Host-file durable principal-store engine.
@@ -333,6 +340,7 @@ pub struct DurableEngine<P: Ord, I, C> {
     principal_codec: C,
     limits: RecoveryLimits,
     faults: Arc<dyn FaultInjector>,
+    arena_reader: RwLock<ArenaReader>,
     inner: Mutex<DurableInner<P>>,
 }
 
@@ -439,6 +447,9 @@ where
         roots
             .seek(SeekFrom::End(0))
             .map_err(|source| io_error("seek root journal", source))?;
+        let arena_reader = arena
+            .try_clone()
+            .map_err(|source| io_error("clone object arena for positional reads", source))?;
 
         Ok(Self {
             directory: path,
@@ -446,6 +457,10 @@ where
             principal_codec,
             limits,
             faults,
+            arena_reader: RwLock::new(ArenaReader {
+                file: arena_reader,
+                generation: 0,
+            }),
             inner: Mutex::new(DurableInner {
                 roots_by_principal,
                 index,
@@ -460,6 +475,7 @@ where
                 }),
                 lock: Some(lock),
                 poisoned: false,
+                arena_generation: 0,
             }),
         })
     }
@@ -487,13 +503,22 @@ where
     ///
     /// Returns [`DurableError::RequiresRecovery`] after a failed write.
     pub fn object(&self, id: ObjectId) -> Result<Option<ObjectRecord>, DurableError> {
-        let mut inner = self.inner.lock();
-        ensure_usable(&inner)?;
-        let Some(location) = inner.index.get(&id).copied() else {
-            return Ok(None);
-        };
-        let files = live_files_mut(&mut inner.files)?;
-        read_indexed_object(&mut files.arena, id, location, &self.identity, self.limits).map(Some)
+        loop {
+            let (location, generation) = {
+                let inner = self.inner.lock();
+                ensure_usable(&inner)?;
+                let Some(location) = inner.index.get(&id).copied() else {
+                    return Ok(None);
+                };
+                (location, inner.arena_generation)
+            };
+            let reader = self.arena_reader.read();
+            if reader.generation != generation {
+                continue;
+            }
+            return read_indexed_object(&reader.file, id, location, &self.identity, self.limits)
+                .map(Some);
+        }
     }
 
     /// Persist one standalone immutable object outside a principal root.

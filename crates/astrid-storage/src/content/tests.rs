@@ -242,6 +242,33 @@ fn named_content_round_trips_lists_ranges_and_deletes() {
 }
 
 #[test]
+fn open_read_handle_remains_on_its_authorized_generation() {
+    let engine = Arc::new(Engine::new(TestIdentity));
+    let store = PrincipalContentStore::from_engine(engine);
+    let owner = "alice".to_owned();
+    let name = ContentName::new("models/current.bin").unwrap();
+    let original = bytes(2 * 1024 * 1024);
+    let replacement = bytes(1024 * 1024);
+    let first = store.put(&owner, &name, &original).unwrap();
+    let handle = store.open_read(&owner, &name).unwrap().unwrap();
+
+    assert_eq!(handle.descriptor(), first.descriptor());
+    assert_eq!(handle.principal_root(), first.principal_root());
+    assert_eq!(
+        handle.read_range(999_000, 12_345).unwrap(),
+        original[999_000..1_011_345]
+    );
+
+    store.put(&owner, &name, &replacement).unwrap();
+    assert_eq!(handle.read().unwrap(), original);
+    assert_eq!(store.read(&owner, &name).unwrap(), Some(replacement));
+
+    assert!(store.delete(&owner, &name).unwrap());
+    assert_eq!(handle.read_range(17, 4096).unwrap(), original[17..4113]);
+    assert!(store.open_read(&owner, &name).unwrap().is_none());
+}
+
+#[test]
 fn streamed_content_matches_slice_identity_and_round_trips() {
     let engine = Arc::new(Engine::new(TestIdentity));
     let store = PrincipalContentStore::from_engine(engine);
