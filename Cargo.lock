@@ -865,6 +865,7 @@ dependencies = [
  "chrono",
  "getrandom 0.4.3",
  "keyring",
+ "parking_lot",
  "serde",
  "serde_json",
  "surrealdb",

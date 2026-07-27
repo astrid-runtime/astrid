@@ -33,10 +33,8 @@
 //! # Feature Flags
 //!
 //! - **`legacy-surrealkv`** — legacy `SurrealKV` reader and migrator
-//! - **`kv`** — compatibility alias for `legacy-surrealkv`; runtime KV is
-//!   unconditional
 //! - **`db`** — `SurrealDB` full query engine
-//! - **`full`** — Both `kv` and `db`
+//! - **`full`** — Both `legacy-surrealkv` and `db`
 
 #![deny(unsafe_code)]
 #![deny(missing_docs)]

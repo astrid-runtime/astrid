@@ -47,10 +47,9 @@ The `build_secret_store` convenience constructor picks the best available backen
 | Feature | Enables |
 |---|---|
 | `legacy-surrealkv` | Legacy `SurrealKvStore` reader and migrator |
-| `kv` | Compatibility alias for `legacy-surrealkv`; runtime KV is unconditional |
 | `db` | `Database` (SurrealDB query engine) |
 | `keychain` | `KeychainSecretStore` + `FallbackSecretStore` |
-| `full` | `kv` + `db` |
+| `full` | `legacy-surrealkv` + `db` |
 
 The KV contract is never feature-gated. `KvStore`, `MemoryKvStore`,
 `ScopedKvStore`, `KvSecretStore`, and the principal-store adapter are always

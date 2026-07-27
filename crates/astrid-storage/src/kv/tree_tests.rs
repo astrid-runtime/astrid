@@ -3,9 +3,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use astrid_storage_engine::InMemoryEngine;
-use astrid_storage_model::{ObjectClass, ObjectId, ObjectIdentity, ObjectRecord, ReferenceKind};
+use astrid_storage_engine::{InMemoryEngine, RootTransaction};
+use astrid_storage_model::{
+    ObjectClass, ObjectId, ObjectIdentity, ObjectKind, ObjectRecord, ObjectReference,
+    ReferenceKind, ReferenceLabel,
+};
 
+use super::tree::{FORMAT_VERSION, KV_LABEL, LEFT_LABEL, ROOT_LABEL, STATE_LABEL, VALUE_LABEL};
 use super::{KvPrincipalResolver, KvQuotaResolver, KvStore, TreeKvStore};
 use crate::{StorageError, StorageResult};
 
@@ -82,6 +86,133 @@ fn fixture() -> Arc<Store> {
         Arc::new(InMemoryEngine::new(TestIdentity)),
         Resolver,
     ))
+}
+
+fn insert_record(
+    engine: &InMemoryEngine<String, TestIdentity>,
+    records: &mut Vec<(ObjectId, ObjectRecord)>,
+    record: ObjectRecord,
+) -> ObjectId {
+    let id = engine.identify(&record);
+    records.push((id, record));
+    id
+}
+
+fn leaf(
+    engine: &InMemoryEngine<String, TestIdentity>,
+    records: &mut Vec<(ObjectId, ObjectRecord)>,
+    value: &[u8],
+) -> ObjectId {
+    let record = ObjectRecord::new(
+        ObjectKind::KvLeaf,
+        FORMAT_VERSION,
+        value.to_vec(),
+        Vec::new(),
+        0,
+        ObjectClass::Data,
+    )
+    .unwrap();
+    insert_record(engine, records, record)
+}
+
+struct BranchSpec<'a> {
+    key: &'a [u8],
+    value: ObjectId,
+    value_len: u64,
+    left: Option<ObjectId>,
+    height: u32,
+    logical_total: u64,
+    quota_total: u64,
+}
+
+fn branch(
+    engine: &InMemoryEngine<String, TestIdentity>,
+    records: &mut Vec<(ObjectId, ObjectRecord)>,
+    spec: BranchSpec<'_>,
+) -> ObjectId {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&spec.height.to_le_bytes());
+    bytes.extend_from_slice(&spec.logical_total.to_le_bytes());
+    bytes.extend_from_slice(&spec.quota_total.to_le_bytes());
+    bytes.extend_from_slice(&spec.value_len.to_le_bytes());
+    bytes.extend_from_slice(spec.key);
+    let mut references = vec![ObjectReference::owns(
+        ReferenceLabel::new(VALUE_LABEL.to_vec()),
+        spec.value,
+    )];
+    if let Some(left) = spec.left {
+        references.push(ObjectReference::owns(
+            ReferenceLabel::new(LEFT_LABEL.to_vec()),
+            left,
+        ));
+    }
+    references.sort();
+    let record = ObjectRecord::new(
+        ObjectKind::KvBranch,
+        FORMAT_VERSION,
+        bytes,
+        references,
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    insert_record(engine, records, record)
+}
+
+fn publish_tree(
+    engine: &InMemoryEngine<String, TestIdentity>,
+    mut records: Vec<(ObjectId, ObjectRecord)>,
+    root: ObjectId,
+    logical_total: u64,
+    quota_total: u64,
+) {
+    let wrapper = ObjectRecord::new(
+        ObjectKind::NamespaceMap,
+        FORMAT_VERSION,
+        quota_total.to_le_bytes().to_vec(),
+        vec![ObjectReference::owns(
+            ReferenceLabel::new(ROOT_LABEL.to_vec()),
+            root,
+        )],
+        logical_total,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let wrapper = insert_record(engine, &mut records, wrapper);
+    let state = ObjectRecord::new(
+        ObjectKind::PrincipalState,
+        FORMAT_VERSION,
+        Vec::new(),
+        vec![ObjectReference::owns(
+            ReferenceLabel::new(KV_LABEL.to_vec()),
+            wrapper,
+        )],
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let state = insert_record(engine, &mut records, state);
+    let commit = ObjectRecord::new(
+        ObjectKind::Commit,
+        FORMAT_VERSION,
+        Vec::new(),
+        vec![ObjectReference::owns(
+            ReferenceLabel::new(STATE_LABEL.to_vec()),
+            state,
+        )],
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let commit = insert_record(engine, &mut records, commit);
+    engine
+        .commit(RootTransaction::new(
+            "alice".to_owned(),
+            None,
+            commit,
+            records,
+        ))
+        .unwrap();
 }
 
 fn next(seed: &mut u64) -> u64 {
@@ -199,6 +330,85 @@ async fn sorted_inserts_remain_height_bounded() {
     assert!(
         store.height_for_test("alice".to_owned()).unwrap() <= 11,
         "AVL height should remain logarithmic"
+    );
+}
+
+#[tokio::test]
+async fn self_consistent_forged_tree_totals_are_rejected() {
+    let engine = Arc::new(InMemoryEngine::new(TestIdentity));
+    let mut records = Vec::new();
+    let value = leaf(engine.as_ref(), &mut records, b"value");
+    let key = b"alice:capsule:test\0key";
+    let root = branch(
+        engine.as_ref(),
+        &mut records,
+        BranchSpec {
+            key,
+            value,
+            value_len: 5,
+            left: None,
+            height: 1,
+            logical_total: 0,
+            quota_total: u64::try_from(key.len()).unwrap(),
+        },
+    );
+    publish_tree(engine.as_ref(), records, root, 0, key.len() as u64);
+    let store = TreeKvStore::<String, TestIdentity, Resolver, _>::from_engine(engine, Resolver);
+
+    assert!(
+        store
+            .get("alice:capsule:test", "key")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("node totals disagree")
+    );
+}
+
+#[tokio::test]
+async fn self_consistent_out_of_order_tree_is_rejected() {
+    let engine = Arc::new(InMemoryEngine::new(TestIdentity));
+    let mut records = Vec::new();
+    let value = leaf(engine.as_ref(), &mut records, b"x");
+    let left_key = b"alice:capsule:test\0z";
+    let left = branch(
+        engine.as_ref(),
+        &mut records,
+        BranchSpec {
+            key: left_key,
+            value,
+            value_len: 1,
+            left: None,
+            height: 1,
+            logical_total: 1,
+            quota_total: u64::try_from(left_key.len() + 1).unwrap(),
+        },
+    );
+    let root_key = b"alice:capsule:test\0m";
+    let quota = u64::try_from(left_key.len() + root_key.len() + 2).unwrap();
+    let root = branch(
+        engine.as_ref(),
+        &mut records,
+        BranchSpec {
+            key: root_key,
+            value,
+            value_len: 1,
+            left: Some(left),
+            height: 2,
+            logical_total: 2,
+            quota_total: quota,
+        },
+    );
+    publish_tree(engine.as_ref(), records, root, 2, quota);
+    let store = TreeKvStore::<String, TestIdentity, Resolver, _>::from_engine(engine, Resolver);
+
+    assert!(
+        store
+            .list_keys("alice:capsule:test")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("key order is invalid")
     );
 }
 

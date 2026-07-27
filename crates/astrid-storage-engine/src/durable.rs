@@ -231,6 +231,8 @@ pub enum DurableError {
     FaultInjected(FaultPoint),
     /// A prior write or injected crash may have diverged memory from disk.
     RequiresRecovery,
+    /// The engine was explicitly closed and no longer owns store files.
+    Closed,
 }
 
 impl fmt::Display for DurableError {
@@ -280,6 +282,7 @@ impl fmt::Display for DurableError {
             Self::RequiresRecovery => {
                 formatter.write_str("durable engine must be dropped and reopened")
             },
+            Self::Closed => formatter.write_str("durable engine is closed"),
         }
     }
 }
@@ -312,10 +315,15 @@ struct DurableInner<P: Ord> {
     roots_by_principal: BTreeMap<P, RootState>,
     index: BTreeMap<ObjectId, ArenaLocation>,
     validated: BTreeSet<ObjectId>,
+    files: Option<DurableFiles>,
+    poisoned: bool,
+}
+
+#[derive(Debug)]
+struct DurableFiles {
     arena: File,
     roots: File,
     lock: File,
-    poisoned: bool,
 }
 
 /// Host-file durable principal-store engine.
@@ -415,9 +423,7 @@ where
                 roots_by_principal,
                 index,
                 validated,
-                arena,
-                roots,
-                lock,
+                files: Some(DurableFiles { arena, roots, lock }),
                 poisoned: false,
             }),
         })
@@ -451,8 +457,9 @@ where
         let Some(location) = inner.index.get(&id).copied() else {
             return Ok(None);
         };
+        let files = live_files_mut(&mut inner.files)?;
         read_indexed_object(
-            &mut inner.arena,
+            &mut files.arena,
             id,
             location,
             self.identity.scheme(),
@@ -483,8 +490,9 @@ where
         let mut inner = self.inner.lock();
         ensure_usable(&inner)?;
         if let Some(location) = inner.index.get(&id).copied() {
+            let files = live_files_mut(&mut inner.files)?;
             let existing = read_indexed_object(
-                &mut inner.arena,
+                &mut files.arena,
                 id,
                 location,
                 self.identity.scheme(),
@@ -497,14 +505,17 @@ where
         }
         let payload = encode_object_frame(self.identity.scheme(), id, record)?;
         ensure_payload_limit(ARENA_FILE, 0, payload.len(), self.limits)?;
-        let persisted = (|| {
-            let location = append_frame(&mut inner.arena, ARENA_MAGIC, &payload)?;
-            inner
-                .arena
-                .sync_data()
-                .map_err(|source| io_error("flush standalone object frame", source))?;
-            Ok(location)
-        })();
+        let persisted = {
+            let files = live_files_mut(&mut inner.files)?;
+            (|| {
+                let location = append_frame(&mut files.arena, ARENA_MAGIC, &payload)?;
+                files
+                    .arena
+                    .sync_data()
+                    .map_err(|source| io_error("flush standalone object frame", source))?;
+                Ok(location)
+            })()
+        };
         match persisted {
             Ok(location) => {
                 inner.index.insert(id, location);
@@ -540,9 +551,10 @@ where
         let Some(root) = inner.roots_by_principal.get(principal).copied() else {
             return Ok(None);
         };
-        let DurableInner { arena, index, .. } = &mut *inner;
+        let DurableInner { files, index, .. } = &mut *inner;
+        let files = live_files_mut(files)?;
         let records = materialize_closure(
-            arena,
+            &mut files.arena,
             index,
             &BTreeMap::new(),
             root.commit,
@@ -566,9 +578,10 @@ where
             .get(principal)
             .copied()
             .ok_or(ModelError::PrincipalMissing)?;
-        let DurableInner { arena, index, .. } = &mut *inner;
+        let DurableInner { files, index, .. } = &mut *inner;
+        let files = live_files_mut(files)?;
         let records = materialize_closure(
-            arena,
+            &mut files.arena,
             index,
             &BTreeMap::new(),
             root.commit,
@@ -620,15 +633,49 @@ where
     pub fn flush(&self) -> Result<(), DurableError> {
         let mut inner = self.inner.lock();
         ensure_usable(&inner)?;
-        if let Err(source) = inner.arena.sync_data() {
+        let files = live_files_mut(&mut inner.files)?;
+        if let Err(source) = files.arena.sync_data() {
             inner.poisoned = true;
             return Err(io_error("flush object arena", source));
         }
-        if let Err(source) = inner.roots.sync_data() {
+        if let Err(source) = files.roots.sync_data() {
             inner.poisoned = true;
             return Err(io_error("flush root journal", source));
         }
         Ok(())
+    }
+
+    /// Flush, unlock, and close the authoritative store files.
+    ///
+    /// Closing is idempotent. Every other operation returns
+    /// [`DurableError::Closed`] after the first close, even while other
+    /// [`Arc`] references keep this engine value alive.
+    ///
+    /// # Errors
+    ///
+    /// Returns a recovery-required, flush, or unlock error after still
+    /// releasing every owned file handle.
+    pub fn close(&self) -> Result<(), DurableError> {
+        let mut inner = self.inner.lock();
+        if inner.files.is_none() {
+            return Ok(());
+        }
+        let poisoned = inner.poisoned;
+        let files = live_files_mut(&mut inner.files)?;
+        let result = if poisoned {
+            Err(DurableError::RequiresRecovery)
+        } else if let Err(source) = files.arena.sync_data() {
+            Err(io_error("flush object arena while closing", source))
+        } else if let Err(source) = files.roots.sync_data() {
+            Err(io_error("flush root journal while closing", source))
+        } else {
+            Ok(())
+        };
+        let files = inner.files.take().ok_or(DurableError::Closed)?;
+        let unlock = fs2::FileExt::unlock(&files.lock)
+            .map_err(|source| io_error("unlock principal store while closing", source));
+        drop(files);
+        result.and(unlock)
     }
 
     fn prepare(
@@ -678,15 +725,7 @@ where
                 },
             }
         }
-        let reachable = validate_incremental_closure(
-            &mut inner.arena,
-            &inner.index,
-            &unique,
-            &inner.validated,
-            commit_id,
-            self.identity.scheme(),
-            self.limits,
-        )?;
+        let reachable = self.validate_pending_closure(inner, &unique, commit_id)?;
 
         let mut objects = Vec::new();
         let mut commit_frame = None;
@@ -695,8 +734,9 @@ where
                 continue;
             }
             if let Some(location) = inner.index.get(&id).copied() {
+                let files = live_files_mut(&mut inner.files)?;
                 let existing = read_indexed_object(
-                    &mut inner.arena,
+                    &mut files.arena,
                     id,
                     location,
                     self.identity.scheme(),
@@ -733,23 +773,48 @@ where
         })
     }
 
+    fn validate_pending_closure(
+        &self,
+        inner: &mut DurableInner<P>,
+        incoming: &BTreeMap<ObjectId, ObjectRecord>,
+        commit: ObjectId,
+    ) -> Result<BTreeSet<ObjectId>, DurableError> {
+        let DurableInner {
+            files,
+            index,
+            validated,
+            ..
+        } = inner;
+        let files = live_files_mut(files)?;
+        validate_incremental_closure(
+            &mut files.arena,
+            index,
+            incoming,
+            validated,
+            commit,
+            self.identity.scheme(),
+            self.limits,
+        )
+    }
+
     fn persist(
         &self,
         inner: &mut DurableInner<P>,
         prepared: &Prepared<P>,
     ) -> Result<Vec<(ObjectId, ArenaLocation)>, DurableError> {
+        let files = live_files_mut(&mut inner.files)?;
         let mut locations = Vec::new();
         for (id, payload) in &prepared.objects {
-            let location = append_frame(&mut inner.arena, ARENA_MAGIC, payload)?;
+            let location = append_frame(&mut files.arena, ARENA_MAGIC, payload)?;
             locations.push((*id, location));
         }
         self.fail_if(FaultPoint::AfterObjectAppend)?;
         if let Some((id, payload)) = &prepared.commit {
-            let location = append_frame(&mut inner.arena, ARENA_MAGIC, payload)?;
+            let location = append_frame(&mut files.arena, ARENA_MAGIC, payload)?;
             locations.push((*id, location));
         }
         self.fail_if(FaultPoint::AfterCommitAppend)?;
-        inner
+        files
             .arena
             .sync_data()
             .map_err(|source| io_error("flush transaction object frames", source))?;
@@ -757,8 +822,8 @@ where
         self.fail_if(FaultPoint::AfterCommitFlush)?;
         self.fail_if(FaultPoint::BeforeRootCas)?;
 
-        append_frame(&mut inner.roots, ROOT_MAGIC, &prepared.journal)?;
-        inner
+        append_frame(&mut files.roots, ROOT_MAGIC, &prepared.journal)?;
+        files
             .roots
             .sync_data()
             .map_err(|source| io_error("flush root-journal frame", source))?;
@@ -777,7 +842,9 @@ where
 impl<P: Ord, I, C> Drop for DurableEngine<P, I, C> {
     fn drop(&mut self) {
         let inner = self.inner.get_mut();
-        let _ = fs2::FileExt::unlock(&inner.lock);
+        if let Some(files) = inner.files.take() {
+            let _ = fs2::FileExt::unlock(&files.lock);
+        }
     }
 }
 
@@ -793,10 +860,17 @@ struct Prepared<P: Ord> {
 }
 
 fn ensure_usable<P: Ord>(inner: &DurableInner<P>) -> Result<(), DurableError> {
+    if inner.files.is_none() {
+        return Err(DurableError::Closed);
+    }
     if inner.poisoned {
         return Err(DurableError::RequiresRecovery);
     }
     Ok(())
+}
+
+fn live_files_mut(files: &mut Option<DurableFiles>) -> Result<&mut DurableFiles, DurableError> {
+    files.as_mut().ok_or(DurableError::Closed)
 }
 
 fn materialize_closure(

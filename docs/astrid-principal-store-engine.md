@@ -75,10 +75,9 @@ writers.
 
 The KV contract, memory/scoped stores, compatibility oracle, and persistent tree
 are unconditional. `legacy-surrealkv` gates only the legacy reader and
-migrator. The former `kv` gate remains as a compatibility alias to
-`legacy-surrealkv`, so existing dependent manifests do not break; it selects no
-runtime backend. Both names can be removed when the supported migration window
-closes.
+migrator. The former `kv` gate is removed because runtime KV is not optional and
+the migration reader has its own precise name. `legacy-surrealkv` can be removed
+when the supported migration window closes.
 
 ## Runtime cutover
 

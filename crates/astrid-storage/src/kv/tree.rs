@@ -16,6 +16,7 @@ use astrid_storage_model::{
     ModelError, ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord,
     ObjectReference, ReferenceKind, ReferenceLabel, RootState,
 };
+use parking_lot::Mutex;
 
 #[cfg(all(feature = "legacy-surrealkv", not(target_family = "wasm")))]
 use super::KvEntry;
@@ -23,21 +24,22 @@ use super::KvEntry;
 use super::composite_key;
 use super::principal::{KvPrincipalResolver, KvQuotaResolver};
 use super::tree_error::{exact_owned_reference, invalid, map_engine};
+use super::{validate_key, validate_namespace};
 use crate::error::{StorageError, StorageResult};
 
 mod adapter;
 
-const FORMAT_VERSION: ObjectFormatVersion = match ObjectFormatVersion::new(3) {
+pub(super) const FORMAT_VERSION: ObjectFormatVersion = match ObjectFormatVersion::new(3) {
     Some(version) => version,
     None => unreachable!(),
 };
-const KV_LABEL: &[u8] = b"kv";
-const LEFT_LABEL: &[u8] = b"left";
+pub(super) const KV_LABEL: &[u8] = b"kv";
+pub(super) const LEFT_LABEL: &[u8] = b"left";
 const PARENT_LABEL: &[u8] = b"parent";
 const RIGHT_LABEL: &[u8] = b"right";
-const ROOT_LABEL: &[u8] = b"root";
-const STATE_LABEL: &[u8] = b"state";
-const VALUE_LABEL: &[u8] = b"value";
+pub(super) const ROOT_LABEL: &[u8] = b"root";
+pub(super) const STATE_LABEL: &[u8] = b"state";
+pub(super) const VALUE_LABEL: &[u8] = b"value";
 const NODE_FIXED_BYTES: usize = 28;
 
 /// Production point-operation KV adapter over a persistent balanced tree.
@@ -45,22 +47,25 @@ pub struct TreeKvStore<P: Ord, I, R, E> {
     engine: Arc<E>,
     resolver: R,
     quota: Option<Arc<dyn KvQuotaResolver<P>>>,
+    validated_trees: Arc<Mutex<BTreeMap<P, TreeValidation>>>,
     marker: PhantomData<fn() -> (P, I)>,
 }
 
 struct BlockingTreeStore<P: Ord, E> {
     engine: Arc<E>,
     quota: Option<Arc<dyn KvQuotaResolver<P>>>,
+    validated_trees: Arc<Mutex<BTreeMap<P, TreeValidation>>>,
 }
 
 impl<P: Ord, I, R, E> TreeKvStore<P, I, R, E> {
     /// Construct a tree adapter without logical quota policy.
     #[must_use]
-    pub const fn from_engine(engine: Arc<E>, resolver: R) -> Self {
+    pub fn from_engine(engine: Arc<E>, resolver: R) -> Self {
         Self {
             engine,
             resolver,
             quota: None,
+            validated_trees: Arc::new(Mutex::new(BTreeMap::new())),
             marker: PhantomData,
         }
     }
@@ -76,6 +81,7 @@ impl<P: Ord, I, R, E> TreeKvStore<P, I, R, E> {
             engine,
             resolver,
             quota: Some(quota),
+            validated_trees: Arc::new(Mutex::new(BTreeMap::new())),
             marker: PhantomData,
         }
     }
@@ -84,6 +90,7 @@ impl<P: Ord, I, R, E> TreeKvStore<P, I, R, E> {
         BlockingTreeStore {
             engine: Arc::clone(&self.engine),
             quota: self.quota.clone(),
+            validated_trees: Arc::clone(&self.validated_trees),
         }
     }
 }
@@ -109,7 +116,12 @@ where
         else {
             return Ok(TreeHeader::empty(owner));
         };
-        decode_header(self.engine.as_ref(), owner, root)
+        decode_header(
+            self.engine.as_ref(),
+            owner,
+            root,
+            self.validated_trees.as_ref(),
+        )
     }
 
     fn read<T>(
@@ -148,7 +160,17 @@ where
             }
             let transaction = context.finish(header, tree, logical_bytes, used)?;
             match self.engine.commit_kv_root(transaction) {
-                Ok(_) => return Ok(result),
+                Ok(_) => {
+                    self.validated_trees.lock().insert(
+                        owner.clone(),
+                        TreeValidation {
+                            root: tree,
+                            logical_bytes,
+                            quota_bytes: used,
+                        },
+                    );
+                    return Ok(result);
+                },
                 Err(KvProjectionError::Model(ModelError::RootConflict { .. })) => {},
                 Err(error) => return Err(map_engine(&error)),
             }
@@ -194,33 +216,29 @@ where
     }
 
     #[cfg(all(feature = "legacy-surrealkv", not(target_family = "wasm")))]
-    pub(crate) fn entries_for_migration(&self, owner: &P) -> StorageResult<Vec<KvEntry>> {
+    pub(crate) fn visit_entries_for_migration(
+        &self,
+        owner: &P,
+        mut visit: impl FnMut(&str, &str, &[u8]) -> StorageResult<()>,
+    ) -> StorageResult<()> {
         let blocking = self.blocking_store();
         let header = blocking.header(owner.clone())?;
         let mut context = TreeContext::new(blocking.engine.as_ref());
-        let mut raw = Vec::new();
-        context.collect_entries(header.tree, &mut raw)?;
-        raw.into_iter()
-            .map(|(composite, value)| {
-                let separator = composite
-                    .iter()
-                    .position(|byte| *byte == 0)
-                    .ok_or_else(|| {
-                        StorageError::Serialization(
-                            "persistent KV key has no namespace separator".to_owned(),
-                        )
-                    })?;
-                let namespace = std::str::from_utf8(&composite[..separator])
-                    .map_err(|error| StorageError::Serialization(error.to_string()))?;
-                let key = std::str::from_utf8(&composite[separator.saturating_add(1)..])
-                    .map_err(|error| StorageError::Serialization(error.to_string()))?;
-                Ok(KvEntry {
-                    namespace: namespace.to_owned(),
-                    key: key.to_owned(),
-                    value,
-                })
-            })
-            .collect()
+        context.visit_entries(header.tree, |composite, value| {
+            let separator = composite
+                .iter()
+                .position(|byte| *byte == 0)
+                .ok_or_else(|| {
+                    StorageError::Serialization(
+                        "persistent KV key has no namespace separator".to_owned(),
+                    )
+                })?;
+            let namespace = std::str::from_utf8(&composite[..separator])
+                .map_err(|error| StorageError::Serialization(error.to_string()))?;
+            let key = std::str::from_utf8(&composite[separator.saturating_add(1)..])
+                .map_err(|error| StorageError::Serialization(error.to_string()))?;
+            visit(namespace, key, value)
+        })
     }
 }
 
@@ -261,9 +279,14 @@ impl<P> TreeHeader<P> {
     }
 }
 
-fn decode_header<P, E>(engine: &E, owner: P, root: RootState) -> StorageResult<TreeHeader<P>>
+fn decode_header<P, E>(
+    engine: &E,
+    owner: P,
+    root: RootState,
+    validated_trees: &Mutex<BTreeMap<P, TreeValidation>>,
+) -> StorageResult<TreeHeader<P>>
 where
-    P: Ord,
+    P: Clone + Ord,
     E: KvProjectionEngine<P>,
 {
     let commit = load_typed(engine, root.commit, ObjectKind::Commit)?;
@@ -293,9 +316,20 @@ where
         },
         _ => return Err(invalid(wrapper_id, "invalid KV tree root reference")),
     };
-    let mut context = TreeContext::<P, E>::new(engine);
-    if context.logical_total(tree)? != wrapper.logical_bytes()
-        || context.quota_total(tree)? != quota_bytes
+    let cached = validated_trees
+        .lock()
+        .get(&owner)
+        .copied()
+        .filter(|validation| validation.root == tree);
+    let validation = if let Some(validation) = cached {
+        validation
+    } else {
+        let mut context = TreeContext::<P, E>::new(engine);
+        let validation = context.validate_tree(tree)?;
+        validated_trees.lock().insert(owner.clone(), validation);
+        validation
+    };
+    if validation.logical_bytes != wrapper.logical_bytes() || validation.quota_bytes != quota_bytes
     {
         return Err(invalid(wrapper_id, "KV tree accounting totals disagree"));
     }
@@ -322,6 +356,21 @@ where
         preserved_state,
         preserved_commit,
     })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TreeValidation {
+    root: Option<ObjectId>,
+    logical_bytes: u64,
+    quota_bytes: u64,
+}
+
+impl TreeValidation {
+    const EMPTY: Self = Self {
+        root: None,
+        logical_bytes: 0,
+        quota_bytes: 0,
+    };
 }
 
 fn load_typed<P, E>(engine: &E, id: ObjectId, kind: ObjectKind) -> StorageResult<ObjectRecord>
@@ -368,6 +417,45 @@ struct TreeNode {
     height: u32,
     logical_total: u64,
     quota_total: u64,
+}
+
+#[derive(Clone, Debug)]
+struct ValidatedNode {
+    minimum_key: Vec<u8>,
+    maximum_key: Vec<u8>,
+    height: u32,
+    logical_total: u64,
+    quota_total: u64,
+}
+
+fn validated_child(
+    parent: ObjectId,
+    child: Option<ObjectId>,
+    missing: &'static str,
+    computed: &mut BTreeMap<ObjectId, ValidatedNode>,
+) -> StorageResult<Option<ValidatedNode>> {
+    child
+        .map(|id| computed.remove(&id).ok_or_else(|| invalid(parent, missing)))
+        .transpose()
+}
+
+fn validate_composite_key(id: ObjectId, key: &[u8]) -> StorageResult<()> {
+    let Some(separator) = key.iter().position(|byte| *byte == 0) else {
+        return Err(invalid(id, "persistent KV key has no namespace separator"));
+    };
+    if separator == 0
+        || separator.saturating_add(1) >= key.len()
+        || key[separator.saturating_add(1)..].contains(&0)
+    {
+        return Err(invalid(id, "persistent KV composite key is non-canonical"));
+    }
+    let namespace = std::str::from_utf8(&key[..separator])
+        .map_err(|_| invalid(id, "persistent KV namespace is not UTF-8"))?;
+    let name = std::str::from_utf8(&key[separator.saturating_add(1)..])
+        .map_err(|_| invalid(id, "persistent KV key is not UTF-8"))?;
+    validate_namespace(namespace)
+        .and_then(|()| validate_key(name))
+        .map_err(|_| invalid(id, "persistent KV composite key is invalid"))
 }
 
 struct TreeContext<'a, P, E> {
@@ -463,9 +551,10 @@ where
                 .map_err(|_| invalid(id, "invalid KV node value length"))?,
         );
         let key = bytes[NODE_FIXED_BYTES..].to_vec();
-        if height == 0 || key.is_empty() || !key.contains(&0) {
+        if height == 0 {
             return Err(invalid(id, "invalid persistent KV tree key"));
         }
+        validate_composite_key(id, &key)?;
         let value = exact_owned_reference(id, &record, VALUE_LABEL, true)?;
         let left = exact_owned_reference(id, &record, LEFT_LABEL, false)?;
         let right = exact_owned_reference(id, &record, RIGHT_LABEL, false)?;
@@ -488,6 +577,122 @@ where
         };
         self.nodes.insert(id, node.clone());
         Ok(node)
+    }
+
+    fn validate_tree(&mut self, root: Option<ObjectId>) -> StorageResult<TreeValidation> {
+        let Some(root) = root else {
+            return Ok(TreeValidation::EMPTY);
+        };
+        let mut marks = BTreeMap::<ObjectId, u8>::new();
+        let mut computed = BTreeMap::<ObjectId, ValidatedNode>::new();
+        let mut stack = vec![(root, false)];
+
+        while let Some((id, expanded)) = stack.pop() {
+            if !expanded {
+                match marks.insert(id, 1) {
+                    Some(1) => return Err(invalid(id, "persistent KV tree contains a cycle")),
+                    Some(2) => {
+                        return Err(invalid(id, "persistent KV tree reuses a branch"));
+                    },
+                    Some(_) | None => {},
+                }
+                let node = self.node(id)?;
+                stack.push((id, true));
+                if let Some(right) = node.right {
+                    stack.push((right, false));
+                }
+                if let Some(left) = node.left {
+                    stack.push((left, false));
+                }
+                continue;
+            }
+
+            let node = self.node(id)?;
+            let validated = self.validate_node(id, &node, &mut computed)?;
+            computed.insert(id, validated);
+            marks.insert(id, 2);
+        }
+
+        let validated = computed
+            .remove(&root)
+            .ok_or_else(|| invalid(root, "persistent KV root validation is missing"))?;
+        Ok(TreeValidation {
+            root: Some(root),
+            logical_bytes: validated.logical_total,
+            quota_bytes: validated.quota_total,
+        })
+    }
+
+    fn validate_node(
+        &mut self,
+        id: ObjectId,
+        node: &TreeNode,
+        computed: &mut BTreeMap<ObjectId, ValidatedNode>,
+    ) -> StorageResult<ValidatedNode> {
+        self.value_bytes(id, node)?;
+        let left = validated_child(
+            id,
+            node.left,
+            "KV left child validation is missing",
+            computed,
+        )?;
+        let right = validated_child(
+            id,
+            node.right,
+            "KV right child validation is missing",
+            computed,
+        )?;
+        if left
+            .as_ref()
+            .is_some_and(|child| child.maximum_key >= node.key)
+            || right
+                .as_ref()
+                .is_some_and(|child| child.minimum_key <= node.key)
+        {
+            return Err(invalid(id, "persistent KV tree key order is invalid"));
+        }
+
+        let left_height = left.as_ref().map_or(0, |child| child.height);
+        let right_height = right.as_ref().map_or(0, |child| child.height);
+        let height = left_height
+            .max(right_height)
+            .checked_add(1)
+            .ok_or_else(|| invalid(id, "persistent KV tree height overflow"))?;
+        if node.height != height || left_height.abs_diff(right_height) > 1 {
+            return Err(invalid(id, "persistent KV tree is not canonical AVL"));
+        }
+        let logical_total = left
+            .as_ref()
+            .map_or(0, |child| child.logical_total)
+            .checked_add(node.value_len)
+            .and_then(|total| {
+                total.checked_add(right.as_ref().map_or(0, |child| child.logical_total))
+            })
+            .ok_or_else(|| invalid(id, "persistent KV tree logical total overflow"))?;
+        let key_len = u64::try_from(node.key.len())
+            .map_err(|_| invalid(id, "persistent KV tree key length overflow"))?;
+        let quota_total = left
+            .as_ref()
+            .map_or(0, |child| child.quota_total)
+            .checked_add(node.value_len)
+            .and_then(|total| total.checked_add(key_len))
+            .and_then(|total| {
+                total.checked_add(right.as_ref().map_or(0, |child| child.quota_total))
+            })
+            .ok_or_else(|| invalid(id, "persistent KV tree quota total overflow"))?;
+        if node.logical_total != logical_total || node.quota_total != quota_total {
+            return Err(invalid(id, "persistent KV tree node totals disagree"));
+        }
+
+        let minimum_key = left.map_or_else(|| node.key.clone(), |child| child.minimum_key);
+        let maximum_key = right.map_or_else(|| node.key.clone(), |child| child.maximum_key);
+        Ok(ValidatedNode {
+            minimum_key,
+            maximum_key,
+            height,
+            logical_total,
+            quota_total,
+        })
     }
 
     fn height(&mut self, node: Option<ObjectId>) -> StorageResult<u32> {
@@ -577,23 +782,27 @@ where
                 Ordering::Less => root = node.left,
                 Ordering::Greater => root = node.right,
                 Ordering::Equal => {
-                    let leaf = self.record(node.value)?;
-                    if leaf.kind() != ObjectKind::KvLeaf
-                        || leaf.format_version() != FORMAT_VERSION
-                        || leaf.class() != ObjectClass::Data
-                        || leaf.logical_bytes() != 0
-                        || !leaf.references().is_empty()
-                    {
-                        return Err(invalid(node.value, "invalid persistent KV value leaf"));
-                    }
-                    if u64::try_from(leaf.canonical_bytes().len()).ok() != Some(node.value_len) {
-                        return Err(invalid(id, "KV node value length does not match leaf"));
-                    }
-                    return Ok(Some(leaf.canonical_bytes().to_vec()));
+                    return self.value_bytes(id, &node).map(Some);
                 },
             }
         }
         Ok(None)
+    }
+
+    fn value_bytes(&self, node_id: ObjectId, node: &TreeNode) -> StorageResult<Vec<u8>> {
+        let leaf = self.record(node.value)?;
+        if leaf.kind() != ObjectKind::KvLeaf
+            || leaf.format_version() != FORMAT_VERSION
+            || leaf.class() != ObjectClass::Data
+            || leaf.logical_bytes() != 0
+            || !leaf.references().is_empty()
+        {
+            return Err(invalid(node.value, "invalid persistent KV value leaf"));
+        }
+        if u64::try_from(leaf.canonical_bytes().len()).ok() != Some(node.value_len) {
+            return Err(invalid(node_id, "KV node value length does not match leaf"));
+        }
+        Ok(leaf.canonical_bytes().to_vec())
     }
 
     fn set(
@@ -779,21 +988,27 @@ where
     }
 
     #[cfg(all(feature = "legacy-surrealkv", not(target_family = "wasm")))]
-    fn collect_entries(
+    fn visit_entries(
         &mut self,
         root: Option<ObjectId>,
-        entries: &mut Vec<(Vec<u8>, Vec<u8>)>,
+        mut visit: impl FnMut(&[u8], &[u8]) -> StorageResult<()>,
     ) -> StorageResult<()> {
-        let Some(id) = root else {
-            return Ok(());
-        };
-        let node = self.node(id)?;
-        self.collect_entries(node.left, entries)?;
-        let value = self
-            .get(Some(id), &node.key)?
-            .ok_or_else(|| invalid(id, "persistent KV node lost its value"))?;
-        entries.push((node.key.clone(), value));
-        self.collect_entries(node.right, entries)
+        let mut stack = Vec::new();
+        let mut current = root;
+        loop {
+            while let Some(id) = current {
+                let node = self.node(id)?;
+                stack.push(id);
+                current = node.left;
+            }
+            let Some(id) = stack.pop() else {
+                return Ok(());
+            };
+            let node = self.node(id)?;
+            let value = self.value_bytes(id, &node)?;
+            visit(&node.key, &value)?;
+            current = node.right;
+        }
     }
 
     fn keys_in_range(

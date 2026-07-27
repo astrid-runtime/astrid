@@ -184,7 +184,7 @@ pub async fn open_runtime_kv(
     let format_spec = format_spec_record()?;
     let format_spec_id = Blake3ObjectIdentityV1.identify(&format_spec);
     let metadata = store_metadata(format_spec_id);
-    let engine = tokio::task::spawn_blocking(move || {
+    let opened = tokio::task::spawn_blocking(move || {
         let existing_complete = prepare_destination(&open_path, &metadata)?;
         let engine = RuntimeEngine::open(
             &open_path,
@@ -220,17 +220,18 @@ pub async fn open_runtime_kv(
                     })?;
             },
         }
-        Ok(engine)
+        Ok((engine, existing_complete))
     })
     .await
     .map_err(|error| {
         StorageError::Connection(format!(
             "durable principal-store open worker failed: {error}"
         ))
-    })?
-    .map(Arc::new)?;
+    })??;
+    let (engine, existing_complete) = opened;
+    let engine = Arc::new(engine);
 
-    if !migrations::is_complete(&store_path) {
+    if !existing_complete {
         migrations::apply_required(home, &store_path, &engine).await?;
     }
 
@@ -489,6 +490,10 @@ mod tests {
         assert_eq!(record.kind(), ObjectKind::Evidence);
         assert_eq!(record.canonical_bytes(), STORE_FORMAT_SPEC);
         assert!(record.references().is_empty());
+        assert_eq!(
+            object_id_hex(id),
+            "62cded9a5b01fe75d7781b66303f5ffe8ced55a43025a0389eefaea5a0c58fe2"
+        );
         assert!(metadata.contains("identity-wire=tagged-identity-v1\n"));
         assert!(metadata.contains(&format!(
             "format-spec-object=1:1:32:{}\n",
@@ -502,7 +507,6 @@ mod tests {
         let home = AstridHome::from_path(directory.path());
         let store = open_runtime_kv(&home, unlimited_quota()).await.unwrap();
         store.close().await.unwrap();
-        drop(store);
 
         let record = format_spec_record().unwrap();
         let id = Blake3ObjectIdentityV1.identify(&record);
@@ -520,6 +524,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(engine.object(id).unwrap(), Some(record));
+        drop(store);
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -569,6 +574,50 @@ mod tests {
                 .iter()
                 .any(|object| object["kind"] == "Commit")
         );
+
+        let format_spec_id = Blake3ObjectIdentityV1.identify(&format_spec_record().unwrap());
+        let engine = RuntimeEngine::open(
+            home.principal_store_path(),
+            Blake3ObjectIdentityV1,
+            StateOwnerCodecV1,
+            RecoveryLimits::process_addressable(),
+        )
+        .unwrap();
+        let replacement_spec = ObjectRecord::new(
+            ObjectKind::Evidence,
+            ObjectFormatVersion::V1,
+            b"self-consistent replacement format specification".to_vec(),
+            Vec::new(),
+            0,
+            ObjectClass::Metadata,
+        )
+        .unwrap();
+        let (replacement_id, inserted) =
+            engine.persist_standalone_object(&replacement_spec).unwrap();
+        assert_eq!(inserted, astrid_storage_model::InsertOutcome::Inserted);
+        engine.close().unwrap();
+        std::fs::write(
+            home.principal_store_path().join(STORE_METADATA_FILE),
+            store_metadata(replacement_id),
+        )
+        .unwrap();
+        let substituted = std::process::Command::new("python3")
+            .arg(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../scripts/principal_store_v1_reader.py"),
+            )
+            .arg(home.principal_store_path())
+            .output()
+            .unwrap();
+        assert!(
+            !substituted.status.success(),
+            "independent reader accepted a substituted format specification"
+        );
+        std::fs::write(
+            home.principal_store_path().join(STORE_METADATA_FILE),
+            store_metadata(format_spec_id),
+        )
+        .unwrap();
 
         let arena_path = home.principal_store_path().join("objects.arena");
         let mut arena = std::fs::read(&arena_path).unwrap();

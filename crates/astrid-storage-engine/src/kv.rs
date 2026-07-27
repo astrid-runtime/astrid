@@ -334,6 +334,19 @@ pub trait KvProjectionEngine<P>: Send + Sync {
     ///
     /// Returns an engine I/O or recovery-required error.
     fn flush_kv(&self) -> Result<(), KvProjectionError>;
+
+    /// Release any engine resources owned by the embedding store.
+    ///
+    /// The default flushes engines that do not distinguish flush from close.
+    /// Durable engines override this to release their singleton lock and file
+    /// handles while rejecting subsequent operations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an engine flush, close, or recovery-required error.
+    fn close_kv(&self) -> Result<(), KvProjectionError> {
+        self.flush_kv()
+    }
 }
 
 impl<P, I> KvProjectionEngine<P> for InMemoryEngine<P, I>
@@ -401,6 +414,10 @@ where
 
     fn flush_kv(&self) -> Result<(), KvProjectionError> {
         self.flush().map_err(map_durable_error)
+    }
+
+    fn close_kv(&self) -> Result<(), KvProjectionError> {
+        self.close().map_err(map_durable_error)
     }
 }
 

@@ -29,6 +29,11 @@ KIND_NAMES = (
     "Derived",
 )
 REFERENCE_NAMES = ("Owns", "Evidence", "Lineage", "Derived")
+FORMAT_SPECIFICATION = (
+    1,
+    1,
+    bytes.fromhex("62cded9a5b01fe75d7781b66303f5ffe8ced55a43025a0389eefaea5a0c58fe2"),
+)
 
 
 class FormatError(Exception):
@@ -243,6 +248,8 @@ def parse_metadata(path):
     tagged = (int(fields[0]), int(fields[1]), bytes.fromhex(fields[3]))
     if int(fields[2]) != len(tagged[2]):
         raise FormatError("format-spec-object length mismatch")
+    if tagged != FORMAT_SPECIFICATION:
+        raise FormatError("store.meta does not name the frozen format specification")
     return tagged
 
 

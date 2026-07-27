@@ -47,13 +47,6 @@ pub(super) fn is_complete(store_path: &Path) -> bool {
         .is_ok_and(|bytes| bytes == LEGACY_TO_V1_MARKER)
 }
 
-#[cfg_attr(
-    not(feature = "legacy-surrealkv"),
-    expect(
-        clippy::unused_async,
-        reason = "keep one startup API across builds with and without the async legacy migrator"
-    )
-)]
 pub(super) async fn apply_required(
     home: &AstridHome,
     store_path: &Path,
@@ -72,7 +65,8 @@ pub(super) async fn apply_required(
         ));
     }
     let legacy_path = home.state_db_path();
-    let legacy_exists = legacy_path.exists();
+    let path_to_check = legacy_path.clone();
+    let legacy_exists = run_blocking_migration(move || Ok(path_to_check.exists())).await?;
     if legacy_exists {
         #[cfg(feature = "legacy-surrealkv")]
         migrate_legacy(&legacy_path, engine).await?;
@@ -83,16 +77,36 @@ pub(super) async fn apply_required(
         )));
     }
     if !legacy_exists {
-        engine
-            .flush()
-            .map_err(|error| StorageError::Internal(error.to_string()))?;
+        let engine = Arc::clone(engine);
+        run_blocking_migration(move || {
+            engine
+                .flush()
+                .map_err(|error| StorageError::Internal(error.to_string()))
+        })
+        .await?;
     }
-    atomic_write(&store_path.join(MIGRATION_MARKER_FILE), LEGACY_TO_V1_MARKER)
+    let marker = store_path.join(MIGRATION_MARKER_FILE);
+    run_blocking_migration(move || atomic_write(&marker, LEGACY_TO_V1_MARKER)).await
 }
 
 #[cfg(feature = "legacy-surrealkv")]
 async fn migrate_legacy(legacy_path: &Path, engine: &Arc<RuntimeEngine>) -> StorageResult<()> {
-    let legacy = SurrealKvStore::open(legacy_path)?;
+    let legacy_path = legacy_path.to_path_buf();
+    let engine = Arc::clone(engine);
+    let legacy = run_blocking_migration(move || {
+        let legacy = SurrealKvStore::open(legacy_path)?;
+        migrate_legacy_blocking(&legacy, &engine)?;
+        Ok(legacy)
+    })
+    .await?;
+    legacy.close().await
+}
+
+#[cfg(feature = "legacy-surrealkv")]
+fn migrate_legacy_blocking(
+    legacy: &SurrealKvStore,
+    engine: &Arc<RuntimeEngine>,
+) -> StorageResult<()> {
     let migration = RuntimeStore::from_engine(Arc::clone(engine), StateOwnerResolver);
     let mut expected = BTreeMap::<StateOwner, MigrationDigest>::new();
     let mut cursor = None;
@@ -108,8 +122,19 @@ async fn migrate_legacy(legacy_path: &Path, engine: &Arc<RuntimeEngine>) -> Stor
     engine
         .flush()
         .map_err(|error| StorageError::Internal(error.to_string()))?;
-    legacy.close().await?;
     Ok(())
+}
+
+async fn run_blocking_migration<T, F>(operation: F) -> StorageResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> StorageResult<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(|error| {
+            StorageError::Internal(format!("principal store migration worker failed: {error}"))
+        })?
 }
 
 #[cfg(feature = "legacy-surrealkv")]
@@ -144,9 +169,9 @@ fn verify_migration(
     for (owner, expected_digest) in expected {
         let mut actual = MigrationDigest::default();
         let store = RuntimeStore::from_engine(Arc::clone(engine), StateOwnerResolver);
-        for entry in store.entries_for_migration(owner)? {
-            actual.add(&entry.namespace, &entry.key, &entry.value)?;
-        }
+        store.visit_entries_for_migration(owner, |namespace, key, value| {
+            actual.add(namespace, key, value)
+        })?;
         if actual.finish() != expected_digest.finish() {
             return Err(StorageError::Internal(format!(
                 "legacy migration verification failed for {owner:?}"
@@ -203,6 +228,9 @@ fn hash_field(hasher: &mut blake3::Hasher, bytes: &[u8]) -> StorageResult<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
     use super::*;
 
     #[test]
@@ -213,5 +241,38 @@ mod tests {
         assert_eq!(MIGRATION_HISTORY[0].from, "legacy");
         assert_eq!(MIGRATION_HISTORY[0].to, CURRENT_STORE_VERSION);
         assert!(MIGRATION_HISTORY[0].rollback.contains("source preserved"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_migration_work_does_not_stall_the_executor() {
+        let entered = Arc::new(AtomicBool::new(false));
+        let released = Arc::new(AtomicBool::new(false));
+        let worker_entered = Arc::clone(&entered);
+        let worker_released = Arc::clone(&released);
+        let release_after_entry = tokio::spawn(async move {
+            while !entered.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+            released.store(true, Ordering::Release);
+        });
+
+        run_blocking_migration(move || {
+            worker_entered.store(true, Ordering::Release);
+            let deadline = Instant::now()
+                .checked_add(Duration::from_millis(500))
+                .unwrap();
+            while !worker_released.load(Ordering::Acquire) {
+                if Instant::now() >= deadline {
+                    return Err(StorageError::Internal(
+                        "migration blocked its async executor".to_owned(),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+        release_after_entry.await.unwrap();
     }
 }

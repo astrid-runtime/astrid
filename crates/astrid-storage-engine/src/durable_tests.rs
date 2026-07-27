@@ -890,6 +890,20 @@ fn second_writer_cannot_open_the_same_store() {
 }
 
 #[test]
+fn explicit_close_releases_files_while_engine_references_remain() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = Arc::new(open(directory.path()));
+    let retained = Arc::clone(&engine);
+
+    engine.close().unwrap();
+    engine.close().unwrap();
+    assert!(matches!(retained.object_count(), Err(DurableError::Closed)));
+
+    let reopened = open(directory.path());
+    assert_eq!(reopened.object_count().unwrap(), 0);
+}
+
+#[test]
 fn configured_frame_boundary_rejects_before_writing() {
     let directory = tempfile::tempdir().unwrap();
     let tiny = RecoveryLimits::new(64).unwrap();

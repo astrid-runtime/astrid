@@ -28,7 +28,7 @@ where
         run_blocking(move || {
             blocking
                 .engine
-                .flush_kv()
+                .close_kv()
                 .map_err(|error| map_engine(&error))
         })
         .await

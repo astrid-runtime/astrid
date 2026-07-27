@@ -194,7 +194,7 @@ where
 {
     async fn close(&self) -> StorageResult<()> {
         self.engine
-            .flush_kv()
+            .close_kv()
             .map_err(|error| map_projection_error(&error))
     }
 
