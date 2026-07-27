@@ -338,3 +338,14 @@ fn invalid_names_cannot_enter_a_snapshot() {
     assert!(snapshot.state().is_empty());
     assert!(engine.root(&"alice".to_owned()).is_none());
 }
+
+#[test]
+fn projection_model_error_preserves_typed_source() {
+    let error = KvProjectionError::from(ModelError::ArithmeticOverflow);
+    let source = std::error::Error::source(&error).unwrap();
+
+    assert_eq!(
+        source.downcast_ref::<ModelError>(),
+        Some(&ModelError::ArithmeticOverflow)
+    );
+}

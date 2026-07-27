@@ -274,7 +274,14 @@ impl fmt::Display for KvProjectionError {
     }
 }
 
-impl std::error::Error for KvProjectionError {}
+impl std::error::Error for KvProjectionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Model(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 impl From<ModelError> for KvProjectionError {
     fn from(error: ModelError) -> Self {
