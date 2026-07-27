@@ -7,9 +7,7 @@
 //! source.
 
 use std::cmp::Ordering;
-use std::fs::{File, OpenOptions};
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use astrid_core::dirs::AstridHome;
@@ -22,7 +20,7 @@ use astrid_storage_model::{
     ReferenceKind,
 };
 
-use crate::content::PrincipalContentStore;
+use crate::content::{ContentWriteOutcome, PrincipalContentStore};
 use crate::error::{StorageError, StorageResult};
 #[cfg(all(test, feature = "legacy-surrealkv"))]
 use crate::kv::SurrealKvStore;
@@ -33,6 +31,13 @@ const STORE_FORMAT_SPEC: &[u8] =
     include_bytes!("../../../docs/astrid-principal-store-format-v1.txt");
 
 mod migrations;
+mod native_io;
+mod staging;
+
+use native_io::{atomic_write, quarantine_directory};
+pub use staging::{
+    NativeContentStagingArea, ReadyStagedContent, StagedContentId, StagedContentWriter,
+};
 
 /// Explicit owner of one durable state root.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -176,6 +181,7 @@ pub type NativePrincipalContentStore = PrincipalContentStore<
 pub struct RuntimePrincipalStore {
     kv: Arc<dyn KvStore>,
     content: Arc<NativePrincipalContentStore>,
+    staging: Arc<NativeContentStagingArea>,
 }
 
 impl RuntimePrincipalStore {
@@ -189,6 +195,27 @@ impl RuntimePrincipalStore {
     #[must_use]
     pub fn content(&self) -> Arc<NativePrincipalContentStore> {
         Arc::clone(&self.content)
+    }
+
+    /// Clone the private native content-staging area.
+    #[must_use]
+    pub fn staging(&self) -> Arc<NativeContentStagingArea> {
+        Arc::clone(&self.staging)
+    }
+
+    /// Publish one sealed native write through the authoritative content store.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage or content-publication error while retaining the
+    /// staged bytes for an idempotent retry.
+    pub async fn publish_staged(
+        &self,
+        staged: ReadyStagedContent,
+    ) -> StorageResult<ContentWriteOutcome> {
+        self.staging
+            .publish(staged, Arc::clone(&self.content))
+            .await
     }
 }
 
@@ -269,7 +296,12 @@ pub async fn open_runtime_principal_store(
     let content = Arc::new(NativePrincipalContentStore::from_engine_with_quota(
         engine, quota,
     ));
-    Ok(RuntimePrincipalStore { kv, content })
+    let staging = Arc::new(NativeContentStagingArea::open(home.content_staging_path())?);
+    Ok(RuntimePrincipalStore {
+        kv,
+        content,
+        staging,
+    })
 }
 
 /// Open the native kernel's authoritative KV store.
@@ -385,105 +417,17 @@ fn prepare_destination(path: &Path, expected_metadata: &[u8]) -> StorageResult<b
 }
 
 fn quarantine_incomplete(path: &Path) -> StorageResult<()> {
-    let parent = path.parent().ok_or_else(|| {
-        StorageError::Connection("principal store path has no parent directory".to_owned())
-    })?;
-    let name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .ok_or_else(|| {
-            StorageError::Connection("principal store path is not valid UTF-8".to_owned())
-        })?;
-    let mut suffix = 0_u64;
-    let destination = loop {
-        let candidate = parent.join(format!("{name}.incomplete.{suffix}"));
-        if !candidate.exists() {
-            break candidate;
-        }
-        suffix = suffix.checked_add(1).ok_or_else(|| {
-            StorageError::Connection("too many incomplete principal stores".to_owned())
-        })?;
-    };
-    std::fs::rename(path, &destination).map_err(|error| {
-        StorageError::Connection(format!(
-            "quarantine incomplete principal store {} as {}: {error}",
-            path.display(),
-            destination.display()
-        ))
-    })?;
-    sync_directory(parent)
-}
-
-fn atomic_write(path: &Path, bytes: &[u8]) -> StorageResult<()> {
-    let parent = path.parent().ok_or_else(|| {
-        StorageError::Connection(format!("path {} has no parent", path.display()))
-    })?;
-    std::fs::create_dir_all(parent).map_err(|error| {
-        StorageError::Connection(format!("create directory {}: {error}", parent.display()))
-    })?;
-    let temporary = temporary_path(path);
-    let mut options = OpenOptions::new();
-    options.create(true).truncate(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&temporary).map_err(|error| {
-        StorageError::Connection(format!(
-            "open temporary state file {}: {error}",
-            temporary.display()
-        ))
-    })?;
-    file.write_all(bytes).map_err(|error| {
-        StorageError::Connection(format!(
-            "write temporary state file {}: {error}",
-            temporary.display()
-        ))
-    })?;
-    file.sync_all().map_err(|error| {
-        StorageError::Connection(format!(
-            "flush temporary state file {}: {error}",
-            temporary.display()
-        ))
-    })?;
-    std::fs::rename(&temporary, path).map_err(|error| {
-        StorageError::Connection(format!(
-            "publish state file {} as {}: {error}",
-            temporary.display(),
-            path.display()
-        ))
-    })?;
-    sync_directory(parent)
-}
-
-fn temporary_path(path: &Path) -> PathBuf {
-    let mut name = path
-        .file_name()
-        .map_or_else(|| "state".into(), std::ffi::OsString::from);
-    name.push(".tmp");
-    path.with_file_name(name)
-}
-
-#[cfg(unix)]
-fn sync_directory(path: &Path) -> StorageResult<()> {
-    File::open(path)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| {
-            StorageError::Connection(format!("flush directory {}: {error}", path.display()))
-        })
-}
-
-#[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> StorageResult<()> {
-    Ok(())
+    quarantine_directory(path, "incomplete").map(|_| ())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Seek as _, SeekFrom, Write as _};
+
     use astrid_storage_model::{ObjectFormatVersion, ObjectKind};
 
     use super::*;
+    use crate::{ChunkingProfile, ContentName};
 
     fn unlimited_quota() -> Arc<dyn KvQuotaResolver<StateOwner>> {
         Arc::new(|owner: &StateOwner| {
@@ -613,6 +557,109 @@ mod tests {
         .unwrap();
         assert_eq!(engine.object(id).unwrap(), Some(record));
         drop(store);
+    }
+
+    #[tokio::test]
+    async fn native_stage_acknowledges_before_ingest_and_publishes_on_a_blocking_worker() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(directory.path());
+        let store = open_runtime_principal_store(&home, unlimited_quota())
+            .await
+            .unwrap();
+        let owner = StateOwner::Principal(PrincipalId::new("alice").unwrap());
+        let name = ContentName::new("workspace/target/release/game").unwrap();
+        let mut writer = store
+            .staging()
+            .begin(owner.clone(), name.clone(), ChunkingProfile::ASTRID_V1)
+            .unwrap();
+        writer.write_all(b"linux build.......").unwrap();
+        writer.seek(SeekFrom::Start(12)).unwrap();
+        writer.write_all(b"artifact").unwrap();
+        writer.set_len(20).unwrap();
+        let staged = writer.seal().unwrap();
+
+        assert_eq!(staged.logical_bytes(), 20);
+        assert_eq!(store.content().describe(&owner, &name).unwrap(), None);
+        assert_eq!(store.staging().ready().unwrap(), vec![staged.clone()]);
+
+        let outcome = store.publish_staged(staged).await.unwrap();
+        assert_eq!(outcome.descriptor().logical_bytes(), 20);
+        assert_eq!(
+            store.content().read(&owner, &name).unwrap(),
+            Some(b"linux build.artifact".to_vec())
+        );
+        assert!(store.staging().ready().unwrap().is_empty());
+        drop(store);
+
+        let reopened = open_runtime_principal_store(&home, unlimited_quota())
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened.content().read(&owner, &name).unwrap(),
+            Some(b"linux build.artifact".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn staged_publication_retries_after_root_commit_before_cleanup() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(directory.path());
+        let store = open_runtime_principal_store(&home, unlimited_quota())
+            .await
+            .unwrap();
+        let owner = StateOwner::Principal(PrincipalId::new("alice").unwrap());
+        let name = ContentName::new("workspace/retry.bin").unwrap();
+        let mut writer = store
+            .staging()
+            .begin(owner.clone(), name.clone(), ChunkingProfile::ASTRID_V1)
+            .unwrap();
+        writer.write_all(b"one identity").unwrap();
+        let staged = writer.seal().unwrap();
+
+        let source = native_io::open_private_file(&staged.content_path()).unwrap();
+        let first = store
+            .content()
+            .put_streaming(&owner, &name, source)
+            .unwrap();
+        assert_eq!(store.staging().ready().unwrap(), vec![staged.clone()]);
+
+        let retried = store.publish_staged(staged).await.unwrap();
+        assert_eq!(retried.descriptor(), first.descriptor());
+        assert_eq!(retried.principal_root(), first.principal_root());
+        assert_eq!(retried.objects_inserted(), 0);
+        assert!(store.staging().ready().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn staged_publication_enforces_close_order_for_the_same_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(directory.path());
+        let store = open_runtime_principal_store(&home, unlimited_quota())
+            .await
+            .unwrap();
+        let owner = StateOwner::Principal(PrincipalId::new("alice").unwrap());
+        let name = ContentName::new("workspace/order.txt").unwrap();
+        let mut first = store
+            .staging()
+            .begin(owner.clone(), name.clone(), ChunkingProfile::ASTRID_V1)
+            .unwrap();
+        first.write_all(b"first close").unwrap();
+        let first = first.seal().unwrap();
+        let mut second = store
+            .staging()
+            .begin(owner.clone(), name.clone(), ChunkingProfile::ASTRID_V1)
+            .unwrap();
+        second.write_all(b"second close").unwrap();
+        let second = second.seal().unwrap();
+
+        let error = store.publish_staged(second.clone()).await.unwrap_err();
+        assert!(error.to_string().contains("earlier close"));
+        store.publish_staged(first).await.unwrap();
+        store.publish_staged(second).await.unwrap();
+        assert_eq!(
+            store.content().read(&owner, &name).unwrap(),
+            Some(b"second close".to_vec())
+        );
     }
 
     #[cfg(not(target_os = "windows"))]

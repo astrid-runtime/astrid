@@ -96,7 +96,15 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   incrementally in four-MiB coalesced shared-engine batches without per-object
   flushes; the ordinary root transaction revalidates the complete closure,
   flushes objects before the root, and retries root conflicts without rereading
-  the source. Source or sink failure never publishes a partial root.
+  the source. Source or sink failure never publishes a partial root. Hosted
+  writable projections can now stage random-access writes in private native
+  files and acknowledge a close after durable bytes plus a checksummed intent,
+  without waiting for content addressing. Startup promotes sealed pre-rename
+  writes, preserves incomplete entries for diagnosis, and rejects redirected
+  or malformed ready entries without deleting acknowledged bytes. Background
+  publication runs on a blocking worker, enforces close order per owner and
+  content name, and uses a durable post-root marker so a crash between the root
+  CAS and cleanup retries idempotently.
   Full and range reconstruction validate the typed graph and load only
   overlapping chunks. `PrincipalContentStore` publishes named content through
   the same per-principal root CAS and durable object arena as KV, so identical

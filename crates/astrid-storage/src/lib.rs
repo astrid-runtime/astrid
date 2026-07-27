@@ -76,7 +76,8 @@ pub use secret::{FallbackSecretStore, KeychainSecretStore};
 pub use kv::SurrealKvStore;
 #[cfg(not(target_family = "wasm"))]
 pub use principal_state::{
-    Blake3ObjectIdentityV1, NativePrincipalContentStore, RuntimePrincipalStore, StateOwner,
+    Blake3ObjectIdentityV1, NativeContentStagingArea, NativePrincipalContentStore,
+    ReadyStagedContent, RuntimePrincipalStore, StagedContentId, StagedContentWriter, StateOwner,
     StateOwnerCodecV1, StateOwnerResolver, open_runtime_kv, open_runtime_principal_store,
 };
 
