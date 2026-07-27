@@ -24,6 +24,23 @@ pub trait ContentSource {
     /// Returns the source-specific error when the backing object arena cannot
     /// complete the read.
     fn load_content_object(&self, id: ObjectId) -> Result<Option<ObjectRecord>, Self::Error>;
+
+    /// Load a bounded group of immutable objects in request order.
+    ///
+    /// The default preserves sources without a batch path. Durable sources may
+    /// coalesce physically adjacent immutable frames into fewer positional
+    /// reads without changing validation or missing-object semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns the source-specific error when the backing object arena cannot
+    /// complete the reads.
+    fn load_content_objects(
+        &self,
+        ids: &[ObjectId],
+    ) -> Result<Vec<Option<ObjectRecord>>, Self::Error> {
+        ids.iter().map(|id| self.load_content_object(*id)).collect()
+    }
 }
 
 /// Content grammar failure or an underlying source failure.
@@ -337,6 +354,11 @@ struct LoadedChunk {
     bytes: Vec<u8>,
 }
 
+struct LoadedRecord {
+    object: ObjectId,
+    record: ObjectRecord,
+}
+
 impl LoadedChunk {
     fn end(&self) -> Result<u64, ContentError> {
         self.start
@@ -449,6 +471,27 @@ fn append_range<S: ContentSource>(
     boundaries: &mut Option<BoundaryWindow>,
 ) -> Result<(), ContentReadError<S::Error>> {
     let record = load(source, object)?;
+    append_loaded_range(
+        source,
+        LoadedRecord { object, record },
+        shape,
+        range,
+        base_offset,
+        output,
+        boundaries,
+    )
+}
+
+fn append_loaded_range<S: ContentSource>(
+    source: &S,
+    loaded: LoadedRecord,
+    shape: ExpectedShape,
+    range: RequestedRange,
+    base_offset: u64,
+    output: &mut Vec<u8>,
+    boundaries: &mut Option<BoundaryWindow>,
+) -> Result<(), ContentReadError<S::Error>> {
+    let LoadedRecord { object, record } = loaded;
     match record.kind() {
         ObjectKind::Chunk => {
             validate_chunk(object, &record, shape)?;
@@ -484,6 +527,7 @@ fn append_range<S: ContentSource>(
             let children = decode_tree(object, &record, shape)?;
             let mut cursor = 0_u64;
             let child_count = children.len();
+            let mut selected = Vec::new();
             for (index, (child, child_length, child_chunk_count)) in
                 children.into_iter().enumerate()
             {
@@ -497,8 +541,7 @@ fn append_range<S: ContentSource>(
                     .checked_add(child_end)
                     .ok_or(ContentError::LengthOverflow)?;
                 if range.start < child_absolute_end && range.end > child_base {
-                    append_range(
-                        source,
+                    selected.push((
                         child,
                         ExpectedShape {
                             logical_bytes: child_length,
@@ -507,13 +550,26 @@ fn append_range<S: ContentSource>(
                             profile: shape.profile,
                             ends_file: shape.ends_file && index.saturating_add(1) == child_count,
                         },
-                        range,
                         child_base,
-                        output,
-                        boundaries,
-                    )?;
+                    ));
                 }
                 cursor = child_end;
+            }
+            let ids: Vec<_> = selected.iter().map(|(child, _, _)| *child).collect();
+            let records = load_many(source, &ids)?;
+            for ((child, child_shape, child_base), record) in selected.into_iter().zip(records) {
+                append_loaded_range(
+                    source,
+                    LoadedRecord {
+                        object: child,
+                        record,
+                    },
+                    child_shape,
+                    range,
+                    child_base,
+                    output,
+                    boundaries,
+                )?;
             }
             Ok(())
         },
@@ -523,6 +579,33 @@ fn append_range<S: ContentSource>(
         }
         .into()),
     }
+}
+
+fn load_many<S: ContentSource>(
+    source: &S,
+    objects: &[ObjectId],
+) -> Result<Vec<ObjectRecord>, ContentReadError<S::Error>> {
+    let Some(first) = objects.first().copied() else {
+        return Ok(Vec::new());
+    };
+    let records = source
+        .load_content_objects(objects)
+        .map_err(ContentReadError::Source)?;
+    if records.len() != objects.len() {
+        return Err(ContentError::InvalidObject {
+            object: first,
+            detail: "content source returned the wrong batch length",
+        }
+        .into());
+    }
+    objects
+        .iter()
+        .copied()
+        .zip(records)
+        .map(|(object, record)| {
+            record.ok_or_else(|| ContentReadError::Content(ContentError::MissingObject(object)))
+        })
+        .collect()
 }
 
 fn load_chunk_at_offset<S: ContentSource>(
