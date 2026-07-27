@@ -13,6 +13,7 @@ const DEFAULT_RANGE_BYTES: usize = 1024 * 1024;
 const DEFAULT_SAMPLES: usize = 3;
 const DEFAULT_SMALL_FILES: usize = 64;
 const DEFAULT_SMALL_FILE_BYTES: usize = 4096;
+const DEFAULT_CONCURRENT_PRINCIPALS: usize = 4;
 
 #[derive(Clone, Debug, Serialize)]
 pub(super) struct Config {
@@ -22,6 +23,7 @@ pub(super) struct Config {
     pub(super) samples: usize,
     pub(super) small_files: usize,
     pub(super) small_file_bytes: usize,
+    pub(super) concurrent_principals: usize,
     pub(super) root: Option<PathBuf>,
     pub(super) output: Option<PathBuf>,
 }
@@ -35,6 +37,7 @@ impl Config {
             samples: DEFAULT_SAMPLES,
             small_files: DEFAULT_SMALL_FILES,
             small_file_bytes: DEFAULT_SMALL_FILE_BYTES,
+            concurrent_principals: DEFAULT_CONCURRENT_PRINCIPALS,
             root: None,
             output: None,
         };
@@ -57,6 +60,10 @@ impl Config {
                 "--small-file-bytes" => {
                     config.small_file_bytes = parse_usize(&mut arguments, "--small-file-bytes")?;
                 },
+                "--concurrent-principals" => {
+                    config.concurrent_principals =
+                        parse_usize(&mut arguments, "--concurrent-principals")?;
+                },
                 "--root" => config.root = Some(parse_path(&mut arguments, "--root")?),
                 "--output" => config.output = Some(parse_path(&mut arguments, "--output")?),
                 "--help" | "-h" => {
@@ -75,6 +82,7 @@ impl Config {
             ("--samples", config.samples),
             ("--small-files", config.small_files),
             ("--small-file-bytes", config.small_file_bytes),
+            ("--concurrent-principals", config.concurrent_principals),
         ] {
             if NonZeroUsize::new(value).is_none() {
                 return Err(format!("{name} must be greater than zero").into());
@@ -124,6 +132,8 @@ fn print_help() {
            --samples N           native large-write samples (default {DEFAULT_SAMPLES})\n\
            --small-files N       small-file operation count (default {DEFAULT_SMALL_FILES})\n\
            --small-file-bytes N  bytes per small file (default {DEFAULT_SMALL_FILE_BYTES})\n\
+           --concurrent-principals N\n\
+                                 shared-content concurrency (default {DEFAULT_CONCURRENT_PRINCIPALS})\n\
            --root PATH           retain benchmark data under PATH\n\
            --output PATH         write the JSON report to PATH\n"
     );

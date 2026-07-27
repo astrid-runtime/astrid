@@ -20,7 +20,7 @@ mod workloads;
 use config::Config;
 use report::Report;
 
-type BenchResult<T> = Result<T, Box<dyn Error>>;
+type BenchResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> BenchResult<()> {

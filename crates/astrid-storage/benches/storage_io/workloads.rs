@@ -31,7 +31,8 @@ pub(super) async fn run(
     benchmark_staging_large_writes(config, root, source, report)?;
     benchmark_content_compute(config, source, report)?;
     benchmark_small_files(config, root, report)?;
-    benchmark_runtime(config, root, source, source_digest, report).await
+    benchmark_runtime(config, root, source, source_digest, report).await?;
+    benchmark_concurrent_principals(config, root, source, source_digest, report).await
 }
 
 fn benchmark_native_large_writes(
@@ -197,46 +198,85 @@ async fn benchmark_runtime(
     source_digest: [u8; 32],
     report: &mut Report,
 ) -> BenchResult<()> {
-    let home = AstridHome::from_path(root.join("astrid-home"));
-    home.ensure()?;
-    let started = Instant::now();
-    let store = open_store(&home).await?;
-    report.record_operations("astrid_fresh_open", 1, vec![started.elapsed()]);
+    benchmark_native_reads(config, source, source_digest, report)?;
     let owner = benchmark_owner()?;
-    let unique_name = benchmark_publication(config, source, report, &store, &owner).await?;
-    benchmark_reads_and_reopen(
-        ReadBenchmark {
-            config,
-            source,
+    let home_path = root.join("astrid-home");
+    let mut samples = RuntimeSamples::default();
+    for sample in 0..config.samples {
+        if sample != 0 {
+            reset_benchmark_home(&home_path)?;
+        }
+        let home = AstridHome::from_path(home_path.clone());
+        home.ensure()?;
+        let started = Instant::now();
+        let store = open_store(&home).await?;
+        samples.fresh_open.push(started.elapsed());
+
+        let publication = benchmark_publication(config, source, &store, &owner).await?;
+        samples.unique_publish.push(publication.unique_publish);
+        samples
+            .unique_end_to_end
+            .push(publication.unique_end_to_end);
+        samples
+            .duplicate_stage_write
+            .push(publication.duplicate_stage_write);
+        samples
+            .duplicate_stage_seal
+            .push(publication.duplicate_stage_seal);
+        samples
+            .duplicate_publish
+            .push(publication.duplicate_publish);
+        samples
+            .duplicate_end_to_end
+            .push(publication.duplicate_end_to_end);
+
+        samples.read_first.push(timed_content_read(
+            store.content().as_ref(),
+            &owner,
+            &publication.unique_name,
+            config.bytes,
+            config.range_bytes,
             source_digest,
-            home,
-            store,
-            owner,
-            unique_name,
-        },
-        report,
-    )
-    .await
+        )?);
+        samples.read_warm.push(timed_content_read(
+            store.content().as_ref(),
+            &owner,
+            &publication.unique_name,
+            config.bytes,
+            config.range_bytes,
+            source_digest,
+        )?);
+
+        drop(store);
+        let started = Instant::now();
+        let reopened = open_store(&home).await?;
+        samples.reopen.push(started.elapsed());
+        samples.read_after_reopen.push(timed_content_read(
+            reopened.content().as_ref(),
+            &owner,
+            &publication.unique_name,
+            config.bytes,
+            config.range_bytes,
+            source_digest,
+        )?);
+        drop(reopened);
+    }
+    samples.record(config, report);
+    Ok(())
 }
 
 async fn benchmark_publication(
     config: &Config,
     source: &Path,
-    report: &mut Report,
     store: &RuntimePrincipalStore,
     owner: &StateOwner,
-) -> BenchResult<ContentName> {
+) -> BenchResult<PublicationSample> {
     let (unique_name, unique_staged, stage_write, stage_seal) =
         stage_source(store, source, owner, "large/unique.bin", config.block_bytes)?;
     let started = Instant::now();
     black_box(store.publish_staged(unique_staged).await?);
     let unique_publish = started.elapsed();
-    report.record_bytes("astrid_publish_unique", config.bytes, vec![unique_publish]);
-    report.record_bytes(
-        "astrid_unique_end_to_end",
-        config.bytes,
-        vec![sum_durations(&[stage_write, stage_seal, unique_publish])?],
-    );
+    let unique_end_to_end = sum_durations(&[stage_write, stage_seal, unique_publish])?;
 
     let (_, duplicate_staged, duplicate_write, duplicate_seal) = stage_source(
         store,
@@ -248,56 +288,88 @@ async fn benchmark_publication(
     let started = Instant::now();
     black_box(store.publish_staged(duplicate_staged).await?);
     let duplicate_publish = started.elapsed();
-    report.record_bytes(
-        "astrid_duplicate_stage_write",
-        config.bytes,
-        vec![duplicate_write],
-    );
-    report.record_bytes(
-        "astrid_duplicate_stage_seal",
-        config.bytes,
-        vec![duplicate_seal],
-    );
-    report.record_bytes(
-        "astrid_publish_duplicate",
-        config.bytes,
-        vec![duplicate_publish],
-    );
-    report.record_bytes(
-        "astrid_duplicate_end_to_end",
-        config.bytes,
-        vec![sum_durations(&[
-            duplicate_write,
-            duplicate_seal,
-            duplicate_publish,
-        ])?],
-    );
-    Ok(unique_name)
+    Ok(PublicationSample {
+        unique_name,
+        unique_publish,
+        unique_end_to_end,
+        duplicate_stage_write: duplicate_write,
+        duplicate_stage_seal: duplicate_seal,
+        duplicate_publish,
+        duplicate_end_to_end: sum_durations(&[duplicate_write, duplicate_seal, duplicate_publish])?,
+    })
 }
 
-struct ReadBenchmark<'a> {
-    config: &'a Config,
-    source: &'a Path,
-    source_digest: [u8; 32],
-    home: AstridHome,
-    store: RuntimePrincipalStore,
-    owner: StateOwner,
+struct PublicationSample {
     unique_name: ContentName,
+    unique_publish: Duration,
+    unique_end_to_end: Duration,
+    duplicate_stage_write: Duration,
+    duplicate_stage_seal: Duration,
+    duplicate_publish: Duration,
+    duplicate_end_to_end: Duration,
 }
 
-async fn benchmark_reads_and_reopen(
-    benchmark: ReadBenchmark<'_>,
+#[derive(Default)]
+struct RuntimeSamples {
+    fresh_open: Vec<Duration>,
+    unique_publish: Vec<Duration>,
+    unique_end_to_end: Vec<Duration>,
+    duplicate_stage_write: Vec<Duration>,
+    duplicate_stage_seal: Vec<Duration>,
+    duplicate_publish: Vec<Duration>,
+    duplicate_end_to_end: Vec<Duration>,
+    read_first: Vec<Duration>,
+    read_warm: Vec<Duration>,
+    reopen: Vec<Duration>,
+    read_after_reopen: Vec<Duration>,
+}
+
+impl RuntimeSamples {
+    fn record(self, config: &Config, report: &mut Report) {
+        report.record_operations("astrid_fresh_open", 1, self.fresh_open);
+        report.record_bytes("astrid_publish_unique", config.bytes, self.unique_publish);
+        report.record_bytes(
+            "astrid_unique_end_to_end",
+            config.bytes,
+            self.unique_end_to_end,
+        );
+        report.record_bytes(
+            "astrid_duplicate_stage_write",
+            config.bytes,
+            self.duplicate_stage_write,
+        );
+        report.record_bytes(
+            "astrid_duplicate_stage_seal",
+            config.bytes,
+            self.duplicate_stage_seal,
+        );
+        report.record_bytes(
+            "astrid_publish_duplicate",
+            config.bytes,
+            self.duplicate_publish,
+        );
+        report.record_bytes(
+            "astrid_duplicate_end_to_end",
+            config.bytes,
+            self.duplicate_end_to_end,
+        );
+        report.record_bytes("astrid_read_first", config.bytes, self.read_first);
+        report.record_bytes("astrid_read_warm", config.bytes, self.read_warm);
+        report.record_operations("astrid_reopen", 1, self.reopen);
+        report.record_bytes(
+            "astrid_read_after_reopen",
+            config.bytes,
+            self.read_after_reopen,
+        );
+    }
+}
+
+fn benchmark_native_reads(
+    config: &Config,
+    source: &Path,
+    source_digest: [u8; 32],
     report: &mut Report,
 ) -> BenchResult<()> {
-    let ReadBenchmark {
-        config,
-        source,
-        source_digest,
-        home,
-        store,
-        owner,
-        unique_name,
-    } = benchmark;
     let native_first = timed_native_read(source, config.block_bytes, source_digest)?;
     let mut native_warm = Vec::with_capacity(config.samples);
     for _ in 0..config.samples {
@@ -309,48 +381,101 @@ async fn benchmark_reads_and_reopen(
     }
     report.record_bytes("native_read_first", config.bytes, vec![native_first]);
     report.record_bytes("native_read_warm", config.bytes, native_warm);
-
-    let astrid_first = timed_content_read(
-        store.content().as_ref(),
-        &owner,
-        &unique_name,
-        config.bytes,
-        config.range_bytes,
-        source_digest,
-    )?;
-    let mut astrid_warm = Vec::with_capacity(config.samples);
-    for _ in 0..config.samples {
-        astrid_warm.push(timed_content_read(
-            store.content().as_ref(),
-            &owner,
-            &unique_name,
-            config.bytes,
-            config.range_bytes,
-            source_digest,
-        )?);
-    }
-    report.record_bytes("astrid_read_first", config.bytes, vec![astrid_first]);
-    report.record_bytes("astrid_read_warm", config.bytes, astrid_warm);
-
-    drop(store);
-    let started = Instant::now();
-    let reopened = open_store(&home).await?;
-    report.record_operations("astrid_reopen", 1, vec![started.elapsed()]);
-    let reopened_read = timed_content_read(
-        reopened.content().as_ref(),
-        &owner,
-        &unique_name,
-        config.bytes,
-        config.range_bytes,
-        source_digest,
-    )?;
-    report.record_bytes(
-        "astrid_read_after_reopen",
-        config.bytes,
-        vec![reopened_read],
-    );
-    drop(reopened);
     Ok(())
+}
+
+async fn benchmark_concurrent_principals(
+    config: &Config,
+    root: &Path,
+    source: &Path,
+    source_digest: [u8; 32],
+    report: &mut Report,
+) -> BenchResult<()> {
+    let total_bytes = config.bytes;
+    let range_bytes = config.range_bytes;
+    let logical_bytes = config
+        .bytes
+        .checked_mul(u64::try_from(config.concurrent_principals)?)
+        .ok_or("concurrent logical byte count overflow")?;
+    let home_path = root.join("concurrent-home");
+    let mut publish_samples = Vec::with_capacity(config.samples);
+    let mut read_samples = Vec::with_capacity(config.samples);
+    for sample in 0..config.samples {
+        if sample != 0 {
+            reset_benchmark_home(&home_path)?;
+        }
+        let home = AstridHome::from_path(home_path.clone());
+        home.ensure()?;
+        let store = open_store(&home).await?;
+        let mut staged = Vec::with_capacity(config.concurrent_principals);
+        let mut descriptors = Vec::with_capacity(config.concurrent_principals);
+        for index in 0..config.concurrent_principals {
+            let owner = benchmark_owner_named(&format!("storage-benchmark-concurrent-{index}"))?;
+            let name = format!("shared/{sample}/{index}.bin");
+            let (name, ready, _, _) =
+                stage_source(&store, source, &owner, &name, config.block_bytes)?;
+            staged.push(ready);
+            descriptors.push((owner, name));
+        }
+
+        let started = Instant::now();
+        let mut publishers = Vec::with_capacity(staged.len());
+        for ready in staged {
+            let store = store.clone();
+            publishers.push(tokio::spawn(
+                async move { store.publish_staged(ready).await },
+            ));
+        }
+        for publisher in publishers {
+            black_box(publisher.await??);
+        }
+        publish_samples.push(started.elapsed());
+
+        let started = Instant::now();
+        let mut readers = Vec::with_capacity(descriptors.len());
+        for (owner, name) in descriptors {
+            let content = store.content();
+            readers.push(tokio::task::spawn_blocking(move || {
+                timed_content_read(
+                    content.as_ref(),
+                    &owner,
+                    &name,
+                    total_bytes,
+                    range_bytes,
+                    source_digest,
+                )
+            }));
+        }
+        for reader in readers {
+            black_box(reader.await??);
+        }
+        read_samples.push(started.elapsed());
+        drop(store);
+    }
+    report.record_bytes(
+        "astrid_concurrent_shared_publish",
+        logical_bytes,
+        publish_samples,
+    );
+    report.record_bytes(
+        "astrid_concurrent_shared_read_warm",
+        logical_bytes,
+        read_samples,
+    );
+    Ok(())
+}
+
+fn reset_benchmark_home(path: &Path) -> BenchResult<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => Err(format!(
+            "benchmark home {} is redirected or not a directory",
+            path.display()
+        )
+        .into()),
+        Ok(_) => std::fs::remove_dir_all(path).map_err(Into::into),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn stage_source(
@@ -505,7 +630,11 @@ pub(super) fn hash_native(path: &Path, block_bytes: usize) -> BenchResult<[u8; 3
 }
 
 fn benchmark_owner() -> BenchResult<StateOwner> {
-    PrincipalId::new("storage-benchmark")
+    benchmark_owner_named("storage-benchmark")
+}
+
+fn benchmark_owner_named(name: &str) -> BenchResult<StateOwner> {
+    PrincipalId::new(name)
         .map(StateOwner::Principal)
         .map_err(Into::into)
 }
