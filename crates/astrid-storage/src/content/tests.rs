@@ -13,6 +13,7 @@ use astrid_storage_model::{
 };
 
 use super::{ContentName, ContentNameError, PrincipalContentError, PrincipalContentStore};
+use crate::StorageError;
 use crate::kv::{KvStore, TreeKvStore};
 
 #[derive(Clone, Copy)]
@@ -507,5 +508,15 @@ fn principal_content_error_preserves_nested_sources() {
     assert_eq!(
         model_source.downcast_ref::<ModelError>(),
         Some(&ModelError::ArithmeticOverflow)
+    );
+
+    let quota = PrincipalContentError::QuotaPolicy(StorageError::Connection(
+        "policy service unavailable".to_owned(),
+    ));
+    assert!(
+        std::error::Error::source(&quota)
+            .unwrap()
+            .downcast_ref::<StorageError>()
+            .is_some()
     );
 }

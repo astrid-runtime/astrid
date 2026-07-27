@@ -21,6 +21,8 @@ use astrid_storage_content::ContentError;
 
 pub(crate) use catalog::{CONTENT_COMPONENT_LABEL, catalog_quota};
 
+use crate::error::StorageError;
+
 /// Canonical name of one principal-owned content value.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ContentName(String);
@@ -235,7 +237,7 @@ pub enum PrincipalContentError {
         limit: u64,
     },
     /// Live quota resolution failed.
-    QuotaPolicy(String),
+    QuotaPolicy(StorageError),
 }
 
 impl fmt::Display for PrincipalContentError {
@@ -274,6 +276,7 @@ impl std::error::Error for PrincipalContentError {
             Self::Content(error) => Some(error),
             Self::ContentSource(error) => Some(error),
             Self::Projection(error) => Some(error),
+            Self::QuotaPolicy(error) => Some(error),
             _ => None,
         }
     }

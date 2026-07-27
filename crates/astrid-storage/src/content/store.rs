@@ -427,7 +427,7 @@ where
         };
         let Some(limit) = quota
             .max_logical_bytes(principal)
-            .map_err(|error| PrincipalContentError::QuotaPolicy(error.to_string()))?
+            .map_err(PrincipalContentError::QuotaPolicy)?
         else {
             return Ok(());
         };
