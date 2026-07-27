@@ -22,6 +22,7 @@ use astrid_storage_model::{
     ReferenceKind,
 };
 
+use crate::content::PrincipalContentStore;
 use crate::error::{StorageError, StorageResult};
 #[cfg(all(test, feature = "legacy-surrealkv"))]
 use crate::kv::SurrealKvStore;
@@ -164,21 +165,46 @@ type RuntimeEngine = DurableEngine<StateOwner, Blake3ObjectIdentityV1, StateOwne
 type RuntimeStore =
     TreeKvStore<StateOwner, Blake3ObjectIdentityV1, StateOwnerResolver, RuntimeEngine>;
 
-/// Open the native kernel's authoritative KV store.
+/// Native named-content projection sharing the authoritative principal arena.
+pub type NativePrincipalContentStore = PrincipalContentStore<
+    StateOwner,
+    DurableEngine<StateOwner, Blake3ObjectIdentityV1, StateOwnerCodecV1>,
+>;
+
+/// Native principal-store projections opened over one durable engine.
+#[derive(Clone)]
+pub struct RuntimePrincipalStore {
+    kv: Arc<dyn KvStore>,
+    content: Arc<NativePrincipalContentStore>,
+}
+
+impl RuntimePrincipalStore {
+    /// Clone the runtime KV projection.
+    #[must_use]
+    pub fn kv(&self) -> Arc<dyn KvStore> {
+        Arc::clone(&self.kv)
+    }
+
+    /// Clone the named content projection.
+    #[must_use]
+    pub fn content(&self) -> Arc<NativePrincipalContentStore> {
+        Arc::clone(&self.content)
+    }
+}
+
+/// Open every native projection over the authoritative principal store.
 ///
-/// The caller must already hold the kernel singleton lock. On first cutover,
-/// legacy state is imported and independently verified before the completion
-/// marker is made durable. A partial prior destination is quarantined rather
-/// than trusted or deleted.
+/// KV and named content share one object arena, principal-root CAS, and live
+/// quota resolver. The caller must already hold the kernel singleton lock.
 ///
 /// # Errors
 ///
 /// Returns a storage error if policy, metadata, migration, verification, or
 /// durable recovery fails.
-pub async fn open_runtime_kv(
+pub async fn open_runtime_principal_store(
     home: &AstridHome,
     quota: Arc<dyn KvQuotaResolver<StateOwner>>,
-) -> StorageResult<Arc<dyn KvStore>> {
+) -> StorageResult<RuntimePrincipalStore> {
     let store_path = home.principal_store_path();
     let open_path = store_path.clone();
     let format_spec = format_spec_record()?;
@@ -235,11 +261,35 @@ pub async fn open_runtime_kv(
         migrations::apply_required(home, &store_path, &engine).await?;
     }
 
-    Ok(Arc::new(RuntimeStore::from_engine_with_quota(
-        engine,
+    let kv: Arc<dyn KvStore> = Arc::new(RuntimeStore::from_engine_with_quota(
+        Arc::clone(&engine),
         StateOwnerResolver,
-        quota,
-    )))
+        Arc::clone(&quota),
+    ));
+    let content = Arc::new(NativePrincipalContentStore::from_engine_with_quota(
+        engine, quota,
+    ));
+    Ok(RuntimePrincipalStore { kv, content })
+}
+
+/// Open the native kernel's authoritative KV store.
+///
+/// The caller must already hold the kernel singleton lock. On first cutover,
+/// legacy state is imported and independently verified before the completion
+/// marker is made durable. A partial prior destination is quarantined rather
+/// than trusted or deleted.
+///
+/// # Errors
+///
+/// Returns a storage error if policy, metadata, migration, verification, or
+/// durable recovery fails.
+pub async fn open_runtime_kv(
+    home: &AstridHome,
+    quota: Arc<dyn KvQuotaResolver<StateOwner>>,
+) -> StorageResult<Arc<dyn KvStore>> {
+    open_runtime_principal_store(home, quota)
+        .await
+        .map(|store| store.kv())
 }
 
 fn format_spec_record() -> StorageResult<ObjectRecord> {

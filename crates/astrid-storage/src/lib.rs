@@ -43,6 +43,7 @@
 #![deny(clippy::unwrap_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
+pub mod content;
 pub mod error;
 pub mod identity;
 pub mod kv;
@@ -53,6 +54,10 @@ pub mod secret;
 #[cfg(feature = "db")]
 pub mod db;
 
+pub use content::{
+    ChunkingProfile, ContentDescriptor, ContentEntry, ContentName, ContentNameError,
+    ContentWriteOutcome, PrincipalContentError, PrincipalContentStore,
+};
 pub use error::{StorageError, StorageResult};
 pub use identity::{IdentityError, IdentityStore, KvIdentityStore};
 pub use kv::{
@@ -71,7 +76,8 @@ pub use secret::{FallbackSecretStore, KeychainSecretStore};
 pub use kv::SurrealKvStore;
 #[cfg(not(target_family = "wasm"))]
 pub use principal_state::{
-    Blake3ObjectIdentityV1, StateOwner, StateOwnerCodecV1, StateOwnerResolver, open_runtime_kv,
+    Blake3ObjectIdentityV1, NativePrincipalContentStore, RuntimePrincipalStore, StateOwner,
+    StateOwnerCodecV1, StateOwnerResolver, open_runtime_kv, open_runtime_principal_store,
 };
 
 #[cfg(feature = "db")]

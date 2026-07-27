@@ -514,6 +514,54 @@ pub(super) fn append_frame(
     })
 }
 
+pub(super) fn append_frames(
+    file: &mut File,
+    magic: [u8; 8],
+    payloads: &[Vec<u8>],
+) -> Result<Vec<ArenaLocation>, DurableError> {
+    let capacity = payloads.iter().try_fold(0_usize, |total, payload| {
+        total
+            .checked_add(FRAME_HEADER_LEN_USIZE)
+            .and_then(|value| value.checked_add(payload.len()))
+            .ok_or(DurableError::EncodingOverflow)
+    })?;
+    let mut encoded = Vec::new();
+    encoded
+        .try_reserve_exact(capacity)
+        .map_err(|_| DurableError::EncodingOverflow)?;
+    let mut locations = Vec::new();
+    locations
+        .try_reserve_exact(payloads.len())
+        .map_err(|_| DurableError::EncodingOverflow)?;
+    let base = file
+        .seek(SeekFrom::End(0))
+        .map_err(|source| io_error("seek durable batch append", source))?;
+    for payload in payloads {
+        let payload_len =
+            u64::try_from(payload.len()).map_err(|_| DurableError::EncodingOverflow)?;
+        let checksum = frame_checksum(magic, payload_len, payload);
+        let relative = u64::try_from(encoded.len()).map_err(|_| DurableError::EncodingOverflow)?;
+        let offset = base
+            .checked_add(relative)
+            .ok_or(DurableError::EncodingOverflow)?;
+        let mut header = [0_u8; FRAME_HEADER_LEN_USIZE];
+        header[..8].copy_from_slice(&magic);
+        header[8..10].copy_from_slice(&FRAME_VERSION.to_le_bytes());
+        header[12..20].copy_from_slice(&payload_len.to_le_bytes());
+        header[CHECKSUM_START..].copy_from_slice(&checksum);
+        encoded.extend_from_slice(&header);
+        encoded.extend_from_slice(payload);
+        locations.push(ArenaLocation {
+            offset,
+            payload_len,
+            checksum,
+        });
+    }
+    file.write_all(&encoded)
+        .map_err(|source| io_error("append durable frame batch", source))?;
+    Ok(locations)
+}
+
 pub(super) fn frame_checksum(magic: [u8; 8], payload_len: u64, payload: &[u8]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new_derive_key("astrid durable physical frame checksum v1");
     hasher.update(&magic);

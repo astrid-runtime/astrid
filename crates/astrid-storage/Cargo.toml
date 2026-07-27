@@ -16,10 +16,11 @@ kv = []
 legacy-surrealkv = ["dep:surrealkv"]
 db = ["dep:surrealdb"]
 keychain = ["dep:keyring"]
-full = ["legacy-surrealkv", "db"]
+full = ["kv", "legacy-surrealkv", "db"]
 
 [dependencies]
 astrid-core = { workspace = true }
+astrid-storage-content = { workspace = true }
 astrid-storage-engine = { workspace = true }
 astrid-storage-model = { workspace = true }
 async-trait = { workspace = true }

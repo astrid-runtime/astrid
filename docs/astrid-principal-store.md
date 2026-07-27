@@ -226,7 +226,7 @@ The implemented engine contract, compatibility oracle, native cutover, and
 durable host-file realization are maintained in
 [Principal Store Engine Realization](astrid-principal-store-engine.md).
 
-## 6. Three identifiers, not one overloaded hash
+## 6. Four identifiers, not one overloaded hash
 
 The system must not turn possession of a hash into permission to read data.
 
@@ -272,11 +272,50 @@ BlobId = H(
 Compression, encryption, erasure coding, or a future encoding migration may
 produce a new `BlobId` for the same `ObjectId`. Logical roots do not change.
 
-### 6.3 Capabilities and root authority
+### 6.3 `SemanticId`
+
+Identity of one value under an immutable, registered equivalence contract:
+
+```text
+SemanticContractId = ObjectId(EquivalenceContract)
+
+SemanticId = TaggedIdentity(
+    algorithm,
+    construction_version,
+    digest_length,
+    H(
+        "astrid-semantic-identity" ||
+        encode(SemanticContractId) ||
+        canonical_stream
+    )
+)
+```
+
+`SemanticId` is neither exact-byte identity nor a similarity score. The
+semantic contract pins one archived canonicalizer capsule, its dependency
+closure, deterministic runtime semantics, typed value schema, and canonical
+stream grammar. Independently versioned representation contracts pin decoders
+from exact encodings into that semantic domain. This separation lets a future
+codec converge with existing values without changing their `SemanticId`.
+Alternate transforms may propose results but cannot mint semantic identity
+without complete reference verification or a contract-pinned proof. Matching
+digests remain candidate equality: canonical streams are compared before two
+bindings collapse, preserving the store's collision-detection rule.
+
+Different encodings may share a `SemanticId` while retaining distinct
+`ObjectId` and `BlobId` values. Arbitrary source representations do not become
+safe to serve across principals merely because their canonical values match.
+The complete substitution threat, registration authority, representation trust
+classes, generic streaming host boundary, image-capsule example, retention
+choices, and typed transformation graph are specified in [Semantic
+Representations](astrid-semantic-representations.md).
+
+### 6.4 Capabilities and root authority
 
 A capability authorizes an operation on a principal or root. It is not an
-`ObjectId` or `BlobId`. Storage backends may be given verify-only access,
-read access, replication access, or deletion access independently.
+`ObjectId`, `SemanticId`, or `BlobId`. Storage backends may be given
+verify-only access, read access, replication access, or deletion access
+independently.
 
 This distinction lets an untrusted placement node verify stored ciphertext
 without learning plaintext or acquiring principal authority.
@@ -709,3 +748,5 @@ Operations](astrid-principal-store-operations.md). Host filesystem projection,
 runtime integration, tensor-ready scaffolding, implementation order, open
 evidence questions, prior art, and the Astrid-specific synthesis continue in
 [Principal Store Runtime Realization](astrid-principal-store-runtime.md).
+Contract-scoped equality, trusted encodings, and typed transformation routing
+continue in [Semantic Representations](astrid-semantic-representations.md).

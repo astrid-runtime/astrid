@@ -128,10 +128,14 @@ ChunkingProfile {
 ```
 
 Content-defined chunking avoids shifting every later boundary after an
-insertion near the start of a file. A FastCDC-like algorithm is a candidate,
-not a pre-selected dependency. Astrid must benchmark source trees, package
-caches, model artifacts, databases, VM images, compressed media, encrypted
-data, and adversarial random data before pinning parameters.
+insertion near the start of a file. The first profile pins FastCDC 2020,
+implementation revision, normalization level one, an unseeded gear table, and
+16/64/256 KiB minimum/target/maximum sizes. Every field is encoded into the
+file object; an exact dependency pin and golden cuts protect stored identity.
+This compatibility point is not universally optimal. Astrid must benchmark
+source trees, caches, model artifacts, databases, VM images, compressed or
+encrypted media, and adversarial random data before adding profiles. Another
+profile reconstructs the same bytes with a deliberately different file ID.
 
 ### 14.3 Collision probability
 

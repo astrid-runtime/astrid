@@ -80,9 +80,48 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   no fixed frame or capacity ceiling, and derives finite storage budgets from
   the live principal profile. Quota accounting includes canonical namespace/key
   bytes as well as values, so empty values cannot consume unmetered
-  principal-controlled metadata. The misleading `kv` gate is removed; the
-  temporary `legacy-surrealkv` feature names only the reader and migrator and
-  selects no runtime backend.
+  principal-controlled metadata. The legacy `kv` feature remains only as a
+  deprecated no-op compatibility alias; `legacy-surrealkv` names the temporary
+  reader and migrator. Neither feature selects a runtime backend.
+- **Principal state can retain named, content-defined file DAGs.** The new
+  `astrid-storage-content` crate turns bytes into canonical chunk, bounded
+  chunk-tree, and file objects using an exact-pinned FastCDC 2020 profile.
+  Files at or below the 256 KiB maximum remain one whole object; larger files
+  enforce the declared minimum/maximum chunk bounds during decode, with only
+  the final chunk exempt from the minimum. A blocking streaming builder reads
+  through a profile-bounded FastCDC buffer and emits immutable records into an
+  identity-checking staging sink without retaining the complete source.
+  Fragmented readers produce the exact same descriptor and canonical DAG as the
+  slice builder. `PrincipalContentStore::put_streaming` stages those records
+  incrementally in four-MiB coalesced shared-engine batches without per-object
+  flushes; the ordinary root transaction revalidates the complete closure,
+  flushes objects before the root, and retries root conflicts without rereading
+  the source. Source or sink failure never publishes a partial root.
+  Full and range reconstruction validate the typed graph and load only
+  overlapping chunks. `PrincipalContentStore` publishes named content through
+  the same per-principal root CAS and durable object arena as KV, so identical
+  chunks and complete files are physically reused across names and principals
+  without creating a side root. Catalog accounting charges every visible byte
+  and name even when physical objects deduplicate, and KV/content mutations
+  enforce one combined live principal quota in either mutation order. Golden
+  boundaries, insertion-locality, malformed graph, concurrent writer, range,
+  alias, and cross-principal tests pin the behavior. Host filesystem
+  materialization, capsule WIT access, encryption domains, and arena compaction
+  remain separate work. The accompanying semantic-representation design
+  separates exact `ObjectId`, contract-scoped `SemanticId`, trusted physical
+  representations, and similarity relations. Stable semantic contracts pin a
+  canonicalizer, while independently versioned representation contracts pin
+  codec decoders so adding a format does not redefine existing identities.
+  Alternate transforms cannot mint identity without complete reference
+  verification or a contract-pinned proof, and untrusted source encodings never
+  enter the shared trusted serving pool by equivalence alone. The design
+  records the cross-principal substitution adversary, authority-controlled
+  registration, bounded typed route planning, generic future streaming WIT,
+  image-codec capsule decomposition, explicit source-retention policy, and
+  derived-cache accounting without activating a capsule interface. The live
+  corpus measured 98.02% object-instance convergence but 47.1% whole-file byte
+  convergence; the 95–98% platform-scale byte result remains a separately
+  testable hypothesis.
 - **Windows local transport uses authenticated per-user named pipes.** A pipe
   name derived only from the caller's operating-system SID replaces
   filesystem endpoint naming on Windows. Local-only byte-mode instances use a

@@ -27,6 +27,7 @@ use parking_lot::RwLock;
 #[cfg(not(target_family = "wasm"))]
 mod durable;
 mod kv;
+mod projection;
 
 #[cfg(not(target_family = "wasm"))]
 pub use durable::{
@@ -37,6 +38,7 @@ pub use kv::{
     KvProjectionEngine, KvProjectionError, KvState, KvStateSnapshot, commit_kv_with_engine,
     kv_snapshot_with_engine,
 };
+pub use projection::{PrincipalProjectionEngine, PrincipalProjectionError};
 
 /// A root update and the immutable records required to reconstruct it.
 ///
@@ -108,6 +110,10 @@ impl CommitOutcome {
     }
 
     /// Return the number of newly admitted immutable objects.
+    ///
+    /// This is a privileged engine diagnostic, not principal-visible
+    /// accounting. Guest APIs must not expose it or vary admission behavior
+    /// from it because doing so would reveal cross-principal deduplication.
     #[must_use]
     pub const fn objects_inserted(self) -> u64 {
         self.objects_inserted
@@ -947,5 +953,16 @@ mod tests {
                 assert_eq!(engine.root(&"alice"), expected_root);
             }
         }
+    }
+
+    #[test]
+    fn projection_model_error_preserves_typed_source() {
+        let error = PrincipalProjectionError::from(ModelError::ArithmeticOverflow);
+        let source = std::error::Error::source(&error).unwrap();
+
+        assert_eq!(
+            source.downcast_ref::<ModelError>(),
+            Some(&ModelError::ArithmeticOverflow)
+        );
     }
 }

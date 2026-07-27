@@ -858,6 +858,7 @@ name = "astrid-storage"
 version = "0.10.4"
 dependencies = [
  "astrid-core",
+ "astrid-storage-content",
  "astrid-storage-engine",
  "astrid-storage-model",
  "async-trait",
@@ -875,6 +876,14 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "astrid-storage-content"
+version = "0.10.4"
+dependencies = [
+ "astrid-storage-model",
+ "fastcdc",
 ]
 
 [[package]]
@@ -3183,6 +3192,12 @@ name = "fast-srgb8"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd2e7510819d6fbf51a5545c8f922716ecfb14df168a3242f7d33e0239efe6a1"
+
+[[package]]
+name = "fastcdc"
+version = "4.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77af40d8a8dadb92dc178569a5f5edb5f3056e98255c2de48ab5d59a52892e0c"
 
 [[package]]
 name = "faster-hex"
