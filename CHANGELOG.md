@@ -80,13 +80,9 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   no fixed frame or capacity ceiling, and derives finite storage budgets from
   the live principal profile. Quota accounting includes canonical namespace/key
   bytes as well as values, so empty values cannot consume unmetered
-  principal-controlled metadata. The misleading `kv` gate is removed; the
-  temporary `legacy-surrealkv` feature names only the reader and migrator and
-  selects no runtime backend.
-  principal-controlled metadata. The misleading `kv` gate is replaced by the
-  temporary `legacy-surrealkv` reader and migrator; its old name remains only
-  as a compatibility alias for dependent manifests and selects no runtime
-  backend.
+  principal-controlled metadata. The legacy `kv` feature remains only as a
+  deprecated no-op compatibility alias; `legacy-surrealkv` names the temporary
+  reader and migrator. Neither feature selects a runtime backend.
 - **Principal state can retain named, content-defined file DAGs.** The new
   `astrid-storage-content` crate turns bytes into canonical chunk, bounded
   chunk-tree, and file objects using an exact-pinned FastCDC 2020 profile.

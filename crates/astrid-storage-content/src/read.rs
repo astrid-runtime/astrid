@@ -7,7 +7,7 @@ use astrid_storage_model::{
 
 use crate::{
     CHUNK_TREE_FANOUT, CONTENT_LABEL, ChunkingProfile, ContentDescriptor, ContentError,
-    FORMAT_VERSION, decode_file_header,
+    FORMAT_VERSION, boundary::is_canonical_boundary, decode_file_header,
 };
 
 /// Fallible object-loading boundary used for lazy content reconstruction.
@@ -146,19 +146,24 @@ fn read_decoded_range<S: ContentSource>(
         object: file,
         detail: "non-empty file has no content reference",
     })?;
+    let shape = ExpectedShape {
+        logical_bytes,
+        chunk_count,
+        tree_depth: canonical_tree_depth(chunk_count),
+        profile,
+        ends_file: true,
+    };
+    let mut boundaries = BoundaryWindow::default();
     append_range(
         source,
         content,
-        ExpectedShape {
-            logical_bytes,
-            chunk_count,
-            tree_depth: canonical_tree_depth(chunk_count),
-            profile,
-            ends_file: true,
-        },
+        shape,
         RequestedRange { start: offset, end },
+        0,
         &mut output,
+        &mut boundaries,
     )?;
+    boundaries.validate_neighbors(source, content, shape, logical_bytes)?;
     if output.len() != capacity {
         return Err(ContentError::InvalidObject {
             object: file,
@@ -184,19 +189,129 @@ struct RequestedRange {
     end: u64,
 }
 
+struct LoadedChunk {
+    object: ObjectId,
+    start: u64,
+    bytes: Vec<u8>,
+}
+
+impl LoadedChunk {
+    fn end(&self) -> Result<u64, ContentError> {
+        self.start
+            .checked_add(u64::try_from(self.bytes.len()).map_err(|_| ContentError::LengthOverflow)?)
+            .ok_or(ContentError::LengthOverflow)
+    }
+}
+
+#[derive(Default)]
+struct BoundaryWindow {
+    first_start: Option<u64>,
+    first_prefix: Vec<u8>,
+    last: Option<LoadedChunk>,
+}
+
+impl BoundaryWindow {
+    fn observe(
+        &mut self,
+        object: ObjectId,
+        start: u64,
+        bytes: &[u8],
+        profile: ChunkingProfile,
+    ) -> Result<(), ContentError> {
+        if bytes.is_empty() {
+            return Err(ContentError::InvalidObject {
+                object,
+                detail: "content chunk is empty",
+            });
+        }
+        let prefix_length = bytes.len().min(2);
+        let prefix = &bytes[..prefix_length];
+        if let Some(previous) = &self.last {
+            if previous.end()? != start {
+                return Err(ContentError::InvalidObject {
+                    object,
+                    detail: "content traversal skipped an overlapping chunk",
+                });
+            }
+            validate_boundary(previous, prefix, profile)?;
+        } else {
+            self.first_start = Some(start);
+            self.first_prefix.extend_from_slice(prefix);
+        }
+        self.last = Some(LoadedChunk {
+            object,
+            start,
+            bytes: bytes.to_vec(),
+        });
+        Ok(())
+    }
+
+    fn validate_neighbors<S: ContentSource>(
+        &self,
+        source: &S,
+        content: ObjectId,
+        shape: ExpectedShape,
+        logical_bytes: u64,
+    ) -> Result<(), ContentReadError<S::Error>> {
+        let first_start = self.first_start.ok_or(ContentError::InvalidObject {
+            object: content,
+            detail: "non-empty range selected no content chunk",
+        })?;
+        if first_start > 0 {
+            let previous =
+                load_chunk_at_offset(source, content, shape, 0, first_start.saturating_sub(1))?;
+            validate_boundary(&previous, &self.first_prefix, shape.profile)?;
+        }
+        let last = self.last.as_ref().ok_or(ContentError::InvalidObject {
+            object: content,
+            detail: "non-empty range selected no final content chunk",
+        })?;
+        let last_end = last.end()?;
+        if last_end < logical_bytes {
+            let next = load_chunk_at_offset(source, content, shape, 0, last_end)?;
+            let prefix_length = next.bytes.len().min(2);
+            validate_boundary(last, &next.bytes[..prefix_length], shape.profile)?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_boundary(
+    left: &LoadedChunk,
+    right_prefix: &[u8],
+    profile: ChunkingProfile,
+) -> Result<(), ContentError> {
+    if is_canonical_boundary(&left.bytes, right_prefix, profile) {
+        Ok(())
+    } else {
+        Err(ContentError::InvalidObject {
+            object: left.object,
+            detail: "chunk boundary violates the declared FastCDC profile",
+        })
+    }
+}
+
 fn append_range<S: ContentSource>(
     source: &S,
     object: ObjectId,
     shape: ExpectedShape,
     range: RequestedRange,
+    base_offset: u64,
     output: &mut Vec<u8>,
+    boundaries: &mut BoundaryWindow,
 ) -> Result<(), ContentReadError<S::Error>> {
     let record = load(source, object)?;
     match record.kind() {
         ObjectKind::Chunk => {
             validate_chunk(object, &record, shape)?;
-            let start = usize::try_from(range.start).map_err(|_| ContentError::LengthOverflow)?;
-            let end = usize::try_from(range.end).map_err(|_| ContentError::LengthOverflow)?;
+            boundaries.observe(object, base_offset, record.canonical_bytes(), shape.profile)?;
+            let chunk_end = base_offset
+                .checked_add(shape.logical_bytes)
+                .ok_or(ContentError::LengthOverflow)?;
+            let start = usize::try_from(range.start.max(base_offset).saturating_sub(base_offset))
+                .map_err(|_| ContentError::LengthOverflow)?;
+            let end = usize::try_from(range.end.min(chunk_end).saturating_sub(base_offset))
+                .map_err(|_| ContentError::LengthOverflow)?;
             let bytes =
                 record
                     .canonical_bytes()
@@ -225,7 +340,13 @@ fn append_range<S: ContentSource>(
                 let child_end = cursor
                     .checked_add(child_length)
                     .ok_or(ContentError::LengthOverflow)?;
-                if range.start < child_end && range.end > cursor {
+                let child_base = base_offset
+                    .checked_add(cursor)
+                    .ok_or(ContentError::LengthOverflow)?;
+                let child_absolute_end = base_offset
+                    .checked_add(child_end)
+                    .ok_or(ContentError::LengthOverflow)?;
+                if range.start < child_absolute_end && range.end > child_base {
                     append_range(
                         source,
                         child,
@@ -236,16 +357,95 @@ fn append_range<S: ContentSource>(
                             profile: shape.profile,
                             ends_file: shape.ends_file && index.saturating_add(1) == child_count,
                         },
-                        RequestedRange {
-                            start: range.start.saturating_sub(cursor),
-                            end: range.end.min(child_end).saturating_sub(cursor),
-                        },
+                        range,
+                        child_base,
                         output,
+                        boundaries,
                     )?;
                 }
                 cursor = child_end;
             }
             Ok(())
+        },
+        _ => Err(ContentError::InvalidObject {
+            object,
+            detail: "file content points to an unsupported object kind",
+        }
+        .into()),
+    }
+}
+
+fn load_chunk_at_offset<S: ContentSource>(
+    source: &S,
+    object: ObjectId,
+    shape: ExpectedShape,
+    base_offset: u64,
+    target_offset: u64,
+) -> Result<LoadedChunk, ContentReadError<S::Error>> {
+    let record = load(source, object)?;
+    match record.kind() {
+        ObjectKind::Chunk => {
+            validate_chunk(object, &record, shape)?;
+            let end = base_offset
+                .checked_add(shape.logical_bytes)
+                .ok_or(ContentError::LengthOverflow)?;
+            if target_offset < base_offset || target_offset >= end {
+                return Err(ContentError::InvalidObject {
+                    object,
+                    detail: "chunk lookup offset is outside the payload",
+                }
+                .into());
+            }
+            Ok(LoadedChunk {
+                object,
+                start: base_offset,
+                bytes: record.canonical_bytes().to_vec(),
+            })
+        },
+        ObjectKind::ChunkTree => {
+            if shape.tree_depth == 0 {
+                return Err(ContentError::InvalidObject {
+                    object,
+                    detail: "chunk tree exceeds canonical depth",
+                }
+                .into());
+            }
+            let children = decode_tree(object, &record, shape)?;
+            let mut cursor = 0_u64;
+            let child_count = children.len();
+            for (index, (child, child_length, child_chunk_count)) in
+                children.into_iter().enumerate()
+            {
+                let child_base = base_offset
+                    .checked_add(cursor)
+                    .ok_or(ContentError::LengthOverflow)?;
+                let child_end = child_base
+                    .checked_add(child_length)
+                    .ok_or(ContentError::LengthOverflow)?;
+                if target_offset >= child_base && target_offset < child_end {
+                    return load_chunk_at_offset(
+                        source,
+                        child,
+                        ExpectedShape {
+                            logical_bytes: child_length,
+                            chunk_count: child_chunk_count,
+                            tree_depth: shape.tree_depth.saturating_sub(1),
+                            profile: shape.profile,
+                            ends_file: shape.ends_file && index.saturating_add(1) == child_count,
+                        },
+                        child_base,
+                        target_offset,
+                    );
+                }
+                cursor = cursor
+                    .checked_add(child_length)
+                    .ok_or(ContentError::LengthOverflow)?;
+            }
+            Err(ContentError::InvalidObject {
+                object,
+                detail: "chunk lookup found no covering child",
+            }
+            .into())
         },
         _ => Err(ContentError::InvalidObject {
             object,

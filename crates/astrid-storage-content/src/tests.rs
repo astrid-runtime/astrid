@@ -367,6 +367,43 @@ fn declared_profile_bounds_reject_adversarial_chunk_shapes() {
 }
 
 #[test]
+fn alternate_in_bounds_fastcdc_cuts_are_rejected() {
+    let profile = ChunkingProfile::fastcdc_v2020(64, 256, 1024, 0).unwrap();
+    let bytes = deterministic_bytes(1025);
+    let canonical = fastcdc::v2020::FastCDC::with_level_and_seed(
+        &bytes,
+        64,
+        256,
+        1024,
+        fastcdc::v2020::Normalization::Level1,
+        0,
+    )
+    .next()
+    .unwrap()
+    .length;
+    let alternate = if canonical == 512 { 513 } else { 512 };
+    let chunks = vec![bytes[..alternate].to_vec(), bytes[alternate..].to_vec()];
+    let (file, source) = manual_content(profile, &chunks);
+
+    assert!(matches!(
+        read_content(&source, file),
+        Err(ContentReadError::Content(ContentError::InvalidObject {
+            detail: "chunk boundary violates the declared FastCDC profile",
+            ..
+        }))
+    ));
+
+    let (file, source) = manual_content(profile, &chunks);
+    assert!(matches!(
+        read_content_range(&source, file, alternate as u64 + 1, 1),
+        Err(ContentReadError::Content(ContentError::InvalidObject {
+            detail: "chunk boundary violates the declared FastCDC profile",
+            ..
+        }))
+    ));
+}
+
+#[test]
 fn malformed_and_missing_content_fail_closed() {
     let bytes = deterministic_bytes(1024 * 1024);
     let built = build_content(&TestIdentity, ChunkingProfile::ASTRID_V1, &bytes).unwrap();

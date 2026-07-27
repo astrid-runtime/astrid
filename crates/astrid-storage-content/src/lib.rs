@@ -24,6 +24,7 @@ use astrid_storage_model::ObjectRecord;
 use astrid_storage_model::{ModelError, ObjectId};
 use core::fmt;
 
+mod boundary;
 #[cfg(feature = "std")]
 mod build;
 mod read;

@@ -11,6 +11,7 @@ use astrid_storage_model::{
 
 use super::tree::{FORMAT_VERSION, KV_LABEL, LEFT_LABEL, ROOT_LABEL, STATE_LABEL, VALUE_LABEL};
 use super::{KvPrincipalResolver, KvQuotaResolver, KvStore, TreeKvStore};
+use crate::content::CONTENT_COMPONENT_LABEL;
 use crate::{StorageError, StorageResult};
 
 #[derive(Clone, Copy, Debug)]
@@ -363,6 +364,67 @@ async fn self_consistent_forged_tree_totals_are_rejected() {
             .unwrap_err()
             .to_string()
             .contains("node totals disagree")
+    );
+}
+
+#[tokio::test]
+async fn non_owning_content_component_is_rejected() {
+    let engine = Arc::new(InMemoryEngine::new(TestIdentity));
+    let mut records = Vec::new();
+    let catalog = ObjectRecord::new(
+        ObjectKind::Directory,
+        FORMAT_VERSION,
+        [0_u8; 12].to_vec(),
+        Vec::new(),
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let catalog = engine.put_object(catalog).unwrap().0;
+    let state = ObjectRecord::new(
+        ObjectKind::PrincipalState,
+        FORMAT_VERSION,
+        Vec::new(),
+        vec![ObjectReference::new(
+            ReferenceLabel::new(CONTENT_COMPONENT_LABEL.to_vec()),
+            catalog,
+            ReferenceKind::Evidence,
+        )],
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let state = insert_record(engine.as_ref(), &mut records, state);
+    let commit = ObjectRecord::new(
+        ObjectKind::Commit,
+        FORMAT_VERSION,
+        Vec::new(),
+        vec![ObjectReference::owns(
+            ReferenceLabel::new(STATE_LABEL.to_vec()),
+            state,
+        )],
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let commit = insert_record(engine.as_ref(), &mut records, commit);
+    engine
+        .commit(RootTransaction::new(
+            "alice".to_owned(),
+            None,
+            commit,
+            records,
+        ))
+        .unwrap();
+    let store = TreeKvStore::<String, TestIdentity, Resolver, _>::from_engine(engine, Resolver);
+
+    assert!(
+        store
+            .list_keys("alice:capsule:test")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("principal content component is not owning")
     );
 }
 

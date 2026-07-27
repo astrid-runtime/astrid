@@ -76,6 +76,12 @@ where
         .filter(|reference| reference.label().as_bytes() != KV_LABEL)
     {
         if reference.label().as_bytes() == CONTENT_COMPONENT_LABEL {
+            if reference.kind() != ReferenceKind::Owns {
+                return Err(invalid(
+                    state_id,
+                    "principal content component is not owning",
+                ));
+            }
             let record = engine
                 .load_kv_object(reference.target())
                 .map_err(|error| map_engine(&error))?
