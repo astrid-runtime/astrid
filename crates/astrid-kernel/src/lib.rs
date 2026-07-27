@@ -355,8 +355,8 @@ impl Kernel {
 
     /// Boot a new Kernel instance mounted at the specified directory.
     ///
-    /// The native composition root: resolves the Astrid home, opens the
-    /// `SurrealKV` store and audit log, loads the runtime key, binds the singleton
+    /// The native composition root: resolves the Astrid home, opens the durable
+    /// principal store and audit log, loads the runtime key, binds the singleton
     /// Unix socket, generates the session token, then delegates to the portable
     /// [`Kernel::with_resources`]. Unix-only — the socket bind and singleton
     /// flock have no browser-profile analogue; that host builds its own
@@ -432,18 +432,34 @@ impl Kernel {
         // Acquire the singleton advisory lock as the FIRST fallible boot step —
         // BEFORE opening any shared state store. A boot-race loser then fails
         // here with the actionable "already running (singleton lock held)"
-        // error and never opens (or even touches) the shared surrealkv KV /
-        // audit stores, rather than dying on a raw `LOCK is already locked` from
+        // error and never opens (or even touches) the shared principal or audit
+        // stores, rather than dying on a raw `LOCK is already locked` from
         // the store layer after having opened one. The listener bind below does
         // NOT re-acquire the lock — it is already held for the process lifetime.
         let singleton_lock = socket::acquire_boot_singleton_lock(&home)?;
 
-        // Open the persistent KV store (needed by the capability store).
-        let kv_path = home.state_db_path();
-        let kv: Arc<dyn astrid_storage::KvStore> = Arc::new(
-            astrid_storage::SurrealKvStore::open(&kv_path)
-                .map_err(|e| std::io::Error::other(format!("Failed to open KV store: {e}")))?,
-        );
+        // Resolve quota policy before opening state so the durable adapter and
+        // capsule engine share exactly one invalidatable profile cache.
+        let profile_cache = Arc::new(PrincipalProfileCache::with_home(home.clone()));
+        let quota_cache = Arc::clone(&profile_cache);
+        let quota: Arc<dyn astrid_storage::KvQuotaResolver<astrid_storage::StateOwner>> =
+            Arc::new(move |owner: &astrid_storage::StateOwner| match owner {
+                astrid_storage::StateOwner::System => Ok(None),
+                astrid_storage::StateOwner::Principal(principal) => quota_cache
+                    .resolve(principal)
+                    .map(|profile| Some(profile.quotas.max_storage_bytes))
+                    .map_err(|error| {
+                        astrid_storage::StorageError::Internal(format!(
+                            "resolve storage quota for {principal}: {error}"
+                        ))
+                    }),
+            });
+
+        // Open the authoritative state store. First cutover imports and
+        // verifies legacy SurrealKV under the singleton lock before serving.
+        let kv = astrid_storage::open_runtime_kv(&home, quota)
+            .await
+            .map_err(|e| std::io::Error::other(format!("Failed to open KV store: {e}")))?;
         // TODO: clear ephemeral keys (e: prefix) on boot when the key
         // lifecycle tier convention is established.
 
@@ -484,7 +500,7 @@ impl Kernel {
             Some(singleton_lock),
         );
 
-        Self::with_resources_and_workspace_layout(
+        Self::with_resources_and_workspace_layout_with_profile_cache(
             session_id,
             workspace_root,
             runtime_limits,
@@ -492,6 +508,7 @@ impl Kernel {
             http_limits,
             resources,
             workspace_layout,
+            Some(profile_cache),
         )
         .await
     }
@@ -561,10 +578,6 @@ impl Kernel {
     ///
     /// Returns an error if VFS mounts, the capability store, group
     /// configuration, or CLI root bootstrap cannot be initialized.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "boot sequence: sequential setup that does not benefit from splitting"
-    )]
     pub async fn with_resources_and_workspace_layout(
         session_id: SessionId,
         workspace_root: PathBuf,
@@ -573,6 +586,34 @@ impl Kernel {
         http_limits: astrid_capsule_types::HttpLimits,
         resources: KernelResources,
         workspace_layout: WorkspaceLayout,
+    ) -> Result<Arc<Self>, std::io::Error> {
+        Self::with_resources_and_workspace_layout_with_profile_cache(
+            session_id,
+            workspace_root,
+            runtime_limits,
+            local_egress,
+            http_limits,
+            resources,
+            workspace_layout,
+            None,
+        )
+        .await
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "boot sequence: sequential setup that does not benefit from splitting"
+    )]
+    #[allow(clippy::too_many_arguments)]
+    async fn with_resources_and_workspace_layout_with_profile_cache(
+        session_id: SessionId,
+        workspace_root: PathBuf,
+        runtime_limits: astrid_capsule_types::CapsuleRuntimeLimits,
+        local_egress: std::collections::HashMap<String, Vec<String>>,
+        http_limits: astrid_capsule_types::HttpLimits,
+        resources: KernelResources,
+        workspace_layout: WorkspaceLayout,
+        profile_cache: Option<Arc<PrincipalProfileCache>>,
     ) -> Result<Arc<Self>, std::io::Error> {
         // The native capsule engine uses `block_in_place`, which requires a
         // multi-thread runtime. The browser profile has no such runtime (and no
@@ -743,7 +784,8 @@ impl Kernel {
             token_path,
             allowance_store,
             identity_store,
-            profile_cache: Arc::new(PrincipalProfileCache::with_home(home.clone())),
+            profile_cache: profile_cache
+                .unwrap_or_else(|| Arc::new(PrincipalProfileCache::with_home(home.clone()))),
             groups,
             astrid_home: home,
             admin_write_lock: Mutex::new(()),
@@ -2175,9 +2217,10 @@ impl Kernel {
             tracing::warn!(error = %e, "failed to clear capability session on shutdown");
         }
 
-        // 2. Release the persistent-store locks FIRST — BEFORE the best-effort
-        // capsule drain. The audit/KV surrealkv `LOCK` MUST be freed on the
-        // graceful path regardless of how long the drain takes: each capsule's
+        // 2. Release persistent resources FIRST — BEFORE the best-effort
+        // capsule drain. The audit SurrealKV `LOCK` and principal-store file
+        // handles MUST be freed on the graceful path regardless of how long
+        // the drain takes: each capsule's
         // unload is bounded (~1s of `Arc::get_mut` retries) but a large fleet
         // draining sequentially could exceed the OS-thread watchdog's force-exit
         // grace, and a force-exit with the audit `LOCK` still held is the exact
@@ -2403,10 +2446,14 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
     let event_bus = Arc::new(EventBus::new());
     let capsules = Arc::new(RwLock::new(CapsuleRegistry::new()));
 
-    // Persistent KV backing capabilities + identity store.
-    let kv: Arc<dyn astrid_storage::KvStore> = Arc::new(
-        astrid_storage::SurrealKvStore::open(home.state_db_path()).expect("test kernel: open kv"),
-    );
+    // Use the same authoritative principal-store composition as native boot.
+    // A test helper opening the legacy import source directly would let kernel
+    // tests pass against a runtime topology that production cannot select.
+    let quota: Arc<dyn astrid_storage::KvQuotaResolver<astrid_storage::StateOwner>> =
+        Arc::new(|_: &astrid_storage::StateOwner| Ok(None));
+    let kv = astrid_storage::open_runtime_kv(&home, quota)
+        .await
+        .expect("test kernel: open authoritative principal store");
     let capabilities = Arc::new(
         CapabilityStore::with_kv_store(Arc::clone(&kv))
             .await

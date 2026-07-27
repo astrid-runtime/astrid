@@ -13,7 +13,7 @@ When a human approves an action with "Allow Always", the security interceptor (`
 
 `ResourcePattern` uses compiled glob matching via `globset`. Patterns like `mcp://filesystem:*` match any tool on that server. `file:///home/user/**` matches any file under that directory. Exact URIs skip glob compilation for speed. Path traversal (`..`) is rejected at pattern creation and again at match time. Defense in depth.
 
-**Dual-tier storage.** Session tokens live in memory via `RwLock<HashMap>`. Persistent tokens survive restarts via SurrealKV. Both tiers share revocation and single-use tracking. Revocation persists to KV before updating in-memory state, so a crash between the two cannot resurrect a revoked token.
+**Dual-tier storage.** Session tokens live in memory via `RwLock<HashMap>`. Persistent tokens survive restarts through the `KvStore` injected by the host; native Astrid injects the authoritative principal store. The legacy standalone SurrealKV constructor remains only for API compatibility during migration. Both tiers share revocation and single-use tracking. Revocation persists to KV before updating in-memory state, so a crash between the two cannot resurrect a revoked token.
 
 **Replay protection.** Single-use tokens are marked consumed atomically under a write lock. `mark_used` checks, persists, and inserts in one critical section to prevent TOCTOU races. State survives process restart via KV.
 

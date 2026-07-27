@@ -49,7 +49,7 @@ fn ensure_run_dir(socket_path: &std::path::Path) -> Result<(), std::io::Error> {
 /// lifetime (dropping it releases the lock). Acquiring the lock ahead of the
 /// store opens means a boot-race loser fails HERE with the actionable "already
 /// running (singleton lock held)" error and never opens — or even touches —
-/// the shared surrealkv stores, instead of dying on a raw
+/// the shared principal and audit stores, instead of dying on a raw
 /// `Database ... LOCK is already locked` from the KV/audit layer after having
 /// opened them. Split from [`bind_listener`] precisely so the lock can be taken
 /// before the stores; the listener bind runs later and does NOT re-acquire it.

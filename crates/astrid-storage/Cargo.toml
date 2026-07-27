@@ -6,30 +6,37 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Unified storage layer for Astrid - SurrealKV (raw KV) and SurrealDB (query engine)"
+description = "Unified storage integration for Astrid principal state, raw KV, and query storage"
 
 [features]
 default = []
-kv = ["dep:surrealkv"]
+# Deprecated compatibility alias. KV is always backed by the native object
+# store; this remains only so existing downstream feature selections compile.
+kv = []
+legacy-surrealkv = ["dep:surrealkv"]
 db = ["dep:surrealdb"]
 keychain = ["dep:keyring"]
-full = ["kv", "db"]
+full = ["legacy-surrealkv", "db"]
 
 [dependencies]
 astrid-core = { workspace = true }
+astrid-storage-engine = { workspace = true }
+astrid-storage-model = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true, features = ["clock"] }
 keyring = { workspace = true, optional = true }
+parking_lot = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 surrealkv = { workspace = true, optional = true }
 surrealdb = { workspace = true, optional = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["rt", "sync"] }
 tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+blake3 = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
@@ -41,6 +48,9 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 # (see scripts/check-wasm-portability.sh).
 [target.'cfg(target_family = "wasm")'.dependencies]
 getrandom = { version = "0.4", features = ["wasm_js"] }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+blake3 = { workspace = true }
 
 [lints]
 workspace = true

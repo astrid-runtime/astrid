@@ -5,24 +5,28 @@
 
 **The persistence layer. Disk for the OS.**
 
-An operating system needs disk. Astrid has two tiers: a raw key-value store for capsule data and a full query engine for system state. Both scale from a single embedded process to a distributed cluster through configuration alone. No code changes. Same API.
+An operating system needs disk. Astrid has a raw key-value contract projected onto typed, durable per-principal roots, plus an optional query engine. The legacy SurrealKV reader remains available only during the migration window.
 
 ## Why two tiers
 
-Capsules need fast, isolated byte storage. The audit log, capability store, and identity system need relations, graph traversal, and SurrealQL queries. Forcing both through the same interface wastes either simplicity or power. So they get separate tiers with separate backing stores, unified behind one crate.
+Capsules and kernel services need fast, isolated byte storage. Some optional
+services need relations, graph traversal, or richer queries. Forcing both
+shapes through one interface wastes either simplicity or power, so the crate
+keeps the principal-state KV contract separate from the optional query engine.
 
 | Deployment | KV backend | DB backend |
 |---|---|---|
-| Dev / single-agent | SurrealKV (embedded LSM-tree) | SurrealDB (embedded, SurrealKV) |
-| Production / multi-node | SurrealKV (embedded) | SurrealDB (over TiKV, Raft) |
+| Dev / single-agent | Durable principal store | SurrealDB (embedded, SurrealKV) |
+| Production / multi-node | Durable principal store plus future placement execution | Deployment-selected query service |
 
-The multi-node path exists in the type system and connection strings. It has not been deployed in production yet.
+Distributed placement for the principal store remains implementation work; it
+is not exposed as a runtime backend selector.
 
 ## Namespace isolation
 
 Every KV operation is scoped to a namespace. WASM guests receive a `ScopedKvStore` bound to `wasm:{capsule_id}` and never see the raw key structure. The kernel uses `system:*` namespaces for internal state.
 
-Internally, keys are stored as `"{namespace}\0{key}"`. The null-byte separator is the isolation boundary. Empty namespaces, empty keys, and keys containing null bytes are rejected at validation before reaching the storage engine. `SurrealKvStore` uses transactional range scans bounded by the null-byte separator, so a namespace scan is O(keys in namespace), not O(total keys).
+Empty namespaces, empty keys, and names containing null bytes are rejected before reaching the storage engine. The native runtime maps host-stamped `{principal}:capsule:{id}` namespaces onto one typed root per validated principal; kernel namespaces remain under a separate system owner.
 
 ## Secret storage
 
@@ -42,12 +46,15 @@ The `build_secret_store` convenience constructor picks the best available backen
 
 | Feature | Enables |
 |---|---|
-| `kv` | `SurrealKvStore` (persistent embedded KV) |
+| `legacy-surrealkv` | Legacy `SurrealKvStore` reader and migrator |
 | `db` | `Database` (SurrealDB query engine) |
 | `keychain` | `KeychainSecretStore` + `FallbackSecretStore` |
-| `full` | `kv` + `db` |
+| `full` | `legacy-surrealkv` + `db` |
 
-`MemoryKvStore` and `KvSecretStore` are always available with no feature flags.
+The KV contract is never feature-gated. `KvStore`, `MemoryKvStore`,
+`ScopedKvStore`, `KvSecretStore`, and the principal-store adapter are always
+available. The old `kv` name remains only so existing dependent manifests keep
+building; only the transition dependency is optional.
 
 ## Usage
 

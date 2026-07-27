@@ -858,10 +858,14 @@ name = "astrid-storage"
 version = "0.10.4"
 dependencies = [
  "astrid-core",
+ "astrid-storage-engine",
+ "astrid-storage-model",
  "async-trait",
+ "blake3",
  "chrono",
  "getrandom 0.4.3",
  "keyring",
+ "parking_lot",
  "serde",
  "serde_json",
  "surrealdb",
@@ -871,6 +875,17 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "astrid-storage-engine"
+version = "0.10.4"
+dependencies = [
+ "astrid-storage-model",
+ "blake3",
+ "fs2",
+ "parking_lot",
+ "tempfile",
 ]
 
 [[package]]

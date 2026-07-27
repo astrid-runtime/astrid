@@ -23,12 +23,66 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   owning, evidence, lineage, and derived references keep retention authority
   explicit, while capability-scoped state views and structural transition
   witnesses model independently verifiable root changes without claiming
-  semantic execution proofs. The current persistence backend and public
-  capsule interfaces are unchanged. Domain-bearing identifiers, relation
-  labels, root generations, object kinds and non-zero format/replica versions
-  are distinct Rust types; imports reject unrelated records, principal roots
-  must name typed commits, and placement epochs advance monotonically over
-  registered blobs.
+  semantic execution proofs. Public capsule interfaces remain unchanged.
+  Domain-bearing identifiers, relation labels, root generations, object kinds,
+  and non-zero format/replica versions are distinct Rust types; imports reject
+  unrelated records, principal roots must name typed commits, and placement
+  epochs advance monotonically over registered blobs.
+- **Principal storage has a thread-safe in-memory engine prototype.** The new
+  `astrid-storage-engine` validates caller-declared object identities and
+  complete immutable closures before publishing linearizable per-principal
+  root generations. Semantic object kinds and kind-scoped format versions are
+  identity-bearing, and a principal root must name a typed commit envelope. The
+  engine supports consistent closure snapshots, exact compare-and-swap, pins,
+  logical accounting, and garbage collection without selecting an on-disk
+  format. Bounded transition traces and concurrent-writer tests exercise the
+  engine contract; the native durable realization refines it while encryption
+  and placement remain future work.
+- **Principal storage has an additive KV compatibility bridge.**
+  `PrincipalKvStore` implements the existing async `KvStore` contract over
+  typed principal roots while requiring an authority-aware
+  namespace-to-principal resolver. The version-one logical projection stores
+  KV leaves, branches, namespace maps, principal state, and commit lineage
+  without choosing a production hash or disk encoding. Root conflicts retry
+  from a fresh snapshot, non-KV state edges survive KV mutations, and generated
+  traces compare every operation and resulting namespace state against both
+  `MemoryKvStore` and `SurrealKvStore`. The bridge remains the whole-state
+  differential oracle; the runtime hot path uses a bounded persistent tree.
+- **Principal storage has a host-file durability foundation.**
+  `DurableEngine` persists immutable object frames before publishing a
+  checksummed principal-root journal record, rebuilds its disposable index on
+  open, truncates incomplete or physically invalid uncommitted tails only when
+  no valid frame follows, and rejects interior or semantic corruption. One
+  object-arena flush makes the transaction's complete object batch durable
+  before one root-journal flush publishes it. An exclusive store lock and
+  poison-on-write-failure behavior prevent
+  concurrent-process corruption and stale in-memory reads. Named crash-boundary
+  tests prove recovery to the old or new complete root. Recovery keeps only
+  roots and arena offsets resident, while live reads load and checksum payloads
+  lazily. Every persistent identity occurrence now carries an algorithm,
+  construction version, and variable digest length with capacity for 384-bit
+  successors. Each store persists a frozen, byte-exact plain-text format
+  specification as an immutable object referenced by `store.meta`; an
+  independent Python reader verifies Rust-produced arenas, identities, root
+  chains, and live closures in CI. Compaction, persistent pins, audit/outbox
+  atomicity, and final representation profiles remain future work.
+- **Native kernel state now cuts over to durable principal roots.** Kernel boot
+  migrates the legacy SurrealKV database under the singleton lock, verifies a
+  canonical digest independently per owner, preserves the legacy source, and
+  publishes a versioned completion marker only after a durable flush.
+  `TreeKvStore` keeps point reads and mutations height-bounded through a
+  persistent AVL tree instead of using the linear compatibility projection.
+  Durable open, arena reads, mutations, and flushes run on the blocking pool
+  rather than parking asynchronous runtime workers during filesystem I/O.
+  System state has its own owner; host-stamped capsule namespaces map to
+  validated principals and share their live, invalidatable profile quota.
+  The principal store is an invariant rather than a configurable backend, has
+  no fixed frame or capacity ceiling, and derives finite storage budgets from
+  the live principal profile. Quota accounting includes canonical namespace/key
+  bytes as well as values, so empty values cannot consume unmetered
+  principal-controlled metadata. The misleading `kv` gate is removed; the
+  temporary `legacy-surrealkv` feature names only the reader and migrator and
+  selects no runtime backend.
 - **Windows local transport uses authenticated per-user named pipes.** A pipe
   name derived only from the caller's operating-system SID replaces
   filesystem endpoint naming on Windows. Local-only byte-mode instances use a

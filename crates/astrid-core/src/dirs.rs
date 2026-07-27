@@ -25,7 +25,8 @@
 //! │   ├── hooks/                         system hooks
 //! │   └── layout-version                 layout version sentinel
 //! ├── var/
-//! │   └── state.db/                      system KV (SurrealKV, persistent)
+//! │   ├── principal-store/               authoritative typed principal state
+//! │   └── state.db/                      read-only legacy SurrealKV import source
 //! ├── run/                               ephemeral runtime state
 //! │   ├── system.sock
 //! │   ├── system.token
@@ -462,10 +463,16 @@ impl AstridHome {
         self.root.join("var")
     }
 
-    /// Path to the system KV database (`var/state.db/`).
+    /// Path to the legacy system KV import source (`var/state.db/`).
     #[must_use]
     pub fn state_db_path(&self) -> PathBuf {
         self.var_dir().join("state.db")
+    }
+
+    /// Path to the typed durable principal store (`var/principal-store/`).
+    #[must_use]
+    pub fn principal_store_path(&self) -> PathBuf {
+        self.var_dir().join("principal-store")
     }
 
     /// Root directory for OS-level copy-on-write workspace clones (`cow/`).

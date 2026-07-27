@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use surrealkv::LSMIterator;
 
 use super::{
-    KvStore, composite_key, namespace_range_end, namespace_range_start, prefix_range_end,
+    KvEntry, KvStore, composite_key, namespace_range_end, namespace_range_start, prefix_range_end,
     validate_key, validate_namespace, validate_prefix,
 };
 use crate::error::{StorageError, StorageResult};
@@ -96,6 +96,68 @@ impl SurrealKvStore {
             .close()
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))
+    }
+
+    /// Read one bounded, key-ordered page for the in-process backend migrator.
+    ///
+    /// `after` is the raw composite key returned by the prior page. The page
+    /// excludes that key and returns its own final raw key as the next cursor.
+    pub(crate) fn migration_page(
+        &self,
+        after: Option<&[u8]>,
+        max_entries: usize,
+    ) -> StorageResult<(Vec<KvEntry>, Option<Vec<u8>>)> {
+        if max_entries == 0 {
+            return Err(StorageError::Internal(
+                "migration page size must be non-zero".to_owned(),
+            ));
+        }
+        let start = after.unwrap_or_default();
+        // Composite keys are non-empty UTF-8 namespace bytes followed by a
+        // null separator and UTF-8 key bytes. 0xff is therefore a strict
+        // exclusive upper bound for every valid stored key.
+        let end = [u8::MAX];
+        let tx = self
+            .tree
+            .begin_with_mode(surrealkv::Mode::ReadOnly)
+            .map_err(|ref error| map_kv_err(error))?;
+        let mut iter = tx
+            .range(start, &end)
+            .map_err(|ref error| map_kv_err(error))?;
+        iter.seek_first().map_err(|ref error| map_kv_err(error))?;
+
+        let mut entries = Vec::new();
+        let mut cursor = None;
+        while iter.valid() && entries.len() < max_entries {
+            let raw_key = iter.key().user_key();
+            if after != Some(raw_key) {
+                let separator = raw_key.iter().position(|byte| *byte == 0).ok_or_else(|| {
+                    StorageError::Serialization(
+                        "legacy KV composite key has no namespace separator".to_owned(),
+                    )
+                })?;
+                let namespace = std::str::from_utf8(&raw_key[..separator]).map_err(|error| {
+                    StorageError::Serialization(format!(
+                        "legacy KV namespace is not UTF-8: {error}"
+                    ))
+                })?;
+                let key = std::str::from_utf8(&raw_key[separator.saturating_add(1)..]).map_err(
+                    |error| {
+                        StorageError::Serialization(format!("legacy KV key is not UTF-8: {error}"))
+                    },
+                )?;
+                validate_namespace(namespace)?;
+                validate_key(key)?;
+                entries.push(KvEntry {
+                    namespace: namespace.to_owned(),
+                    key: key.to_owned(),
+                    value: iter.value().map_err(|ref error| map_kv_err(error))?,
+                });
+                cursor = Some(raw_key.to_vec());
+            }
+            iter.next().map_err(|ref error| map_kv_err(error))?;
+        }
+        Ok((entries, cursor))
     }
 }
 

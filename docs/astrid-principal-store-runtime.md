@@ -2,8 +2,31 @@
 
 This companion to [Astrid Principal Store](astrid-principal-store.md) carries
 the runtime boundary, delivery order, remaining evidence questions, and prior
-art. The core data, authority, migration, accounting, and host-projection
-architecture remains in the primary design.
+art. Operational economics, accounting, privacy, and retention are specified
+in [Astrid Principal Store Operations](astrid-principal-store-operations.md).
+
+## 18. Host filesystem projection
+
+The object graph is authoritative. A normal filesystem is a projection and
+ingestion boundary.
+
+For an Astrid-managed workspace:
+
+- a successful write transaction creates a new root;
+- external host changes are ingested through a watcher plus periodic
+  reconciliation;
+- watcher events are hints, never proof of a complete history;
+- deletion becomes a directory entry removal in a new root, while prior roots
+  remain only under explicit retention;
+- materialization occurs in a new directory or file and becomes visible through
+  atomic rename;
+- path resolution uses beneath/no-follow semantics and rejects device nodes,
+  sockets, escaping links, and platform-specific special names; and
+- symlink targets remain uninterpreted bytes during import/export.
+
+On platforms where exact mutation capture is required, Astrid should mount a
+filesystem service or route writes through a mediated interface rather than
+claim provenance from after-the-fact watching.
 
 ## 19. Native Astrid integration
 
@@ -49,22 +72,33 @@ outputs, ownership, or historical transitions into sparse relations and
 einsum-like evaluation plans. It is a derived reasoning surface, not a knowledge
 graph and not a prerequisite for reading a file or recovering a principal.
 
-## 21. Implementation order
+## 21. Implementation order and current boundary
 
-1. Land `astrid-storage-model` with canonical identifiers, ownership classes,
+The current implementation stack completes the first six items below.
+`SurrealKvStore` remains a migration oracle and read-only import source, not a
+configurable runtime backend.
+
+Delivered:
+
+1. `astrid-storage-model` defines canonical identifiers, ownership classes,
    object grammar, closure validation, accounting definitions, and a small
    executable state machine.
-2. Model typed state views and structural transition witnesses; prove they bind
+2. Typed state views and structural transition witnesses bind
    selectors, patches, and both roots without importing authority.
-3. Run model and property tests for commit, crash, view, witness, import, GC,
+3. Model and property tests cover commit, crash, view, witness, import, GC,
    and rebalance.
-4. Add an engine prototype over in-memory immutable objects and atomic roots.
-5. Add the principal-store-backed `KvStore` adapter and differential tests
+4. The engine prototype operates over in-memory immutable objects and atomic
+   roots.
+5. The principal-store-backed `KvStore` adapter has differential tests
    against `MemoryKvStore` and `SurrealKvStore`.
-6. Add typed filesystem roots and a safe materializer; integrate Linux-realm
+6. Durable segments, a disposable index, a checksummed root journal, fault
+   injection, recovery, a persistent tree projection, and quota enforcement
+   support the native KV cutover. Compaction remains future work.
+
+Remaining:
+
+7. Add typed filesystem roots and a safe materializer; integrate Linux-realm
    principal-home checkpoints and explicit external-workspace observations.
-7. Add durable segments, indexes, WAL, fault injection, recovery, compaction,
-   and quota enforcement.
 8. Make local clone/fork root-based while preserving explicit secret behavior.
 9. Implement full/view export and staged import, then thin transfer.
 10. Add placement epochs, repair, operator dry-run, and online rebalance.
