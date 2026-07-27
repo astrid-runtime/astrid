@@ -301,10 +301,16 @@ fn streaming_source_failure_stages_only_unreachable_objects() {
         limit: 6 * 1024 * 1024,
     };
 
-    assert!(matches!(
-        store.put_streaming(&owner, &ContentName::new("broken").unwrap(), source),
-        Err(PrincipalContentError::ContentSource(_))
-    ));
+    let error = store
+        .put_streaming(&owner, &ContentName::new("broken").unwrap(), source)
+        .unwrap_err();
+    assert!(matches!(&error, PrincipalContentError::ContentSource(_)));
+    assert!(
+        std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<io::Error>()
+            .is_some()
+    );
     assert_eq!(engine.root(&owner), None);
     assert!(engine.object_count() > 0);
     assert!(store.list(&owner).unwrap().is_empty());

@@ -9,7 +9,7 @@ mod store;
 #[cfg(test)]
 mod tests;
 
-use std::fmt;
+use std::{fmt, io};
 
 use astrid_storage_engine::PrincipalProjectionError;
 use astrid_storage_model::{ObjectId, RootState};
@@ -144,7 +144,7 @@ impl ContentWriteOutcome {
 }
 
 /// Failure to read or mutate principal-owned content.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 #[non_exhaustive]
 pub enum PrincipalContentError {
     /// Content name was empty, non-UTF-8 on decode, or contained a null byte.
@@ -152,7 +152,7 @@ pub enum PrincipalContentError {
     /// Canonical content-DAG construction or decoding failed.
     Content(ContentError),
     /// Streaming byte source failed before a complete file was staged.
-    ContentSource(String),
+    ContentSource(io::Error),
     /// Shared principal projection engine failed.
     Projection(PrincipalProjectionError),
     /// Principal state or catalog did not match its canonical grammar.
@@ -208,6 +208,7 @@ impl std::error::Error for PrincipalContentError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Content(error) => Some(error),
+            Self::ContentSource(error) => Some(error),
             Self::Projection(error) => Some(error),
             _ => None,
         }

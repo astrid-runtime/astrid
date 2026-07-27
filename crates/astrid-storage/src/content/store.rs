@@ -706,9 +706,7 @@ fn map_read_error(error: ContentReadError<PrincipalProjectionError>) -> Principa
 fn map_stream_error(error: ContentStreamError<PrincipalProjectionError>) -> PrincipalContentError {
     match error {
         ContentStreamError::Content(error) => error.into(),
-        ContentStreamError::Source(error) => {
-            PrincipalContentError::ContentSource(error.to_string())
-        },
+        ContentStreamError::Source(error) => PrincipalContentError::ContentSource(error),
         ContentStreamError::Sink(error) => error.into(),
     }
 }
