@@ -21,6 +21,8 @@ use fs2::FileExt;
 use parking_lot::Mutex;
 
 use crate::{CommitOutcome, RootSnapshot, RootTransaction};
+use group::CommitGroup;
+pub use group::GroupCommitPolicy;
 
 const ARENA_FILE: &str = "objects.arena";
 const ROOT_FILE: &str = "roots.journal";
@@ -336,6 +338,8 @@ pub struct DurableEngine<P: Ord, I, C> {
     principal_codec: C,
     limits: RecoveryLimits,
     faults: Arc<dyn FaultInjector>,
+    group_policy: GroupCommitPolicy,
+    commit_group: Mutex<CommitGroup<P>>,
     inner: Mutex<DurableInner<P>>,
 }
 
@@ -344,6 +348,7 @@ impl<P: Ord, I, C> fmt::Debug for DurableEngine<P, I, C> {
         formatter
             .debug_struct("DurableEngine")
             .field("limits", &self.limits)
+            .field("group_policy", &self.group_policy)
             .finish_non_exhaustive()
     }
 }
@@ -367,7 +372,40 @@ where
         principal_codec: C,
         limits: RecoveryLimits,
     ) -> Result<Self, DurableError> {
-        Self::open_with_faults(path, identity, principal_codec, limits, Arc::new(NoFaults))
+        Self::open_configured(
+            path,
+            identity,
+            principal_codec,
+            limits,
+            GroupCommitPolicy::default(),
+            Arc::new(NoFaults),
+        )
+    }
+
+    /// Open or create a durable store with an explicit group-commit policy.
+    ///
+    /// Setting both policy delays to zero disables intentional waiting while
+    /// preserving batching of callers queued behind an in-flight durability
+    /// flush.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::open`].
+    pub fn open_with_group_commit_policy(
+        path: impl AsRef<Path>,
+        identity: I,
+        principal_codec: C,
+        limits: RecoveryLimits,
+        group_policy: GroupCommitPolicy,
+    ) -> Result<Self, DurableError> {
+        Self::open_configured(
+            path,
+            identity,
+            principal_codec,
+            limits,
+            group_policy,
+            Arc::new(NoFaults),
+        )
     }
 
     /// Open or create a durable store with an explicit fault injector.
@@ -380,6 +418,24 @@ where
         identity: I,
         principal_codec: C,
         limits: RecoveryLimits,
+        faults: Arc<dyn FaultInjector>,
+    ) -> Result<Self, DurableError> {
+        Self::open_configured(
+            path,
+            identity,
+            principal_codec,
+            limits,
+            GroupCommitPolicy::default(),
+            faults,
+        )
+    }
+
+    fn open_configured(
+        path: impl AsRef<Path>,
+        identity: I,
+        principal_codec: C,
+        limits: RecoveryLimits,
+        group_policy: GroupCommitPolicy,
         faults: Arc<dyn FaultInjector>,
     ) -> Result<Self, DurableError> {
         let path = path.as_ref();
@@ -419,6 +475,8 @@ where
             principal_codec,
             limits,
             faults,
+            group_policy,
+            commit_group: Mutex::new(CommitGroup::default()),
             inner: Mutex::new(DurableInner {
                 roots_by_principal,
                 index,
@@ -591,43 +649,11 @@ where
         usage_from_closure(&records, root.commit).map_err(Into::into)
     }
 
-    /// Persist a complete immutable transaction and publish its root.
-    ///
-    /// Known-stale transactions and all model/encoding errors are rejected
-    /// before any bytes are appended. Once I/O starts, any error poisons this
-    /// instance; drop and reopen it so recovery can reconcile disk state.
-    ///
-    /// # Errors
-    ///
-    /// Returns an identity, collision, graph, root-conflict, encoding, I/O, or
-    /// injected-fault error. A returned I/O/fault error requires reopen.
-    pub fn commit(&self, transaction: RootTransaction<P>) -> Result<CommitOutcome, DurableError> {
-        let mut inner = self.inner.lock();
-        ensure_usable(&inner)?;
-        let prepared = self.prepare(&mut inner, transaction)?;
-        match self.persist(&mut inner, &prepared) {
-            Ok(locations) => {
-                inner.index.extend(locations);
-                inner.validated.extend(prepared.validated.iter().copied());
-                inner
-                    .roots_by_principal
-                    .insert(prepared.principal.clone(), prepared.root);
-                Ok(CommitOutcome {
-                    root: prepared.root,
-                    objects_inserted: prepared.objects_inserted,
-                })
-            },
-            Err(error) => {
-                inner.poisoned = true;
-                Err(error)
-            },
-        }
-    }
-
     fn prepare(
         &self,
         inner: &mut DurableInner<P>,
         transaction: RootTransaction<P>,
+        pending_roots: &BTreeMap<P, RootState>,
     ) -> Result<Prepared<P>, DurableError> {
         let RootTransaction {
             principal,
@@ -645,7 +671,10 @@ where
                 .into());
             }
         }
-        let actual = inner.roots_by_principal.get(&principal).copied();
+        let actual = pending_roots
+            .get(&principal)
+            .copied()
+            .or_else(|| inner.roots_by_principal.get(&principal).copied());
         if actual != expected {
             return Err(ModelError::RootConflict { expected, actual }.into());
         }
@@ -693,7 +722,8 @@ where
                 }
                 continue;
             }
-            let payload = encode_object_frame(self.identity.scheme(), id, &record)?;
+            let payload: Arc<[u8]> =
+                encode_object_frame(self.identity.scheme(), id, &record)?.into();
             ensure_payload_limit(ARENA_FILE, 0, payload.len(), self.limits)?;
             if id == commit_id {
                 commit_frame = Some((id, payload));
@@ -743,40 +773,6 @@ where
         )
     }
 
-    fn persist(
-        &self,
-        inner: &mut DurableInner<P>,
-        prepared: &Prepared<P>,
-    ) -> Result<Vec<(ObjectId, ArenaLocation)>, DurableError> {
-        let files = live_files_mut(&mut inner.files)?;
-        let mut locations = Vec::new();
-        for (id, payload) in &prepared.objects {
-            let location = append_frame(&mut files.arena, ARENA_MAGIC, payload)?;
-            locations.push((*id, location));
-        }
-        self.fail_if(FaultPoint::AfterObjectAppend)?;
-        if let Some((id, payload)) = &prepared.commit {
-            let location = append_frame(&mut files.arena, ARENA_MAGIC, payload)?;
-            locations.push((*id, location));
-        }
-        self.fail_if(FaultPoint::AfterCommitAppend)?;
-        files
-            .arena
-            .sync_data()
-            .map_err(|source| io_error("flush transaction object frames", source))?;
-        self.fail_if(FaultPoint::AfterObjectFlush)?;
-        self.fail_if(FaultPoint::AfterCommitFlush)?;
-        self.fail_if(FaultPoint::BeforeRootCas)?;
-
-        append_frame(&mut files.roots, ROOT_MAGIC, &prepared.journal)?;
-        files
-            .roots
-            .sync_data()
-            .map_err(|source| io_error("flush root-journal frame", source))?;
-        self.fail_if(FaultPoint::AfterRootCas)?;
-        Ok(locations)
-    }
-
     fn fail_if(&self, point: FaultPoint) -> Result<(), DurableError> {
         if self.faults.should_fail(point) {
             return Err(DurableError::FaultInjected(point));
@@ -799,8 +795,8 @@ struct Prepared<P: Ord> {
     principal: P,
     root: RootState,
     objects_inserted: u64,
-    objects: Vec<(ObjectId, Vec<u8>)>,
-    commit: Option<(ObjectId, Vec<u8>)>,
+    objects: Vec<(ObjectId, Arc<[u8]>)>,
+    commit: Option<(ObjectId, Arc<[u8]>)>,
     journal: Vec<u8>,
     validated: BTreeSet<ObjectId>,
 }
@@ -955,6 +951,8 @@ fn recovery_closure_error(error: DurableError, root_offset: u64) -> DurableError
 
 #[path = "durable_staging.rs"]
 mod staging;
+
+mod group;
 
 #[path = "durable_format.rs"]
 mod format;
