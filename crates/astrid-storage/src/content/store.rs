@@ -131,12 +131,6 @@ where
     }
 
     fn mark_verified(&self, verified: VerifiedContent) {
-        if !matches!(
-            self.engine.current_root(&self.principal),
-            Ok(Some(root)) if root == self.principal_root
-        ) {
-            return;
-        }
         self.verified_files
             .write()
             .entry(self.principal.clone())
