@@ -27,6 +27,10 @@ use core::fmt;
 #[cfg(feature = "std")]
 mod build;
 mod read;
+#[cfg(feature = "std")]
+mod stream;
+#[cfg(all(test, feature = "std"))]
+mod stream_tests;
 #[cfg(all(test, feature = "std"))]
 mod tests;
 
@@ -35,6 +39,8 @@ pub use build::{BuiltContent, build_content};
 pub use read::{
     ContentReadError, ContentSource, describe_content, read_content, read_content_range,
 };
+#[cfg(feature = "std")]
+pub use stream::{ContentObjectSink, ContentStreamError, StreamedContent, build_content_streaming};
 
 /// Maximum children in one canonical chunk-tree node.
 ///

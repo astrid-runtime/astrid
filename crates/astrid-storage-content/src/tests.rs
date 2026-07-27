@@ -15,7 +15,7 @@ use crate::{
 };
 
 #[derive(Clone, Copy)]
-struct TestIdentity;
+pub(super) struct TestIdentity;
 
 impl ObjectIdentity for TestIdentity {
     fn identify(&self, record: &ObjectRecord) -> ObjectId {
@@ -75,7 +75,7 @@ impl ContentSource for MapSource {
     }
 }
 
-fn deterministic_bytes(length: usize) -> Vec<u8> {
+pub(super) fn deterministic_bytes(length: usize) -> Vec<u8> {
     let mut state = 0x4d59_5df4_d0f3_3173_u64;
     (0..length)
         .map(|_| {

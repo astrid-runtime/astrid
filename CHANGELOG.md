@@ -92,7 +92,11 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   chunk-tree, and file objects using an exact-pinned FastCDC 2020 profile.
   Files at or below the 256 KiB maximum remain one whole object; larger files
   enforce the declared minimum/maximum chunk bounds during decode, with only
-  the final chunk exempt from the minimum.
+  the final chunk exempt from the minimum. A blocking streaming builder reads
+  through a profile-bounded FastCDC buffer and emits immutable records into an
+  identity-checking staging sink without retaining the complete source.
+  Fragmented readers produce the exact same descriptor and canonical DAG as the
+  slice builder; source or sink failure never publishes a partial root.
   Full and range reconstruction validate the typed graph and load only
   overlapping chunks. `PrincipalContentStore` publishes named content through
   the same per-principal root CAS and durable object arena as KV, so identical

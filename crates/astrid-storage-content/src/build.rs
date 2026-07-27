@@ -49,10 +49,10 @@ impl BuiltContent {
 }
 
 #[derive(Clone, Copy)]
-struct Child {
-    id: ObjectId,
-    logical_bytes: u64,
-    chunk_count: u64,
+pub(super) struct Child {
+    pub(super) id: ObjectId,
+    pub(super) logical_bytes: u64,
+    pub(super) chunk_count: u64,
 }
 
 /// Build a canonical content DAG from ordinary bytes.
@@ -119,22 +119,7 @@ pub fn build_content<I: ObjectIdentity>(
 
     let chunk_count = u64::try_from(chunks.len()).map_err(|_| ContentError::LengthOverflow)?;
     let content = build_tree(identity, &mut records, chunks)?;
-    let references = content
-        .map(|child| {
-            vec![ObjectReference::owns(
-                ReferenceLabel::new(CONTENT_LABEL.to_vec()),
-                child.id,
-            )]
-        })
-        .unwrap_or_default();
-    let file = ObjectRecord::new(
-        ObjectKind::File,
-        FORMAT_VERSION,
-        encode_file_header(profile, logical_bytes, chunk_count),
-        references,
-        0,
-        ObjectClass::Metadata,
-    )?;
+    let file = file_record(profile, logical_bytes, chunk_count, content)?;
     let file = insert_record(identity, &mut records, file)?;
     Ok(BuiltContent {
         descriptor: ContentDescriptor::new(file, logical_bytes, chunk_count, profile),
@@ -151,14 +136,7 @@ fn push_chunk<I: ObjectIdentity>(
     unique_chunks: &mut BTreeSet<ObjectId>,
     bytes: &[u8],
 ) -> Result<(), ContentError> {
-    let record = ObjectRecord::new(
-        ObjectKind::Chunk,
-        FORMAT_VERSION,
-        bytes.to_vec(),
-        Vec::new(),
-        0,
-        ObjectClass::Data,
-    )?;
+    let record = chunk_record(bytes)?;
     let id = insert_record(identity, records, record)?;
     unique_chunks.insert(id);
     chunks.push(Child {
@@ -195,6 +173,28 @@ fn build_tree_node<I: ObjectIdentity>(
     records: &mut BTreeMap<ObjectId, ObjectRecord>,
     children: &[Child],
 ) -> Result<Child, ContentError> {
+    let (tree, logical_bytes, chunk_count) = tree_record(children)?;
+    let id = insert_record(identity, records, tree)?;
+    Ok(Child {
+        id,
+        logical_bytes,
+        chunk_count,
+    })
+}
+
+pub(super) fn chunk_record(bytes: &[u8]) -> Result<ObjectRecord, ContentError> {
+    ObjectRecord::new(
+        ObjectKind::Chunk,
+        FORMAT_VERSION,
+        bytes.to_vec(),
+        Vec::new(),
+        0,
+        ObjectClass::Data,
+    )
+    .map_err(Into::into)
+}
+
+pub(super) fn tree_record(children: &[Child]) -> Result<(ObjectRecord, u64, u64), ContentError> {
     let count = u16::try_from(children.len()).map_err(|_| ContentError::LengthOverflow)?;
     let logical_bytes = children.iter().try_fold(0_u64, |total, child| {
         total
@@ -228,10 +228,30 @@ fn build_tree_node<I: ObjectIdentity>(
         0,
         ObjectClass::Metadata,
     )?;
-    let id = insert_record(identity, records, tree)?;
-    Ok(Child {
-        id,
-        logical_bytes,
-        chunk_count,
-    })
+    Ok((tree, logical_bytes, chunk_count))
+}
+
+pub(super) fn file_record(
+    profile: ChunkingProfile,
+    logical_bytes: u64,
+    chunk_count: u64,
+    content: Option<Child>,
+) -> Result<ObjectRecord, ContentError> {
+    let references = content
+        .map(|child| {
+            vec![ObjectReference::owns(
+                ReferenceLabel::new(CONTENT_LABEL.to_vec()),
+                child.id,
+            )]
+        })
+        .unwrap_or_default();
+    ObjectRecord::new(
+        ObjectKind::File,
+        FORMAT_VERSION,
+        encode_file_header(profile, logical_bytes, chunk_count),
+        references,
+        0,
+        ObjectClass::Metadata,
+    )
+    .map_err(Into::into)
 }

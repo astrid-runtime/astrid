@@ -170,12 +170,21 @@ Each operation:
 6. publishes all reachable new records and one new principal root atomically;
 7. retries the complete logical mutation if the root CAS conflicts.
 
-The current `build_content` API accepts a complete source slice and copies its
-chunks into a complete pending record set. Peak memory therefore includes both
-the input and the built closure. It is suitable for present catalog-scale
-content, not multi-gigabyte model weights; a streaming builder is required
-before those workloads are enabled. The read-bound, delta-proportional ingest
-pipeline and its crash marker protocol are tracked in
+`build_content` remains the convenient whole-slice API and the differential
+oracle. `build_content_streaming` accepts any blocking byte reader and emits
+each immutable chunk/tree/file record into a `ContentObjectSink`. The sink owns
+identity computation, collision rejection, idempotent deduplication, and
+unpublished staging; the builder never selects or publishes a principal root.
+Source memory is bounded by a constant multiple of the profile maximum
+(prefetch, FastCDC buffer, and current chunk), while chunk identities and
+aggregate tree metadata remain proportional to the chunk count. Every reader
+fragmentation produces the same descriptor and canonical object DAG as the
+slice builder, including the one-whole-chunk rule at or below 256 KiB.
+
+A source or sink failure may leave unreachable immutable staging records but
+can never expose a partial file. Durable bulk adoption, one-pair fsync, the
+staging marker protocol, and staged-file-as-contiguous-representation work are
+tracked in
 [#1392](https://github.com/astrid-runtime/astrid/issues/1392).
 
 Deletes remain possible above quota. Growth is rejected when the combined
@@ -296,6 +305,9 @@ Regression coverage includes:
 - proof that range reads skip unrelated objects;
 - deterministic profile identity and golden FastCDC cut lengths;
 - high chunk reuse after a local insertion;
+- streaming/slice identity across boundary sizes, multi-level trees, and
+  adversarial one-byte source fragmentation;
+- bounded source reads plus source/sink failure without a file descriptor;
 - missing and malformed object rejection;
 - cross-principal physical reuse with independent logical usage;
 - duplicate aliases rejected by finite quota;
@@ -312,7 +324,7 @@ This increment does not provide:
 - host filesystem projection or path traversal;
 - directory trees, symlinks, executable metadata, or atomic rename;
 - capsule WIT/host calls before the interface freeze is lifted;
-- streaming ingestion that avoids holding the source slice in memory;
+- durable bulk-ingest transactions and staged-file adoption;
 - encryption and erasure-domain key management;
 - semantic equivalence contracts and trusted representation selection;
 - compaction or online garbage collection;
