@@ -184,6 +184,16 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   measured a 2.68-microsecond warm catalog lookup and 3,480 retained metadata
   bytes for one replacement versus 17,250,041 bytes for the legacy rewrite.
   Closes #1400.
+- **Principal storage has a reproducible native I/O benchmark boundary.** A
+  custom release-profile benchmark compares same-volume native writes and
+  explicit syncs with staging writes, durable seal, unique and duplicate
+  publication, content-only construction, verified range reads, and engine
+  reopen. It reports raw samples and derived throughput as JSON, keeps
+  foreground acknowledgement separate from asynchronous publication, and
+  compares small-file close, sync, and seal rather than calling them equivalent
+  operations. The companion benchmark contract defines the future read/write
+  filesystem-provider matrix without presenting engine measurements as mounted
+  throughput. Refs #1392 and #1391.
 - **Windows local transport uses authenticated per-user named pipes.** A pipe
   name derived only from the caller's operating-system SID replaces
   filesystem endpoint naming on Windows. Local-only byte-mode instances use a

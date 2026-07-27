@@ -441,6 +441,13 @@ For each chunking profile record:
 - export/import throughput;
 - cold and warm reconstruction latency.
 
+The reproducible native-path harness and the mounted-provider acceptance matrix
+are specified in
+[Storage I/O Benchmarks](astrid-storage-io-benchmarks.md). Results must keep
+cached writes, durability barriers, content publication, and verified
+reconstruction as separate measurements. Until a provider adapter exists, no
+engine or staging result may be presented as mounted-filesystem throughput.
+
 A candidate profile fails if it relies on a hard total-size ceiling, unbounded
 RAM, or a workload-specific ratio presented as a general claim.
 
