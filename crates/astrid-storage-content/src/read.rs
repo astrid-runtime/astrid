@@ -7,7 +7,8 @@ use astrid_storage_model::{
 
 use crate::{
     CHUNK_TREE_FANOUT, CONTENT_LABEL, ChunkingProfile, ContentDescriptor, ContentError,
-    FORMAT_VERSION, OpenedContent, boundary::is_canonical_boundary, decode_file_header,
+    FORMAT_VERSION, OpenedContent, VerifiedContent, boundary::is_canonical_boundary,
+    decode_file_header,
 };
 
 /// Fallible object-loading boundary used for lazy content reconstruction.
@@ -113,6 +114,50 @@ pub fn read_opened_content<S: ContentSource>(
     source: &S,
     opened: OpenedContent,
 ) -> Result<Vec<u8>, ContentReadError<S::Error>> {
+    read_opened_content_and_verify(source, opened).map(|(bytes, _)| bytes)
+}
+
+/// Reconstruct all bytes and return proof of complete boundary validation.
+///
+/// # Errors
+///
+/// Returns a source, allocation, missing-object, or canonical grammar error.
+/// No verification token is returned unless reconstruction and every canonical
+/// boundary check complete successfully.
+pub fn read_opened_content_and_verify<S: ContentSource>(
+    source: &S,
+    opened: OpenedContent,
+) -> Result<(Vec<u8>, VerifiedContent), ContentReadError<S::Error>> {
+    let descriptor = opened.descriptor();
+    let bytes = read_decoded_range(
+        source,
+        descriptor.file(),
+        (
+            descriptor.profile(),
+            descriptor.logical_bytes(),
+            descriptor.chunk_count(),
+            opened.content(),
+        ),
+        0,
+        descriptor.logical_bytes(),
+        true,
+    )?;
+    Ok((bytes, VerifiedContent::new(opened)))
+}
+
+/// Reconstruct all bytes from a previously verified immutable file.
+///
+/// Object identities and source checks remain enforced; only redundant
+/// content-boundary validation is skipped.
+///
+/// # Errors
+///
+/// Returns a source, allocation, missing-object, or canonical grammar error.
+pub fn read_verified_content<S: ContentSource>(
+    source: &S,
+    verified: VerifiedContent,
+) -> Result<Vec<u8>, ContentReadError<S::Error>> {
+    let opened = verified.opened_content();
     let descriptor = opened.descriptor();
     read_decoded_range(
         source,
@@ -125,6 +170,7 @@ pub fn read_opened_content<S: ContentSource>(
         ),
         0,
         descriptor.logical_bytes(),
+        false,
     )
 }
 
@@ -167,6 +213,39 @@ pub fn read_opened_content_range<S: ContentSource>(
         ),
         offset,
         length,
+        true,
+    )
+}
+
+/// Reconstruct a range from a previously verified immutable file.
+///
+/// Object identities and source checks remain enforced; only redundant
+/// content-boundary validation is skipped.
+///
+/// # Errors
+///
+/// Returns an out-of-bounds, source, allocation, missing-object, or canonical
+/// grammar error.
+pub fn read_verified_content_range<S: ContentSource>(
+    source: &S,
+    verified: VerifiedContent,
+    offset: u64,
+    length: u64,
+) -> Result<Vec<u8>, ContentReadError<S::Error>> {
+    let opened = verified.opened_content();
+    let descriptor = opened.descriptor();
+    read_decoded_range(
+        source,
+        descriptor.file(),
+        (
+            descriptor.profile(),
+            descriptor.logical_bytes(),
+            descriptor.chunk_count(),
+            opened.content(),
+        ),
+        offset,
+        length,
+        false,
     )
 }
 
@@ -176,6 +255,7 @@ fn read_decoded_range<S: ContentSource>(
     decoded: (ChunkingProfile, u64, u64, Option<ObjectId>),
     offset: u64,
     length: u64,
+    validate_boundaries: bool,
 ) -> Result<Vec<u8>, ContentReadError<S::Error>> {
     let (profile, logical_bytes, chunk_count, content) = decoded;
     let end = offset
@@ -212,7 +292,7 @@ fn read_decoded_range<S: ContentSource>(
         profile,
         ends_file: true,
     };
-    let mut boundaries = BoundaryWindow::default();
+    let mut boundaries = validate_boundaries.then(BoundaryWindow::default);
     append_range(
         source,
         content,
@@ -222,7 +302,9 @@ fn read_decoded_range<S: ContentSource>(
         &mut output,
         &mut boundaries,
     )?;
-    boundaries.validate_neighbors(source, content, shape, logical_bytes)?;
+    if let Some(boundaries) = &boundaries {
+        boundaries.validate_neighbors(source, content, shape, logical_bytes)?;
+    }
     if output.len() != capacity {
         return Err(ContentError::InvalidObject {
             object: file,
@@ -357,13 +439,15 @@ fn append_range<S: ContentSource>(
     range: RequestedRange,
     base_offset: u64,
     output: &mut Vec<u8>,
-    boundaries: &mut BoundaryWindow,
+    boundaries: &mut Option<BoundaryWindow>,
 ) -> Result<(), ContentReadError<S::Error>> {
     let record = load(source, object)?;
     match record.kind() {
         ObjectKind::Chunk => {
             validate_chunk(object, &record, shape)?;
-            boundaries.observe(object, base_offset, record.canonical_bytes(), shape.profile)?;
+            if let Some(boundaries) = boundaries {
+                boundaries.observe(object, base_offset, record.canonical_bytes(), shape.profile)?;
+            }
             let chunk_end = base_offset
                 .checked_add(shape.logical_bytes)
                 .ok_or(ContentError::LengthOverflow)?;

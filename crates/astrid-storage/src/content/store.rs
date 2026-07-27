@@ -1,19 +1,21 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::Read;
 use std::marker::PhantomData;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use astrid_storage_content::{
     BuiltContent, ChunkingProfile, ContentDescriptor, ContentError, ContentObjectSink,
-    ContentReadError, ContentSource, ContentStreamError, OpenedContent, build_content,
-    build_content_streaming, open_content, read_opened_content, read_opened_content_range,
+    ContentReadError, ContentSource, ContentStreamError, OpenedContent, VerifiedContent,
+    build_content, build_content_streaming, open_content, read_opened_content_and_verify,
+    read_opened_content_range, read_verified_content, read_verified_content_range,
 };
 use astrid_storage_engine::{PrincipalProjectionEngine, PrincipalProjectionError, RootTransaction};
 use astrid_storage_model::{
     InsertOutcome, ModelError, ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind,
     ObjectRecord, ObjectReference, ReferenceKind, ReferenceLabel, RootState,
 };
+use parking_lot::RwLock;
 
 use super::catalog::{
     CONTENT_COMPONENT_LABEL, Catalog, CatalogValue, decode_catalog, encode_catalog,
@@ -31,10 +33,16 @@ const PRINCIPAL_GRAPH_VERSION: ObjectFormatVersion = match ObjectFormatVersion::
     None => unreachable!(),
 };
 
+type VerifiedFileMap<P> = BTreeMap<P, BTreeMap<ObjectId, VerifiedContent>>;
+// Partition proof reuse by principal so cache timing cannot reveal that
+// another principal previously published or read equal content.
+type SharedVerifiedFiles<P> = Arc<RwLock<VerifiedFileMap<P>>>;
+
 /// Named content projection over one shared principal-state engine.
 pub struct PrincipalContentStore<P: Ord, E> {
     engine: Arc<E>,
     quota: Option<Arc<dyn KvQuotaResolver<P>>>,
+    verified_files: OnceLock<SharedVerifiedFiles<P>>,
 }
 
 /// Principal-scoped immutable content handle for repeated verified reads.
@@ -46,8 +54,9 @@ pub struct PrincipalContentStore<P: Ord, E> {
 pub struct PrincipalContentReadHandle<P: Ord, E> {
     engine: Arc<E>,
     opened: OpenedContent,
+    principal: P,
     principal_root: RootState,
-    marker: PhantomData<fn() -> P>,
+    verified_files: SharedVerifiedFiles<P>,
 }
 
 impl<P: Ord, E> fmt::Debug for PrincipalContentReadHandle<P, E> {
@@ -62,7 +71,7 @@ impl<P: Ord, E> fmt::Debug for PrincipalContentReadHandle<P, E> {
 
 impl<P, E> PrincipalContentReadHandle<P, E>
 where
-    P: Ord,
+    P: Clone + Ord,
     E: PrincipalProjectionEngine<P>,
 {
     /// Return the immutable descriptor validated when the handle was opened.
@@ -84,11 +93,14 @@ where
     /// Returns a content or projection error when verification or allocation
     /// fails.
     pub fn read(&self) -> Result<Vec<u8>, PrincipalContentError> {
-        read_opened_content(
-            &EngineSource::<P, E>::new(self.engine.as_ref()),
-            self.opened,
-        )
-        .map_err(map_read_error)
+        let source = EngineSource::<P, E>::new(self.engine.as_ref());
+        if let Some(verified) = self.verified() {
+            return read_verified_content(&source, verified).map_err(map_read_error);
+        }
+        let (bytes, verified) =
+            read_opened_content_and_verify(&source, self.opened).map_err(map_read_error)?;
+        self.mark_verified(verified);
+        Ok(bytes)
     }
 
     /// Reconstruct an exact range of the opened value.
@@ -98,23 +110,51 @@ where
     /// Returns a content, projection, range, or allocation error when the
     /// requested bytes cannot be reconstructed exactly.
     pub fn read_range(&self, offset: u64, length: u64) -> Result<Vec<u8>, PrincipalContentError> {
-        read_opened_content_range(
-            &EngineSource::<P, E>::new(self.engine.as_ref()),
-            self.opened,
-            offset,
-            length,
-        )
-        .map_err(map_read_error)
+        let source = EngineSource::<P, E>::new(self.engine.as_ref());
+        match self.verified() {
+            Some(verified) => read_verified_content_range(&source, verified, offset, length)
+                .map_err(map_read_error),
+            None => read_opened_content_range(&source, self.opened, offset, length)
+                .map_err(map_read_error),
+        }
+    }
+
+    fn verified(&self) -> Option<VerifiedContent> {
+        self.verified_files
+            .read()
+            .get(&self.principal)
+            .and_then(|files| files.get(&self.opened.descriptor().file()))
+            .copied()
+    }
+
+    fn mark_verified(&self, verified: VerifiedContent) {
+        if !matches!(
+            self.engine.current_root(&self.principal),
+            Ok(Some(root)) if root == self.principal_root
+        ) {
+            return;
+        }
+        self.verified_files
+            .write()
+            .entry(self.principal.clone())
+            .or_default()
+            .insert(verified.descriptor().file(), verified);
     }
 }
 
 impl<P: Ord, E> PrincipalContentStore<P, E> {
+    fn verified_files(&self) -> &SharedVerifiedFiles<P> {
+        self.verified_files
+            .get_or_init(|| Arc::new(RwLock::new(BTreeMap::new())))
+    }
+
     /// Construct without a principal-specific quota.
     #[must_use]
     pub const fn from_engine(engine: Arc<E>) -> Self {
         Self {
             engine,
             quota: None,
+            verified_files: OnceLock::new(),
         }
     }
 
@@ -124,6 +164,7 @@ impl<P: Ord, E> PrincipalContentStore<P, E> {
         Self {
             engine,
             quota: Some(quota),
+            verified_files: OnceLock::new(),
         }
     }
 }
@@ -174,7 +215,7 @@ where
             profile,
             bytes,
         )?;
-        self.publish(principal, name, built.descriptor(), Some(&built), 0)
+        self.publish(principal, name, built.verified_content(), Some(&built), 0)
     }
 
     /// Stream bytes under `name` using Astrid's pinned chunking profile.
@@ -221,7 +262,7 @@ where
         self.publish(
             principal,
             name,
-            streamed.descriptor(),
+            streamed.verified_content(),
             None,
             sink.objects_inserted,
         )
@@ -231,10 +272,11 @@ where
         &self,
         principal: &P,
         name: &ContentName,
-        descriptor: ContentDescriptor,
+        verified: VerifiedContent,
         built: Option<&BuiltContent>,
         staged_objects_inserted: u64,
     ) -> Result<ContentWriteOutcome, PrincipalContentError> {
+        let descriptor = verified.descriptor();
         loop {
             let mut header = self.header(principal.clone())?;
             if header
@@ -249,6 +291,7 @@ where
                         "catalog entry exists without a principal root",
                     )
                 })?;
+                self.mark_verified(principal.clone(), verified);
                 return Ok(ContentWriteOutcome::new(descriptor, root, 0));
             }
             header.catalog.insert(
@@ -258,10 +301,18 @@ where
                     logical_bytes: descriptor.logical_bytes(),
                 },
             )?;
+            let live_files = header
+                .catalog
+                .entries
+                .values()
+                .map(|entry| entry.file)
+                .collect();
             self.enforce_quota(principal, &header)?;
             let transaction = self.encode_transaction(header, built)?;
             match self.engine.commit_root(transaction) {
                 Ok(outcome) => {
+                    self.retain_verified(principal, &live_files);
+                    self.mark_verified(principal.clone(), verified);
                     let objects_inserted = staged_objects_inserted
                         .checked_add(outcome.objects_inserted())
                         .ok_or(PrincipalContentError::AccountingOverflow)?;
@@ -292,9 +343,18 @@ where
             if header.catalog.remove(name)?.is_none() {
                 return Ok(false);
             }
+            let live_files = header
+                .catalog
+                .entries
+                .values()
+                .map(|entry| entry.file)
+                .collect();
             let transaction = self.encode_transaction(header, None)?;
             match self.engine.commit_root(transaction) {
-                Ok(_) => return Ok(true),
+                Ok(_) => {
+                    self.retain_verified(principal, &live_files);
+                    return Ok(true);
+                },
                 Err(PrincipalProjectionError::Model(ModelError::RootConflict { .. })) => {},
                 Err(error) => return Err(error.into()),
             }
@@ -349,8 +409,17 @@ where
         let root = header
             .root
             .ok_or_else(|| invalid(entry.file, "catalog entry exists without a principal root"))?;
-        let opened = open_content(&EngineSource::<P, E>::new(self.engine.as_ref()), entry.file)
-            .map_err(map_read_error)?;
+        let verified = self
+            .verified_files()
+            .read()
+            .get(principal)
+            .and_then(|files| files.get(&entry.file))
+            .copied();
+        let opened = match verified {
+            Some(verified) => verified.opened_content(),
+            None => open_content(&EngineSource::<P, E>::new(self.engine.as_ref()), entry.file)
+                .map_err(map_read_error)?,
+        };
         let descriptor = opened.descriptor();
         if descriptor.logical_bytes() != entry.logical_bytes {
             return Err(invalid(
@@ -361,8 +430,9 @@ where
         Ok(Some(PrincipalContentReadHandle {
             engine: Arc::clone(&self.engine),
             opened,
+            principal: principal.clone(),
             principal_root: root,
-            marker: PhantomData,
+            verified_files: Arc::clone(self.verified_files()),
         }))
     }
 
@@ -409,6 +479,25 @@ where
     /// Returns a projection error when durable state cannot be flushed.
     pub fn flush(&self) -> Result<(), PrincipalContentError> {
         self.engine.flush_projection().map_err(Into::into)
+    }
+
+    fn mark_verified(&self, principal: P, verified: VerifiedContent) {
+        self.verified_files()
+            .write()
+            .entry(principal)
+            .or_default()
+            .insert(verified.descriptor().file(), verified);
+    }
+
+    fn retain_verified(&self, principal: &P, live_files: &BTreeSet<ObjectId>) {
+        let mut verified = self.verified_files().write();
+        if live_files.is_empty() {
+            verified.remove(principal);
+            return;
+        }
+        if let Some(files) = verified.get_mut(principal) {
+            files.retain(|file, _| live_files.contains(file));
+        }
     }
 
     fn header(&self, principal: P) -> Result<ContentHeader<P>, PrincipalContentError> {

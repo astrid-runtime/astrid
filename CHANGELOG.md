@@ -134,6 +134,11 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   Principal-scoped read handles resolve and validate a root generation,
   catalog entry, and file descriptor once, then preserve that immutable
   generation across later replacement or deletion of the catalog name.
+  Canonical builders and completed validating reads mint unforgeable
+  verification tokens, allowing later reads to skip redundant FastCDC
+  neighbour proofs while retaining object, shape, and range checks. Reuse is
+  partitioned by principal so cache timing cannot expose another principal's
+  equal content.
 - **Windows local transport uses authenticated per-user named pipes.** A pipe
   name derived only from the caller's operating-system SID replaces
   filesystem endpoint naming on Windows. Local-only byte-mode instances use a

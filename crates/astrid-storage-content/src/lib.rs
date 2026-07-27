@@ -39,7 +39,8 @@ mod tests;
 pub use build::{BuiltContent, build_content};
 pub use read::{
     ContentReadError, ContentSource, describe_content, open_content, read_content,
-    read_content_range, read_opened_content, read_opened_content_range,
+    read_content_range, read_opened_content, read_opened_content_and_verify,
+    read_opened_content_range, read_verified_content, read_verified_content_range,
 };
 #[cfg(feature = "std")]
 pub use stream::{ContentObjectSink, ContentStreamError, StreamedContent, build_content_streaming};
@@ -226,6 +227,34 @@ impl OpenedContent {
 
     pub(crate) const fn content(self) -> Option<ObjectId> {
         self.content
+    }
+}
+
+/// Proof that one immutable file DAG has canonical content boundaries.
+///
+/// A token is produced only by Astrid's canonical builders or by a completed
+/// validating read. Because object identities bind the complete immutable
+/// closure, the proof remains valid for that exact file identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VerifiedContent {
+    opened: OpenedContent,
+}
+
+impl VerifiedContent {
+    pub(crate) const fn new(opened: OpenedContent) -> Self {
+        Self { opened }
+    }
+
+    /// Return the verified immutable file descriptor.
+    #[must_use]
+    pub const fn descriptor(self) -> ContentDescriptor {
+        self.opened.descriptor()
+    }
+
+    /// Return the opened file metadata carried by this proof.
+    #[must_use]
+    pub const fn opened_content(self) -> OpenedContent {
+        self.opened
     }
 }
 
