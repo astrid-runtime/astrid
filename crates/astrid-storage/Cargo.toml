@@ -38,8 +38,13 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 blake3 = { workspace = true }
+serde = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[[bench]]
+name = "storage_io"
+harness = false
 
 # Astrid's wasm-capable crates use getrandom 0.4 with its `wasm_js` backend.
 # surrealkv still pulls a separate getrandom 0.3 edge; its backend is configured

@@ -202,8 +202,9 @@ Windows, and Linux filesystem providers. It is deliberately not a mount:
 1. a provider derives the `StateOwner` from its authenticated host context and
    opens a private random-access native file;
 2. ordinary writes, seeks, and truncation touch only that file;
-3. close calls `seal`, which flushes the bytes and a versioned, checksummed
-   intent before moving the directory into the ready queue;
+3. the durable acknowledgement path calls `seal`, which flushes the bytes and
+   a versioned, checksummed intent before moving the directory into the ready
+   queue;
 4. `seal` returning is the provider acknowledgement boundary; chunking and
    object admission have not run;
 5. an ordered background consumer streams the file through
@@ -215,6 +216,14 @@ The close-order sequence is allocated at seal rather than open. Publication
 rejects a later close while an earlier close for the same owner and content
 name remains queued, so a slow old handle cannot overwrite a newer result.
 Different names do not share this ordering dependency.
+
+A provider must not silently equate this stronger durable acknowledgement with
+an ordinary host `close`. The benchmark contract in
+[Storage I/O Benchmarks](astrid-storage-io-benchmarks.md) measures cached write,
+close, explicit sync, seal, and background publication separately. A hosted
+filesystem must state whether ordinary close waits for `seal`, whether only
+`fsync` does, and how a provider-process crash recovers a closed but not yet
+durably sealed working transaction.
 
 A process crash before the intent leaves unacknowledged bytes that startup
 preserves under `quarantine/`. A crash after the intent but before the
