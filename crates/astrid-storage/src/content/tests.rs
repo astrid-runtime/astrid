@@ -372,6 +372,62 @@ fn verified_handle_reuse_survives_an_unrelated_root_commit() {
 }
 
 #[test]
+fn one_shot_reads_reuse_the_current_decoded_header() {
+    let engine = Arc::new(CountingEngine::new());
+    let writer = PrincipalContentStore::from_engine(Arc::clone(&engine));
+    let reader = PrincipalContentStore::from_engine(Arc::clone(&engine));
+    let owner = "alice".to_owned();
+    let name = ContentName::new("catalog/target.bin").unwrap();
+    let value = bytes(2 * 1024 * 1024);
+    writer.put(&owner, &name, &value).unwrap();
+    for index in 0..64 {
+        writer
+            .put(
+                &owner,
+                &ContentName::new(format!("catalog/other-{index}.bin")).unwrap(),
+                format!("value-{index}").as_bytes(),
+            )
+            .unwrap();
+    }
+
+    engine.reset_object_loads();
+    assert_eq!(
+        reader.read_range(&owner, &name, 999_000, 12_345).unwrap(),
+        Some(value[999_000..1_011_345].to_vec())
+    );
+    let first_loads = engine.object_loads();
+
+    engine.reset_object_loads();
+    assert_eq!(
+        reader.read_range(&owner, &name, 999_000, 12_345).unwrap(),
+        Some(value[999_000..1_011_345].to_vec())
+    );
+    let cached_loads = engine.object_loads();
+    assert!(
+        cached_loads < first_loads,
+        "cached one-shot read loaded {cached_loads} objects; first read loaded {first_loads}"
+    );
+
+    writer
+        .put(
+            &owner,
+            &ContentName::new("catalog/new-generation.bin").unwrap(),
+            b"new root generation",
+        )
+        .unwrap();
+    engine.reset_object_loads();
+    assert_eq!(
+        reader.read_range(&owner, &name, 999_000, 12_345).unwrap(),
+        Some(value[999_000..1_011_345].to_vec())
+    );
+    let next_generation_loads = engine.object_loads();
+    assert!(
+        next_generation_loads > cached_loads,
+        "new generation loaded {next_generation_loads} objects; cached generation loaded {cached_loads}"
+    );
+}
+
+#[test]
 fn streamed_content_matches_slice_identity_and_round_trips() {
     let engine = Arc::new(Engine::new(TestIdentity));
     let store = PrincipalContentStore::from_engine(engine);
