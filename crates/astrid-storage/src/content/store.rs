@@ -14,9 +14,12 @@ use astrid_storage_model::{
     InsertOutcome, ModelError, ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind,
     ObjectRecord, ObjectReference, ReferenceKind, ReferenceLabel, RootState,
 };
+use parking_lot::Mutex;
 
 use super::catalog::{
-    CONTENT_COMPONENT_LABEL, Catalog, CatalogValue, decode_catalog, encode_catalog,
+    CONTENT_COMPONENT_LABEL, CatalogRoot, CatalogSummary, CatalogValidation, CatalogValue,
+    build_catalog, decode_legacy_catalog, delete, insert, list, lookup, root_from_record,
+    validate_catalog,
 };
 use super::{ContentEntry, ContentName, ContentWriteOutcome, PrincipalContentError};
 use crate::kv::KvQuotaResolver;
@@ -35,15 +38,17 @@ const PRINCIPAL_GRAPH_VERSION: ObjectFormatVersion = match ObjectFormatVersion::
 pub struct PrincipalContentStore<P: Ord, E> {
     engine: Arc<E>,
     quota: Option<Arc<dyn KvQuotaResolver<P>>>,
+    validated_catalogs: Arc<Mutex<BTreeMap<P, CatalogValidation>>>,
 }
 
 impl<P: Ord, E> PrincipalContentStore<P, E> {
     /// Construct without a principal-specific quota.
     #[must_use]
-    pub const fn from_engine(engine: Arc<E>) -> Self {
+    pub fn from_engine(engine: Arc<E>) -> Self {
         Self {
             engine,
             quota: None,
+            validated_catalogs: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -53,7 +58,36 @@ impl<P: Ord, E> PrincipalContentStore<P, E> {
         Self {
             engine,
             quota: Some(quota),
+            validated_catalogs: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    pub(crate) fn from_engine_with_quota_and_validation(
+        engine: Arc<E>,
+        quota: Arc<dyn KvQuotaResolver<P>>,
+        validated_catalogs: Arc<Mutex<BTreeMap<P, CatalogValidation>>>,
+    ) -> Self {
+        Self {
+            engine,
+            quota: Some(quota),
+            validated_catalogs,
+        }
+    }
+
+    pub(crate) fn from_engine_with_validation(
+        engine: Arc<E>,
+        validated_catalogs: Arc<Mutex<BTreeMap<P, CatalogValidation>>>,
+    ) -> Self {
+        Self {
+            engine,
+            quota: None,
+            validated_catalogs,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn validated_catalog_count(&self) -> usize {
+        self.validated_catalogs.lock().len()
     }
 }
 
@@ -70,6 +104,108 @@ where
     P: Clone + Ord + Send + Sync,
     E: PrincipalProjectionEngine<P>,
 {
+    /// Convert one principal's legacy flat content catalog in place.
+    ///
+    /// The operation is idempotent and publishes through the ordinary
+    /// principal-root compare-and-swap. It is invoked only by the ordered
+    /// native-store migration while the kernel singleton lock is held.
+    pub(crate) fn migrate_legacy_catalog(
+        &self,
+        principal: &P,
+    ) -> Result<bool, PrincipalContentError> {
+        loop {
+            let Some(root) = self.engine.current_root(principal)? else {
+                return Ok(false);
+            };
+            let commit =
+                self.load_typed(root.commit, ObjectKind::Commit, PRINCIPAL_GRAPH_VERSION)?;
+            require_structural(root.commit, &commit)?;
+            let state_id = owned_target(root.commit, &commit, STATE_LABEL)?;
+            let state = self.load_typed(
+                state_id,
+                ObjectKind::PrincipalState,
+                PRINCIPAL_GRAPH_VERSION,
+            )?;
+            require_structural(state_id, &state)?;
+            let Some(content_reference) =
+                state.reference(&ReferenceLabel::new(CONTENT_COMPONENT_LABEL))
+            else {
+                return Ok(false);
+            };
+            if content_reference.kind() != ReferenceKind::Owns {
+                return Err(invalid(
+                    state_id,
+                    "principal content component is not owning",
+                ));
+            }
+            let catalog_id = content_reference.target();
+            let catalog_record = self.load_required(catalog_id)?;
+            if catalog_record.format_version() != ObjectFormatVersion::V1 {
+                let root = root_from_record(catalog_id, &catalog_record)?;
+                let validation =
+                    validate_catalog(Some(root), &mut |object| self.load_required(object))?;
+                self.validated_catalogs
+                    .lock()
+                    .insert(principal.clone(), validation);
+                return Ok(false);
+            }
+            let legacy = decode_legacy_catalog(catalog_id, &catalog_record)?;
+            for entry in legacy.entries.values() {
+                let descriptor =
+                    describe_content(&EngineSource::<P, E>::new(self.engine.as_ref()), entry.file)
+                        .map_err(map_read_error)?;
+                if descriptor.logical_bytes() != entry.logical_bytes {
+                    return Err(invalid(
+                        entry.file,
+                        "legacy catalog and file logical lengths disagree",
+                    ));
+                }
+            }
+            let (catalog, catalog_records) = build_catalog(&legacy.entries, &|record| {
+                self.engine.identify_object(record)
+            })?;
+            let preserved_state = state
+                .references()
+                .iter()
+                .filter(|reference| reference.label().as_bytes() != CONTENT_COMPONENT_LABEL)
+                .cloned()
+                .collect();
+            let preserved_commit = commit
+                .references()
+                .iter()
+                .filter(|reference| {
+                    reference.label().as_bytes() != STATE_LABEL
+                        && reference.label().as_bytes() != PARENT_LABEL
+                })
+                .cloned()
+                .collect();
+            let header = ContentHeader {
+                principal: principal.clone(),
+                root: Some(root),
+                catalog,
+                previous_catalog_quota_bytes: legacy.quota_bytes,
+                other_quota_bytes: 0,
+                preserved_state,
+                preserved_commit,
+            };
+            let transaction = self.encode_transaction(header, None, catalog_records)?;
+            match self.engine.commit_root(transaction) {
+                Ok(_) => {
+                    self.validated_catalogs.lock().insert(
+                        principal.clone(),
+                        CatalogValidation {
+                            root: catalog.map(|root| root.object),
+                            summary: catalog.map_or(CatalogSummary::default(), |root| root.summary),
+                        },
+                    );
+                    return Ok(true);
+                },
+                Err(PrincipalProjectionError::Model(ModelError::RootConflict { .. })) => {},
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
     /// Store bytes under `name` using Astrid's pinned chunking profile.
     ///
     /// # Errors
@@ -166,10 +302,8 @@ where
     ) -> Result<ContentWriteOutcome, PrincipalContentError> {
         loop {
             let mut header = self.header(principal.clone())?;
-            if header
-                .catalog
-                .entries
-                .get(name)
+            if self
+                .catalog_lookup(header.catalog, name)?
                 .is_some_and(|entry| entry.file == descriptor.file())
             {
                 let root = header.root.ok_or_else(|| {
@@ -180,17 +314,29 @@ where
                 })?;
                 return Ok(ContentWriteOutcome::new(descriptor, root, 0));
             }
-            header.catalog.insert(
-                name.clone(),
+            let mutation = insert(
+                header.catalog,
+                name,
                 CatalogValue {
                     file: descriptor.file(),
                     logical_bytes: descriptor.logical_bytes(),
                 },
+                &mut |object| self.load_required(object),
+                &|record| self.engine.identify_object(record),
             )?;
+            header.catalog = mutation.root;
             self.enforce_quota(principal, &header)?;
-            let transaction = self.encode_transaction(header, built)?;
+            let catalog = header.catalog;
+            let transaction = self.encode_transaction(header, built, mutation.records)?;
             match self.engine.commit_root(transaction) {
                 Ok(outcome) => {
+                    self.validated_catalogs.lock().insert(
+                        principal.clone(),
+                        CatalogValidation {
+                            root: catalog.map(|root| root.object),
+                            summary: catalog.map_or(CatalogSummary::default(), |root| root.summary),
+                        },
+                    );
                     let objects_inserted = staged_objects_inserted
                         .checked_add(outcome.objects_inserted())
                         .ok_or(PrincipalContentError::AccountingOverflow)?;
@@ -218,12 +364,29 @@ where
     pub fn delete(&self, principal: &P, name: &ContentName) -> Result<bool, PrincipalContentError> {
         loop {
             let mut header = self.header(principal.clone())?;
-            if header.catalog.remove(name)?.is_none() {
+            let mutation = delete(
+                header.catalog,
+                name,
+                &mut |object| self.load_required(object),
+                &|record| self.engine.identify_object(record),
+            )?;
+            if mutation.previous.is_none() {
                 return Ok(false);
             }
-            let transaction = self.encode_transaction(header, None)?;
+            header.catalog = mutation.root;
+            let catalog = header.catalog;
+            let transaction = self.encode_transaction(header, None, mutation.records)?;
             match self.engine.commit_root(transaction) {
-                Ok(_) => return Ok(true),
+                Ok(_) => {
+                    self.validated_catalogs.lock().insert(
+                        principal.clone(),
+                        CatalogValidation {
+                            root: catalog.map(|root| root.object),
+                            summary: catalog.map_or(CatalogSummary::default(), |root| root.summary),
+                        },
+                    );
+                    return Ok(true);
+                },
                 Err(PrincipalProjectionError::Model(ModelError::RootConflict { .. })) => {},
                 Err(error) => return Err(error.into()),
             }
@@ -237,8 +400,8 @@ where
     /// Returns a principal-graph or projection error when the authoritative
     /// catalog cannot be decoded.
     pub fn list(&self, principal: &P) -> Result<Vec<ContentEntry>, PrincipalContentError> {
-        self.header(principal.clone())
-            .map(|header| header.catalog.list())
+        let header = self.header(principal.clone())?;
+        list(header.catalog, &mut |object| self.load_required(object))
     }
 
     /// Describe one named value without reading its chunks.
@@ -253,7 +416,7 @@ where
         name: &ContentName,
     ) -> Result<Option<ContentDescriptor>, PrincipalContentError> {
         let header = self.header(principal.clone())?;
-        let Some(entry) = header.catalog.entries.get(name) else {
+        let Some(entry) = self.catalog_lookup(header.catalog, name)? else {
             return Ok(None);
         };
         let descriptor =
@@ -339,7 +502,7 @@ where
         )?;
         require_structural(state_id, &state)?;
 
-        let mut catalog = Catalog::default();
+        let mut catalog = None;
         let mut other_quota_bytes = 0_u64;
         let mut preserved_state = Vec::new();
         for reference in state.references() {
@@ -352,7 +515,30 @@ where
                         .engine
                         .load_object(reference.target())?
                         .ok_or_else(|| ContentError::MissingObject(reference.target()))?;
-                    catalog = decode_catalog(reference.target(), &record)?;
+                    let root = root_from_record(reference.target(), &record)?;
+                    let cached = self
+                        .validated_catalogs
+                        .lock()
+                        .get(&principal)
+                        .copied()
+                        .filter(|validation| validation.root == Some(root.object));
+                    let validation = if let Some(validation) = cached {
+                        validation
+                    } else {
+                        let validation =
+                            validate_catalog(Some(root), &mut |object| self.load_required(object))?;
+                        self.validated_catalogs
+                            .lock()
+                            .insert(principal.clone(), validation);
+                        validation
+                    };
+                    if validation.summary != root.summary {
+                        return Err(invalid(
+                            root.object,
+                            "content catalog validation totals disagree",
+                        ));
+                    }
+                    catalog = Some(root);
                 },
                 KV_COMPONENT_LABEL => {
                     other_quota_bytes = other_quota_bytes
@@ -377,7 +563,7 @@ where
         Ok(ContentHeader {
             principal,
             root: Some(root),
-            previous_catalog_quota_bytes: catalog.quota_bytes,
+            previous_catalog_quota_bytes: catalog.map_or(0, |root| root.summary.quota_bytes),
             catalog,
             other_quota_bytes,
             preserved_state,
@@ -433,7 +619,7 @@ where
         };
         let used = header
             .other_quota_bytes
-            .checked_add(header.catalog.quota_bytes)
+            .checked_add(header.catalog.map_or(0, |root| root.summary.quota_bytes))
             .ok_or(PrincipalContentError::AccountingOverflow)?;
         let previous = header
             .other_quota_bytes
@@ -449,17 +635,19 @@ where
         &self,
         header: ContentHeader<P>,
         built: Option<&BuiltContent>,
+        catalog_records: BTreeMap<ObjectId, ObjectRecord>,
     ) -> Result<RootTransaction<P>, PrincipalContentError> {
         let mut records: BTreeMap<ObjectId, ObjectRecord> = built
             .map(|built| built.records().iter().cloned().collect())
             .unwrap_or_default();
+        for (_, record) in catalog_records {
+            self.insert(&mut records, record)?;
+        }
         let mut state_references = header.preserved_state;
-        if !header.catalog.entries.is_empty() {
-            let catalog = encode_catalog(&header.catalog)?;
-            let catalog = self.insert(&mut records, catalog)?;
+        if let Some(catalog) = header.catalog {
             state_references.push(ObjectReference::owns(
                 ReferenceLabel::new(CONTENT_COMPONENT_LABEL.to_vec()),
-                catalog,
+                catalog.object,
             ));
         }
         state_references.sort();
@@ -505,6 +693,20 @@ where
         ))
     }
 
+    fn catalog_lookup(
+        &self,
+        root: Option<CatalogRoot>,
+        name: &ContentName,
+    ) -> Result<Option<CatalogValue>, PrincipalContentError> {
+        lookup(root, name, &mut |object| self.load_required(object))
+    }
+
+    fn load_required(&self, object: ObjectId) -> Result<ObjectRecord, PrincipalContentError> {
+        self.engine
+            .load_object(object)?
+            .ok_or_else(|| ContentError::MissingObject(object).into())
+    }
+
     fn insert(
         &self,
         records: &mut BTreeMap<ObjectId, ObjectRecord>,
@@ -529,7 +731,7 @@ where
 struct ContentHeader<P> {
     principal: P,
     root: Option<RootState>,
-    catalog: Catalog,
+    catalog: Option<CatalogRoot>,
     previous_catalog_quota_bytes: u64,
     other_quota_bytes: u64,
     preserved_state: Vec<ObjectReference>,
@@ -541,7 +743,7 @@ impl<P> ContentHeader<P> {
         Self {
             principal,
             root: None,
-            catalog: Catalog::default(),
+            catalog: None,
             previous_catalog_quota_bytes: 0,
             other_quota_bytes: 0,
             preserved_state: Vec::new(),

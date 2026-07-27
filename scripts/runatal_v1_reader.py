@@ -41,6 +41,11 @@ FORMAT_SPECIFICATION = (
     1,
     bytes.fromhex("32379c2a9e1d0fe166ac37f30d8772bd88d6c99a6ae31bb75cc7e8a8f4ce4307"),
 )
+CONTENT_CATALOG_SPECIFICATION = (
+    1,
+    1,
+    bytes.fromhex("8f3999b066b666396259c4a92f9de7c5b8e67df9d38a69fb4fb824968b56ecdb"),
+)
 
 
 class FormatError(Exception):
@@ -490,14 +495,28 @@ def parse_metadata(path):
     for key, value in required.items():
         if entries.get(key) != value:
             raise FormatError(f"unsupported store.meta {key}")
-    fields = entries["format-spec-object"].split(":")
+    specification = parse_metadata_identity(entries["format-spec-object"])
+    if specification != FORMAT_SPECIFICATION:
+        raise FormatError("store.meta does not name the frozen format specification")
+    catalog_value = entries.get("content-catalog-spec-object")
+    catalog_specification = (
+        None if catalog_value is None else parse_metadata_identity(catalog_value)
+    )
+    if (
+        catalog_specification is not None
+        and catalog_specification != CONTENT_CATALOG_SPECIFICATION
+    ):
+        raise FormatError("store.meta names an unknown content catalog specification")
+    return specification, catalog_specification
+
+
+def parse_metadata_identity(value):
+    fields = value.split(":")
     if len(fields) != 4:
-        raise FormatError("invalid format-spec-object")
+        raise FormatError("invalid metadata identity")
     tagged = (int(fields[0]), int(fields[1]), bytes.fromhex(fields[3]))
     if int(fields[2]) != len(tagged[2]):
-        raise FormatError("format-spec-object length mismatch")
-    if tagged != FORMAT_SPECIFICATION:
-        raise FormatError("store.meta does not name the frozen format specification")
+        raise FormatError("metadata identity length mismatch")
     return tagged
 
 
@@ -523,7 +542,7 @@ def validate_closure(objects, root):
 
 
 def recover(store, include_payloads):
-    specification = parse_metadata(store / "store.meta")
+    specification, catalog_specification = parse_metadata(store / "store.meta")
     objects = {}
     offsets = {}
     for offset, payload in frames(store / "objects.arena", ARENA_MAGIC):
@@ -544,6 +563,18 @@ def recover(store, include_payloads):
         or spec["references"]
     ):
         raise FormatError("missing or invalid in-band format specification")
+    if catalog_specification is not None:
+        catalog_key = identity_text(catalog_specification)
+        catalog_spec = objects.get(catalog_key)
+        if (
+            catalog_spec is None
+            or catalog_spec["kind"] != 10
+            or catalog_spec["version"] != 1
+            or catalog_spec["class"] != 1
+            or catalog_spec["logical_bytes"] != 0
+            or catalog_spec["references"]
+        ):
+            raise FormatError("missing or invalid content catalog specification")
 
     roots = {}
     for offset, payload in frames(store / "roots.journal", ROOT_MAGIC):
@@ -597,6 +628,11 @@ def recover(store, include_payloads):
         dumped_objects.append(dumped)
     return {
         "format_spec_object": spec_key,
+        "content_catalog_spec_object": (
+            None
+            if catalog_specification is None
+            else identity_text(catalog_specification)
+        ),
         "objects": dumped_objects,
         "roots": {
             name: {"generation": root[0], "commit": identity_text(root[1])}

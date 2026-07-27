@@ -5,15 +5,16 @@
 //! migrator while their specifications and golden fixtures remain in source
 //! history.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
-#[cfg(feature = "legacy-surrealkv")]
-use std::collections::BTreeMap;
+use parking_lot::Mutex;
 
-use super::{RuntimeEngine, atomic_write};
+use super::{NativePrincipalContentStore, RuntimeEngine, StateOwner, atomic_write};
 #[cfg(feature = "legacy-surrealkv")]
-use super::{RuntimeStore, StateOwner, StateOwnerResolver};
+use super::{RuntimeStore, StateOwnerResolver};
+use crate::content::CatalogValidation;
 use crate::error::{StorageError, StorageResult};
 #[cfg(feature = "legacy-surrealkv")]
 use crate::kv::{KvPrincipalResolver, SurrealKvStore};
@@ -22,9 +23,13 @@ use astrid_core::dirs::AstridHome;
 pub(super) const MIGRATION_MARKER_FILE: &str = "migration.complete";
 #[cfg(feature = "legacy-surrealkv")]
 const MIGRATION_PAGE_ENTRIES: usize = 512;
-const CURRENT_STORE_VERSION: u32 = 1;
+const CURRENT_STORE_VERSION: u32 = 2;
 const MINIMUM_SUPPORTED_STORE_VERSION: u32 = 1;
-const LEGACY_TO_V1_MARKER: &[u8] = b"migration=surrealkv-to-principal-store\nfrom=legacy\nto=1\n";
+pub(super) const LEGACY_TO_V1_MARKER: &[u8] =
+    b"migration=surrealkv-to-principal-store\nfrom=legacy\nto=1\n";
+pub(super) const CATALOG_TREE_MARKER: &[u8] =
+    b"migration=surrealkv-to-principal-store\nfrom=legacy\nto=1\n\
+      migration=flat-content-catalog-to-radix-tree\nfrom=1\nto=2\n";
 
 /// Human-auditable record of the transforms compiled into this binary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,58 +40,118 @@ struct MigrationDescriptor {
     rollback: &'static str,
 }
 
-const MIGRATION_HISTORY: &[MigrationDescriptor] = &[MigrationDescriptor {
-    id: "surrealkv-to-principal-store",
-    from: "legacy",
-    to: 1,
-    rollback: "legacy source preserved; post-cutover writes require export",
-}];
+const MIGRATION_HISTORY: &[MigrationDescriptor] = &[
+    MigrationDescriptor {
+        id: "surrealkv-to-principal-store",
+        from: "legacy",
+        to: 1,
+        rollback: "legacy source preserved; post-cutover writes require export",
+    },
+    MigrationDescriptor {
+        id: "flat-content-catalog-to-radix-tree",
+        from: "1",
+        to: 2,
+        rollback: "old root remains in commit lineage until retention removes it",
+    },
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MigrationState {
+    Uninitialized,
+    PrincipalStore,
+    CatalogTree,
+}
+
+fn migration_state(store_path: &Path) -> MigrationState {
+    match std::fs::read(store_path.join(MIGRATION_MARKER_FILE)).as_deref() {
+        Ok(bytes) if bytes == CATALOG_TREE_MARKER => MigrationState::CatalogTree,
+        Ok(bytes) if bytes == LEGACY_TO_V1_MARKER => MigrationState::PrincipalStore,
+        _ => MigrationState::Uninitialized,
+    }
+}
 
 pub(super) fn is_complete(store_path: &Path) -> bool {
-    std::fs::read(store_path.join(MIGRATION_MARKER_FILE))
-        .is_ok_and(|bytes| bytes == LEGACY_TO_V1_MARKER)
+    migration_state(store_path) != MigrationState::Uninitialized
 }
 
 pub(super) async fn apply_required(
     home: &AstridHome,
     store_path: &Path,
     engine: &Arc<RuntimeEngine>,
+    validated_catalogs: &Arc<Mutex<BTreeMap<StateOwner, CatalogValidation>>>,
 ) -> StorageResult<()> {
-    debug_assert_eq!(CURRENT_STORE_VERSION, MINIMUM_SUPPORTED_STORE_VERSION);
-    let migration = MIGRATION_HISTORY.first().ok_or_else(|| {
+    let first = MIGRATION_HISTORY.first().ok_or_else(|| {
         StorageError::Internal("principal store has no compiled migration path".to_owned())
     })?;
-    if migration.id != "surrealkv-to-principal-store"
-        || migration.from != "legacy"
-        || migration.to != CURRENT_STORE_VERSION
+    let last = MIGRATION_HISTORY.last().ok_or_else(|| {
+        StorageError::Internal("principal store has no compiled migration path".to_owned())
+    })?;
+    if first.id != "surrealkv-to-principal-store"
+        || first.from != "legacy"
+        || first.to != MINIMUM_SUPPORTED_STORE_VERSION
+        || last.id != "flat-content-catalog-to-radix-tree"
+        || last.to != CURRENT_STORE_VERSION
     {
         return Err(StorageError::Internal(
             "principal store migration registry is inconsistent".to_owned(),
         ));
     }
+    let state = migration_state(store_path);
+    if state == MigrationState::CatalogTree {
+        return Ok(());
+    }
     let legacy_path = home.state_db_path();
-    let path_to_check = legacy_path.clone();
-    let legacy_exists = run_blocking_migration(move || Ok(path_to_check.exists())).await?;
-    if legacy_exists {
-        #[cfg(feature = "legacy-surrealkv")]
-        migrate_legacy(&legacy_path, engine).await?;
-        #[cfg(not(feature = "legacy-surrealkv"))]
-        return Err(StorageError::Connection(format!(
-            "legacy state exists at {}; rebuild with the legacy-surrealkv feature to migrate it",
-            legacy_path.display()
-        )));
+    if state == MigrationState::Uninitialized {
+        let path_to_check = legacy_path.clone();
+        let legacy_exists = run_blocking_migration(move || Ok(path_to_check.exists())).await?;
+        if legacy_exists {
+            #[cfg(feature = "legacy-surrealkv")]
+            migrate_legacy(&legacy_path, engine).await?;
+            #[cfg(not(feature = "legacy-surrealkv"))]
+            return Err(StorageError::Connection(format!(
+                "legacy state exists at {}; rebuild with the legacy-surrealkv feature to migrate it",
+                legacy_path.display()
+            )));
+        }
+        if !legacy_exists {
+            let engine = Arc::clone(engine);
+            run_blocking_migration(move || {
+                engine
+                    .flush()
+                    .map_err(|error| StorageError::Internal(error.to_string()))
+            })
+            .await?;
+        }
     }
-    if !legacy_exists {
-        let engine = Arc::clone(engine);
-        run_blocking_migration(move || {
-            engine
-                .flush()
-                .map_err(|error| StorageError::Internal(error.to_string()))
-        })
-        .await?;
-    }
+    migrate_content_catalogs(engine, validated_catalogs).await?;
     let marker = store_path.join(MIGRATION_MARKER_FILE);
-    run_blocking_migration(move || atomic_write(&marker, LEGACY_TO_V1_MARKER)).await
+    run_blocking_migration(move || atomic_write(&marker, CATALOG_TREE_MARKER)).await
+}
+
+async fn migrate_content_catalogs(
+    engine: &Arc<RuntimeEngine>,
+    validated_catalogs: &Arc<Mutex<BTreeMap<StateOwner, CatalogValidation>>>,
+) -> StorageResult<()> {
+    let engine = Arc::clone(engine);
+    let validated_catalogs = Arc::clone(validated_catalogs);
+    run_blocking_migration(move || {
+        let principals = engine
+            .roots()
+            .map_err(|error| StorageError::Internal(error.to_string()))?;
+        let content = NativePrincipalContentStore::from_engine_with_validation(
+            Arc::clone(&engine),
+            validated_catalogs,
+        );
+        for (principal, _) in principals {
+            content
+                .migrate_legacy_catalog(&principal)
+                .map_err(|error| StorageError::Serialization(error.to_string()))?;
+        }
+        engine
+            .flush()
+            .map_err(|error| StorageError::Internal(error.to_string()))
+    })
+    .await
 }
 
 #[cfg(feature = "legacy-surrealkv")]
@@ -236,11 +301,14 @@ mod tests {
     #[test]
     fn compiled_history_is_contiguous_and_bounded() {
         assert_eq!(MINIMUM_SUPPORTED_STORE_VERSION, 1);
-        assert_eq!(CURRENT_STORE_VERSION, 1);
-        assert_eq!(MIGRATION_HISTORY.len(), 1);
+        assert_eq!(CURRENT_STORE_VERSION, 2);
+        assert_eq!(MIGRATION_HISTORY.len(), 2);
         assert_eq!(MIGRATION_HISTORY[0].from, "legacy");
-        assert_eq!(MIGRATION_HISTORY[0].to, CURRENT_STORE_VERSION);
+        assert_eq!(MIGRATION_HISTORY[0].to, MINIMUM_SUPPORTED_STORE_VERSION);
+        assert_eq!(MIGRATION_HISTORY[1].from, "1");
+        assert_eq!(MIGRATION_HISTORY[1].to, CURRENT_STORE_VERSION);
         assert!(MIGRATION_HISTORY[0].rollback.contains("source preserved"));
+        assert!(MIGRATION_HISTORY[1].rollback.contains("commit lineage"));
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -15,6 +15,7 @@ use astrid_storage_model::{
     VerifierEvidenceId,
 };
 
+use super::bootstrap;
 use super::format_amendment::{STORE_METADATA_FILE, format_spec_record, store_metadata};
 use super::{Blake3ObjectIdentityV1, RuntimeEngine, StateOwnerCodecV1};
 
@@ -41,9 +42,14 @@ fn open_fixture_store(path: &Path) -> RuntimeEngine {
     let specification = format_spec_record().unwrap();
     let specification_id = Blake3ObjectIdentityV1.identify(&specification);
     engine.persist_standalone_object(&specification).unwrap();
+    let catalog_specification = bootstrap::content_catalog_format_specification().unwrap();
+    let catalog_specification_id = Blake3ObjectIdentityV1.identify(&catalog_specification);
+    engine
+        .persist_standalone_object(&catalog_specification)
+        .unwrap();
     std::fs::write(
         path.join(STORE_METADATA_FILE),
-        store_metadata(specification_id),
+        store_metadata(specification_id, catalog_specification_id),
     )
     .unwrap();
     engine

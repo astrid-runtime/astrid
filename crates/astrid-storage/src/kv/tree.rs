@@ -53,6 +53,7 @@ pub struct TreeKvStore<P: Ord, I, R, E> {
     resolver: R,
     quota: Option<Arc<dyn KvQuotaResolver<P>>>,
     validated_trees: Arc<Mutex<BTreeMap<P, TreeValidation>>>,
+    validated_content: Arc<Mutex<BTreeMap<P, crate::content::CatalogValidation>>>,
     marker: PhantomData<fn() -> (P, I)>,
 }
 
@@ -60,6 +61,7 @@ struct BlockingTreeStore<P: Ord, E> {
     engine: Arc<E>,
     quota: Option<Arc<dyn KvQuotaResolver<P>>>,
     validated_trees: Arc<Mutex<BTreeMap<P, TreeValidation>>>,
+    validated_content: Arc<Mutex<BTreeMap<P, crate::content::CatalogValidation>>>,
 }
 
 impl<P: Ord, I, R, E> TreeKvStore<P, I, R, E> {
@@ -71,6 +73,7 @@ impl<P: Ord, I, R, E> TreeKvStore<P, I, R, E> {
             resolver,
             quota: None,
             validated_trees: Arc::new(Mutex::new(BTreeMap::new())),
+            validated_content: Arc::new(Mutex::new(BTreeMap::new())),
             marker: PhantomData,
         }
     }
@@ -87,6 +90,23 @@ impl<P: Ord, I, R, E> TreeKvStore<P, I, R, E> {
             resolver,
             quota: Some(quota),
             validated_trees: Arc::new(Mutex::new(BTreeMap::new())),
+            validated_content: Arc::new(Mutex::new(BTreeMap::new())),
+            marker: PhantomData,
+        }
+    }
+
+    pub(crate) fn from_engine_with_quota_and_content_validation(
+        engine: Arc<E>,
+        resolver: R,
+        quota: Arc<dyn KvQuotaResolver<P>>,
+        validated_content: Arc<Mutex<BTreeMap<P, crate::content::CatalogValidation>>>,
+    ) -> Self {
+        Self {
+            engine,
+            resolver,
+            quota: Some(quota),
+            validated_trees: Arc::new(Mutex::new(BTreeMap::new())),
+            validated_content,
             marker: PhantomData,
         }
     }
@@ -96,6 +116,7 @@ impl<P: Ord, I, R, E> TreeKvStore<P, I, R, E> {
             engine: Arc::clone(&self.engine),
             quota: self.quota.clone(),
             validated_trees: Arc::clone(&self.validated_trees),
+            validated_content: Arc::clone(&self.validated_content),
         }
     }
 }
@@ -126,6 +147,7 @@ where
             owner,
             root,
             self.validated_trees.as_ref(),
+            self.validated_content.as_ref(),
         )
     }
 

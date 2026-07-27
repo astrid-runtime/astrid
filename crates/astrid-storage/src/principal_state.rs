@@ -7,6 +7,7 @@
 //! source.
 
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use astrid_core::dirs::AstridHome;
@@ -15,8 +16,9 @@ use astrid_storage_engine::{
     DurableEngine, IdentityScheme, PersistentObjectIdentity, PrincipalCodec, RecoveryLimits,
 };
 use astrid_storage_model::{ObjectClass, ObjectId, ObjectIdentity, ObjectRecord, ReferenceKind};
+use parking_lot::Mutex;
 
-use crate::content::{ContentWriteOutcome, PrincipalContentStore};
+use crate::content::{CatalogValidation, ContentWriteOutcome, PrincipalContentStore};
 use crate::error::{StorageError, StorageResult};
 #[cfg(all(test, feature = "legacy-surrealkv"))]
 use crate::kv::SurrealKvStore;
@@ -36,10 +38,13 @@ mod staging;
 
 #[cfg(test)]
 use format_amendment::{
-    DestinationFormat, PRE_DERIVATION_FORMAT_SPEC_ID, STORE_FORMAT_SPEC, STORE_METADATA_FILE,
+    DestinationFormat, PRE_DERIVATION_FORMAT_SPEC_ID, STORE_FORMAT_SPEC, legacy_store_metadata,
     object_id_hex, persist_format_specification,
 };
-use format_amendment::{prepare_destination, prepare_format_specification, store_metadata};
+use format_amendment::{
+    STORE_METADATA_FILE, prepare_catalog_specification, prepare_destination,
+    prepare_format_specification, store_metadata,
+};
 use native_io::atomic_write;
 pub use staging::{
     NativeContentStagingArea, ReadyStagedContent, StagedContentId, StagedContentWriter,
@@ -224,6 +229,11 @@ impl RuntimePrincipalStore {
             .publish(staged, Arc::clone(&self.content))
             .await
     }
+
+    #[cfg(test)]
+    fn validated_catalog_count(&self) -> usize {
+        self.content.validated_catalog_count()
+    }
 }
 
 /// Open every native projection over the authoritative principal store.
@@ -243,10 +253,14 @@ pub async fn open_runtime_principal_store(
     let open_path = store_path.clone();
     let format_spec = bootstrap::format_specification()?;
     let format_spec_id = Blake3ObjectIdentityV1.identify(&format_spec);
-    let metadata = store_metadata(format_spec_id);
+    let catalog_spec = bootstrap::content_catalog_format_specification()?;
+    let catalog_spec_id = Blake3ObjectIdentityV1.identify(&catalog_spec);
+    let metadata = store_metadata(format_spec_id, catalog_spec_id);
+    let metadata_for_open = metadata.clone();
     let opened = tokio::task::spawn_blocking(move || {
-        let destination_format = prepare_destination(&open_path, &metadata)?;
-        let existing_complete = destination_format.is_existing();
+        let destination_format =
+            prepare_destination(&open_path, &metadata_for_open, format_spec_id)?;
+        let metadata_current = destination_format.metadata_is_current();
         let engine = RuntimeEngine::open(
             &open_path,
             Blake3ObjectIdentityV1,
@@ -256,15 +270,9 @@ pub async fn open_runtime_principal_store(
         .map_err(|error| {
             StorageError::Connection(format!("open durable principal store: {error}"))
         })?;
-        prepare_format_specification(
-            &engine,
-            &open_path,
-            destination_format,
-            &format_spec,
-            format_spec_id,
-            &metadata,
-        )?;
-        Ok((engine, existing_complete))
+        prepare_format_specification(&engine, destination_format, &format_spec, format_spec_id)?;
+        prepare_catalog_specification(&engine, destination_format, &catalog_spec, catalog_spec_id)?;
+        Ok((engine, metadata_current))
     })
     .await
     .map_err(|error| {
@@ -272,22 +280,36 @@ pub async fn open_runtime_principal_store(
             "durable principal-store open worker failed: {error}"
         ))
     })??;
-    let (engine, existing_complete) = opened;
+    let (engine, metadata_current) = opened;
     let engine = Arc::new(engine);
+    let validated_catalogs = Arc::new(Mutex::new(BTreeMap::<StateOwner, CatalogValidation>::new()));
 
-    if !existing_complete {
-        migrations::apply_required(home, &store_path, &engine).await?;
+    migrations::apply_required(home, &store_path, &engine, &validated_catalogs).await?;
+    if !metadata_current {
+        let metadata_path = store_path.join(STORE_METADATA_FILE);
+        tokio::task::spawn_blocking(move || atomic_write(&metadata_path, &metadata))
+            .await
+            .map_err(|error| {
+                StorageError::Connection(format!(
+                    "principal-store metadata migration worker failed: {error}"
+                ))
+            })??;
     }
 
-    let kv: Arc<dyn KvStore> = Arc::new(RuntimeStore::from_engine_with_quota(
-        Arc::clone(&engine),
-        StateOwnerResolver,
-        Arc::clone(&quota),
-    ));
-    let content = Arc::new(NativePrincipalContentStore::from_engine_with_quota(
-        Arc::clone(&engine),
-        quota,
-    ));
+    let kv: Arc<dyn KvStore> =
+        Arc::new(RuntimeStore::from_engine_with_quota_and_content_validation(
+            Arc::clone(&engine),
+            StateOwnerResolver,
+            Arc::clone(&quota),
+            Arc::clone(&validated_catalogs),
+        ));
+    let content = Arc::new(
+        NativePrincipalContentStore::from_engine_with_quota_and_validation(
+            Arc::clone(&engine),
+            quota,
+            validated_catalogs,
+        ),
+    );
     let staging = Arc::new(NativeContentStagingArea::open(home.content_staging_path())?);
     Ok(RuntimePrincipalStore {
         engine,
@@ -318,652 +340,4 @@ pub async fn open_runtime_kv(
 }
 
 #[cfg(test)]
-mod tests {
-    use std::io::{Seek as _, SeekFrom, Write as _};
-    use std::path::Path;
-
-    use astrid_storage_model::{ObjectFormatVersion, ObjectKind};
-
-    use super::*;
-    use crate::{ChunkingProfile, ContentName};
-
-    fn unlimited_quota() -> Arc<dyn KvQuotaResolver<StateOwner>> {
-        Arc::new(|owner: &StateOwner| {
-            Ok(match owner {
-                StateOwner::System => None,
-                StateOwner::Principal(_) => Some(u64::MAX),
-            })
-        })
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    fn assert_reader_rejects_substituted_format_specification(home: &AstridHome, script: &Path) {
-        let format_spec_id =
-            Blake3ObjectIdentityV1.identify(&bootstrap::format_specification().unwrap());
-        let engine = RuntimeEngine::open(
-            home.principal_store_path(),
-            Blake3ObjectIdentityV1,
-            StateOwnerCodecV1,
-            RecoveryLimits::process_addressable(),
-        )
-        .unwrap();
-        let replacement_spec = ObjectRecord::new(
-            ObjectKind::Evidence,
-            ObjectFormatVersion::V1,
-            b"self-consistent replacement format specification".to_vec(),
-            Vec::new(),
-            0,
-            ObjectClass::Metadata,
-        )
-        .unwrap();
-        let (replacement_id, inserted) =
-            engine.persist_standalone_object(&replacement_spec).unwrap();
-        assert_eq!(inserted, astrid_storage_model::InsertOutcome::Inserted);
-        engine.close().unwrap();
-
-        let metadata = home.principal_store_path().join(STORE_METADATA_FILE);
-        std::fs::write(&metadata, store_metadata(replacement_id)).unwrap();
-        let substituted = std::process::Command::new("python3")
-            .arg(script)
-            .arg(home.principal_store_path())
-            .output()
-            .unwrap();
-        assert!(
-            !substituted.status.success(),
-            "independent reader accepted a substituted format specification"
-        );
-        std::fs::write(metadata, store_metadata(format_spec_id)).unwrap();
-    }
-
-    #[test]
-    fn owner_codec_round_trips_only_canonical_values() {
-        let codec = StateOwnerCodecV1;
-        let owners = [
-            StateOwner::System,
-            StateOwner::Principal(PrincipalId::new("alice").unwrap()),
-        ];
-        for owner in owners {
-            let encoded = codec.encode(&owner);
-            assert_eq!(codec.decode(&encoded), Some(owner));
-        }
-        assert_eq!(codec.decode(&[]), None);
-        assert_eq!(codec.decode(&[0, 0]), None);
-        assert_eq!(codec.decode(&[1]), None);
-        assert_eq!(codec.decode(&[1, b':']), None);
-    }
-
-    #[test]
-    fn object_identity_v1_has_a_stable_golden_vector() {
-        let record = ObjectRecord::new(
-            ObjectKind::KvLeaf,
-            ObjectFormatVersion::V1,
-            b"hello".to_vec(),
-            Vec::new(),
-            0,
-            ObjectClass::Data,
-        )
-        .unwrap();
-        assert_eq!(
-            Blake3ObjectIdentityV1.identify(&record).as_bytes(),
-            &[
-                14, 77, 237, 193, 155, 81, 194, 119, 35, 35, 59, 81, 40, 49, 0, 31, 232, 131, 137,
-                111, 27, 237, 250, 91, 151, 7, 135, 21, 99, 27, 128, 55,
-            ]
-        );
-    }
-
-    #[test]
-    fn format_specification_has_a_tagged_metadata_identity() {
-        let record = bootstrap::format_specification().unwrap();
-        let id = Blake3ObjectIdentityV1.identify(&record);
-        let metadata = String::from_utf8(store_metadata(id)).unwrap();
-
-        assert_eq!(record.kind(), ObjectKind::Evidence);
-        assert_eq!(record.canonical_bytes(), STORE_FORMAT_SPEC);
-        assert!(record.references().is_empty());
-        assert_eq!(
-            object_id_hex(id),
-            "32379c2a9e1d0fe166ac37f30d8772bd88d6c99a6ae31bb75cc7e8a8f4ce4307"
-        );
-        assert!(metadata.contains("identity-wire=tagged-identity-v1\n"));
-        assert!(metadata.contains(&format!(
-            "format-spec-object=1:1:32:{}\n",
-            object_id_hex(id)
-        )));
-    }
-
-    #[test]
-    fn pre_derivation_v1_runatal_upgrade_is_idempotent_and_preserves_history() {
-        let directory = tempfile::tempdir().unwrap();
-        let store_path = directory.path().join("principal-store");
-        std::fs::create_dir_all(&store_path).unwrap();
-        let engine = RuntimeEngine::open(
-            &store_path,
-            Blake3ObjectIdentityV1,
-            StateOwnerCodecV1,
-            RecoveryLimits::process_addressable(),
-        )
-        .unwrap();
-        let legacy_spec = ObjectRecord::new(
-            ObjectKind::Evidence,
-            ObjectFormatVersion::V1,
-            b"pre-derivation format 1 specification".to_vec(),
-            Vec::new(),
-            0,
-            ObjectClass::Metadata,
-        )
-        .unwrap();
-        let (legacy_spec_id, _) = engine.persist_standalone_object(&legacy_spec).unwrap();
-        let current_spec = bootstrap::format_specification().unwrap();
-        let current_spec_id = Blake3ObjectIdentityV1.identify(&current_spec);
-        let current_metadata = store_metadata(current_spec_id);
-        atomic_write(
-            &store_path.join(STORE_METADATA_FILE),
-            &store_metadata(legacy_spec_id),
-        )
-        .unwrap();
-
-        // Simulate a crash after the successor RÚNATAL object became durable
-        // but before store.meta changed.
-        persist_format_specification(&engine, &current_spec).unwrap();
-        prepare_format_specification(
-            &engine,
-            &store_path,
-            DestinationFormat::PriorV1(legacy_spec_id),
-            &current_spec,
-            current_spec_id,
-            &current_metadata,
-        )
-        .unwrap();
-
-        assert_eq!(
-            std::fs::read(store_path.join(STORE_METADATA_FILE)).unwrap(),
-            current_metadata
-        );
-        assert_eq!(engine.object(legacy_spec_id).unwrap(), Some(legacy_spec));
-        assert_eq!(
-            engine.object(current_spec_id).unwrap(),
-            Some(current_spec.clone())
-        );
-        prepare_format_specification(
-            &engine,
-            &store_path,
-            DestinationFormat::Current,
-            &current_spec,
-            current_spec_id,
-            &store_metadata(current_spec_id),
-        )
-        .unwrap();
-        engine.close().unwrap();
-    }
-
-    #[tokio::test]
-    async fn completed_pre_derivation_v1_store_is_selected_for_runatal_amendment() {
-        let directory = tempfile::tempdir().unwrap();
-        let home = AstridHome::from_path(directory.path());
-        let store = open_runtime_kv(&home, unlimited_quota()).await.unwrap();
-        store.close().await.unwrap();
-        drop(store);
-
-        let store_path = home.principal_store_path();
-        std::fs::write(
-            store_path.join(STORE_METADATA_FILE),
-            store_metadata(PRE_DERIVATION_FORMAT_SPEC_ID),
-        )
-        .unwrap();
-        let current_spec = bootstrap::format_specification().unwrap();
-        let current_metadata = store_metadata(Blake3ObjectIdentityV1.identify(&current_spec));
-        assert_eq!(
-            prepare_destination(&store_path, &current_metadata).unwrap(),
-            DestinationFormat::PriorV1(PRE_DERIVATION_FORMAT_SPEC_ID)
-        );
-    }
-
-    #[tokio::test]
-    async fn new_store_persists_and_verifies_the_in_band_specification() {
-        let directory = tempfile::tempdir().unwrap();
-        let home = AstridHome::from_path(directory.path());
-        let store = open_runtime_kv(&home, unlimited_quota()).await.unwrap();
-        store.close().await.unwrap();
-
-        let record = bootstrap::format_specification().unwrap();
-        let id = Blake3ObjectIdentityV1.identify(&record);
-        let arena = std::fs::read(home.principal_store_path().join("objects.arena")).unwrap();
-        assert_eq!(&arena[52..54], &1_u16.to_le_bytes());
-        assert_eq!(&arena[54..56], &1_u16.to_le_bytes());
-        assert_eq!(&arena[56..60], &32_u32.to_le_bytes());
-        assert_eq!(&arena[60..92], id.as_bytes());
-
-        let engine = RuntimeEngine::open(
-            home.principal_store_path(),
-            Blake3ObjectIdentityV1,
-            StateOwnerCodecV1,
-            RecoveryLimits::process_addressable(),
-        )
-        .unwrap();
-        assert_eq!(engine.object(id).unwrap(), Some(record));
-        drop(store);
-    }
-
-    #[tokio::test]
-    async fn native_stage_acknowledges_before_ingest_and_publishes_on_a_blocking_worker() {
-        let directory = tempfile::tempdir().unwrap();
-        let home = AstridHome::from_path(directory.path());
-        let store = open_runtime_principal_store(&home, unlimited_quota())
-            .await
-            .unwrap();
-        let owner = StateOwner::Principal(PrincipalId::new("alice").unwrap());
-        let name = ContentName::new("workspace/target/release/game").unwrap();
-        let mut writer = store
-            .staging()
-            .begin(owner.clone(), name.clone(), ChunkingProfile::ASTRID_V1)
-            .unwrap();
-        writer.write_all(b"linux build.......").unwrap();
-        writer.seek(SeekFrom::Start(12)).unwrap();
-        writer.write_all(b"artifact").unwrap();
-        writer.set_len(20).unwrap();
-        let staged = writer.seal().unwrap();
-
-        assert_eq!(staged.logical_bytes(), 20);
-        assert_eq!(store.content().describe(&owner, &name).unwrap(), None);
-        assert_eq!(store.staging().ready().unwrap(), vec![staged.clone()]);
-
-        let outcome = store.publish_staged(staged).await.unwrap();
-        assert_eq!(outcome.descriptor().logical_bytes(), 20);
-        assert_eq!(
-            store.content().read(&owner, &name).unwrap(),
-            Some(b"linux build.artifact".to_vec())
-        );
-        assert!(store.staging().ready().unwrap().is_empty());
-        drop(store);
-
-        let reopened = open_runtime_principal_store(&home, unlimited_quota())
-            .await
-            .unwrap();
-        assert_eq!(
-            reopened.content().read(&owner, &name).unwrap(),
-            Some(b"linux build.artifact".to_vec())
-        );
-    }
-
-    #[tokio::test]
-    async fn staged_publication_retries_after_root_commit_before_cleanup() {
-        let directory = tempfile::tempdir().unwrap();
-        let home = AstridHome::from_path(directory.path());
-        let store = open_runtime_principal_store(&home, unlimited_quota())
-            .await
-            .unwrap();
-        let owner = StateOwner::Principal(PrincipalId::new("alice").unwrap());
-        let name = ContentName::new("workspace/retry.bin").unwrap();
-        let mut writer = store
-            .staging()
-            .begin(owner.clone(), name.clone(), ChunkingProfile::ASTRID_V1)
-            .unwrap();
-        writer.write_all(b"one identity").unwrap();
-        let staged = writer.seal().unwrap();
-
-        let source = native_io::open_private_file(&staged.content_path()).unwrap();
-        let first = store
-            .content()
-            .put_streaming(&owner, &name, source)
-            .unwrap();
-        assert_eq!(store.staging().ready().unwrap(), vec![staged.clone()]);
-
-        let retried = store.publish_staged(staged).await.unwrap();
-        assert_eq!(retried.descriptor(), first.descriptor());
-        assert_eq!(retried.principal_root(), first.principal_root());
-        assert_eq!(retried.objects_inserted(), 0);
-        assert!(store.staging().ready().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn staged_publication_enforces_close_order_for_the_same_name() {
-        let directory = tempfile::tempdir().unwrap();
-        let home = AstridHome::from_path(directory.path());
-        let store = open_runtime_principal_store(&home, unlimited_quota())
-            .await
-            .unwrap();
-        let owner = StateOwner::Principal(PrincipalId::new("alice").unwrap());
-        let name = ContentName::new("workspace/order.txt").unwrap();
-        let mut first = store
-            .staging()
-            .begin(owner.clone(), name.clone(), ChunkingProfile::ASTRID_V1)
-            .unwrap();
-        first.write_all(b"first close").unwrap();
-        let first = first.seal().unwrap();
-        let mut second = store
-            .staging()
-            .begin(owner.clone(), name.clone(), ChunkingProfile::ASTRID_V1)
-            .unwrap();
-        second.write_all(b"second close").unwrap();
-        let second = second.seal().unwrap();
-
-        let error = store.publish_staged(second.clone()).await.unwrap_err();
-        assert!(error.to_string().contains("earlier close"));
-        store.publish_staged(first).await.unwrap();
-        store.publish_staged(second).await.unwrap();
-        assert_eq!(
-            store.content().read(&owner, &name).unwrap(),
-            Some(b"second close".to_vec())
-        );
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    #[tokio::test]
-    async fn independent_reader_accepts_a_rust_produced_store() {
-        let directory = tempfile::tempdir().unwrap();
-        let home = AstridHome::from_path(directory.path());
-        let store = open_runtime_kv(&home, unlimited_quota()).await.unwrap();
-        store
-            .set("alice:capsule:shell", "cwd", b"/workspace".to_vec())
-            .await
-            .unwrap();
-        store.close().await.unwrap();
-        drop(store);
-
-        let script =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/runatal_v1_reader.py");
-        let output = std::process::Command::new("python3")
-            .arg(&script)
-            .arg(home.principal_store_path())
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "independent reader failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let decoded: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(decoded["roots"]["alice"]["generation"], 0);
-        assert!(
-            decoded["roots"]["alice"]["commit"]
-                .as_str()
-                .unwrap()
-                .starts_with("1:1:32:")
-        );
-        assert!(
-            decoded["objects"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|object| object["kind"] == "Evidence")
-        );
-        assert!(
-            decoded["objects"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|object| object["kind"] == "Commit")
-        );
-
-        assert_reader_rejects_substituted_format_specification(&home, &script);
-
-        let arena_path = home.principal_store_path().join("objects.arena");
-        let mut arena = std::fs::read(&arena_path).unwrap();
-        arena[100] ^= 0x80;
-        std::fs::write(&arena_path, arena).unwrap();
-        let rejected = std::process::Command::new("python3")
-            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/runatal_v1_reader.py"))
-            .arg(home.principal_store_path())
-            .output()
-            .unwrap();
-        assert!(
-            !rejected.status.success(),
-            "independent reader accepted a corrupt Rust-produced store"
-        );
-    }
-
-    #[tokio::test]
-    async fn completed_store_does_not_self_heal_a_missing_runatal_object() {
-        let directory = tempfile::tempdir().unwrap();
-        let home = AstridHome::from_path(directory.path());
-        let path = home.principal_store_path();
-        std::fs::create_dir_all(&path).unwrap();
-        let record = bootstrap::format_specification().unwrap();
-        let id = Blake3ObjectIdentityV1.identify(&record);
-        std::fs::write(path.join(STORE_METADATA_FILE), store_metadata(id)).unwrap();
-        drop(
-            RuntimeEngine::open(
-                &path,
-                Blake3ObjectIdentityV1,
-                StateOwnerCodecV1,
-                RecoveryLimits::process_addressable(),
-            )
-            .unwrap(),
-        );
-        std::fs::write(
-            path.join(migrations::MIGRATION_MARKER_FILE),
-            b"migration=surrealkv-to-principal-store\nfrom=legacy\nto=1\n",
-        )
-        .unwrap();
-
-        let Err(error) = open_runtime_kv(&home, unlimited_quota()).await else {
-            panic!("completed store without its RÚNATAL object was accepted");
-        };
-        assert!(
-            error
-                .to_string()
-                .contains("missing its in-band format specification")
-        );
-    }
-
-    #[test]
-    fn namespace_owner_fails_closed_at_the_host_stamped_boundary() {
-        let resolver = StateOwnerResolver;
-        assert_eq!(
-            resolver.resolve("system:identity").unwrap(),
-            StateOwner::System
-        );
-        assert_eq!(
-            resolver.resolve("alice:capsule:shell").unwrap(),
-            StateOwner::Principal(PrincipalId::new("alice").unwrap())
-        );
-        assert!(matches!(
-            resolver.resolve("alice:capsule:"),
-            Err(StorageError::InvalidKey(message))
-                if message.contains("empty capsule identifier")
-        ));
-    }
-
-    #[cfg(feature = "legacy-surrealkv")]
-    #[tokio::test]
-    async fn first_boot_migrates_verifies_and_preserves_legacy_state() {
-        let directory = tempfile::tempdir().unwrap();
-        let home = AstridHome::from_path(directory.path());
-        let legacy = SurrealKvStore::open(home.state_db_path()).unwrap();
-        legacy
-            .set("system:identity", "root", b"default".to_vec())
-            .await
-            .unwrap();
-        legacy
-            .set("alice:capsule:shell", "cwd", b"/workspace".to_vec())
-            .await
-            .unwrap();
-        legacy
-            .set("bob:capsule:build", "toolchain", b"rust".to_vec())
-            .await
-            .unwrap();
-        legacy.close().await.unwrap();
-
-        let store = open_runtime_kv(&home, unlimited_quota()).await.unwrap();
-        assert_eq!(
-            store.get("system:identity", "root").await.unwrap(),
-            Some(b"default".to_vec())
-        );
-        assert_eq!(
-            store.get("alice:capsule:shell", "cwd").await.unwrap(),
-            Some(b"/workspace".to_vec())
-        );
-        assert_eq!(
-            store.get("bob:capsule:build", "toolchain").await.unwrap(),
-            Some(b"rust".to_vec())
-        );
-        assert!(
-            home.principal_store_path()
-                .join(migrations::MIGRATION_MARKER_FILE)
-                .exists()
-        );
-        store.close().await.unwrap();
-        drop(store);
-
-        let legacy = SurrealKvStore::open(home.state_db_path()).unwrap();
-        assert_eq!(
-            legacy.get("alice:capsule:shell", "cwd").await.unwrap(),
-            Some(b"/workspace".to_vec())
-        );
-        legacy
-            .set("alice:capsule:shell", "legacy-only", b"stale".to_vec())
-            .await
-            .unwrap();
-        legacy.close().await.unwrap();
-
-        let reopened = open_runtime_kv(&home, unlimited_quota()).await.unwrap();
-        assert_eq!(
-            reopened
-                .get("alice:capsule:shell", "legacy-only")
-                .await
-                .unwrap(),
-            None
-        );
-        assert_eq!(
-            reopened.get("alice:capsule:shell", "cwd").await.unwrap(),
-            Some(b"/workspace".to_vec())
-        );
-    }
-
-    #[tokio::test]
-    async fn live_quota_blocks_growth_but_allows_recovery_and_system_state() {
-        let directory = tempfile::tempdir().unwrap();
-        let home = AstridHome::from_path(directory.path());
-        let quota: Arc<dyn KvQuotaResolver<StateOwner>> = Arc::new(|owner: &StateOwner| {
-            Ok(match owner {
-                StateOwner::System => None,
-                StateOwner::Principal(_) => Some(27),
-            })
-        });
-        let store = open_runtime_kv(&home, quota).await.unwrap();
-
-        store
-            .set("alice:capsule:shell", "one", b"1234".to_vec())
-            .await
-            .unwrap();
-        assert!(matches!(
-            store.set("alice:capsule:shell", "two", b"5".to_vec()).await,
-            Err(StorageError::Internal(message))
-                if message
-                    == "storage quota exceeded: mutation would use 51 bytes (limit 27)"
-        ));
-        store
-            .set("alice:capsule:shell", "one", b"123".to_vec())
-            .await
-            .unwrap();
-        assert!(store.delete("alice:capsule:shell", "one").await.unwrap());
-        store
-            .set("alice:capsule:shell", "two", b"1234".to_vec())
-            .await
-            .unwrap();
-        assert!(matches!(
-            store.set("alice:capsule:shell", "empty", Vec::new()).await,
-            Err(StorageError::Internal(message))
-                if message
-                    == "storage quota exceeded: mutation would use 52 bytes (limit 27)"
-        ));
-        store
-            .set("system:identity", "unmetered", vec![0; 64])
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn incomplete_destination_is_quarantined_before_reimport() {
-        let directory = tempfile::tempdir().unwrap();
-        let home = AstridHome::from_path(directory.path());
-        std::fs::create_dir_all(home.principal_store_path()).unwrap();
-        std::fs::write(home.principal_store_path().join("partial"), b"incomplete").unwrap();
-
-        let store = open_runtime_kv(&home, unlimited_quota()).await.unwrap();
-        assert!(
-            home.var_dir()
-                .join("principal-store.incomplete.0")
-                .join("partial")
-                .exists()
-        );
-        assert!(
-            home.principal_store_path()
-                .join(migrations::MIGRATION_MARKER_FILE)
-                .exists()
-        );
-        drop(store);
-    }
-
-    #[cfg(not(feature = "legacy-surrealkv"))]
-    #[tokio::test]
-    async fn legacy_source_requires_the_transition_feature() {
-        let directory = tempfile::tempdir().unwrap();
-        let home = AstridHome::from_path(directory.path());
-        std::fs::create_dir_all(home.state_db_path()).unwrap();
-
-        let Err(error) = open_runtime_kv(&home, unlimited_quota()).await else {
-            panic!("legacy source opened without transition support");
-        };
-        assert!(
-            error
-                .to_string()
-                .contains("rebuild with the legacy-surrealkv feature")
-        );
-    }
-
-    #[tokio::test]
-    async fn durable_point_update_has_height_bounded_write_amplification() {
-        let directory = tempfile::tempdir().unwrap();
-        let limits = RecoveryLimits::new(1024 * 1024).unwrap();
-        let engine = Arc::new(
-            RuntimeEngine::open(
-                directory.path(),
-                Blake3ObjectIdentityV1,
-                StateOwnerCodecV1,
-                limits,
-            )
-            .unwrap(),
-        );
-        let store = RuntimeStore::from_engine(Arc::clone(&engine), StateOwnerResolver);
-        for value in 0..256_u32 {
-            store
-                .set(
-                    "alice:capsule:build",
-                    &format!("{value:04}"),
-                    value.to_le_bytes().to_vec(),
-                )
-                .await
-                .unwrap();
-        }
-        let before = engine.object_count().unwrap();
-        store
-            .set("alice:capsule:build", "0128", b"replacement".to_vec())
-            .await
-            .unwrap();
-        let inserted = engine.object_count().unwrap().saturating_sub(before);
-        assert!(
-            inserted <= 16,
-            "one point update inserted {inserted} objects for a 256-key tree"
-        );
-        store.close().await.unwrap();
-        drop(store);
-        drop(engine);
-
-        let reopened = Arc::new(
-            RuntimeEngine::open(
-                directory.path(),
-                Blake3ObjectIdentityV1,
-                StateOwnerCodecV1,
-                limits,
-            )
-            .unwrap(),
-        );
-        let store = RuntimeStore::from_engine(reopened, StateOwnerResolver);
-        assert_eq!(
-            store.get("alice:capsule:build", "0128").await.unwrap(),
-            Some(b"replacement".to_vec())
-        );
-    }
-}
+mod runtime_tests;

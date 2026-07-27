@@ -2,9 +2,9 @@
 
 use std::path::Path;
 
-use astrid_storage_model::{
-    InsertOutcome, ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord,
-};
+#[cfg(test)]
+use astrid_storage_model::InsertOutcome;
+use astrid_storage_model::{ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord};
 
 use super::migrations;
 use super::native_io::{atomic_write, quarantine_directory};
@@ -53,7 +53,26 @@ pub(super) fn format_spec_record() -> StorageResult<ObjectRecord> {
     })
 }
 
-pub(super) fn store_metadata(format_spec: ObjectId) -> Vec<u8> {
+pub(super) fn store_metadata(format_spec: ObjectId, catalog_spec: ObjectId) -> Vec<u8> {
+    let digest = object_id_hex(format_spec);
+    let catalog_digest = object_id_hex(catalog_spec);
+    format!(
+        "format=astrid-principal-store-v1\n\
+         identity=blake3-object-identity-v1\n\
+         identity-wire=tagged-identity-v1\n\
+         format-spec-object={}:{}:32:{digest}\n\
+         content-catalog-spec-object={}:{}:32:{catalog_digest}\n\
+         principal-codec=state-owner-v1\n\
+         projection=kv-tree-v3\n",
+        BLAKE3_OBJECT_IDENTITY_V1_SCHEME.algorithm(),
+        BLAKE3_OBJECT_IDENTITY_V1_SCHEME.construction(),
+        BLAKE3_OBJECT_IDENTITY_V1_SCHEME.algorithm(),
+        BLAKE3_OBJECT_IDENTITY_V1_SCHEME.construction(),
+    )
+    .into_bytes()
+}
+
+pub(super) fn legacy_store_metadata(format_spec: ObjectId) -> Vec<u8> {
     let digest = object_id_hex(format_spec);
     format!(
         "format=astrid-principal-store-v1\n\
@@ -86,14 +105,15 @@ pub(super) enum DestinationFormat {
 }
 
 impl DestinationFormat {
-    pub(super) const fn is_existing(self) -> bool {
-        !matches!(self, Self::New)
+    pub(super) const fn metadata_is_current(self) -> bool {
+        matches!(self, Self::New | Self::Current)
     }
 }
 
 pub(super) fn prepare_destination(
     path: &Path,
     expected_metadata: &[u8],
+    current_format_spec: ObjectId,
 ) -> StorageResult<DestinationFormat> {
     let mut existing_complete = false;
     if path.exists() {
@@ -119,10 +139,9 @@ pub(super) fn prepare_destination(
         })?;
         if actual != expected_metadata {
             if existing_complete
-                && let Some(prior) = PRIOR_V1_FORMAT_SPEC_IDS
-                    .iter()
-                    .copied()
-                    .find(|candidate| actual == store_metadata(*candidate))
+                && let Some(prior) = std::iter::once(current_format_spec)
+                    .chain(PRIOR_V1_FORMAT_SPEC_IDS.iter().copied())
+                    .find(|candidate| actual == legacy_store_metadata(*candidate))
             {
                 return validate_authoritative_files(path)
                     .map(|()| DestinationFormat::PriorV1(prior));
@@ -147,34 +166,25 @@ pub(super) fn prepare_destination(
 
 pub(super) fn prepare_format_specification(
     engine: &RuntimeEngine,
-    store_path: &Path,
     destination_format: DestinationFormat,
     current_spec: &ObjectRecord,
     current_spec_id: ObjectId,
-    current_metadata: &[u8],
 ) -> StorageResult<()> {
     match destination_format {
-        DestinationFormat::Current => match read_format_specification(engine, current_spec_id)? {
-            Some(actual) if actual == *current_spec => Ok(()),
-            Some(_) => Err(StorageError::Connection(
-                "in-band store format specification does not match store.meta".to_owned(),
-            )),
-            None => Err(StorageError::Connection(
-                "completed principal store is missing its in-band format specification".to_owned(),
-            )),
-        },
-        DestinationFormat::New => {
-            if let Some(actual) = read_format_specification(engine, current_spec_id)? {
-                if actual != *current_spec {
-                    return Err(StorageError::Connection(
-                        "new principal store contains a conflicting format specification"
-                            .to_owned(),
-                    ));
-                }
-                return Ok(());
-            }
-            persist_format_specification(engine, current_spec).map(|_| ())
-        },
+        DestinationFormat::Current => ensure_specification(
+            engine,
+            current_spec_id,
+            current_spec,
+            true,
+            "in-band format specification",
+        ),
+        DestinationFormat::New => ensure_specification(
+            engine,
+            current_spec_id,
+            current_spec,
+            false,
+            "in-band format specification",
+        ),
         DestinationFormat::PriorV1(legacy_spec_id) => {
             let legacy = read_format_specification(engine, legacy_spec_id)?.ok_or_else(|| {
                 StorageError::Connection(
@@ -192,9 +202,54 @@ pub(super) fn prepare_format_specification(
                     "prior format-v1 specification has an invalid object shape".to_owned(),
                 ));
             }
-            persist_format_specification(engine, current_spec)?;
-            atomic_write(&store_path.join(STORE_METADATA_FILE), current_metadata)
+            ensure_specification(
+                engine,
+                current_spec_id,
+                current_spec,
+                false,
+                "in-band format specification",
+            )
         },
+    }
+}
+
+pub(super) fn prepare_catalog_specification(
+    engine: &RuntimeEngine,
+    destination_format: DestinationFormat,
+    catalog_spec: &ObjectRecord,
+    catalog_spec_id: ObjectId,
+) -> StorageResult<()> {
+    ensure_specification(
+        engine,
+        catalog_spec_id,
+        catalog_spec,
+        matches!(destination_format, DestinationFormat::Current),
+        "content catalog specification",
+    )
+}
+
+fn ensure_specification(
+    engine: &RuntimeEngine,
+    object: ObjectId,
+    expected: &ObjectRecord,
+    missing_is_error: bool,
+    description: &'static str,
+) -> StorageResult<()> {
+    match engine
+        .object(object)
+        .map_err(|error| StorageError::Connection(format!("read {description}: {error}")))?
+    {
+        Some(actual) if actual == *expected => Ok(()),
+        Some(_) => Err(StorageError::Connection(format!(
+            "{description} does not match store.meta"
+        ))),
+        None if missing_is_error => Err(StorageError::Connection(format!(
+            "completed principal store is missing its {description}"
+        ))),
+        None => engine
+            .persist_standalone_object(expected)
+            .map(|_| ())
+            .map_err(|error| StorageError::Connection(format!("persist {description}: {error}"))),
     }
 }
 
@@ -207,6 +262,7 @@ pub(super) fn read_format_specification(
     })
 }
 
+#[cfg(test)]
 pub(super) fn persist_format_specification(
     engine: &RuntimeEngine,
     record: &ObjectRecord,

@@ -1,56 +1,25 @@
 use std::collections::BTreeMap;
 
 use astrid_storage_model::{
-    ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord, ObjectReference,
-    ReferenceKind, ReferenceLabel,
+    ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord, ReferenceKind,
 };
+#[cfg(test)]
+use astrid_storage_model::{ObjectReference, ReferenceLabel};
 
-use super::{ContentEntry, ContentName, PrincipalContentError};
+use super::super::{ContentName, PrincipalContentError};
+use super::CatalogValue;
 
-pub(crate) const CONTENT_COMPONENT_LABEL: &[u8] = b"content";
 const CATALOG_HEADER_BYTES: usize = 12;
 const CATALOG_VERSION: ObjectFormatVersion = ObjectFormatVersion::V1;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct CatalogValue {
-    pub(crate) file: ObjectId,
-    pub(crate) logical_bytes: u64,
-}
-
 #[derive(Clone, Debug, Default)]
-pub(crate) struct Catalog {
+pub(crate) struct LegacyCatalog {
     pub(crate) entries: BTreeMap<ContentName, CatalogValue>,
     pub(crate) logical_bytes: u64,
     pub(crate) quota_bytes: u64,
 }
 
-impl Catalog {
-    pub(crate) fn insert(
-        &mut self,
-        name: ContentName,
-        value: CatalogValue,
-    ) -> Result<Option<CatalogValue>, PrincipalContentError> {
-        let previous = self.entries.insert(name, value);
-        self.recalculate()?;
-        Ok(previous)
-    }
-
-    pub(crate) fn remove(
-        &mut self,
-        name: &ContentName,
-    ) -> Result<Option<CatalogValue>, PrincipalContentError> {
-        let previous = self.entries.remove(name);
-        self.recalculate()?;
-        Ok(previous)
-    }
-
-    pub(crate) fn list(&self) -> Vec<ContentEntry> {
-        self.entries
-            .iter()
-            .map(|(name, value)| ContentEntry::new(name.clone(), value.file, value.logical_bytes))
-            .collect()
-    }
-
+impl LegacyCatalog {
     fn recalculate(&mut self) -> Result<(), PrincipalContentError> {
         let (logical, quota) =
             self.entries
@@ -73,7 +42,10 @@ impl Catalog {
     }
 }
 
-pub(crate) fn encode_catalog(catalog: &Catalog) -> Result<ObjectRecord, PrincipalContentError> {
+#[cfg(test)]
+pub(crate) fn encode_catalog(
+    catalog: &LegacyCatalog,
+) -> Result<ObjectRecord, PrincipalContentError> {
     let count = u32::try_from(catalog.entries.len())
         .map_err(|_| PrincipalContentError::AccountingOverflow)?;
     let mut bytes = Vec::with_capacity(
@@ -103,7 +75,7 @@ pub(crate) fn encode_catalog(catalog: &Catalog) -> Result<ObjectRecord, Principa
 pub(crate) fn decode_catalog(
     object: ObjectId,
     record: &ObjectRecord,
-) -> Result<Catalog, PrincipalContentError> {
+) -> Result<LegacyCatalog, PrincipalContentError> {
     let bytes = record.canonical_bytes();
     if record.kind() != ObjectKind::Directory
         || record.format_version() != CATALOG_VERSION
@@ -128,7 +100,7 @@ pub(crate) fn decode_catalog(
     {
         return Err(invalid(object, "content catalog count is inconsistent"));
     }
-    let mut catalog = Catalog::default();
+    let mut catalog = LegacyCatalog::default();
     for (index, reference) in record.references().iter().enumerate() {
         if reference.kind() != ReferenceKind::Owns {
             return Err(invalid(object, "content catalog entry is not owning"));
@@ -159,13 +131,6 @@ pub(crate) fn decode_catalog(
         return Err(invalid(object, "content catalog accounting disagrees"));
     }
     Ok(catalog)
-}
-
-pub(crate) fn catalog_quota(
-    object: ObjectId,
-    record: &ObjectRecord,
-) -> Result<u64, PrincipalContentError> {
-    decode_catalog(object, record).map(|catalog| catalog.quota_bytes)
 }
 
 fn invalid(object: ObjectId, detail: &'static str) -> PrincipalContentError {

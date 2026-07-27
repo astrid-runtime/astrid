@@ -611,6 +611,25 @@ where
         Ok(inner.roots_by_principal.get(principal).copied())
     }
 
+    /// Return a consistent copy of every current principal root.
+    ///
+    /// This is a privileged maintenance surface for ordered store migrations,
+    /// compaction, and operator diagnostics. Projection APIs must continue to
+    /// address one authorized principal at a time.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableError::RequiresRecovery`] after a failed write.
+    pub fn roots(&self) -> Result<Vec<(P, RootState)>, DurableError> {
+        let inner = self.inner.lock();
+        ensure_usable(&inner)?;
+        Ok(inner
+            .roots_by_principal
+            .iter()
+            .map(|(principal, root)| (principal.clone(), *root))
+            .collect())
+    }
+
     /// Capture one current root and its complete owning closure.
     ///
     /// # Errors
