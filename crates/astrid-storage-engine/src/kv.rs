@@ -219,6 +219,7 @@ impl<P> KvStateSnapshot<P> {
 
 /// Failure to decode or commit the typed key/value projection.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum KvProjectionError {
     /// The underlying object/root model rejected the operation.
     Model(ModelError),

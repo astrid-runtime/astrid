@@ -138,6 +138,7 @@ pub trait PersistentObjectIdentity: ObjectIdentity {
 
 /// Crash boundary exposed by the first durable engine slice.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FaultPoint {
     /// Non-commit object frames have been appended but not flushed.
     AfterObjectAppend,
@@ -171,6 +172,7 @@ impl FaultInjector for NoFaults {
 
 /// Failure to open, recover, or update a durable principal store.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum DurableError {
     /// The portable state model rejected an operation.
     Model(ModelError),
