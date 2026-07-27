@@ -5,6 +5,8 @@ Status: executable native-path baseline; mounted-provider measurements pending
 Last reviewed: 2026-07-27
 
 Tracking:
+[#1398](https://github.com/astrid-runtime/astrid/issues/1398),
+[#1399](https://github.com/astrid-runtime/astrid/issues/1399),
 [#1392](https://github.com/astrid-runtime/astrid/issues/1392),
 [#1391](https://github.com/astrid-runtime/astrid/issues/1391), and
 [#1396](https://github.com/astrid-runtime/astrid/issues/1396)
@@ -19,6 +21,16 @@ measurements.
 - No mounted filesystem provider exists yet, so these results are not mount
   throughput, metadata latency, `mmap` behavior, or open-handle evidence.
 
+On a hosted platform, Astrid's arena and staging files are themselves stored by
+APFS, NTFS/ReFS, or the host Linux filesystem. For the same bytes and durability
+contract, the hosted target is therefore near-native overhead, not a claim that
+additional work can outrun its backing filesystem. Hosted Astrid can finish a
+logical workload faster when deduplication, change detection, sparse transfer,
+cached representations, or grouped durability avoid work the conventional path
+performs. Beating the host on raw physical storage requires Astrid to own the
+lower storage path, as in the bare-metal program or a purpose-built raw-device
+backend.
+
 The benchmark never folds background publication into a foreground write
 number. It records:
 
@@ -29,7 +41,9 @@ number. It records:
 5. content construction without durable-engine work;
 6. unique and duplicate publication;
 7. first, warm, and post-reopen verified reads; and
-8. fresh and populated engine open.
+8. fresh and populated engine open; and
+9. concurrent publication and verified reads of shared content by multiple
+   principals.
 
 Small-file batches separately compare native write-and-close, native
 write-and-sync, and Astrid write-and-seal. These operations have different
@@ -47,6 +61,7 @@ cargo +1.95 bench -p astrid-storage --bench storage_io -- \
   --samples 3 \
   --small-files 64 \
   --small-file-bytes 4096 \
+  --concurrent-principals 4 \
   --output /tmp/astrid-storage-io.json
 ```
 
@@ -57,19 +72,34 @@ temporary directory. The JSON contains every raw nanosecond sample, the
 median, range, byte or operation count, target OS and architecture, logical CPU
 count, and the exact workload configuration.
 
+`--samples` applies to unique publication, duplicate publication, engine open
+and reopen, Astrid reads, native writes, seals, and the concurrent workloads.
+Each store sample starts with a fresh engine so “unique” remains unique and
+reopen does not silently measure a growing prior sample. When `--root` is
+provided, the final single-principal and concurrent stores are retained; prior
+sample stores are removed outside the timed intervals.
+
 The source is deterministic and incompressible-looking. Source generation and
 its reference digest are outside every timed interval. Native and Astrid paths
 use the same source and the same user-space copy buffer. Every native and
 reconstructed read is BLAKE3-checked against that reference.
 
-The first read is merely the first read in that process. It is not called
-uncached: portable, non-privileged page-cache eviction is unavailable. Record
-cache state and any platform-specific eviction procedure separately rather
-than relabeling a warm read as cold.
+The first native read is merely the first read in that process and intentionally
+remains a single observation. It is not called uncached: portable,
+non-privileged page-cache eviction is unavailable. Record cache state and any
+platform-specific eviction procedure separately rather than relabeling a warm
+read as cold.
+
+The native read baseline hashes every byte with single-threaded BLAKE3 and
+checks the resulting digest. Its roughly 1.6 GiB/s result on the machine below
+is therefore a verified-read floor, not the storage device's unverified read
+ceiling. A raw disk number is not an honest comparator for Astrid's mandatory
+verification.
 
 ## Initial measurement
 
-This baseline was recorded from commit `756ab50` plus the benchmark harness on:
+This repeated baseline was recorded from commit `756ab50` plus the benchmark
+harness on:
 
 - Mac Studio, Apple M2 Ultra, 24 CPU cores, 192 GB RAM;
 - macOS 26.2;
@@ -81,37 +111,61 @@ Large-path medians:
 
 | Operation | Median | Throughput |
 |---|---:|---:|
-| Native cached write | 97.61 ms | 5,245 MiB/s |
-| Native sync after write | 108.78 ms | separate durability latency |
-| Astrid cached staging write | 97.48 ms | 5,253 MiB/s |
-| Astrid durable staging seal | 157.03 ms | 3,260 MiB/s over pending bytes |
-| Content construction without engine admission | 654.18 ms | 783 MiB/s |
-| Unique background publication | 2,164.50 ms | 237 MiB/s |
-| Cached staging through unique publication | 2,394.79 ms | 214 MiB/s |
-| Duplicate background publication | 1,746.44 ms | 293 MiB/s |
-| Cached staging through duplicate publication | 2,033.85 ms | 252 MiB/s |
-| Native warm verified-by-benchmark read | 320.23 ms | 1,599 MiB/s |
-| Astrid warm one-MiB range reconstruction | 1,559.62 ms | 328 MiB/s |
-| Populated engine reopen | 1,834.49 ms | not a byte-throughput metric |
+| Native cached write | 440.27 ms | 1,163 MiB/s |
+| Native sync after write | 13.31 ms | separate durability latency |
+| Astrid cached staging write | 484.47 ms | 1,057 MiB/s |
+| Astrid durable staging seal | 46.13 ms | separate durability latency |
+| Content construction without engine admission | 644.88 ms | 794 MiB/s |
+| Unique background publication | 2,095.42 ms | 244 MiB/s |
+| Cached staging through unique publication | 2,318.57 ms | 221 MiB/s |
+| Duplicate background publication | 1,685.04 ms | 304 MiB/s |
+| Cached staging through duplicate publication | 2,187.49 ms | 234 MiB/s |
+| Native warm verified-by-benchmark read | 315.36 ms | 1,624 MiB/s |
+| Astrid warm one-MiB range reconstruction | 1,540.00 ms | 332 MiB/s |
+| Populated engine reopen | 1,789.85 ms | not a byte-throughput metric |
 
-The cached staging write is statistically indistinguishable from the native
-cached-write path in this run. That is the correct foundation for a writable
-mount. It does not make the complete path native-speed: durable seal, content
-construction, object admission, and verified reconstruction remain separate.
+Absolute cached-write rates varied with host state between runs, so same-run
+ratios are the useful evidence. Astrid's cached staging write reached 90.9% of
+native in this repeated run and matched it in the earlier run. That validates
+the native staging acknowledgement architecture: bytes can land without
+waiting for content addressing. It does not make the complete path
+native-speed. Durable seal, content construction, object admission, and
+verified reconstruction remain separate measured work.
 
 Small 4 KiB file medians over batches of 64:
 
 | Operation | Throughput |
 |---|---:|
-| Native write and close | 13,408 files/s |
-| Native write and `sync_all` | 229 files/s |
-| Astrid write and durable seal | 45 files/s |
+| Native write and close | 1,389 files/s |
+| Native write and `sync_all` | 122 files/s |
+| Astrid write and durable seal | 24.6 files/s |
 
 Mapping every host close synchronously to today's durable seal would therefore
 be a visible small-file regression. The provider contract must distinguish
 ordinary close from explicit durability and define provider-process recovery
 for work queued between those boundaries. This result does not authorize
 weakening `seal`; `seal` remains the durable primitive.
+
+## Concurrent principals
+
+Four principals published and then read the same 512 MiB logical content
+concurrently. Staging and seal were completed before the publication timer, so
+the result isolates shared object admission, root publication, and read
+contention:
+
+| Operation | Aggregate throughput | Scaling over one principal |
+|---|---:|---:|
+| One-principal unique publication | 244 MiB/s | 1.00× |
+| Four-principal shared publication | 562 MiB/s | 2.30× |
+| One-principal warm verified read | 332 MiB/s | 1.00× |
+| Four-principal shared verified reads | 481 MiB/s | 1.45× |
+
+Sharing already improves aggregate throughput, but neither path approaches
+four-way scaling. The shared read takes 2.76 times one-reader latency to serve
+four readers. This directly exposes the global engine mutex and per-call
+metadata reconstruction that a single-principal benchmark cannot show. The
+publication result similarly establishes the before-number for group commit
+and narrower appender critical sections.
 
 ## Read-size sensitivity
 
@@ -140,15 +194,56 @@ a verified contiguous representation lets the provider serve ordinary
 sequential and `mmap`-compatible reads without rebuilding the file for every
 request.
 
+## Current bottleneck map
+
+These causes are verified against the code at the measured baseline, not
+inferred from throughput alone:
+
+- **Range reads rebuild all lookup state.** Every call reloads and validates the
+  principal commit, state, flat catalog, file descriptor, overlapping tree
+  nodes and chunks, plus boundary-neighbor chunks. Every object load locks the
+  global durable engine, seeks one shared arena file, allocates a frame buffer,
+  verifies its physical checksum, and decodes a new record. No descriptor,
+  tree-node, or chunk state survives the call. The 64 KiB-to-one-MiB scaling
+  below is the direct signature of this fixed ceremony. The first corrective
+  sequence is an immutable decoded-object cache, positional reads outside the
+  engine mutex, and an open-content handle that pins root/descriptor/traversal
+  state (#1399); contiguous representations then remove gather I/O for hot
+  large objects.
+- **Publication is serial and copy-heavy, but identity encoding is no longer
+  under the mutex.** Streaming currently copies each chunk into an
+  `ObjectRecord`; the sink identifies it, the durable admission boundary
+  identifies it again and encodes a frame, and the appender checksums and
+  copies every encoded payload into one coalesced buffer before writing. The
+  first identity and frame encoding already happen before the engine lock.
+  Under the lock remain duplicate-object readback, frame checksums and batch
+  assembly, append, closure validation, and commit durability. Profiling must
+  apportion those current costs before changing the authority boundary.
+- **One seal performs at least five durability operations.** It flushes the
+  content file, flushes and renames an intent temporary, flushes that
+  directory, renames the staged directory, and flushes both the writing and
+  ready directories. This is deliberately strong but cannot be mapped onto
+  every ordinary close. Provider `close`, `fsync`, sealed-generation
+  publication, and grouped intent durability need distinct contracts.
+- **Reopen scans the entire arena and journal on current `main`.** It verifies
+  and rebuilds the in-memory index from write history. The persistent-index
+  work in #1386 changes this to a verified checkpoint plus tail; compaction and
+  journal snapshots bound the history that remains.
+- **One `Mutex<DurableInner>` serializes arena access across principals.**
+  Current object reads hold it across seek, read, checksum, allocation, and
+  decode. Publication also takes it for index/readback/append work and commit.
+  The four-principal results quantify this cliff before positional reads,
+  immutable caches, narrower write critical sections, and group durability.
+
 ## Scale interpretation
 
 Linear projections are planning aids, not measurements. At the 512 MiB rates:
 
-- staging and durable seal for 100 GiB project to roughly 51 seconds;
-- unique background publication of 100 GiB projects to roughly 7.2 minutes;
-- one-MiB verified reconstruction of 100 GiB projects to roughly 5.2 minutes;
+- staging and durable seal for 100 GiB project to roughly 1.8 minutes;
+- unique background publication of 100 GiB projects to roughly 7.0 minutes;
+- one-MiB verified reconstruction of 100 GiB projects to roughly 5.1 minutes;
   and
-- one-TiB unique publication projects to roughly 74 minutes.
+- one-TiB unique publication projects to roughly 72 minutes.
 
 The first-ever one-TiB ingest target of minutes is therefore not met by the
 current serial implementation. The measurement supports the existing work:
