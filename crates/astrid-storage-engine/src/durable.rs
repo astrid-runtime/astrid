@@ -499,7 +499,7 @@ where
         if let Some(location) = inner.index.get(&id).copied() {
             let files = live_files_mut(&mut inner.files)?;
             let existing = read_indexed_object(
-                &mut files.arena,
+                &files.arena,
                 id,
                 location,
                 self.identity.scheme(),
@@ -689,7 +689,7 @@ where
             if let Some(location) = inner.index.get(&id).copied() {
                 let files = live_files_mut(&mut inner.files)?;
                 let existing = read_indexed_object(
-                    &mut files.arena,
+                    &files.arena,
                     id,
                     location,
                     self.identity.scheme(),

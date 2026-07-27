@@ -44,7 +44,7 @@ where
             let existing = {
                 let files = live_files_mut(&mut inner.files)?;
                 read_indexed_object(
-                    &mut files.arena,
+                    &files.arena,
                     id,
                     location,
                     self.identity.scheme(),
@@ -116,7 +116,7 @@ where
                 let existing = {
                     let files = live_files_mut(&mut inner.files)?;
                     read_indexed_object(
-                        &mut files.arena,
+                        &files.arena,
                         *id,
                         location,
                         self.identity.scheme(),
