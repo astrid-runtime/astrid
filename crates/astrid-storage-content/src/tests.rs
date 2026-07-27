@@ -13,7 +13,7 @@ use crate::{
     CHUNK_TREE_FANOUT, CONTENT_LABEL, ChunkingProfile, ContentError, ContentReadError,
     ContentSource, FILE_HEADER_BYTES, FORMAT_VERSION, build_content, describe_content,
     encode_file_header, open_content, read_content, read_content_range, read_opened_content,
-    read_opened_content_range,
+    read_opened_content_and_verify, read_opened_content_range, read_verified_content_range,
 };
 
 #[derive(Clone, Copy)]
@@ -210,6 +210,39 @@ fn opened_content_reuses_the_validated_file_descriptor() {
         1,
         "repeated reads must not reload the immutable file descriptor"
     );
+}
+
+#[test]
+fn verified_content_skips_only_redundant_boundary_reads() {
+    let bytes = deterministic_bytes(8 * 1024 * 1024);
+    let built = build_content(&TestIdentity, ChunkingProfile::ASTRID_V1, &bytes).unwrap();
+    let offset = 4_000_000_u64;
+    let length = 64 * 1024_u64;
+
+    let validating_source = MapSource::new(built.records());
+    let opened = open_content(&validating_source, built.descriptor().file()).unwrap();
+    let validating = read_opened_content_range(&validating_source, opened, offset, length).unwrap();
+    let validating_loads = validating_source.loads.get();
+
+    let verified_source = MapSource::new(built.records());
+    let verified =
+        read_verified_content_range(&verified_source, built.verified_content(), offset, length)
+            .unwrap();
+    assert_eq!(verified, validating);
+    assert!(
+        verified_source.loads.get() < validating_loads,
+        "verified range loaded {} objects; validating range loaded {validating_loads}",
+        verified_source.loads.get()
+    );
+}
+
+#[test]
+fn malformed_content_cannot_mint_a_verification_token() {
+    let profile = ChunkingProfile::fastcdc_v2020(64, 256, 1024, 0).unwrap();
+    let (file, source) = manual_content(profile, &[vec![1; 63], vec![2; 962]]);
+    let opened = open_content(&source, file).unwrap();
+
+    assert!(read_opened_content_and_verify(&source, opened).is_err());
 }
 
 #[test]
