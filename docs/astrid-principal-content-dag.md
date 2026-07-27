@@ -192,9 +192,45 @@ catalog/commit metadata and do not reread the source.
 
 A source or sink failure may therefore leave unreachable immutable records but
 can never expose a partial file. The operation is deliberately blocking;
-async callers must dispatch it through a blocking-worker boundary. Durable
-staging-file markers, parallel chunk/hash workers, change detection, and
-staged-file-as-contiguous-representation work remain tracked in
+async callers must dispatch it through a blocking-worker boundary.
+
+### Hosted writable-projection staging
+
+`NativeContentStagingArea` is the shared write backend for future macOS,
+Windows, and Linux filesystem providers. It is deliberately not a mount:
+
+1. a provider derives the `StateOwner` from its authenticated host context and
+   opens a private random-access native file;
+2. ordinary writes, seeks, and truncation touch only that file;
+3. close calls `seal`, which flushes the bytes and a versioned, checksummed
+   intent before moving the directory into the ready queue;
+4. `seal` returning is the provider acknowledgement boundary; chunking and
+   object admission have not run;
+5. an ordered background consumer streams the file through
+   `PrincipalContentStore` on a blocking worker; and
+6. only a successful principal-root CAS writes the durable publication marker
+   and permits conservative cleanup.
+
+The close-order sequence is allocated at seal rather than open. Publication
+rejects a later close while an earlier close for the same owner and content
+name remains queued, so a slow old handle cannot overwrite a newer result.
+Different names do not share this ordering dependency.
+
+A process crash before the intent leaves unacknowledged bytes that startup
+preserves under `quarantine/`. A crash after the intent but before the
+directory rename promotes the sealed write on reopen. A crash after the root
+CAS but before cleanup safely repeats the operation: exact bytes reproduce the
+same file identity, the already-current catalog returns the same root, and no
+new objects are admitted. Redirected sources, malformed markers, changed
+lengths, non-canonical queue names, and unexpected directory members fail
+closed without deleting acknowledged bytes.
+
+This private area is never a guest path. A platform provider must bind each
+open handle to a host-stamped principal and that principal's live resource
+lease before exposing writes. The current increment supplies the common
+crash-safe lifecycle; provider adapters, staged-byte reservation accounting,
+parallel chunk/hash workers, change detection, and adopting the staged file as
+a contiguous physical representation remain tracked in
 [#1392](https://github.com/astrid-runtime/astrid/issues/1392).
 
 Canonical 128-way packing is positional. Appends and size-preserving
@@ -347,7 +383,8 @@ This increment does not provide:
 - host filesystem projection or path traversal;
 - directory trees, symlinks, executable metadata, or atomic rename;
 - capsule WIT/host calls before the interface freeze is lifted;
-- durable bulk-ingest transactions and staged-file adoption;
+- staged-byte reservation accounting, bulk-ingest transactions, or staged-file
+  adoption as a physical representation;
 - encryption and erasure-domain key management;
 - semantic equivalence contracts and trusted representation selection;
 - compaction or online garbage collection;

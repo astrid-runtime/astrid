@@ -475,6 +475,16 @@ impl AstridHome {
         self.var_dir().join("principal-store")
     }
 
+    /// Private native write-staging area for principal content (`var/content-staging/`).
+    ///
+    /// Filesystem providers acknowledge writes from this area before content
+    /// ingestion publishes them into the authoritative principal store. It is
+    /// engine-private state and must never be projected into a guest view.
+    #[must_use]
+    pub fn content_staging_path(&self) -> PathBuf {
+        self.var_dir().join("content-staging")
+    }
+
     /// Root directory for OS-level copy-on-write workspace clones (`cow/`).
     ///
     /// Each non-git capsule workspace gets a per-workspace subdirectory here

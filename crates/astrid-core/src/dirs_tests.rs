@@ -171,6 +171,10 @@ fn test_astrid_home_fhs_paths() {
         home.principal_store_path(),
         PathBuf::from(format!("{r}/var/principal-store"))
     );
+    assert_eq!(
+        home.content_staging_path(),
+        PathBuf::from(format!("{r}/var/content-staging"))
+    );
     assert_eq!(home.run_dir(), PathBuf::from(format!("{r}/run")));
     assert_eq!(
         home.socket_path(),
