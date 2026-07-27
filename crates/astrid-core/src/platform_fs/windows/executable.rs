@@ -24,7 +24,7 @@ pub(in crate::platform_fs) fn replace_executable_set(
     install_guard.verify_contract(BoundaryContract::TrustedForCreate)?;
     extract_guard.verify()?;
     let _transaction_lock = acquire_transaction_lock(install_dir, &install_guard)?;
-    recover_executable_transaction_locked(install_dir, &install_guard)?;
+    let _ = recover_executable_transaction_locked(install_dir, &install_guard)?;
     install_guard.verify_contract(BoundaryContract::TrustedForCreate)?;
 
     let journal = prepare_executable_transaction(
@@ -40,13 +40,13 @@ pub(in crate::platform_fs) fn replace_executable_set(
         if recovery.is_ok() {
             cleanup_transaction_files(install_dir, &journal, &install_guard);
         }
-        return Err(recovery_error(error, recovery));
+        return Err(recovery_error(error, recovery.map(|_| ())));
     }
     let result =
         finish_executable_transaction(install_dir, &journal, transaction_id, &install_guard);
     if let Err(error) = result {
         let recovery = recover_executable_transaction_locked(install_dir, &install_guard);
-        return Err(recovery_error(error, recovery));
+        return Err(recovery_error(error, recovery.map(|_| ())));
     }
     cleanup_rollback_files(install_dir, &journal, &install_guard);
     Ok(())
@@ -368,9 +368,12 @@ pub(super) fn validate_transaction_entry(
     Ok(())
 }
 
-#[cfg(test)]
-pub(super) fn recover_executable_transaction(install_dir: &Path) -> io::Result<()> {
+pub(in crate::platform_fs) fn recover_executable_transaction(
+    install_dir: &Path,
+) -> io::Result<bool> {
+    validate_local_absolute_path(install_dir)?;
     let guard = TrustedPathGuard::capture(install_dir)?;
+    guard.verify_contract(BoundaryContract::TrustedForCreate)?;
     let _transaction_lock = acquire_transaction_lock(install_dir, &guard)?;
     recover_executable_transaction_locked(install_dir, &guard)
 }
@@ -378,9 +381,9 @@ pub(super) fn recover_executable_transaction(install_dir: &Path) -> io::Result<(
 pub(super) fn recover_executable_transaction_locked(
     install_dir: &Path,
     guard: &TrustedPathGuard,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     let Some(journal) = read_transaction_journal(install_dir, guard)? else {
-        return Ok(());
+        return Ok(false);
     };
     guard.with_verified_mutation(
         "executable transaction recovery",
@@ -412,7 +415,7 @@ pub(super) fn recover_executable_transaction_locked(
     guard.verify_contract(BoundaryContract::TrustedForCreate)?;
     remove_guarded_file(guard, &install_dir.join(TRANSACTION_JOURNAL))?;
     cleanup_transaction_files(install_dir, &journal, guard);
-    Ok(())
+    Ok(true)
 }
 
 pub(super) fn restore_transaction_entry(

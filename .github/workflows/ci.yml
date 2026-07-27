@@ -9,6 +9,8 @@ on:
       - 'scripts/test_release_manifest.py'
       - 'scripts/musl_release_manifest.py'
       - 'scripts/test_musl_release_manifest.py'
+      - 'scripts/windows_release_manifest.py'
+      - 'scripts/test_windows_release_manifest.py'
       - 'scripts/check_glibc.py'
       - 'scripts/test_check_glibc.py'
       - 'scripts/check_static_elf.py'
@@ -38,6 +40,8 @@ on:
       - 'scripts/test_release_manifest.py'
       - 'scripts/musl_release_manifest.py'
       - 'scripts/test_musl_release_manifest.py'
+      - 'scripts/windows_release_manifest.py'
+      - 'scripts/test_windows_release_manifest.py'
       - 'scripts/check_glibc.py'
       - 'scripts/test_check_glibc.py'
       - 'scripts/check_static_elf.py'
@@ -241,6 +245,7 @@ jobs:
         run: |
           python3 scripts/test_release_manifest.py
           python3 scripts/test_musl_release_manifest.py
+          python3 scripts/test_windows_release_manifest.py
           python3 scripts/test_check_glibc.py
           python3 scripts/test_check_static_elf.py
           python3 scripts/test_release_publication.py

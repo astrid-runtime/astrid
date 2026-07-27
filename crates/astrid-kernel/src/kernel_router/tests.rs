@@ -14,6 +14,55 @@ use std::sync::atomic::AtomicBool;
 
 use super::test_util::all_kernel_request_variants;
 
+struct PrivateRouterTestHome {
+    home: astrid_core::dirs::AstridHome,
+    #[cfg(not(windows))]
+    _temporary: tempfile::TempDir,
+}
+
+impl PrivateRouterTestHome {
+    fn new() -> Self {
+        #[cfg(windows)]
+        {
+            let runtime_root = astrid_core::platform_fs::default_astrid_home_root()
+                .expect("resolve Windows LocalAppData");
+            let local_app_data = runtime_root
+                .parent()
+                .and_then(std::path::Path::parent)
+                .expect("Astrid runtime root is below Windows LocalAppData");
+            let root = local_app_data.join(format!(
+                "AstridKernelRouterTest-{}",
+                uuid::Uuid::new_v4().simple()
+            ));
+            astrid_core::platform_fs::ensure_private_directory(&root)
+                .expect("create private Windows kernel-router test home");
+            Self {
+                home: astrid_core::dirs::AstridHome::from_path(root),
+            }
+        }
+
+        #[cfg(not(windows))]
+        {
+            let temporary = tempfile::tempdir().expect("create kernel-router test home");
+            Self {
+                home: astrid_core::dirs::AstridHome::from_path(temporary.path()),
+                _temporary: temporary,
+            }
+        }
+    }
+
+    fn home(&self) -> astrid_core::dirs::AstridHome {
+        self.home.clone()
+    }
+}
+
+#[cfg(windows)]
+impl Drop for PrivateRouterTestHome {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(self.home.root());
+    }
+}
+
 struct InventoryCapsule {
     id: CapsuleId,
     manifest: CapsuleManifest,
@@ -396,9 +445,8 @@ fn resolve_caller_rejects_invalid_principal() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn management_router_denies_missing_and_invalid_principals_deterministically() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let home = astrid_core::dirs::AstridHome::from_path(dir.path());
-    let kernel = crate::test_kernel_with_home(home).await;
+    let home = PrivateRouterTestHome::new();
+    let kernel = crate::test_kernel_with_home(home.home()).await;
     drop(spawn_kernel_router(Arc::clone(&kernel)));
 
     for (suffix, principal) in [
@@ -564,9 +612,8 @@ async fn assert_shutdown_audit_rows(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn denied_shutdown_does_not_consume_an_authorized_principals_budget() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let home = astrid_core::dirs::AstridHome::from_path(dir.path());
-    let kernel = crate::test_kernel_with_home(home).await;
+    let home = PrivateRouterTestHome::new();
+    let kernel = crate::test_kernel_with_home(home.home()).await;
     let restricted = PrincipalId::new("restricted").expect("valid principal");
     let operator = PrincipalId::new("operator").expect("valid principal");
 
@@ -624,9 +671,8 @@ async fn denied_shutdown_does_not_consume_an_authorized_principals_budget() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn authorization_denial_does_not_precharge_a_later_grant() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let home = astrid_core::dirs::AstridHome::from_path(dir.path());
-    let kernel = crate::test_kernel_with_home(home).await;
+    let home = PrivateRouterTestHome::new();
+    let kernel = crate::test_kernel_with_home(home.home()).await;
     let principal = PrincipalId::new("new-operator").expect("valid principal");
 
     seed_profile(&kernel, &principal, &PrincipalProfile::default());
@@ -668,9 +714,8 @@ async fn authorization_denial_does_not_precharge_a_later_grant() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn device_scope_denial_does_not_consume_the_principals_budget() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let home = astrid_core::dirs::AstridHome::from_path(dir.path());
-    let kernel = crate::test_kernel_with_home(home).await;
+    let home = PrivateRouterTestHome::new();
+    let kernel = crate::test_kernel_with_home(home.home()).await;
     let principal = PrincipalId::new("device-scoped-operator").expect("valid principal");
     let full = DeviceKey::new("e".repeat(64), DeviceScope::Full, None, 0);
     let attenuated = DeviceKey::new(
@@ -742,6 +787,49 @@ async fn device_scope_denial_does_not_consume_the_principals_budget() {
     assert_shutdown_rate_limited(&limited, "authorized device's second shutdown");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn management_router_denies_unauthorized_shutdown_without_signaling_exit() {
+    let home = PrivateRouterTestHome::new();
+    let kernel = crate::test_kernel_with_home(home.home()).await;
+    drop(spawn_kernel_router(Arc::clone(&kernel)));
+
+    let caller = PrincipalId::new("status-only").expect("valid principal");
+    seed_profile(
+        &kernel,
+        &caller,
+        &PrincipalProfile {
+            grants: vec!["system:status".to_string()],
+            ..Default::default()
+        },
+    );
+    let shutdown = kernel.shutdown_tx.subscribe();
+
+    let response = request_kernel(
+        &kernel,
+        &caller,
+        "unauthorized_shutdown",
+        KernelRequest::Shutdown {
+            reason: Some("must be denied".to_string()),
+        },
+    )
+    .await;
+
+    assert!(
+        matches!(response, KernelResponse::Error(_)),
+        "unauthorized shutdown must return an explicit error, got {response:?}"
+    );
+    assert!(
+        !*shutdown.borrow(),
+        "authorization denial must not signal the daemon shutdown channel"
+    );
+    assert!(
+        !shutdown
+            .has_changed()
+            .expect("shutdown sender remains alive during router test"),
+        "authorization denial must not publish any shutdown-channel update"
+    );
+}
+
 // ── Agent-loop readiness dispatch (roundtrip) ────────────────────
 
 /// Driving `GetAgentReadiness` through the live management router must
@@ -752,9 +840,8 @@ async fn device_scope_denial_does_not_consume_the_principals_budget() {
 async fn get_agent_readiness_returns_readiness_response() {
     use astrid_core::profile::PrincipalProfile;
 
-    let dir = tempfile::tempdir().expect("tempdir");
-    let home = astrid_core::dirs::AstridHome::from_path(dir.path());
-    let kernel = crate::test_kernel_with_home(home).await;
+    let home = PrivateRouterTestHome::new();
+    let kernel = crate::test_kernel_with_home(home.home()).await;
 
     // Seed the default principal as admin so it satisfies the
     // `self:capsule:list` gate (the lightweight test constructor does not
@@ -836,9 +923,8 @@ async fn capsule_inventory_requests_are_filtered_to_callers_grants() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn list_capsules_uses_materialized_inventory_without_runtime_load() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let home = astrid_core::dirs::AstridHome::from_path(dir.path());
-    let kernel = crate::test_kernel_with_home(home).await;
+    let home = PrivateRouterTestHome::new();
+    let kernel = crate::test_kernel_with_home(home.home()).await;
     drop(spawn_kernel_router(Arc::clone(&kernel)));
 
     let caller = PrincipalId::new("alice").expect("valid principal");
@@ -1146,10 +1232,9 @@ fn seed_inventory_device_scopes(
     devices
 }
 
-async fn kernel_with_inventory_capsules() -> (tempfile::TempDir, Arc<crate::Kernel>) {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let home = astrid_core::dirs::AstridHome::from_path(dir.path());
-    let kernel = crate::test_kernel_with_home(home).await;
+async fn kernel_with_inventory_capsules() -> (PrivateRouterTestHome, Arc<crate::Kernel>) {
+    let home = PrivateRouterTestHome::new();
+    let kernel = crate::test_kernel_with_home(home.home()).await;
 
     {
         let mut reg = kernel.capsules.write().await;
@@ -1163,7 +1248,7 @@ async fn kernel_with_inventory_capsules() -> (tempfile::TempDir, Arc<crate::Kern
     }
 
     drop(spawn_kernel_router(Arc::clone(&kernel)));
-    (dir, kernel)
+    (home, kernel)
 }
 
 async fn seed_capsule_inventory_profile(
@@ -1388,9 +1473,8 @@ async fn request_kernel_for_device(
 /// went through the capability-gated `GetAgentReadiness` request as the caller.
 #[tokio::test]
 async fn agent_readiness_probe_reflects_loaded_registry_without_capability() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let home = astrid_core::dirs::AstridHome::from_path(dir.path());
-    let kernel = crate::test_kernel_with_home(home).await;
+    let home = PrivateRouterTestHome::new();
+    let kernel = crate::test_kernel_with_home(home.home()).await;
 
     // No admin seeding, no router — the probe is a direct in-process read.
     let report = kernel.agent_readiness_probe().probe().await;
@@ -1410,9 +1494,8 @@ async fn agent_readiness_probe_reflects_loaded_registry_without_capability() {
 /// a bus timeout. Mirrors the readiness-probe in-process pattern.
 #[tokio::test]
 async fn capsule_topic_probe_reflects_loaded_registry_without_capability() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let home = astrid_core::dirs::AstridHome::from_path(dir.path());
-    let kernel = crate::test_kernel_with_home(home).await;
+    let home = PrivateRouterTestHome::new();
+    let kernel = crate::test_kernel_with_home(home.home()).await;
 
     let probe = kernel.capsule_topic_probe();
     assert!(
@@ -1423,9 +1506,8 @@ async fn capsule_topic_probe_reflects_loaded_registry_without_capability() {
 
 #[tokio::test]
 async fn capsule_topic_probe_can_target_exact_capsule_in_principal_view() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let home = astrid_core::dirs::AstridHome::from_path(dir.path());
-    let kernel = crate::test_kernel_with_home(home).await;
+    let home = PrivateRouterTestHome::new();
+    let kernel = crate::test_kernel_with_home(home.home()).await;
     let principal = PrincipalId::new("regular-user").expect("valid principal");
     let topic = "session.v1.request.list";
 
@@ -1480,9 +1562,8 @@ async fn capsule_topic_probe_can_target_exact_capsule_in_principal_view() {
 
 #[tokio::test]
 async fn capsule_service_probe_accepts_only_one_compatible_interface_provider() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let home = astrid_core::dirs::AstridHome::from_path(dir.path());
-    let kernel = crate::test_kernel_with_home(home).await;
+    let home = PrivateRouterTestHome::new();
+    let kernel = crate::test_kernel_with_home(home.home()).await;
     let principal = PrincipalId::new("regular-user").expect("valid principal");
     let topic = "session.v1.request.list";
     let provider_source = uuid::Uuid::new_v4();

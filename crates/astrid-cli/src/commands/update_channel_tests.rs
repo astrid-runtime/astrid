@@ -4,6 +4,36 @@ const VERSION: &str = "1.2.3";
 const COMMIT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const CONTRACTS_COMMIT: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
+#[cfg(windows)]
+struct FreshWindowsChannelRoot {
+    path: std::path::PathBuf,
+}
+
+#[cfg(windows)]
+impl FreshWindowsChannelRoot {
+    fn new() -> Self {
+        let runtime_root = astrid_core::platform_fs::default_astrid_home_root()
+            .expect("resolve Windows LocalAppData");
+        let local_app_data = runtime_root
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("Astrid runtime root is below Windows LocalAppData");
+        let path = local_app_data.join(format!(
+            "AstridChannelStateTest-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        assert!(!path.exists(), "fresh channel state root must not exist");
+        Self { path }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for FreshWindowsChannelRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
 fn targets() -> Vec<TargetMetadata> {
     TARGETS
         .iter()
@@ -34,6 +64,28 @@ fn musl_targets() -> Vec<TargetMetadata> {
             let ordinal = index.checked_add(30).expect("target ordinal fits usize");
             let checksum_ordinal = index
                 .checked_add(40)
+                .expect("target checksum ordinal fits usize");
+            let asset = format!("astrid-{VERSION}-{triple}.tar.gz");
+            TargetMetadata {
+                triple: (*triple).to_owned(),
+                asset: asset.clone(),
+                size: i64::try_from(ordinal).expect("target ordinal fits i64"),
+                blake3: format!("{ordinal:064x}"),
+                sha256: format!("{checksum_ordinal:064x}"),
+                sigstore_bundle: format!("{asset}.sigstore.json"),
+            }
+        })
+        .collect()
+}
+
+fn windows_targets() -> Vec<TargetMetadata> {
+    WINDOWS_TARGETS
+        .iter()
+        .enumerate()
+        .map(|(index, triple)| {
+            let ordinal = index.checked_add(50).expect("target ordinal fits usize");
+            let checksum_ordinal = index
+                .checked_add(60)
                 .expect("target checksum ordinal fits usize");
             let asset = format!("astrid-{VERSION}-{triple}.tar.gz");
             TargetMetadata {
@@ -101,7 +153,7 @@ fn pointer(channel: UpdateChannel, generation: i64) -> ChannelPointer {
 }
 
 fn musl_extension(pointer: &ChannelPointer, legacy_manifest: &[u8]) -> Vec<u8> {
-    toml::to_string(&MuslReleaseExtension {
+    toml::to_string(&ReleaseExtension {
         schema_version: 1,
         kind: "astrid-release-musl-extension".to_owned(),
         product: PRODUCT.to_owned(),
@@ -118,6 +170,60 @@ fn musl_extension(pointer: &ChannelPointer, legacy_manifest: &[u8]) -> Vec<u8> {
     })
     .unwrap()
     .into_bytes()
+}
+
+fn verify_musl_extension(
+    bytes: &[u8],
+    legacy_manifest: &[u8],
+    pointer: &ChannelPointer,
+    target: &str,
+) -> anyhow::Result<String> {
+    verify_release_extension(
+        bytes,
+        legacy_manifest,
+        pointer,
+        target,
+        "astrid-release-musl-extension",
+        MUSL_TARGETS,
+        "musl",
+    )
+}
+
+fn windows_extension(pointer: &ChannelPointer, legacy_manifest: &[u8]) -> Vec<u8> {
+    toml::to_string(&ReleaseExtension {
+        schema_version: 1,
+        kind: "astrid-release-windows-extension".to_owned(),
+        product: PRODUCT.to_owned(),
+        repository: REPOSITORY.to_owned(),
+        version: pointer.release.version.clone(),
+        tag: pointer.release.tag.clone(),
+        source_commit: pointer.release.source_commit.clone(),
+        release_workflow_identity: pointer.release.release_workflow_identity.clone(),
+        legacy_release: LegacyReleaseBinding {
+            metadata_asset: pointer.release.metadata_asset.clone(),
+            metadata_blake3: blake3::hash(legacy_manifest).to_hex().to_string(),
+        },
+        targets: windows_targets(),
+    })
+    .unwrap()
+    .into_bytes()
+}
+
+fn verify_windows_extension(
+    bytes: &[u8],
+    legacy_manifest: &[u8],
+    pointer: &ChannelPointer,
+    target: &str,
+) -> anyhow::Result<String> {
+    verify_release_extension(
+        bytes,
+        legacy_manifest,
+        pointer,
+        target,
+        "astrid-release-windows-extension",
+        WINDOWS_TARGETS,
+        "Windows",
+    )
 }
 
 fn nightly_pointer(generation: i64) -> ChannelPointer {
@@ -142,6 +248,35 @@ fn encoded(pointer: &ChannelPointer) -> Vec<u8> {
 
 fn validation_time() -> DateTime<Utc> {
     "2026-07-17T00:00:00Z".parse().unwrap()
+}
+
+#[cfg(windows)]
+#[test]
+fn channel_state_write_provisions_and_replaces_private_windows_state() {
+    let fresh = FreshWindowsChannelRoot::new();
+    let state = fresh.path.join("var").join("update").join("channels");
+    let pointer = state.join("stable.toml");
+
+    ensure_channel_state_dir(&state).expect("provision private Windows channel state");
+    atomic_write(&pointer, b"generation = 1\n").expect("write initial private channel state");
+    atomic_write(&pointer, b"generation = 2\n").expect("replace private channel state");
+
+    assert_eq!(
+        read_accepted_channel_state(&pointer).expect("read replaced private channel state"),
+        b"generation = 2\n"
+    );
+    astrid_core::platform_fs::validate_private_file(&pointer)
+        .expect("channel state file must retain its exact private ACL");
+
+    for path in [
+        fresh.path.clone(),
+        fresh.path.join("var"),
+        fresh.path.join("var").join("update"),
+        state,
+    ] {
+        astrid_core::platform_fs::ensure_private_directory(&path)
+            .expect("channel state directory must retain its exact private ACL");
+    }
 }
 
 #[test]
@@ -335,7 +470,7 @@ struct RecordingMuslMetadataSource {
     authentications: std::sync::atomic::AtomicUsize,
 }
 
-impl MuslMetadataSource for RecordingMuslMetadataSource {
+impl ExtensionMetadataSource for RecordingMuslMetadataSource {
     async fn download(&self, url: &str, _limit: usize, _label: &str) -> anyhow::Result<Vec<u8>> {
         self.downloads.lock().unwrap().push(url.to_owned());
         if url.ends_with(".sigstore.json") {
@@ -360,7 +495,7 @@ impl MuslMetadataSource for RecordingMuslMetadataSource {
 }
 
 #[tokio::test]
-async fn target_resolver_fetches_and_authenticates_extension_only_for_musl() {
+async fn target_resolver_avoids_extensions_for_legacy_and_authenticates_musl() {
     let legacy = release_manifest();
     let value = pointer(UpdateChannel::Stable, 1);
     let extension = musl_extension(&value, &legacy);
@@ -426,6 +561,56 @@ async fn target_resolver_fetches_and_authenticates_extension_only_for_musl() {
     );
 }
 
+#[tokio::test]
+async fn target_resolver_fetches_and_authenticates_windows_extension() {
+    let legacy = release_manifest();
+    let value = pointer(UpdateChannel::Stable, 1);
+    let windows_metadata_name = windows_metadata_asset(VERSION);
+    let windows_metadata_url = format!("https://release.example/{windows_metadata_name}");
+    let windows_bundle_url = format!("{windows_metadata_url}.sigstore.json");
+    let windows_release = serde_json::json!({
+        "assets": [
+            {
+                "name": windows_metadata_name.clone(),
+                "browser_download_url": windows_metadata_url.clone()
+            },
+            {
+                "name": format!("{windows_metadata_name}.sigstore.json"),
+                "browser_download_url": windows_bundle_url.clone()
+            }
+        ]
+    });
+    let windows_source = RecordingMuslMetadataSource {
+        extension: windows_extension(&value, &legacy),
+        bundle: b"authenticated-windows-bundle".to_vec(),
+        downloads: std::sync::Mutex::new(Vec::new()),
+        authentications: std::sync::atomic::AtomicUsize::new(0),
+    };
+    let windows_target = WINDOWS_TARGETS[0];
+    assert_eq!(
+        resolve_target_blake3(
+            &windows_source,
+            &windows_release,
+            &legacy,
+            &value,
+            windows_target,
+        )
+        .await
+        .unwrap(),
+        windows_targets()[0].blake3
+    );
+    assert_eq!(
+        *windows_source.downloads.lock().unwrap(),
+        vec![windows_metadata_url, windows_bundle_url]
+    );
+    assert_eq!(
+        windows_source
+            .authentications
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+}
+
 #[test]
 fn legacy_channel_and_release_documents_stay_exactly_four_target_only() {
     let mut value = pointer(UpdateChannel::Stable, 1);
@@ -466,11 +651,61 @@ fn musl_extension_accepts_exactly_two_targets_and_selects_requested_digest() {
 }
 
 #[test]
+fn windows_extension_accepts_exactly_two_targets_and_selects_requested_digest() {
+    let legacy = release_manifest();
+    let value = pointer(UpdateChannel::Stable, 1);
+    let extension = windows_extension(&value, &legacy);
+    for target in windows_targets() {
+        assert_eq!(
+            verify_windows_extension(&extension, &legacy, &value, &target.triple).unwrap(),
+            target.blake3
+        );
+    }
+}
+
+#[test]
+fn windows_extension_rejects_wrong_kind_or_target_set() {
+    let legacy = release_manifest();
+    let value = pointer(UpdateChannel::Stable, 1);
+    let extension = windows_extension(&value, &legacy);
+    let parsed: ReleaseExtension =
+        toml::from_str(std::str::from_utf8(&extension).unwrap()).unwrap();
+
+    let mut wrong_kind = parsed.clone();
+    wrong_kind.kind = "astrid-release-musl-extension".to_owned();
+    assert!(
+        verify_windows_extension(
+            toml::to_string(&wrong_kind).unwrap().as_bytes(),
+            &legacy,
+            &value,
+            WINDOWS_TARGETS[0],
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("identity")
+    );
+
+    let mut unexpected = parsed;
+    unexpected.targets[0].triple = TARGETS[0].to_owned();
+    assert!(
+        verify_windows_extension(
+            toml::to_string(&unexpected).unwrap().as_bytes(),
+            &legacy,
+            &value,
+            WINDOWS_TARGETS[1],
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("target set")
+    );
+}
+
+#[test]
 fn musl_extension_rejects_missing_duplicate_and_unexpected_targets() {
     let legacy = release_manifest();
     let value = pointer(UpdateChannel::Stable, 1);
     let extension = musl_extension(&value, &legacy);
-    let parsed: MuslReleaseExtension =
+    let parsed: ReleaseExtension =
         toml::from_str(std::str::from_utf8(&extension).unwrap()).unwrap();
 
     let mut missing = parsed.clone();
@@ -521,7 +756,7 @@ fn musl_extension_rejects_release_identity_and_legacy_binding_mismatches() {
     let legacy = release_manifest();
     let value = pointer(UpdateChannel::Stable, 1);
     let extension = musl_extension(&value, &legacy);
-    let parsed: MuslReleaseExtension =
+    let parsed: ReleaseExtension =
         toml::from_str(std::str::from_utf8(&extension).unwrap()).unwrap();
 
     let mut wrong_source = parsed.clone();

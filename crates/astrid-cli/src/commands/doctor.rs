@@ -27,7 +27,6 @@ pub(crate) struct DoctorArgs {
 pub(crate) async fn run(args: DoctorArgs) -> Result<ExitCode> {
     println!("{}", "Astrid health check".bold());
     let mut all_passed = true;
-    let mut daemon_endpoint_present = false;
 
     let home_check = match AstridHome::resolve() {
         Ok(home) => {
@@ -60,34 +59,32 @@ pub(crate) async fn run(args: DoctorArgs) -> Result<ExitCode> {
                 ),
             );
         }
-        let socket = home.socket_path();
-        match astrid_core::local_transport::endpoint_is_present(&socket) {
-            Ok(true) => {
-                daemon_endpoint_present = true;
-                check_pass("Daemon socket", &format!("present at {}", socket.display()));
-            },
-            Ok(false) => {
-                check_warn(
-                    "Daemon socket",
-                    &format!("missing at {} — run `astrid start`", socket.display()),
-                );
-            },
-            Err(error) => {
-                all_passed = false;
-                check_fail("Daemon endpoint", &error.to_string());
-            },
-        }
     }
 
-    if !args.no_daemon && daemon_endpoint_present {
-        match daemon_roundtrip().await {
-            Ok(()) => check_pass("Daemon roundtrip", "GetStatus succeeded"),
+    let daemon_authenticated = if args.no_daemon {
+        false
+    } else {
+        match crate::commands::daemon::authenticated_daemon_is_running().await {
+            Ok(true) => {
+                check_pass(
+                    "Daemon transport",
+                    "authenticated GetStatus roundtrip succeeded",
+                );
+                true
+            },
+            Ok(false) => {
+                check_warn("Daemon transport", "not running — run `astrid start`");
+                false
+            },
             Err(e) => {
                 all_passed = false;
-                check_fail("Daemon roundtrip", &e.to_string());
+                check_fail("Daemon transport", &e.to_string());
+                false
             },
         }
+    };
 
+    if daemon_authenticated {
         // Agent-loop readiness: can the loaded capsule set actually serve a
         // chat turn? A daemon can be healthy yet have no prompt subscriber /
         // response publisher, in which case prompts silently never reply.
@@ -134,30 +131,6 @@ fn check_warn(name: &str, detail: &str) {
 
 fn check_fail(name: &str, detail: &str) {
     println!("  [{}]  {} — {}", "FAIL".red().bold(), name.bold(), detail);
-}
-
-async fn daemon_roundtrip() -> Result<()> {
-    let mut client = tokio::time::timeout(
-        Duration::from_secs(5),
-        crate::socket_client::connect_kernel_for_workspace(None),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("connection timed out after 5s"))??;
-    match tokio::time::timeout(
-        Duration::from_secs(5),
-        client.request(KernelRequest::GetStatus),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("daemon response timed out after 5s"))??
-    {
-        KernelResponse::Status(_) => Ok(()),
-        KernelResponse::Error(message) => {
-            Err(anyhow::anyhow!("daemon rejected status request: {message}"))
-        },
-        _ => Err(anyhow::anyhow!(
-            "daemon returned an unexpected status response"
-        )),
-    }
 }
 
 /// Query the daemon for agent-loop readiness over the same socket the

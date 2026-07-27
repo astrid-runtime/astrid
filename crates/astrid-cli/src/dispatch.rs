@@ -27,6 +27,13 @@ const fn tracker_657() -> TrackingIssue {
     }
 }
 
+fn stop_exit_code(confirmation: commands::daemon::StopConfirmation) -> ExitCode {
+    match confirmation {
+        commands::daemon::StopConfirmation::ConfirmedGone => ExitCode::SUCCESS,
+        commands::daemon::StopConfirmation::Unconfirmed => ExitCode::from(1),
+    }
+}
+
 /// Top-level dispatcher. Returns the process [`ExitCode`].
 pub(crate) async fn dispatch(cli: Cli) -> Result<ExitCode> {
     // Discovery flag: print the co-installed `astrid-emit` path and
@@ -194,7 +201,7 @@ async fn dispatch_subcommand(
                 grant_capsules,
             };
             commands::init::run_init(&distro, &opts).await?;
-            commands::self_update::ensure_path_setup()?;
+            commands::self_update::ensure_path_setup(yes)?;
             Ok(ExitCode::SUCCESS)
         },
         Some(Commands::Capsule { command }) => dispatch_capsule(command).await,
@@ -204,19 +211,15 @@ async fn dispatch_subcommand(
         Some(Commands::Gc(args)) => commands::gc::run(&args),
         Some(Commands::Config { command }) => dispatch_config(command),
         Some(Commands::Session { command }) => dispatch_session(command),
-        Some(Commands::Start) => {
+        Some(Commands::Start(args)) => {
             bootstrap::ensure_global_config().await;
-            commands::daemon::handle_start().await?;
-            Ok(ExitCode::SUCCESS)
+            commands::daemon::handle_start(args.foreground).await
         },
         Some(Commands::Status) => {
             commands::daemon::handle_status().await?;
             Ok(ExitCode::SUCCESS)
         },
-        Some(Commands::Stop) => {
-            commands::daemon::handle_stop().await?;
-            Ok(ExitCode::SUCCESS)
-        },
+        Some(Commands::Stop) => Ok(stop_exit_code(commands::daemon::handle_stop().await?)),
         Some(Commands::Restart) => commands::restart::run().await,
         Some(Commands::Logs(args)) => commands::logs::run(&args),
         Some(Commands::Ps(args)) => commands::ps::run(args).await,
@@ -558,6 +561,18 @@ mod tests {
     use clap::Parser;
 
     use super::*;
+
+    #[test]
+    fn stop_reports_unconfirmed_exit_to_automation() {
+        assert_eq!(
+            stop_exit_code(commands::daemon::StopConfirmation::ConfirmedGone),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            stop_exit_code(commands::daemon::StopConfirmation::Unconfirmed),
+            ExitCode::from(1)
+        );
+    }
 
     #[test]
     fn offline_commands_never_check_for_updates() {

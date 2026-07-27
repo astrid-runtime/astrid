@@ -497,6 +497,7 @@ impl SandboxCommand {
                 extra_masks,
                 extra_read_paths,
                 extra_write_paths,
+                clear_env,
             );
             Err(io::Error::other(
                 "native process execution requires an OS sandbox (bwrap/Seatbelt); \

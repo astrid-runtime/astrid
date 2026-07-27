@@ -70,7 +70,22 @@ pub(super) fn acquire_named_private_lock(
                 GENERIC_READ | GENERIC_WRITE | READ_CONTROL,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 FILE_OPEN,
-            )?;
+            )
+            .map_err(|error| {
+                if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION.cast_signed()) {
+                    // The creator retains DELETE access without sharing delete
+                    // so an owner cannot have its lock path replaced. Windows
+                    // reports a second opener as sharing contention before
+                    // LockFileEx can report WouldBlock; normalize both native
+                    // contention paths to the public lock contract.
+                    with_context(
+                        io::Error::new(io::ErrorKind::WouldBlock, error),
+                        format!("{owner_description} owns {}", path.display()),
+                    )
+                } else {
+                    error
+                }
+            })?;
             validate_private_acl_handle(handle.0, false, &path.display().to_string())?;
             let raw = handle.0;
             std::mem::forget(handle);
@@ -96,6 +111,42 @@ pub(super) fn acquire_named_private_lock(
     )?;
     guard.verify()?;
     Ok(file)
+}
+
+pub(super) fn open_guarded_private_append_file(
+    guard: &TrustedPathGuard,
+    path: &Path,
+) -> io::Result<File> {
+    let name = guarded_child_name(guard, path)?;
+    let handle = match open_guarded_child_with_options(
+        guard,
+        name,
+        FILE_APPEND_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        FILE_CREATE,
+    ) {
+        Ok(handle) => handle,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            open_guarded_child_with_options(
+                guard,
+                name,
+                FILE_APPEND_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                FILE_OPEN,
+            )?
+        },
+        Err(error) => return Err(error),
+    };
+    validate_private_acl_handle(handle.0, false, &path.display().to_string())?;
+    guard.verify_contract(BoundaryContract::ExactPrivateDirectory)?;
+    let raw = handle.0;
+    std::mem::forget(handle);
+    // SAFETY: ownership transfers from OwnedHandle exactly once. The handle
+    // carries FILE_APPEND_DATA without FILE_WRITE_DATA; FILE_READ_ATTRIBUTES is
+    // present only so the exact-handle regular-file validation above can query
+    // its identity. Local writes therefore cannot overwrite existing log bytes
+    // even across independent process handles.
+    Ok(unsafe { File::from_raw_handle(raw.cast()) })
 }
 
 #[cfg(test)]

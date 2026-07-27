@@ -161,10 +161,12 @@ fn resolve_http_limits(cfg: Option<&astrid_config::Config>) -> astrid_capsule::H
     )
 }
 
-/// Whether a loaded capsule can serve the kernel-owned CLI Unix socket.
+/// Whether a loaded capsule can serve the kernel-owned CLI local transport.
 ///
 /// Package names are distribution policy. The runtime identifies the bridge
-/// by the behavior it requests: a long-lived uplink with a Unix bind.
+/// by the behavior it requests: a long-lived uplink with the canonical
+/// `unix:` manifest capability, which names this host-local transport contract
+/// on both Unix sockets and Windows named pipes.
 fn provides_cli_socket_uplink(manifest: &astrid_capsule::manifest::CapsuleManifest) -> bool {
     manifest.capabilities.uplink
         && manifest.capabilities.net_bind.iter().any(|binding| {
@@ -290,7 +292,7 @@ pub async fn run() -> Result<()> {
         );
     }
 
-    // Verify a compatible CLI socket uplink loaded. Without one, the daemon
+    // Verify a compatible CLI local-transport uplink loaded. Without one, the daemon
     // has no accept loop and CLI connections will always time out. Identify
     // the provider by manifest behavior, never a distribution package name.
     {
@@ -300,12 +302,12 @@ pub async fn run() -> Result<()> {
             .any(|capsule| provides_cli_socket_uplink(capsule.manifest()));
         if !has_cli_proxy {
             tracing::error!(
-                "compatible CLI socket uplink not found - \
+                "compatible CLI local-transport uplink not found - \
                  daemon cannot accept CLI connections"
             );
             anyhow::bail!(
-                "Compatible CLI socket uplink not found. \
-                 Install a capsule that provides a Unix socket uplink, then restart the daemon."
+                "Compatible CLI local-transport uplink not found. \
+                 Install a capsule that provides the CLI uplink, then restart the daemon."
             );
         }
     }
@@ -429,7 +431,7 @@ fn spawn_gateway(
     //
     //   * the event bus, so the SSE audit stream and the bus-direct
     //     admin client can subscribe / publish locally without going
-    //     back over the Unix socket;
+    //     back over the host-local transport;
     //   * the persistent audit log, so the new
     //     `GET /api/sys/audit` historical-query route has somewhere
     //     to read from;

@@ -15,7 +15,8 @@
 /// files (`run/system.{sock,pid,ready,token}`) for the next `start` to trip on.
 /// `setsid(2)` makes the daemon a session leader with no controlling terminal,
 /// immune to the spawner's teardown, so its shutdown path always runs. One call
-/// covers both the ephemeral and persistent spawn modes.
+/// covers the ephemeral and persistent background spawn modes. Foreground mode
+/// sets an internal marker so it deliberately remains attached.
 ///
 /// Best-effort: `setsid` fails only with `EPERM`, which means the process is
 /// already a process-group leader (already detached) — ignoring the result is
@@ -23,7 +24,9 @@
 /// the crate's `#![deny(unsafe_code)]`.
 fn main() -> anyhow::Result<()> {
     #[cfg(unix)]
-    let _ = nix::unistd::setsid();
+    if std::env::var_os("ASTRID_DAEMON_FOREGROUND").as_deref() != Some(std::ffi::OsStr::new("1")) {
+        let _ = nix::unistd::setsid();
+    }
 
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()

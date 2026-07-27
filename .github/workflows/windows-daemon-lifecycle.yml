@@ -1,0 +1,412 @@
+name: Windows daemon lifecycle
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/**'
+      - '.gitmodules'
+      - 'rust-toolchain.toml'
+      - 'wit'
+      - 'wit/**'
+      - 'scripts/windows-daemon-lifecycle.ps1'
+      - '.github/workflows/release.yml'
+      - '.github/workflows/windows-daemon-lifecycle.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/**'
+      - '.gitmodules'
+      - 'rust-toolchain.toml'
+      - 'wit'
+      - 'wit/**'
+      - 'scripts/windows-daemon-lifecycle.ps1'
+      - '.github/workflows/release.yml'
+      - '.github/workflows/windows-daemon-lifecycle.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  native:
+    name: Native lifecycle tests (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Checkout pinned compatible CLI uplink
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: unicity-aos/aos-ce
+          path: .aos-ce
+          ref: f23d4672b1cef775975fcf47791da86d84160c3b
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: '1.95.0'
+          targets: ${{ matrix.target }}
+          components: clippy
+
+      - name: Install pinned AOS capsule toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: '1.94.0'
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          key: windows-daemon-lifecycle-${{ matrix.target }}
+          cache-on-failure: true
+
+      - name: Check Windows lifecycle crates
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: >-
+          cargo check
+          -p astrid
+          -p astrid-daemon
+          -p astrid-kernel
+          --all-features
+          --locked
+          --target $env:TARGET
+
+      - name: Lint Windows lifecycle targets
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: >-
+          cargo clippy
+          -p astrid
+          -p astrid-daemon
+          -p astrid-kernel
+          --all-targets
+          --all-features
+          --locked
+          --target $env:TARGET
+          --no-deps
+          --
+          -D warnings
+
+      - name: Test native CLI lifecycle decisions
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: >-
+          cargo test
+          -p astrid
+          --locked
+          --target $env:TARGET
+          commands::daemon::tests
+
+      - name: Test native background process isolation
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: >-
+          cargo test
+          -p astrid
+          --locked
+          --target $env:TARGET
+          commands::windows_process::tests
+
+      - name: Test native process control
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: >-
+          cargo test
+          -p astrid
+          --locked
+          --target $env:TARGET
+          commands::daemon_control
+
+      - name: Test unconfirmed stop exit status
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: >-
+          cargo test
+          -p astrid
+          --locked
+          --target $env:TARGET
+          dispatch::tests::stop_reports_unconfirmed_exit_to_automation
+
+      - name: Test native self-update transactions
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: >-
+          cargo test
+          -p astrid
+          --locked
+          --target $env:TARGET
+          commands::self_update::windows::tests
+
+      - name: Test native persistent PATH decisions
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: >-
+          cargo test
+          -p astrid
+          --locked
+          --target $env:TARGET
+          commands::self_update::windows_path::tests
+
+      - name: Test native executable replacement and recovery
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: >-
+          cargo test
+          -p astrid-core
+          --locked
+          --target $env:TARGET
+          platform_fs
+
+      - name: Test shared self-update decisions
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: >-
+          cargo test
+          -p astrid
+          --locked
+          --target $env:TARGET
+          commands::self_update::tests
+
+      - name: Test private channel state provisioning
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: >-
+          cargo test
+          -p astrid
+          --locked
+          --target $env:TARGET
+          commands::update_channel::tests
+
+      - name: Test fresh-home runtime signing
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: >-
+          cargo test
+          -p astrid-build
+          --locked
+          --target $env:TARGET
+          runtime_signing_provisions_fresh_private_windows_home
+
+      - name: Test native daemon runtime
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: >-
+          cargo test
+          -p astrid-daemon
+          --locked
+          --target $env:TARGET
+
+      - name: Test native management router
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: >-
+          cargo test
+          -p astrid-kernel
+          --locked
+          --target $env:TARGET
+          kernel_router::tests
+
+      - name: Test native transport lifecycle
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: >-
+          cargo test
+          -p astrid-kernel
+          --locked
+          --target $env:TARGET
+          socket::tests
+
+      - name: Test native ephemeral daemon lifetime
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: >-
+          cargo test
+          -p astrid-kernel
+          --locked
+          --target $env:TARGET
+          ephemeral_
+
+      - name: Test native persistent daemon lifetime
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: >-
+          cargo test
+          -p astrid-kernel
+          --locked
+          --target $env:TARGET
+          persistent_kernel_does_not_shutdown_on_last_disconnect
+
+      - name: Build native lifecycle binaries
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: >-
+          cargo build
+          -p astrid
+          --bins
+          --all-features
+          --locked
+          --target $env:TARGET
+
+      - name: Exercise authenticated daemon lifecycle
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: >-
+          ./scripts/windows-daemon-lifecycle.ps1
+          -Target $env:TARGET
+          -CapsuleSource "$env:GITHUB_WORKSPACE\.aos-ce\capsules\capsule-cli"
+
+      - name: Upload lifecycle failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-daemon-lifecycle-${{ matrix.target }}
+          path: ${{ runner.temp }}/windows-daemon-lifecycle-${{ matrix.target }}
+          if-no-files-found: ignore
+
+  updater:
+    name: Native updater lifecycle (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: '1.95.0'
+          targets: ${{ matrix.target }}
+
+      - name: Cache release updater artifacts
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          key: windows-updater-lifecycle-release-${{ matrix.target }}
+          cache-on-failure: true
+
+      - name: Build release executable set
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: >-
+          cargo build
+          --release
+          -p astrid
+          --bins
+          --locked
+          --target $env:TARGET
+
+      - name: Verify release fixture fits the authenticated payload bound
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: |
+          $limit = 100MB
+          $names = @(
+            "astrid-daemon.exe",
+            "astrid-build.exe",
+            "astrid-emit.exe",
+            "astrid.exe"
+          )
+          foreach ($name in $names) {
+            $binary = Join-Path $env:GITHUB_WORKSPACE "target\$env:TARGET\release\$name"
+            $artifact = Get-Item -LiteralPath $binary
+            Write-Host ("Release {0}: {1:N2} MiB" -f $name, ($artifact.Length / 1MB))
+            if ($artifact.Length -gt $limit) {
+              throw "Release $name exceeds the 100 MiB authenticated update payload bound"
+            }
+          }
+
+      - name: Build release updater integration harness
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: >-
+          cargo test
+          --release
+          -p astrid
+          --test windows_update_helper
+          --locked
+          --target $env:TARGET
+          --no-run
+
+      - name: Exercise the real release-profile Windows update helper
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: >-
+          cargo test
+          --release
+          -p astrid
+          --test windows_update_helper
+          --locked
+          --target $env:TARGET
+          --
+          --nocapture

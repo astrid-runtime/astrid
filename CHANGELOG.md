@@ -38,6 +38,27 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   cancellable busy-instance retries support probe-then-connect and concurrent
   clients. Native x86_64 and ARM64 Windows jobs exercise binding, concurrent
   instances, shutdown, and reconnect behavior. Closes #1349.
+- **Windows daemon control now uses native process and lifecycle semantics.**
+  Start and readiness require an authenticated management roundtrip, persistent
+  daemons are created detached without any implicit idle timeout, and `start
+  --foreground` stays attached through daemon exit. Stop and restart retain the
+  PID, executable, and process-creation identity gate while using the same
+  retained Windows process handle for wedged daemons, including when the
+  authenticated shutdown transport fails before an acknowledgement; explicit
+  handshake and shutdown rejections remain fail-closed, and status and doctor
+  no longer infer health from a socket pathname.
+  Companion discovery and signed self-update also understand `.exe` names.
+  Self-update replaces the complete four-executable installation as a durable,
+  recoverable transaction, and self-managed installs can add their directory
+  to the persistent per-user `PATH` with explicit confirmation. The release
+  workflow publishes authenticated x64 and ARM64 MSVC archives through an
+  additive Windows metadata extension that remains bound to the four-target
+  legacy channel manifest. Native Windows-only process, update-transaction,
+  and persistent-`PATH` tests run on x64 and ARM64 CI, where the built CLI and
+  daemon also prove persistent idle survival and an MCP-spawned ephemeral
+  daemon's prompt exit after its final named-pipe client disconnects, alongside
+  authenticated status, stop, and confirmed-process-exit coverage. Closes
+  #1350.
 - **Linux amd64 now has a distro-neutral OCI build target.** The image packages
   exact immutable GitHub release bytes only after their tagged release-workflow
   signatures and manifest digests verify, runs the persistent daemon as a

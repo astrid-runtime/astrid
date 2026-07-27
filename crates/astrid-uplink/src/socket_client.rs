@@ -21,22 +21,41 @@ use astrid_core::session_token::{
 use astrid_types::Topic;
 use astrid_types::ipc::{IpcMessage, IpcPayload};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(not(windows))]
 use tracing::warn;
 
-/// Path to the kernel's Unix-domain socket. Falls back to
-/// `/tmp/.astrid/run/system.sock` if `ASTRID_HOME` can't be resolved
-/// — matches the pre-existing CLI behaviour so single-host development
-/// continues to work without env setup.
+/// Path to the kernel's local transport endpoint.
+///
+/// Unix preserves the legacy `/tmp/.astrid/run/system.sock` development
+/// fallback. Windows fails closed rather than selecting a shared or
+/// drive-relative fallback outside the private per-user Astrid home.
+///
+/// # Panics
+///
+/// On Windows, panics if the private per-user Astrid home cannot be resolved.
 #[must_use]
 pub fn proxy_socket_path() -> std::path::PathBuf {
-    use astrid_core::dirs::AstridHome;
-    match AstridHome::resolve() {
-        Ok(home) => home.socket_path(),
+    match try_proxy_socket_path() {
+        Ok(path) => path,
         Err(e) => {
-            warn!(error = %e, "Failed to resolve ASTRID_HOME; falling back to /tmp/.astrid/run/system.sock");
-            std::path::PathBuf::from("/tmp/.astrid/run/system.sock")
+            #[cfg(windows)]
+            panic!("Failed to resolve the private Windows ASTRID_HOME: {e}");
+            #[cfg(not(windows))]
+            {
+                warn!(error = %e, "Failed to resolve ASTRID_HOME; falling back to /tmp/.astrid/run/system.sock");
+                std::path::PathBuf::from("/tmp/.astrid/run/system.sock")
+            }
         },
     }
+}
+
+/// Resolve the kernel's local transport endpoint without a platform fallback.
+///
+/// # Errors
+///
+/// Returns an error when the private per-user Astrid home cannot be resolved.
+pub fn try_proxy_socket_path() -> std::io::Result<std::path::PathBuf> {
+    astrid_core::dirs::AstridHome::resolve().map(|home| home.socket_path())
 }
 
 /// Path to the daemon readiness sentinel.
@@ -45,38 +64,71 @@ pub fn proxy_socket_path() -> std::path::PathBuf {
 /// fully initialized. NOTE: also duplicated in
 /// `astrid-kernel/src/socket.rs` because the kernel cannot depend on
 /// this crate; the canonical path is `AstridHome::ready_path()`.
+///
+/// # Panics
+///
+/// On Windows, panics if the private per-user Astrid home cannot be resolved.
 #[must_use]
 pub fn readiness_path() -> std::path::PathBuf {
-    use astrid_core::dirs::AstridHome;
-    match AstridHome::resolve() {
-        Ok(home) => home.ready_path(),
+    match try_readiness_path() {
+        Ok(path) => path,
         Err(e) => {
-            warn!(
-                error = %e,
-                "Failed to resolve ASTRID_HOME; falling back to /tmp/.astrid/run/system.ready"
-            );
-            std::path::PathBuf::from("/tmp/.astrid/run/system.ready")
+            #[cfg(windows)]
+            panic!("Failed to resolve the private Windows ASTRID_HOME: {e}");
+            #[cfg(not(windows))]
+            {
+                warn!(
+                    error = %e,
+                    "Failed to resolve ASTRID_HOME; falling back to /tmp/.astrid/run/system.ready"
+                );
+                std::path::PathBuf::from("/tmp/.astrid/run/system.ready")
+            }
         },
     }
+}
+
+/// Resolve the daemon readiness sentinel without a platform fallback.
+///
+/// # Errors
+///
+/// Returns an error when the private per-user Astrid home cannot be resolved.
+pub fn try_readiness_path() -> std::io::Result<std::path::PathBuf> {
+    astrid_core::dirs::AstridHome::resolve().map(|home| home.ready_path())
 }
 
 /// Path to the daemon PID file (`run/system.pid`).
 ///
 /// The daemon records its PID here at boot (after acquiring the singleton
 /// lock). `astrid stop`/`astrid restart` read it to signal a wedged daemon
-/// that is unreachable over the socket but still holding the lock. Falls back
-/// to the same `/tmp` location as the socket so single-host development keeps
-/// working without env setup — and so the CLI looks where the daemon wrote.
+/// that is unreachable over the socket but still holding the lock. Unix keeps
+/// the legacy `/tmp` development fallback; Windows fails closed.
+///
+/// # Panics
+///
+/// On Windows, panics if the private per-user Astrid home cannot be resolved.
 #[must_use]
 pub fn pid_path() -> std::path::PathBuf {
-    use astrid_core::dirs::AstridHome;
-    match AstridHome::resolve() {
-        Ok(home) => home.pid_path(),
+    match try_pid_path() {
+        Ok(path) => path,
         Err(e) => {
-            warn!(error = %e, "Failed to resolve ASTRID_HOME; falling back to /tmp/.astrid/run/system.pid");
-            std::path::PathBuf::from("/tmp/.astrid/run/system.pid")
+            #[cfg(windows)]
+            panic!("Failed to resolve the private Windows ASTRID_HOME: {e}");
+            #[cfg(not(windows))]
+            {
+                warn!(error = %e, "Failed to resolve ASTRID_HOME; falling back to /tmp/.astrid/run/system.pid");
+                std::path::PathBuf::from("/tmp/.astrid/run/system.pid")
+            }
         },
     }
+}
+
+/// Resolve the daemon PID file without a platform fallback.
+///
+/// # Errors
+///
+/// Returns an error when the private per-user Astrid home cannot be resolved.
+pub fn try_pid_path() -> std::io::Result<std::path::PathBuf> {
+    astrid_core::dirs::AstridHome::resolve().map(|home| home.pid_path())
 }
 
 /// Path to the session-authentication token file.
@@ -164,6 +216,13 @@ impl SocketClient {
     /// Returns an error if the local endpoint does not exist, connection
     /// fails, or the handshake is rejected.
     pub async fn connect(session_id: SessionId, principal: PrincipalId) -> Result<Self> {
+        #[cfg(windows)]
+        let path = try_proxy_socket_path().context("Failed to resolve local transport path")?;
+        // Preserve the historical Unix development fallback when neither
+        // ASTRID_HOME nor HOME resolves. Windows deliberately uses the
+        // fallible path above because a shared fallback would cross the
+        // per-user security boundary.
+        #[cfg(not(windows))]
         let path = proxy_socket_path();
 
         let mut stream = local_transport::connect(&path)
@@ -462,6 +521,32 @@ const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 /// Maximum allowed size of a handshake response payload (bytes).
 const MAX_HANDSHAKE_RESPONSE_SIZE: usize = 4096;
 
+/// An explicit daemon-side rejection of a local transport handshake.
+///
+/// Callers that own process-recovery behavior can distinguish this from a
+/// broken or timed-out transport and must not bypass the daemon's decision by
+/// escalating to an OS-level process signal.
+#[derive(Debug, thiserror::Error)]
+#[error("Daemon rejected connection: {reason}")]
+pub struct HandshakeRejected {
+    reason: String,
+}
+
+impl HandshakeRejected {
+    /// Build a typed rejection while preserving the daemon-provided reason.
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+
+    /// The daemon-provided rejection reason.
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
 /// Path to the per-principal signing key (`keys/<principal>.key`), if
 /// `ASTRID_HOME` resolves. The daemon writes this 0600 file when the
 /// principal's keypair is minted (issue #45/#852); the connecting process,
@@ -566,7 +651,7 @@ async fn perform_handshake_in_home(
         let reason = response
             .reason
             .unwrap_or_else(|| "unknown error".to_string());
-        anyhow::bail!("Daemon rejected connection: {reason}");
+        return Err(HandshakeRejected::new(reason).into());
     }
 
     Ok(authenticated)

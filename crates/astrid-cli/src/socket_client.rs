@@ -5,15 +5,74 @@
 //! the shared crate now; this module keeps the historical import path
 //! (`crate::socket_client::*`) working without churning every caller.
 
-pub(crate) use astrid_uplink::socket_client::{
-    SocketClient, pid_path, proxy_socket_path, readiness_path,
-};
+pub(crate) use astrid_uplink::socket_client::SocketClient;
 
 use std::future::Future;
+use std::path::PathBuf;
 
 use anyhow::Result;
 use astrid_core::PrincipalId;
 use astrid_uplink::KernelClient;
+
+/// Resolve the CLI transport path while preserving the historical Unix
+/// development fallback. Windows must fail closed on home-resolution errors.
+#[cfg_attr(
+    not(windows),
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "callers share the fallible Windows path contract"
+    )
+)]
+pub(crate) fn try_proxy_socket_path() -> std::io::Result<PathBuf> {
+    #[cfg(windows)]
+    {
+        astrid_uplink::socket_client::try_proxy_socket_path()
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(astrid_uplink::socket_client::proxy_socket_path())
+    }
+}
+
+/// Resolve the CLI readiness path with the same platform policy as the
+/// transport path.
+#[cfg_attr(
+    not(windows),
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "callers share the fallible Windows path contract"
+    )
+)]
+pub(crate) fn try_readiness_path() -> std::io::Result<PathBuf> {
+    #[cfg(windows)]
+    {
+        astrid_uplink::socket_client::try_readiness_path()
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(astrid_uplink::socket_client::readiness_path())
+    }
+}
+
+/// Resolve the CLI PID path with the same platform policy as the transport
+/// path.
+#[cfg_attr(
+    not(windows),
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "callers share the fallible Windows path contract"
+    )
+)]
+pub(crate) fn try_pid_path() -> std::io::Result<PathBuf> {
+    #[cfg(windows)]
+    {
+        astrid_uplink::socket_client::try_pid_path()
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(astrid_uplink::socket_client::pid_path())
+    }
+}
 
 enum KernelConnectionScope<'a> {
     Workspace(Option<&'a std::path::Path>),

@@ -83,21 +83,30 @@ pub(crate) fn init_logging(cli: &Cli) {
 /// 1. Same directory as the current executable (co-installed)
 /// 2. `PATH` lookup
 pub(crate) fn find_companion_binary(name: &str) -> Result<std::path::PathBuf> {
+    let native_name = companion_binary_name(name, std::env::consts::EXE_SUFFIX);
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {
-        let candidate = dir.join(name);
+        let candidate = dir.join(&native_name);
         if candidate.is_file() {
             return Ok(candidate);
         }
     }
-    if let Ok(path) = which::which(name) {
+    if let Ok(path) = which::which(&native_name) {
         return Ok(path);
     }
     anyhow::bail!(
-        "{name} not found. Ensure it is installed alongside the astrid CLI \
-         or available in PATH."
+        "{} not found. Ensure it is installed alongside the astrid CLI \
+         or available in PATH.",
+        std::path::Path::new(&native_name).display()
     )
+}
+
+fn companion_binary_name(name: &str, exe_suffix: &str) -> std::ffi::OsString {
+    if exe_suffix.is_empty() || name.ends_with(exe_suffix) {
+        return name.into();
+    }
+    format!("{name}{exe_suffix}").into()
 }
 
 /// Run the legacy `astrid build` companion binary, used both by the
@@ -158,8 +167,8 @@ pub(crate) async fn run_or_connect(
     };
     let workspace_root = selected_workspace_root(workspace);
 
-    let socket_path = socket_client::proxy_socket_path();
-    let ready_path = socket_client::readiness_path();
+    let socket_path = socket_client::try_proxy_socket_path()?;
+    let ready_path = socket_client::try_readiness_path()?;
 
     let needs_boot = match astrid_core::local_transport::connect_outcome(&socket_path).await {
         Ok(astrid_core::local_transport::ConnectOutcome::Connected(stream)) => {
@@ -174,11 +183,10 @@ pub(crate) async fn run_or_connect(
         Ok(astrid_core::local_transport::ConnectOutcome::Stale) => {
             println!(
                 "{}",
-                theme::Theme::warning("Found dead socket. Cleaning up and restarting daemon...")
+                theme::Theme::warning("Found a stale endpoint. Restarting the daemon...")
             );
-            astrid_core::local_transport::remove_stale_endpoint(&socket_path)
-                .context("failed to clean up stale daemon endpoint")?;
-            let _ = std::fs::remove_file(&ready_path);
+            // The spawn path owns cleanup while holding the daemon singleton
+            // lock. Unlinking after this probe would race a newer generation.
             true
         },
         Err(error) => anyhow::bail!("Failed to check socket: {error}"),
@@ -201,13 +209,19 @@ pub(crate) async fn run_or_connect(
     .await
     {
         Ok(c) => {
-            drop(daemon_child);
+            if let Some(child) = daemon_child {
+                commands::daemon::detach_running_child(child)?;
+            }
             c
         },
         Err(e) => {
-            if let Some(mut child) = daemon_child {
-                let _ = child.kill();
-                let _ = child.wait();
+            if let Some(child) = daemon_child
+                && let Err(cleanup_error) = commands::daemon::terminate_child_bounded(child).await
+            {
+                return Err(anyhow::Error::new(e).context(format!(
+                    "failed to connect to the newly started daemon, and bounded child cleanup \
+                     also failed: {cleanup_error}"
+                )));
             }
             let log_hint = astrid_core::dirs::AstridHome::resolve().map_or_else(
                 |_| "Failed to connect to daemon".to_string(),
@@ -234,7 +248,20 @@ pub(crate) async fn run_or_connect(
 
 #[cfg(test)]
 mod tests {
-    use super::selected_workspace_root;
+    use super::{companion_binary_name, selected_workspace_root};
+
+    #[test]
+    fn companion_binary_uses_native_executable_suffix_once() {
+        assert_eq!(
+            companion_binary_name("astrid-daemon", ".exe"),
+            "astrid-daemon.exe"
+        );
+        assert_eq!(
+            companion_binary_name("astrid-daemon.exe", ".exe"),
+            "astrid-daemon.exe"
+        );
+        assert_eq!(companion_binary_name("astrid-daemon", ""), "astrid-daemon");
+    }
 
     #[test]
     fn explicit_workspace_root_wins_over_current_directory() {

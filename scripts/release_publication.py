@@ -11,6 +11,7 @@ from pathlib import Path
 
 import release_manifest
 import musl_release_manifest
+import windows_release_manifest
 
 
 FIXED_PAYLOADS = ("BLAKE3SUMS.txt", "SHA256SUMS.txt")
@@ -103,6 +104,33 @@ def validate_release_assets(
         )
         payloads |= musl_archives | {musl_metadata_name}
 
+    windows_metadata_name = windows_release_manifest.metadata_name(version)
+    windows_archives = {
+        release_manifest.expected_asset(version, target)
+        for target in release_manifest.WINDOWS_TARGETS
+    }
+    windows_markers = {windows_metadata_name, *windows_archives}
+    windows_markers |= {f"{name}.sigstore.json" for name in windows_markers}
+    has_windows_extension = bool(
+        ({path.name for path in entries} & windows_markers)
+        or (checksum_assets & windows_archives)
+    )
+    windows_metadata = None
+    if has_windows_extension:
+        windows_metadata_path = directory / windows_metadata_name
+        windows_metadata = windows_release_manifest.load_manifest(
+            windows_metadata_path
+        )
+        windows_release_manifest.validate_manifest(
+            windows_metadata,
+            legacy_manifest=metadata,
+            legacy_manifest_blake3=release_manifest.blake3_file(metadata_path),
+            artifacts=directory,
+            verify_artifacts=True,
+            require_bundles=True,
+        )
+        payloads |= windows_archives | {windows_metadata_name}
+
     expected = payloads | {f"{name}.sigstore.json" for name in payloads}
     actual = {path.name for path in entries}
     require(
@@ -120,6 +148,9 @@ def validate_release_assets(
     targets = list(metadata["targets"])
     if musl_metadata is not None:
         targets.extend(musl_metadata["targets"])
+    if windows_metadata is not None:
+        targets.extend(windows_metadata["targets"])
+    if musl_metadata is not None or windows_metadata is not None:
         for algorithm, checksum_name in (
             ("blake3", "BLAKE3SUMS.txt"),
             ("sha256", "SHA256SUMS.txt"),

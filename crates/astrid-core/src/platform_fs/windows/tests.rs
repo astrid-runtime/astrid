@@ -24,6 +24,8 @@ use crate::session_token::SessionToken;
 
 #[path = "tests/authority.rs"]
 mod authority_tests;
+#[path = "tests/locking.rs"]
+mod locking_tests;
 
 static NATIVE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -42,6 +44,25 @@ fn private_temp() -> tempfile::TempDir {
     apply_private_acl(root.path(), true).unwrap();
     validate_private_acl(root.path(), true).unwrap();
     root
+}
+
+#[test]
+fn private_append_handles_never_overwrite_existing_bytes() {
+    let root = private_temp();
+    let path = root.path().join("daemon-boot.log");
+    let mut first = super::open_private_append_file(&path).unwrap();
+    let mut second = super::open_private_append_file(&path).unwrap();
+
+    first.write_all(b"first\n").unwrap();
+    second.write_all(b"second\n").unwrap();
+    first.write_all(b"third\n").unwrap();
+    first.flush().unwrap();
+    second.flush().unwrap();
+    drop(first);
+    drop(second);
+
+    assert_eq!(std::fs::read(&path).unwrap(), b"first\nsecond\nthird\n");
+    validate_private_file(&path).unwrap();
 }
 
 fn update_tree() -> (tempfile::TempDir, PathBuf, PathBuf) {
@@ -804,8 +825,9 @@ fn process_abort_recovers_on_next_run() {
         .status()
         .unwrap();
     assert!(!status.success());
-    recover_executable_transaction(&install).unwrap();
+    assert!(recover_executable_transaction(&install).unwrap());
     assert_old_set(&install);
+    assert!(!recover_executable_transaction(&install).unwrap());
 }
 
 #[test]

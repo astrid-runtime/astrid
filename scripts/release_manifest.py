@@ -26,6 +26,10 @@ MUSL_TARGETS = (
     "aarch64-unknown-linux-musl",
     "x86_64-unknown-linux-musl",
 )
+WINDOWS_TARGETS = (
+    "aarch64-pc-windows-msvc",
+    "x86_64-pc-windows-msvc",
+)
 ROOT_KEYS = {
     "schema-version",
     "kind",
@@ -112,11 +116,12 @@ def expected_asset(version: str, target: str) -> str:
 def validate_release_checksum_names(entries: dict[str, str], version: str, label: str) -> None:
     """Keep the legacy four-target manifest compatible with combined checksums."""
     legacy = {expected_asset(version, target) for target in TARGETS}
-    combined = legacy | {expected_asset(version, target) for target in MUSL_TARGETS}
-    if set(entries) not in (legacy, combined):
+    musl = {expected_asset(version, target) for target in MUSL_TARGETS}
+    windows = {expected_asset(version, target) for target in WINDOWS_TARGETS}
+    if set(entries) not in (legacy, legacy | musl, legacy | musl | windows):
         fail(
             f"{label} must contain exactly the four legacy release archives, "
-            "optionally plus the two supported musl archives"
+            "optionally plus both musl archives, or all musl and Windows archives"
         )
 
 

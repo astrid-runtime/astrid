@@ -113,6 +113,24 @@ class ReleaseManifestTests(unittest.TestCase):
         self.assertEqual(combined, legacy)
         self.assertEqual(release_manifest.render_manifest(combined), legacy_rendered)
 
+    def test_legacy_manifest_shape_is_unchanged_with_all_eight_checksums(self) -> None:
+        legacy = self.manifest()
+        b3 = self.artifacts / "BLAKE3SUMS.txt"
+        sha = self.artifacts / "SHA256SUMS.txt"
+        extensions = (
+            *release_manifest.MUSL_TARGETS,
+            *release_manifest.WINDOWS_TARGETS,
+        )
+        for index, target in enumerate(extensions, 20):
+            name = release_manifest.expected_asset(VERSION, target)
+            (self.artifacts / name).write_bytes(bytes([index]) * index)
+            with b3.open("a") as output:
+                output.write(f"{index:064x}  {name}\n")
+            with sha.open("a") as output:
+                output.write(f"{index + 8:064x}  {name}\n")
+        combined = self.manifest()
+        self.assertEqual(combined, legacy)
+
     def test_rejects_duplicate_target(self) -> None:
         manifest = self.manifest()
         manifest["targets"][1]["triple"] = manifest["targets"][0]["triple"]

@@ -76,6 +76,15 @@ fn replacement_input_validation_rejects_partial_or_ambiguous_sets() {
     assert!(validate_replacement_inputs(&install, &extract, &["astrid", "astrid-daemon"]).is_err());
 }
 
+#[cfg(not(windows))]
+#[test]
+fn non_windows_executable_recovery_has_no_persistent_transaction() {
+    assert_eq!(
+        recover_executable_set(Path::new("/unused")).unwrap(),
+        ExecutableRecoveryOutcome::NotNeeded
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn unix_replacement_preserves_backups_and_cleans_staging() {

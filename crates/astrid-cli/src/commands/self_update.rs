@@ -20,6 +20,16 @@ use super::update_auth::{
 };
 use super::update_channel;
 
+#[cfg(windows)]
+#[allow(unsafe_code)]
+#[path = "self_update/windows.rs"]
+mod windows;
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+#[path = "self_update/windows_path.rs"]
+mod windows_path;
+
 #[path = "self_update_notice.rs"]
 mod notice;
 pub(crate) use notice::print_update_banner;
@@ -37,7 +47,18 @@ const MAX_RELEASE_ASSETS: usize = 1_024;
 const MAX_BUNDLE_BYTES: usize = 256 * 1024;
 const MAX_MANIFEST_BYTES: usize = 256 * 1024;
 
-const MANAGED_BINARIES: &[&str] = &["astrid", "astrid-daemon"];
+#[cfg(not(windows))]
+const MANAGED_BINARIES: &[&str] = &["astrid", "astrid-daemon", "astrid-build", "astrid-emit"];
+
+#[cfg(windows)]
+pub(crate) fn run_internal_windows_update_helper() -> Option<anyhow::Result<()>> {
+    windows::internal_helper_request().map(|request| request.and_then(windows::run_helper_request))
+}
+
+#[cfg(windows)]
+pub(crate) fn reconcile_previous_windows_update() -> anyhow::Result<bool> {
+    windows::reconcile_previous_update()
+}
 
 /// GitHub API base URL. `ASTRID_UPDATE_API` overrides it so the flow can be
 /// rehearsed against a local/staging mock server.
@@ -64,6 +85,7 @@ fn resolve_repo(source: Option<&str>) -> anyhow::Result<(String, String)> {
 }
 
 /// The `~/.astrid/bin` directory where `astrid init` puts self-managed binaries.
+#[cfg(not(windows))]
 fn astrid_bin_dir() -> anyhow::Result<PathBuf> {
     let home = astrid_core::dirs::AstridHome::resolve()?;
     Ok(home.root().join("bin"))
@@ -96,6 +118,8 @@ fn platform_target_for(os: &str, arch: &str, target_env: &str) -> anyhow::Result
         ("linux", "aarch64", "musl") => Ok("aarch64-unknown-linux-musl"),
         ("linux", "x86_64", "gnu") => Ok("x86_64-unknown-linux-gnu"),
         ("linux", "aarch64", "gnu") => Ok("aarch64-unknown-linux-gnu"),
+        ("windows", "x86_64", _) => Ok("x86_64-pc-windows-msvc"),
+        ("windows", "aarch64", _) => Ok("aarch64-pc-windows-msvc"),
         ("linux", "x86_64" | "aarch64", env) => {
             bail!("Unsupported Linux target environment: {env}")
         },
@@ -154,21 +178,43 @@ fn cargo_bin_dirs() -> Vec<PathBuf> {
 /// differs.
 fn is_cargo_managed(exe: &Path) -> bool {
     use std::ffi::OsStr;
-    if cargo_bin_dirs().iter().any(|dir| exe.starts_with(dir)) {
+    let parent_matches = |dir: &PathBuf| {
+        #[cfg(windows)]
+        {
+            exe.parent().is_some_and(|parent| {
+                windows_path::paths_equal_case_insensitive(parent.as_os_str(), dir.as_os_str())
+                    .unwrap_or(false)
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            exe.starts_with(dir)
+        }
+    };
+    if cargo_bin_dirs().iter().any(parent_matches) {
         return true;
     }
     let comps: Vec<&OsStr> = exe
         .components()
         .map(std::path::Component::as_os_str)
         .collect();
-    comps
-        .windows(2)
-        .any(|w| w[0] == OsStr::new(".cargo") && w[1] == OsStr::new("bin"))
+    comps.windows(2).any(|w| {
+        #[cfg(windows)]
+        {
+            windows_path::paths_equal_case_insensitive(w[0], OsStr::new(".cargo")).unwrap_or(false)
+                && windows_path::paths_equal_case_insensitive(w[1], OsStr::new("bin"))
+                    .unwrap_or(false)
+        }
+        #[cfg(not(windows))]
+        {
+            w[0] == OsStr::new(".cargo") && w[1] == OsStr::new("bin")
+        }
+    })
 }
 
 /// How the running `astrid` binary is managed. Determines how an update is
 /// APPLIED (and the instruction shown); the version CHECK itself is
-/// install-method-independent — always the GitHub release, on macOS and Linux.
+/// install-method-independent — always the authenticated GitHub release.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InstallMethod {
     /// Homebrew (`…/Cellar/astrid/…`) — updates via `brew upgrade`.
@@ -362,6 +408,7 @@ pub(super) async fn download_bounded(
 /// individual name boundary; an interrupted mixed set is restored on the next
 /// attempt. The `.bak` copies are left in place for manual rollback after a
 /// successful update.
+#[cfg(not(windows))]
 fn backup_and_swap(install_dir: &Path, extract_dir: &Path, names: &[&str]) -> anyhow::Result<()> {
     astrid_core::platform_fs::replace_executable_set(install_dir, extract_dir, names)
         .context("failed to replace authenticated Astrid executables")
@@ -397,19 +444,67 @@ fn confirm(prompt: &str, assume_yes: bool) -> anyhow::Result<bool> {
     Ok(input.is_empty() || input.eq_ignore_ascii_case("y") || input.eq_ignore_ascii_case("yes"))
 }
 
+struct PreparedInPlaceUpdate {
+    _temp_guard: tempfile::TempDir,
+    payload: PathBuf,
+    install_root: PathBuf,
+}
+
+async fn prepare_in_place_update(
+    client: &reqwest::Client,
+    release: &serde_json::Value,
+    version: &str,
+    target: &str,
+    expected_blake3: &str,
+    exe: &Path,
+    assume_yes: bool,
+) -> anyhow::Result<Option<PreparedInPlaceUpdate>> {
+    let install_dir = exe
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("cannot resolve install directory for {}", exe.display()))?
+        .to_path_buf();
+    if !is_writable_dir(&install_dir) {
+        bail!(
+            "{} is not writable — re-run with elevated permissions, or reinstall via Homebrew/cargo.",
+            install_dir.display()
+        );
+    }
+
+    if !confirm(
+        &format!(
+            "Update Astrid v{CURRENT_VERSION} → v{version} in {}?",
+            install_dir.display()
+        ),
+        assume_yes,
+    )? {
+        println!("{}", Theme::dimmed("Update cancelled."));
+        return Ok(None);
+    }
+
+    let (temp_dir, extract_dir) =
+        download_verify_extract(client, release, version, target, expected_blake3)
+            .await
+            .map_err(anyhow::Error::new)?;
+    Ok(Some(PreparedInPlaceUpdate {
+        _temp_guard: temp_dir,
+        payload: extract_dir,
+        install_root: install_dir,
+    }))
+}
+
+fn update_client() -> anyhow::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .user_agent("astrid-cli")
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .context("failed to build update HTTP client")
+}
+
 /// Run the self-update command — flag → stage → finish:
 /// resolve the signed channel, (for self-managed installs) verify + atomically
 /// swap the binary in place with rollback, restart the daemon, then update
 /// capsules. Distro refresh requires explicit recorded source provenance and is
 /// deliberately skipped by this path. Homebrew installs are deferred to `brew upgrade`.
-#[cfg(windows)]
-pub(crate) async fn run_self_update(_args: UpdateArgs) -> anyhow::Result<()> {
-    anyhow::bail!(
-        "Astrid self-update is not enabled on Windows; native packaging and code-signing support are not complete"
-    )
-}
-
-#[cfg(not(windows))]
 pub(crate) async fn run_self_update(args: UpdateArgs) -> anyhow::Result<()> {
     let target = platform_target()?;
     let (owner, repo) = resolve_repo(args.source.as_deref())?;
@@ -424,10 +519,7 @@ pub(crate) async fn run_self_update(args: UpdateArgs) -> anyhow::Result<()> {
         ))
     );
 
-    let client = reqwest::Client::builder()
-        .user_agent("astrid-cli")
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
+    let client = update_client()?;
 
     let resolved =
         update_channel::resolve_signed_channel(&client, &owner, &repo, args.channel, target)
@@ -471,48 +563,72 @@ pub(crate) async fn run_self_update(args: UpdateArgs) -> anyhow::Result<()> {
         UpdatePlan::ApplyInPlace => {},
     }
 
-    let install_dir = exe
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("cannot resolve install directory for {}", exe.display()))?
-        .to_path_buf();
-    if !is_writable_dir(&install_dir) {
-        bail!(
-            "{} is not writable — re-run with elevated permissions, or reinstall via Homebrew/cargo.",
-            install_dir.display()
-        );
-    }
-
-    if !confirm(
-        &format!(
-            "Update Astrid v{CURRENT_VERSION} → v{version_str} in {}?",
-            install_dir.display()
-        ),
-        args.yes,
-    )? {
-        println!("{}", Theme::dimmed("Update cancelled."));
-        return Ok(());
-    }
-
-    let (_tmp_dir, extract_dir) = download_verify_extract(
+    let Some(prepared) = prepare_in_place_update(
         &client,
         &release,
         &version_str,
         target,
         &resolved.target_blake3,
+        &exe,
+        args.yes,
     )
-    .await
-    .map_err(anyhow::Error::new)?;
+    .await?
+    else {
+        return Ok(());
+    };
+    let PreparedInPlaceUpdate {
+        _temp_guard,
+        payload: extract_dir,
+        install_root: install_dir,
+    } = prepared;
 
-    backup_and_swap(&install_dir, &extract_dir, MANAGED_BINARIES)?;
+    #[cfg(windows)]
+    {
+        finish_update(&install_dir).await?;
+        // Capsule synchronization can contact or start the daemon. Make the
+        // strict, confirmed stop the final step before the exit-time helper is
+        // launched so neither executable can still be mapped by a live daemon.
+        stop_daemon_before_windows_replacement().await?;
+        windows::stage_and_launch(&install_dir, &extract_dir, &version_str)?;
+        println!(
+            "{}",
+            Theme::success(&format!(
+                "Verified v{version_str}; Windows will replace the executables as this command exits \
+                 (previous binaries remain as *.bak in {}).",
+                install_dir.display()
+            ))
+        );
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    {
+        backup_and_swap(&install_dir, &extract_dir, MANAGED_BINARIES)?;
+        println!(
+            "{}",
+            Theme::success(&format!(
+                "Updated to v{version_str} (previous binaries kept as *.bak in {})",
+                install_dir.display()
+            ))
+        );
+        finish_update(&install_dir).await
+    }
+}
+
+#[cfg(windows)]
+async fn stop_daemon_before_windows_replacement() -> anyhow::Result<()> {
     println!(
         "{}",
-        Theme::success(&format!(
-            "Updated to v{version_str} (previous binaries kept as *.bak in {})",
-            install_dir.display()
-        ))
+        Theme::info("Stopping any running daemon before replacing its executable...")
     );
-
-    finish_update(&install_dir).await
+    let confirmation = super::daemon::handle_stop()
+        .await
+        .context("failed to stop daemon before Windows executable replacement")?;
+    anyhow::ensure!(
+        confirmation == super::daemon::StopConfirmation::ConfirmedGone,
+        "cannot replace Windows executables until the daemon is confirmed stopped"
+    );
+    Ok(())
 }
 
 /// Authenticate, content-check, and extract one platform archive.
@@ -574,22 +690,37 @@ async fn download_verify_extract(
         .map_err(UpdateStageError::Preparation)
 }
 
-/// After the binary swap: restart a running daemon so the new code takes effect,
-/// update capsules, and warn if the install dir isn't on PATH.
+/// Complete the update housekeeping around the platform-specific binary swap.
+///
+/// This stops a detected daemon, synchronizes capsules, and warns when the
+/// install directory is not on PATH. Unix calls it after the in-place swap;
+/// Windows calls it before the final confirmed stop and exit-time helper launch.
 async fn finish_update(install_dir: &Path) -> anyhow::Result<()> {
-    if astrid_core::local_transport::endpoint_is_present(&crate::socket_client::proxy_socket_path())?
-    {
+    if astrid_core::local_transport::endpoint_is_present(
+        &crate::socket_client::try_proxy_socket_path()?,
+    )? {
         println!(
             "{}",
             Theme::info("Stopping the running daemon so the new version loads on next use...")
         );
-        if let Err(e) = super::daemon::handle_stop().await {
-            println!(
-                "{}",
-                Theme::warning(&format!(
-                    "Could not stop the daemon ({e}); restart it with `astrid restart`."
-                ))
-            );
+        match super::daemon::handle_stop().await {
+            Ok(super::daemon::StopConfirmation::ConfirmedGone) => {},
+            Ok(super::daemon::StopConfirmation::Unconfirmed) => {
+                println!(
+                    "{}",
+                    Theme::warning(
+                        "Could not confirm the daemon exited; inspect it before restarting."
+                    )
+                );
+            },
+            Err(error) => {
+                println!(
+                    "{}",
+                    Theme::warning(&format!(
+                        "Could not stop the daemon ({error}); restart it with `astrid restart`."
+                    ))
+                );
+            },
         }
     }
 
@@ -670,6 +801,7 @@ fn is_in_path(dir: &Path) -> bool {
 }
 
 /// Detect the user's shell RC file.
+#[cfg(not(windows))]
 fn detect_shell_rc() -> Option<PathBuf> {
     let home = directories::BaseDirs::new()?.home_dir().to_path_buf();
     let shell = std::env::var("SHELL").unwrap_or_default();
@@ -707,6 +839,7 @@ fn detect_shell_rc() -> Option<PathBuf> {
 /// as "already configured" would silently skip the real PATH setup. Both
 /// match paths in [`rc_configures_path`] consult this so a commented block or
 /// token never counts.
+#[cfg(any(not(windows), test))]
 fn match_is_commented(rc: &str, start: usize) -> bool {
     let line_start = rc[..start].rfind('\n').map_or(0, |nl| nl.saturating_add(1));
     rc[line_start..start].contains('#')
@@ -726,6 +859,7 @@ fn match_is_commented(rc: &str, start: usize) -> bool {
 /// unsure we err toward ADDING the block — a duplicate PATH entry is harmless;
 /// a silent skip is not. Pure over its inputs so the guarantee is
 /// unit-testable without a real shell rc.
+#[cfg(any(not(windows), test))]
 fn rc_configures_path(rc_contents: &str, bin_str: &str, export_line: &str) -> bool {
     // Our exact block is the authoritative "already done" marker — unless it
     // is commented out, in which case it is inert and we must add a live one.
@@ -772,81 +906,90 @@ fn rc_configures_path(rc_contents: &str, bin_str: &str, export_line: &str) -> bo
     false
 }
 
-/// Ensure `~/.astrid/bin` is in PATH. Prompts user if interactive.
+/// Ensure the self-managed Astrid executable directory is persistently in PATH.
 ///
 /// Called by `astrid init` after capsule installation.
-pub(crate) fn ensure_path_setup() -> anyhow::Result<()> {
-    let bin_dir = astrid_bin_dir()?;
-    std::fs::create_dir_all(&bin_dir)?;
-
-    if is_in_path(&bin_dir) {
-        return Ok(());
-    }
-
-    let bin_str = bin_dir.to_string_lossy();
-    let Some(rc_file) = detect_shell_rc() else {
-        println!(
-            "{}",
-            Theme::warning(&format!("Add {bin_str} to your PATH manually."))
-        );
-        return Ok(());
-    };
-
-    let export_line = if rc_file.to_string_lossy().contains("fish") {
-        format!("fish_add_path {bin_str}")
-    } else {
-        format!("export PATH=\"{bin_str}:$PATH\"")
-    };
-
-    // Idempotency: if the rc file already wires the bin dir onto PATH, do
-    // NOT append a second block. `astrid init` (and the first-run auto-init)
-    // calls this on every run, so an unguarded append would accumulate a
-    // duplicate `# Astrid OS` block per invocation.
-    if let Ok(contents) = std::fs::read_to_string(&rc_file)
-        && rc_configures_path(&contents, &bin_str, &export_line)
+pub(crate) fn ensure_path_setup(yes: bool) -> anyhow::Result<()> {
+    #[cfg(windows)]
     {
-        return Ok(()); // Already configured, just not sourced yet
+        let exe = running_binary()?;
+        windows_path::ensure_path_setup(&exe, InstallMethod::detect(&exe), yes)
     }
 
-    // Prompt if interactive
-    if std::io::stdin().is_terminal() {
-        eprint!(
-            "\n{bin_str} is not in your PATH. Add it to {}? [Y/n] ",
-            rc_file.display()
-        );
-        std::io::Write::flush(&mut std::io::stderr())?;
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-        let input = input.trim();
-        if !input.is_empty() && !input.eq_ignore_ascii_case("y") {
-            println!(
-                "{}",
-                Theme::dimmed(&format!("Skipped. Add manually: {export_line}"))
-            );
+    #[cfg(not(windows))]
+    {
+        let bin_dir = astrid_bin_dir()?;
+        std::fs::create_dir_all(&bin_dir)?;
+
+        if is_in_path(&bin_dir) {
             return Ok(());
         }
+
+        let bin_str = bin_dir.to_string_lossy();
+        let Some(rc_file) = detect_shell_rc() else {
+            println!(
+                "{}",
+                Theme::warning(&format!("Add {bin_str} to your PATH manually."))
+            );
+            return Ok(());
+        };
+
+        let export_line = if rc_file.to_string_lossy().contains("fish") {
+            format!("fish_add_path {bin_str}")
+        } else {
+            format!("export PATH=\"{bin_str}:$PATH\"")
+        };
+
+        // Idempotency: if the rc file already wires the bin dir onto PATH, do
+        // NOT append a second block. `astrid init` (and the first-run auto-init)
+        // calls this on every run, so an unguarded append would accumulate a
+        // duplicate `# Astrid OS` block per invocation.
+        if let Ok(contents) = std::fs::read_to_string(&rc_file)
+            && rc_configures_path(&contents, &bin_str, &export_line)
+        {
+            return Ok(()); // Already configured, just not sourced yet
+        }
+
+        // Prompt if interactive
+        if !yes && std::io::stdin().is_terminal() {
+            eprint!(
+                "\n{bin_str} is not in your PATH. Add it to {}? [Y/n] ",
+                rc_file.display()
+            );
+            std::io::Write::flush(&mut std::io::stderr())?;
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            let input = input.trim();
+            if !input.is_empty() && !input.eq_ignore_ascii_case("y") {
+                println!(
+                    "{}",
+                    Theme::dimmed(&format!("Skipped. Add manually: {export_line}"))
+                );
+                return Ok(());
+            }
+        }
+
+        // Append to RC file
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&rc_file)?;
+        std::io::Write::write_all(
+            &mut file,
+            format!("\n# Astrid OS\n{export_line}\n").as_bytes(),
+        )?;
+
+        println!(
+            "{}",
+            Theme::success(&format!("Added to {}", rc_file.display()))
+        );
+        println!(
+            "  Run: {} (or restart your terminal)",
+            Theme::dimmed(&format!("source {}", rc_file.display()))
+        );
+
+        Ok(())
     }
-
-    // Append to RC file
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&rc_file)?;
-    std::io::Write::write_all(
-        &mut file,
-        format!("\n# Astrid OS\n{export_line}\n").as_bytes(),
-    )?;
-
-    println!(
-        "{}",
-        Theme::success(&format!("Added to {}", rc_file.display()))
-    );
-    println!(
-        "  Run: {} (or restart your terminal)",
-        Theme::dimmed(&format!("source {}", rc_file.display()))
-    );
-
-    Ok(())
 }
 
 #[cfg(test)]

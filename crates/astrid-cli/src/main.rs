@@ -40,6 +40,8 @@ mod principal;
 mod repl;
 /// The socket client for interacting with the Kernel.
 pub mod socket_client;
+#[cfg(test)]
+mod test_support;
 mod theme;
 mod tui;
 mod value_formatter;
@@ -47,6 +49,27 @@ mod workspace_layout;
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    #[cfg(windows)]
+    if let Some(result) = commands::self_update::run_internal_windows_update_helper() {
+        return match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("Windows update helper failed: {error:#}");
+                ExitCode::from(1)
+            },
+        };
+    }
+
+    #[cfg(windows)]
+    match commands::self_update::reconcile_previous_windows_update() {
+        Ok(false) => {},
+        Ok(true) => return ExitCode::from(1),
+        Err(error) => {
+            eprintln!("Windows update recovery failed: {error:#}");
+            return ExitCode::from(1);
+        },
+    }
+
     let parsed = cli::Cli::parse();
     if workspace_layout::initialize(parsed.workspace_state_dir.clone()).is_err() {
         eprintln!("error: workspace layout was already initialized");

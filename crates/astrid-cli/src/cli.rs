@@ -13,10 +13,11 @@ use crate::commands::UpdateChannel;
 use crate::commands::{
     agent::AgentCommand, audit::AuditArgs, budget::BudgetCommand, caps::CapsCommand,
     capsule::config::ConfigArgs as CapsuleConfigArgs, capsule::show::ShowArgs as CapsuleShowArgs,
-    completions::CompletionsArgs, doctor::DoctorArgs, gc::GcArgs, group::GroupCommand,
-    invite::InviteCommand, keypair::KeypairCommand, logs::LogsArgs, pair_device::PairDeviceCommand,
-    ps::PsArgs, quota::QuotaCommand, run::RunArgs, secret::SecretCommand, setup::SetupArgs,
-    top::TopArgs, trust::TrustCommand, version::VersionArgs, voucher::VoucherCommand, who::WhoArgs,
+    completions::CompletionsArgs, daemon::StartArgs, doctor::DoctorArgs, gc::GcArgs,
+    group::GroupCommand, invite::InviteCommand, keypair::KeypairCommand, logs::LogsArgs,
+    pair_device::PairDeviceCommand, ps::PsArgs, quota::QuotaCommand, run::RunArgs,
+    secret::SecretCommand, setup::SetupArgs, top::TopArgs, trust::TrustCommand,
+    version::VersionArgs, voucher::VoucherCommand, who::WhoArgs,
 };
 
 /// Astrid - Secure Agent Runtime
@@ -281,8 +282,8 @@ pub(crate) enum Commands {
     /// Garbage collect content-addressed stores (WIT, orphaned binaries).
     Gc(GcArgs),
 
-    /// Start the Astrid daemon in persistent mode (detached, no TUI)
-    Start,
+    /// Start the Astrid daemon in persistent mode (detached unless `--foreground`)
+    Start(StartArgs),
 
     /// Show daemon status (PID, uptime, connected clients, loaded capsules)
     Status,
