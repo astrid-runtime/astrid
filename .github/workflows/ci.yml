@@ -537,6 +537,21 @@ jobs:
             echo "No public API inputs changed; skipping cargo-semver-checks."
           fi
 
+          new_packages=""
+          while IFS= read -r manifest; do
+            if ! package=$(python3 -c \
+              'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["package"]["name"])' \
+              "$manifest") || [ -z "$package" ]; then
+              echo "::error file=$manifest::New workspace package has no parseable package name."
+              exit 1
+            fi
+            new_packages="${new_packages:+$new_packages,}$package"
+          done < <(git diff --name-only --diff-filter=A "$BASE_SHA"...HEAD -- 'crates/*/Cargo.toml')
+          echo "new-packages=$new_packages" >> "$GITHUB_OUTPUT"
+          if [ -n "$new_packages" ]; then
+            echo "New packages have no baseline API and will be excluded: $new_packages"
+          fi
+
       - name: Install Rust toolchain
         if: steps.api-inputs.outputs.run == 'true'
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -572,6 +587,7 @@ jobs:
         with:
           manifest-path: Cargo.toml
           baseline-rev: ${{ github.event.pull_request.base.sha }}
+          exclude: ${{ steps.api-inputs.outputs.new-packages }}
           feature-group: all-features
           rust-toolchain: manual
           github-token: ${{ github.token }}

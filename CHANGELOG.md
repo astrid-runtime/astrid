@@ -11,6 +11,24 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Added
 
+- **Principal storage now has a portable executable architecture model.** The
+  `no_std` `astrid-storage-model` crate defines immutable logical objects,
+  distinct encoded blob identities, atomic principal-root transitions,
+  idempotent closure import/export, root-and-pin garbage collection, stable
+  per-principal accounting, and root-preserving placement epochs. Companion
+  design and evidence documents specify the future user-space engine,
+  filesystem/KV migration, principal export/import, sysadmin rebalancing,
+  privacy and erasure domains, realistic deduplication bounds, and the
+  crash/property/adversarial tests required before production claims. Typed
+  owning, evidence, lineage, and derived references keep retention authority
+  explicit, while capability-scoped state views and structural transition
+  witnesses model independently verifiable root changes without claiming
+  semantic execution proofs. The current persistence backend and public
+  capsule interfaces are unchanged. Domain-bearing identifiers, relation
+  labels, root generations, object kinds and non-zero format/replica versions
+  are distinct Rust types; imports reject unrelated records, principal roots
+  must name typed commits, and placement epochs advance monotonically over
+  registered blobs.
 - **Windows local transport uses authenticated per-user named pipes.** A pipe
   name derived only from the caller's operating-system SID replaces
   filesystem endpoint naming on Windows. Local-only byte-mode instances use a

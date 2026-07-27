@@ -1,0 +1,12 @@
+[package]
+name = "astrid-storage-model"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Portable executable model for Astrid principal state, import, GC, and placement"
+
+[lints]
+workspace = true
