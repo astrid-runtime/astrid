@@ -24,7 +24,8 @@ use crate::kv::KvQuotaResolver;
 const KV_COMPONENT_LABEL: &[u8] = b"kv";
 const PARENT_LABEL: &[u8] = b"parent";
 const STATE_LABEL: &[u8] = b"state";
-const STAGING_BATCH_BYTES: usize = 4 * 1024 * 1024;
+// Soft write-coalescing target, not a record, file, or deployment limit.
+const STAGING_BATCH_TARGET_BYTES: usize = 4 * 1024 * 1024;
 const PRINCIPAL_GRAPH_VERSION: ObjectFormatVersion = match ObjectFormatVersion::new(3) {
     Some(version) => version,
     None => unreachable!(),
@@ -677,7 +678,7 @@ where
             .pending_bytes
             .saturating_add(staged_record_size(&record));
         self.pending.insert(id, record);
-        if self.pending_bytes >= STAGING_BATCH_BYTES {
+        if self.pending_bytes >= STAGING_BATCH_TARGET_BYTES {
             self.finish()?;
         }
         Ok(id)

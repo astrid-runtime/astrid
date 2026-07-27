@@ -197,6 +197,17 @@ staging-file markers, parallel chunk/hash workers, change detection, and
 staged-file-as-contiguous-representation work remain tracked in
 [#1392](https://github.com/astrid-runtime/astrid/issues/1392).
 
+Canonical 128-way packing is positional. Appends and size-preserving
+replacements rewrite only affected root-to-leaf paths, but a middle insertion
+or deletion that changes the chunk count shifts every later group and rewrites
+the tail's internal nodes after FastCDC resynchronizes. The chunks still dedup;
+the metadata does not. For scale, a one-byte middle insertion in a 100-GiB file
+can rewrite roughly 12,900 tree nodes, about 50 MiB of metadata and well below
+one percent of the file. Workloads requiring cheap repeated middle edits
+should model the mutable units as multiple content objects instead of one giant
+file. Variable-fill packing is not an escape hatch because it would sacrifice
+the canonical tree shape that makes identities and deduplication stable.
+
 Deletes remain possible above quota. Growth is rejected when the combined
 post-write total exceeds the live principal budget and exceeds the prior total.
 KV applies the same combined calculation, so mutation order cannot bypass the
