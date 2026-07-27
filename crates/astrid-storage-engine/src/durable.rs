@@ -337,6 +337,7 @@ pub struct DurableEngine<P: Ord, I, C> {
     limits: RecoveryLimits,
     faults: Arc<dyn FaultInjector>,
     arena_reader: File,
+    object_cache: ObjectCache<P>,
     inner: Mutex<DurableInner<P>>,
 }
 
@@ -368,7 +369,40 @@ where
         principal_codec: C,
         limits: RecoveryLimits,
     ) -> Result<Self, DurableError> {
-        Self::open_with_faults(path, identity, principal_codec, limits, Arc::new(NoFaults))
+        Self::open_with_options(
+            path,
+            identity,
+            principal_codec,
+            limits,
+            Arc::new(NoFaults),
+            ObjectCacheConfig::disabled(),
+        )
+    }
+
+    /// Open or create a durable store with an explicitly governed decoded
+    /// object cache.
+    ///
+    /// The engine never selects a hidden default cache ceiling. The embedding
+    /// runtime owns both the live total controller and per-principal budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::open`].
+    pub fn open_with_object_cache(
+        path: impl AsRef<Path>,
+        identity: I,
+        principal_codec: C,
+        limits: RecoveryLimits,
+        object_cache: ObjectCacheConfig<P>,
+    ) -> Result<Self, DurableError> {
+        Self::open_with_options(
+            path,
+            identity,
+            principal_codec,
+            limits,
+            Arc::new(NoFaults),
+            object_cache,
+        )
     }
 
     /// Open or create a durable store with an explicit fault injector.
@@ -382,6 +416,24 @@ where
         principal_codec: C,
         limits: RecoveryLimits,
         faults: Arc<dyn FaultInjector>,
+    ) -> Result<Self, DurableError> {
+        Self::open_with_options(
+            path,
+            identity,
+            principal_codec,
+            limits,
+            faults,
+            ObjectCacheConfig::disabled(),
+        )
+    }
+
+    fn open_with_options(
+        path: impl AsRef<Path>,
+        identity: I,
+        principal_codec: C,
+        limits: RecoveryLimits,
+        faults: Arc<dyn FaultInjector>,
+        object_cache: ObjectCacheConfig<P>,
     ) -> Result<Self, DurableError> {
         let path = path.as_ref();
         std::fs::create_dir_all(path)
@@ -424,6 +476,7 @@ where
             limits,
             faults,
             arena_reader,
+            object_cache: ObjectCache::new(object_cache),
             inner: Mutex::new(DurableInner {
                 roots_by_principal,
                 index,
@@ -473,6 +526,47 @@ where
             self.limits,
         )
         .map(Some)
+    }
+
+    /// Return one immutable object through the principal-accounted decoded
+    /// cache.
+    ///
+    /// Cache policy never changes read correctness. A bypass or miss performs
+    /// the ordinary positional frame read and full validation before the
+    /// resulting record can be retained.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableError::RequiresRecovery`] after a failed write, or a
+    /// frame/identity error when the arena cannot supply the requested object.
+    pub fn object_for(
+        &self,
+        principal: &P,
+        id: ObjectId,
+    ) -> Result<Option<ObjectRecord>, DurableError> {
+        if let Some(record) = self.object_cache.get(principal, id) {
+            return Ok(Some(record.as_ref().clone()));
+        }
+        let Some(record) = self.object(id)? else {
+            return Ok(None);
+        };
+        let record = self.object_cache.insert(principal, id, record);
+        Ok(Some(record.as_ref().clone()))
+    }
+
+    /// Return privileged cache diagnostics.
+    #[must_use]
+    pub fn object_cache_stats(&self) -> ObjectCacheStats {
+        self.object_cache.stats()
+    }
+
+    /// Return the bytes currently charged to one principal.
+    ///
+    /// This is kernel/operator accounting and must not be exposed to guests,
+    /// because cache residency is a performance detail.
+    #[must_use]
+    pub fn object_cache_principal_charge(&self, principal: &P) -> u64 {
+        self.object_cache.principal_charge(principal)
     }
 
     /// Persist one standalone immutable object outside a principal root.
@@ -963,11 +1057,18 @@ fn recovery_closure_error(error: DurableError, root_offset: u64) -> DurableError
 #[path = "durable_staging.rs"]
 mod staging;
 
+#[path = "durable_cache.rs"]
+mod cache;
 #[path = "durable_format.rs"]
 mod format;
 #[path = "durable_lifecycle.rs"]
 mod lifecycle;
 
+use cache::ObjectCache;
+pub use cache::{
+    ObjectCacheCapacity, ObjectCacheConfig, ObjectCacheController, ObjectCacheStats,
+    PrincipalObjectCacheBudget,
+};
 use format::{
     append_frame, append_frames, encode_object_frame, encode_root_record, ensure_payload_limit,
     io_error, open_rw, read_indexed_object, recover_arena, recover_roots, sync_store_directory,

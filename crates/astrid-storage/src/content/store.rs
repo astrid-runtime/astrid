@@ -95,7 +95,7 @@ where
     /// Returns a content or projection error when verification or allocation
     /// fails.
     pub fn read(&self) -> Result<Vec<u8>, PrincipalContentError> {
-        let source = EngineSource::<P, E>::new(self.engine.as_ref());
+        let source = EngineSource::<P, E>::new(self.engine.as_ref(), &self.principal);
         if let Some(verified) = self.verified() {
             return read_verified_content(&source, verified).map_err(map_read_error);
         }
@@ -112,7 +112,7 @@ where
     /// Returns a content, projection, range, or allocation error when the
     /// requested bytes cannot be reconstructed exactly.
     pub fn read_range(&self, offset: u64, length: u64) -> Result<Vec<u8>, PrincipalContentError> {
-        let source = EngineSource::<P, E>::new(self.engine.as_ref());
+        let source = EngineSource::<P, E>::new(self.engine.as_ref(), &self.principal);
         match self.verified() {
             Some(verified) => read_verified_content_range(&source, verified, offset, length)
                 .map_err(map_read_error),
@@ -422,8 +422,11 @@ where
             .copied();
         let opened = match verified {
             Some(verified) => verified.opened_content(),
-            None => open_content(&EngineSource::<P, E>::new(self.engine.as_ref()), entry.file)
-                .map_err(map_read_error)?,
+            None => open_content(
+                &EngineSource::<P, E>::new(self.engine.as_ref(), principal),
+                entry.file,
+            )
+            .map_err(map_read_error)?,
         };
         let descriptor = opened.descriptor();
         if descriptor.logical_bytes() != entry.logical_bytes {
@@ -784,15 +787,12 @@ where
 
 struct EngineSource<'a, P, E> {
     engine: &'a E,
-    marker: PhantomData<fn() -> P>,
+    principal: &'a P,
 }
 
 impl<'a, P, E> EngineSource<'a, P, E> {
-    const fn new(engine: &'a E) -> Self {
-        Self {
-            engine,
-            marker: PhantomData,
-        }
+    const fn new(engine: &'a E, principal: &'a P) -> Self {
+        Self { engine, principal }
     }
 }
 
@@ -803,7 +803,7 @@ where
     type Error = PrincipalProjectionError;
 
     fn load_content_object(&self, id: ObjectId) -> Result<Option<ObjectRecord>, Self::Error> {
-        self.engine.load_object(id)
+        self.engine.load_object_for(self.principal, id)
     }
 }
 

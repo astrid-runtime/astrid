@@ -13,7 +13,8 @@ use std::sync::Arc;
 use astrid_core::dirs::AstridHome;
 use astrid_core::principal::PrincipalId;
 use astrid_storage_engine::{
-    DurableEngine, IdentityScheme, PersistentObjectIdentity, PrincipalCodec, RecoveryLimits,
+    DurableEngine, IdentityScheme, ObjectCacheConfig, PersistentObjectIdentity, PrincipalCodec,
+    RecoveryLimits,
 };
 use astrid_storage_model::{
     ObjectClass, ObjectFormatVersion, ObjectId, ObjectIdentity, ObjectKind, ObjectRecord,
@@ -232,6 +233,24 @@ pub async fn open_runtime_principal_store(
     home: &AstridHome,
     quota: Arc<dyn KvQuotaResolver<StateOwner>>,
 ) -> StorageResult<RuntimePrincipalStore> {
+    open_runtime_principal_store_with_object_cache(home, quota, ObjectCacheConfig::disabled()).await
+}
+
+/// Open every native projection with an explicitly governed decoded-object
+/// cache.
+///
+/// The injected policy owns total and per-principal resident budgets. Cache
+/// misses, disabled policy, and eviction always fall back to verified arena
+/// reads.
+///
+/// # Errors
+///
+/// Returns the same errors as [`open_runtime_principal_store`].
+pub async fn open_runtime_principal_store_with_object_cache(
+    home: &AstridHome,
+    quota: Arc<dyn KvQuotaResolver<StateOwner>>,
+    object_cache: ObjectCacheConfig<StateOwner>,
+) -> StorageResult<RuntimePrincipalStore> {
     let store_path = home.principal_store_path();
     let open_path = store_path.clone();
     let format_spec = format_spec_record()?;
@@ -239,11 +258,12 @@ pub async fn open_runtime_principal_store(
     let metadata = store_metadata(format_spec_id);
     let opened = tokio::task::spawn_blocking(move || {
         let existing_complete = prepare_destination(&open_path, &metadata)?;
-        let engine = RuntimeEngine::open(
+        let engine = RuntimeEngine::open_with_object_cache(
             &open_path,
             Blake3ObjectIdentityV1,
             StateOwnerCodecV1,
             RecoveryLimits::process_addressable(),
+            object_cache,
         )
         .map_err(|error| {
             StorageError::Connection(format!("open durable principal store: {error}"))

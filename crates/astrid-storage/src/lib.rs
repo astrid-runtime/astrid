@@ -79,6 +79,7 @@ pub use principal_state::{
     Blake3ObjectIdentityV1, NativeContentStagingArea, NativePrincipalContentStore,
     ReadyStagedContent, RuntimePrincipalStore, StagedContentId, StagedContentWriter, StateOwner,
     StateOwnerCodecV1, StateOwnerResolver, open_runtime_kv, open_runtime_principal_store,
+    open_runtime_principal_store_with_object_cache,
 };
 
 #[cfg(feature = "db")]
