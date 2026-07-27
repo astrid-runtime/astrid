@@ -188,12 +188,12 @@ physical_bytes(store) =
 ```
 
 `size(o)` is the stable logical canonical-record size, not merely the payload
-length. It includes the object's kind, format version, accounting class,
-logical byte declaration, canonical bytes, and every reference's label, target
-identity, and relation kind. Engine framing, checksums, algorithm tags, indexes,
-and allocator overhead remain physical costs reported separately. This keeps
-quota and garbage-collection accounting independent of a particular arena
-encoding without leaving attacker-controlled reference metadata unmetered.
+length and not Rust heap capacity. The executable model charges the fixed
+kind/version/class/length fields, canonical payload bytes, and every
+reference's label length, label bytes, target `ObjectId`, and reachability
+kind. Durable framing, checksums, algorithm tags, indexes, and allocator
+amplification belong to `physical_bytes(store)`. Keeping this calculation on
+`ObjectRecord` gives quota and garbage-collection reports one definition.
 
 Enforce a stable per-principal quota on retained logical ownership plus
 metadata, not on a moving “fair share” of physical bytes. Alice's permitted
