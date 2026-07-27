@@ -539,8 +539,9 @@ jobs:
 
           new_packages=""
           while IFS= read -r manifest; do
-            package=$(awk -F'"' '/^name = "/ { print $2; exit }' "$manifest")
-            if [ -z "$package" ]; then
+            if ! package=$(python3 -c \
+              'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["package"]["name"])' \
+              "$manifest") || [ -z "$package" ]; then
               echo "::error file=$manifest::New workspace package has no parseable package name."
               exit 1
             fi
