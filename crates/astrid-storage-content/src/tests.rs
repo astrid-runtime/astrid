@@ -57,6 +57,7 @@ impl ObjectIdentity for TestIdentity {
 struct MapSource {
     records: BTreeMap<ObjectId, ObjectRecord>,
     loads: Cell<usize>,
+    batch_loads: Cell<usize>,
 }
 
 impl MapSource {
@@ -64,6 +65,7 @@ impl MapSource {
         Self {
             records: records.iter().cloned().collect(),
             loads: Cell::new(0),
+            batch_loads: Cell::new(0),
         }
     }
 }
@@ -74,6 +76,16 @@ impl ContentSource for MapSource {
     fn load_content_object(&self, id: ObjectId) -> Result<Option<ObjectRecord>, Self::Error> {
         self.loads.set(self.loads.get().saturating_add(1));
         Ok(self.records.get(&id).cloned())
+    }
+
+    fn load_content_objects(
+        &self,
+        ids: &[ObjectId],
+    ) -> Result<Vec<Option<ObjectRecord>>, Self::Error> {
+        self.batch_loads
+            .set(self.batch_loads.get().saturating_add(1));
+        self.loads.set(self.loads.get().saturating_add(ids.len()));
+        Ok(ids.iter().map(|id| self.records.get(id).cloned()).collect())
     }
 }
 
@@ -170,6 +182,7 @@ fn manual_content(profile: ChunkingProfile, chunks: &[Vec<u8>]) -> (ObjectId, Ma
         MapSource {
             records,
             loads: Cell::new(0),
+            batch_loads: Cell::new(0),
         },
     )
 }
@@ -263,6 +276,23 @@ fn exact_ranges_cross_chunk_and_tree_boundaries() {
             bytes[start..end]
         );
     }
+}
+
+#[test]
+fn multi_chunk_ranges_use_the_source_batch_boundary() {
+    let bytes = deterministic_bytes(5 * 1024 * 1024);
+    let built = build_content(&TestIdentity, ChunkingProfile::ASTRID_V1, &bytes).unwrap();
+    let source = MapSource::new(built.records());
+
+    assert_eq!(
+        read_verified_content_range(&source, built.verified_content(), 2_000_000, 1_000_000,)
+            .unwrap(),
+        bytes[2_000_000..3_000_000]
+    );
+    assert!(
+        source.batch_loads.get() > 0,
+        "multi-chunk traversal bypassed the source batch boundary"
+    );
 }
 
 #[test]

@@ -443,6 +443,44 @@ fn indexed_object_read_does_not_move_the_append_cursor() {
 }
 
 #[test]
+fn adjacent_indexed_objects_share_one_positional_read_span() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open(directory.path());
+    let first = ObjectRecord::new(
+        ObjectKind::Evidence,
+        ObjectFormatVersion::V1,
+        b"first adjacent object".to_vec(),
+        Vec::new(),
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let second = ObjectRecord::new(
+        ObjectKind::Evidence,
+        ObjectFormatVersion::V1,
+        b"second adjacent object".to_vec(),
+        Vec::new(),
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let (first_id, _) = engine.persist_standalone_object(&first).unwrap();
+    let (second_id, _) = engine.persist_standalone_object(&second).unwrap();
+    let missing = ObjectId::new([0x55; 32]);
+
+    assert_eq!(
+        engine
+            .objects_for(
+                &"alice".to_owned(),
+                &[second_id, missing, first_id, second_id],
+            )
+            .unwrap(),
+        vec![Some(second.clone()), None, Some(first), Some(second),]
+    );
+    assert_eq!(last_batch_spans(), 1);
+}
+
+#[test]
 fn standalone_bootstrap_object_cannot_own_principal_state() {
     let directory = tempfile::tempdir().unwrap();
     let engine = open(directory.path());

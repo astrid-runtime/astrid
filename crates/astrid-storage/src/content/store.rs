@@ -805,6 +805,13 @@ where
     fn load_content_object(&self, id: ObjectId) -> Result<Option<ObjectRecord>, Self::Error> {
         self.engine.load_object_for(self.principal, id)
     }
+
+    fn load_content_objects(
+        &self,
+        ids: &[ObjectId],
+    ) -> Result<Vec<Option<ObjectRecord>>, Self::Error> {
+        self.engine.load_objects_for(self.principal, ids)
+    }
 }
 
 struct EngineSink<'a, P, E> {

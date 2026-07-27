@@ -132,6 +132,25 @@ pub trait PrincipalProjectionEngine<P>: Send + Sync {
         self.load_object(id)
     }
 
+    /// Load immutable objects in request order with principal cache
+    /// attribution.
+    ///
+    /// The default preserves engines without a coalesced batch path.
+    ///
+    /// # Errors
+    ///
+    /// Returns a projection error when the object arena cannot complete the
+    /// reads.
+    fn load_objects_for(
+        &self,
+        principal: &P,
+        ids: &[ObjectId],
+    ) -> Result<Vec<Option<ObjectRecord>>, PrincipalProjectionError> {
+        ids.iter()
+            .map(|id| self.load_object_for(principal, *id))
+            .collect()
+    }
+
     /// Atomically publish one principal-state transition.
     ///
     /// # Errors
@@ -236,6 +255,14 @@ where
         id: ObjectId,
     ) -> Result<Option<ObjectRecord>, PrincipalProjectionError> {
         self.object_for(principal, id).map_err(map_durable)
+    }
+
+    fn load_objects_for(
+        &self,
+        principal: &P,
+        ids: &[ObjectId],
+    ) -> Result<Vec<Option<ObjectRecord>>, PrincipalProjectionError> {
+        self.objects_for(principal, ids).map_err(map_durable)
     }
 
     fn commit_root(

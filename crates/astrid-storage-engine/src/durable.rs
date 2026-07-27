@@ -554,6 +554,60 @@ where
         Ok(Some(record.as_ref().clone()))
     }
 
+    /// Return immutable objects in request order through the
+    /// principal-accounted decoded cache.
+    ///
+    /// Cache misses are resolved from one index snapshot. Physically adjacent
+    /// arena frames are read as one span and each frame retains its complete
+    /// checksum, identity, and canonical decode validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableError::RequiresRecovery`] after a failed write, or a
+    /// frame/identity error when the arena cannot supply a requested object.
+    pub fn objects_for(
+        &self,
+        principal: &P,
+        ids: &[ObjectId],
+    ) -> Result<Vec<Option<ObjectRecord>>, DurableError> {
+        let mut results = vec![None; ids.len()];
+        let mut missing = BTreeMap::<ObjectId, Vec<usize>>::new();
+        for (index, id) in ids.iter().copied().enumerate() {
+            if let Some(record) = self.object_cache.get(principal, id) {
+                results[index] = Some(record.as_ref().clone());
+            } else {
+                missing.entry(id).or_default().push(index);
+            }
+        }
+        if missing.is_empty() {
+            return Ok(results);
+        }
+
+        let locations = {
+            let inner = self.inner.lock();
+            ensure_usable(&inner)?;
+            missing
+                .keys()
+                .filter_map(|id| inner.index.get(id).copied().map(|location| (*id, location)))
+                .collect::<Vec<_>>()
+        };
+        let loaded = read_indexed_objects(
+            &self.arena_reader,
+            &locations,
+            self.identity.scheme(),
+            self.limits,
+        )?;
+        for (id, record) in loaded {
+            let cached = self.object_cache.insert(principal, id, record);
+            if let Some(indices) = missing.get(&id) {
+                for index in indices {
+                    results[*index] = Some(cached.as_ref().clone());
+                }
+            }
+        }
+        Ok(results)
+    }
+
     /// Return privileged cache diagnostics.
     #[must_use]
     pub fn object_cache_stats(&self) -> ObjectCacheStats {
@@ -1071,10 +1125,11 @@ pub use cache::{
 };
 use format::{
     append_frame, append_frames, encode_object_frame, encode_root_record, ensure_payload_limit,
-    io_error, open_rw, read_indexed_object, recover_arena, recover_roots, sync_store_directory,
+    io_error, open_rw, read_indexed_object, read_indexed_objects, recover_arena, recover_roots,
+    sync_store_directory,
 };
 #[cfg(test)]
-use format::{decode_object_frame, frame_checksum};
+use format::{decode_object_frame, frame_checksum, last_batch_spans};
 
 #[cfg(test)]
 #[path = "durable_tests.rs"]
