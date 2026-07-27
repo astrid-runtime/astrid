@@ -7,9 +7,9 @@ use std::time::Duration;
 use super::*;
 
 #[derive(Clone, Copy, Debug)]
-struct TestIdentity;
+pub(super) struct TestIdentity;
 
-const TEST_IDENTITY_SCHEME: IdentityScheme = match IdentityScheme::new(u16::MAX, 1) {
+pub(super) const TEST_IDENTITY_SCHEME: IdentityScheme = match IdentityScheme::new(u16::MAX, 1) {
     Some(scheme) => scheme,
     None => unreachable!(),
 };
@@ -76,7 +76,7 @@ impl PersistentObjectIdentity for BlockingIdentity {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct Utf8Codec;
+pub(super) struct Utf8Codec;
 
 impl PrincipalCodec<String> for Utf8Codec {
     fn encode(&self, principal: &String) -> Vec<u8> {
@@ -97,9 +97,9 @@ impl FaultInjector for FailAt {
     }
 }
 
-type TestEngine = DurableEngine<String, TestIdentity, Utf8Codec>;
+pub(super) type TestEngine = DurableEngine<String, TestIdentity, Utf8Codec>;
 
-fn limits() -> RecoveryLimits {
+pub(super) fn limits() -> RecoveryLimits {
     RecoveryLimits::new(1024 * 1024).unwrap()
 }
 
@@ -107,7 +107,7 @@ fn label(bytes: &[u8]) -> ReferenceLabel {
     ReferenceLabel::new(bytes.to_vec())
 }
 
-fn open(path: &Path) -> TestEngine {
+pub(super) fn open(path: &Path) -> TestEngine {
     DurableEngine::open(path, TestIdentity, Utf8Codec, limits()).unwrap()
 }
 
@@ -122,7 +122,7 @@ fn open_with_fault(path: &Path, point: FaultPoint) -> TestEngine {
     .unwrap()
 }
 
-fn transaction(
+pub(super) fn transaction(
     principal: &str,
     expected: Option<RootState>,
     payload: &[u8],
@@ -215,7 +215,7 @@ fn frame_end(path: &Path, offset: u64) -> u64 {
         .unwrap()
 }
 
-fn flip_byte(path: &Path, offset: u64) {
+pub(super) fn flip_byte(path: &Path, offset: u64) {
     let mut file = OpenOptions::new()
         .read(true)
         .write(true)

@@ -71,12 +71,15 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   differential oracle; the runtime hot path uses a bounded persistent tree.
 - **Principal storage has a host-file durability foundation.**
   `DurableEngine` persists immutable object frames before publishing a
-  checksummed principal-root journal record, rebuilds its disposable index on
-  open, truncates incomplete or physically invalid uncommitted tails only when
-  no valid frame follows, and rejects interior or semantic corruption. One
+  checksummed principal-root journal record and maintains a disposable,
+  checksummed persistent object-location index. A missing, stale, torn, or
+  corrupt index falls back to authoritative arena recovery; principal roots
+  always come from journal replay and live closure verification. Recovery
+  truncates incomplete or physically invalid uncommitted tails only when no
+  valid frame follows, and rejects interior or semantic corruption. One
   object-arena flush makes the transaction's complete object batch durable
-  before one root-journal flush publishes it. An exclusive store lock and
-  poison-on-write-failure behavior prevent
+  before one root-journal flush publishes it; index deltas add no commit-path
+  flush. An exclusive store lock and poison-on-write-failure behavior prevent
   concurrent-process corruption and stale in-memory reads. Named crash-boundary
   tests prove recovery to the old or new complete root. Recovery keeps only
   roots and arena offsets resident, while live reads load and checksum payloads

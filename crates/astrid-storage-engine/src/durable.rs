@@ -2,8 +2,8 @@
 //!
 //! Object frames and principal-root transitions live in separate files. New
 //! immutable objects are flushed before a root-journal frame can make them
-//! authoritative. The in-memory object index is rebuilt from the arena on
-//! every open; it is deliberately disposable performance state.
+//! authoritative. A disposable persistent index accelerates clean reopen but
+//! never participates in root authority or archival export.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -15,7 +15,7 @@ use std::sync::Arc;
 use astrid_storage_model::{
     InsertOutcome, ModelError, ObjectClass, ObjectFormatVersion, ObjectId, ObjectIdentity,
     ObjectKind, ObjectRecord, ObjectReference, PrincipalUsage, ReferenceKind, ReferenceLabel,
-    RootGeneration, RootState, World,
+    RootGeneration, RootState,
 };
 use fs2::FileExt;
 use parking_lot::Mutex;
@@ -24,9 +24,11 @@ use crate::{CommitOutcome, RootSnapshot, RootTransaction};
 
 const ARENA_FILE: &str = "objects.arena";
 const ROOT_FILE: &str = "roots.journal";
+const INDEX_FILE: &str = "objects.index";
 const LOCK_FILE: &str = "store.lock";
 const ARENA_MAGIC: [u8; 8] = *b"ASTOBJ1\0";
 const ROOT_MAGIC: [u8; 8] = *b"ASTROOT\0";
+const INDEX_MAGIC: [u8; 8] = *b"ASTIDX1\0";
 const FRAME_VERSION: u16 = 1;
 const FRAME_HEADER_LEN: u64 = 52;
 const FRAME_HEADER_LEN_USIZE: usize = 52;
@@ -323,6 +325,9 @@ struct DurableInner<P: Ord> {
 struct DurableFiles {
     arena: File,
     roots: File,
+    index_cache: Option<File>,
+    arena_len: u64,
+    arena_tail: Option<ArenaLocation>,
     lock: File,
 }
 
@@ -332,6 +337,7 @@ struct DurableFiles {
 /// identity, while `C` owns the canonical persistent representation of `P`.
 /// Neither principal authority nor quota policy is inferred by this engine.
 pub struct DurableEngine<P: Ord, I, C> {
+    directory: PathBuf,
     identity: I,
     principal_codec: C,
     limits: RecoveryLimits,
@@ -359,8 +365,9 @@ where
     /// # Errors
     ///
     /// Returns an I/O, lock, frame, identity, principal-codec, or model
-    /// recovery error. A truncated final frame is treated as an uncommitted
-    /// tail and removed; a complete invalid frame is never silently repaired.
+    /// recovery error. An incomplete or physically invalid final frame is
+    /// treated as an uncommitted tail only when no valid frame follows it;
+    /// semantic invalidity and interior corruption remain fatal.
     pub fn open(
         path: impl AsRef<Path>,
         identity: I,
@@ -382,8 +389,8 @@ where
         limits: RecoveryLimits,
         faults: Arc<dyn FaultInjector>,
     ) -> Result<Self, DurableError> {
-        let path = path.as_ref();
-        std::fs::create_dir_all(path)
+        let path = path.as_ref().to_path_buf();
+        std::fs::create_dir_all(&path)
             .map_err(|source| io_error("create principal-store directory", source))?;
         let lock_path = path.join(LOCK_FILE);
         let lock = open_rw(&lock_path)?;
@@ -396,17 +403,44 @@ where
 
         let mut arena = open_rw(&path.join(ARENA_FILE))?;
         let mut roots = open_rw(&path.join(ROOT_FILE))?;
-        sync_store_directory(path)?;
+        let mut index_cache = open_rw(&path.join(INDEX_FILE)).ok();
+        sync_store_directory(&path)?;
         let scheme = identity.scheme();
-        let index = recover_arena(&mut arena, &identity, limits)?;
+        let arena_len = arena
+            .metadata()
+            .map_err(|source| io_error("read object-arena metadata", source))?
+            .len();
+        let cached = index_cache
+            .as_mut()
+            .and_then(|file| recover_index(file, &mut arena, scheme, limits, arena_len));
+        let (index, arena_tail) = if let Some(state) = cached {
+            (state.objects, state.arena_tail)
+        } else {
+            let (index, arena_tail) = recover_arena(&mut arena, &identity, limits)?;
+            let state = IndexState {
+                arena_len: arena
+                    .metadata()
+                    .map_err(|source| io_error("read recovered arena metadata", source))?
+                    .len(),
+                arena_tail,
+                objects: index,
+            };
+            drop(index_cache.take());
+            index_cache = replace_index(&path, &state, scheme);
+            (state.objects, state.arena_tail)
+        };
         let (roots_by_principal, validated) = recover_roots(
             &mut roots,
             &mut arena,
             &index,
             &principal_codec,
-            scheme,
+            &identity,
             limits,
         )?;
+        let arena_len = arena
+            .metadata()
+            .map_err(|source| io_error("read recovered arena metadata", source))?
+            .len();
         arena
             .seek(SeekFrom::End(0))
             .map_err(|source| io_error("seek object arena", source))?;
@@ -415,6 +449,7 @@ where
             .map_err(|source| io_error("seek root journal", source))?;
 
         Ok(Self {
+            directory: path,
             identity,
             principal_codec,
             limits,
@@ -517,9 +552,23 @@ where
             })()
         };
         match persisted {
-            Ok(location) => {
+            Ok((location, arena_len)) => {
                 inner.index.insert(id, location);
                 inner.validated.insert(id);
+                let locations = [(id, location)];
+                if let Some(mut cache) = inner.index_cache.take() {
+                    let delta = IndexDelta {
+                        previous_arena_len,
+                        arena_len,
+                        arena_tail: location,
+                        objects: &locations,
+                    };
+                    if append_index_delta(&mut cache, &delta, self.identity.scheme()).is_ok() {
+                        inner.index_cache = Some(cache);
+                    }
+                }
+                inner.arena_len = arena_len;
+                inner.arena_tail = Some(location);
                 Ok((id, InsertOutcome::Inserted))
             },
             Err(error) => {
@@ -558,7 +607,7 @@ where
             index,
             &BTreeMap::new(),
             root.commit,
-            self.identity.scheme(),
+            &self.identity,
             self.limits,
         )?;
         Ok(Some(RootSnapshot { root, records }))
@@ -585,7 +634,7 @@ where
             index,
             &BTreeMap::new(),
             root.commit,
-            self.identity.scheme(),
+            &self.identity,
             self.limits,
         )?;
         usage_from_closure(&records, root.commit).map_err(Into::into)
@@ -605,13 +654,31 @@ where
         let mut inner = self.inner.lock();
         ensure_usable(&inner)?;
         let prepared = self.prepare(&mut inner, transaction)?;
+        let previous_arena_len = inner.arena_len;
         match self.persist(&mut inner, &prepared) {
-            Ok(locations) => {
-                inner.index.extend(locations);
+            Ok(persisted) => {
+                inner.index.extend(persisted.locations.iter().copied());
                 inner.validated.extend(prepared.validated.iter().copied());
                 inner
                     .roots_by_principal
                     .insert(prepared.principal.clone(), prepared.root);
+                if let Some((_, arena_tail)) = persisted.locations.last().copied()
+                    && let Some(mut cache) = inner.index_cache.take()
+                {
+                    let delta = IndexDelta {
+                        previous_arena_len,
+                        arena_len: persisted.arena_len,
+                        arena_tail,
+                        objects: &persisted.locations,
+                    };
+                    if append_index_delta(&mut cache, &delta, self.identity.scheme()).is_ok() {
+                        inner.index_cache = Some(cache);
+                    }
+                }
+                inner.arena_len = persisted.arena_len;
+                if let Some((_, location)) = persisted.locations.last().copied() {
+                    inner.arena_tail = Some(location);
+                }
                 Ok(CommitOutcome {
                     root: prepared.root,
                     objects_inserted: prepared.objects_inserted,
@@ -685,7 +752,7 @@ where
                     &mut files.arena,
                     id,
                     location,
-                    self.identity.scheme(),
+                    &self.identity,
                     self.limits,
                 )?;
                 if existing != record {
@@ -774,7 +841,15 @@ where
             .sync_data()
             .map_err(|source| io_error("flush root-journal frame", source))?;
         self.fail_if(FaultPoint::AfterRootCas)?;
-        Ok(locations)
+        let arena_len = inner
+            .arena
+            .metadata()
+            .map_err(|source| io_error("read committed arena metadata", source))?
+            .len();
+        Ok(Persisted {
+            locations,
+            arena_len,
+        })
     }
 
     fn fail_if(&self, point: FaultPoint) -> Result<(), DurableError> {
@@ -792,6 +867,12 @@ impl<P: Ord, I, C> Drop for DurableEngine<P, I, C> {
             let _ = fs2::FileExt::unlock(&files.lock);
         }
     }
+}
+
+#[derive(Debug)]
+struct Persisted {
+    locations: Vec<(ObjectId, ArenaLocation)>,
+    arena_len: u64,
 }
 
 #[derive(Debug)]
@@ -967,7 +1048,15 @@ use format::{
 };
 #[cfg(test)]
 use format::{decode_object_frame, frame_checksum};
+use index_cache::{IndexDelta, IndexState, append_index_delta, recover_index, replace_index};
+use validation::{
+    materialize_closure, recovery_closure_error, usage_from_closure, validate_commit_closure,
+    validate_incremental_closure,
+};
 
+#[cfg(test)]
+#[path = "durable_index_tests.rs"]
+mod index_tests;
 #[cfg(test)]
 #[path = "durable_tests.rs"]
 mod tests;
