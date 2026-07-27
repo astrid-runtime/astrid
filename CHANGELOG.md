@@ -276,7 +276,14 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   verification tokens, allowing later reads to skip redundant FastCDC
   neighbour proofs while retaining object, shape, and range checks. Reuse is
   partitioned by principal so cache timing cannot expose another principal's
-  equal content.
+  equal content. A separately governed decoded-object cache shares immutable
+  allocations physically while charging every principal their complete
+  logical weight; cache exhaustion always falls back to verified arena reads.
+  Cache hits now remain shared through the projection and content-source
+  boundaries instead of cloning full records, physically adjacent frames are
+  verified from coalesced positional reads, and synchronized tick indexes make
+  global and per-principal eviction logarithmic rather than scanning the
+  cache under its mutex. Closes #1399.
 - **Windows local transport uses authenticated per-user named pipes.** A pipe
   name derived only from the caller's operating-system SID replaces
   filesystem endpoint naming on Windows. Local-only byte-mode instances use a
