@@ -181,10 +181,20 @@ aggregate tree metadata remain proportional to the chunk count. Every reader
 fragmentation produces the same descriptor and canonical object DAG as the
 slice builder, including the one-whole-chunk rule at or below 256 KiB.
 
-A source or sink failure may leave unreachable immutable staging records but
-can never expose a partial file. Durable bulk adoption, one-pair fsync, the
-staging marker protocol, and staged-file-as-contiguous-representation work are
-tracked in
+`PrincipalContentStore::put_streaming` binds that sink to the shared projection
+engine. It buffers records to a four-MiB staging target; the durable engine
+identity-checks the complete batch before writing and appends its physical
+frames with one coalesced write and no per-record flush. After the source is
+complete, the ordinary principal-root transaction validates the full staged
+closure inside its critical section, flushes the complete arena prefix, and
+only then appends and flushes the root journal. Root conflicts rebuild only
+catalog/commit metadata and do not reread the source.
+
+A source or sink failure may therefore leave unreachable immutable records but
+can never expose a partial file. The operation is deliberately blocking;
+async callers must dispatch it through a blocking-worker boundary. Durable
+staging-file markers, parallel chunk/hash workers, change detection, and
+staged-file-as-contiguous-representation work remain tracked in
 [#1392](https://github.com/astrid-runtime/astrid/issues/1392).
 
 Deletes remain possible above quota. Growth is rejected when the combined
@@ -308,6 +318,8 @@ Regression coverage includes:
 - streaming/slice identity across boundary sizes, multi-level trees, and
   adversarial one-byte source fragmentation;
 - bounded source reads plus source/sink failure without a file descriptor;
+- durable staged-closure validation and flush through a root-only commit;
+- root-conflict retry without rereading the streaming source;
 - missing and malformed object rejection;
 - cross-principal physical reuse with independent logical usage;
 - duplicate aliases rejected by finite quota;

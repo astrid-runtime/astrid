@@ -96,7 +96,11 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   through a profile-bounded FastCDC buffer and emits immutable records into an
   identity-checking staging sink without retaining the complete source.
   Fragmented readers produce the exact same descriptor and canonical DAG as the
-  slice builder; source or sink failure never publishes a partial root.
+  slice builder. `PrincipalContentStore::put_streaming` stages those records
+  incrementally in four-MiB coalesced shared-engine batches without per-object
+  flushes; the ordinary root transaction revalidates the complete closure,
+  flushes objects before the root, and retries root conflicts without rereading
+  the source. Source or sink failure never publishes a partial root.
   Full and range reconstruction validate the typed graph and load only
   overlapping chunks. `PrincipalContentStore` publishes named content through
   the same per-principal root CAS and durable object arena as KV, so identical

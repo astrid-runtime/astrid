@@ -953,14 +953,17 @@ fn recovery_closure_error(error: DurableError, root_offset: u64) -> DurableError
     }
 }
 
+#[path = "durable_staging.rs"]
+mod staging;
+
 #[path = "durable_format.rs"]
 mod format;
 #[path = "durable_lifecycle.rs"]
 mod lifecycle;
 
 use format::{
-    append_frame, encode_object_frame, encode_root_record, ensure_payload_limit, io_error, open_rw,
-    read_indexed_object, recover_arena, recover_roots, sync_store_directory,
+    append_frame, append_frames, encode_object_frame, encode_root_record, ensure_payload_limit,
+    io_error, open_rw, read_indexed_object, recover_arena, recover_roots, sync_store_directory,
 };
 #[cfg(test)]
 use format::{decode_object_frame, frame_checksum};

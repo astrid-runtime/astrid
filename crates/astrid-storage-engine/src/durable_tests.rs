@@ -399,6 +399,146 @@ fn standalone_bootstrap_object_cannot_own_principal_state() {
 }
 
 #[test]
+fn staged_closure_is_validated_and_flushed_by_root_commit() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open(directory.path());
+    let (commit, transaction) = transaction("alice", None, b"streamed");
+    for (_, record) in transaction.records().iter().rev() {
+        assert_eq!(
+            engine.stage_object(record).unwrap().1,
+            InsertOutcome::Inserted
+        );
+    }
+    assert_eq!(engine.object_count().unwrap(), 2);
+    assert_eq!(engine.root(&"alice".to_owned()).unwrap(), None);
+
+    let outcome = engine
+        .commit(RootTransaction::new(
+            "alice".to_owned(),
+            None,
+            commit,
+            Vec::new(),
+        ))
+        .unwrap();
+    assert_eq!(outcome.objects_inserted(), 0);
+    drop(engine);
+
+    let reopened = open(directory.path());
+    assert_eq!(
+        reopened.root(&"alice".to_owned()).unwrap(),
+        Some(outcome.root())
+    );
+    assert_eq!(
+        reopened
+            .snapshot(&"alice".to_owned())
+            .unwrap()
+            .unwrap()
+            .records()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn incomplete_staging_cannot_publish_a_dangling_root() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open(directory.path());
+    let (commit, transaction) = transaction("alice", None, b"incomplete");
+    let commit_record = transaction
+        .records()
+        .iter()
+        .find(|(_, record)| record.kind() == ObjectKind::Commit)
+        .unwrap()
+        .1
+        .clone();
+    engine.stage_object(&commit_record).unwrap();
+
+    assert!(matches!(
+        engine.commit(RootTransaction::new(
+            "alice".to_owned(),
+            None,
+            commit,
+            Vec::new(),
+        )),
+        Err(DurableError::Model(ModelError::MissingObject(_)))
+    ));
+    assert_eq!(engine.root(&"alice".to_owned()).unwrap(), None);
+    assert!(engine.object(commit).unwrap().is_some());
+}
+
+#[test]
+fn staged_batch_is_idempotent_and_publishes_in_one_root_commit() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open(directory.path());
+    let (commit, transaction) = transaction("alice", None, b"batch");
+    let mut records: Vec<_> = transaction
+        .records()
+        .iter()
+        .map(|(_, record)| record.clone())
+        .collect();
+    records.push(records[0].clone());
+
+    let outcomes = engine.stage_objects(records).unwrap();
+    assert_eq!(outcomes.len(), 3);
+    assert_eq!(outcomes[0].1, InsertOutcome::Inserted);
+    assert_eq!(outcomes[1].1, InsertOutcome::Inserted);
+    assert_eq!(outcomes[2].1, InsertOutcome::AlreadyPresent);
+
+    let outcome = engine
+        .commit(RootTransaction::new(
+            "alice".to_owned(),
+            None,
+            commit,
+            Vec::new(),
+        ))
+        .unwrap();
+    assert_eq!(outcome.objects_inserted(), 0);
+    assert!(engine.snapshot(&"alice".to_owned()).unwrap().is_some());
+}
+
+#[test]
+fn staged_batch_collision_appends_nothing() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = DurableEngine::<String, ConstantIdentity, Utf8Codec>::open(
+        directory.path(),
+        ConstantIdentity,
+        Utf8Codec,
+        limits(),
+    )
+    .unwrap();
+    let first = ObjectRecord::new(
+        ObjectKind::Chunk,
+        ObjectFormatVersion::V1,
+        b"first".to_vec(),
+        Vec::new(),
+        5,
+        ObjectClass::Data,
+    )
+    .unwrap();
+    let second = ObjectRecord::new(
+        ObjectKind::Chunk,
+        ObjectFormatVersion::V1,
+        b"second".to_vec(),
+        Vec::new(),
+        6,
+        ObjectClass::Data,
+    )
+    .unwrap();
+
+    assert!(matches!(
+        engine.stage_objects(vec![first, second]),
+        Err(DurableError::Model(ModelError::ObjectCollision(_)))
+    ));
+    assert_eq!(engine.object_count().unwrap(), 0);
+    assert_eq!(
+        std::fs::metadata(directory.path().join(ARENA_FILE))
+            .unwrap()
+            .len(),
+        0
+    );
+}
+
+#[test]
 fn commit_flush_reopen_rebuilds_index_and_root() {
     let directory = tempfile::tempdir().unwrap();
     let engine = open(directory.path());

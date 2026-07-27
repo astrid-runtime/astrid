@@ -147,6 +147,8 @@ pub enum PrincipalContentError {
     InvalidName,
     /// Canonical content-DAG construction or decoding failed.
     Content(ContentError),
+    /// Streaming byte source failed before a complete file was staged.
+    ContentSource(String),
     /// Shared principal projection engine failed.
     Projection(PrincipalProjectionError),
     /// Principal state or catalog did not match its canonical grammar.
@@ -174,6 +176,7 @@ impl fmt::Display for PrincipalContentError {
         match self {
             Self::InvalidName => formatter.write_str("invalid principal content name"),
             Self::Content(error) => error.fmt(formatter),
+            Self::ContentSource(error) => write!(formatter, "principal content source: {error}"),
             Self::Projection(error) => error.fmt(formatter),
             Self::InvalidGraph { object, detail } => {
                 write!(

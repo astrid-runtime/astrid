@@ -1,16 +1,18 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::io::Read;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
 use astrid_storage_content::{
-    BuiltContent, ChunkingProfile, ContentDescriptor, ContentError, ContentReadError,
-    ContentSource, build_content, describe_content, read_content, read_content_range,
+    BuiltContent, ChunkingProfile, ContentDescriptor, ContentError, ContentObjectSink,
+    ContentReadError, ContentSource, ContentStreamError, build_content, build_content_streaming,
+    describe_content, read_content, read_content_range,
 };
 use astrid_storage_engine::{PrincipalProjectionEngine, PrincipalProjectionError, RootTransaction};
 use astrid_storage_model::{
-    ModelError, ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord,
-    ObjectReference, ReferenceKind, ReferenceLabel, RootState,
+    InsertOutcome, ModelError, ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind,
+    ObjectRecord, ObjectReference, ReferenceKind, ReferenceLabel, RootState,
 };
 
 use super::catalog::{
@@ -22,6 +24,7 @@ use crate::kv::KvQuotaResolver;
 const KV_COMPONENT_LABEL: &[u8] = b"kv";
 const PARENT_LABEL: &[u8] = b"parent";
 const STATE_LABEL: &[u8] = b"state";
+const STAGING_BATCH_BYTES: usize = 4 * 1024 * 1024;
 const PRINCIPAL_GRAPH_VERSION: ObjectFormatVersion = match ObjectFormatVersion::new(3) {
     Some(version) => version,
     None => unreachable!(),
@@ -99,37 +102,101 @@ where
             profile,
             bytes,
         )?;
+        self.publish(principal, name, built.descriptor(), Some(&built), 0)
+    }
+
+    /// Stream bytes under `name` using Astrid's pinned chunking profile.
+    ///
+    /// The blocking source is consumed once. Immutable content objects are
+    /// staged incrementally, then the completed file is published through the
+    /// ordinary principal-root compare-and-swap. Callers running on an async
+    /// executor must invoke this method from a blocking worker.
+    ///
+    /// # Errors
+    ///
+    /// Returns a source, content, principal-graph, projection, or quota error
+    /// without publishing a partial file.
+    pub fn put_streaming<R: Read>(
+        &self,
+        principal: &P,
+        name: &ContentName,
+        source: R,
+    ) -> Result<ContentWriteOutcome, PrincipalContentError> {
+        self.put_streaming_with_profile(principal, name, source, ChunkingProfile::ASTRID_V1)
+    }
+
+    /// Stream bytes under `name` using an explicit persistent profile.
+    ///
+    /// Source or staging failure may leave unreachable immutable objects for
+    /// compaction, but no principal root can observe them. Root conflicts
+    /// retry only catalog publication; source bytes are not read again.
+    ///
+    /// # Errors
+    ///
+    /// Returns a source, content, principal-graph, projection, or quota error
+    /// without publishing a partial file.
+    pub fn put_streaming_with_profile<R: Read>(
+        &self,
+        principal: &P,
+        name: &ContentName,
+        source: R,
+        profile: ChunkingProfile,
+    ) -> Result<ContentWriteOutcome, PrincipalContentError> {
+        let mut sink = EngineSink::<P, E>::new(self.engine.as_ref());
+        let streamed =
+            build_content_streaming(profile, source, &mut sink).map_err(map_stream_error)?;
+        sink.finish()?;
+        self.publish(
+            principal,
+            name,
+            streamed.descriptor(),
+            None,
+            sink.objects_inserted,
+        )
+    }
+
+    fn publish(
+        &self,
+        principal: &P,
+        name: &ContentName,
+        descriptor: ContentDescriptor,
+        built: Option<&BuiltContent>,
+        staged_objects_inserted: u64,
+    ) -> Result<ContentWriteOutcome, PrincipalContentError> {
         loop {
             let mut header = self.header(principal.clone())?;
             if header
                 .catalog
                 .entries
                 .get(name)
-                .is_some_and(|entry| entry.file == built.descriptor().file())
+                .is_some_and(|entry| entry.file == descriptor.file())
             {
                 let root = header.root.ok_or_else(|| {
                     invalid(
-                        built.descriptor().file(),
+                        descriptor.file(),
                         "catalog entry exists without a principal root",
                     )
                 })?;
-                return Ok(ContentWriteOutcome::new(built.descriptor(), root, 0));
+                return Ok(ContentWriteOutcome::new(descriptor, root, 0));
             }
             header.catalog.insert(
                 name.clone(),
                 CatalogValue {
-                    file: built.descriptor().file(),
-                    logical_bytes: built.descriptor().logical_bytes(),
+                    file: descriptor.file(),
+                    logical_bytes: descriptor.logical_bytes(),
                 },
             )?;
             self.enforce_quota(principal, &header)?;
-            let transaction = self.encode_transaction(header, Some(&built))?;
+            let transaction = self.encode_transaction(header, built)?;
             match self.engine.commit_root(transaction) {
                 Ok(outcome) => {
+                    let objects_inserted = staged_objects_inserted
+                        .checked_add(outcome.objects_inserted())
+                        .ok_or(PrincipalContentError::AccountingOverflow)?;
                     return Ok(ContentWriteOutcome::new(
-                        built.descriptor(),
+                        descriptor,
                         outcome.root(),
-                        outcome.objects_inserted(),
+                        objects_inserted,
                     ));
                 },
                 Err(PrincipalProjectionError::Model(ModelError::RootConflict { .. })) => {},
@@ -530,10 +597,118 @@ where
     }
 }
 
+struct EngineSink<'a, P, E> {
+    engine: &'a E,
+    objects_inserted: u64,
+    pending_bytes: usize,
+    pending: BTreeMap<ObjectId, ObjectRecord>,
+    marker: PhantomData<fn() -> P>,
+}
+
+impl<'a, P, E> EngineSink<'a, P, E> {
+    const fn new(engine: &'a E) -> Self {
+        Self {
+            engine,
+            objects_inserted: 0,
+            pending_bytes: 0,
+            pending: BTreeMap::new(),
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<P, E> EngineSink<'_, P, E>
+where
+    E: PrincipalProjectionEngine<P>,
+{
+    fn finish(&mut self) -> Result<(), PrincipalProjectionError> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let pending = std::mem::take(&mut self.pending);
+        self.pending_bytes = 0;
+        let expected: Vec<_> = pending.keys().copied().collect();
+        let outcomes = self.engine.stage_objects(pending.into_values().collect())?;
+        if outcomes.len() != expected.len() {
+            return Err(PrincipalProjectionError::Engine(
+                "staging engine returned the wrong outcome count".to_owned(),
+            ));
+        }
+        for (expected, (computed, outcome)) in expected.into_iter().zip(outcomes) {
+            if computed != expected {
+                return Err(PrincipalProjectionError::Model(
+                    ModelError::ObjectIdentityMismatch {
+                        declared: expected,
+                        computed,
+                    },
+                ));
+            }
+            if outcome == InsertOutcome::Inserted {
+                self.objects_inserted =
+                    self.objects_inserted
+                        .checked_add(1)
+                        .ok_or(PrincipalProjectionError::Model(
+                            ModelError::ArithmeticOverflow,
+                        ))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<P, E> ContentObjectSink for EngineSink<'_, P, E>
+where
+    E: PrincipalProjectionEngine<P>,
+{
+    type Error = PrincipalProjectionError;
+
+    fn stage_content_object(&mut self, record: ObjectRecord) -> Result<ObjectId, Self::Error> {
+        let id = self.engine.identify_object(&record);
+        match self.pending.get(&id) {
+            Some(existing) if existing == &record => return Ok(id),
+            Some(_) => {
+                return Err(PrincipalProjectionError::Model(
+                    ModelError::ObjectCollision(id),
+                ));
+            },
+            None => {},
+        }
+        self.pending_bytes = self
+            .pending_bytes
+            .saturating_add(staged_record_size(&record));
+        self.pending.insert(id, record);
+        if self.pending_bytes >= STAGING_BATCH_BYTES {
+            self.finish()?;
+        }
+        Ok(id)
+    }
+}
+
+fn staged_record_size(record: &ObjectRecord) -> usize {
+    record
+        .references()
+        .iter()
+        .fold(record.canonical_bytes().len(), |size, reference| {
+            size.saturating_add(reference.label().as_bytes().len())
+                .saturating_add(40)
+        })
+        .saturating_add(64)
+}
+
 fn map_read_error(error: ContentReadError<PrincipalProjectionError>) -> PrincipalContentError {
     match error {
         ContentReadError::Content(error) => error.into(),
         ContentReadError::Source(error) => error.into(),
+    }
+}
+
+fn map_stream_error(error: ContentStreamError<PrincipalProjectionError>) -> PrincipalContentError {
+    match error {
+        ContentStreamError::Content(error) => error.into(),
+        ContentStreamError::Source(error) => {
+            PrincipalContentError::ContentSource(error.to_string())
+        },
+        ContentStreamError::Sink(error) => error.into(),
     }
 }
 

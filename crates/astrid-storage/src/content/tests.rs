@@ -1,7 +1,16 @@
+use std::io::{self, Read};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use astrid_storage_engine::InMemoryEngine;
-use astrid_storage_model::{ObjectClass, ObjectId, ObjectIdentity, ObjectRecord, ReferenceKind};
+use astrid_storage_engine::{
+    CommitOutcome, DurableEngine, IdentityScheme, InMemoryEngine, PersistentObjectIdentity,
+    PrincipalCodec, PrincipalProjectionEngine, PrincipalProjectionError, RecoveryLimits,
+    RootTransaction,
+};
+use astrid_storage_model::{
+    InsertOutcome, ModelError, ObjectClass, ObjectId, ObjectIdentity, ObjectRecord, ReferenceKind,
+    RootState,
+};
 
 use super::{ContentName, PrincipalContentError, PrincipalContentStore};
 use crate::kv::{KvStore, TreeKvStore};
@@ -37,7 +46,87 @@ impl ObjectIdentity for TestIdentity {
     }
 }
 
+const TEST_IDENTITY_SCHEME: IdentityScheme = match IdentityScheme::new(u16::MAX, 7) {
+    Some(scheme) => scheme,
+    None => unreachable!(),
+};
+
+impl PersistentObjectIdentity for TestIdentity {
+    fn scheme(&self) -> IdentityScheme {
+        TEST_IDENTITY_SCHEME
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Utf8Codec;
+
+impl PrincipalCodec<String> for Utf8Codec {
+    fn encode(&self, principal: &String) -> Vec<u8> {
+        principal.as_bytes().to_vec()
+    }
+
+    fn decode(&self, bytes: &[u8]) -> Option<String> {
+        std::str::from_utf8(bytes).ok().map(str::to_owned)
+    }
+}
+
 type Engine = InMemoryEngine<String, TestIdentity>;
+
+struct ConflictOnceEngine {
+    inner: Engine,
+    conflict: AtomicBool,
+}
+
+impl ConflictOnceEngine {
+    fn new() -> Self {
+        Self {
+            inner: Engine::new(TestIdentity),
+            conflict: AtomicBool::new(true),
+        }
+    }
+}
+
+impl PrincipalProjectionEngine<String> for ConflictOnceEngine {
+    fn identify_object(&self, record: &ObjectRecord) -> ObjectId {
+        self.inner.identify(record)
+    }
+
+    fn stage_object(
+        &self,
+        record: ObjectRecord,
+    ) -> Result<(ObjectId, InsertOutcome), PrincipalProjectionError> {
+        self.inner.put_object(record).map_err(Into::into)
+    }
+
+    fn current_root(
+        &self,
+        principal: &String,
+    ) -> Result<Option<RootState>, PrincipalProjectionError> {
+        Ok(self.inner.root(principal))
+    }
+
+    fn load_object(&self, id: ObjectId) -> Result<Option<ObjectRecord>, PrincipalProjectionError> {
+        Ok(self.inner.object(id))
+    }
+
+    fn commit_root(
+        &self,
+        transaction: RootTransaction<String>,
+    ) -> Result<CommitOutcome, PrincipalProjectionError> {
+        if self.conflict.swap(false, Ordering::SeqCst) {
+            return Err(ModelError::RootConflict {
+                expected: transaction.expected(),
+                actual: self.inner.root(transaction.principal()),
+            }
+            .into());
+        }
+        self.inner.commit(transaction).map_err(Into::into)
+    }
+
+    fn flush_projection(&self) -> Result<(), PrincipalProjectionError> {
+        Ok(())
+    }
+}
 
 fn bytes(length: usize) -> Vec<u8> {
     let mut state = 0x8f3f_73b5_cf1c_9ade_u64;
@@ -49,6 +138,59 @@ fn bytes(length: usize) -> Vec<u8> {
             (state >> 29).to_le_bytes()[0]
         })
         .collect()
+}
+
+struct CountingReader {
+    bytes: Vec<u8>,
+    offset: usize,
+    bytes_read: Arc<AtomicUsize>,
+}
+
+impl Read for CountingReader {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        let length = output
+            .len()
+            .min(self.bytes.len().saturating_sub(self.offset));
+        if length == 0 {
+            return Ok(0);
+        }
+        let end = self
+            .offset
+            .checked_add(length)
+            .ok_or(io::Error::other("test reader position overflow"))?;
+        output[..length].copy_from_slice(&self.bytes[self.offset..end]);
+        self.offset = end;
+        self.bytes_read.fetch_add(length, Ordering::SeqCst);
+        Ok(length)
+    }
+}
+
+struct FailAfter {
+    bytes: Vec<u8>,
+    offset: usize,
+    limit: usize,
+}
+
+impl Read for FailAfter {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if self.offset >= self.limit {
+            return Err(io::Error::other("injected streaming source failure"));
+        }
+        let length = output
+            .len()
+            .min(self.limit.saturating_sub(self.offset))
+            .min(self.bytes.len().saturating_sub(self.offset));
+        if length == 0 {
+            return Ok(0);
+        }
+        let end = self
+            .offset
+            .checked_add(length)
+            .ok_or(io::Error::other("test reader position overflow"))?;
+        output[..length].copy_from_slice(&self.bytes[self.offset..end]);
+        self.offset = end;
+        Ok(length)
+    }
 }
 
 #[test]
@@ -76,6 +218,116 @@ fn named_content_round_trips_lists_ranges_and_deletes() {
     assert!(store.delete(&owner, &name).unwrap());
     assert!(!store.delete(&owner, &name).unwrap());
     assert_eq!(store.read(&owner, &name).unwrap(), None);
+}
+
+#[test]
+fn streamed_content_matches_slice_identity_and_round_trips() {
+    let engine = Arc::new(Engine::new(TestIdentity));
+    let store = PrincipalContentStore::from_engine(engine);
+    let value = bytes(2 * 1024 * 1024);
+    let streamed = store
+        .put_streaming(
+            &"alice".to_owned(),
+            &ContentName::new("streamed").unwrap(),
+            value.as_slice(),
+        )
+        .unwrap();
+    let sliced = store
+        .put(
+            &"bob".to_owned(),
+            &ContentName::new("sliced").unwrap(),
+            &value,
+        )
+        .unwrap();
+
+    assert_eq!(streamed.descriptor(), sliced.descriptor());
+    assert_eq!(
+        store
+            .read(&"alice".to_owned(), &ContentName::new("streamed").unwrap())
+            .unwrap(),
+        Some(value)
+    );
+    assert!(sliced.objects_inserted() < streamed.objects_inserted());
+}
+
+#[test]
+fn streamed_content_survives_durable_engine_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = "alice".to_owned();
+    let name = ContentName::new("durable").unwrap();
+    let value = bytes(2 * 1024 * 1024);
+    let engine = Arc::new(
+        DurableEngine::open(
+            directory.path(),
+            TestIdentity,
+            Utf8Codec,
+            RecoveryLimits::new(1024 * 1024).unwrap(),
+        )
+        .unwrap(),
+    );
+    let store = PrincipalContentStore::from_engine(Arc::clone(&engine));
+    let outcome = store
+        .put_streaming(&owner, &name, value.as_slice())
+        .unwrap();
+    assert_eq!(store.read(&owner, &name).unwrap(), Some(value.clone()));
+    drop(store);
+    drop(engine);
+
+    let reopened = Arc::new(
+        DurableEngine::open(
+            directory.path(),
+            TestIdentity,
+            Utf8Codec,
+            RecoveryLimits::new(1024 * 1024).unwrap(),
+        )
+        .unwrap(),
+    );
+    let store = PrincipalContentStore::from_engine(reopened);
+    assert_eq!(
+        store.describe(&owner, &name).unwrap(),
+        Some(outcome.descriptor())
+    );
+    assert_eq!(store.read(&owner, &name).unwrap(), Some(value));
+}
+
+#[test]
+fn streaming_source_failure_stages_only_unreachable_objects() {
+    let engine = Arc::new(Engine::new(TestIdentity));
+    let store = PrincipalContentStore::from_engine(Arc::clone(&engine));
+    let owner = "alice".to_owned();
+    let source = FailAfter {
+        bytes: bytes(8 * 1024 * 1024),
+        offset: 0,
+        limit: 6 * 1024 * 1024,
+    };
+
+    assert!(matches!(
+        store.put_streaming(&owner, &ContentName::new("broken").unwrap(), source),
+        Err(PrincipalContentError::ContentSource(_))
+    ));
+    assert_eq!(engine.root(&owner), None);
+    assert!(engine.object_count() > 0);
+    assert!(store.list(&owner).unwrap().is_empty());
+}
+
+#[test]
+fn root_conflict_retries_publication_without_rereading_the_source() {
+    let engine = Arc::new(ConflictOnceEngine::new());
+    let store = PrincipalContentStore::from_engine(engine);
+    let value = bytes(2 * 1024 * 1024);
+    let bytes_read = Arc::new(AtomicUsize::new(0));
+    let source = CountingReader {
+        bytes: value.clone(),
+        offset: 0,
+        bytes_read: Arc::clone(&bytes_read),
+    };
+    let owner = "alice".to_owned();
+    let name = ContentName::new("retry").unwrap();
+
+    store.put_streaming(&owner, &name, source).unwrap();
+
+    assert_eq!(bytes_read.load(Ordering::SeqCst), value.len());
+    assert_eq!(store.read(&owner, &name).unwrap(), Some(value));
 }
 
 #[test]

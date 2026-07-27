@@ -6,7 +6,9 @@
 
 use std::fmt;
 
-use astrid_storage_model::{ModelError, ObjectId, ObjectIdentity, ObjectRecord, RootState};
+use astrid_storage_model::{
+    InsertOutcome, ModelError, ObjectId, ObjectIdentity, ObjectRecord, RootState,
+};
 
 use crate::{CommitOutcome, InMemoryEngine, RootTransaction};
 #[cfg(not(target_family = "wasm"))]
@@ -43,6 +45,48 @@ impl From<ModelError> for PrincipalProjectionError {
 pub trait PrincipalProjectionEngine<P>: Send + Sync {
     /// Compute one canonical object identity.
     fn identify_object(&self, record: &ObjectRecord) -> ObjectId;
+
+    /// Stage one immutable object without publishing a principal root.
+    ///
+    /// The engine recomputes identity and rejects collisions. A successful new
+    /// admission need not be durable until a later [`Self::commit_root`]
+    /// flushes the object arena before publishing its root. Staged objects are
+    /// unreachable and may be reclaimed when no committed root refers to them.
+    ///
+    /// The default keeps this method additive for projection engines that do
+    /// not support incremental staging.
+    ///
+    /// # Errors
+    ///
+    /// Returns a projection error when incremental staging is unsupported or
+    /// object admission fails.
+    fn stage_object(
+        &self,
+        _record: ObjectRecord,
+    ) -> Result<(ObjectId, InsertOutcome), PrincipalProjectionError> {
+        Err(PrincipalProjectionError::Engine(
+            "incremental object staging is unsupported".to_owned(),
+        ))
+    }
+
+    /// Stage immutable objects as one implementation-defined append batch.
+    ///
+    /// Results must correspond to input order. The default preserves support
+    /// for existing engines by calling [`Self::stage_object`] for each record;
+    /// durable engines may coalesce the physical write.
+    ///
+    /// # Errors
+    ///
+    /// Returns a projection error when any object cannot be admitted.
+    fn stage_objects(
+        &self,
+        records: Vec<ObjectRecord>,
+    ) -> Result<Vec<(ObjectId, InsertOutcome)>, PrincipalProjectionError> {
+        records
+            .into_iter()
+            .map(|record| self.stage_object(record))
+            .collect()
+    }
 
     /// Return a principal's current root.
     ///
@@ -88,6 +132,23 @@ where
         self.identify(record)
     }
 
+    fn stage_object(
+        &self,
+        record: ObjectRecord,
+    ) -> Result<(ObjectId, InsertOutcome), PrincipalProjectionError> {
+        self.put_object(record).map_err(Into::into)
+    }
+
+    fn stage_objects(
+        &self,
+        records: Vec<ObjectRecord>,
+    ) -> Result<Vec<(ObjectId, InsertOutcome)>, PrincipalProjectionError> {
+        records
+            .into_iter()
+            .map(|record| self.put_object(record).map_err(Into::into))
+            .collect()
+    }
+
     fn current_root(&self, principal: &P) -> Result<Option<RootState>, PrincipalProjectionError> {
         Ok(self.root(principal))
     }
@@ -117,6 +178,20 @@ where
 {
     fn identify_object(&self, record: &ObjectRecord) -> ObjectId {
         self.identify(record)
+    }
+
+    fn stage_object(
+        &self,
+        record: ObjectRecord,
+    ) -> Result<(ObjectId, InsertOutcome), PrincipalProjectionError> {
+        DurableEngine::stage_object(self, &record).map_err(map_durable)
+    }
+
+    fn stage_objects(
+        &self,
+        records: Vec<ObjectRecord>,
+    ) -> Result<Vec<(ObjectId, InsertOutcome)>, PrincipalProjectionError> {
+        DurableEngine::stage_objects(self, records).map_err(map_durable)
     }
 
     fn current_root(&self, principal: &P) -> Result<Option<RootState>, PrincipalProjectionError> {
