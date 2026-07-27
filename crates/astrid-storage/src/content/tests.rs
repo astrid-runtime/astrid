@@ -129,6 +129,64 @@ impl PrincipalProjectionEngine<String> for ConflictOnceEngine {
     }
 }
 
+struct CountingEngine {
+    inner: Engine,
+    object_loads: AtomicUsize,
+}
+
+impl CountingEngine {
+    fn new() -> Self {
+        Self {
+            inner: Engine::new(TestIdentity),
+            object_loads: AtomicUsize::new(0),
+        }
+    }
+
+    fn reset_object_loads(&self) {
+        self.object_loads.store(0, Ordering::SeqCst);
+    }
+
+    fn object_loads(&self) -> usize {
+        self.object_loads.load(Ordering::SeqCst)
+    }
+}
+
+impl PrincipalProjectionEngine<String> for CountingEngine {
+    fn identify_object(&self, record: &ObjectRecord) -> ObjectId {
+        self.inner.identify(record)
+    }
+
+    fn stage_object(
+        &self,
+        record: ObjectRecord,
+    ) -> Result<(ObjectId, InsertOutcome), PrincipalProjectionError> {
+        self.inner.put_object(record).map_err(Into::into)
+    }
+
+    fn current_root(
+        &self,
+        principal: &String,
+    ) -> Result<Option<RootState>, PrincipalProjectionError> {
+        Ok(self.inner.root(principal))
+    }
+
+    fn load_object(&self, id: ObjectId) -> Result<Option<ObjectRecord>, PrincipalProjectionError> {
+        self.object_loads.fetch_add(1, Ordering::SeqCst);
+        Ok(self.inner.object(id))
+    }
+
+    fn commit_root(
+        &self,
+        transaction: RootTransaction<String>,
+    ) -> Result<CommitOutcome, PrincipalProjectionError> {
+        self.inner.commit(transaction).map_err(Into::into)
+    }
+
+    fn flush_projection(&self) -> Result<(), PrincipalProjectionError> {
+        Ok(())
+    }
+}
+
 fn bytes(length: usize) -> Vec<u8> {
     let mut state = 0x8f3f_73b5_cf1c_9ade_u64;
     (0..length)
@@ -265,6 +323,52 @@ fn open_read_handle_remains_on_its_authorized_generation() {
     assert!(store.delete(&owner, &name).unwrap());
     assert_eq!(handle.read_range(17, 4096).unwrap(), original[17..4113]);
     assert!(store.open_read(&owner, &name).unwrap().is_none());
+}
+
+#[test]
+fn verified_handle_reuse_survives_an_unrelated_root_commit() {
+    let engine = Arc::new(CountingEngine::new());
+    let writer = PrincipalContentStore::from_engine(Arc::clone(&engine));
+    let reader = PrincipalContentStore::from_engine(Arc::clone(&engine));
+    let owner = "alice".to_owned();
+    let name = ContentName::new("models/stable.bin").unwrap();
+    let value = bytes(2 * 1024 * 1024);
+    writer.put(&owner, &name, &value).unwrap();
+    let handle = reader.open_read(&owner, &name).unwrap().unwrap();
+
+    writer
+        .put(
+            &owner,
+            &ContentName::new("state/unrelated.bin").unwrap(),
+            b"unrelated root movement",
+        )
+        .unwrap();
+    assert_ne!(
+        Some(handle.principal_root()),
+        engine.current_root(&owner).unwrap()
+    );
+    assert_eq!(handle.read().unwrap(), value);
+
+    engine.reset_object_loads();
+    assert_eq!(
+        handle.read_range(999_000, 12_345).unwrap(),
+        value[999_000..1_011_345]
+    );
+    let verified_loads = engine.object_loads();
+
+    let uncached = PrincipalContentStore::from_engine(Arc::clone(&engine));
+    let uncached_handle = uncached.open_read(&owner, &name).unwrap().unwrap();
+    engine.reset_object_loads();
+    assert_eq!(
+        uncached_handle.read_range(999_000, 12_345).unwrap(),
+        value[999_000..1_011_345]
+    );
+    let validating_loads = engine.object_loads();
+
+    assert!(
+        verified_loads < validating_loads,
+        "verified handle loaded {verified_loads} objects; validating handle loaded {validating_loads}"
+    );
 }
 
 #[test]
