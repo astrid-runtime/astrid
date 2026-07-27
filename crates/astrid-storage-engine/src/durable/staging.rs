@@ -43,7 +43,7 @@ where
         if let Some(location) = inner.index.get(&id).copied() {
             let existing = {
                 let files = live_files_mut(&mut inner.files)?;
-                read_indexed_object(&mut files.arena, id, location, &self.identity, self.limits)?
+                read_indexed_object(&files.arena, id, location, &self.identity, self.limits)?
             };
             if &existing != record {
                 return Err(ModelError::ObjectCollision(id).into());
@@ -110,13 +110,7 @@ where
             if let Some(location) = inner.index.get(id).copied() {
                 let existing = {
                     let files = live_files_mut(&mut inner.files)?;
-                    read_indexed_object(
-                        &mut files.arena,
-                        *id,
-                        location,
-                        &self.identity,
-                        self.limits,
-                    )?
+                    read_indexed_object(&files.arena, *id, location, &self.identity, self.limits)?
                 };
                 if &existing != record {
                     return Err(ModelError::ObjectCollision(*id).into());

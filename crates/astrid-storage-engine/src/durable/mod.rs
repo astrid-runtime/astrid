@@ -545,13 +545,8 @@ where
         if let Some(location) = inner.index.get(&id).copied() {
             let (existing, needs_flush) = {
                 let files = live_files_mut(&mut inner.files)?;
-                let existing = read_indexed_object(
-                    &mut files.arena,
-                    id,
-                    location,
-                    &self.identity,
-                    self.limits,
-                )?;
+                let existing =
+                    read_indexed_object(&files.arena, id, location, &self.identity, self.limits)?;
                 (existing, location.offset >= files.arena_len)
             };
             if &existing != record {
@@ -812,13 +807,8 @@ where
             }
             if let Some(location) = inner.index.get(&id).copied() {
                 let files = live_files_mut(&mut inner.files)?;
-                let existing = read_indexed_object(
-                    &mut files.arena,
-                    id,
-                    location,
-                    &self.identity,
-                    self.limits,
-                )?;
+                let existing =
+                    read_indexed_object(&files.arena, id, location, &self.identity, self.limits)?;
                 if existing != record {
                     return Err(ModelError::ObjectCollision(id).into());
                 }
