@@ -38,6 +38,7 @@ type VerifiedFileMap<P> = BTreeMap<P, BTreeMap<ObjectId, VerifiedContent>>;
 // Partition proof reuse by principal so cache timing cannot reveal that
 // another principal previously published or read equal content.
 type SharedVerifiedFiles<P> = Arc<RwLock<VerifiedFileMap<P>>>;
+type DecodedHeaderMap<P> = BTreeMap<P, Arc<ContentHeader<P>>>;
 
 /// Named content projection over one shared principal-state engine.
 pub struct PrincipalContentStore<P: Ord, E> {
@@ -46,6 +47,7 @@ pub struct PrincipalContentStore<P: Ord, E> {
     validated_catalogs: Arc<Mutex<BTreeMap<P, CatalogValidation>>>,
     validated_kv: Arc<KvValidationCache<P>>,
     verified_files: OnceLock<SharedVerifiedFiles<P>>,
+    decoded_headers: OnceLock<RwLock<DecodedHeaderMap<P>>>,
 }
 
 /// Principal-scoped immutable content handle for repeated verified reads.
@@ -145,6 +147,11 @@ impl<P: Ord, E> PrincipalContentStore<P, E> {
             .get_or_init(|| Arc::new(RwLock::new(BTreeMap::new())))
     }
 
+    fn decoded_headers(&self) -> &RwLock<DecodedHeaderMap<P>> {
+        self.decoded_headers
+            .get_or_init(|| RwLock::new(BTreeMap::new()))
+    }
+
     /// Construct without a principal-specific quota.
     #[must_use]
     pub fn from_engine(engine: Arc<E>) -> Self {
@@ -154,6 +161,7 @@ impl<P: Ord, E> PrincipalContentStore<P, E> {
             validated_catalogs: Arc::new(Mutex::new(BTreeMap::new())),
             validated_kv: Arc::new(KvValidationCache::default()),
             verified_files: OnceLock::new(),
+            decoded_headers: OnceLock::new(),
         }
     }
 
@@ -166,6 +174,7 @@ impl<P: Ord, E> PrincipalContentStore<P, E> {
             validated_catalogs: Arc::new(Mutex::new(BTreeMap::new())),
             validated_kv: Arc::new(KvValidationCache::default()),
             verified_files: OnceLock::new(),
+            decoded_headers: OnceLock::new(),
         }
     }
 
@@ -181,6 +190,7 @@ impl<P: Ord, E> PrincipalContentStore<P, E> {
             validated_catalogs,
             validated_kv,
             verified_files: OnceLock::new(),
+            decoded_headers: OnceLock::new(),
         }
     }
 
@@ -194,6 +204,7 @@ impl<P: Ord, E> PrincipalContentStore<P, E> {
             validated_catalogs,
             validated_kv: Arc::new(KvValidationCache::default()),
             verified_files: OnceLock::new(),
+            decoded_headers: OnceLock::new(),
         }
     }
 
@@ -409,7 +420,7 @@ where
     ) -> Result<ContentWriteOutcome, PrincipalContentError> {
         let descriptor = verified.descriptor();
         loop {
-            let mut header = self.header(principal.clone())?;
+            let mut header = self.header(principal.clone())?.as_ref().clone();
             if self
                 .catalog_lookup(header.catalog, name)?
                 .is_some_and(|entry| entry.file == descriptor.file())
@@ -439,6 +450,7 @@ where
             let transaction = self.encode_transaction(header, built, mutation.records)?;
             match self.engine.commit_root(transaction) {
                 Ok(outcome) => {
+                    self.invalidate_header(principal);
                     self.validated_catalogs.lock().insert(
                         principal.clone(),
                         CatalogValidation {
@@ -473,7 +485,7 @@ where
     /// changing the catalog.
     pub fn delete(&self, principal: &P, name: &ContentName) -> Result<bool, PrincipalContentError> {
         loop {
-            let mut header = self.header(principal.clone())?;
+            let mut header = self.header(principal.clone())?.as_ref().clone();
             let mutation = delete(
                 header.catalog,
                 name,
@@ -488,6 +500,7 @@ where
             let transaction = self.encode_transaction(header, None, mutation.records)?;
             match self.engine.commit_root(transaction) {
                 Ok(_) => {
+                    self.invalidate_header(principal);
                     self.validated_catalogs.lock().insert(
                         principal.clone(),
                         CatalogValidation {
@@ -631,8 +644,30 @@ where
             .insert(verified.descriptor().file(), verified);
     }
 
-    fn header(&self, principal: P) -> Result<ContentHeader<P>, PrincipalContentError> {
-        let Some(root) = self.engine.current_root(&principal)? else {
+    fn header(&self, principal: P) -> Result<Arc<ContentHeader<P>>, PrincipalContentError> {
+        let root = self.engine.current_root(&principal)?;
+        if let Some(header) = self
+            .decoded_headers()
+            .read()
+            .get(&principal)
+            .filter(|header| header.root == root)
+            .cloned()
+        {
+            return Ok(header);
+        }
+        let header = Arc::new(self.decode_header(principal.clone(), root)?);
+        self.decoded_headers()
+            .write()
+            .insert(principal, Arc::clone(&header));
+        Ok(header)
+    }
+
+    fn decode_header(
+        &self,
+        principal: P,
+        root: Option<RootState>,
+    ) -> Result<ContentHeader<P>, PrincipalContentError> {
+        let Some(root) = root else {
             return Ok(ContentHeader::empty(principal));
         };
         let commit = self.load_typed(root.commit, ObjectKind::Commit, PRINCIPAL_GRAPH_VERSION)?;
@@ -712,6 +747,12 @@ where
             preserved_state,
             preserved_commit,
         })
+    }
+
+    fn invalidate_header(&self, principal: &P) {
+        if let Some(headers) = self.decoded_headers.get() {
+            headers.write().remove(principal);
+        }
     }
 
     fn kv_quota(&self, principal: &P, object: ObjectId) -> Result<u64, PrincipalContentError> {
@@ -889,6 +930,7 @@ where
     }
 }
 
+#[derive(Clone)]
 struct ContentHeader<P> {
     principal: P,
     root: Option<RootState>,
