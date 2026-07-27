@@ -294,8 +294,7 @@ impl<P: Ord> World<P> {
         let mut usage = PrincipalUsage::default();
         for id in closure {
             let record = self.objects.get(&id).ok_or(ModelError::MissingObject(id))?;
-            let retained = u64::try_from(record.canonical_bytes.len())
-                .map_err(|_| ModelError::ArithmeticOverflow)?;
+            let retained = record.retained_bytes()?;
             usage.object_count = usage
                 .object_count
                 .checked_add(1)
@@ -335,8 +334,7 @@ impl<P: Ord> World<P> {
             .collect();
         for id in &garbage {
             let record = self.objects.get(id).ok_or(ModelError::MissingObject(*id))?;
-            let bytes = u64::try_from(record.canonical_bytes.len())
-                .map_err(|_| ModelError::ArithmeticOverflow)?;
+            let bytes = record.retained_bytes()?;
             report.objects_removed = report
                 .objects_removed
                 .checked_add(1)

@@ -398,8 +398,9 @@ impl ObjectFormatVersion {
 /// Canonical object bytes and their typed child references.
 ///
 /// `logical_bytes` is the number of user-visible bytes contributed by this
-/// object. Structural objects normally contribute zero. `canonical_bytes`
-/// remains part of retained and physical accounting regardless of class.
+/// object. Structural objects normally contribute zero. The complete canonical
+/// record—including payload and references—remains part of retained accounting
+/// regardless of class.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObjectRecord {
     kind: ObjectKind,
@@ -411,6 +412,19 @@ pub struct ObjectRecord {
 }
 
 impl ObjectRecord {
+    // Stable widths in the logical canonical record encoding. Durable engines
+    // may add framing, checksums, algorithm tags, and indexes; those belong to
+    // physical-store accounting rather than a principal's retained quota.
+    const FIXED_RETAINED_BYTES: u64 = 2 // object kind
+        + 2 // format version
+        + 1 // accounting class
+        + 8 // logical byte contribution
+        + 8 // canonical payload length
+        + 8; // reference count
+    const FIXED_REFERENCE_BYTES: u64 = 8 // label length
+        + 32 // target ObjectId
+        + 1; // reference kind
+
     /// Construct a canonical object record.
     ///
     /// References must be strictly increasing by relation label. Requiring one
@@ -476,6 +490,35 @@ impl ObjectRecord {
             .iter()
             .filter(|reference| reference.kind == ReferenceKind::Owns)
             .map(|reference| reference.target)
+    }
+
+    /// Return the stable bytes charged for retaining this canonical record.
+    ///
+    /// The total covers every identity-bearing field in the logical record:
+    /// fixed fields, canonical payload bytes, and each reference's label,
+    /// target identifier, and reachability kind. It deliberately excludes
+    /// engine framing, checksums, indexes, and allocation overhead, which are
+    /// physical-store costs rather than stable per-principal accounting.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelError::ArithmeticOverflow`] when a length or the total
+    /// cannot be represented as `u64`.
+    pub fn retained_bytes(&self) -> Result<u64, ModelError> {
+        let canonical_bytes = u64::try_from(self.canonical_bytes.len())
+            .map_err(|_| ModelError::ArithmeticOverflow)?;
+        let mut retained = Self::FIXED_RETAINED_BYTES
+            .checked_add(canonical_bytes)
+            .ok_or(ModelError::ArithmeticOverflow)?;
+        for reference in &self.references {
+            let label_bytes = u64::try_from(reference.label.as_bytes().len())
+                .map_err(|_| ModelError::ArithmeticOverflow)?;
+            retained = retained
+                .checked_add(Self::FIXED_REFERENCE_BYTES)
+                .and_then(|total| total.checked_add(label_bytes))
+                .ok_or(ModelError::ArithmeticOverflow)?;
+        }
+        Ok(retained)
     }
 
     /// Find a reference by its canonical relation label.
@@ -643,9 +686,9 @@ pub struct PrincipalUsage {
     pub object_count: u64,
     /// Sum of user-visible byte contributions.
     pub logical_bytes: u64,
-    /// Sum of canonical bytes for all distinct reachable objects.
+    /// Sum of complete canonical-record bytes for all reachable objects.
     pub retained_object_bytes: u64,
-    /// Retained bytes belonging to metadata-class objects.
+    /// Complete canonical-record bytes belonging to metadata-class objects.
     pub metadata_bytes: u64,
 }
 
@@ -654,7 +697,7 @@ pub struct PrincipalUsage {
 pub struct GcReport {
     /// Number of objects removed.
     pub objects_removed: u64,
-    /// Canonical object bytes removed.
+    /// Complete canonical-record bytes removed.
     pub bytes_removed: u64,
 }
 

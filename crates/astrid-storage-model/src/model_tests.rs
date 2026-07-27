@@ -259,8 +259,47 @@ fn non_owning_reference_does_not_expand_principal_closure() {
         PrincipalUsage {
             object_count: 1,
             logical_bytes: 0,
-            retained_object_bytes: 1,
-            metadata_bytes: 1,
+            retained_object_bytes: 72,
+            metadata_bytes: 72,
+        }
+    );
+}
+
+#[test]
+fn accounting_charges_complete_records_including_reference_labels() {
+    let mut world = World::<&str>::new();
+    let long_label = vec![7; 4 * 1024];
+    let root_record = metadata_refs(
+        2,
+        vec![ObjectReference::new(
+            ReferenceLabel::new(long_label),
+            id(1),
+            ReferenceKind::Evidence,
+        )],
+    );
+    // 29 fixed record bytes + 1 payload byte + an 8-byte label length,
+    // 4096 label bytes, a 32-byte target, and a 1-byte reference kind.
+    let retained_bytes = 4_167;
+    assert_eq!(root_record.retained_bytes(), Ok(retained_bytes));
+    world.insert_object(id(2), root_record).unwrap();
+
+    let root = world.compare_and_swap_root("alice", None, id(2)).unwrap();
+    assert_eq!(
+        world.principal_usage(&"alice").unwrap(),
+        PrincipalUsage {
+            object_count: 1,
+            logical_bytes: 0,
+            retained_object_bytes: retained_bytes,
+            metadata_bytes: retained_bytes,
+        }
+    );
+
+    world.compare_and_remove_root(&"alice", root).unwrap();
+    assert_eq!(
+        world.collect_garbage().unwrap(),
+        GcReport {
+            objects_removed: 1,
+            bytes_removed: retained_bytes,
         }
     );
 }
@@ -291,7 +330,7 @@ fn evidence_requires_its_own_pin_for_retention() {
         world.collect_garbage().unwrap(),
         GcReport {
             objects_removed: 1,
-            bytes_removed: 1,
+            bytes_removed: 30,
         }
     );
     assert_eq!(world.closure(id(2)).unwrap(), BTreeSet::from([id(2)]));
@@ -658,7 +697,7 @@ fn garbage_collection_respects_roots_and_pins() {
         world.collect_garbage().unwrap(),
         GcReport {
             objects_removed: 1,
-            bytes_removed: 1,
+            bytes_removed: 30,
         }
     );
 }
@@ -677,8 +716,8 @@ fn another_principal_does_not_change_enforced_usage() {
         PrincipalUsage {
             object_count: 3,
             logical_bytes: 2,
-            retained_object_bytes: 3,
-            metadata_bytes: 1,
+            retained_object_bytes: 174,
+            metadata_bytes: 114,
         }
     );
 }
@@ -703,7 +742,7 @@ fn deleting_one_principal_preserves_shared_objects() {
         world.collect_garbage().unwrap(),
         GcReport {
             objects_removed: 2,
-            bytes_removed: 2,
+            bytes_removed: 144,
         }
     );
     assert_eq!(world.principal_usage(&"bob").unwrap().logical_bytes, 1);

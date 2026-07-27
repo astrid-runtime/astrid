@@ -858,6 +858,14 @@ physical_bytes(store) =
     encoded replicas + indexes + WAL + free-space/compaction amplification
 ```
 
+`size(o)` is the stable logical canonical-record size, not merely the payload
+length and not Rust heap capacity. The executable model charges the fixed
+kind/version/class/length fields, canonical payload bytes, and every
+reference's label length, label bytes, target `ObjectId`, and reachability
+kind. Durable framing, checksums, algorithm tags, indexes, and allocator
+amplification belong to `physical_bytes(store)`. Keeping this calculation on
+`ObjectRecord` gives quota and garbage-collection reports one definition.
+
 Enforce a stable per-principal quota on retained logical ownership plus metadata,
 not on a moving “fair share” of physical bytes. Alice's permitted state must not
 shrink because Bob deleted his reference or grow because Bob imported the same
