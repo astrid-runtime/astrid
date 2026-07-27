@@ -1,6 +1,6 @@
 //! Incremental immutable-object staging for durable root transactions.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use astrid_storage_model::{InsertOutcome, ModelError, ObjectId, ObjectRecord};
 
@@ -82,50 +82,73 @@ where
         &self,
         records: Vec<ObjectRecord>,
     ) -> Result<Vec<(ObjectId, InsertOutcome)>, DurableError> {
-        let mut inner = self.inner.lock();
-        ensure_usable(&inner)?;
-        let mut incoming = BTreeMap::<ObjectId, ObjectRecord>::new();
-        let mut outcomes = Vec::new();
-        outcomes
+        let mut incoming = BTreeMap::<ObjectId, (ObjectRecord, Vec<u8>)>::new();
+        let mut input_order = Vec::new();
+        input_order
             .try_reserve_exact(records.len())
             .map_err(|_| DurableError::EncodingOverflow)?;
         for record in records {
             let id = self.identify(&record);
-            if let Some(existing) = incoming.get(&id) {
+            input_order.push(id);
+            if let Some((existing, _)) = incoming.get(&id) {
                 if existing != &record {
                     return Err(ModelError::ObjectCollision(id).into());
                 }
-                outcomes.push((id, InsertOutcome::AlreadyPresent));
                 continue;
             }
-            if let Some(location) = inner.index.get(&id).copied() {
+            let payload = encode_object_frame(self.identity.scheme(), id, &record)?;
+            ensure_payload_limit(ARENA_FILE, 0, payload.len(), self.limits)?;
+            incoming.insert(id, (record, payload));
+        }
+
+        let mut inner = self.inner.lock();
+        ensure_usable(&inner)?;
+        let mut already_present = BTreeSet::new();
+        for (id, (record, _)) in &incoming {
+            if let Some(location) = inner.index.get(id).copied() {
                 let existing = read_indexed_object(
                     &mut inner.arena,
-                    id,
+                    *id,
                     location,
                     self.identity.scheme(),
                     self.limits,
                 )?;
-                if existing != record {
-                    return Err(ModelError::ObjectCollision(id).into());
+                if &existing != record {
+                    return Err(ModelError::ObjectCollision(*id).into());
                 }
-                outcomes.push((id, InsertOutcome::AlreadyPresent));
-                continue;
+                already_present.insert(*id);
             }
-            incoming.insert(id, record);
-            outcomes.push((id, InsertOutcome::Inserted));
+        }
+
+        let mut outcomes = Vec::new();
+        outcomes
+            .try_reserve_exact(input_order.len())
+            .map_err(|_| DurableError::EncodingOverflow)?;
+        let mut accounted = already_present.clone();
+        for id in input_order {
+            let outcome = if accounted.insert(id) {
+                InsertOutcome::Inserted
+            } else {
+                InsertOutcome::AlreadyPresent
+            };
+            outcomes.push((id, outcome));
         }
 
         let mut ids = Vec::new();
         let mut payloads = Vec::new();
-        ids.try_reserve_exact(incoming.len())
+        let append_count = incoming
+            .keys()
+            .filter(|id| !already_present.contains(id))
+            .count();
+        ids.try_reserve_exact(append_count)
             .map_err(|_| DurableError::EncodingOverflow)?;
         payloads
-            .try_reserve_exact(incoming.len())
+            .try_reserve_exact(append_count)
             .map_err(|_| DurableError::EncodingOverflow)?;
-        for (id, record) in incoming {
-            let payload = encode_object_frame(self.identity.scheme(), id, &record)?;
-            ensure_payload_limit(ARENA_FILE, 0, payload.len(), self.limits)?;
+        for (id, (_, payload)) in incoming {
+            if already_present.contains(&id) {
+                continue;
+            }
             ids.push(id);
             payloads.push(payload);
         }
