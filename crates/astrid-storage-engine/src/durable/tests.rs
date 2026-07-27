@@ -1369,9 +1369,12 @@ fn governed_object_cache_verifies_once_and_charges_each_principal() {
     let alice = "alice".to_owned();
     let bob = "bob".to_owned();
 
-    assert_eq!(engine.object_for(&alice, id).unwrap(), Some(record.clone()));
-    assert_eq!(engine.object_for(&alice, id).unwrap(), Some(record.clone()));
-    assert_eq!(engine.object_for(&bob, id).unwrap(), Some(record));
+    let alice_first = engine.shared_object_for(&alice, id).unwrap().unwrap();
+    let alice_second = engine.shared_object_for(&alice, id).unwrap().unwrap();
+    let bob_record = engine.shared_object_for(&bob, id).unwrap().unwrap();
+    assert_eq!(alice_first.as_ref(), &record);
+    assert!(Arc::ptr_eq(&alice_first, &alice_second));
+    assert!(Arc::ptr_eq(&alice_first, &bob_record));
 
     let stats = engine.object_cache_stats();
     assert_eq!(stats.misses, 1);
@@ -1389,6 +1392,7 @@ fn governed_object_cache_verifies_once_and_charges_each_principal() {
     );
     assert_eq!(stats.resident_associations, 2);
     assert!(stats.resident_association_bytes > 0);
+    assert_eq!(engine.object_for(&alice, id).unwrap(), Some(record));
 }
 
 #[test]

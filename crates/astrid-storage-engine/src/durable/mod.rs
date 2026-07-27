@@ -590,14 +590,34 @@ where
         principal: &P,
         id: ObjectId,
     ) -> Result<Option<ObjectRecord>, DurableError> {
+        self.shared_object_for(principal, id)
+            .map(|record| record.map(|record| record.as_ref().clone()))
+    }
+
+    /// Return one immutable object through the principal-accounted decoded
+    /// cache without cloning its allocation.
+    ///
+    /// Cache policy never changes read correctness. A bypass or miss performs
+    /// the ordinary positional frame read and full validation before the
+    /// resulting record can be retained.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableError::RequiresRecovery`] after a failed write, or a
+    /// frame/identity error when the arena cannot supply the requested object.
+    pub fn shared_object_for(
+        &self,
+        principal: &P,
+        id: ObjectId,
+    ) -> Result<Option<Arc<ObjectRecord>>, DurableError> {
         if let Some(record) = self.object_cache.get(principal, id) {
-            return Ok(Some(record.as_ref().clone()));
+            return Ok(Some(record));
         }
         let Some(record) = self.object(id)? else {
             return Ok(None);
         };
         let record = self.object_cache.insert(principal, id, record);
-        Ok(Some(record.as_ref().clone()))
+        Ok(Some(record))
     }
 
     /// Return immutable objects in request order through the
@@ -616,11 +636,35 @@ where
         principal: &P,
         ids: &[ObjectId],
     ) -> Result<Vec<Option<ObjectRecord>>, DurableError> {
+        self.shared_objects_for(principal, ids).map(|records| {
+            records
+                .into_iter()
+                .map(|record| record.map(|record| record.as_ref().clone()))
+                .collect()
+        })
+    }
+
+    /// Return immutable objects in request order through shared cache
+    /// allocations.
+    ///
+    /// Cache misses are resolved from one index snapshot. Physically adjacent
+    /// arena frames are read as one span and each frame retains its complete
+    /// checksum, identity, and canonical decode validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableError::RequiresRecovery`] after a failed write, or a
+    /// frame/identity error when the arena cannot supply a requested object.
+    pub fn shared_objects_for(
+        &self,
+        principal: &P,
+        ids: &[ObjectId],
+    ) -> Result<Vec<Option<Arc<ObjectRecord>>>, DurableError> {
         let mut results = vec![None; ids.len()];
         let mut missing = BTreeMap::<ObjectId, Vec<usize>>::new();
         for (index, id) in ids.iter().copied().enumerate() {
             if let Some(record) = self.object_cache.get(principal, id) {
-                results[index] = Some(record.as_ref().clone());
+                results[index] = Some(record);
             } else {
                 missing.entry(id).or_default().push(index);
             }
@@ -649,7 +693,7 @@ where
             let cached = self.object_cache.insert(principal, id, record);
             if let Some(indices) = missing.get(&id) {
                 for index in indices {
-                    results[*index] = Some(cached.as_ref().clone());
+                    results[*index] = Some(Arc::clone(&cached));
                 }
             }
         }

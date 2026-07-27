@@ -1004,11 +1004,25 @@ where
         self.engine.load_object_for(self.principal, id)
     }
 
+    fn load_shared_content_object(
+        &self,
+        id: ObjectId,
+    ) -> Result<Option<Arc<ObjectRecord>>, Self::Error> {
+        self.engine.load_shared_object_for(self.principal, id)
+    }
+
     fn load_content_objects(
         &self,
         ids: &[ObjectId],
     ) -> Result<Vec<Option<ObjectRecord>>, Self::Error> {
         self.engine.load_objects_for(self.principal, ids)
+    }
+
+    fn load_shared_content_objects(
+        &self,
+        ids: &[ObjectId],
+    ) -> Result<Vec<Option<Arc<ObjectRecord>>>, Self::Error> {
+        self.engine.load_shared_objects_for(self.principal, ids)
     }
 }
 
