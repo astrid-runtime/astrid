@@ -110,6 +110,10 @@ impl CommitOutcome {
     }
 
     /// Return the number of newly admitted immutable objects.
+    ///
+    /// This is a privileged engine diagnostic, not principal-visible
+    /// accounting. Guest APIs must not expose it or vary admission behavior
+    /// from it because doing so would reveal cross-principal deduplication.
     #[must_use]
     pub const fn objects_inserted(self) -> u64 {
         self.objects_inserted

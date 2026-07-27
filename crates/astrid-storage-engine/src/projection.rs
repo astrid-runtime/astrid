@@ -59,6 +59,8 @@ pub trait PrincipalProjectionEngine<P>: Send + Sync {
     /// admission need not be durable until a later [`Self::commit_root`]
     /// flushes the object arena before publishing its root. Staged objects are
     /// unreachable and may be reclaimed when no committed root refers to them.
+    /// Callers must keep the returned admission outcome below the guest API
+    /// boundary because it reveals whether deduplication found existing bytes.
     ///
     /// The default keeps this method additive for projection engines that do
     /// not support incremental staging.
@@ -80,7 +82,8 @@ pub trait PrincipalProjectionEngine<P>: Send + Sync {
     ///
     /// Results must correspond to input order. The default preserves support
     /// for existing engines by calling [`Self::stage_object`] for each record;
-    /// durable engines may coalesce the physical write.
+    /// durable engines may coalesce the physical write. Admission outcomes are
+    /// privileged diagnostics and must not become guest-visible.
     ///
     /// # Errors
     ///

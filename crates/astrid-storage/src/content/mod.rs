@@ -133,6 +133,10 @@ impl ContentWriteOutcome {
     }
 
     /// Return the number of newly admitted physical objects.
+    ///
+    /// This is a kernel-side diagnostic for tests and operations. It must not
+    /// cross a capsule, mount, or other principal-visible API boundary because
+    /// it reveals whether content already existed in the shared store.
     #[must_use]
     pub const fn objects_inserted(self) -> u64 {
         self.objects_inserted
