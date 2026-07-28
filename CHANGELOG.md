@@ -71,22 +71,40 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   differential oracle; the runtime hot path uses a bounded persistent tree.
 - **Principal storage has a host-file durability foundation.**
   `DurableEngine` persists immutable object frames before publishing a
-  checksummed principal-root journal record, rebuilds its disposable index on
-  open, truncates incomplete or physically invalid uncommitted tails only when
-  no valid frame follows, and rejects interior or semantic corruption. One
+  checksummed principal-root journal record and maintains a disposable,
+  checksummed persistent object-location index. A missing, stale, torn, or
+  corrupt index falls back to authoritative arena recovery; principal roots
+  always come from journal replay and live closure verification. Recovery
+  truncates incomplete or physically invalid uncommitted tails only when no
+  valid frame follows, and rejects interior or semantic corruption. One
   object-arena flush makes the transaction's complete object batch durable
-  before one root-journal flush publishes it. An exclusive store lock and
-  poison-on-write-failure behavior prevent
-  concurrent-process corruption and stale in-memory reads. Named crash-boundary
-  tests prove recovery to the old or new complete root. Recovery keeps only
+  before one root-journal flush publishes it; index deltas add no commit-path
+  flush. Deltas consume an incrementally tracked append frontier, so an earlier
+  staged frame cannot disappear behind a later durability boundary and commits
+  do not rescan the complete object map. An exclusive store lock and
+  poison-on-write-failure behavior prevent concurrent-process corruption and
+  stale in-memory reads. Named crash-boundary tests prove recovery to the old
+  or new complete root. Recovery keeps only
   roots and arena offsets resident, while live reads load and checksum payloads
   lazily. Every persistent identity occurrence now carries an algorithm,
   construction version, and variable digest length with capacity for 384-bit
-  successors. Each store persists a frozen, byte-exact plain-text format
-  specification as an immutable object referenced by `store.meta`; an
-  independent Python reader verifies Rust-produced arenas, identities, root
-  chains, and live closures in CI. Compaction, persistent pins, audit/outbox
-  atomicity, and final representation profiles remain future work.
+  successors. Each store persists RÚNATAL — Recoverable Universal Notation for
+  Astrid's Tagged Archival Layout — as a frozen, byte-exact plain-text
+  specification object referenced by `store.meta`; an independent Python
+  reader verifies Rust-produced arenas, identities, root chains, and live
+  closures in CI. Proof-audited arena compaction now rewrites
+  exactly the closures selected by an explicit retention contract, preserves
+  root generations in a canonical journal snapshot, and atomically replaces
+  both authority files through a durable intent. Recovery accepts only a
+  complete arena/journal pair, rebuilds the disposable index, and is exercised
+  at every named replacement boundary. Compaction is a sealed engine-only
+  Refinery pass; Tensor Logic may audit its native condemned set but cannot
+  acquire deletion authority. Every deletion now prepares a self-contained,
+  checksummed evidence bundle before publishing its intent; recovery installs
+  only the exact physical placement named by that receipt, marks it ready for
+  independent audit delivery before deleting the old generation, and retains
+  it until explicit acknowledgement. Persistent history-pin policy, kernel
+  audit draining, and final representation profiles remain future work.
 - **Native kernel state now cuts over to durable principal roots.** Kernel boot
   migrates the legacy SurrealKV database under the singleton lock, verifies a
   canonical digest independently per owner, preserves the legacy source, and

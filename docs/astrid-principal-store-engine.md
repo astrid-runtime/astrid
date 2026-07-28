@@ -163,9 +163,46 @@ Commit order is:
 3. append and flush one root-journal compare-and-swap record;
 4. update the in-memory root map, validated frontier, and disposable index.
 
-The root-journal flush is the durable linearization point. An interrupted
-engine is poisoned and refuses both reads and writes until reopen. On reopen,
-the engine:
+The root-journal flush is the durable linearization point. `objects.index` is a
+disposable recovery accelerator, never a third authority file. It contains a
+checksummed checkpoint followed by checksummed deltas that cache:
+
+- the exact object-arena prefix covered by the checkpoint; and
+- tagged object identities and their physical arena locations.
+
+Principal roots and validated closures are intentionally not cached. Reopen
+always replays the authoritative root journal and verifies every final live
+closure against identity-checked arena objects. A corrupt index therefore
+cannot select a principal root or bless an invalid closure.
+
+An index delta is appended only after the arena and root-journal durability
+order above has completed. It does not add another flush to a commit. Explicit
+engine flush and orderly shutdown flush the cache; a crash may therefore leave
+the index behind the authoritative files without making either ambiguous.
+
+On reopen, an index is usable only when its frame chain is canonical, its
+identity scheme matches the store, its covered lengths do not exceed the
+authoritative files, and its recorded physical locations still agree with the
+corresponding arena frame headers. A clean exact-prefix match restores the
+cached object-location index without scanning orphaned payloads. The root
+journal and every final live closure are still replayed and verified. An
+uncovered authoritative arena tail currently causes a complete arena rebuild;
+incremental tail replay is a compatible future optimization. Any malformed,
+corrupt, ahead-of-authority, or otherwise inconsistent index is discarded and
+rebuilt from the arena. No index failure may prevent recovery that succeeds
+without it.
+
+Checkpoint replacement uses a same-directory temporary file and file flush.
+Unix publishes it with atomic replacement plus a directory flush. Windows,
+whose standard rename does not replace an existing file, rotates the old cache
+through a backup name before publishing the new one. A crash in that window may
+lose the cache and trigger authoritative recovery, but cannot lose logical
+state. The cache format is not part of `export_closure` or the RÚNATAL promise
+and may change or disappear without migrating logical state.
+
+An interrupted engine is poisoned and refuses both reads and writes until
+reopen. When the persistent cache cannot be used, reopen performs the complete
+authoritative recovery path:
 
 - takes an exclusive process lock;
 - scans and identity-checks every complete object frame;
@@ -203,17 +240,34 @@ with Rust; CI runs it against a Rust-produced store and requires it to verify
 checksums, recompute object identities, replay roots, and validate live
 closures. This is the minimum two-readers rule for any format called durable.
 
-This realization deliberately has one active arena and an in-memory rebuilt
-offset index. Runtime KV and live per-principal logical quotas are integrated.
-It does not yet seal arenas, compact unreachable history, persist pins, expose
-root removal, coordinate an audit/outbox record, inject short writes or
-disk-full errors, encrypt erasure domains, or select final export `BlobId`
-profiles. Those claims remain attached to their evidence gates.
+This realization deliberately has one active arena. Runtime KV, the disposable
+persistent recovery index, live per-principal logical quotas, and proof-audited
+generation replacement are integrated. It does not yet seal arenas, persist a
+history-pin policy, expose root removal, drain GC receipts into the independent
+kernel audit log, inject short writes or disk-full errors, encrypt erasure
+domains, or select final export `BlobId` profiles. The engine-owned
+transactional outbox now preserves each self-contained receipt until the audit
+sink explicitly acknowledges it; composition still owns retry, backpressure,
+and audit anchoring. Those claims remain attached to their evidence gates.
 
-Until compaction and a persistent index land, live logical quota is not a disk
-quota and open cost remains proportional to the complete append history. Heavy
-content workloads must not be enabled against this realization merely because
-the logical content format exists.
+Live logical quota becomes a physical bound only after the durable compactor
+runs. The compactor copies the closures selected by current principal roots and
+explicit native retention roots into a replacement arena, writes a canonical
+current-root snapshot, and publishes both files under a durable recovery
+intent. The persistent index removes payload re-hashing from clean reopen;
+compaction makes arena and journal size proportional to the selected retained
+set. Heavy content workloads remain gated on operational scheduling,
+accounting, independent-audit delivery, and measured compaction cadence even
+though the logical format and engine mechanism exist.
+
+The engine does not infer a history policy. Callers provide the identified
+retention contract and exact extra roots for system objects, export/import
+leases, active immutable read handles, legal holds, and operator pins. Current
+principal roots are always included. Commit publication, liveness capture,
+proof recheck, and generation replacement share one mutation fence, so a
+dedup hit cannot be collected between closure validation and root publication.
+The pass is sealed inside the engine: an observer or Tensor Logic adapter can
+reject a plan but cannot implement the physical deletion capability.
 
 ## Why this matters particularly for agents
 

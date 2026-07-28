@@ -433,7 +433,25 @@ pub trait EngineCompactionPass: sealed::EngineCompactionSealed {
     fn operation_contract(&self) -> ObjectId;
 }
 
-mod sealed {
+pub(crate) struct NativeArenaCompactionPass {
+    operation_contract: ObjectId,
+}
+
+impl NativeArenaCompactionPass {
+    pub(crate) const fn new(operation_contract: ObjectId) -> Self {
+        Self { operation_contract }
+    }
+}
+
+impl sealed::EngineCompactionSealed for NativeArenaCompactionPass {}
+
+impl EngineCompactionPass for NativeArenaCompactionPass {
+    fn operation_contract(&self) -> ObjectId {
+        self.operation_contract
+    }
+}
+
+pub(crate) mod sealed {
     pub trait EngineCompactionSealed {}
 }
 

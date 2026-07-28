@@ -8,10 +8,11 @@ Text encoding: UTF-8 without a terminating NUL
 Document line endings: LF
 
 This document is the byte-level recovery contract for Astrid principal stores.
-It is deliberately plain text and is itself stored as an immutable Evidence
-object. The tagged identity of that object is named by store.meta. No Astrid
-executable, Rust compiler, source repository, generated schema, or disposable
-index is required to decode the authoritative files.
+It is RÚNATAL: Recoverable Universal Notation for Astrid's Tagged Archival
+Layout. It is deliberately plain text and is itself stored as an immutable
+Evidence object. The tagged identity of that object is named by store.meta. No
+Astrid executable, Rust compiler, source repository, generated schema, or
+disposable index is required to decode the authoritative files.
 
 This specification describes format 1 only. A decoder MUST reject non-zero
 reserved fields, unknown physical frame versions, malformed lengths, trailing
@@ -196,7 +197,7 @@ Stable object_kind codes:
 
 Only Owns references enter a principal's default reconstruction closure.
 Evidence, Lineage, and Derived targets survive only when independently rooted,
-pinned, or selected by an explicit archival policy. The Rosetta Evidence object
+pinned, or selected by an explicit archival policy. The RÚNATAL Evidence object
 is retained because store.meta names it, not because every principal owns it.
 
 
@@ -241,7 +242,10 @@ equal. The same ID naming unequal records is a collision and MUST fail.
 6. ROOT JOURNAL PAYLOAD AND REPLAY
 ==================================
 
-Each ASTROOT physical payload is exactly:
+An ASTROOT physical payload is either a transition record or a root-snapshot
+record.
+
+A transition record is exactly:
 
   u64            principal_length
   u8[]           principal[principal_length]
@@ -258,6 +262,25 @@ expected_tag 0 means no expected root and carries no RootState. expected_tag 1
 means one expected RootState follows. Other values are invalid. The payload
 MUST end after replacement.
 
+A root-snapshot record is exactly:
+
+  u64            snapshot_sentinel = 18446744073709551615
+  u8             snapshot_record = 1
+  u64            root_count
+
+  repeated root_count times:
+      u64        principal_length
+      u8[]       principal[principal_length]
+      RootState  current
+
+Snapshot principals MUST be in strictly increasing unsigned bytewise
+lexicographic order. Duplicates, unknown snapshot_record values, and trailing
+bytes are invalid. A snapshot MUST be the first physical journal frame. Later
+transition frames replay against the snapshot exactly as they replay against
+prior transitions. The sentinel cannot collide with a valid transition:
+principal bytes of that declared length cannot fit inside the containing
+physical frame.
+
 The state-owner-v1 principal codec is:
 
   00                           system owner
@@ -267,8 +290,9 @@ The system encoding is exactly one byte. A principal ID is 1 through 64 ASCII
 bytes, each in A-Z, a-z, 0-9, hyphen, or underscore. Re-encoding a decoded
 principal MUST reproduce the original bytes.
 
-Replay records in file order, maintaining a map principal -> RootState.
-For each record:
+Replay records in file order, maintaining a map principal -> RootState. A
+first-frame snapshot initializes that map with the encoded generations and
+commit identities. For each transition record:
 
   1. actual is the current map value or absent.
   2. expected MUST equal actual byte-for-byte.
@@ -432,10 +456,10 @@ Directory content catalog:
   the UTF-8 byte length of every name.
 
 
-7.3 Store format Evidence object
----------------------------------
+7.3 RÚNATAL store-format Evidence object
+-----------------------------------------
 
-The Rosetta object described in section 1 is:
+The RÚNATAL object described in section 1 is:
 
   kind=10, version=1, class=Metadata, logical_bytes=0
   canonical_bytes = this complete document, from its first byte through its
@@ -611,6 +635,59 @@ ObjectId, and placement-before MUST differ from placement-after. Therefore a
 proof for one plan cannot be attached to a different deletion or a later fact
 snapshot.
 
+The v1 durable compactor represents each placement target as a generic kind-6
+Evidence object with version 1, Metadata class, logical_bytes 0, empty
+references, and these canonical_bytes:
+
+  "astrid-gc-placement-set-v1\0"
+  ObjectId operation_contract
+  u64 arena_bytes
+  u64 root_journal_bytes
+  u8[32] root_journal_digest
+  u64 object_count
+      repeated in ObjectId order:
+          ObjectId object
+          u64 arena_frame_offset
+          u64 arena_payload_length
+          u8[32] arena_frame_checksum
+  u64 root_count
+      repeated in canonical principal-byte order:
+          u64 principal_length
+          u8[principal_length] principal
+          u64 root_generation
+          ObjectId commit
+
+All integers are little-endian. ObjectId fields inside canonical_bytes use the
+current 32-byte logical digest; the containing Evidence identity remains
+algorithm-tagged wherever it occurs on persistent wire. root_journal_digest is
+BLAKE3 under derive-key string:
+
+  astrid gc placement root journal digest v1
+
+Arena offsets and physical-frame checksums bind every object frame and its
+ordering. The root-journal digest binds the journal bytes rather than only its
+decoded root map. Recovery after durable compaction intent MUST install the
+exact placement-after identity, not any other semantically valid arena/journal
+pair.
+
+The execution-measurements target is generic kind-6 Evidence with version 1,
+Metadata class, logical_bytes 0, empty references, and:
+
+  "astrid-gc-transition-measurements-v1\0"
+  u64 objects_before
+  u64 objects_after
+  u64 objects_reclaimed
+  u64 arena_bytes_before
+  u64 arena_bytes_after
+  u64 root_journal_bytes_before
+  u64 root_journal_bytes_after
+
+The GC delivery outbox is not an authority or archival format. Its ready bundle
+contains the eight canonical ObjectRecords required by the receipt: fact
+snapshot, retention policy, Tensor Logic proof, plan, placement-before,
+placement-after, execution measurements, and commit receipt. Long-term export
+materializes those records through the ordinary self-contained bundle grammar.
+
 
 8. RECONSTRUCTION PROCEDURE
 ===========================
@@ -618,12 +695,12 @@ snapshot.
 An independent recovery implementation can reconstruct current state as
 follows:
 
-  1. Parse store.meta and obtain the tagged Rosetta object identity.
+  1. Parse store.meta and obtain the tagged RÚNATAL object identity.
   2. Scan objects.arena as physical frames. Check magic, version, reserved
      bytes, length, and checksum. Decode each ObjectRecord, enforce strict
      reference ordering, recompute construction-1 identities, and build a map
      from complete tagged identity to record.
-  3. Verify that the Rosetta object named by store.meta equals this document.
+  3. Verify that the RÚNATAL object named by store.meta equals this document.
   4. Scan roots.journal, check every physical frame, decode canonical
      state-owner principals, and replay the compare-and-swap chain.
   5. For each current root, recursively follow Owns references. Reject a
@@ -644,7 +721,7 @@ current principal unless reached from the journal's selected root through Owns.
 The durable unit of long-term survival is a deterministic export_closure
 bundle, not an arena's current physical placement. Such a bundle contains:
 
-  - this Rosetta Evidence object and its tagged identity;
+  - this RÚNATAL Evidence object and its tagged identity;
   - the selected tagged principal root;
   - every object in the root's complete Owns closure;
   - any explicitly selected evidence, lineage, or derived closures; and

@@ -7,9 +7,9 @@ use std::time::Duration;
 use super::*;
 
 #[derive(Clone, Copy, Debug)]
-struct TestIdentity;
+pub(super) struct TestIdentity;
 
-const TEST_IDENTITY_SCHEME: IdentityScheme = match IdentityScheme::new(u16::MAX, 1) {
+pub(super) const TEST_IDENTITY_SCHEME: IdentityScheme = match IdentityScheme::new(u16::MAX, 1) {
     Some(scheme) => scheme,
     None => unreachable!(),
 };
@@ -76,7 +76,7 @@ impl PersistentObjectIdentity for BlockingIdentity {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct Utf8Codec;
+pub(super) struct Utf8Codec;
 
 impl PrincipalCodec<String> for Utf8Codec {
     fn encode(&self, principal: &String) -> Vec<u8> {
@@ -97,9 +97,9 @@ impl FaultInjector for FailAt {
     }
 }
 
-type TestEngine = DurableEngine<String, TestIdentity, Utf8Codec>;
+pub(super) type TestEngine = DurableEngine<String, TestIdentity, Utf8Codec>;
 
-fn limits() -> RecoveryLimits {
+pub(super) fn limits() -> RecoveryLimits {
     RecoveryLimits::new(1024 * 1024).unwrap()
 }
 
@@ -107,7 +107,7 @@ fn label(bytes: &[u8]) -> ReferenceLabel {
     ReferenceLabel::new(bytes.to_vec())
 }
 
-fn open(path: &Path) -> TestEngine {
+pub(super) fn open(path: &Path) -> TestEngine {
     DurableEngine::open(path, TestIdentity, Utf8Codec, limits()).unwrap()
 }
 
@@ -122,7 +122,7 @@ fn open_with_fault(path: &Path, point: FaultPoint) -> TestEngine {
     .unwrap()
 }
 
-fn transaction(
+pub(super) fn transaction(
     principal: &str,
     expected: Option<RootState>,
     payload: &[u8],
@@ -215,7 +215,7 @@ fn frame_end(path: &Path, offset: u64) -> u64 {
         .unwrap()
 }
 
-fn flip_byte(path: &Path, offset: u64) {
+pub(super) fn flip_byte(path: &Path, offset: u64) {
     let mut file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -637,6 +637,43 @@ fn commit_flush_reopen_rebuilds_index_and_root() {
             .records()
             .len(),
         2
+    );
+}
+
+#[test]
+fn root_snapshot_preserves_generation_and_accepts_future_cas() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open(directory.path());
+    let (first_commit, first_transaction) = transaction("alice", None, b"first");
+    let first = engine.commit(first_transaction).unwrap().root();
+    let (second_commit, second_transaction) = transaction("alice", Some(first), b"second");
+    let second = engine.commit(second_transaction).unwrap().root();
+    assert_ne!(first_commit, second_commit);
+    engine.close().unwrap();
+
+    let payload =
+        encode_root_snapshot(TEST_IDENTITY_SCHEME, &[(b"alice".to_vec(), second)]).unwrap();
+    let journal_path = directory.path().join(ROOT_FILE);
+    let mut journal = OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(journal_path)
+        .unwrap();
+    append_frame(&mut journal, ROOT_MAGIC, &payload).unwrap();
+    journal.sync_data().unwrap();
+    drop(journal);
+
+    let recovered = open(directory.path());
+    assert_eq!(recovered.root(&"alice".to_owned()).unwrap(), Some(second));
+    let root_only =
+        RootTransaction::new("alice".to_owned(), Some(second), second.commit, Vec::new());
+    let third = recovered.commit(root_only).unwrap().root();
+    assert_eq!(third.generation, second.generation.checked_next().unwrap());
+    drop(recovered);
+
+    assert_eq!(
+        open(directory.path()).root(&"alice".to_owned()).unwrap(),
+        Some(third)
     );
 }
 

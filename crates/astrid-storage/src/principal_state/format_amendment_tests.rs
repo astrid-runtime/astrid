@@ -27,7 +27,7 @@ fn semantic(value: u8) -> SemanticContractId {
 }
 
 fn reader() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/principal_store_v1_reader.py")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/runatal_v1_reader.py")
 }
 
 fn open_fixture_store(path: &Path) -> RuntimeEngine {

@@ -1,12 +1,11 @@
 //! Native arena and root-journal framing, parsing, and recovery.
 
 use super::{
-    ARENA_FILE, ARENA_MAGIC, ArenaLocation, BTreeMap, BTreeSet, CHECKSUM_START, DurableError,
+    ARENA_FILE, ARENA_MAGIC, ArenaLocation, BTreeMap, CHECKSUM_START, DurableError,
     FRAME_HEADER_LEN, FRAME_HEADER_LEN_USIZE, FRAME_VERSION, File, IdentityScheme, ModelError,
     ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord, ObjectReference,
-    OpenOptions, Path, PersistentObjectIdentity, PrincipalCodec, ROOT_FILE, ROOT_MAGIC, Read,
-    RecoveryLimits, ReferenceKind, ReferenceLabel, RootGeneration, RootState, Seek, SeekFrom,
-    Write, io, materialize_closure, recovery_closure_error, validate_commit_closure,
+    OpenOptions, Path, PersistentObjectIdentity, Read, RecoveryLimits, ReferenceKind,
+    ReferenceLabel, Seek, SeekFrom, Write, io,
 };
 
 const IDENTITY_PREFIX_BYTES: usize = 8;
@@ -15,13 +14,14 @@ const CURRENT_DIGEST_BYTES_USIZE: usize = 32;
 const MIN_REFERENCE_WIRE_BYTES: usize =
     std::mem::size_of::<u64>() + IDENTITY_PREFIX_BYTES + CURRENT_DIGEST_BYTES_USIZE + 1;
 
-pub(super) fn read_indexed_object(
+pub(super) fn read_indexed_object<I: PersistentObjectIdentity>(
     arena: &mut File,
     expected_id: ObjectId,
     location: ArenaLocation,
-    scheme: IdentityScheme,
+    identity: &I,
     limits: RecoveryLimits,
 ) -> Result<ObjectRecord, DurableError> {
+    let scheme = identity.scheme();
     let payload = read_frame_at(arena, ARENA_FILE, ARENA_MAGIC, location.offset, limits)?;
     let payload_len = u64::try_from(payload.len()).map_err(|_| DurableError::EncodingOverflow)?;
     if payload_len != location.payload_len
@@ -42,7 +42,114 @@ pub(super) fn read_indexed_object(
             "indexed object identifier mismatch",
         ));
     }
+    if identity.identify(&record) != expected_id {
+        return Err(corrupt(
+            ARENA_FILE,
+            location.offset,
+            "indexed object identity does not match its canonical record",
+        ));
+    }
     Ok(record)
+}
+
+pub(super) fn verify_indexed_location(
+    arena: &mut File,
+    expected_id: ObjectId,
+    location: ArenaLocation,
+    scheme: IdentityScheme,
+    limits: RecoveryLimits,
+) -> Result<(), DurableError> {
+    let file_len = arena
+        .metadata()
+        .map_err(|source| io_error("read indexed arena metadata", source))?
+        .len();
+    let frame_end = location
+        .offset
+        .checked_add(FRAME_HEADER_LEN)
+        .and_then(|value| value.checked_add(location.payload_len))
+        .ok_or(DurableError::EncodingOverflow)?;
+    if frame_end > file_len {
+        return Err(corrupt(
+            ARENA_FILE,
+            location.offset,
+            "indexed frame extends beyond the arena",
+        ));
+    }
+    arena
+        .seek(SeekFrom::Start(location.offset))
+        .map_err(|source| io_error("seek indexed arena header", source))?;
+    let mut header = [0_u8; FRAME_HEADER_LEN_USIZE];
+    arena
+        .read_exact(&mut header)
+        .map_err(|source| io_error("read indexed arena header", source))?;
+    if header[..8] != ARENA_MAGIC
+        || u16::from_le_bytes([header[8], header[9]]) != FRAME_VERSION
+        || header[10..12] != [0, 0]
+    {
+        return Err(corrupt(
+            ARENA_FILE,
+            location.offset,
+            "indexed frame header is invalid",
+        ));
+    }
+    let payload_len = u64::from_le_bytes(
+        header[12..20]
+            .try_into()
+            .map_err(|_| DurableError::EncodingOverflow)?,
+    );
+    if payload_len > limits.max_frame_bytes {
+        return Err(DurableError::FrameTooLarge {
+            file: ARENA_FILE,
+            offset: location.offset,
+            declared: payload_len,
+            limit: limits.max_frame_bytes,
+        });
+    }
+    let checksum: [u8; 32] = header[CHECKSUM_START..]
+        .try_into()
+        .map_err(|_| DurableError::EncodingOverflow)?;
+    if payload_len != location.payload_len || checksum != location.checksum {
+        return Err(corrupt(
+            ARENA_FILE,
+            location.offset,
+            "indexed frame header does not match the cache",
+        ));
+    }
+    let mut identity_bytes = [0_u8; IDENTITY_PREFIX_BYTES + CURRENT_DIGEST_BYTES_USIZE];
+    arena
+        .read_exact(&mut identity_bytes)
+        .map_err(|source| io_error("read indexed object identity", source))?;
+    let mut reader = SliceReader::new(&identity_bytes);
+    let actual = reader
+        .identity(scheme)
+        .map_err(|detail| corrupt(ARENA_FILE, location.offset, detail))?;
+    if actual != expected_id {
+        return Err(corrupt(
+            ARENA_FILE,
+            location.offset,
+            "indexed object identity mismatch",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn verify_indexed_tail(
+    arena: &mut File,
+    location: ArenaLocation,
+    limits: RecoveryLimits,
+) -> Result<(), DurableError> {
+    let payload = read_frame_at(arena, ARENA_FILE, ARENA_MAGIC, location.offset, limits)?;
+    let payload_len = u64::try_from(payload.len()).map_err(|_| DurableError::EncodingOverflow)?;
+    if payload_len != location.payload_len
+        || frame_checksum(ARENA_MAGIC, payload_len, &payload) != location.checksum
+    {
+        return Err(corrupt(
+            ARENA_FILE,
+            location.offset,
+            "indexed arena tail no longer matches the cache",
+        ));
+    }
+    Ok(())
 }
 
 fn read_frame_at(
@@ -134,9 +241,10 @@ pub(super) fn recover_arena<I: PersistentObjectIdentity>(
     arena: &mut File,
     identity: &I,
     limits: RecoveryLimits,
-) -> Result<BTreeMap<ObjectId, ArenaLocation>, DurableError> {
+) -> Result<(BTreeMap<ObjectId, ArenaLocation>, Option<ArenaLocation>), DurableError> {
     let scheme = identity.scheme();
     let mut index = BTreeMap::<ObjectId, ArenaLocation>::new();
+    let mut tail = None;
     scan_frames(arena, ARENA_FILE, ARENA_MAGIC, limits, |offset, payload| {
         let (id, record) = decode_object_frame(payload, scheme)
             .map_err(|detail| corrupt(ARENA_FILE, offset, detail))?;
@@ -150,6 +258,11 @@ pub(super) fn recover_arena<I: PersistentObjectIdentity>(
         let payload_len =
             u64::try_from(payload.len()).map_err(|_| DurableError::EncodingOverflow)?;
         let checksum = frame_checksum(ARENA_MAGIC, payload_len, payload);
+        let location = ArenaLocation {
+            offset,
+            payload_len,
+            checksum,
+        };
         match index.get(&id) {
             Some(existing)
                 if existing.payload_len == payload_len && existing.checksum == checksum => {},
@@ -161,111 +274,16 @@ pub(super) fn recover_arena<I: PersistentObjectIdentity>(
                 });
             },
             None => {
-                index.insert(
-                    id,
-                    ArenaLocation {
-                        offset,
-                        payload_len,
-                        checksum,
-                    },
-                );
+                index.insert(id, location);
             },
         }
+        tail = Some(location);
         Ok(())
     })?;
-    Ok(index)
+    Ok((index, tail))
 }
 
-pub(super) fn recover_roots<P, C>(
-    roots: &mut File,
-    arena: &mut File,
-    index: &BTreeMap<ObjectId, ArenaLocation>,
-    codec: &C,
-    scheme: IdentityScheme,
-    limits: RecoveryLimits,
-) -> Result<(BTreeMap<P, RootState>, BTreeSet<ObjectId>), DurableError>
-where
-    P: Clone + Ord,
-    C: PrincipalCodec<P>,
-{
-    let mut recovered = BTreeMap::<P, (RootState, u64)>::new();
-    scan_frames(roots, ROOT_FILE, ROOT_MAGIC, limits, |offset, payload| {
-        let record = decode_root_record(payload, scheme)
-            .map_err(|detail| corrupt(ROOT_FILE, offset, detail))?;
-        let principal = codec
-            .decode(record.principal)
-            .ok_or(DurableError::InvalidPrincipal { offset })?;
-        if codec.encode(&principal) != record.principal {
-            return Err(DurableError::InvalidPrincipal { offset });
-        }
-        if encode_root_record(
-            scheme,
-            record.principal,
-            record.expected,
-            record.replacement,
-        )? != payload
-        {
-            return Err(corrupt(
-                ROOT_FILE,
-                offset,
-                "root-journal frame is not canonical",
-            ));
-        }
-        let actual = recovered.get(&principal).map(|(root, _)| *root);
-        if actual != record.expected {
-            return Err(DurableError::RecoveryModel {
-                file: ROOT_FILE,
-                offset,
-                source: ModelError::RootConflict {
-                    expected: record.expected,
-                    actual,
-                },
-            });
-        }
-        let generation = match actual {
-            Some(root) => root.generation.checked_next(),
-            None => Some(RootGeneration::INITIAL),
-        }
-        .ok_or(DurableError::RecoveryModel {
-            file: ROOT_FILE,
-            offset,
-            source: ModelError::ArithmeticOverflow,
-        })?;
-        if record.replacement.generation != generation {
-            return Err(corrupt(
-                ROOT_FILE,
-                offset,
-                "replacement generation does not match journal history",
-            ));
-        }
-        recovered.insert(principal, (record.replacement, offset));
-        Ok(())
-    })?;
-
-    let mut validated = BTreeSet::new();
-    for (root, offset) in recovered.values().copied() {
-        let records =
-            materialize_closure(arena, index, &BTreeMap::new(), root.commit, scheme, limits)
-                .map_err(|error| recovery_closure_error(error, offset))?;
-        validate_commit_closure(&records, root.commit).map_err(|source| {
-            DurableError::RecoveryModel {
-                file: ROOT_FILE,
-                offset,
-                source,
-            }
-        })?;
-        validated.extend(records.into_iter().map(|(id, _)| id));
-    }
-    Ok((
-        recovered
-            .into_iter()
-            .map(|(principal, (root, _))| (principal, root))
-            .collect(),
-        validated,
-    ))
-}
-
-fn scan_frames(
+pub(super) fn scan_frames(
     file: &mut File,
     file_name: &'static str,
     magic: [u8; 8],
@@ -681,62 +699,6 @@ pub(super) fn decode_object_frame(
     Ok((id, record))
 }
 
-pub(super) fn encode_root_record(
-    scheme: IdentityScheme,
-    principal: &[u8],
-    expected: Option<RootState>,
-    replacement: RootState,
-) -> Result<Vec<u8>, DurableError> {
-    let principal_len =
-        u64::try_from(principal.len()).map_err(|_| DurableError::EncodingOverflow)?;
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(&principal_len.to_le_bytes());
-    bytes.extend_from_slice(principal);
-    match expected {
-        None => bytes.push(0),
-        Some(root) => {
-            bytes.push(1);
-            encode_root_state(&mut bytes, scheme, root);
-        },
-    }
-    encode_root_state(&mut bytes, scheme, replacement);
-    Ok(bytes)
-}
-
-fn encode_root_state(bytes: &mut Vec<u8>, scheme: IdentityScheme, root: RootState) {
-    bytes.extend_from_slice(&root.generation.get().to_le_bytes());
-    encode_identity(bytes, scheme, root.commit);
-}
-
-struct DecodedRootRecord<'a> {
-    principal: &'a [u8],
-    expected: Option<RootState>,
-    replacement: RootState,
-}
-
-fn decode_root_record(
-    bytes: &[u8],
-    scheme: IdentityScheme,
-) -> Result<DecodedRootRecord<'_>, &'static str> {
-    let mut reader = SliceReader::new(bytes);
-    let principal_len = reader.usize_len()?;
-    let principal = reader.take(principal_len)?;
-    let expected = match reader.u8()? {
-        0 => None,
-        1 => Some(reader.root_state(scheme)?),
-        _ => return Err("invalid expected-root tag"),
-    };
-    let replacement = reader.root_state(scheme)?;
-    if reader.remaining() != 0 {
-        return Err("trailing root-journal bytes");
-    }
-    Ok(DecodedRootRecord {
-        principal,
-        expected,
-        replacement,
-    })
-}
-
 struct SliceReader<'a> {
     bytes: &'a [u8],
     offset: usize,
@@ -812,12 +774,5 @@ impl<'a> SliceReader<'a> {
             .try_into()
             .map(ObjectId::new)
             .map_err(|_| "identity digest length does not match the supported scheme")
-    }
-
-    fn root_state(&mut self, scheme: IdentityScheme) -> Result<RootState, &'static str> {
-        Ok(RootState {
-            generation: RootGeneration::new(self.u64()?),
-            commit: self.identity(scheme)?,
-        })
     }
 }
