@@ -2,21 +2,21 @@
 
 Status: exploratory architecture and execution plan
 
-Last reviewed: 2026-07-18
+Last reviewed: 2026-07-28
 
 Code baseline: Astrid Runtime `v0.10.1` (`4771bab3`)
 
 Decision state: scope an Astrid-owned kernel; implementation choices remain open
 
 Execution and evidence are tracked in the
-[AI-Native OS Workplan](astrid-ai-native-os-workplan.md). The precise driver-role
+[Native OS Workplan](astrid-native-os-workplan.md). The precise driver-role
 boundary is in the [Driver Domain Contract](astrid-driver-domain-contract.md).
 
 ## 1. Executive conclusion
 
 Build an actual Astrid kernel.
 
-Do not make that kernel a prerequisite for the first agent OS. The immediate
+Do not make that kernel a prerequisite for the first hosted distribution. The immediate
 workbench is the principal-owned `AOS Realm` capsule in `unicity-aos/aos-ce`: a
 Linux-shaped environment hosted by today's daemon and, later, unchanged by the
 native host. It gives the kernel programme a real workload while keeping Linux

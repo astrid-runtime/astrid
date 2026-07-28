@@ -2,11 +2,11 @@
 
 Status: Milestone 0 exit artifact; binding on all native-kernel work
 
-Last reviewed: 2026-07-21
+Last reviewed: 2026-07-28
 
 Companions: [threat model](astrid-kernel-threat-model.md),
 [native-kernel scope](astrid-native-kernel.md),
-[AI-native OS workplan](astrid-ai-native-os-workplan.md),
+[native OS workplan](astrid-native-os-workplan.md),
 [driver domain contract](astrid-driver-domain-contract.md),
 [Tensor Logic composition](astrid-tensor-logic-composition.md)
 
@@ -269,3 +269,50 @@ evidence that forced the change, and the property given up. Covenant items
 (section 2) additionally require demonstrating that the excluded capability
 cannot be provided by a ring-3 domain at acceptable cost, with measurements.
 Convenience, schedule pressure, and dependency drift are not evidence.
+
+## 11. Typed-endpoint system addendum
+
+**POSIX is a capsule. Linux is a Realm.**
+
+This addendum clarifies the user-space architecture above the covenant. It does
+not admit product policy, path authority, a reasoner, a component runtime, or a
+filesystem into ring 0.
+
+Astrid's native system ABI is one typed capability-endpoint model across:
+
+- protection-domain IPC;
+- kernel-mediated device queues and bounded shared memory;
+- driver-domain services;
+- component imports and exports;
+- filesystems, network stacks, displays, audio, and accelerators; and
+- local or remote services whose handles preserve the same authority meaning
+  under serialization.
+
+The implementations differ by layer. Ring 0 handles native capability objects
+and bounded messages. Ring-3 hosts translate them into portable WIT resources
+and interfaces. Linux and other compatibility environments translate their
+syscalls into those services without making POSIX the native ABI.
+
+The kernel does not route from a goal. It emits the capability-scoped live
+relations required by the legibility obligation. Mimir or another user-space
+reasoner may propose a typed route across software and hardware endpoints,
+including driver, queue, memory, locality, budget, and reset constraints. The
+exact validator and held capabilities determine whether the route is
+materializable. The reasoner proposes; ed25519 disposes.
+
+A dynamic capability namespace is the hosted and component-level realization
+of this model. Loading a service creates newly discoverable typed endpoints in
+the authorized principal's view; revocation removes them and invalidates stale
+handles. Names and descriptions aid discovery but never invoke an operation
+without a held capability. This protocol lives above ring 0 and must preserve
+epoch consistency, bounded enumeration, atomic replacement, and
+principal-scoped visibility. The protocol and acceptance surface are tracked in
+[issue #1406](https://github.com/astrid-runtime/astrid/issues/1406).
+
+Astrid Runtime ships no capsules. It is the neutral upstream—Linux rather than
+Ubuntu in the operating-system analogy. Distros select filesystems, Linux
+Realms, drivers, reasoners, context assemblers, providers, shells, and human or
+agent interfaces. Agents are an important evaluation workload for this system,
+not its definition. The neutral operating-system mechanisms remain useful to
+any component graph that needs isolation, typed composition, durable state, and
+auditable authority.

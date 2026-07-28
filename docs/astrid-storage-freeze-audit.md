@@ -325,11 +325,67 @@ Sparse anchor-only indexing is not the default because it knowingly sacrifices
 chunk-level convergence. It remains an option only if the filter and
 locality-paged full index miss their measured targets.
 
+## D10. Canonical sequence identity for Huginn
+
+### Decision
+
+Huginn's neutral core primitive is a canonical persistent sequence of
+identified typed blocks. The selected Merkle-rope construction gives every
+ordered prefix one stable identity independent of encoder implementation.
+
+This is the core perch only. Tokenizers, conversation templates, retrieval
+policy, provider adapters, and context assembly ship in downstream distros, not
+Astrid Runtime.
+
+### Rationale
+
+Stable prefix identities let downstream systems reuse tokenization and
+model-prefix work without treating one mutable prompt blob as memory. A
+history-dependent balanced rope would permit several ObjectIds for one ordered
+sequence, fragmenting deduplication and computation reuse. A flat object would
+rewrite the whole sequence on append.
+
+The primitive is identity-bearing even though its first consumer is a
+capsule-layer context assembler. Its format choices therefore require the same
+pre-release discipline as chunk trees and KV nodes.
+
+### Work order
+
+- Compare canonical radix-tree, Merkle-mountain-range, and other candidate
+  structures against prefix stability, append cost, edit amplification, proof
+  size, and traversal locality.
+- Freeze leaf and internal-node kinds, domain separators, fanout, packing,
+  split, and empty-sequence rules for the selected structure.
+- Commit block count and logical-byte totals and validate them on decode.
+- Define the one accepted partial right-edge shape and prefix-boundary
+  representation.
+- Freeze role, content-contract, representation-contract, and rendering
+  parameter encodings for sequence blocks.
+- Specify `Owns`, `Evidence`, and `Derived` edge use without making an identity
+  into authority.
+- Bound depth, block size, child count, traversal work, and decoded totals.
+- Add byte-exact re-encode, alternative-shape rejection, bounded-append,
+  middle-edit amplification, export, and GC fixtures to the Rust and
+  independent readers.
+
+### Acceptance
+
+- Two independent encoders produce byte-identical trees and roots.
+- Decode followed by re-encode is byte-exact.
+- Alternative trees for one ordered sequence fail closed.
+- Append preserves source blocks, reuses unaffected subtrees, performs bounded
+  metadata work, and leaves existing prefix identities unchanged.
+- A middle edit invalidates model-prefix states from the changed position
+  onward; its physical metadata amplification is recorded.
+- Deleting every tokenization, summary, or KV-cache representation preserves
+  the sequence and its source-memory semantics.
+
 ## Sequence
 
 1. Principal UID and chunker evidence gate before the first format release.
 2. B+-tree format and benchmarks.
-3. Cross-hash attestation and successor migration specification.
-4. Projection-only name folding documentation.
-5. Refinery sketch prototype with the chunker evidence tooling.
-6. Mechanical closing audit.
+3. Huginn canonical-sequence format and independent fixtures.
+4. Cross-hash attestation and successor migration specification.
+5. Projection-only name folding documentation.
+6. Refinery sketch prototype with the chunker evidence tooling.
+7. Mechanical closing audit.

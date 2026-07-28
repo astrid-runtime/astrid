@@ -39,6 +39,10 @@ trust and pass its name, repository, local `Distro.toml`, or signed `.shuttle`
 archive explicitly with `--distro`. Operators running an uncomposed runtime can
 skip `init` and start the daemon directly.
 
+Astrid Runtime ships no capsules. It is the neutral upstream—Linux rather than
+Ubuntu in the operating-system analogy. Distros provide filesystems, Realms,
+reasoners, providers, shells, and agent or human interfaces.
+
 Start with [the Book](https://github.com/astrid-runtime/book) for the
 architecture or the [Contributor Handbook](https://github.com/astrid-runtime/handbook)
 to contribute.

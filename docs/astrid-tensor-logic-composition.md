@@ -2,7 +2,7 @@
 
 Status: architecture design and pre-implementation model
 
-Last reviewed: 2026-07-18
+Last reviewed: 2026-07-28
 
 Code baseline: Astrid Runtime 0.10.1
 
@@ -10,7 +10,7 @@ Decision state: preserve current behavior; add an exact composition model first;
 reserve Tensor Logic execution for a later, explicitly activated backend
 
 Execution and evidence are tracked in the
-[AI-Native OS Workplan](astrid-ai-native-os-workplan.md). Hardware-role terminology
+[Native OS Workplan](astrid-native-os-workplan.md). Hardware-role terminology
 is defined by the [Driver Domain Contract](astrid-driver-domain-contract.md).
 
 ## 1. Executive decision
@@ -78,11 +78,34 @@ optional Tensor Logic backend for learning and neural-symbolic composition
 Current routing, manifests, public WIT, and capsule behavior remain authoritative
 until a later gate explicitly promotes composition output into execution.
 
+### 1.1 Mimir and the authority line
+
+**Mimir** is the deterministic Tensor Logic reasoner: the vendor-independent
+Rust implementation of rules, facts, epochs, `check()`, `why_not()`, and
+byte-stable proof trees.
+
+Mimir is not part of the Astrid kernel and not a raven-branded capsule bundled
+by Astrid Runtime. It is a contract-governed project with an independent
+ownership and release boundary. Distros may include a Mimir service by default
+and connect it to Astrid's principal-scoped relation projection.
+
+Astrid supplies a self-legible system: live topology relations are born from
+enforced state, and receipt grammars such as `GcPlanEvidence` can carry exact
+reasoning artifacts. Mimir reasons over those inputs above the authority line.
+Its output remains a proposal or audit explanation. Exact validators,
+capabilities, signatures, and root publication remain authoritative:
+
+> The reasoner proposes; ed25519 disposes.
+
+The deterministic `T=0` fragment is the conformance oracle. Learned scores or a
+future tensor backend may rank already-valid alternatives but cannot establish
+eligibility.
+
 ## 2. The operating-system thesis
 
 Plan 9 made a private namespace of file services the compositional surface of the
 machine. Astrid can make a principal-scoped relation of typed interfaces the
-compositional surface of an AI-native machine.
+compositional surface of the machine.
 
 The primitive is not a fact about the world. It is an executable affordance:
 
@@ -96,7 +119,7 @@ this signed component
   at this cost and locality
 ~~~
 
-An AI-native OS should be able to answer:
+Astrid should be able to answer:
 
 - What can this machine do for this principal right now?
 - Which installed components can be connected to satisfy this goal?
@@ -203,7 +226,8 @@ This design does not:
 - silently select between ambiguous providers;
 - promise that every graph-shaped workflow is safe or terminating;
 - require all capsules to be rewritten;
-- create a new Astrid repository before a real ownership boundary demands it.
+- put the Astrid-specific catalog or validator in a separate repository merely
+  because the independent Mimir reasoner has a real ownership boundary.
 
 ## 5. Existing Astrid foundation
 
@@ -1186,8 +1210,8 @@ remain language-neutral so other Component Model toolchains can follow.
 
 ## 13. Library sketch
 
-The first implementation should be one crate with strong internal modules, not a
-constellation of premature packages:
+The integration and reasoner have different ownership boundaries. Core owns the
+Astrid-specific catalog, projection, exact validator, and adapter contract:
 
 ~~~text
 crates/astrid-composition/
@@ -1198,18 +1222,28 @@ crates/astrid-composition/
     extract.rs         manifest, WIT, registry, host-service, grant projections
     canonical.rs       stable ordering, fingerprints, hashes
     relation.rs        domains, axes, relation declarations
-    equation.rs        backend-neutral program IR
-    rules.rs           Astrid base and derived equations
     goal.rs            canonical goal IR
-    backend.rs         evaluator trait and limits
-    sparse.rs          exact sparse-Boolean evaluator
+    mimir.rs           bounded fact/query/proof adapter
     plan.rs            proposed/validated typestates
     validate.rs        exact fresh validation
-    explain.rs         derivation tree and diagnostics
+    explain.rs         proof-tree validation and diagnostics
     scenario.rs        fixture helpers and golden outputs
 ~~~
 
-No runtime mutation module belongs in the first crate revision.
+Mimir owns the deterministic language and evaluator:
+
+~~~text
+mimir/
+  canonical relations, rules, and epochs
+  deterministic sparse evaluation at T=0
+  check() and why_not()
+  byte-stable proof trees
+  backend conformance fixtures
+~~~
+
+No runtime mutation module belongs in either first revision. The core adapter
+projects only the caller-visible bounded facts and treats every Mimir result as
+untrusted proposed data until exact validation.
 
 ### 13.1 Core type sketch
 
@@ -1225,21 +1259,14 @@ pub struct CatalogSnapshot<P> {
     principal: P,
 }
 
-pub struct Program<W> {
-    domains: Vec<Domain>,
-    relations: Vec<RelationDecl<W>>,
-    equations: Vec<Equation<W>>,
-    limits: EvaluationLimits,
-}
-
-pub trait Evaluator<W> {
+pub trait Reasoner {
     type Error;
 
-    fn evaluate(
+    fn check(
         &self,
-        program: &Program<W>,
+        facts: &PrincipalFactProjection,
         query: &Query,
-    ) -> Result<Evaluation<W>, Self::Error>;
+    ) -> Result<ProposedDerivation, Self::Error>;
 }
 
 pub struct Plan<S> {
@@ -1261,7 +1288,7 @@ The exact generic bounds are implementation work. The architectural requirements
 are:
 
 - principal scope is carried by type or immutable value;
-- evaluator backend is generic;
+- reasoner adapter is generic and bounded;
 - proposed and validated plans are distinct;
 - content IDs are domain-bearing newtypes, not strings;
 - public wrappers remain additive and generic where a backend or authority provider
@@ -1305,9 +1332,9 @@ exact catalog helpers, with regression tests proving unchanged results.
 
 ## 14. Repository ownership
 
-### 14.1 Does this need another repository?
+### 14.1 Repository split
 
-Not initially.
+Yes, for Mimir; no, for the Astrid-specific integration.
 
 The Astrid integration belongs in core because it consumes:
 
@@ -1318,27 +1345,32 @@ The Astrid integration belongs in core because it consumes:
 - event routing and lifecycle;
 - kernel resource/budget views.
 
-Creating a new Astrid repository would make atomic refactors and compatibility
-testing harder before the API exists.
+The deterministic reasoner has a real independent ownership boundary: it is
+vendor-free, useful outside Astrid, contract-governed, and released on its own
+conformance evidence. It therefore lives in the Mimir project.
+
+The Astrid catalog, authority projection, exact validator, and Mimir adapter
+remain in core because they consume live Astrid types and must move atomically
+with them.
 
 ### 14.2 Generic Tensor Logic ownership
 
-The general Tensor Logic language, compiler, and tensor backends should remain
-independent of Astrid. If an existing tensor-logic repository is the intended home,
-Astrid should consume a versioned library from it only after the equation IR and
-backend contract are stable.
+The general Tensor Logic language, compiler, exact reasoner, and future tensor
+backends remain independent of Astrid under Mimir's contract. Astrid consumes a
+versioned interface and conformance fixtures rather than importing provider or
+product behavior.
 
-Do not create a third repository solely for an adapter. Start with:
+Do not create a third repository solely for an adapter:
 
 ~~~text
 core/crates/astrid-composition
-  exact Astrid catalog, IR, sparse evaluator, validator
+  Astrid catalog, projection, adapter, exact validator
 
-external tensor-logic library, later
-  general language/compiler/tensor backend
+Mimir project
+  deterministic language, exact evaluator, proof trees, future backends
 
-core adapter module or crate, later
-  converts Astrid Program into the external Tensor Logic representation
+downstream distro
+  packages and activates the Mimir service under operator policy
 ~~~
 
 Split an adapter crate only when dependency weight or release cadence proves the
@@ -1535,7 +1567,7 @@ property test, Alloy command/assertion, TLA+ trace, or end-to-end test as indica
 | Existing capsule has no imports/exports | It remains loadable; composition sees only declared topic/tool ports |
 | Existing opaque proxy | It remains usable explicitly; excluded from automatic typed connection |
 
-### 16.10 Dock and AI-native OS behavior
+### 16.10 Dock and native OS behavior
 
 | Scenario | Expected result |
 |---|---|
@@ -1752,7 +1784,7 @@ Astrid capsule manifests.
 | Strict canonical type identity | Sound automatic composition | More explicit adapters |
 | Principal snapshot before planning | Privacy and correct authority | Less cache sharing |
 | Read-only introduction | Preserves runtime and exposes model errors safely | Delays visible automation |
-| One core crate initially | Easy atomic refactor and testing | Generic language boundary remains provisional |
+| Core integration plus contract-governed Mimir | Neutral reusable reasoner; clear authority boundary | Versioned adapter and conformance matrix |
 | Host exact validator | Authority remains below AI language | Trusted code and duplicate semantic checks to minimize |
 | Plan-scoped route overlay later | Exact provider selection and rollback | New host mechanism |
 | Explicit ambiguity | No accidental provider authority | More operator/policy decisions |
@@ -1774,9 +1806,9 @@ Sensitivity points:
 
 ### Does this need another repository?
 
-No new Astrid repository now. Put the Astrid-specific exact library in core. Keep
-the general Tensor Logic implementation independent and integrate later through the
-reserved backend.
+Mimir has its own contract-governed project. Put the Astrid-specific catalog,
+authority projection, exact validator, and adapter in core. Distros may include
+the Mimir service by default; Astrid Runtime does not bundle it.
 
 ### How do we preserve what currently works?
 
@@ -1786,13 +1818,14 @@ use differential regression tests against readiness/toposort results.
 
 ### Should Tensor Logic itself be a capsule?
 
-Eventually, likely yes for learned and heavyweight evaluation. The exact catalog
-and validator remain host libraries. A Tensor Logic planner capsule can receive a
-bounded principal-projected program and return candidate plans over IPC. This keeps
-AI policy outside the kernel and makes the backend replaceable.
+Mimir is an independently packaged user-space service, commonly delivered by a
+distro as a capsule-compatible component. The exact catalog and validator remain
+core libraries. Mimir receives a bounded principal-projected fact set and returns
+candidate plans or audit proofs over a versioned contract. This keeps reasoning
+outside the kernel and makes the implementation replaceable.
 
-The first sparse evaluator should remain an in-process pure library because it is
-the semantic oracle and design harness, not an intelligent service.
+Tests may link the deterministic evaluator in-process as a semantic oracle. That
+test arrangement does not move reasoning below the production authority line.
 
 ### Is the graph stored?
 
@@ -1893,10 +1926,10 @@ Exit:
 
 Deliver:
 
-- astrid-composition crate;
-- catalog and named-index equation IR;
-- sparse Boolean evaluator;
-- exact explanations;
+- the core `astrid-composition` catalog, projection, validator, and adapter;
+- the Mimir canonical relation/rule contract;
+- Mimir's deterministic sparse evaluator;
+- byte-stable proof trees and exact explanations;
 - property-based tests;
 - generated scale fixtures;
 - no daemon integration and no tensor dependency.

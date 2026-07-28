@@ -1,8 +1,8 @@
-# Astrid AI-Native OS Workplan
+# Astrid Native OS Workplan
 
 Status: active architecture workplan
 
-Last reviewed: 2026-07-18
+Last reviewed: 2026-07-28
 
 Baselines:
 
@@ -88,7 +88,7 @@ flowchart TB
     RealmSeed[Bounded realm process seed]
     RealmStorage[Principal-scoped durable VFS]
     RealmProcesses[Processes, pipes, waits, and shell]
-    RealmWorkbench[Agent toolchain and capsule build]
+    RealmWorkbench[Development toolchain and capsule build]
 
     Catalog[Exact composition catalog and evaluator]
     Models[Alloy and TLA+ models]
@@ -240,8 +240,9 @@ guest action invokes a host process.
   clock, audio, asset, and optional network providers.
 - [ ] Hand-derive canonical base relations and expected candidate plans.
 - [ ] Specify cardinality and ambiguity without changing the public manifest.
-- [ ] Implement the backend-neutral named-axis equation IR.
-- [ ] Implement the deterministic sparse Boolean reference evaluator.
+- [ ] Freeze the versioned core-to-Mimir fact, query, and proof contract.
+- [ ] Implement the deterministic sparse Boolean reference evaluator in Mimir.
+- [ ] Implement the principal-scoped Mimir adapter and exact validator in core.
 - [ ] Extract existing readiness/toposort compatibility logic into shared pure
   helpers with regression tests.
 - [ ] Implement proposed/validated plan typestates and fresh epoch validation.

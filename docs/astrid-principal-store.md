@@ -5,7 +5,7 @@ Status: proposed architecture and implementation contract
 Last reviewed: 2026-07-25
 
 Companions: [native-kernel scope](astrid-native-kernel.md),
-[AI-native OS workplan](astrid-ai-native-os-workplan.md),
+[native OS workplan](astrid-native-os-workplan.md),
 [kernel evidence matrix](astrid-kernel-evidence-matrix.md), and
 [principal-store evidence plan](astrid-principal-store-evidence.md).
 

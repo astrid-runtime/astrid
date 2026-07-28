@@ -13,6 +13,8 @@ Related documents:
 - `astrid-muninn.md` defines the fleet derivation index and its verification
   policy.
 - `astrid-huginn.md` applies the model to context assembly.
+- `astrid-agent-process-model.md` applies the execution classes to a
+  distro-provided agent harness.
 - `astrid-refinery.md` applies it to bounded cold-path work.
 
 ## Thesis
@@ -308,5 +310,5 @@ objects.
 2. Build Muninn over durable derivation evidence and a disposable index.
 3. Add Refinery scheduling and pass seams before arena compaction.
 4. Freeze the Tensor Logic GC fact schema and linked plan/commit receipts.
-5. Amend Forge, local-model, distro, Realm, audit, export, sync, and public
-   content charters as consumers of the same primitive.
+5. Amend Forge, local-model, distro, Realm, agent-process, audit, export, sync,
+   and public content charters as consumers of the same primitive.

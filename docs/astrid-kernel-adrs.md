@@ -17,7 +17,7 @@ be picked. Each record states context, the decision, the alternatives
 weighed, and the consequences, so a later reader sees not just what was
 chosen but what was rejected and why.
 
-These are the seven decisions the [workplan](astrid-ai-native-os-workplan.md)
+These are the seven decisions the [workplan](astrid-native-os-workplan.md)
 requires before the v0 ABI sketch: protection domains, capability object
 representation, handle transfer, revocation, fault endpoints, scheduling,
 and audit ordering. Each is numbered `ADR-K<n>` and referenced from the ABI

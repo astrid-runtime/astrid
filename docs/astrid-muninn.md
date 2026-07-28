@@ -1,7 +1,23 @@
 # Muninn: Verified Computation Memory
 
-Status: design contract. No guest-facing interface is activated by this
-document.
+Status: core mechanism contract. No guest-facing interface or Muninn-branded
+capsule is activated or shipped by this document.
+
+## Perch and flight
+
+Muninn's **perch** is Astrid-proper: canonical derivation evidence, verification
+and trust-state rules, and a disposable engine index over that evidence.
+
+Muninn's **flight** is downstream policy: which workloads participate,
+spot-check scheduling, sampling rates, maintenance budgets, operator
+diagnostics, and product presentation. Those behaviors belong to distro
+capsules and services. Astrid Runtime supplies the neutral mechanism and does
+not select or bundle a Muninn capsule.
+
+The core document defines the invariant a downstream implementation must
+preserve. It does not turn the runtime into a product distro, just as an
+upstream operating-system kernel does not select the distribution's user
+space.
 
 Muninn is Astrid's fleet derivation memory: a disposable lookup index over
 durable, independently verified derivation evidence.
@@ -88,9 +104,9 @@ operation. It falls back to execution.
 
 ## Spot-checking as continuous attestation
 
-At an operator-defined sampling rate, Astrid re-executes an eligible pure or
-snapshot-bound derivation under its exact recorded invocation and byte-compares
-all result objects.
+At an operator-defined sampling rate, a downstream maintenance service asks the
+core mechanism to re-execute an eligible pure or snapshot-bound derivation
+under its exact recorded invocation and byte-compares all result objects.
 
 The sample selector must be unpredictable to the transform. A transform must
 not be able to behave deterministically only when it expects verification.
@@ -208,7 +224,10 @@ executed and believed; revocation records why it is no longer trusted.
 Successor transforms create successor invocations. Old and new results may be
 related through Lineage or Evidence but are never silently aliased.
 
-## Initial consumers
+## Downstream consumers
+
+The runtime mechanism is product-neutral. Candidate consumers supplied by a
+distro or another Astrid subsystem include:
 
 1. content verification and canonical-boundary validation;
 2. Forge capsule builds keyed by complete source and toolchain closure;
@@ -222,7 +241,8 @@ The slogans are conditional on complete invocation identity:
 
 - unchanged reproducible builds become lookups;
 - unchanged deterministic tests become evidence lookups, with sampled reruns;
-- agents reuse verified content and context work they are authorized to see.
+- downstream agent harnesses reuse verified content and context work they are
+  authorized to see.
 
 ## Acceptance
 
