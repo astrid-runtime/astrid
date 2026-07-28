@@ -373,6 +373,64 @@ fn verified_handle_reuse_survives_an_unrelated_root_commit() {
 }
 
 #[test]
+fn range_edge_proofs_are_principal_scoped_and_pruned_with_live_files() {
+    let engine = Arc::new(CountingEngine::new());
+    let writer = PrincipalContentStore::from_engine(Arc::clone(&engine));
+    let reader = PrincipalContentStore::from_engine(Arc::clone(&engine));
+    let alice = "alice".to_owned();
+    let bob = "bob".to_owned();
+    let name = ContentName::new("models/shared.bin").unwrap();
+    let value = bytes(8 * 1024 * 1024);
+    writer.put(&alice, &name, &value).unwrap();
+    writer.put(&bob, &name, &value).unwrap();
+    let alice_handle = reader.open_read(&alice, &name).unwrap().unwrap();
+    let bob_handle = reader.open_read(&bob, &name).unwrap().unwrap();
+    let offset = 4_000_000_u64;
+    let length = 64 * 1024_u64;
+    let start = usize::try_from(offset).unwrap();
+    let end = usize::try_from(offset + length).unwrap();
+
+    engine.reset_object_loads();
+    assert_eq!(
+        alice_handle.read_range(offset, length).unwrap(),
+        value[start..end]
+    );
+    let alice_first = engine.object_loads();
+
+    engine.reset_object_loads();
+    assert_eq!(
+        alice_handle.read_range(offset, length).unwrap(),
+        value[start..end]
+    );
+    let alice_reused = engine.object_loads();
+    assert!(
+        alice_reused < alice_first,
+        "reused range loaded {alice_reused} objects; first validation loaded {alice_first}"
+    );
+
+    engine.reset_object_loads();
+    assert_eq!(
+        bob_handle.read_range(offset, length).unwrap(),
+        value[start..end]
+    );
+    assert!(
+        engine.object_loads() >= alice_first,
+        "Bob reused Alice's verification evidence"
+    );
+
+    assert!(reader.delete(&alice, &name).unwrap());
+    engine.reset_object_loads();
+    assert_eq!(
+        alice_handle.read_range(offset, length).unwrap(),
+        value[start..end]
+    );
+    assert!(
+        engine.object_loads() >= alice_first,
+        "an open handle retained process-local evidence after its file left the live catalog"
+    );
+}
+
+#[test]
 fn one_shot_reads_reuse_the_current_decoded_header() {
     let engine = Arc::new(CountingEngine::new());
     let writer = PrincipalContentStore::from_engine(Arc::clone(&engine));

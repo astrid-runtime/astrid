@@ -6,10 +6,10 @@ use std::sync::{Arc, OnceLock};
 
 use astrid_storage_content::{
     BuiltContent, ChunkingProfile, ContentDescriptor, ContentError, ContentObjectSink,
-    ContentReadError, ContentSource, ContentStreamError, OpenedContent, VerifiedContent,
-    build_content, build_content_streaming, describe_content, open_content,
-    read_opened_content_and_verify, read_opened_content_range, read_verified_content,
-    read_verified_content_range,
+    ContentReadError, ContentSource, ContentStreamError, ContentVerificationState, OpenedContent,
+    VerifiedContent, build_content, build_content_streaming, describe_content, open_content,
+    read_opened_content_and_verify, read_opened_content_range_with_verification,
+    read_verified_content, read_verified_content_range,
 };
 use astrid_storage_engine::{PrincipalProjectionEngine, PrincipalProjectionError, RootTransaction};
 use astrid_storage_model::{
@@ -38,6 +38,8 @@ type VerifiedFileMap<P> = BTreeMap<P, BTreeMap<ObjectId, VerifiedContent>>;
 // Partition proof reuse by principal so cache timing cannot reveal that
 // another principal previously published or read equal content.
 type SharedVerifiedFiles<P> = Arc<RwLock<VerifiedFileMap<P>>>;
+type PartialVerificationMap<P> = BTreeMap<P, BTreeMap<ObjectId, ContentVerificationState>>;
+type SharedPartialVerifications<P> = Arc<RwLock<PartialVerificationMap<P>>>;
 type DecodedHeaderMap<P> = BTreeMap<P, Arc<ContentHeader<P>>>;
 
 /// Named content projection over one shared principal-state engine.
@@ -47,6 +49,7 @@ pub struct PrincipalContentStore<P: Ord, E> {
     validated_catalogs: Arc<Mutex<BTreeMap<P, CatalogValidation>>>,
     validated_kv: Arc<KvValidationCache<P>>,
     verified_files: OnceLock<SharedVerifiedFiles<P>>,
+    partial_verifications: OnceLock<SharedPartialVerifications<P>>,
     decoded_headers: OnceLock<RwLock<DecodedHeaderMap<P>>>,
 }
 
@@ -62,6 +65,7 @@ pub struct PrincipalContentReadHandle<P: Ord, E> {
     principal: P,
     principal_root: RootState,
     verified_files: SharedVerifiedFiles<P>,
+    partial_verifications: SharedPartialVerifications<P>,
 }
 
 impl<P: Ord, E> fmt::Debug for PrincipalContentReadHandle<P, E> {
@@ -116,12 +120,35 @@ where
     /// requested bytes cannot be reconstructed exactly.
     pub fn read_range(&self, offset: u64, length: u64) -> Result<Vec<u8>, PrincipalContentError> {
         let source = EngineSource::<P, E>::new(self.engine.as_ref(), &self.principal);
-        match self.verified() {
-            Some(verified) => read_verified_content_range(&source, verified, offset, length)
-                .map_err(map_read_error),
-            None => read_opened_content_range(&source, self.opened, offset, length)
-                .map_err(map_read_error),
+        if let Some(verified) = self.verified() {
+            return read_verified_content_range(&source, verified, offset, length)
+                .map_err(map_read_error);
         }
+        let partial = self.partial_verifications.read();
+        let empty = ContentVerificationState::default();
+        let known = partial
+            .get(&self.principal)
+            .and_then(|files| files.get(&self.opened.descriptor().file()))
+            .unwrap_or(&empty);
+        let (bytes, delta) = read_opened_content_range_with_verification(
+            &source,
+            self.opened,
+            known,
+            offset,
+            length,
+        )
+        .map_err(map_read_error)?;
+        drop(partial);
+        if !delta.is_empty() {
+            self.partial_verifications
+                .write()
+                .entry(self.principal.clone())
+                .or_default()
+                .entry(self.opened.descriptor().file())
+                .or_default()
+                .merge(delta);
+        }
+        Ok(bytes)
     }
 
     fn verified(&self) -> Option<VerifiedContent> {
@@ -133,11 +160,15 @@ where
     }
 
     fn mark_verified(&self, verified: VerifiedContent) {
+        let file = verified.descriptor().file();
         self.verified_files
             .write()
             .entry(self.principal.clone())
             .or_default()
-            .insert(verified.descriptor().file(), verified);
+            .insert(file, verified);
+        if let Some(files) = self.partial_verifications.write().get_mut(&self.principal) {
+            files.remove(&file);
+        }
     }
 }
 
@@ -152,6 +183,11 @@ impl<P: Ord, E> PrincipalContentStore<P, E> {
             .get_or_init(|| RwLock::new(BTreeMap::new()))
     }
 
+    fn partial_verifications(&self) -> &SharedPartialVerifications<P> {
+        self.partial_verifications
+            .get_or_init(|| Arc::new(RwLock::new(BTreeMap::new())))
+    }
+
     /// Construct without a principal-specific quota.
     #[must_use]
     pub fn from_engine(engine: Arc<E>) -> Self {
@@ -161,6 +197,7 @@ impl<P: Ord, E> PrincipalContentStore<P, E> {
             validated_catalogs: Arc::new(Mutex::new(BTreeMap::new())),
             validated_kv: Arc::new(KvValidationCache::default()),
             verified_files: OnceLock::new(),
+            partial_verifications: OnceLock::new(),
             decoded_headers: OnceLock::new(),
         }
     }
@@ -174,6 +211,7 @@ impl<P: Ord, E> PrincipalContentStore<P, E> {
             validated_catalogs: Arc::new(Mutex::new(BTreeMap::new())),
             validated_kv: Arc::new(KvValidationCache::default()),
             verified_files: OnceLock::new(),
+            partial_verifications: OnceLock::new(),
             decoded_headers: OnceLock::new(),
         }
     }
@@ -190,6 +228,7 @@ impl<P: Ord, E> PrincipalContentStore<P, E> {
             validated_catalogs,
             validated_kv,
             verified_files: OnceLock::new(),
+            partial_verifications: OnceLock::new(),
             decoded_headers: OnceLock::new(),
         }
     }
@@ -204,6 +243,7 @@ impl<P: Ord, E> PrincipalContentStore<P, E> {
             validated_catalogs,
             validated_kv: Arc::new(KvValidationCache::default()),
             verified_files: OnceLock::new(),
+            partial_verifications: OnceLock::new(),
             decoded_headers: OnceLock::new(),
         }
     }
@@ -423,17 +463,15 @@ where
         let descriptor = verified.descriptor();
         loop {
             let mut header = self.header(principal.clone())?.as_ref().clone();
-            if self
-                .catalog_lookup(header.catalog, name)?
-                .is_some_and(|entry| entry.file == descriptor.file())
-            {
+            let previous = self.catalog_lookup(header.catalog, name)?;
+            if previous.is_some_and(|entry| entry.file == descriptor.file()) {
                 let root = header.root.ok_or_else(|| {
                     invalid(
                         descriptor.file(),
                         "catalog entry exists without a principal root",
                     )
                 })?;
-                self.mark_verified(principal.clone(), verified);
+                self.mark_verified(principal, verified);
                 return Ok(ContentWriteOutcome::new(descriptor, root, 0));
             }
             let mutation = insert(
@@ -460,7 +498,10 @@ where
                             summary: catalog.map_or(CatalogSummary::default(), |root| root.summary),
                         },
                     );
-                    self.mark_verified(principal.clone(), verified);
+                    if let Some(previous) = previous {
+                        self.discard_verification(principal, previous.file);
+                    }
+                    self.mark_verified(principal, verified);
                     let objects_inserted = staged_objects_inserted
                         .checked_add(outcome.objects_inserted())
                         .ok_or(PrincipalContentError::AccountingOverflow)?;
@@ -494,9 +535,10 @@ where
                 &mut |object| self.load_required(object),
                 &|record| self.engine.identify_object(record),
             )?;
-            if mutation.previous.is_none() {
+            let Some(previous) = mutation.previous else {
                 return Ok(false);
-            }
+            };
+            let removed = previous.file;
             header.catalog = mutation.root;
             let catalog = header.catalog;
             let transaction = self.encode_transaction(header, None, mutation.records)?;
@@ -510,6 +552,7 @@ where
                             summary: catalog.map_or(CatalogSummary::default(), |root| root.summary),
                         },
                     );
+                    self.discard_verification(principal, removed);
                     return Ok(true);
                 },
                 Err(PrincipalProjectionError::Model(ModelError::RootConflict { .. })) => {},
@@ -593,6 +636,7 @@ where
             principal: principal.clone(),
             principal_root: root,
             verified_files: Arc::clone(self.verified_files()),
+            partial_verifications: Arc::clone(self.partial_verifications()),
         }))
     }
 
@@ -641,12 +685,25 @@ where
         self.engine.flush_projection().map_err(Into::into)
     }
 
-    fn mark_verified(&self, principal: P, verified: VerifiedContent) {
+    fn mark_verified(&self, principal: &P, verified: VerifiedContent) {
+        let file = verified.descriptor().file();
         self.verified_files()
             .write()
-            .entry(principal)
+            .entry(principal.clone())
             .or_default()
-            .insert(verified.descriptor().file(), verified);
+            .insert(file, verified);
+        if let Some(files) = self.partial_verifications().write().get_mut(principal) {
+            files.remove(&file);
+        }
+    }
+
+    fn discard_verification(&self, principal: &P, file: ObjectId) {
+        if let Some(files) = self.verified_files().write().get_mut(principal) {
+            files.remove(&file);
+        }
+        if let Some(files) = self.partial_verifications().write().get_mut(principal) {
+            files.remove(&file);
+        }
     }
 
     fn header(&self, principal: P) -> Result<Arc<ContentHeader<P>>, PrincipalContentError> {

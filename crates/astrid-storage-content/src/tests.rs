@@ -9,11 +9,13 @@ use astrid_storage_model::{
     ReferenceKind, ReferenceLabel,
 };
 
+use crate::boundary::is_canonical_boundary;
 use crate::{
     CHUNK_TREE_FANOUT, CONTENT_LABEL, ChunkingProfile, ContentError, ContentReadError,
-    ContentSource, FILE_HEADER_BYTES, FORMAT_VERSION, build_content, describe_content,
-    encode_file_header, open_content, read_content, read_content_range, read_opened_content,
-    read_opened_content_and_verify, read_opened_content_range, read_verified_content_range,
+    ContentSource, ContentVerificationState, FILE_HEADER_BYTES, FORMAT_VERSION, build_content,
+    describe_content, encode_file_header, open_content, read_content, read_content_range,
+    read_opened_content, read_opened_content_and_verify, read_opened_content_range,
+    read_opened_content_range_with_verification, read_verified_content_range,
 };
 
 #[derive(Clone, Copy)]
@@ -246,6 +248,106 @@ fn verified_content_skips_only_redundant_boundary_reads() {
         verified_source.loads.get() < validating_loads,
         "verified range loaded {} objects; validating range loaded {validating_loads}",
         verified_source.loads.get()
+    );
+}
+
+#[test]
+fn range_verification_reuses_only_successfully_observed_tree_edges() {
+    let bytes = deterministic_bytes(8 * 1024 * 1024);
+    let built = build_content(&TestIdentity, ChunkingProfile::ASTRID_V1, &bytes).unwrap();
+    let source = MapSource::new(built.records());
+    let opened = open_content(&source, built.descriptor().file()).unwrap();
+    let mut verification = ContentVerificationState::default();
+    let offset = 4_000_000_u64;
+    let length = 64 * 1024_u64;
+
+    source.loads.set(0);
+    let (first, delta) =
+        read_opened_content_range_with_verification(&source, opened, &verification, offset, length)
+            .unwrap();
+    let first_loads = source.loads.get();
+    assert!(!delta.is_empty());
+    assert!(delta.boundary_count() > 0);
+    verification.merge(delta);
+
+    source.loads.set(0);
+    let (second, delta) =
+        read_opened_content_range_with_verification(&source, opened, &verification, offset, length)
+            .unwrap();
+    let start = usize::try_from(offset).unwrap();
+    let end = usize::try_from(offset + length).unwrap();
+    assert_eq!(first, bytes[start..end]);
+    assert_eq!(second, first);
+    assert!(delta.is_empty(), "known edges were redundantly revalidated");
+    assert!(
+        source.loads.get() < first_loads,
+        "known range loaded {} objects; first validation loaded {first_loads}",
+        source.loads.get()
+    );
+}
+
+#[test]
+fn failed_range_validation_returns_no_reusable_edge_proofs() {
+    let profile = ChunkingProfile::fastcdc_v2020(64, 256, 1024, 0).unwrap();
+    let (file, source) = manual_content(profile, &[vec![1; 63], vec![2; 962]]);
+    let opened = open_content(&source, file).unwrap();
+    let verification = ContentVerificationState::default();
+
+    assert!(
+        read_opened_content_range_with_verification(&source, opened, &verification, 62, 2,)
+            .is_err()
+    );
+    assert_eq!(verification.boundary_count(), 0);
+}
+
+#[test]
+fn range_verification_is_bound_to_the_exact_chunking_profile() {
+    let first_profile = ChunkingProfile::fastcdc_v2020(64, 256, 1024, 0).unwrap();
+    let second_profile = ChunkingProfile::fastcdc_v2020(64, 256, 1024, 1).unwrap();
+    let right = vec![0x5a; 600];
+    let left = (0_u16..=u16::MAX)
+        .find_map(|nonce| {
+            let mut state = u64::from(nonce).saturating_add(1);
+            let candidate = (0..512)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    (state >> 37).to_le_bytes()[0]
+                })
+                .collect::<Vec<_>>();
+            (is_canonical_boundary(&candidate, &right[..2], first_profile)
+                && !is_canonical_boundary(&candidate, &right[..2], second_profile))
+            .then_some(candidate)
+        })
+        .expect("test data with profile-specific boundary");
+
+    let (first_file, first_source) = manual_content(first_profile, &[left.clone(), right.clone()]);
+    let first_opened = open_content(&first_source, first_file).unwrap();
+    let mut verification = ContentVerificationState::default();
+    let (_, delta) = read_opened_content_range_with_verification(
+        &first_source,
+        first_opened,
+        &verification,
+        500,
+        24,
+    )
+    .unwrap();
+    assert_eq!(delta.boundary_count(), 1);
+    verification.merge(delta);
+
+    let (second_file, second_source) = manual_content(second_profile, &[left, right]);
+    let second_opened = open_content(&second_source, second_file).unwrap();
+    assert!(
+        read_opened_content_range_with_verification(
+            &second_source,
+            second_opened,
+            &verification,
+            500,
+            24,
+        )
+        .is_err(),
+        "evidence from another gear seed bypassed boundary validation"
     );
 }
 

@@ -1,4 +1,4 @@
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
 use core::fmt;
 
 use astrid_storage_model::{
@@ -79,6 +79,115 @@ pub trait ContentSource {
                 .map(|record| record.map(Arc::new))
                 .collect()
         })
+    }
+}
+
+/// Process-local proofs for canonical boundaries inside immutable chunk trees.
+///
+/// Proofs are keyed by the identity of the tree node, the exact edge between
+/// two adjacent children, and every identity-bearing chunking parameter. The
+/// fields are private: non-empty state can only be produced by a successful
+/// validating read. Embedders should partition this state at their authority
+/// boundary; Astrid's principal store keeps one state per principal and file.
+///
+/// Each tree uses one 128-bit edge bitmap, so verification metadata is bounded
+/// by the number of visited tree nodes rather than the logical file size.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ContentVerificationState {
+    edges: BTreeMap<VerificationDomain, u128>,
+}
+
+impl ContentVerificationState {
+    /// Merge proofs returned by a successful range read.
+    pub fn merge(&mut self, delta: ContentVerificationDelta) {
+        for (domain, edges) in delta.edges {
+            *self.edges.entry(domain).or_default() |= edges;
+        }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn boundary_count(&self) -> u64 {
+        self.edges
+            .values()
+            .map(|edges| u64::from(edges.count_ones()))
+            .sum()
+    }
+
+    fn contains(&self, edge: VerifiedEdge) -> bool {
+        self.edges
+            .get(&edge.domain)
+            .is_some_and(|edges| edges & edge.mask() != 0)
+    }
+}
+
+/// Newly validated boundary proofs from one successful range read.
+///
+/// The type has no public constructor. A delta exists only after the content
+/// reader has validated every boundary it contains.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ContentVerificationDelta {
+    edges: BTreeMap<VerificationDomain, u128>,
+}
+
+impl ContentVerificationDelta {
+    /// Return whether the read discovered no new boundary proofs.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.edges.is_empty()
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn boundary_count(&self) -> u64 {
+        self.edges
+            .values()
+            .map(|edges| u64::from(edges.count_ones()))
+            .sum()
+    }
+
+    fn insert(&mut self, edge: VerifiedEdge) {
+        *self.edges.entry(edge.domain).or_default() |= edge.mask();
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct VerificationDomain {
+    tree: ObjectId,
+    minimum_bytes: u32,
+    average_bytes: u32,
+    maximum_bytes: u32,
+    gear_seed: u64,
+}
+
+impl VerificationDomain {
+    const fn new(tree: ObjectId, profile: ChunkingProfile) -> Self {
+        Self {
+            tree,
+            minimum_bytes: profile.minimum_bytes(),
+            average_bytes: profile.average_bytes(),
+            maximum_bytes: profile.maximum_bytes(),
+            gear_seed: profile.gear_seed(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VerifiedEdge {
+    domain: VerificationDomain,
+    left_child: u16,
+}
+
+impl VerifiedEdge {
+    const fn new(tree: ObjectId, left_child: u16, profile: ChunkingProfile) -> Self {
+        Self {
+            domain: VerificationDomain::new(tree, profile),
+            left_child,
+        }
+    }
+
+    fn mask(self) -> u128 {
+        1_u128 << u32::from(self.left_child)
     }
 }
 
@@ -186,7 +295,7 @@ pub fn read_opened_content_and_verify<S: ContentSource>(
     opened: OpenedContent,
 ) -> Result<(Vec<u8>, VerifiedContent), ContentReadError<S::Error>> {
     let descriptor = opened.descriptor();
-    let bytes = read_decoded_range(
+    let (bytes, _) = read_decoded_range(
         source,
         descriptor.file(),
         (
@@ -197,7 +306,7 @@ pub fn read_opened_content_and_verify<S: ContentSource>(
         ),
         0,
         descriptor.logical_bytes(),
-        true,
+        BoundaryMode::Validate,
     )?;
     Ok((bytes, VerifiedContent::new(opened)))
 }
@@ -227,8 +336,9 @@ pub fn read_verified_content<S: ContentSource>(
         ),
         0,
         descriptor.logical_bytes(),
-        false,
+        BoundaryMode::Skip,
     )
+    .map(|(bytes, _)| bytes)
 }
 
 /// Reconstruct an exact byte range while traversing only overlapping chunks.
@@ -270,7 +380,43 @@ pub fn read_opened_content_range<S: ContentSource>(
         ),
         offset,
         length,
-        true,
+        BoundaryMode::Validate,
+    )
+    .map(|(bytes, _)| bytes)
+}
+
+/// Reconstruct a range while reusing and extending local boundary proofs.
+///
+/// The known state can skip only `FastCDC` boundaries already validated for the
+/// exact immutable tree edge and chunking profile. Object loading, canonical
+/// decoding, shape validation, and range checks always remain active. The
+/// returned delta is empty or contains only proofs established by this
+/// successful read; callers may merge it after releasing any shared read lock.
+///
+/// # Errors
+///
+/// Returns an out-of-bounds, source, allocation, missing-object, or canonical
+/// grammar error. No delta is returned when any check fails.
+pub fn read_opened_content_range_with_verification<S: ContentSource>(
+    source: &S,
+    opened: OpenedContent,
+    known: &ContentVerificationState,
+    offset: u64,
+    length: u64,
+) -> Result<(Vec<u8>, ContentVerificationDelta), ContentReadError<S::Error>> {
+    let descriptor = opened.descriptor();
+    read_decoded_range(
+        source,
+        descriptor.file(),
+        (
+            descriptor.profile(),
+            descriptor.logical_bytes(),
+            descriptor.chunk_count(),
+            opened.content(),
+        ),
+        offset,
+        length,
+        BoundaryMode::Reuse(known),
     )
 }
 
@@ -302,8 +448,16 @@ pub fn read_verified_content_range<S: ContentSource>(
         ),
         offset,
         length,
-        false,
+        BoundaryMode::Skip,
     )
+    .map(|(bytes, _)| bytes)
+}
+
+#[derive(Clone, Copy)]
+enum BoundaryMode<'a> {
+    Skip,
+    Validate,
+    Reuse(&'a ContentVerificationState),
 }
 
 fn read_decoded_range<S: ContentSource>(
@@ -312,8 +466,8 @@ fn read_decoded_range<S: ContentSource>(
     decoded: (ChunkingProfile, u64, u64, Option<ObjectId>),
     offset: u64,
     length: u64,
-    validate_boundaries: bool,
-) -> Result<Vec<u8>, ContentReadError<S::Error>> {
+    boundary_mode: BoundaryMode<'_>,
+) -> Result<(Vec<u8>, ContentVerificationDelta), ContentReadError<S::Error>> {
     let (profile, logical_bytes, chunk_count, content) = decoded;
     let end = offset
         .checked_add(length)
@@ -336,7 +490,7 @@ fn read_decoded_range<S: ContentSource>(
         .try_reserve_exact(capacity)
         .map_err(|_| ContentError::LengthOverflow)?;
     if length == 0 {
-        return Ok(output);
+        return Ok((output, ContentVerificationDelta::default()));
     }
     let content = content.ok_or(ContentError::InvalidObject {
         object: file,
@@ -349,17 +503,29 @@ fn read_decoded_range<S: ContentSource>(
         profile,
         ends_file: true,
     };
-    let mut boundaries = validate_boundaries.then(BoundaryWindow::default);
-    append_range(
+    let mut boundaries = match boundary_mode {
+        BoundaryMode::Skip => None,
+        BoundaryMode::Validate => Some(BoundaryWindow::new(None)),
+        BoundaryMode::Reuse(known) => Some(BoundaryWindow::new(Some(known))),
+    };
+    let record = load(source, content)?;
+    let mut traversal = RangeTraversal {
+        range: RequestedRange { start: offset, end },
+        output: &mut output,
+        boundaries: &mut boundaries,
+    };
+    append_loaded_range(
         source,
-        content,
-        shape,
-        RequestedRange { start: offset, end },
-        0,
-        &mut output,
-        &mut boundaries,
+        TraversalNode {
+            object: content,
+            record,
+            shape,
+            base_offset: 0,
+            path: Vec::new(),
+        },
+        &mut traversal,
     )?;
-    if let Some(boundaries) = &boundaries {
+    if let Some(boundaries) = &mut boundaries {
         boundaries.validate_neighbors(source, content, shape, logical_bytes)?;
     }
     if output.len() != capacity {
@@ -369,7 +535,12 @@ fn read_decoded_range<S: ContentSource>(
         }
         .into());
     }
-    Ok(output)
+    Ok((
+        output,
+        boundaries
+            .map(BoundaryWindow::into_delta)
+            .unwrap_or_default(),
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -391,11 +562,21 @@ struct LoadedChunk {
     object: ObjectId,
     start: u64,
     bytes: Vec<u8>,
+    path: Vec<TreeStep>,
 }
 
-struct LoadedRecord {
+struct TraversalNode {
     object: ObjectId,
     record: Arc<ObjectRecord>,
+    shape: ExpectedShape,
+    base_offset: u64,
+    path: Vec<TreeStep>,
+}
+
+struct RangeTraversal<'output, 'verification> {
+    range: RequestedRange,
+    output: &'output mut Vec<u8>,
+    boundaries: &'output mut Option<BoundaryWindow<'verification>>,
 }
 
 impl LoadedChunk {
@@ -406,19 +587,44 @@ impl LoadedChunk {
     }
 }
 
-#[derive(Default)]
-struct BoundaryWindow {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TreeStep {
+    tree: ObjectId,
+    child_index: u16,
+    child_count: u16,
+}
+
+struct BoundaryWindow<'a> {
+    known: Option<&'a ContentVerificationState>,
+    delta: ContentVerificationDelta,
     first_start: Option<u64>,
     first_prefix: Vec<u8>,
+    first_path: Vec<TreeStep>,
     last: Option<LoadedChunk>,
 }
 
-impl BoundaryWindow {
+impl<'a> BoundaryWindow<'a> {
+    fn new(known: Option<&'a ContentVerificationState>) -> Self {
+        Self {
+            known,
+            delta: ContentVerificationDelta::default(),
+            first_start: None,
+            first_prefix: Vec::new(),
+            first_path: Vec::new(),
+            last: None,
+        }
+    }
+
+    fn into_delta(self) -> ContentVerificationDelta {
+        self.delta
+    }
+
     fn observe(
         &mut self,
         object: ObjectId,
         start: u64,
         bytes: &[u8],
+        path: &[TreeStep],
         profile: ChunkingProfile,
     ) -> Result<(), ContentError> {
         if bytes.is_empty() {
@@ -429,28 +635,31 @@ impl BoundaryWindow {
         }
         let prefix_length = bytes.len().min(2);
         let prefix = &bytes[..prefix_length];
-        if let Some(previous) = &self.last {
+        if let Some(previous) = self.last.take() {
             if previous.end()? != start {
                 return Err(ContentError::InvalidObject {
                     object,
                     detail: "content traversal skipped an overlapping chunk",
                 });
             }
-            validate_boundary(previous, prefix, profile)?;
+            let edge = edge_between(&previous.path, path, object, profile)?;
+            self.validate_edge(&previous, prefix, edge, profile)?;
         } else {
             self.first_start = Some(start);
             self.first_prefix.extend_from_slice(prefix);
+            self.first_path.extend_from_slice(path);
         }
         self.last = Some(LoadedChunk {
             object,
             start,
             bytes: bytes.to_vec(),
+            path: path.to_vec(),
         });
         Ok(())
     }
 
     fn validate_neighbors<S: ContentSource>(
-        &self,
+        &mut self,
         source: &S,
         content: ObjectId,
         shape: ExpectedShape,
@@ -461,19 +670,32 @@ impl BoundaryWindow {
             detail: "non-empty range selected no content chunk",
         })?;
         if first_start > 0 {
-            let previous =
-                load_chunk_at_offset(source, content, shape, 0, first_start.saturating_sub(1))?;
-            validate_boundary(&previous, &self.first_prefix, shape.profile)?;
+            let edge = edge_before(&self.first_path, content, shape.profile)?;
+            if !self.is_verified(edge) {
+                let previous = load_chunk_at_offset(
+                    source,
+                    content,
+                    shape,
+                    0,
+                    first_start.saturating_sub(1),
+                    Vec::new(),
+                )?;
+                let prefix = self.first_prefix.clone();
+                self.validate_edge(&previous, &prefix, edge, shape.profile)?;
+            }
         }
-        let last = self.last.as_ref().ok_or(ContentError::InvalidObject {
+        let last = self.last.take().ok_or(ContentError::InvalidObject {
             object: content,
             detail: "non-empty range selected no final content chunk",
         })?;
         let last_end = last.end()?;
         if last_end < logical_bytes {
-            let next = load_chunk_at_offset(source, content, shape, 0, last_end)?;
-            let prefix_length = next.bytes.len().min(2);
-            validate_boundary(last, &next.bytes[..prefix_length], shape.profile)?;
+            let edge = edge_after(&last.path, content, shape.profile)?;
+            if !self.is_verified(edge) {
+                let next = load_chunk_at_offset(source, content, shape, 0, last_end, Vec::new())?;
+                let prefix_length = next.bytes.len().min(2);
+                self.validate_edge(&last, &next.bytes[..prefix_length], edge, shape.profile)?;
+            }
         } else if shape.chunk_count > 1 && !is_canonical_final_chunk(&last.bytes, shape.profile) {
             return Err(ContentError::InvalidObject {
                 object: last.object,
@@ -483,6 +705,84 @@ impl BoundaryWindow {
         }
         Ok(())
     }
+
+    fn is_verified(&self, edge: VerifiedEdge) -> bool {
+        self.known.is_some_and(|known| known.contains(edge))
+            || self
+                .delta
+                .edges
+                .get(&edge.domain)
+                .is_some_and(|edges| edges & edge.mask() != 0)
+    }
+
+    fn validate_edge(
+        &mut self,
+        left: &LoadedChunk,
+        right_prefix: &[u8],
+        edge: VerifiedEdge,
+        profile: ChunkingProfile,
+    ) -> Result<(), ContentError> {
+        if self.is_verified(edge) {
+            return Ok(());
+        }
+        validate_boundary(left, right_prefix, profile)?;
+        self.delta.insert(edge);
+        Ok(())
+    }
+}
+
+fn edge_between(
+    left: &[TreeStep],
+    right: &[TreeStep],
+    object: ObjectId,
+    profile: ChunkingProfile,
+) -> Result<VerifiedEdge, ContentError> {
+    for (left, right) in left.iter().zip(right) {
+        if left == right {
+            continue;
+        }
+        if left.tree == right.tree && right.child_index == left.child_index.saturating_add(1) {
+            return Ok(VerifiedEdge::new(left.tree, left.child_index, profile));
+        }
+        return Err(ContentError::InvalidObject {
+            object,
+            detail: "adjacent chunks have inconsistent tree paths",
+        });
+    }
+    Err(ContentError::InvalidObject {
+        object,
+        detail: "adjacent chunks do not diverge at a tree edge",
+    })
+}
+
+fn edge_before(
+    path: &[TreeStep],
+    object: ObjectId,
+    profile: ChunkingProfile,
+) -> Result<VerifiedEdge, ContentError> {
+    path.iter()
+        .rev()
+        .find(|step| step.child_index > 0)
+        .map(|step| VerifiedEdge::new(step.tree, step.child_index.saturating_sub(1), profile))
+        .ok_or(ContentError::InvalidObject {
+            object,
+            detail: "non-initial chunk has no preceding tree edge",
+        })
+}
+
+fn edge_after(
+    path: &[TreeStep],
+    object: ObjectId,
+    profile: ChunkingProfile,
+) -> Result<VerifiedEdge, ContentError> {
+    path.iter()
+        .rev()
+        .find(|step| step.child_index.saturating_add(1) < step.child_count)
+        .map(|step| VerifiedEdge::new(step.tree, step.child_index, profile))
+        .ok_or(ContentError::InvalidObject {
+            object,
+            detail: "non-final chunk has no following tree edge",
+        })
 }
 
 fn validate_boundary(
@@ -500,124 +800,147 @@ fn validate_boundary(
     }
 }
 
-fn append_range<S: ContentSource>(
-    source: &S,
-    object: ObjectId,
-    shape: ExpectedShape,
-    range: RequestedRange,
-    base_offset: u64,
-    output: &mut Vec<u8>,
-    boundaries: &mut Option<BoundaryWindow>,
-) -> Result<(), ContentReadError<S::Error>> {
-    let record = load(source, object)?;
-    append_loaded_range(
-        source,
-        LoadedRecord { object, record },
-        shape,
-        range,
-        base_offset,
-        output,
-        boundaries,
-    )
-}
-
 fn append_loaded_range<S: ContentSource>(
     source: &S,
-    loaded: LoadedRecord,
-    shape: ExpectedShape,
-    range: RequestedRange,
-    base_offset: u64,
-    output: &mut Vec<u8>,
-    boundaries: &mut Option<BoundaryWindow>,
+    node: TraversalNode,
+    traversal: &mut RangeTraversal<'_, '_>,
 ) -> Result<(), ContentReadError<S::Error>> {
-    let LoadedRecord { object, record } = loaded;
-    match record.kind() {
-        ObjectKind::Chunk => {
-            validate_chunk(object, &record, shape)?;
-            if let Some(boundaries) = boundaries {
-                boundaries.observe(object, base_offset, record.canonical_bytes(), shape.profile)?;
-            }
-            let chunk_end = base_offset
-                .checked_add(shape.logical_bytes)
-                .ok_or(ContentError::LengthOverflow)?;
-            let start = usize::try_from(range.start.max(base_offset).saturating_sub(base_offset))
-                .map_err(|_| ContentError::LengthOverflow)?;
-            let end = usize::try_from(range.end.min(chunk_end).saturating_sub(base_offset))
-                .map_err(|_| ContentError::LengthOverflow)?;
-            let bytes =
-                record
-                    .canonical_bytes()
-                    .get(start..end)
-                    .ok_or(ContentError::InvalidObject {
-                        object,
-                        detail: "chunk range exceeds payload",
-                    })?;
-            output.extend_from_slice(bytes);
-            Ok(())
-        },
-        ObjectKind::ChunkTree => {
-            if shape.tree_depth == 0 {
-                return Err(ContentError::InvalidObject {
-                    object,
-                    detail: "chunk tree exceeds canonical depth",
-                }
-                .into());
-            }
-            let children = decode_tree(object, &record, shape)?;
-            let mut cursor = 0_u64;
-            let child_count = children.len();
-            let mut selected = Vec::new();
-            for (index, (child, child_length, child_chunk_count)) in
-                children.into_iter().enumerate()
-            {
-                let child_end = cursor
-                    .checked_add(child_length)
-                    .ok_or(ContentError::LengthOverflow)?;
-                let child_base = base_offset
-                    .checked_add(cursor)
-                    .ok_or(ContentError::LengthOverflow)?;
-                let child_absolute_end = base_offset
-                    .checked_add(child_end)
-                    .ok_or(ContentError::LengthOverflow)?;
-                if range.start < child_absolute_end && range.end > child_base {
-                    selected.push((
-                        child,
-                        ExpectedShape {
-                            logical_bytes: child_length,
-                            chunk_count: child_chunk_count,
-                            tree_depth: shape.tree_depth.saturating_sub(1),
-                            profile: shape.profile,
-                            ends_file: shape.ends_file && index.saturating_add(1) == child_count,
-                        },
-                        child_base,
-                    ));
-                }
-                cursor = child_end;
-            }
-            let ids: Vec<_> = selected.iter().map(|(child, _, _)| *child).collect();
-            let records = load_many(source, &ids)?;
-            for ((child, child_shape, child_base), record) in selected.into_iter().zip(records) {
-                append_loaded_range(
-                    source,
-                    LoadedRecord {
-                        object: child,
-                        record,
-                    },
-                    child_shape,
-                    range,
-                    child_base,
-                    output,
-                    boundaries,
-                )?;
-            }
-            Ok(())
-        },
+    match node.record.kind() {
+        ObjectKind::Chunk => append_chunk_range(node, traversal),
+        ObjectKind::ChunkTree => append_tree_range(source, node, traversal),
         _ => Err(ContentError::InvalidObject {
-            object,
+            object: node.object,
             detail: "file content points to an unsupported object kind",
         }
         .into()),
     }
+}
+
+fn append_chunk_range<E>(
+    node: TraversalNode,
+    traversal: &mut RangeTraversal<'_, '_>,
+) -> Result<(), ContentReadError<E>> {
+    let TraversalNode {
+        object,
+        record,
+        shape,
+        base_offset,
+        path,
+    } = node;
+    validate_chunk(object, &record, shape)?;
+    if let Some(boundaries) = traversal.boundaries.as_mut() {
+        boundaries.observe(
+            object,
+            base_offset,
+            record.canonical_bytes(),
+            &path,
+            shape.profile,
+        )?;
+    }
+    let chunk_end = base_offset
+        .checked_add(shape.logical_bytes)
+        .ok_or(ContentError::LengthOverflow)?;
+    let start = usize::try_from(
+        traversal
+            .range
+            .start
+            .max(base_offset)
+            .saturating_sub(base_offset),
+    )
+    .map_err(|_| ContentError::LengthOverflow)?;
+    let end = usize::try_from(
+        traversal
+            .range
+            .end
+            .min(chunk_end)
+            .saturating_sub(base_offset),
+    )
+    .map_err(|_| ContentError::LengthOverflow)?;
+    let bytes = record
+        .canonical_bytes()
+        .get(start..end)
+        .ok_or(ContentError::InvalidObject {
+            object,
+            detail: "chunk range exceeds payload",
+        })?;
+    traversal.output.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn append_tree_range<S: ContentSource>(
+    source: &S,
+    node: TraversalNode,
+    traversal: &mut RangeTraversal<'_, '_>,
+) -> Result<(), ContentReadError<S::Error>> {
+    let TraversalNode {
+        object,
+        record,
+        shape,
+        base_offset,
+        path,
+    } = node;
+    if shape.tree_depth == 0 {
+        return Err(ContentError::InvalidObject {
+            object,
+            detail: "chunk tree exceeds canonical depth",
+        }
+        .into());
+    }
+    let children = decode_tree(object, &record, shape)?;
+    let mut cursor = 0_u64;
+    let child_count = children.len();
+    let child_count_u16 = u16::try_from(child_count).map_err(|_| ContentError::LengthOverflow)?;
+    let mut selected = Vec::new();
+    for (index, (child, child_length, child_chunk_count)) in children.into_iter().enumerate() {
+        let child_end = cursor
+            .checked_add(child_length)
+            .ok_or(ContentError::LengthOverflow)?;
+        let child_base = base_offset
+            .checked_add(cursor)
+            .ok_or(ContentError::LengthOverflow)?;
+        let child_absolute_end = base_offset
+            .checked_add(child_end)
+            .ok_or(ContentError::LengthOverflow)?;
+        if traversal.range.start < child_absolute_end && traversal.range.end > child_base {
+            let child_index = u16::try_from(index).map_err(|_| ContentError::LengthOverflow)?;
+            let mut child_path = path.clone();
+            child_path.push(TreeStep {
+                tree: object,
+                child_index,
+                child_count: child_count_u16,
+            });
+            selected.push((
+                child,
+                ExpectedShape {
+                    logical_bytes: child_length,
+                    chunk_count: child_chunk_count,
+                    tree_depth: shape.tree_depth.saturating_sub(1),
+                    profile: shape.profile,
+                    ends_file: shape.ends_file && index.saturating_add(1) == child_count,
+                },
+                child_base,
+                child_path,
+            ));
+        }
+        cursor = child_end;
+    }
+    let ids: Vec<_> = selected.iter().map(|(child, _, _, _)| *child).collect();
+    let records = load_many(source, &ids)?;
+    for ((child, child_shape, child_base, child_path), record) in selected.into_iter().zip(records)
+    {
+        append_loaded_range(
+            source,
+            TraversalNode {
+                object: child,
+                record,
+                shape: child_shape,
+                base_offset: child_base,
+                path: child_path,
+            },
+            traversal,
+        )?;
+    }
+    Ok(())
 }
 
 fn load_many<S: ContentSource>(
@@ -653,6 +976,7 @@ fn load_chunk_at_offset<S: ContentSource>(
     shape: ExpectedShape,
     base_offset: u64,
     target_offset: u64,
+    path: Vec<TreeStep>,
 ) -> Result<LoadedChunk, ContentReadError<S::Error>> {
     let record = load(source, object)?;
     match record.kind() {
@@ -672,6 +996,7 @@ fn load_chunk_at_offset<S: ContentSource>(
                 object,
                 start: base_offset,
                 bytes: record.canonical_bytes().to_vec(),
+                path,
             })
         },
         ObjectKind::ChunkTree => {
@@ -695,6 +1020,16 @@ fn load_chunk_at_offset<S: ContentSource>(
                     .checked_add(child_length)
                     .ok_or(ContentError::LengthOverflow)?;
                 if target_offset >= child_base && target_offset < child_end {
+                    let child_index =
+                        u16::try_from(index).map_err(|_| ContentError::LengthOverflow)?;
+                    let child_count_u16 =
+                        u16::try_from(child_count).map_err(|_| ContentError::LengthOverflow)?;
+                    let mut child_path = path;
+                    child_path.push(TreeStep {
+                        tree: object,
+                        child_index,
+                        child_count: child_count_u16,
+                    });
                     return load_chunk_at_offset(
                         source,
                         child,
@@ -707,6 +1042,7 @@ fn load_chunk_at_offset<S: ContentSource>(
                         },
                         child_base,
                         target_offset,
+                        child_path,
                     );
                 }
                 cursor = cursor

@@ -283,7 +283,12 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   boundaries instead of cloning full records, physically adjacent frames are
   verified from coalesced positional reads, and synchronized tick indexes make
   global and per-principal eviction logarithmic rather than scanning the
-  cache under its mutex. Closes #1399.
+  cache under its mutex. Model-scale range reads retain successful local
+  boundary evidence as profile-bound 128-bit bitmaps per immutable chunk-tree
+  node, so a cold range still touches only its own chunks and neighbours while
+  later reads avoid neighbour-only I/O without first scanning the complete
+  file. Evidence is principal/file-partitioned, fail-closed, process-local, and
+  pruned with live catalog files. Closes #1399.
 - **Windows local transport uses authenticated per-user named pipes.** A pipe
   name derived only from the caller's operating-system SID replaces
   filesystem endpoint naming on Windows. Local-only byte-mode instances use a

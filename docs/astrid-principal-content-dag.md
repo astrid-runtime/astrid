@@ -233,6 +233,30 @@ tree nodes and chunks. Returned bytes are copied into caller-owned memory; the
 current API does not expose mapped arena storage or hand out raw engine
 references.
 
+An unverified range does not scan the complete file. It validates the
+FastCDC boundaries inside the requested range plus, when present, the
+immediately preceding and following chunk. Successful checks produce
+process-local edge evidence keyed by:
+
+- the immutable `ChunkTree` ObjectId;
+- the exact adjacent-child edge inside that node; and
+- every identity-bearing chunking-profile field.
+
+Each node uses one 128-bit bitmap, matching the canonical fanout. Repeated
+ranges can therefore skip already-proven FastCDC work and avoid loading a
+neighbour used only as boundary context, without creating one heavyweight
+token per chunk or requiring an O(file) first touch. Tree decoding, object
+identity, expected byte/chunk totals, chunk bounds, and requested-range checks
+remain active on every read.
+
+The principal store partitions this evidence by principal and file. Equal
+content in another principal cannot inherit warmth, and evidence is pruned
+when its file leaves that store instance's live catalog. An already-open
+generation may validate and cache the edge again because the handle remains a
+live read authority. The evidence is deliberately not durable; a future
+persistent form must be an authenticated `Evidence` object bound into the
+root-CAS graph, never an editable sidecar.
+
 Objects are immutable, so a concurrent catalog update cannot change the bytes
 behind a descriptor. Durable garbage collection is not yet active. Once it is,
 long-running readers must pin a root or use a bounded read lease.
