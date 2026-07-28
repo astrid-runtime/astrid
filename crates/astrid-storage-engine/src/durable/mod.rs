@@ -921,22 +921,14 @@ fn live_files_mut(files: &mut Option<DurableFiles>) -> Result<&mut DurableFiles,
     files.as_mut().ok_or(DurableError::Closed)
 }
 
-#[path = "durable_staging.rs"]
 mod staging;
 
-#[path = "durable_compaction.rs"]
 mod compaction;
-#[path = "durable_faults.rs"]
 mod faults;
-#[path = "durable_format.rs"]
 mod format;
-#[path = "durable_index.rs"]
-mod index_cache;
-#[path = "durable_lifecycle.rs"]
+mod index;
 mod lifecycle;
-#[path = "durable_roots.rs"]
 mod roots;
-#[path = "durable_validation.rs"]
 mod validation;
 
 use compaction::recover_interrupted_compaction;
@@ -952,7 +944,7 @@ use format::{
     ensure_payload_limit, io_error, open_rw, read_indexed_object, recover_arena, scan_frames,
     sync_store_directory, verify_indexed_location, verify_indexed_tail,
 };
-use index_cache::{IndexState, recover_index, replace_index};
+use index::{IndexState, recover_index, replace_index};
 use roots::{encode_root_record, encode_root_snapshot, recover_roots};
 use validation::{
     materialize_closure, recovery_closure_error, usage_from_closure, validate_commit_closure,
@@ -960,11 +952,8 @@ use validation::{
 };
 
 #[cfg(test)]
-#[path = "durable_compaction_tests.rs"]
 mod compaction_tests;
 #[cfg(test)]
-#[path = "durable_index_tests.rs"]
 mod index_tests;
 #[cfg(test)]
-#[path = "durable_tests.rs"]
 mod tests;

@@ -31,11 +31,8 @@ pub(super) const ROOTS_COMPACTING: &str = "roots.journal.compacting";
 pub(super) const ARENA_PREVIOUS: &str = "objects.arena.previous";
 pub(super) const ROOTS_PREVIOUS: &str = "roots.journal.previous";
 
-#[path = "durable_compaction_evidence.rs"]
 mod evidence;
-#[path = "durable_compaction_outbox.rs"]
 mod outbox;
-#[path = "durable_compaction_recovery.rs"]
 mod recovery;
 
 pub use evidence::CompactionEvidenceBundle;
