@@ -2148,9 +2148,13 @@ impl ExecutionEngine for WasmEngine {
         // busy), distinct from a slow guest call.
         let pool_wait_ms = checkout_start.elapsed().as_millis() as u64;
         let typed_instance = checkout.instance();
-        let result: CapsuleResult<HookTriggerResult> = {
+        // ── Phase 1: SET ──────────────────────────────────────
+        //
+        // Host-side only — nothing here enters the guest, so an early exit
+        // (error or future-drop) in this phase leaves the instance clean and
+        // `PoolCheckout::drop` returns it to the pool un-armed.
+        {
             let s = checkout.store_mut();
-            // ── Phase 1: SET ──────────────────────────────────────
             let applied_profile: Arc<astrid_core::profile::PrincipalProfile> =
                 invocation_profile.clone().unwrap_or_else(|| {
                     Arc::new(astrid_core::profile::PrincipalProfile::default_ref().clone())
@@ -2256,14 +2260,23 @@ impl ExecutionEngine for WasmEngine {
                 }
             }
 
-            // ── Phase 2: CALL ─────────────────────────────────────
-            //
-            // Cancellation safety: the `call_async` future below may be
-            // dropped by the dispatcher (e.g. tokio task abort). Dropping it
-            // drops `checkout`, whose `Drop` synchronously runs Phase 3 CLEAR
-            // *before* the wasm fiber is torn down and returns the instance to
-            // the pool, so the next lease observes `caller_context = None` and
-            // every `invocation_*` field cleared.
+        }
+
+        // ── Phase 2: CALL ─────────────────────────────────────
+        //
+        // Cancellation safety: the `call_async` future below may be
+        // dropped by the dispatcher (e.g. tokio task abort). Dropping it
+        // drops `checkout`, whose `Drop` synchronously runs — and because the
+        // checkout is ARMED across the guest call, a future-drop mid-guest
+        // DISCARDS the instance rather than returning it: wasmtime poisons a
+        // component instance on any non-clean exit (trap, cancel, panic), and
+        // a returned poisoned instance would be re-leased first (LIFO) and
+        // permanently capture the capsule's invocation path (the 2026-07-28
+        // all-principals agent wedge). Disarm happens below only on a clean
+        // exit; see `PoolCheckout::arm`/`disarm`.
+        checkout.arm();
+        let result: CapsuleResult<HookTriggerResult> = {
+            let s = checkout.store_mut();
             let typed_lookup = typed_instance
                 .get_typed_func::<(String, Vec<u8>), (HookTriggerResult,)>(
                     &mut *s,
@@ -2282,6 +2295,16 @@ impl ExecutionEngine for WasmEngine {
                 ))),
             }
         };
+        match &result {
+            // Clean guest exit — the instance is re-enterable; return it.
+            Ok(_) => checkout.disarm(),
+            // Export lookup failed BEFORE the guest was entered — clean.
+            Err(CapsuleError::UnsupportedEntryPoint(_)) => checkout.disarm(),
+            // Trap or host-error propagated out of `call_async`: the component
+            // instance is poisoned (`cannot enter component instance` on every
+            // later call). Stay armed — `PoolCheckout::drop` discards it.
+            Err(_) => {},
+        }
         // Per-invocation CPU measurement: fuel counts DOWN from the seed, so
         // `seed - remaining` is the exact deterministic instruction count for
         // this call. Read while `checkout` is still alive (the `s` borrow above

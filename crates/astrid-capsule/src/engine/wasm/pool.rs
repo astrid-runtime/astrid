@@ -165,11 +165,12 @@ pub(super) struct CapsuleInstancePool {
     reset_resources_on_return: bool,
     /// On-demand instance factory for lazy growth.
     builder: Arc<InstanceBuilder>,
-    /// Whether a checkout that finds no warm instance may build one. `false`
-    /// for the size-1 `host_process` carve-out (`max == min_idle == 1`): its
-    /// single instance is always warm, so this is belt-and-suspenders — if a
-    /// build were ever reached it would mint a *second* Store and violate the
-    /// carve-out, so we fail closed instead.
+    /// Whether this pool can hold more instances than its warm set
+    /// (`max > min_idle`). Gates the idle evictor and the log level of a
+    /// checkout-time build. NOTE: a checkout that finds no warm instance
+    /// builds one regardless — the held permit already guarantees the total
+    /// stays ≤ `max` — which is how a size-1 carve-out recovers after an
+    /// armed discard destroyed its only instance (see [`PoolCheckout`]).
     allow_grow: bool,
     /// Idle-eviction timer; aborted on drop. `None` when the pool cannot grow
     /// (`max == min_idle`) — `available` can then never exceed `min_idle`, so
@@ -221,10 +222,11 @@ impl CapsuleInstancePool {
     /// Lease an instance, awaiting a permit if `max` are already in use.
     ///
     /// With a permit in hand the pool is below `max`, so this pops a warm
-    /// instance or — when none is warm — builds a fresh one (lazy grow).
-    /// Returns `None` if the semaphore is closed (capsule unloading), if a
-    /// lazy build fails, or if a non-growable pool somehow finds no warm
-    /// instance — all treated by the caller as "not invocable".
+    /// instance or — when none is warm — builds a fresh one (lazy grow, or a
+    /// rebuild after an armed discard; the permit guarantees the total never
+    /// exceeds `max`, so this is sound even for the size-1 carve-out).
+    /// Returns `None` if the semaphore is closed (capsule unloading) or if a
+    /// build fails — both treated by the caller as "not invocable".
     pub(super) async fn checkout(&self) -> Option<PoolCheckout> {
         let permit = Arc::clone(&self.permits).acquire_owned().await.ok()?;
         // Pop the most-recently-returned instance (the BACK — return pushes
@@ -240,10 +242,22 @@ impl CapsuleInstancePool {
         let pooled = match warm {
             Some(pooled) => pooled,
             None => {
+                // Build a replacement. Sound for EVERY pool, including the
+                // size-1 `host_process` carve-out: we hold a permit, so total
+                // instances = in-flight-under-other-permits ≤ max - 1, and
+                // building keeps the count ≤ max. For the carve-out this
+                // branch was historically unreachable ("its instance is
+                // always warm") and failed closed against minting a second
+                // Store — but an armed discard (see [`PoolCheckout`]) can now
+                // legitimately leave `available` empty at count 0, and
+                // refusing to rebuild would leave the capsule permanently
+                // un-invocable ("no capsule instance available" forever). The
+                // permit argument above is exactly the no-second-Store
+                // guarantee the fail-closed branch existed to protect.
                 if !self.allow_grow {
-                    // Unreachable for a size-1 carve-out (its instance is
-                    // always warm); fail closed rather than mint a second Store.
-                    return None;
+                    tracing::info!(
+                        "rebuilding discarded instance for non-growable pool"
+                    );
                 }
                 match self.builder.build().await {
                     Ok(pooled) => pooled,
@@ -258,6 +272,7 @@ impl CapsuleInstancePool {
             pooled: Some(pooled),
             available: Arc::clone(&self.available),
             reset_resources_on_return: self.reset_resources_on_return,
+            armed: false,
             _permit: permit,
         })
     }
@@ -333,12 +348,39 @@ fn drain_excess<T>(queue: &mut VecDeque<T>, min_idle: usize) -> Vec<T> {
 /// Folding the clear into the return guarantees the next lease of this
 /// instance observes a clean `HostState`, and that no instance (or permit) is
 /// leaked on an error path.
+///
+/// ## Armed discard: a non-clean guest exit poisons the instance
+///
+/// Wasmtime **poisons a component instance on any trap**: the instance's
+/// reentrance flag stays cleared, and every later call on it fails with
+/// `cannot enter component instance`. The same applies when the `call_async`
+/// future is dropped mid-guest (caller cancellation) or the invocation
+/// panics. Returning such an instance to the pool is fatal in combination
+/// with LIFO checkout: the poisoned instance is the most-recently-returned,
+/// so it is re-leased first, fails instantly, is returned again, and
+/// permanently captures the capsule's entire invocation path (the 2026-07-28
+/// all-principals agent wedge — one epoch-interrupted LLM stream poisoned
+/// `openai-compat` until a daemon restart).
+///
+/// The caller therefore [`arm`](Self::arm)s the checkout immediately before
+/// entering the guest and [`disarm`](Self::disarm)s it only on a clean exit
+/// (an `Ok` return from the guest call, or an export-lookup failure where the
+/// guest was never entered). `Drop` of an **armed** checkout DISCARDS the
+/// instance — dropping its Store — instead of returning it; the released
+/// permit lets a later checkout lazily rebuild a fresh instance, so one bad
+/// invocation costs exactly one instance, never the capsule.
 pub(super) struct PoolCheckout {
     pooled: Option<PooledInstance>,
     available: Arc<Mutex<VecDeque<PooledInstance>>>,
     /// Mirrors [`CapsuleInstancePool::reset_resources_on_return`]; copied at
     /// checkout so the drop path needs no back-pointer to the pool.
     reset_resources_on_return: bool,
+    /// Whether the guest call is (still) in a possibly-non-clean state. Set by
+    /// [`arm`](Self::arm) just before guest entry, cleared by
+    /// [`disarm`](Self::disarm) on clean exit. While `true`, `Drop` discards
+    /// the instance instead of returning it — covering the trap path, the
+    /// panic-unwind path, and future-drop on caller cancellation alike.
+    armed: bool,
     _permit: OwnedSemaphorePermit,
 }
 
@@ -354,11 +396,51 @@ impl PoolCheckout {
     pub(super) fn store_mut(&mut self) -> &mut Store<HostState> {
         &mut self.pooled.as_mut().expect("active checkout").store
     }
+
+    /// Mark the guest call as in flight: from now until [`disarm`](Self::disarm),
+    /// dropping this checkout DISCARDS the instance instead of returning it.
+    ///
+    /// Call immediately before entering the guest (`call_async`). Everything
+    /// before guest entry (the SET phase) is host-side only and cannot poison
+    /// the instance, so an early exit there still returns the instance.
+    pub(super) fn arm(&mut self) {
+        self.armed = true;
+    }
+
+    /// Mark the guest call as cleanly exited: dropping this checkout returns
+    /// the instance to the pool again.
+    ///
+    /// Only call when the instance is provably re-enterable — an `Ok` return
+    /// from the guest call, or an export lookup that failed *before* the guest
+    /// was entered. Any trap or host-error propagated out of `call_async`
+    /// leaves the instance poisoned (`cannot enter component instance` on
+    /// every later call) and MUST stay armed.
+    pub(super) fn disarm(&mut self) {
+        self.armed = false;
+    }
 }
 
 impl Drop for PoolCheckout {
     fn drop(&mut self) {
         if let Some(mut pooled) = self.pooled.take() {
+            // Armed = the guest call did not exit cleanly (trap, panic-unwind,
+            // or future-drop mid-call). Wasmtime poisons the component
+            // instance on any of those — every later call on it would fail
+            // with `cannot enter component instance` — and LIFO checkout would
+            // re-lease it FIRST, permanently capturing the capsule's
+            // invocation path (the 2026-07-28 agent wedge). Discard it: drop
+            // the Store (also closing any orphaned resources it still holds)
+            // and let the released permit lazily rebuild a replacement on a
+            // later checkout.
+            if self.armed {
+                tracing::warn!(
+                    capsule_id = %pooled.store.data().capsule_id,
+                    "discarding pooled instance after non-clean guest exit \
+                     (trap/cancel/panic poisons the component instance)"
+                );
+                drop(pooled);
+                return;
+            }
             // Phase 3: CLEAR. Reset every per-invocation field before the
             // instance returns to the pool so the next lease starts clean.
             // Mirrors the old `ClearOnDrop` guard from the single-Store path.
@@ -704,6 +786,86 @@ mod tests {
             .await
             .expect("unblocks on return")
             .expect("same instance again");
+        drop(c2);
+        cancel.cancel();
+    }
+
+    /// An ARMED checkout (the guest call did not exit cleanly — trap, panic,
+    /// or future-drop) must be DISCARDED on drop, never returned; a later
+    /// checkout must rebuild a fresh instance rather than block or fail.
+    ///
+    /// Regression test for the 2026-07-28 all-principals agent wedge: an
+    /// epoch-interrupt trap poisoned an `openai-compat` instance, the return
+    /// path pushed it back, and LIFO checkout re-leased the poisoned instance
+    /// to every subsequent LLM invocation (`cannot enter component instance`)
+    /// until a daemon restart.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn armed_checkout_is_discarded_and_pool_rebuilds() {
+        let cancel = CancellationToken::new();
+        let pool = empty_pool(2, 1, &cancel).await;
+
+        // Lease the single warm instance and simulate a non-clean guest exit.
+        let mut c1 = pool.checkout().await.expect("warm instance");
+        c1.arm();
+        drop(c1);
+
+        // The instance must NOT have been returned to the warm set.
+        assert_eq!(
+            pool.available.lock().expect("pool mutex").len(),
+            0,
+            "an armed checkout must be discarded, not returned"
+        );
+
+        // The pool must recover: a later checkout rebuilds a fresh instance.
+        let c2 = tokio::time::timeout(Duration::from_millis(1000), pool.checkout())
+            .await
+            .expect("checkout after a discard must not block")
+            .expect("pool must rebuild a fresh instance after a discard");
+        drop(c2);
+        // The rebuilt instance exited cleanly (never armed) → returned.
+        assert_eq!(pool.available.lock().expect("pool mutex").len(), 1);
+        cancel.cancel();
+    }
+
+    /// `arm` followed by `disarm` (a clean guest exit) keeps the pre-existing
+    /// return-to-pool behavior byte-identical.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn disarmed_checkout_returns_to_pool() {
+        let cancel = CancellationToken::new();
+        let pool = empty_pool(2, 1, &cancel).await;
+
+        let mut c1 = pool.checkout().await.expect("warm instance");
+        c1.arm();
+        c1.disarm(); // clean guest exit
+        drop(c1);
+
+        assert_eq!(
+            pool.available.lock().expect("pool mutex").len(),
+            1,
+            "a disarmed (clean-exit) checkout must return to the pool"
+        );
+        cancel.cancel();
+    }
+
+    /// The size-1 `host_process` carve-out must REBUILD after an armed
+    /// discard destroyed its only instance — refusing to build (the old
+    /// fail-closed branch) would leave the capsule permanently un-invocable
+    /// ("no capsule instance available" forever). Holding the single permit
+    /// guarantees the rebuild never coexists with another live Store, which
+    /// is the invariant the fail-closed branch existed to protect.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn carveout_pool_rebuilds_after_discard() {
+        let cancel = CancellationToken::new();
+        let pool = empty_pool(1, 1, &cancel).await;
+
+        let mut c1 = pool.checkout().await.expect("the one instance");
+        c1.arm();
+        drop(c1); // discards the carve-out's only instance
+
+        let c2 = tokio::time::timeout(Duration::from_millis(1000), pool.checkout())
+            .await
+            .expect("carve-out checkout after a discard must not block")
+            .expect("carve-out must rebuild its single instance after a discard");
         drop(c2);
         cancel.cancel();
     }
