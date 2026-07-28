@@ -18,6 +18,12 @@ pub(super) const PRE_DERIVATION_FORMAT_SPEC_ID: ObjectId = ObjectId::new([
     98, 205, 237, 154, 91, 1, 254, 117, 215, 120, 27, 102, 48, 63, 95, 254, 140, 237, 85, 164, 48,
     37, 160, 56, 158, 239, 174, 165, 160, 197, 143, 226,
 ]);
+pub(super) const PRE_COMPACTION_FORMAT_SPEC_ID: ObjectId = ObjectId::new([
+    53, 180, 70, 251, 209, 156, 164, 173, 11, 19, 67, 180, 12, 26, 50, 178, 238, 216, 238, 247,
+    149, 3, 66, 97, 164, 9, 42, 10, 42, 232, 6, 254,
+]);
+const PRIOR_V1_FORMAT_SPEC_IDS: [ObjectId; 2] =
+    [PRE_DERIVATION_FORMAT_SPEC_ID, PRE_COMPACTION_FORMAT_SPEC_ID];
 
 pub(super) fn format_spec_record() -> StorageResult<ObjectRecord> {
     ObjectRecord::new(
@@ -64,7 +70,7 @@ pub(super) fn object_id_hex(id: ObjectId) -> String {
 pub(super) enum DestinationFormat {
     New,
     Current,
-    PreDerivationV1(ObjectId),
+    PriorV1(ObjectId),
 }
 
 impl DestinationFormat {
@@ -100,9 +106,14 @@ pub(super) fn prepare_destination(
             ))
         })?;
         if actual != expected_metadata {
-            if existing_complete && actual == store_metadata(PRE_DERIVATION_FORMAT_SPEC_ID) {
+            if existing_complete
+                && let Some(prior) = PRIOR_V1_FORMAT_SPEC_IDS
+                    .iter()
+                    .copied()
+                    .find(|candidate| actual == store_metadata(*candidate))
+            {
                 return validate_authoritative_files(path)
-                    .map(|()| DestinationFormat::PreDerivationV1(PRE_DERIVATION_FORMAT_SPEC_ID));
+                    .map(|()| DestinationFormat::PriorV1(prior));
             }
             return Err(unsupported_format_error(&metadata));
         }
@@ -152,10 +163,10 @@ pub(super) fn prepare_format_specification(
             }
             persist_format_specification(engine, current_spec).map(|_| ())
         },
-        DestinationFormat::PreDerivationV1(legacy_spec_id) => {
+        DestinationFormat::PriorV1(legacy_spec_id) => {
             let legacy = read_format_specification(engine, legacy_spec_id)?.ok_or_else(|| {
                 StorageError::Connection(
-                    "completed principal store is missing its pre-derivation format specification"
+                    "completed principal store is missing its prior format-v1 specification"
                         .to_owned(),
                 )
             })?;
@@ -166,7 +177,7 @@ pub(super) fn prepare_format_specification(
                 || !legacy.references().is_empty()
             {
                 return Err(StorageError::Connection(
-                    "pre-derivation format specification has an invalid object shape".to_owned(),
+                    "prior format-v1 specification has an invalid object shape".to_owned(),
                 ));
             }
             persist_format_specification(engine, current_spec)?;

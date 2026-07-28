@@ -31,8 +31,8 @@ mod staging;
 
 #[cfg(test)]
 use format_amendment::{
-    DestinationFormat, PRE_DERIVATION_FORMAT_SPEC_ID, STORE_FORMAT_SPEC, STORE_METADATA_FILE,
-    object_id_hex, persist_format_specification,
+    DestinationFormat, PRE_COMPACTION_FORMAT_SPEC_ID, PRE_DERIVATION_FORMAT_SPEC_ID,
+    STORE_FORMAT_SPEC, STORE_METADATA_FILE, object_id_hex, persist_format_specification,
 };
 use format_amendment::{
     format_spec_record, prepare_destination, prepare_format_specification, store_metadata,
@@ -316,7 +316,11 @@ mod tests {
     use std::io::{Seek as _, SeekFrom, Write as _};
     use std::path::Path;
 
-    use astrid_storage_model::{ObjectFormatVersion, ObjectKind};
+    use astrid_storage_engine::{
+        CompactionFacts, CompactionProofVerifier, CompactionRetainedRoot, CompactionRetention,
+        CompactionRootKind,
+    };
+    use astrid_storage_model::{ObjectFormatVersion, ObjectKind, RetentionPolicyId};
 
     use super::*;
     use crate::{ChunkingProfile, ContentName};
@@ -328,6 +332,31 @@ mod tests {
                 StateOwner::Principal(_) => Some(u64::MAX),
             })
         })
+    }
+
+    struct AcceptCompactionProof;
+
+    impl CompactionProofVerifier for AcceptCompactionProof {
+        fn verify(
+            &self,
+            facts: &CompactionFacts,
+            _policy: &ObjectRecord,
+            _proof: &ObjectRecord,
+        ) -> bool {
+            !facts.condemned().is_empty()
+        }
+    }
+
+    fn evidence(bytes: &[u8]) -> ObjectRecord {
+        ObjectRecord::new(
+            ObjectKind::Evidence,
+            ObjectFormatVersion::V1,
+            bytes.to_vec(),
+            Vec::new(),
+            0,
+            ObjectClass::Metadata,
+        )
+        .unwrap()
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -416,7 +445,7 @@ mod tests {
         assert!(record.references().is_empty());
         assert_eq!(
             object_id_hex(id),
-            "35b446fbd19ca4ad0b1343b40c1a32b2eed8eef795034261a4092a0a2ae806fe"
+            "d8f2cb250736799fd8b26f307e20c4d949d6cea1836614a5547210e82bbfcec1"
         );
         assert!(metadata.contains("identity-wire=tagged-identity-v1\n"));
         assert!(metadata.contains(&format!(
@@ -462,7 +491,7 @@ mod tests {
         prepare_format_specification(
             &engine,
             &store_path,
-            DestinationFormat::PreDerivationV1(legacy_spec_id),
+            DestinationFormat::PriorV1(legacy_spec_id),
             &current_spec,
             current_spec_id,
             &current_metadata,
@@ -508,7 +537,29 @@ mod tests {
         let current_metadata = store_metadata(Blake3ObjectIdentityV1.identify(&current_spec));
         assert_eq!(
             prepare_destination(&store_path, &current_metadata).unwrap(),
-            DestinationFormat::PreDerivationV1(PRE_DERIVATION_FORMAT_SPEC_ID)
+            DestinationFormat::PriorV1(PRE_DERIVATION_FORMAT_SPEC_ID)
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_pre_compaction_v1_store_is_selected_for_rosetta_amendment() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(directory.path());
+        let store = open_runtime_kv(&home, unlimited_quota()).await.unwrap();
+        store.close().await.unwrap();
+        drop(store);
+
+        let store_path = home.principal_store_path();
+        std::fs::write(
+            store_path.join(STORE_METADATA_FILE),
+            store_metadata(PRE_COMPACTION_FORMAT_SPEC_ID),
+        )
+        .unwrap();
+        let current_spec = format_spec_record().unwrap();
+        let current_metadata = store_metadata(Blake3ObjectIdentityV1.identify(&current_spec));
+        assert_eq!(
+            prepare_destination(&store_path, &current_metadata).unwrap(),
+            DestinationFormat::PriorV1(PRE_COMPACTION_FORMAT_SPEC_ID)
         );
     }
 
@@ -707,6 +758,68 @@ mod tests {
             !rejected.status.success(),
             "independent reader accepted a corrupt Rust-produced store"
         );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn independent_reader_accepts_a_compacted_root_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(directory.path());
+        let store = open_runtime_kv(&home, unlimited_quota()).await.unwrap();
+        store
+            .set("alice:capsule:shell", "cwd", b"/workspace".to_vec())
+            .await
+            .unwrap();
+        store.close().await.unwrap();
+        drop(store);
+
+        let engine = RuntimeEngine::open(
+            home.principal_store_path(),
+            Blake3ObjectIdentityV1,
+            StateOwnerCodecV1,
+            RecoveryLimits::process_addressable(),
+        )
+        .unwrap();
+        engine
+            .persist_standalone_object(&evidence(b"collect-me"))
+            .unwrap();
+        let format_spec_id = engine.identify(&format_spec_record().unwrap());
+        let policy = evidence(b"test-retain-current-roots-and-rosetta");
+        let retention = CompactionRetention::new(
+            ObjectId::new([0xC0; 32]),
+            RetentionPolicyId::new(engine.identify(&policy)),
+            [CompactionRetainedRoot::new(
+                CompactionRootKind::System,
+                format_spec_id,
+            )],
+        );
+        let facts = engine.capture_compaction_facts(&retention).unwrap();
+        let plan = engine
+            .verify_compaction_plan(
+                retention,
+                facts,
+                policy,
+                evidence(b"test-tensor-logic-proof"),
+                &AcceptCompactionProof,
+            )
+            .unwrap();
+        engine.compact(&plan).unwrap();
+        engine.close().unwrap();
+
+        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/principal_store_v1_reader.py");
+        let compacted = std::process::Command::new("python3")
+            .arg(script)
+            .arg(home.principal_store_path())
+            .output()
+            .unwrap();
+        assert!(
+            compacted.status.success(),
+            "independent reader rejected compacted root snapshot: {}",
+            String::from_utf8_lossy(&compacted.stderr)
+        );
+        let decoded: serde_json::Value = serde_json::from_slice(&compacted.stdout).unwrap();
+        assert_eq!(decoded["roots"]["alice"]["generation"], 0);
     }
 
     #[tokio::test]

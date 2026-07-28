@@ -88,8 +88,15 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   successors. Each store persists a frozen, byte-exact plain-text format
   specification as an immutable object referenced by `store.meta`; an
   independent Python reader verifies Rust-produced arenas, identities, root
-  chains, and live closures in CI. Compaction, persistent pins, audit/outbox
-  atomicity, and final representation profiles remain future work.
+  chains, and live closures in CI. Proof-audited arena compaction now rewrites
+  exactly the closures selected by an explicit retention contract, preserves
+  root generations in a canonical journal snapshot, and atomically replaces
+  both authority files through a durable intent. Recovery accepts only a
+  complete arena/journal pair, rebuilds the disposable index, and is exercised
+  at every named replacement boundary. Compaction is a sealed engine-only
+  Refinery pass; Tensor Logic may audit its native condemned set but cannot
+  acquire deletion authority. Persistent history-pin policy, audit/outbox
+  delivery, and final representation profiles remain future work.
 - **Native kernel state now cuts over to durable principal roots.** Kernel boot
   migrates the legacy SurrealKV database under the singleton lock, verifies a
   canonical digest independently per owner, preserves the legacy source, and

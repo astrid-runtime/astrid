@@ -13,6 +13,8 @@ FRAME_CONTEXT = "astrid durable physical frame checksum v1"
 OBJECT_CONTEXT = "astrid principal store object identity v1"
 ARENA_MAGIC = b"ASTOBJ1\0"
 ROOT_MAGIC = b"ASTROOT\0"
+ROOT_SNAPSHOT_SENTINEL = (1 << 64) - 1
+ROOT_SNAPSHOT_RECORD = 1
 HEADER_BYTES = 52
 KIND_NAMES = (
     "Chunk",
@@ -37,7 +39,7 @@ REFERENCE_NAMES = ("Owns", "Evidence", "Lineage", "Derived")
 FORMAT_SPECIFICATION = (
     1,
     1,
-    bytes.fromhex("35b446fbd19ca4ad0b1343b40c1a32b2eed8eef795034261a4092a0a2ae806fe"),
+    bytes.fromhex("d8f2cb250736799fd8b26f307e20c4d949d6cea1836614a5547210e82bbfcec1"),
 )
 
 
@@ -430,7 +432,22 @@ def root_state(cursor):
 
 def decode_root(payload):
     cursor = Cursor(payload)
-    principal = cursor.take(cursor.integer(8))
+    prefix = cursor.integer(8)
+    if prefix == ROOT_SNAPSHOT_SENTINEL:
+        if cursor.integer(1) != ROOT_SNAPSHOT_RECORD:
+            raise FormatError("unknown root-journal extension record")
+        entries = []
+        previous = None
+        for _ in range(cursor.integer(8)):
+            principal = cursor.take(cursor.integer(8))
+            if previous is not None and principal <= previous:
+                raise FormatError("non-canonical root snapshot order")
+            previous = principal
+            entries.append((principal, root_state(cursor)))
+        cursor.done()
+        return ("snapshot", entries)
+
+    principal = cursor.take(prefix)
     expected_tag = cursor.integer(1)
     if expected_tag == 0:
         expected = None
@@ -440,7 +457,7 @@ def decode_root(payload):
         raise FormatError("invalid expected-root tag")
     replacement = root_state(cursor)
     cursor.done()
-    return principal, expected, replacement
+    return ("transition", principal, expected, replacement)
 
 
 def principal_text(principal):
@@ -530,15 +547,25 @@ def recover(store, include_payloads):
 
     roots = {}
     for offset, payload in frames(store / "roots.journal", ROOT_MAGIC):
-        principal, expected, replacement = decode_root(payload)
-        name = principal_text(principal)
-        actual = roots.get(name)
-        if actual != expected:
-            raise FormatError(f"root CAS mismatch for {name} at byte {offset}")
-        generation = 0 if actual is None else actual[0] + 1
-        if replacement[0] != generation:
-            raise FormatError(f"root generation mismatch for {name} at byte {offset}")
-        roots[name] = replacement
+        record = decode_root(payload)
+        if record[0] == "snapshot":
+            if offset != 0 or roots:
+                raise FormatError("root snapshot must be the first journal frame")
+            for principal, current in record[1]:
+                name = principal_text(principal)
+                if name in roots:
+                    raise FormatError(f"duplicate snapshot principal {name}")
+                roots[name] = current
+        else:
+            _, principal, expected, replacement = record
+            name = principal_text(principal)
+            actual = roots.get(name)
+            if actual != expected:
+                raise FormatError(f"root CAS mismatch for {name} at byte {offset}")
+            generation = 0 if actual is None else actual[0] + 1
+            if replacement[0] != generation:
+                raise FormatError(f"root generation mismatch for {name} at byte {offset}")
+            roots[name] = replacement
     for name, root in roots.items():
         record = objects.get(identity_text(root[1]))
         if record is None or record["kind"] != 9:

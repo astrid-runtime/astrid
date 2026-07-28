@@ -641,6 +641,43 @@ fn commit_flush_reopen_rebuilds_index_and_root() {
 }
 
 #[test]
+fn root_snapshot_preserves_generation_and_accepts_future_cas() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open(directory.path());
+    let (first_commit, first_transaction) = transaction("alice", None, b"first");
+    let first = engine.commit(first_transaction).unwrap().root();
+    let (second_commit, second_transaction) = transaction("alice", Some(first), b"second");
+    let second = engine.commit(second_transaction).unwrap().root();
+    assert_ne!(first_commit, second_commit);
+    engine.close().unwrap();
+
+    let payload =
+        encode_root_snapshot(TEST_IDENTITY_SCHEME, &[(b"alice".to_vec(), second)]).unwrap();
+    let journal_path = directory.path().join(ROOT_FILE);
+    let mut journal = OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(journal_path)
+        .unwrap();
+    append_frame(&mut journal, ROOT_MAGIC, &payload).unwrap();
+    journal.sync_data().unwrap();
+    drop(journal);
+
+    let recovered = open(directory.path());
+    assert_eq!(recovered.root(&"alice".to_owned()).unwrap(), Some(second));
+    let root_only =
+        RootTransaction::new("alice".to_owned(), Some(second), second.commit, Vec::new());
+    let third = recovered.commit(root_only).unwrap().root();
+    assert_eq!(third.generation, second.generation.checked_next().unwrap());
+    drop(recovered);
+
+    assert_eq!(
+        open(directory.path()).root(&"alice".to_owned()).unwrap(),
+        Some(third)
+    );
+}
+
+#[test]
 fn every_exposed_fault_recovers_old_or_new_complete_root() {
     for point in [
         FaultPoint::AfterObjectAppend,

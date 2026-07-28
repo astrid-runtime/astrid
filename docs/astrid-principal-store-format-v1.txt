@@ -241,7 +241,10 @@ equal. The same ID naming unequal records is a collision and MUST fail.
 6. ROOT JOURNAL PAYLOAD AND REPLAY
 ==================================
 
-Each ASTROOT physical payload is exactly:
+An ASTROOT physical payload is either a transition record or a root-snapshot
+record.
+
+A transition record is exactly:
 
   u64            principal_length
   u8[]           principal[principal_length]
@@ -258,6 +261,25 @@ expected_tag 0 means no expected root and carries no RootState. expected_tag 1
 means one expected RootState follows. Other values are invalid. The payload
 MUST end after replacement.
 
+A root-snapshot record is exactly:
+
+  u64            snapshot_sentinel = 18446744073709551615
+  u8             snapshot_record = 1
+  u64            root_count
+
+  repeated root_count times:
+      u64        principal_length
+      u8[]       principal[principal_length]
+      RootState  current
+
+Snapshot principals MUST be in strictly increasing unsigned bytewise
+lexicographic order. Duplicates, unknown snapshot_record values, and trailing
+bytes are invalid. A snapshot MUST be the first physical journal frame. Later
+transition frames replay against the snapshot exactly as they replay against
+prior transitions. The sentinel cannot collide with a valid transition:
+principal bytes of that declared length cannot fit inside the containing
+physical frame.
+
 The state-owner-v1 principal codec is:
 
   00                           system owner
@@ -267,8 +289,9 @@ The system encoding is exactly one byte. A principal ID is 1 through 64 ASCII
 bytes, each in A-Z, a-z, 0-9, hyphen, or underscore. Re-encoding a decoded
 principal MUST reproduce the original bytes.
 
-Replay records in file order, maintaining a map principal -> RootState.
-For each record:
+Replay records in file order, maintaining a map principal -> RootState. A
+first-frame snapshot initializes that map with the encoded generations and
+commit identities. For each transition record:
 
   1. actual is the current map value or absent.
   2. expected MUST equal actual byte-for-byte.

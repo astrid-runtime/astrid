@@ -154,6 +154,22 @@ pub enum FaultPoint {
     BeforeRootCas,
     /// The root-journal frame is durable.
     AfterRootCas,
+    /// Replacement arena and root snapshot are durable but unpublished.
+    AfterCompactionFilesFlush,
+    /// The durable compaction intent exists and recovery must finish or roll back.
+    AfterCompactionIntentFlush,
+    /// The previous arena name is durable and the active name is temporarily absent.
+    AfterCompactionArenaBackup,
+    /// The compacted arena occupies the active name.
+    AfterCompactionArenaPromote,
+    /// The previous root journal name is durable and the active name is temporarily absent.
+    AfterCompactionRootsBackup,
+    /// The compacted root snapshot occupies the active name.
+    AfterCompactionRootsPromote,
+    /// The compacted authority pair and its directory entries are durable.
+    AfterCompactionDirectoryFlush,
+    /// Old generations are gone but the durable intent still protects cleanup recovery.
+    BeforeCompactionIntentRemoval,
 }
 
 /// Injectable crash decision used by recovery tests and harnesses.
@@ -229,6 +245,14 @@ pub enum DurableError {
     EncodingOverflow,
     /// A `store.meta` bootstrap object attempted to own principal state.
     BootstrapObjectOwnsState,
+    /// Compaction evidence, retention, or its native fact snapshot was invalid.
+    InvalidCompactionEvidence(&'static str),
+    /// The native liveness snapshot changed between proof and physical rewrite.
+    CompactionSnapshotChanged,
+    /// No unreachable object exists for a garbage-collecting compaction plan.
+    NoCompactionWork,
+    /// The injected Tensor Logic proof verifier rejected the deletion plan.
+    CompactionProofRejected,
     /// A named crash boundary interrupted the transaction.
     FaultInjected(FaultPoint),
     /// A prior write or injected crash may have diverged memory from disk.
@@ -280,6 +304,18 @@ impl fmt::Display for DurableError {
             Self::BootstrapObjectOwnsState => {
                 formatter.write_str("standalone bootstrap object must not own other objects")
             },
+            Self::InvalidCompactionEvidence(detail) => {
+                write!(formatter, "invalid compaction evidence: {detail}")
+            },
+            Self::CompactionSnapshotChanged => {
+                formatter.write_str("compaction liveness snapshot changed after planning")
+            },
+            Self::NoCompactionWork => {
+                formatter.write_str("compaction plan contains no unreachable objects")
+            },
+            Self::CompactionProofRejected => {
+                formatter.write_str("compaction proof verifier rejected the deletion plan")
+            },
             Self::FaultInjected(point) => write!(formatter, "fault injected at {point:?}"),
             Self::RequiresRecovery => {
                 formatter.write_str("durable engine must be dropped and reopened")
@@ -305,7 +341,7 @@ impl From<ModelError> for DurableError {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ArenaLocation {
     offset: u64,
     payload_len: u64,
@@ -318,6 +354,7 @@ struct DurableInner<P: Ord> {
     index: BTreeMap<ObjectId, ArenaLocation>,
     validated: BTreeSet<ObjectId>,
     files: Option<DurableFiles>,
+    lock: Option<File>,
     poisoned: bool,
 }
 
@@ -328,7 +365,6 @@ struct DurableFiles {
     index_cache: Option<File>,
     arena_len: u64,
     arena_tail: Option<ArenaLocation>,
-    lock: File,
 }
 
 /// Host-file durable principal-store engine.
@@ -401,6 +437,7 @@ where
             return Err(io_error("lock principal store", source));
         }
 
+        recover_interrupted_compaction(&path, &principal_codec, &identity, limits)?;
         let mut arena = open_rw(&path.join(ARENA_FILE))?;
         let mut roots = open_rw(&path.join(ROOT_FILE))?;
         let mut index_cache = open_rw(&path.join(INDEX_FILE)).ok();
@@ -464,8 +501,8 @@ where
                     index_cache,
                     arena_len,
                     arena_tail,
-                    lock,
                 }),
+                lock: Some(lock),
                 poisoned: false,
             }),
         })
@@ -877,11 +914,13 @@ where
 impl<P: Ord, I, C> Drop for DurableEngine<P, I, C> {
     fn drop(&mut self) {
         let inner = self.inner.get_mut();
-        if let Some(mut files) = inner.files.take() {
-            if let Some(cache) = &mut files.index_cache {
-                let _ = cache.sync_data();
-            }
-            let _ = fs2::FileExt::unlock(&files.lock);
+        if let Some(mut files) = inner.files.take()
+            && let Some(cache) = &mut files.index_cache
+        {
+            let _ = cache.sync_data();
+        }
+        if let Some(lock) = inner.lock.take() {
+            let _ = fs2::FileExt::unlock(&lock);
         }
     }
 }
@@ -904,11 +943,11 @@ struct Prepared<P: Ord> {
 }
 
 fn ensure_usable<P: Ord>(inner: &DurableInner<P>) -> Result<(), DurableError> {
-    if inner.files.is_none() {
-        return Err(DurableError::Closed);
-    }
     if inner.poisoned {
         return Err(DurableError::RequiresRecovery);
+    }
+    if inner.files.is_none() {
+        return Err(DurableError::Closed);
     }
     Ok(())
 }
@@ -920,28 +959,41 @@ fn live_files_mut(files: &mut Option<DurableFiles>) -> Result<&mut DurableFiles,
 #[path = "durable_staging.rs"]
 mod staging;
 
+#[path = "durable_compaction.rs"]
+mod compaction;
 #[path = "durable_format.rs"]
 mod format;
 #[path = "durable_index.rs"]
 mod index_cache;
 #[path = "durable_lifecycle.rs"]
 mod lifecycle;
+#[path = "durable_roots.rs"]
+mod roots;
 #[path = "durable_validation.rs"]
 mod validation;
 
+use compaction::recover_interrupted_compaction;
+pub use compaction::{
+    CompactionFacts, CompactionProofVerifier, CompactionReport, CompactionRetainedRoot,
+    CompactionRetention, CompactionRootKind, VerifiedCompactionPlan,
+};
 use format::{
-    append_frame, append_frames, encode_object_frame, encode_root_record, ensure_payload_limit,
-    io_error, open_rw, read_indexed_object, recover_arena, recover_roots, scan_frames,
-    sync_store_directory, verify_indexed_location, verify_indexed_tail,
+    append_frame, append_frames, corrupt, encode_object_frame, ensure_payload_limit, io_error,
+    open_rw, read_indexed_object, recover_arena, scan_frames, sync_store_directory,
+    verify_indexed_location, verify_indexed_tail,
 };
 #[cfg(test)]
 use format::{decode_object_frame, frame_checksum};
 use index_cache::{IndexDelta, IndexState, append_index_delta, recover_index, replace_index};
+use roots::{encode_root_record, encode_root_snapshot, recover_roots};
 use validation::{
     materialize_closure, recovery_closure_error, usage_from_closure, validate_commit_closure,
     validate_incremental_closure,
 };
 
+#[cfg(test)]
+#[path = "durable_compaction_tests.rs"]
+mod compaction_tests;
 #[cfg(test)]
 #[path = "durable_index_tests.rs"]
 mod index_tests;

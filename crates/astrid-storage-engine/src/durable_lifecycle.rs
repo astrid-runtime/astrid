@@ -46,12 +46,11 @@ where
     /// releasing every owned file handle.
     pub fn close(&self) -> Result<(), DurableError> {
         let mut inner = self.inner.lock();
-        if inner.files.is_none() {
+        if inner.files.is_none() && inner.lock.is_none() {
             return Ok(());
         }
         let poisoned = inner.poisoned;
-        let result = {
-            let files = live_files_mut(&mut inner.files)?;
+        let result = if let Some(files) = inner.files.as_mut() {
             if poisoned {
                 Err(DurableError::RequiresRecovery)
             } else if let Err(source) = files.arena.sync_data() {
@@ -61,14 +60,20 @@ where
             } else {
                 Ok(())
             }
+        } else if poisoned {
+            Err(DurableError::RequiresRecovery)
+        } else {
+            Err(DurableError::Closed)
         };
-        if result.is_ok() {
+        if result.is_ok() && inner.files.is_some() {
             self.checkpoint_index(&mut inner);
         }
-        let files = inner.files.take().ok_or(DurableError::Closed)?;
-        let unlock = fs2::FileExt::unlock(&files.lock)
-            .map_err(|source| io_error("unlock principal store while closing", source));
-        drop(files);
+        drop(inner.files.take());
+        let unlock = match inner.lock.take() {
+            Some(lock) => fs2::FileExt::unlock(&lock)
+                .map_err(|source| io_error("unlock principal store while closing", source)),
+            None => Ok(()),
+        };
         result.and(unlock)
     }
 

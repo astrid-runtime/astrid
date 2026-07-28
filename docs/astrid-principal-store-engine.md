@@ -241,18 +241,31 @@ checksums, recompute object identities, replay roots, and validate live
 closures. This is the minimum two-readers rule for any format called durable.
 
 This realization deliberately has one active arena. Runtime KV, the disposable
-persistent recovery index, and live per-principal logical quotas are integrated.
-It does not yet seal arenas, compact unreachable history, persist pins, expose
-root removal, coordinate an audit/outbox record, inject short writes or
-disk-full errors, encrypt erasure domains, or select final export `BlobId`
-profiles. Those claims remain attached to their evidence gates.
+persistent recovery index, live per-principal logical quotas, and proof-audited
+generation replacement are integrated. It does not yet seal arenas, persist a
+history-pin policy, expose root removal, coordinate the kernel audit/outbox
+record, inject short writes or disk-full errors, encrypt erasure domains, or
+select final export `BlobId` profiles. Those claims remain attached to their
+evidence gates.
 
-Until compaction lands, live logical quota is not a disk quota and both the
-arena and its disposable index still contain unreachable history. The index
-removes payload re-hashing from clean reopen; compaction is what makes their
-size and replay metadata proportional to selected live state. Heavy content
-workloads remain gated on compaction merely because the logical content format
-and recovery accelerator exist.
+Live logical quota becomes a physical bound only after the durable compactor
+runs. The compactor copies the closures selected by current principal roots and
+explicit native retention roots into a replacement arena, writes a canonical
+current-root snapshot, and publishes both files under a durable recovery
+intent. The persistent index removes payload re-hashing from clean reopen;
+compaction makes arena and journal size proportional to the selected retained
+set. Heavy content workloads remain gated on operational scheduling,
+accounting, and measured compaction cadence even though the logical format and
+engine mechanism exist.
+
+The engine does not infer a history policy. Callers provide the identified
+retention contract and exact extra roots for system objects, export/import
+leases, active immutable read handles, legal holds, and operator pins. Current
+principal roots are always included. Commit publication, liveness capture,
+proof recheck, and generation replacement share one mutation fence, so a
+dedup hit cannot be collected between closure validation and root publication.
+The pass is sealed inside the engine: an observer or Tensor Logic adapter can
+reject a plan but cannot implement the physical deletion capability.
 
 ## Why this matters particularly for agents
 

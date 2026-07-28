@@ -1,12 +1,11 @@
 //! Native arena and root-journal framing, parsing, and recovery.
 
 use super::{
-    ARENA_FILE, ARENA_MAGIC, ArenaLocation, BTreeMap, BTreeSet, CHECKSUM_START, DurableError,
+    ARENA_FILE, ARENA_MAGIC, ArenaLocation, BTreeMap, CHECKSUM_START, DurableError,
     FRAME_HEADER_LEN, FRAME_HEADER_LEN_USIZE, FRAME_VERSION, File, IdentityScheme, ModelError,
     ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord, ObjectReference,
-    OpenOptions, Path, PersistentObjectIdentity, PrincipalCodec, ROOT_FILE, ROOT_MAGIC, Read,
-    RecoveryLimits, ReferenceKind, ReferenceLabel, RootGeneration, RootState, Seek, SeekFrom,
-    Write, io, materialize_closure, recovery_closure_error, validate_commit_closure,
+    OpenOptions, Path, PersistentObjectIdentity, Read, RecoveryLimits, ReferenceKind,
+    ReferenceLabel, Seek, SeekFrom, Write, io,
 };
 
 const IDENTITY_PREFIX_BYTES: usize = 8;
@@ -282,103 +281,6 @@ pub(super) fn recover_arena<I: PersistentObjectIdentity>(
         Ok(())
     })?;
     Ok((index, tail))
-}
-
-pub(super) fn recover_roots<P, I, C>(
-    roots: &mut File,
-    arena: &mut File,
-    index: &BTreeMap<ObjectId, ArenaLocation>,
-    codec: &C,
-    identity: &I,
-    limits: RecoveryLimits,
-) -> Result<(BTreeMap<P, RootState>, BTreeSet<ObjectId>), DurableError>
-where
-    P: Clone + Ord,
-    I: PersistentObjectIdentity,
-    C: PrincipalCodec<P>,
-{
-    let scheme = identity.scheme();
-    let mut recovered = BTreeMap::<P, (RootState, u64)>::new();
-    scan_frames(roots, ROOT_FILE, ROOT_MAGIC, limits, |offset, payload| {
-        let record = decode_root_record(payload, scheme)
-            .map_err(|detail| corrupt(ROOT_FILE, offset, detail))?;
-        let principal = codec
-            .decode(record.principal)
-            .ok_or(DurableError::InvalidPrincipal { offset })?;
-        if codec.encode(&principal) != record.principal {
-            return Err(DurableError::InvalidPrincipal { offset });
-        }
-        if encode_root_record(
-            scheme,
-            record.principal,
-            record.expected,
-            record.replacement,
-        )? != payload
-        {
-            return Err(corrupt(
-                ROOT_FILE,
-                offset,
-                "root-journal frame is not canonical",
-            ));
-        }
-        let actual = recovered.get(&principal).map(|(root, _)| *root);
-        if actual != record.expected {
-            return Err(DurableError::RecoveryModel {
-                file: ROOT_FILE,
-                offset,
-                source: ModelError::RootConflict {
-                    expected: record.expected,
-                    actual,
-                },
-            });
-        }
-        let generation = match actual {
-            Some(root) => root.generation.checked_next(),
-            None => Some(RootGeneration::INITIAL),
-        }
-        .ok_or(DurableError::RecoveryModel {
-            file: ROOT_FILE,
-            offset,
-            source: ModelError::ArithmeticOverflow,
-        })?;
-        if record.replacement.generation != generation {
-            return Err(corrupt(
-                ROOT_FILE,
-                offset,
-                "replacement generation does not match journal history",
-            ));
-        }
-        recovered.insert(principal, (record.replacement, offset));
-        Ok(())
-    })?;
-
-    let mut validated = BTreeSet::new();
-    for (root, offset) in recovered.values().copied() {
-        let records = materialize_closure(
-            arena,
-            index,
-            &BTreeMap::new(),
-            root.commit,
-            identity,
-            limits,
-        )
-        .map_err(|error| recovery_closure_error(error, offset))?;
-        validate_commit_closure(&records, root.commit).map_err(|source| {
-            DurableError::RecoveryModel {
-                file: ROOT_FILE,
-                offset,
-                source,
-            }
-        })?;
-        validated.extend(records.into_iter().map(|(id, _)| id));
-    }
-    Ok((
-        recovered
-            .into_iter()
-            .map(|(principal, (root, _))| (principal, root))
-            .collect(),
-        validated,
-    ))
 }
 
 pub(super) fn scan_frames(
@@ -797,62 +699,6 @@ pub(super) fn decode_object_frame(
     Ok((id, record))
 }
 
-pub(super) fn encode_root_record(
-    scheme: IdentityScheme,
-    principal: &[u8],
-    expected: Option<RootState>,
-    replacement: RootState,
-) -> Result<Vec<u8>, DurableError> {
-    let principal_len =
-        u64::try_from(principal.len()).map_err(|_| DurableError::EncodingOverflow)?;
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(&principal_len.to_le_bytes());
-    bytes.extend_from_slice(principal);
-    match expected {
-        None => bytes.push(0),
-        Some(root) => {
-            bytes.push(1);
-            encode_root_state(&mut bytes, scheme, root);
-        },
-    }
-    encode_root_state(&mut bytes, scheme, replacement);
-    Ok(bytes)
-}
-
-fn encode_root_state(bytes: &mut Vec<u8>, scheme: IdentityScheme, root: RootState) {
-    bytes.extend_from_slice(&root.generation.get().to_le_bytes());
-    encode_identity(bytes, scheme, root.commit);
-}
-
-struct DecodedRootRecord<'a> {
-    principal: &'a [u8],
-    expected: Option<RootState>,
-    replacement: RootState,
-}
-
-fn decode_root_record(
-    bytes: &[u8],
-    scheme: IdentityScheme,
-) -> Result<DecodedRootRecord<'_>, &'static str> {
-    let mut reader = SliceReader::new(bytes);
-    let principal_len = reader.usize_len()?;
-    let principal = reader.take(principal_len)?;
-    let expected = match reader.u8()? {
-        0 => None,
-        1 => Some(reader.root_state(scheme)?),
-        _ => return Err("invalid expected-root tag"),
-    };
-    let replacement = reader.root_state(scheme)?;
-    if reader.remaining() != 0 {
-        return Err("trailing root-journal bytes");
-    }
-    Ok(DecodedRootRecord {
-        principal,
-        expected,
-        replacement,
-    })
-}
-
 struct SliceReader<'a> {
     bytes: &'a [u8],
     offset: usize,
@@ -928,12 +774,5 @@ impl<'a> SliceReader<'a> {
             .try_into()
             .map(ObjectId::new)
             .map_err(|_| "identity digest length does not match the supported scheme")
-    }
-
-    fn root_state(&mut self, scheme: IdentityScheme) -> Result<RootState, &'static str> {
-        Ok(RootState {
-            generation: RootGeneration::new(self.u64()?),
-            commit: self.identity(scheme)?,
-        })
     }
 }
