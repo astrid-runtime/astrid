@@ -420,7 +420,7 @@ mod tests {
         assert!(record.references().is_empty());
         assert_eq!(
             object_id_hex(id),
-            "86390e5573cd6248eceeb5904bf9decb8929fe67aae638d531ab119418000e19"
+            "32379c2a9e1d0fe166ac37f30d8772bd88d6c99a6ae31bb75cc7e8a8f4ce4307"
         );
         assert!(metadata.contains("identity-wire=tagged-identity-v1\n"));
         assert!(metadata.contains(&format!(
@@ -430,7 +430,7 @@ mod tests {
     }
 
     #[test]
-    fn pre_derivation_v1_rosetta_upgrade_is_idempotent_and_preserves_history() {
+    fn pre_derivation_v1_runatal_upgrade_is_idempotent_and_preserves_history() {
         let directory = tempfile::tempdir().unwrap();
         let store_path = directory.path().join("principal-store");
         std::fs::create_dir_all(&store_path).unwrap();
@@ -460,7 +460,7 @@ mod tests {
         )
         .unwrap();
 
-        // Simulate a crash after the successor Rosetta object became durable
+        // Simulate a crash after the successor RÚNATAL object became durable
         // but before store.meta changed.
         persist_format_specification(&engine, &current_spec).unwrap();
         prepare_format_specification(
@@ -495,7 +495,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_pre_derivation_v1_store_is_selected_for_rosetta_amendment() {
+    async fn completed_pre_derivation_v1_store_is_selected_for_runatal_amendment() {
         let directory = tempfile::tempdir().unwrap();
         let home = AstridHome::from_path(directory.path());
         let store = open_runtime_kv(&home, unlimited_quota()).await.unwrap();
@@ -658,8 +658,8 @@ mod tests {
         store.close().await.unwrap();
         drop(store);
 
-        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../scripts/principal_store_v1_reader.py");
+        let script =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/runatal_v1_reader.py");
         let output = std::process::Command::new("python3")
             .arg(&script)
             .arg(home.principal_store_path())
@@ -700,10 +700,7 @@ mod tests {
         arena[100] ^= 0x80;
         std::fs::write(&arena_path, arena).unwrap();
         let rejected = std::process::Command::new("python3")
-            .arg(
-                Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../../scripts/principal_store_v1_reader.py"),
-            )
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/runatal_v1_reader.py"))
             .arg(home.principal_store_path())
             .output()
             .unwrap();
@@ -714,7 +711,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_store_does_not_self_heal_a_missing_rosetta_object() {
+    async fn completed_store_does_not_self_heal_a_missing_runatal_object() {
         let directory = tempfile::tempdir().unwrap();
         let home = AstridHome::from_path(directory.path());
         let path = home.principal_store_path();
@@ -738,7 +735,7 @@ mod tests {
         .unwrap();
 
         let Err(error) = open_runtime_kv(&home, unlimited_quota()).await else {
-            panic!("completed store without its Rosetta object was accepted");
+            panic!("completed store without its RÚNATAL object was accepted");
         };
         assert!(
             error

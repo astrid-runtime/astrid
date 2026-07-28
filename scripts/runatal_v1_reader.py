@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Independent, deliberately primitive Astrid principal-store format-1 reader."""
+"""Independent, deliberately primitive Astrid RÚNATAL format-1 reader."""
 
 import argparse
 import json
@@ -7,7 +7,7 @@ import struct
 import sys
 from pathlib import Path
 
-from principal_store_v1_blake3 import derive_key
+from runatal_v1_blake3 import derive_key
 
 FRAME_CONTEXT = "astrid durable physical frame checksum v1"
 OBJECT_CONTEXT = "astrid principal store object identity v1"
@@ -39,7 +39,7 @@ REFERENCE_NAMES = ("Owns", "Evidence", "Lineage", "Derived")
 FORMAT_SPECIFICATION = (
     1,
     1,
-    bytes.fromhex("86390e5573cd6248eceeb5904bf9decb8929fe67aae638d531ab119418000e19"),
+    bytes.fromhex("32379c2a9e1d0fe166ac37f30d8772bd88d6c99a6ae31bb75cc7e8a8f4ce4307"),
 )
 
 

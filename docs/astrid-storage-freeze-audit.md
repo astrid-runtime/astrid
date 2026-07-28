@@ -56,7 +56,7 @@ diversity from BLAKE3.
 
 - Attestation produces cross-hash evidence on a test store.
 - The successor migration procedure is in the format specification.
-- The independent Rosetta reader verifies a cross-hash record.
+- The independent RÚNATAL reader verifies a cross-hash record.
 
 ### Export manifest
 
@@ -98,7 +98,7 @@ principal concept.
 
 - Freeze the genesis-record encoding and domain separation.
 - Add the durable owner codec using the UID.
-- Update `store.meta`, the Rosetta specification, and the independent reader.
+- Update `store.meta`, the RÚNATAL specification, and the independent reader.
 - Reuse the kernel identity record if its canonical encoding is stable;
   otherwise stabilize it as part of this work.
 - Development stores may be wiped before the first release; no permanent
@@ -137,7 +137,7 @@ path-copy nodes reduce write amplification, object loads, and recovery work.
 - Freeze split, merge, and inline/spill rules.
 - Recompute and validate cached totals during decode.
 - Reject unsorted keys, invalid child bounds, and malformed occupancy.
-- Update the Rosetta specification and independent reader.
+- Update the RÚNATAL specification and independent reader.
 - Benchmark amplification, operations per second, and get latency at 10k,
   100k, and one million keys.
 
@@ -222,7 +222,7 @@ addition constants. It does not gain a synthetic average-size field.
 
 - The complete sweep is attached to the gate issue.
 - Golden cuts and adversarial fixtures pass.
-- The profile grammar is frozen in the Rosetta specification.
+- The profile grammar is frozen in the RÚNATAL specification.
 
 ## D5. Byte-exact content names
 
@@ -292,7 +292,7 @@ The following remain deliberate:
 
 ## D8. Mechanical format audit
 
-Before the first release, the Rosetta specification records whether each
+Before the first release, the RÚNATAL specification records whether each
 constant is evidence-backed or deliberately arbitrary and harmless:
 
 - ObjectKind values;

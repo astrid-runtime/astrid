@@ -77,7 +77,7 @@ async fn independent_reader_accepts_a_compacted_root_snapshot() {
         .persist_standalone_object(&evidence(b"collect-me"))
         .unwrap();
     let format_spec_id = engine.identify(&format_spec_record().unwrap());
-    let policy = evidence(b"test-retain-current-roots-and-rosetta");
+    let policy = evidence(b"test-retain-current-roots-and-runatal");
     let retention = CompactionRetention::new(
         ObjectId::new([0xC0; 32]),
         RetentionPolicyId::new(engine.identify(&policy)),
@@ -99,8 +99,7 @@ async fn independent_reader_accepts_a_compacted_root_snapshot() {
     engine.compact(&plan).unwrap();
     engine.close().unwrap();
 
-    let script =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/principal_store_v1_reader.py");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/runatal_v1_reader.py");
     let compacted = std::process::Command::new("python3")
         .arg(script)
         .arg(home.principal_store_path())

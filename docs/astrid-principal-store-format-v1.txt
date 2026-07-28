@@ -8,10 +8,11 @@ Text encoding: UTF-8 without a terminating NUL
 Document line endings: LF
 
 This document is the byte-level recovery contract for Astrid principal stores.
-It is deliberately plain text and is itself stored as an immutable Evidence
-object. The tagged identity of that object is named by store.meta. No Astrid
-executable, Rust compiler, source repository, generated schema, or disposable
-index is required to decode the authoritative files.
+It is RÚNATAL: Recoverable Universal Notation for Astrid's Tagged Archival
+Layout. It is deliberately plain text and is itself stored as an immutable
+Evidence object. The tagged identity of that object is named by store.meta. No
+Astrid executable, Rust compiler, source repository, generated schema, or
+disposable index is required to decode the authoritative files.
 
 This specification describes format 1 only. A decoder MUST reject non-zero
 reserved fields, unknown physical frame versions, malformed lengths, trailing
@@ -196,7 +197,7 @@ Stable object_kind codes:
 
 Only Owns references enter a principal's default reconstruction closure.
 Evidence, Lineage, and Derived targets survive only when independently rooted,
-pinned, or selected by an explicit archival policy. The Rosetta Evidence object
+pinned, or selected by an explicit archival policy. The RÚNATAL Evidence object
 is retained because store.meta names it, not because every principal owns it.
 
 
@@ -455,10 +456,10 @@ Directory content catalog:
   the UTF-8 byte length of every name.
 
 
-7.3 Store format Evidence object
----------------------------------
+7.3 RÚNATAL store-format Evidence object
+-----------------------------------------
 
-The Rosetta object described in section 1 is:
+The RÚNATAL object described in section 1 is:
 
   kind=10, version=1, class=Metadata, logical_bytes=0
   canonical_bytes = this complete document, from its first byte through its
@@ -694,12 +695,12 @@ materializes those records through the ordinary self-contained bundle grammar.
 An independent recovery implementation can reconstruct current state as
 follows:
 
-  1. Parse store.meta and obtain the tagged Rosetta object identity.
+  1. Parse store.meta and obtain the tagged RÚNATAL object identity.
   2. Scan objects.arena as physical frames. Check magic, version, reserved
      bytes, length, and checksum. Decode each ObjectRecord, enforce strict
      reference ordering, recompute construction-1 identities, and build a map
      from complete tagged identity to record.
-  3. Verify that the Rosetta object named by store.meta equals this document.
+  3. Verify that the RÚNATAL object named by store.meta equals this document.
   4. Scan roots.journal, check every physical frame, decode canonical
      state-owner principals, and replay the compare-and-swap chain.
   5. For each current root, recursively follow Owns references. Reject a
@@ -720,7 +721,7 @@ current principal unless reached from the journal's selected root through Owns.
 The durable unit of long-term survival is a deterministic export_closure
 bundle, not an arena's current physical placement. Such a bundle contains:
 
-  - this Rosetta Evidence object and its tagged identity;
+  - this RÚNATAL Evidence object and its tagged identity;
   - the selected tagged principal root;
   - every object in the root's complete Owns closure;
   - any explicitly selected evidence, lineage, or derived closures; and

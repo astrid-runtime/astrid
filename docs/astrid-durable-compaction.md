@@ -75,7 +75,7 @@ Current roots are always live. Additional roots are a strictly ordered,
 deduplicated set of `(reason, ObjectId)` facts covering whichever objects
 composition has independently authorized, including:
 
-- the Rosetta specification named by `store.meta`;
+- the RÚNATAL specification named by `store.meta`;
 - system bootstrap and identity-migration evidence;
 - active export, import, bulk-ingest, and placement leases;
 - immutable read-handle closures;

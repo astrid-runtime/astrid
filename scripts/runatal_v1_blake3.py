@@ -1,4 +1,4 @@
-"""Tiny one-shot BLAKE3 used only by the independent format-1 reader.
+"""Tiny one-shot BLAKE3 used only by the independent RÚNATAL format-1 reader.
 
 This deliberately shares no code or package with Astrid's Rust implementation.
 It implements only unkeyed hashing and derive-key hashing and is not optimized.

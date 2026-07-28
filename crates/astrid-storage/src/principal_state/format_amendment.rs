@@ -1,4 +1,4 @@
-//! Frozen format-v1 Rosetta object and crash-safe in-place amendments.
+//! Frozen format-v1 RÚNATAL object and crash-safe in-place amendments.
 
 use std::path::Path;
 
@@ -26,10 +26,15 @@ pub(super) const PRE_GC_OUTBOX_FORMAT_SPEC_ID: ObjectId = ObjectId::new([
     216, 242, 203, 37, 7, 54, 121, 159, 216, 178, 111, 48, 126, 32, 196, 217, 73, 214, 206, 161,
     131, 102, 20, 165, 84, 114, 16, 232, 43, 191, 206, 193,
 ]);
-const PRIOR_V1_FORMAT_SPEC_IDS: [ObjectId; 3] = [
+pub(super) const PRE_RUNATAL_NAMING_FORMAT_SPEC_ID: ObjectId = ObjectId::new([
+    134, 57, 14, 85, 115, 205, 98, 72, 236, 238, 181, 144, 75, 249, 222, 203, 137, 41, 254, 103,
+    170, 230, 56, 213, 49, 171, 17, 148, 24, 0, 14, 25,
+]);
+const PRIOR_V1_FORMAT_SPEC_IDS: [ObjectId; 4] = [
     PRE_DERIVATION_FORMAT_SPEC_ID,
     PRE_COMPACTION_FORMAT_SPEC_ID,
     PRE_GC_OUTBOX_FORMAT_SPEC_ID,
+    PRE_RUNATAL_NAMING_FORMAT_SPEC_ID,
 ];
 
 pub(super) fn format_spec_record() -> StorageResult<ObjectRecord> {

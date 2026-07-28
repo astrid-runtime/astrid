@@ -1,4 +1,4 @@
-//! Selection coverage for known in-place format-1 Rosetta amendments.
+//! Selection coverage for known in-place format-1 RÚNATAL amendments.
 
 use std::sync::Arc;
 
@@ -6,7 +6,8 @@ use astrid_storage_model::{ObjectId, ObjectIdentity};
 
 use super::format_amendment::{
     DestinationFormat, PRE_COMPACTION_FORMAT_SPEC_ID, PRE_GC_OUTBOX_FORMAT_SPEC_ID,
-    STORE_METADATA_FILE, format_spec_record, prepare_destination, store_metadata,
+    PRE_RUNATAL_NAMING_FORMAT_SPEC_ID, STORE_METADATA_FILE, format_spec_record,
+    prepare_destination, store_metadata,
 };
 use super::{Blake3ObjectIdentityV1, KvQuotaResolver, StateOwner, open_runtime_kv};
 use astrid_core::dirs::AstridHome;
@@ -21,8 +22,12 @@ fn unlimited_quota() -> Arc<dyn KvQuotaResolver<StateOwner>> {
 }
 
 #[tokio::test]
-async fn completed_prior_v1_stores_are_selected_for_rosetta_amendment() {
-    for prior in [PRE_COMPACTION_FORMAT_SPEC_ID, PRE_GC_OUTBOX_FORMAT_SPEC_ID] {
+async fn completed_prior_v1_stores_are_selected_for_runatal_amendment() {
+    for prior in [
+        PRE_COMPACTION_FORMAT_SPEC_ID,
+        PRE_GC_OUTBOX_FORMAT_SPEC_ID,
+        PRE_RUNATAL_NAMING_FORMAT_SPEC_ID,
+    ] {
         assert_prior_format_is_selected(prior).await;
     }
 }

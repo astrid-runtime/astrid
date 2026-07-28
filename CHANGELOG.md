@@ -85,10 +85,11 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   roots and arena offsets resident, while live reads load and checksum payloads
   lazily. Every persistent identity occurrence now carries an algorithm,
   construction version, and variable digest length with capacity for 384-bit
-  successors. Each store persists a frozen, byte-exact plain-text format
-  specification as an immutable object referenced by `store.meta`; an
-  independent Python reader verifies Rust-produced arenas, identities, root
-  chains, and live closures in CI. Proof-audited arena compaction now rewrites
+  successors. Each store persists RÚNATAL — Recoverable Universal Notation for
+  Astrid's Tagged Archival Layout — as a frozen, byte-exact plain-text
+  specification object referenced by `store.meta`; an independent Python
+  reader verifies Rust-produced arenas, identities, root chains, and live
+  closures in CI. Proof-audited arena compaction now rewrites
   exactly the closures selected by an explicit retention contract, preserves
   root generations in a canonical journal snapshot, and atomically replaces
   both authority files through a durable intent. Recovery accepts only a

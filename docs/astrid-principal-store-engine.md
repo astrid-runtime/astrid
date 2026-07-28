@@ -197,7 +197,7 @@ Unix publishes it with atomic replacement plus a directory flush. Windows,
 whose standard rename does not replace an existing file, rotates the old cache
 through a backup name before publishing the new one. A crash in that window may
 lose the cache and trigger authoritative recovery, but cannot lose logical
-state. The cache format is not part of `export_closure` or the Rosetta promise
+state. The cache format is not part of `export_closure` or the RÚNATAL promise
 and may change or disappear without migrating logical state.
 
 An interrupted engine is poisoned and refuses both reads and writes until
