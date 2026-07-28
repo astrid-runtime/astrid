@@ -12,6 +12,13 @@ use super::{
 };
 use crate::PreparedProjectionObject;
 
+type EncodedStagedObject = (ObjectRecord, Vec<u8>);
+
+struct PreparedStageBatch {
+    incoming: BTreeMap<ObjectId, EncodedStagedObject>,
+    input_order: Vec<ObjectId>,
+}
+
 impl<P, I, C> DurableEngine<P, I, C>
 where
     P: Clone + Ord,
@@ -120,7 +127,78 @@ where
         &self,
         objects: Vec<PreparedProjectionObject>,
     ) -> Result<Vec<(ObjectId, InsertOutcome)>, DurableError> {
-        let mut incoming = BTreeMap::<ObjectId, (ObjectRecord, Vec<u8>)>::new();
+        self.stage_prepared_objects_inner(None, objects)
+    }
+
+    /// Stage an engine-prepared batch with principal-accounted cache reuse.
+    ///
+    /// Existing immutable records may satisfy the mandatory equality check
+    /// from the governed decoded-object cache. Newly admitted records are
+    /// offered to that same cache after their arena locations become visible.
+    /// Cache refusal or eviction never changes admission correctness.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::stage_prepared_objects`].
+    pub fn stage_prepared_objects_for(
+        &self,
+        principal: &P,
+        objects: Vec<PreparedProjectionObject>,
+    ) -> Result<Vec<(ObjectId, InsertOutcome)>, DurableError> {
+        self.stage_prepared_objects_inner(Some(principal), objects)
+    }
+
+    fn stage_prepared_objects_inner(
+        &self,
+        principal: Option<&P>,
+        objects: Vec<PreparedProjectionObject>,
+    ) -> Result<Vec<(ObjectId, InsertOutcome)>, DurableError> {
+        let PreparedStageBatch {
+            incoming,
+            input_order,
+        } = self.prepare_staging_batch(objects)?;
+        let cached = principal.map_or_else(BTreeMap::new, |principal| {
+            incoming
+                .keys()
+                .filter_map(|id| {
+                    self.object_cache
+                        .get(principal, *id)
+                        .map(|record| (*id, record))
+                })
+                .collect()
+        });
+        let mut inner = self.inner.lock();
+        ensure_usable(&inner)?;
+        let already_present = self.validate_staged_dedup_hits(&mut inner, &incoming, &cached)?;
+        let outcomes = staging_outcomes(input_order, &already_present)?;
+        let append = prepare_staged_append(incoming, &already_present, principal.is_some())?;
+        let appended = {
+            let files = live_files_mut(&mut inner.files)?;
+            append_frames(&mut files.arena, ARENA_MAGIC, &append.payloads)
+        };
+        match appended {
+            Ok(locations) => {
+                inner.index.extend(append.ids.into_iter().zip(locations));
+                drop(inner);
+                if let Some(principal) = principal {
+                    for (id, record) in append.cache_records {
+                        self.object_cache.insert(principal, id, record);
+                    }
+                }
+                Ok(outcomes)
+            },
+            Err(error) => {
+                inner.poisoned = true;
+                Err(error)
+            },
+        }
+    }
+
+    fn prepare_staging_batch(
+        &self,
+        objects: Vec<PreparedProjectionObject>,
+    ) -> Result<PreparedStageBatch, DurableError> {
+        let mut incoming = BTreeMap::<ObjectId, EncodedStagedObject>::new();
         let mut input_order = Vec::new();
         input_order
             .try_reserve_exact(objects.len())
@@ -150,74 +228,108 @@ where
             ensure_payload_limit(ARENA_FILE, 0, payload.len(), self.limits)?;
             incoming.insert(id, (record, payload));
         }
+        Ok(PreparedStageBatch {
+            incoming,
+            input_order,
+        })
+    }
 
-        let mut inner = self.inner.lock();
-        ensure_usable(&inner)?;
+    fn validate_staged_dedup_hits(
+        &self,
+        inner: &mut super::DurableInner<P>,
+        incoming: &BTreeMap<ObjectId, EncodedStagedObject>,
+        cached: &BTreeMap<ObjectId, Arc<ObjectRecord>>,
+    ) -> Result<BTreeSet<ObjectId>, DurableError> {
         let mut already_present = BTreeSet::new();
-        for (id, (record, _)) in &incoming {
+        for (id, (record, _)) in incoming {
             if let Some(location) = inner.index.get(id).copied() {
-                let existing = {
-                    let files = live_files_mut(&mut inner.files)?;
-                    read_indexed_object(
-                        &files.arena,
-                        *id,
-                        location,
-                        self.identity.scheme(),
-                        self.limits,
-                    )?
+                let existing = if let Some(existing) = cached.get(id) {
+                    Arc::clone(existing)
+                } else {
+                    let existing = {
+                        let files = live_files_mut(&mut inner.files)?;
+                        read_indexed_object(
+                            &files.arena,
+                            *id,
+                            location,
+                            self.identity.scheme(),
+                            self.limits,
+                        )?
+                    };
+                    Arc::new(existing)
                 };
-                if &existing != record {
+                if existing.as_ref() != record {
                     return Err(ModelError::ObjectCollision(*id).into());
                 }
                 already_present.insert(*id);
             }
         }
+        Ok(already_present)
+    }
+}
 
-        let mut outcomes = Vec::new();
-        outcomes
-            .try_reserve_exact(input_order.len())
-            .map_err(|_| DurableError::EncodingOverflow)?;
-        let mut accounted = already_present.clone();
-        for id in input_order {
-            let outcome = if accounted.insert(id) {
-                InsertOutcome::Inserted
-            } else {
-                InsertOutcome::AlreadyPresent
-            };
-            outcomes.push((id, outcome));
-        }
+struct PreparedStagedAppend {
+    ids: Vec<ObjectId>,
+    payloads: Vec<Vec<u8>>,
+    cache_records: Vec<(ObjectId, ObjectRecord)>,
+}
 
-        let mut ids = Vec::new();
-        let mut payloads = Vec::new();
-        let append_count = incoming
-            .keys()
-            .filter(|id| !already_present.contains(id))
-            .count();
-        ids.try_reserve_exact(append_count)
-            .map_err(|_| DurableError::EncodingOverflow)?;
-        payloads
-            .try_reserve_exact(append_count)
-            .map_err(|_| DurableError::EncodingOverflow)?;
-        for (id, (_, payload)) in incoming {
-            if already_present.contains(&id) {
-                continue;
-            }
-            ids.push(id);
-            payloads.push(payload);
-        }
-        let appended = {
-            let files = live_files_mut(&mut inner.files)?;
-            append_frames(&mut files.arena, ARENA_MAGIC, &payloads)
+fn staging_outcomes(
+    input_order: Vec<ObjectId>,
+    already_present: &BTreeSet<ObjectId>,
+) -> Result<Vec<(ObjectId, InsertOutcome)>, DurableError> {
+    let mut outcomes = Vec::new();
+    outcomes
+        .try_reserve_exact(input_order.len())
+        .map_err(|_| DurableError::EncodingOverflow)?;
+    let mut accounted = already_present.clone();
+    for id in input_order {
+        let outcome = if accounted.insert(id) {
+            InsertOutcome::Inserted
+        } else {
+            InsertOutcome::AlreadyPresent
         };
-        match appended {
-            Ok(locations) => {
-                inner.index.extend(ids.into_iter().zip(locations));
-                Ok(outcomes)
-            },
-            Err(error) => {
-                inner.poisoned = true;
-                Err(error)
-            },
+        outcomes.push((id, outcome));
+    }
+    Ok(outcomes)
+}
+
+fn prepare_staged_append(
+    incoming: BTreeMap<ObjectId, EncodedStagedObject>,
+    already_present: &BTreeSet<ObjectId>,
+    retain_for_cache: bool,
+) -> Result<PreparedStagedAppend, DurableError> {
+    let append_count = incoming
+        .keys()
+        .filter(|id| !already_present.contains(id))
+        .count();
+    let mut append = PreparedStagedAppend {
+        ids: Vec::new(),
+        payloads: Vec::new(),
+        cache_records: Vec::new(),
+    };
+    append
+        .ids
+        .try_reserve_exact(append_count)
+        .map_err(|_| DurableError::EncodingOverflow)?;
+    append
+        .payloads
+        .try_reserve_exact(append_count)
+        .map_err(|_| DurableError::EncodingOverflow)?;
+    if retain_for_cache {
+        append
+            .cache_records
+            .try_reserve_exact(incoming.len())
+            .map_err(|_| DurableError::EncodingOverflow)?;
+    }
+    for (id, (record, payload)) in incoming {
+        if !already_present.contains(&id) {
+            append.ids.push(id);
+            append.payloads.push(payload);
+        }
+        if retain_for_cache {
+            append.cache_records.push((id, record));
         }
     }
+    Ok(append)
 }

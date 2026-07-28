@@ -641,6 +641,128 @@ fn staged_batch_is_idempotent_and_publishes_in_one_root_commit() {
     assert!(engine.snapshot(&"alice".to_owned()).unwrap().is_some());
 }
 
+#[test]
+fn principal_staging_reuses_governed_cache_and_charges_each_principal() {
+    let directory = tempfile::tempdir().unwrap();
+    let total = ObjectCacheCapacity::Bounded(std::num::NonZeroU64::new(2 * 1024 * 1024).unwrap());
+    let engine = open_with_cache(directory.path(), ObjectCacheController::new(total));
+    let record = ObjectRecord::new(
+        ObjectKind::Chunk,
+        ObjectFormatVersion::V1,
+        b"principal staged cache".to_vec(),
+        Vec::new(),
+        22,
+        ObjectClass::Data,
+    )
+    .unwrap();
+    let alice = "alice".to_owned();
+    let bob = "bob".to_owned();
+
+    let first = engine.prepare_object(record.clone());
+    assert_eq!(
+        engine
+            .stage_prepared_objects_for(&alice, vec![first])
+            .unwrap()[0]
+            .1,
+        InsertOutcome::Inserted
+    );
+    let after_insert = engine.object_cache_stats();
+    assert_eq!(after_insert.insertions, 1);
+    assert_eq!(after_insert.resident_objects, 1);
+
+    let duplicate = engine.prepare_object(record.clone());
+    assert_eq!(
+        engine
+            .stage_prepared_objects_for(&alice, vec![duplicate])
+            .unwrap()[0]
+            .1,
+        InsertOutcome::AlreadyPresent
+    );
+    let shared = engine.prepare_object(record);
+    assert_eq!(
+        engine
+            .stage_prepared_objects_for(&bob, vec![shared])
+            .unwrap()[0]
+            .1,
+        InsertOutcome::AlreadyPresent
+    );
+
+    let after_reuse = engine.object_cache_stats();
+    assert_eq!(after_reuse.hits, after_insert.hits + 2);
+    assert_eq!(after_reuse.resident_objects, 1);
+    assert_eq!(after_reuse.resident_associations, 2);
+    assert_eq!(
+        engine.object_cache_principal_charge(&alice),
+        after_reuse.resident_record_bytes
+    );
+    assert_eq!(
+        engine.object_cache_principal_charge(&bob),
+        after_reuse.resident_record_bytes
+    );
+}
+
+#[test]
+fn final_root_validation_reuses_principal_staged_records() {
+    let directory = tempfile::tempdir().unwrap();
+    let total = ObjectCacheCapacity::Bounded(std::num::NonZeroU64::new(2 * 1024 * 1024).unwrap());
+    let engine = open_with_cache(directory.path(), ObjectCacheController::new(total));
+    let principal = "alice".to_owned();
+    let (commit, transaction) = transaction(&principal, None, b"cached closure");
+    let prepared = transaction
+        .records()
+        .iter()
+        .map(|(_, record)| engine.prepare_object(record.clone()))
+        .collect();
+    engine
+        .stage_prepared_objects_for(&principal, prepared)
+        .unwrap();
+    let before_commit = engine.object_cache_stats();
+
+    let outcome = engine
+        .commit(RootTransaction::new(
+            principal.clone(),
+            None,
+            commit,
+            Vec::new(),
+        ))
+        .unwrap();
+
+    let after_commit = engine.object_cache_stats();
+    assert_eq!(after_commit.misses, before_commit.misses);
+    assert_eq!(after_commit.hits, before_commit.hits + 3);
+    assert_eq!(engine.root(&principal).unwrap(), Some(outcome.root()));
+}
+
+#[test]
+fn cache_budget_refusal_preserves_staging_and_root_validation() {
+    let directory = tempfile::tempdir().unwrap();
+    let total = ObjectCacheCapacity::Bounded(std::num::NonZeroU64::new(1).unwrap());
+    let engine = open_with_cache(directory.path(), ObjectCacheController::new(total));
+    let principal = "alice".to_owned();
+    let (commit, transaction) = transaction(&principal, None, b"uncached closure");
+    let prepared = transaction
+        .records()
+        .iter()
+        .map(|(_, record)| engine.prepare_object(record.clone()))
+        .collect();
+
+    engine
+        .stage_prepared_objects_for(&principal, prepared)
+        .unwrap();
+    assert_eq!(engine.object_cache_stats().resident_objects, 0);
+    let outcome = engine
+        .commit(RootTransaction::new(
+            principal.clone(),
+            None,
+            commit,
+            Vec::new(),
+        ))
+        .unwrap();
+
+    assert_eq!(engine.object_cache_stats().resident_objects, 0);
+    assert_eq!(engine.root(&principal).unwrap(), Some(outcome.root()));
+}
+
 #[derive(Default)]
 struct PartialVectoredWriter {
     bytes: Vec<u8>,

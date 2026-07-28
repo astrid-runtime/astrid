@@ -270,6 +270,23 @@ pub trait PrincipalProjectionEngine<P>: Send + Sync {
         Ok(outcomes)
     }
 
+    /// Stage prepared objects with principal-accounted accelerator reuse.
+    ///
+    /// The principal is an accounting and cache-partition key, not admission
+    /// authority. Implementations without a governed decoded-object cache take
+    /// the ordinary prepared staging path.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::stage_prepared_objects`].
+    fn stage_prepared_objects_for(
+        &self,
+        _principal: &P,
+        objects: Vec<PreparedProjectionObject>,
+    ) -> Result<Vec<(ObjectId, InsertOutcome)>, PrincipalProjectionError> {
+        self.stage_prepared_objects(objects)
+    }
+
     /// Return a principal's current root.
     ///
     /// # Errors
@@ -503,6 +520,14 @@ where
         objects: Vec<PreparedProjectionObject>,
     ) -> Result<Vec<(ObjectId, InsertOutcome)>, PrincipalProjectionError> {
         DurableEngine::stage_prepared_objects(self, objects).map_err(map_durable)
+    }
+
+    fn stage_prepared_objects_for(
+        &self,
+        principal: &P,
+        objects: Vec<PreparedProjectionObject>,
+    ) -> Result<Vec<(ObjectId, InsertOutcome)>, PrincipalProjectionError> {
+        DurableEngine::stage_prepared_objects_for(self, principal, objects).map_err(map_durable)
     }
 
     fn current_root(&self, principal: &P) -> Result<Option<RootState>, PrincipalProjectionError> {

@@ -914,7 +914,7 @@ where
                 },
             }
         }
-        let reachable = self.validate_pending_closure(inner, &unique, commit_id)?;
+        let reachable = self.validate_pending_closure(inner, &principal, &unique, commit_id)?;
 
         let mut objects = Vec::new();
         let mut commit_frame = None;
@@ -965,6 +965,7 @@ where
     fn validate_pending_closure(
         &self,
         inner: &mut DurableInner<P>,
+        principal: &P,
         incoming: &BTreeMap<ObjectId, ObjectRecord>,
         commit: ObjectId,
     ) -> Result<BTreeSet<ObjectId>, DurableError> {
@@ -975,15 +976,17 @@ where
             ..
         } = inner;
         let files = live_files_mut(files)?;
-        validate_incremental_closure(
-            &mut files.arena,
+        IncrementalClosureValidator {
+            arena: &mut files.arena,
             index,
             incoming,
             validated,
-            commit,
-            self.identity.scheme(),
-            self.limits,
-        )
+            object_cache: &self.object_cache,
+            principal,
+            scheme: self.identity.scheme(),
+            limits: self.limits,
+        }
+        .validate(commit)
     }
 
     fn persist(
@@ -1113,66 +1116,92 @@ fn validate_commit_closure(
     Ok(())
 }
 
-fn validate_incremental_closure(
-    arena: &mut File,
-    index: &BTreeMap<ObjectId, ArenaLocation>,
-    incoming: &BTreeMap<ObjectId, ObjectRecord>,
-    validated: &BTreeSet<ObjectId>,
-    root: ObjectId,
+struct IncrementalClosureValidator<'a, P: Ord> {
+    arena: &'a mut File,
+    index: &'a BTreeMap<ObjectId, ArenaLocation>,
+    incoming: &'a BTreeMap<ObjectId, ObjectRecord>,
+    validated: &'a BTreeSet<ObjectId>,
+    object_cache: &'a ObjectCache<P>,
+    principal: &'a P,
     scheme: IdentityScheme,
     limits: RecoveryLimits,
-) -> Result<BTreeSet<ObjectId>, DurableError> {
-    let root_record = if let Some(record) = incoming.get(&root) {
-        record.clone()
-    } else {
-        let location = index
-            .get(&root)
-            .copied()
-            .ok_or(ModelError::MissingObject(root))?;
-        read_indexed_object(arena, root, location, scheme, limits)?
-    };
-    if root_record.kind() != ObjectKind::Commit {
-        return Err(ModelError::RootNotCommit {
-            object: root,
-            actual: root_record.kind(),
-        }
-        .into());
-    }
-    let mut reachable = BTreeSet::new();
-    let mut marks = BTreeMap::<ObjectId, u8>::new();
-    let mut stack = vec![(root, false)];
+}
 
-    while let Some((id, expanded)) = stack.pop() {
-        if validated.contains(&id) {
+impl<P> IncrementalClosureValidator<'_, P>
+where
+    P: Clone + Ord,
+{
+    fn validate(&mut self, root: ObjectId) -> Result<BTreeSet<ObjectId>, DurableError> {
+        let root_kind = self.record(root)?.as_ref().kind();
+        if root_kind != ObjectKind::Commit {
+            return Err(ModelError::RootNotCommit {
+                object: root,
+                actual: root_kind,
+            }
+            .into());
+        }
+        let mut reachable = BTreeSet::new();
+        let mut marks = BTreeMap::<ObjectId, u8>::new();
+        let mut stack = vec![(root, false)];
+
+        while let Some((id, expanded)) = stack.pop() {
+            if self.validated.contains(&id) {
+                reachable.insert(id);
+                continue;
+            }
+            if expanded {
+                marks.insert(id, 2);
+                continue;
+            }
+            match marks.get(&id).copied() {
+                Some(2) => continue,
+                Some(1) => return Err(ModelError::ObjectCycle(id).into()),
+                Some(_) | None => {},
+            }
+            let record = self.record(id)?;
             reachable.insert(id);
-            continue;
+            marks.insert(id, 1);
+            stack.push((id, true));
+            for child in record.as_ref().owning_references().rev() {
+                stack.push((child, false));
+            }
         }
-        if expanded {
-            marks.insert(id, 2);
-            continue;
+        Ok(reachable)
+    }
+
+    fn record(&mut self, id: ObjectId) -> Result<ClosureRecord<'_>, DurableError> {
+        if let Some(record) = self.incoming.get(&id) {
+            return Ok(ClosureRecord::Incoming(record));
         }
-        match marks.get(&id).copied() {
-            Some(2) => continue,
-            Some(1) => return Err(ModelError::ObjectCycle(id).into()),
-            Some(_) | None => {},
+        if let Some(record) = self.object_cache.get(self.principal, id) {
+            return Ok(ClosureRecord::Cached(record));
         }
-        let record = if let Some(record) = incoming.get(&id) {
-            record.clone()
-        } else {
-            let location = index
-                .get(&id)
-                .copied()
-                .ok_or(ModelError::MissingObject(id))?;
-            read_indexed_object(arena, id, location, scheme, limits)?
-        };
-        reachable.insert(id);
-        marks.insert(id, 1);
-        stack.push((id, true));
-        for child in record.owning_references().rev() {
-            stack.push((child, false));
+        let location = self
+            .index
+            .get(&id)
+            .copied()
+            .ok_or(ModelError::MissingObject(id))?;
+        let record = read_indexed_object(self.arena, id, location, self.scheme, self.limits)?;
+        Ok(ClosureRecord::Cached(self.object_cache.insert(
+            self.principal,
+            id,
+            record,
+        )))
+    }
+}
+
+enum ClosureRecord<'a> {
+    Incoming(&'a ObjectRecord),
+    Cached(Arc<ObjectRecord>),
+}
+
+impl AsRef<ObjectRecord> for ClosureRecord<'_> {
+    fn as_ref(&self) -> &ObjectRecord {
+        match self {
+            Self::Incoming(record) => record,
+            Self::Cached(record) => record,
         }
     }
-    Ok(reachable)
 }
 
 fn usage_from_closure(

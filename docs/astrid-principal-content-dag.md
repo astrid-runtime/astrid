@@ -190,7 +190,13 @@ The durable append encodes each frame independently, then uses vectored I/O over
 the frame headers and existing payload buffers rather than copying the batch
 into a second aggregate buffer. Partial vectored writes, interrupted writes,
 and platform-specific vector-count limits are retried without changing the
-physical format. No record is flushed individually. After the source is
+physical format. Principal-bound staging offers admitted records to the same
+governed immutable-object cache used by reads. A cached duplicate still passes
+the mandatory byte-equality check, while final closure traversal can reuse the
+verified decoded records without re-reading and checksumming their frames.
+Physical records remain shared, every participating principal is charged full
+logical cache weight, and cache refusal or eviction falls back to the ordinary
+verified arena path. No record is flushed individually. After the source is
 complete, the ordinary principal-root transaction validates the full staged
 closure inside its critical section, flushes the complete arena prefix, and
 only then appends and flushes the root journal. Root conflicts rebuild only

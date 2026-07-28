@@ -275,7 +275,7 @@ where
         source: R,
         profile: ChunkingProfile,
     ) -> Result<ContentWriteOutcome, PrincipalContentError> {
-        let mut sink = EngineSink::<P, E>::new(self.engine.as_ref());
+        let mut sink = EngineSink::<P, E>::new(self.engine.as_ref(), principal);
         let streamed =
             build_content_streaming(profile, source, &mut sink).map_err(map_stream_error)?;
         sink.finish()?;
@@ -883,6 +883,7 @@ where
 
 struct EngineSink<'a, P, E> {
     engine: &'a E,
+    principal: &'a P,
     objects_inserted: u64,
     pending_bytes: usize,
     pending: BTreeMap<ObjectId, PreparedProjectionObject>,
@@ -890,9 +891,10 @@ struct EngineSink<'a, P, E> {
 }
 
 impl<'a, P, E> EngineSink<'a, P, E> {
-    const fn new(engine: &'a E) -> Self {
+    const fn new(engine: &'a E, principal: &'a P) -> Self {
         Self {
             engine,
+            principal,
             objects_inserted: 0,
             pending_bytes: 0,
             pending: BTreeMap::new(),
@@ -914,7 +916,7 @@ where
         let expected: Vec<_> = pending.keys().copied().collect();
         let outcomes = self
             .engine
-            .stage_prepared_objects(pending.into_values().collect())?;
+            .stage_prepared_objects_for(self.principal, pending.into_values().collect())?;
         if outcomes.len() != expected.len() {
             return Err(PrincipalProjectionError::Engine(
                 "staging engine returned the wrong outcome count".to_owned(),

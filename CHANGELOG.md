@@ -244,6 +244,14 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   rejected on mismatch before admission. Arena batches now use retry-safe
   vectored writes over frame headers and existing encoded payloads instead of
   copying every four-MiB staging batch into another aggregate allocation.
+- **Content publication reuses governed decoded-object records.**
+  Principal-bound staging offers admitted records to the same operator-owned,
+  per-principal-accounted cache as verified reads. Duplicate admission can
+  perform its mandatory equality check without another arena read, and final
+  root closure validation can traverse cached immutable records without
+  re-reading and checksumming their frames. Physical entries remain shared
+  while each principal pays full logical cache weight; disabled policy,
+  eviction, or budget refusal preserves the verified arena fallback.
 - **Kernel management rate limits no longer cross authorization boundaries.**
   Requests consume a principal-and-method-scoped action budget only after
   principal and device-scope authorization succeeds. A restricted caller or
