@@ -7,7 +7,13 @@ Last reviewed: 2026-07-25
 Companions: [native-kernel scope](astrid-native-kernel.md),
 [AI-native OS workplan](astrid-ai-native-os-workplan.md),
 [kernel evidence matrix](astrid-kernel-evidence-matrix.md), and
-[principal-store evidence plan](astrid-principal-store-evidence.md)
+[principal-store evidence plan](astrid-principal-store-evidence.md).
+
+The pre-release constants and literature posture are recorded in the
+[storage freeze audit](astrid-storage-freeze-audit.md) and
+[storage FTO triage](astrid-storage-fto-triage.md). Deterministic computation
+above the object layer follows the
+[conservation-of-computation contract](astrid-conservation-of-computation.md).
 
 ## 1. Decision
 

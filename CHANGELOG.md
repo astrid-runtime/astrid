@@ -11,6 +11,27 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Added
 
+- **Astrid has a content-addressed computation design contract.** A canonical
+  invocation object now specifies the complete identity boundary for reusable
+  deterministic work, including the exact transform closure, its registered
+  contract, typed ordered inputs, canonical parameters, semantics-visible
+  runtime profiles, output contracts, provenance snapshots, and explicit
+  seeds. Pure, snapshot-bound, effectful, and nondeterministic
+  execution classes prevent memoization from replaying side effects. Muninn is
+  specified as a disposable fleet index over durable derivation evidence, with
+  differential spot checks, logical-versus-physical compute accounting, and
+  principal/trust-domain authority preserved below its cache. Huginn applies
+  the same primitive to canonical local-model context and prefix assembly. The
+  Refinery contract and initial engine seam unify scrub, SHA-384 cross-hashing,
+  resemblance sketches, and representation-aware compaction behind one
+  resource-budget shape while retaining a sealed engine-only mutation
+  boundary. Linked GC plan and commit evidence keep the exact fact snapshot,
+  retention policy, auditor proof, condemned set, and placement transition
+  replayable, while commit construction rejects a changed fence-held snapshot.
+  Durable storage freeze and
+  freedom-to-operate records pin the associated format, chunking, identity,
+  and public-layer research decisions without activating a capsule or WIT
+  surface.
 - **Principal storage now has a portable executable architecture model.** The
   `no_std` `astrid-storage-model` crate defines immutable logical objects,
   distinct encoded blob identities, atomic principal-root transitions,

@@ -215,6 +215,17 @@ capsule behavior accidentally.
 - [ ] Prove that a forged principal identifier, guest root, package hook, or child
   process cannot widen the realm's outer Astrid grants.
 
+Realm artifacts use the universal derivation model rather than a private image
+cache. A distro is a `Derived` object over its canonical capsule/configuration
+set and pinned composition transform. A Realm image is a `Derived` object over
+the immutable base, canonical package set, image recipe, target profile, and
+explicit principal overlay seed. Muninn may reuse identical base/image
+derivations across authorized sharing domains; private writable homes remain
+principal-owned roots and are never folded into the shared image identity.
+Export materializes an independently verifiable image or includes its complete
+generator closure. At least one recoverable representation remains live under
+the store's representation invariant.
+
 Exit condition: an agent can restart its realm, recover the same private home, use
 files/pipes/processes through a shell, build an installable capsule, and export it
 through an explicit portal; a second principal cannot observe that state, and no
@@ -492,6 +503,9 @@ and counterexamples before large kernel and driver surfaces.
 - Do not create a separate Astrid driver repository before a stable independent
   contract and release cadence exist.
 - Keep generic Tensor Logic language/compiler work independent of Astrid.
+- Keep the full Tensor Logic design record in its eventual canonical repository
+  once that home is selected; core owns only the Astrid composition, fact, and
+  evidence contracts that consume it.
 - Use the canonical WIT and RFC repositories only when a public contract is being
   proposed.
 - Convert the unchecked items into GitHub issues only when implementation ownership

@@ -27,7 +27,9 @@ use parking_lot::RwLock;
 #[cfg(not(target_family = "wasm"))]
 mod durable;
 mod kv;
+mod muninn;
 mod projection;
+mod refinery;
 
 #[cfg(not(target_family = "wasm"))]
 pub use durable::{
@@ -38,7 +40,17 @@ pub use kv::{
     KvProjectionEngine, KvProjectionError, KvState, KvStateSnapshot, commit_kv_with_engine,
     kv_snapshot_with_engine,
 };
+pub use muninn::{
+    InMemoryMuninnIndex, MuninnAdmission, MuninnHit, MuninnTrustState, MuninnVerificationError,
+    VerifiedDerivationEvidence, verify_derivation_evidence,
+};
 pub use projection::{PrincipalProjectionEngine, PrincipalProjectionError};
+pub use refinery::{
+    EngineCompactionPass, ProposedRefineryOutput, RefineryBatchContext, RefineryCheckpointId,
+    RefineryOutputClass, RefineryPass, RefineryPassDescriptorId, RefineryProposalError,
+    RefineryProposalSink, RefineryResourceBudget, RefineryRunError, RefinerySnapshotId,
+    VerifiedRefineryObject, run_refinery_observer,
+};
 
 /// A root update and the immutable records required to reconstruct it.
 ///
@@ -395,6 +407,9 @@ impl<P: Ord, I: ObjectIdentity> InMemoryEngine<P, I> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod muninn_tests;
 
 #[cfg(test)]
 mod tests {

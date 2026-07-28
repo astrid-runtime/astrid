@@ -9,6 +9,12 @@ principal content store identifies exact canonical object records only. A
 future capsule-facing transformation interface changes WIT and therefore
 requires an RFC after the interface freeze is lifted.
 
+Deterministic transform invocation, reuse, and maintenance are specified by
+[Conservation of Computation](astrid-conservation-of-computation.md),
+[Muninn](astrid-muninn.md), and the
+[Astrid Refinery](astrid-refinery.md). Those designs consume this contract;
+they do not weaken its reference-transform or registration authority.
+
 ## The problem
 
 Content-addressed storage recognizes equal bytes. It does not recognize that:

@@ -325,6 +325,16 @@ pub enum ObjectKind {
     Evidence,
     /// Rebuildable index or materialization.
     Derived,
+    /// Semantics-visible execution surface shared by compatible engine builds.
+    RuntimeSemanticProfile,
+    /// Complete canonical request for one derivation.
+    DerivationInvocation,
+    /// Verified relation from one derivation invocation to its results.
+    DerivationEvidence,
+    /// Garbage-collection plan and its closed-world safety proof.
+    GcPlanEvidence,
+    /// Executed garbage-collection transition bound to one exact plan.
+    GcCommitEvidence,
 }
 
 impl ObjectKind {
@@ -344,6 +354,11 @@ impl ObjectKind {
             Self::Commit => 9,
             Self::Evidence => 10,
             Self::Derived => 11,
+            Self::RuntimeSemanticProfile => 12,
+            Self::DerivationInvocation => 13,
+            Self::DerivationEvidence => 14,
+            Self::GcPlanEvidence => 15,
+            Self::GcCommitEvidence => 16,
         }
     }
 
@@ -363,6 +378,11 @@ impl ObjectKind {
             9 => Some(Self::Commit),
             10 => Some(Self::Evidence),
             11 => Some(Self::Derived),
+            12 => Some(Self::RuntimeSemanticProfile),
+            13 => Some(Self::DerivationInvocation),
+            14 => Some(Self::DerivationEvidence),
+            15 => Some(Self::GcPlanEvidence),
+            16 => Some(Self::GcCommitEvidence),
             _ => None,
         }
     }
@@ -594,8 +614,25 @@ pub trait ObjectIdentity {
     fn identify(&self, record: &ObjectRecord) -> ObjectId;
 }
 
+mod derivation;
+mod derivation_evidence;
+mod gc_evidence;
 mod proof;
 
+pub use derivation::{
+    AuthorityEpochId, CanonicalParametersId, ComputationSharingDomainId, DerivationContractId,
+    DerivationInvocation, DerivationModelError, DeterministicSeedId, EngineBuildId, ExecutionClass,
+    ExecutionMeasurementsId, HostFunctionSemanticBinding, InvocationId, InvocationInput,
+    OutputContractId, RuntimeSemanticProfile, RuntimeSemanticProfileId, SemanticContractId,
+    SnapshotId, TransformId,
+};
+pub use derivation_evidence::{
+    DerivationEvidence, DerivationEvidenceError, DerivationOutput, VerifierEvidenceId,
+};
+pub use gc_evidence::{
+    GcCommitEvidence, GcCommitId, GcEvidenceError, GcFactSnapshotId, GcPlanEvidence, GcPlanId,
+    PlacementSetId, RetentionPolicyId, TensorLogicProofId,
+};
 pub use proof::{
     OwnedSubtreePatch, ReferencePath, StateSelector, StateViewProof, TransitionWitness,
     VerifiedStateView,
@@ -940,6 +977,12 @@ impl core::error::Error for ModelError {}
 mod world;
 
 pub use world::World;
+
+#[cfg(test)]
+mod derivation_tests;
+
+#[cfg(test)]
+mod gc_evidence_tests;
 
 #[cfg(test)]
 #[path = "model_tests.rs"]

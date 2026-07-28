@@ -7,7 +7,6 @@
 //! source.
 
 use std::cmp::Ordering;
-use std::path::Path;
 use std::sync::Arc;
 
 use astrid_core::dirs::AstridHome;
@@ -15,10 +14,7 @@ use astrid_core::principal::PrincipalId;
 use astrid_storage_engine::{
     DurableEngine, IdentityScheme, PersistentObjectIdentity, PrincipalCodec, RecoveryLimits,
 };
-use astrid_storage_model::{
-    ObjectClass, ObjectFormatVersion, ObjectId, ObjectIdentity, ObjectKind, ObjectRecord,
-    ReferenceKind,
-};
+use astrid_storage_model::{ObjectClass, ObjectId, ObjectIdentity, ObjectRecord, ReferenceKind};
 
 use crate::content::{ContentWriteOutcome, PrincipalContentStore};
 use crate::error::{StorageError, StorageResult};
@@ -26,15 +22,22 @@ use crate::error::{StorageError, StorageResult};
 use crate::kv::SurrealKvStore;
 use crate::kv::{KvPrincipalResolver, KvQuotaResolver, KvStore, TreeKvStore};
 
-const STORE_METADATA_FILE: &str = "store.meta";
-const STORE_FORMAT_SPEC: &[u8] =
-    include_bytes!("../../../docs/astrid-principal-store-format-v1.txt");
-
+mod format_amendment;
+#[cfg(test)]
+mod format_amendment_tests;
 mod migrations;
 mod native_io;
 mod staging;
 
-use native_io::{atomic_write, quarantine_directory};
+#[cfg(test)]
+use format_amendment::{
+    DestinationFormat, PRE_DERIVATION_FORMAT_SPEC_ID, STORE_FORMAT_SPEC, STORE_METADATA_FILE,
+    object_id_hex, persist_format_specification,
+};
+use format_amendment::{
+    format_spec_record, prepare_destination, prepare_format_specification, store_metadata,
+};
+use native_io::atomic_write;
 pub use staging::{
     NativeContentStagingArea, ReadyStagedContent, StagedContentId, StagedContentWriter,
 };
@@ -238,7 +241,8 @@ pub async fn open_runtime_principal_store(
     let format_spec_id = Blake3ObjectIdentityV1.identify(&format_spec);
     let metadata = store_metadata(format_spec_id);
     let opened = tokio::task::spawn_blocking(move || {
-        let existing_complete = prepare_destination(&open_path, &metadata)?;
+        let destination_format = prepare_destination(&open_path, &metadata)?;
+        let existing_complete = destination_format.is_existing();
         let engine = RuntimeEngine::open(
             &open_path,
             Blake3ObjectIdentityV1,
@@ -248,31 +252,14 @@ pub async fn open_runtime_principal_store(
         .map_err(|error| {
             StorageError::Connection(format!("open durable principal store: {error}"))
         })?;
-        match engine.object(format_spec_id).map_err(|error| {
-            StorageError::Connection(format!("read in-band store format specification: {error}"))
-        })? {
-            Some(actual) if actual == format_spec => {},
-            Some(_) => {
-                return Err(StorageError::Connection(
-                    "in-band store format specification does not match store.meta".to_owned(),
-                ));
-            },
-            None if existing_complete => {
-                return Err(StorageError::Connection(
-                    "completed principal store is missing its in-band format specification"
-                        .to_owned(),
-                ));
-            },
-            None => {
-                engine
-                    .persist_standalone_object(&format_spec)
-                    .map_err(|error| {
-                        StorageError::Connection(format!(
-                            "persist in-band store format specification: {error}"
-                        ))
-                    })?;
-            },
-        }
+        prepare_format_specification(
+            &engine,
+            &open_path,
+            destination_format,
+            &format_spec,
+            format_spec_id,
+            &metadata,
+        )?;
         Ok((engine, existing_complete))
     })
     .await
@@ -324,105 +311,10 @@ pub async fn open_runtime_kv(
         .map(|store| store.kv())
 }
 
-fn format_spec_record() -> StorageResult<ObjectRecord> {
-    ObjectRecord::new(
-        ObjectKind::Evidence,
-        ObjectFormatVersion::V1,
-        STORE_FORMAT_SPEC.to_vec(),
-        Vec::new(),
-        0,
-        ObjectClass::Metadata,
-    )
-    .map_err(|error| {
-        StorageError::Serialization(format!(
-            "construct in-band store format specification: {error}"
-        ))
-    })
-}
-
-fn store_metadata(format_spec: ObjectId) -> Vec<u8> {
-    let digest = object_id_hex(format_spec);
-    format!(
-        "format=astrid-principal-store-v1\n\
-         identity=blake3-object-identity-v1\n\
-         identity-wire=tagged-identity-v1\n\
-         format-spec-object={}:{}:32:{digest}\n\
-         principal-codec=state-owner-v1\n\
-         projection=kv-tree-v3\n",
-        BLAKE3_OBJECT_IDENTITY_V1_SCHEME.algorithm(),
-        BLAKE3_OBJECT_IDENTITY_V1_SCHEME.construction(),
-    )
-    .into_bytes()
-}
-
-fn object_id_hex(id: ObjectId) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut digest = String::with_capacity(64);
-    for byte in id.as_bytes() {
-        digest.push(char::from(HEX[usize::from(byte >> 4)]));
-        digest.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    digest
-}
-
-fn prepare_destination(path: &Path, expected_metadata: &[u8]) -> StorageResult<bool> {
-    let mut existing_complete = false;
-    if path.exists() {
-        if migrations::is_complete(path) {
-            existing_complete = true;
-        } else {
-            quarantine_incomplete(path)?;
-        }
-    }
-    std::fs::create_dir_all(path).map_err(|error| {
-        StorageError::Connection(format!(
-            "create principal store directory {}: {error}",
-            path.display()
-        ))
-    })?;
-    let metadata = path.join(STORE_METADATA_FILE);
-    if metadata.exists() {
-        let actual = std::fs::read(&metadata).map_err(|error| {
-            StorageError::Connection(format!(
-                "read principal store metadata {}: {error}",
-                metadata.display()
-            ))
-        })?;
-        if actual != expected_metadata {
-            return Err(StorageError::Connection(format!(
-                "principal store metadata at {} selects an unsupported format",
-                metadata.display()
-            )));
-        }
-    } else if existing_complete {
-        return Err(StorageError::Connection(format!(
-            "completed principal store at {} is missing format metadata",
-            path.display()
-        )));
-    } else {
-        atomic_write(&metadata, expected_metadata)?;
-    }
-    if existing_complete {
-        for authoritative in ["objects.arena", "roots.journal"] {
-            let required = path.join(authoritative);
-            if !required.is_file() {
-                return Err(StorageError::Connection(format!(
-                    "completed principal store is missing authoritative file {}",
-                    required.display()
-                )));
-            }
-        }
-    }
-    Ok(existing_complete)
-}
-
-fn quarantine_incomplete(path: &Path) -> StorageResult<()> {
-    quarantine_directory(path, "incomplete").map(|_| ())
-}
-
 #[cfg(test)]
 mod tests {
     use std::io::{Seek as _, SeekFrom, Write as _};
+    use std::path::Path;
 
     use astrid_storage_model::{ObjectFormatVersion, ObjectKind};
 
@@ -524,13 +416,100 @@ mod tests {
         assert!(record.references().is_empty());
         assert_eq!(
             object_id_hex(id),
-            "62cded9a5b01fe75d7781b66303f5ffe8ced55a43025a0389eefaea5a0c58fe2"
+            "35b446fbd19ca4ad0b1343b40c1a32b2eed8eef795034261a4092a0a2ae806fe"
         );
         assert!(metadata.contains("identity-wire=tagged-identity-v1\n"));
         assert!(metadata.contains(&format!(
             "format-spec-object=1:1:32:{}\n",
             object_id_hex(id)
         )));
+    }
+
+    #[test]
+    fn pre_derivation_v1_rosetta_upgrade_is_idempotent_and_preserves_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let store_path = directory.path().join("principal-store");
+        std::fs::create_dir_all(&store_path).unwrap();
+        let engine = RuntimeEngine::open(
+            &store_path,
+            Blake3ObjectIdentityV1,
+            StateOwnerCodecV1,
+            RecoveryLimits::process_addressable(),
+        )
+        .unwrap();
+        let legacy_spec = ObjectRecord::new(
+            ObjectKind::Evidence,
+            ObjectFormatVersion::V1,
+            b"pre-derivation format 1 specification".to_vec(),
+            Vec::new(),
+            0,
+            ObjectClass::Metadata,
+        )
+        .unwrap();
+        let (legacy_spec_id, _) = engine.persist_standalone_object(&legacy_spec).unwrap();
+        let current_spec = format_spec_record().unwrap();
+        let current_spec_id = Blake3ObjectIdentityV1.identify(&current_spec);
+        let current_metadata = store_metadata(current_spec_id);
+        atomic_write(
+            &store_path.join(STORE_METADATA_FILE),
+            &store_metadata(legacy_spec_id),
+        )
+        .unwrap();
+
+        // Simulate a crash after the successor Rosetta object became durable
+        // but before store.meta changed.
+        persist_format_specification(&engine, &current_spec).unwrap();
+        prepare_format_specification(
+            &engine,
+            &store_path,
+            DestinationFormat::PreDerivationV1(legacy_spec_id),
+            &current_spec,
+            current_spec_id,
+            &current_metadata,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(store_path.join(STORE_METADATA_FILE)).unwrap(),
+            current_metadata
+        );
+        assert_eq!(engine.object(legacy_spec_id).unwrap(), Some(legacy_spec));
+        assert_eq!(
+            engine.object(current_spec_id).unwrap(),
+            Some(current_spec.clone())
+        );
+        prepare_format_specification(
+            &engine,
+            &store_path,
+            DestinationFormat::Current,
+            &current_spec,
+            current_spec_id,
+            &store_metadata(current_spec_id),
+        )
+        .unwrap();
+        engine.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn completed_pre_derivation_v1_store_is_selected_for_rosetta_amendment() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(directory.path());
+        let store = open_runtime_kv(&home, unlimited_quota()).await.unwrap();
+        store.close().await.unwrap();
+        drop(store);
+
+        let store_path = home.principal_store_path();
+        std::fs::write(
+            store_path.join(STORE_METADATA_FILE),
+            store_metadata(PRE_DERIVATION_FORMAT_SPEC_ID),
+        )
+        .unwrap();
+        let current_spec = format_spec_record().unwrap();
+        let current_metadata = store_metadata(Blake3ObjectIdentityV1.identify(&current_spec));
+        assert_eq!(
+            prepare_destination(&store_path, &current_metadata).unwrap(),
+            DestinationFormat::PreDerivationV1(PRE_DERIVATION_FORMAT_SPEC_ID)
+        );
     }
 
     #[tokio::test]
@@ -920,9 +899,8 @@ mod tests {
         let home = AstridHome::from_path(directory.path());
         std::fs::create_dir_all(home.state_db_path()).unwrap();
 
-        let error = match open_runtime_kv(&home, unlimited_quota()).await {
-            Err(error) => error,
-            Ok(_) => panic!("legacy source opened without transition support"),
+        let Err(error) = open_runtime_kv(&home, unlimited_quota()).await else {
+            panic!("legacy source opened without transition support");
         };
         assert!(
             error

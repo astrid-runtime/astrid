@@ -31,6 +31,11 @@ fn stable_object_codes_round_trip_and_reject_unknown_values() {
         ObjectKind::Commit,
         ObjectKind::Evidence,
         ObjectKind::Derived,
+        ObjectKind::RuntimeSemanticProfile,
+        ObjectKind::DerivationInvocation,
+        ObjectKind::DerivationEvidence,
+        ObjectKind::GcPlanEvidence,
+        ObjectKind::GcCommitEvidence,
     ] {
         assert_eq!(ObjectKind::from_code(kind.code()), Some(kind));
     }
