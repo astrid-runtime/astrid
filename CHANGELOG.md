@@ -95,8 +95,12 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   complete arena/journal pair, rebuilds the disposable index, and is exercised
   at every named replacement boundary. Compaction is a sealed engine-only
   Refinery pass; Tensor Logic may audit its native condemned set but cannot
-  acquire deletion authority. Persistent history-pin policy, audit/outbox
-  delivery, and final representation profiles remain future work.
+  acquire deletion authority. Every deletion now prepares a self-contained,
+  checksummed evidence bundle before publishing its intent; recovery installs
+  only the exact physical placement named by that receipt, marks it ready for
+  independent audit delivery before deleting the old generation, and retains
+  it until explicit acknowledgement. Persistent history-pin policy, kernel
+  audit draining, and final representation profiles remain future work.
 - **Native kernel state now cuts over to durable principal roots.** Kernel boot
   migrates the legacy SurrealKV database under the singleton lock, verifies a
   canonical digest independently per owner, preserves the legacy source, and

@@ -634,6 +634,59 @@ ObjectId, and placement-before MUST differ from placement-after. Therefore a
 proof for one plan cannot be attached to a different deletion or a later fact
 snapshot.
 
+The v1 durable compactor represents each placement target as a generic kind-6
+Evidence object with version 1, Metadata class, logical_bytes 0, empty
+references, and these canonical_bytes:
+
+  "astrid-gc-placement-set-v1\0"
+  ObjectId operation_contract
+  u64 arena_bytes
+  u64 root_journal_bytes
+  u8[32] root_journal_digest
+  u64 object_count
+      repeated in ObjectId order:
+          ObjectId object
+          u64 arena_frame_offset
+          u64 arena_payload_length
+          u8[32] arena_frame_checksum
+  u64 root_count
+      repeated in canonical principal-byte order:
+          u64 principal_length
+          u8[principal_length] principal
+          u64 root_generation
+          ObjectId commit
+
+All integers are little-endian. ObjectId fields inside canonical_bytes use the
+current 32-byte logical digest; the containing Evidence identity remains
+algorithm-tagged wherever it occurs on persistent wire. root_journal_digest is
+BLAKE3 under derive-key string:
+
+  astrid gc placement root journal digest v1
+
+Arena offsets and physical-frame checksums bind every object frame and its
+ordering. The root-journal digest binds the journal bytes rather than only its
+decoded root map. Recovery after durable compaction intent MUST install the
+exact placement-after identity, not any other semantically valid arena/journal
+pair.
+
+The execution-measurements target is generic kind-6 Evidence with version 1,
+Metadata class, logical_bytes 0, empty references, and:
+
+  "astrid-gc-transition-measurements-v1\0"
+  u64 objects_before
+  u64 objects_after
+  u64 objects_reclaimed
+  u64 arena_bytes_before
+  u64 arena_bytes_after
+  u64 root_journal_bytes_before
+  u64 root_journal_bytes_after
+
+The GC delivery outbox is not an authority or archival format. Its ready bundle
+contains the eight canonical ObjectRecords required by the receipt: fact
+snapshot, retention policy, Tensor Logic proof, plan, placement-before,
+placement-after, execution measurements, and commit receipt. Long-term export
+materializes those records through the ordinary self-contained bundle grammar.
+
 
 8. RECONSTRUCTION PROCEDURE
 ===========================

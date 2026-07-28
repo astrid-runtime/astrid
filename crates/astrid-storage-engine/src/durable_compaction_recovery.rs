@@ -1,24 +1,41 @@
 //! Recovery protocol for atomic arena and root-journal generation replacement.
 
-use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use astrid_storage_model::RootState;
+use astrid_storage_model::{
+    GcCommitId, ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord,
+    ObjectReference, PlacementSetId, ReferenceKind, ReferenceLabel,
+};
 
 use super::super::scan_frames;
 use super::{
-    ARENA_COMPACTING, ARENA_FILE, ARENA_PREVIOUS, COMPACTION_INTENT_FILE, COMPACTION_INTENT_TEMP,
-    COMPACTION_INTENT_V1, COMPACTION_MAGIC, DurableError, INDEX_FILE, PersistentObjectIdentity,
-    PrincipalCodec, ROOT_FILE, ROOTS_COMPACTING, ROOTS_PREVIOUS, RecoveryLimits, append_frame,
-    io_error, open_rw, recover_arena, recover_roots, sync_store_directory,
+    ARENA_COMPACTING, ARENA_FILE, ARENA_PREVIOUS, COMPACTION_INTENT_FILE, COMPACTION_INTENT_PREFIX,
+    COMPACTION_INTENT_TEMP, COMPACTION_MAGIC, CompactionIntent, DurableError, INDEX_FILE,
+    PersistentObjectIdentity, PrincipalCodec, ROOT_FILE, ROOTS_COMPACTING, ROOTS_PREVIOUS,
+    RecoveryLimits, append_frame, decode_object_frame, encode_object_frame, ensure_payload_limit,
+    evidence, io_error, open_rw, outbox, recover_arena, recover_roots, root_journal_digest,
+    sync_store_directory,
 };
 
-pub(super) fn write_compaction_intent(directory: &Path) -> Result<(), DurableError> {
+const INTENT_OPERATION_LABEL: &[u8] = b"00-operation-contract";
+const INTENT_COMMIT_LABEL: &[u8] = b"01-gc-commit";
+const INTENT_PLACEMENT_LABEL: &[u8] = b"02-placement-after";
+
+pub(super) fn write_compaction_intent<I: PersistentObjectIdentity>(
+    directory: &Path,
+    intent_model: CompactionIntent,
+    identity: &I,
+    limits: RecoveryLimits,
+) -> Result<(), DurableError> {
     let temporary = directory.join(COMPACTION_INTENT_TEMP);
     let intent = directory.join(COMPACTION_INTENT_FILE);
     let mut file = super::create_private_file(&temporary)?;
-    append_frame(&mut file, COMPACTION_MAGIC, &COMPACTION_INTENT_V1)?;
+    let record = intent_record(intent_model)?;
+    let id = identity.identify(&record);
+    let payload = encode_object_frame(identity.scheme(), id, &record)?;
+    ensure_payload_limit(COMPACTION_INTENT_FILE, 0, payload.len(), limits)?;
+    append_frame(&mut file, COMPACTION_MAGIC, &payload)?;
     file.sync_data()
         .map_err(|source| io_error("flush compaction intent", source))?;
     std::fs::rename(&temporary, &intent)
@@ -79,6 +96,7 @@ pub(super) fn cleanup_without_intent(directory: &Path) -> Result<(), DurableErro
     cleanup_authority_remnants(directory, ARENA_FILE, ARENA_COMPACTING, ARENA_PREVIOUS)?;
     cleanup_authority_remnants(directory, ROOT_FILE, ROOTS_COMPACTING, ROOTS_PREVIOUS)?;
     remove_if_exists(&directory.join(COMPACTION_INTENT_TEMP))?;
+    outbox::cleanup_unpublished(directory)?;
     sync_store_directory(directory)
 }
 
@@ -100,48 +118,142 @@ where
     {
         return cleanup_without_intent(directory);
     }
-    validate_intent(&intent, limits)?;
+    let intent_model = validate_intent(&intent, identity, limits)?;
+    let bundle = outbox::load_prepared_or_ready(directory, intent_model.commit, identity, limits)?;
+    if bundle.placement_after_id(identity) != intent_model.placement_after {
+        return Err(DurableError::InvalidCompactionEvidence(
+            "compaction intent placement differs from its evidence bundle",
+        ));
+    }
     let arenas = candidate_paths(directory, ARENA_FILE, ARENA_COMPACTING, ARENA_PREVIOUS)?;
     let roots = candidate_paths(directory, ROOT_FILE, ROOTS_COMPACTING, ROOTS_PREVIOUS)?;
-    let (arena, root) = find_valid_pair(&arenas, &roots, codec, identity, limits)?;
+    let (arena, root) = find_valid_pair(&arenas, &roots, intent_model, codec, identity, limits)?;
     install_candidate(directory, &arena, ARENA_FILE, ARENA_PREVIOUS)?;
     install_candidate(directory, &root, ROOT_FILE, ROOTS_PREVIOUS)?;
     sync_store_directory(directory)?;
-    validate_candidate_pair(
+    let installed = placement_id(
         &directory.join(ARENA_FILE),
         &directory.join(ROOT_FILE),
+        intent_model.operation_contract,
         codec,
         identity,
         limits,
     )?;
+    if installed != intent_model.placement_after {
+        return Err(DurableError::InvalidCompactionEvidence(
+            "recovered compaction placement differs from its durable intent",
+        ));
+    }
     remove_if_exists(&directory.join(INDEX_FILE))?;
+    let ready = outbox::mark_ready(directory, intent_model.commit, identity, limits)?;
+    if ready != bundle {
+        return Err(DurableError::InvalidCompactionEvidence(
+            "recovered GC evidence differs from its prepared bundle",
+        ));
+    }
     finish_compaction(directory)
 }
 
-fn validate_intent(path: &Path, limits: RecoveryLimits) -> Result<(), DurableError> {
+fn validate_intent<I: PersistentObjectIdentity>(
+    path: &Path,
+    identity: &I,
+    limits: RecoveryLimits,
+) -> Result<CompactionIntent, DurableError> {
     let mut file = open_rw(path)?;
-    let mut frames = 0_u8;
+    let mut recovered = None;
     scan_frames(
         &mut file,
         COMPACTION_INTENT_FILE,
         COMPACTION_MAGIC,
         limits,
         |offset, payload| {
-            if offset != 0 || payload != COMPACTION_INTENT_V1 {
+            if offset != 0 || recovered.is_some() {
                 return Err(DurableError::InvalidCompactionEvidence(
                     "compaction intent is not canonical",
                 ));
             }
-            frames = frames.saturating_add(1);
+            let (id, record) = decode_object_frame(payload, identity.scheme()).map_err(|_| {
+                DurableError::InvalidCompactionEvidence("compaction intent object is invalid")
+            })?;
+            if identity.identify(&record) != id
+                || encode_object_frame(identity.scheme(), id, &record)? != payload
+            {
+                return Err(DurableError::InvalidCompactionEvidence(
+                    "compaction intent identity or encoding is invalid",
+                ));
+            }
+            recovered = Some(parse_intent_record(&record)?);
             Ok(())
         },
     )?;
-    if frames != 1 {
+    recovered.ok_or(DurableError::InvalidCompactionEvidence(
+        "compaction intent must contain one durable frame",
+    ))
+}
+
+fn intent_record(intent: CompactionIntent) -> Result<ObjectRecord, DurableError> {
+    ObjectRecord::new(
+        ObjectKind::Evidence,
+        ObjectFormatVersion::V1,
+        COMPACTION_INTENT_PREFIX.to_vec(),
+        vec![
+            intent_reference(INTENT_OPERATION_LABEL, intent.operation_contract),
+            intent_reference(INTENT_COMMIT_LABEL, intent.commit.object_id()),
+            intent_reference(INTENT_PLACEMENT_LABEL, intent.placement_after.object_id()),
+        ],
+        0,
+        ObjectClass::Metadata,
+    )
+    .map_err(DurableError::Model)
+}
+
+fn parse_intent_record(record: &ObjectRecord) -> Result<CompactionIntent, DurableError> {
+    if record.kind() != ObjectKind::Evidence
+        || record.format_version() != ObjectFormatVersion::V1
+        || record.class() != ObjectClass::Metadata
+        || record.logical_bytes() != 0
+        || record.canonical_bytes() != COMPACTION_INTENT_PREFIX
+        || record.references().len() != 3
+    {
         return Err(DurableError::InvalidCompactionEvidence(
-            "compaction intent must contain one durable frame",
+            "compaction intent record has an invalid shape",
         ));
     }
-    Ok(())
+    let references = record.references();
+    for reference in references {
+        if reference.kind() != ReferenceKind::Evidence {
+            return Err(DurableError::InvalidCompactionEvidence(
+                "compaction intent references must be non-owning Evidence",
+            ));
+        }
+    }
+    if references[0].label().as_bytes() != INTENT_OPERATION_LABEL
+        || references[1].label().as_bytes() != INTENT_COMMIT_LABEL
+        || references[2].label().as_bytes() != INTENT_PLACEMENT_LABEL
+    {
+        return Err(DurableError::InvalidCompactionEvidence(
+            "compaction intent fields are not canonical",
+        ));
+    }
+    let intent = CompactionIntent {
+        operation_contract: references[0].target(),
+        commit: GcCommitId::new(references[1].target()),
+        placement_after: PlacementSetId::new(references[2].target()),
+    };
+    if intent_record(intent)? != *record {
+        return Err(DurableError::InvalidCompactionEvidence(
+            "compaction intent does not round-trip canonically",
+        ));
+    }
+    Ok(intent)
+}
+
+fn intent_reference(label: &[u8], target: ObjectId) -> ObjectReference {
+    ObjectReference::new(
+        ReferenceLabel::new(label.to_vec()),
+        target,
+        ReferenceKind::Evidence,
+    )
 }
 
 fn candidate_paths(
@@ -166,6 +278,7 @@ fn candidate_paths(
 fn find_valid_pair<P, I, C>(
     arenas: &[PathBuf],
     roots: &[PathBuf],
+    intent: CompactionIntent,
     codec: &C,
     identity: &I,
     limits: RecoveryLimits,
@@ -175,29 +288,36 @@ where
     I: PersistentObjectIdentity,
     C: PrincipalCodec<P>,
 {
-    let mut last_error = None;
     for arena in arenas {
         for root in roots {
-            match validate_candidate_pair(arena, root, codec, identity, limits) {
-                Ok(()) => return Ok((arena.clone(), root.clone())),
-                Err(error) => last_error = Some(error),
+            match placement_id(
+                arena,
+                root,
+                intent.operation_contract,
+                codec,
+                identity,
+                limits,
+            ) {
+                Ok(actual) if actual == intent.placement_after => {
+                    return Ok((arena.clone(), root.clone()));
+                },
+                Ok(_) | Err(_) => {},
             }
         }
     }
-    Err(
-        last_error.unwrap_or(DurableError::InvalidCompactionEvidence(
-            "no complete authority pair survived interrupted compaction",
-        )),
-    )
+    Err(DurableError::InvalidCompactionEvidence(
+        "no authority pair matches the receipted compacted placement",
+    ))
 }
 
-fn validate_candidate_pair<P, I, C>(
+fn placement_id<P, I, C>(
     arena_path: &Path,
     root_path: &Path,
+    operation_contract: astrid_storage_model::ObjectId,
     codec: &C,
     identity: &I,
     limits: RecoveryLimits,
-) -> Result<(), DurableError>
+) -> Result<PlacementSetId, DurableError>
 where
     P: Clone + Ord,
     I: PersistentObjectIdentity,
@@ -206,9 +326,29 @@ where
     let mut arena = open_rw(arena_path)?;
     let mut roots = open_rw(root_path)?;
     let (index, _) = recover_arena(&mut arena, identity, limits)?;
-    let _: (BTreeMap<P, RootState>, _) =
+    let (roots_by_principal, _) =
         recover_roots(&mut roots, &mut arena, &index, codec, identity, limits)?;
-    Ok(())
+    let arena_bytes = arena
+        .metadata()
+        .map_err(|source| io_error("read candidate arena metadata", source))?
+        .len();
+    let root_journal_bytes = roots
+        .metadata()
+        .map_err(|source| io_error("read candidate root metadata", source))?
+        .len();
+    let root_digest = root_journal_digest(&mut roots)?;
+    let record = evidence::placement_record(
+        &evidence::PlacementView {
+            operation_contract,
+            arena_bytes,
+            root_journal_bytes,
+            root_journal_digest: root_digest,
+            index: &index,
+            roots: &roots_by_principal,
+        },
+        codec,
+    )?;
+    Ok(PlacementSetId::new(identity.identify(&record)))
 }
 
 fn install_candidate(

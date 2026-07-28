@@ -110,34 +110,44 @@ compaction writes and verifies private replacements first:
 2. write the complete current-root map as the first
    `roots.journal.compacting` snapshot frame;
 3. flush both replacements and their directory entries;
-4. publish and flush `compaction.intent`;
-5. rename each active authority file to `.previous`, then promote its
+4. construct the self-contained plan/commit evidence bundle, write it as a
+   private `gc-outbox/*.prepared` file, and flush the outbox directory;
+5. publish and flush `compaction.intent`, naming the receipt, pinned operation
+   contract, and exact destination placement;
+6. rename each active authority file to `.previous`, then promote its
    `.compacting` successor;
-6. flush the directory and reopen the promoted pair;
-7. rebuild the disposable `objects.index`;
-8. remove old/private generations and flush;
-9. remove `compaction.intent` last and flush again.
+7. flush the directory and reopen the promoted pair;
+8. recompute its physical placement identity and require an exact match with
+   the intent;
+9. rebuild the disposable `objects.index`;
+10. rename the evidence bundle to `*.ready` and flush the outbox;
+11. remove old/private generations and flush; and
+12. remove `compaction.intent` last and flush again.
 
-The marker is the recovery authority. Without it, private files are
-unpublished remnants and the active pair wins. With it, recovery validates
-available arena/root combinations, installs one complete pair that reconstructs
-the same current roots, discards the stale index, and removes the marker only
-after cleanup is durable. Logical roots do not change during compaction, so an
-old arena can pair with the root snapshot and a compacted arena can pair with
-the prior journal when both validate the complete selected closure.
+The marker and prepared receipt jointly form the recovery authority. Without
+the marker, private replacement files and prepared evidence are unpublished
+remnants and the active pair wins. With it, recovery requires the named
+evidence bundle, validates available arena/root combinations, and installs
+only the pair whose full physical placement identity equals the receipt. A
+merely valid old pair is not an admissible fallback after intent publication.
+Recovery marks the receipt ready before discarding old generations and removes
+the intent only after cleanup is durable.
 
 Named fault injection covers:
 
 - replacement files durable, intent absent;
+- evidence prepared, intent absent;
 - intent durable;
 - arena backup and arena promotion;
 - root-journal backup and root-journal promotion;
 - promoted directory durable; and
+- evidence ready for independent delivery; and
 - cleanup durable immediately before intent removal.
 
 Every interruption requires dropping the poisoned engine instance. Reopen
-recovers one complete authority pair, rebuilds the index, preserves every root
-generation, and accepts the next compare-and-swap transition.
+either recovers the exact receipted successor or fails closed. Successful
+recovery rebuilds the index, preserves every root generation, leaves one ready
+receipt, and accepts the next compare-and-swap transition.
 
 ## Evidence
 
@@ -146,12 +156,56 @@ Logic proof and names the condemned set through non-owning Evidence edges.
 `GcCommitEvidence` binds that plan to commit-time facts, old/new physical
 placement sets, and execution measurements.
 
-The engine currently constructs and retains the plan inputs during replacement.
-Before the compactor is scheduled automatically, the kernel integration must
-atomically deliver the plan and commit receipt to the independent audit
-outbox. The audit chain remains outside the store so storage corruption cannot
-erase its own witness. No background scheduler may invoke destructive
-compaction until that delivery path is wired and crash-tested.
+The engine outbox carries eight identity-verified records in fixed order:
+fact snapshot, retention policy, Tensor Logic proof, plan, old placement, new
+placement, measurements, and commit receipt. A bundle is not delivery-visible
+while it is merely prepared. It becomes visible through
+`pending_compaction_evidence` only after the exact destination placement is
+durable. The kernel appends the bundle to the independent audit log and calls
+`acknowledge_compaction_evidence` only after that append is durable.
+Acknowledgement deletes the delivery copy, not evidence already anchored by
+the audit sink.
+
+The outbox is deliberately not the audit chain. It is a transactional delivery
+buffer inside the singleton store directory. Audit remains independently
+append-only so storage corruption cannot erase its own witness. No background
+scheduler may invoke destructive compaction until kernel composition drains
+this outbox and applies retry/backpressure policy.
+
+### Physical-placement Evidence grammar
+
+Each old/new placement is generic metadata Evidence with empty references and:
+
+```text
+"astrid-gc-placement-set-v1\0"
+ObjectId operation_contract
+u64 arena_bytes
+u64 root_journal_bytes
+[u8; 32] root_journal_digest
+u64 object_count
+    repeated in ObjectId order:
+        ObjectId object
+        u64 arena_frame_offset
+        u64 arena_payload_length
+        [u8; 32] arena_frame_checksum
+u64 root_count
+    repeated in principal-byte order:
+        u64 principal_length
+        u8[] principal
+        u64 root_generation
+        ObjectId commit
+```
+
+Integers are little-endian. The root-journal digest is BLAKE3 under derive-key
+context `astrid gc placement root journal digest v1`; the Evidence prefix
+versions that choice. Arena locations plus frame checksums bind every canonical
+object frame and its ordering. Consequently the destination identity describes
+the exact promoted authority pair, not merely an equivalent root map.
+
+Execution measurements use prefix
+`astrid-gc-transition-measurements-v1\0` followed by seven little-endian
+`u64` values: objects before, after, and reclaimed; arena bytes before and
+after; and root-journal bytes before and after.
 
 ## Operational measurements
 

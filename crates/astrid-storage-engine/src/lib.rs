@@ -33,10 +33,10 @@ mod refinery;
 
 #[cfg(not(target_family = "wasm"))]
 pub use durable::{
-    CompactionFacts, CompactionProofVerifier, CompactionReport, CompactionRetainedRoot,
-    CompactionRetention, CompactionRootKind, DurableEngine, DurableError, FaultInjector,
-    FaultPoint, IdentityScheme, NoFaults, PersistentObjectIdentity, PrincipalCodec, RecoveryLimits,
-    VerifiedCompactionPlan,
+    CompactionEvidenceBundle, CompactionFacts, CompactionProofVerifier, CompactionReport,
+    CompactionRetainedRoot, CompactionRetention, CompactionRootKind, DurableEngine, DurableError,
+    FaultInjector, FaultPoint, IdentityScheme, NoFaults, PersistentObjectIdentity, PrincipalCodec,
+    RecoveryLimits, VerifiedCompactionPlan,
 };
 pub use kv::{
     KvProjectionEngine, KvProjectionError, KvState, KvStateSnapshot, commit_kv_with_engine,

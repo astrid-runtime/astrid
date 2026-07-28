@@ -138,56 +138,6 @@ pub trait PersistentObjectIdentity: ObjectIdentity {
     fn scheme(&self) -> IdentityScheme;
 }
 
-/// Crash boundary exposed by the first durable engine slice.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum FaultPoint {
-    /// Non-commit object frames have been appended but not flushed.
-    AfterObjectAppend,
-    /// The transaction's complete object batch has been flushed.
-    AfterObjectFlush,
-    /// The transaction's immutable commit frame has been appended.
-    AfterCommitAppend,
-    /// Compatibility checkpoint after the shared object-batch flush.
-    AfterCommitFlush,
-    /// All objects are durable but no root-journal frame was appended.
-    BeforeRootCas,
-    /// The root-journal frame is durable.
-    AfterRootCas,
-    /// Replacement arena and root snapshot are durable but unpublished.
-    AfterCompactionFilesFlush,
-    /// The durable compaction intent exists and recovery must finish or roll back.
-    AfterCompactionIntentFlush,
-    /// The previous arena name is durable and the active name is temporarily absent.
-    AfterCompactionArenaBackup,
-    /// The compacted arena occupies the active name.
-    AfterCompactionArenaPromote,
-    /// The previous root journal name is durable and the active name is temporarily absent.
-    AfterCompactionRootsBackup,
-    /// The compacted root snapshot occupies the active name.
-    AfterCompactionRootsPromote,
-    /// The compacted authority pair and its directory entries are durable.
-    AfterCompactionDirectoryFlush,
-    /// Old generations are gone but the durable intent still protects cleanup recovery.
-    BeforeCompactionIntentRemoval,
-}
-
-/// Injectable crash decision used by recovery tests and harnesses.
-pub trait FaultInjector: Send + Sync {
-    /// Return `true` to stop at `point` and require the engine to be reopened.
-    fn should_fail(&self, point: FaultPoint) -> bool;
-}
-
-/// Fault injector that never interrupts a transaction.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct NoFaults;
-
-impl FaultInjector for NoFaults {
-    fn should_fail(&self, _point: FaultPoint) -> bool {
-        false
-    }
-}
-
 /// Failure to open, recover, or update a durable principal store.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -961,6 +911,8 @@ mod staging;
 
 #[path = "durable_compaction.rs"]
 mod compaction;
+#[path = "durable_faults.rs"]
+mod faults;
 #[path = "durable_format.rs"]
 mod format;
 #[path = "durable_index.rs"]
@@ -974,16 +926,17 @@ mod validation;
 
 use compaction::recover_interrupted_compaction;
 pub use compaction::{
-    CompactionFacts, CompactionProofVerifier, CompactionReport, CompactionRetainedRoot,
-    CompactionRetention, CompactionRootKind, VerifiedCompactionPlan,
+    CompactionEvidenceBundle, CompactionFacts, CompactionProofVerifier, CompactionReport,
+    CompactionRetainedRoot, CompactionRetention, CompactionRootKind, VerifiedCompactionPlan,
 };
-use format::{
-    append_frame, append_frames, corrupt, encode_object_frame, ensure_payload_limit, io_error,
-    open_rw, read_indexed_object, recover_arena, scan_frames, sync_store_directory,
-    verify_indexed_location, verify_indexed_tail,
-};
+pub use faults::{FaultInjector, FaultPoint, NoFaults};
 #[cfg(test)]
-use format::{decode_object_frame, frame_checksum};
+use format::frame_checksum;
+use format::{
+    append_frame, append_frames, corrupt, decode_object_frame, encode_object_frame,
+    ensure_payload_limit, io_error, open_rw, read_indexed_object, recover_arena, scan_frames,
+    sync_store_directory, verify_indexed_location, verify_indexed_tail,
+};
 use index_cache::{IndexDelta, IndexState, append_index_delta, recover_index, replace_index};
 use roots::{encode_root_record, encode_root_snapshot, recover_roots};
 use validation::{

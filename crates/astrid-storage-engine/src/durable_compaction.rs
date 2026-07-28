@@ -6,8 +6,8 @@ use std::io::{Seek, SeekFrom};
 use std::path::Path;
 
 use astrid_storage_model::{
-    GcFactSnapshotId, GcPlanEvidence, ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind,
-    ObjectRecord, RetentionPolicyId, RootState, TensorLogicProofId,
+    GcCommitId, GcFactSnapshotId, GcPlanEvidence, ObjectClass, ObjectFormatVersion, ObjectId,
+    ObjectKind, ObjectRecord, PlacementSetId, RetentionPolicyId, RootState, TensorLogicProofId,
 };
 
 use crate::refinery::{EngineCompactionPass, NativeArenaCompactionPass};
@@ -15,28 +15,41 @@ use crate::refinery::{EngineCompactionPass, NativeArenaCompactionPass};
 use super::{
     ARENA_FILE, ARENA_MAGIC, ArenaLocation, DurableEngine, DurableError, DurableFiles,
     DurableInner, FaultPoint, INDEX_FILE, IndexState, PersistentObjectIdentity, PrincipalCodec,
-    ROOT_FILE, ROOT_MAGIC, RecoveryLimits, append_frame, encode_object_frame, encode_root_snapshot,
-    ensure_payload_limit, io_error, live_files_mut, materialize_closure, open_rw,
-    read_indexed_object, recover_arena, recover_roots, replace_index, sync_store_directory,
+    ROOT_FILE, ROOT_MAGIC, RecoveryLimits, append_frame, decode_object_frame, encode_object_frame,
+    encode_root_snapshot, ensure_payload_limit, io_error, live_files_mut, materialize_closure,
+    open_rw, read_indexed_object, recover_arena, recover_roots, replace_index, scan_frames,
+    sync_store_directory,
 };
 
 const FACT_SNAPSHOT_PREFIX: &[u8] = b"astrid-gc-fact-snapshot-v1\0";
 pub(super) const COMPACTION_INTENT_FILE: &str = "compaction.intent";
 pub(super) const COMPACTION_INTENT_TEMP: &str = "compaction.intent.tmp";
 const COMPACTION_MAGIC: [u8; 8] = *b"ASTCMP1\0";
-const COMPACTION_INTENT_V1: [u8; 1] = [1];
+const COMPACTION_INTENT_PREFIX: &[u8] = b"astrid-gc-compaction-intent-v1\0";
 pub(super) const ARENA_COMPACTING: &str = "objects.arena.compacting";
 pub(super) const ROOTS_COMPACTING: &str = "roots.journal.compacting";
 pub(super) const ARENA_PREVIOUS: &str = "objects.arena.previous";
 pub(super) const ROOTS_PREVIOUS: &str = "roots.journal.previous";
 
+#[path = "durable_compaction_evidence.rs"]
+mod evidence;
+#[path = "durable_compaction_outbox.rs"]
+mod outbox;
 #[path = "durable_compaction_recovery.rs"]
 mod recovery;
 
+pub use evidence::CompactionEvidenceBundle;
 use recovery::{
     backup_active, cleanup_without_intent, prepare_finish_compaction, promote_compacting,
     remove_compaction_intent, write_compaction_intent,
 };
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CompactionIntent {
+    operation_contract: ObjectId,
+    commit: GcCommitId,
+    placement_after: PlacementSetId,
+}
 
 pub(super) fn recover_interrupted_compaction<P, I, C>(
     directory: &Path,
@@ -238,6 +251,7 @@ pub struct CompactionReport {
     arena_bytes_before: u64,
     arena_bytes_after: u64,
     fact_snapshot: GcFactSnapshotId,
+    gc_commit: GcCommitId,
 }
 
 impl CompactionReport {
@@ -275,6 +289,12 @@ impl CompactionReport {
     #[must_use]
     pub const fn fact_snapshot(self) -> GcFactSnapshotId {
         self.fact_snapshot
+    }
+
+    /// Return the independently deliverable receipt for this physical rewrite.
+    #[must_use]
+    pub const fn gc_commit(self) -> GcCommitId {
+        self.gc_commit
     }
 }
 
@@ -374,6 +394,36 @@ where
             inner.poisoned = true;
         }
         result
+    }
+
+    /// Return completed GC receipts awaiting independent audit persistence.
+    ///
+    /// Every returned bundle is self-contained and identity-verified. Reading
+    /// the outbox does not acknowledge delivery.
+    ///
+    /// # Errors
+    ///
+    /// Returns a recovery-required, I/O, framing, identity, or evidence error.
+    pub fn pending_compaction_evidence(
+        &self,
+    ) -> Result<Vec<CompactionEvidenceBundle>, DurableError> {
+        let inner = self.inner.lock();
+        super::ensure_usable(&inner)?;
+        outbox::pending(&self.directory, &self.identity, self.limits)
+    }
+
+    /// Acknowledge one receipt after the independent audit sink is durable.
+    ///
+    /// Acknowledgement is idempotent. It removes only the delivery copy; it
+    /// never changes principal roots or the physical compaction generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a recovery-required, I/O, framing, identity, or evidence error.
+    pub fn acknowledge_compaction_evidence(&self, commit: GcCommitId) -> Result<(), DurableError> {
+        let inner = self.inner.lock();
+        super::ensure_usable(&inner)?;
+        outbox::acknowledge(&self.directory, commit, &self.identity, self.limits)
     }
 
     fn capture_facts_locked(
@@ -533,7 +583,18 @@ struct ReplacementState<P: Ord> {
     index: BTreeMap<ObjectId, ArenaLocation>,
     validated: BTreeSet<ObjectId>,
     arena_len: u64,
+    root_len: u64,
+    root_digest: [u8; 32],
     arena_tail: Option<ArenaLocation>,
+}
+
+struct PreparedCompaction {
+    objects_before: u64,
+    objects_after: u64,
+    objects_reclaimed: u64,
+    arena_bytes_before: u64,
+    bundle: CompactionEvidenceBundle,
+    intent: CompactionIntent,
 }
 
 impl<P, I, C> DurableEngine<P, I, C>
@@ -554,22 +615,21 @@ where
                 "native compaction operation contract mismatch",
             ));
         }
-        let evidence = self.compaction_evidence(authorization)?;
-        if evidence
-            .keys()
-            .any(|id| authorization.facts.condemned.binary_search(id).is_ok())
-        {
-            return Err(DurableError::InvalidCompactionEvidence(
-                "retained compaction evidence was condemned by its own plan",
-            ));
-        }
-        cleanup_without_intent(&self.directory)?;
-        let objects_before =
-            u64::try_from(inner.index.len()).map_err(|_| DurableError::EncodingOverflow)?;
-        let arena_bytes_before = live_files_mut(&mut inner.files)?.arena_len;
-        self.write_replacement_files(inner, live, &evidence)?;
+        let prepared = self.prepare_compaction(inner, authorization, live)?;
         self.fail_if(FaultPoint::AfterCompactionFilesFlush)?;
-        write_compaction_intent(&self.directory)?;
+        outbox::prepare(
+            &self.directory,
+            &prepared.bundle,
+            &self.identity,
+            self.limits,
+        )?;
+        self.fail_if(FaultPoint::AfterCompactionEvidencePrepare)?;
+        write_compaction_intent(
+            &self.directory,
+            prepared.intent,
+            &self.identity,
+            self.limits,
+        )?;
         self.fail_if(FaultPoint::AfterCompactionIntentFlush)?;
 
         drop(inner.files.take());
@@ -577,10 +637,135 @@ where
         sync_store_directory(&self.directory)?;
         self.fail_if(FaultPoint::AfterCompactionDirectoryFlush)?;
         let replacement = self.open_replacement_files()?;
+        let promoted = evidence::placement_record(
+            &evidence::PlacementView {
+                operation_contract: prepared.intent.operation_contract,
+                arena_bytes: replacement.arena_len,
+                root_journal_bytes: replacement.root_len,
+                root_journal_digest: replacement.root_digest,
+                index: &replacement.index,
+                roots: &replacement.roots,
+            },
+            &self.principal_codec,
+        )?;
+        if PlacementSetId::new(self.identify(&promoted)) != prepared.intent.placement_after {
+            return Err(DurableError::InvalidCompactionEvidence(
+                "promoted compaction placement differs from its durable receipt",
+            ));
+        }
+        let arena_bytes_after = replacement.arena_len;
+        self.install_replacement(inner, replacement)?;
+        let ready = outbox::mark_ready(
+            &self.directory,
+            prepared.intent.commit,
+            &self.identity,
+            self.limits,
+        )?;
+        if ready != prepared.bundle {
+            return Err(DurableError::InvalidCompactionEvidence(
+                "ready GC evidence differs from the prepared receipt",
+            ));
+        }
+        self.fail_if(FaultPoint::AfterCompactionEvidenceReady)?;
+        prepare_finish_compaction(&self.directory)?;
+        self.fail_if(FaultPoint::BeforeCompactionIntentRemoval)?;
+        remove_compaction_intent(&self.directory)?;
+        Ok(CompactionReport {
+            objects_before: prepared.objects_before,
+            objects_after: prepared.objects_after,
+            objects_reclaimed: prepared.objects_reclaimed,
+            arena_bytes_before: prepared.arena_bytes_before,
+            arena_bytes_after,
+            fact_snapshot: authorization.facts.snapshot,
+            gc_commit: prepared.intent.commit,
+        })
+    }
+
+    fn prepare_compaction(
+        &self,
+        inner: &mut DurableInner<P>,
+        authorization: &VerifiedCompactionPlan,
+        live: &BTreeSet<ObjectId>,
+    ) -> Result<PreparedCompaction, DurableError> {
+        cleanup_without_intent(&self.directory)?;
+        let objects_before =
+            u64::try_from(inner.index.len()).map_err(|_| DurableError::EncodingOverflow)?;
+        let (arena_bytes_before, root_bytes_before, root_digest_before) = {
+            let files = live_files_mut(&mut inner.files)?;
+            let root_bytes = files
+                .roots
+                .metadata()
+                .map_err(|source| io_error("read root journal metadata before compaction", source))?
+                .len();
+            let root_digest = root_journal_digest(&mut files.roots)?;
+            (files.arena_len, root_bytes, root_digest)
+        };
+        let replacement = self.write_replacement_files(inner, live)?;
         let objects_after =
             u64::try_from(replacement.index.len()).map_err(|_| DurableError::EncodingOverflow)?;
-        let objects_reclaimed = u64::try_from(authorization.facts.condemned.len())
-            .map_err(|_| DurableError::EncodingOverflow)?;
+        let objects_reclaimed = objects_before.checked_sub(objects_after).ok_or(
+            DurableError::InvalidCompactionEvidence(
+                "replacement contains more objects than the source arena",
+            ),
+        )?;
+        if objects_reclaimed
+            != u64::try_from(authorization.facts.condemned.len())
+                .map_err(|_| DurableError::EncodingOverflow)?
+        {
+            return Err(DurableError::InvalidCompactionEvidence(
+                "replacement does not execute the complete condemned set",
+            ));
+        }
+        let bundle = evidence::build_bundle(
+            authorization,
+            &evidence::PlacementView {
+                operation_contract: authorization.retention.operation_contract,
+                arena_bytes: arena_bytes_before,
+                root_journal_bytes: root_bytes_before,
+                root_journal_digest: root_digest_before,
+                index: &inner.index,
+                roots: &inner.roots_by_principal,
+            },
+            &evidence::PlacementView {
+                operation_contract: authorization.retention.operation_contract,
+                arena_bytes: replacement.arena_len,
+                root_journal_bytes: replacement.root_len,
+                root_journal_digest: replacement.root_digest,
+                index: &replacement.index,
+                roots: &replacement.roots,
+            },
+            evidence::TransitionMeasurements {
+                objects_before,
+                objects_after,
+                objects_reclaimed,
+                arena_bytes_before,
+                arena_bytes_after: replacement.arena_len,
+                root_bytes_before,
+                root_bytes_after: replacement.root_len,
+            },
+            &self.principal_codec,
+            &self.identity,
+        )?;
+        let intent = CompactionIntent {
+            operation_contract: authorization.retention.operation_contract,
+            commit: bundle.commit_id(),
+            placement_after: bundle.placement_after_id(&self.identity),
+        };
+        Ok(PreparedCompaction {
+            objects_before,
+            objects_after,
+            objects_reclaimed,
+            arena_bytes_before,
+            bundle,
+            intent,
+        })
+    }
+
+    fn install_replacement(
+        &self,
+        inner: &mut DurableInner<P>,
+        replacement: ReplacementState<P>,
+    ) -> Result<(), DurableError> {
         let index_state = IndexState {
             arena_len: replacement.arena_len,
             arena_tail: replacement.arena_tail,
@@ -605,94 +790,29 @@ where
             arena_len: replacement.arena_len,
             arena_tail: replacement.arena_tail,
         });
-        prepare_finish_compaction(&self.directory)?;
-        self.fail_if(FaultPoint::BeforeCompactionIntentRemoval)?;
-        remove_compaction_intent(&self.directory)?;
-        Ok(CompactionReport {
-            objects_before,
-            objects_after,
-            objects_reclaimed,
-            arena_bytes_before,
-            arena_bytes_after: replacement.arena_len,
-            fact_snapshot: authorization.facts.snapshot,
-        })
-    }
-
-    fn compaction_evidence(
-        &self,
-        authorization: &VerifiedCompactionPlan,
-    ) -> Result<BTreeMap<ObjectId, ObjectRecord>, DurableError> {
-        let plan_record = authorization
-            .plan
-            .to_object_record()
-            .map_err(|_| DurableError::InvalidCompactionEvidence("GC plan encoding failed"))?;
-        let mut records = BTreeMap::new();
-        for record in [
-            authorization.facts.snapshot_record.clone(),
-            authorization.policy_record.clone(),
-            authorization.proof_record.clone(),
-            plan_record,
-        ] {
-            if record.owning_references().next().is_some()
-                && record.kind() != ObjectKind::GcPlanEvidence
-            {
-                return Err(DurableError::InvalidCompactionEvidence(
-                    "supplied evidence must not introduce an unavailable owning closure",
-                ));
-            }
-            let id = self.identify(&record);
-            match records.get(&id) {
-                Some(existing) if existing == &record => {},
-                Some(_) => return Err(astrid_storage_model::ModelError::ObjectCollision(id).into()),
-                None => {
-                    records.insert(id, record);
-                },
-            }
-        }
-        Ok(records)
+        Ok(())
     }
 
     fn write_replacement_files(
         &self,
         inner: &mut DurableInner<P>,
         live: &BTreeSet<ObjectId>,
-        evidence: &BTreeMap<ObjectId, ObjectRecord>,
-    ) -> Result<(), DurableError> {
+    ) -> Result<ReplacementState<P>, DurableError> {
         let mut arena = create_private_file(&self.directory.join(ARENA_COMPACTING))?;
         let mut new_index = BTreeMap::new();
-        let ids = live
-            .iter()
-            .copied()
-            .chain(evidence.keys().copied())
-            .collect::<BTreeSet<_>>();
         let super::DurableInner { files, index, .. } = inner;
         let files = live_files_mut(files)?;
-        for id in ids {
-            let record = if let Some(record) = evidence.get(&id) {
-                if let Some(location) = index.get(&id).copied() {
-                    let existing = read_indexed_object(
-                        &mut files.arena,
-                        id,
-                        location,
-                        &self.identity,
-                        self.limits,
-                    )?;
-                    if existing != *record {
-                        return Err(astrid_storage_model::ModelError::ObjectCollision(id).into());
-                    }
-                }
-                record.clone()
-            } else {
-                let location = index
-                    .get(&id)
-                    .copied()
-                    .ok_or(astrid_storage_model::ModelError::MissingObject(id))?;
-                read_indexed_object(&mut files.arena, id, location, &self.identity, self.limits)?
-            };
-            let payload = encode_object_frame(self.identity.scheme(), id, &record)?;
+        for id in live {
+            let location = index
+                .get(id)
+                .copied()
+                .ok_or(astrid_storage_model::ModelError::MissingObject(*id))?;
+            let record =
+                read_indexed_object(&mut files.arena, *id, location, &self.identity, self.limits)?;
+            let payload = encode_object_frame(self.identity.scheme(), *id, &record)?;
             ensure_payload_limit(ARENA_FILE, 0, payload.len(), self.limits)?;
             let location = append_frame(&mut arena, ARENA_MAGIC, &payload)?;
-            new_index.insert(id, location);
+            new_index.insert(*id, location);
         }
         arena
             .sync_data()
@@ -744,11 +864,18 @@ where
             .metadata()
             .map_err(|source| io_error("read compacted arena metadata", source))?
             .len();
+        let root_len = roots
+            .metadata()
+            .map_err(|source| io_error("read compacted root metadata", source))?
+            .len();
+        let root_digest = root_journal_digest(&mut roots)?;
         Ok(ReplacementState {
             roots: roots_by_principal,
             index,
             validated,
             arena_len,
+            root_len,
+            root_digest,
             arena_tail,
         })
     }
@@ -784,6 +911,20 @@ fn create_private_file(path: &Path) -> Result<File, DurableError> {
         .map_err(|source| io_error("create compaction file", source))
 }
 
+pub(super) fn root_journal_digest(file: &mut File) -> Result<[u8; 32], DurableError> {
+    let position = file
+        .stream_position()
+        .map_err(|source| io_error("capture root journal position", source))?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|source| io_error("seek root journal for placement digest", source))?;
+    let mut hasher = blake3::Hasher::new_derive_key("astrid gc placement root journal digest v1");
+    std::io::copy(file, &mut hasher)
+        .map_err(|source| io_error("hash root journal placement", source))?;
+    file.seek(SeekFrom::Start(position))
+        .map_err(|source| io_error("restore root journal position", source))?;
+    Ok(*hasher.finalize().as_bytes())
+}
+
 fn validate_replacement<P, I, C>(
     arena: &mut File,
     roots: &mut File,
@@ -791,18 +932,36 @@ fn validate_replacement<P, I, C>(
     codec: &C,
     identity: &I,
     limits: RecoveryLimits,
-) -> Result<(), DurableError>
+) -> Result<ReplacementState<P>, DurableError>
 where
     P: Clone + Ord,
     I: PersistentObjectIdentity,
     C: PrincipalCodec<P>,
 {
-    let (recovered, _) = recover_arena(arena, identity, limits)?;
+    let (recovered, arena_tail) = recover_arena(arena, identity, limits)?;
     if &recovered != expected_index {
         return Err(DurableError::InvalidCompactionEvidence(
             "replacement arena index changed during verification",
         ));
     }
-    recover_roots(roots, arena, &recovered, codec, identity, limits)?;
-    Ok(())
+    let (roots_by_principal, validated) =
+        recover_roots(roots, arena, &recovered, codec, identity, limits)?;
+    let arena_len = arena
+        .metadata()
+        .map_err(|source| io_error("read replacement arena metadata", source))?
+        .len();
+    let root_len = roots
+        .metadata()
+        .map_err(|source| io_error("read replacement root metadata", source))?
+        .len();
+    let root_digest = root_journal_digest(roots)?;
+    Ok(ReplacementState {
+        roots: roots_by_principal,
+        index: recovered,
+        validated,
+        arena_len,
+        root_len,
+        root_digest,
+        arena_tail,
+    })
 }

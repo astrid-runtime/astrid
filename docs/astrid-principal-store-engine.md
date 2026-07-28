@@ -243,10 +243,12 @@ closures. This is the minimum two-readers rule for any format called durable.
 This realization deliberately has one active arena. Runtime KV, the disposable
 persistent recovery index, live per-principal logical quotas, and proof-audited
 generation replacement are integrated. It does not yet seal arenas, persist a
-history-pin policy, expose root removal, coordinate the kernel audit/outbox
-record, inject short writes or disk-full errors, encrypt erasure domains, or
-select final export `BlobId` profiles. Those claims remain attached to their
-evidence gates.
+history-pin policy, expose root removal, drain GC receipts into the independent
+kernel audit log, inject short writes or disk-full errors, encrypt erasure
+domains, or select final export `BlobId` profiles. The engine-owned
+transactional outbox now preserves each self-contained receipt until the audit
+sink explicitly acknowledges it; composition still owns retry, backpressure,
+and audit anchoring. Those claims remain attached to their evidence gates.
 
 Live logical quota becomes a physical bound only after the durable compactor
 runs. The compactor copies the closures selected by current principal roots and
@@ -255,8 +257,8 @@ current-root snapshot, and publishes both files under a durable recovery
 intent. The persistent index removes payload re-hashing from clean reopen;
 compaction makes arena and journal size proportional to the selected retained
 set. Heavy content workloads remain gated on operational scheduling,
-accounting, and measured compaction cadence even though the logical format and
-engine mechanism exist.
+accounting, independent-audit delivery, and measured compaction cadence even
+though the logical format and engine mechanism exist.
 
 The engine does not infer a history policy. Callers provide the identified
 retention contract and exact extra roots for system objects, export/import

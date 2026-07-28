@@ -22,8 +22,15 @@ pub(super) const PRE_COMPACTION_FORMAT_SPEC_ID: ObjectId = ObjectId::new([
     53, 180, 70, 251, 209, 156, 164, 173, 11, 19, 67, 180, 12, 26, 50, 178, 238, 216, 238, 247,
     149, 3, 66, 97, 164, 9, 42, 10, 42, 232, 6, 254,
 ]);
-const PRIOR_V1_FORMAT_SPEC_IDS: [ObjectId; 2] =
-    [PRE_DERIVATION_FORMAT_SPEC_ID, PRE_COMPACTION_FORMAT_SPEC_ID];
+pub(super) const PRE_GC_OUTBOX_FORMAT_SPEC_ID: ObjectId = ObjectId::new([
+    216, 242, 203, 37, 7, 54, 121, 159, 216, 178, 111, 48, 126, 32, 196, 217, 73, 214, 206, 161,
+    131, 102, 20, 165, 84, 114, 16, 232, 43, 191, 206, 193,
+]);
+const PRIOR_V1_FORMAT_SPEC_IDS: [ObjectId; 3] = [
+    PRE_DERIVATION_FORMAT_SPEC_ID,
+    PRE_COMPACTION_FORMAT_SPEC_ID,
+    PRE_GC_OUTBOX_FORMAT_SPEC_ID,
+];
 
 pub(super) fn format_spec_record() -> StorageResult<ObjectRecord> {
     ObjectRecord::new(

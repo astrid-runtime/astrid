@@ -1,7 +1,8 @@
 # The Astrid Refinery
 
-Status: design contract with the initial observer/compaction type seam. The
-resource-authority scheduler must exist before arena compaction is implemented.
+Status: design contract, observer seam, and explicit engine compaction
+mechanism. The resource-authority scheduler and audit-outbox drain must exist
+before compaction runs automatically.
 
 The Refinery is one bounded cold-path pipeline for work that already needs to
 stream live stored bytes:
@@ -205,6 +206,13 @@ The commit fails closed if the digest differs. A proof for one plan can never
 be attached to another deletion. The plan owns its fact snapshot, retention
 policy, and proof so the receipt's owning closure retains everything needed to
 replay the deletion explanation; condemned-object edges stay non-owning.
+
+Before intent publication, the engine durably prepares that complete evidence
+closure in its transactional GC outbox. The intent names the receipt and exact
+destination placement. Recovery may install only that placement and makes the
+bundle ready before cleaning the old generation. Automatic scheduling remains
+disabled until kernel composition can durably append and acknowledge each
+ready bundle in the independent audit chain.
 
 ## Acceptance
 
