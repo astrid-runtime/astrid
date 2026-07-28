@@ -1876,35 +1876,173 @@ fn spawn_capsule_health_monitor(kernel: Arc<Kernel>) -> tokio::task::JoinHandle<
     })
 }
 
+/// How long after its last `user.v1.prompt` a principal keeps receiving
+/// per-principal watchdog ticks. Comfortably beyond the longest react phase
+/// timeout, so a stuck turn is still being ticked when it crosses its
+/// deadline; after the TTL the principal simply stops costing a tick.
+const WATCHDOG_PRINCIPAL_TTL: std::time::Duration = std::time::Duration::from_secs(900);
+
+/// Bound on the watchdog's recently-active-principal set. Beyond it the
+/// stalest entry is evicted — an evicted principal only loses the recovery
+/// *backstop* until its next prompt, never correctness.
+const WATCHDOG_MAX_PRINCIPALS: usize = 256;
+
+/// Record a principal sighting in the watchdog's active set, evicting the
+/// stalest entry when the (bounded) set is full. Factored out of the task
+/// loop so the eviction discipline is unit-testable.
+fn watchdog_note_principal(
+    active: &mut std::collections::HashMap<String, std::time::Instant>,
+    principal: String,
+    now: std::time::Instant,
+    cap: usize,
+) {
+    if principal.is_empty() {
+        return;
+    }
+    if active.len() >= cap
+        && !active.contains_key(&principal)
+        && let Some(stalest) = active
+            .iter()
+            .min_by_key(|(_, seen)| **seen)
+            .map(|(k, _)| k.clone())
+    {
+        active.remove(&stalest);
+    }
+    active.insert(principal, now);
+}
+
 /// Spawns a periodic watchdog that publishes `astrid.v1.watchdog.tick` events every 5 seconds.
 ///
 /// The `ReAct` capsule (WASM guest) cannot use async timers, so this kernel-side task
 /// drives timeout enforcement by waking the capsule on a fixed interval. Each tick
 /// causes the capsule's `handle_watchdog_tick` interceptor to run `check_phase_timeout`.
+///
+/// ## Per-principal fan-out (2026-07-28 wedge follow-up)
+///
+/// The tick used to be published WITHOUT a principal, so react's
+/// `handle_watchdog_tick` always ran under the capsule OWNER's KV scope and
+/// could only see the owner's `react.active_sessions` index — every
+/// per-principal session (each gateway-minted bearer) was invisible to
+/// phase-timeout recovery, and a per-principal turn that lost its LLM stream
+/// hung forever instead of failing at the phase timeout. The task now watches
+/// `user.v1.prompt` on the bus and re-publishes each tick once per RECENTLY
+/// ACTIVE principal (a prompt within [`WATCHDOG_PRINCIPAL_TTL`]), stamped
+/// with that principal, so the dispatcher runs react's tick handler under the
+/// right per-(capsule, principal) scope and the existing recovery logic sees
+/// that principal's sessions. The principal-less tick is kept for owner-scope
+/// sessions; the active set is bounded by [`WATCHDOG_MAX_PRINCIPALS`].
 fn spawn_react_watchdog(event_bus: Arc<EventBus>) -> tokio::task::JoinHandle<()> {
+    fn publish_tick(event_bus: &EventBus, principal: Option<String>) {
+        let mut msg = astrid_events::ipc::IpcMessage::new(
+            astrid_events::ipc::Topic::from_raw("astrid.v1.watchdog.tick"),
+            astrid_events::ipc::IpcPayload::Custom {
+                data: serde_json::json!({}),
+            },
+            uuid::Uuid::new_v4(),
+        );
+        if let Some(principal) = principal {
+            msg = msg.with_principal(principal);
+        }
+        let _ = event_bus.publish(astrid_events::AstridEvent::Ipc {
+            metadata: astrid_events::EventMetadata::new("kernel"),
+            message: msg,
+        });
+    }
+
     tokio::spawn(async move {
+        // Broadcast subscription used ONLY to observe `user.v1.prompt`
+        // principals; drained continuously in the select loop below, so it
+        // cannot meaningfully lag (a lagged/lost sighting merely delays that
+        // principal's backstop until its next prompt).
+        let mut receiver = event_bus.subscribe_as("react_watchdog");
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
         // The first tick fires immediately - skip it to give capsules time to load.
         interval.tick().await;
 
-        loop {
-            interval.tick().await;
-            metrics::counter!(METRIC_BACKGROUND_TICKS_TOTAL, "loop" => "react_watchdog")
-                .increment(1);
+        let mut active: std::collections::HashMap<String, std::time::Instant> =
+            std::collections::HashMap::new();
 
-            let msg = astrid_events::ipc::IpcMessage::new(
-                astrid_events::ipc::Topic::from_raw("astrid.v1.watchdog.tick"),
-                astrid_events::ipc::IpcPayload::Custom {
-                    data: serde_json::json!({}),
+        loop {
+            tokio::select! {
+                event = receiver.recv() => {
+                    let Some(event) = event else {
+                        // Bus closed — daemon shutting down; ticks are moot.
+                        return;
+                    };
+                    if let astrid_events::AstridEvent::Ipc { message, .. } = &*event
+                        && message.topic.as_str() == "user.v1.prompt"
+                        && let Some(principal) = message.principal.clone()
+                    {
+                        watchdog_note_principal(
+                            &mut active,
+                            principal,
+                            std::time::Instant::now(),
+                            WATCHDOG_MAX_PRINCIPALS,
+                        );
+                    }
                 },
-                uuid::Uuid::new_v4(),
-            );
-            let _ = event_bus.publish(astrid_events::AstridEvent::Ipc {
-                metadata: astrid_events::EventMetadata::new("kernel"),
-                message: msg,
-            });
+                _ = interval.tick() => {
+                    metrics::counter!(METRIC_BACKGROUND_TICKS_TOTAL, "loop" => "react_watchdog")
+                        .increment(1);
+                    active.retain(|_, seen| seen.elapsed() < WATCHDOG_PRINCIPAL_TTL);
+
+                    // Owner-scope tick — the pre-existing behaviour.
+                    publish_tick(&event_bus, None);
+                    // Per-principal fan-out for recently-active principals.
+                    for principal in active.keys() {
+                        publish_tick(&event_bus, Some(principal.clone()));
+                    }
+                },
+            }
         }
     })
+}
+
+#[cfg(test)]
+mod watchdog_tests {
+    use super::watchdog_note_principal;
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    /// The active set stays bounded: at capacity, noting a NEW principal
+    /// evicts the stalest entry; re-noting an existing principal only
+    /// refreshes its timestamp.
+    #[test]
+    fn note_principal_bounds_and_evicts_stalest() {
+        let mut active: HashMap<String, Instant> = HashMap::new();
+        let t0 = Instant::now();
+
+        watchdog_note_principal(&mut active, "alice".into(), t0, 2);
+        watchdog_note_principal(
+            &mut active,
+            "bob".into(),
+            t0.checked_add(Duration::from_secs(1)).expect("time"),
+            2,
+        );
+        // Refresh alice — she is now the NEWEST.
+        watchdog_note_principal(
+            &mut active,
+            "alice".into(),
+            t0.checked_add(Duration::from_secs(2)).expect("time"),
+            2,
+        );
+        // At cap: carol evicts the stalest (bob, not alice).
+        watchdog_note_principal(
+            &mut active,
+            "carol".into(),
+            t0.checked_add(Duration::from_secs(3)).expect("time"),
+            2,
+        );
+
+        assert_eq!(active.len(), 2, "set must stay at cap");
+        assert!(active.contains_key("alice"), "refreshed entry survives");
+        assert!(active.contains_key("carol"), "new entry admitted");
+        assert!(!active.contains_key("bob"), "stalest entry evicted");
+
+        // Empty principals are never tracked.
+        watchdog_note_principal(&mut active, String::new(), t0, 2);
+        assert_eq!(active.len(), 2);
+    }
 }
 
 // ---------------------------------------------------------------------------
