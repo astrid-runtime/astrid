@@ -458,7 +458,14 @@ where
                 roots_by_principal,
                 index,
                 validated,
-                files: Some(DurableFiles { arena, roots, lock }),
+                files: Some(DurableFiles {
+                    arena,
+                    roots,
+                    index_cache,
+                    arena_len,
+                    arena_tail,
+                    lock,
+                }),
                 poisoned: false,
             }),
         })
@@ -493,14 +500,7 @@ where
             return Ok(None);
         };
         let files = live_files_mut(&mut inner.files)?;
-        read_indexed_object(
-            &mut files.arena,
-            id,
-            location,
-            self.identity.scheme(),
-            self.limits,
-        )
-        .map(Some)
+        read_indexed_object(&mut files.arena, id, location, &self.identity, self.limits).map(Some)
     }
 
     /// Persist one standalone immutable object outside a principal root.
@@ -526,13 +526,8 @@ where
         ensure_usable(&inner)?;
         if let Some(location) = inner.index.get(&id).copied() {
             let files = live_files_mut(&mut inner.files)?;
-            let existing = read_indexed_object(
-                &mut files.arena,
-                id,
-                location,
-                self.identity.scheme(),
-                self.limits,
-            )?;
+            let existing =
+                read_indexed_object(&mut files.arena, id, location, &self.identity, self.limits)?;
             if &existing != record {
                 return Err(ModelError::ObjectCollision(id).into());
             }
@@ -540,23 +535,31 @@ where
         }
         let payload = encode_object_frame(self.identity.scheme(), id, record)?;
         ensure_payload_limit(ARENA_FILE, 0, payload.len(), self.limits)?;
-        let persisted = {
+        let (previous_arena_len, persisted) = {
             let files = live_files_mut(&mut inner.files)?;
-            (|| {
+            let previous_arena_len = files.arena_len;
+            let persisted = (|| {
                 let location = append_frame(&mut files.arena, ARENA_MAGIC, &payload)?;
                 files
                     .arena
                     .sync_data()
                     .map_err(|source| io_error("flush standalone object frame", source))?;
-                Ok(location)
-            })()
+                let arena_len = files
+                    .arena
+                    .metadata()
+                    .map_err(|source| io_error("read standalone arena metadata", source))?
+                    .len();
+                Ok((location, arena_len))
+            })();
+            (previous_arena_len, persisted)
         };
         match persisted {
             Ok((location, arena_len)) => {
                 inner.index.insert(id, location);
                 inner.validated.insert(id);
                 let locations = [(id, location)];
-                if let Some(mut cache) = inner.index_cache.take() {
+                let files = live_files_mut(&mut inner.files)?;
+                if let Some(mut cache) = files.index_cache.take() {
                     let delta = IndexDelta {
                         previous_arena_len,
                         arena_len,
@@ -564,11 +567,11 @@ where
                         objects: &locations,
                     };
                     if append_index_delta(&mut cache, &delta, self.identity.scheme()).is_ok() {
-                        inner.index_cache = Some(cache);
+                        files.index_cache = Some(cache);
                     }
                 }
-                inner.arena_len = arena_len;
-                inner.arena_tail = Some(location);
+                files.arena_len = arena_len;
+                files.arena_tail = Some(location);
                 Ok((id, InsertOutcome::Inserted))
             },
             Err(error) => {
@@ -654,7 +657,7 @@ where
         let mut inner = self.inner.lock();
         ensure_usable(&inner)?;
         let prepared = self.prepare(&mut inner, transaction)?;
-        let previous_arena_len = inner.arena_len;
+        let previous_arena_len = live_files_mut(&mut inner.files)?.arena_len;
         match self.persist(&mut inner, &prepared) {
             Ok(persisted) => {
                 inner.index.extend(persisted.locations.iter().copied());
@@ -662,23 +665,34 @@ where
                 inner
                     .roots_by_principal
                     .insert(prepared.principal.clone(), prepared.root);
-                if let Some((_, arena_tail)) = persisted.locations.last().copied()
-                    && let Some(mut cache) = inner.index_cache.take()
+                let delta_locations = inner
+                    .index
+                    .iter()
+                    .filter(|(_, location)| location.offset >= previous_arena_len)
+                    .map(|(id, location)| (*id, *location))
+                    .collect::<Vec<_>>();
+                let arena_tail = inner
+                    .index
+                    .values()
+                    .copied()
+                    .max_by_key(|location| location.offset);
+                let files = live_files_mut(&mut inner.files)?;
+                if persisted.arena_len > previous_arena_len
+                    && let Some(arena_tail) = arena_tail
+                    && let Some(mut cache) = files.index_cache.take()
                 {
                     let delta = IndexDelta {
                         previous_arena_len,
                         arena_len: persisted.arena_len,
                         arena_tail,
-                        objects: &persisted.locations,
+                        objects: &delta_locations,
                     };
                     if append_index_delta(&mut cache, &delta, self.identity.scheme()).is_ok() {
-                        inner.index_cache = Some(cache);
+                        files.index_cache = Some(cache);
                     }
                 }
-                inner.arena_len = persisted.arena_len;
-                if let Some((_, location)) = persisted.locations.last().copied() {
-                    inner.arena_tail = Some(location);
-                }
+                files.arena_len = persisted.arena_len;
+                files.arena_tail = arena_tail;
                 Ok(CommitOutcome {
                     root: prepared.root,
                     objects_inserted: prepared.objects_inserted,
@@ -805,7 +819,7 @@ where
             incoming,
             validated,
             commit,
-            self.identity.scheme(),
+            &self.identity,
             self.limits,
         )
     }
@@ -814,7 +828,7 @@ where
         &self,
         inner: &mut DurableInner<P>,
         prepared: &Prepared<P>,
-    ) -> Result<Vec<(ObjectId, ArenaLocation)>, DurableError> {
+    ) -> Result<Persisted, DurableError> {
         let files = live_files_mut(&mut inner.files)?;
         let mut locations = Vec::new();
         for (id, payload) in &prepared.objects {
@@ -841,7 +855,7 @@ where
             .sync_data()
             .map_err(|source| io_error("flush root-journal frame", source))?;
         self.fail_if(FaultPoint::AfterRootCas)?;
-        let arena_len = inner
+        let arena_len = files
             .arena
             .metadata()
             .map_err(|source| io_error("read committed arena metadata", source))?
@@ -863,7 +877,10 @@ where
 impl<P: Ord, I, C> Drop for DurableEngine<P, I, C> {
     fn drop(&mut self) {
         let inner = self.inner.get_mut();
-        if let Some(files) = inner.files.take() {
+        if let Some(mut files) = inner.files.take() {
+            if let Some(cache) = &mut files.index_cache {
+                let _ = cache.sync_data();
+            }
             let _ = fs2::FileExt::unlock(&files.lock);
         }
     }
@@ -900,151 +917,22 @@ fn live_files_mut(files: &mut Option<DurableFiles>) -> Result<&mut DurableFiles,
     files.as_mut().ok_or(DurableError::Closed)
 }
 
-fn materialize_closure(
-    arena: &mut File,
-    index: &BTreeMap<ObjectId, ArenaLocation>,
-    incoming: &BTreeMap<ObjectId, ObjectRecord>,
-    root: ObjectId,
-    scheme: IdentityScheme,
-    limits: RecoveryLimits,
-) -> Result<Vec<(ObjectId, ObjectRecord)>, DurableError> {
-    let mut records = BTreeMap::new();
-    let mut marks = BTreeMap::<ObjectId, u8>::new();
-    let mut stack = vec![(root, false)];
-
-    while let Some((id, expanded)) = stack.pop() {
-        if expanded {
-            marks.insert(id, 2);
-            continue;
-        }
-        match marks.get(&id).copied() {
-            Some(2) => continue,
-            Some(1) => return Err(ModelError::ObjectCycle(id).into()),
-            Some(_) | None => {},
-        }
-        let record = if let Some(record) = incoming.get(&id) {
-            record.clone()
-        } else {
-            let location = index
-                .get(&id)
-                .copied()
-                .ok_or(ModelError::MissingObject(id))?;
-            read_indexed_object(arena, id, location, scheme, limits)?
-        };
-        marks.insert(id, 1);
-        stack.push((id, true));
-        for child in record.owning_references().rev() {
-            stack.push((child, false));
-        }
-        records.insert(id, record);
-    }
-    Ok(records.into_iter().collect())
-}
-
-fn validate_commit_closure(
-    records: &[(ObjectId, ObjectRecord)],
-    commit: ObjectId,
-) -> Result<(), ModelError> {
-    let mut world = World::<()>::new();
-    world.import_closure(records, commit)?;
-    world.compare_and_swap_root((), None, commit)?;
-    Ok(())
-}
-
-fn validate_incremental_closure(
-    arena: &mut File,
-    index: &BTreeMap<ObjectId, ArenaLocation>,
-    incoming: &BTreeMap<ObjectId, ObjectRecord>,
-    validated: &BTreeSet<ObjectId>,
-    root: ObjectId,
-    scheme: IdentityScheme,
-    limits: RecoveryLimits,
-) -> Result<BTreeSet<ObjectId>, DurableError> {
-    let root_record = if let Some(record) = incoming.get(&root) {
-        record.clone()
-    } else {
-        let location = index
-            .get(&root)
-            .copied()
-            .ok_or(ModelError::MissingObject(root))?;
-        read_indexed_object(arena, root, location, scheme, limits)?
-    };
-    if root_record.kind() != ObjectKind::Commit {
-        return Err(ModelError::RootNotCommit {
-            object: root,
-            actual: root_record.kind(),
-        }
-        .into());
-    }
-    let mut reachable = BTreeSet::new();
-    let mut marks = BTreeMap::<ObjectId, u8>::new();
-    let mut stack = vec![(root, false)];
-
-    while let Some((id, expanded)) = stack.pop() {
-        if validated.contains(&id) {
-            reachable.insert(id);
-            continue;
-        }
-        if expanded {
-            marks.insert(id, 2);
-            continue;
-        }
-        match marks.get(&id).copied() {
-            Some(2) => continue,
-            Some(1) => return Err(ModelError::ObjectCycle(id).into()),
-            Some(_) | None => {},
-        }
-        let record = if let Some(record) = incoming.get(&id) {
-            record.clone()
-        } else {
-            let location = index
-                .get(&id)
-                .copied()
-                .ok_or(ModelError::MissingObject(id))?;
-            read_indexed_object(arena, id, location, scheme, limits)?
-        };
-        reachable.insert(id);
-        marks.insert(id, 1);
-        stack.push((id, true));
-        for child in record.owning_references().rev() {
-            stack.push((child, false));
-        }
-    }
-    Ok(reachable)
-}
-
-fn usage_from_closure(
-    records: &[(ObjectId, ObjectRecord)],
-    commit: ObjectId,
-) -> Result<PrincipalUsage, ModelError> {
-    let mut world = World::<()>::new();
-    world.import_closure(records, commit)?;
-    world.compare_and_swap_root((), None, commit)?;
-    world.principal_usage(&())
-}
-
-fn recovery_closure_error(error: DurableError, root_offset: u64) -> DurableError {
-    match error {
-        DurableError::Model(source) => DurableError::RecoveryModel {
-            file: ROOT_FILE,
-            offset: root_offset,
-            source,
-        },
-        other => other,
-    }
-}
-
 #[path = "durable_staging.rs"]
 mod staging;
 
 #[path = "durable_format.rs"]
 mod format;
+#[path = "durable_index.rs"]
+mod index_cache;
 #[path = "durable_lifecycle.rs"]
 mod lifecycle;
+#[path = "durable_validation.rs"]
+mod validation;
 
 use format::{
     append_frame, append_frames, encode_object_frame, encode_root_record, ensure_payload_limit,
-    io_error, open_rw, read_indexed_object, recover_arena, recover_roots, sync_store_directory,
+    io_error, open_rw, read_indexed_object, recover_arena, recover_roots, scan_frames,
+    sync_store_directory, verify_indexed_location, verify_indexed_tail,
 };
 #[cfg(test)]
 use format::{decode_object_frame, frame_checksum};

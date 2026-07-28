@@ -206,3 +206,55 @@ fn clean_index_defers_orphan_payload_scrub_but_reads_remain_verified() {
         })
     ));
 }
+
+#[test]
+fn rooted_staging_advances_the_index_across_earlier_orphans() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open(directory.path());
+    let orphan = ObjectRecord::new(
+        ObjectKind::Chunk,
+        ObjectFormatVersion::V1,
+        b"staged orphan before the rooted batch".to_vec(),
+        Vec::new(),
+        35,
+        ObjectClass::Data,
+    )
+    .unwrap();
+    let (orphan_id, outcome) = engine.stage_object(&orphan).unwrap();
+    assert_eq!(outcome, InsertOutcome::Inserted);
+
+    let (commit, transaction) = transaction("alice", None, b"rooted staging");
+    let staged = transaction
+        .records()
+        .iter()
+        .map(|(_, record)| record.clone())
+        .collect();
+    engine.stage_objects(staged).unwrap();
+    let root = engine
+        .commit(RootTransaction::new(
+            "alice".to_owned(),
+            None,
+            commit,
+            Vec::new(),
+        ))
+        .unwrap()
+        .root();
+    drop(engine);
+
+    let arena = directory.path().join(ARENA_FILE);
+    let orphan_payload_byte = FRAME_HEADER_LEN
+        .checked_add(OBJECT_CANONICAL_BYTES_OFFSET)
+        .unwrap();
+    flip_byte(&arena, orphan_payload_byte);
+
+    let recovered = open(directory.path());
+    assert_eq!(recovered.root(&"alice".to_owned()).unwrap(), Some(root));
+    assert!(matches!(
+        recovered.object(orphan_id),
+        Err(DurableError::Corrupt {
+            file: ARENA_FILE,
+            detail: "frame checksum mismatch",
+            ..
+        })
+    ));
+}
