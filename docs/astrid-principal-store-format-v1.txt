@@ -188,6 +188,11 @@ Stable object_kind codes:
    9  Commit
   10  Evidence
   11  Derived
+  12  RuntimeSemanticProfile
+  13  DerivationInvocation
+  14  DerivationEvidence
+  15  GcPlanEvidence
+  16  GcCommitEvidence
 
 Only Owns references enter a principal's default reconstruction closure.
 Evidence, Lineage, and Derived targets survive only when independently rooted,
@@ -439,6 +444,91 @@ The Rosetta object described in section 1 is:
 
 Other Evidence objects are kind-scoped application records and remain opaque
 unless their own frozen schema accompanies an export.
+
+
+7.4 Runtime semantic profile
+----------------------------
+
+RuntimeSemanticProfile is kind 12, version 1, class Metadata, logical_bytes 0.
+canonical_bytes is exactly one component-model-presence byte:
+
+  0  no component-model semantics reference
+  1  one component-model semantics reference is present
+
+Other values are invalid. The byte MUST agree with the presence of
+"01-component-model". Every reference has kind Owns. The required fixed
+references are:
+
+  "00-wasm-core"            WebAssembly core semantics contract
+  "02-float"                floating-point and NaN semantics contract
+  "03-threads"              thread and scheduling semantics contract
+  "04-resource-failure"     deterministic resource-failure contract
+
+The optional component-model semantics reference is:
+
+  "01-component-model"
+
+Enabled proposal contracts are a strictly ObjectId-ordered set. Reference i is:
+
+  "10-proposal/" || i as u64 big-endian || 00
+
+Proposal ordinals begin at zero with no gap. The target ObjectIds MUST be
+strictly increasing.
+
+Host-function semantic contracts are strictly ordered by their non-empty
+canonical function-name bytes. Their labels are:
+
+  "20-host-function/" || canonical function name
+
+No engine build identifier occurs in this object. A build identity belongs in
+execution evidence. Compatible builds name the same profile only after
+conformance to every semantics-visible contract above.
+
+
+7.5 Derivation invocation
+-------------------------
+
+DerivationInvocation is kind 13, version 1, class Metadata, logical_bytes 0.
+canonical_bytes is exactly two bytes. Byte 0 is the execution class:
+
+  0  Pure
+  1  SnapshotBound
+  2  Effectful
+  3  Nondeterministic
+
+Byte 1 is an optional-field presence mask:
+
+  bit 0  provenance snapshot reference is present
+  bit 1  deterministic seed reference is present
+
+All other bits MUST be zero. The mask MUST agree with the optional references.
+
+Required Owns references are:
+
+  "00-transform"                  exact capsule or executable closure
+  "01-transform-contract"         registered derivation contract
+  "02-canonical-parameters"       typed canonical parameter object
+  "03-runtime-semantic-profile"   kind-12 profile
+  "04-output-contract"            typed output contract
+
+Optional references are:
+
+  "05-provenance-snapshot"  Evidence  immutable observation snapshot
+  "06-deterministic-seed"   Owns      explicit seed material
+
+Input i uses an Evidence relation whose label is:
+
+  "10-input/" || i as u64 big-endian || 00 || non-empty semantic label
+
+Input ordinals begin at zero with no gap. Sequence order is identity-bearing.
+The Pure class forbids a provenance snapshot. SnapshotBound requires one.
+Effectful and Nondeterministic invocations are recordable but MUST NOT populate
+a reusable derivation index.
+
+Kinds 14 through 16 reserve the derivation and linked garbage-collection
+evidence domain. Until their complete schemas are frozen in this document,
+readers preserve them as opaque typed objects and no runtime may claim
+independent semantic decoding of their canonical payloads.
 
 
 8. RECONSTRUCTION PROCEDURE

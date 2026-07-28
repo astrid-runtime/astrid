@@ -50,6 +50,7 @@ Conceptually:
 DerivationInvocation {
     format_version
     execution_class
+    transform
     transform_contract
     ordered_inputs
     canonical_parameters
@@ -73,6 +74,12 @@ identity.
 `canonical_parameters` is an ObjectId naming a typed canonical parameter
 object, not an opaque caller-provided byte string. The transform contract
 defines that object's schema, bounds, and canonical encoding.
+
+`transform` names the exact capsule or immutable executable closure whose
+bytes run. `transform_contract` names the operator-registered rules that
+interpret and constrain it. A contract name alone is not a computation
+identity: two implementations can disagree or one can be malicious. Changing
+either the implementation closure or its contract changes `InvocationId`.
 
 `ordered_inputs` contains explicit labels and ordinals. A set of equal inputs
 in a different semantic order is a different invocation unless the transform
@@ -243,6 +250,7 @@ An admitted derivation records at least:
 ```text
 DerivationEvidence {
     invocation: InvocationId
+    transform: ObjectId
     transform_contract: ObjectId
     runtime_semantic_profile: RuntimeSemanticProfileId
     actual_engine_build: ObjectId

@@ -29,6 +29,10 @@ use crate::kv::{KvPrincipalResolver, KvQuotaResolver, KvStore, TreeKvStore};
 const STORE_METADATA_FILE: &str = "store.meta";
 const STORE_FORMAT_SPEC: &[u8] =
     include_bytes!("../../../docs/astrid-principal-store-format-v1.txt");
+const PRE_DERIVATION_FORMAT_SPEC_ID: ObjectId = ObjectId::new([
+    98, 205, 237, 154, 91, 1, 254, 117, 215, 120, 27, 102, 48, 63, 95, 254, 140, 237, 85, 164, 48,
+    37, 160, 56, 158, 239, 174, 165, 160, 197, 143, 226,
+]);
 
 mod migrations;
 mod native_io;
@@ -238,7 +242,8 @@ pub async fn open_runtime_principal_store(
     let format_spec_id = Blake3ObjectIdentityV1.identify(&format_spec);
     let metadata = store_metadata(format_spec_id);
     let opened = tokio::task::spawn_blocking(move || {
-        let existing_complete = prepare_destination(&open_path, &metadata)?;
+        let destination_format = prepare_destination(&open_path, &metadata)?;
+        let existing_complete = destination_format.is_existing();
         let engine = RuntimeEngine::open(
             &open_path,
             Blake3ObjectIdentityV1,
@@ -248,31 +253,14 @@ pub async fn open_runtime_principal_store(
         .map_err(|error| {
             StorageError::Connection(format!("open durable principal store: {error}"))
         })?;
-        match engine.object(format_spec_id).map_err(|error| {
-            StorageError::Connection(format!("read in-band store format specification: {error}"))
-        })? {
-            Some(actual) if actual == format_spec => {},
-            Some(_) => {
-                return Err(StorageError::Connection(
-                    "in-band store format specification does not match store.meta".to_owned(),
-                ));
-            },
-            None if existing_complete => {
-                return Err(StorageError::Connection(
-                    "completed principal store is missing its in-band format specification"
-                        .to_owned(),
-                ));
-            },
-            None => {
-                engine
-                    .persist_standalone_object(&format_spec)
-                    .map_err(|error| {
-                        StorageError::Connection(format!(
-                            "persist in-band store format specification: {error}"
-                        ))
-                    })?;
-            },
-        }
+        prepare_format_specification(
+            &engine,
+            &open_path,
+            destination_format,
+            &format_spec,
+            format_spec_id,
+            &metadata,
+        )?;
         Ok((engine, existing_complete))
     })
     .await
@@ -365,7 +353,20 @@ fn object_id_hex(id: ObjectId) -> String {
     digest
 }
 
-fn prepare_destination(path: &Path, expected_metadata: &[u8]) -> StorageResult<bool> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DestinationFormat {
+    New,
+    Current,
+    PreDerivationV1(ObjectId),
+}
+
+impl DestinationFormat {
+    const fn is_existing(self) -> bool {
+        !matches!(self, Self::New)
+    }
+}
+
+fn prepare_destination(path: &Path, expected_metadata: &[u8]) -> StorageResult<DestinationFormat> {
     let mut existing_complete = false;
     if path.exists() {
         if migrations::is_complete(path) {
@@ -389,10 +390,11 @@ fn prepare_destination(path: &Path, expected_metadata: &[u8]) -> StorageResult<b
             ))
         })?;
         if actual != expected_metadata {
-            return Err(StorageError::Connection(format!(
-                "principal store metadata at {} selects an unsupported format",
-                metadata.display()
-            )));
+            if existing_complete && actual == store_metadata(PRE_DERIVATION_FORMAT_SPEC_ID) {
+                return validate_authoritative_files(path)
+                    .map(|()| DestinationFormat::PreDerivationV1(PRE_DERIVATION_FORMAT_SPEC_ID));
+            }
+            return Err(unsupported_format_error(&metadata));
         }
     } else if existing_complete {
         return Err(StorageError::Connection(format!(
@@ -403,17 +405,104 @@ fn prepare_destination(path: &Path, expected_metadata: &[u8]) -> StorageResult<b
         atomic_write(&metadata, expected_metadata)?;
     }
     if existing_complete {
-        for authoritative in ["objects.arena", "roots.journal"] {
-            let required = path.join(authoritative);
-            if !required.is_file() {
-                return Err(StorageError::Connection(format!(
-                    "completed principal store is missing authoritative file {}",
-                    required.display()
-                )));
+        validate_authoritative_files(path)?;
+        Ok(DestinationFormat::Current)
+    } else {
+        Ok(DestinationFormat::New)
+    }
+}
+
+fn prepare_format_specification(
+    engine: &RuntimeEngine,
+    store_path: &Path,
+    destination_format: DestinationFormat,
+    current_spec: &ObjectRecord,
+    current_spec_id: ObjectId,
+    current_metadata: &[u8],
+) -> StorageResult<()> {
+    match destination_format {
+        DestinationFormat::Current => match read_format_specification(engine, current_spec_id)? {
+            Some(actual) if actual == *current_spec => Ok(()),
+            Some(_) => Err(StorageError::Connection(
+                "in-band store format specification does not match store.meta".to_owned(),
+            )),
+            None => Err(StorageError::Connection(
+                "completed principal store is missing its in-band format specification".to_owned(),
+            )),
+        },
+        DestinationFormat::New => {
+            if let Some(actual) = read_format_specification(engine, current_spec_id)? {
+                if actual != *current_spec {
+                    return Err(StorageError::Connection(
+                        "new principal store contains a conflicting format specification"
+                            .to_owned(),
+                    ));
+                }
+                return Ok(());
             }
+            persist_format_specification(engine, current_spec).map(|_| ())
+        },
+        DestinationFormat::PreDerivationV1(legacy_spec_id) => {
+            let legacy = read_format_specification(engine, legacy_spec_id)?.ok_or_else(|| {
+                StorageError::Connection(
+                    "completed principal store is missing its pre-derivation format specification"
+                        .to_owned(),
+                )
+            })?;
+            if legacy.kind() != ObjectKind::Evidence
+                || legacy.format_version() != ObjectFormatVersion::V1
+                || legacy.class() != ObjectClass::Metadata
+                || legacy.logical_bytes() != 0
+                || !legacy.references().is_empty()
+            {
+                return Err(StorageError::Connection(
+                    "pre-derivation format specification has an invalid object shape".to_owned(),
+                ));
+            }
+            persist_format_specification(engine, current_spec)?;
+            atomic_write(&store_path.join(STORE_METADATA_FILE), current_metadata)
+        },
+    }
+}
+
+fn read_format_specification(
+    engine: &RuntimeEngine,
+    object: ObjectId,
+) -> StorageResult<Option<ObjectRecord>> {
+    engine.object(object).map_err(|error| {
+        StorageError::Connection(format!("read in-band store format specification: {error}"))
+    })
+}
+
+fn persist_format_specification(
+    engine: &RuntimeEngine,
+    record: &ObjectRecord,
+) -> StorageResult<(ObjectId, astrid_storage_model::InsertOutcome)> {
+    engine.persist_standalone_object(record).map_err(|error| {
+        StorageError::Connection(format!(
+            "persist in-band store format specification: {error}"
+        ))
+    })
+}
+
+fn validate_authoritative_files(path: &Path) -> StorageResult<()> {
+    for authoritative in ["objects.arena", "roots.journal"] {
+        let required = path.join(authoritative);
+        if !required.is_file() {
+            return Err(StorageError::Connection(format!(
+                "completed principal store is missing authoritative file {}",
+                required.display()
+            )));
         }
     }
-    Ok(existing_complete)
+    Ok(())
+}
+
+fn unsupported_format_error(metadata: &Path) -> StorageError {
+    StorageError::Connection(format!(
+        "principal store metadata at {} selects an unsupported format",
+        metadata.display()
+    ))
 }
 
 fn quarantine_incomplete(path: &Path) -> StorageResult<()> {
@@ -524,13 +613,100 @@ mod tests {
         assert!(record.references().is_empty());
         assert_eq!(
             object_id_hex(id),
-            "62cded9a5b01fe75d7781b66303f5ffe8ced55a43025a0389eefaea5a0c58fe2"
+            "a51e1599577b1d0f9b897d3d23571246bcf666393e42f8b278ea2ecfba792791"
         );
         assert!(metadata.contains("identity-wire=tagged-identity-v1\n"));
         assert!(metadata.contains(&format!(
             "format-spec-object=1:1:32:{}\n",
             object_id_hex(id)
         )));
+    }
+
+    #[test]
+    fn pre_derivation_v1_rosetta_upgrade_is_idempotent_and_preserves_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let store_path = directory.path().join("principal-store");
+        std::fs::create_dir_all(&store_path).unwrap();
+        let engine = RuntimeEngine::open(
+            &store_path,
+            Blake3ObjectIdentityV1,
+            StateOwnerCodecV1,
+            RecoveryLimits::process_addressable(),
+        )
+        .unwrap();
+        let legacy_spec = ObjectRecord::new(
+            ObjectKind::Evidence,
+            ObjectFormatVersion::V1,
+            b"pre-derivation format 1 specification".to_vec(),
+            Vec::new(),
+            0,
+            ObjectClass::Metadata,
+        )
+        .unwrap();
+        let (legacy_spec_id, _) = engine.persist_standalone_object(&legacy_spec).unwrap();
+        let current_spec = format_spec_record().unwrap();
+        let current_spec_id = Blake3ObjectIdentityV1.identify(&current_spec);
+        let current_metadata = store_metadata(current_spec_id);
+        atomic_write(
+            &store_path.join(STORE_METADATA_FILE),
+            &store_metadata(legacy_spec_id),
+        )
+        .unwrap();
+
+        // Simulate a crash after the successor Rosetta object became durable
+        // but before store.meta changed.
+        persist_format_specification(&engine, &current_spec).unwrap();
+        prepare_format_specification(
+            &engine,
+            &store_path,
+            DestinationFormat::PreDerivationV1(legacy_spec_id),
+            &current_spec,
+            current_spec_id,
+            &current_metadata,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(store_path.join(STORE_METADATA_FILE)).unwrap(),
+            current_metadata
+        );
+        assert_eq!(engine.object(legacy_spec_id).unwrap(), Some(legacy_spec));
+        assert_eq!(
+            engine.object(current_spec_id).unwrap(),
+            Some(current_spec.clone())
+        );
+        prepare_format_specification(
+            &engine,
+            &store_path,
+            DestinationFormat::Current,
+            &current_spec,
+            current_spec_id,
+            &store_metadata(current_spec_id),
+        )
+        .unwrap();
+        engine.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn completed_pre_derivation_v1_store_is_selected_for_rosetta_amendment() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(directory.path());
+        let store = open_runtime_kv(&home, unlimited_quota()).await.unwrap();
+        store.close().await.unwrap();
+        drop(store);
+
+        let store_path = home.principal_store_path();
+        std::fs::write(
+            store_path.join(STORE_METADATA_FILE),
+            store_metadata(PRE_DERIVATION_FORMAT_SPEC_ID),
+        )
+        .unwrap();
+        let current_spec = format_spec_record().unwrap();
+        let current_metadata = store_metadata(Blake3ObjectIdentityV1.identify(&current_spec));
+        assert_eq!(
+            prepare_destination(&store_path, &current_metadata).unwrap(),
+            DestinationFormat::PreDerivationV1(PRE_DERIVATION_FORMAT_SPEC_ID)
+        );
     }
 
     #[tokio::test]
@@ -920,9 +1096,8 @@ mod tests {
         let home = AstridHome::from_path(directory.path());
         std::fs::create_dir_all(home.state_db_path()).unwrap();
 
-        let error = match open_runtime_kv(&home, unlimited_quota()).await {
-            Err(error) => error,
-            Ok(_) => panic!("legacy source opened without transition support"),
+        let Err(error) = open_runtime_kv(&home, unlimited_quota()).await else {
+            panic!("legacy source opened without transition support");
         };
         assert!(
             error

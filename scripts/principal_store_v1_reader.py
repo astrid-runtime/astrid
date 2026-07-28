@@ -27,12 +27,17 @@ KIND_NAMES = (
     "Commit",
     "Evidence",
     "Derived",
+    "RuntimeSemanticProfile",
+    "DerivationInvocation",
+    "DerivationEvidence",
+    "GcPlanEvidence",
+    "GcCommitEvidence",
 )
 REFERENCE_NAMES = ("Owns", "Evidence", "Lineage", "Derived")
 FORMAT_SPECIFICATION = (
     1,
     1,
-    bytes.fromhex("62cded9a5b01fe75d7781b66303f5ffe8ced55a43025a0389eefaea5a0c58fe2"),
+    bytes.fromhex("a51e1599577b1d0f9b897d3d23571246bcf666393e42f8b278ea2ecfba792791"),
 )
 
 

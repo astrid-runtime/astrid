@@ -110,6 +110,7 @@ The audit event schema is:
 DerivationMismatch {
     invocation: InvocationId
     evidence: ObjectId
+    transform: ObjectId
     transform_contract: ObjectId
     runtime_semantic_profile: ObjectId
     original_engine_build: ObjectId
