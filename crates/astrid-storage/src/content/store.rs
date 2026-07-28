@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Read;
 use std::marker::PhantomData;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use astrid_storage_content::{
     BuiltContent, ChunkingProfile, ContentDescriptor, ContentError, ContentObjectSink,
@@ -11,12 +11,15 @@ use astrid_storage_content::{
     read_opened_content_and_verify, read_opened_content_range_with_verification,
     read_verified_content, read_verified_content_range,
 };
-use astrid_storage_engine::{PrincipalProjectionEngine, PrincipalProjectionError, RootTransaction};
+use astrid_storage_engine::{
+    PrincipalProjectionEngine, PrincipalProjectionError, ProjectionCacheEntry, ProjectionCacheKey,
+    ProjectionCachePayload, RootTransaction,
+};
 use astrid_storage_model::{
     InsertOutcome, ModelError, ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind,
     ObjectRecord, ObjectReference, ReferenceKind, ReferenceLabel, RootState,
 };
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 
 use super::catalog::{
     CONTENT_COMPONENT_LABEL, CatalogRoot, CatalogSummary, CatalogValidation, CatalogValue,
@@ -33,14 +36,9 @@ const PARENT_LABEL: &[u8] = b"parent";
 const STATE_LABEL: &[u8] = b"state";
 // Soft write-coalescing target, not a record, file, or deployment limit.
 const STAGING_BATCH_TARGET_BYTES: usize = 4 * 1024 * 1024;
-
-type VerifiedFileMap<P> = BTreeMap<P, BTreeMap<ObjectId, VerifiedContent>>;
-// Partition proof reuse by principal so cache timing cannot reveal that
-// another principal previously published or read equal content.
-type SharedVerifiedFiles<P> = Arc<RwLock<VerifiedFileMap<P>>>;
-type PartialVerificationMap<P> = BTreeMap<P, BTreeMap<ObjectId, ContentVerificationState>>;
-type SharedPartialVerifications<P> = Arc<RwLock<PartialVerificationMap<P>>>;
-type DecodedHeaderMap<P> = BTreeMap<P, Arc<ContentHeader<P>>>;
+const VERIFIED_CONTENT_CACHE_KEY: ProjectionCacheKey = ProjectionCacheKey::new(1);
+const PARTIAL_VERIFICATION_CACHE_KEY: ProjectionCacheKey = ProjectionCacheKey::new(2);
+const DECODED_HEADER_CACHE_KEY: ProjectionCacheKey = ProjectionCacheKey::new(3);
 
 /// Named content projection over one shared principal-state engine.
 pub struct PrincipalContentStore<P: Ord, E> {
@@ -48,9 +46,6 @@ pub struct PrincipalContentStore<P: Ord, E> {
     quota: Option<Arc<dyn KvQuotaResolver<P>>>,
     validated_catalogs: Arc<Mutex<BTreeMap<P, CatalogValidation>>>,
     validated_kv: Arc<KvValidationCache<P>>,
-    verified_files: OnceLock<SharedVerifiedFiles<P>>,
-    partial_verifications: OnceLock<SharedPartialVerifications<P>>,
-    decoded_headers: OnceLock<RwLock<DecodedHeaderMap<P>>>,
 }
 
 /// Principal-scoped immutable content handle for repeated verified reads.
@@ -64,8 +59,6 @@ pub struct PrincipalContentReadHandle<P: Ord, E> {
     opened: OpenedContent,
     principal: P,
     principal_root: RootState,
-    verified_files: SharedVerifiedFiles<P>,
-    partial_verifications: SharedPartialVerifications<P>,
 }
 
 impl<P: Ord, E> fmt::Debug for PrincipalContentReadHandle<P, E> {
@@ -124,70 +117,63 @@ where
             return read_verified_content_range(&source, verified, offset, length)
                 .map_err(map_read_error);
         }
-        let partial = self.partial_verifications.read();
+        let file = self.opened.descriptor().file();
+        let known = self
+            .engine
+            .load_projection_cache(&self.principal, file, PARTIAL_VERIFICATION_CACHE_KEY)
+            .and_then(|entry| entry.downcast::<CachedPartialVerification>());
         let empty = ContentVerificationState::default();
-        let known = partial
-            .get(&self.principal)
-            .and_then(|files| files.get(&self.opened.descriptor().file()))
-            .unwrap_or(&empty);
         let (bytes, delta) = read_opened_content_range_with_verification(
             &source,
             self.opened,
-            known,
+            known.as_deref().map_or(&empty, |known| &known.0),
             offset,
             length,
         )
         .map_err(map_read_error)?;
-        drop(partial);
         if !delta.is_empty() {
-            self.partial_verifications
-                .write()
-                .entry(self.principal.clone())
-                .or_default()
-                .entry(self.opened.descriptor().file())
-                .or_default()
-                .merge(delta);
+            let mut next = known
+                .as_deref()
+                .map_or_else(ContentVerificationState::default, |known| known.0.clone());
+            next.merge(delta);
+            let _ = self.engine.retain_projection_cache(
+                &self.principal,
+                file,
+                PARTIAL_VERIFICATION_CACHE_KEY,
+                ProjectionCacheEntry::new(CachedPartialVerification(next)),
+            );
         }
         Ok(bytes)
     }
 
     fn verified(&self) -> Option<VerifiedContent> {
-        self.verified_files
-            .read()
-            .get(&self.principal)
-            .and_then(|files| files.get(&self.opened.descriptor().file()))
-            .copied()
+        self.engine
+            .load_projection_cache(
+                &self.principal,
+                self.opened.descriptor().file(),
+                VERIFIED_CONTENT_CACHE_KEY,
+            )
+            .and_then(|entry| entry.downcast::<CachedVerifiedContent>())
+            .map(|verified| verified.0)
     }
 
     fn mark_verified(&self, verified: VerifiedContent) {
         let file = verified.descriptor().file();
-        self.verified_files
-            .write()
-            .entry(self.principal.clone())
-            .or_default()
-            .insert(file, verified);
-        if let Some(files) = self.partial_verifications.write().get_mut(&self.principal) {
-            files.remove(&file);
-        }
+        let _ = self.engine.discard_projection_cache(
+            &self.principal,
+            file,
+            PARTIAL_VERIFICATION_CACHE_KEY,
+        );
+        let _ = self.engine.retain_projection_cache(
+            &self.principal,
+            file,
+            VERIFIED_CONTENT_CACHE_KEY,
+            ProjectionCacheEntry::new(CachedVerifiedContent(verified)),
+        );
     }
 }
 
 impl<P: Ord, E> PrincipalContentStore<P, E> {
-    fn verified_files(&self) -> &SharedVerifiedFiles<P> {
-        self.verified_files
-            .get_or_init(|| Arc::new(RwLock::new(BTreeMap::new())))
-    }
-
-    fn decoded_headers(&self) -> &RwLock<DecodedHeaderMap<P>> {
-        self.decoded_headers
-            .get_or_init(|| RwLock::new(BTreeMap::new()))
-    }
-
-    fn partial_verifications(&self) -> &SharedPartialVerifications<P> {
-        self.partial_verifications
-            .get_or_init(|| Arc::new(RwLock::new(BTreeMap::new())))
-    }
-
     /// Construct without a principal-specific quota.
     #[must_use]
     pub fn from_engine(engine: Arc<E>) -> Self {
@@ -196,9 +182,6 @@ impl<P: Ord, E> PrincipalContentStore<P, E> {
             quota: None,
             validated_catalogs: Arc::new(Mutex::new(BTreeMap::new())),
             validated_kv: Arc::new(KvValidationCache::default()),
-            verified_files: OnceLock::new(),
-            partial_verifications: OnceLock::new(),
-            decoded_headers: OnceLock::new(),
         }
     }
 
@@ -210,9 +193,6 @@ impl<P: Ord, E> PrincipalContentStore<P, E> {
             quota: Some(quota),
             validated_catalogs: Arc::new(Mutex::new(BTreeMap::new())),
             validated_kv: Arc::new(KvValidationCache::default()),
-            verified_files: OnceLock::new(),
-            partial_verifications: OnceLock::new(),
-            decoded_headers: OnceLock::new(),
         }
     }
 
@@ -227,9 +207,6 @@ impl<P: Ord, E> PrincipalContentStore<P, E> {
             quota: Some(quota),
             validated_catalogs,
             validated_kv,
-            verified_files: OnceLock::new(),
-            partial_verifications: OnceLock::new(),
-            decoded_headers: OnceLock::new(),
         }
     }
 
@@ -242,9 +219,6 @@ impl<P: Ord, E> PrincipalContentStore<P, E> {
             quota: None,
             validated_catalogs,
             validated_kv: Arc::new(KvValidationCache::default()),
-            verified_files: OnceLock::new(),
-            partial_verifications: OnceLock::new(),
-            decoded_headers: OnceLock::new(),
         }
     }
 
@@ -340,7 +314,6 @@ where
                 .cloned()
                 .collect();
             let header = ContentHeader {
-                principal: principal.clone(),
                 root: Some(root),
                 catalog,
                 previous_catalog_quota_bytes: legacy.quota_bytes,
@@ -348,7 +321,8 @@ where
                 preserved_state,
                 preserved_commit,
             };
-            let transaction = self.encode_transaction(header, None, catalog_records)?;
+            let transaction =
+                self.encode_transaction(principal.clone(), header, None, catalog_records)?;
             match self.engine.commit_root(transaction) {
                 Ok(_) => {
                     self.validated_catalogs.lock().insert(
@@ -462,8 +436,8 @@ where
     ) -> Result<ContentWriteOutcome, PrincipalContentError> {
         let descriptor = verified.descriptor();
         loop {
-            let mut header = self.header(principal.clone())?.as_ref().clone();
-            let previous = self.catalog_lookup(header.catalog, name)?;
+            let mut header = self.header(principal)?.as_ref().clone();
+            let previous = self.catalog_lookup(principal, header.catalog, name)?;
             if previous.is_some_and(|entry| entry.file == descriptor.file()) {
                 let root = header.root.ok_or_else(|| {
                     invalid(
@@ -481,16 +455,16 @@ where
                     file: descriptor.file(),
                     logical_bytes: descriptor.logical_bytes(),
                 },
-                &mut |object| self.load_required(object),
+                &mut |object| self.load_required_for(principal, object),
                 &|record| self.engine.identify_object(record),
             )?;
             header.catalog = mutation.root;
             self.enforce_quota(principal, &header)?;
             let catalog = header.catalog;
-            let transaction = self.encode_transaction(header, built, mutation.records)?;
+            let transaction =
+                self.encode_transaction(principal.clone(), header, built, mutation.records)?;
             match self.engine.commit_root(transaction) {
                 Ok(outcome) => {
-                    self.invalidate_header(principal);
                     self.validated_catalogs.lock().insert(
                         principal.clone(),
                         CatalogValidation {
@@ -498,9 +472,6 @@ where
                             summary: catalog.map_or(CatalogSummary::default(), |root| root.summary),
                         },
                     );
-                    if let Some(previous) = previous {
-                        self.discard_verification(principal, previous.file);
-                    }
                     self.mark_verified(principal, verified);
                     let objects_inserted = staged_objects_inserted
                         .checked_add(outcome.objects_inserted())
@@ -528,23 +499,22 @@ where
     /// changing the catalog.
     pub fn delete(&self, principal: &P, name: &ContentName) -> Result<bool, PrincipalContentError> {
         loop {
-            let mut header = self.header(principal.clone())?.as_ref().clone();
+            let mut header = self.header(principal)?.as_ref().clone();
             let mutation = delete(
                 header.catalog,
                 name,
-                &mut |object| self.load_required(object),
+                &mut |object| self.load_required_for(principal, object),
                 &|record| self.engine.identify_object(record),
             )?;
-            let Some(previous) = mutation.previous else {
+            let Some(_) = mutation.previous else {
                 return Ok(false);
             };
-            let removed = previous.file;
             header.catalog = mutation.root;
             let catalog = header.catalog;
-            let transaction = self.encode_transaction(header, None, mutation.records)?;
+            let transaction =
+                self.encode_transaction(principal.clone(), header, None, mutation.records)?;
             match self.engine.commit_root(transaction) {
                 Ok(_) => {
-                    self.invalidate_header(principal);
                     self.validated_catalogs.lock().insert(
                         principal.clone(),
                         CatalogValidation {
@@ -552,7 +522,6 @@ where
                             summary: catalog.map_or(CatalogSummary::default(), |root| root.summary),
                         },
                     );
-                    self.discard_verification(principal, removed);
                     return Ok(true);
                 },
                 Err(PrincipalProjectionError::Model(ModelError::RootConflict { .. })) => {},
@@ -568,8 +537,10 @@ where
     /// Returns a principal-graph or projection error when the authoritative
     /// catalog cannot be decoded.
     pub fn list(&self, principal: &P) -> Result<Vec<ContentEntry>, PrincipalContentError> {
-        let header = self.header(principal.clone())?;
-        list(header.catalog, &mut |object| self.load_required(object))
+        let header = self.header(principal)?;
+        list(header.catalog, &mut |object| {
+            self.load_required_for(principal, object)
+        })
     }
 
     /// Describe one named value without reading its chunks.
@@ -602,19 +573,18 @@ where
         principal: &P,
         name: &ContentName,
     ) -> Result<Option<PrincipalContentReadHandle<P, E>>, PrincipalContentError> {
-        let header = self.header(principal.clone())?;
-        let Some(entry) = self.catalog_lookup(header.catalog, name)? else {
+        let header = self.header(principal)?;
+        let Some(entry) = self.catalog_lookup(principal, header.catalog, name)? else {
             return Ok(None);
         };
         let root = header
             .root
             .ok_or_else(|| invalid(entry.file, "catalog entry exists without a principal root"))?;
         let verified = self
-            .verified_files()
-            .read()
-            .get(principal)
-            .and_then(|files| files.get(&entry.file))
-            .copied();
+            .engine
+            .load_projection_cache(principal, entry.file, VERIFIED_CONTENT_CACHE_KEY)
+            .and_then(|entry| entry.downcast::<CachedVerifiedContent>())
+            .map(|verified| verified.0);
         let opened = match verified {
             Some(verified) => verified.opened_content(),
             None => open_content(
@@ -635,8 +605,6 @@ where
             opened,
             principal: principal.clone(),
             principal_root: root,
-            verified_files: Arc::clone(self.verified_files()),
-            partial_verifications: Arc::clone(self.partial_verifications()),
         }))
     }
 
@@ -687,55 +655,66 @@ where
 
     fn mark_verified(&self, principal: &P, verified: VerifiedContent) {
         let file = verified.descriptor().file();
-        self.verified_files()
-            .write()
-            .entry(principal.clone())
-            .or_default()
-            .insert(file, verified);
-        if let Some(files) = self.partial_verifications().write().get_mut(principal) {
-            files.remove(&file);
-        }
+        let _ = self.engine.load_shared_object_for(principal, file);
+        let _ =
+            self.engine
+                .discard_projection_cache(principal, file, PARTIAL_VERIFICATION_CACHE_KEY);
+        let _ = self.engine.retain_projection_cache(
+            principal,
+            file,
+            VERIFIED_CONTENT_CACHE_KEY,
+            ProjectionCacheEntry::new(CachedVerifiedContent(verified)),
+        );
     }
 
-    fn discard_verification(&self, principal: &P, file: ObjectId) {
-        if let Some(files) = self.verified_files().write().get_mut(principal) {
-            files.remove(&file);
-        }
-        if let Some(files) = self.partial_verifications().write().get_mut(principal) {
-            files.remove(&file);
-        }
-    }
-
-    fn header(&self, principal: P) -> Result<Arc<ContentHeader<P>>, PrincipalContentError> {
-        let root = self.engine.current_root(&principal)?;
-        if let Some(header) = self
-            .decoded_headers()
-            .read()
-            .get(&principal)
-            .filter(|header| header.root == root)
-            .cloned()
+    fn header(&self, principal: &P) -> Result<Arc<ContentHeader>, PrincipalContentError> {
+        let root = self.engine.current_root(principal)?;
+        if let Some(root) = root
+            && let Some(header) = self
+                .engine
+                .load_projection_cache(principal, root.commit, DECODED_HEADER_CACHE_KEY)
+                .and_then(|entry| entry.downcast::<ContentHeader>())
+            && header.root == Some(root)
         {
             return Ok(header);
         }
-        let header = Arc::new(self.decode_header(principal.clone(), root)?);
-        self.decoded_headers()
-            .write()
-            .insert(principal, Arc::clone(&header));
-        Ok(header)
+        let header = self.decode_header(principal, root)?;
+        let Some(root) = root else {
+            return Ok(Arc::new(header));
+        };
+        if self.engine.retain_projection_cache(
+            principal,
+            root.commit,
+            DECODED_HEADER_CACHE_KEY,
+            ProjectionCacheEntry::new(header.clone()),
+        ) && let Some(retained) = self
+            .engine
+            .load_projection_cache(principal, root.commit, DECODED_HEADER_CACHE_KEY)
+            .and_then(|entry| entry.downcast::<ContentHeader>())
+        {
+            return Ok(retained);
+        }
+        Ok(Arc::new(header))
     }
 
     fn decode_header(
         &self,
-        principal: P,
+        principal: &P,
         root: Option<RootState>,
-    ) -> Result<ContentHeader<P>, PrincipalContentError> {
+    ) -> Result<ContentHeader, PrincipalContentError> {
         let Some(root) = root else {
-            return Ok(ContentHeader::empty(principal));
+            return Ok(ContentHeader::empty());
         };
-        let commit = self.load_typed(root.commit, ObjectKind::Commit, PRINCIPAL_GRAPH_VERSION)?;
+        let commit = self.load_typed(
+            principal,
+            root.commit,
+            ObjectKind::Commit,
+            PRINCIPAL_GRAPH_VERSION,
+        )?;
         require_structural(root.commit, &commit)?;
         let state_id = owned_target(root.commit, &commit, STATE_LABEL)?;
         let state = self.load_typed(
+            principal,
             state_id,
             ObjectKind::PrincipalState,
             PRINCIPAL_GRAPH_VERSION,
@@ -753,20 +732,21 @@ where
                 CONTENT_COMPONENT_LABEL => {
                     let record = self
                         .engine
-                        .load_object(reference.target())?
+                        .load_object_for(principal, reference.target())?
                         .ok_or_else(|| ContentError::MissingObject(reference.target()))?;
                     let root = root_from_record(reference.target(), &record)?;
                     let cached = self
                         .validated_catalogs
                         .lock()
-                        .get(&principal)
+                        .get(principal)
                         .copied()
                         .filter(|validation| validation.root == Some(root.object));
                     let validation = if let Some(validation) = cached {
                         validation
                     } else {
-                        let validation =
-                            validate_catalog(Some(root), &mut |object| self.load_required(object))?;
+                        let validation = validate_catalog(Some(root), &mut |object| {
+                            self.load_required_for(principal, object)
+                        })?;
                         self.validated_catalogs
                             .lock()
                             .insert(principal.clone(), validation);
@@ -782,7 +762,7 @@ where
                 },
                 KV_COMPONENT_LABEL => {
                     other_quota_bytes = other_quota_bytes
-                        .checked_add(self.kv_quota(&principal, reference.target())?)
+                        .checked_add(self.kv_quota(principal, reference.target())?)
                         .ok_or(PrincipalContentError::AccountingOverflow)?;
                     preserved_state.push(reference.clone());
                 },
@@ -801,7 +781,6 @@ where
             .cloned()
             .collect();
         Ok(ContentHeader {
-            principal,
             root: Some(root),
             previous_catalog_quota_bytes: catalog.map_or(0, |root| root.summary.quota_bytes),
             catalog,
@@ -809,12 +788,6 @@ where
             preserved_state,
             preserved_commit,
         })
-    }
-
-    fn invalidate_header(&self, principal: &P) {
-        if let Some(headers) = self.decoded_headers.get() {
-            headers.write().remove(principal);
-        }
     }
 
     fn kv_quota(&self, principal: &P, object: ObjectId) -> Result<u64, PrincipalContentError> {
@@ -829,13 +802,14 @@ where
 
     fn load_typed(
         &self,
+        principal: &P,
         object: ObjectId,
         kind: ObjectKind,
         version: ObjectFormatVersion,
     ) -> Result<ObjectRecord, PrincipalContentError> {
         let record = self
             .engine
-            .load_object(object)?
+            .load_object_for(principal, object)?
             .ok_or(ContentError::MissingObject(object))?;
         if record.kind() != kind || record.format_version() != version {
             return Err(invalid(
@@ -870,7 +844,7 @@ where
     fn enforce_quota(
         &self,
         principal: &P,
-        header: &ContentHeader<P>,
+        header: &ContentHeader,
     ) -> Result<(), PrincipalContentError> {
         let Some(quota) = &self.quota else {
             return Ok(());
@@ -897,7 +871,8 @@ where
 
     fn encode_transaction(
         &self,
-        header: ContentHeader<P>,
+        principal: P,
+        header: ContentHeader,
         built: Option<&BuiltContent>,
         catalog_records: BTreeMap<ObjectId, ObjectRecord>,
     ) -> Result<RootTransaction<P>, PrincipalContentError> {
@@ -950,7 +925,7 @@ where
         .map_err(PrincipalProjectionError::Model)?;
         let commit = self.insert(&mut records, commit)?;
         Ok(RootTransaction::new(
-            header.principal,
+            principal,
             header.root,
             commit,
             records.into_iter().collect(),
@@ -959,15 +934,28 @@ where
 
     fn catalog_lookup(
         &self,
+        principal: &P,
         root: Option<CatalogRoot>,
         name: &ContentName,
     ) -> Result<Option<CatalogValue>, PrincipalContentError> {
-        lookup(root, name, &mut |object| self.load_required(object))
+        lookup(root, name, &mut |object| {
+            self.load_required_for(principal, object)
+        })
     }
 
     fn load_required(&self, object: ObjectId) -> Result<ObjectRecord, PrincipalContentError> {
         self.engine
             .load_object(object)?
+            .ok_or_else(|| ContentError::MissingObject(object).into())
+    }
+
+    fn load_required_for(
+        &self,
+        principal: &P,
+        object: ObjectId,
+    ) -> Result<ObjectRecord, PrincipalContentError> {
+        self.engine
+            .load_object_for(principal, object)?
             .ok_or_else(|| ContentError::MissingObject(object).into())
     }
 
@@ -993,8 +981,7 @@ where
 }
 
 #[derive(Clone)]
-struct ContentHeader<P> {
-    principal: P,
+struct ContentHeader {
     root: Option<RootState>,
     catalog: Option<CatalogRoot>,
     previous_catalog_quota_bytes: u64,
@@ -1003,10 +990,9 @@ struct ContentHeader<P> {
     preserved_commit: Vec<ObjectReference>,
 }
 
-impl<P> ContentHeader<P> {
-    fn empty(principal: P) -> Self {
+impl ContentHeader {
+    fn empty() -> Self {
         Self {
-            principal,
             root: None,
             catalog: None,
             previous_catalog_quota_bytes: 0,
@@ -1014,6 +1000,41 @@ impl<P> ContentHeader<P> {
             preserved_state: Vec::new(),
             preserved_commit: Vec::new(),
         }
+    }
+}
+
+impl ProjectionCachePayload for ContentHeader {
+    fn retained_bytes(&self) -> u64 {
+        let reference_bytes = |references: &Vec<ObjectReference>| {
+            references.iter().fold(
+                references
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ObjectReference>()),
+                |total, reference| total.saturating_add(reference.label().as_bytes().len()),
+            )
+        };
+        u64::try_from(
+            std::mem::size_of::<Self>()
+                .saturating_add(reference_bytes(&self.preserved_state))
+                .saturating_add(reference_bytes(&self.preserved_commit)),
+        )
+        .unwrap_or(u64::MAX)
+    }
+}
+
+struct CachedVerifiedContent(VerifiedContent);
+
+impl ProjectionCachePayload for CachedVerifiedContent {
+    fn retained_bytes(&self) -> u64 {
+        u64::try_from(std::mem::size_of::<Self>()).unwrap_or(u64::MAX)
+    }
+}
+
+struct CachedPartialVerification(ContentVerificationState);
+
+impl ProjectionCachePayload for CachedPartialVerification {
+    fn retained_bytes(&self) -> u64 {
+        self.0.retained_bytes()
     }
 }
 

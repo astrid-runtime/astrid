@@ -1,6 +1,7 @@
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
+use crate::ProjectionCachePayload;
 use astrid_storage_model::{
     ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord, ObjectReference,
     ReferenceKind, ReferenceLabel,
@@ -44,7 +45,7 @@ fn assert_lru_indexes(cache: &ObjectCache<String>) {
         let expected: BTreeSet<_> = partition
             .entries
             .iter()
-            .map(|(object, tick)| (*tick, *object))
+            .map(|(object, entry)| (entry.last_access, *object))
             .collect();
         assert_eq!(partition.lru, expected);
     }
@@ -168,4 +169,74 @@ fn weight_covers_reference_payloads() {
     )
     .unwrap();
     assert!(cache_weight(&record) > u64::try_from(record.canonical_bytes().len()).unwrap());
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TestProjection(Vec<u8>);
+
+impl ProjectionCachePayload for TestProjection {
+    fn retained_bytes(&self) -> u64 {
+        u64::try_from(std::mem::size_of::<Self>().saturating_add(self.0.capacity()))
+            .unwrap_or(u64::MAX)
+    }
+}
+
+#[test]
+fn projection_values_share_the_object_cache_budget_and_principal_partition() {
+    let value = record(5);
+    let record_weight = cache_weight(&value);
+    let association = association_weight::<String>();
+    let projection = TestProjection(vec![7; 4096]);
+    let projection_weight = projection_cache_weight(projection.retained_bytes());
+    let capacity = NonZeroU64::new(
+        record_weight
+            .saturating_add(association)
+            .saturating_add(projection_weight),
+    )
+    .unwrap();
+    let controller = ObjectCacheController::new(ObjectCacheCapacity::Bounded(capacity));
+    let cache = cache(controller.clone(), capacity.get());
+    let alice = "alice".to_owned();
+    let bob = "bob".to_owned();
+    let id = object(5);
+    let key = ProjectionCacheKey::new(1);
+
+    cache.insert(&alice, id, value);
+    assert!(cache.retain_projection(&alice, id, key, ProjectionCacheEntry::new(projection)));
+    assert_eq!(
+        cache
+            .projection(&alice, id, key)
+            .and_then(|value| value.downcast::<TestProjection>())
+            .as_deref(),
+        Some(&TestProjection(vec![7; 4096]))
+    );
+    assert!(
+        cache
+            .projection(&bob, id, key)
+            .and_then(|value| value.downcast::<TestProjection>())
+            .is_none()
+    );
+
+    let stats = cache.stats();
+    assert_eq!(stats.resident_projection_entries, 1);
+    assert_eq!(stats.resident_projection_bytes, projection_weight);
+    assert_eq!(
+        cache.principal_charge(&alice),
+        record_weight.saturating_add(projection_weight)
+    );
+    assert_eq!(cache.principal_charge(&bob), 0);
+    assert!(stats.resident_bytes <= capacity.get());
+
+    controller.set_capacity(ObjectCacheCapacity::Bounded(
+        NonZeroU64::new(record_weight.saturating_add(association)).unwrap(),
+    ));
+    assert!(
+        cache
+            .projection(&alice, id, key)
+            .and_then(|value| value.downcast::<TestProjection>())
+            .is_none()
+    );
+    let stats = cache.stats();
+    assert_eq!(stats.resident_projection_entries, 0);
+    assert_eq!(stats.resident_projection_bytes, 0);
 }

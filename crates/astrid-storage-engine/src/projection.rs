@@ -4,6 +4,7 @@
 //! atomic principal root. This trait prevents each projection from inventing
 //! a side root while keeping the engine unaware of projection semantics.
 
+use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
@@ -14,6 +15,75 @@ use astrid_storage_model::{
 use crate::{CommitOutcome, InMemoryEngine, RootTransaction};
 #[cfg(not(target_family = "wasm"))]
 use crate::{DurableEngine, DurableError, PersistentObjectIdentity, PrincipalCodec};
+
+/// Opaque name for one projection-owned process-local cache value.
+///
+/// The key is meaningful only to the projection that defines it. The engine
+/// uses it to keep independently typed accelerators apart while governing all
+/// retained host memory through one cache authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ProjectionCacheKey(u64);
+
+impl ProjectionCacheKey {
+    /// Construct a stable projection-local cache key.
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+/// Process-local payload accepted by the governed projection cache.
+///
+/// Implementations must include owned heap allocations in `retained_bytes`.
+/// The value is an accelerator only: refusing or evicting it must never change
+/// projection correctness.
+pub trait ProjectionCachePayload: Any + Send + Sync {
+    /// Return the complete resident-memory charge for this value.
+    fn retained_bytes(&self) -> u64;
+}
+
+/// Type-erased projection-cache entry crossing the engine boundary.
+#[derive(Clone)]
+pub struct ProjectionCacheEntry {
+    value: Arc<dyn Any + Send + Sync>,
+    retained_bytes: u64,
+}
+
+impl ProjectionCacheEntry {
+    /// Wrap one typed accelerator and capture its resident-memory charge.
+    #[must_use]
+    pub fn new<T: ProjectionCachePayload>(value: T) -> Self {
+        Self {
+            retained_bytes: value.retained_bytes(),
+            value: Arc::new(value),
+        }
+    }
+
+    /// Recover a shared typed value when the cache key belongs to `T`.
+    #[must_use]
+    pub fn downcast<T: ProjectionCachePayload>(&self) -> Option<Arc<T>> {
+        Arc::downcast(Arc::clone(&self.value)).ok()
+    }
+
+    /// Return the payload's declared resident-memory charge.
+    #[must_use]
+    pub const fn retained_bytes(&self) -> u64 {
+        self.retained_bytes
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn into_parts(self) -> (Arc<dyn Any + Send + Sync>, u64) {
+        (self.value, self.retained_bytes)
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) const fn from_parts(value: Arc<dyn Any + Send + Sync>, retained_bytes: u64) -> Self {
+        Self {
+            value,
+            retained_bytes,
+        }
+    }
+}
 
 /// Failure at the generic principal projection boundary.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -193,6 +263,46 @@ pub trait PrincipalProjectionEngine<P>: Send + Sync {
         })
     }
 
+    /// Load one projection-owned accelerator under principal attribution.
+    ///
+    /// The default disables retention. A cache miss, disabled budget, or
+    /// eviction returns `None`; callers must also treat a typed downcast
+    /// mismatch as a miss and take the ordinary correctness path.
+    fn load_projection_cache(
+        &self,
+        _principal: &P,
+        _object: ObjectId,
+        _key: ProjectionCacheKey,
+    ) -> Option<ProjectionCacheEntry> {
+        None
+    }
+
+    /// Retain one projection-owned accelerator under the same global and
+    /// per-principal budgets as decoded immutable objects.
+    ///
+    /// Returns `false` when policy declines retention. Callers must still
+    /// return the valid result that produced the accelerator.
+    fn retain_projection_cache(
+        &self,
+        _principal: &P,
+        _object: ObjectId,
+        _key: ProjectionCacheKey,
+        _value: ProjectionCacheEntry,
+    ) -> bool {
+        false
+    }
+
+    /// Discard one projection-owned accelerator when a stronger or newer
+    /// process-local value makes it redundant.
+    fn discard_projection_cache(
+        &self,
+        _principal: &P,
+        _object: ObjectId,
+        _key: ProjectionCacheKey,
+    ) -> bool {
+        false
+    }
+
     /// Atomically publish one principal-state transition.
     ///
     /// # Errors
@@ -321,6 +431,34 @@ where
         ids: &[ObjectId],
     ) -> Result<Vec<Option<Arc<ObjectRecord>>>, PrincipalProjectionError> {
         self.shared_objects_for(principal, ids).map_err(map_durable)
+    }
+
+    fn load_projection_cache(
+        &self,
+        principal: &P,
+        object: ObjectId,
+        key: ProjectionCacheKey,
+    ) -> Option<ProjectionCacheEntry> {
+        self.projection_cache(principal, object, key)
+    }
+
+    fn retain_projection_cache(
+        &self,
+        principal: &P,
+        object: ObjectId,
+        key: ProjectionCacheKey,
+        value: ProjectionCacheEntry,
+    ) -> bool {
+        DurableEngine::retain_projection_cache(self, principal, object, key, value)
+    }
+
+    fn discard_projection_cache(
+        &self,
+        principal: &P,
+        object: ObjectId,
+        key: ProjectionCacheKey,
+    ) -> bool {
+        DurableEngine::discard_projection_cache(self, principal, object, key)
     }
 
     fn commit_root(

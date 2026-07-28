@@ -47,7 +47,10 @@ pub use muninn::{
     InMemoryMuninnIndex, MuninnAdmission, MuninnHit, MuninnTrustState, MuninnVerificationError,
     VerifiedDerivationEvidence, verify_derivation_evidence,
 };
-pub use projection::{PrincipalProjectionEngine, PrincipalProjectionError};
+pub use projection::{
+    PrincipalProjectionEngine, PrincipalProjectionError, ProjectionCacheEntry, ProjectionCacheKey,
+    ProjectionCachePayload,
+};
 #[cfg(not(target_family = "wasm"))]
 pub use refinery::{
     BottomKSketch, BottomKSketchDescriptor, BottomKSketchError, SketchSampleSize, SketchScoreWidth,

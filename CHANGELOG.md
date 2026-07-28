@@ -287,8 +287,13 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   boundary evidence as profile-bound 128-bit bitmaps per immutable chunk-tree
   node, so a cold range still touches only its own chunks and neighbours while
   later reads avoid neighbour-only I/O without first scanning the complete
-  file. Evidence is principal/file-partitioned, fail-closed, process-local, and
-  pruned with live catalog files. Closes #1399.
+  file. Edge evidence, complete-file tokens, and decoded catalog headers are
+  principal/object-partitioned, fail-closed, process-local values inside the
+  same governed cache as decoded objects. Their physical bytes and
+  per-principal logical charges are bounded by the injected cache authority;
+  refusal or eviction always falls back to verified reads. Cold reopen tests
+  corrupt a neighbour frame after recovery and prove that no process-local
+  evidence can suppress its checksum failure. Closes #1399.
 - **Windows local transport uses authenticated per-user named pipes.** A pipe
   name derived only from the caller's operating-system SID replaces
   filesystem endpoint naming on Windows. Local-only byte-mode instances use a

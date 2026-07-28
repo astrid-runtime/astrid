@@ -1,16 +1,20 @@
-use std::io::{self, Read};
+use std::collections::BTreeMap;
+use std::fs::OpenOptions;
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use astrid_storage_engine::{
     CommitOutcome, DurableEngine, IdentityScheme, InMemoryEngine, PersistentObjectIdentity,
-    PrincipalCodec, PrincipalProjectionEngine, PrincipalProjectionError, RecoveryLimits,
-    RootTransaction,
+    PrincipalCodec, PrincipalProjectionEngine, PrincipalProjectionError, ProjectionCacheEntry,
+    ProjectionCacheKey, RecoveryLimits, RootTransaction,
 };
 use astrid_storage_model::{
     InsertOutcome, ModelError, ObjectClass, ObjectId, ObjectIdentity, ObjectKind, ObjectRecord,
     ObjectReference, ReferenceKind, ReferenceLabel, RootState,
 };
+use fastcdc::v2020::{FastCDC, Normalization};
+use parking_lot::RwLock;
 
 use super::{ContentName, ContentNameError, PrincipalContentError, PrincipalContentStore};
 use crate::StorageError;
@@ -73,6 +77,14 @@ impl PrincipalCodec<String> for Utf8Codec {
 }
 
 type Engine = InMemoryEngine<String, TestIdentity>;
+type TestProjectionKey = (String, ObjectId, ProjectionCacheKey);
+type TestProjectionMap = BTreeMap<TestProjectionKey, ProjectionCacheEntry>;
+
+#[test]
+fn projection_engine_trait_remains_object_safe() {
+    let engine = Engine::new(TestIdentity);
+    let _erased: &dyn PrincipalProjectionEngine<String> = &engine;
+}
 
 struct ConflictOnceEngine {
     inner: Engine,
@@ -133,6 +145,7 @@ impl PrincipalProjectionEngine<String> for ConflictOnceEngine {
 struct CountingEngine {
     inner: Engine,
     object_loads: AtomicUsize,
+    projection_cache: RwLock<TestProjectionMap>,
 }
 
 impl CountingEngine {
@@ -140,6 +153,7 @@ impl CountingEngine {
         Self {
             inner: Engine::new(TestIdentity),
             object_loads: AtomicUsize::new(0),
+            projection_cache: RwLock::new(BTreeMap::new()),
         }
     }
 
@@ -149,6 +163,10 @@ impl CountingEngine {
 
     fn object_loads(&self) -> usize {
         self.object_loads.load(Ordering::SeqCst)
+    }
+
+    fn clear_projection_cache(&self) {
+        self.projection_cache.write().clear();
     }
 }
 
@@ -174,6 +192,43 @@ impl PrincipalProjectionEngine<String> for CountingEngine {
     fn load_object(&self, id: ObjectId) -> Result<Option<ObjectRecord>, PrincipalProjectionError> {
         self.object_loads.fetch_add(1, Ordering::SeqCst);
         Ok(self.inner.object(id))
+    }
+
+    fn load_projection_cache(
+        &self,
+        principal: &String,
+        object: ObjectId,
+        key: ProjectionCacheKey,
+    ) -> Option<ProjectionCacheEntry> {
+        self.projection_cache
+            .read()
+            .get(&(principal.clone(), object, key))
+            .cloned()
+    }
+
+    fn retain_projection_cache(
+        &self,
+        principal: &String,
+        object: ObjectId,
+        key: ProjectionCacheKey,
+        value: ProjectionCacheEntry,
+    ) -> bool {
+        self.projection_cache
+            .write()
+            .insert((principal.clone(), object, key), value);
+        true
+    }
+
+    fn discard_projection_cache(
+        &self,
+        principal: &String,
+        object: ObjectId,
+        key: ProjectionCacheKey,
+    ) -> bool {
+        self.projection_cache
+            .write()
+            .remove(&(principal.clone(), object, key))
+            .is_some()
     }
 
     fn commit_root(
@@ -357,6 +412,7 @@ fn verified_handle_reuse_survives_an_unrelated_root_commit() {
     );
     let verified_loads = engine.object_loads();
 
+    engine.clear_projection_cache();
     let uncached = PrincipalContentStore::from_engine(Arc::clone(&engine));
     let uncached_handle = uncached.open_read(&owner, &name).unwrap().unwrap();
     engine.reset_object_loads();
@@ -373,7 +429,7 @@ fn verified_handle_reuse_survives_an_unrelated_root_commit() {
 }
 
 #[test]
-fn range_edge_proofs_are_principal_scoped_and_pruned_with_live_files() {
+fn range_edge_proofs_are_principal_scoped_and_remain_safe_for_open_handles() {
     let engine = Arc::new(CountingEngine::new());
     let writer = PrincipalContentStore::from_engine(Arc::clone(&engine));
     let reader = PrincipalContentStore::from_engine(Arc::clone(&engine));
@@ -383,6 +439,7 @@ fn range_edge_proofs_are_principal_scoped_and_pruned_with_live_files() {
     let value = bytes(8 * 1024 * 1024);
     writer.put(&alice, &name, &value).unwrap();
     writer.put(&bob, &name, &value).unwrap();
+    engine.clear_projection_cache();
     let alice_handle = reader.open_read(&alice, &name).unwrap().unwrap();
     let bob_handle = reader.open_read(&bob, &name).unwrap().unwrap();
     let offset = 4_000_000_u64;
@@ -425,8 +482,8 @@ fn range_edge_proofs_are_principal_scoped_and_pruned_with_live_files() {
         value[start..end]
     );
     assert!(
-        engine.object_loads() >= alice_first,
-        "an open handle retained process-local evidence after its file left the live catalog"
+        engine.object_loads() <= alice_reused,
+        "an authorized open handle lost governed immutable evidence after catalog deletion"
     );
 }
 
@@ -554,6 +611,94 @@ fn streamed_content_survives_durable_engine_reopen() {
         Some(outcome.descriptor())
     );
     assert_eq!(store.read(&owner, &name).unwrap(), Some(value));
+}
+
+#[test]
+fn cold_range_after_reopen_rejects_a_tampered_neighbour_chunk() {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = "alice".to_owned();
+    let name = ContentName::new("durable-neighbour").unwrap();
+    let value = bytes(8 * 1024 * 1024);
+    let profile = astrid_storage_content::ChunkingProfile::ASTRID_V1;
+    let chunks: Vec<_> = FastCDC::with_level_and_seed(
+        &value,
+        usize::try_from(profile.minimum_bytes()).unwrap(),
+        usize::try_from(profile.average_bytes()).unwrap(),
+        usize::try_from(profile.maximum_bytes()).unwrap(),
+        Normalization::Level1,
+        profile.gear_seed(),
+    )
+    .collect();
+    assert!(chunks.len() >= 3);
+    let selected = chunks.len() / 2;
+    let target = &chunks[selected];
+    let neighbour = &chunks[selected - 1];
+
+    let engine = Arc::new(
+        DurableEngine::open(
+            directory.path(),
+            TestIdentity,
+            Utf8Codec,
+            RecoveryLimits::new(1024 * 1024).unwrap(),
+        )
+        .unwrap(),
+    );
+    let store = PrincipalContentStore::from_engine(Arc::clone(&engine));
+    store.put(&owner, &name, &value).unwrap();
+    drop(store);
+    drop(engine);
+
+    let reopened = Arc::new(
+        DurableEngine::open(
+            directory.path(),
+            TestIdentity,
+            Utf8Codec,
+            RecoveryLimits::new(1024 * 1024).unwrap(),
+        )
+        .unwrap(),
+    );
+    let store = PrincipalContentStore::from_engine(reopened);
+    let arena_path = directory.path().join("objects.arena");
+    let arena = std::fs::read(&arena_path).unwrap();
+    let neighbour_end = neighbour.offset.checked_add(neighbour.length).unwrap();
+    let neighbour_bytes = &value[neighbour.offset..neighbour_end];
+    let needle = &neighbour_bytes[..64];
+    let matches: Vec<_> = arena
+        .windows(needle.len())
+        .enumerate()
+        .filter_map(|(offset, bytes)| (bytes == needle).then_some(offset))
+        .collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "test neighbour prefix must identify exactly one arena payload"
+    );
+    let corrupt_offset = matches[0].saturating_add(17);
+    let mut arena = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&arena_path)
+        .unwrap();
+    arena
+        .seek(SeekFrom::Start(u64::try_from(corrupt_offset).unwrap()))
+        .unwrap();
+    let mut byte = [0_u8; 1];
+    arena.read_exact(&mut byte).unwrap();
+    byte[0] ^= 0x80;
+    arena
+        .seek(SeekFrom::Start(u64::try_from(corrupt_offset).unwrap()))
+        .unwrap();
+    arena.write_all(&byte).unwrap();
+    arena.sync_data().unwrap();
+
+    let range_offset = u64::try_from(target.offset.saturating_add(8)).unwrap();
+    let error = store
+        .read_range(&owner, &name, range_offset, 32)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("checksum"),
+        "unexpected cold tamper error: {error}"
+    );
 }
 
 #[test]

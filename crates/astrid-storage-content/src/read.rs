@@ -88,7 +88,8 @@ pub trait ContentSource {
 /// two adjacent children, and every identity-bearing chunking parameter. The
 /// fields are private: non-empty state can only be produced by a successful
 /// validating read. Embedders should partition this state at their authority
-/// boundary; Astrid's principal store keeps one state per principal and file.
+/// boundary and charge retained memory. Astrid's principal store keeps it in
+/// the governed principal/object projection cache.
 ///
 /// Each tree uses one 128-bit edge bitmap, so verification metadata is bounded
 /// by the number of visited tree nodes rather than the logical file size.
@@ -103,6 +104,19 @@ impl ContentVerificationState {
         for (domain, edges) in delta.edges {
             *self.edges.entry(domain).or_default() |= edges;
         }
+    }
+
+    /// Return a conservative resident-memory charge for process-local proof
+    /// reuse.
+    #[must_use]
+    pub fn retained_bytes(&self) -> u64 {
+        let entry = core::mem::size_of::<VerificationDomain>()
+            .saturating_add(core::mem::size_of::<u128>())
+            .saturating_add(core::mem::size_of::<usize>().saturating_mul(3));
+        u64::try_from(
+            core::mem::size_of::<Self>().saturating_add(self.edges.len().saturating_mul(entry)),
+        )
+        .unwrap_or(u64::MAX)
     }
 
     #[cfg(test)]
