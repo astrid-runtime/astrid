@@ -325,6 +325,56 @@ Sparse anchor-only indexing is not the default because it knowingly sacrifices
 chunk-level convergence. It remains an option only if the filter and
 locality-paged full index miss their measured targets.
 
+## D10. Canonical GC fact-snapshot identity is final
+
+Tracks: [#1409](https://github.com/astrid-runtime/astrid/issues/1409)
+
+### Decision
+
+Format v1 defines `GcFactSnapshotId` as the ordinary object identity of the
+exact canonical fact-snapshot Evidence bytes specified in
+[Durable Compaction](astrid-durable-compaction.md). That identity is independent
+of whether the facts were assembled by a full scan or maintained
+incrementally. Format v1 reserves no alternate snapshot-derivation
+discriminator.
+
+A future incremental implementation may maintain a materialized fact view,
+immutable view generations, and an engine-local running digest. Those are
+acceleration and fencing state, not durable authority. A plan continues to
+carry the canonical `GcFactSnapshotId`; commit may collapse its mutation-lock
+fence to an O(1) comparison against the exact materialized-view generation from
+which that snapshot was produced. At any time, a full canonical re-encode must
+produce byte-for-byte identical Evidence and the same `GcFactSnapshotId`.
+
+The format-1 grammar remains reachability-only. A retention policy requiring
+object kind, class, age, or another absent fact introduces an explicitly new
+fact-snapshot grammar and domain prefix. It must not reinterpret existing
+format-1 snapshots or receipts.
+
+### Rationale
+
+The current fence captures the complete object universe under the mutation
+lock three times per compaction cycle. Its cost is acceptable at present but
+would stall all principals for an operationally unacceptable interval near 16
+million objects. The scale fix is incremental fact maintenance and an
+O(1) generation fence, not a second meaning for historical receipts.
+
+Keeping one canonical identity preserves byte-stable proof replay, audit-chain
+uniformity, and independent reconstruction. It also makes the incremental
+implementation continuously testable against the simple full-scan oracle.
+
+### Future acceptance
+
+- Arbitrary commits, root changes, retained-root leases, and resurrection
+  races produce byte-identical incremental and full-scan snapshots.
+- A mutation after plan capture fails the generation fence before replacement.
+- Full canonical re-encoding periodically verifies the running view and
+  identity; mismatch fails closed and emits an operator-visible integrity
+  event.
+- Mutation-lock hold time for plan verification and commit fencing is
+  independent of object-universe cardinality.
+- Existing format-1 plans, receipts, and audit records replay unchanged.
+
 ## Sequence
 
 1. Principal UID and chunker evidence gate before the first format release.
