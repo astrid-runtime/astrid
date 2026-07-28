@@ -406,6 +406,7 @@ impl EventDispatcher {
             dispatch_to_capsule_queues(
                 &capsule_queues,
                 &self.chain_locks,
+                &self.event_bus,
                 matches,
                 topic,
                 payload_bytes,
@@ -415,6 +416,99 @@ impl EventDispatcher {
 
         debug!("Event dispatcher stopped (event bus closed)");
     }
+}
+
+/// IPC topic carrying a structured "an interceptor dispatch failed" signal.
+///
+/// Dispatch is fire-and-forget by design, which historically meant a failed
+/// invocation was only a host-side `warn!` — the ORIGIN of the event (e.g.
+/// react awaiting an `llm.v1.request.generate.*` it published) waited forever
+/// with no signal, and the requester's session hung until an outer timeout.
+/// The 2026-07-28 all-principals wedge rode exactly this: every LLM dispatch
+/// failed instantly on a poisoned instance, and every turn hung silently.
+///
+/// On a (non-`NotSupported`) invocation error, the dispatcher now publishes
+/// this topic with `{ failed_topic, capsule_id, action, error, request_id?,
+/// session_id? }` (the ids are best-effort correlation extracted from the
+/// failed event's own payload), stamped with the failed event's principal so a
+/// per-principal subscriber (react) handles it under the right KV scope and
+/// can fail the owning turn loudly. Failures of THIS topic's own handling are
+/// never re-signalled (loop guard in [`emit_dispatch_failed`]).
+pub const DISPATCH_FAILED_TOPIC: &str = "astrid.v1.dispatch.failed";
+
+/// Best-effort extraction of `request_id` / `session_id` from a failed
+/// event's guest payload bytes, for the [`DISPATCH_FAILED_TOPIC`] signal.
+///
+/// Looks at the top level, then one object level deep (tagged-enum payload
+/// shapes nest their fields). Anything unparseable — or oversized, guarding
+/// the failure path against burning CPU on a multi-megabyte prompt payload —
+/// yields `(None, None)`: the signal is still published, just without
+/// correlation ids.
+fn extract_correlation(payload: &[u8]) -> (Option<String>, Option<String>) {
+    const MAX_PARSE_BYTES: usize = 512 * 1024;
+    if payload.len() > MAX_PARSE_BYTES {
+        return (None, None);
+    }
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(payload) else {
+        return (None, None);
+    };
+    fn find(value: &serde_json::Value, key: &str) -> Option<String> {
+        let obj = value.as_object()?;
+        if let Some(s) = obj.get(key).and_then(serde_json::Value::as_str) {
+            return Some(s.to_string());
+        }
+        obj.values().find_map(|nested| {
+            nested
+                .as_object()
+                .and_then(|o| o.get(key))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+    }
+    (find(&value, "request_id"), find(&value, "session_id"))
+}
+
+/// Publish the [`DISPATCH_FAILED_TOPIC`] signal for a failed interceptor
+/// invocation. See the topic doc for the payload contract; the principal is
+/// copied from the failed event so the signal routes to the same
+/// per-(capsule, principal) scope the origin published under.
+fn emit_dispatch_failed(
+    event_bus: &EventBus,
+    capsule_id: &CapsuleId,
+    action: &str,
+    topic: &str,
+    payload: &[u8],
+    ipc_message: Option<&astrid_events::ipc::IpcMessage>,
+    error: &crate::error::CapsuleError,
+) {
+    // Loop guard: a failure while HANDLING a dispatch-failed signal must not
+    // mint another signal — that would recurse for as long as the handler
+    // keeps failing.
+    if topic == DISPATCH_FAILED_TOPIC {
+        return;
+    }
+    let (request_id, session_id) = extract_correlation(payload);
+    let mut msg = astrid_events::ipc::IpcMessage::new(
+        astrid_events::ipc::Topic::from_raw(DISPATCH_FAILED_TOPIC),
+        astrid_events::ipc::IpcPayload::Custom {
+            data: serde_json::json!({
+                "failed_topic": topic,
+                "capsule_id": capsule_id.as_str(),
+                "action": action,
+                "error": error.to_string(),
+                "request_id": request_id,
+                "session_id": session_id,
+            }),
+        },
+        uuid::Uuid::new_v4(),
+    );
+    if let Some(principal) = ipc_message.and_then(|m| m.principal.clone()) {
+        msg = msg.with_principal(principal);
+    }
+    event_bus.publish(AstridEvent::Ipc {
+        metadata: astrid_events::EventMetadata::new("dispatcher"),
+        message: msg,
+    });
 }
 
 /// Dispatch matching interceptors for an event.
@@ -438,6 +532,7 @@ impl EventDispatcher {
 fn dispatch_to_capsule_queues(
     queues: &CapsuleQueues,
     chain_locks: &ChainLocks,
+    event_bus: &Arc<EventBus>,
     matches: Vec<(Arc<dyn Capsule>, String, u32)>,
     topic: Arc<String>,
     payload_bytes: Arc<Vec<u8>>,
@@ -454,6 +549,7 @@ fn dispatch_to_capsule_queues(
         let (capsule, action, _priority) = matches.into_iter().next().unwrap();
         dispatch_single(
             queues,
+            Arc::clone(event_bus),
             capsule,
             action,
             topic,
@@ -485,6 +581,7 @@ fn dispatch_to_capsule_queues(
         for (capsule, action, _priority) in matches {
             dispatch_single(
                 queues,
+                Arc::clone(event_bus),
                 capsule,
                 action,
                 Arc::clone(&topic),
@@ -503,6 +600,7 @@ fn dispatch_to_capsule_queues(
     let topic_clone = Arc::clone(&topic);
     let ipc_clone = ipc_message.clone();
     let chain_locks_clone = Arc::clone(chain_locks);
+    let event_bus_clone = Arc::clone(event_bus);
     tokio::task::spawn(async move {
         let mut current_payload = (*payload_bytes).clone();
 
@@ -580,6 +678,18 @@ fn dispatch_to_capsule_queues(
                         error = %e,
                         "Interceptor invocation failed — continuing chain"
                     );
+                    // Signal the origin so it can fail its request loudly
+                    // instead of waiting out a timeout (fire-and-forget
+                    // dispatch otherwise swallows the failure entirely).
+                    emit_dispatch_failed(
+                        &event_bus_clone,
+                        capsule.id(),
+                        action,
+                        &topic_clone,
+                        &current_payload,
+                        ipc_clone.as_deref(),
+                        &e,
+                    );
                     // Continue chain on error — don't let a broken capsule
                     // block the entire pipeline
                 },
@@ -608,6 +718,7 @@ fn get_or_spawn_consumer(
     queues: &CapsuleQueues,
     capsule: &Arc<dyn Capsule>,
     key: (CapsuleId, PrincipalKey),
+    event_bus: Arc<EventBus>,
 ) -> mpsc::Sender<InterceptorWork> {
     let mut guard = queues.lock();
     // Never hand back a CLOSED sender. The mapped entry can be stale: an
@@ -665,7 +776,7 @@ fn get_or_spawn_consumer(
     let queues_arc = Arc::clone(queues);
     let cleanup_key = effective_key.clone();
     tokio::task::spawn(async move {
-        run_consumer(rx, capsule_arc, queues_arc, cleanup_key).await;
+        run_consumer(rx, capsule_arc, queues_arc, cleanup_key, event_bus).await;
     });
     tx
 }
@@ -680,6 +791,7 @@ async fn run_consumer(
     capsule: Arc<dyn Capsule>,
     queues: CapsuleQueues,
     key: (CapsuleId, PrincipalKey),
+    event_bus: Arc<EventBus>,
 ) {
     loop {
         match tokio::time::timeout(idle_consumer_grace(), rx.recv()).await {
@@ -734,6 +846,20 @@ async fn run_consumer(
                             topic = %work.topic,
                             error = %e,
                             "Interceptor invocation failed"
+                        );
+                        // Signal the origin so it can fail its request loudly
+                        // instead of waiting out a timeout — fire-and-forget
+                        // dispatch otherwise swallows the failure entirely
+                        // (the 2026-07-28 wedge: every LLM dispatch failed
+                        // instantly, every turn hung silently).
+                        emit_dispatch_failed(
+                            &event_bus,
+                            capsule.id(),
+                            &work.action,
+                            &work.topic,
+                            &work.payload,
+                            work.ipc_message.as_deref(),
+                            &e,
                         );
                     },
                 }
@@ -810,8 +936,13 @@ async fn run_consumer(
 /// Keying on the full `PrincipalKey` (Option<String>) means alice's
 /// events don't head-of-line block bob's on the same capsule, even
 /// when both fall in the same `PrincipalClass` (#813 Layer 3).
+// One over the 7-argument threshold: the `event_bus` rides along solely so a
+// failed invocation can publish the dispatch-failed signal; bundling it into
+// a struct would obscure an otherwise positional, single-call-site helper.
+#[allow(clippy::too_many_arguments)]
 fn dispatch_single(
     queues: &CapsuleQueues,
+    event_bus: Arc<EventBus>,
     capsule: Arc<dyn Capsule>,
     action: String,
     topic: Arc<String>,
@@ -820,7 +951,7 @@ fn dispatch_single(
     principal_key: PrincipalKey,
 ) {
     let key = (capsule.id().clone(), principal_key);
-    let sender = get_or_spawn_consumer(queues, &capsule, key.clone());
+    let sender = get_or_spawn_consumer(queues, &capsule, key.clone(), Arc::clone(&event_bus));
 
     let work = InterceptorWork {
         action,
@@ -842,7 +973,7 @@ fn dispatch_single(
             // stall under a 100-wide prompt burst — the route's consumer closed
             // and every later prompt was dropped.) The re-spawn just spawned its
             // consumer, so the retry cannot hit the same race.
-            let sender = get_or_spawn_consumer(queues, &capsule, key);
+            let sender = get_or_spawn_consumer(queues, &capsule, key, event_bus);
             match sender.try_send(work) {
                 Ok(()) => {},
                 // `Full` after a fresh re-spawn is the same intended shed-load

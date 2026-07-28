@@ -36,6 +36,9 @@ struct MockCapsule {
     principal_log: Option<Arc<Mutex<Vec<String>>>>,
     /// Optional shared counter incremented on every invoke.
     invoke_counter: Option<Arc<AtomicUsize>>,
+    /// When set, `invoke_interceptor` returns `Err(WasmError(..))` with this
+    /// message — models a trapped/broken capsule for dispatch-failed tests.
+    error_override: Option<String>,
 }
 
 impl MockCapsule {
@@ -107,6 +110,7 @@ impl MockCapsule {
             result_override: None,
             principal_log: None,
             invoke_counter: None,
+            error_override: None,
         };
         (capsule, invoked)
     }
@@ -147,6 +151,9 @@ impl Capsule for MockCapsule {
         }
         if let Some(ref c) = self.invoke_counter {
             c.fetch_add(1, Ordering::SeqCst);
+        }
+        if let Some(ref e) = self.error_override {
+            return Err(crate::error::CapsuleError::WasmError(e.clone()));
         }
         if let Some(ref result) = self.result_override {
             return Ok(result.clone());
@@ -873,6 +880,7 @@ async fn dispatch_respawns_when_mapped_consumer_is_closed() {
     // deliver rather than hand back the dead sender and drop.
     dispatch_single(
         &queues,
+        Arc::new(EventBus::with_capacity(64)),
         Arc::clone(&capsule),
         "test_action".to_string(),
         Arc::new("respawn.topic".to_string()),
@@ -1417,4 +1425,153 @@ mod access_enforcement {
         assert!(!gated("session.v1.append"));
         assert!(!gated("tool.v1.response.describe.foo"));
     }
+}
+
+// ── Dispatch-failed signal tests (astrid.v1.dispatch.failed) ────────────
+
+/// A (non-`NotSupported`) interceptor invocation error must publish a
+/// structured `astrid.v1.dispatch.failed` signal carrying the failed topic,
+/// capsule, error text, the best-effort `request_id` correlation from the
+/// failed event's own payload, and the failed event's principal — so a
+/// per-principal subscriber (react) can fail the owning request loudly
+/// instead of hanging until an outer timeout (the 2026-07-28 wedge mode).
+#[tokio::test]
+async fn failed_dispatch_emits_dispatch_failed_signal() {
+    let (mut capsule, _) = MockCapsule::new("llm-mock", "llm.v1.request.generate.mock");
+    capsule.error_override = Some("wasm trap: cannot enter component instance".to_string());
+
+    let mut registry = CapsuleRegistry::new();
+    registry.register(Box::new(capsule)).unwrap();
+    let registry = Arc::new(RwLock::new(registry));
+
+    let bus = Arc::new(EventBus::with_capacity(64));
+    let mut failed_rx = bus.subscribe_as("dispatch-failed-listener");
+    let dispatcher = EventDispatcher::new(Arc::clone(&registry), Arc::clone(&bus));
+    let handle = tokio::spawn(dispatcher.run());
+    tokio::task::yield_now().await;
+
+    // Shaped like react's `llm.v1.request.generate.*` publish: principal-
+    // tagged, request_id in the payload.
+    let msg = astrid_events::ipc::IpcMessage::new(
+        Topic::from_raw("llm.v1.request.generate.mock"),
+        IpcPayload::Custom {
+            data: serde_json::json!({
+                "request_id": "11111111-2222-3333-4444-555555555555"
+            }),
+        },
+        uuid::Uuid::nil(),
+    )
+    .with_principal("alice");
+    bus.publish(AstridEvent::Ipc {
+        metadata: astrid_events::EventMetadata::new("test"),
+        message: msg,
+    });
+
+    // Await the signal (skipping the original event echoing back to us).
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut signal = None;
+    while std::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(200), failed_rx.recv()).await {
+            Ok(Some(event)) => {
+                if let AstridEvent::Ipc { message, .. } = &*event
+                    && message.topic.to_string() == DISPATCH_FAILED_TOPIC
+                {
+                    signal = Some(message.clone());
+                    break;
+                }
+            },
+            Ok(None) => break,
+            Err(_elapsed) => {},
+        }
+    }
+    let signal = signal.expect("a dispatch.failed signal must be published for a failed invocation");
+    assert_eq!(
+        signal.principal.as_deref(),
+        Some("alice"),
+        "the signal must carry the failed event's principal"
+    );
+    let IpcPayload::Custom { data } = &signal.payload else {
+        panic!("dispatch.failed payload must be Custom, got {:?}", signal.payload);
+    };
+    assert_eq!(data["failed_topic"], "llm.v1.request.generate.mock");
+    assert_eq!(data["capsule_id"], "llm-mock");
+    assert_eq!(data["action"], "test_action");
+    assert_eq!(data["request_id"], "11111111-2222-3333-4444-555555555555");
+    assert!(
+        data["error"]
+            .as_str()
+            .expect("error string")
+            .contains("cannot enter component instance"),
+        "error text must propagate"
+    );
+
+    handle.abort();
+}
+
+/// Loop guard: a failure while HANDLING `astrid.v1.dispatch.failed` itself
+/// must NOT mint another signal — otherwise a persistently-failing handler
+/// recurses forever. Exactly the one originally-published event is seen.
+#[tokio::test]
+async fn dispatch_failed_handling_failure_is_not_resignalled() {
+    let (mut capsule, invoked) = MockCapsule::new("broken-failed-handler", DISPATCH_FAILED_TOPIC);
+    capsule.error_override = Some("handler is broken".to_string());
+
+    let mut registry = CapsuleRegistry::new();
+    registry.register(Box::new(capsule)).unwrap();
+    let registry = Arc::new(RwLock::new(registry));
+
+    let bus = Arc::new(EventBus::with_capacity(64));
+    let mut rx = bus.subscribe_as("loop-guard-listener");
+    let dispatcher = EventDispatcher::new(Arc::clone(&registry), Arc::clone(&bus));
+    let handle = tokio::spawn(dispatcher.run());
+    tokio::task::yield_now().await;
+
+    publish_ipc(&bus, DISPATCH_FAILED_TOPIC);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(invoked.load(Ordering::SeqCst), "handler must have run (and failed)");
+
+    // Count dispatch.failed events on the bus: exactly the one we published.
+    let mut seen = 0;
+    while let Ok(Some(event)) =
+        tokio::time::timeout(Duration::from_millis(100), rx.recv()).await
+    {
+        if let AstridEvent::Ipc { message, .. } = &*event
+            && message.topic.to_string() == DISPATCH_FAILED_TOPIC
+        {
+            seen += 1;
+        }
+    }
+    assert_eq!(
+        seen, 1,
+        "a failure handling dispatch.failed must not be re-signalled"
+    );
+
+    handle.abort();
+}
+
+/// `extract_correlation` finds ids at the top level and one object level deep
+/// (tagged-enum payload shapes), and gives up cleanly on garbage/oversized
+/// payloads.
+#[test]
+fn extract_correlation_shapes() {
+    let top = serde_json::to_vec(&serde_json::json!({
+        "request_id": "r-1", "session_id": "s-1"
+    }))
+    .unwrap();
+    assert_eq!(
+        extract_correlation(&top),
+        (Some("r-1".to_string()), Some("s-1".to_string()))
+    );
+
+    let nested = serde_json::to_vec(&serde_json::json!({
+        "type": "llm_request",
+        "inner": { "request_id": "r-2" }
+    }))
+    .unwrap();
+    assert_eq!(extract_correlation(&nested), (Some("r-2".to_string()), None));
+
+    assert_eq!(extract_correlation(b"not json"), (None, None));
+
+    let oversized = vec![b' '; 600 * 1024];
+    assert_eq!(extract_correlation(&oversized), (None, None));
 }
