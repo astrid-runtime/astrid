@@ -864,6 +864,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "chrono",
+ "fastcdc",
  "getrandom 0.4.3",
  "keyring",
  "parking_lot",

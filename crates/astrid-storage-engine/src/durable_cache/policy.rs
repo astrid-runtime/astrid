@@ -115,7 +115,8 @@ impl<P> PrincipalObjectCacheBudget<P> for DisabledPrincipalBudget {
     }
 }
 
-/// Complete injected cache policy.
+/// Complete injected cache policy for decoded objects and projection-owned
+/// accelerators.
 pub struct ObjectCacheConfig<P> {
     pub(super) controller: ObjectCacheController,
     pub(super) principal_budget: Arc<dyn PrincipalObjectCacheBudget<P>>,
@@ -172,4 +173,16 @@ pub struct ObjectCacheStats {
     pub resident_association_bytes: u64,
     /// Current number of principal-to-record associations.
     pub resident_associations: u64,
+    /// Projection-owned accelerator lookups served from governed memory.
+    pub projection_hits: u64,
+    /// Projection-owned accelerator lookups that were absent or evicted.
+    pub projection_misses: u64,
+    /// Projection-owned values accepted into governed memory.
+    pub projection_insertions: u64,
+    /// Projection-owned values discarded by replacement or cache eviction.
+    pub projection_evictions: u64,
+    /// Current bytes charged for projection-owned accelerator values.
+    pub resident_projection_bytes: u64,
+    /// Current number of projection-owned accelerator values.
+    pub resident_projection_entries: u64,
 }

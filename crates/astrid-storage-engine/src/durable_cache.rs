@@ -1,12 +1,17 @@
-//! Resource-accounted cache for verified immutable arena objects.
+//! Resource-accounted cache for verified immutable arena objects and
+//! projection-owned accelerators.
 //!
 //! Physical records are shared by `ObjectId`, while every principal that uses
 //! one is charged its full cache weight. Charging does not vary with sharing,
 //! so principal-visible resource accounting cannot reveal a deduplication hit.
+//! Type-erased projection values remain principal-local and are charged to the
+//! same injected total and per-principal budgets.
 
+use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use crate::{ProjectionCacheEntry, ProjectionCacheKey};
 use astrid_storage_model::{ObjectId, ObjectRecord};
 use parking_lot::Mutex;
 
@@ -25,9 +30,19 @@ struct CachedObject<P: Ord> {
     principals: BTreeSet<P>,
 }
 
+struct CachedProjection {
+    value: Arc<dyn Any + Send + Sync>,
+    weight: u64,
+}
+
+struct PrincipalEntry {
+    last_access: u64,
+    projections: BTreeMap<ProjectionCacheKey, CachedProjection>,
+}
+
 #[derive(Default)]
 struct PrincipalPartition {
-    entries: BTreeMap<ObjectId, u64>,
+    entries: BTreeMap<ObjectId, PrincipalEntry>,
     lru: BTreeSet<(u64, ObjectId)>,
     charged_bytes: u64,
 }
@@ -39,12 +54,18 @@ struct CacheState<P: Ord> {
     resident_record_bytes: u64,
     resident_association_bytes: u64,
     resident_associations: u64,
+    resident_projection_bytes: u64,
+    resident_projection_entries: u64,
     clock: u64,
     hits: u64,
     misses: u64,
     bypasses: u64,
     insertions: u64,
     evictions: u64,
+    projection_hits: u64,
+    projection_misses: u64,
+    projection_insertions: u64,
+    projection_evictions: u64,
 }
 
 impl<P: Ord> Default for CacheState<P> {
@@ -56,12 +77,18 @@ impl<P: Ord> Default for CacheState<P> {
             resident_record_bytes: 0,
             resident_association_bytes: 0,
             resident_associations: 0,
+            resident_projection_bytes: 0,
+            resident_projection_entries: 0,
             clock: 0,
             hits: 0,
             misses: 0,
             bypasses: 0,
             insertions: 0,
             evictions: 0,
+            projection_hits: 0,
+            projection_misses: 0,
+            projection_insertions: 0,
+            projection_evictions: 0,
         }
     }
 }
@@ -174,7 +201,13 @@ where
         );
         state.lru.insert((tick, object));
         let partition = state.principals.entry(principal.clone()).or_default();
-        partition.entries.insert(object, tick);
+        partition.entries.insert(
+            object,
+            PrincipalEntry {
+                last_access: tick,
+                projections: BTreeMap::new(),
+            },
+        );
         partition.lru.insert((tick, object));
         partition.charged_bytes = partition.charged_bytes.saturating_add(weight);
         state.resident_record_bytes = state.resident_record_bytes.saturating_add(weight);
@@ -199,6 +232,12 @@ where
             resident_record_bytes: state.resident_record_bytes,
             resident_association_bytes: state.resident_association_bytes,
             resident_associations: state.resident_associations,
+            projection_hits: state.projection_hits,
+            projection_misses: state.projection_misses,
+            projection_insertions: state.projection_insertions,
+            projection_evictions: state.projection_evictions,
+            resident_projection_bytes: state.resident_projection_bytes,
+            resident_projection_entries: state.resident_projection_entries,
         }
     }
 
@@ -209,6 +248,136 @@ where
             .get(principal)
             .map_or(0, |partition| partition.charged_bytes)
     }
+
+    pub(super) fn projection(
+        &self,
+        principal: &P,
+        object: ObjectId,
+        key: ProjectionCacheKey,
+    ) -> Option<ProjectionCacheEntry> {
+        let global_capacity = self.controller.capacity();
+        let principal_capacity = self.principal_budget.capacity(principal);
+        if global_capacity == ObjectCacheCapacity::Disabled
+            || principal_capacity == ObjectCacheCapacity::Disabled
+        {
+            let mut state = self.state.lock();
+            state.projection_misses = state.projection_misses.saturating_add(1);
+            return None;
+        }
+        let mut state = self.state.lock();
+        state.trim_global(global_capacity);
+        state.trim_principal(principal, principal_capacity);
+        let value = state
+            .principals
+            .get(principal)
+            .and_then(|partition| partition.entries.get(&object))
+            .and_then(|entry| entry.projections.get(&key))
+            .map(|entry| Arc::clone(&entry.value));
+        let Some(value) = value else {
+            state.projection_misses = state.projection_misses.saturating_add(1);
+            return None;
+        };
+        let weight = state
+            .principals
+            .get(principal)
+            .and_then(|partition| partition.entries.get(&object))
+            .and_then(|entry| entry.projections.get(&key))
+            .map_or(0, |entry| entry.weight);
+        if state.touch(principal, object).is_none() {
+            state.projection_misses = state.projection_misses.saturating_add(1);
+            return None;
+        }
+        state.projection_hits = state.projection_hits.saturating_add(1);
+        Some(ProjectionCacheEntry::from_parts(value, weight))
+    }
+
+    pub(super) fn retain_projection(
+        &self,
+        principal: &P,
+        object: ObjectId,
+        key: ProjectionCacheKey,
+        value: ProjectionCacheEntry,
+    ) -> bool {
+        let (value, payload_weight) = value.into_parts();
+        let weight = projection_cache_weight(payload_weight);
+        let global_capacity = self.controller.capacity();
+        let principal_capacity = self.principal_budget.capacity(principal);
+        if weight == u64::MAX
+            || global_capacity == ObjectCacheCapacity::Disabled
+            || principal_capacity == ObjectCacheCapacity::Disabled
+        {
+            return false;
+        }
+
+        let mut state = self.state.lock();
+        state.trim_global(global_capacity);
+        state.trim_principal(principal, principal_capacity);
+        if !state.is_attached(principal, object) {
+            return false;
+        }
+        let replaced_weight = state
+            .principals
+            .get(principal)
+            .and_then(|partition| partition.entries.get(&object))
+            .and_then(|entry| entry.projections.get(&key))
+            .map_or(0, |entry| entry.weight);
+        state.evict_principal_until_fits_with_credit(
+            principal,
+            weight,
+            replaced_weight,
+            principal_capacity,
+            object,
+        );
+        state.evict_global_until_fits_with_credit(weight, replaced_weight, global_capacity, object);
+        if !state.can_fit_principal_with_credit(
+            principal,
+            weight,
+            replaced_weight,
+            principal_capacity,
+        ) || !state.can_fit_global_with_credit(weight, replaced_weight, global_capacity)
+            || !state.is_attached(principal, object)
+        {
+            return false;
+        }
+
+        let Some(partition) = state.principals.get_mut(principal) else {
+            return false;
+        };
+        let Some(entry) = partition.entries.get_mut(&object) else {
+            return false;
+        };
+        let replaced = entry
+            .projections
+            .insert(key, CachedProjection { value, weight });
+        partition.charged_bytes = partition
+            .charged_bytes
+            .saturating_sub(replaced_weight)
+            .saturating_add(weight);
+        state.resident_association_bytes = state
+            .resident_association_bytes
+            .saturating_sub(replaced_weight)
+            .saturating_add(weight);
+        state.resident_projection_bytes = state
+            .resident_projection_bytes
+            .saturating_sub(replaced_weight)
+            .saturating_add(weight);
+        if replaced.is_some() {
+            state.projection_evictions = state.projection_evictions.saturating_add(1);
+        } else {
+            state.resident_projection_entries = state.resident_projection_entries.saturating_add(1);
+        }
+        state.projection_insertions = state.projection_insertions.saturating_add(1);
+        state.touch(principal, object).is_some()
+    }
+
+    pub(super) fn discard_projection(
+        &self,
+        principal: &P,
+        object: ObjectId,
+        key: ProjectionCacheKey,
+    ) -> bool {
+        self.state.lock().remove_projection(principal, object, key)
+    }
 }
 
 impl<P> CacheState<P>
@@ -218,6 +387,34 @@ where
     fn tick(&mut self) -> u64 {
         self.clock = self.clock.saturating_add(1);
         self.clock
+    }
+
+    fn remove_projection(
+        &mut self,
+        principal: &P,
+        object: ObjectId,
+        key: ProjectionCacheKey,
+    ) -> bool {
+        let removed = self
+            .principals
+            .get_mut(principal)
+            .and_then(|partition| partition.entries.get_mut(&object))
+            .and_then(|entry| entry.projections.remove(&key));
+        let Some(removed) = removed else {
+            return false;
+        };
+        if let Some(partition) = self.principals.get_mut(principal) {
+            partition.charged_bytes = partition.charged_bytes.saturating_sub(removed.weight);
+        }
+        self.resident_association_bytes = self
+            .resident_association_bytes
+            .saturating_sub(removed.weight);
+        self.resident_projection_bytes = self
+            .resident_projection_bytes
+            .saturating_sub(removed.weight);
+        self.resident_projection_entries = self.resident_projection_entries.saturating_sub(1);
+        self.projection_evictions = self.projection_evictions.saturating_add(1);
+        true
     }
 
     fn touch(&mut self, principal: &P, object: ObjectId) -> Option<Arc<ObjectRecord>> {
@@ -235,9 +432,10 @@ where
         self.lru.remove(&(previous_tick, object));
         self.lru.insert((tick, object));
         let partition = self.principals.get_mut(principal)?;
-        if let Some(previous_tick) = partition.entries.insert(object, tick) {
-            partition.lru.remove(&(previous_tick, object));
-        }
+        let entry = partition.entries.get_mut(&object)?;
+        let previous_tick = entry.last_access;
+        entry.last_access = tick;
+        partition.lru.remove(&(previous_tick, object));
         partition.lru.insert((tick, object));
         Some(record)
     }
@@ -264,6 +462,16 @@ where
         }
         let partition = self.principals.entry(principal.clone()).or_default();
         partition.charged_bytes = partition.charged_bytes.saturating_add(weight);
+        partition.entries.insert(
+            object,
+            PrincipalEntry {
+                last_access: self
+                    .entries
+                    .get(&object)
+                    .map_or(self.clock, |entry| entry.last_access),
+                projections: BTreeMap::new(),
+            },
+        );
         self.resident_association_bytes = self
             .resident_association_bytes
             .saturating_add(association_weight::<P>());
@@ -291,6 +499,39 @@ where
         })
     }
 
+    fn can_fit_principal_with_credit(
+        &self,
+        principal: &P,
+        weight: u64,
+        credit: u64,
+        capacity: ObjectCacheCapacity,
+    ) -> bool {
+        let charged = self
+            .principals
+            .get(principal)
+            .map_or(0, |partition| partition.charged_bytes);
+        capacity.limit().is_none_or(|limit| {
+            charged
+                .saturating_sub(credit)
+                .checked_add(weight)
+                .is_some_and(|total| total <= limit)
+        })
+    }
+
+    fn can_fit_global_with_credit(
+        &self,
+        weight: u64,
+        credit: u64,
+        capacity: ObjectCacheCapacity,
+    ) -> bool {
+        capacity.limit().is_none_or(|limit| {
+            self.resident_bytes()
+                .saturating_sub(credit)
+                .checked_add(weight)
+                .is_some_and(|total| total <= limit)
+        })
+    }
+
     fn evict_principal_until_fits(
         &mut self,
         principal: &P,
@@ -302,6 +543,29 @@ where
                 .principals
                 .get(principal)
                 .and_then(|partition| partition.lru.first().map(|(_, object)| *object));
+            let Some(victim) = victim else {
+                break;
+            };
+            self.detach_principal(principal, victim);
+        }
+    }
+
+    fn evict_principal_until_fits_with_credit(
+        &mut self,
+        principal: &P,
+        weight: u64,
+        credit: u64,
+        capacity: ObjectCacheCapacity,
+        protected: ObjectId,
+    ) {
+        while !self.can_fit_principal_with_credit(principal, weight, credit, capacity) {
+            let victim = self.principals.get(principal).and_then(|partition| {
+                partition
+                    .lru
+                    .iter()
+                    .find(|(_, object)| *object != protected)
+                    .map(|(_, object)| *object)
+            });
             let Some(victim) = victim else {
                 break;
             };
@@ -345,6 +609,26 @@ where
         }
     }
 
+    fn evict_global_until_fits_with_credit(
+        &mut self,
+        weight: u64,
+        credit: u64,
+        capacity: ObjectCacheCapacity,
+        protected: ObjectId,
+    ) {
+        while !self.can_fit_global_with_credit(weight, credit, capacity) {
+            let victim = self
+                .lru
+                .iter()
+                .find(|(_, object)| *object != protected)
+                .map(|(_, object)| *object);
+            let Some(victim) = victim else {
+                break;
+            };
+            self.remove_physical(victim);
+        }
+    }
+
     fn trim_global(&mut self, capacity: ObjectCacheCapacity) {
         while capacity
             .limit()
@@ -364,14 +648,26 @@ where
             return;
         };
         if let Some(partition) = self.principals.get_mut(principal)
-            && let Some(tick) = partition.entries.remove(&object)
+            && let Some(entry) = partition.entries.remove(&object)
         {
-            partition.lru.remove(&(tick, object));
-            partition.charged_bytes = partition.charged_bytes.saturating_sub(weight);
+            let projection = projection_weight(&entry);
+            partition.lru.remove(&(entry.last_access, object));
+            partition.charged_bytes = partition
+                .charged_bytes
+                .saturating_sub(weight)
+                .saturating_sub(projection);
             self.resident_association_bytes = self
                 .resident_association_bytes
-                .saturating_sub(association_weight::<P>());
+                .saturating_sub(association_weight::<P>())
+                .saturating_sub(projection);
             self.resident_associations = self.resident_associations.saturating_sub(1);
+            self.resident_projection_bytes =
+                self.resident_projection_bytes.saturating_sub(projection);
+            let projection_count = u64::try_from(entry.projections.len()).unwrap_or(u64::MAX);
+            self.resident_projection_entries = self
+                .resident_projection_entries
+                .saturating_sub(projection_count);
+            self.projection_evictions = self.projection_evictions.saturating_add(projection_count);
         }
         if self
             .principals
@@ -396,14 +692,28 @@ where
         self.lru.remove(&(entry.last_access, object));
         for principal in entry.principals {
             if let Some(partition) = self.principals.get_mut(&principal)
-                && let Some(tick) = partition.entries.remove(&object)
+                && let Some(principal_entry) = partition.entries.remove(&object)
             {
-                partition.lru.remove(&(tick, object));
-                partition.charged_bytes = partition.charged_bytes.saturating_sub(entry.weight);
+                let projection = projection_weight(&principal_entry);
+                partition.lru.remove(&(principal_entry.last_access, object));
+                partition.charged_bytes = partition
+                    .charged_bytes
+                    .saturating_sub(entry.weight)
+                    .saturating_sub(projection);
                 self.resident_association_bytes = self
                     .resident_association_bytes
-                    .saturating_sub(association_weight::<P>());
+                    .saturating_sub(association_weight::<P>())
+                    .saturating_sub(projection);
                 self.resident_associations = self.resident_associations.saturating_sub(1);
+                self.resident_projection_bytes =
+                    self.resident_projection_bytes.saturating_sub(projection);
+                let projection_count =
+                    u64::try_from(principal_entry.projections.len()).unwrap_or(u64::MAX);
+                self.resident_projection_entries = self
+                    .resident_projection_entries
+                    .saturating_sub(projection_count);
+                self.projection_evictions =
+                    self.projection_evictions.saturating_add(projection_count);
             }
             if self
                 .principals
@@ -443,6 +753,19 @@ fn association_weight<P>() -> u64 {
             .saturating_add(std::mem::size_of::<u64>()),
     )
     .unwrap_or(u64::MAX)
+}
+
+fn projection_weight(entry: &PrincipalEntry) -> u64 {
+    entry.projections.values().fold(0_u64, |total, projection| {
+        total.saturating_add(projection.weight)
+    })
+}
+
+fn projection_cache_weight(payload: u64) -> u64 {
+    let metadata = std::mem::size_of::<ProjectionCacheKey>()
+        .saturating_add(std::mem::size_of::<CachedProjection>())
+        .saturating_add(std::mem::size_of::<usize>().saturating_mul(3));
+    payload.saturating_add(u64::try_from(metadata).unwrap_or(u64::MAX))
 }
 
 #[cfg(test)]

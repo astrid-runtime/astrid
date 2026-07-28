@@ -667,6 +667,47 @@ where
         self.object_cache.principal_charge(principal)
     }
 
+    /// Load one projection-owned process-local accelerator from governed
+    /// cache memory.
+    ///
+    /// A disabled budget, eviction, missing object association, or type
+    /// mismatch returns `None`. The authoritative object path is unaffected.
+    #[must_use]
+    pub fn projection_cache(
+        &self,
+        principal: &P,
+        object: ObjectId,
+        key: ProjectionCacheKey,
+    ) -> Option<ProjectionCacheEntry> {
+        self.object_cache.projection(principal, object, key)
+    }
+
+    /// Retain one projection-owned process-local accelerator under the same
+    /// total and per-principal budgets as decoded immutable objects.
+    ///
+    /// Returns `false` when policy declines retention. Projection correctness
+    /// must not depend on this value remaining resident.
+    pub fn retain_projection_cache(
+        &self,
+        principal: &P,
+        object: ObjectId,
+        key: ProjectionCacheKey,
+        value: ProjectionCacheEntry,
+    ) -> bool {
+        self.object_cache
+            .retain_projection(principal, object, key, value)
+    }
+
+    /// Discard one projection-owned accelerator and release its cache charge.
+    pub fn discard_projection_cache(
+        &self,
+        principal: &P,
+        object: ObjectId,
+        key: ProjectionCacheKey,
+    ) -> bool {
+        self.object_cache.discard_projection(principal, object, key)
+    }
+
     /// Persist one standalone immutable object outside a principal root.
     ///
     /// This narrow path exists for store-level bootstrap evidence referenced
@@ -1162,6 +1203,7 @@ mod format;
 #[path = "durable_lifecycle.rs"]
 mod lifecycle;
 
+use crate::{ProjectionCacheEntry, ProjectionCacheKey};
 use cache::ObjectCache;
 pub use cache::{
     ObjectCacheCapacity, ObjectCacheConfig, ObjectCacheController, ObjectCacheStats,

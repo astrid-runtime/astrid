@@ -507,11 +507,26 @@ mod tests {
             store.kv().get("alice:capsule:shell", "cwd").await.unwrap(),
             Some(b"/workspace".to_vec())
         );
+        let content_name = ContentName::new("models/cache-accounting.bin").unwrap();
+        let content = vec![0x5a; 512 * 1024];
+        store
+            .content()
+            .put(&owner, &content_name, &content)
+            .unwrap();
+        assert_eq!(
+            store
+                .content()
+                .read_range(&owner, &content_name, 1024, 4096)
+                .unwrap(),
+            Some(content[1024..5120].to_vec())
+        );
 
         let stats = store.object_cache_stats();
         assert!(stats.resident_objects > 0);
         assert!(stats.resident_record_bytes > 0);
         assert!(stats.resident_association_bytes > 0);
+        assert!(stats.resident_projection_entries > 0);
+        assert!(stats.resident_projection_bytes > 0);
         assert!(store.object_cache_principal_charge(&owner) > 0);
     }
 

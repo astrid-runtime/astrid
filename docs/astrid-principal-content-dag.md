@@ -273,12 +273,19 @@ identity, expected byte/chunk totals, chunk bounds, and requested-range checks
 remain active on every read.
 
 The principal store partitions this evidence by principal and file. Equal
-content in another principal cannot inherit warmth, and evidence is pruned
-when its file leaves that store instance's live catalog. An already-open
-generation may validate and cache the edge again because the handle remains a
-live read authority. The evidence is deliberately not durable; a future
-persistent form must be an authenticated `Evidence` object bound into the
-root-CAS graph, never an editable sidecar.
+content in another principal cannot inherit warmth. Edge bitmaps, complete-file
+tokens, and decoded root/catalog headers live in the same operator-governed
+projection cache as decoded immutable objects: their resident bytes count
+against the total pool and the principal's logical cache share. Eviction or
+budget refusal only removes acceleration; the next read takes the complete
+verified path. An already-open generation may retain evidence after its catalog
+name is replaced or deleted because that handle remains a live read authority,
+but the evidence cannot outlive the cache association or its budget.
+
+The evidence is deliberately not durable; a future persistent form must be an
+authenticated `Evidence` object bound into the root-CAS graph, never an editable
+sidecar. A cold process therefore reloads the neighbour chunks it needs and
+rejects any frame whose checksum or object identity changed after recovery.
 
 Objects are immutable, so a concurrent catalog update cannot change the bytes
 behind a descriptor. Durable garbage collection is not yet active. Once it is,
