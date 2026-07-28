@@ -1,24 +1,21 @@
-//! Integration coverage for compacted stores and the independent reader.
+//! Integration coverage for production retention and independently decoded compaction.
 
 #![cfg(not(target_os = "windows"))]
 
 use std::path::Path;
 use std::sync::Arc;
 
+use astrid_core::dirs::AstridHome;
 use astrid_storage_engine::{
-    CompactionFacts, CompactionProofVerifier, CompactionRetainedRoot, CompactionRetention,
-    CompactionRootKind, RecoveryLimits,
+    CompactionFacts, CompactionProofVerifier, CompactionRetention, CompactionRootKind,
 };
 use astrid_storage_model::{
     ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord, RetentionPolicyId,
 };
 
-use super::format_amendment::format_spec_record;
-use super::{
-    Blake3ObjectIdentityV1, KvQuotaResolver, RuntimeEngine, StateOwner, StateOwnerCodecV1,
-    open_runtime_kv,
-};
-use astrid_core::dirs::AstridHome;
+use super::bootstrap::RuntimeBootstrapObject;
+use super::format_amendment::object_id_hex;
+use super::{KvQuotaResolver, StateOwner, open_runtime_principal_store};
 
 struct AcceptCompactionProof;
 
@@ -55,39 +52,59 @@ fn evidence(bytes: &[u8]) -> ObjectRecord {
 }
 
 #[tokio::test]
-async fn independent_reader_accepts_a_compacted_root_snapshot() {
+async fn production_retention_preserves_every_registered_bootstrap_object() {
     let directory = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(directory.path());
-    let store = open_runtime_kv(&home, unlimited_quota()).await.unwrap();
+    let store = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
     store
+        .kv()
         .set("alice:capsule:shell", "cwd", b"/workspace".to_vec())
         .await
         .unwrap();
-    store.close().await.unwrap();
-    drop(store);
-
-    let engine = RuntimeEngine::open(
-        home.principal_store_path(),
-        Blake3ObjectIdentityV1,
-        StateOwnerCodecV1,
-        RecoveryLimits::process_addressable(),
-    )
-    .unwrap();
-    engine
+    let (orphan, _) = store
+        .engine
         .persist_standalone_object(&evidence(b"collect-me"))
         .unwrap();
-    let format_spec_id = engine.identify(&format_spec_record().unwrap());
-    let policy = evidence(b"test-retain-current-roots-and-runatal");
-    let retention = CompactionRetention::new(
-        ObjectId::new([0xC0; 32]),
-        RetentionPolicyId::new(engine.identify(&policy)),
-        [CompactionRetainedRoot::new(
-            CompactionRootKind::System,
-            format_spec_id,
-        )],
+    let bootstraps = RuntimeBootstrapObject::registered()
+        .iter()
+        .map(|bootstrap| {
+            let record = bootstrap.record().unwrap();
+            (store.engine.identify(&record), record)
+        })
+        .collect::<Vec<_>>();
+    let format_spec_id = store.engine.identify(
+        &RuntimeBootstrapObject::RunatalFormatSpecification
+            .record()
+            .unwrap(),
     );
-    let facts = engine.capture_compaction_facts(&retention).unwrap();
-    let plan = engine
+    let policy = evidence(b"test-runtime-retention");
+    let retention = store
+        .prepare_compaction_retention(
+            ObjectId::new([0xC0; 32]),
+            RetentionPolicyId::new(store.engine.identify(&policy)),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+    for (object, _) in &bootstraps {
+        assert!(
+            retention.additional_roots().iter().any(|root| {
+                root.kind() == CompactionRootKind::System && root.object() == *object
+            })
+        );
+    }
+    let facts = store.engine.capture_compaction_facts(&retention).unwrap();
+    assert!(facts.condemned().contains(&orphan));
+    assert!(
+        bootstraps
+            .iter()
+            .all(|(object, _)| !facts.condemned().contains(object))
+    );
+    let plan = store
+        .engine
         .verify_compaction_plan(
             retention,
             facts,
@@ -96,8 +113,21 @@ async fn independent_reader_accepts_a_compacted_root_snapshot() {
             &AcceptCompactionProof,
         )
         .unwrap();
-    engine.compact(&plan).unwrap();
-    engine.close().unwrap();
+    store.engine.compact(&plan).unwrap();
+    store.engine.close().unwrap();
+    drop(store);
+
+    let reopened = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    for (object, record) in &bootstraps {
+        assert_eq!(
+            reopened.engine.object(*object).unwrap().as_ref(),
+            Some(record)
+        );
+    }
+    reopened.engine.close().unwrap();
+    drop(reopened);
 
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/runatal_v1_reader.py");
     let compacted = std::process::Command::new("python3")
@@ -112,4 +142,64 @@ async fn independent_reader_accepts_a_compacted_root_snapshot() {
     );
     let decoded: serde_json::Value = serde_json::from_slice(&compacted.stdout).unwrap();
     assert_eq!(decoded["roots"]["alice"]["generation"], 0);
+    assert_eq!(
+        decoded["format_spec_object"],
+        format!("1:1:32:{}", object_id_hex(format_spec_id))
+    );
+}
+
+#[tokio::test]
+async fn raw_engine_retention_can_omit_bootstrap_but_runtime_constructor_fails_closed() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    let store = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    store
+        .kv()
+        .set("alice:capsule:shell", "cwd", b"/workspace".to_vec())
+        .await
+        .unwrap();
+    let format_spec = RuntimeBootstrapObject::RunatalFormatSpecification
+        .record()
+        .unwrap();
+    let format_spec_id = store.engine.identify(&format_spec);
+    let policy = evidence(b"test-policy-neutral-engine-retention");
+    let raw_retention = CompactionRetention::new(
+        ObjectId::new([0xC0; 32]),
+        RetentionPolicyId::new(store.engine.identify(&policy)),
+        [],
+    );
+    let facts = store
+        .engine
+        .capture_compaction_facts(&raw_retention)
+        .unwrap();
+    assert!(facts.condemned().contains(&format_spec_id));
+    let plan = store
+        .engine
+        .verify_compaction_plan(
+            raw_retention,
+            facts,
+            policy,
+            evidence(b"test-tensor-logic-proof"),
+            &AcceptCompactionProof,
+        )
+        .unwrap();
+    store.engine.compact(&plan).unwrap();
+
+    let policy = evidence(b"subsequent-runtime-retention");
+    let error = store
+        .prepare_compaction_retention(
+            ObjectId::new([0xC0; 32]),
+            RetentionPolicyId::new(store.engine.identify(&policy)),
+            Vec::new(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("protected RÚNATAL format specification is missing")
+    );
+    store.engine.close().unwrap();
 }

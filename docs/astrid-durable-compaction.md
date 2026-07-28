@@ -92,6 +92,15 @@ not select current-only, keep-N, time-window, or hybrid history policy. The
 policy object and roots make that decision inspectable and keep its accounting
 separate.
 
+The raw engine contract remains policy-neutral and can therefore omit any
+standalone object. Native runtime composition must instead construct retention
+through `RuntimePrincipalStore::prepare_compaction_retention`. That boundary
+adds every object in the single runtime-bootstrap registry as a typed `System`
+root and identity-checks each record before returning a retention value. A
+missing RÚNATAL specification or future registered bootstrap object therefore
+fails before a destructive plan can be verified, rather than after compaction
+at the next reopen.
+
 ## Dedup-resurrection and handle fences
 
 Commit preparation, root publication, liveness capture, and physical
