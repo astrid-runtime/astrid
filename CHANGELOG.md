@@ -21,10 +21,11 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   specified as a disposable fleet index over durable derivation evidence, with
   differential spot checks, logical-versus-physical compute accounting, and
   principal/trust-domain authority preserved below its cache. Huginn applies
-  the same primitive to canonical local-model context and prefix assembly. One
-  Refinery scheduler and resource budget cover scrub, SHA-384 cross-hashing,
-  resemblance sketches, and representation-aware compaction while retaining a
-  sealed engine-only mutation boundary. Durable storage freeze and
+  the same primitive to canonical local-model context and prefix assembly. The
+  Refinery contract and initial engine seam unify scrub, SHA-384 cross-hashing,
+  resemblance sketches, and representation-aware compaction behind one
+  resource-budget shape while retaining a sealed engine-only mutation
+  boundary. Durable storage freeze and
   freedom-to-operate records pin the associated format, chunking, identity,
   and public-layer research decisions without activating a capsule or WIT
   surface.

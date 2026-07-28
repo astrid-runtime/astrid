@@ -1,7 +1,7 @@
 # The Astrid Refinery
 
-Status: design contract. The scheduling and pass seams must exist before arena
-compaction is implemented.
+Status: design contract with the initial observer/compaction type seam. The
+resource-authority scheduler must exist before arena compaction is implemented.
 
 The Refinery is one bounded cold-path pipeline for work that already needs to
 stream live stored bytes:
@@ -45,8 +45,10 @@ EngineCompactionPass
     -> atomically publish new physical placement
 ```
 
-The first Rust seam should encode that distinction in types rather than a
-runtime `privileged` flag.
+The Rust seam encodes that distinction in types rather than a runtime
+`privileged` flag: `RefineryPass` receives only verified immutable records and
+an untrusted proposal sink, while `EngineCompactionPass` has a private sealed
+supertrait that external observers cannot implement.
 
 ## Pass identity
 

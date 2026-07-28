@@ -29,6 +29,7 @@ mod durable;
 mod kv;
 mod muninn;
 mod projection;
+mod refinery;
 
 #[cfg(not(target_family = "wasm"))]
 pub use durable::{
@@ -44,6 +45,12 @@ pub use muninn::{
     VerifiedDerivationEvidence, verify_derivation_evidence,
 };
 pub use projection::{PrincipalProjectionEngine, PrincipalProjectionError};
+pub use refinery::{
+    EngineCompactionPass, ProposedRefineryOutput, RefineryBatchContext, RefineryCheckpointId,
+    RefineryOutputClass, RefineryPass, RefineryPassDescriptorId, RefineryProposalError,
+    RefineryProposalSink, RefineryResourceBudget, RefineryRunError, RefinerySnapshotId,
+    VerifiedRefineryObject, run_refinery_observer,
+};
 
 /// A root update and the immutable records required to reconstruct it.
 ///
