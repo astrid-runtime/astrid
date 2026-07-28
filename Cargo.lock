@@ -843,6 +843,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "astrid-resources"
+version = "0.10.4"
+dependencies = [
+ "parking_lot",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "astrid-runtime"
 version = "0.10.4"
 dependencies = [
