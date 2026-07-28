@@ -202,13 +202,16 @@ Windows, and Linux filesystem providers. It is deliberately not a mount:
 1. a provider derives the `StateOwner` from its authenticated host context and
    opens a private random-access native file;
 2. ordinary writes, seeks, and truncation touch only that file;
-3. close calls `seal`, which flushes the bytes and a versioned, checksummed
-   intent before moving the directory into the ready queue;
-4. `seal` returning is the provider acknowledgement boundary; chunking and
-   object admission have not run;
-5. an ordered background consumer streams the file through
+3. an explicit durable close calls `seal`, which appends a recoverable intent
+   footer, flushes the generation, and renames it into the ready namespace;
+4. concurrent seals share one generation-directory flush and one append-only
+   intent-journal flush under the same configurable group policy as durable
+   principal commits;
+5. `seal` returning is the durable provider acknowledgement boundary; chunking
+   and object admission have not run;
+6. an ordered background consumer streams the logical file prefix through
    `PrincipalContentStore` on a blocking worker; and
-6. only a successful principal-root CAS writes the durable publication marker
+7. only a successful principal-root CAS appends a durable publication record
    and permits conservative cleanup.
 
 The close-order sequence is allocated at seal rather than open. Publication
@@ -216,14 +219,20 @@ rejects a later close while an earlier close for the same owner and content
 name remains queued, so a slow old handle cannot overwrite a newer result.
 Different names do not share this ordering dependency.
 
-A process crash before the intent leaves unacknowledged bytes that startup
-preserves under `quarantine/`. A crash after the intent but before the
-directory rename promotes the sealed write on reopen. A crash after the root
-CAS but before cleanup safely repeats the operation: exact bytes reproduce the
-same file identity, the already-current catalog returns the same root, and no
-new objects are admitted. Redirected sources, malformed markers, changed
-lengths, non-canonical queue names, and unexpected directory members fail
-closed without deleting acknowledged bytes.
+A process crash before a valid sealed footer leaves unacknowledged bytes that
+startup preserves under `quarantine/`. A valid footer is independent recovery
+evidence when a crash tears the final seal-journal frame; recovery reconstructs
+and flushes the missing record. A valid later journal frame makes corruption
+interior and open fails. A crash after the root CAS but before cleanup safely
+repeats the operation: exact bytes reproduce the same file identity, the
+already-current catalog returns the same root, and no new objects are admitted.
+A durable publication record permits idempotent cleanup even when the file was
+already removed. Redirected sources, mismatched footers, changed lengths, and
+non-canonical queue names fail closed without deleting acknowledged bytes.
+
+The wire layout, acknowledgement sequence, legacy migration, crash matrix, and
+measured group-seal checkpoint are recorded in
+[the seal-journal design](astrid-storage-seal-journal.md).
 
 This private area is never a guest path. A platform provider must bind each
 open handle to a host-stamped principal and that principal's live resource

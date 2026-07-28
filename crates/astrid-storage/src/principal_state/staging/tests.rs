@@ -1,13 +1,85 @@
-use std::io::{Seek as _, Write as _};
+use std::io::{Read as _, Seek as _, Write as _};
+use std::sync::Barrier;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::time::Duration;
 
 use astrid_core::principal::PrincipalId;
 use uuid::Uuid;
 
 use super::format::{StagingIntent, decode_intent, encode_intent};
+use super::journal::{JournalRecord, StageKey, append_records, encoded_frame, flush_journal};
 use super::*;
+use crate::principal_state::native_io::{atomic_write, sync_directory};
 
 fn owner() -> StateOwner {
     StateOwner::Principal(PrincipalId::new("alice").unwrap())
+}
+
+fn open_area(path: &Path) -> NativeContentStagingArea {
+    NativeContentStagingArea::open_with_group_commit_policy(path, GroupCommitPolicy::immediate())
+        .unwrap()
+}
+
+fn writer(area: &NativeContentStagingArea, name: &str) -> StagedContentWriter {
+    area.begin(
+        owner(),
+        ContentName::new(name).unwrap(),
+        ChunkingProfile::ASTRID_V1,
+    )
+    .unwrap()
+}
+
+fn read_logical(staged: &ReadyStagedContent) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    open_private_file(&staged.content_path())
+        .unwrap()
+        .take(staged.logical_bytes())
+        .read_to_end(&mut bytes)
+        .unwrap();
+    bytes
+}
+
+#[derive(Debug)]
+struct FailOnce {
+    point: StagingFaultPoint,
+    fired: AtomicBool,
+}
+
+#[derive(Debug)]
+struct BarrierAt {
+    point: StagingFaultPoint,
+    barrier: Arc<Barrier>,
+}
+
+impl StagingFaultInjector for BarrierAt {
+    fn fail(&self, point: StagingFaultPoint) -> StorageResult<()> {
+        if point == self.point {
+            self.barrier.wait();
+        }
+        Ok(())
+    }
+}
+
+impl StagingFaultInjector for FailOnce {
+    fn fail(&self, point: StagingFaultPoint) -> StorageResult<()> {
+        if point == self.point && !self.fired.swap(true, AtomicOrdering::SeqCst) {
+            Err(connection(format!("injected staging fault at {point:?}")))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn open_with_fault(path: &Path, point: StagingFaultPoint) -> NativeContentStagingArea {
+    NativeContentStagingArea::open_configured(
+        path.to_path_buf(),
+        GroupCommitPolicy::immediate(),
+        Arc::new(FailOnce {
+            point,
+            fired: AtomicBool::new(false),
+        }),
+    )
+    .unwrap()
 }
 
 #[test]
@@ -34,21 +106,9 @@ fn intent_round_trips_and_rejects_corruption() {
 #[test]
 fn sealing_orders_by_close_and_survives_reopen() {
     let directory = tempfile::tempdir().unwrap();
-    let area = NativeContentStagingArea::open(directory.path()).unwrap();
-    let mut older = area
-        .begin(
-            owner(),
-            ContentName::new("same-name").unwrap(),
-            ChunkingProfile::ASTRID_V1,
-        )
-        .unwrap();
-    let mut newer = area
-        .begin(
-            owner(),
-            ContentName::new("same-name").unwrap(),
-            ChunkingProfile::ASTRID_V1,
-        )
-        .unwrap();
+    let area = open_area(directory.path());
+    let mut older = writer(&area, "same-name");
+    let mut newer = writer(&area, "same-name");
     older.write_all(b"began first").unwrap();
     newer.write_all(b"closed first").unwrap();
     let closed_first = newer.seal().unwrap();
@@ -58,7 +118,7 @@ fn sealing_orders_by_close_and_survives_reopen() {
 
     assert!(closed_first.sequence() < closed_last.sequence());
     drop(area);
-    let reopened = NativeContentStagingArea::open(directory.path()).unwrap();
+    let reopened = open_area(directory.path());
     let ready = reopened.ready().unwrap();
     assert_eq!(ready.len(), 2);
     assert_eq!(ready[0].id(), closed_first.id());
@@ -67,60 +127,41 @@ fn sealing_orders_by_close_and_survives_reopen() {
 }
 
 #[test]
-fn interrupted_seal_is_promoted_but_unsealed_bytes_are_quarantined() {
+fn unacknowledged_open_and_orphan_sealed_generations_are_quarantined() {
     let directory = tempfile::tempdir().unwrap();
-    let root = directory.path();
-    let area = NativeContentStagingArea::open(root).unwrap();
-    let mut sealed = area
-        .begin(
-            owner(),
-            ContentName::new("sealed").unwrap(),
-            ChunkingProfile::ASTRID_V1,
-        )
-        .unwrap();
-    sealed.write_all(b"recover me").unwrap();
-    let sealed_directory = sealed.directory.clone().unwrap();
-    let file = sealed.file.take().unwrap();
-    file.sync_all().unwrap();
-    let intent = StagingIntent {
-        sequence: area.allocate_sequence().unwrap(),
-        id: sealed.id,
-        owner: sealed.owner.clone(),
-        name: sealed.name.clone(),
-        profile: sealed.profile,
-        logical_bytes: 10,
-    };
-    atomic_write(
-        &sealed_directory.join(INTENT_FILE),
-        &encode_intent(&intent).unwrap(),
-    )
-    .unwrap();
-    sealed.preserve_on_drop = true;
-    drop(sealed);
+    let area = open_area(directory.path());
+    let mut open = writer(&area, "open");
+    open.write_all(b"not acknowledged").unwrap();
+    open.preserve_on_drop = true;
+    let open_name = open.path.as_ref().unwrap().file_name().unwrap().to_owned();
+    drop(open);
 
-    let mut unsealed = area
-        .begin(
-            owner(),
-            ContentName::new("unsealed").unwrap(),
-            ChunkingProfile::ASTRID_V1,
-        )
-        .unwrap();
-    unsealed.write_all(b"not acknowledged").unwrap();
-    unsealed.preserve_on_drop = true;
-    let unsealed_id = unsealed.id;
-    drop(unsealed);
+    let mut orphan = writer(&area, "orphan");
+    orphan.write_all(b"renamed but not journalled").unwrap();
+    let open_path = orphan.path.take().unwrap();
+    let orphan_path = area
+        .inner
+        .generations
+        .join(sealed_generation_name(9, orphan.id));
+    std::fs::rename(&open_path, &orphan_path).unwrap();
+    orphan.preserve_on_drop = true;
+    drop(orphan);
     drop(area);
 
-    let recovered = NativeContentStagingArea::open(root).unwrap();
-    let ready = recovered.ready().unwrap();
-    assert_eq!(ready.len(), 1);
-    assert_eq!(ready[0].id(), intent.id);
+    let reopened = open_area(directory.path());
+    assert!(reopened.ready().unwrap().is_empty());
+    let quarantine = directory.path().join(QUARANTINE_DIRECTORY);
     assert!(
-        recovered
-            .inner
-            .root
-            .join(QUARANTINE_DIRECTORY)
-            .join(format!("{unsealed_id}.unsealed.0"))
+        quarantine
+            .join(format!("{}.unsealed.0", open_name.to_string_lossy()))
+            .exists()
+    );
+    assert!(
+        quarantine
+            .join(format!(
+                "{}.orphan.0",
+                orphan_path.file_name().unwrap().to_string_lossy()
+            ))
             .exists()
     );
 }
@@ -131,16 +172,10 @@ fn ready_scan_rejects_a_symlinked_content_source() {
     use std::os::unix::fs::symlink;
 
     let directory = tempfile::tempdir().unwrap();
-    let area = NativeContentStagingArea::open(directory.path()).unwrap();
-    let mut writer = area
-        .begin(
-            owner(),
-            ContentName::new("redirect").unwrap(),
-            ChunkingProfile::ASTRID_V1,
-        )
-        .unwrap();
-    writer.write_all(b"safe").unwrap();
-    let staged = writer.seal().unwrap();
+    let area = open_area(directory.path());
+    let mut staged_writer = writer(&area, "redirect");
+    staged_writer.write_all(b"safe").unwrap();
+    let staged = staged_writer.seal().unwrap();
     std::fs::remove_file(staged.content_path()).unwrap();
     symlink("/etc/passwd", staged.content_path()).unwrap();
 
@@ -153,73 +188,344 @@ fn ready_scan_rejects_a_symlinked_content_source() {
 }
 
 #[test]
-fn corrupt_ready_intent_fails_closed_without_deleting_staged_bytes() {
+fn torn_journal_tail_is_truncated_without_losing_the_valid_prefix() {
     let directory = tempfile::tempdir().unwrap();
-    let area = NativeContentStagingArea::open(directory.path()).unwrap();
-    let mut writer = area
-        .begin(
-            owner(),
-            ContentName::new("keep-on-corruption").unwrap(),
-            ChunkingProfile::ASTRID_V1,
-        )
-        .unwrap();
-    writer.write_all(b"still here").unwrap();
-    let staged = writer.seal().unwrap();
-    let intent_path = staged.directory.join(INTENT_FILE);
-    let mut bytes = std::fs::read(&intent_path).unwrap();
-    bytes[8] ^= 0x40;
-    std::fs::write(&intent_path, bytes).unwrap();
+    let area = open_area(directory.path());
+    let mut first_writer = writer(&area, "first");
+    first_writer.write_all(b"first").unwrap();
+    let first = first_writer.seal().unwrap();
 
-    assert!(area.ready().is_err());
-    assert_eq!(std::fs::read(staged.content_path()).unwrap(), b"still here");
+    let torn_intent = StagingIntent {
+        sequence: first.sequence().checked_add(1).unwrap(),
+        id: StagedContentId(Uuid::new_v4()),
+        owner: owner(),
+        name: ContentName::new("torn").unwrap(),
+        profile: ChunkingProfile::ASTRID_V1,
+        logical_bytes: 4,
+    };
+    let frame = encoded_frame(&JournalRecord::Sealed(torn_intent)).unwrap();
+    let mut journal = area.inner.journal.lock();
+    journal.file.seek(SeekFrom::End(0)).unwrap();
+    journal.file.write_all(&frame[..frame.len() / 2]).unwrap();
+    drop(journal);
+    drop(area);
+
+    let reopened = open_area(directory.path());
+    assert_eq!(reopened.ready().unwrap(), vec![first]);
 }
 
 #[test]
-fn ready_scan_reaps_every_interrupted_cleanup_prefix() {
-    let cleanup_prefixes: &[(&str, &[&str])] = &[
-        ("before-cleanup", &[]),
-        ("after-content-removal", &[CONTENT_FILE]),
-        ("after-intent-removal", &[CONTENT_FILE, INTENT_FILE]),
-        (
-            "after-marker-removal",
-            &[CONTENT_FILE, INTENT_FILE, PUBLISHED_FILE],
-        ),
+fn every_seal_crash_prefix_recovers_only_acknowledgeable_state() {
+    let cases = [
+        (StagingFaultPoint::ContentFlushed, 0),
+        (StagingFaultPoint::GenerationRenamed, 1),
+        (StagingFaultPoint::GenerationDirectoryFlushed, 1),
+        // An append that reached the page cache may survive even though the
+        // caller did not receive acknowledgement. Recovery accepting that
+        // complete record is safe because the generation directory was
+        // synchronized first.
+        (StagingFaultPoint::SealJournalAppended, 1),
+        (StagingFaultPoint::SealJournalFlushed, 1),
     ];
-
-    for (case, removed_files) in cleanup_prefixes {
+    for (point, recovered_count) in cases {
         let directory = tempfile::tempdir().unwrap();
-        let area = NativeContentStagingArea::open(directory.path()).unwrap();
-        let mut published_writer = area
-            .begin(
-                owner(),
-                ContentName::new("published").unwrap(),
-                ChunkingProfile::ASTRID_V1,
-            )
-            .unwrap();
-        published_writer.write_all(b"published bytes").unwrap();
-        let published = published_writer.seal().unwrap();
-        atomic_write(&published.directory.join(PUBLISHED_FILE), PUBLISHED_MARKER).unwrap();
+        let area = open_with_fault(directory.path(), point);
+        let mut staged_writer = writer(&area, "faulted");
+        staged_writer.write_all(b"preserve me").unwrap();
+        assert!(staged_writer.seal().is_err(), "{point:?}");
+        drop(area);
 
-        let mut pending_writer = area
-            .begin(
-                owner(),
-                ContentName::new("still-pending").unwrap(),
-                ChunkingProfile::ASTRID_V1,
-            )
-            .unwrap();
-        pending_writer.write_all(b"pending bytes").unwrap();
-        let pending = pending_writer.seal().unwrap();
-
-        for name in *removed_files {
-            std::fs::remove_file(published.directory.join(name)).unwrap();
-        }
-
-        let ready = area.ready().unwrap();
-        assert_eq!(ready.len(), 1, "{case}");
-        assert_eq!(ready[0].id(), pending.id(), "{case}");
-        assert!(!published.directory.exists(), "{case}");
-        assert!(pending.directory.exists(), "{case}");
+        let reopened = open_area(directory.path());
+        assert_eq!(
+            reopened.ready().unwrap().len(),
+            recovered_count,
+            "{point:?}"
+        );
     }
+}
+
+#[test]
+fn every_publication_cleanup_prefix_reopens_as_completed() {
+    for point in [
+        StagingFaultPoint::PublicationJournalAppended,
+        StagingFaultPoint::PublicationJournalFlushed,
+        StagingFaultPoint::GenerationCleaned,
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let area = open_with_fault(directory.path(), point);
+        let mut staged_writer = writer(&area, "published");
+        staged_writer.write_all(b"published bytes").unwrap();
+        let staged = staged_writer.seal().unwrap();
+        assert!(area.mark_published(&staged).is_err(), "{point:?}");
+        drop(area);
+
+        let reopened = open_area(directory.path());
+        assert!(reopened.ready().unwrap().is_empty(), "{point:?}");
+        assert!(!staged.content_path().exists(), "{point:?}");
+    }
+}
+
+#[test]
+fn concurrent_seals_share_one_journal_group() {
+    let directory = tempfile::tempdir().unwrap();
+    let barrier = Arc::new(Barrier::new(8));
+    let area = Arc::new(
+        NativeContentStagingArea::open_configured(
+            directory.path().to_path_buf(),
+            GroupCommitPolicy::new(Duration::from_millis(200)),
+            Arc::new(BarrierAt {
+                point: StagingFaultPoint::ContentFlushed,
+                barrier: Arc::clone(&barrier),
+            }),
+        )
+        .unwrap(),
+    );
+    let mut workers = Vec::new();
+    for index in 0..8 {
+        let area = Arc::clone(&area);
+        workers.push(std::thread::spawn(move || {
+            let mut staged_writer = writer(&area, &format!("file-{index}"));
+            staged_writer.write_all(b"batched").unwrap();
+            staged_writer.seal().unwrap()
+        }));
+    }
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    assert_eq!(area.inner.seal_groups_completed.load(Ordering::SeqCst), 1);
+    assert_eq!(area.ready().unwrap().len(), 8);
+}
+
+#[test]
+fn corrupt_interior_journal_frame_fails_open() {
+    let directory = tempfile::tempdir().unwrap();
+    let area = open_area(directory.path());
+    for name in ["first", "second"] {
+        let mut staged_writer = writer(&area, name);
+        staged_writer.write_all(name.as_bytes()).unwrap();
+        staged_writer.seal().unwrap();
+    }
+    drop(area);
+
+    let journal_path = directory.path().join(JOURNAL_FILE);
+    let mut bytes = std::fs::read(&journal_path).unwrap();
+    bytes[20] ^= 0x80;
+    std::fs::write(&journal_path, bytes).unwrap();
+
+    let error = NativeContentStagingArea::open_with_group_commit_policy(
+        directory.path(),
+        GroupCommitPolicy::immediate(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("corrupt interior"));
+}
+
+#[test]
+fn corrupt_seal_tail_rebuilds_from_the_generation_footer() {
+    let directory = tempfile::tempdir().unwrap();
+    let area = open_area(directory.path());
+    let mut staged = Vec::new();
+    for name in ["first", "second"] {
+        let mut staged_writer = writer(&area, name);
+        staged_writer.write_all(name.as_bytes()).unwrap();
+        staged.push(staged_writer.seal().unwrap());
+    }
+    drop(area);
+
+    let journal_path = directory.path().join(JOURNAL_FILE);
+    let mut bytes = std::fs::read(&journal_path).unwrap();
+    let frames: Vec<_> = bytes
+        .windows(8)
+        .enumerate()
+        .filter_map(|(offset, magic)| (magic == b"ASTRSTG1").then_some(offset))
+        .collect();
+    assert_eq!(frames.len(), 2);
+    bytes[frames[1] + 20] ^= 0x80;
+    std::fs::write(&journal_path, bytes).unwrap();
+
+    let reopened = open_area(directory.path());
+    assert_eq!(reopened.ready().unwrap(), staged);
+}
+
+#[test]
+fn corrupt_completion_tail_with_missing_generation_fails_closed() {
+    let directory = tempfile::tempdir().unwrap();
+    let area = open_area(directory.path());
+    let mut staged_writer = writer(&area, "published");
+    staged_writer.write_all(b"published").unwrap();
+    let staged = staged_writer.seal().unwrap();
+    let key = StageKey {
+        sequence: staged.sequence(),
+        id: staged.id(),
+    };
+    {
+        let mut journal = area.inner.journal.lock();
+        append_records(&mut journal.file, &[JournalRecord::Published(key)]).unwrap();
+        flush_journal(&journal.file).unwrap();
+    }
+    std::fs::remove_file(staged.content_path()).unwrap();
+    sync_directory(&area.inner.generations).unwrap();
+    drop(area);
+
+    let journal_path = directory.path().join(JOURNAL_FILE);
+    let mut bytes = std::fs::read(&journal_path).unwrap();
+    let completion = bytes
+        .windows(8)
+        .enumerate()
+        .filter_map(|(offset, magic)| (magic == b"ASTRSTG1").then_some(offset))
+        .next_back()
+        .unwrap();
+    bytes[completion + 20] ^= 0x80;
+    std::fs::write(&journal_path, bytes).unwrap();
+
+    assert!(NativeContentStagingArea::open(directory.path()).is_err());
+}
+
+#[test]
+fn published_record_reaps_every_interrupted_cleanup_state() {
+    for remove_before_reopen in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let area = open_area(directory.path());
+        let mut staged_writer = writer(&area, "published");
+        staged_writer.write_all(b"published bytes").unwrap();
+        let staged = staged_writer.seal().unwrap();
+        let key = StageKey {
+            sequence: staged.sequence(),
+            id: staged.id(),
+        };
+        {
+            let mut journal = area.inner.journal.lock();
+            append_records(&mut journal.file, &[JournalRecord::Published(key)]).unwrap();
+            flush_journal(&journal.file).unwrap();
+        }
+        if remove_before_reopen {
+            std::fs::remove_file(staged.content_path()).unwrap();
+        }
+        drop(area);
+
+        let reopened = open_area(directory.path());
+        assert!(reopened.ready().unwrap().is_empty());
+        assert!(!staged.content_path().exists());
+        assert_eq!(
+            std::fs::metadata(directory.path().join(JOURNAL_FILE))
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+}
+
+#[test]
+fn legacy_pending_published_and_unsealed_entries_migrate_without_loss() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let writing = root.join(legacy::WRITING_DIRECTORY);
+    let ready = root.join(legacy::READY_DIRECTORY);
+    let quarantine = root.join(QUARANTINE_DIRECTORY);
+    for path in [&writing, &ready, &quarantine] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+
+    let pending = legacy_entry(&ready, 4, "pending", b"keep me", false);
+    let published = legacy_entry(&ready, 5, "published", b"already published", true);
+    let published_directory = ready.join(format!("{:020}-{}", published.sequence, published.id));
+
+    let unsealed_id = StagedContentId(Uuid::new_v4());
+    let unsealed = writing.join(unsealed_id.to_string());
+    std::fs::create_dir(&unsealed).unwrap();
+    std::fs::write(unsealed.join(legacy::CONTENT_FILE), b"never acknowledged").unwrap();
+    sync_directory(&writing).unwrap();
+
+    let area = open_area(root);
+    let ready_entries = area.ready().unwrap();
+    assert_eq!(ready_entries.len(), 1);
+    assert_eq!(ready_entries[0].id(), pending.id);
+    assert_eq!(read_logical(&ready_entries[0]), b"keep me");
+    assert!(!published_directory.exists());
+    assert!(
+        quarantine
+            .join(format!("{unsealed_id}.legacy-unsealed.0"))
+            .exists()
+    );
+}
+
+#[test]
+fn legacy_migration_resumes_before_or_after_the_generation_footer() {
+    for footer_state in ["missing", "torn", "complete"] {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let ready = root.join(legacy::READY_DIRECTORY);
+        let generations = root.join(GENERATIONS_DIRECTORY);
+        let quarantine = root.join(QUARANTINE_DIRECTORY);
+        for path in [&ready, &generations, &quarantine] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let intent = legacy_entry(&ready, 11, "resume", b"migration bytes", false);
+        let legacy_directory = ready.join(format!("{:020}-{}", intent.sequence, intent.id));
+        let target = generations.join(sealed_generation_name(intent.sequence, intent.id));
+        std::fs::rename(legacy_directory.join(legacy::CONTENT_FILE), &target).unwrap();
+        if footer_state == "complete" {
+            let mut generation = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&target)
+                .unwrap();
+            append_generation_footer(&mut generation, &intent).unwrap();
+            generation.sync_all().unwrap();
+        } else if footer_state == "torn" {
+            let mut generation = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&target)
+                .unwrap();
+            generation.write_all(b"ASTRID-STAGE-F1").unwrap();
+            generation.sync_all().unwrap();
+        }
+        sync_directory(&generations).unwrap();
+
+        let area = open_area(root);
+        let entries = area.ready().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id(), intent.id);
+        assert_eq!(read_logical(&entries[0]), b"migration bytes");
+        assert!(!legacy_directory.exists());
+    }
+}
+
+fn legacy_entry(
+    ready: &Path,
+    sequence: u64,
+    name: &str,
+    content: &[u8],
+    published: bool,
+) -> StagingIntent {
+    let id = StagedContentId(Uuid::new_v4());
+    let directory = ready.join(format!("{sequence:020}-{id}"));
+    std::fs::create_dir(&directory).unwrap();
+    let content_path = directory.join(legacy::CONTENT_FILE);
+    std::fs::write(&content_path, content).unwrap();
+    File::open(&content_path).unwrap().sync_all().unwrap();
+    let intent = StagingIntent {
+        sequence,
+        id,
+        owner: owner(),
+        name: ContentName::new(name).unwrap(),
+        profile: ChunkingProfile::ASTRID_V1,
+        logical_bytes: u64::try_from(content.len()).unwrap(),
+    };
+    atomic_write(
+        &directory.join(legacy::INTENT_FILE),
+        &encode_intent(&intent).unwrap(),
+    )
+    .unwrap();
+    if published {
+        atomic_write(
+            &directory.join(legacy::PUBLISHED_FILE),
+            legacy::PUBLISHED_MARKER,
+        )
+        .unwrap();
+    }
+    sync_directory(ready).unwrap();
+    intent
 }
 
 #[cfg(unix)]
@@ -235,4 +541,54 @@ fn staging_root_cannot_be_a_symlink() {
 
     let error = NativeContentStagingArea::open(&redirected).unwrap_err();
     assert!(error.to_string().contains("redirected or not a directory"));
+}
+
+#[test]
+#[ignore = "explicit native seal-group throughput probe"]
+fn native_seal_group_scale_probe() {
+    const SEALS_PER_WRITER: u16 = 64;
+    const SAMPLES: u8 = 3;
+
+    for writers in [1_u8, 2, 4, 8] {
+        for sample in 0..SAMPLES {
+            let directory = tempfile::tempdir().unwrap();
+            let area = Arc::new(NativeContentStagingArea::open(directory.path()).unwrap());
+            let barrier = Arc::new(Barrier::new(usize::from(writers)));
+            let started = std::time::Instant::now();
+            let mut workers = Vec::new();
+            for writer_index in 0..writers {
+                let area = Arc::clone(&area);
+                let barrier = Arc::clone(&barrier);
+                workers.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    let mut latencies = Vec::new();
+                    for seal_index in 0..SEALS_PER_WRITER {
+                        let mut staged_writer =
+                            writer(&area, &format!("probe/{writer_index}/{seal_index}"));
+                        staged_writer.write_all(&[0x5a; 4096]).unwrap();
+                        let operation = std::time::Instant::now();
+                        staged_writer.seal().unwrap();
+                        latencies.push(operation.elapsed());
+                    }
+                    latencies
+                }));
+            }
+            let mut latencies = Vec::new();
+            for worker in workers {
+                latencies.extend(worker.join().unwrap());
+            }
+            let elapsed = started.elapsed();
+            latencies.sort_unstable();
+            let operations = u32::from(writers) * u32::from(SEALS_PER_WRITER);
+            let p95_index = latencies.len().saturating_mul(95).div_ceil(100) - 1;
+            println!(
+                "native_seal_group writers={writers} sample={sample} operations={operations} seals_per_second={:.1} p50_us={} p95_us={} max_us={} wall_ms={}",
+                f64::from(operations) / elapsed.as_secs_f64(),
+                latencies[latencies.len() / 2].as_micros(),
+                latencies[p95_index].as_micros(),
+                latencies.last().unwrap().as_micros(),
+                elapsed.as_millis()
+            );
+        }
+    }
 }

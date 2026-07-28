@@ -422,7 +422,7 @@ fn quarantine_incomplete(path: &Path) -> StorageResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Seek as _, SeekFrom, Write as _};
+    use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
     use std::time::Instant;
 
     use astrid_storage_model::{ObjectFormatVersion, ObjectKind};
@@ -617,7 +617,9 @@ mod tests {
         writer.write_all(b"one identity").unwrap();
         let staged = writer.seal().unwrap();
 
-        let source = native_io::open_private_file(&staged.content_path()).unwrap();
+        let source = native_io::open_private_file(&staged.content_path())
+            .unwrap()
+            .take(staged.logical_bytes());
         let first = store
             .content()
             .put_streaming(&owner, &name, source)
