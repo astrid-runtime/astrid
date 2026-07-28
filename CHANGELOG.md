@@ -25,7 +25,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   Refinery contract and initial engine seam unify scrub, SHA-384 cross-hashing,
   resemblance sketches, and representation-aware compaction behind one
   resource-budget shape while retaining a sealed engine-only mutation
-  boundary. Durable storage freeze and
+  boundary. Linked GC plan and commit evidence keep the exact fact snapshot,
+  retention policy, auditor proof, condemned set, and placement transition
+  replayable, while commit construction rejects a changed fence-held snapshot.
+  Durable storage freeze and
   freedom-to-operate records pin the associated format, chunking, identity,
   and public-layer research decisions without activating a capsule or WIT
   surface.

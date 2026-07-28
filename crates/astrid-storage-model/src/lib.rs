@@ -616,6 +616,7 @@ pub trait ObjectIdentity {
 
 mod derivation;
 mod derivation_evidence;
+mod gc_evidence;
 mod proof;
 
 pub use derivation::{
@@ -627,6 +628,10 @@ pub use derivation::{
 };
 pub use derivation_evidence::{
     DerivationEvidence, DerivationEvidenceError, DerivationOutput, VerifierEvidenceId,
+};
+pub use gc_evidence::{
+    GcCommitEvidence, GcCommitId, GcEvidenceError, GcFactSnapshotId, GcPlanEvidence, GcPlanId,
+    PlacementSetId, RetentionPolicyId, TensorLogicProofId,
 };
 pub use proof::{
     OwnedSubtreePatch, ReferencePath, StateSelector, StateViewProof, TransitionWitness,
@@ -975,6 +980,9 @@ pub use world::World;
 
 #[cfg(test)]
 mod derivation_tests;
+
+#[cfg(test)]
+mod gc_evidence_tests;
 
 #[cfg(test)]
 #[path = "model_tests.rs"]

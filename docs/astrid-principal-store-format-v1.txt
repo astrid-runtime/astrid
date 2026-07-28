@@ -566,10 +566,50 @@ the owned invocation, verify every duplicated invocation field, reject a
 non-memoizable execution class, and prove every output's exact complete Owns
 closure before populating a reusable index.
 
-Kinds 15 and 16 reserve the linked garbage-collection evidence domain. Until
-their complete schemas are frozen in this document, readers preserve them as
-opaque typed objects and no runtime may claim independent semantic decoding of
-their canonical payloads.
+
+7.7 Garbage-collection plan evidence
+------------------------------------
+
+GcPlanEvidence is kind 15, version 1, class Metadata, logical_bytes 0, with
+empty canonical_bytes. Its fixed references are:
+
+  "00-fact-snapshot"       Owns      complete frozen relation/fence snapshot
+  "01-retention-policy"    Owns      history, pin, handle, erasure, and
+                                    quarantine policy
+  "02-tensor-logic-proof"  Owns      byte-stable auditor proof for this plan
+
+Owning these three records keeps the material needed to replay why deletion
+was believed safe. Tensor Logic remains an auditor: native liveness and
+publication fences authorize and enforce collection.
+
+Condemned object i uses a non-owning Evidence relation:
+
+  "10-condemned/" || i as u64 big-endian || 00
+
+The condemned set MUST be non-empty, its ordinals begin at zero with no gap,
+and its target ObjectIds MUST be strictly increasing. The non-owning relation
+records intent without retaining the bytes selected for deletion.
+
+
+7.8 Garbage-collection commit evidence
+--------------------------------------
+
+GcCommitEvidence is kind 16, version 1, class Metadata, logical_bytes 0, with
+empty canonical_bytes. Its references are:
+
+  "00-plan"                    Owns      exact kind-15 plan executed
+  "01-fact-snapshot"           Evidence  snapshot recomputed under commit fence
+  "02-placement-before"        Evidence  complete pre-collection placement set
+  "03-placement-after"         Evidence  complete durable successor placement
+  "04-execution-measurements"  Evidence  canonical resource measurements
+
+Before physical publication, the implementation MUST recompute the liveness
+fact snapshot while holding the native GC fence and compare it byte-for-byte
+with the snapshot owned by the plan. A mismatch fails the commit before any
+authoritative placement change. The receipt MUST recompute and match the plan
+ObjectId, and placement-before MUST differ from placement-after. Therefore a
+proof for one plan cannot be attached to a different deletion or a later fact
+snapshot.
 
 
 8. RECONSTRUCTION PROCEDURE

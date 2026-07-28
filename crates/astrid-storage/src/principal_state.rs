@@ -613,7 +613,7 @@ mod tests {
         assert!(record.references().is_empty());
         assert_eq!(
             object_id_hex(id),
-            "6ab669464459d7c570f9d1b9ea2b07a2f63eb73b0fde8ff5cbe4853d1545e400"
+            "35b446fbd19ca4ad0b1343b40c1a32b2eed8eef795034261a4092a0a2ae806fe"
         );
         assert!(metadata.contains("identity-wire=tagged-identity-v1\n"));
         assert!(metadata.contains(&format!(

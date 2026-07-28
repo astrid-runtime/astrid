@@ -202,7 +202,9 @@ destructive collection ships, each batch has:
    placement transition.
 
 The commit fails closed if the digest differs. A proof for one plan can never
-be attached to another deletion.
+be attached to another deletion. The plan owns its fact snapshot, retention
+policy, and proof so the receipt's owning closure retains everything needed to
+replay the deletion explanation; condemned-object edges stay non-owning.
 
 ## Acceptance
 
