@@ -155,6 +155,231 @@ def object_material(record):
     return bytes(output)
 
 
+def require_metadata_schema(record, kind, canonical_length):
+    if (
+        record["kind"] != kind
+        or record["version"] != 1
+        or record["class"] != 1
+        or record["logical_bytes"] != 0
+        or len(record["canonical"]) != canonical_length
+    ):
+        raise FormatError(f"invalid {KIND_NAMES[kind]} object header")
+
+
+def indexed_suffix(label, prefix, expected, require_suffix):
+    index_end = len(prefix) + 8
+    suffix_start = index_end + 1
+    if (
+        len(label) < suffix_start
+        or not label.startswith(prefix)
+        or label[index_end] != 0
+        or int.from_bytes(label[len(prefix) : index_end], "big") != expected
+    ):
+        raise FormatError("invalid indexed reference label")
+    suffix = label[suffix_start:]
+    if require_suffix and not suffix:
+        raise FormatError("indexed semantic label is empty")
+    if not require_suffix and suffix:
+        raise FormatError("indexed set label has a suffix")
+    return suffix
+
+
+def require_reference_kind(reference, expected):
+    if reference["kind"] != expected:
+        raise FormatError("invalid canonical reference kind")
+
+
+def validate_runtime_profile(record):
+    require_metadata_schema(record, 12, 1)
+    component_present = record["canonical"][0]
+    if component_present not in (0, 1):
+        raise FormatError("invalid runtime-profile option byte")
+    required = {
+        b"00-wasm-core",
+        b"02-float",
+        b"03-threads",
+        b"04-resource-failure",
+    }
+    seen = set()
+    proposal_count = 0
+    previous_proposal = None
+    previous_host = None
+    component_seen = False
+    for reference in record["references"]:
+        require_reference_kind(reference, 0)
+        label = reference["label"]
+        if label in required:
+            seen.add(label)
+        elif label == b"01-component-model":
+            component_seen = True
+        elif label.startswith(b"10-proposal/"):
+            indexed_suffix(label, b"10-proposal/", proposal_count, False)
+            target = reference["target"]
+            if previous_proposal is not None and target <= previous_proposal:
+                raise FormatError("runtime proposals are not a canonical set")
+            previous_proposal = target
+            proposal_count += 1
+        elif label.startswith(b"20-host-function/"):
+            name = label[len(b"20-host-function/") :]
+            if not name or (previous_host is not None and name <= previous_host):
+                raise FormatError("runtime host functions are not canonical")
+            previous_host = name
+        else:
+            raise FormatError("unknown runtime-profile field")
+    if seen != required or component_seen != bool(component_present):
+        raise FormatError("incomplete runtime-profile fields")
+
+
+def validate_derivation_invocation(record):
+    require_metadata_schema(record, 13, 2)
+    execution_class, option_mask = record["canonical"]
+    if execution_class > 3 or option_mask & ~0b11:
+        raise FormatError("invalid derivation invocation payload")
+    expected = {
+        b"00-transform": 0,
+        b"01-transform-contract": 0,
+        b"02-canonical-parameters": 0,
+        b"03-runtime-semantic-profile": 0,
+        b"04-output-contract": 0,
+    }
+    seen = set()
+    snapshot_seen = False
+    seed_seen = False
+    input_count = 0
+    for reference in record["references"]:
+        label = reference["label"]
+        if label in expected:
+            require_reference_kind(reference, expected[label])
+            seen.add(label)
+        elif label == b"05-provenance-snapshot":
+            require_reference_kind(reference, 1)
+            snapshot_seen = True
+        elif label == b"06-deterministic-seed":
+            require_reference_kind(reference, 0)
+            seed_seen = True
+        elif label.startswith(b"10-input/"):
+            require_reference_kind(reference, 1)
+            indexed_suffix(label, b"10-input/", input_count, True)
+            input_count += 1
+        else:
+            raise FormatError("unknown derivation invocation field")
+    if seen != set(expected):
+        raise FormatError("incomplete derivation invocation fields")
+    if bool(option_mask & 1) != snapshot_seen or bool(option_mask & 2) != seed_seen:
+        raise FormatError("derivation invocation option mask mismatch")
+    if (execution_class == 0 and snapshot_seen) or (
+        execution_class == 1 and not snapshot_seen
+    ):
+        raise FormatError("derivation execution class conflicts with snapshot")
+
+
+def validate_derivation_evidence(record):
+    require_metadata_schema(record, 14, 2)
+    execution_class, verifier_present = record["canonical"]
+    if execution_class > 3 or verifier_present not in (0, 1):
+        raise FormatError("invalid derivation evidence payload")
+    expected = {
+        b"00-invocation": 0,
+        b"01-transform": 1,
+        b"02-transform-contract": 1,
+        b"03-runtime-semantic-profile": 1,
+        b"04-engine-build": 1,
+        b"05-execution-measurements": 1,
+        b"06-authority-epoch": 1,
+        b"07-computation-sharing-domain": 1,
+    }
+    seen = set()
+    verifier_seen = False
+    input_count = 0
+    output_count = 0
+    for reference in record["references"]:
+        label = reference["label"]
+        if label in expected:
+            require_reference_kind(reference, expected[label])
+            seen.add(label)
+        elif label == b"08-verifier-evidence":
+            require_reference_kind(reference, 1)
+            verifier_seen = True
+        elif label.startswith(b"10-input/"):
+            require_reference_kind(reference, 1)
+            indexed_suffix(label, b"10-input/", input_count, True)
+            input_count += 1
+        elif label.startswith(b"20-output/"):
+            require_reference_kind(reference, 3)
+            indexed_suffix(label, b"20-output/", output_count, True)
+            output_count += 1
+        else:
+            raise FormatError("unknown derivation evidence field")
+    if seen != set(expected) or not output_count:
+        raise FormatError("incomplete derivation evidence fields")
+    if verifier_seen != bool(verifier_present):
+        raise FormatError("derivation evidence verifier mask mismatch")
+
+
+def validate_gc_plan(record):
+    require_metadata_schema(record, 15, 0)
+    expected = {
+        b"00-fact-snapshot": 0,
+        b"01-retention-policy": 0,
+        b"02-tensor-logic-proof": 0,
+    }
+    seen = set()
+    condemned_count = 0
+    previous_target = None
+    for reference in record["references"]:
+        label = reference["label"]
+        if label in expected:
+            require_reference_kind(reference, expected[label])
+            seen.add(label)
+        elif label.startswith(b"10-condemned/"):
+            require_reference_kind(reference, 1)
+            indexed_suffix(label, b"10-condemned/", condemned_count, False)
+            target = reference["target"]
+            if previous_target is not None and target <= previous_target:
+                raise FormatError("GC condemned identities are not a canonical set")
+            previous_target = target
+            condemned_count += 1
+        else:
+            raise FormatError("unknown GC plan field")
+    if seen != set(expected) or not condemned_count:
+        raise FormatError("incomplete GC plan fields")
+
+
+def validate_gc_commit(record):
+    require_metadata_schema(record, 16, 0)
+    expected = {
+        b"00-plan": 0,
+        b"01-fact-snapshot": 1,
+        b"02-placement-before": 1,
+        b"03-placement-after": 1,
+        b"04-execution-measurements": 1,
+    }
+    seen = {}
+    for reference in record["references"]:
+        label = reference["label"]
+        if label not in expected:
+            raise FormatError("unknown GC commit field")
+        require_reference_kind(reference, expected[label])
+        seen[label] = reference["target"]
+    if set(seen) != set(expected):
+        raise FormatError("incomplete GC commit fields")
+    if seen[b"02-placement-before"] == seen[b"03-placement-after"]:
+        raise FormatError("GC commit records an unchanged placement")
+
+
+def validate_known_schema(record):
+    validators = {
+        12: validate_runtime_profile,
+        13: validate_derivation_invocation,
+        14: validate_derivation_evidence,
+        15: validate_gc_plan,
+        16: validate_gc_commit,
+    }
+    validator = validators.get(record["kind"])
+    if validator is not None:
+        validator(record)
+
+
 def decode_object(payload):
     cursor = Cursor(payload)
     object_id = identity(cursor)
@@ -190,6 +415,7 @@ def decode_object(payload):
         "canonical": canonical,
         "references": references,
     }
+    validate_known_schema(record)
     if object_id[:2] != (1, 1) or len(object_id[2]) != 32:
         raise FormatError("reader does not implement this object identity")
     computed = derive_key(OBJECT_CONTEXT, object_material(record))
