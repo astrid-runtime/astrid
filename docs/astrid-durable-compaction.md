@@ -69,6 +69,11 @@ audit custody `5`. Reference-kind codes are the frozen ObjectRecord codes.
 This snapshot records all relations for replay and explanation; only owning
 edges plus the selected roots determine native liveness.
 
+The format-1 snapshot proves reachability only. A future policy that
+discriminates by object kind, class, age, or another absent attribute requires
+an explicitly extended fact grammar and a new `GcFactSnapshotId` derivation
+contract; it cannot reinterpret this snapshot.
+
 ## Retention is not inferred
 
 Current roots are always live. Additional roots are a strictly ordered,

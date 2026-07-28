@@ -340,8 +340,14 @@ where
         if facts.condemned.is_empty() {
             return Err(DurableError::NoCompactionWork);
         }
-        require_evidence_record(&policy_record, "retention policy must be Evidence")?;
-        require_evidence_record(&proof_record, "Tensor Logic proof must be Evidence")?;
+        require_evidence_record(
+            &policy_record,
+            "retention policy must be canonical generic Evidence",
+        )?;
+        require_evidence_record(
+            &proof_record,
+            "Tensor Logic proof must be canonical generic Evidence",
+        )?;
         let policy_id = self.identify(&policy_record);
         if policy_id != retention.policy.object_id() {
             return Err(DurableError::InvalidCompactionEvidence(
@@ -572,7 +578,12 @@ fn require_evidence_record(
     record: &ObjectRecord,
     detail: &'static str,
 ) -> Result<(), DurableError> {
-    if record.kind() != ObjectKind::Evidence {
+    if record.kind() != ObjectKind::Evidence
+        || record.format_version() != ObjectFormatVersion::V1
+        || record.class() != ObjectClass::Metadata
+        || record.logical_bytes() != 0
+        || !record.references().is_empty()
+    {
         return Err(DurableError::InvalidCompactionEvidence(detail));
     }
     Ok(())
@@ -692,13 +703,18 @@ where
             u64::try_from(inner.index.len()).map_err(|_| DurableError::EncodingOverflow)?;
         let (arena_bytes_before, root_bytes_before, root_digest_before) = {
             let files = live_files_mut(&mut inner.files)?;
+            let arena_bytes = files
+                .arena
+                .metadata()
+                .map_err(|source| io_error("read object arena metadata before compaction", source))?
+                .len();
             let root_bytes = files
                 .roots
                 .metadata()
                 .map_err(|source| io_error("read root journal metadata before compaction", source))?
                 .len();
             let root_digest = root_journal_digest(&mut files.roots)?;
-            (files.arena_len, root_bytes, root_digest)
+            (arena_bytes, root_bytes, root_digest)
         };
         let replacement = self.write_replacement_files(inner, live)?;
         let objects_after =
@@ -782,6 +798,7 @@ where
             .map_err(|source| io_error("seek compacted root journal", source))?;
         inner.roots_by_principal = replacement.roots;
         inner.index = replacement.index;
+        inner.pending_index_locations.clear();
         inner.validated = replacement.validated;
         inner.files = Some(DurableFiles {
             arena,

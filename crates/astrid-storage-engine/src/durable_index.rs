@@ -14,8 +14,9 @@ use std::path::Path;
 use astrid_storage_model::ObjectId;
 
 use super::{
-    ArenaLocation, DurableError, FRAME_HEADER_LEN, INDEX_FILE, INDEX_MAGIC, IdentityScheme,
-    RecoveryLimits, append_frame, open_rw, scan_frames, sync_store_directory,
+    ARENA_FILE, ArenaLocation, DurableEngine, DurableError, DurableInner, FRAME_HEADER_LEN,
+    INDEX_FILE, INDEX_MAGIC, IdentityScheme, PersistentObjectIdentity, PrincipalCodec,
+    RecoveryLimits, append_frame, live_files_mut, open_rw, scan_frames, sync_store_directory,
     verify_indexed_location, verify_indexed_tail,
 };
 
@@ -38,6 +39,57 @@ pub(super) struct IndexDelta<'a> {
     pub(super) arena_len: u64,
     pub(super) arena_tail: ArenaLocation,
     pub(super) objects: &'a [(ObjectId, ArenaLocation)],
+}
+
+impl<P, I, C> DurableEngine<P, I, C>
+where
+    P: Clone + Ord,
+    I: PersistentObjectIdentity,
+    C: PrincipalCodec<P>,
+{
+    /// Publish every arena location appended since the cached durable frontier.
+    pub(super) fn advance_index_frontier(
+        &self,
+        inner: &mut DurableInner<P>,
+        arena_len: u64,
+    ) -> Result<(), DurableError> {
+        let previous_arena_len = live_files_mut(&mut inner.files)?.arena_len;
+        if arena_len < previous_arena_len {
+            return Err(DurableError::Corrupt {
+                file: ARENA_FILE,
+                offset: arena_len,
+                detail: "object arena moved behind the cached durable frontier",
+            });
+        }
+        if arena_len == previous_arena_len {
+            debug_assert!(inner.pending_index_locations.is_empty());
+            return Ok(());
+        }
+
+        let locations = std::mem::take(&mut inner.pending_index_locations);
+        let Some(arena_tail) = locations.last().map(|(_, location)| *location) else {
+            return Err(DurableError::Corrupt {
+                file: ARENA_FILE,
+                offset: previous_arena_len,
+                detail: "object arena advanced without indexed locations",
+            });
+        };
+        let files = live_files_mut(&mut inner.files)?;
+        if let Some(mut cache) = files.index_cache.take() {
+            let delta = IndexDelta {
+                previous_arena_len,
+                arena_len,
+                arena_tail,
+                objects: &locations,
+            };
+            if append_index_delta(&mut cache, &delta, self.identity.scheme()).is_ok() {
+                files.index_cache = Some(cache);
+            }
+        }
+        files.arena_len = arena_len;
+        files.arena_tail = Some(arena_tail);
+        Ok(())
+    }
 }
 
 /// Attempt to restore an exact object-arena prefix from the cache.

@@ -114,6 +114,10 @@ work. Compaction may receive emergency priority under disk pressure without
 allowing optional recompression or sketching to inherit that priority.
 
 Sampling work for Muninn uses the same maintenance budget and audit shape.
+One compaction cycle currently performs three complete fact captures: initial
+planning, proof-time recheck, and the mutation-fence recheck. Scheduler budgets
+therefore account for approximately three full store reads before the
+replacement traversal, rather than pricing only the final rewrite.
 
 ## Registered initial passes
 

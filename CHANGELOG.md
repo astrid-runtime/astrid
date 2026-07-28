@@ -79,9 +79,12 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   valid frame follows, and rejects interior or semantic corruption. One
   object-arena flush makes the transaction's complete object batch durable
   before one root-journal flush publishes it; index deltas add no commit-path
-  flush. An exclusive store lock and poison-on-write-failure behavior prevent
-  concurrent-process corruption and stale in-memory reads. Named crash-boundary
-  tests prove recovery to the old or new complete root. Recovery keeps only
+  flush. Deltas consume an incrementally tracked append frontier, so an earlier
+  staged frame cannot disappear behind a later durability boundary and commits
+  do not rescan the complete object map. An exclusive store lock and
+  poison-on-write-failure behavior prevent concurrent-process corruption and
+  stale in-memory reads. Named crash-boundary tests prove recovery to the old
+  or new complete root. Recovery keeps only
   roots and arena offsets resident, while live reads load and checksum payloads
   lazily. Every persistent identity occurrence now carries an algorithm,
   construction version, and variable digest length with capacity for 384-bit

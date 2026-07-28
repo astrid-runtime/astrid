@@ -103,5 +103,6 @@ where
         files.index_cache = replace_index(&self.directory, &state, self.identity.scheme());
         files.arena_len = arena_len;
         files.arena_tail = arena_tail;
+        inner.pending_index_locations.clear();
     }
 }

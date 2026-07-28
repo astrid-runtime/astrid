@@ -284,6 +284,90 @@ fn rejected_tensor_logic_proof_never_mints_an_authorization() {
 }
 
 #[test]
+fn plan_rejects_evidence_that_the_durable_outbox_cannot_deliver() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = super::tests::open(directory.path());
+    two_versions(&engine);
+
+    let invalid_policy = ObjectRecord::new(
+        ObjectKind::Evidence,
+        ObjectFormatVersion::V1,
+        b"data-class-policy".to_vec(),
+        Vec::new(),
+        0,
+        ObjectClass::Data,
+    )
+    .unwrap();
+    let invalid_retention = retention(&engine, &invalid_policy, []);
+    let invalid_policy_facts = engine.capture_compaction_facts(&invalid_retention).unwrap();
+    assert!(matches!(
+        engine.verify_compaction_plan(
+            invalid_retention,
+            invalid_policy_facts,
+            invalid_policy,
+            evidence(b"valid-proof"),
+            &AcceptProof,
+        ),
+        Err(DurableError::InvalidCompactionEvidence(
+            "retention policy must be canonical generic Evidence"
+        ))
+    ));
+
+    let policy = evidence(b"valid-policy");
+    let valid_retention = retention(&engine, &policy, []);
+    let valid_facts = engine.capture_compaction_facts(&valid_retention).unwrap();
+    let invalid_proof = ObjectRecord::new(
+        ObjectKind::Evidence,
+        ObjectFormatVersion::V1,
+        b"data-class-proof".to_vec(),
+        Vec::new(),
+        0,
+        ObjectClass::Data,
+    )
+    .unwrap();
+    assert!(matches!(
+        engine.verify_compaction_plan(
+            valid_retention,
+            valid_facts,
+            policy,
+            invalid_proof,
+            &AcceptProof,
+        ),
+        Err(DurableError::InvalidCompactionEvidence(
+            "Tensor Logic proof must be canonical generic Evidence"
+        ))
+    ));
+}
+
+#[test]
+fn placement_before_binds_the_physical_arena_after_staging() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = super::tests::open(directory.path());
+    two_versions(&engine);
+    engine
+        .stage_object(&evidence(b"unpublished-staged-evidence"))
+        .unwrap();
+    let physical_arena_bytes = std::fs::metadata(directory.path().join(ARENA_FILE))
+        .unwrap()
+        .len();
+    let policy = evidence(b"retain-current-roots");
+    let authorization = plan(&engine, retention(&engine, &policy, []), policy);
+
+    let report = engine.compact(&authorization).unwrap();
+    let pending = engine.pending_compaction_evidence().unwrap();
+    let placement = pending[0].placement_before().canonical_bytes();
+    let arena_bytes_offset = b"astrid-gc-placement-set-v1\0".len() + 32;
+    let receipted_arena_bytes = u64::from_le_bytes(
+        placement[arena_bytes_offset..arena_bytes_offset + 8]
+            .try_into()
+            .unwrap(),
+    );
+
+    assert_eq!(report.arena_bytes_before(), physical_arena_bytes);
+    assert_eq!(receipted_arena_bytes, physical_arena_bytes);
+}
+
+#[test]
 fn every_named_compaction_crash_boundary_recovers_a_complete_authority_pair() {
     let points = [
         FaultPoint::AfterCompactionFilesFlush,

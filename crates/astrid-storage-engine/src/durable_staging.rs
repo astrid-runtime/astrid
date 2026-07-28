@@ -59,6 +59,7 @@ where
         match appended {
             Ok(location) => {
                 inner.index.insert(id, location);
+                inner.pending_index_locations.push((id, location));
                 Ok((id, InsertOutcome::Inserted))
             },
             Err(error) => {
@@ -162,7 +163,10 @@ where
         };
         match appended {
             Ok(locations) => {
-                inner.index.extend(ids.into_iter().zip(locations));
+                for location in ids.into_iter().zip(locations) {
+                    inner.index.insert(location.0, location.1);
+                    inner.pending_index_locations.push(location);
+                }
                 Ok(outcomes)
             },
             Err(error) => {

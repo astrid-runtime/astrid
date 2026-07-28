@@ -258,3 +258,46 @@ fn rooted_staging_advances_the_index_across_earlier_orphans() {
         })
     ));
 }
+
+#[test]
+fn standalone_insert_indexes_the_complete_staged_suffix_before_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open(directory.path());
+    let staged_one = ObjectRecord::new(
+        ObjectKind::Chunk,
+        ObjectFormatVersion::V1,
+        b"single staged object".to_vec(),
+        Vec::new(),
+        20,
+        ObjectClass::Data,
+    )
+    .unwrap();
+    let staged_two = ObjectRecord::new(
+        ObjectKind::Chunk,
+        ObjectFormatVersion::V1,
+        b"batch staged object".to_vec(),
+        Vec::new(),
+        19,
+        ObjectClass::Data,
+    )
+    .unwrap();
+    let staged_one_id = engine.stage_object(&staged_one).unwrap().0;
+    let staged_two_id = engine.stage_objects(vec![staged_two.clone()]).unwrap()[0].0;
+    let bootstrap = ObjectRecord::new(
+        ObjectKind::Evidence,
+        ObjectFormatVersion::V1,
+        b"standalone durability boundary".to_vec(),
+        Vec::new(),
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let bootstrap_id = engine.persist_standalone_object(&bootstrap).unwrap().0;
+    drop(engine);
+
+    let reopened = open(directory.path());
+    assert_eq!(reopened.object(staged_one_id).unwrap(), Some(staged_one));
+    assert_eq!(reopened.object(staged_two_id).unwrap(), Some(staged_two));
+    assert_eq!(reopened.object(bootstrap_id).unwrap(), Some(bootstrap));
+    assert_eq!(reopened.object_count().unwrap(), 3);
+}

@@ -122,6 +122,10 @@ pub(super) fn pending<I: PersistentObjectIdentity>(
 
     let mut bundles = Vec::new();
     for entry in entries {
+        // Unknown entries fail the entire drain deliberately. Ignoring one
+        // would let filesystem corruption or local tampering hide custody
+        // ambiguity behind otherwise valid receipts; operator remediation is
+        // required before delivery resumes.
         let name = entry
             .file_name()
             .into_string()
