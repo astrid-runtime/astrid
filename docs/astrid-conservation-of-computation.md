@@ -132,8 +132,13 @@ conformance fixtures. A behavior-changing release registers a new profile. A
 behavior-preserving release continues to use the existing profile, preserving
 fleet memo durability.
 
-Registration is operator authority. A capsule cannot announce that an
-incompatible runtime is equivalent to an existing profile.
+Runtime-profile and transform-contract registration is signature-level
+operator authority recorded in the governed contract registry. A capsule
+cannot announce that an incompatible runtime is equivalent to an existing
+profile. In particular, host-function determinism is not inferable from the
+object model: the registering authority owns conformance testing and the risk
+of admitting a semantic contract whose implementation observes undeclared
+state.
 
 ## Execution classes
 

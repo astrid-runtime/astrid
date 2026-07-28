@@ -53,6 +53,14 @@ MuninnEntry {
 The index can be dropped and rebuilt by walking retained Evidence and Derived
 relations. Losing it loses speed, never correctness or authority.
 
+Invocation inputs are deliberately non-owning Evidence relations. Muninn does
+not keep private or obsolete source bytes alive merely because their
+computation was once reusable. Consequently, a spot-check can execute only
+while policy-selected roots or pins still retain the complete input closure.
+The Refinery sampling scheduler should prefer young eligible entries and
+record an unavailable input as an expired sample opportunity, never as a
+successful verification.
+
 An entry may be:
 
 - `verified`: admitted by the governed derivation service;
@@ -164,6 +172,12 @@ work belongs to the operator ledger.
 
 Cache warmth is an accepted residual timing signal. Deployments that reject
 that residual use distinct sharing domains and cache partitions.
+
+The initial bounded in-memory index is first-observation retained, not LRU.
+Eviction removes reuse eligibility but retains a bounded conflict guard for
+that invocation until an off-side rebuild has scanned all retained evidence.
+This makes eviction a performance change without allowing a previously
+conflicting result to become reusable merely because the cache churned.
 
 ## Resource authority
 

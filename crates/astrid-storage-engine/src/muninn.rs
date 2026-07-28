@@ -147,11 +147,11 @@ impl MuninnHit {
 pub enum MuninnAdmission {
     /// A new invocation entry was indexed.
     Inserted,
-    /// The exact same evidence and outputs were already indexed.
+    /// The exact same outputs were already indexed with supporting evidence.
     AlreadyPresent,
     /// The injected index budget was exhausted; execution remains valid.
     CapacityExhausted,
-    /// The invocation was already bound to different evidence or outputs.
+    /// The invocation was already bound to different outputs.
     Conflict {
         /// Existing durable evidence identity.
         existing: ObjectId,
@@ -166,6 +166,7 @@ struct MuninnEntry {
     outputs: Vec<ObjectId>,
     trust: MuninnTrustState,
     last_spot_check: Option<ObjectId>,
+    resident: bool,
 }
 
 /// Process-local, correctness-independent Muninn lookup table.
@@ -174,20 +175,50 @@ struct MuninnEntry {
 /// operator policy, and the common resource authority may replace this simple
 /// entry budget without changing evidence or lookup semantics. Exhaustion and
 /// eviction never fail a valid derivation; they only remove the acceleration.
+///
+/// This first implementation retains one bounded observation slot for every
+/// key it has admitted, even after eviction. That prevents eviction or
+/// `clear()` from forgetting a previously observed conflicting result. Freed
+/// resident slots are therefore not reused for different invocation keys.
+/// Replacement policies arrive with the resource authority; an off-side
+/// rebuild must scan all retained evidence before its index becomes visible.
 #[derive(Debug)]
 pub struct InMemoryMuninnIndex {
     capacity: NonZeroUsize,
-    entries: RwLock<BTreeMap<(ComputationSharingDomainId, InvocationId), MuninnEntry>>,
+    slots: RwLock<BTreeMap<(ComputationSharingDomainId, InvocationId), MuninnEntry>>,
 }
 
 impl InMemoryMuninnIndex {
     /// Construct an empty index with an explicitly injected entry budget.
+    ///
+    /// This is appropriate when no retained derivation evidence exists. A
+    /// restart with retained evidence must use
+    /// [`Self::from_retained_evidence`] so no partially rebuilt table becomes
+    /// visible.
     #[must_use]
     pub fn new(capacity: NonZeroUsize) -> Self {
         Self {
             capacity,
-            entries: RwLock::new(BTreeMap::new()),
+            slots: RwLock::new(BTreeMap::new()),
         }
+    }
+
+    /// Rebuild an index off-side from the complete retained evidence set.
+    ///
+    /// The returned index is not observable until every item has been
+    /// admitted, so input order cannot expose one side of a conflict during
+    /// recovery. Unknown keys after the bounded observation budget is full
+    /// remain uncached for this index generation.
+    #[must_use]
+    pub fn from_retained_evidence<'a>(
+        capacity: NonZeroUsize,
+        evidence: impl IntoIterator<Item = &'a VerifiedDerivationEvidence>,
+    ) -> Self {
+        let index = Self::new(capacity);
+        for verified in evidence {
+            let _ = index.admit(verified);
+        }
+        index
     }
 
     /// Return the injected entry budget.
@@ -199,13 +230,17 @@ impl InMemoryMuninnIndex {
     /// Return the current number of disposable entries.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.entries.read().len()
+        self.slots
+            .read()
+            .values()
+            .filter(|entry| entry.resident)
+            .count()
     }
 
     /// Return whether the disposable index is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.entries.read().is_empty()
+        self.len() == 0
     }
 
     /// Admit evidence only after [`verify_derivation_evidence`] succeeds.
@@ -216,27 +251,32 @@ impl InMemoryMuninnIndex {
     #[must_use]
     pub fn admit(&self, verified: &VerifiedDerivationEvidence) -> MuninnAdmission {
         let key = (verified.sharing_domain, verified.invocation);
-        let mut entries = self.entries.write();
-        if let Some(existing) = entries.get_mut(&key) {
-            if existing.evidence == verified.evidence && existing.outputs == verified.outputs {
+        let mut slots = self.slots.write();
+        if let Some(existing) = slots.get_mut(&key) {
+            if existing.outputs == verified.outputs {
+                if existing.trust == MuninnTrustState::Verified {
+                    existing.resident = true;
+                }
                 return MuninnAdmission::AlreadyPresent;
             }
             existing.trust = MuninnTrustState::Suspect;
+            existing.resident = false;
             return MuninnAdmission::Conflict {
                 existing: existing.evidence,
                 incoming: verified.evidence,
             };
         }
-        if entries.len() >= self.capacity.get() {
+        if slots.len() >= self.capacity.get() {
             return MuninnAdmission::CapacityExhausted;
         }
-        entries.insert(
+        slots.insert(
             key,
             MuninnEntry {
                 evidence: verified.evidence,
                 outputs: verified.outputs.clone(),
                 trust: MuninnTrustState::Verified,
                 last_spot_check: None,
+                resident: true,
             },
         );
         MuninnAdmission::Inserted
@@ -253,9 +293,9 @@ impl InMemoryMuninnIndex {
         domain: ComputationSharingDomainId,
         invocation: InvocationId,
     ) -> Option<MuninnHit> {
-        let entries = self.entries.read();
-        let entry = entries.get(&(domain, invocation))?;
-        if entry.trust != MuninnTrustState::Verified {
+        let slots = self.slots.read();
+        let entry = slots.get(&(domain, invocation))?;
+        if !entry.resident || entry.trust != MuninnTrustState::Verified {
             return None;
         }
         Some(MuninnHit {
@@ -276,26 +316,47 @@ impl InMemoryMuninnIndex {
         trust: MuninnTrustState,
         spot_check_evidence: Option<ObjectId>,
     ) -> bool {
-        let mut entries = self.entries.write();
-        let Some(entry) = entries.get_mut(&(domain, invocation)) else {
+        let mut slots = self.slots.write();
+        let Some(entry) = slots.get_mut(&(domain, invocation)) else {
             return false;
         };
+        if trust == MuninnTrustState::Verified
+            && entry.trust != MuninnTrustState::Verified
+            && spot_check_evidence.is_none()
+        {
+            return false;
+        }
         entry.trust = trust;
         if spot_check_evidence.is_some() {
             entry.last_spot_check = spot_check_evidence;
         }
+        if trust == MuninnTrustState::Verified {
+            entry.resident = true;
+        }
         true
     }
 
-    /// Remove one disposable entry.
+    /// Evict one reusable entry while retaining its bounded conflict guard.
     #[must_use]
     pub fn evict(&self, domain: ComputationSharingDomainId, invocation: InvocationId) -> bool {
-        self.entries.write().remove(&(domain, invocation)).is_some()
+        let mut slots = self.slots.write();
+        let Some(entry) = slots.get_mut(&(domain, invocation)) else {
+            return false;
+        };
+        let was_resident = entry.resident;
+        entry.resident = false;
+        was_resident
     }
 
-    /// Drop the entire accelerator without touching durable evidence.
+    /// Drop all reusable entries while retaining bounded conflict guards.
+    ///
+    /// To discard the guards as well, build a fresh index off-side from the
+    /// complete retained evidence set and publish it only after that scan
+    /// finishes.
     pub fn clear(&self) {
-        self.entries.write().clear();
+        for entry in self.slots.write().values_mut() {
+            entry.resident = false;
+        }
     }
 }
 
@@ -357,37 +418,33 @@ impl std::fmt::Display for MuninnVerificationError {
     }
 }
 
-fn validate_complete_output_closure(
+pub(super) fn validate_complete_output_closure(
     outputs: &[ObjectId],
     records: &BTreeMap<ObjectId, ObjectRecord>,
 ) -> Result<BTreeSet<ObjectId>, MuninnVerificationError> {
     let mut marks = BTreeMap::<ObjectId, u8>::new();
     let mut reachable = BTreeSet::new();
     for output in outputs {
-        visit_output(*output, records, &mut marks, &mut reachable)?;
+        let mut work = vec![(*output, false)];
+        while let Some((id, expanded)) = work.pop() {
+            if expanded {
+                marks.insert(id, 2);
+                continue;
+            }
+            match marks.get(&id) {
+                Some(1) => return Err(MuninnVerificationError::CyclicOutputClosure(id)),
+                Some(2) => continue,
+                _ => {},
+            }
+            let record = records
+                .get(&id)
+                .ok_or(MuninnVerificationError::MissingOutputObject(id))?;
+            marks.insert(id, 1);
+            reachable.insert(id);
+            work.push((id, true));
+            let children: Vec<_> = record.owning_references().collect();
+            work.extend(children.into_iter().rev().map(|child| (child, false)));
+        }
     }
     Ok(reachable)
-}
-
-fn visit_output(
-    id: ObjectId,
-    records: &BTreeMap<ObjectId, ObjectRecord>,
-    marks: &mut BTreeMap<ObjectId, u8>,
-    reachable: &mut BTreeSet<ObjectId>,
-) -> Result<(), MuninnVerificationError> {
-    match marks.get(&id) {
-        Some(1) => return Err(MuninnVerificationError::CyclicOutputClosure(id)),
-        Some(2) => return Ok(()),
-        _ => {},
-    }
-    let record = records
-        .get(&id)
-        .ok_or(MuninnVerificationError::MissingOutputObject(id))?;
-    marks.insert(id, 1);
-    reachable.insert(id);
-    for child in record.owning_references() {
-        visit_output(child, records, marks, reachable)?;
-    }
-    marks.insert(id, 2);
-    Ok(())
 }

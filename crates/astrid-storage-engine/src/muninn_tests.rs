@@ -13,7 +13,7 @@ use astrid_storage_model::{
 
 use super::muninn::{
     InMemoryMuninnIndex, MuninnAdmission, MuninnTrustState, MuninnVerificationError,
-    VerifiedDerivationEvidence, verify_derivation_evidence,
+    VerifiedDerivationEvidence, validate_complete_output_closure, verify_derivation_evidence,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -95,6 +95,15 @@ fn verified(
     output_seed: u8,
     domain: u8,
 ) -> Result<VerifiedDerivationEvidence, MuninnVerificationError> {
+    verified_with_engine(class, output_seed, domain, 8)
+}
+
+fn verified_with_engine(
+    class: ExecutionClass,
+    output_seed: u8,
+    domain: u8,
+    engine: u8,
+) -> Result<VerifiedDerivationEvidence, MuninnVerificationError> {
     let identity = TestIdentity;
     let invocation = invocation(class);
     let invocation_record = invocation.to_object_record().unwrap();
@@ -103,7 +112,7 @@ fn verified(
     let evidence = DerivationEvidence::new(
         invocation_id,
         &invocation,
-        EngineBuildId::new(opaque(8)),
+        EngineBuildId::new(opaque(engine)),
         vec![DerivationOutput::new(b"artifact".to_vec(), output).unwrap()],
         ExecutionMeasurementsId::new(opaque(9)),
         Some(VerifierEvidenceId::new(opaque(10))),
@@ -135,8 +144,12 @@ fn verified_evidence_rebuilds_a_disposable_index() {
 
     index.clear();
     assert!(index.is_empty());
-    assert_eq!(index.admit(&verified), MuninnAdmission::Inserted);
+    assert_eq!(index.admit(&verified), MuninnAdmission::AlreadyPresent);
     assert_eq!(index.len(), 1);
+
+    let rebuilt =
+        InMemoryMuninnIndex::from_retained_evidence(NonZeroUsize::new(4).unwrap(), [&verified]);
+    assert_eq!(rebuilt.len(), 1);
 }
 
 #[test]
@@ -231,6 +244,70 @@ fn conflicting_evidence_is_quarantined_not_silently_replaced() {
             .lookup(first.sharing_domain(), first.invocation())
             .is_none()
     );
+    index.clear();
+    assert_eq!(
+        index.admit(&first),
+        MuninnAdmission::AlreadyPresent,
+        "clearing resident entries must retain the conflict guard"
+    );
+    assert!(
+        index
+            .lookup(first.sharing_domain(), first.invocation())
+            .is_none(),
+        "a conflicting invocation must stay quarantined after clear"
+    );
+    assert!(!index.set_trust_state(
+        first.sharing_domain(),
+        first.invocation(),
+        MuninnTrustState::Verified,
+        None,
+    ));
+    assert!(index.set_trust_state(
+        first.sharing_domain(),
+        first.invocation(),
+        MuninnTrustState::Verified,
+        Some(opaque(91)),
+    ));
+    assert!(
+        index
+            .lookup(first.sharing_domain(), first.invocation())
+            .is_some(),
+        "explicit rehabilitation evidence may restore reuse"
+    );
+}
+
+#[test]
+fn matching_outputs_may_accumulate_distinct_execution_evidence() {
+    let first = verified_with_engine(ExecutionClass::Pure, 20, 30, 8).unwrap();
+    let supporting = verified_with_engine(ExecutionClass::Pure, 20, 30, 18).unwrap();
+    assert_ne!(first.evidence(), supporting.evidence());
+    assert_eq!(first.outputs(), supporting.outputs());
+
+    let index = InMemoryMuninnIndex::new(NonZeroUsize::new(4).unwrap());
+    assert_eq!(index.admit(&first), MuninnAdmission::Inserted);
+    assert_eq!(index.admit(&supporting), MuninnAdmission::AlreadyPresent);
+    assert_eq!(
+        index
+            .lookup(first.sharing_domain(), first.invocation())
+            .unwrap()
+            .outputs(),
+        first.outputs()
+    );
+}
+
+#[test]
+fn off_side_rebuild_quarantines_conflicts_in_any_input_order() {
+    let first = verified(ExecutionClass::Pure, 20, 30).unwrap();
+    let conflicting = verified(ExecutionClass::Pure, 21, 30).unwrap();
+    for evidence in [[&first, &conflicting], [&conflicting, &first]] {
+        let index =
+            InMemoryMuninnIndex::from_retained_evidence(NonZeroUsize::new(4).unwrap(), evidence);
+        assert!(
+            index
+                .lookup(first.sharing_domain(), first.invocation())
+                .is_none()
+        );
+    }
 }
 
 #[test]
@@ -261,4 +338,45 @@ fn capacity_and_domain_partitioning_change_performance_only() {
     );
     assert!(index.evict(first.sharing_domain(), first.invocation()));
     assert!(index.is_empty());
+    assert_eq!(
+        index.admit(&other_domain),
+        MuninnAdmission::CapacityExhausted,
+        "eviction must not forget the bounded observation slot"
+    );
+    assert_eq!(index.admit(&first), MuninnAdmission::AlreadyPresent);
+}
+
+#[test]
+fn deeply_nested_output_closure_uses_an_explicit_work_list() {
+    const DEPTH: u32 = 20_000;
+
+    let identity = TestIdentity;
+    let mut records = BTreeMap::new();
+    let mut child = None;
+    for depth in 0..DEPTH {
+        let references = child
+            .map(|target| {
+                vec![ObjectReference::new(
+                    ReferenceLabel::new(b"child".to_vec()),
+                    target,
+                    ReferenceKind::Owns,
+                )]
+            })
+            .unwrap_or_default();
+        let record = ObjectRecord::new(
+            ObjectKind::Derived,
+            ObjectFormatVersion::V1,
+            depth.to_le_bytes().to_vec(),
+            references,
+            0,
+            ObjectClass::Metadata,
+        )
+        .unwrap();
+        let id = identity.identify(&record);
+        records.insert(id, record);
+        child = Some(id);
+    }
+
+    let reachable = validate_complete_output_closure(&[child.unwrap()], &records).unwrap();
+    assert_eq!(reachable.len(), DEPTH as usize);
 }
