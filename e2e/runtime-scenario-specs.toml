@@ -214,6 +214,16 @@ denial = ["cross-principal, stale, or unknown request id is rejected or ignored"
 state = ["elicit waiter is consumed once"]
 evidence = ["prompt SSE and elicit response artifacts"]
 
+[scenarios.ephemeral_spawn]
+status = "mapped"
+surfaces = ["cli"]
+auth = ["admin/default"]
+success = ["caller spawns a derived locked-down principal, runs one bounded job under it, and the throwaway plus its footprint are torn down"]
+denial = ["the throwaway has an empty capsule allow-list, so it can invoke no tool and cannot egress or act; approval requests are auto-denied"]
+state = ["a derived principal is created then fully reclaimed (home, keys, secrets); no residue remains after teardown"]
+evidence = ["agent spawn CLI transcript and post-teardown agent list"]
+remaining = ["live loop execution (react + LLM capsule set) and fresh-principal warm-up are mapped but not yet executed by the harness"]
+
 [scenarios.first_party_capsule_commands]
 status = "mapped"
 surfaces = ["cli", "capsule"]
