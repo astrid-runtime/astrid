@@ -509,6 +509,12 @@ holds the canonical statement, typed non-owning references bind both eras, and
 tagged identities admit the successor digest. The ceremony changes roots and
 evidence; it never reinterprets an old digest or signature in place.
 
+The operational audit log remains independent of the store and periodically
+anchors its signed chain head through the Evidence/root-CAS protocol in
+[Audit Chain Anchoring into Principal Storage](astrid-audit-store-anchoring.md).
+The store therefore adds export and archaeological custody without becoming
+the only witness to its own correctness.
+
 ## 13. CI gates
 
 | Gate | Evidence |

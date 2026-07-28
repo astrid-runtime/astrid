@@ -58,6 +58,20 @@ diversity from BLAKE3.
 - The successor migration procedure is in the format specification.
 - The independent Rosetta reader verifies a cross-hash record.
 
+### Export manifest
+
+`export_closure` has an optional SHA-384 manifest mode that consumes the same
+cross-hash tree Evidence. It emits the selected tagged roots, canonical object
+ordering, per-object/tree SHA-384 witnesses, relevant ceremony identity, and
+signature material without inventing a second hashing pipeline. When required
+evidence is absent, export schedules or requests the pinned Refinery
+attestation pass and fails with a typed prerequisite rather than silently
+claiming a compliance manifest.
+
+This is a CNSA-sized/FIPS-family digest artifact, not a claim that the whole
+product or deployment is certified. The manifest remains self-verifying and
+independent of arena offsets or the live engine.
+
 ## D2. Stable opaque principal UID before the first release
 
 ### Decision

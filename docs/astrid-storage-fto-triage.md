@@ -136,6 +136,9 @@ Evidence decides the first durable profile. Algorithm novelty does not.
 
 ## Public-layer crypto research shelf
 
+The frozen roadmap and activation boundary are in
+[Future Public Content Crypto Stack](astrid-public-content-crypto-roadmap.md).
+
 The future public or sync content layer may combine:
 
 - a reviewed keyed-CDC construction, currently led by Truong et al.,

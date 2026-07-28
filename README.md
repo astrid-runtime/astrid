@@ -251,6 +251,11 @@ Building capsules is a first-class workflow in Astrid. The Forge (`astrid capsul
 tools and runtime-served guidance) is the on-ramp; the direction is an agent that writes, builds, and
 installs its own capsules within the capability sandbox.
 
+Reproducible builds and deterministic tests are consumers of
+[Muninn's verified computation memory](docs/astrid-forge-muninn.md): complete source and toolchain
+closures become derivation inputs, so an unchanged fleet build is a verified lookup while install,
+signing, and publication remain fresh authorized effects.
+
 ### Live capsule lifecycle
 
 ```bash
@@ -293,7 +298,10 @@ list.
 - **Operator guides** live in [`docs/`](docs/): the [unified config schema](docs/config.md),
   [LLM model selection](docs/models.md), [distro signing](docs/distro-signing.md), the
   [gateway deployment runbook](docs/gateway-deployment.md), and
-  [generating a gateway client](docs/gateway-client.md).
+  [generating a gateway client](docs/gateway-client.md). Architecture programs include
+  [conservation of computation](docs/astrid-conservation-of-computation.md),
+  [Muninn](docs/astrid-muninn.md), [Huginn](docs/astrid-huginn.md), and the
+  [Refinery](docs/astrid-refinery.md).
 
 ## Development
 

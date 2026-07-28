@@ -140,8 +140,10 @@ migration story.
 - Critical owning closures may request additional local copies through the
   existing `ReplicaCount` placement model.
 - Multi-device synchronization will exchange verified closures and publish
-  roots through ordinary compare-and-swap; its product and conflict semantics
-  must be designed when that work is called.
+  roots through ordinary compare-and-swap. Object-set difference uses the
+  rateless reconciliation direction in
+  [Multi-Device Object-Set Reconciliation](astrid-sync-reconciliation.md);
+  product and conflict semantics remain a separate design.
 - Delta compression between near-identical chunks is considered only if the
   temporal version-chain sweep demonstrates savings beyond content-defined
   chunk reuse.

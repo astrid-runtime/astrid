@@ -52,6 +52,11 @@ belong to the grammar, not the content.
 The canonical encoding uses the same explicit field and ordering discipline as
 `DerivationInvocation`. Ambient JSON serialization is not identity.
 
+The assembly contract pins one reference transform by ObjectId through the
+semantic-contract machinery. Alternate implementations may accelerate it only
+after their output verifies against the reference; they cannot mint a
+`ContextId` by claiming the same display-name contract.
+
 ## Persistent sequence structure
 
 A large context should not be one flat mutable blob. Huginn models it as a
@@ -95,6 +100,17 @@ The initial experiment measures:
 - resident KV bytes and reuse lifetime;
 - cold, warm, append-only, and middle-edit behavior; and
 - result correctness across cache eviction and process restart.
+
+The experiment records two derivation families:
+
+```text
+assemble(context-contract, ordered source closure) -> ContextId
+advance(model, tokenizer, backend-profile, prefix, next block) -> PrefixState
+```
+
+The local Gemma harness owns both execution and KV-cache measurement, so cold,
+warm, partial-prefix, eviction, and restart results are attributable to Huginn
+rather than a provider's opaque cache.
 
 ## Determinism boundary
 

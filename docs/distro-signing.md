@@ -29,6 +29,16 @@ A signature does **not** survive key theft on its own (a thief re-signs).
 The durable guarantee is to **vendor the `.shuttle` / pin its BLAKE3** —
 see §6.
 
+### 1.1 Distro composition as a derivation
+
+The installed distro image is a deterministic `Derived` object over the
+canonical `Distro.lock`, pinned capsule objects, selected configuration
+objects, target profile, and exact composition transform. This does not replace
+signature verification: signatures authorize the inputs, while the derivation
+identity makes repeated composition reproducible and reusable through Muninn.
+Private secrets and per-principal writable state are excluded from the shared
+image and remain separate principal-owned roots.
+
 ## 2. Trust: TOFU, pinning, official keys
 
 Trust is per-distro and lives at `~/.astrid/trust/<distro-id>.pub` (one
