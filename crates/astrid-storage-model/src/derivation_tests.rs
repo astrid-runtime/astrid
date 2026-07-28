@@ -78,6 +78,24 @@ fn invocation(class: ExecutionClass) -> DerivationInvocation {
     .unwrap()
 }
 
+fn evidence(class: ExecutionClass) -> DerivationEvidence {
+    let invocation = invocation(class);
+    DerivationEvidence::new(
+        invocation.identify(&RecordIdentity).unwrap(),
+        &invocation,
+        EngineBuildId::new(id(40)),
+        vec![
+            DerivationOutput::new(b"artifact".to_vec(), id(41)).unwrap(),
+            DerivationOutput::new(b"manifest".to_vec(), id(42)).unwrap(),
+        ],
+        ExecutionMeasurementsId::new(id(43)),
+        Some(VerifierEvidenceId::new(id(44))),
+        AuthorityEpochId::new(id(45)),
+        ComputationSharingDomainId::new(id(46)),
+    )
+    .unwrap()
+}
+
 #[test]
 fn execution_class_codes_are_stable_and_memoization_is_explicit() {
     for class in [
@@ -362,5 +380,71 @@ fn canonical_decoders_reject_optional_reference_mask_disagreement() {
     assert_eq!(
         DerivationInvocation::from_object_record(&invocation_without_seed_presence),
         Err(DerivationModelError::InvalidOptionMask)
+    );
+}
+
+#[test]
+fn derivation_evidence_round_trips_and_validates_its_exact_invocation() {
+    let invocation = invocation(ExecutionClass::Pure);
+    let evidence = evidence(ExecutionClass::Pure);
+    let record = evidence.to_object_record().unwrap();
+    assert_eq!(
+        DerivationEvidence::from_object_record(&record),
+        Ok(evidence.clone())
+    );
+    assert_eq!(
+        evidence.identify(&RecordIdentity),
+        Ok(RecordIdentity.identify(&record))
+    );
+    assert_eq!(
+        evidence.validate_invocation(&invocation, &RecordIdentity),
+        Ok(())
+    );
+    assert_eq!(record.references()[0].kind(), ReferenceKind::Owns);
+    assert!(
+        record
+            .references()
+            .iter()
+            .filter(|reference| reference.label().as_bytes().starts_with(b"20-output/"))
+            .all(|reference| reference.kind() == ReferenceKind::Derived)
+    );
+}
+
+#[test]
+fn derivation_evidence_rejects_drift_from_its_invocation() {
+    let base = invocation(ExecutionClass::Pure);
+    let changed = DerivationInvocation::new(
+        base.execution_class(),
+        TransformId::new(id(99)),
+        base.transform_contract(),
+        base.inputs().to_vec(),
+        base.canonical_parameters(),
+        base.runtime_semantic_profile(),
+        base.output_contract(),
+        base.snapshot(),
+        base.seed(),
+    )
+    .unwrap();
+    assert_eq!(
+        evidence(ExecutionClass::Pure).validate_invocation(&changed, &RecordIdentity),
+        Err(DerivationEvidenceError::InvocationMismatch)
+    );
+}
+
+#[test]
+fn derivation_evidence_rejects_optional_mask_disagreement() {
+    let record = evidence(ExecutionClass::Pure).to_object_record().unwrap();
+    let without_verifier_presence = ObjectRecord::new(
+        ObjectKind::DerivationEvidence,
+        ObjectFormatVersion::V1,
+        vec![ExecutionClass::Pure.code(), 0],
+        record.references().to_vec(),
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    assert_eq!(
+        DerivationEvidence::from_object_record(&without_verifier_presence),
+        Err(DerivationEvidenceError::InvalidOptionMask)
     );
 }

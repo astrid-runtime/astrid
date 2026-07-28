@@ -525,10 +525,51 @@ The Pure class forbids a provenance snapshot. SnapshotBound requires one.
 Effectful and Nondeterministic invocations are recordable but MUST NOT populate
 a reusable derivation index.
 
-Kinds 14 through 16 reserve the derivation and linked garbage-collection
-evidence domain. Until their complete schemas are frozen in this document,
-readers preserve them as opaque typed objects and no runtime may claim
-independent semantic decoding of their canonical payloads.
+
+7.6 Derivation evidence
+-----------------------
+
+DerivationEvidence is kind 14, version 1, class Metadata, logical_bytes 0.
+canonical_bytes is exactly two bytes. Byte 0 is the execution-class code from
+section 7.5. Byte 1 is a verifier-evidence presence byte:
+
+  0  no verifier/reference-execution evidence
+  1  one verifier/reference-execution reference is present
+
+Other values are invalid. The byte MUST agree with "08-verifier-evidence".
+
+The fixed references are:
+
+  "00-invocation"                  Owns      kind-13 invocation
+  "01-transform"                   Evidence  exact executed transform
+  "02-transform-contract"          Evidence  registered transform contract
+  "03-runtime-semantic-profile"    Evidence  kind-12 profile
+  "04-engine-build"                Evidence  actual executing engine build
+  "05-execution-measurements"      Evidence  canonical resource measurements
+  "06-authority-epoch"             Evidence  admission-policy epoch
+  "07-computation-sharing-domain"  Evidence  operator sharing domain
+  "08-verifier-evidence"           Evidence  optional verifier evidence
+
+Input i repeats the invocation input with an Evidence relation:
+
+  "10-input/" || i as u64 big-endian || 00 || non-empty semantic label
+
+Output i uses a Derived relation:
+
+  "20-output/" || i as u64 big-endian || 00 || non-empty semantic label
+
+Input and output ordinals each begin at zero with no gap. At least one output
+is required. Output references deliberately do not retain result bytes:
+evidence is a verified relation, while root and pin policy decides whether a
+result remains live. Admission MUST recompute the evidence identity, decode
+the owned invocation, verify every duplicated invocation field, reject a
+non-memoizable execution class, and prove every output's exact complete Owns
+closure before populating a reusable index.
+
+Kinds 15 and 16 reserve the linked garbage-collection evidence domain. Until
+their complete schemas are frozen in this document, readers preserve them as
+opaque typed objects and no runtime may claim independent semantic decoding of
+their canonical payloads.
 
 
 8. RECONSTRUCTION PROCEDURE

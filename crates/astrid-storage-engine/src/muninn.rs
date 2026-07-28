@@ -1,0 +1,393 @@
+//! Disposable lookup index over independently verified derivation evidence.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
+
+use astrid_storage_model::{
+    ComputationSharingDomainId, DerivationEvidence, DerivationEvidenceError, DerivationInvocation,
+    DerivationModelError, InvocationId, ObjectId, ObjectIdentity, ObjectRecord,
+};
+use parking_lot::RwLock;
+
+/// Evidence whose identity, invocation, and complete output closures have been
+/// recomputed by the engine.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedDerivationEvidence {
+    evidence: ObjectId,
+    invocation: InvocationId,
+    sharing_domain: ComputationSharingDomainId,
+    outputs: Vec<ObjectId>,
+}
+
+impl VerifiedDerivationEvidence {
+    /// Return the durable evidence identity.
+    #[must_use]
+    pub const fn evidence(&self) -> ObjectId {
+        self.evidence
+    }
+
+    /// Return the complete invocation identity.
+    #[must_use]
+    pub const fn invocation(&self) -> InvocationId {
+        self.invocation
+    }
+
+    /// Return the computation-sharing domain recorded at admission.
+    #[must_use]
+    pub const fn sharing_domain(&self) -> ComputationSharingDomainId {
+        self.sharing_domain
+    }
+
+    /// Borrow ordered result identities.
+    #[must_use]
+    pub fn outputs(&self) -> &[ObjectId] {
+        &self.outputs
+    }
+}
+
+/// Verify the complete durable relation before it may enter Muninn.
+///
+/// `output_closure` must be exactly the union of every output's complete Owns
+/// closure. Every declared identifier is recomputed, cycles and missing
+/// objects fail closed, and effectful or nondeterministic invocations are
+/// rejected from reuse.
+///
+/// This verifies storage and invocation integrity. Governed execution remains
+/// responsible for establishing that the evidence came from an authorized
+/// sandbox run; this function does not turn a stored claim into authority.
+///
+/// # Errors
+///
+/// Returns a typed verification error for identity substitution, malformed
+/// canonical records, invocation drift, ineligible execution classes, or an
+/// incomplete/cyclic/extraneous output closure.
+pub fn verify_derivation_evidence<I: ObjectIdentity>(
+    identity: &I,
+    evidence_id: ObjectId,
+    evidence_record: &ObjectRecord,
+    invocation_record: &ObjectRecord,
+    output_closure: &BTreeMap<ObjectId, ObjectRecord>,
+) -> Result<VerifiedDerivationEvidence, MuninnVerificationError> {
+    if identity.identify(evidence_record) != evidence_id {
+        return Err(MuninnVerificationError::EvidenceIdentityMismatch);
+    }
+    let evidence = DerivationEvidence::from_object_record(evidence_record)
+        .map_err(MuninnVerificationError::InvalidEvidence)?;
+    if identity.identify(invocation_record) != evidence.invocation().object_id() {
+        return Err(MuninnVerificationError::InvocationIdentityMismatch);
+    }
+    let invocation = DerivationInvocation::from_object_record(invocation_record)
+        .map_err(MuninnVerificationError::InvalidInvocation)?;
+    evidence
+        .validate_invocation(&invocation, identity)
+        .map_err(MuninnVerificationError::InvalidEvidence)?;
+    if !invocation.is_memoizable() {
+        return Err(MuninnVerificationError::ExecutionClassNotMemoizable);
+    }
+
+    for (declared, record) in output_closure {
+        if identity.identify(record) != *declared {
+            return Err(MuninnVerificationError::OutputIdentityMismatch(*declared));
+        }
+    }
+    let outputs: Vec<_> = evidence
+        .outputs()
+        .iter()
+        .map(astrid_storage_model::DerivationOutput::object)
+        .collect();
+    let reachable = validate_complete_output_closure(&outputs, output_closure)?;
+    if reachable.len() != output_closure.len() {
+        return Err(MuninnVerificationError::ExtraneousOutputRecord);
+    }
+
+    Ok(VerifiedDerivationEvidence {
+        evidence: evidence_id,
+        invocation: evidence.invocation(),
+        sharing_domain: evidence.sharing_domain(),
+        outputs,
+    })
+}
+
+/// Reuse state of one disposable Muninn entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MuninnTrustState {
+    /// Structurally verified and eligible for a policy-authorized hit.
+    Verified,
+    /// Excluded after a mismatch or unresolved integrity signal.
+    Suspect,
+    /// Excluded because transform, profile, or authority was revoked.
+    Revoked,
+    /// Excluded because snapshot or policy validity ended.
+    Expired,
+}
+
+/// Read-only result of an eligible Muninn lookup.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MuninnHit {
+    evidence: ObjectId,
+    outputs: Vec<ObjectId>,
+}
+
+impl MuninnHit {
+    /// Return the durable evidence that justifies this hit.
+    #[must_use]
+    pub const fn evidence(&self) -> ObjectId {
+        self.evidence
+    }
+
+    /// Borrow ordered result identities.
+    #[must_use]
+    pub fn outputs(&self) -> &[ObjectId] {
+        &self.outputs
+    }
+}
+
+/// Outcome of admitting verified evidence into the disposable index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MuninnAdmission {
+    /// A new invocation entry was indexed.
+    Inserted,
+    /// The exact same evidence and outputs were already indexed.
+    AlreadyPresent,
+    /// The injected index budget was exhausted; execution remains valid.
+    CapacityExhausted,
+    /// The invocation was already bound to different evidence or outputs.
+    Conflict {
+        /// Existing durable evidence identity.
+        existing: ObjectId,
+        /// Conflicting durable evidence identity.
+        incoming: ObjectId,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MuninnEntry {
+    evidence: ObjectId,
+    outputs: Vec<ObjectId>,
+    trust: MuninnTrustState,
+    last_spot_check: Option<ObjectId>,
+}
+
+/// Process-local, correctness-independent Muninn lookup table.
+///
+/// Capacity has no library default: native composition must inject a bounded
+/// operator policy, and the common resource authority may replace this simple
+/// entry budget without changing evidence or lookup semantics. Exhaustion and
+/// eviction never fail a valid derivation; they only remove the acceleration.
+#[derive(Debug)]
+pub struct InMemoryMuninnIndex {
+    capacity: NonZeroUsize,
+    entries: RwLock<BTreeMap<(ComputationSharingDomainId, InvocationId), MuninnEntry>>,
+}
+
+impl InMemoryMuninnIndex {
+    /// Construct an empty index with an explicitly injected entry budget.
+    #[must_use]
+    pub fn new(capacity: NonZeroUsize) -> Self {
+        Self {
+            capacity,
+            entries: RwLock::new(BTreeMap::new()),
+        }
+    }
+
+    /// Return the injected entry budget.
+    #[must_use]
+    pub const fn capacity(&self) -> NonZeroUsize {
+        self.capacity
+    }
+
+    /// Return the current number of disposable entries.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.read().len()
+    }
+
+    /// Return whether the disposable index is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.read().is_empty()
+    }
+
+    /// Admit evidence only after [`verify_derivation_evidence`] succeeds.
+    ///
+    /// A conflicting result marks the old entry suspect and never replaces it
+    /// silently. Capacity exhaustion returns an outcome rather than an error
+    /// because the uncached execution result remains valid.
+    #[must_use]
+    pub fn admit(&self, verified: &VerifiedDerivationEvidence) -> MuninnAdmission {
+        let key = (verified.sharing_domain, verified.invocation);
+        let mut entries = self.entries.write();
+        if let Some(existing) = entries.get_mut(&key) {
+            if existing.evidence == verified.evidence && existing.outputs == verified.outputs {
+                return MuninnAdmission::AlreadyPresent;
+            }
+            existing.trust = MuninnTrustState::Suspect;
+            return MuninnAdmission::Conflict {
+                existing: existing.evidence,
+                incoming: verified.evidence,
+            };
+        }
+        if entries.len() >= self.capacity.get() {
+            return MuninnAdmission::CapacityExhausted;
+        }
+        entries.insert(
+            key,
+            MuninnEntry {
+                evidence: verified.evidence,
+                outputs: verified.outputs.clone(),
+                trust: MuninnTrustState::Verified,
+                last_spot_check: None,
+            },
+        );
+        MuninnAdmission::Inserted
+    }
+
+    /// Look up one invocation inside one computation-sharing domain.
+    ///
+    /// Only verified entries are returned. Callers must authorize access and
+    /// re-check current contract, closure, and policy eligibility before
+    /// returning any result bytes.
+    #[must_use]
+    pub fn lookup(
+        &self,
+        domain: ComputationSharingDomainId,
+        invocation: InvocationId,
+    ) -> Option<MuninnHit> {
+        let entries = self.entries.read();
+        let entry = entries.get(&(domain, invocation))?;
+        if entry.trust != MuninnTrustState::Verified {
+            return None;
+        }
+        Some(MuninnHit {
+            evidence: entry.evidence,
+            outputs: entry.outputs.clone(),
+        })
+    }
+
+    /// Change disposable trust state after governed policy or audit checks.
+    ///
+    /// `spot_check_evidence` identifies the audit record that justified the
+    /// transition when one exists.
+    #[must_use]
+    pub fn set_trust_state(
+        &self,
+        domain: ComputationSharingDomainId,
+        invocation: InvocationId,
+        trust: MuninnTrustState,
+        spot_check_evidence: Option<ObjectId>,
+    ) -> bool {
+        let mut entries = self.entries.write();
+        let Some(entry) = entries.get_mut(&(domain, invocation)) else {
+            return false;
+        };
+        entry.trust = trust;
+        if spot_check_evidence.is_some() {
+            entry.last_spot_check = spot_check_evidence;
+        }
+        true
+    }
+
+    /// Remove one disposable entry.
+    #[must_use]
+    pub fn evict(&self, domain: ComputationSharingDomainId, invocation: InvocationId) -> bool {
+        self.entries.write().remove(&(domain, invocation)).is_some()
+    }
+
+    /// Drop the entire accelerator without touching durable evidence.
+    pub fn clear(&self) {
+        self.entries.write().clear();
+    }
+}
+
+/// Failure while rebuilding or admitting a durable derivation relation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MuninnVerificationError {
+    /// The evidence record did not hash to its declared identity.
+    EvidenceIdentityMismatch,
+    /// The invocation record did not hash to the identity named by evidence.
+    InvocationIdentityMismatch,
+    /// The evidence object was malformed or drifted from the invocation.
+    InvalidEvidence(DerivationEvidenceError),
+    /// The invocation object was malformed.
+    InvalidInvocation(DerivationModelError),
+    /// Effectful or nondeterministic execution was offered for reuse.
+    ExecutionClassNotMemoizable,
+    /// An output-closure record did not hash to its declared identity.
+    OutputIdentityMismatch(ObjectId),
+    /// A result or owned descendant was absent.
+    MissingOutputObject(ObjectId),
+    /// An output Owns graph contained a cycle.
+    CyclicOutputClosure(ObjectId),
+    /// The supplied closure contained an object not reachable from any output.
+    ExtraneousOutputRecord,
+}
+
+impl std::fmt::Display for MuninnVerificationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EvidenceIdentityMismatch => {
+                formatter.write_str("derivation evidence identity mismatch")
+            },
+            Self::InvocationIdentityMismatch => {
+                formatter.write_str("derivation invocation identity mismatch")
+            },
+            Self::InvalidEvidence(error) => {
+                write!(formatter, "invalid derivation evidence: {error}")
+            },
+            Self::InvalidInvocation(error) => {
+                write!(formatter, "invalid derivation invocation: {error}")
+            },
+            Self::ExecutionClassNotMemoizable => {
+                formatter.write_str("derivation execution class is not memoizable")
+            },
+            Self::OutputIdentityMismatch(id) => {
+                write!(formatter, "derivation output identity mismatch at {id:?}")
+            },
+            Self::MissingOutputObject(id) => {
+                write!(formatter, "derivation output closure is missing {id:?}")
+            },
+            Self::CyclicOutputClosure(id) => {
+                write!(formatter, "derivation output closure is cyclic at {id:?}")
+            },
+            Self::ExtraneousOutputRecord => {
+                formatter.write_str("derivation output closure contains extraneous records")
+            },
+        }
+    }
+}
+
+fn validate_complete_output_closure(
+    outputs: &[ObjectId],
+    records: &BTreeMap<ObjectId, ObjectRecord>,
+) -> Result<BTreeSet<ObjectId>, MuninnVerificationError> {
+    let mut marks = BTreeMap::<ObjectId, u8>::new();
+    let mut reachable = BTreeSet::new();
+    for output in outputs {
+        visit_output(*output, records, &mut marks, &mut reachable)?;
+    }
+    Ok(reachable)
+}
+
+fn visit_output(
+    id: ObjectId,
+    records: &BTreeMap<ObjectId, ObjectRecord>,
+    marks: &mut BTreeMap<ObjectId, u8>,
+    reachable: &mut BTreeSet<ObjectId>,
+) -> Result<(), MuninnVerificationError> {
+    match marks.get(&id) {
+        Some(1) => return Err(MuninnVerificationError::CyclicOutputClosure(id)),
+        Some(2) => return Ok(()),
+        _ => {},
+    }
+    let record = records
+        .get(&id)
+        .ok_or(MuninnVerificationError::MissingOutputObject(id))?;
+    marks.insert(id, 1);
+    reachable.insert(id);
+    for child in record.owning_references() {
+        visit_output(child, records, marks, reachable)?;
+    }
+    marks.insert(id, 2);
+    Ok(())
+}

@@ -259,11 +259,14 @@ DerivationEvidence {
     execution_measurements
     verifier_or_reference_evidence
     authority_epoch
+    computation_sharing_domain
 }
 ```
 
 Muninn's live index is disposable. The immutable evidence and result objects
-are sufficient to rebuild it.
+are sufficient to rebuild it. Evidence points to outputs with non-owning
+`Derived` relations: evidence records why a result is believed, while
+principal roots and pins decide whether the result bytes remain live.
 
 `export_closure` materializes authoritative result bytes. It may also include
 the invocation, transform closure, runtime profile, and evidence so a

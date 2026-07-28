@@ -83,6 +83,22 @@ object_id_newtype!(
     /// Identity of one complete canonical derivation invocation.
     InvocationId
 );
+object_id_newtype!(
+    /// Identity of the engine build that executed a derivation.
+    EngineBuildId
+);
+object_id_newtype!(
+    /// Identity of canonical resource measurements for one execution.
+    ExecutionMeasurementsId
+);
+object_id_newtype!(
+    /// Identity of the authority-policy epoch used for admission.
+    AuthorityEpochId
+);
+object_id_newtype!(
+    /// Identity of an operator-declared computation-sharing domain.
+    ComputationSharingDomainId
+);
 
 /// Reuse class of one computation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

@@ -615,13 +615,18 @@ pub trait ObjectIdentity {
 }
 
 mod derivation;
+mod derivation_evidence;
 mod proof;
 
 pub use derivation::{
-    CanonicalParametersId, DerivationContractId, DerivationInvocation, DerivationModelError,
-    DeterministicSeedId, ExecutionClass, HostFunctionSemanticBinding, InvocationId,
-    InvocationInput, OutputContractId, RuntimeSemanticProfile, RuntimeSemanticProfileId,
-    SemanticContractId, SnapshotId, TransformId,
+    AuthorityEpochId, CanonicalParametersId, ComputationSharingDomainId, DerivationContractId,
+    DerivationInvocation, DerivationModelError, DeterministicSeedId, EngineBuildId, ExecutionClass,
+    ExecutionMeasurementsId, HostFunctionSemanticBinding, InvocationId, InvocationInput,
+    OutputContractId, RuntimeSemanticProfile, RuntimeSemanticProfileId, SemanticContractId,
+    SnapshotId, TransformId,
+};
+pub use derivation_evidence::{
+    DerivationEvidence, DerivationEvidenceError, DerivationOutput, VerifierEvidenceId,
 };
 pub use proof::{
     OwnedSubtreePatch, ReferencePath, StateSelector, StateViewProof, TransitionWitness,
