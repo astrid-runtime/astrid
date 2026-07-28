@@ -1,6 +1,7 @@
 //! Incremental immutable-object staging for durable root transactions.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use astrid_storage_model::{InsertOutcome, ModelError, ObjectId, ObjectRecord};
 
@@ -9,6 +10,7 @@ use super::{
     append_frame, append_frames, encode_object_frame, ensure_payload_limit, ensure_usable,
     live_files_mut, read_indexed_object,
 };
+use crate::PreparedProjectionObject;
 
 impl<P, I, C> DurableEngine<P, I, C>
 where
@@ -16,6 +18,14 @@ where
     I: PersistentObjectIdentity,
     C: PrincipalCodec<P>,
 {
+    /// Compute one immutable object identity and bind it to this engine
+    /// instance for later batch staging.
+    #[must_use]
+    pub fn prepare_object(&self, record: ObjectRecord) -> PreparedProjectionObject {
+        let id = self.identify(&record);
+        PreparedProjectionObject::bound(id, record, Arc::clone(&self.preparation_origin))
+    }
+
     /// Stage one immutable object without publishing a principal root.
     ///
     /// Identity is recomputed and an existing object is read back before a
@@ -89,13 +99,46 @@ where
         &self,
         records: Vec<ObjectRecord>,
     ) -> Result<Vec<(ObjectId, InsertOutcome)>, DurableError> {
+        self.stage_prepared_objects(
+            records
+                .into_iter()
+                .map(|record| self.prepare_object(record))
+                .collect(),
+        )
+    }
+
+    /// Stage an engine-prepared batch with one coalesced arena write.
+    ///
+    /// Identity is reused only for values prepared by this exact engine
+    /// instance. Values crossing an engine boundary are recomputed and checked
+    /// before admission, preserving server-side identity verification.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::stage_objects`].
+    pub fn stage_prepared_objects(
+        &self,
+        objects: Vec<PreparedProjectionObject>,
+    ) -> Result<Vec<(ObjectId, InsertOutcome)>, DurableError> {
         let mut incoming = BTreeMap::<ObjectId, (ObjectRecord, Vec<u8>)>::new();
         let mut input_order = Vec::new();
         input_order
-            .try_reserve_exact(records.len())
+            .try_reserve_exact(objects.len())
             .map_err(|_| DurableError::EncodingOverflow)?;
-        for record in records {
-            let id = self.identify(&record);
+        for object in objects {
+            let (declared, record, origin) = object.into_parts();
+            let id = if origin
+                .as_ref()
+                .is_some_and(|origin| Arc::ptr_eq(origin, &self.preparation_origin))
+            {
+                declared
+            } else {
+                let computed = self.identify(&record);
+                if computed != declared {
+                    return Err(ModelError::ObjectIdentityMismatch { declared, computed }.into());
+                }
+                computed
+            };
             input_order.push(id);
             if let Some((existing, _)) = incoming.get(&id) {
                 if existing != &record {

@@ -40,8 +40,8 @@ pub use kv::{
     kv_snapshot_with_engine,
 };
 pub use projection::{
-    PrincipalProjectionEngine, PrincipalProjectionError, ProjectionCacheEntry, ProjectionCacheKey,
-    ProjectionCachePayload,
+    PreparedProjectionObject, PrincipalProjectionEngine, PrincipalProjectionError,
+    ProjectionCacheEntry, ProjectionCacheKey, ProjectionCachePayload,
 };
 
 /// A root update and the immutable records required to reconstruct it.

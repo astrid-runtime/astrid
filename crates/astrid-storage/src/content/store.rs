@@ -16,7 +16,9 @@ use astrid_storage_content::{
     read_opened_content_and_verify, read_opened_content_range_with_verification,
     read_verified_content, read_verified_content_range,
 };
-use astrid_storage_engine::{PrincipalProjectionEngine, PrincipalProjectionError, RootTransaction};
+use astrid_storage_engine::{
+    PreparedProjectionObject, PrincipalProjectionEngine, PrincipalProjectionError, RootTransaction,
+};
 use astrid_storage_engine::{ProjectionCacheEntry, ProjectionCacheKey, ProjectionCachePayload};
 use astrid_storage_model::{
     InsertOutcome, ModelError, ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind,
@@ -883,7 +885,7 @@ struct EngineSink<'a, P, E> {
     engine: &'a E,
     objects_inserted: u64,
     pending_bytes: usize,
-    pending: BTreeMap<ObjectId, ObjectRecord>,
+    pending: BTreeMap<ObjectId, PreparedProjectionObject>,
     marker: PhantomData<fn() -> P>,
 }
 
@@ -910,7 +912,9 @@ where
         let pending = std::mem::take(&mut self.pending);
         self.pending_bytes = 0;
         let expected: Vec<_> = pending.keys().copied().collect();
-        let outcomes = self.engine.stage_objects(pending.into_values().collect())?;
+        let outcomes = self
+            .engine
+            .stage_prepared_objects(pending.into_values().collect())?;
         if outcomes.len() != expected.len() {
             return Err(PrincipalProjectionError::Engine(
                 "staging engine returned the wrong outcome count".to_owned(),
@@ -945,9 +949,10 @@ where
     type Error = PrincipalProjectionError;
 
     fn stage_content_object(&mut self, record: ObjectRecord) -> Result<ObjectId, Self::Error> {
-        let id = self.engine.identify_object(&record);
+        let prepared = self.engine.prepare_object(record);
+        let id = prepared.id();
         match self.pending.get(&id) {
-            Some(existing) if existing == &record => return Ok(id),
+            Some(existing) if existing.record() == prepared.record() => return Ok(id),
             Some(_) => {
                 return Err(PrincipalProjectionError::Model(
                     ModelError::ObjectCollision(id),
@@ -957,8 +962,8 @@ where
         }
         self.pending_bytes = self
             .pending_bytes
-            .saturating_add(staged_record_size(&record));
-        self.pending.insert(id, record);
+            .saturating_add(staged_record_size(prepared.record()));
+        self.pending.insert(id, prepared);
         if self.pending_bytes >= STAGING_BATCH_TARGET_BYTES {
             self.finish()?;
         }

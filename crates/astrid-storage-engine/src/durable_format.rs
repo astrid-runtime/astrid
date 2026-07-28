@@ -8,6 +8,7 @@ use super::{
     RecoveryLimits, ReferenceKind, ReferenceLabel, RootGeneration, RootState, Seek, SeekFrom,
     Write, io, materialize_closure, recovery_closure_error, validate_commit_closure,
 };
+use std::io::IoSlice;
 
 const IDENTITY_PREFIX_BYTES: usize = 8;
 const CURRENT_DIGEST_BYTES: u32 = 32;
@@ -725,15 +726,9 @@ pub(super) fn append_frames(
     magic: [u8; 8],
     payloads: &[Vec<u8>],
 ) -> Result<Vec<ArenaLocation>, DurableError> {
-    let capacity = payloads.iter().try_fold(0_usize, |total, payload| {
-        total
-            .checked_add(FRAME_HEADER_LEN_USIZE)
-            .and_then(|value| value.checked_add(payload.len()))
-            .ok_or(DurableError::EncodingOverflow)
-    })?;
-    let mut encoded = Vec::new();
-    encoded
-        .try_reserve_exact(capacity)
+    let mut headers = Vec::new();
+    headers
+        .try_reserve_exact(payloads.len())
         .map_err(|_| DurableError::EncodingOverflow)?;
     let mut locations = Vec::new();
     locations
@@ -742,11 +737,11 @@ pub(super) fn append_frames(
     let base = file
         .seek(SeekFrom::End(0))
         .map_err(|source| io_error("seek durable batch append", source))?;
+    let mut relative = 0_u64;
     for payload in payloads {
         let payload_len =
             u64::try_from(payload.len()).map_err(|_| DurableError::EncodingOverflow)?;
         let checksum = frame_checksum(magic, payload_len, payload);
-        let relative = u64::try_from(encoded.len()).map_err(|_| DurableError::EncodingOverflow)?;
         let offset = base
             .checked_add(relative)
             .ok_or(DurableError::EncodingOverflow)?;
@@ -755,17 +750,62 @@ pub(super) fn append_frames(
         header[8..10].copy_from_slice(&FRAME_VERSION.to_le_bytes());
         header[12..20].copy_from_slice(&payload_len.to_le_bytes());
         header[CHECKSUM_START..].copy_from_slice(&checksum);
-        encoded.extend_from_slice(&header);
-        encoded.extend_from_slice(payload);
+        headers.push(header);
         locations.push(ArenaLocation {
             offset,
             payload_len,
             checksum,
         });
+        relative = relative
+            .checked_add(FRAME_HEADER_LEN)
+            .and_then(|value| value.checked_add(payload_len))
+            .ok_or(DurableError::EncodingOverflow)?;
     }
-    file.write_all(&encoded)
+
+    let slice_count = payloads
+        .len()
+        .checked_mul(2)
+        .ok_or(DurableError::EncodingOverflow)?;
+    let mut slices = Vec::new();
+    slices
+        .try_reserve_exact(slice_count)
+        .map_err(|_| DurableError::EncodingOverflow)?;
+    for (header, payload) in headers.iter().zip(payloads) {
+        slices.push(IoSlice::new(header));
+        slices.push(IoSlice::new(payload));
+    }
+    write_all_vectored(file, &mut slices)
         .map_err(|source| io_error("append durable frame batch", source))?;
     Ok(locations)
+}
+
+pub(super) fn write_all_vectored<W: Write>(
+    writer: &mut W,
+    buffers: &mut [IoSlice<'_>],
+) -> io::Result<()> {
+    let mut remaining = buffers;
+    let mut slice_limit = remaining.len();
+    while !remaining.is_empty() {
+        let offered = remaining.len().min(slice_limit);
+        match writer.write_vectored(&remaining[..offered]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write durable frame batch",
+                ));
+            },
+            Ok(written) => IoSlice::advance_slices(&mut remaining, written),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {},
+            Err(error) if error.kind() == io::ErrorKind::InvalidInput && offered > 1 => {
+                // Native vectored-I/O limits vary by platform. Discover a
+                // supported batch width without imposing a format or resource
+                // limit; an invalid single slice remains a real I/O failure.
+                slice_limit = offered / 2;
+            },
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn frame_checksum(magic: [u8; 8], payload_len: u64, payload: &[u8]) -> [u8; 32] {

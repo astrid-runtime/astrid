@@ -20,6 +20,7 @@ use astrid_storage_model::{
 use fs2::FileExt;
 use parking_lot::Mutex;
 
+use crate::projection::PreparationOrigin;
 use crate::{CommitOutcome, RootSnapshot, RootTransaction};
 
 const ARENA_FILE: &str = "objects.arena";
@@ -333,6 +334,7 @@ struct DurableFiles {
 /// Neither principal authority nor quota policy is inferred by this engine.
 pub struct DurableEngine<P: Ord, I, C> {
     identity: I,
+    preparation_origin: Arc<PreparationOrigin>,
     principal_codec: C,
     limits: RecoveryLimits,
     faults: Arc<dyn FaultInjector>,
@@ -472,6 +474,7 @@ where
 
         Ok(Self {
             identity,
+            preparation_origin: Arc::new(PreparationOrigin),
             principal_codec,
             limits,
             faults,
@@ -1215,7 +1218,7 @@ use format::{
     sync_store_directory,
 };
 #[cfg(test)]
-use format::{decode_object_frame, frame_checksum, last_batch_spans};
+use format::{decode_object_frame, frame_checksum, last_batch_spans, write_all_vectored};
 
 #[cfg(test)]
 #[path = "durable_tests.rs"]

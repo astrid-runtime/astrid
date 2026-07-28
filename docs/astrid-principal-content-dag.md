@@ -183,8 +183,14 @@ slice builder, including the one-whole-chunk rule at or below 256 KiB.
 
 `PrincipalContentStore::put_streaming` binds that sink to the shared projection
 engine. It buffers records to a four-MiB staging target; the durable engine
-identity-checks the complete batch before writing and appends its physical
-frames with one coalesced write and no per-record flush. After the source is
+computes each identity once and returns an opaque prepared record to the sink.
+Only values prepared by that exact engine instance may reuse the identity at
+admission; a value crossing an engine boundary is recomputed before any write.
+The durable append encodes each frame independently, then uses vectored I/O over
+the frame headers and existing payload buffers rather than copying the batch
+into a second aggregate buffer. Partial vectored writes, interrupted writes,
+and platform-specific vector-count limits are retried without changing the
+physical format. No record is flushed individually. After the source is
 complete, the ordinary principal-root transaction validates the full staged
 closure inside its critical section, flushes the complete arena prefix, and
 only then appends and flushes the root journal. Root conflicts rebuild only

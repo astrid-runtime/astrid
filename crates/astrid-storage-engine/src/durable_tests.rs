@@ -1,5 +1,7 @@
 //! Tests for the native durable principal-state engine.
+use std::io::{ErrorKind, IoSlice};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
@@ -70,6 +72,43 @@ impl ObjectIdentity for BlockingIdentity {
 }
 
 impl PersistentObjectIdentity for BlockingIdentity {
+    fn scheme(&self) -> IdentityScheme {
+        TEST_IDENTITY_SCHEME
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CountingIdentity {
+    calls: Arc<AtomicUsize>,
+}
+
+impl ObjectIdentity for CountingIdentity {
+    fn identify(&self, record: &ObjectRecord) -> ObjectId {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        TestIdentity.identify(record)
+    }
+}
+
+impl PersistentObjectIdentity for CountingIdentity {
+    fn scheme(&self) -> IdentityScheme {
+        TEST_IDENTITY_SCHEME
+    }
+}
+
+#[derive(Clone, Debug)]
+struct InstanceIdentity {
+    byte: u8,
+    calls: Arc<AtomicUsize>,
+}
+
+impl ObjectIdentity for InstanceIdentity {
+    fn identify(&self, _record: &ObjectRecord) -> ObjectId {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        ObjectId::new([self.byte; 32])
+    }
+}
+
+impl PersistentObjectIdentity for InstanceIdentity {
     fn scheme(&self) -> IdentityScheme {
         TEST_IDENTITY_SCHEME
     }
@@ -600,6 +639,171 @@ fn staged_batch_is_idempotent_and_publishes_in_one_root_commit() {
         .unwrap();
     assert_eq!(outcome.objects_inserted(), 0);
     assert!(engine.snapshot(&"alice".to_owned()).unwrap().is_some());
+}
+
+#[derive(Default)]
+struct PartialVectoredWriter {
+    bytes: Vec<u8>,
+    calls: usize,
+}
+
+impl Write for PartialVectoredWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let written = buffer.len().min(3);
+        self.bytes.extend_from_slice(&buffer[..written]);
+        self.calls = self.calls.saturating_add(1);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn write_vectored(&mut self, buffers: &[IoSlice<'_>]) -> std::io::Result<usize> {
+        if buffers.len() > 2 {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                "simulated platform iovec limit",
+            ));
+        }
+        self.calls = self.calls.saturating_add(1);
+        let mut remaining = 5_usize;
+        let mut written = 0_usize;
+        for buffer in buffers {
+            let take = buffer.len().min(remaining);
+            self.bytes.extend_from_slice(&buffer[..take]);
+            written = written.saturating_add(take);
+            remaining -= take;
+            if remaining == 0 {
+                break;
+            }
+        }
+        Ok(written)
+    }
+}
+
+#[test]
+fn vectored_batch_write_handles_partial_cross_slice_progress() {
+    let first = b"header";
+    let second = b"payload";
+    let third = b"tail";
+    let mut slices = [
+        IoSlice::new(first),
+        IoSlice::new(second),
+        IoSlice::new(third),
+    ];
+    let mut writer = PartialVectoredWriter::default();
+
+    write_all_vectored(&mut writer, &mut slices).unwrap();
+
+    assert_eq!(writer.bytes, [first.as_slice(), second, third].concat());
+    assert!(writer.calls > 1);
+}
+
+struct ZeroVectoredWriter;
+
+impl Write for ZeroVectoredWriter {
+    fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+        Ok(0)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn write_vectored(&mut self, _buffers: &[IoSlice<'_>]) -> std::io::Result<usize> {
+        Ok(0)
+    }
+}
+
+#[test]
+fn vectored_batch_write_rejects_zero_progress() {
+    let mut slices = [IoSlice::new(b"pending")];
+
+    let error = write_all_vectored(&mut ZeroVectoredWriter, &mut slices).unwrap_err();
+
+    assert_eq!(error.kind(), ErrorKind::WriteZero);
+}
+
+#[test]
+fn same_engine_prepared_object_reuses_server_computed_identity() {
+    let directory = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let engine = DurableEngine::<String, CountingIdentity, Utf8Codec>::open(
+        directory.path(),
+        CountingIdentity {
+            calls: Arc::clone(&calls),
+        },
+        Utf8Codec,
+        limits(),
+    )
+    .unwrap();
+    let record = ObjectRecord::new(
+        ObjectKind::Chunk,
+        ObjectFormatVersion::V1,
+        b"prepared once".to_vec(),
+        Vec::new(),
+        13,
+        ObjectClass::Data,
+    )
+    .unwrap();
+
+    let prepared = engine.prepare_object(record);
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    let outcomes = engine.stage_prepared_objects(vec![prepared]).unwrap();
+
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].1, InsertOutcome::Inserted);
+}
+
+#[test]
+fn prepared_object_crossing_engine_boundary_is_reverified() {
+    let first_directory = tempfile::tempdir().unwrap();
+    let second_directory = tempfile::tempdir().unwrap();
+    let first_calls = Arc::new(AtomicUsize::new(0));
+    let second_calls = Arc::new(AtomicUsize::new(0));
+    let first = DurableEngine::<String, InstanceIdentity, Utf8Codec>::open(
+        first_directory.path(),
+        InstanceIdentity {
+            byte: 1,
+            calls: Arc::clone(&first_calls),
+        },
+        Utf8Codec,
+        limits(),
+    )
+    .unwrap();
+    let second = DurableEngine::<String, InstanceIdentity, Utf8Codec>::open(
+        second_directory.path(),
+        InstanceIdentity {
+            byte: 2,
+            calls: Arc::clone(&second_calls),
+        },
+        Utf8Codec,
+        limits(),
+    )
+    .unwrap();
+    let record = ObjectRecord::new(
+        ObjectKind::Chunk,
+        ObjectFormatVersion::V1,
+        b"cross-engine".to_vec(),
+        Vec::new(),
+        12,
+        ObjectClass::Data,
+    )
+    .unwrap();
+    let prepared = first.prepare_object(record);
+
+    assert!(matches!(
+        second.stage_prepared_objects(vec![prepared]),
+        Err(DurableError::Model(ModelError::ObjectIdentityMismatch {
+            declared,
+            computed,
+        })) if declared == ObjectId::new([1; 32]) && computed == ObjectId::new([2; 32])
+    ));
+    assert_eq!(first_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(second_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(second.object_count().unwrap(), 0);
 }
 
 #[test]

@@ -85,6 +85,64 @@ impl ProjectionCacheEntry {
     }
 }
 
+/// Instance identity for engine-proven prepared objects.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) struct PreparationOrigin;
+
+/// Immutable object whose identity was computed by a projection engine.
+///
+/// Fields are private so a caller cannot pair arbitrary bytes with a declared
+/// identifier. Durable engines bind prepared values to the engine instance
+/// that computed them; a value crossing that boundary is recomputed before
+/// admission.
+pub struct PreparedProjectionObject {
+    id: ObjectId,
+    record: ObjectRecord,
+    #[cfg(not(target_family = "wasm"))]
+    origin: Option<Arc<PreparationOrigin>>,
+}
+
+impl PreparedProjectionObject {
+    fn unbound(id: ObjectId, record: ObjectRecord) -> Self {
+        Self {
+            id,
+            record,
+            #[cfg(not(target_family = "wasm"))]
+            origin: None,
+        }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn bound(
+        id: ObjectId,
+        record: ObjectRecord,
+        origin: Arc<PreparationOrigin>,
+    ) -> Self {
+        Self {
+            id,
+            record,
+            origin: Some(origin),
+        }
+    }
+
+    /// Return the engine-computed object identifier.
+    #[must_use]
+    pub const fn id(&self) -> ObjectId {
+        self.id
+    }
+
+    /// Borrow the canonical immutable record.
+    #[must_use]
+    pub const fn record(&self) -> &ObjectRecord {
+        &self.record
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn into_parts(self) -> (ObjectId, ObjectRecord, Option<Arc<PreparationOrigin>>) {
+        (self.id, self.record, self.origin)
+    }
+}
+
 /// Failure at the generic principal projection boundary.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -123,6 +181,15 @@ impl From<ModelError> for PrincipalProjectionError {
 pub trait PrincipalProjectionEngine<P>: Send + Sync {
     /// Compute one canonical object identity.
     fn identify_object(&self, record: &ObjectRecord) -> ObjectId;
+
+    /// Compute an immutable object's identity once for later staging.
+    ///
+    /// The returned type has no public constructor, so callers cannot forge a
+    /// declared identity. Engines with instance-bound preparation should
+    /// override this method and [`Self::stage_prepared_objects`].
+    fn prepare_object(&self, record: ObjectRecord) -> PreparedProjectionObject {
+        PreparedProjectionObject::unbound(self.identify_object(&record), record)
+    }
 
     /// Stage one immutable object without publishing a principal root.
     ///
@@ -167,6 +234,40 @@ pub trait PrincipalProjectionEngine<P>: Send + Sync {
             .into_iter()
             .map(|record| self.stage_object(record))
             .collect()
+    }
+
+    /// Stage engine-prepared objects as one implementation-defined batch.
+    ///
+    /// The default preserves existing engines by taking the ordinary staging
+    /// path and checking that its independently computed identities agree.
+    /// Durable engines can avoid that repeated identity pass when the opaque
+    /// prepared values originated from the same engine instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns a projection or identity-mismatch error before publication.
+    fn stage_prepared_objects(
+        &self,
+        objects: Vec<PreparedProjectionObject>,
+    ) -> Result<Vec<(ObjectId, InsertOutcome)>, PrincipalProjectionError> {
+        let expected: Vec<_> = objects.iter().map(PreparedProjectionObject::id).collect();
+        let outcomes =
+            self.stage_objects(objects.into_iter().map(|object| object.record).collect())?;
+        if outcomes.len() != expected.len() {
+            return Err(PrincipalProjectionError::Engine(
+                "staging engine returned the wrong outcome count".to_owned(),
+            ));
+        }
+        for (expected, (computed, _)) in expected.iter().zip(&outcomes) {
+            if expected != computed {
+                return Err(ModelError::ObjectIdentityMismatch {
+                    declared: *expected,
+                    computed: *computed,
+                }
+                .into());
+            }
+        }
+        Ok(outcomes)
     }
 
     /// Return a principal's current root.
@@ -379,6 +480,10 @@ where
         self.identify(record)
     }
 
+    fn prepare_object(&self, record: ObjectRecord) -> PreparedProjectionObject {
+        DurableEngine::prepare_object(self, record)
+    }
+
     fn stage_object(
         &self,
         record: ObjectRecord,
@@ -391,6 +496,13 @@ where
         records: Vec<ObjectRecord>,
     ) -> Result<Vec<(ObjectId, InsertOutcome)>, PrincipalProjectionError> {
         DurableEngine::stage_objects(self, records).map_err(map_durable)
+    }
+
+    fn stage_prepared_objects(
+        &self,
+        objects: Vec<PreparedProjectionObject>,
+    ) -> Result<Vec<(ObjectId, InsertOutcome)>, PrincipalProjectionError> {
+        DurableEngine::stage_prepared_objects(self, objects).map_err(map_durable)
     }
 
     fn current_root(&self, principal: &P) -> Result<Option<RootState>, PrincipalProjectionError> {

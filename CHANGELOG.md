@@ -237,6 +237,13 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Fixed
 
+- **Streaming content publication avoids redundant hashing and batch copies.**
+  The projection boundary carries opaque, engine-prepared immutable records so
+  the engine-computed object identity is reused only by the exact durable
+  engine instance that minted it; records crossing engines are recomputed and
+  rejected on mismatch before admission. Arena batches now use retry-safe
+  vectored writes over frame headers and existing encoded payloads instead of
+  copying every four-MiB staging batch into another aggregate allocation.
 - **Kernel management rate limits no longer cross authorization boundaries.**
   Requests consume a principal-and-method-scoped action budget only after
   principal and device-scope authorization succeeds. A restricted caller or
