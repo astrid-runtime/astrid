@@ -62,46 +62,10 @@ The gear fingerprint is not object identity. The engine's injected,
 domain-separated BLAKE3 identity covers each chunk's complete bytes and every
 typed structural record. Collision checking still compares canonical records.
 
-The pinned sizes are measured rather than speculative. A real FastCDC sweep
-over 5.73 GB of live Astrid state and a 2.45 GB development workspace found:
-
-- whole-file identity alone removed 47.1% of the live-state bytes, collapsing
-  230,080 files to 4,551 unique whole objects;
-- total unique-byte-plus-object cost varied by only 0.5% across 8–256 KiB on
-  state and by 3% on the workspace; and
-- the 64 KiB target was within 0.07% and 1.2% of the respective measured
-  capacity optima while using 3.5–7 times fewer objects than the smaller-chunk
-  alternatives.
-
-Object count therefore governs this profile: every object consumes index,
-closure-validation, and recovery work. The result measures spatial
-deduplication in one snapshot. It must be rerun over version chains once
-temporal content history exists.
-
-Two convergence ratios must not be conflated:
-
-```text
-object-instance convergence
-    = 1 - 4,551 unique whole objects / 230,080 file instances
-    = 98.02%
-
-whole-file byte-capacity convergence
-    = 1 - unique whole-file bytes / logical file bytes
-    = 47.1%
-```
-
-The measured 98.02% object-instance result is evidence that homogeneous agent
-state repeats a very small artifact vocabulary and that per-object overhead is
-an important economic axis. It is not evidence of 98% byte savings: repeated
-small files dominate instance count while unique large files dominate bytes.
-
-Magnusson's 95–98% platform-scale byte-capacity convergence is recorded as a
-scaling hypothesis, not as a benchmark result. Temporal versions, many
-principals, semantic normalization across encodings, and physical compression
-could move marginal unique-byte growth toward it; this snapshot did not measure
-those axes. The measurement protocol in
-[Semantic Representations](astrid-semantic-representations.md) keeps each
-contribution separate.
+The pinned sizes are measured rather than speculative. The corpus, convergence
+definitions, complete sweep result, and hypothesis boundary live in the single
+[Storage Performance and Convergence](astrid-storage-performance.md) record.
+This document owns the persistent grammar only.
 
 ## Canonical objects
 
@@ -202,8 +166,9 @@ Windows, and Linux filesystem providers. It is deliberately not a mount:
 1. a provider derives the `StateOwner` from its authenticated host context and
    opens a private random-access native file;
 2. ordinary writes, seeks, and truncation touch only that file;
-3. close calls `seal`, which flushes the bytes and a versioned, checksummed
-   intent before moving the directory into the ready queue;
+3. the durable acknowledgement path calls `seal`, which flushes the bytes and
+   a versioned, checksummed intent before moving the directory into the ready
+   queue;
 4. `seal` returning is the provider acknowledgement boundary; chunking and
    object admission have not run;
 5. an ordered background consumer streams the file through
@@ -215,6 +180,14 @@ The close-order sequence is allocated at seal rather than open. Publication
 rejects a later close while an earlier close for the same owner and content
 name remains queued, so a slow old handle cannot overwrite a newer result.
 Different names do not share this ordering dependency.
+
+A provider must not silently equate this stronger durable acknowledgement with
+an ordinary host `close`. The benchmark contract in
+[Storage Performance and Convergence](astrid-storage-performance.md) measures
+cached write, close, explicit sync, seal, and background publication
+separately. A hosted filesystem must state whether ordinary close waits for
+`seal`, whether only `fsync` does, and how a provider-process crash recovers a
+closed but not yet durably sealed working transaction.
 
 A process crash before the intent leaves unacknowledged bytes that startup
 preserves under `quarantine/`. A crash after the intent but before the

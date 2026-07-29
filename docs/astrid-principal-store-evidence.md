@@ -416,30 +416,10 @@ materializer, compression decoder, and signature/envelope parser.
 
 ## 10. Deduplication benchmark contract
 
-Publish measurements, not a universal ratio. Corpus classes:
-
-- multiple revisions of source trees;
-- Rust/C/C++ build outputs and dependency caches;
-- package-manager stores;
-- Linux root filesystems and VM images;
-- database files and logs;
-- model weights and tensor artifacts;
-- text, media, compressed archives;
-- encrypted files;
-- uniform random and adversarial boundary-shifting data.
-
-For each chunking profile record:
-
-- logical input bytes;
-- unique chunk and metadata bytes;
-- deduplication ratio;
-- compression ratio separately;
-- chunk count and size distribution;
-- ingest throughput and peak memory;
-- small-edit write amplification;
-- index and reference amplification;
-- export/import throughput;
-- cold and warm reconstruction latency.
+The corpus matrix, convergence vocabulary, reported metrics, native-path
+harness, and mounted-provider acceptance matrix are specified once in
+[Storage Performance and Convergence](astrid-storage-performance.md). This
+evidence plan requires that contract; it does not duplicate it.
 
 A candidate profile fails if it relies on a hard total-size ceiling, unbounded
 RAM, or a workload-specific ratio presented as a general claim.
