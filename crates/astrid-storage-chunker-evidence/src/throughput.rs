@@ -74,13 +74,13 @@ fn samples(
     )
 }
 
-fn fold_digest(guard: &mut [u8; 32], digest: &[u8; 32]) {
+pub(crate) fn fold_digest(guard: &mut [u8; 32], digest: &[u8; 32]) {
     for (guard_byte, digest_byte) in guard.iter_mut().zip(digest) {
         *guard_byte ^= digest_byte;
     }
 }
 
-fn timing(bytes: u64, median: Duration, minimum: Duration) -> Result<Timing> {
+pub(crate) fn timing(bytes: u64, median: Duration, minimum: Duration) -> Result<Timing> {
     let median_nanoseconds = median.as_nanos();
     let bytes_per_second = u128::from(bytes)
         .checked_mul(1_000_000_000)

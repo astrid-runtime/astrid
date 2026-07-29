@@ -16,8 +16,8 @@ The measured alternatives do not justify changing durable identity:
 - the best matched MinCDC profile changes combined estimated retained cost by
   -0.0105%, effectively a tie;
 - the lowest-cost MinCDC profile improves that estimate by 0.1086% but creates
-  41.59% more unique chunk objects across the two live corpora;
-- MinCDC is materially faster in this scalar pipeline, while the expanded
+  41.58% more unique chunk objects across the two live corpora;
+- MinCDC is materially faster in the scalar CPU-only fixture, while the expanded
   local-edit study finds no material stability winner between FastCDC and the
   distribution-matched MinCDC profile;
 - Moth's caterpillar encoding collapsed 60 records in the matched live-state
@@ -53,7 +53,7 @@ The corpora were:
 | Label | Shape | Logical size |
 |---|---:|---:|
 | `agent-state` | 230,086 files | 5.73 GB |
-| `dev-workspace` | 47,761 files | 2.47 GB |
+| `dev-workspace` | 47,772 files | 2.47 GB |
 | `captured-code` | 32 real `Cargo.lock` revisions read directly from Git | 8.14 MB |
 | `synthetic-version-chain-v1` | 16 controlled local edits | 67.1 MB |
 | `synthetic-adversarial-v1` | empty, short, zeros, all-ones, periodic, monotone, repeated, pseudorandom, and boundary-pressure inputs | 58.7 MB |
@@ -78,7 +78,7 @@ bytes.
 |---|---:|---:|---:|---:|---:|---:|
 | FastCDC 16/64/256 | 110.1 KiB | 76.5 KiB | 51.38% | 26.10% | baseline | baseline |
 | MinCDC observed-match 32–160 | 93.1 KiB | 86.0 KiB | 51.38% | 26.18% | -0.0105% | +8.46% |
-| MinCDC wide 32–96 | 59.7 KiB | 59.1 KiB | 51.44% | 26.44% | -0.1086% | +41.59% |
+| MinCDC wide 32–96 | 59.7 KiB | 59.1 KiB | 51.44% | 26.44% | -0.1086% | +41.58% |
 | MinCDC same bounds 16–256 | 130.5 KiB | 115.5 KiB | 51.35% | 25.86% | +0.1323% | -8.56% |
 
 The cost estimate is explicit and directional: unique chunk bytes plus 162
@@ -115,13 +115,28 @@ profile is slightly better on both. Stability therefore does not decide the
 format. Retained cost, object population, implementation independence, and
 existing production behavior do.
 
-Release-mode CPU-only medians on the measured Apple M2 Ultra host, Rust 1.95.0:
+Each corpus/profile pair also has three alternating end-to-end passes per
+mode. These medians include file I/O and the whole-file policy:
+
+| Profile | Agent chunk only | Agent + BLAKE3 | Workspace chunk only | Workspace + BLAKE3 |
+|---|---:|---:|---:|---:|
+| FastCDC 16/64/256 | 315.85 MiB/s | 301.25 MiB/s | 855.79 MiB/s | 576.35 MiB/s |
+| MinCDC observed-match 32–160 | 234.42 MiB/s | 202.14 MiB/s | 1,214.72 MiB/s | 709.21 MiB/s |
+| Moth observed-match 32–160 | 208.37 MiB/s | 194.29 MiB/s | 1,141.75 MiB/s | 681.92 MiB/s |
+
+Alternating order prevents the second mode from inheriting a systematically
+warmer page cache. The results also show why CPU-only throughput is not a
+corpus result: FastCDC's larger whole-file threshold wins on the agent-state
+shape, while MinCDC's boundary speed wins on the development workspace.
+
+Release-mode CPU-only medians on a deterministic 64 MiB fixture, measured on
+the Apple M2 Ultra host with Rust 1.95.0:
 
 | Profile | Chunk only | Chunk + BLAKE3 |
 |---|---:|---:|
-| FastCDC 16/64/256 | 1,717.46 MiB/s | 866.00 MiB/s |
-| MinCDC observed-match 32–160 | 11,092.33 MiB/s | 1,569.20 MiB/s |
-| Moth observed-match 32–160 | 10,582.22 MiB/s | 1,483.78 MiB/s |
+| FastCDC 16/64/256 | 1,741.77 MiB/s | 881.70 MiB/s |
+| MinCDC observed-match 32–160 | 10,545.61 MiB/s | 1,520.67 MiB/s |
+| Moth observed-match 32–160 | 10,725.95 MiB/s | 1,539.49 MiB/s |
 
 MinCDC's compute result is real and worth retaining as evidence. It does not,
 by itself, outweigh an identity migration for effectively unchanged retained
@@ -175,8 +190,10 @@ cargo run --release -p astrid-storage-chunker-evidence -- \
 
 The report contains wall-time measurements, so reruns are not byte-identical.
 Corpus counts, boundaries, identities, deduplication totals, representation
-counts, and stability outcomes are deterministic. Throughput is compared by
-median and must be interpreted within the recorded host/toolchain boundary.
+counts, and stability outcomes are deterministic. CPU-only throughput uses
+three in-memory samples per profile. Corpus throughput uses three alternating
+end-to-end samples per mode and includes file I/O. Both must be interpreted
+within the recorded host/toolchain boundary.
 
 ## Reopening the decision
 

@@ -1,9 +1,10 @@
 use std::fs::{self, File};
+use std::hint::black_box;
 use std::io::{BufReader, Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -12,9 +13,11 @@ use walkdir::WalkDir;
 use crate::algorithm::Candidate;
 use crate::fixture::{periodic_bytes, pseudorandom_bytes};
 use crate::metrics::{Accumulator, Measurements};
+use crate::throughput::{Timing, fold_digest, timing};
 
 const EXCLUDED_TOP_LEVEL_DIRECTORIES: &[&str] = &["keys", "secrets", "run", ".Trash"];
 const READER_CAPACITY: usize = 1024 * 1024;
+const CORPUS_THROUGHPUT_SAMPLES: usize = 3;
 
 #[derive(Clone)]
 enum Input {
@@ -50,7 +53,16 @@ pub struct CandidateResult {
     pub corpus: String,
     pub corpus_kind: CorpusKind,
     pub candidate: Candidate,
+    pub throughput: CorpusThroughput,
     pub measurements: Measurements,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CorpusThroughput {
+    pub samples: u64,
+    pub scope: &'static str,
+    pub chunk_only: Timing,
+    pub chunk_and_blake3: Timing,
 }
 
 impl Corpus {
@@ -135,6 +147,10 @@ impl Corpus {
     }
 
     pub fn measure(&self, candidate: Candidate) -> Result<CandidateResult> {
+        // The authoritative measurement immediately following these timing
+        // passes re-hashes every file against the baseline snapshot. Timing
+        // never substitutes for corpus-integrity validation.
+        let (chunk_only, chunk_and_blake3) = self.measure_throughput_samples(&candidate)?;
         let started = Instant::now();
         let mut accumulator = Accumulator::default();
         for input in &self.inputs {
@@ -176,6 +192,12 @@ impl Corpus {
             corpus: self.name.clone(),
             corpus_kind: self.kind,
             candidate,
+            throughput: CorpusThroughput {
+                samples: u64::try_from(CORPUS_THROUGHPUT_SAMPLES)?,
+                scope: "median of alternating end-to-end corpus traversals including file I/O and the whole-file policy",
+                chunk_only,
+                chunk_and_blake3,
+            },
             measurements: accumulator.finish(started.elapsed())?,
         })
     }
@@ -184,12 +206,156 @@ impl Corpus {
         &self.name
     }
 
+    fn measure_throughput_samples(&self, candidate: &Candidate) -> Result<(Timing, Timing)> {
+        let mut chunk_only = Vec::with_capacity(CORPUS_THROUGHPUT_SAMPLES);
+        let mut chunk_and_blake3 = Vec::with_capacity(CORPUS_THROUGHPUT_SAMPLES);
+        for sample in 0..CORPUS_THROUGHPUT_SAMPLES {
+            if sample % 2 == 0 {
+                chunk_only.push(self.measure_throughput(candidate, false)?);
+                chunk_and_blake3.push(self.measure_throughput(candidate, true)?);
+            } else {
+                chunk_and_blake3.push(self.measure_throughput(candidate, true)?);
+                chunk_only.push(self.measure_throughput(candidate, false)?);
+            }
+        }
+        chunk_only.sort_unstable();
+        chunk_and_blake3.sort_unstable();
+        let logical_bytes = self.logical_bytes()?;
+        Ok((
+            timing(
+                logical_bytes,
+                chunk_only[chunk_only.len() / 2],
+                chunk_only[0],
+            )?,
+            timing(
+                logical_bytes,
+                chunk_and_blake3[chunk_and_blake3.len() / 2],
+                chunk_and_blake3[0],
+            )?,
+        ))
+    }
+
+    fn measure_throughput(&self, candidate: &Candidate, hash_records: bool) -> Result<Duration> {
+        let started = Instant::now();
+        let mut guard = [0_u8; 32];
+        for input in &self.inputs {
+            let observed_bytes = match input {
+                Input::File { path, .. } => {
+                    let file = File::open(path).with_context(|| {
+                        format!("open corpus throughput input {}", path.display())
+                    })?;
+                    measure_reader(
+                        BufReader::with_capacity(READER_CAPACITY, file),
+                        input.logical_bytes(),
+                        candidate,
+                        hash_records,
+                        &mut guard,
+                    )?
+                },
+                Input::Memory(bytes) => measure_reader(
+                    Cursor::new(bytes.as_ref()),
+                    input.logical_bytes(),
+                    candidate,
+                    hash_records,
+                    &mut guard,
+                )?,
+            };
+            if observed_bytes != input.logical_bytes() {
+                bail!(
+                    "corpus input changed during throughput measurement: expected {} bytes, read {observed_bytes}",
+                    input.logical_bytes()
+                );
+            }
+        }
+        black_box(guard);
+        Ok(started.elapsed())
+    }
+
+    fn logical_bytes(&self) -> Result<u64> {
+        self.inputs.iter().try_fold(0_u64, |total, input| {
+            total
+                .checked_add(input.logical_bytes())
+                .ok_or_else(|| anyhow::anyhow!("corpus logical byte count overflow"))
+        })
+    }
+
     fn from_files(name: String, kind: CorpusKind, inputs: Vec<Input>) -> Result<Self> {
         validate_label(&name)?;
         if inputs.is_empty() {
             bail!("corpus {name:?} contains no regular files");
         }
         Ok(Self { name, kind, inputs })
+    }
+}
+
+fn measure_reader<R: Read>(
+    reader: R,
+    logical_bytes: u64,
+    candidate: &Candidate,
+    hash_records: bool,
+    guard: &mut [u8; 32],
+) -> Result<u64> {
+    let mut reader = CountingReader::new(reader);
+    if logical_bytes <= u64::from(candidate.maximum_bytes) {
+        let mut buffer = vec![0_u8; READER_CAPACITY];
+        let mut hasher = hash_records.then(blake3::Hasher::new);
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            if let Some(hasher) = &mut hasher {
+                hasher.update(&buffer[..read]);
+            } else {
+                guard[0] ^= buffer[0];
+                let last = read
+                    .checked_sub(1)
+                    .expect("a non-empty read has a final byte");
+                guard[1] ^= buffer[last];
+            }
+        }
+        if logical_bytes != 0
+            && let Some(hasher) = hasher
+        {
+            fold_digest(guard, hasher.finalize().as_bytes());
+        }
+    } else {
+        candidate.visit_records(&mut reader, |bytes, logical_chunks| {
+            if hash_records {
+                fold_digest(guard, blake3::hash(bytes).as_bytes());
+            } else {
+                guard[0] ^= bytes.first().copied().unwrap_or_default();
+                guard[1] ^= bytes.last().copied().unwrap_or_default();
+                guard[2] ^= u8::try_from(logical_chunks & 0xff)?;
+            }
+            Ok(())
+        })?;
+    }
+    Ok(reader.bytes_read)
+}
+
+struct CountingReader<R> {
+    inner: R,
+    bytes_read: u64,
+}
+
+impl<R> CountingReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            bytes_read: 0,
+        }
+    }
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        self.bytes_read = self
+            .bytes_read
+            .checked_add(u64::try_from(read).map_err(std::io::Error::other)?)
+            .ok_or_else(|| std::io::Error::other("corpus byte count overflow"))?;
+        Ok(read)
     }
 }
 
@@ -422,6 +588,9 @@ mod tests {
             first.measurements.chunk_deduplication,
             second.measurements.chunk_deduplication
         );
+        assert_eq!(first.throughput.samples, 3);
+        assert!(first.throughput.chunk_only.median_bytes_per_second > 0);
+        assert!(first.throughput.chunk_and_blake3.median_bytes_per_second > 0);
     }
 
     #[test]
