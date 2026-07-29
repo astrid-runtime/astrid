@@ -16,6 +16,7 @@ pub(super) struct Report {
     config: Config,
     metrics: Vec<Metric>,
     substrate_comparisons: Vec<SubstrateComparison>,
+    throughput_scaling: Vec<ThroughputScaling>,
     write_amplifications: Vec<WriteAmplification>,
 }
 
@@ -30,6 +31,7 @@ impl Report {
             config,
             metrics: Vec::new(),
             substrate_comparisons: Vec::new(),
+            throughput_scaling: Vec::new(),
             write_amplifications: Vec::new(),
         }
     }
@@ -76,6 +78,40 @@ impl Report {
         Ok(())
     }
 
+    pub(super) fn record_throughput_scaling(
+        &mut self,
+        name: &'static str,
+        aggregate_metric: &'static str,
+        single_principal_metric: &'static str,
+    ) -> Result<(), String> {
+        let aggregate_mib_per_second = self
+            .metric(aggregate_metric)
+            .ok_or_else(|| format!("unknown aggregate scaling metric {aggregate_metric:?}"))?
+            .median_mib_per_second
+            .ok_or_else(|| format!("aggregate scaling metric {aggregate_metric:?} has no bytes"))?;
+        let single_principal_mib_per_second = self
+            .metric(single_principal_metric)
+            .ok_or_else(|| {
+                format!("unknown single-principal scaling metric {single_principal_metric:?}")
+            })?
+            .median_mib_per_second
+            .ok_or_else(|| {
+                format!("single-principal scaling metric {single_principal_metric:?} has no bytes")
+            })?;
+        if single_principal_mib_per_second <= 0.0 {
+            return Err(format!(
+                "single-principal scaling metric {single_principal_metric:?} has zero throughput"
+            ));
+        }
+        self.throughput_scaling.push(ThroughputScaling {
+            name,
+            aggregate_metric,
+            single_principal_metric,
+            median_throughput_ratio: aggregate_mib_per_second / single_principal_mib_per_second,
+        });
+        Ok(())
+    }
+
     pub(super) fn record_write_amplification(
         &mut self,
         name: &'static str,
@@ -97,10 +133,7 @@ impl Report {
             .first()
             .copied()
             .ok_or_else(|| format!("write amplification metric {name:?} has no minimum"))?;
-        let median = authoritative_bytes_appended
-            .get(authoritative_bytes_appended.len() / 2)
-            .copied()
-            .ok_or_else(|| format!("write amplification metric {name:?} has no median"))?;
+        let median = median_u64(&authoritative_bytes_appended);
         let maximum = authoritative_bytes_appended
             .last()
             .copied()
@@ -138,6 +171,16 @@ impl Report {
                 println!(
                     "{:<38} {:>17.3}×",
                     comparison.name, comparison.median_elapsed_ratio
+                );
+            }
+        }
+        if !self.throughput_scaling.is_empty() {
+            println!();
+            println!("{:<38} {:>18}", "concurrent workload", "aggregate/single");
+            for scaling in &self.throughput_scaling {
+                println!(
+                    "{:<38} {:>17.3}×",
+                    scaling.name, scaling.median_throughput_ratio
                 );
             }
         }
@@ -185,6 +228,14 @@ struct SubstrateComparison {
 }
 
 #[derive(Debug, Serialize)]
+struct ThroughputScaling {
+    name: &'static str,
+    aggregate_metric: &'static str,
+    single_principal_metric: &'static str,
+    median_throughput_ratio: f64,
+}
+
+#[derive(Debug, Serialize)]
 struct WriteAmplification {
     name: &'static str,
     logical_bytes_per_sample: u64,
@@ -212,10 +263,7 @@ impl Metric {
     ) -> Self {
         samples.sort_unstable();
         let minimum = samples.first().copied().unwrap_or(Duration::ZERO);
-        let median = samples
-            .get(samples.len() / 2)
-            .copied()
-            .unwrap_or(Duration::ZERO);
+        let median = median_duration(&samples);
         let maximum = samples.last().copied().unwrap_or(Duration::ZERO);
         let seconds = median.as_secs_f64();
         Self {
@@ -233,6 +281,48 @@ impl Metric {
                 .filter(|_| seconds > 0.0)
                 .map(|count| operations_per_second(count, seconds)),
         }
+    }
+}
+
+fn median_duration(sorted: &[Duration]) -> Duration {
+    match sorted.len() {
+        0 => Duration::ZERO,
+        length if length % 2 == 1 => sorted[length / 2],
+        length => {
+            let middle = length / 2;
+            let lower = sorted[middle
+                .checked_sub(1)
+                .expect("a nonempty even slice has a lower midpoint")];
+            let upper = sorted[middle];
+            let half_difference = upper
+                .checked_sub(lower)
+                .and_then(|difference| difference.checked_div(2))
+                .expect("sorted durations have a representable midpoint");
+            lower
+                .checked_add(half_difference)
+                .expect("the midpoint is bounded by the upper duration")
+        },
+    }
+}
+
+fn median_u64(sorted: &[u64]) -> u64 {
+    match sorted.len() {
+        0 => 0,
+        length if length % 2 == 1 => sorted[length / 2],
+        length => {
+            let middle = length / 2;
+            let lower = sorted[middle
+                .checked_sub(1)
+                .expect("a nonempty even slice has a lower midpoint")];
+            let upper = sorted[middle];
+            let half_difference = upper
+                .checked_sub(lower)
+                .and_then(|difference| difference.checked_div(2))
+                .expect("sorted integers have a representable midpoint");
+            lower
+                .checked_add(half_difference)
+                .expect("the midpoint is bounded by the upper integer")
+        },
     }
 }
 

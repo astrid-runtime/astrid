@@ -43,6 +43,16 @@ pub(super) async fn run(
         "astrid_read_warm",
         "native_read_warm",
     )?;
+    report.record_throughput_scaling(
+        "concurrent_shared_publication",
+        "astrid_concurrent_shared_publish",
+        "astrid_publish_unique",
+    )?;
+    report.record_throughput_scaling(
+        "concurrent_shared_warm_read",
+        "astrid_concurrent_shared_read_warm",
+        "astrid_read_warm",
+    )?;
     Ok(())
 }
 

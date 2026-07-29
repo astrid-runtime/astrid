@@ -28,7 +28,7 @@
       ],
       "minimum_milliseconds": 95.167666,
       "median_milliseconds": 112.687875,
-      "maximum_milliseconds": 127.69662500000001,
+      "maximum_milliseconds": 127.696625,
       "median_mib_per_second": 1135.8808567470103,
       "median_operations_per_second": null
     },
@@ -86,7 +86,7 @@
         163575333,
         164868834
       ],
-      "minimum_milliseconds": 162.29808400000002,
+      "minimum_milliseconds": 162.298084,
       "median_milliseconds": 163.575333,
       "maximum_milliseconds": 164.868834,
       "median_mib_per_second": 782.5140725833033,
@@ -102,8 +102,8 @@
         2073791
       ],
       "minimum_milliseconds": 1.383625,
-      "median_milliseconds": 2.0114579999999997,
-      "maximum_milliseconds": 2.0737910000000004,
+      "median_milliseconds": 2.011458,
+      "maximum_milliseconds": 2.073791,
       "median_mib_per_second": null,
       "median_operations_per_second": 7954.429075824602
     },
@@ -118,7 +118,7 @@
       ],
       "minimum_milliseconds": 76.378292,
       "median_milliseconds": 77.995458,
-      "maximum_milliseconds": 79.97066699999999,
+      "maximum_milliseconds": 79.970667,
       "median_mib_per_second": null,
       "median_operations_per_second": 205.1401505969745
     },
@@ -131,7 +131,7 @@
         354865042,
         357037916
       ],
-      "minimum_milliseconds": 352.02733400000005,
+      "minimum_milliseconds": 352.027334,
       "median_milliseconds": 354.865042,
       "maximum_milliseconds": 357.037916,
       "median_mib_per_second": null,
@@ -144,9 +144,9 @@
       "samples_nanoseconds": [
         108336125
       ],
-      "minimum_milliseconds": 108.33612500000001,
-      "median_milliseconds": 108.33612500000001,
-      "maximum_milliseconds": 108.33612500000001,
+      "minimum_milliseconds": 108.336125,
+      "median_milliseconds": 108.336125,
+      "maximum_milliseconds": 108.336125,
       "median_mib_per_second": 1181.5080149857677,
       "median_operations_per_second": null
     },
@@ -159,7 +159,7 @@
         79660667,
         79708208
       ],
-      "minimum_milliseconds": 79.65658400000001,
+      "minimum_milliseconds": 79.656584,
       "median_milliseconds": 79.660667,
       "maximum_milliseconds": 79.708208,
       "median_mib_per_second": 1606.8155693449064,
@@ -175,8 +175,8 @@
         37728584
       ],
       "minimum_milliseconds": 26.588333,
-      "median_milliseconds": 34.299707999999995,
-      "maximum_milliseconds": 37.728584000000005,
+      "median_milliseconds": 34.299708,
+      "maximum_milliseconds": 37.728584,
       "median_mib_per_second": null,
       "median_operations_per_second": 29.154767148455026
     },
@@ -234,9 +234,9 @@
         46665459,
         48708541
       ],
-      "minimum_milliseconds": 42.498208000000005,
+      "minimum_milliseconds": 42.498208,
       "median_milliseconds": 46.665459,
-      "maximum_milliseconds": 48.708541000000004,
+      "maximum_milliseconds": 48.708541,
       "median_mib_per_second": 2742.9281259185727,
       "median_operations_per_second": null
     },
@@ -264,8 +264,8 @@
         528295459,
         530509042
       ],
-      "minimum_milliseconds": 522.7559160000001,
-      "median_milliseconds": 528.2954589999999,
+      "minimum_milliseconds": 522.755916,
+      "median_milliseconds": 528.295459,
       "maximum_milliseconds": 530.509042,
       "median_mib_per_second": 242.2886621859076,
       "median_operations_per_second": null
@@ -280,8 +280,8 @@
         184359958
       ],
       "minimum_milliseconds": 176.238541,
-      "median_milliseconds": 176.71437500000002,
-      "maximum_milliseconds": 184.35995799999998,
+      "median_milliseconds": 176.714375,
+      "maximum_milliseconds": 184.359958,
       "median_mib_per_second": 724.3326978917249,
       "median_operations_per_second": null
     },
@@ -295,8 +295,8 @@
         81492875
       ],
       "minimum_milliseconds": 79.565458,
-      "median_milliseconds": 81.37304200000001,
-      "maximum_milliseconds": 81.49287500000001,
+      "median_milliseconds": 81.373042,
+      "maximum_milliseconds": 81.492875,
       "median_mib_per_second": 1573.0025184507665,
       "median_operations_per_second": null
     },
@@ -311,7 +311,7 @@
       ],
       "minimum_milliseconds": 447.345416,
       "median_milliseconds": 449.020292,
-      "maximum_milliseconds": 453.73616599999997,
+      "maximum_milliseconds": 453.736166,
       "median_mib_per_second": null,
       "median_operations_per_second": 2.2270708424910115
     },
@@ -324,9 +324,9 @@
         509673458,
         510730834
       ],
-      "minimum_milliseconds": 509.57679199999995,
+      "minimum_milliseconds": 509.576792,
       "median_milliseconds": 509.673458,
-      "maximum_milliseconds": 510.73083399999996,
+      "maximum_milliseconds": 510.730834,
       "median_mib_per_second": 251.14119244561488,
       "median_operations_per_second": null
     },
@@ -371,7 +371,7 @@
       ],
       "minimum_milliseconds": 94.258542,
       "median_milliseconds": 94.520584,
-      "maximum_milliseconds": 94.59762500000001,
+      "maximum_milliseconds": 94.597625,
       "median_mib_per_second": 5416.809527964829,
       "median_operations_per_second": null
     }
@@ -387,7 +387,7 @@
       "name": "warm_verified_read",
       "astrid_metric": "astrid_read_warm",
       "substrate_metric": "native_read_warm",
-      "median_elapsed_ratio": 1.0214958657074766
+      "median_elapsed_ratio": 1.0214958657074764
     }
   ],
   "write_amplifications": [
@@ -415,7 +415,21 @@
       "minimum_authoritative_bytes_appended": 864,
       "median_authoritative_bytes_appended": 864,
       "maximum_authoritative_bytes_appended": 864,
-      "median_physical_to_logical_ratio": 6.4373016357421875e-6
+      "median_physical_to_logical_ratio": 0.0000064373016357421875
+    }
+  ],
+  "throughput_scaling": [
+    {
+      "name": "concurrent_shared_publication",
+      "aggregate_metric": "astrid_concurrent_shared_publish",
+      "single_principal_metric": "astrid_publish_unique",
+      "median_throughput_ratio": 2.385066592859032
+    },
+    {
+      "name": "concurrent_shared_warm_read",
+      "aggregate_metric": "astrid_concurrent_shared_read_warm",
+      "single_principal_metric": "astrid_read_warm",
+      "median_throughput_ratio": 3.4436114783209546
     }
   ]
 }

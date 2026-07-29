@@ -13,4 +13,7 @@ The early JSON schema did not embed Git revision, command line, dirty-tree
 state, or cache policy. The canonical document records reconstructed ancestry
 and explicitly prevents independent experiment branches from being presented
 as one integrated result. The next canonical run must embed that provenance in
-the report itself.
+the report itself. Derived medians, rates, comparisons, and amplification
+ratios in the archived files were recalculated from the unchanged raw samples
+after the even-sample median rule was corrected to average both central
+observations.

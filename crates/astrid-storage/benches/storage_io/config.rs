@@ -129,7 +129,7 @@ fn print_help() {
            --bytes N             large-file corpus bytes (default {DEFAULT_BYTES})\n\
            --block-bytes N       native copy buffer bytes (default {DEFAULT_BLOCK_BYTES})\n\
            --range-bytes N       published range-read bytes (default {DEFAULT_RANGE_BYTES})\n\
-           --samples N           native large-write samples (default {DEFAULT_SAMPLES})\n\
+           --samples N           samples per repeatable workload (default {DEFAULT_SAMPLES})\n\
            --small-files N       small-file operation count (default {DEFAULT_SMALL_FILES})\n\
            --small-file-bytes N  bytes per small file (default {DEFAULT_SMALL_FILE_BYTES})\n\
            --concurrent-principals N\n\

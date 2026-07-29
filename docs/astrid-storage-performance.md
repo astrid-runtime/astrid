@@ -155,9 +155,11 @@ overwrite a populated directory. Without it, the harness uses and removes a
 temporary directory. The JSON contains every raw nanosecond sample, the
 median, range, byte or operation count, target OS and architecture, logical CPU
 count, and the exact workload configuration. It also records contract-matched
-elapsed-over-substrate ratios and the exact growth in `objects.arena` plus
-`roots.journal` for unique and duplicate publication. That growth is
-authoritative file length appended, not filesystem-allocated block count.
+elapsed-over-substrate ratios, aggregate-to-single-principal throughput
+scaling, and the exact growth in `objects.arena` plus `roots.journal` for
+unique and duplicate publication. For even sample counts, the reported median
+is the midpoint of the two central observations. Arena growth is authoritative
+file length appended, not filesystem-allocated block count.
 
 `--samples` applies to unique publication, duplicate publication, engine open
 and reopen, Astrid reads, native writes, seals, and the concurrent workloads.
@@ -171,8 +173,10 @@ its reference digest are outside every timed interval. Native and Astrid paths
 use the same source and the same user-space copy buffer. Every native and
 reconstructed read is BLAKE3-checked against that reference.
 
-The first native read is merely the first read in that process and intentionally
-remains a single observation. It is not called uncached: portable,
+The first native-read value is merely the first measured native-read
+observation and intentionally remains a single observation. The preceding
+native-write, staging, and content-compute workloads have already read the
+source and likely warmed the page cache. It is not called uncached: portable,
 non-privileged page-cache eviction is unavailable. Record cache state and any
 platform-specific eviction procedure separately rather than relabeling a warm
 read as cold.
@@ -264,8 +268,8 @@ into quantified acceptance gates:
   About 42% of 64 KiB read time was neighbor-chunk loading outside the requested
   range and another 13% was repeated gear-boundary validation. The
   `perf/storage-cached-positional-reads` branch moved 64 KiB single-stream reads
-  from 92.9 to 227.7 MiB/s and four-principal aggregate reads from 105.8 to
-  839.0 MiB/s by moving reads outside the write mutex and reusing
+  from 93.1 to 228.8 MiB/s and four-principal aggregate reads from 106.0 to
+  840.2 MiB/s by moving reads outside the write mutex and reusing
   principal-partitioned verification tokens. The remaining cache and
   post-reopen work stays tracked in #1399.
 - Durable KV writes measured 8.6 ms, or 117 writes/s for the whole store.
@@ -304,15 +308,15 @@ successor.
 
 | Code state | Request | Native verified | Astrid verified | Four-principal aggregate |
 | --- | ---: | ---: | ---: | ---: |
-| Pre-handle baseline | 64 KiB | 1,588 MiB/s | 92.9 MiB/s | 105.8 MiB/s |
-| Positional handles (`8dfd6938`) | 64 KiB | 1,588 MiB/s | 94.4 MiB/s | 353.2 MiB/s |
-| Boundary evidence (`1d2679ef`) | 64 KiB | 1,589 MiB/s | 227.7 MiB/s | 839.0 MiB/s |
+| Pre-handle baseline | 64 KiB | 1,607 MiB/s | 93.1 MiB/s | 106.0 MiB/s |
+| Positional handles (`8dfd6938`) | 64 KiB | 1,596 MiB/s | 94.9 MiB/s | 353.9 MiB/s |
+| Boundary evidence (`1d2679ef`) | 64 KiB | 1,592 MiB/s | 228.8 MiB/s | 840.2 MiB/s |
 | Object/header cache (`d69309ef`) | 64 KiB | 1,607 MiB/s | 1,573.0 MiB/s | 5,416.8 MiB/s |
-| Governed cache (`e0bf4217`) | 64 KiB | 1,593 MiB/s | 1,548.4 MiB/s | 5,026.7 MiB/s |
-| Governed cache (`e0bf4217`) | 1 MiB | 1,612 MiB/s | 1,706.4 MiB/s | 6,512.0 MiB/s |
+| Governed cache (`e0bf4217`) | 64 KiB | 1,595 MiB/s | 1,570.0 MiB/s | 5,057.3 MiB/s |
+| Governed cache (`e0bf4217`) | 1 MiB | 1,615 MiB/s | 1,739.3 MiB/s | 6,517.9 MiB/s |
 
-The final 64 KiB run reaches 97.2% of same-run verified-native throughput. The
-one-MiB hot run reaches 105.9%. Astrid may legitimately lead that comparator
+The final 64 KiB run reaches 98.5% of same-run verified-native throughput. The
+one-MiB hot run reaches 107.7%. Astrid may legitimately lead that comparator
 when it reuses immutable verified objects while the native reader hashes bytes
 again. This is not mounted-provider throughput and must be confirmed after
 integration.
