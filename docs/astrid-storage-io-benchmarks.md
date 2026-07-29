@@ -1,8 +1,13 @@
 # Astrid Storage I/O Benchmarks
 
+Selected raw outputs and the cross-branch measurement ledger are preserved in
+[`benchmarks/storage-io/`](benchmarks/storage-io/README.md). The ledger names
+which comparisons are direct, which optimization branches were independent,
+and which results were not yet integrated into the storage line.
+
 Status: executable native-path baseline; mounted-provider measurements pending
 
-Last reviewed: 2026-07-28
+Last reviewed: 2026-07-29
 
 Tracking:
 [#1398](https://github.com/astrid-runtime/astrid/issues/1398),
