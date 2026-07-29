@@ -169,6 +169,21 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   corpus measured 98.02% object-instance convergence but 47.1% whole-file byte
   convergence; the 95–98% platform-scale byte result remains a separately
   testable hypothesis.
+- **Named content uses a canonical path-copy radix catalog.** Point lookup and
+  mutation no longer decode or rewrite every principal name. UTF-8 names plus
+  a zero terminator form prefix-free radix keys, making root identity
+  independent of insertion history while a replacement writes only its search
+  path. Leaves contribute visible bytes exactly once; structural branches
+  carry checked child totals for constant-time root quota accounting. Complete
+  principal-partitioned validation rejects false totals, non-canonical
+  partitions, reuse, cycles, and file-length substitution before either KV or
+  content trusts a catalog root. An ordered, crash-resumable migration converts
+  legacy flat catalogs through the ordinary root CAS, and a second in-band
+  frozen specification plus the independent reader keep the new grammar
+  recoverable without Astrid code. At 230,000 entries, the release probe
+  measured a 2.68-microsecond warm catalog lookup and 3,480 retained metadata
+  bytes for one replacement versus 17,250,041 bytes for the legacy rewrite.
+  Closes #1400.
 - **Windows local transport uses authenticated per-user named pipes.** A pipe
   name derived only from the caller's operating-system SID replaces
   filesystem endpoint naming on Windows. Local-only byte-mode instances use a

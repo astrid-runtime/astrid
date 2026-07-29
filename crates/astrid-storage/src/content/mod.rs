@@ -19,7 +19,11 @@ pub use store::PrincipalContentStore;
 
 use astrid_storage_content::ContentError;
 
-pub(crate) use catalog::{CONTENT_COMPONENT_LABEL, catalog_quota};
+pub(crate) use catalog::{
+    CONTENT_COMPONENT_LABEL, CatalogValidation, root_from_record, validate_catalog,
+};
+#[cfg(test)]
+pub(crate) use catalog::{CatalogValue, LegacyCatalog, encode_legacy_catalog};
 
 use crate::error::StorageError;
 

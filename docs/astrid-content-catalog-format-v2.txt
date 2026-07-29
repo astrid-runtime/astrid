@@ -1,0 +1,153 @@
+ASTRID CONTENT CATALOG FORMAT 2
+--------------------------------
+
+Status: frozen archival specification
+Parent specification: ASTRID PRINCIPAL STORE FORMAT 1
+Integer encoding: unsigned little-endian
+Text encoding: UTF-8 without a terminating NUL
+Document line endings: LF
+
+This document defines the content catalog grammar introduced after the parent
+store specification was frozen. It is stored as an immutable Evidence object.
+store.meta names both specifications. A deterministic export containing a
+format-2 catalog MUST include this document.
+
+
+1. NAME BIT STRING
+------------------
+
+A content name is non-empty UTF-8 and contains no zero byte. Slash is an
+ordinary byte with no path traversal meaning.
+
+The radix key is the exact UTF-8 name bytes followed by one zero byte. Bits are
+numbered from zero in network order: bit zero is the most significant bit of
+the first byte, bit seven is its least significant bit, and bit eight is the
+most significant bit of the second byte. The appended zero makes the key set
+prefix-free because a valid name byte is never zero.
+
+Names are ordered by unsigned bytewise comparison. This is also the in-order
+order of the radix tree.
+
+
+2. COMMON NODE RULES
+--------------------
+
+Both node forms have:
+
+  kind=Directory (4)
+  object_format_version=2
+  class=Metadata (1)
+
+References obey the parent specification's strict unsigned bytewise label
+ordering. No references other than those defined below are allowed.
+
+
+3. LEAF
+-------
+
+Canonical bytes are exactly:
+
+  u8   tag = 0
+  u64  visible_logical_bytes
+  u64  name_byte_length
+  u8[] name[name_byte_length]
+
+There is exactly one reference:
+
+  Owns label "file" -> File version 1
+
+ObjectRecord.logical_bytes equals visible_logical_bytes. The target File's
+reconstructed logical length MUST equal visible_logical_bytes.
+
+The leaf summary is:
+
+  logical_bytes = visible_logical_bytes
+  quota_bytes   = visible_logical_bytes + name_byte_length
+  entries       = 1
+
+All additions are checked unsigned arithmetic.
+
+
+4. BRANCH
+---------
+
+Canonical bytes are exactly 57 bytes:
+
+  u8   tag = 1
+  u64  distinguishing_bit
+  u64  left_logical_bytes
+  u64  left_quota_bytes
+  u64  left_entries
+  u64  right_logical_bytes
+  u64  right_quota_bytes
+  u64  right_entries
+
+There are exactly two references in this order:
+
+  Owns label "left"  -> Directory version 2
+  Owns label "right" -> Directory version 2
+
+ObjectRecord.logical_bytes is zero. Branches are structural and do not
+contribute visible bytes a second time.
+
+The branch summary is the checked component-wise sum of the left and right
+summaries stored in canonical bytes.
+
+
+5. CANONICAL TREE
+-----------------
+
+An empty catalog has no "content" component reference in PrincipalState.
+A non-empty catalog's "content" reference owns exactly one leaf or branch.
+
+For every branch:
+
+  - distinguishing_bit strictly increases down each child path;
+  - every left key has zero at distinguishing_bit;
+  - every right key has one at distinguishing_bit;
+  - the first differing bit between the maximum left key and minimum right
+    key is distinguishing_bit;
+  - every stored child summary equals the summary recomputed from that child;
+  - the two child closures are disjoint; and
+  - the complete tree is finite and acyclic.
+
+These rules define the compressed binary radix tree uniquely from the set of
+name/value leaves. Insertion history is not part of the identity.
+
+A decoder MUST reject malformed payload lengths, tags, names, references,
+accounting overflow, false child summaries, non-increasing branch bits,
+non-canonical partitions, node reuse, cycles, missing files, and leaf lengths
+that disagree with their File descriptors.
+
+
+6. POINT OPERATIONS
+-------------------
+
+Lookup follows distinguishing bits to one leaf and compares the complete name.
+
+Insertion compares the reached leaf with the new key, introduces a branch at
+their first differing bit when necessary, and copies only ancestors above that
+point. Replacement copies the existing leaf path. Deletion removes the leaf
+and its parent, promotes the sibling, and copies the remaining ancestors.
+
+A bulk builder over sorted leaves chooses the first differing bit of each
+range, partitions the range at that bit, and recurses on the two non-empty
+ranges. It MUST produce the same root as any sequence of canonical point
+insertions.
+
+
+7. LEGACY TRANSITION
+--------------------
+
+Directory version 1 remains defined by the parent specification. It is accepted
+only by the ordered flat-content-catalog-to-radix-tree migration.
+
+The migration fully validates the legacy catalog and every File length,
+bulk-builds this canonical tree, and publishes it through the ordinary
+principal-root compare-and-swap. It advances its durable migration marker only
+after every current principal root is converted and the engine is flushed.
+Already converted roots are no-ops after a crash. New writes never emit
+Directory version 1.
+
+
+END OF ASTRID CONTENT CATALOG FORMAT 2

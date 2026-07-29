@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use astrid_storage_engine::KvProjectionEngine;
+use astrid_storage_engine::{KvProjectionEngine, PrincipalProjectionError};
 use astrid_storage_model::{
     ModelError, ObjectClass, ObjectId, ObjectKind, ObjectRecord, ObjectReference, ReferenceKind,
     ReferenceLabel, RootState,
@@ -10,7 +10,10 @@ use parking_lot::Mutex;
 use super::{
     FORMAT_VERSION, KV_LABEL, PARENT_LABEL, ROOT_LABEL, STATE_LABEL, TreeContext, TreeValidation,
 };
-use crate::content::{CONTENT_COMPONENT_LABEL, catalog_quota};
+use crate::content::{
+    CONTENT_COMPONENT_LABEL, CatalogValidation, PrincipalContentError, root_from_record,
+    validate_catalog,
+};
 use crate::error::{StorageError, StorageResult};
 use crate::kv::tree_error::{invalid, map_engine};
 
@@ -44,6 +47,7 @@ pub(super) fn decode_header<P, E>(
     owner: P,
     root: RootState,
     validated_trees: &Mutex<BTreeMap<P, TreeValidation>>,
+    validated_content: &Mutex<BTreeMap<P, CatalogValidation>>,
 ) -> StorageResult<TreeHeader<P>>
 where
     P: Clone + Ord,
@@ -86,8 +90,41 @@ where
                 .load_kv_object(reference.target())
                 .map_err(|error| map_engine(&error))?
                 .ok_or_else(|| map_engine(&ModelError::MissingObject(reference.target()).into()))?;
-            let content_quota = catalog_quota(reference.target(), &record)
+            let catalog_root = root_from_record(reference.target(), &record)
                 .map_err(|error| StorageError::Serialization(error.to_string()))?;
+            let cached = validated_content
+                .lock()
+                .get(&owner)
+                .copied()
+                .filter(|validation| validation.root == Some(catalog_root.object));
+            let validation = if let Some(validation) = cached {
+                validation
+            } else {
+                let validation = validate_catalog(Some(catalog_root), &mut |object| {
+                    engine
+                        .load_kv_object(object)
+                        .map_err(|error| {
+                            PrincipalContentError::Projection(PrincipalProjectionError::Engine(
+                                error.to_string(),
+                            ))
+                        })
+                        .and_then(|record| {
+                            record.ok_or(PrincipalContentError::Projection(
+                                PrincipalProjectionError::Model(ModelError::MissingObject(object)),
+                            ))
+                        })
+                })
+                .map_err(|error| StorageError::Serialization(error.to_string()))?;
+                validated_content.lock().insert(owner.clone(), validation);
+                validation
+            };
+            if validation.summary != catalog_root.summary {
+                return Err(invalid(
+                    reference.target(),
+                    "content catalog accounting totals disagree",
+                ));
+            }
+            let content_quota = validation.summary.quota_bytes;
             other_quota_bytes = other_quota_bytes
                 .checked_add(content_quota)
                 .ok_or_else(|| {

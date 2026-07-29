@@ -4,10 +4,11 @@ use std::sync::Arc;
 
 use astrid_storage_model::{ObjectId, ObjectIdentity};
 
+use super::bootstrap;
 use super::format_amendment::{
     DestinationFormat, PRE_COMPACTION_FORMAT_SPEC_ID, PRE_GC_OUTBOX_FORMAT_SPEC_ID,
     PRE_RUNATAL_NAMING_FORMAT_SPEC_ID, STORE_METADATA_FILE, format_spec_record,
-    prepare_destination, store_metadata,
+    legacy_store_metadata, prepare_destination, store_metadata,
 };
 use super::{Blake3ObjectIdentityV1, KvQuotaResolver, StateOwner, open_runtime_kv};
 use astrid_core::dirs::AstridHome;
@@ -40,11 +41,20 @@ async fn assert_prior_format_is_selected(prior: ObjectId) {
     drop(store);
 
     let store_path = home.principal_store_path();
-    std::fs::write(store_path.join(STORE_METADATA_FILE), store_metadata(prior)).unwrap();
+    std::fs::write(
+        store_path.join(STORE_METADATA_FILE),
+        legacy_store_metadata(prior),
+    )
+    .unwrap();
     let current_spec = format_spec_record().unwrap();
-    let current_metadata = store_metadata(Blake3ObjectIdentityV1.identify(&current_spec));
+    let current_spec_id = Blake3ObjectIdentityV1.identify(&current_spec);
+    let catalog_spec = bootstrap::content_catalog_format_specification().unwrap();
+    let current_metadata = store_metadata(
+        current_spec_id,
+        Blake3ObjectIdentityV1.identify(&catalog_spec),
+    );
     assert_eq!(
-        prepare_destination(&store_path, &current_metadata).unwrap(),
+        prepare_destination(&store_path, &current_metadata, current_spec_id).unwrap(),
         DestinationFormat::PriorV1(prior)
     );
 }

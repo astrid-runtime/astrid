@@ -3,7 +3,9 @@
 use std::sync::Arc;
 
 use astrid_storage_engine::{CompactionRetainedRoot, CompactionRetention, CompactionRootKind};
-use astrid_storage_model::{ObjectId, ObjectRecord, RetentionPolicyId};
+use astrid_storage_model::{
+    ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord, RetentionPolicyId,
+};
 
 use super::format_amendment::format_spec_record;
 use super::{RuntimeEngine, RuntimePrincipalStore, StorageError, StorageResult};
@@ -13,10 +15,16 @@ use super::{RuntimeEngine, RuntimePrincipalStore, StorageError, StorageResult};
 pub(super) enum RuntimeBootstrapObject {
     /// Byte-exact specification required to decode the authoritative files.
     RunatalFormatSpecification,
+    /// Byte-exact specification required to decode content-catalog trees.
+    ContentCatalogFormatSpecification,
 }
 
-const RUNTIME_BOOTSTRAP_OBJECTS: &[RuntimeBootstrapObject] =
-    &[RuntimeBootstrapObject::RunatalFormatSpecification];
+const CONTENT_CATALOG_FORMAT_SPEC: &[u8] =
+    include_bytes!("../../../../docs/astrid-content-catalog-format-v2.txt");
+const RUNTIME_BOOTSTRAP_OBJECTS: &[RuntimeBootstrapObject] = &[
+    RuntimeBootstrapObject::RunatalFormatSpecification,
+    RuntimeBootstrapObject::ContentCatalogFormatSpecification,
+];
 
 impl RuntimeBootstrapObject {
     /// Return every standalone object protected by runtime composition.
@@ -28,18 +36,36 @@ impl RuntimeBootstrapObject {
     pub(super) fn record(self) -> StorageResult<ObjectRecord> {
         match self {
             Self::RunatalFormatSpecification => format_spec_record(),
+            Self::ContentCatalogFormatSpecification => ObjectRecord::new(
+                ObjectKind::Evidence,
+                ObjectFormatVersion::V1,
+                CONTENT_CATALOG_FORMAT_SPEC.to_vec(),
+                Vec::new(),
+                0,
+                ObjectClass::Metadata,
+            )
+            .map_err(|error| {
+                StorageError::Serialization(format!(
+                    "construct in-band content catalog format specification: {error}"
+                ))
+            }),
         }
     }
 
     const fn name(self) -> &'static str {
         match self {
             Self::RunatalFormatSpecification => "RÚNATAL format specification",
+            Self::ContentCatalogFormatSpecification => "content catalog format specification",
         }
     }
 }
 
 pub(super) fn format_specification() -> StorageResult<ObjectRecord> {
     RuntimeBootstrapObject::RunatalFormatSpecification.record()
+}
+
+pub(super) fn content_catalog_format_specification() -> StorageResult<ObjectRecord> {
+    RuntimeBootstrapObject::ContentCatalogFormatSpecification.record()
 }
 
 fn compaction_retention(
