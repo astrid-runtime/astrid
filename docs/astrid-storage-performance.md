@@ -1,11 +1,15 @@
-# Astrid Storage I/O Benchmarks
+# Astrid Storage Performance and Convergence
 
-Selected raw outputs and the cross-branch measurement ledger are preserved in
-[`benchmarks/storage-io/`](benchmarks/storage-io/README.md). The ledger names
-which comparisons are direct, which optimization branches were independent,
-and which results were not yet integrated into the storage line.
+This is the single measurement record for storage convergence, engine I/O,
+publication, recovery, catalog scaling, and future filesystem-provider
+performance. Component design documents define behavior and link here instead
+of copying results.
 
-Status: executable native-path baseline; mounted-provider measurements pending
+Selected raw outputs are preserved in
+[`benchmarks/storage-io/`](benchmarks/storage-io/README.md).
+
+Status: convergence and native-path baselines recorded; mounted-provider
+measurements pending
 
 Last reviewed: 2026-07-29
 
@@ -75,6 +79,59 @@ number. It records:
 Small-file batches separately compare native write-and-close, native
 write-and-sync, and Astrid write-and-seal. These operations have different
 durability contracts and must never share one label.
+
+## Convergence vocabulary and result
+
+One percentage cannot describe the storage result. Every study reports:
+
+```text
+object-instance convergence
+    1 - unique exact objects / logical object instances
+
+exact-byte capacity convergence
+    1 - unique whole-object bytes / logical bytes
+
+chunk capacity convergence
+    1 - unique chunked bytes / logical bytes
+
+semantic capacity convergence
+    savings added by verified cross-representation equivalence
+
+physical capacity convergence
+    1 - final stored bytes including encoding and metadata / logical bytes
+
+marginal novelty
+    additional unique physical bytes / additional logical bytes
+```
+
+The FastCDC study used 5.73 GB of live Astrid state and a 2.45 GB development
+workspace. The live-state snapshot contained 230,080 file instances but only
+4,551 unique whole-file objects:
+
+```text
+object-instance convergence
+    = 1 - 4,551 / 230,080
+    = 98.02%
+
+whole-file byte-capacity convergence
+    = 47.1%
+```
+
+Repeated small files dominate the instance count while unique large files
+dominate capacity. The 98.02% result therefore proves a small repeated object
+vocabulary, not 98% physical storage savings.
+
+Across the 8–256 KiB FastCDC sweep, total unique-byte-plus-object cost varied
+by only 0.5% on state and 3% on the workspace. The selected 64 KiB target was
+within 0.07% and 1.2% of the respective measured capacity optima while using
+3.5–7 times fewer objects than the smaller-chunk alternatives. Object count,
+and its index, validation, and recovery cost, determined the profile choice.
+
+Magnusson's 95–98% platform-scale byte-capacity convergence remains a
+hypothesis. Evidence requires cumulative and marginal curves over principal
+count, retained version depth, exact and chunk reuse, verified semantic
+normalization, post-dedup compression, metadata, and corpus class. No combined
+95–98% capacity claim is made until that experiment exists.
 
 ## Reproduction
 
@@ -235,6 +292,89 @@ into quantified acceptance gates:
 Physical bytes appended per logical byte and per operation are therefore
 release metrics, not diagnostics.
 
+## Optimization experiments
+
+Several optimization branches were measured independently before integration.
+The raw files preserve those experiments; they are not one linear release
+score. The post-compaction run at `79d980d2`, for example, excludes the
+independent read and publication branches and must not be presented as their
+successor.
+
+### Verified warm reads
+
+| Code state | Request | Native verified | Astrid verified | Four-principal aggregate |
+| --- | ---: | ---: | ---: | ---: |
+| Pre-handle baseline | 64 KiB | 1,588 MiB/s | 92.9 MiB/s | 105.8 MiB/s |
+| Positional handles (`8dfd6938`) | 64 KiB | 1,588 MiB/s | 94.4 MiB/s | 353.2 MiB/s |
+| Boundary evidence (`1d2679ef`) | 64 KiB | 1,589 MiB/s | 227.7 MiB/s | 839.0 MiB/s |
+| Object/header cache (`d69309ef`) | 64 KiB | 1,607 MiB/s | 1,573.0 MiB/s | 5,416.8 MiB/s |
+| Governed cache (`e0bf4217`) | 64 KiB | 1,593 MiB/s | 1,548.4 MiB/s | 5,026.7 MiB/s |
+| Governed cache (`e0bf4217`) | 1 MiB | 1,612 MiB/s | 1,706.4 MiB/s | 6,512.0 MiB/s |
+
+The final 64 KiB run reaches 97.2% of same-run verified-native throughput. The
+one-MiB hot run reaches 105.9%. Astrid may legitimately lead that comparator
+when it reuses immutable verified objects while the native reader hashes bytes
+again. This is not mounted-provider throughput and must be confirmed after
+integration.
+
+### Publication and durability
+
+| Code state | Unique | Duplicate | Four-principal shared |
+| --- | ---: | ---: | ---: |
+| Pipeline baseline | 232.8 MiB/s | 289.8 MiB/s | 573.9 MiB/s |
+| One-pass pipeline (`4193217f`) | 275.0 MiB/s | 353.1 MiB/s | 578.3 MiB/s |
+| Governed record reuse (`97df6492`) | 427.4 MiB/s | 646.5 MiB/s | 1,065.4 MiB/s |
+
+The focused durability probes recorded:
+
+- strict KV group commit (`aed1b3aa`): eight writers rose from 135 to
+  802.5 operations/s while one writer remained at 117.3 operations/s; and
+- staging intent journal (`32dc52fb`): strict 4 KiB seals rose from 43.7 to
+  71.8 seals/s for one writer and from 78.3 to 186.4 seals/s for eight.
+
+### Catalog scaling
+
+The path-copy catalog replaced the linear flat catalog in `d9a1463a`.
+
+| Entries | Bulk build | Warm lookup | Replacement nodes | Replacement metadata | Flat rewrite |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 2,000 | 5 ms | 2.26 µs | 11 | 1,887 B | 150,041 B |
+| 230,000 | 374 ms | 2.68 µs | 20 | 3,480 B | 17,250,041 B |
+
+The 230,000-entry replacement retains about 4,957 times less catalog metadata.
+The durable 1,000-publication probe additionally measured:
+
+| Workload | Arena growth | Root journal | Publication | Reopen |
+| --- | ---: | ---: | ---: | ---: |
+| Duplicate 4 KiB content | 1,906,879 B | 170,952 B | 10.62 s | 365 ms |
+| Unique 4 KiB content | 6,336,445 B | 170,952 B | 11.15 s | 793 ms |
+
+The duplicate workload averages about 1.9 KiB of total arena growth per
+publication, down from roughly 110 KiB near 2,000 entries with the flat
+catalog.
+
+### Raw artifact map
+
+| Files under `benchmarks/storage-io/` | Code state |
+| --- | --- |
+| `astrid-storage-io-m2-ultra-v3.json` | benchmark `228a38cc`, storage baseline `756ab50c` |
+| `astrid-storage-read-baseline-64k.json` | parent of `8dfd6938` plus harness |
+| `astrid-storage-read-path-64k.json` | `8dfd6938` |
+| `astrid-storage-verified-64k.json` | `1d2679ef` |
+| `astrid-storage-cache-final-64k.json` | `d69309ef` |
+| `astrid-storage-governed-hot-64k.json`, `astrid-storage-governed-hot-1m.json` | `e0bf4217` |
+| `astrid-storage-publication-before.json` | code `3d44cbd6`, harness `ee6990d4` |
+| `astrid-storage-publication-after.json` | code `4193217f`, harness `63d0125e` |
+| `astrid-storage-publication-cache-before.json` | `bcc45eef` |
+| `astrid-storage-publication-cache-after.json` | code `97df6492`, harness `09318a04` |
+| `astrid-storage-postcompaction.json` | `79d980d2` |
+
+The early report schema omitted Git revision and command line. These
+associations are reconstructed from dedicated worktrees, ancestry, names, and
+timestamps; they are historical evidence, not release attestation. The next
+schema must embed revision, dirty-tree state, command line, cache policy, and a
+result digest.
+
 ## Read-size sensitivity
 
 A diagnostic 128 MiB run varied only the `PrincipalContentStore::read_range`
@@ -327,6 +467,10 @@ architecture require a second suite:
 
 - a realistic agent-state corpus with repeated files and temporal version
   chains;
+- source revisions, build outputs, dependency caches, and package stores;
+- Linux root filesystems, Realm/VM images, databases, and logs;
+- model weights, tensor artifacts, text, media, and compressed archives;
+- encrypted, uniform-random, and adversarial boundary-shifting input;
 - a mixed KV/content workload across multiple principals;
 - a working set larger than RAM, with cache state and any privileged cache
   eviction procedure recorded explicitly;
@@ -336,6 +480,12 @@ architecture require a second suite:
 - arena growth, fragmentation, and reopen cost over a long-lived mutation
   trace; and
 - change-detection and sparse-transfer runs where only the delta is absent.
+
+Every profile reports logical bytes; unique whole, chunk, metadata, and final
+physical bytes; chunk count and distribution; compression separately; ingest,
+export, import, cold-read, and warm-read throughput; CPU and peak memory; edit,
+index, and reference amplification; durability barriers; and marginal novelty
+as principals and history accumulate.
 
 For this scoreboard Astrid may complete faster than a conventional layout by
 avoiding reads, writes, transfers, and durability barriers. The report must

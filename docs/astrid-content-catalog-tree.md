@@ -145,18 +145,9 @@ The implementation is accepted only when tests or benchmarks demonstrate:
 - legacy migration is idempotent across interruption; and
 - malformed ordering, accounting, reuse, and cycle cases fail closed.
 
-The checked-in release-mode cardinality probe currently reports:
-
-| Entries | Bulk build | Warm point lookup | Replacement nodes | Replacement retained metadata | Flat-catalog rewrite |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 2,000 | 5 ms | 2.26 us | 11 | 1,887 B | 150,041 B |
-| 230,000 | 374 ms | 2.68 us | 20 | 3,480 B | 17,250,041 B |
-
-These are in-process catalog measurements, not storage-device throughput.
-They isolate the term this change removes. At the measured live cardinality, a
-replacement retains about 4,957 times less catalog metadata than serializing
-the legacy object, and lookup remains in microseconds rather than inheriting
-the legacy full-catalog decode. Run with:
+The measured cardinality, amplification, publication, and reopen results live
+in [Storage Performance and Convergence](astrid-storage-performance.md).
+Reproduce the in-process cardinality probe with:
 
 `cargo test -p astrid-storage --release catalog_scale_probe -- --ignored --nocapture`
 
@@ -168,19 +159,6 @@ principal state, commit objects, and frame overhead, and requires less than
 content equality may eliminate data writes without causing catalog metadata to
 grow as a full rewrite times cardinality.
 
-The corresponding explicit performance probe measures duplicate and unique
-4 KiB publications plus reopen time. On the development APFS host, 1,000
-publications produced:
-
-| Workload | Arena growth | Root journal growth | Publication time | Reopen |
-| --- | ---: | ---: | ---: | ---: |
-| Duplicate content | 1,906,879 B | 170,952 B | 10.62 s | 365 ms |
-| Unique content | 6,336,445 B | 170,952 B | 11.15 s | 793 ms |
-
-The former flat catalog appended about 110 KiB per duplicate publication near
-2,000 entries. The path-copy implementation averaged about 1.9 KiB of arena
-growth across the 1,000-publication duplicate workload, including ordinary
-state and commit records rather than only catalog nodes. Run the durable probe
-with:
+Reproduce the durable publication and reopen probe with:
 
 `cargo test -p astrid-storage catalog_durable_performance_probe -- --ignored --nocapture`

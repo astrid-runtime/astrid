@@ -528,52 +528,11 @@ substitution safe.
 
 ## Convergence measurement
 
-One percentage cannot describe the storage result. Every study reports at
-least:
-
-```text
-object-instance convergence
-    1 - unique exact objects / logical object instances
-
-exact-byte capacity convergence
-    1 - unique whole-object bytes / logical bytes
-
-chunk capacity convergence
-    1 - unique chunked bytes / logical bytes
-
-semantic capacity convergence
-    savings added by verified cross-representation equivalence
-
-physical capacity convergence
-    1 - final stored bytes including encoding and metadata / logical bytes
-
-marginal novelty
-    additional unique physical bytes / additional logical bytes
-```
-
-The live Astrid-state sweep measured 230,080 file instances and 4,551 unique
-whole-file objects: 98.02% object-instance convergence. It measured only 47.1%
-whole-file byte-capacity convergence. The first result supports the claim that
-agent state repeats a small vocabulary; it does not convert into a 98% capacity
-claim because large unique objects dominate bytes.
-
-Magnusson's 95–98% platform-scale byte-capacity convergence remains a
-hypothesis. It is plausible only if marginal novelty falls as the corpus gains
-principals and history. Evidence requires a cumulative and marginal curve over:
-
-- increasing principal count;
-- retained version depth;
-- exact whole-object reuse;
-- content-defined chunk reuse;
-- verified semantic normalization by real representation capsules;
-- post-dedup compression and physical metadata; and
-- corpus classes, especially text, dependencies, media, models, encrypted
-  input, and already-compressed input.
-
-Each lever is reported independently before a combined physical number. The
-existing FastCDC sweep can measure the first chunked baseline; temporal and
-semantic runs wait for representative version chains and implemented reference
-capsules. No 95–98% byte result is claimed until that experiment exists.
+Semantic equivalence contributes one separately reported term to convergence;
+it never changes the byte-identity or authorization rules in this document.
+The metric vocabulary, measured whole-file results, platform-scale hypothesis,
+and required corpus axes live in
+[Storage Performance and Convergence](astrid-storage-performance.md).
 
 ## Required evidence before activation
 
