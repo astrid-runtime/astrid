@@ -22,6 +22,7 @@ use crate::error::{StorageError, StorageResult};
 use crate::kv::SurrealKvStore;
 use crate::kv::{KvPrincipalResolver, KvQuotaResolver, KvStore, TreeKvStore};
 
+mod bootstrap;
 #[cfg(test)]
 mod compaction_tests;
 mod format_amendment;
@@ -38,9 +39,7 @@ use format_amendment::{
     DestinationFormat, PRE_DERIVATION_FORMAT_SPEC_ID, STORE_FORMAT_SPEC, STORE_METADATA_FILE,
     object_id_hex, persist_format_specification,
 };
-use format_amendment::{
-    format_spec_record, prepare_destination, prepare_format_specification, store_metadata,
-};
+use format_amendment::{prepare_destination, prepare_format_specification, store_metadata};
 use native_io::atomic_write;
 pub use staging::{
     NativeContentStagingArea, ReadyStagedContent, StagedContentId, StagedContentWriter,
@@ -186,6 +185,7 @@ pub type NativePrincipalContentStore = PrincipalContentStore<
 /// Native principal-store projections opened over one durable engine.
 #[derive(Clone)]
 pub struct RuntimePrincipalStore {
+    engine: Arc<RuntimeEngine>,
     kv: Arc<dyn KvStore>,
     content: Arc<NativePrincipalContentStore>,
     staging: Arc<NativeContentStagingArea>,
@@ -241,7 +241,7 @@ pub async fn open_runtime_principal_store(
 ) -> StorageResult<RuntimePrincipalStore> {
     let store_path = home.principal_store_path();
     let open_path = store_path.clone();
-    let format_spec = format_spec_record()?;
+    let format_spec = bootstrap::format_specification()?;
     let format_spec_id = Blake3ObjectIdentityV1.identify(&format_spec);
     let metadata = store_metadata(format_spec_id);
     let opened = tokio::task::spawn_blocking(move || {
@@ -285,10 +285,12 @@ pub async fn open_runtime_principal_store(
         Arc::clone(&quota),
     ));
     let content = Arc::new(NativePrincipalContentStore::from_engine_with_quota(
-        engine, quota,
+        Arc::clone(&engine),
+        quota,
     ));
     let staging = Arc::new(NativeContentStagingArea::open(home.content_staging_path())?);
     Ok(RuntimePrincipalStore {
+        engine,
         kv,
         content,
         staging,
@@ -336,7 +338,8 @@ mod tests {
 
     #[cfg(not(target_os = "windows"))]
     fn assert_reader_rejects_substituted_format_specification(home: &AstridHome, script: &Path) {
-        let format_spec_id = Blake3ObjectIdentityV1.identify(&format_spec_record().unwrap());
+        let format_spec_id =
+            Blake3ObjectIdentityV1.identify(&bootstrap::format_specification().unwrap());
         let engine = RuntimeEngine::open(
             home.principal_store_path(),
             Blake3ObjectIdentityV1,
@@ -411,7 +414,7 @@ mod tests {
 
     #[test]
     fn format_specification_has_a_tagged_metadata_identity() {
-        let record = format_spec_record().unwrap();
+        let record = bootstrap::format_specification().unwrap();
         let id = Blake3ObjectIdentityV1.identify(&record);
         let metadata = String::from_utf8(store_metadata(id)).unwrap();
 
@@ -451,7 +454,7 @@ mod tests {
         )
         .unwrap();
         let (legacy_spec_id, _) = engine.persist_standalone_object(&legacy_spec).unwrap();
-        let current_spec = format_spec_record().unwrap();
+        let current_spec = bootstrap::format_specification().unwrap();
         let current_spec_id = Blake3ObjectIdentityV1.identify(&current_spec);
         let current_metadata = store_metadata(current_spec_id);
         atomic_write(
@@ -508,7 +511,7 @@ mod tests {
             store_metadata(PRE_DERIVATION_FORMAT_SPEC_ID),
         )
         .unwrap();
-        let current_spec = format_spec_record().unwrap();
+        let current_spec = bootstrap::format_specification().unwrap();
         let current_metadata = store_metadata(Blake3ObjectIdentityV1.identify(&current_spec));
         assert_eq!(
             prepare_destination(&store_path, &current_metadata).unwrap(),
@@ -523,7 +526,7 @@ mod tests {
         let store = open_runtime_kv(&home, unlimited_quota()).await.unwrap();
         store.close().await.unwrap();
 
-        let record = format_spec_record().unwrap();
+        let record = bootstrap::format_specification().unwrap();
         let id = Blake3ObjectIdentityV1.identify(&record);
         let arena = std::fs::read(home.principal_store_path().join("objects.arena")).unwrap();
         assert_eq!(&arena[52..54], &1_u16.to_le_bytes());
@@ -716,7 +719,7 @@ mod tests {
         let home = AstridHome::from_path(directory.path());
         let path = home.principal_store_path();
         std::fs::create_dir_all(&path).unwrap();
-        let record = format_spec_record().unwrap();
+        let record = bootstrap::format_specification().unwrap();
         let id = Blake3ObjectIdentityV1.identify(&record);
         std::fs::write(path.join(STORE_METADATA_FILE), store_metadata(id)).unwrap();
         drop(

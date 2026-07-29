@@ -250,6 +250,13 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Fixed
 
+- **Production compaction retention preserves every standalone bootstrap
+  object.** `RuntimePrincipalStore` now builds scheduler-facing retention from
+  one typed bootstrap registry, adds each registered object as a `System` root,
+  and verifies its presence before returning a policy for proof. The raw
+  durable engine remains policy-neutral, while native composition can no
+  longer silently collect the RÚNATAL specification and discover the damage
+  only when the store next opens. Closes #1408.
 - **Kernel management rate limits no longer cross authorization boundaries.**
   Requests consume a principal-and-method-scoped action budget only after
   principal and device-scope authorization succeeds. A restricted caller or
