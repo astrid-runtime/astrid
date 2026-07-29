@@ -53,7 +53,8 @@ fn apply_order(names: &[&str]) -> (CatalogRoot, BTreeMap<ObjectId, ObjectRecord>
     let mut root = None;
     let mut objects = BTreeMap::new();
     for (index, name) in names.iter().enumerate() {
-        let (value, content) = content_value(u8::try_from(index + 1).unwrap(), index + 1);
+        let ordinal = index.checked_add(1).unwrap();
+        let (value, content) = content_value(u8::try_from(ordinal).unwrap(), ordinal);
         objects.extend(content);
         let mutation = insert(
             root,
@@ -78,8 +79,8 @@ fn apply_order(names: &[&str]) -> (CatalogRoot, BTreeMap<ObjectId, ObjectRecord>
 fn insertion_order_does_not_change_the_canonical_root() {
     let (alpha, alpha_objects) = content_value(1, 1);
     let (alphabet, alphabet_objects) = content_value(2, 2);
-    let (model_a, model_a_objects) = content_value(3, 3);
-    let (model_z, model_z_objects) = content_value(4, 4);
+    let (model_a, first_model_objects) = content_value(3, 3);
+    let (model_z, last_model_objects) = content_value(4, 4);
     let (world, world_objects) = content_value(5, 5);
     let entries = [
         ("alpha", alpha),
@@ -91,8 +92,8 @@ fn insertion_order_does_not_change_the_canonical_root() {
     let content_objects: BTreeMap<_, _> = alpha_objects
         .into_iter()
         .chain(alphabet_objects)
-        .chain(model_a_objects)
-        .chain(model_z_objects)
+        .chain(first_model_objects)
+        .chain(last_model_objects)
         .chain(world_objects)
         .collect();
     let permutations = [
@@ -287,7 +288,7 @@ fn thousand_deduplicated_four_kib_publications_have_bounded_catalog_metadata() {
     const TOTAL_METADATA_BUDGET: u64 = 4 * 1024 * 1024;
 
     let identity = TestIdentity;
-    let (shared_value, mut objects) = content_value(7, LOGICAL_BYTES as usize);
+    let (shared_value, mut objects) = content_value(7, usize::try_from(LOGICAL_BYTES).unwrap());
     let mut root = None;
     let mut total_metadata = 0_u64;
     let mut largest_publication = 0_u64;

@@ -4,7 +4,7 @@ use std::path::Path;
 
 use astrid_storage_engine::RootTransaction;
 use astrid_storage_model::{
-    ObjectClass, ObjectFormatVersion, ObjectKind, ObjectReference, ReferenceLabel,
+    ObjectClass, ObjectFormatVersion, ObjectKind, ObjectReference, ReferenceLabel, RootState,
 };
 
 use super::*;
@@ -258,18 +258,16 @@ async fn new_store_persists_and_verifies_the_in_band_specification() {
     drop(store);
 }
 
-#[tokio::test]
-async fn flat_content_catalog_migration_resumes_and_is_idempotent() {
-    let directory = tempfile::tempdir().unwrap();
-    let home = AstridHome::from_path(directory.path());
-    let owner = StateOwner::Principal(PrincipalId::new("alice").unwrap());
-    let name = ContentName::new("workspace/legacy.bin").unwrap();
-    let bytes = b"legacy content survives the catalog migration";
-
-    let store = open_runtime_principal_store(&home, unlimited_quota())
+async fn install_legacy_catalog_fixture(
+    home: &AstridHome,
+    owner: &StateOwner,
+    name: &ContentName,
+    bytes: &[u8],
+) -> RootState {
+    let store = open_runtime_principal_store(home, unlimited_quota())
         .await
         .unwrap();
-    let published = store.content().put(&owner, &name, bytes).unwrap();
+    let published = store.content().put(owner, name, bytes).unwrap();
     drop(store);
 
     let engine = RuntimeEngine::open(
@@ -279,17 +277,19 @@ async fn flat_content_catalog_migration_resumes_and_is_idempotent() {
         RecoveryLimits::process_addressable(),
     )
     .unwrap();
-    let previous = engine.root(&owner).unwrap().unwrap();
+    let previous = engine.root(owner).unwrap().unwrap();
+    let logical_bytes = u64::try_from(bytes.len()).unwrap();
+    let quota_bytes = u64::try_from(bytes.len().checked_add(name.as_str().len()).unwrap()).unwrap();
     let legacy = LegacyCatalog {
         entries: BTreeMap::from([(
             name.clone(),
             CatalogValue {
                 file: published.descriptor().file(),
-                logical_bytes: bytes.len() as u64,
+                logical_bytes,
             },
         )]),
-        logical_bytes: bytes.len() as u64,
-        quota_bytes: (bytes.len() + name.as_str().len()) as u64,
+        logical_bytes,
+        quota_bytes,
     };
     let catalog = encode_legacy_catalog(&legacy).unwrap();
     let catalog_id = Blake3ObjectIdentityV1.identify(&catalog);
@@ -338,6 +338,7 @@ async fn flat_content_catalog_migration_resumes_and_is_idempotent() {
         .unwrap()
         .root();
     engine.close().unwrap();
+
     std::fs::write(
         home.principal_store_path()
             .join(migrations::MIGRATION_MARKER_FILE),
@@ -351,6 +352,28 @@ async fn flat_content_catalog_migration_resumes_and_is_idempotent() {
         legacy_store_metadata(format_spec_id),
     )
     .unwrap();
+    legacy_root
+}
+
+fn assert_catalog_tree_marker(home: &AstridHome) {
+    assert_eq!(
+        std::fs::read(
+            home.principal_store_path()
+                .join(migrations::MIGRATION_MARKER_FILE)
+        )
+        .unwrap(),
+        migrations::CATALOG_TREE_MARKER
+    );
+}
+
+#[tokio::test]
+async fn flat_content_catalog_migration_resumes_and_is_idempotent() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    let owner = StateOwner::Principal(PrincipalId::new("alice").unwrap());
+    let name = ContentName::new("workspace/legacy.bin").unwrap();
+    let bytes = b"legacy content survives the catalog migration";
+    let legacy_root = install_legacy_catalog_fixture(&home, &owner, &name, bytes).await;
 
     let migrated = open_runtime_principal_store(&home, unlimited_quota())
         .await
@@ -374,14 +397,7 @@ async fn flat_content_catalog_migration_resumes_and_is_idempotent() {
         legacy_root.generation.checked_next().unwrap()
     );
     migrated_engine.close().unwrap();
-    assert_eq!(
-        std::fs::read(
-            home.principal_store_path()
-                .join(migrations::MIGRATION_MARKER_FILE)
-        )
-        .unwrap(),
-        migrations::CATALOG_TREE_MARKER
-    );
+    assert_catalog_tree_marker(&home);
     let migrated_metadata =
         std::fs::read_to_string(home.principal_store_path().join(STORE_METADATA_FILE)).unwrap();
     assert!(migrated_metadata.contains("content-catalog-spec-object="));
@@ -408,14 +424,7 @@ async fn flat_content_catalog_migration_resumes_and_is_idempotent() {
     )
     .unwrap();
     assert_eq!(reopened_engine.root(&owner).unwrap(), Some(migrated_root));
-    assert_eq!(
-        std::fs::read(
-            home.principal_store_path()
-                .join(migrations::MIGRATION_MARKER_FILE)
-        )
-        .unwrap(),
-        migrations::CATALOG_TREE_MARKER
-    );
+    assert_catalog_tree_marker(&home);
 }
 
 #[tokio::test]
