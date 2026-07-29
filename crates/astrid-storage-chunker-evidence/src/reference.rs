@@ -138,10 +138,40 @@ mod tests {
 
     #[test]
     fn maximum_is_inclusive_for_non_final_chunks() {
-        let data = pseudorandom_bytes(10_000, 0xfeed_face_cafe_babe);
-        let lengths = chunk_lengths(&data, 64, 128);
-        for length in &lengths[..lengths.len() - 1] {
-            assert!((64..=128).contains(length));
+        let candidate = candidates(8)
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.name == "mincdc-hash4-narrow-8k")
+            .unwrap();
+        let minimum = usize::try_from(candidate.minimum_bytes).unwrap();
+        let maximum = usize::try_from(candidate.maximum_bytes).unwrap();
+        let mut data = vec![0xff; maximum * 3];
+        let zero_score_window = 0_u32
+            .wrapping_sub(MINCDC_ADDEND)
+            .wrapping_mul(inverse_odd_u32(MINCDC_MULTIPLIER))
+            .to_le_bytes();
+        data[maximum - zero_score_window.len()..maximum].copy_from_slice(&zero_score_window);
+
+        let expected = chunk_lengths(&data, minimum, maximum);
+        assert_eq!(expected[0], maximum);
+
+        let mut actual = Vec::new();
+        candidate
+            .visit_boundary_chunks(Cursor::new(&data), |chunk| {
+                actual.push(chunk.len());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    fn inverse_odd_u32(value: u32) -> u32 {
+        debug_assert_eq!(value & 1, 1);
+        let mut inverse = value;
+        for _ in 0..5 {
+            inverse = inverse.wrapping_mul(2_u32.wrapping_sub(value.wrapping_mul(inverse)));
         }
+        debug_assert_eq!(value.wrapping_mul(inverse), 1);
+        inverse
     }
 }

@@ -16,7 +16,7 @@ The measured alternatives do not justify changing durable identity:
 - the best matched MinCDC profile changes combined estimated retained cost by
   -0.0105%, effectively a tie;
 - the lowest-cost MinCDC profile improves that estimate by 0.1086% but creates
-  41.60% more unique chunk objects across the two live corpora;
+  41.59% more unique chunk objects across the two live corpora;
 - MinCDC is materially faster in this scalar pipeline, but its local-edit
   resynchronization tail is 2.6–3.6 times the FastCDC result;
 - Moth's caterpillar encoding collapsed 60 records in the matched live-state
@@ -52,29 +52,33 @@ The corpora were:
 | Label | Shape | Logical size |
 |---|---:|---:|
 | `agent-state` | 230,086 files | 5.73 GB |
-| `dev-workspace` | 47,723 files | 2.47 GB |
-| `captured-code` | 32 real `Cargo.lock` revisions read directly from Git | 8.12 MB |
+| `dev-workspace` | 47,746 files | 2.47 GB |
+| `captured-code` | 32 real `Cargo.lock` revisions read directly from Git | 8.14 MB |
 | `synthetic-version-chain-v1` | 16 controlled local edits | 67.1 MB |
 | `synthetic-adversarial-v1` | empty, short, zeros, all-ones, periodic, monotone, repeated, pseudorandom, and boundary-pressure inputs | 58.7 MB |
 
 Paths, file names, revision IDs, and file-level identities are not serialized.
 Top-level `keys`, `secrets`, `run`, and `.Trash` directories are excluded from
-directory snapshots. Symlinks are never followed.
+directory snapshots. Symlinks are never followed. The harness captures a
+length-and-BLAKE3 baseline for every file before measuring any candidate and
+aborts if any later pass observes different bytes, including a same-length
+replacement.
 
 ## Storage results
 
-The first pass reproduced the prior whole-file result exactly: the agent-state
-corpus saves 47.08% before chunking. Chunking raises that to 51.39–51.45% for
+The first pass reproduced the prior whole-file result within the explicit
+floor-to-basis-points reporting rule: the agent-state corpus saves 47.07%
+before chunking. Chunking raises that to 51.35–51.44% for
 the candidates below. The remaining differences are small enough that object
 population, recovery work, and resynchronization matter more than retained
 bytes.
 
 | Profile | Agent CDC mean | Workspace CDC mean | Agent saved | Workspace saved | Combined cost vs FastCDC | Unique objects vs FastCDC |
 |---|---:|---:|---:|---:|---:|---:|
-| FastCDC 16/64/256 | 110.1 KiB | 76.5 KiB | 51.39% | 26.12% | baseline | baseline |
-| MinCDC observed-match 32–160 | 93.1 KiB | 86.0 KiB | 51.39% | 26.20% | -0.0105% | +8.47% |
-| MinCDC wide 32–96 | 59.7 KiB | 59.1 KiB | 51.45% | 26.45% | -0.1086% | +41.60% |
-| MinCDC same bounds 16–256 | 130.5 KiB | 115.5 KiB | 51.36% | 25.87% | +0.1323% | -8.56% |
+| FastCDC 16/64/256 | 110.1 KiB | 76.5 KiB | 51.38% | 26.10% | baseline | baseline |
+| MinCDC observed-match 32–160 | 93.1 KiB | 86.0 KiB | 51.38% | 26.18% | -0.0105% | +8.47% |
+| MinCDC wide 32–96 | 59.7 KiB | 59.1 KiB | 51.44% | 26.44% | -0.1086% | +41.59% |
+| MinCDC same bounds 16–256 | 130.5 KiB | 115.5 KiB | 51.35% | 25.86% | +0.1323% | -8.56% |
 
 The cost estimate is explicit and directional: unique chunk bytes plus 162
 bytes per unique chunk object plus 40 bytes per physical reference record. It
@@ -106,9 +110,9 @@ Release-mode CPU-only medians on the measured Apple M2 Ultra host, Rust 1.95.0:
 
 | Profile | Chunk only | Chunk + BLAKE3 |
 |---|---:|---:|
-| FastCDC 16/64/256 | 1,657.59 MiB/s | 831.69 MiB/s |
-| MinCDC observed-match 32–160 | 11,627.90 MiB/s | 1,671.76 MiB/s |
-| Moth observed-match 32–160 | 10,812.63 MiB/s | 1,553.68 MiB/s |
+| FastCDC 16/64/256 | 1,818.73 MiB/s | 912.35 MiB/s |
+| MinCDC observed-match 32–160 | 10,888.28 MiB/s | 1,565.22 MiB/s |
+| Moth observed-match 32–160 | 10,860.11 MiB/s | 1,548.39 MiB/s |
 
 MinCDC's compute result is real and worth retaining as evidence. It does not,
 by itself, outweigh an identity migration for effectively unchanged retained

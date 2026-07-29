@@ -56,7 +56,7 @@ fn samples(
         let mut guard = [0_u8; 32];
         candidate.visit_records(Cursor::new(fixture), |bytes, logical_chunks| {
             if hash_chunks {
-                guard = *blake3::hash(bytes).as_bytes();
+                fold_digest(&mut guard, blake3::hash(bytes).as_bytes());
             } else {
                 guard[0] ^= bytes.first().copied().unwrap_or_default();
                 guard[1] ^= u8::try_from(logical_chunks & 0xff)?;
@@ -72,6 +72,12 @@ fn samples(
         durations[durations.len() / 2],
         durations[0],
     )
+}
+
+fn fold_digest(guard: &mut [u8; 32], digest: &[u8; 32]) {
+    for (guard_byte, digest_byte) in guard.iter_mut().zip(digest) {
+        *guard_byte ^= digest_byte;
+    }
 }
 
 fn timing(bytes: u64, median: Duration, minimum: Duration) -> Result<Timing> {
@@ -108,5 +114,16 @@ mod tests {
         .unwrap();
         assert_eq!(result.median_bytes_per_second, 2 * 1024 * 1024);
         assert_eq!(result.median_mib_per_second_times_100, 200);
+    }
+
+    #[test]
+    fn every_chunk_digest_contributes_to_the_guard() {
+        let first = *blake3::hash(b"first").as_bytes();
+        let second = *blake3::hash(b"second").as_bytes();
+        let mut guard = [0_u8; 32];
+        fold_digest(&mut guard, &first);
+        fold_digest(&mut guard, &second);
+        assert_ne!(guard, first);
+        assert_ne!(guard, second);
     }
 }

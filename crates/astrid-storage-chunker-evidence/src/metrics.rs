@@ -185,24 +185,26 @@ fn deduplication(logical_bytes: u64, retained_bytes: u64) -> Result<Deduplicatio
     let saved_bytes = logical_bytes
         .checked_sub(retained_bytes)
         .ok_or_else(|| anyhow::anyhow!("retained bytes exceed logical bytes"))?;
-    let retained_basis_points = if logical_bytes == 0 {
-        0
-    } else {
-        retained_bytes
-            .checked_mul(BASIS_POINTS)
-            .and_then(|value| value.checked_div(logical_bytes))
-            .ok_or_else(|| anyhow::anyhow!("dedup ratio overflow"))?
-    };
     Ok(Deduplication {
         retained_bytes,
         saved_bytes,
-        retained_basis_points,
-        saved_basis_points: if logical_bytes == 0 {
-            0
-        } else {
-            BASIS_POINTS.saturating_sub(retained_basis_points)
-        },
+        retained_basis_points: basis_points(retained_bytes, logical_bytes)?,
+        saved_basis_points: basis_points(saved_bytes, logical_bytes)?,
     })
+}
+
+/// Returns the ratio in basis points, rounded down.
+///
+/// Retained and saved ratios are deliberately calculated independently with
+/// this same rule. Deriving one as the complement of the other would round one
+/// side up whenever the exact ratio is fractional.
+fn basis_points(part: u64, total: u64) -> Result<u64> {
+    if total == 0 {
+        return Ok(0);
+    }
+    part.checked_mul(BASIS_POINTS)
+        .and_then(|value| value.checked_div(total))
+        .ok_or_else(|| anyhow::anyhow!("dedup ratio overflow"))
 }
 
 fn distribution(sorted: &[(u64, u64)]) -> Result<ChunkSizeDistributionBytes> {
@@ -286,6 +288,15 @@ mod tests {
                 saved_bytes: 529,
                 retained_basis_points: 4_710,
                 saved_basis_points: 5_290,
+            }
+        );
+        assert_eq!(
+            deduplication(3, 1).unwrap(),
+            Deduplication {
+                retained_bytes: 1,
+                saved_bytes: 2,
+                retained_basis_points: 3_333,
+                saved_basis_points: 6_666,
             }
         );
         assert_eq!(

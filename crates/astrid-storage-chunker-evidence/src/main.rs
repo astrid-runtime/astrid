@@ -212,7 +212,7 @@ fn print_help() {
          \x20                          Add up to 32 real versions without temporary files\n\
          \x20 --no-synthetic           Exclude deterministic public fixtures\n\
          \x20 --target-kib N           Compare profiles around N KiB (repeatable)\n\
-         \x20 --output PATH            Write pretty JSON instead of stdout\n\
+         \x20 --output PATH            Write compact JSON to PATH instead of stdout\n\
          \x20 -h, --help               Print this help"
     );
 }

@@ -117,11 +117,19 @@ impl Candidate {
                     visit(&chunk?.data)?;
                 }
             },
-            Algorithm::MinCdcHash4 | Algorithm::MothCaterpillar => {
+            Algorithm::MinCdcHash4 => {
                 visit_min_cdc(reader, minimum, maximum, |chunk, count| {
                     debug_assert_eq!(count, 1);
                     visit(chunk)
                 })?;
+            },
+            Algorithm::MothCaterpillar => {
+                let mut chunker = MothReadChunker::try_new(reader, minimum, maximum)?;
+                while let Some(segment) = chunker.next()? {
+                    for _ in 0..segment.chunk_count() {
+                        visit(segment.dedup_key())?;
+                    }
+                }
             },
         }
         Ok(())

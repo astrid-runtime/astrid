@@ -18,8 +18,17 @@ const READER_CAPACITY: usize = 1024 * 1024;
 
 #[derive(Clone)]
 enum Input {
-    File { path: PathBuf, logical_bytes: u64 },
+    File {
+        path: PathBuf,
+        snapshot: FileSnapshot,
+    },
     Memory(Arc<[u8]>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileSnapshot {
+    logical_bytes: u64,
+    identity: [u8; 32],
 }
 
 pub struct Corpus {
@@ -132,19 +141,17 @@ impl Corpus {
             let logical_bytes = input.logical_bytes();
             if logical_bytes <= u64::from(candidate.maximum_bytes) {
                 let bytes = input.read_all()?;
-                if u64::try_from(bytes.len())? != logical_bytes {
-                    bail!("corpus input changed while being read");
+                let observed = FileSnapshot::from_bytes(&bytes)?;
+                input.validate_observation(observed)?;
+                accumulator.add_file_identity(observed.logical_bytes, observed.identity)?;
+                if !bytes.is_empty() {
+                    accumulator.add_whole_record(&bytes)?;
                 }
-                accumulator.add_file(&bytes)?;
-                accumulator.add_whole_record(&bytes)?;
                 continue;
             }
 
             match input {
-                Input::File {
-                    path,
-                    logical_bytes,
-                } => {
+                Input::File { path, snapshot } => {
                     let file = File::open(path)
                         .with_context(|| format!("open corpus input {}", path.display()))?;
                     let mut reader =
@@ -152,13 +159,9 @@ impl Corpus {
                     candidate.visit_records(&mut reader, |chunk, logical_chunks| {
                         accumulator.add_chunk_record(chunk, logical_chunks)
                     })?;
-                    let (observed_bytes, identity) = reader.finish();
-                    if observed_bytes != *logical_bytes {
-                        bail!(
-                            "corpus input changed while being read: expected {logical_bytes} bytes, read {observed_bytes}"
-                        );
-                    }
-                    accumulator.add_file_identity(observed_bytes, identity)?;
+                    let observed = reader.finish();
+                    snapshot.validate(observed)?;
+                    accumulator.add_file_identity(observed.logical_bytes, observed.identity)?;
                 },
                 Input::Memory(bytes) => {
                     accumulator.add_file(bytes)?;
@@ -205,8 +208,29 @@ impl<R> HashingReader<R> {
         }
     }
 
-    fn finish(self) -> (u64, [u8; 32]) {
-        (self.bytes_read, *self.hasher.finalize().as_bytes())
+    fn finish(self) -> FileSnapshot {
+        FileSnapshot {
+            logical_bytes: self.bytes_read,
+            identity: *self.hasher.finalize().as_bytes(),
+        }
+    }
+}
+
+impl FileSnapshot {
+    fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        Ok(Self {
+            logical_bytes: u64::try_from(bytes.len())?,
+            identity: *blake3::hash(bytes).as_bytes(),
+        })
+    }
+
+    fn validate(self, observed: Self) -> Result<()> {
+        if self != observed {
+            bail!(
+                "corpus input changed after the baseline snapshot; rerun against immutable inputs"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -225,7 +249,7 @@ impl<R: Read> Read for HashingReader<R> {
 impl Input {
     fn logical_bytes(&self) -> u64 {
         match self {
-            Self::File { logical_bytes, .. } => *logical_bytes,
+            Self::File { snapshot, .. } => snapshot.logical_bytes,
             Self::Memory(bytes) => {
                 u64::try_from(bytes.len()).expect("in-memory fixture length fits in u64")
             },
@@ -238,6 +262,13 @@ impl Input {
                 fs::read(path).with_context(|| format!("read corpus input {}", path.display()))
             },
             Self::Memory(bytes) => Ok(bytes.to_vec()),
+        }
+    }
+
+    fn validate_observation(&self, observed: FileSnapshot) -> Result<()> {
+        match self {
+            Self::File { snapshot, .. } => snapshot.validate(observed),
+            Self::Memory(bytes) => FileSnapshot::from_bytes(bytes)?.validate(observed),
         }
     }
 }
@@ -261,16 +292,29 @@ fn collect_files(root: &Path, recursive: bool) -> Result<Vec<Input>> {
         if !entry.file_type().is_file() {
             continue;
         }
-        let metadata = entry
-            .metadata()
-            .with_context(|| format!("stat corpus input {}", entry.path().display()))?;
-        inputs.push(Input::File {
-            path: entry.into_path(),
-            logical_bytes: metadata.len(),
-        });
+        let path = entry.into_path();
+        let snapshot = snapshot_file(&path)?;
+        inputs.push(Input::File { path, snapshot });
     }
     inputs.sort_by(|left, right| input_path(left).cmp(&input_path(right)));
     Ok(inputs)
+}
+
+fn snapshot_file(path: &Path) -> Result<FileSnapshot> {
+    let file = File::open(path)
+        .with_context(|| format!("open corpus input for snapshot {}", path.display()))?;
+    let expected_bytes = file
+        .metadata()
+        .with_context(|| format!("stat corpus input {}", path.display()))?
+        .len();
+    let mut reader = HashingReader::new(BufReader::with_capacity(READER_CAPACITY, file));
+    std::io::copy(&mut reader, &mut std::io::sink())
+        .with_context(|| format!("snapshot corpus input {}", path.display()))?;
+    let snapshot = reader.finish();
+    if snapshot.logical_bytes != expected_bytes {
+        bail!("corpus input changed while its baseline snapshot was captured");
+    }
+    Ok(snapshot)
 }
 
 fn validate_label(label: &str) -> Result<()> {
@@ -394,5 +438,30 @@ mod tests {
             assert!(validate_relative_git_path(Path::new(invalid)).is_err());
         }
         validate_relative_git_path(Path::new("crates/storage/src/lib.rs")).unwrap();
+    }
+
+    #[test]
+    fn empty_files_do_not_mint_chunk_objects_or_references() {
+        let corpus = Corpus {
+            name: "empty-file-regression".to_owned(),
+            kind: CorpusKind::SyntheticAdversarial,
+            inputs: vec![memory(Vec::new()), memory(vec![0x5a])],
+        };
+        let measurements = corpus
+            .measure(candidates(8).unwrap().remove(0))
+            .unwrap()
+            .measurements;
+        assert_eq!(measurements.files, 2);
+        assert_eq!(measurements.total_chunks, 1);
+        assert_eq!(measurements.representation_records, 1);
+        assert_eq!(measurements.unique_chunks, 1);
+    }
+
+    #[test]
+    fn same_length_changes_fail_snapshot_validation() {
+        let original = FileSnapshot::from_bytes(b"same").unwrap();
+        let changed = FileSnapshot::from_bytes(b"size").unwrap();
+        assert_eq!(original.logical_bytes, changed.logical_bytes);
+        assert!(original.validate(changed).is_err());
     }
 }
