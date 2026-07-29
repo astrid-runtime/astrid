@@ -282,7 +282,7 @@ fn validation_rejects_shared_children_and_false_accounting() {
 }
 
 #[test]
-fn thousand_deduplicated_four_kib_publications_have_bounded_catalog_metadata() {
+fn thousand_path_copy_insertions_have_bounded_catalog_node_metadata() {
     const PUBLICATIONS: u64 = 1_000;
     const LOGICAL_BYTES: u64 = 4 * 1024;
     const TOTAL_METADATA_BUDGET: u64 = 4 * 1024 * 1024;

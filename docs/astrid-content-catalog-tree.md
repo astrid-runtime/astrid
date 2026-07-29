@@ -160,9 +160,27 @@ the legacy full-catalog decode. Run with:
 
 `cargo test -p astrid-storage --release catalog_scale_probe -- --ignored --nocapture`
 
-The non-ignored regression fixture also publishes 1,000 distinct names that
-all reference one deduplicated 4 KiB file. It requires every catalog mutation
-to retain less metadata than the logical file size and the complete sequence
-to retain less than 4 MiB of catalog metadata. This pins the former
-deduplication failure mode: content equality may eliminate data writes without
-causing catalog metadata to grow as a full rewrite times cardinality.
+The non-ignored durable regression publishes 1,000 distinct names that all
+reference one deduplicated 4 KiB file through `RuntimePrincipalStore`. It
+measures the real `objects.arena` growth, including content-catalog nodes,
+principal state, commit objects, and frame overhead, and requires less than
+16 KiB per publication. This pins the former deduplication failure mode:
+content equality may eliminate data writes without causing catalog metadata to
+grow as a full rewrite times cardinality.
+
+The corresponding explicit performance probe measures duplicate and unique
+4 KiB publications plus reopen time. On the development APFS host, 1,000
+publications produced:
+
+| Workload | Arena growth | Root journal growth | Publication time | Reopen |
+| --- | ---: | ---: | ---: | ---: |
+| Duplicate content | 1,906,879 B | 170,952 B | 10.62 s | 365 ms |
+| Unique content | 6,336,445 B | 170,952 B | 11.15 s | 793 ms |
+
+The former flat catalog appended about 110 KiB per duplicate publication near
+2,000 entries. The path-copy implementation averaged about 1.9 KiB of arena
+growth across the 1,000-publication duplicate workload, including ordinary
+state and commit records rather than only catalog nodes. Run the durable probe
+with:
+
+`cargo test -p astrid-storage catalog_durable_performance_probe -- --ignored --nocapture`

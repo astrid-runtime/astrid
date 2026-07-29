@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::io::{Seek as _, SeekFrom, Write as _};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use astrid_storage_engine::RootTransaction;
 use astrid_storage_model::{
@@ -258,33 +259,22 @@ async fn new_store_persists_and_verifies_the_in_band_specification() {
     drop(store);
 }
 
-async fn install_legacy_catalog_fixture(
-    home: &AstridHome,
+fn replace_catalog_with_legacy(
+    engine: &RuntimeEngine,
     owner: &StateOwner,
     name: &ContentName,
-    bytes: &[u8],
+    file: ObjectId,
+    logical_bytes: u64,
 ) -> RootState {
-    let store = open_runtime_principal_store(home, unlimited_quota())
-        .await
-        .unwrap();
-    let published = store.content().put(owner, name, bytes).unwrap();
-    drop(store);
-
-    let engine = RuntimeEngine::open(
-        home.principal_store_path(),
-        Blake3ObjectIdentityV1,
-        StateOwnerCodecV1,
-        RecoveryLimits::process_addressable(),
-    )
-    .unwrap();
     let previous = engine.root(owner).unwrap().unwrap();
-    let logical_bytes = u64::try_from(bytes.len()).unwrap();
-    let quota_bytes = u64::try_from(bytes.len().checked_add(name.as_str().len()).unwrap()).unwrap();
+    let quota_bytes = logical_bytes
+        .checked_add(u64::try_from(name.as_str().len()).unwrap())
+        .unwrap();
     let legacy = LegacyCatalog {
         entries: BTreeMap::from([(
             name.clone(),
             CatalogValue {
-                file: published.descriptor().file(),
+                file,
                 logical_bytes,
             },
         )]),
@@ -324,7 +314,7 @@ async fn install_legacy_catalog_fixture(
     )
     .unwrap();
     let commit_id = Blake3ObjectIdentityV1.identify(&commit);
-    let legacy_root = engine
+    engine
         .commit(RootTransaction::new(
             owner.clone(),
             Some(previous),
@@ -336,9 +326,10 @@ async fn install_legacy_catalog_fixture(
             ],
         ))
         .unwrap()
-        .root();
-    engine.close().unwrap();
+        .root()
+}
 
+fn mark_store_as_legacy(home: &AstridHome) {
     std::fs::write(
         home.principal_store_path()
             .join(migrations::MIGRATION_MARKER_FILE),
@@ -352,7 +343,51 @@ async fn install_legacy_catalog_fixture(
         legacy_store_metadata(format_spec_id),
     )
     .unwrap();
-    legacy_root
+}
+
+async fn install_legacy_catalog_fixtures(
+    home: &AstridHome,
+    fixtures: &[(&StateOwner, &ContentName, &[u8])],
+) -> BTreeMap<StateOwner, RootState> {
+    let store = open_runtime_principal_store(home, unlimited_quota())
+        .await
+        .unwrap();
+    let published: Vec<_> = fixtures
+        .iter()
+        .map(|(owner, name, bytes)| {
+            (
+                (*owner).clone(),
+                (*name).clone(),
+                store.content().put(owner, name, bytes).unwrap(),
+            )
+        })
+        .collect();
+    drop(store);
+
+    let engine = RuntimeEngine::open(
+        home.principal_store_path(),
+        Blake3ObjectIdentityV1,
+        StateOwnerCodecV1,
+        RecoveryLimits::process_addressable(),
+    )
+    .unwrap();
+    let legacy_roots = published
+        .into_iter()
+        .map(|(owner, name, outcome)| {
+            let descriptor = outcome.descriptor();
+            let root = replace_catalog_with_legacy(
+                &engine,
+                &owner,
+                &name,
+                descriptor.file(),
+                descriptor.logical_bytes(),
+            );
+            (owner, root)
+        })
+        .collect();
+    engine.close().unwrap();
+    mark_store_as_legacy(home);
+    legacy_roots
 }
 
 fn assert_catalog_tree_marker(home: &AstridHome) {
@@ -366,22 +401,147 @@ fn assert_catalog_tree_marker(home: &AstridHome) {
     );
 }
 
+#[derive(Debug)]
+struct CatalogWorkloadMetrics {
+    arena_bytes: u64,
+    root_journal_bytes: u64,
+    publication_time: Duration,
+    reopen_time: Duration,
+}
+
+fn durable_file_len(home: &AstridHome, name: &str) -> u64 {
+    std::fs::metadata(home.principal_store_path().join(name))
+        .unwrap()
+        .len()
+}
+
+async fn measure_catalog_publications(unique_content: bool) -> CatalogWorkloadMetrics {
+    const PUBLICATIONS: u64 = 1_000;
+    const CONTENT_BYTES: usize = 4 * 1024;
+
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    let owner = StateOwner::Principal(PrincipalId::new("catalog-probe").unwrap());
+    let store = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let arena_before = durable_file_len(&home, "objects.arena");
+    let roots_before = durable_file_len(&home, "roots.journal");
+    let started = Instant::now();
+    for index in 0..PUBLICATIONS {
+        let name = ContentName::new(format!("workspace/fixture/{index:04}")).unwrap();
+        let mut bytes = vec![7_u8; CONTENT_BYTES];
+        if unique_content {
+            bytes[..8].copy_from_slice(&index.to_le_bytes());
+        }
+        store.content().put(&owner, &name, &bytes).unwrap();
+    }
+    let publication_time = started.elapsed();
+    let arena_bytes = durable_file_len(&home, "objects.arena")
+        .checked_sub(arena_before)
+        .unwrap();
+    let root_journal_bytes = durable_file_len(&home, "roots.journal")
+        .checked_sub(roots_before)
+        .unwrap();
+    drop(store);
+
+    let reopen_started = Instant::now();
+    let reopened = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let reopen_time = reopen_started.elapsed();
+    assert_eq!(
+        reopened.content().list(&owner).unwrap().len(),
+        usize::try_from(PUBLICATIONS).unwrap()
+    );
+    drop(reopened);
+
+    CatalogWorkloadMetrics {
+        arena_bytes,
+        root_journal_bytes,
+        publication_time,
+        reopen_time,
+    }
+}
+
+#[tokio::test]
+async fn thousand_deduplicated_four_kib_publications_bound_durable_arena_growth() {
+    const PUBLICATIONS: u64 = 1_000;
+    const MAX_ARENA_BYTES_PER_PUBLICATION: u64 = 16 * 1024;
+
+    let metrics = measure_catalog_publications(false).await;
+    assert!(
+        metrics.arena_bytes
+            < PUBLICATIONS
+                .checked_mul(MAX_ARENA_BYTES_PER_PUBLICATION)
+                .unwrap(),
+        "deduplicated publications appended unexpected arena bytes: {metrics:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "explicit durable catalog amplification and reopen probe"]
+async fn catalog_durable_performance_probe() {
+    let duplicate = measure_catalog_publications(false).await;
+    let unique = measure_catalog_publications(true).await;
+    for (name, metrics) in [("duplicate", duplicate), ("unique", unique)] {
+        eprintln!(
+            "{name}: arena={} roots={} publication={:?} reopen={:?}",
+            metrics.arena_bytes,
+            metrics.root_journal_bytes,
+            metrics.publication_time,
+            metrics.reopen_time
+        );
+    }
+}
+
 #[tokio::test]
 async fn flat_content_catalog_migration_resumes_and_is_idempotent() {
     let directory = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(directory.path());
-    let owner = StateOwner::Principal(PrincipalId::new("alice").unwrap());
-    let name = ContentName::new("workspace/legacy.bin").unwrap();
-    let bytes = b"legacy content survives the catalog migration";
-    let legacy_root = install_legacy_catalog_fixture(&home, &owner, &name, bytes).await;
+    let alice = StateOwner::Principal(PrincipalId::new("alice").unwrap());
+    let bob = StateOwner::Principal(PrincipalId::new("bob").unwrap());
+    let alice_name = ContentName::new("workspace/alice-legacy.bin").unwrap();
+    let bob_name = ContentName::new("workspace/bob-legacy.bin").unwrap();
+    let alice_bytes = b"alice content survives the catalog migration";
+    let bob_bytes = b"bob content survives the catalog migration";
+    let legacy_roots = install_legacy_catalog_fixtures(
+        &home,
+        &[
+            (&alice, &alice_name, alice_bytes),
+            (&bob, &bob_name, bob_bytes),
+        ],
+    )
+    .await;
+
+    let engine = Arc::new(
+        RuntimeEngine::open(
+            home.principal_store_path(),
+            Blake3ObjectIdentityV1,
+            StateOwnerCodecV1,
+            RecoveryLimits::process_addressable(),
+        )
+        .unwrap(),
+    );
+    let content = NativePrincipalContentStore::from_engine(Arc::clone(&engine));
+    assert!(content.migrate_legacy_catalog(&alice).unwrap());
+    let partially_migrated_alice_root = engine.root(&alice).unwrap().unwrap();
+    assert_eq!(engine.root(&bob).unwrap(), legacy_roots.get(&bob).copied());
+    drop(content);
+    engine.close().unwrap();
+    drop(engine);
 
     let migrated = open_runtime_principal_store(&home, unlimited_quota())
         .await
         .unwrap();
-    assert_eq!(migrated.validated_catalog_count(), 1);
+    assert_eq!(migrated.validated_catalog_count(), 2);
     assert_eq!(
-        migrated.content().read(&owner, &name).unwrap(),
-        Some(bytes.to_vec())
+        migrated.content().read(&alice, &alice_name).unwrap(),
+        Some(alice_bytes.to_vec())
+    );
+    assert_eq!(
+        migrated.content().read(&bob, &bob_name).unwrap(),
+        Some(bob_bytes.to_vec())
     );
     drop(migrated);
     let migrated_engine = RuntimeEngine::open(
@@ -391,10 +551,17 @@ async fn flat_content_catalog_migration_resumes_and_is_idempotent() {
         RecoveryLimits::process_addressable(),
     )
     .unwrap();
-    let migrated_root = migrated_engine.root(&owner).unwrap().unwrap();
+    let migrated_alice_root = migrated_engine.root(&alice).unwrap().unwrap();
+    let migrated_bob_root = migrated_engine.root(&bob).unwrap().unwrap();
+    assert_eq!(migrated_alice_root, partially_migrated_alice_root);
     assert_eq!(
-        migrated_root.generation,
-        legacy_root.generation.checked_next().unwrap()
+        migrated_bob_root.generation,
+        legacy_roots
+            .get(&bob)
+            .unwrap()
+            .generation
+            .checked_next()
+            .unwrap()
     );
     migrated_engine.close().unwrap();
     assert_catalog_tree_marker(&home);
@@ -412,8 +579,12 @@ async fn flat_content_catalog_migration_resumes_and_is_idempotent() {
         .await
         .unwrap();
     assert_eq!(
-        reopened.content().read(&owner, &name).unwrap(),
-        Some(bytes.to_vec())
+        reopened.content().read(&alice, &alice_name).unwrap(),
+        Some(alice_bytes.to_vec())
+    );
+    assert_eq!(
+        reopened.content().read(&bob, &bob_name).unwrap(),
+        Some(bob_bytes.to_vec())
     );
     drop(reopened);
     let reopened_engine = RuntimeEngine::open(
@@ -423,7 +594,11 @@ async fn flat_content_catalog_migration_resumes_and_is_idempotent() {
         RecoveryLimits::process_addressable(),
     )
     .unwrap();
-    assert_eq!(reopened_engine.root(&owner).unwrap(), Some(migrated_root));
+    assert_eq!(
+        reopened_engine.root(&alice).unwrap(),
+        Some(migrated_alice_root)
+    );
+    assert_eq!(reopened_engine.root(&bob).unwrap(), Some(migrated_bob_root));
     assert_catalog_tree_marker(&home);
 }
 
