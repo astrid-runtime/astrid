@@ -1,0 +1,398 @@
+use std::fs::{self, File};
+use std::io::{BufReader, Cursor, Read};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Arc;
+use std::time::Instant;
+
+use anyhow::{Context, Result, bail};
+use serde::Serialize;
+use walkdir::WalkDir;
+
+use crate::algorithm::Candidate;
+use crate::fixture::{periodic_bytes, pseudorandom_bytes};
+use crate::metrics::{Accumulator, Measurements};
+
+const EXCLUDED_TOP_LEVEL_DIRECTORIES: &[&str] = &["keys", "secrets", "run", ".Trash"];
+const READER_CAPACITY: usize = 1024 * 1024;
+
+#[derive(Clone)]
+enum Input {
+    File { path: PathBuf, logical_bytes: u64 },
+    Memory(Arc<[u8]>),
+}
+
+pub struct Corpus {
+    name: String,
+    kind: CorpusKind,
+    inputs: Vec<Input>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CorpusKind {
+    DirectorySnapshot,
+    VersionChain,
+    SyntheticAdversarial,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CandidateResult {
+    pub corpus: String,
+    pub corpus_kind: CorpusKind,
+    pub candidate: Candidate,
+    pub measurements: Measurements,
+}
+
+impl Corpus {
+    pub fn from_path(name: String, root: &Path) -> Result<Self> {
+        Self::from_files(
+            name,
+            CorpusKind::DirectorySnapshot,
+            collect_files(root, true)?,
+        )
+    }
+
+    pub fn version_chain_from_path(name: String, root: &Path) -> Result<Self> {
+        Self::from_files(name, CorpusKind::VersionChain, collect_files(root, false)?)
+    }
+
+    pub fn version_chain_from_git(
+        name: String,
+        repository: &Path,
+        relative_path: &Path,
+    ) -> Result<Self> {
+        validate_relative_git_path(relative_path)?;
+        let revisions = Command::new("git")
+            .args(["-C"])
+            .arg(repository)
+            .args(["rev-list", "--reverse", "--max-count=32", "HEAD", "--"])
+            .arg(relative_path)
+            .output()
+            .context("enumerate captured version chain")?;
+        if !revisions.status.success() {
+            bail!("git could not enumerate the captured version chain");
+        }
+        let revisions = String::from_utf8(revisions.stdout).context("git emitted non-UTF-8 IDs")?;
+        let mut inputs = Vec::new();
+        for revision in revisions.lines() {
+            if revision.is_empty() || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                bail!("git emitted an invalid revision ID");
+            }
+            let object = format!("{revision}:{}", relative_path.to_string_lossy());
+            let version = Command::new("git")
+                .args(["-C"])
+                .arg(repository)
+                .args(["show", &object])
+                .output()
+                .context("read captured version")?;
+            if version.status.success() {
+                inputs.push(memory(version.stdout));
+            }
+        }
+        if inputs.len() < 2 {
+            bail!("captured version chain must contain at least two readable versions");
+        }
+        Self::from_files(name, CorpusKind::VersionChain, inputs)
+    }
+
+    pub fn synthetic_adversarial() -> Self {
+        let mebibyte = 1024 * 1024;
+        let inputs = vec![
+            memory(Vec::new()),
+            memory(vec![0x5a]),
+            memory(vec![0x7e; 4093]),
+            memory(vec![0; 8 * mebibyte]),
+            memory(vec![0xff; 8 * mebibyte]),
+            memory(periodic_bytes(8 * mebibyte)),
+            memory((0_u8..=u8::MAX).cycle().take(8 * mebibyte).collect()),
+            memory(b"abcd".repeat(2 * mebibyte)),
+            memory(pseudorandom_bytes(8 * mebibyte, 0x5eed_f00d_dead_beef)),
+            memory(boundary_pressure(8 * mebibyte)),
+        ];
+        Self {
+            name: "synthetic-adversarial-v1".to_owned(),
+            kind: CorpusKind::SyntheticAdversarial,
+            inputs,
+        }
+    }
+
+    pub fn synthetic_version_chain() -> Self {
+        Self {
+            name: "synthetic-version-chain-v1".to_owned(),
+            kind: CorpusKind::VersionChain,
+            inputs: version_chain(),
+        }
+    }
+
+    pub fn measure(&self, candidate: Candidate) -> Result<CandidateResult> {
+        let started = Instant::now();
+        let mut accumulator = Accumulator::default();
+        for input in &self.inputs {
+            let logical_bytes = input.logical_bytes();
+            if logical_bytes <= u64::from(candidate.maximum_bytes) {
+                let bytes = input.read_all()?;
+                if u64::try_from(bytes.len())? != logical_bytes {
+                    bail!("corpus input changed while being read");
+                }
+                accumulator.add_file(&bytes)?;
+                accumulator.add_whole_record(&bytes)?;
+                continue;
+            }
+
+            match input {
+                Input::File {
+                    path,
+                    logical_bytes,
+                } => {
+                    let file = File::open(path)
+                        .with_context(|| format!("open corpus input {}", path.display()))?;
+                    let mut reader =
+                        HashingReader::new(BufReader::with_capacity(READER_CAPACITY, file));
+                    candidate.visit_records(&mut reader, |chunk, logical_chunks| {
+                        accumulator.add_chunk_record(chunk, logical_chunks)
+                    })?;
+                    let (observed_bytes, identity) = reader.finish();
+                    if observed_bytes != *logical_bytes {
+                        bail!(
+                            "corpus input changed while being read: expected {logical_bytes} bytes, read {observed_bytes}"
+                        );
+                    }
+                    accumulator.add_file_identity(observed_bytes, identity)?;
+                },
+                Input::Memory(bytes) => {
+                    accumulator.add_file(bytes)?;
+                    candidate
+                        .visit_records(Cursor::new(bytes.as_ref()), |chunk, logical_chunks| {
+                            accumulator.add_chunk_record(chunk, logical_chunks)
+                        })?;
+                },
+            }
+        }
+        Ok(CandidateResult {
+            corpus: self.name.clone(),
+            corpus_kind: self.kind,
+            candidate,
+            measurements: accumulator.finish(started.elapsed())?,
+        })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn from_files(name: String, kind: CorpusKind, inputs: Vec<Input>) -> Result<Self> {
+        validate_label(&name)?;
+        if inputs.is_empty() {
+            bail!("corpus {name:?} contains no regular files");
+        }
+        Ok(Self { name, kind, inputs })
+    }
+}
+
+struct HashingReader<R> {
+    inner: R,
+    hasher: blake3::Hasher,
+    bytes_read: u64,
+}
+
+impl<R> HashingReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            hasher: blake3::Hasher::new(),
+            bytes_read: 0,
+        }
+    }
+
+    fn finish(self) -> (u64, [u8; 32]) {
+        (self.bytes_read, *self.hasher.finalize().as_bytes())
+    }
+}
+
+impl<R: Read> Read for HashingReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        self.hasher.update(&buffer[..read]);
+        self.bytes_read = self
+            .bytes_read
+            .checked_add(u64::try_from(read).map_err(std::io::Error::other)?)
+            .ok_or_else(|| std::io::Error::other("corpus byte count overflow"))?;
+        Ok(read)
+    }
+}
+
+impl Input {
+    fn logical_bytes(&self) -> u64 {
+        match self {
+            Self::File { logical_bytes, .. } => *logical_bytes,
+            Self::Memory(bytes) => {
+                u64::try_from(bytes.len()).expect("in-memory fixture length fits in u64")
+            },
+        }
+    }
+
+    fn read_all(&self) -> Result<Vec<u8>> {
+        match self {
+            Self::File { path, .. } => {
+                fs::read(path).with_context(|| format!("read corpus input {}", path.display()))
+            },
+            Self::Memory(bytes) => Ok(bytes.to_vec()),
+        }
+    }
+}
+
+fn collect_files(root: &Path, recursive: bool) -> Result<Vec<Input>> {
+    let maximum_depth = if recursive { usize::MAX } else { 1 };
+    let walker = WalkDir::new(root)
+        .max_depth(maximum_depth)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            if entry.depth() != 1 {
+                return true;
+            }
+            let name = entry.file_name().to_string_lossy();
+            !EXCLUDED_TOP_LEVEL_DIRECTORIES.contains(&name.as_ref())
+        });
+    let mut inputs = Vec::new();
+    for entry in walker {
+        let entry = entry.with_context(|| format!("walk corpus {}", root.display()))?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let metadata = entry
+            .metadata()
+            .with_context(|| format!("stat corpus input {}", entry.path().display()))?;
+        inputs.push(Input::File {
+            path: entry.into_path(),
+            logical_bytes: metadata.len(),
+        });
+    }
+    inputs.sort_by(|left, right| input_path(left).cmp(&input_path(right)));
+    Ok(inputs)
+}
+
+fn validate_label(label: &str) -> Result<()> {
+    if label.is_empty()
+        || !label
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        bail!("corpus label must contain only lowercase ASCII letters, digits, and hyphens");
+    }
+    Ok(())
+}
+
+fn validate_relative_git_path(path: &Path) -> Result<()> {
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+        || path.to_string_lossy().contains(':')
+    {
+        bail!("git history path must be a relative in-repository path");
+    }
+    Ok(())
+}
+
+fn input_path(input: &Input) -> Option<&Path> {
+    match input {
+        Input::File { path, .. } => Some(path),
+        Input::Memory(_) => None,
+    }
+}
+
+fn memory(bytes: Vec<u8>) -> Input {
+    Input::Memory(Arc::from(bytes))
+}
+
+fn boundary_pressure(length: usize) -> Vec<u8> {
+    let mut bytes = pseudorandom_bytes(length, 0x9f4a_7c15_6a09_e667);
+    for window in bytes.chunks_mut(64 * 1024) {
+        if window.len() >= 64 {
+            window[..32].fill(0);
+            window[32..64].fill(0xff);
+        }
+    }
+    bytes
+}
+
+fn version_chain() -> Vec<Input> {
+    let base = pseudorandom_bytes(4 * 1024 * 1024, 0x1234_5678_90ab_cdef);
+    let mut versions = Vec::new();
+    for generation in 0..16_usize {
+        let mut version = base.clone();
+        let insertion = generation
+            .checked_mul(4093)
+            .and_then(|offset| offset.checked_add(1_000_000))
+            .expect("version-chain offset is bounded by constants");
+        let marker = format!("astrid-version-{generation:02}");
+        version.splice(insertion..insertion, marker.bytes());
+        let replacement = generation
+            .checked_mul(8191)
+            .and_then(|offset| offset.checked_add(2_000_000))
+            .expect("version-chain replacement is bounded by constants");
+        let end = replacement
+            .checked_add(256)
+            .expect("version-chain replacement is bounded by constants");
+        version[replacement..end].fill(u8::try_from(generation).expect("generation fits in u8"));
+        versions.push(memory(version));
+    }
+    versions
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::algorithm::candidates;
+
+    #[test]
+    fn synthetic_corpora_are_deterministic_except_for_wall_time() {
+        let candidate = candidates(8).unwrap().remove(1);
+        let first = Corpus::synthetic_version_chain()
+            .measure(candidate.clone())
+            .unwrap();
+        let second = Corpus::synthetic_version_chain()
+            .measure(candidate)
+            .unwrap();
+        assert_eq!(
+            first.measurements.logical_bytes,
+            second.measurements.logical_bytes
+        );
+        assert_eq!(
+            first.measurements.total_chunks,
+            second.measurements.total_chunks
+        );
+        assert_eq!(
+            first.measurements.unique_chunks,
+            second.measurements.unique_chunks
+        );
+        assert_eq!(
+            first.measurements.chunk_deduplication,
+            second.measurements.chunk_deduplication
+        );
+    }
+
+    #[test]
+    fn corpus_labels_cannot_smuggle_paths_into_reports() {
+        for invalid in ["", "../home", "Users-Joshua", "contains space", "a/b"] {
+            assert!(validate_label(invalid).is_err());
+        }
+        validate_label("agent-state").unwrap();
+    }
+
+    #[test]
+    fn git_history_paths_stay_inside_the_repository() {
+        for invalid in ["/tmp/file", "../file", "dir/../../file", "revision:file"] {
+            assert!(validate_relative_git_path(Path::new(invalid)).is_err());
+        }
+        validate_relative_git_path(Path::new("crates/storage/src/lib.rs")).unwrap();
+    }
+}

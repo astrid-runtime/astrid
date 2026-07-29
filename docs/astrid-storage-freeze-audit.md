@@ -149,6 +149,12 @@ path-copy nodes reduce write amplification, object loads, and recovery work.
 
 ## D4. Evidence gate for the first content-defined chunker
 
+**Status:** complete. The reproducible harness, full measurements, supply-chain
+record, and decision are in
+[`astrid-storage-chunker-evidence.md`](astrid-storage-chunker-evidence.md).
+The evidence retains the existing FastCDC profile; no durable format change is
+made.
+
 ### Decision
 
 Run the chunker evidence gate before the first format release.

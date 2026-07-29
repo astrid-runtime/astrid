@@ -24,6 +24,7 @@ members = [
     "crates/astrid-prelude",
     "crates/astrid-runtime",
     "crates/astrid-storage",
+    "crates/astrid-storage-chunker-evidence",
     "crates/astrid-storage-content",
     "crates/astrid-storage-engine",
     "crates/astrid-storage-model",
@@ -162,6 +163,13 @@ metrics-exporter-prometheus = { version = "0.18", default-features = false }
 # Linux/macOS/Windows/FreeBSD; `collect()` is called per scrape, no
 # background thread.
 metrics-process = "2.4"
+# Oracle-only dependency for the pre-release chunker evidence harness. Persistent
+# format behavior is implemented by Astrid from a frozen specification; this
+# crate does not define or enter the production storage path.
+mincdc = "=0.1.0"
+# Evidence-only upstream benchmark candidate. It is never the authority for
+# persistent format behavior and is absent from all production crates.
+mothcdc = "=0.7.2"
 notify = "8"
 # `parking_lot::RwLock`/`Mutex` are used in the event-bus per-(capsule,
 # topic, principal) routing demux so the synchronous `EventBus::publish`

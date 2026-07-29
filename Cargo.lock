@@ -879,6 +879,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "astrid-storage-chunker-evidence"
+version = "0.10.4"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "fastcdc",
+ "mincdc",
+ "mothcdc",
+ "serde",
+ "serde_json",
+ "walkdir",
+]
+
+[[package]]
 name = "astrid-storage-content"
 version = "0.10.4"
 dependencies = [
@@ -5266,6 +5280,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 
 [[package]]
+name = "mincdc"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d2923e26fcf6c3699531d13e141a4c18bb0852d5614da154805dcf6348fbf21"
+
+[[package]]
 name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5292,6 +5312,12 @@ dependencies = [
  "wasi",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "mothcdc"
+version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92178805d35d7ad5f2c66dfe1a08eb27c9a4350d603911b0db32a18e6b7d627f"
 
 [[package]]
 name = "moxcms"
