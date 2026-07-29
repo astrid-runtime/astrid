@@ -289,6 +289,8 @@ fn checked_ratio(value: u32, numerator: u32, denominator: u32, label: &str) -> R
 mod tests {
     use std::io::Cursor;
 
+    use crate::fixture::pseudorandom_bytes;
+
     use super::*;
 
     #[test]
@@ -327,7 +329,7 @@ mod tests {
         let candidates = candidates(8).unwrap();
         let mincdc = candidate(&candidates, "mincdc-hash4-narrow-8k");
         let mothcdc = candidate(&candidates, "moth-caterpillar-narrow-8k");
-        let data = vec![0_u8; 1_000_000];
+        let data = pseudorandom_bytes(1_000_000, 0xc0de_cafe_5eed_f00d);
         assert_eq!(
             boundary_lengths(mincdc, &data),
             boundary_lengths(mothcdc, &data)

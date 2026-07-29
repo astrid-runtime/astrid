@@ -17,8 +17,9 @@ The measured alternatives do not justify changing durable identity:
   -0.0105%, effectively a tie;
 - the lowest-cost MinCDC profile improves that estimate by 0.1086% but creates
   41.59% more unique chunk objects across the two live corpora;
-- MinCDC is materially faster in this scalar pipeline, but its local-edit
-  resynchronization tail is 2.6–3.6 times the FastCDC result;
+- MinCDC is materially faster in this scalar pipeline, while the expanded
+  local-edit study finds no material stability winner between FastCDC and the
+  distribution-matched MinCDC profile;
 - Moth's caterpillar encoding collapsed 60 records in the matched live-state
   run and none in the workspace or captured history, a 2,400-byte directional
   metadata estimate rather than a storage-architecture win; and
@@ -52,7 +53,7 @@ The corpora were:
 | Label | Shape | Logical size |
 |---|---:|---:|
 | `agent-state` | 230,086 files | 5.73 GB |
-| `dev-workspace` | 47,746 files | 2.47 GB |
+| `dev-workspace` | 47,761 files | 2.47 GB |
 | `captured-code` | 32 real `Cargo.lock` revisions read directly from Git | 8.14 MB |
 | `synthetic-version-chain-v1` | 16 controlled local edits | 67.1 MB |
 | `synthetic-adversarial-v1` | empty, short, zeros, all-ones, periodic, monotone, repeated, pseudorandom, and boundary-pressure inputs | 58.7 MB |
@@ -76,7 +77,7 @@ bytes.
 | Profile | Agent CDC mean | Workspace CDC mean | Agent saved | Workspace saved | Combined cost vs FastCDC | Unique objects vs FastCDC |
 |---|---:|---:|---:|---:|---:|---:|
 | FastCDC 16/64/256 | 110.1 KiB | 76.5 KiB | 51.38% | 26.10% | baseline | baseline |
-| MinCDC observed-match 32–160 | 93.1 KiB | 86.0 KiB | 51.38% | 26.18% | -0.0105% | +8.47% |
+| MinCDC observed-match 32–160 | 93.1 KiB | 86.0 KiB | 51.38% | 26.18% | -0.0105% | +8.46% |
 | MinCDC wide 32–96 | 59.7 KiB | 59.1 KiB | 51.44% | 26.44% | -0.1086% | +41.59% |
 | MinCDC same bounds 16–256 | 130.5 KiB | 115.5 KiB | 51.35% | 25.86% | +0.1323% | -8.56% |
 
@@ -95,24 +96,32 @@ a FastCDC 16/64/160 profile before proposing a format change.
 ## Boundary stability and throughput
 
 Every candidate was run against insert, delete, and equal-length replacement
-at the byte before, exactly at, and the byte after an observed boundary.
-All reused at least 97.63% of unaffected boundaries in the deterministic
-8 MiB fixture.
+at the byte before, exactly at, and the byte after seven deterministic,
+quantile-matched boundary neighborhoods. The resulting 63 cases per profile
+all resynchronized. Across every candidate, each edit preserved at least
+94.48% of unaffected boundaries in the deterministic 8 MiB fixture.
 
-| Profile | Worst boundary survival | Longest resynchronization |
-|---|---:|---:|
-| FastCDC 16/64/256 | 99.06% | 58,222 B |
-| MinCDC observed-match 32–160 | 98.78% | 152,644 B |
-| MinCDC wide 32–96 | 98.40% | 159,114 B |
-| MinCDC same bounds 16–256 | 98.18% | 208,706 B |
+| Profile | Worst boundary survival | p95 resynchronization | Maximum resynchronization |
+|---|---:|---:|---:|
+| FastCDC 16/64/256 | 98.13% | 173,659 B | 173,916 B |
+| MinCDC observed-match 32–160 | 97.56% | 159,401 B | 200,899 B |
+| MinCDC wide 32–96 | 98.40% | 159,114 B | 164,628 B |
+| MinCDC same bounds 16–256 | 96.36% | 250,549 B | 410,992 B |
+
+The expanded measurement retracts the earlier single-midpoint claim that
+MinCDC had a 2.6–3.6 times longer resynchronization tail. The matched profile
+has a slightly shorter p95 and a 15.5% longer maximum than FastCDC; the wide
+profile is slightly better on both. Stability therefore does not decide the
+format. Retained cost, object population, implementation independence, and
+existing production behavior do.
 
 Release-mode CPU-only medians on the measured Apple M2 Ultra host, Rust 1.95.0:
 
 | Profile | Chunk only | Chunk + BLAKE3 |
 |---|---:|---:|
-| FastCDC 16/64/256 | 1,818.73 MiB/s | 912.35 MiB/s |
-| MinCDC observed-match 32–160 | 10,888.28 MiB/s | 1,565.22 MiB/s |
-| Moth observed-match 32–160 | 10,860.11 MiB/s | 1,548.39 MiB/s |
+| FastCDC 16/64/256 | 1,717.46 MiB/s | 866.00 MiB/s |
+| MinCDC observed-match 32–160 | 11,092.33 MiB/s | 1,569.20 MiB/s |
+| Moth observed-match 32–160 | 10,582.22 MiB/s | 1,483.78 MiB/s |
 
 MinCDC's compute result is real and worth retaining as evidence. It does not,
 by itself, outweigh an identity migration for effectively unchanged retained
@@ -121,8 +130,10 @@ device-read ceiling without changing the file format.
 
 ## Reproducibility and trust boundary
 
-The exact evidence-oracle revisions are recorded in the JSON and locked in
-`Cargo.lock`:
+`Cargo.lock` pins the registry versions and package checksums used for the run.
+The corresponding upstream tag revisions inspected for provenance are recorded
+separately in the JSON and below; the lockfile does not authenticate those Git
+revisions:
 
 | Component | Version | Source revision | License | Role |
 |---|---|---|---|---|
