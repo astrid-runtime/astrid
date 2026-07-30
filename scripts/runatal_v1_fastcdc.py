@@ -105,9 +105,9 @@ def validate_profile(profile):
     return profile
 
 
-def cut(source, profile):
+def _cut_indexed(source_length, byte_at, profile):
     _, _, normalization, minimum, average, maximum, seed = validate_profile(profile)
-    remaining = len(source)
+    remaining = source_length
     if remaining <= minimum:
         return remaining
     remaining = min(remaining, maximum)
@@ -123,26 +123,45 @@ def cut(source, profile):
 
     while index < center // 2:
         at = index * 2
-        shifted = ((GEAR[source[at]] << 1) & U64_MASK) ^ seed_ls
+        shifted = ((GEAR[byte_at(at)] << 1) & U64_MASK) ^ seed_ls
         fingerprint = ((fingerprint << 2) + shifted) & U64_MASK
         if fingerprint & mask_s_ls == 0:
             return at
-        fingerprint = (fingerprint + (GEAR[source[at + 1]] ^ seed)) & U64_MASK
+        fingerprint = (fingerprint + (GEAR[byte_at(at + 1)] ^ seed)) & U64_MASK
         if fingerprint & mask_s == 0:
             return at + 1
         index += 1
 
     while index < remaining // 2:
         at = index * 2
-        shifted = ((GEAR[source[at]] << 1) & U64_MASK) ^ seed_ls
+        shifted = ((GEAR[byte_at(at)] << 1) & U64_MASK) ^ seed_ls
         fingerprint = ((fingerprint << 2) + shifted) & U64_MASK
         if fingerprint & mask_l_ls == 0:
             return at
-        fingerprint = (fingerprint + (GEAR[source[at + 1]] ^ seed)) & U64_MASK
+        fingerprint = (fingerprint + (GEAR[byte_at(at + 1)] ^ seed)) & U64_MASK
         if fingerprint & mask_l == 0:
             return at + 1
         index += 1
     return remaining
+
+
+def cut(source, profile):
+    return _cut_indexed(len(source), source.__getitem__, profile)
+
+
+def is_canonical_boundary(left, right_prefix, profile):
+    if not left or not right_prefix or len(right_prefix) > 2:
+        return False
+
+    def byte_at(index):
+        if index < len(left):
+            return left[index]
+        return right_prefix[index - len(left)]
+
+    return (
+        _cut_indexed(len(left) + len(right_prefix), byte_at, profile)
+        == len(left)
+    )
 
 
 def chunk_lengths(source, profile):
@@ -167,21 +186,9 @@ def validate_boundaries(chunks, profile):
     validate_profile(profile)
     if not chunks:
         return
-    maximum = profile[5]
-    for index, chunk in enumerate(chunks):
-        final = index + 1 == len(chunks)
-        if final:
-            continue
-        window = bytearray(chunk)
-        following_index = index + 1
-        while following_index < len(chunks):
-            remaining = maximum - len(window)
-            if remaining <= 0:
-                break
-            following = chunks[following_index]
-            window += following[:remaining]
-            following_index += 1
-        if cut(window, profile) != len(chunk):
+    for index in range(len(chunks) - 1):
+        right_prefix = chunks[index + 1][:2]
+        if not is_canonical_boundary(chunks[index], right_prefix, profile):
             raise ValueError(f"non-canonical FastCDC boundary at chunk {index}")
 
 

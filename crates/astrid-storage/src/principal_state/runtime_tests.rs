@@ -73,6 +73,28 @@ fn assert_reader_rejects_substituted_format_specification(home: &AstridHome, scr
     std::fs::write(metadata, store_metadata(format_spec_id, catalog_spec_id)).unwrap();
 }
 
+#[cfg(not(target_os = "windows"))]
+fn assert_reader_requires_catalog_specification(home: &AstridHome, script: &Path) {
+    let metadata = home.principal_store_path().join(STORE_METADATA_FILE);
+    let current = std::fs::read_to_string(&metadata).unwrap();
+    let without_catalog = current
+        .lines()
+        .filter(|line| !line.starts_with("content-catalog-spec-object="))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&metadata, format!("{without_catalog}\n")).unwrap();
+    let rejected = std::process::Command::new("python3")
+        .arg(script)
+        .arg(home.principal_store_path())
+        .output()
+        .unwrap();
+    assert!(
+        !rejected.status.success(),
+        "independent reader accepted metadata without its catalog specification"
+    );
+    std::fs::write(metadata, current).unwrap();
+}
+
 #[test]
 fn owner_codec_round_trips_only_canonical_values() {
     let codec = StateOwnerCodecV1;
@@ -795,6 +817,7 @@ async fn independent_reader_accepts_a_rust_produced_store() {
         )
     );
 
+    assert_reader_requires_catalog_specification(&home, &script);
     assert_reader_rejects_substituted_format_specification(&home, &script);
 
     let arena_path = home.principal_store_path().join("objects.arena");
