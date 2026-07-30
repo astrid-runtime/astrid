@@ -11,6 +11,16 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Added
 
+- **Durable closures can carry construction-diverse custody evidence.** A
+  verified Refinery pass streams one exact, canonically ordered Owns closure
+  into a bounded-fanout SHA-384 tree, then emits an Ed25519-signed Evidence
+  record binding its selected roots, immutable snapshot, pass descriptor, and
+  placement epoch. The pass rejects omissions, unrelated objects, cycles,
+  substitutions, and reordered input before publication; generated records
+  still enter the store through ordinary Evidence admission. RÚNATAL freezes
+  the byte grammar and successor re-root ceremony, and its independent reader
+  rebuilds the same tree and verifies the signature. BLAKE3-256 remains the
+  ingest and read-path identity.
 - **Durable principal ownership now uses stable opaque identities.** A
   canonical genesis record binds each principal's existing identity UUID,
   creation timestamp, and initial Ed25519 key to a domain-separated 32-byte

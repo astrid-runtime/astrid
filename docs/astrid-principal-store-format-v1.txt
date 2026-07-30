@@ -814,6 +814,132 @@ placement-after, execution measurements, and commit receipt. Long-term export
 materializes those records through the ordinary self-contained bundle grammar.
 
 
+7.9 SHA-384 closure-attestation evidence
+----------------------------------------
+
+Construction-1 ObjectIds remain BLAKE3-256. Periodic Refinery custody
+ceremonies bind an exact selected Owns closure to a construction-diverse
+SHA-384 tree without adding SHA-384 to ingest or ordinary reads. All records in
+this section are kind=10 Evidence, version=1, class=Metadata, logical_bytes=0.
+
+The canonical source ordering is ascending ObjectId digest bytes. Selected
+roots are non-empty and strictly ascending. The input object stream MUST equal
+the union of those roots' Owns closures: an omission, cycle, duplicate,
+reordering, or unrelated object fails before Evidence is emitted.
+
+The exact logical-record envelope hashed by this ceremony is:
+
+  u16  object_kind
+  u16  object_format_version
+  u8   object_class
+  u64  logical_bytes
+  u64  canonical_bytes_length
+  u8[] canonical_bytes
+  u64  reference_count
+  repeated reference_count times:
+      u64            label_length
+      u8[]           label
+      TaggedIdentity target
+      u8             reference_kind
+
+All integers are little-endian. The complete tagged source ObjectId precedes
+that envelope in the object witness. For current objects the tag is
+algorithm=1, construction=1, length=32.
+
+  object_digest =
+      SHA-384("astrid sha384 object witness v1\0"
+              || tagged_source_object_id
+              || logical_record_envelope)
+
+Leaf Evidence has canonical_bytes:
+
+  bytes "astrid-sha384-leaf-v1\0"
+  u16   entry_count, 1 through 128
+  bytes leaf_digest[48]
+  repeated entry_count times:
+      TaggedIdentity source_object_id
+      bytes          object_digest[48]
+
+It has one Evidence reference per entry. Label i is the bytes "source/"
+followed by i as a two-byte big-endian integer. Its target equals the encoded
+source_object_id. Entries are strictly ascending. Every leaf except the final
+leaf contains 128 entries.
+
+  leaf_digest =
+      SHA-384("astrid sha384 leaf v1\0"
+              || u16(entry_count)
+              || each(tagged_source_object_id || object_digest))
+
+Internal-node Evidence has canonical_bytes:
+
+  bytes "astrid-sha384-node-v1\0"
+  u16   level, 1 through 10
+  u16   child_count, 1 through 128
+  u64   subtree_object_count
+  bytes node_digest[48]
+  repeated child_count times:
+      u64   child_object_count
+      bytes child_digest[48]
+
+It has one Owns reference per child. Label i is the bytes "child/" followed by
+i as a two-byte big-endian integer. Children at one node have the same level.
+Consecutive nodes group at most 128 children; every non-final group at a level
+is full. A one-child internal node occurs only when promoting a final partial
+group beside an already-complete higher group.
+
+  node_digest =
+      SHA-384("astrid sha384 node v1\0"
+              || u16(level)
+              || u16(child_count)
+              || u64(subtree_object_count)
+              || each(u64(child_object_count) || child_digest))
+
+The ceremony Evidence has canonical_bytes:
+
+  bytes "astrid-sha384-attestation-v1\0"
+  u16   signature_algorithm = 1              Ed25519
+  u16   selected_root_count
+  u64   closure_object_count
+  u64   observed_placement_epoch
+  bytes tree_digest[48]
+  TaggedIdentity refinery_pass_descriptor
+  TaggedIdentity refinery_snapshot
+  repeated selected_root_count times:
+      TaggedIdentity selected_root
+  bytes ed25519_public_key[32]
+  bytes ed25519_signature[64]
+
+Its references, in order, are:
+
+  Evidence "00-pass-descriptor" -> refinery_pass_descriptor
+  Evidence "01-snapshot"        -> refinery_snapshot
+  Evidence "10-root/" || u16be(i) -> selected_root i
+  Owns     "20-tree"            -> root Evidence of the digest tree
+
+The Ed25519 signature covers this exact statement:
+
+  bytes "astrid sha384 attestation statement v1\0"
+  TaggedIdentity refinery_pass_descriptor
+  TaggedIdentity refinery_snapshot
+  u64            observed_placement_epoch
+  u16            selected_root_count
+  TaggedIdentity selected_roots[selected_root_count]
+  u64            closure_object_count
+  bytes          tree_digest[48]
+  u16            signature_algorithm = 1
+  bytes          ed25519_public_key[32]
+
+Admission recomputes every current ObjectId, each object digest, the canonical
+tree, and the ceremony signature. Authority registration for a pass descriptor
+and signing key is outside this grammar. A capsule may propose bytes but cannot
+declare itself an attestation authority.
+
+An optional export manifest is a deterministic view over the same records:
+selected roots, ordered object witnesses, tree Evidence, ceremony statement,
+public key, and signature. It does not run a second hashing pipeline. An export
+request that lacks the required Evidence reports a typed prerequisite.
+
+
 8. RECONSTRUCTION PROCEDURE
 ===========================
 
@@ -877,6 +1003,14 @@ bottom-up under the registered successor construction, rewriting every target
 identity before its parent, then publish successor-tagged roots. During the
 overlap, retain both root sets.
 
+The authorization input for that re-root is a pre-deprecation section 7.9
+ceremony whose exact selected roots and complete old closure verify under its
+registered Ed25519 authority. Recompute the section 7.9 logical-record
+envelopes while reading the old closure and require every recorded SHA-384
+object witness and the signed tree root to match before minting a successor
+identity. Evidence created only after the old algorithm's distrust date cannot
+authorize migration by itself.
+
 Record the old-to-new identity mapping in immutable Evidence records. A mapping
 record names its old object with a Lineage reference and its successor with an
 Evidence reference, and records both complete tagged identities in canonical
@@ -885,6 +1019,14 @@ mapping Evidence closure. Complete at least one verified export, import, and
 independent-reader recovery under the successor before old roots may leave the
 live set. Retention policy, legal holds, and re-attestation policy may require
 the old namespace to remain archived after it stops serving reads.
+
+The mapping is immutable evidence, never an alias table: lookups under the old
+tag continue to mean the old bytes, and lookups under the successor tag mean
+the successor reconstruction. The ceremony, migration implementation identity,
+old and new selected roots, complete mapping closure, authority epoch, and
+cutover time are retained together. Re-attestation under a successor signature
+algorithm overlaps the old signature chain before either signing scheme is
+deprecated.
 
 This is a re-root, not an in-place reinterpretation. The same digest bytes under
 different tags are different identities. Never change store.meta to name a

@@ -864,6 +864,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "chrono",
+ "ed25519-dalek 3.0.0",
  "getrandom 0.4.3",
  "hex",
  "keyring",
@@ -908,8 +909,10 @@ version = "0.10.4"
 dependencies = [
  "astrid-storage-model",
  "blake3",
+ "ed25519-dalek 3.0.0",
  "fs2",
  "parking_lot",
+ "sha2 0.11.0",
  "tempfile",
 ]
 

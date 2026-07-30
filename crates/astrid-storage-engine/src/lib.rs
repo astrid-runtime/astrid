@@ -48,10 +48,12 @@ pub use muninn::{
 };
 pub use projection::{PrincipalProjectionEngine, PrincipalProjectionError};
 pub use refinery::{
-    EngineCompactionPass, ProposedRefineryOutput, RefineryBatchContext, RefineryCheckpointId,
-    RefineryOutputClass, RefineryPass, RefineryPassDescriptorId, RefineryProposalError,
-    RefineryProposalSink, RefineryResourceBudget, RefineryRunError, RefinerySnapshotId,
-    VerifiedRefineryObject, run_refinery_observer,
+    CrossHashAttestation, CrossHashSigner, CrossHashVerifier, EngineCompactionPass,
+    ProposedRefineryOutput, RefineryBatchContext, RefineryCheckpointId, RefineryOutputClass,
+    RefineryPass, RefineryPassDescriptorId, RefineryProposalError, RefineryProposalSink,
+    RefineryResourceBudget, RefineryRunError, RefinerySnapshotId, Sha384AttestationError,
+    VerifiedRefineryObject, attest_sha384_closure, run_refinery_observer,
+    verify_sha384_attestation,
 };
 
 /// A root update and the immutable records required to reconstruct it.

@@ -8,6 +8,11 @@ Each entry records a decision, rationale, work order, and acceptance evidence.
 
 ## D1. BLAKE3-256 identity with mandatory SHA-384 cross-hash attestation
 
+**Status:** complete. The verified Refinery observer emits a bounded-fanout
+SHA-384 Evidence tree and Ed25519 ceremony record over one exact selected
+closure. Production Rust and the independent RÚNATAL reader rebuild the same
+canonical tree and reject reordered, omitted, substituted, or tampered input.
+
 ### Decision
 
 Primary addressing remains BLAKE3-256. Astrid does not widen BLAKE3 output and
@@ -384,7 +389,8 @@ implementation continuously testable against the simple full-scan oracle.
 ## Sequence
 
 1. Complete the cross-hash attestation and successor migration specification.
-2. Record projection-only name folding and doctor behavior.
-3. Complete the Refinery sketch prototype with the chunker evidence tooling.
-4. Run the mechanical closing audit and declare the format frozen on GitHub.
-5. Create the release tag only as part of the actual release workflow.
+2. Replace the persistent KV projection with the decided path-copy B+-tree.
+3. Record projection-only name folding and doctor behavior.
+4. Complete the Refinery sketch prototype with the chunker evidence tooling.
+5. Run the mechanical closing audit and declare the format frozen on GitHub.
+6. Create the release tag only as part of the actual release workflow.

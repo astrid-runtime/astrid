@@ -15,6 +15,7 @@ from runatal_v1_fastcdc import (
     validate_profile,
     verify_golden_vectors,
 )
+from runatal_v1_sha384 import verify_cross_hash_attestations
 
 FRAME_CONTEXT = "astrid durable physical frame checksum v1"
 OBJECT_CONTEXT = "astrid principal store object identity v1"
@@ -46,7 +47,7 @@ REFERENCE_NAMES = ("Owns", "Evidence", "Lineage", "Derived")
 FORMAT_SPECIFICATION = (
     1,
     1,
-    bytes.fromhex("9bf81709c78311fea1011137f8dab3b6cd8ffe6c8ea6040cfec7192efb89aba0"),
+    bytes.fromhex("39eba259587f8cacbee042788f2cbdc3e8064b8c48fc8ba93800ba02c8c60d32"),
 )
 CONTENT_CATALOG_SPECIFICATION = (
     1,
@@ -906,6 +907,8 @@ def recover(store, include_payloads):
             or catalog_spec["references"]
         ):
             raise FormatError("missing or invalid content catalog specification")
+
+    verify_cross_hash_attestations(objects)
 
     roots = {}
     for offset, payload in frames(store / "roots.journal", ROOT_MAGIC):

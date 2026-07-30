@@ -2,6 +2,13 @@
 
 use astrid_storage_model::{ObjectId, ObjectIdentity, ObjectKind, ObjectRecord, PlacementEpoch};
 
+mod cross_hash;
+
+pub use cross_hash::{
+    CrossHashAttestation, CrossHashSigner, CrossHashVerifier, Sha384AttestationError,
+    attest_sha384_closure, verify_sha384_attestation,
+};
+
 /// Identity of one pinned Refinery pass descriptor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RefineryPassDescriptorId(ObjectId);
@@ -584,3 +591,6 @@ mod tests {
         assert!(rejected_pass.observed.is_empty());
     }
 }
+
+#[cfg(test)]
+mod cross_hash_tests;

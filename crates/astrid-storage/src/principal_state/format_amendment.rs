@@ -38,16 +38,21 @@ pub(super) const PRE_PRINCIPAL_UID_FORMAT_SPEC_ID: ObjectId = ObjectId::new([
     85, 200, 134, 121, 240, 15, 63, 130, 73, 234, 248, 71, 254, 79, 186, 136, 159, 63, 159, 9, 224,
     16, 72, 245, 235, 0, 226, 208, 216, 12, 142, 147,
 ]);
+pub(super) const PRE_SHA384_ATTESTATION_FORMAT_SPEC_ID: ObjectId = ObjectId::new([
+    155, 248, 23, 9, 199, 131, 17, 254, 161, 1, 17, 55, 248, 218, 179, 182, 205, 143, 254, 108,
+    142, 166, 4, 12, 254, 199, 25, 46, 251, 137, 171, 160,
+]);
 const CONTENT_CATALOG_FORMAT_SPEC_ID: ObjectId = ObjectId::new([
     143, 57, 153, 176, 102, 182, 102, 57, 98, 89, 196, 169, 47, 157, 231, 197, 184, 230, 125, 249,
     211, 138, 105, 251, 79, 184, 36, 150, 139, 86, 236, 219,
 ]);
-const PRIOR_V1_FORMAT_SPEC_IDS: [ObjectId; 5] = [
+const PRIOR_V1_FORMAT_SPEC_IDS: [ObjectId; 6] = [
     PRE_DERIVATION_FORMAT_SPEC_ID,
     PRE_COMPACTION_FORMAT_SPEC_ID,
     PRE_GC_OUTBOX_FORMAT_SPEC_ID,
     PRE_RUNATAL_NAMING_FORMAT_SPEC_ID,
     PRE_FASTCDC_FREEZE_FORMAT_SPEC_ID,
+    PRE_SHA384_ATTESTATION_FORMAT_SPEC_ID,
 ];
 
 pub(super) fn format_spec_record() -> StorageResult<ObjectRecord> {
