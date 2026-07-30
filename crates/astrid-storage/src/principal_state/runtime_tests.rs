@@ -21,6 +21,18 @@ fn unlimited_quota() -> Arc<dyn KvQuotaResolver<StateOwner>> {
     })
 }
 
+fn chunker_golden_source(length: usize) -> Vec<u8> {
+    let mut state = 0x4d59_5df4_d0f3_3173_u64;
+    (0..length)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 37) & 0xff) as u8
+        })
+        .collect()
+}
+
 #[cfg(not(target_os = "windows"))]
 fn assert_reader_rejects_substituted_format_specification(home: &AstridHome, script: &Path) {
     let format_spec_id =
@@ -59,6 +71,54 @@ fn assert_reader_rejects_substituted_format_specification(home: &AstridHome, scr
         "independent reader accepted a substituted format specification"
     );
     std::fs::write(metadata, store_metadata(format_spec_id, catalog_spec_id)).unwrap();
+}
+
+#[cfg(not(target_os = "windows"))]
+fn assert_reader_requires_catalog_specification(home: &AstridHome, script: &Path) {
+    let metadata = home.principal_store_path().join(STORE_METADATA_FILE);
+    let current = std::fs::read_to_string(&metadata).unwrap();
+    let without_catalog = current
+        .lines()
+        .filter(|line| !line.starts_with("content-catalog-spec-object="))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&metadata, format!("{without_catalog}\n")).unwrap();
+    let rejected = std::process::Command::new("python3")
+        .arg(script)
+        .arg(home.principal_store_path())
+        .output()
+        .unwrap();
+    assert!(
+        !rejected.status.success(),
+        "independent reader accepted metadata without its catalog specification"
+    );
+
+    let leading_zero = current.replacen(
+        "content-catalog-spec-object=1:1:32:",
+        "content-catalog-spec-object=01:1:32:",
+        1,
+    );
+    let catalog_id = object_id_hex(
+        Blake3ObjectIdentityV1
+            .identify(&bootstrap::content_catalog_format_specification().unwrap()),
+    );
+    let uppercase_digest = current.replacen(&catalog_id, &catalog_id.to_ascii_uppercase(), 1);
+    for (description, malformed) in [
+        ("leading-zero algorithm tag", leading_zero),
+        ("uppercase digest", uppercase_digest),
+    ] {
+        std::fs::write(&metadata, malformed).unwrap();
+        let rejected = std::process::Command::new("python3")
+            .arg(script)
+            .arg(home.principal_store_path())
+            .output()
+            .unwrap();
+        assert!(
+            !rejected.status.success(),
+            "independent reader accepted a {description}"
+        );
+    }
+    std::fs::write(metadata, current).unwrap();
 }
 
 #[test]
@@ -111,7 +171,7 @@ fn format_specification_has_a_tagged_metadata_identity() {
     assert!(record.references().is_empty());
     assert_eq!(
         object_id_hex(id),
-        "32379c2a9e1d0fe166ac37f30d8772bd88d6c99a6ae31bb75cc7e8a8f4ce4307"
+        "55c88679f00f3f8249eaf847fe4fba889f3f9f09e01048f5eb00e2d0d80c8e93"
     );
     assert_eq!(
         object_id_hex(catalog_id),
@@ -166,14 +226,20 @@ fn pre_derivation_v1_runatal_upgrade_is_idempotent_and_preserves_history() {
     persist_format_specification(&engine, &current_spec).unwrap();
     prepare_format_specification(
         &engine,
-        DestinationFormat::PriorV1(legacy_spec_id),
+        DestinationFormat::PriorV1 {
+            format_spec: legacy_spec_id,
+            catalog_spec_was_declared: false,
+        },
         &current_spec,
         current_spec_id,
     )
     .unwrap();
     prepare_catalog_specification(
         &engine,
-        DestinationFormat::PriorV1(legacy_spec_id),
+        DestinationFormat::PriorV1 {
+            format_spec: legacy_spec_id,
+            catalog_spec_was_declared: false,
+        },
         &catalog_spec,
         catalog_spec_id,
     )
@@ -206,6 +272,33 @@ fn pre_derivation_v1_runatal_upgrade_is_idempotent_and_preserves_history() {
     engine.close().unwrap();
 }
 
+#[test]
+fn prior_metadata_that_declared_a_catalog_specification_requires_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = RuntimeEngine::open(
+        directory.path(),
+        Blake3ObjectIdentityV1,
+        StateOwnerCodecV1,
+        RecoveryLimits::process_addressable(),
+    )
+    .unwrap();
+    let catalog_spec = bootstrap::content_catalog_format_specification().unwrap();
+    let catalog_spec_id = Blake3ObjectIdentityV1.identify(&catalog_spec);
+    let destination = DestinationFormat::PriorV1 {
+        format_spec: PRE_DERIVATION_FORMAT_SPEC_ID,
+        catalog_spec_was_declared: true,
+    };
+
+    let error = prepare_catalog_specification(&engine, destination, &catalog_spec, catalog_spec_id)
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("completed principal store is missing its content catalog specification"),
+        "{error}"
+    );
+}
+
 #[tokio::test]
 async fn completed_pre_derivation_v1_store_is_selected_for_runatal_amendment() {
     let directory = tempfile::tempdir().unwrap();
@@ -228,8 +321,16 @@ async fn completed_pre_derivation_v1_store_is_selected_for_runatal_amendment() {
         Blake3ObjectIdentityV1.identify(&catalog_spec),
     );
     assert_eq!(
-        prepare_destination(&store_path, &current_metadata, current_spec_id).unwrap(),
-        DestinationFormat::PriorV1(PRE_DERIVATION_FORMAT_SPEC_ID)
+        prepare_destination(
+            &store_path,
+            &current_metadata,
+            Blake3ObjectIdentityV1.identify(&catalog_spec),
+        )
+        .unwrap(),
+        DestinationFormat::PriorV1 {
+            format_spec: PRE_DERIVATION_FORMAT_SPEC_ID,
+            catalog_spec_was_declared: false,
+        }
     );
 }
 
@@ -334,13 +435,6 @@ fn mark_store_as_legacy(home: &AstridHome) {
         home.principal_store_path()
             .join(migrations::MIGRATION_MARKER_FILE),
         migrations::LEGACY_TO_V1_MARKER,
-    )
-    .unwrap();
-    let format_spec_id =
-        Blake3ObjectIdentityV1.identify(&bootstrap::format_specification().unwrap());
-    std::fs::write(
-        home.principal_store_path().join(STORE_METADATA_FILE),
-        legacy_store_metadata(format_spec_id),
     )
     .unwrap();
 }
@@ -710,12 +804,20 @@ async fn staged_publication_enforces_close_order_for_the_same_name() {
 async fn independent_reader_accepts_a_rust_produced_store() {
     let directory = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(directory.path());
-    let store = open_runtime_kv(&home, unlimited_quota()).await.unwrap();
+    let store = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
     store
+        .kv()
         .set("alice:capsule:shell", "cwd", b"/workspace".to_vec())
         .await
         .unwrap();
-    store.close().await.unwrap();
+    let owner = StateOwner::Principal(PrincipalId::new("alice").unwrap());
+    let name = ContentName::new("workspace/fastcdc-golden.bin").unwrap();
+    store
+        .content()
+        .put(&owner, &name, &chunker_golden_source(1024 * 1024))
+        .unwrap();
     drop(store);
 
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/runatal_v1_reader.py");
@@ -730,7 +832,7 @@ async fn independent_reader_accepts_a_rust_produced_store() {
         String::from_utf8_lossy(&output.stderr)
     );
     let decoded: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(decoded["roots"]["alice"]["generation"], 0);
+    assert_eq!(decoded["roots"]["alice"]["generation"], 1);
     assert!(
         decoded["roots"]["alice"]["commit"]
             .as_str()
@@ -751,6 +853,13 @@ async fn independent_reader_accepts_a_rust_produced_store() {
             .iter()
             .any(|object| object["kind"] == "Commit")
     );
+    assert!(
+        decoded["objects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|object| object["kind"] == "File")
+    );
     assert_eq!(
         decoded["content_catalog_spec_object"],
         format!(
@@ -762,6 +871,7 @@ async fn independent_reader_accepts_a_rust_produced_store() {
         )
     );
 
+    assert_reader_requires_catalog_specification(&home, &script);
     assert_reader_rejects_substituted_format_specification(&home, &script);
 
     let arena_path = home.principal_store_path().join("objects.arena");

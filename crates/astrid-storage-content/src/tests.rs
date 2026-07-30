@@ -287,6 +287,23 @@ fn profile_identity_is_deterministic_and_seeded() {
     );
     assert_eq!(first.descriptor().chunk_count(), boundaries.len() as u64);
     let seeded = ChunkingProfile::fastcdc_v2020(16 * 1024, 64 * 1024, 256 * 1024, 7).unwrap();
+    let seeded_boundaries: Vec<_> = fastcdc::v2020::FastCDC::with_level_and_seed(
+        &bytes,
+        16 * 1024,
+        64 * 1024,
+        256 * 1024,
+        fastcdc::v2020::Normalization::Level1,
+        7,
+    )
+    .map(|chunk| chunk.length)
+    .collect();
+    assert_eq!(
+        seeded_boundaries,
+        vec![
+            38_508, 66_500, 109_559, 79_560, 87_748, 95_882, 86_696, 53_024, 87_355, 46_926,
+            103_947, 22_388, 92_486, 69_996, 8_001,
+        ]
+    );
     let alternate = build_content(&TestIdentity, seeded, &bytes).unwrap();
     assert_ne!(first.descriptor().file(), alternate.descriptor().file());
     assert_eq!(
@@ -306,6 +323,56 @@ fn profile_identity_is_deterministic_and_seeded() {
     .unwrap();
     assert_eq!(zeros.descriptor().chunk_count(), 4);
     assert_eq!(zeros.unique_chunks(), 1);
+}
+
+#[test]
+fn odd_minimum_profile_keeps_its_pre_freeze_boundaries() {
+    let bytes = deterministic_bytes(4096);
+    let profile = ChunkingProfile::fastcdc_v2020(65, 256, 1024, 0).unwrap();
+    let boundaries: Vec<_> = fastcdc::v2020::FastCDC::with_level_and_seed(
+        &bytes,
+        65,
+        256,
+        1024,
+        fastcdc::v2020::Normalization::Level1,
+        0,
+    )
+    .map(|chunk| chunk.length)
+    .collect();
+    assert_eq!(
+        boundaries,
+        vec![
+            75, 301, 295, 297, 568, 412, 123, 169, 324, 294, 76, 358, 283, 483, 38
+        ]
+    );
+
+    let built = build_content(&TestIdentity, profile, &bytes).unwrap();
+    assert_eq!(built.descriptor().chunk_count(), boundaries.len() as u64);
+    assert_eq!(
+        read_content(&MapSource::new(built.records()), built.descriptor().file()).unwrap(),
+        bytes
+    );
+
+    // FastCDC's two-byte loop starts at floor(minimum / 2), so odd profiles
+    // can canonically cut one byte below the declared minimum.
+    let mut edge_bytes = vec![1_u8; 2048];
+    edge_bytes[64] = 248;
+    let edge_boundaries: Vec<_> = fastcdc::v2020::FastCDC::with_level_and_seed(
+        &edge_bytes,
+        65,
+        256,
+        1024,
+        fastcdc::v2020::Normalization::Level1,
+        0,
+    )
+    .map(|chunk| chunk.length)
+    .collect();
+    assert_eq!(edge_boundaries.first(), Some(&64));
+    let edge = build_content(&TestIdentity, profile, &edge_bytes).unwrap();
+    assert_eq!(
+        read_content(&MapSource::new(edge.records()), edge.descriptor().file()).unwrap(),
+        edge_bytes
+    );
 }
 
 #[test]
@@ -457,6 +524,35 @@ fn invalid_profiles_and_ranges_are_rejected() {
         Err(ContentReadError::Content(
             ContentError::RangeOutOfBounds { .. }
         ))
+    ));
+}
+
+#[test]
+fn merged_final_fastcdc_chunks_are_rejected() {
+    let profile = ChunkingProfile::ASTRID_V1;
+    let bytes = deterministic_bytes(1024 * 1024);
+    let mut chunks = Vec::new();
+    for chunk in fastcdc::v2020::FastCDC::with_level_and_seed(
+        &bytes,
+        profile.minimum_bytes() as usize,
+        profile.average_bytes() as usize,
+        profile.maximum_bytes() as usize,
+        fastcdc::v2020::Normalization::Level1,
+        profile.gear_seed(),
+    ) {
+        chunks.push(bytes[chunk.offset..chunk.offset + chunk.length].to_vec());
+    }
+    let final_chunk = chunks.pop().unwrap();
+    chunks.last_mut().unwrap().extend_from_slice(&final_chunk);
+    assert!(chunks.last().unwrap().len() <= profile.maximum_bytes() as usize);
+    let (file, source) = manual_content(profile, &chunks);
+
+    assert!(matches!(
+        read_content(&source, file),
+        Err(ContentReadError::Content(ContentError::InvalidObject {
+            detail: "final chunk violates the declared FastCDC profile",
+            ..
+        }))
     ));
 }
 

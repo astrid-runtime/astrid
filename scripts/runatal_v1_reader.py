@@ -8,6 +8,13 @@ import sys
 from pathlib import Path
 
 from runatal_v1_blake3 import derive_key
+from runatal_v1_fastcdc import (
+    ASTRID_V1,
+    cut,
+    is_canonical_boundary,
+    validate_profile,
+    verify_golden_vectors,
+)
 
 FRAME_CONTEXT = "astrid durable physical frame checksum v1"
 OBJECT_CONTEXT = "astrid principal store object identity v1"
@@ -39,13 +46,16 @@ REFERENCE_NAMES = ("Owns", "Evidence", "Lineage", "Derived")
 FORMAT_SPECIFICATION = (
     1,
     1,
-    bytes.fromhex("32379c2a9e1d0fe166ac37f30d8772bd88d6c99a6ae31bb75cc7e8a8f4ce4307"),
+    bytes.fromhex("55c88679f00f3f8249eaf847fe4fba889f3f9f09e01048f5eb00e2d0d80c8e93"),
 )
 CONTENT_CATALOG_SPECIFICATION = (
     1,
     1,
     bytes.fromhex("8f3999b066b666396259c4a92f9de7c5b8e67df9d38a69fb4fb824968b56ecdb"),
 )
+CHUNK_TREE_FANOUT = 128
+CONTENT_LABEL = b"content"
+U64_MAX = (1 << 64) - 1
 
 
 class FormatError(Exception):
@@ -194,6 +204,318 @@ def indexed_suffix(label, prefix, expected, require_suffix):
 def require_reference_kind(reference, expected):
     if reference["kind"] != expected:
         raise FormatError("invalid canonical reference kind")
+
+
+def decode_file(record):
+    require_metadata_schema(record, 2, 40)
+    (
+        algorithm,
+        revision,
+        normalization,
+        minimum,
+        average,
+        maximum,
+        seed,
+        logical_bytes,
+        chunk_count,
+    ) = struct.unpack("<BHBIIIQQQ", record["canonical"])
+    profile = (
+        algorithm,
+        revision,
+        normalization,
+        minimum,
+        average,
+        maximum,
+        seed,
+    )
+    try:
+        validate_profile(profile)
+    except ValueError as error:
+        raise FormatError(str(error)) from error
+    references = record["references"]
+    if not logical_bytes:
+        if chunk_count or references:
+            raise FormatError("empty File has chunks or content")
+        return profile, 0, 0, None
+    if not chunk_count:
+        raise FormatError("non-empty File has no chunks")
+    if (chunk_count == 1) != (logical_bytes <= maximum):
+        raise FormatError("File violates the whole-object threshold")
+    if (
+        len(references) != 1
+        or references[0]["label"] != CONTENT_LABEL
+        or references[0]["kind"] != 0
+    ):
+        raise FormatError("invalid File content reference")
+    return profile, logical_bytes, chunk_count, references[0]["target"]
+
+
+def canonical_tree_depth(chunk_count):
+    depth = 0
+    capacity = 1
+    while capacity < chunk_count:
+        capacity *= CHUNK_TREE_FANOUT
+        depth += 1
+    return depth
+
+
+def tree_capacity(depth):
+    return CHUNK_TREE_FANOUT**depth
+
+
+def validate_profile_bounds(logical_bytes, chunk_count, profile, ends_file):
+    minimum = profile[3] & ~1
+    maximum = profile[5]
+    maximum_total = chunk_count * maximum
+    required_full_chunks = chunk_count - 1 if ends_file else chunk_count
+    minimum_total = required_full_chunks * minimum + (1 if ends_file else 0)
+    if (
+        logical_bytes > U64_MAX
+        or maximum_total > U64_MAX
+        or minimum_total > U64_MAX
+        or logical_bytes < minimum_total
+        or logical_bytes > maximum_total
+    ):
+        raise FormatError("content shape violates the declared chunking profile")
+
+
+def decode_tree(record, shape):
+    logical_bytes, chunk_count, depth, profile, ends_file = shape
+    require_metadata_schema(record, 1, len(record["canonical"]))
+    canonical = record["canonical"]
+    if len(canonical) < 18:
+        raise FormatError("truncated ChunkTree header")
+    child_count, stored_bytes, stored_chunks = struct.unpack("<HQQ", canonical[:18])
+    references = record["references"]
+    if (
+        not 1 <= child_count <= CHUNK_TREE_FANOUT
+        or len(references) != child_count
+        or len(canonical) != 18 + child_count * 16
+        or stored_bytes != logical_bytes
+        or stored_chunks != chunk_count
+    ):
+        raise FormatError("inconsistent ChunkTree header")
+
+    children = []
+    total_bytes = 0
+    total_chunks = 0
+    child_capacity = tree_capacity(depth - 1)
+    for index, reference in enumerate(references):
+        if reference["label"] != index.to_bytes(2, "big") or reference["kind"] != 0:
+            raise FormatError("non-canonical ChunkTree child reference")
+        start = 18 + index * 16
+        child_bytes, child_chunks = struct.unpack("<QQ", canonical[start : start + 16])
+        if (
+            not child_bytes
+            or not child_chunks
+            or child_chunks > child_capacity
+            or (index + 1 < child_count and child_chunks != child_capacity)
+        ):
+            raise FormatError("non-canonical ChunkTree child shape")
+        child_ends_file = ends_file and index + 1 == child_count
+        validate_profile_bounds(
+            child_bytes,
+            child_chunks,
+            profile,
+            child_ends_file,
+        )
+        total_bytes += child_bytes
+        total_chunks += child_chunks
+        if total_bytes > U64_MAX or total_chunks > U64_MAX:
+            raise FormatError("ChunkTree child totals overflow u64")
+        children.append(
+            (
+                reference["target"],
+                (
+                    child_bytes,
+                    child_chunks,
+                    depth - 1,
+                    profile,
+                    child_ends_file,
+                ),
+            )
+        )
+    if total_bytes != stored_bytes or total_chunks != stored_chunks:
+        raise FormatError("ChunkTree child totals do not match its header")
+    return children
+
+
+def validate_content_boundary(left_object, left, right_prefix, profile, memo):
+    key = (identity_text(left_object), right_prefix, profile)
+    valid = memo.get(key)
+    if valid is None:
+        valid = is_canonical_boundary(left, right_prefix, profile)
+        memo[key] = valid
+    if not valid:
+        raise FormatError("non-canonical FastCDC boundary")
+
+
+def content_summary(objects, object_id, shape, summaries, boundaries):
+    key = (identity_text(object_id), shape)
+    cached = summaries.get(key)
+    if cached is not None:
+        return cached
+
+    logical_bytes, chunk_count, depth, profile, ends_file = shape
+    record = objects.get(identity_text(object_id))
+    if record is None:
+        raise FormatError("File content object is missing")
+    if record["kind"] == 0:
+        if (
+            record["version"] != 1
+            or record["class"] != 0
+            or record["logical_bytes"] != 0
+            or record["references"]
+            or len(record["canonical"]) != logical_bytes
+            or chunk_count != 1
+            or depth != 0
+        ):
+            raise FormatError("invalid Chunk object")
+        validate_profile_bounds(logical_bytes, 1, profile, ends_file)
+        summary = (
+            record["canonical"][:2],
+            object_id,
+            record["canonical"],
+        )
+        summaries[key] = summary
+        return summary
+    if record["kind"] != 1 or depth == 0:
+        raise FormatError("File content points to a non-canonical object kind")
+
+    first_prefix = None
+    last_object = None
+    last_bytes = None
+    for child, child_shape in decode_tree(record, shape):
+        child_prefix, child_last_object, child_last_bytes = content_summary(
+            objects,
+            child,
+            child_shape,
+            summaries,
+            boundaries,
+        )
+        if last_bytes is None:
+            first_prefix = child_prefix
+        else:
+            validate_content_boundary(
+                last_object,
+                last_bytes,
+                child_prefix,
+                profile,
+                boundaries,
+            )
+        last_object = child_last_object
+        last_bytes = child_last_bytes
+
+    if first_prefix is None or last_object is None or last_bytes is None:
+        raise FormatError("non-empty ChunkTree has no content summary")
+    summary = (first_prefix, last_object, last_bytes)
+    summaries[key] = summary
+    return summary
+
+
+def validate_file(objects, record):
+    profile, logical_bytes, chunk_count, content = decode_file(record)
+    if content is None:
+        return
+    shape = (
+        logical_bytes,
+        chunk_count,
+        canonical_tree_depth(chunk_count),
+        profile,
+        True,
+    )
+    _, last_object, last_bytes = content_summary(objects, content, shape, {}, {})
+    if chunk_count > 1 and cut(last_bytes, profile) != len(last_bytes):
+        raise FormatError(
+            f"non-canonical FastCDC final chunk {identity_text(last_object)}"
+        )
+
+
+def verify_content_summary_vectors():
+    overflow_profile = (1, 1, 1, 64, 256, 16_777_216, 0)
+    overflow_chunks = 1 << 40
+    try:
+        validate_profile_bounds(
+            (overflow_chunks - 1) * 64 + 1,
+            overflow_chunks,
+            overflow_profile,
+            True,
+        )
+    except FormatError:
+        pass
+    else:
+        raise FormatError("profile-bound multiplication accepted u64 overflow")
+
+    chunk_id = (1, 1, bytes((1,)) * 32)
+    branch_id = (1, 1, bytes((2,)) * 32)
+    root_id = (1, 1, bytes((3,)) * 32)
+    chunk_bytes = bytes(ASTRID_V1[5])
+
+    def tree_record(child, child_bytes, child_chunks):
+        count = CHUNK_TREE_FANOUT
+        logical_bytes = child_bytes * count
+        chunk_count = child_chunks * count
+        canonical = bytearray(struct.pack("<HQQ", count, logical_bytes, chunk_count))
+        references = []
+        for index in range(count):
+            canonical += struct.pack("<QQ", child_bytes, child_chunks)
+            references.append(
+                {
+                    "label": index.to_bytes(2, "big"),
+                    "target": child,
+                    "kind": 0,
+                }
+            )
+        return {
+            "kind": 1,
+            "version": 1,
+            "canonical": bytes(canonical),
+            "logical_bytes": 0,
+            "class": 1,
+            "references": references,
+        }
+
+    class CountingObjects(dict):
+        def __init__(self, *args):
+            super().__init__(*args)
+            self.lookups = {}
+
+        def get(self, key, default=None):
+            self.lookups[key] = self.lookups.get(key, 0) + 1
+            return super().get(key, default)
+
+    chunk_record = {
+        "kind": 0,
+        "version": 1,
+        "canonical": chunk_bytes,
+        "logical_bytes": 0,
+        "class": 0,
+        "references": [],
+    }
+    branch_record = tree_record(chunk_id, len(chunk_bytes), 1)
+    root_record = tree_record(
+        branch_id,
+        len(chunk_bytes) * CHUNK_TREE_FANOUT,
+        CHUNK_TREE_FANOUT,
+    )
+    objects = CountingObjects(
+        {
+            identity_text(chunk_id): chunk_record,
+            identity_text(branch_id): branch_record,
+            identity_text(root_id): root_record,
+        }
+    )
+    chunk_count = CHUNK_TREE_FANOUT**2
+    shape = (
+        len(chunk_bytes) * chunk_count,
+        chunk_count,
+        2,
+        ASTRID_V1,
+        True,
+    )
+    content_summary(objects, root_id, shape, {}, {})
+    if any(lookups > 2 for lookups in objects.lookups.values()):
+        raise FormatError("shared content subtree was expanded instead of memoized")
 
 
 def validate_runtime_profile(record):
@@ -498,14 +820,15 @@ def parse_metadata(path):
     specification = parse_metadata_identity(entries["format-spec-object"])
     if specification != FORMAT_SPECIFICATION:
         raise FormatError("store.meta does not name the frozen format specification")
-    catalog_value = entries.get("content-catalog-spec-object")
-    catalog_specification = (
-        None if catalog_value is None else parse_metadata_identity(catalog_value)
-    )
-    if (
-        catalog_specification is not None
-        and catalog_specification != CONTENT_CATALOG_SPECIFICATION
-    ):
+    try:
+        catalog_specification = parse_metadata_identity(
+            entries["content-catalog-spec-object"]
+        )
+    except KeyError as error:
+        raise FormatError(
+            "store.meta omits the frozen content catalog specification"
+        ) from error
+    if catalog_specification != CONTENT_CATALOG_SPECIFICATION:
         raise FormatError("store.meta names an unknown content catalog specification")
     return specification, catalog_specification
 
@@ -514,9 +837,19 @@ def parse_metadata_identity(value):
     fields = value.split(":")
     if len(fields) != 4:
         raise FormatError("invalid metadata identity")
-    tagged = (int(fields[0]), int(fields[1]), bytes.fromhex(fields[3]))
-    if int(fields[2]) != len(tagged[2]):
+    try:
+        algorithm = int(fields[0])
+        construction = int(fields[1])
+        declared_length = int(fields[2])
+        digest = bytes.fromhex(fields[3])
+    except ValueError as error:
+        raise FormatError("invalid metadata identity") from error
+    tagged = (algorithm, construction, digest)
+    if declared_length != len(digest):
         raise FormatError("metadata identity length mismatch")
+    canonical = f"{algorithm}:{construction}:{declared_length}:{digest.hex()}"
+    if value != canonical:
+        raise FormatError("non-canonical metadata identity")
     return tagged
 
 
@@ -539,9 +872,12 @@ def validate_closure(objects, root):
         marks[key] = 2
 
     visit(root)
+    return set(marks)
 
 
 def recover(store, include_payloads):
+    verify_golden_vectors()
+    verify_content_summary_vectors()
     specification, catalog_specification = parse_metadata(store / "store.meta")
     objects = {}
     offsets = {}
@@ -597,11 +933,17 @@ def recover(store, include_payloads):
             if replacement[0] != generation:
                 raise FormatError(f"root generation mismatch for {name} at byte {offset}")
             roots[name] = replacement
+    validated_files = set()
     for name, root in roots.items():
         record = objects.get(identity_text(root[1]))
         if record is None or record["kind"] != 9:
             raise FormatError(f"principal {name} root is not a Commit")
-        validate_closure(objects, root[1])
+        closure = validate_closure(objects, root[1])
+        for key in closure:
+            record = objects[key]
+            if record["kind"] == 2 and key not in validated_files:
+                validate_file(objects, record)
+                validated_files.add(key)
 
     dumped_objects = []
     for key in sorted(objects):
@@ -628,11 +970,7 @@ def recover(store, include_payloads):
         dumped_objects.append(dumped)
     return {
         "format_spec_object": spec_key,
-        "content_catalog_spec_object": (
-            None
-            if catalog_specification is None
-            else identity_text(catalog_specification)
-        ),
+        "content_catalog_spec_object": identity_text(catalog_specification),
         "objects": dumped_objects,
         "roots": {
             name: {"generation": root[0], "commit": identity_text(root[1])}

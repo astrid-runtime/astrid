@@ -30,11 +30,16 @@ pub(super) const PRE_RUNATAL_NAMING_FORMAT_SPEC_ID: ObjectId = ObjectId::new([
     134, 57, 14, 85, 115, 205, 98, 72, 236, 238, 181, 144, 75, 249, 222, 203, 137, 41, 254, 103,
     170, 230, 56, 213, 49, 171, 17, 148, 24, 0, 14, 25,
 ]);
-const PRIOR_V1_FORMAT_SPEC_IDS: [ObjectId; 4] = [
+pub(super) const PRE_FASTCDC_FREEZE_FORMAT_SPEC_ID: ObjectId = ObjectId::new([
+    50, 55, 156, 42, 158, 29, 15, 225, 102, 172, 55, 243, 13, 135, 114, 189, 136, 214, 201, 154,
+    106, 227, 27, 183, 92, 199, 232, 168, 244, 206, 67, 7,
+]);
+const PRIOR_V1_FORMAT_SPEC_IDS: [ObjectId; 5] = [
     PRE_DERIVATION_FORMAT_SPEC_ID,
     PRE_COMPACTION_FORMAT_SPEC_ID,
     PRE_GC_OUTBOX_FORMAT_SPEC_ID,
     PRE_RUNATAL_NAMING_FORMAT_SPEC_ID,
+    PRE_FASTCDC_FREEZE_FORMAT_SPEC_ID,
 ];
 
 pub(super) fn format_spec_record() -> StorageResult<ObjectRecord> {
@@ -101,7 +106,10 @@ pub(super) fn object_id_hex(id: ObjectId) -> String {
 pub(super) enum DestinationFormat {
     New,
     Current,
-    PriorV1(ObjectId),
+    PriorV1 {
+        format_spec: ObjectId,
+        catalog_spec_was_declared: bool,
+    },
 }
 
 impl DestinationFormat {
@@ -113,7 +121,7 @@ impl DestinationFormat {
 pub(super) fn prepare_destination(
     path: &Path,
     expected_metadata: &[u8],
-    current_format_spec: ObjectId,
+    current_catalog_spec: ObjectId,
 ) -> StorageResult<DestinationFormat> {
     let mut existing_complete = false;
     if path.exists() {
@@ -139,12 +147,27 @@ pub(super) fn prepare_destination(
         })?;
         if actual != expected_metadata {
             if existing_complete
-                && let Some(prior) = std::iter::once(current_format_spec)
-                    .chain(PRIOR_V1_FORMAT_SPEC_IDS.iter().copied())
-                    .find(|candidate| actual == legacy_store_metadata(*candidate))
+                && let Some(prior) =
+                    PRIOR_V1_FORMAT_SPEC_IDS
+                        .iter()
+                        .copied()
+                        .find_map(|candidate| {
+                            if actual == legacy_store_metadata(candidate) {
+                                Some(DestinationFormat::PriorV1 {
+                                    format_spec: candidate,
+                                    catalog_spec_was_declared: false,
+                                })
+                            } else if actual == store_metadata(candidate, current_catalog_spec) {
+                                Some(DestinationFormat::PriorV1 {
+                                    format_spec: candidate,
+                                    catalog_spec_was_declared: true,
+                                })
+                            } else {
+                                None
+                            }
+                        })
             {
-                return validate_authoritative_files(path)
-                    .map(|()| DestinationFormat::PriorV1(prior));
+                return validate_authoritative_files(path).map(|()| prior);
             }
             return Err(unsupported_format_error(&metadata));
         }
@@ -185,7 +208,10 @@ pub(super) fn prepare_format_specification(
             false,
             "in-band format specification",
         ),
-        DestinationFormat::PriorV1(legacy_spec_id) => {
+        DestinationFormat::PriorV1 {
+            format_spec: legacy_spec_id,
+            ..
+        } => {
             let legacy = read_format_specification(engine, legacy_spec_id)?.ok_or_else(|| {
                 StorageError::Connection(
                     "completed principal store is missing its prior format-v1 specification"
@@ -223,7 +249,14 @@ pub(super) fn prepare_catalog_specification(
         engine,
         catalog_spec_id,
         catalog_spec,
-        matches!(destination_format, DestinationFormat::Current),
+        matches!(
+            destination_format,
+            DestinationFormat::Current
+                | DestinationFormat::PriorV1 {
+                    catalog_spec_was_declared: true,
+                    ..
+                }
+        ),
         "content catalog specification",
     )
 }

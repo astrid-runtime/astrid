@@ -149,34 +149,23 @@ path-copy nodes reduce write amplification, object loads, and recovery work.
 
 ## D4. Evidence gate for the first content-defined chunker
 
-**Status:** evidence decision complete; format integration remains open. The
-reproducible harness, full measurements, supply-chain record, and decision are in
+**Status:** complete. The reproducible harness, full measurements, supply-chain
+record, and decision are in
 [`astrid-storage-chunker-evidence.md`](astrid-storage-chunker-evidence.md).
-The evidence retains the existing FastCDC profile; no durable format change is
-made. Golden cuts for the production and independent readers and the frozen
-RÚNATAL profile grammar remain acceptance work before the format tag.
+The byte-exact algorithm, accepted parameter grammar, and three golden vectors
+are frozen in RÚNATAL and verified by both production Rust and the independent
+reader.
 
 ### Decision
 
-Run the chunker evidence gate before the first format release.
+Format one retains FastCDC 2020 with implementation revision one,
+normalization level one, 16/64/256 KiB bounds, zero gear seed, and chunk-tree
+fanout 128. Files at or below 256 KiB remain whole objects.
 
-The leading candidate is the hashed robust MinCDC family, with:
-
-- window `w = 4`;
-- pinned upstream constants;
-- the leftmost minimum of the hashed window between strict minimum and maximum
-  chunk sizes;
-- ties resolved to the earliest index;
-- a strictly enforced maximum; and
-- only the final chunk permitted below the minimum.
-
-The measured 16/64/256 KiB profile is the starting point, not an assumption:
-MinCDC has a different distribution and must be swept on the same corpora.
-
-If it reproduces its claimed performance or distribution advantages, it
-becomes the first Astrid profile and FastCDC never becomes durable format. If
-the results are noise, the published and already-measured FastCDC profile wins
-the tie.
+The evidence gate rejected a chunker change: the best lower-object-cost MinCDC
+candidate improved the measured combined cost by only 0.1086% while increasing
+unique-object count by 41.58%. The selected construction is therefore frozen
+from its behavior, not from the continued availability of a Rust crate.
 
 ### Rationale
 
@@ -209,27 +198,26 @@ fingerprinting through chunk-length patterns.
 
 ### Wire-format rule
 
-The file header and staging intent carry an algorithm discriminator followed by
-that algorithm's canonical parameter block. `ChunkingProfile` is a closed
-tagged type. Unknown algorithms fail closed.
-
-Candidate MinCDC parameters contain its window, strict bounds, multiplier, and
-addition constants. It does not gain a synthetic average-size field.
+The File header and staging intent carry algorithm discriminator 1,
+implementation revision 1, normalization 1, minimum/average/maximum sizes, and
+the gear seed. Unknown algorithms, revisions, normalization levels, and
+out-of-grammar parameters fail closed.
 
 ### Work order
 
-- Add MinCDC and Chonkers candidates to the existing sweep tool.
-- Re-run both measured corpora.
-- Add zeros, repetitions, boundary-forcing, and parameter-recovery fixtures.
-- Pin exact constants, tie-breaking, and final-chunk behavior.
-- Produce golden boundary fixtures for the Rust and independent readers.
-- Verify the chosen implementation's license.
+- Preserve the evidence harness and captured results.
+- Pin exact masks, gear-table derivation, wrapping arithmetic, seeded behavior,
+  whole-object threshold, and final-chunk behavior in RÚNATAL.
+- Keep literal golden boundary fixtures in production Rust and the independent
+  reader.
+- Validate every rooted File against the frozen construction during independent
+  recovery.
 
 ### Acceptance
 
-- The complete sweep is attached to the gate issue.
-- Golden cuts and adversarial fixtures pass.
-- The profile grammar is frozen in the RÚNATAL specification.
+- The complete sweep and supply-chain record are checked in.
+- Golden cuts and adversarial fixtures pass in both implementations.
+- The profile grammar is frozen in the in-band RÚNATAL specification.
 
 ## D5. Byte-exact content names
 
