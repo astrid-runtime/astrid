@@ -46,7 +46,7 @@ REFERENCE_NAMES = ("Owns", "Evidence", "Lineage", "Derived")
 FORMAT_SPECIFICATION = (
     1,
     1,
-    bytes.fromhex("eb32736259880e48df7c3249d1ef2037b83863a89011859c213ae1c39f7dd135"),
+    bytes.fromhex("55c88679f00f3f8249eaf847fe4fba889f3f9f09e01048f5eb00e2d0d80c8e93"),
 )
 CONTENT_CATALOG_SPECIFICATION = (
     1,
@@ -271,6 +271,8 @@ def validate_profile_bounds(logical_bytes, chunk_count, profile, ends_file):
     minimum_total = required_full_chunks * minimum + (1 if ends_file else 0)
     if (
         logical_bytes > U64_MAX
+        or maximum_total > U64_MAX
+        or minimum_total > U64_MAX
         or logical_bytes < minimum_total
         or logical_bytes > maximum_total
     ):
@@ -319,6 +321,8 @@ def decode_tree(record, shape):
         )
         total_bytes += child_bytes
         total_chunks += child_chunks
+        if total_bytes > U64_MAX or total_chunks > U64_MAX:
+            raise FormatError("ChunkTree child totals overflow u64")
         children.append(
             (
                 reference["target"],
@@ -428,6 +432,20 @@ def validate_file(objects, record):
 
 
 def verify_content_summary_vectors():
+    overflow_profile = (1, 1, 1, 64, 256, 16_777_216, 0)
+    overflow_chunks = 1 << 40
+    try:
+        validate_profile_bounds(
+            (overflow_chunks - 1) * 64 + 1,
+            overflow_chunks,
+            overflow_profile,
+            True,
+        )
+    except FormatError:
+        pass
+    else:
+        raise FormatError("profile-bound multiplication accepted u64 overflow")
+
     chunk_id = (1, 1, bytes((1,)) * 32)
     branch_id = (1, 1, bytes((2,)) * 32)
     root_id = (1, 1, bytes((3,)) * 32)

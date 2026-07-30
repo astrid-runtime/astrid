@@ -455,6 +455,8 @@ File:
   multi-chunk content, applying the cut function to the final chunk alone MUST
   consume its full length. One-chunk content remains governed by the
   whole-object threshold and does not perform this final-suffix check.
+  Profile-bound products, and ChunkTree child byte and chunk-count totals, use
+  checked unsigned 64-bit arithmetic. Any overflow makes the object invalid.
 
   Algorithm 1, implementation revision 1 is the following exact unsigned
   64-bit FastCDC construction. All additions and left shifts wrap modulo 2^64.

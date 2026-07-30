@@ -145,7 +145,7 @@ fn format_specification_has_a_tagged_metadata_identity() {
     assert!(record.references().is_empty());
     assert_eq!(
         object_id_hex(id),
-        "eb32736259880e48df7c3249d1ef2037b83863a89011859c213ae1c39f7dd135"
+        "55c88679f00f3f8249eaf847fe4fba889f3f9f09e01048f5eb00e2d0d80c8e93"
     );
     assert_eq!(
         object_id_hex(catalog_id),
