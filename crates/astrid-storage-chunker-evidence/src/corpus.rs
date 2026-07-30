@@ -100,6 +100,9 @@ impl Corpus {
             if revision.is_empty() || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
                 bail!("git emitted an invalid revision ID");
             }
+            if !git_path_exists_at_revision(repository, relative_path, revision)? {
+                continue;
+            }
             let object = format!("{revision}:{}", relative_path.to_string_lossy());
             let version = Command::new("git")
                 .args(["-C"])
@@ -107,9 +110,13 @@ impl Corpus {
                 .args(["show", &object])
                 .output()
                 .context("read captured version")?;
-            if version.status.success() {
-                inputs.push(memory(version.stdout));
+            if !version.status.success() {
+                bail!(
+                    "git could not read captured version: {}",
+                    String::from_utf8_lossy(&version.stderr).trim()
+                );
             }
+            inputs.push(memory(version.stdout));
         }
         if inputs.len() < 2 {
             bail!("captured version chain must contain at least two readable versions");
@@ -535,6 +542,27 @@ fn validate_relative_git_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn git_path_exists_at_revision(
+    repository: &Path,
+    relative_path: &Path,
+    revision: &str,
+) -> Result<bool> {
+    let tree = Command::new("git")
+        .args(["-C"])
+        .arg(repository)
+        .args(["ls-tree", "--full-tree", revision, "--"])
+        .arg(relative_path)
+        .output()
+        .context("inspect captured version path")?;
+    if !tree.status.success() {
+        bail!(
+            "git could not inspect captured version: {}",
+            String::from_utf8_lossy(&tree.stderr).trim()
+        );
+    }
+    Ok(!tree.stdout.is_empty())
+}
+
 fn input_path(input: &Input) -> Option<&Path> {
     match input {
         Input::File { path, .. } => Some(path),
@@ -659,6 +687,20 @@ mod tests {
             assert!(validate_relative_git_path(Path::new(invalid)).is_err());
         }
         validate_relative_git_path(Path::new("crates/storage/src/lib.rs")).unwrap();
+    }
+
+    #[test]
+    fn git_history_distinguishes_absent_paths_from_git_failures() {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        assert!(git_path_exists_at_revision(&repository, Path::new("Cargo.lock"), "HEAD").unwrap());
+        assert!(
+            !git_path_exists_at_revision(&repository, Path::new("definitely-not-present"), "HEAD")
+                .unwrap()
+        );
+        assert!(
+            git_path_exists_at_revision(&repository, Path::new("Cargo.lock"), "not-a-revision")
+                .is_err()
+        );
     }
 
     #[test]

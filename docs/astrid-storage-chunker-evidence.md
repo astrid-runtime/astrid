@@ -63,7 +63,7 @@ The corpora were:
 |---|---:|---:|
 | `agent-state` | 230,088 files | 5.73 GB |
 | `dev-workspace` | 47,805 files | 2.47 GB |
-| `captured-code` | 32 real `Cargo.lock` revisions read directly from Git | 8.14 MB |
+| `captured-code` | 32 real `Cargo.lock` revisions read directly from Git | 8.16 MB |
 | `synthetic-version-chain-v1` | 16 controlled local edits | 67.1 MB |
 | `synthetic-adversarial-v1` | empty, short, zeros, all-ones, periodic, monotone, repeated, pseudorandom, and boundary-pressure inputs | 58.7 MB |
 

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -100,7 +101,18 @@ fn load_corpora(options: &Options) -> Result<Vec<Corpus>> {
     if corpora.is_empty() {
         bail!("no corpus selected; omit --no-synthetic or pass a corpus or version-chain option");
     }
+    ensure_unique_corpus_labels(&corpora)?;
     Ok(corpora)
+}
+
+fn ensure_unique_corpus_labels(corpora: &[Corpus]) -> Result<()> {
+    let mut labels = HashSet::with_capacity(corpora.len());
+    for corpus in corpora {
+        if !labels.insert(corpus.name()) {
+            bail!("duplicate corpus label {:?}", corpus.name());
+        }
+    }
+    Ok(())
 }
 
 fn write_report(output: Option<&PathBuf>, report: &EvidenceReport) -> Result<()> {
@@ -215,4 +227,18 @@ fn print_help() {
          \x20 --output PATH            Write compact JSON to PATH instead of stdout\n\
          \x20 -h, --help               Print this help"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_corpus_labels_are_rejected() {
+        let corpora = [
+            Corpus::synthetic_adversarial(),
+            Corpus::synthetic_adversarial(),
+        ];
+        assert!(ensure_unique_corpus_labels(&corpora).is_err());
+    }
 }
