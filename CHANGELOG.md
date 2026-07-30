@@ -11,6 +11,14 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Added
 
+- **The selected FastCDC content profile is frozen as implementation-independent
+  format.** RÚNATAL now specifies the exact gear-table derivation,
+  normalization masks, wrapping cut algorithm, accepted parameter grammar,
+  whole-object policy, and seeded and unseeded golden vectors. Production Rust
+  and the independent reader reproduce those vectors; independent recovery
+  validates every rooted file's canonical tree shape and chunk boundaries.
+  Existing development stores amend in place to the successor in-band
+  specification.
 - **The format-one content chunker now has a reproducible evidence gate.** A
   non-published harness compares the pinned FastCDC profile with exact MinCDC
   and Moth evidence oracles across live aggregate corpora, captured and

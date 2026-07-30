@@ -53,10 +53,13 @@ maximum on every chunk, and the minimum on every non-final chunk. A final chunk
 may be shorter than the minimum.
 
 The dependency is exact-pinned because boundaries influence the immutable file
-root. The complete profile is encoded in each `File`, and a deterministic
-one-megabyte fixture pins every expected cut length. A future profile may use a
-different algorithm, seed, size distribution, or implementation revision
-without making an existing file undecodable.
+root. The complete profile is encoded in each `File`. RÚNATAL specifies the
+algorithm independently, including table generation, masks, wrapping
+arithmetic, seeded behavior, and three one-megabyte golden vectors. Production
+Rust and the independent reader reproduce those vectors and validate admitted
+file boundaries. A future profile may use a different algorithm, seed, size
+distribution, or implementation revision without making an existing file
+undecodable.
 
 The gear fingerprint is not object identity. The engine's injected,
 domain-separated BLAKE3 identity covers each chunk's complete bytes and every

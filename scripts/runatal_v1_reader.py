@@ -8,6 +8,11 @@ import sys
 from pathlib import Path
 
 from runatal_v1_blake3 import derive_key
+from runatal_v1_fastcdc import (
+    validate_boundaries,
+    validate_profile,
+    verify_golden_vectors,
+)
 
 FRAME_CONTEXT = "astrid durable physical frame checksum v1"
 OBJECT_CONTEXT = "astrid principal store object identity v1"
@@ -39,13 +44,16 @@ REFERENCE_NAMES = ("Owns", "Evidence", "Lineage", "Derived")
 FORMAT_SPECIFICATION = (
     1,
     1,
-    bytes.fromhex("32379c2a9e1d0fe166ac37f30d8772bd88d6c99a6ae31bb75cc7e8a8f4ce4307"),
+    bytes.fromhex("400f5d0982d8ad8eb5ecfb77f6b7d7b2c11e09e9595a6d25e150f7e707b37c17"),
 )
 CONTENT_CATALOG_SPECIFICATION = (
     1,
     1,
     bytes.fromhex("8f3999b066b666396259c4a92f9de7c5b8e67df9d38a69fb4fb824968b56ecdb"),
 )
+CHUNK_TREE_FANOUT = 128
+CONTENT_LABEL = b"content"
+U64_MAX = (1 << 64) - 1
 
 
 class FormatError(Exception):
@@ -194,6 +202,182 @@ def indexed_suffix(label, prefix, expected, require_suffix):
 def require_reference_kind(reference, expected):
     if reference["kind"] != expected:
         raise FormatError("invalid canonical reference kind")
+
+
+def decode_file(record):
+    require_metadata_schema(record, 2, 40)
+    (
+        algorithm,
+        revision,
+        normalization,
+        minimum,
+        average,
+        maximum,
+        seed,
+        logical_bytes,
+        chunk_count,
+    ) = struct.unpack("<BHBIIIQQQ", record["canonical"])
+    profile = (
+        algorithm,
+        revision,
+        normalization,
+        minimum,
+        average,
+        maximum,
+        seed,
+    )
+    try:
+        validate_profile(profile)
+    except ValueError as error:
+        raise FormatError(str(error)) from error
+    references = record["references"]
+    if not logical_bytes:
+        if chunk_count or references:
+            raise FormatError("empty File has chunks or content")
+        return profile, 0, 0, None
+    if not chunk_count:
+        raise FormatError("non-empty File has no chunks")
+    if (chunk_count == 1) != (logical_bytes <= maximum):
+        raise FormatError("File violates the whole-object threshold")
+    if (
+        len(references) != 1
+        or references[0]["label"] != CONTENT_LABEL
+        or references[0]["kind"] != 0
+    ):
+        raise FormatError("invalid File content reference")
+    return profile, logical_bytes, chunk_count, references[0]["target"]
+
+
+def canonical_tree_depth(chunk_count):
+    depth = 0
+    capacity = 1
+    while capacity < chunk_count:
+        capacity *= CHUNK_TREE_FANOUT
+        depth += 1
+    return depth
+
+
+def tree_capacity(depth):
+    return CHUNK_TREE_FANOUT**depth
+
+
+def validate_profile_bounds(logical_bytes, chunk_count, profile, ends_file):
+    minimum = profile[3]
+    maximum = profile[5]
+    maximum_total = chunk_count * maximum
+    required_full_chunks = chunk_count - 1 if ends_file else chunk_count
+    minimum_total = required_full_chunks * minimum + (1 if ends_file else 0)
+    if (
+        logical_bytes > U64_MAX
+        or logical_bytes < minimum_total
+        or logical_bytes > maximum_total
+    ):
+        raise FormatError("content shape violates the declared chunking profile")
+
+
+def decode_tree(record, shape):
+    logical_bytes, chunk_count, depth, profile, ends_file = shape
+    require_metadata_schema(record, 1, len(record["canonical"]))
+    canonical = record["canonical"]
+    if len(canonical) < 18:
+        raise FormatError("truncated ChunkTree header")
+    child_count, stored_bytes, stored_chunks = struct.unpack("<HQQ", canonical[:18])
+    references = record["references"]
+    if (
+        not 1 <= child_count <= CHUNK_TREE_FANOUT
+        or len(references) != child_count
+        or len(canonical) != 18 + child_count * 16
+        or stored_bytes != logical_bytes
+        or stored_chunks != chunk_count
+    ):
+        raise FormatError("inconsistent ChunkTree header")
+
+    children = []
+    total_bytes = 0
+    total_chunks = 0
+    child_capacity = tree_capacity(depth - 1)
+    for index, reference in enumerate(references):
+        if reference["label"] != index.to_bytes(2, "big") or reference["kind"] != 0:
+            raise FormatError("non-canonical ChunkTree child reference")
+        start = 18 + index * 16
+        child_bytes, child_chunks = struct.unpack("<QQ", canonical[start : start + 16])
+        if (
+            not child_bytes
+            or not child_chunks
+            or child_chunks > child_capacity
+            or (index + 1 < child_count and child_chunks != child_capacity)
+        ):
+            raise FormatError("non-canonical ChunkTree child shape")
+        child_ends_file = ends_file and index + 1 == child_count
+        validate_profile_bounds(
+            child_bytes,
+            child_chunks,
+            profile,
+            child_ends_file,
+        )
+        total_bytes += child_bytes
+        total_chunks += child_chunks
+        children.append(
+            (
+                reference["target"],
+                (
+                    child_bytes,
+                    child_chunks,
+                    depth - 1,
+                    profile,
+                    child_ends_file,
+                ),
+            )
+        )
+    if total_bytes != stored_bytes or total_chunks != stored_chunks:
+        raise FormatError("ChunkTree child totals do not match its header")
+    return children
+
+
+def content_chunks(objects, object_id, shape):
+    logical_bytes, chunk_count, depth, profile, ends_file = shape
+    record = objects.get(identity_text(object_id))
+    if record is None:
+        raise FormatError("File content object is missing")
+    if record["kind"] == 0:
+        if (
+            record["version"] != 1
+            or record["class"] != 0
+            or record["logical_bytes"] != 0
+            or record["references"]
+            or len(record["canonical"]) != logical_bytes
+            or chunk_count != 1
+            or depth != 0
+        ):
+            raise FormatError("invalid Chunk object")
+        validate_profile_bounds(logical_bytes, 1, profile, ends_file)
+        return [record["canonical"]]
+    if record["kind"] != 1 or depth == 0:
+        raise FormatError("File content points to a non-canonical object kind")
+    chunks = []
+    for child, child_shape in decode_tree(record, shape):
+        chunks.extend(content_chunks(objects, child, child_shape))
+    return chunks
+
+
+def validate_file(objects, record):
+    profile, logical_bytes, chunk_count, content = decode_file(record)
+    if content is None:
+        return
+    shape = (
+        logical_bytes,
+        chunk_count,
+        canonical_tree_depth(chunk_count),
+        profile,
+        True,
+    )
+    chunks = content_chunks(objects, content, shape)
+    if len(chunks) != chunk_count or sum(map(len, chunks)) != logical_bytes:
+        raise FormatError("File content totals do not match its header")
+    try:
+        validate_boundaries(chunks, profile)
+    except ValueError as error:
+        raise FormatError(str(error)) from error
 
 
 def validate_runtime_profile(record):
@@ -539,9 +723,11 @@ def validate_closure(objects, root):
         marks[key] = 2
 
     visit(root)
+    return set(marks)
 
 
 def recover(store, include_payloads):
+    verify_golden_vectors()
     specification, catalog_specification = parse_metadata(store / "store.meta")
     objects = {}
     offsets = {}
@@ -597,11 +783,17 @@ def recover(store, include_payloads):
             if replacement[0] != generation:
                 raise FormatError(f"root generation mismatch for {name} at byte {offset}")
             roots[name] = replacement
+    validated_files = set()
     for name, root in roots.items():
         record = objects.get(identity_text(root[1]))
         if record is None or record["kind"] != 9:
             raise FormatError(f"principal {name} root is not a Commit")
-        validate_closure(objects, root[1])
+        closure = validate_closure(objects, root[1])
+        for key in closure:
+            record = objects[key]
+            if record["kind"] == 2 and key not in validated_files:
+                validate_file(objects, record)
+                validated_files.add(key)
 
     dumped_objects = []
     for key in sorted(objects):

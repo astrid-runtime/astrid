@@ -287,6 +287,23 @@ fn profile_identity_is_deterministic_and_seeded() {
     );
     assert_eq!(first.descriptor().chunk_count(), boundaries.len() as u64);
     let seeded = ChunkingProfile::fastcdc_v2020(16 * 1024, 64 * 1024, 256 * 1024, 7).unwrap();
+    let seeded_boundaries: Vec<_> = fastcdc::v2020::FastCDC::with_level_and_seed(
+        &bytes,
+        16 * 1024,
+        64 * 1024,
+        256 * 1024,
+        fastcdc::v2020::Normalization::Level1,
+        7,
+    )
+    .map(|chunk| chunk.length)
+    .collect();
+    assert_eq!(
+        seeded_boundaries,
+        vec![
+            38_508, 66_500, 109_559, 79_560, 87_748, 95_882, 86_696, 53_024, 87_355, 46_926,
+            103_947, 22_388, 92_486, 69_996, 8_001,
+        ]
+    );
     let alternate = build_content(&TestIdentity, seeded, &bytes).unwrap();
     assert_ne!(first.descriptor().file(), alternate.descriptor().file());
     assert_eq!(
@@ -306,6 +323,16 @@ fn profile_identity_is_deterministic_and_seeded() {
     .unwrap();
     assert_eq!(zeros.descriptor().chunk_count(), 4);
     assert_eq!(zeros.unique_chunks(), 1);
+}
+
+#[test]
+fn format_one_profile_rejects_an_odd_minimum() {
+    assert!(matches!(
+        ChunkingProfile::fastcdc_v2020(65, 256, 1024, 0),
+        Err(ContentError::InvalidProfile(
+            "minimum chunk size must be even"
+        ))
+    ));
 }
 
 #[test]

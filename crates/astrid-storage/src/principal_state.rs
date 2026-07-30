@@ -258,8 +258,12 @@ pub async fn open_runtime_principal_store(
     let metadata = store_metadata(format_spec_id, catalog_spec_id);
     let metadata_for_open = metadata.clone();
     let opened = tokio::task::spawn_blocking(move || {
-        let destination_format =
-            prepare_destination(&open_path, &metadata_for_open, format_spec_id)?;
+        let destination_format = prepare_destination(
+            &open_path,
+            &metadata_for_open,
+            format_spec_id,
+            catalog_spec_id,
+        )?;
         let metadata_current = destination_format.metadata_is_current();
         let engine = RuntimeEngine::open(
             &open_path,
