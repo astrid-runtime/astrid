@@ -181,39 +181,10 @@ pub(crate) async fn invite_redeem(
     // because the redeem path needs the pre-built `AuthConfig`, but
     // the responsibility split is identical: identity store first,
     // profile second, home tree third — with rollback at every step.
-    let user = match kernel
-        .identity_store
-        .create_user(Some(principal.as_str()))
-        .await
+    if let Err(error) =
+        provision_invited_principal(kernel, &principal, &normalised_key, &profile).await
     {
-        Ok(u) => u,
-        Err(e) => return err_internal(format!("identity store create_user failed: {e}")),
-    };
-    if let Err(e) = kernel
-        .identity_store
-        .link("cli", principal.as_str(), user.id, "system")
-        .await
-    {
-        let _ = kernel.identity_store.delete_user(user.id).await;
-        return err_internal(format!("identity store link failed: {e}"));
-    }
-    let profile_path = kernel.astrid_home.profile_path(&principal);
-    if let Err(e) = profile.save_to_path(&profile_path) {
-        let _ = kernel
-            .identity_store
-            .unlink("cli", principal.as_str())
-            .await;
-        let _ = kernel.identity_store.delete_user(user.id).await;
-        return err_internal(format!("profile save failed: {e}"));
-    }
-    if let Err(e) = kernel.astrid_home.principal_home(&principal).ensure() {
-        let _ = kernel
-            .identity_store
-            .unlink("cli", principal.as_str())
-            .await;
-        let _ = kernel.identity_store.delete_user(user.id).await;
-        let _ = std::fs::remove_file(&profile_path);
-        return err_internal(format!("principal home tree provisioning failed: {e}"));
+        return err_internal(error);
     }
 
     // Decrement / remove the invite. Saturating sub guards against
@@ -248,6 +219,50 @@ pub(crate) async fn invite_redeem(
         group: chosen.group,
         public_key_fingerprint: fingerprint,
     })
+}
+
+async fn provision_invited_principal(
+    kernel: &Arc<crate::Kernel>,
+    principal: &PrincipalId,
+    normalised_key: &str,
+    profile: &PrincipalProfile,
+) -> Result<(), String> {
+    let initial_public_key = astrid_crypto::PublicKey::from_hex(normalised_key)
+        .map(<[u8; 32]>::from)
+        .map_err(|error| format!("validated invite key decode failed: {error}"))?;
+    let user = kernel
+        .identity_store
+        .create_principal(principal.clone(), initial_public_key)
+        .await
+        .map_err(|error| format!("identity store create_user failed: {error}"))?;
+    if let Err(error) = kernel
+        .identity_store
+        .link("cli", principal.as_str(), user.id, "system")
+        .await
+    {
+        let _ = kernel.identity_store.delete_user(user.id).await;
+        return Err(format!("identity store link failed: {error}"));
+    }
+
+    let profile_path = kernel.astrid_home.profile_path(principal);
+    if let Err(error) = profile.save_to_path(&profile_path) {
+        let _ = kernel
+            .identity_store
+            .unlink("cli", principal.as_str())
+            .await;
+        let _ = kernel.identity_store.delete_user(user.id).await;
+        return Err(format!("profile save failed: {error}"));
+    }
+    if let Err(error) = kernel.astrid_home.principal_home(principal).ensure() {
+        let _ = kernel
+            .identity_store
+            .unlink("cli", principal.as_str())
+            .await;
+        let _ = kernel.identity_store.delete_user(user.id).await;
+        let _ = std::fs::remove_file(&profile_path);
+        return Err(format!("principal home tree provisioning failed: {error}"));
+    }
+    Ok(())
 }
 
 /// Find the index of the first live invite whose token hashes to `token`.

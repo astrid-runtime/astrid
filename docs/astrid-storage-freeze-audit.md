@@ -74,6 +74,12 @@ independent of arena offsets or the live engine.
 
 ## D2. Stable opaque principal UID before the first release
 
+**Status:** complete. The canonical genesis record, owner codec, runtime
+directory, in-place alias-owner migration, and independent-reader grammar are
+implemented together. Existing pre-release stores migrate without changing
+root generations or commit identities; queued native staging intents migrate
+under the same crash marker.
+
 ### Decision
 
 Root journals and durable principal keying use a stable opaque 32-byte
@@ -101,13 +107,18 @@ principal concept.
 - Update `store.meta`, the RÚNATAL specification, and the independent reader.
 - Reuse the kernel identity record if its canonical encoding is stable;
   otherwise stabilize it as part of this work.
-- Development stores may be wiped before the first release; no permanent
-  migration promise exists yet.
+- Rewrite alias-keyed root snapshots and publication intents under the
+  singleton runtime lock. Keep the old root journal as rollback evidence until
+  retention policy explicitly removes it.
 
 ### Acceptance
 
 - Rotating a principal key changes neither UID nor journal ownership.
 - Renaming a principal touches no durable root-journal entry.
+- Migration preserves every root generation and commit identity, rejects an
+  unmapped owner, and resumes from every root-journal promotion prefix.
+- The live alias directory is populated atomically from validated identity
+  records before a principal-owned namespace is served.
 
 ## D3. Path-copy B+-tree for principal KV
 
@@ -372,9 +383,8 @@ implementation continuously testable against the simple full-scan oracle.
 
 ## Sequence
 
-1. Principal UID and chunker evidence gate before the first format release.
-2. B+-tree format and benchmarks.
-3. Cross-hash attestation and successor migration specification.
-4. Projection-only name folding documentation.
-5. Refinery sketch prototype with the chunker evidence tooling.
-6. Mechanical closing audit.
+1. Complete the cross-hash attestation and successor migration specification.
+2. Record projection-only name folding and doctor behavior.
+3. Complete the Refinery sketch prototype with the chunker evidence tooling.
+4. Run the mechanical closing audit and declare the format frozen on GitHub.
+5. Create the release tag only as part of the actual release workflow.

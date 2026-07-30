@@ -41,7 +41,7 @@ The format-1 metadata entries are:
   identity-wire=tagged-identity-v1
   format-spec-object=1:1:32:<64 lowercase hexadecimal digits>
   content-catalog-spec-object=1:1:32:<64 lowercase hexadecimal digits>
-  principal-codec=state-owner-v1
+  principal-codec=principal-uid-v1
   projection=kv-tree-v3
 
 The four colon-separated format-spec-object fields are identity algorithm,
@@ -288,14 +288,31 @@ prior transitions. The sentinel cannot collide with a valid transition:
 principal bytes of that declared length cannot fit inside the containing
 physical frame.
 
-The state-owner-v1 principal codec is:
+The principal-uid-v1 principal codec is:
 
   00                           system owner
-  01 <principal-id UTF-8>      principal owner
+  01 <32-byte principal UID>   principal owner
 
-The system encoding is exactly one byte. A principal ID is 1 through 64 ASCII
-bytes, each in A-Z, a-z, 0-9, hyphen, or underscore. Re-encoding a decoded
-principal MUST reproduce the original bytes.
+The system encoding is exactly one byte. A principal encoding is exactly 33
+bytes: tag 01 followed by the 32-byte, domain-separated BLAKE3 digest of its
+canonical genesis identity record. A display name, alias, current public key,
+or UUID text is never stored in the root journal.
+
+The principal genesis identity record hashed by BLAKE3 derive-key context
+"astrid principal uid v1" is exactly 68 bytes:
+
+  u16     genesis_format_version = 1
+  u16     initial_key_algorithm = 1        (Ed25519)
+  u32     initial_public_key_length = 32
+  u8[16]  identity UUID bytes
+  i64     creation Unix seconds
+  u32     creation nanoseconds
+  u8[32]  initial Ed25519 public key
+
+Integers are little-endian. creation_nanoseconds MUST be below 1000000000.
+The identity UUID and creation time are the values in the authoritative
+AstridUserId record. Current aliases and authentication keys reference this
+UID and may change without rewriting durable roots.
 
 Replay records in file order, maintaining a map principal -> RootState. A
 first-frame snapshot initializes that map with the encoded generations and
@@ -812,7 +829,7 @@ follows:
   3. Verify that the RÚNATAL object named by store.meta equals this document
      and the catalog-specification object equals its named child document.
   4. Scan roots.journal, check every physical frame, decode canonical
-     state-owner principals, and replay the compare-and-swap chain.
+     principal-UID owners, and replay the compare-and-swap chain.
   5. For each current root, recursively follow Owns references. Reject a
      missing object, cycle, non-Commit root, or malformed understood schema.
   6. Decode Commit -> PrincipalState. Decode the "kv" NamespaceMap and its AVL

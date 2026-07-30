@@ -6,23 +6,24 @@
 //! completion marker. The legacy database remains untouched as a recovery
 //! source.
 
-use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use astrid_core::dirs::AstridHome;
+use astrid_core::identity::PrincipalUid;
 use astrid_core::principal::PrincipalId;
 use astrid_storage_engine::{
     DurableEngine, IdentityScheme, PersistentObjectIdentity, PrincipalCodec, RecoveryLimits,
 };
 use astrid_storage_model::{ObjectClass, ObjectId, ObjectIdentity, ObjectRecord, ReferenceKind};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 
 use crate::content::{CatalogValidation, ContentWriteOutcome, PrincipalContentStore};
 use crate::error::{StorageError, StorageResult};
+use crate::identity::{IdentityStore, KvIdentityStore};
 #[cfg(all(test, feature = "legacy-surrealkv"))]
 use crate::kv::SurrealKvStore;
-use crate::kv::{KvPrincipalResolver, KvQuotaResolver, KvStore, TreeKvStore};
+use crate::kv::{KvPrincipalResolver, KvQuotaResolver, KvStore, ScopedKvStore, TreeKvStore};
 
 mod bootstrap;
 #[cfg(test)]
@@ -34,6 +35,7 @@ mod format_amendment_tests;
 mod format_migration_tests;
 mod migrations;
 mod native_io;
+mod owner_migration;
 mod staging;
 
 #[cfg(test)]
@@ -51,28 +53,154 @@ pub use staging::{
 };
 
 /// Explicit owner of one durable state root.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum StateOwner {
     /// Kernel-owned state that must not consume a user's storage quota.
     System,
     /// State owned by one validated Astrid principal.
-    Principal(PrincipalId),
+    Principal(PrincipalUid),
 }
 
-impl Ord for StateOwner {
-    fn cmp(&self, other: &Self) -> Ordering {
-        match (self, other) {
-            (Self::System, Self::System) => Ordering::Equal,
-            (Self::System, Self::Principal(_)) => Ordering::Less,
-            (Self::Principal(_), Self::System) => Ordering::Greater,
-            (Self::Principal(left), Self::Principal(right)) => left.as_str().cmp(right.as_str()),
+/// Live, capability-bound mapping between mutable principal aliases and
+/// stable durable UIDs.
+///
+/// The root journal never stores an alias. This directory is populated from
+/// validated principal identity records before user-owned namespaces are
+/// served. Renaming updates the two maps without changing any durable root.
+#[derive(Clone, Debug, Default)]
+pub struct PrincipalDirectory {
+    inner: Arc<RwLock<PrincipalDirectoryState>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PrincipalDirectoryState {
+    aliases: HashMap<PrincipalId, PrincipalUid>,
+    principals: HashMap<PrincipalUid, PrincipalId>,
+}
+
+impl PrincipalDirectory {
+    /// Register one validated alias-to-UID binding.
+    ///
+    /// Repeating the same binding is idempotent. Reusing either side for a
+    /// different identity fails closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either the alias or UID is already bound to a
+    /// different identity.
+    pub fn register(&self, alias: PrincipalId, uid: PrincipalUid) -> StorageResult<()> {
+        let mut state = self.inner.write();
+        if state
+            .aliases
+            .get(&alias)
+            .is_some_and(|existing| *existing != uid)
+        {
+            return Err(StorageError::Internal(format!(
+                "principal alias {alias} is already bound to a different uid"
+            )));
+        }
+        if let Some(existing) = state
+            .principals
+            .get(&uid)
+            .filter(|existing| *existing != &alias)
+        {
+            return Err(StorageError::Internal(format!(
+                "principal uid {uid} is already bound to alias {existing}"
+            )));
+        }
+        state.aliases.insert(alias.clone(), uid);
+        state.principals.insert(uid, alias);
+        Ok(())
+    }
+
+    pub(crate) fn unregister(&self, alias: &PrincipalId, uid: PrincipalUid) {
+        let mut state = self.inner.write();
+        if state.aliases.get(alias) == Some(&uid) && state.principals.get(&uid) == Some(alias) {
+            state.aliases.remove(alias);
+            state.principals.remove(&uid);
         }
     }
-}
 
-impl PartialOrd for StateOwner {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
+    pub(crate) fn replace_all(
+        &self,
+        bindings: impl IntoIterator<Item = (PrincipalId, PrincipalUid)>,
+    ) -> StorageResult<()> {
+        let replacement = Self::default();
+        for (alias, uid) in bindings {
+            replacement.register(alias, uid)?;
+        }
+        *self.inner.write() = replacement.inner.read().clone();
+        Ok(())
+    }
+
+    /// Resolve a current alias to its stable durable UID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the alias has no admitted durable identity.
+    pub fn uid_for(&self, alias: &PrincipalId) -> StorageResult<PrincipalUid> {
+        self.inner
+            .read()
+            .aliases
+            .get(alias)
+            .copied()
+            .ok_or_else(|| {
+                StorageError::InvalidKey(format!(
+                    "principal alias {alias} has no registered durable identity"
+                ))
+            })
+    }
+
+    /// Resolve a durable UID to its current alias.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the UID has no current live alias.
+    pub fn alias_for(&self, uid: PrincipalUid) -> StorageResult<PrincipalId> {
+        self.inner
+            .read()
+            .principals
+            .get(&uid)
+            .cloned()
+            .ok_or_else(|| {
+                StorageError::InvalidKey(format!(
+                    "principal uid {uid} has no registered live alias"
+                ))
+            })
+    }
+
+    /// Rebind one existing UID to a new validated alias.
+    ///
+    /// The old alias must currently name `uid`, and the replacement alias must
+    /// be unused. No root-journal bytes change.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the source binding is stale or the replacement
+    /// alias is already in use.
+    pub fn rename(
+        &self,
+        uid: PrincipalUid,
+        old_alias: &PrincipalId,
+        new_alias: PrincipalId,
+    ) -> StorageResult<()> {
+        let mut state = self.inner.write();
+        if state.aliases.get(old_alias) != Some(&uid)
+            || state.principals.get(&uid) != Some(old_alias)
+        {
+            return Err(StorageError::InvalidKey(format!(
+                "principal rename source {old_alias} does not match uid {uid}"
+            )));
+        }
+        if let Some(existing) = state.aliases.get(&new_alias) {
+            return Err(StorageError::InvalidKey(format!(
+                "principal rename target {new_alias} is already bound to uid {existing}"
+            )));
+        }
+        state.aliases.remove(old_alias);
+        state.aliases.insert(new_alias.clone(), uid);
+        state.principals.insert(uid, new_alias);
+        Ok(())
     }
 }
 
@@ -133,9 +261,9 @@ impl PrincipalCodec<StateOwner> for StateOwnerCodecV1 {
         match owner {
             StateOwner::System => vec![0],
             StateOwner::Principal(principal) => {
-                let mut bytes = Vec::with_capacity(principal.as_str().len().saturating_add(1));
+                let mut bytes = Vec::with_capacity(33);
                 bytes.push(1);
-                bytes.extend_from_slice(principal.as_str().as_bytes());
+                bytes.extend_from_slice(principal.as_bytes());
                 bytes
             },
         }
@@ -144,18 +272,28 @@ impl PrincipalCodec<StateOwner> for StateOwnerCodecV1 {
     fn decode(&self, bytes: &[u8]) -> Option<StateOwner> {
         match bytes.split_first()? {
             (0, []) => Some(StateOwner::System),
-            (1, principal) => std::str::from_utf8(principal)
-                .ok()
-                .and_then(|value| PrincipalId::new(value.to_owned()).ok())
-                .map(StateOwner::Principal),
+            (1, principal) if principal.len() == 32 => {
+                let uid = PrincipalUid::from_bytes(<[u8; 32]>::try_from(principal).ok()?);
+                Some(StateOwner::Principal(uid))
+            },
             _ => None,
         }
     }
 }
 
 /// Authority-aware mapping from live KV namespaces to durable owners.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct StateOwnerResolver;
+#[derive(Clone, Debug)]
+pub struct StateOwnerResolver {
+    principals: PrincipalDirectory,
+}
+
+impl StateOwnerResolver {
+    /// Bind namespace resolution to the validated live principal directory.
+    #[must_use]
+    pub fn new(principals: PrincipalDirectory) -> Self {
+        Self { principals }
+    }
+}
 
 impl KvPrincipalResolver<StateOwner> for StateOwnerResolver {
     fn resolve(&self, namespace: &str) -> StorageResult<StateOwner> {
@@ -167,13 +305,14 @@ impl KvPrincipalResolver<StateOwner> for StateOwnerResolver {
                 "host-stamped capsule namespace has an empty capsule identifier".to_owned(),
             ));
         }
-        PrincipalId::new(principal.to_owned())
+        let principal = PrincipalId::new(principal.to_owned()).map_err(|error| {
+            StorageError::InvalidKey(format!(
+                "capsule namespace has invalid host-stamped principal: {error}"
+            ))
+        })?;
+        self.principals
+            .uid_for(&principal)
             .map(StateOwner::Principal)
-            .map_err(|error| {
-                StorageError::InvalidKey(format!(
-                    "capsule namespace has invalid host-stamped principal: {error}"
-                ))
-            })
     }
 }
 
@@ -194,6 +333,7 @@ pub struct RuntimePrincipalStore {
     kv: Arc<dyn KvStore>,
     content: Arc<NativePrincipalContentStore>,
     staging: Arc<NativeContentStagingArea>,
+    principals: PrincipalDirectory,
 }
 
 impl RuntimePrincipalStore {
@@ -213,6 +353,12 @@ impl RuntimePrincipalStore {
     #[must_use]
     pub fn staging(&self) -> Arc<NativeContentStagingArea> {
         Arc::clone(&self.staging)
+    }
+
+    /// Clone the live alias-to-UID directory used by every projection.
+    #[must_use]
+    pub fn principal_directory(&self) -> PrincipalDirectory {
+        self.principals.clone()
     }
 
     /// Publish one sealed native write through the authoritative content store.
@@ -249,6 +395,24 @@ pub async fn open_runtime_principal_store(
     home: &AstridHome,
     quota: Arc<dyn KvQuotaResolver<StateOwner>>,
 ) -> StorageResult<RuntimePrincipalStore> {
+    open_runtime_principal_store_with_directory(home, quota, PrincipalDirectory::default()).await
+}
+
+/// Open every native projection with an externally shared principal
+/// directory.
+///
+/// Native kernel composition uses this form so namespace resolution,
+/// identity lifecycle, and UID-to-alias quota policy share one mapping.
+///
+/// # Errors
+///
+/// Returns a storage error if policy, metadata, migration, verification, or
+/// durable recovery fails.
+pub async fn open_runtime_principal_store_with_directory(
+    home: &AstridHome,
+    quota: Arc<dyn KvQuotaResolver<StateOwner>>,
+    principals: PrincipalDirectory,
+) -> StorageResult<RuntimePrincipalStore> {
     let store_path = home.principal_store_path();
     let open_path = store_path.clone();
     let format_spec = bootstrap::format_specification()?;
@@ -256,6 +420,8 @@ pub async fn open_runtime_principal_store(
     let catalog_spec = bootstrap::content_catalog_format_specification()?;
     let catalog_spec_id = Blake3ObjectIdentityV1.identify(&catalog_spec);
     let metadata = store_metadata(format_spec_id, catalog_spec_id);
+    owner_migration::apply_if_required(home, &principals, &format_spec, &catalog_spec, &metadata)
+        .await?;
     let metadata_for_open = metadata.clone();
     let opened = tokio::task::spawn_blocking(move || {
         let destination_format =
@@ -284,7 +450,8 @@ pub async fn open_runtime_principal_store(
     let engine = Arc::new(engine);
     let validated_catalogs = Arc::new(Mutex::new(BTreeMap::<StateOwner, CatalogValidation>::new()));
 
-    migrations::apply_required(home, &store_path, &engine, &validated_catalogs).await?;
+    migrations::apply_required(home, &store_path, &engine, &validated_catalogs, &principals)
+        .await?;
     if !metadata_current {
         let metadata_path = store_path.join(STORE_METADATA_FILE);
         tokio::task::spawn_blocking(move || atomic_write(&metadata_path, &metadata))
@@ -299,10 +466,21 @@ pub async fn open_runtime_principal_store(
     let kv: Arc<dyn KvStore> =
         Arc::new(RuntimeStore::from_engine_with_quota_and_content_validation(
             Arc::clone(&engine),
-            StateOwnerResolver,
+            StateOwnerResolver::new(principals.clone()),
             Arc::clone(&quota),
             Arc::clone(&validated_catalogs),
         ));
+    KvIdentityStore::with_principal_directory(
+        ScopedKvStore::new(Arc::clone(&kv), "system:identity")?,
+        principals.clone(),
+    )
+    .load_principal_directory()
+    .await
+    .map_err(|error| {
+        StorageError::Connection(format!(
+            "load principal identities before serving durable namespaces: {error}"
+        ))
+    })?;
     let content = Arc::new(
         NativePrincipalContentStore::from_engine_with_quota_and_validation(
             Arc::clone(&engine),
@@ -316,6 +494,7 @@ pub async fn open_runtime_principal_store(
         kv,
         content,
         staging,
+        principals,
     })
 }
 
@@ -335,6 +514,23 @@ pub async fn open_runtime_kv(
     quota: Arc<dyn KvQuotaResolver<StateOwner>>,
 ) -> StorageResult<Arc<dyn KvStore>> {
     open_runtime_principal_store(home, quota)
+        .await
+        .map(|store| store.kv())
+}
+
+/// Open the native kernel KV projection with an externally shared principal
+/// directory.
+///
+/// # Errors
+///
+/// Returns a storage error if policy, metadata, migration, verification, or
+/// durable recovery fails.
+pub async fn open_runtime_kv_with_directory(
+    home: &AstridHome,
+    quota: Arc<dyn KvQuotaResolver<StateOwner>>,
+    principals: PrincipalDirectory,
+) -> StorageResult<Arc<dyn KvStore>> {
+    open_runtime_principal_store_with_directory(home, quota, principals)
         .await
         .map(|store| store.kv())
 }

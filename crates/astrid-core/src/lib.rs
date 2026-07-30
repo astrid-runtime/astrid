@@ -71,7 +71,10 @@ pub use types::{
 pub use utils::truncate_to_boundary;
 
 // Identity types
-pub use identity::{AstridUserId, FrontendLink, normalize_platform};
+pub use identity::{
+    AstridUserId, FrontendLink, PrincipalGenesis, PrincipalIdentity, PrincipalIdentityError,
+    PrincipalUid, normalize_platform,
+};
 
 // Uplink types
 pub use uplink::{

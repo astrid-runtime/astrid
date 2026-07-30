@@ -77,8 +77,10 @@ pub use kv::SurrealKvStore;
 #[cfg(not(target_family = "wasm"))]
 pub use principal_state::{
     Blake3ObjectIdentityV1, NativeContentStagingArea, NativePrincipalContentStore,
-    ReadyStagedContent, RuntimePrincipalStore, StagedContentId, StagedContentWriter, StateOwner,
-    StateOwnerCodecV1, StateOwnerResolver, open_runtime_kv, open_runtime_principal_store,
+    PrincipalDirectory, ReadyStagedContent, RuntimePrincipalStore, StagedContentId,
+    StagedContentWriter, StateOwner, StateOwnerCodecV1, StateOwnerResolver, open_runtime_kv,
+    open_runtime_kv_with_directory, open_runtime_principal_store,
+    open_runtime_principal_store_with_directory,
 };
 
 #[cfg(feature = "db")]

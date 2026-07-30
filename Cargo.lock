@@ -865,6 +865,7 @@ dependencies = [
  "blake3",
  "chrono",
  "getrandom 0.4.3",
+ "hex",
  "keyring",
  "parking_lot",
  "serde",

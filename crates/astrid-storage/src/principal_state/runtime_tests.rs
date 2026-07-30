@@ -3,6 +3,8 @@ use std::io::{Seek as _, SeekFrom, Write as _};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "legacy-surrealkv")]
+use astrid_core::profile::{DeviceKey, DeviceScope, PrincipalProfile};
 use astrid_storage_engine::RootTransaction;
 use astrid_storage_model::{
     ObjectClass, ObjectFormatVersion, ObjectKind, ObjectReference, ReferenceLabel, RootState,
@@ -19,6 +21,46 @@ fn unlimited_quota() -> Arc<dyn KvQuotaResolver<StateOwner>> {
             StateOwner::Principal(_) => Some(u64::MAX),
         })
     })
+}
+
+fn test_uid(alias: &str) -> PrincipalUid {
+    let mut hasher = blake3::Hasher::new_derive_key("astrid principal uid test fixture v1");
+    hasher.update(alias.as_bytes());
+    PrincipalUid::from_bytes(*hasher.finalize().as_bytes())
+}
+
+fn test_owner(alias: &str) -> StateOwner {
+    StateOwner::Principal(test_uid(alias))
+}
+
+fn test_directory(aliases: &[&str]) -> PrincipalDirectory {
+    let directory = PrincipalDirectory::default();
+    for alias in aliases {
+        directory
+            .register(PrincipalId::new(*alias).unwrap(), test_uid(alias))
+            .unwrap();
+    }
+    directory
+}
+
+async fn create_test_principal(store: &RuntimePrincipalStore, alias: &str) -> PrincipalUid {
+    let identities = KvIdentityStore::with_principal_directory(
+        ScopedKvStore::new(store.kv(), "system:identity").unwrap(),
+        store.principal_directory(),
+    );
+    let user = identities
+        .create_principal(
+            PrincipalId::new(alias).unwrap(),
+            *blake3::hash(alias.as_bytes()).as_bytes(),
+        )
+        .await
+        .unwrap();
+    identities
+        .get_principal_identity(user.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .uid
 }
 
 fn chunker_golden_source(length: usize) -> Vec<u8> {
@@ -124,10 +166,7 @@ fn assert_reader_requires_catalog_specification(home: &AstridHome, script: &Path
 #[test]
 fn owner_codec_round_trips_only_canonical_values() {
     let codec = StateOwnerCodecV1;
-    let owners = [
-        StateOwner::System,
-        StateOwner::Principal(PrincipalId::new("alice").unwrap()),
-    ];
+    let owners = [StateOwner::System, test_owner("alice")];
     for owner in owners {
         let encoded = codec.encode(&owner);
         assert_eq!(codec.decode(&encoded), Some(owner));
@@ -171,13 +210,14 @@ fn format_specification_has_a_tagged_metadata_identity() {
     assert!(record.references().is_empty());
     assert_eq!(
         object_id_hex(id),
-        "55c88679f00f3f8249eaf847fe4fba889f3f9f09e01048f5eb00e2d0d80c8e93"
+        "9bf81709c78311fea1011137f8dab3b6cd8ffe6c8ea6040cfec7192efb89aba0"
     );
     assert_eq!(
         object_id_hex(catalog_id),
         "8f3999b066b666396259c4a92f9de7c5b8e67df9d38a69fb4fb824968b56ecdb"
     );
     assert!(metadata.contains("identity-wire=tagged-identity-v1\n"));
+    assert!(metadata.contains("principal-codec=principal-uid-v1\n"));
     assert!(metadata.contains(&format!(
         "format-spec-object=1:1:32:{}\n",
         object_id_hex(id)
@@ -515,10 +555,14 @@ async fn measure_catalog_publications(unique_content: bool) -> CatalogWorkloadMe
 
     let directory = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(directory.path());
-    let owner = StateOwner::Principal(PrincipalId::new("catalog-probe").unwrap());
-    let store = open_runtime_principal_store(&home, unlimited_quota())
-        .await
-        .unwrap();
+    let owner = test_owner("catalog-probe");
+    let store = open_runtime_principal_store_with_directory(
+        &home,
+        unlimited_quota(),
+        test_directory(&["catalog-probe"]),
+    )
+    .await
+    .unwrap();
     let arena_before = durable_file_len(&home, "objects.arena");
     let roots_before = durable_file_len(&home, "roots.journal");
     let started = Instant::now();
@@ -593,8 +637,8 @@ async fn catalog_durable_performance_probe() {
 async fn flat_content_catalog_migration_resumes_and_is_idempotent() {
     let directory = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(directory.path());
-    let alice = StateOwner::Principal(PrincipalId::new("alice").unwrap());
-    let bob = StateOwner::Principal(PrincipalId::new("bob").unwrap());
+    let alice = test_owner("alice");
+    let bob = test_owner("bob");
     let alice_name = ContentName::new("workspace/alice-legacy.bin").unwrap();
     let bob_name = ContentName::new("workspace/bob-legacy.bin").unwrap();
     let alice_bytes = b"alice content survives the catalog migration";
@@ -703,7 +747,7 @@ async fn native_stage_acknowledges_before_ingest_and_publishes_on_a_blocking_wor
     let store = open_runtime_principal_store(&home, unlimited_quota())
         .await
         .unwrap();
-    let owner = StateOwner::Principal(PrincipalId::new("alice").unwrap());
+    let owner = test_owner("alice");
     let name = ContentName::new("workspace/target/release/game").unwrap();
     let mut writer = store
         .staging()
@@ -744,7 +788,7 @@ async fn staged_publication_retries_after_root_commit_before_cleanup() {
     let store = open_runtime_principal_store(&home, unlimited_quota())
         .await
         .unwrap();
-    let owner = StateOwner::Principal(PrincipalId::new("alice").unwrap());
+    let owner = test_owner("alice");
     let name = ContentName::new("workspace/retry.bin").unwrap();
     let mut writer = store
         .staging()
@@ -774,7 +818,7 @@ async fn staged_publication_enforces_close_order_for_the_same_name() {
     let store = open_runtime_principal_store(&home, unlimited_quota())
         .await
         .unwrap();
-    let owner = StateOwner::Principal(PrincipalId::new("alice").unwrap());
+    let owner = test_owner("alice");
     let name = ContentName::new("workspace/order.txt").unwrap();
     let mut first = store
         .staging()
@@ -807,12 +851,14 @@ async fn independent_reader_accepts_a_rust_produced_store() {
     let store = open_runtime_principal_store(&home, unlimited_quota())
         .await
         .unwrap();
+    let alice_uid = create_test_principal(&store, "alice").await;
+    let alice = alice_uid.to_string();
     store
         .kv()
         .set("alice:capsule:shell", "cwd", b"/workspace".to_vec())
         .await
         .unwrap();
-    let owner = StateOwner::Principal(PrincipalId::new("alice").unwrap());
+    let owner = StateOwner::Principal(alice_uid);
     let name = ContentName::new("workspace/fastcdc-golden.bin").unwrap();
     store
         .content()
@@ -832,9 +878,9 @@ async fn independent_reader_accepts_a_rust_produced_store() {
         String::from_utf8_lossy(&output.stderr)
     );
     let decoded: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(decoded["roots"]["alice"]["generation"], 1);
+    assert_eq!(decoded["roots"][alice.as_str()]["generation"], 1);
     assert!(
-        decoded["roots"]["alice"]["commit"]
+        decoded["roots"][alice.as_str()]["commit"]
             .as_str()
             .unwrap()
             .starts_with("1:1:32:")
@@ -971,14 +1017,14 @@ async fn current_metadata_does_not_self_heal_a_missing_catalog_specification() {
 
 #[test]
 fn namespace_owner_fails_closed_at_the_host_stamped_boundary() {
-    let resolver = StateOwnerResolver;
+    let resolver = StateOwnerResolver::new(test_directory(&["alice"]));
     assert_eq!(
         resolver.resolve("system:identity").unwrap(),
         StateOwner::System
     );
     assert_eq!(
         resolver.resolve("alice:capsule:shell").unwrap(),
-        StateOwner::Principal(PrincipalId::new("alice").unwrap())
+        test_owner("alice")
     );
     assert!(matches!(
         resolver.resolve("alice:capsule:"),
@@ -992,7 +1038,29 @@ fn namespace_owner_fails_closed_at_the_host_stamped_boundary() {
 async fn first_boot_migrates_verifies_and_preserves_legacy_state() {
     let directory = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(directory.path());
-    let legacy = SurrealKvStore::open(home.state_db_path()).unwrap();
+    let legacy = Arc::new(SurrealKvStore::open(home.state_db_path()).unwrap());
+    let legacy_kv: Arc<dyn KvStore> = legacy.clone();
+    let identities = KvIdentityStore::new(
+        ScopedKvStore::new(Arc::clone(&legacy_kv), "system:identity").unwrap(),
+    );
+    for (alias, key) in [("alice", [0x11; 32]), ("bob", [0x22; 32])] {
+        let principal = PrincipalId::new(alias).unwrap();
+        let user = identities.create_user(Some(alias)).await.unwrap();
+        identities
+            .link("astrid-agent", alias, user.id, "system")
+            .await
+            .unwrap();
+        let mut profile = PrincipalProfile::default();
+        profile.auth.public_keys.push(DeviceKey::new(
+            hex::encode(key),
+            DeviceScope::Full,
+            None,
+            1_700_000_000,
+        ));
+        profile
+            .save_to_path(&home.profile_path(&principal))
+            .unwrap();
+    }
     legacy
         .set("system:identity", "root", b"default".to_vec())
         .await
@@ -1005,6 +1073,8 @@ async fn first_boot_migrates_verifies_and_preserves_legacy_state() {
         .set("bob:capsule:build", "toolchain", b"rust".to_vec())
         .await
         .unwrap();
+    drop(identities);
+    drop(legacy_kv);
     legacy.close().await.unwrap();
 
     let store = open_runtime_kv(&home, unlimited_quota()).await.unwrap();
@@ -1063,7 +1133,9 @@ async fn live_quota_blocks_growth_but_allows_recovery_and_system_state() {
             StateOwner::Principal(_) => Some(27),
         })
     });
-    let store = open_runtime_kv(&home, quota).await.unwrap();
+    let store = open_runtime_principal_store(&home, quota).await.unwrap();
+    create_test_principal(&store, "alice").await;
+    let store = store.kv();
 
     store
         .set("alice:capsule:shell", "one", b"1234".to_vec())
@@ -1148,7 +1220,11 @@ async fn durable_point_update_has_height_bounded_write_amplification() {
         )
         .unwrap(),
     );
-    let store = RuntimeStore::from_engine(Arc::clone(&engine), StateOwnerResolver);
+    let principals = test_directory(&["alice"]);
+    let store = RuntimeStore::from_engine(
+        Arc::clone(&engine),
+        StateOwnerResolver::new(principals.clone()),
+    );
     for value in 0..256_u32 {
         store
             .set(
@@ -1182,7 +1258,7 @@ async fn durable_point_update_has_height_bounded_write_amplification() {
         )
         .unwrap(),
     );
-    let store = RuntimeStore::from_engine(reopened, StateOwnerResolver);
+    let store = RuntimeStore::from_engine(reopened, StateOwnerResolver::new(principals));
     assert_eq!(
         store.get("alice:capsule:build", "0128").await.unwrap(),
         Some(b"replacement".to_vec())

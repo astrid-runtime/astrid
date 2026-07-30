@@ -195,6 +195,9 @@ pub enum DurableError {
     EncodingOverflow,
     /// A `store.meta` bootstrap object attempted to own principal state.
     BootstrapObjectOwnsState,
+    /// A destination-only snapshot restore violated its empty-store or
+    /// canonical-closure contract.
+    InvalidRestore(&'static str),
     /// Compaction evidence, retention, or its native fact snapshot was invalid.
     InvalidCompactionEvidence(&'static str),
     /// The native liveness snapshot changed between proof and physical rewrite.
@@ -254,6 +257,7 @@ impl fmt::Display for DurableError {
             Self::BootstrapObjectOwnsState => {
                 formatter.write_str("standalone bootstrap object must not own other objects")
             },
+            Self::InvalidRestore(detail) => write!(formatter, "invalid snapshot restore: {detail}"),
             Self::InvalidCompactionEvidence(detail) => {
                 write!(formatter, "invalid compaction evidence: {detail}")
             },
@@ -947,6 +951,7 @@ mod faults;
 mod format;
 mod index;
 mod lifecycle;
+mod restore;
 mod roots;
 mod validation;
 
