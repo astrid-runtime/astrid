@@ -417,9 +417,12 @@ async fn derive_bindings(
             .list_links(user.id)
             .await
             .map_err(|error| identity_error(&error))?;
-        let linked_aliases = links
+        let mut linked_aliases = links
             .iter()
-            .filter(|link| link.platform == "astrid-agent")
+            .filter(|link| {
+                link.platform == "astrid-agent"
+                    || (link.platform == "cli" && link.platform_user_id != "local")
+            })
             .map(|link| PrincipalId::new(link.platform_user_id.clone()))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| {
@@ -428,6 +431,8 @@ async fn derive_bindings(
                     user.id
                 ))
             })?;
+        linked_aliases.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+        linked_aliases.dedup();
         if linked_aliases.len() > 1 {
             return Err(StorageError::Connection(format!(
                 "identity user {} names multiple Astrid principals",
@@ -618,7 +623,7 @@ mod tests {
     async fn alias_roots_migrate_without_changing_generation_or_commit() {
         let directory = tempfile::tempdir().unwrap();
         let home = AstridHome::from_path(directory.path());
-        let alias = PrincipalId::new("alice").unwrap();
+        let alias = PrincipalId::new("Alice").unwrap();
         let initial_public_key = [0x42; 32];
         let mut profile = PrincipalProfile::default();
         profile.auth.public_keys.push(DeviceKey::new(
@@ -646,13 +651,16 @@ mod tests {
         let identities = KvIdentityStore::new(
             ScopedKvStore::new(Arc::clone(&legacy_kv), "system:identity").unwrap(),
         );
-        let user = identities.create_user(Some("alice")).await.unwrap();
+        // Legacy agent provisioning stored `cli/<principal>` while the user
+        // record normalized its display name into a different alias.
+        let user = identities.create_user(Some("Alice")).await.unwrap();
+        assert_eq!(user.principal, PrincipalId::new("alice").unwrap());
         identities
-            .link("astrid-agent", alias.as_str(), user.id, "system")
+            .link("cli", alias.as_str(), user.id, "system")
             .await
             .unwrap();
         let principal_kv =
-            ScopedKvStore::new(Arc::clone(&legacy_kv), "alice:capsule:demo").unwrap();
+            ScopedKvStore::new(Arc::clone(&legacy_kv), "Alice:capsule:demo").unwrap();
         principal_kv.set("answer", b"42".to_vec()).await.unwrap();
         let old_root = legacy
             .root(&AliasStateOwner::Principal(alias.clone()))
@@ -682,7 +690,7 @@ mod tests {
             migrated.engine.root(&StateOwner::Principal(uid)).unwrap(),
             Some(old_root)
         );
-        let migrated_kv = ScopedKvStore::new(migrated.kv(), "alice:capsule:demo").unwrap();
+        let migrated_kv = ScopedKvStore::new(migrated.kv(), "Alice:capsule:demo").unwrap();
         assert_eq!(
             migrated_kv.get("answer").await.unwrap(),
             Some(b"42".to_vec())

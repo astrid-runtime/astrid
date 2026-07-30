@@ -34,6 +34,20 @@ use persistence::PersistedUser;
 // source-file cap.
 include!("identity/contract.rs");
 
+#[derive(Debug)]
+enum DirectoryMutation {
+    Unchanged,
+    Registered {
+        alias: PrincipalId,
+        uid: PrincipalUid,
+    },
+    Renamed {
+        uid: PrincipalUid,
+        previous: PrincipalId,
+        current: PrincipalId,
+    },
+}
+
 // ---------------------------------------------------------------------------
 // KV-backed implementation
 // ---------------------------------------------------------------------------
@@ -95,17 +109,71 @@ impl KvIdentityStore {
         format!("name/{name}")
     }
 
-    fn register_principal(
+    fn bind_directory(
         &self,
-        principal: PrincipalId,
+        previous_alias: Option<&PrincipalId>,
+        principal: &PrincipalId,
         uid: PrincipalUid,
-    ) -> Result<(), IdentityError> {
-        if let Some(directory) = &self.principals {
-            directory.register(principal, uid).map_err(|error| {
-                IdentityError::InvalidInput(format!("principal identity collision: {error}"))
-            })?;
+    ) -> Result<DirectoryMutation, IdentityError> {
+        let Some(directory) = &self.principals else {
+            return Ok(DirectoryMutation::Unchanged);
+        };
+        match directory.alias_for(uid) {
+            Ok(existing) if existing == *principal => Ok(DirectoryMutation::Unchanged),
+            Ok(existing) if previous_alias == Some(&existing) => {
+                directory
+                    .rename(uid, &existing, principal.clone())
+                    .map_err(|error| IdentityError::InvalidInput(error.to_string()))?;
+                Ok(DirectoryMutation::Renamed {
+                    uid,
+                    previous: existing,
+                    current: principal.clone(),
+                })
+            },
+            Ok(existing) => Err(IdentityError::InvalidInput(format!(
+                "principal uid {uid} is already bound to alias {existing}"
+            ))),
+            Err(_) => {
+                if let Some(previous) = previous_alias
+                    && let Ok(existing) = directory.uid_for(previous)
+                {
+                    return Err(IdentityError::InvalidInput(format!(
+                        "principal alias {previous} is bound to a different uid {existing}"
+                    )));
+                }
+                directory
+                    .register(principal.clone(), uid)
+                    .map_err(|error| {
+                        IdentityError::InvalidInput(format!(
+                            "principal identity collision: {error}"
+                        ))
+                    })?;
+                Ok(DirectoryMutation::Registered {
+                    alias: principal.clone(),
+                    uid,
+                })
+            },
         }
-        Ok(())
+    }
+
+    fn rollback_directory(&self, mutation: DirectoryMutation) -> Result<(), IdentityError> {
+        let Some(directory) = &self.principals else {
+            return Ok(());
+        };
+        match mutation {
+            DirectoryMutation::Unchanged => Ok(()),
+            DirectoryMutation::Registered { alias, uid } => {
+                directory.unregister(&alias, uid);
+                Ok(())
+            },
+            DirectoryMutation::Renamed {
+                uid,
+                previous,
+                current,
+            } => directory
+                .rename(uid, &current, previous)
+                .map_err(|error| IdentityError::Storage(format!("directory rollback: {error}"))),
+        }
     }
 
     /// Read the immutable principal identity bound to one user record.
@@ -218,21 +286,17 @@ impl IdentityStore for KvIdentityStore {
             initial_public_key,
         ))
         .map_err(|error| IdentityError::InvalidInput(error.to_string()))?;
-        self.register_principal(principal.clone(), identity.uid)?;
+        let directory_mutation = self.bind_directory(None, &principal, identity.uid)?;
         if let Err(error) = self
             .persist_user_record(&user, Some(identity.clone()))
             .await
         {
-            if let Some(directory) = &self.principals {
-                directory.unregister(&principal, identity.uid);
-            }
+            self.rollback_directory(directory_mutation)?;
             return Err(error);
         }
         if let Err(error) = self.index_display_name(&user).await {
             let _ = self.kv.delete(&Self::user_key(user.id)).await;
-            if let Some(directory) = &self.principals {
-                directory.unregister(&user.principal, identity.uid);
-            }
+            self.rollback_directory(directory_mutation)?;
             return Err(error);
         }
         Ok(user)
@@ -264,32 +328,13 @@ impl IdentityStore for KvIdentityStore {
             ))
             .map_err(|error| IdentityError::InvalidInput(error.to_string()))?,
         };
-        if let Some(directory) = &self.principals {
-            match directory.uid_for(&previous_alias) {
-                Ok(existing) if existing == identity.uid && previous_alias != principal => {
-                    directory
-                        .rename(identity.uid, &previous_alias, principal.clone())
-                        .map_err(|error| IdentityError::InvalidInput(error.to_string()))?;
-                },
-                Ok(existing) if existing != identity.uid => {
-                    return Err(IdentityError::InvalidInput(format!(
-                        "principal alias {previous_alias} is bound to a different uid"
-                    )));
-                },
-                _ => self.register_principal(principal.clone(), identity.uid)?,
-            }
-        }
+        let directory_mutation =
+            self.bind_directory(Some(&previous_alias), &principal, identity.uid)?;
         if let Err(error) = self
             .persist_user_record(&user.user, Some(identity.clone()))
             .await
         {
-            if let Some(directory) = &self.principals {
-                if previous_alias == principal {
-                    directory.unregister(&principal, identity.uid);
-                } else {
-                    let _ = directory.rename(identity.uid, &principal, previous_alias);
-                }
-            }
+            self.rollback_directory(directory_mutation)?;
             return Err(error);
         }
         Ok(identity)
@@ -528,6 +573,11 @@ impl IdentityStore for KvIdentityStore {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+mod failure_tests;
+#[cfg(test)]
+mod principal_tests;
+
+#[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
@@ -538,119 +588,6 @@ mod tests {
         let kv_backend = Arc::new(MemoryKvStore::new());
         let scoped = ScopedKvStore::new(kv_backend, "system:identity").unwrap();
         KvIdentityStore::new(scoped)
-    }
-
-    fn make_principal_store() -> (KvIdentityStore, PrincipalDirectory) {
-        let kv_backend = Arc::new(MemoryKvStore::new());
-        let scoped = ScopedKvStore::new(kv_backend, "system:identity").unwrap();
-        let principals = PrincipalDirectory::default();
-        (
-            KvIdentityStore::with_principal_directory(scoped, principals.clone()),
-            principals,
-        )
-    }
-
-    #[tokio::test]
-    async fn principal_identity_survives_alias_and_auth_key_changes() {
-        let (store, principals) = make_principal_store();
-        let original = PrincipalId::new("alice").unwrap();
-        let renamed = PrincipalId::new("alice-renamed").unwrap();
-        let user = store
-            .create_principal(original.clone(), [0x11; 32])
-            .await
-            .unwrap();
-        let identity = store
-            .get_principal_identity(user.id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(principals.uid_for(&original).unwrap(), identity.uid);
-
-        let rebound = store
-            .bind_principal_identity(user.id, renamed.clone(), [0x22; 32])
-            .await
-            .unwrap();
-        assert_eq!(rebound, identity);
-        assert!(principals.uid_for(&original).is_err());
-        assert_eq!(principals.uid_for(&renamed).unwrap(), identity.uid);
-        assert_eq!(principals.alias_for(identity.uid).unwrap(), renamed);
-        assert_eq!(
-            store.get_principal_identity(user.id).await.unwrap(),
-            Some(identity)
-        );
-    }
-
-    #[tokio::test]
-    async fn deleting_principal_removes_only_its_live_alias_binding() {
-        let (store, principals) = make_principal_store();
-        let alice_alias = PrincipalId::new("alice").unwrap();
-        let bob_alias = PrincipalId::new("bob").unwrap();
-        let alice = store
-            .create_principal(alice_alias.clone(), [0x11; 32])
-            .await
-            .unwrap();
-        let bob = store
-            .create_principal(bob_alias.clone(), [0x22; 32])
-            .await
-            .unwrap();
-        let bob_uid = store
-            .get_principal_identity(bob.id)
-            .await
-            .unwrap()
-            .unwrap()
-            .uid;
-
-        assert!(store.delete_user(alice.id).await.unwrap());
-        assert!(principals.uid_for(&alice_alias).is_err());
-        assert_eq!(principals.uid_for(&bob_alias).unwrap(), bob_uid);
-    }
-
-    #[tokio::test]
-    async fn loading_directory_rejects_alias_or_uid_collisions_atomically() {
-        let kv_backend = Arc::new(MemoryKvStore::new());
-        let scoped = ScopedKvStore::new(kv_backend, "system:identity").unwrap();
-        let principals = PrincipalDirectory::default();
-        let store = KvIdentityStore::with_principal_directory(scoped, principals.clone());
-        let retained_alias = PrincipalId::new("retained").unwrap();
-        let retained_uid = PrincipalUid::from_bytes([0x77; 32]);
-        principals
-            .register(retained_alias.clone(), retained_uid)
-            .unwrap();
-
-        let first = AstridUserId::new().with_principal(PrincipalId::new("same").unwrap());
-        let mut second = AstridUserId::new().with_principal(PrincipalId::new("other").unwrap());
-        second.principal = PrincipalId::new("same").unwrap();
-        let first_identity = PrincipalIdentity::from_genesis(PrincipalGenesis::from_parts(
-            first.id,
-            first.created_at,
-            [1; 32],
-        ))
-        .unwrap();
-        let second_identity = PrincipalIdentity::from_genesis(PrincipalGenesis::from_parts(
-            second.id,
-            second.created_at,
-            [2; 32],
-        ))
-        .unwrap();
-        store
-            .persist_user_record(&first, Some(first_identity))
-            .await
-            .unwrap();
-        store
-            .persist_user_record(&second, Some(second_identity))
-            .await
-            .unwrap();
-
-        assert!(matches!(
-            store.load_principal_directory().await,
-            Err(IdentityError::InvalidInput(_))
-        ));
-        assert_eq!(principals.uid_for(&retained_alias).unwrap(), retained_uid);
-        assert!(
-            principals
-                .uid_for(&PrincipalId::new("same").unwrap())
-                .is_err()
-        );
     }
 
     #[tokio::test]
