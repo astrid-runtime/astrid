@@ -71,3 +71,35 @@ async fn assert_prior_format_is_selected(prior: ObjectId, catalog_aware: bool) {
         }
     );
 }
+
+#[tokio::test]
+async fn current_format_identity_without_catalog_metadata_fails_closed() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    let store = open_runtime_kv(&home, unlimited_quota()).await.unwrap();
+    store.close().await.unwrap();
+    drop(store);
+
+    let store_path = home.principal_store_path();
+    let current_spec = format_spec_record().unwrap();
+    let current_spec_id = Blake3ObjectIdentityV1.identify(&current_spec);
+    let catalog_spec_id = Blake3ObjectIdentityV1
+        .identify(&bootstrap::content_catalog_format_specification().unwrap());
+    std::fs::write(
+        store_path.join(STORE_METADATA_FILE),
+        legacy_store_metadata(current_spec_id),
+    )
+    .unwrap();
+
+    let error = prepare_destination(
+        &store_path,
+        &store_metadata(current_spec_id, catalog_spec_id),
+        current_spec_id,
+        catalog_spec_id,
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("selects an unsupported format"),
+        "{error}"
+    );
+}

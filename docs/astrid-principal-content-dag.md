@@ -49,8 +49,9 @@ Version one records:
 
 Content at or below 256 KiB is stored as one whole chunk; FastCDC engages only
 above that threshold. The decoder enforces the same canonical choice, the
-maximum on every chunk, and the minimum on every non-final chunk. A final chunk
-may be shorter than the minimum.
+maximum on every chunk, and `2 * floor(minimum / 2)` on every non-final chunk
+because FastCDC's two-byte loop rounds odd minima down. A final chunk may be
+shorter than that effective minimum.
 
 The dependency is exact-pinned because boundaries influence the immutable file
 root. The complete profile is encoded in each `File`. RÚNATAL specifies the

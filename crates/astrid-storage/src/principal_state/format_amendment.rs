@@ -148,23 +148,34 @@ pub(super) fn prepare_destination(
         })?;
         if actual != expected_metadata {
             if existing_complete
-                && let Some(prior) = std::iter::once(current_format_spec)
-                    .chain(PRIOR_V1_FORMAT_SPEC_IDS.iter().copied())
-                    .find_map(|candidate| {
-                        if actual == legacy_store_metadata(candidate) {
-                            Some(DestinationFormat::PriorV1 {
-                                format_spec: candidate,
-                                catalog_spec_was_declared: false,
-                            })
-                        } else if actual == store_metadata(candidate, current_catalog_spec) {
-                            Some(DestinationFormat::PriorV1 {
-                                format_spec: candidate,
-                                catalog_spec_was_declared: true,
-                            })
-                        } else {
-                            None
-                        }
-                    })
+                && migrations::requires_catalog_tree_migration(path)
+                && actual == legacy_store_metadata(current_format_spec)
+            {
+                return validate_authoritative_files(path).map(|()| DestinationFormat::PriorV1 {
+                    format_spec: current_format_spec,
+                    catalog_spec_was_declared: false,
+                });
+            }
+            if existing_complete
+                && let Some(prior) =
+                    PRIOR_V1_FORMAT_SPEC_IDS
+                        .iter()
+                        .copied()
+                        .find_map(|candidate| {
+                            if actual == legacy_store_metadata(candidate) {
+                                Some(DestinationFormat::PriorV1 {
+                                    format_spec: candidate,
+                                    catalog_spec_was_declared: false,
+                                })
+                            } else if actual == store_metadata(candidate, current_catalog_spec) {
+                                Some(DestinationFormat::PriorV1 {
+                                    format_spec: candidate,
+                                    catalog_spec_was_declared: true,
+                                })
+                            } else {
+                                None
+                            }
+                        })
             {
                 return validate_authoritative_files(path).map(|()| prior);
             }
