@@ -121,7 +121,6 @@ impl DestinationFormat {
 pub(super) fn prepare_destination(
     path: &Path,
     expected_metadata: &[u8],
-    current_format_spec: ObjectId,
     current_catalog_spec: ObjectId,
 ) -> StorageResult<DestinationFormat> {
     let mut existing_complete = false;
@@ -147,15 +146,6 @@ pub(super) fn prepare_destination(
             ))
         })?;
         if actual != expected_metadata {
-            if existing_complete
-                && migrations::requires_catalog_tree_migration(path)
-                && actual == legacy_store_metadata(current_format_spec)
-            {
-                return validate_authoritative_files(path).map(|()| DestinationFormat::PriorV1 {
-                    format_spec: current_format_spec,
-                    catalog_spec_was_declared: false,
-                });
-            }
             if existing_complete
                 && let Some(prior) =
                     PRIOR_V1_FORMAT_SPEC_IDS

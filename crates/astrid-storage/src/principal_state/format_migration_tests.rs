@@ -58,13 +58,7 @@ async fn assert_prior_format_is_selected(prior: ObjectId, catalog_aware: bool) {
     let current_spec_id = Blake3ObjectIdentityV1.identify(&current_spec);
     let current_metadata = store_metadata(current_spec_id, catalog_spec_id);
     assert_eq!(
-        prepare_destination(
-            &store_path,
-            &current_metadata,
-            current_spec_id,
-            catalog_spec_id,
-        )
-        .unwrap(),
+        prepare_destination(&store_path, &current_metadata, catalog_spec_id,).unwrap(),
         DestinationFormat::PriorV1 {
             format_spec: prior,
             catalog_spec_was_declared: catalog_aware,
@@ -94,7 +88,6 @@ async fn current_format_identity_without_catalog_metadata_fails_closed() {
     let error = prepare_destination(
         &store_path,
         &store_metadata(current_spec_id, catalog_spec_id),
-        current_spec_id,
         catalog_spec_id,
     )
     .unwrap_err();

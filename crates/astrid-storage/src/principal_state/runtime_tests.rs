@@ -298,7 +298,6 @@ async fn completed_pre_derivation_v1_store_is_selected_for_runatal_amendment() {
         prepare_destination(
             &store_path,
             &current_metadata,
-            current_spec_id,
             Blake3ObjectIdentityV1.identify(&catalog_spec),
         )
         .unwrap(),
@@ -410,13 +409,6 @@ fn mark_store_as_legacy(home: &AstridHome) {
         home.principal_store_path()
             .join(migrations::MIGRATION_MARKER_FILE),
         migrations::LEGACY_TO_V1_MARKER,
-    )
-    .unwrap();
-    let format_spec_id =
-        Blake3ObjectIdentityV1.identify(&bootstrap::format_specification().unwrap());
-    std::fs::write(
-        home.principal_store_path().join(STORE_METADATA_FILE),
-        legacy_store_metadata(format_spec_id),
     )
     .unwrap();
 }

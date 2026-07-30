@@ -74,10 +74,6 @@ pub(super) fn is_complete(store_path: &Path) -> bool {
     migration_state(store_path) != MigrationState::Uninitialized
 }
 
-pub(super) fn requires_catalog_tree_migration(store_path: &Path) -> bool {
-    migration_state(store_path) == MigrationState::PrincipalStore
-}
-
 pub(super) async fn apply_required(
     home: &AstridHome,
     store_path: &Path,
