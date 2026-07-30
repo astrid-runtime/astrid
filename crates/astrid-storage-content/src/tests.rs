@@ -341,7 +341,9 @@ fn odd_minimum_profile_keeps_its_pre_freeze_boundaries() {
     .collect();
     assert_eq!(
         boundaries,
-        vec![75, 301, 295, 297, 568, 412, 123, 169, 324, 294, 76, 358, 283, 483, 38]
+        vec![
+            75, 301, 295, 297, 568, 412, 123, 169, 324, 294, 76, 358, 283, 483, 38
+        ]
     );
 
     let built = build_content(&TestIdentity, profile, &bytes).unwrap();
