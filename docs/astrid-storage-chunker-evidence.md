@@ -71,8 +71,10 @@ Paths, file names, revision IDs, and file-level identities are not serialized.
 Top-level `keys`, `secrets`, `run`, and `.Trash` directories are excluded from
 directory snapshots. Symlinks are never followed. The harness captures a
 length-and-BLAKE3 baseline for every file before measuring any candidate and
-aborts if any later pass observes different bytes, including a same-length
-replacement.
+immediately re-hashes each timed file outside the timed interval. It aborts if
+any later pass observes different bytes, including a same-length replacement.
+The checked-in live-corpus report was generated from temporary point-in-time
+APFS copies rather than actively changing source directories.
 
 ## Storage results
 

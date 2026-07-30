@@ -147,9 +147,9 @@ impl Corpus {
     }
 
     pub fn measure(&self, candidate: Candidate) -> Result<CandidateResult> {
-        // The authoritative measurement immediately following these timing
-        // passes re-hashes every file against the baseline snapshot. Timing
-        // never substitutes for corpus-integrity validation.
+        // Every timed file read is immediately re-hashed outside its timed
+        // interval. The authoritative measurement that follows independently
+        // validates the same baseline again.
         let (chunk_only, chunk_and_blake3) = self.measure_throughput_samples(&candidate)?;
         let started = Instant::now();
         let mut accumulator = Accumulator::default();
@@ -248,9 +248,10 @@ impl Corpus {
     }
 
     fn measure_throughput(&self, candidate: &Candidate, hash_records: bool) -> Result<Duration> {
-        let started = Instant::now();
+        let mut elapsed = Duration::ZERO;
         let mut guard = [0_u8; 32];
         for input in &self.inputs {
+            let started = Instant::now();
             let observed_bytes = match input {
                 Input::File { path, .. } => {
                     let file = File::open(path).with_context(|| {
@@ -272,15 +273,19 @@ impl Corpus {
                     &mut guard,
                 )?,
             };
+            elapsed = elapsed
+                .checked_add(started.elapsed())
+                .ok_or_else(|| anyhow::anyhow!("corpus throughput duration overflow"))?;
             if observed_bytes != input.logical_bytes() {
                 bail!(
                     "corpus input changed during throughput measurement: expected {} bytes, read {observed_bytes}",
                     input.logical_bytes()
                 );
             }
+            input.validate_current_file()?;
         }
         black_box(guard);
-        Ok(started.elapsed())
+        Ok(elapsed)
     }
 
     fn logical_bytes(&self) -> Result<u64> {
@@ -448,6 +453,13 @@ impl Input {
             Self::File { snapshot, .. } => snapshot.validate(observed),
             Self::Memory(bytes) => FileSnapshot::from_bytes(bytes)?.validate(observed),
         }
+    }
+
+    fn validate_current_file(&self) -> Result<()> {
+        if let Self::File { path, snapshot } = self {
+            snapshot.validate(snapshot_file(path)?)?;
+        }
+        Ok(())
     }
 }
 
@@ -678,5 +690,20 @@ mod tests {
         let changed = FileSnapshot::from_bytes(b"size").unwrap();
         assert_eq!(original.logical_bytes, changed.logical_bytes);
         assert!(original.validate(changed).is_err());
+    }
+
+    #[test]
+    fn timed_file_validation_detects_same_length_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("input.bin");
+        fs::write(&path, b"same").unwrap();
+        let input = Input::File {
+            path: path.clone(),
+            snapshot: snapshot_file(&path).unwrap(),
+        };
+
+        fs::write(path, b"size").unwrap();
+
+        assert!(input.validate_current_file().is_err());
     }
 }

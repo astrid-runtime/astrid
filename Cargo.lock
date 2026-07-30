@@ -889,6 +889,7 @@ dependencies = [
  "mothcdc",
  "serde",
  "serde_json",
+ "tempfile",
  "walkdir",
 ]
 
