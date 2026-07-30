@@ -92,6 +92,32 @@ fn assert_reader_requires_catalog_specification(home: &AstridHome, script: &Path
         !rejected.status.success(),
         "independent reader accepted metadata without its catalog specification"
     );
+
+    let leading_zero = current.replacen(
+        "content-catalog-spec-object=1:1:32:",
+        "content-catalog-spec-object=01:1:32:",
+        1,
+    );
+    let catalog_id = object_id_hex(
+        Blake3ObjectIdentityV1
+            .identify(&bootstrap::content_catalog_format_specification().unwrap()),
+    );
+    let uppercase_digest = current.replacen(&catalog_id, &catalog_id.to_ascii_uppercase(), 1);
+    for (description, malformed) in [
+        ("leading-zero algorithm tag", leading_zero),
+        ("uppercase digest", uppercase_digest),
+    ] {
+        std::fs::write(&metadata, malformed).unwrap();
+        let rejected = std::process::Command::new("python3")
+            .arg(script)
+            .arg(home.principal_store_path())
+            .output()
+            .unwrap();
+        assert!(
+            !rejected.status.success(),
+            "independent reader accepted a {description}"
+        );
+    }
     std::fs::write(metadata, current).unwrap();
 }
 

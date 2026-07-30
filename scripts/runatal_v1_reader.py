@@ -837,9 +837,19 @@ def parse_metadata_identity(value):
     fields = value.split(":")
     if len(fields) != 4:
         raise FormatError("invalid metadata identity")
-    tagged = (int(fields[0]), int(fields[1]), bytes.fromhex(fields[3]))
-    if int(fields[2]) != len(tagged[2]):
+    try:
+        algorithm = int(fields[0])
+        construction = int(fields[1])
+        declared_length = int(fields[2])
+        digest = bytes.fromhex(fields[3])
+    except ValueError as error:
+        raise FormatError("invalid metadata identity") from error
+    tagged = (algorithm, construction, digest)
+    if declared_length != len(digest):
         raise FormatError("metadata identity length mismatch")
+    canonical = f"{algorithm}:{construction}:{declared_length}:{digest.hex()}"
+    if value != canonical:
+        raise FormatError("non-canonical metadata identity")
     return tagged
 
 
