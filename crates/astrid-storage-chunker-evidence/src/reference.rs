@@ -4,7 +4,11 @@
 //! harness can catch divergence in the optimized third-party implementation
 //! without sharing its SIMD or buffering machinery.
 
-use crate::algorithm::{MINCDC_ADDEND, MINCDC_MULTIPLIER, MINCDC_WINDOW_BYTES};
+// These literals intentionally do not import the implementation constants:
+// agreement must fail if either side drifts.
+const REFERENCE_WINDOW_BYTES: u8 = 4;
+const REFERENCE_MULTIPLIER: u32 = 0x915f_77f5;
+const REFERENCE_ADDEND: u32 = 0x3463_6463;
 
 pub fn chunk_lengths(bytes: &[u8], minimum: usize, maximum: usize) -> Vec<usize> {
     assert!(minimum <= maximum);
@@ -23,7 +27,7 @@ pub fn chunk_lengths(bytes: &[u8], minimum: usize, maximum: usize) -> Vec<usize>
         }
 
         let search_start = offset
-            .checked_add(minimum.saturating_sub(usize::from(MINCDC_WINDOW_BYTES)))
+            .checked_add(minimum.saturating_sub(usize::from(REFERENCE_WINDOW_BYTES)))
             .expect("the input and configured bounds are addressable");
         let search_stop = offset
             .checked_add(maximum)
@@ -43,7 +47,7 @@ pub fn chunk_lengths(bytes: &[u8], minimum: usize, maximum: usize) -> Vec<usize>
 }
 
 fn leftmost_minimum(bytes: &[u8]) -> usize {
-    const WINDOW: usize = MINCDC_WINDOW_BYTES as usize;
+    const WINDOW: usize = REFERENCE_WINDOW_BYTES as usize;
     if bytes.len() < WINDOW {
         return bytes.len();
     }
@@ -74,8 +78,8 @@ fn score(window: &[u8]) -> u32 {
         .try_into()
         .expect("the scalar oracle only scores four-byte windows");
     u32::from_le_bytes(bytes)
-        .wrapping_mul(MINCDC_MULTIPLIER)
-        .wrapping_add(MINCDC_ADDEND)
+        .wrapping_mul(REFERENCE_MULTIPLIER)
+        .wrapping_add(REFERENCE_ADDEND)
 }
 
 #[cfg(test)]
@@ -147,8 +151,8 @@ mod tests {
         let maximum = usize::try_from(candidate.maximum_bytes).unwrap();
         let mut data = vec![0xff; maximum * 3];
         let zero_score_window = 0_u32
-            .wrapping_sub(MINCDC_ADDEND)
-            .wrapping_mul(inverse_odd_u32(MINCDC_MULTIPLIER))
+            .wrapping_sub(REFERENCE_ADDEND)
+            .wrapping_mul(inverse_odd_u32(REFERENCE_MULTIPLIER))
             .to_le_bytes();
         data[maximum - zero_score_window.len()..maximum].copy_from_slice(&zero_score_window);
 

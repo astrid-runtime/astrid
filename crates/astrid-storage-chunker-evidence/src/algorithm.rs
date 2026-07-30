@@ -290,7 +290,7 @@ fn checked_ratio(value: u32, numerator: u32, denominator: u32, label: &str) -> R
 mod tests {
     use std::io::Cursor;
 
-    use crate::fixture::pseudorandom_bytes;
+    use crate::fixture::{periodic_bytes, pseudorandom_bytes};
 
     use super::*;
 
@@ -326,15 +326,55 @@ mod tests {
     }
 
     #[test]
-    fn moth_and_min_cdc_share_underlying_boundaries() {
+    fn every_moth_profile_matches_min_cdc_on_adversarial_and_eof_inputs() {
         let candidates = candidates(8).unwrap();
-        let mincdc = candidate(&candidates, "mincdc-hash4-narrow-8k");
-        let mothcdc = candidate(&candidates, "moth-caterpillar-narrow-8k");
-        let data = pseudorandom_bytes(1_000_000, 0xc0de_cafe_5eed_f00d);
-        assert_eq!(
-            boundary_lengths(mincdc, &data),
-            boundary_lengths(mothcdc, &data)
-        );
+        let mut pairs = 0;
+        for mothcdc in candidates
+            .iter()
+            .filter(|candidate| candidate.algorithm == Algorithm::MothCaterpillar)
+        {
+            let mincdc = candidates
+                .iter()
+                .find(|candidate| {
+                    candidate.algorithm == Algorithm::MinCdcHash4
+                        && candidate.minimum_bytes == mothcdc.minimum_bytes
+                        && candidate.maximum_bytes == mothcdc.maximum_bytes
+                })
+                .expect("each Moth profile has a paired MinCDC profile");
+            let minimum = usize::try_from(mothcdc.minimum_bytes).unwrap();
+            let maximum = usize::try_from(mothcdc.maximum_bytes).unwrap();
+            let lengths = [
+                0,
+                1,
+                minimum - 1,
+                minimum,
+                minimum + 1,
+                maximum - 1,
+                maximum,
+                maximum + 1,
+                maximum * 3 + 17,
+            ];
+            for length in lengths {
+                let fixtures = [
+                    vec![0; length],
+                    vec![0xff; length],
+                    periodic_bytes(length),
+                    pseudorandom_bytes(length, 0xc0de_cafe_5eed_f00d),
+                ];
+                for data in fixtures {
+                    assert_eq!(
+                        boundary_lengths(mincdc, &data),
+                        boundary_lengths(mothcdc, &data),
+                        "paired profiles {} and {} diverged for {} bytes",
+                        mincdc.name,
+                        mothcdc.name,
+                        data.len()
+                    );
+                }
+            }
+            pairs += 1;
+        }
+        assert_eq!(pairs, 3);
     }
 
     #[test]

@@ -13,11 +13,11 @@ use walkdir::WalkDir;
 use crate::algorithm::Candidate;
 use crate::fixture::{periodic_bytes, pseudorandom_bytes};
 use crate::metrics::{Accumulator, Measurements};
-use crate::throughput::{Timing, fold_digest, timing};
+use crate::throughput::{Timing, fold_digest, median_duration, timing};
 
 const EXCLUDED_TOP_LEVEL_DIRECTORIES: &[&str] = &["keys", "secrets", "run", ".Trash"];
 const READER_CAPACITY: usize = 1024 * 1024;
-const CORPUS_THROUGHPUT_SAMPLES: usize = 3;
+const CORPUS_THROUGHPUT_SAMPLES: usize = 4;
 
 #[derive(Clone)]
 enum Input {
@@ -233,17 +233,11 @@ impl Corpus {
         chunk_only.sort_unstable();
         chunk_and_blake3.sort_unstable();
         let logical_bytes = self.logical_bytes()?;
+        let chunk_only_median = median_duration(&chunk_only)?;
+        let chunk_and_blake3_median = median_duration(&chunk_and_blake3)?;
         Ok((
-            timing(
-                logical_bytes,
-                chunk_only[chunk_only.len() / 2],
-                chunk_only[0],
-            )?,
-            timing(
-                logical_bytes,
-                chunk_and_blake3[chunk_and_blake3.len() / 2],
-                chunk_and_blake3[0],
-            )?,
+            timing(logical_bytes, chunk_only_median, chunk_only[0])?,
+            timing(logical_bytes, chunk_and_blake3_median, chunk_and_blake3[0])?,
         ))
     }
 
@@ -617,7 +611,7 @@ mod tests {
             first.measurements.chunk_deduplication,
             second.measurements.chunk_deduplication
         );
-        assert_eq!(first.throughput.samples, 3);
+        assert_eq!(first.throughput.samples, 4);
         assert!(first.throughput.chunk_only.median_bytes_per_second > 0);
         assert!(first.throughput.chunk_and_blake3.median_bytes_per_second > 0);
     }

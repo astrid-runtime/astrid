@@ -67,11 +67,8 @@ fn samples(
         durations.push(started.elapsed());
     }
     durations.sort_unstable();
-    timing(
-        u64::try_from(fixture.len())?,
-        durations[durations.len() / 2],
-        durations[0],
-    )
+    let median = median_duration(&durations)?;
+    timing(u64::try_from(fixture.len())?, median, durations[0])
 }
 
 pub(crate) fn fold_digest(guard: &mut [u8; 32], digest: &[u8; 32]) {
@@ -96,6 +93,29 @@ pub(crate) fn timing(bytes: u64, median: Duration, minimum: Duration) -> Result<
         median_bytes_per_second: u64::try_from(bytes_per_second)?,
         median_mib_per_second_times_100: u64::try_from(mib_per_second_times_100)?,
     })
+}
+
+pub(crate) fn median_duration(sorted: &[Duration]) -> Result<Duration> {
+    if sorted.is_empty() {
+        bail!("throughput sample count must be non-zero");
+    }
+    let middle = sorted.len() / 2;
+    if sorted.len() % 2 == 1 {
+        Ok(sorted[middle])
+    } else {
+        let lower_index = middle
+            .checked_sub(1)
+            .ok_or_else(|| anyhow::anyhow!("balanced median has no lower sample"))?;
+        let lower = sorted[lower_index];
+        let upper = sorted[middle];
+        let half_delta = upper
+            .checked_sub(lower)
+            .and_then(|delta| delta.checked_div(2))
+            .ok_or_else(|| anyhow::anyhow!("balanced median duration overflow"))?;
+        lower
+            .checked_add(half_delta)
+            .ok_or_else(|| anyhow::anyhow!("balanced median duration overflow"))
+    }
 }
 
 #[cfg(test)]
@@ -125,5 +145,19 @@ mod tests {
         fold_digest(&mut guard, &second);
         assert_ne!(guard, first);
         assert_ne!(guard, second);
+    }
+
+    #[test]
+    fn median_averages_the_middle_pair_for_balanced_samples() {
+        let durations = [
+            Duration::from_millis(1),
+            Duration::from_millis(3),
+            Duration::from_millis(5),
+            Duration::from_millis(9),
+        ];
+        assert_eq!(
+            median_duration(&durations).unwrap(),
+            Duration::from_millis(4)
+        );
     }
 }

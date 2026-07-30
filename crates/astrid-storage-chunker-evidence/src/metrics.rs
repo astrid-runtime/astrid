@@ -42,7 +42,7 @@ pub struct Measurements {
     pub estimated_reference_metadata_bytes: u64,
     pub estimated_unique_object_cost_bytes: u64,
     pub elapsed_nanoseconds: u128,
-    pub chunk_size_distribution_bytes: ChunkSizeDistributionBytes,
+    pub chunk_size_distribution_bytes: Option<ChunkSizeDistributionBytes>,
     pub cdc_chunk_size_distribution_bytes: Option<ChunkSizeDistributionBytes>,
 }
 
@@ -132,7 +132,7 @@ impl Accumulator {
             estimated_reference_metadata_bytes,
             "retained byte estimate",
         )?;
-        let chunk_size_distribution_bytes = distribution(&self.chunk_lengths)?;
+        let chunk_size_distribution_bytes = optional_distribution(&self.chunk_lengths)?;
         Ok(Measurements {
             files: self.files,
             logical_bytes: self.logical_bytes,
@@ -327,5 +327,18 @@ mod tests {
         );
         assert_eq!(measurements.unique_chunks, 2);
         assert_eq!(measurements.chunk_deduplication.saved_basis_points, 5_000);
+    }
+
+    #[test]
+    fn an_all_empty_corpus_has_no_chunk_distribution() {
+        let mut accumulator = Accumulator::default();
+        accumulator.add_file(b"").unwrap();
+        accumulator.add_file(b"").unwrap();
+        let measurements = accumulator.finish(Duration::ZERO).unwrap();
+
+        assert_eq!(measurements.files, 2);
+        assert_eq!(measurements.total_chunks, 0);
+        assert_eq!(measurements.chunk_size_distribution_bytes, None);
+        assert_eq!(measurements.cdc_chunk_size_distribution_bytes, None);
     }
 }

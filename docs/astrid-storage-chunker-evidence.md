@@ -61,8 +61,8 @@ The corpora were:
 
 | Label | Shape | Logical size |
 |---|---:|---:|
-| `agent-state` | 230,086 files | 5.73 GB |
-| `dev-workspace` | 47,783 files | 2.47 GB |
+| `agent-state` | 230,088 files | 5.73 GB |
+| `dev-workspace` | 47,805 files | 2.47 GB |
 | `captured-code` | 32 real `Cargo.lock` revisions read directly from Git | 8.14 MB |
 | `synthetic-version-chain-v1` | 16 controlled local edits | 67.1 MB |
 | `synthetic-adversarial-v1` | empty, short, zeros, all-ones, periodic, monotone, repeated, pseudorandom, and boundary-pressure inputs | 58.7 MB |
@@ -90,7 +90,7 @@ bytes.
 | FastCDC 16/64/256 | 107.6 KiB | 74.7 KiB | 51.38% | 26.10% | baseline | baseline |
 | MinCDC empirical compromise 32–160 | 90.9 KiB | 83.9 KiB | 51.38% | 26.18% | -0.0105% | +8.46% |
 | MinCDC wide 32–96 | 58.3 KiB | 57.7 KiB | 51.44% | 26.44% | -0.1086% | +41.58% |
-| MinCDC same bounds 16–256 | 130.5 KiB | 115.5 KiB | 51.35% | 25.86% | +0.1323% | -8.56% |
+| MinCDC same bounds 16–256 | 127.5 KiB | 112.8 KiB | 51.35% | 25.86% | +0.1323% | -8.56% |
 
 The cost estimate is explicit and directional: unique chunk bytes plus 162
 bytes per unique chunk object plus 40 bytes per physical reference record. It
@@ -126,14 +126,14 @@ the wide profile is slightly better on both. Stability therefore does not
 decide the format. Retained cost, object population, implementation
 independence, and existing production behavior do.
 
-Each corpus/profile pair also has three alternating end-to-end passes per
-mode. These medians include file I/O and the whole-file policy:
+Each corpus/profile pair also has four order-balanced, alternating end-to-end
+passes per mode. These medians include file I/O and the whole-file policy:
 
 | Profile | Agent chunk only | Agent + BLAKE3 | Workspace chunk only | Workspace + BLAKE3 |
 |---|---:|---:|---:|---:|
-| FastCDC 16/64/256 | 234.23 MiB/s | 205.65 MiB/s | 890.13 MiB/s | 591.07 MiB/s |
-| MinCDC empirical compromise 32–160 | 226.21 MiB/s | 203.18 MiB/s | 1,160.00 MiB/s | 684.69 MiB/s |
-| Moth empirical compromise 32–160 | 227.10 MiB/s | 201.73 MiB/s | 1,170.09 MiB/s | 682.35 MiB/s |
+| FastCDC 16/64/256 | 347.51 MiB/s | 285.27 MiB/s | 945.81 MiB/s | 613.96 MiB/s |
+| MinCDC empirical compromise 32–160 | 231.62 MiB/s | 207.46 MiB/s | 1,133.24 MiB/s | 682.87 MiB/s |
+| Moth empirical compromise 32–160 | 229.57 MiB/s | 200.36 MiB/s | 1,100.45 MiB/s | 665.11 MiB/s |
 
 Alternating order prevents the second mode from inheriting a systematically
 warmer page cache. The results also show why CPU-only throughput is not a
@@ -145,9 +145,9 @@ the Apple M2 Ultra host with Rust 1.95.0:
 
 | Profile | Chunk only | Chunk + BLAKE3 |
 |---|---:|---:|
-| FastCDC 16/64/256 | 1,753.24 MiB/s | 885.60 MiB/s |
-| MinCDC empirical compromise 32–160 | 10,245.66 MiB/s | 1,463.27 MiB/s |
-| Moth empirical compromise 32–160 | 10,361.29 MiB/s | 1,495.56 MiB/s |
+| FastCDC 16/64/256 | 1,803.91 MiB/s | 907.74 MiB/s |
+| MinCDC empirical compromise 32–160 | 9,993.49 MiB/s | 1,482.58 MiB/s |
+| Moth empirical compromise 32–160 | 9,922.99 MiB/s | 1,476.08 MiB/s |
 
 MinCDC's compute result is real and worth retaining as evidence. It does not,
 by itself, outweigh an identity migration for effectively unchanged retained
@@ -202,10 +202,10 @@ cargo run --release -p astrid-storage-chunker-evidence -- \
 The report contains wall-time measurements, so reruns are not byte-identical.
 Corpus counts, boundaries, identities, deduplication totals, representation
 counts, and stability outcomes are deterministic. CPU-only throughput uses
-three in-memory samples per profile. Corpus throughput uses three alternating
-end-to-end samples per mode; directory snapshots include file I/O, while
-memory-backed synthetic and Git-history corpora do not. Both must be
-interpreted within the recorded host/toolchain boundary.
+three in-memory samples per profile. Corpus throughput uses four
+order-balanced, alternating end-to-end samples per mode; directory snapshots
+include file I/O, while memory-backed synthetic and Git-history corpora do not.
+Both must be interpreted within the recorded host/toolchain boundary.
 
 ## Reopening the decision
 
