@@ -34,6 +34,14 @@ pub(super) const PRE_FASTCDC_FREEZE_FORMAT_SPEC_ID: ObjectId = ObjectId::new([
     50, 55, 156, 42, 158, 29, 15, 225, 102, 172, 55, 243, 13, 135, 114, 189, 136, 214, 201, 154,
     106, 227, 27, 183, 92, 199, 232, 168, 244, 206, 67, 7,
 ]);
+pub(super) const PRE_PRINCIPAL_UID_FORMAT_SPEC_ID: ObjectId = ObjectId::new([
+    85, 200, 134, 121, 240, 15, 63, 130, 73, 234, 248, 71, 254, 79, 186, 136, 159, 63, 159, 9, 224,
+    16, 72, 245, 235, 0, 226, 208, 216, 12, 142, 147,
+]);
+const CONTENT_CATALOG_FORMAT_SPEC_ID: ObjectId = ObjectId::new([
+    143, 57, 153, 176, 102, 182, 102, 57, 98, 89, 196, 169, 47, 157, 231, 197, 184, 230, 125, 249,
+    211, 138, 105, 251, 79, 184, 36, 150, 139, 86, 236, 219,
+]);
 const PRIOR_V1_FORMAT_SPEC_IDS: [ObjectId; 5] = [
     PRE_DERIVATION_FORMAT_SPEC_ID,
     PRE_COMPACTION_FORMAT_SPEC_ID,
@@ -67,6 +75,25 @@ pub(super) fn store_metadata(format_spec: ObjectId, catalog_spec: ObjectId) -> V
          identity-wire=tagged-identity-v1\n\
          format-spec-object={}:{}:32:{digest}\n\
          content-catalog-spec-object={}:{}:32:{catalog_digest}\n\
+         principal-codec=principal-uid-v1\n\
+         projection=kv-tree-v3\n",
+        BLAKE3_OBJECT_IDENTITY_V1_SCHEME.algorithm(),
+        BLAKE3_OBJECT_IDENTITY_V1_SCHEME.construction(),
+        BLAKE3_OBJECT_IDENTITY_V1_SCHEME.algorithm(),
+        BLAKE3_OBJECT_IDENTITY_V1_SCHEME.construction(),
+    )
+    .into_bytes()
+}
+
+fn alias_store_metadata(format_spec: ObjectId, catalog_spec: ObjectId) -> Vec<u8> {
+    let digest = object_id_hex(format_spec);
+    let catalog_digest = object_id_hex(catalog_spec);
+    format!(
+        "format=astrid-principal-store-v1\n\
+         identity=blake3-object-identity-v1\n\
+         identity-wire=tagged-identity-v1\n\
+         format-spec-object={}:{}:32:{digest}\n\
+         content-catalog-spec-object={}:{}:32:{catalog_digest}\n\
          principal-codec=state-owner-v1\n\
          projection=kv-tree-v3\n",
         BLAKE3_OBJECT_IDENTITY_V1_SCHEME.algorithm(),
@@ -90,6 +117,17 @@ pub(super) fn legacy_store_metadata(format_spec: ObjectId) -> Vec<u8> {
         BLAKE3_OBJECT_IDENTITY_V1_SCHEME.construction(),
     )
     .into_bytes()
+}
+
+pub(super) fn is_supported_alias_owner_metadata(actual: &[u8]) -> bool {
+    PRIOR_V1_FORMAT_SPEC_IDS
+        .iter()
+        .copied()
+        .chain([PRE_PRINCIPAL_UID_FORMAT_SPEC_ID])
+        .any(|candidate| {
+            actual == legacy_store_metadata(candidate)
+                || actual == alias_store_metadata(candidate, CONTENT_CATALOG_FORMAT_SPEC_ID)
+        })
 }
 
 pub(super) fn object_id_hex(id: ObjectId) -> String {

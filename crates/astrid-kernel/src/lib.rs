@@ -441,25 +441,35 @@ impl Kernel {
         // Resolve quota policy before opening state so the durable adapter and
         // capsule engine share exactly one invalidatable profile cache.
         let profile_cache = Arc::new(PrincipalProfileCache::with_home(home.clone()));
+        let principal_directory = astrid_storage::PrincipalDirectory::default();
         let quota_cache = Arc::clone(&profile_cache);
+        let quota_principals = principal_directory.clone();
         let quota: Arc<dyn astrid_storage::KvQuotaResolver<astrid_storage::StateOwner>> =
             Arc::new(move |owner: &astrid_storage::StateOwner| match owner {
                 astrid_storage::StateOwner::System => Ok(None),
-                astrid_storage::StateOwner::Principal(principal) => quota_cache
-                    .resolve(principal)
-                    .map(|profile| Some(profile.quotas.max_storage_bytes))
-                    .map_err(|error| {
-                        astrid_storage::StorageError::Internal(format!(
-                            "resolve storage quota for {principal}: {error}"
-                        ))
-                    }),
+                astrid_storage::StateOwner::Principal(owner) => {
+                    quota_principals.alias_for(*owner).and_then(|principal| {
+                        quota_cache
+                            .resolve(&principal)
+                            .map(|profile| Some(profile.quotas.max_storage_bytes))
+                            .map_err(|error| {
+                                astrid_storage::StorageError::Internal(format!(
+                                    "resolve storage quota for {principal}: {error}"
+                                ))
+                            })
+                    })
+                },
             });
 
         // Open the authoritative state store. First cutover imports and
         // verifies legacy SurrealKV under the singleton lock before serving.
-        let kv = astrid_storage::open_runtime_kv(&home, quota)
-            .await
-            .map_err(|e| std::io::Error::other(format!("Failed to open KV store: {e}")))?;
+        let kv = astrid_storage::open_runtime_kv_with_directory(
+            &home,
+            quota,
+            principal_directory.clone(),
+        )
+        .await
+        .map_err(|e| std::io::Error::other(format!("Failed to open KV store: {e}")))?;
         // TODO: clear ephemeral keys (e: prefix) on boot when the key
         // lifecycle tier convention is established.
 
@@ -500,7 +510,7 @@ impl Kernel {
             Some(singleton_lock),
         );
 
-        Self::with_resources_and_workspace_layout_with_profile_cache(
+        Self::with_resources_and_workspace_layout_with_profile_cache_and_directory(
             session_id,
             workspace_root,
             runtime_limits,
@@ -509,6 +519,7 @@ impl Kernel {
             resources,
             workspace_layout,
             Some(profile_cache),
+            principal_directory,
         )
         .await
     }
@@ -600,10 +611,6 @@ impl Kernel {
         .await
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "boot sequence: sequential setup that does not benefit from splitting"
-    )]
     #[allow(clippy::too_many_arguments)]
     async fn with_resources_and_workspace_layout_with_profile_cache(
         session_id: SessionId,
@@ -614,6 +621,36 @@ impl Kernel {
         resources: KernelResources,
         workspace_layout: WorkspaceLayout,
         profile_cache: Option<Arc<PrincipalProfileCache>>,
+    ) -> Result<Arc<Self>, std::io::Error> {
+        Self::with_resources_and_workspace_layout_with_profile_cache_and_directory(
+            session_id,
+            workspace_root,
+            runtime_limits,
+            local_egress,
+            http_limits,
+            resources,
+            workspace_layout,
+            profile_cache,
+            astrid_storage::PrincipalDirectory::default(),
+        )
+        .await
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "boot sequence: sequential setup that does not benefit from splitting"
+    )]
+    #[allow(clippy::too_many_arguments)]
+    async fn with_resources_and_workspace_layout_with_profile_cache_and_directory(
+        session_id: SessionId,
+        workspace_root: PathBuf,
+        runtime_limits: astrid_capsule_types::CapsuleRuntimeLimits,
+        local_egress: std::collections::HashMap<String, Vec<String>>,
+        http_limits: astrid_capsule_types::HttpLimits,
+        resources: KernelResources,
+        workspace_layout: WorkspaceLayout,
+        profile_cache: Option<Arc<PrincipalProfileCache>>,
+        principal_directory: astrid_storage::PrincipalDirectory,
     ) -> Result<Arc<Self>, std::io::Error> {
         // The native capsule engine uses `block_in_place`, which requires a
         // multi-thread runtime. The browser profile has no such runtime (and no
@@ -710,7 +747,18 @@ impl Kernel {
         let identity_kv = astrid_storage::ScopedKvStore::new(Arc::clone(&kv), "system:identity")
             .map_err(|e| std::io::Error::other(format!("Failed to create identity KV: {e}")))?;
         let identity_store: Arc<dyn astrid_storage::IdentityStore> =
-            Arc::new(astrid_storage::KvIdentityStore::new(identity_kv));
+            Arc::new(astrid_storage::KvIdentityStore::with_principal_directory(
+                identity_kv,
+                principal_directory.clone(),
+            ));
+        identity_store
+            .load_principal_directory()
+            .await
+            .map_err(|error| {
+                std::io::Error::other(format!(
+                    "Failed to load durable principal identities: {error}"
+                ))
+            })?;
 
         // Load group config (issue #670). Boot-loaded once, then swapped
         // atomically by Layer 6 admin topics (issue #672). Missing file
@@ -3431,14 +3479,22 @@ async fn bootstrap_cli_root_user(
         ))
     })?;
 
+    let principal = astrid_core::PrincipalId::default();
+    let initial_public_key = principal_initial_public_key(home, &principal)?;
+
     // Check if root user already exists by trying to resolve the CLI link.
-    if let Some(_user) = store.resolve("cli", "local").await? {
+    if let Some(user) = store.resolve("cli", "local").await? {
+        store
+            .bind_principal_identity(user.id, principal, initial_public_key)
+            .await?;
         tracing::debug!("CLI root user already linked");
         return Ok(());
     }
 
     // No CLI link exists. Create or find the root user.
-    let user = store.create_user(Some("root")).await?;
+    let user = store
+        .create_principal(principal, initial_public_key)
+        .await?;
     tracing::info!(user_id = %user.id, "Created CLI root user");
 
     // Link the CLI platform identity.
@@ -3446,6 +3502,33 @@ async fn bootstrap_cli_root_user(
     tracing::info!(user_id = %user.id, "Linked CLI root user (cli/local)");
 
     Ok(())
+}
+
+fn principal_initial_public_key(
+    home: &astrid_core::dirs::AstridHome,
+    principal: &astrid_core::PrincipalId,
+) -> Result<[u8; 32], astrid_storage::IdentityError> {
+    let profile = astrid_core::PrincipalProfile::load(home, principal).map_err(|error| {
+        astrid_storage::IdentityError::Storage(format!(
+            "load profile for principal identity {principal}: {error}"
+        ))
+    })?;
+    let device = profile
+        .auth
+        .public_keys
+        .iter()
+        .min_by_key(|device| (device.created_at, device.key_id.as_str()))
+        .ok_or_else(|| {
+            astrid_storage::IdentityError::InvalidInput(format!(
+                "principal {principal} has no Ed25519 key for genesis identity"
+            ))
+        })?;
+    let public_key = astrid_crypto::PublicKey::from_hex(&device.pubkey).map_err(|error| {
+        astrid_storage::IdentityError::InvalidInput(format!(
+            "principal {principal} has an invalid genesis public key: {error}"
+        ))
+    })?;
+    Ok(public_key.into())
 }
 
 /// Migrate a legacy per-principal `profile.toml` from the pre-#672
@@ -3592,29 +3675,12 @@ fn mint_default_principal_keypair(
         return Ok(false);
     }
 
-    let keypair = astrid_crypto::KeyPair::generate();
     let keys_dir = home.keys_dir();
     std::fs::create_dir_all(&keys_dir)?;
     let key_path = keys_dir.join(format!("{principal}.key"));
-    // Create the file 0600 atomically (via `OpenOptions::mode`) BEFORE writing
-    // the secret bytes, so the private key is never momentarily group/world
-    // readable between a `write` and a follow-up `set_permissions` chmod.
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&key_path)?;
-        f.write_all(&keypair.secret_key_bytes())?;
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(&key_path, keypair.secret_key_bytes())?;
-    }
+    // Reuse a key left by an interrupted prior boot. The crypto helper creates
+    // and syncs an owner-only key without ever replacing a winner.
+    let keypair = astrid_crypto::load_or_generate_keypair(&key_path)?;
 
     // Register Full-scope: the default principal's bootstrap keypair acts
     // with the principal's full authority. Dedup by canonical pubkey.

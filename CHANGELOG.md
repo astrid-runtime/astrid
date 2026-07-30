@@ -11,6 +11,16 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Added
 
+- **Durable principal ownership now uses stable opaque identities.** A
+  canonical genesis record binds each principal's existing identity UUID,
+  creation timestamp, and initial Ed25519 key to a domain-separated 32-byte
+  UID. Root journals and native staging intents store that UID rather than a
+  mutable alias; alias lookup remains a capability-bound runtime directory.
+  Existing pre-release stores rewrite root snapshots and queued intents under
+  a crash-recoverable marker while preserving exact root generations and
+  commit identities. Alias changes and authentication-key rotation therefore
+  do not rewrite durable ownership, and the RÚNATAL reader independently
+  decodes the frozen owner grammar.
 - **The selected FastCDC content profile is frozen as implementation-independent
   format.** RÚNATAL now specifies the exact gear-table derivation,
   normalization masks, wrapping cut algorithm, accepted parameter grammar,

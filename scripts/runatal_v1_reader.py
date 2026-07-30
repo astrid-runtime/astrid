@@ -46,7 +46,7 @@ REFERENCE_NAMES = ("Owns", "Evidence", "Lineage", "Derived")
 FORMAT_SPECIFICATION = (
     1,
     1,
-    bytes.fromhex("55c88679f00f3f8249eaf847fe4fba889f3f9f09e01048f5eb00e2d0d80c8e93"),
+    bytes.fromhex("9bf81709c78311fea1011137f8dab3b6cd8ffe6c8ea6040cfec7192efb89aba0"),
 )
 CONTENT_CATALOG_SPECIFICATION = (
     1,
@@ -790,14 +790,9 @@ def decode_root(payload):
 def principal_text(principal):
     if principal == b"\0":
         return "system"
-    if principal[:1] == b"\1":
-        value = principal[1:].decode("ascii")
-        if not 1 <= len(value) <= 64 or any(
-            not (character.isalnum() or character in "-_") for character in value
-        ):
-            raise FormatError("invalid principal identifier")
-        return value
-    raise FormatError("invalid state-owner encoding")
+    if len(principal) == 33 and principal[:1] == b"\1":
+        return principal[1:].hex()
+    raise FormatError("invalid principal-uid encoding")
 
 
 def parse_metadata(path):
@@ -811,7 +806,7 @@ def parse_metadata(path):
         "format": "astrid-principal-store-v1",
         "identity": "blake3-object-identity-v1",
         "identity-wire": "tagged-identity-v1",
-        "principal-codec": "state-owner-v1",
+        "principal-codec": "principal-uid-v1",
         "projection": "kv-tree-v3",
     }
     for key, value in required.items():

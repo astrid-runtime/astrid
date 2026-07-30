@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use astrid_core::dirs::AstridHome;
-use astrid_core::principal::PrincipalId;
+use astrid_core::identity::PrincipalUid;
 use astrid_storage::{
     Blake3ObjectIdentityV1, ChunkingProfile, ContentName, KvQuotaResolver,
     NativeContentStagingArea, NativePrincipalContentStore, RuntimePrincipalStore, StateOwner,
@@ -95,14 +95,14 @@ fn benchmark_staging_large_writes(
     source: &Path,
     report: &mut Report,
 ) -> BenchResult<()> {
-    let owner = benchmark_owner()?;
+    let owner = benchmark_owner();
     let mut write_samples = Vec::with_capacity(config.samples);
     let mut seal_samples = Vec::with_capacity(config.samples);
     for sample in 0..config.samples {
         let directory = tempfile::tempdir_in(root)?;
         let staging = NativeContentStagingArea::open(directory.path().join("staging"))?;
         let name = ContentName::new(format!("large/{sample}"))?;
-        let mut writer = staging.begin(owner.clone(), name, ChunkingProfile::ASTRID_V1)?;
+        let mut writer = staging.begin(owner, name, ChunkingProfile::ASTRID_V1)?;
         let mut input = File::open(source)?;
         let started = Instant::now();
         let copied = copy_stream(&mut input, &mut writer, config.block_bytes)?;
@@ -193,12 +193,12 @@ fn benchmark_small_files(config: &Config, root: &Path, report: &mut Report) -> B
     );
 
     let staging = NativeContentStagingArea::open(root.join("small-staging"))?;
-    let owner = benchmark_owner()?;
+    let owner = benchmark_owner();
     for sample in 0..config.samples {
         let started = Instant::now();
         for index in 0..config.small_files {
             let name = ContentName::new(format!("small/{sample}/{index}"))?;
-            let mut writer = staging.begin(owner.clone(), name, ChunkingProfile::ASTRID_V1)?;
+            let mut writer = staging.begin(owner, name, ChunkingProfile::ASTRID_V1)?;
             writer.write_all(&payload)?;
             black_box(writer.seal()?);
         }
@@ -220,7 +220,7 @@ async fn benchmark_runtime(
     report: &mut Report,
 ) -> BenchResult<()> {
     benchmark_native_reads(config, source, source_digest, report)?;
-    let owner = benchmark_owner()?;
+    let owner = benchmark_owner();
     let home_path = root.join("astrid-home");
     let mut samples = RuntimeSamples::default();
     for sample in 0..config.samples {
@@ -476,7 +476,7 @@ async fn benchmark_concurrent_principals(
         let mut staged = Vec::with_capacity(config.concurrent_principals);
         let mut descriptors = Vec::with_capacity(config.concurrent_principals);
         for index in 0..config.concurrent_principals {
-            let owner = benchmark_owner_named(&format!("storage-benchmark-concurrent-{index}"))?;
+            let owner = benchmark_owner_named(&format!("storage-benchmark-concurrent-{index}"));
             let name = format!("shared/{sample}/{index}.bin");
             let (name, ready, _, _) =
                 stage_source(&store, source, &owner, &name, config.block_bytes)?;
@@ -557,10 +557,9 @@ fn stage_source(
     Duration,
 )> {
     let name = ContentName::new(name)?;
-    let mut writer =
-        store
-            .staging()
-            .begin(owner.clone(), name.clone(), ChunkingProfile::ASTRID_V1)?;
+    let mut writer = store
+        .staging()
+        .begin(*owner, name.clone(), ChunkingProfile::ASTRID_V1)?;
     let mut input = File::open(source)?;
     let started = Instant::now();
     let copied = copy_stream(&mut input, &mut writer, block_bytes)?;
@@ -695,14 +694,14 @@ pub(super) fn hash_native(path: &Path, block_bytes: usize) -> BenchResult<[u8; 3
     Ok(*hasher.finalize().as_bytes())
 }
 
-fn benchmark_owner() -> BenchResult<StateOwner> {
+fn benchmark_owner() -> StateOwner {
     benchmark_owner_named("storage-benchmark")
 }
 
-fn benchmark_owner_named(name: &str) -> BenchResult<StateOwner> {
-    PrincipalId::new(name)
-        .map(StateOwner::Principal)
-        .map_err(Into::into)
+fn benchmark_owner_named(name: &str) -> StateOwner {
+    let mut hasher = blake3::Hasher::new_derive_key("astrid storage benchmark principal uid v1");
+    hasher.update(name.as_bytes());
+    StateOwner::Principal(PrincipalUid::from_bytes(*hasher.finalize().as_bytes()))
 }
 
 fn create_truncated(path: &Path) -> std::io::Result<File> {

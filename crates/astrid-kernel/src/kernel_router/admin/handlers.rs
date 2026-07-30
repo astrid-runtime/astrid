@@ -334,7 +334,8 @@ async fn agent_create(
                 || inherit_from.is_some()
                 || !groups.is_empty()
                 || !grants.is_empty(),
-        );
+        )
+        .await;
     }
 
     // A genuinely new principal: build its profile, mint its keypair, register

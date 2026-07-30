@@ -6,6 +6,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use astrid_core::dirs::AstridHome;
+use astrid_core::identity::PrincipalUid;
+use astrid_core::principal::PrincipalId;
 use astrid_storage_engine::{
     CompactionFacts, CompactionProofVerifier, CompactionRetention, CompactionRootKind,
 };
@@ -15,7 +17,10 @@ use astrid_storage_model::{
 
 use super::bootstrap::RuntimeBootstrapObject;
 use super::format_amendment::object_id_hex;
-use super::{KvQuotaResolver, StateOwner, open_runtime_principal_store};
+use super::{
+    IdentityStore, KvIdentityStore, KvQuotaResolver, RuntimePrincipalStore, ScopedKvStore,
+    StateOwner, open_runtime_principal_store,
+};
 
 struct AcceptCompactionProof;
 
@@ -39,6 +44,23 @@ fn unlimited_quota() -> Arc<dyn KvQuotaResolver<StateOwner>> {
     })
 }
 
+async fn create_alice(store: &RuntimePrincipalStore) -> PrincipalUid {
+    let identities = KvIdentityStore::with_principal_directory(
+        ScopedKvStore::new(store.kv(), "system:identity").unwrap(),
+        store.principal_directory(),
+    );
+    let user = identities
+        .create_principal(PrincipalId::new("alice").unwrap(), [0xA1; 32])
+        .await
+        .unwrap();
+    identities
+        .get_principal_identity(user.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .uid
+}
+
 fn evidence(bytes: &[u8]) -> ObjectRecord {
     ObjectRecord::new(
         ObjectKind::Evidence,
@@ -58,6 +80,7 @@ async fn production_retention_preserves_every_registered_bootstrap_object() {
     let store = open_runtime_principal_store(&home, unlimited_quota())
         .await
         .unwrap();
+    let alice_uid = create_alice(&store).await;
     store
         .kv()
         .set("alice:capsule:shell", "cwd", b"/workspace".to_vec())
@@ -141,7 +164,7 @@ async fn production_retention_preserves_every_registered_bootstrap_object() {
         String::from_utf8_lossy(&compacted.stderr)
     );
     let decoded: serde_json::Value = serde_json::from_slice(&compacted.stdout).unwrap();
-    assert_eq!(decoded["roots"]["alice"]["generation"], 0);
+    assert_eq!(decoded["roots"][alice_uid.to_string()]["generation"], 0);
     assert_eq!(
         decoded["format_spec_object"],
         format!("1:1:32:{}", object_id_hex(format_spec_id))
@@ -155,6 +178,7 @@ async fn raw_engine_retention_can_omit_bootstrap_but_runtime_constructor_fails_c
     let store = open_runtime_principal_store(&home, unlimited_quota())
         .await
         .unwrap();
+    create_alice(&store).await;
     store
         .kv()
         .set("alice:capsule:shell", "cwd", b"/workspace".to_vec())

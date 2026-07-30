@@ -4,9 +4,12 @@
 //! platforms, and [`FrontendLink`], a mapping from platform-specific identities
 //! to Astrid users.
 
+/// Stable principal identity.
+pub mod principal;
 /// Core identity types.
 pub mod types;
 
+pub use principal::{PrincipalGenesis, PrincipalIdentity, PrincipalIdentityError, PrincipalUid};
 pub use types::{AstridUserId, FrontendLink, normalize_platform};
 
 #[cfg(test)]

@@ -20,121 +20,32 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use astrid_core::identity::types::{AstridUserId, FrontendLink, normalize_platform};
+use astrid_core::identity::{PrincipalGenesis, PrincipalIdentity, PrincipalUid};
+use astrid_core::principal::PrincipalId;
 
+use crate::PrincipalDirectory;
 use crate::kv::ScopedKvStore;
 
-// ---------------------------------------------------------------------------
-// Error type
-// ---------------------------------------------------------------------------
+mod persistence;
+use persistence::PersistedUser;
 
-/// Errors from identity store operations.
-#[derive(Debug, thiserror::Error)]
-pub enum IdentityError {
-    /// The specified user was not found.
-    #[error("user not found: {0}")]
-    UserNotFound(Uuid),
+// Keep these established public items nominally in `identity` while their
+// physical source remains independently reviewable under the repository's
+// source-file cap.
+include!("identity/contract.rs");
 
-    /// The underlying storage operation failed.
-    #[error("storage error: {0}")]
-    Storage(String),
-
-    /// Input validation failed.
-    #[error("invalid input: {0}")]
-    InvalidInput(String),
-}
-
-// ---------------------------------------------------------------------------
-// Trait
-// ---------------------------------------------------------------------------
-
-/// Identity store for managing users and platform links.
-///
-/// All operations are async because the backing store (KV) is async.
-#[async_trait]
-pub trait IdentityStore: Send + Sync + fmt::Debug {
-    /// Create a new [`AstridUserId`]. Returns the created user.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`IdentityError::Storage`] if persistence fails.
-    async fn create_user(&self, display_name: Option<&str>) -> Result<AstridUserId, IdentityError>;
-
-    /// Look up a user by UUID. Returns `None` if not found.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`IdentityError::Storage`] if the read fails.
-    async fn get_user(&self, id: Uuid) -> Result<Option<AstridUserId>, IdentityError>;
-
-    /// Resolve a platform identity to an [`AstridUserId`].
-    /// Returns `None` if no link exists for this platform + `user_id` pair.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`IdentityError::Storage`] if the read fails.
-    /// Returns [`IdentityError::InvalidInput`] if platform or `user_id` is empty.
-    async fn resolve(
-        &self,
-        platform: &str,
-        platform_user_id: &str,
-    ) -> Result<Option<AstridUserId>, IdentityError>;
-
-    /// Link a platform identity to an existing [`AstridUserId`].
-    ///
-    /// Uses upsert semantics: if a link already exists for this
-    /// platform + `user_id`, it is updated to point to the new user.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`IdentityError::UserNotFound`] if the target user doesn't exist.
-    /// Returns [`IdentityError::InvalidInput`] if any input is empty.
-    /// Returns [`IdentityError::Storage`] if persistence fails.
-    async fn link(
-        &self,
-        platform: &str,
-        platform_user_id: &str,
-        astrid_user_id: Uuid,
-        method: &str,
-    ) -> Result<FrontendLink, IdentityError>;
-
-    /// Remove a platform link. Returns `true` if the link existed.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`IdentityError::InvalidInput`] if platform or `user_id` is empty.
-    /// Returns [`IdentityError::Storage`] if the delete fails.
-    async fn unlink(&self, platform: &str, platform_user_id: &str) -> Result<bool, IdentityError>;
-
-    /// List all links for a given [`AstridUserId`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`IdentityError::Storage`] if the scan fails.
-    async fn list_links(&self, astrid_user_id: Uuid) -> Result<Vec<FrontendLink>, IdentityError>;
-
-    /// Look up a user by display name. Returns `None` if not found.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`IdentityError::Storage`] if the read fails.
-    async fn get_user_by_name(&self, name: &str) -> Result<Option<AstridUserId>, IdentityError>;
-
-    /// Remove a user record, every link pointing at it, and the display
-    /// name index. Returns `true` if the user existed (and was deleted),
-    /// `false` if the UUID was already absent (idempotent).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`IdentityError::Storage`] if any underlying read, scan,
-    /// or delete fails.
-    async fn delete_user(&self, id: Uuid) -> Result<bool, IdentityError>;
-
-    /// List every user record currently in the store.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`IdentityError::Storage`] if the scan or any read fails.
-    async fn list_users(&self) -> Result<Vec<AstridUserId>, IdentityError>;
+#[derive(Debug)]
+enum DirectoryMutation {
+    Unchanged,
+    Registered {
+        alias: PrincipalId,
+        uid: PrincipalUid,
+    },
+    Renamed {
+        uid: PrincipalUid,
+        previous: PrincipalId,
+        current: PrincipalId,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -148,12 +59,17 @@ pub trait IdentityStore: Send + Sync + fmt::Debug {
 #[derive(Clone)]
 pub struct KvIdentityStore {
     kv: ScopedKvStore,
+    principals: Option<PrincipalDirectory>,
 }
 
 impl fmt::Debug for KvIdentityStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("KvIdentityStore")
             .field("namespace", &self.kv.namespace())
+            .field(
+                "principal_directory",
+                &self.principals.as_ref().map(|_| "attached"),
+            )
             .finish()
     }
 }
@@ -162,7 +78,20 @@ impl KvIdentityStore {
     /// Create a new KV-backed identity store.
     #[must_use]
     pub fn new(kv: ScopedKvStore) -> Self {
-        Self { kv }
+        Self {
+            kv,
+            principals: None,
+        }
+    }
+
+    /// Create a KV-backed identity store bound to the runtime's live
+    /// principal directory.
+    #[must_use]
+    pub fn with_principal_directory(kv: ScopedKvStore, principals: PrincipalDirectory) -> Self {
+        Self {
+            kv,
+            principals: Some(principals),
+        }
     }
 
     /// Build the KV key for a user record.
@@ -178,6 +107,97 @@ impl KvIdentityStore {
     /// Build the KV key for a name-to-UUID index entry.
     fn name_key(name: &str) -> String {
         format!("name/{name}")
+    }
+
+    fn bind_directory(
+        &self,
+        previous_alias: Option<&PrincipalId>,
+        principal: &PrincipalId,
+        uid: PrincipalUid,
+    ) -> Result<DirectoryMutation, IdentityError> {
+        let Some(directory) = &self.principals else {
+            return Ok(DirectoryMutation::Unchanged);
+        };
+        match directory.alias_for(uid) {
+            Ok(existing) if existing == *principal => Ok(DirectoryMutation::Unchanged),
+            Ok(existing) if previous_alias == Some(&existing) => {
+                directory
+                    .rename(uid, &existing, principal.clone())
+                    .map_err(|error| IdentityError::InvalidInput(error.to_string()))?;
+                Ok(DirectoryMutation::Renamed {
+                    uid,
+                    previous: existing,
+                    current: principal.clone(),
+                })
+            },
+            Ok(existing) => Err(IdentityError::InvalidInput(format!(
+                "principal uid {uid} is already bound to alias {existing}"
+            ))),
+            Err(_) => {
+                if let Some(previous) = previous_alias
+                    && let Ok(existing) = directory.uid_for(previous)
+                {
+                    return Err(IdentityError::InvalidInput(format!(
+                        "principal alias {previous} is bound to a different uid {existing}"
+                    )));
+                }
+                directory
+                    .register(principal.clone(), uid)
+                    .map_err(|error| {
+                        IdentityError::InvalidInput(format!(
+                            "principal identity collision: {error}"
+                        ))
+                    })?;
+                Ok(DirectoryMutation::Registered {
+                    alias: principal.clone(),
+                    uid,
+                })
+            },
+        }
+    }
+
+    fn rollback_directory(&self, mutation: DirectoryMutation) -> Result<(), IdentityError> {
+        let Some(directory) = &self.principals else {
+            return Ok(());
+        };
+        match mutation {
+            DirectoryMutation::Unchanged => Ok(()),
+            DirectoryMutation::Registered { alias, uid } => {
+                directory.unregister(&alias, uid);
+                Ok(())
+            },
+            DirectoryMutation::Renamed {
+                uid,
+                previous,
+                current,
+            } => directory
+                .rename(uid, &current, previous)
+                .map_err(|error| IdentityError::Storage(format!("directory rollback: {error}"))),
+        }
+    }
+
+    /// Read the immutable principal identity bound to one user record.
+    ///
+    /// Frontend-only users legitimately return `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an identity or storage error if the persisted record is
+    /// malformed.
+    pub async fn get_principal_identity(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<PrincipalIdentity>, IdentityError> {
+        let identity = self
+            .load_user_record(id)
+            .await?
+            .and_then(|record| record.principal_identity);
+        if let Some(identity) = &identity {
+            identity
+                .validate()
+                .map_err(|error| IdentityError::InvalidInput(error.to_string()))?;
+        }
+        Ok(identity)
     }
 
     /// Validate that a string is non-empty.
@@ -232,36 +252,127 @@ impl IdentityStore for KvIdentityStore {
             user = user.with_display_name(name);
         }
 
-        self.kv
-            .set_json(&Self::user_key(user.id), &user)
-            .await
-            .map_err(|e| IdentityError::Storage(e.to_string()))?;
+        self.persist_user(&user).await?;
 
         // Index by display name if provided.
         // Note: this overwrites any existing name index entry. The name index is
         // a best-effort lookup for config resolution, not a uniqueness constraint.
         // Last writer wins - the most recently created user with a given name
         // will be found by `get_user_by_name`.
-        if let Some(name) = display_name
-            && !name.trim().is_empty()
-        {
-            self.kv
-                .set(
-                    &Self::name_key(name.trim()),
-                    user.id.to_string().into_bytes(),
-                )
-                .await
-                .map_err(|e| IdentityError::Storage(e.to_string()))?;
-        }
+        self.index_display_name(&user).await?;
 
         Ok(user)
     }
 
-    async fn get_user(&self, id: Uuid) -> Result<Option<AstridUserId>, IdentityError> {
-        self.kv
-            .get_json::<AstridUserId>(&Self::user_key(id))
+    async fn create_principal(
+        &self,
+        principal: PrincipalId,
+        initial_public_key: [u8; 32],
+    ) -> Result<AstridUserId, IdentityError> {
+        for user in self.list_users().await? {
+            if user.principal == principal && self.get_principal_identity(user.id).await?.is_some()
+            {
+                return Err(IdentityError::InvalidInput(format!(
+                    "principal alias {principal} already has an identity"
+                )));
+            }
+        }
+        let user = AstridUserId::new()
+            .with_principal(principal.clone())
+            .with_display_name(principal.as_str());
+        let identity = PrincipalIdentity::from_genesis(PrincipalGenesis::from_parts(
+            user.id,
+            user.created_at,
+            initial_public_key,
+        ))
+        .map_err(|error| IdentityError::InvalidInput(error.to_string()))?;
+        let directory_mutation = self.bind_directory(None, &principal, identity.uid)?;
+        if let Err(error) = self
+            .persist_user_record(&user, Some(identity.clone()))
             .await
-            .map_err(|e| IdentityError::Storage(e.to_string()))
+        {
+            self.rollback_directory(directory_mutation)?;
+            return Err(error);
+        }
+        if let Err(error) = self.index_display_name(&user).await {
+            let _ = self.kv.delete(&Self::user_key(user.id)).await;
+            self.rollback_directory(directory_mutation)?;
+            return Err(error);
+        }
+        Ok(user)
+    }
+
+    async fn bind_principal_identity(
+        &self,
+        id: Uuid,
+        principal: PrincipalId,
+        initial_public_key: [u8; 32],
+    ) -> Result<PrincipalIdentity, IdentityError> {
+        let mut user = self
+            .load_user_record(id)
+            .await?
+            .ok_or(IdentityError::UserNotFound(id))?;
+        let previous_alias = user.user.principal.clone();
+        user.user.principal = principal.clone();
+        let identity = match user.principal_identity {
+            Some(identity) => {
+                identity
+                    .validate()
+                    .map_err(|error| IdentityError::InvalidInput(error.to_string()))?;
+                identity
+            },
+            None => PrincipalIdentity::from_genesis(PrincipalGenesis::from_parts(
+                user.user.id,
+                user.user.created_at,
+                initial_public_key,
+            ))
+            .map_err(|error| IdentityError::InvalidInput(error.to_string()))?,
+        };
+        let directory_mutation =
+            self.bind_directory(Some(&previous_alias), &principal, identity.uid)?;
+        if let Err(error) = self
+            .persist_user_record(&user.user, Some(identity.clone()))
+            .await
+        {
+            self.rollback_directory(directory_mutation)?;
+            return Err(error);
+        }
+        Ok(identity)
+    }
+
+    async fn load_principal_directory(&self) -> Result<(), IdentityError> {
+        let keys = self
+            .kv
+            .list_keys_with_prefix("user/")
+            .await
+            .map_err(|error| IdentityError::Storage(error.to_string()))?;
+        let mut bindings = Vec::new();
+        for key in keys {
+            if let Some(user) = self
+                .kv
+                .get_json::<PersistedUser>(&key)
+                .await
+                .map_err(|error| IdentityError::Storage(error.to_string()))?
+                && let Some(identity) = user.principal_identity
+            {
+                identity
+                    .validate()
+                    .map_err(|error| IdentityError::InvalidInput(error.to_string()))?;
+                bindings.push((user.user.principal, identity.uid));
+            }
+        }
+        if let Some(directory) = &self.principals {
+            directory.replace_all(bindings).map_err(|error| {
+                IdentityError::InvalidInput(format!("principal directory: {error}"))
+            })?;
+        }
+        Ok(())
+    }
+
+    async fn get_user(&self, id: Uuid) -> Result<Option<AstridUserId>, IdentityError> {
+        self.load_user_record(id)
+            .await
+            .map(|record| record.map(|record| record.user))
     }
 
     async fn resolve(
@@ -378,9 +489,10 @@ impl IdentityStore for KvIdentityStore {
     }
 
     async fn delete_user(&self, id: Uuid) -> Result<bool, IdentityError> {
-        let Some(user) = self.get_user(id).await? else {
+        let Some(record) = self.load_user_record(id).await? else {
             return Ok(false);
         };
+        let user = record.user;
 
         // Drop every link that points at this user. We scan `link/` and
         // delete matches — O(links) per delete, but the link table is
@@ -429,6 +541,9 @@ impl IdentityStore for KvIdentityStore {
             .delete(&Self::user_key(id))
             .await
             .map_err(|e| IdentityError::Storage(e.to_string()))?;
+        if let (Some(directory), Some(identity)) = (&self.principals, record.principal_identity) {
+            directory.unregister(&user.principal, identity.uid);
+        }
         Ok(true)
     }
 
@@ -456,6 +571,11 @@ impl IdentityStore for KvIdentityStore {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod failure_tests;
+#[cfg(test)]
+mod principal_tests;
 
 #[cfg(test)]
 mod tests {

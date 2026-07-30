@@ -11,9 +11,11 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use super::{NativePrincipalContentStore, RuntimeEngine, StateOwner, atomic_write};
+use super::{
+    NativePrincipalContentStore, PrincipalDirectory, RuntimeEngine, StateOwner, atomic_write,
+};
 #[cfg(feature = "legacy-surrealkv")]
-use super::{RuntimeStore, StateOwnerResolver};
+use super::{RuntimeStore, StateOwnerResolver, owner_migration};
 use crate::content::CatalogValidation;
 use crate::error::{StorageError, StorageResult};
 #[cfg(feature = "legacy-surrealkv")]
@@ -79,7 +81,12 @@ pub(super) async fn apply_required(
     store_path: &Path,
     engine: &Arc<RuntimeEngine>,
     validated_catalogs: &Arc<Mutex<BTreeMap<StateOwner, CatalogValidation>>>,
+    principals: &PrincipalDirectory,
 ) -> StorageResult<()> {
+    // This authority is consumed only by the optional legacy importer, but
+    // keeping it in the common signature makes every migration entry point
+    // share the same identity boundary.
+    let _ = principals;
     let first = MIGRATION_HISTORY.first().ok_or_else(|| {
         StorageError::Internal("principal store has no compiled migration path".to_owned())
     })?;
@@ -106,7 +113,7 @@ pub(super) async fn apply_required(
         let legacy_exists = run_blocking_migration(move || Ok(path_to_check.exists())).await?;
         if legacy_exists {
             #[cfg(feature = "legacy-surrealkv")]
-            migrate_legacy(&legacy_path, engine).await?;
+            migrate_legacy(&legacy_path, engine, home, principals).await?;
             #[cfg(not(feature = "legacy-surrealkv"))]
             return Err(StorageError::Connection(format!(
                 "legacy state exists at {}; rebuild with the legacy-surrealkv feature to migrate it",
@@ -155,15 +162,29 @@ async fn migrate_content_catalogs(
 }
 
 #[cfg(feature = "legacy-surrealkv")]
-async fn migrate_legacy(legacy_path: &Path, engine: &Arc<RuntimeEngine>) -> StorageResult<()> {
+async fn migrate_legacy(
+    legacy_path: &Path,
+    engine: &Arc<RuntimeEngine>,
+    home: &AstridHome,
+    principals: &PrincipalDirectory,
+) -> StorageResult<()> {
     let legacy_path = legacy_path.to_path_buf();
-    let engine = Arc::clone(engine);
-    let legacy = run_blocking_migration(move || {
-        let legacy = SurrealKvStore::open(legacy_path)?;
-        migrate_legacy_blocking(&legacy, &engine)?;
-        Ok(legacy)
+    let legacy =
+        run_blocking_migration(move || SurrealKvStore::open(legacy_path).map(Arc::new)).await?;
+    let legacy_kv: Arc<dyn crate::KvStore> = legacy.clone();
+    owner_migration::populate_directory(home, principals, legacy_kv).await?;
+    let migration_legacy = Arc::clone(&legacy);
+    let migration_engine = Arc::clone(engine);
+    let migration_principals = principals.clone();
+    run_blocking_migration(move || {
+        migrate_legacy_blocking(&migration_legacy, &migration_engine, &migration_principals)
     })
     .await?;
+    let migrated: Arc<dyn crate::KvStore> = Arc::new(RuntimeStore::from_engine(
+        Arc::clone(engine),
+        StateOwnerResolver::new(principals.clone()),
+    ));
+    owner_migration::backfill_principal_identities(home, principals, migrated).await?;
     legacy.close().await
 }
 
@@ -171,8 +192,10 @@ async fn migrate_legacy(legacy_path: &Path, engine: &Arc<RuntimeEngine>) -> Stor
 fn migrate_legacy_blocking(
     legacy: &SurrealKvStore,
     engine: &Arc<RuntimeEngine>,
+    principals: &PrincipalDirectory,
 ) -> StorageResult<()> {
-    let migration = RuntimeStore::from_engine(Arc::clone(engine), StateOwnerResolver);
+    let resolver = StateOwnerResolver::new(principals.clone());
+    let migration = RuntimeStore::from_engine(Arc::clone(engine), resolver.clone());
     let mut expected = BTreeMap::<StateOwner, MigrationDigest>::new();
     let mut cursor = None;
     loop {
@@ -180,10 +203,10 @@ fn migrate_legacy_blocking(
         if entries.is_empty() {
             break;
         }
-        import_page(&migration, &entries, &mut expected)?;
+        import_page(&migration, &resolver, &entries, &mut expected)?;
         cursor = next;
     }
-    verify_migration(engine, &expected)?;
+    verify_migration(engine, &expected, principals)?;
     engine
         .flush()
         .map_err(|error| StorageError::Internal(error.to_string()))?;
@@ -205,10 +228,10 @@ where
 #[cfg(feature = "legacy-surrealkv")]
 fn import_page(
     store: &RuntimeStore,
+    resolver: &StateOwnerResolver,
     entries: &[crate::KvEntry],
     expected: &mut BTreeMap<StateOwner, MigrationDigest>,
 ) -> StorageResult<()> {
-    let resolver = StateOwnerResolver;
     let mut start = 0;
     while start < entries.len() {
         let owner = resolver.resolve(&entries[start].namespace)?;
@@ -230,10 +253,14 @@ fn import_page(
 fn verify_migration(
     engine: &Arc<RuntimeEngine>,
     expected: &BTreeMap<StateOwner, MigrationDigest>,
+    principals: &PrincipalDirectory,
 ) -> StorageResult<()> {
     for (owner, expected_digest) in expected {
         let mut actual = MigrationDigest::default();
-        let store = RuntimeStore::from_engine(Arc::clone(engine), StateOwnerResolver);
+        let store = RuntimeStore::from_engine(
+            Arc::clone(engine),
+            StateOwnerResolver::new(principals.clone()),
+        );
         store.visit_entries_for_migration(owner, |namespace, key, value| {
             actual.add(namespace, key, value)
         })?;

@@ -7,8 +7,8 @@ use uuid::Uuid;
 
 use super::format::load_intent;
 use super::{
-    CONTENT_FILE, INTENT_FILE, PUBLISHED_FILE, PUBLISHED_MARKER, ReadyStagedContent,
-    StagedContentId, connection,
+    CONTENT_FILE, INTENT_FILE, LEGACY_INTENT_FILE, PUBLISHED_FILE, PUBLISHED_MARKER,
+    ReadyStagedContent, StagedContentId, connection,
 };
 use crate::error::StorageResult;
 use crate::principal_state::native_io::{sync_directory, validate_private_regular_file};
@@ -194,7 +194,12 @@ pub(super) fn parse_ready_name(name: &str) -> StorageResult<(u64, StagedContentI
 
 pub(super) fn remove_known_stage_files(directory: &Path) -> StorageResult<()> {
     validate_stage_entries(directory)?;
-    for name in [CONTENT_FILE, INTENT_FILE, PUBLISHED_FILE] {
+    for name in [
+        CONTENT_FILE,
+        INTENT_FILE,
+        LEGACY_INTENT_FILE,
+        PUBLISHED_FILE,
+    ] {
         let path = directory.join(name);
         match std::fs::remove_file(&path) {
             Ok(()) => {},
@@ -288,7 +293,11 @@ fn validate_stage_entries(directory: &Path) -> StorageResult<()> {
             ))
         })?;
         let name = entry.file_name();
-        if name != CONTENT_FILE && name != INTENT_FILE && name != PUBLISHED_FILE {
+        if name != CONTENT_FILE
+            && name != INTENT_FILE
+            && name != LEGACY_INTENT_FILE
+            && name != PUBLISHED_FILE
+        {
             return Err(connection(format!(
                 "unexpected file in staging entry {}",
                 entry.path().display()

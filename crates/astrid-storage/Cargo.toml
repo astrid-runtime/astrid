@@ -25,6 +25,7 @@ astrid-storage-engine = { workspace = true }
 astrid-storage-model = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true, features = ["clock"] }
+hex = { workspace = true }
 keyring = { workspace = true, optional = true }
 parking_lot = { workspace = true }
 serde = { workspace = true }

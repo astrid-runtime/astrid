@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use astrid_core::identity::PrincipalUid;
+use astrid_core::principal::PrincipalId;
 use uuid::Uuid;
 
 use super::native_io::{
@@ -26,7 +28,7 @@ mod recovery;
 #[cfg(test)]
 mod tests;
 
-use format::{StagingIntent, encode_intent};
+use format::{LegacyStagingOwner, StagingIntent, encode_intent, load_intent, load_legacy_intent};
 use recovery::{
     ReadyRecoveryState, load_ready, next_sequence, parse_ready_name, read_directory, ready_name,
     ready_recovery_state, recover_writing, remove_known_stage_files,
@@ -36,9 +38,129 @@ const WRITING_DIRECTORY: &str = "writing";
 const READY_DIRECTORY: &str = "ready";
 const QUARANTINE_DIRECTORY: &str = "quarantine";
 const CONTENT_FILE: &str = "content.bin";
-const INTENT_FILE: &str = "intent.v1";
+const INTENT_FILE: &str = "intent.v2";
+const LEGACY_INTENT_FILE: &str = "intent.v1";
 const PUBLISHED_FILE: &str = "published.v1";
 const PUBLISHED_MARKER: &[u8] = b"astrid-content-stage-published-v1\n";
+
+pub(super) fn migrate_alias_owner_intents(
+    root: &Path,
+    mut resolve: impl FnMut(&PrincipalId) -> StorageResult<PrincipalUid>,
+) -> StorageResult<()> {
+    match std::fs::symlink_metadata(root) {
+        Ok(_) => ensure_private_directory(root)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(connection(format!(
+                "inspect legacy staging root {}: {error}",
+                root.display()
+            )));
+        },
+    }
+    for name in [WRITING_DIRECTORY, READY_DIRECTORY] {
+        let queue = root.join(name);
+        match std::fs::symlink_metadata(&queue) {
+            Ok(_) => ensure_private_directory(&queue)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(connection(format!(
+                    "inspect legacy staging queue {}: {error}",
+                    queue.display()
+                )));
+            },
+        }
+        for entry in read_directory(&queue)? {
+            let entry = entry.map_err(|error| {
+                connection(format!(
+                    "enumerate legacy staging queue {}: {error}",
+                    queue.display()
+                ))
+            })?;
+            migrate_entry_intent(&entry.path(), &mut resolve)?;
+        }
+    }
+    Ok(())
+}
+
+fn migrate_entry_intent(
+    directory: &Path,
+    resolve: &mut impl FnMut(&PrincipalId) -> StorageResult<PrincipalUid>,
+) -> StorageResult<()> {
+    validate_stage_directory(directory)?;
+    let legacy_path = directory.join(LEGACY_INTENT_FILE);
+    match std::fs::symlink_metadata(&legacy_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(connection(format!(
+                "inspect legacy staged intent {}: {error}",
+                legacy_path.display()
+            )));
+        },
+        Ok(_) => {},
+    }
+    let legacy = load_legacy_intent(&legacy_path)?;
+    let owner = match &legacy.owner {
+        LegacyStagingOwner::System => StateOwner::System,
+        LegacyStagingOwner::Principal(alias) => StateOwner::Principal(resolve(alias)?),
+    };
+    let migrated = StagingIntent {
+        sequence: legacy.sequence,
+        id: legacy.id,
+        owner,
+        name: legacy.name,
+        profile: legacy.profile,
+        logical_bytes: legacy.logical_bytes,
+    };
+    let current_path = directory.join(INTENT_FILE);
+    match std::fs::symlink_metadata(&current_path) {
+        Ok(_) => {
+            if load_intent(&current_path)? != migrated {
+                return Err(connection(format!(
+                    "legacy and UID staging intents disagree in {}",
+                    directory.display()
+                )));
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            atomic_write(&current_path, &encode_intent(&migrated)?)?;
+        },
+        Err(error) => {
+            return Err(connection(format!(
+                "inspect UID staged intent {}: {error}",
+                current_path.display()
+            )));
+        },
+    }
+    std::fs::remove_file(&legacy_path).map_err(|error| {
+        connection(format!(
+            "remove migrated staged intent {}: {error}",
+            legacy_path.display()
+        ))
+    })?;
+    sync_directory(directory)
+}
+
+fn validate_stage_directory(path: &Path) -> StorageResult<()> {
+    astrid_core::platform_fs::verify_no_redirects(path).map_err(|error| {
+        connection(format!(
+            "validate staging directory {}: {error}",
+            path.display()
+        ))
+    })?;
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        connection(format!(
+            "inspect staging directory {}: {error}",
+            path.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(connection(format!(
+            "staging entry {} is redirected or not a directory",
+            path.display()
+        )));
+    }
+    Ok(())
+}
 
 /// Opaque identifier for one native staged write.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -298,7 +420,7 @@ impl StagedContentWriter {
         let intent = StagingIntent {
             sequence,
             id: self.id,
-            owner: self.owner.clone(),
+            owner: self.owner,
             name: self.name.clone(),
             profile: self.profile,
             logical_bytes,

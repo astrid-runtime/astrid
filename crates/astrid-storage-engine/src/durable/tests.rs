@@ -88,6 +88,19 @@ impl PrincipalCodec<String> for Utf8Codec {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct U64Codec;
+
+impl PrincipalCodec<u64> for U64Codec {
+    fn encode(&self, principal: &u64) -> Vec<u8> {
+        principal.to_le_bytes().to_vec()
+    }
+
+    fn decode(&self, bytes: &[u8]) -> Option<u64> {
+        <[u8; 8]>::try_from(bytes).ok().map(u64::from_le_bytes)
+    }
+}
+
 #[derive(Debug)]
 struct FailAt(FaultPoint);
 
@@ -674,6 +687,109 @@ fn root_snapshot_preserves_generation_and_accepts_future_cas() {
     assert_eq!(
         open(directory.path()).root(&"alice".to_owned()).unwrap(),
         Some(third)
+    );
+}
+
+#[test]
+fn destination_restore_preserves_roots_and_accepts_future_cas() {
+    let source_directory = tempfile::tempdir().unwrap();
+    let source = open(source_directory.path());
+    let (_, first_transaction) = transaction("alice", None, b"first");
+    let first = source.commit(first_transaction).unwrap().root();
+    let (_, second_transaction) = transaction("alice", Some(first), b"second");
+    let second = source.commit(second_transaction).unwrap().root();
+    let snapshot = source.snapshot(&"alice".to_owned()).unwrap().unwrap();
+
+    let destination_directory = tempfile::tempdir().unwrap();
+    let destination = open(destination_directory.path());
+    let bootstrap = ObjectRecord::new(
+        ObjectKind::Evidence,
+        ObjectFormatVersion::V1,
+        b"destination bootstrap".to_vec(),
+        Vec::new(),
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    destination.persist_standalone_object(&bootstrap).unwrap();
+    destination
+        .restore_snapshots(vec![("alice".to_owned(), snapshot)])
+        .unwrap();
+    assert_eq!(destination.root(&"alice".to_owned()).unwrap(), Some(second));
+    destination.close().unwrap();
+
+    let restored = open(destination_directory.path());
+    assert_eq!(restored.root(&"alice".to_owned()).unwrap(), Some(second));
+    assert_eq!(
+        restored
+            .snapshot(&"alice".to_owned())
+            .unwrap()
+            .unwrap()
+            .records()
+            .len(),
+        2
+    );
+    let root_only =
+        RootTransaction::new("alice".to_owned(), Some(second), second.commit, Vec::new());
+    let third = restored.commit(root_only).unwrap().root();
+    assert_eq!(third.generation, second.generation.checked_next().unwrap());
+}
+
+#[test]
+fn destination_restore_rejects_a_store_with_existing_roots() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open(directory.path());
+    let (_, transaction) = transaction("alice", None, b"existing");
+    engine.commit(transaction).unwrap();
+    let snapshot = engine.snapshot(&"alice".to_owned()).unwrap().unwrap();
+
+    assert!(matches!(
+        engine.restore_snapshots(vec![("alice".to_owned(), snapshot)]),
+        Err(DurableError::InvalidRestore(
+            "destination already has principal roots"
+        ))
+    ));
+}
+
+#[test]
+fn mapped_root_snapshot_rekeys_principals_without_changing_roots() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open(directory.path());
+    let (_, alice_transaction) = transaction("alice", None, b"alice");
+    let alice = engine.commit(alice_transaction).unwrap().root();
+    let (_, bob_transaction) = transaction("bob", None, b"bob");
+    let bob = engine.commit(bob_transaction).unwrap().root();
+    let arena_before = std::fs::read(directory.path().join(ARENA_FILE)).unwrap();
+    let replacement = directory.path().join("roots.mapped");
+
+    engine
+        .write_mapped_root_snapshot(&replacement, &U64Codec, |principal| {
+            match principal.as_str() {
+                "alice" => Ok(11),
+                "bob" => Ok(22),
+                _ => Err(DurableError::InvalidRestore("unexpected test principal")),
+            }
+        })
+        .unwrap();
+    assert_eq!(
+        engine.root(&"alice".to_owned()).unwrap(),
+        Some(alice),
+        "writing the successor snapshot must not mutate live roots"
+    );
+    engine.close().unwrap();
+    std::fs::rename(
+        directory.path().join(ROOT_FILE),
+        directory.path().join("roots.previous"),
+    )
+    .unwrap();
+    std::fs::rename(replacement, directory.path().join(ROOT_FILE)).unwrap();
+
+    let migrated = DurableEngine::open(directory.path(), TestIdentity, U64Codec, limits()).unwrap();
+    assert_eq!(migrated.root(&11).unwrap(), Some(alice));
+    assert_eq!(migrated.root(&22).unwrap(), Some(bob));
+    assert_eq!(
+        std::fs::read(directory.path().join(ARENA_FILE)).unwrap(),
+        arena_before
     );
 }
 

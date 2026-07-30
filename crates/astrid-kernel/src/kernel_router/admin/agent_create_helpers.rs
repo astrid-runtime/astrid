@@ -63,9 +63,10 @@ pub(super) async fn provision_new_principal(
     // denies it, but the operator/OS-user CLI can read it to sign), and the
     // public key + the `Keypair` auth method are registered on the profile so
     // the handshake can verify a signature against it.
-    if let Err(resp) = mint_principal_keypair(kernel, &principal, &mut profile) {
-        return resp;
-    }
+    let initial_public_key = match mint_principal_keypair(kernel, &principal, &mut profile) {
+        Ok(public_key) => public_key,
+        Err(resp) => return resp,
+    };
 
     if let Err(e) = profile.validate() {
         return err_bad_input(format!("profile rejected: {e}"));
@@ -73,7 +74,7 @@ pub(super) async fn provision_new_principal(
 
     let user = match kernel
         .identity_store
-        .create_user(Some(principal.as_str()))
+        .create_principal(principal.clone(), initial_public_key)
         .await
     {
         Ok(u) => u,
@@ -332,39 +333,17 @@ fn mint_principal_keypair(
     kernel: &Arc<crate::Kernel>,
     principal: &PrincipalId,
     profile: &mut PrincipalProfile,
-) -> Result<(), AdminResponseBody> {
-    let keypair = astrid_crypto::KeyPair::generate();
+) -> Result<[u8; 32], AdminResponseBody> {
     let keys_dir = kernel.astrid_home.keys_dir();
     if let Err(e) = std::fs::create_dir_all(&keys_dir) {
         return Err(err_internal(format!("keys dir create failed: {e}")));
     }
     let key_path = keys_dir.join(format!("{principal}.key"));
-    // Create the key file 0600 atomically (via `OpenOptions::mode`) BEFORE
-    // writing the secret bytes, so the ed25519 private key is never momentarily
-    // group/world readable in the (0755) keys dir between a `write` and a
-    // follow-up `set_permissions` chmod — the TOCTOU a co-tenant could race.
-    // Mirrors `mint_default_principal_keypair` in the kernel bootstrap.
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let write_result = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&key_path)
-            .and_then(|mut f| f.write_all(&keypair.secret_key_bytes()));
-        if let Err(e) = write_result {
-            return Err(err_internal(format!("principal key write failed: {e}")));
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        if let Err(e) = std::fs::write(&key_path, keypair.secret_key_bytes()) {
-            return Err(err_internal(format!("principal key write failed: {e}")));
-        }
-    }
+    // Reuse a key left by an interrupted provisioning attempt. The crypto
+    // helper durably creates an owner-only key without replacement and returns
+    // the winner if another process claimed the path first.
+    let keypair = astrid_crypto::load_or_generate_keypair(&key_path)
+        .map_err(|e| err_internal(format!("principal key load/create failed: {e}")))?;
     // Register the minted public key Full-scope: a principal's own bootstrap
     // keypair acts with the principal's full authority. Dedup by canonical
     // pubkey so a re-mint is idempotent.
@@ -393,7 +372,7 @@ fn mint_principal_keypair(
             .methods
             .push(astrid_core::profile::AuthMethod::Keypair);
     }
-    Ok(())
+    Ok(*keypair.public_key_bytes())
 }
 
 /// Backfill a missing per-principal keypair onto an EXISTING profile.
@@ -417,7 +396,7 @@ fn mint_principal_keypair(
 /// error rather than being silently ignored.
 ///
 /// Runs under the admin write lock held by the caller.
-pub(super) fn backfill_keypair(
+pub(super) async fn backfill_keypair(
     kernel: &Arc<crate::Kernel>,
     principal: &PrincipalId,
     profile_path: &Path,
@@ -433,6 +412,7 @@ pub(super) fn backfill_keypair(
         Ok(p) => p,
         Err(e) => return err_profile(principal, &e),
     };
+    let original_profile = profile.clone();
 
     // "Keyless" = the profile carries no ed25519 credential.
     // `mint_principal_keypair` registers BOTH the `Keypair` auth method and an
@@ -454,18 +434,50 @@ pub(super) fn backfill_keypair(
     // writes the private key to system custody under `keys/` (NOT the principal
     // home) and appends the public key + `Keypair` method — exactly as the
     // create path does, reusing the same helper.
-    if let Err(resp) = mint_principal_keypair(kernel, principal, &mut profile) {
-        return resp;
-    }
+    let initial_public_key = match mint_principal_keypair(kernel, principal, &mut profile) {
+        Ok(public_key) => public_key,
+        Err(resp) => return resp,
+    };
 
     if let Err(e) = profile.validate() {
         return err_bad_input(format!("profile rejected: {e}"));
     }
 
+    let user = match kernel
+        .identity_store
+        .resolve(AGENT_IDENTITY_PLATFORM, principal.as_str())
+        .await
+    {
+        Ok(Some(user)) => user,
+        Ok(None) => {
+            return err_internal(format!(
+                "principal {principal} has no identity record for keypair backfill"
+            ));
+        },
+        Err(error) => {
+            return err_internal(format!(
+                "identity store lookup failed during keypair backfill: {error}"
+            ));
+        },
+    };
     // Persist via the same save path create uses. Groups, grants, network,
     // process, quotas, and home are untouched — only `auth` changed.
     if let Err(e) = profile.save_to_path(profile_path) {
         return err_profile(principal, &e);
+    }
+    if let Err(error) = kernel
+        .identity_store
+        .bind_principal_identity(user.id, principal.clone(), initial_public_key)
+        .await
+    {
+        return match original_profile.save_to_path(profile_path) {
+            Ok(()) => err_internal(format!(
+                "principal identity backfill failed; profile rolled back: {error}"
+            )),
+            Err(rollback) => err_internal(format!(
+                "principal identity backfill failed ({error}) and profile rollback failed ({rollback})"
+            )),
+        };
     }
     // Drop any cached pre-backfill profile so the next handshake re-reads the
     // freshly-minted credential rather than the stale keyless copy.
