@@ -658,8 +658,11 @@ fn validate_profile_bounds(
     } else {
         chunk_count
     };
+    // FastCDC 2020 begins its two-byte loop at floor(minimum / 2), so an odd
+    // declared minimum has an effective non-final lower bound one byte lower.
+    let effective_minimum = u64::from(profile.minimum_bytes() & !1);
     let mut minimum_total = required_full_chunks
-        .checked_mul(u64::from(profile.minimum_bytes()))
+        .checked_mul(effective_minimum)
         .ok_or(ContentError::LengthOverflow)?;
     if ends_file {
         minimum_total = minimum_total

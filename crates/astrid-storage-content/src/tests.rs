@@ -352,6 +352,27 @@ fn odd_minimum_profile_keeps_its_pre_freeze_boundaries() {
         read_content(&MapSource::new(built.records()), built.descriptor().file()).unwrap(),
         bytes
     );
+
+    // FastCDC's two-byte loop starts at floor(minimum / 2), so odd profiles
+    // can canonically cut one byte below the declared minimum.
+    let mut edge_bytes = vec![1_u8; 2048];
+    edge_bytes[64] = 248;
+    let edge_boundaries: Vec<_> = fastcdc::v2020::FastCDC::with_level_and_seed(
+        &edge_bytes,
+        65,
+        256,
+        1024,
+        fastcdc::v2020::Normalization::Level1,
+        0,
+    )
+    .map(|chunk| chunk.length)
+    .collect();
+    assert_eq!(edge_boundaries.first(), Some(&64));
+    let edge = build_content(&TestIdentity, profile, &edge_bytes).unwrap();
+    assert_eq!(
+        read_content(&MapSource::new(edge.records()), edge.descriptor().file()).unwrap(),
+        edge_bytes
+    );
 }
 
 #[test]

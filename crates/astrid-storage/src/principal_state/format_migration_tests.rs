@@ -65,6 +65,9 @@ async fn assert_prior_format_is_selected(prior: ObjectId, catalog_aware: bool) {
             catalog_spec_id,
         )
         .unwrap(),
-        DestinationFormat::PriorV1(prior)
+        DestinationFormat::PriorV1 {
+            format_spec: prior,
+            catalog_spec_was_declared: catalog_aware,
+        }
     );
 }

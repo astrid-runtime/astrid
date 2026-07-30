@@ -145,7 +145,7 @@ fn format_specification_has_a_tagged_metadata_identity() {
     assert!(record.references().is_empty());
     assert_eq!(
         object_id_hex(id),
-        "13f88f766dae2fc6a3d4accc902990add90a5f4b2d855e74889771b4aac7c4a8"
+        "0f9a06bce643fb90e6446c4c0dc42144ba1446826e5c7c624cebeb661a479143"
     );
     assert_eq!(
         object_id_hex(catalog_id),
@@ -200,14 +200,20 @@ fn pre_derivation_v1_runatal_upgrade_is_idempotent_and_preserves_history() {
     persist_format_specification(&engine, &current_spec).unwrap();
     prepare_format_specification(
         &engine,
-        DestinationFormat::PriorV1(legacy_spec_id),
+        DestinationFormat::PriorV1 {
+            format_spec: legacy_spec_id,
+            catalog_spec_was_declared: false,
+        },
         &current_spec,
         current_spec_id,
     )
     .unwrap();
     prepare_catalog_specification(
         &engine,
-        DestinationFormat::PriorV1(legacy_spec_id),
+        DestinationFormat::PriorV1 {
+            format_spec: legacy_spec_id,
+            catalog_spec_was_declared: false,
+        },
         &catalog_spec,
         catalog_spec_id,
     )
@@ -240,6 +246,33 @@ fn pre_derivation_v1_runatal_upgrade_is_idempotent_and_preserves_history() {
     engine.close().unwrap();
 }
 
+#[test]
+fn prior_metadata_that_declared_a_catalog_specification_requires_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = RuntimeEngine::open(
+        directory.path(),
+        Blake3ObjectIdentityV1,
+        StateOwnerCodecV1,
+        RecoveryLimits::process_addressable(),
+    )
+    .unwrap();
+    let catalog_spec = bootstrap::content_catalog_format_specification().unwrap();
+    let catalog_spec_id = Blake3ObjectIdentityV1.identify(&catalog_spec);
+    let destination = DestinationFormat::PriorV1 {
+        format_spec: PRE_DERIVATION_FORMAT_SPEC_ID,
+        catalog_spec_was_declared: true,
+    };
+
+    let error = prepare_catalog_specification(&engine, destination, &catalog_spec, catalog_spec_id)
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("completed principal store is missing its content catalog specification"),
+        "{error}"
+    );
+}
+
 #[tokio::test]
 async fn completed_pre_derivation_v1_store_is_selected_for_runatal_amendment() {
     let directory = tempfile::tempdir().unwrap();
@@ -269,7 +302,10 @@ async fn completed_pre_derivation_v1_store_is_selected_for_runatal_amendment() {
             Blake3ObjectIdentityV1.identify(&catalog_spec),
         )
         .unwrap(),
-        DestinationFormat::PriorV1(PRE_DERIVATION_FORMAT_SPEC_ID)
+        DestinationFormat::PriorV1 {
+            format_spec: PRE_DERIVATION_FORMAT_SPEC_ID,
+            catalog_spec_was_declared: false,
+        }
     );
 }
 

@@ -449,8 +449,9 @@ File:
   Non-empty content has exactly one Owns label "content" targeting a Chunk or
   ChunkTree. Content at or below maximum_chunk_bytes has exactly one whole
   Chunk; FastCDC is used only above that threshold. Every chunk is at most the
-  profile maximum. Every non-final chunk is at least the profile minimum; the
-  final chunk may contain 1 through maximum bytes.
+  profile maximum. The effective minimum is
+  2 * floor(minimum_chunk_bytes / 2). Every non-final chunk is at least that
+  effective minimum; the final chunk may contain 1 through maximum bytes.
 
   Algorithm 1, implementation revision 1 is the following exact unsigned
   64-bit FastCDC construction. All additions and left shifts wrap modulo 2^64.

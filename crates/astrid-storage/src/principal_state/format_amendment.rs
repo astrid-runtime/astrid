@@ -106,7 +106,10 @@ pub(super) fn object_id_hex(id: ObjectId) -> String {
 pub(super) enum DestinationFormat {
     New,
     Current,
-    PriorV1(ObjectId),
+    PriorV1 {
+        format_spec: ObjectId,
+        catalog_spec_was_declared: bool,
+    },
 }
 
 impl DestinationFormat {
@@ -147,13 +150,23 @@ pub(super) fn prepare_destination(
             if existing_complete
                 && let Some(prior) = std::iter::once(current_format_spec)
                     .chain(PRIOR_V1_FORMAT_SPEC_IDS.iter().copied())
-                    .find(|candidate| {
-                        actual == legacy_store_metadata(*candidate)
-                            || actual == store_metadata(*candidate, current_catalog_spec)
+                    .find_map(|candidate| {
+                        if actual == legacy_store_metadata(candidate) {
+                            Some(DestinationFormat::PriorV1 {
+                                format_spec: candidate,
+                                catalog_spec_was_declared: false,
+                            })
+                        } else if actual == store_metadata(candidate, current_catalog_spec) {
+                            Some(DestinationFormat::PriorV1 {
+                                format_spec: candidate,
+                                catalog_spec_was_declared: true,
+                            })
+                        } else {
+                            None
+                        }
                     })
             {
-                return validate_authoritative_files(path)
-                    .map(|()| DestinationFormat::PriorV1(prior));
+                return validate_authoritative_files(path).map(|()| prior);
             }
             return Err(unsupported_format_error(&metadata));
         }
@@ -194,7 +207,10 @@ pub(super) fn prepare_format_specification(
             false,
             "in-band format specification",
         ),
-        DestinationFormat::PriorV1(legacy_spec_id) => {
+        DestinationFormat::PriorV1 {
+            format_spec: legacy_spec_id,
+            ..
+        } => {
             let legacy = read_format_specification(engine, legacy_spec_id)?.ok_or_else(|| {
                 StorageError::Connection(
                     "completed principal store is missing its prior format-v1 specification"
@@ -232,7 +248,14 @@ pub(super) fn prepare_catalog_specification(
         engine,
         catalog_spec_id,
         catalog_spec,
-        matches!(destination_format, DestinationFormat::Current),
+        matches!(
+            destination_format,
+            DestinationFormat::Current
+                | DestinationFormat::PriorV1 {
+                    catalog_spec_was_declared: true,
+                    ..
+                }
+        ),
         "content catalog specification",
     )
 }

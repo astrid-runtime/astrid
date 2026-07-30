@@ -45,7 +45,7 @@ REFERENCE_NAMES = ("Owns", "Evidence", "Lineage", "Derived")
 FORMAT_SPECIFICATION = (
     1,
     1,
-    bytes.fromhex("13f88f766dae2fc6a3d4accc902990add90a5f4b2d855e74889771b4aac7c4a8"),
+    bytes.fromhex("0f9a06bce643fb90e6446c4c0dc42144ba1446826e5c7c624cebeb661a479143"),
 )
 CONTENT_CATALOG_SPECIFICATION = (
     1,
@@ -263,7 +263,7 @@ def tree_capacity(depth):
 
 
 def validate_profile_bounds(logical_bytes, chunk_count, profile, ends_file):
-    minimum = profile[3]
+    minimum = profile[3] & ~1
     maximum = profile[5]
     maximum_total = chunk_count * maximum
     required_full_chunks = chunk_count - 1 if ends_file else chunk_count

@@ -243,6 +243,14 @@ def verify_golden_vectors():
             "FastCDC odd-minimum golden mismatch: "
             f"expected {ODD_MINIMUM_GOLDEN_LENGTHS}, got {odd_actual}"
         )
+    odd_edge = bytearray([1] * 2048)
+    odd_edge[64] = 248
+    odd_edge_lengths = chunk_lengths(odd_edge, odd_minimum)
+    if odd_edge_lengths[0] != 64:
+        raise ValueError(
+            "FastCDC odd-minimum effective-bound mismatch: "
+            f"expected first chunk 64, got {odd_edge_lengths[0]}"
+        )
 
     chunks = []
     offset = 0
