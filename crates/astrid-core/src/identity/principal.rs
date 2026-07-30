@@ -307,7 +307,7 @@ mod tests {
                 .parse::<PrincipalUid>()
                 .is_err()
         );
-        assert!(format!("0{}", uid).parse::<PrincipalUid>().is_err());
+        assert!(format!("0{uid}").parse::<PrincipalUid>().is_err());
     }
 
     #[test]

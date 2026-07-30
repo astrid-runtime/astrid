@@ -47,6 +47,7 @@ pub mod content;
 pub mod error;
 pub mod identity;
 pub mod kv;
+mod principal_directory;
 #[cfg(not(target_family = "wasm"))]
 pub mod principal_state;
 pub mod secret;
@@ -64,6 +65,7 @@ pub use kv::{
     KvEntry, KvPrincipalResolver, KvQuotaResolver, KvStore, MemoryKvStore, PrincipalKvStore,
     ScopedKvStore, TreeKvStore,
 };
+pub use principal_directory::PrincipalDirectory;
 pub use secret::{
     DenySecretStore, FileSecretStore, KvSecretStore, ReadThroughSecretStore, SecretStore,
     SecretStoreError, build_secret_store,
@@ -77,10 +79,9 @@ pub use kv::SurrealKvStore;
 #[cfg(not(target_family = "wasm"))]
 pub use principal_state::{
     Blake3ObjectIdentityV1, NativeContentStagingArea, NativePrincipalContentStore,
-    PrincipalDirectory, ReadyStagedContent, RuntimePrincipalStore, StagedContentId,
-    StagedContentWriter, StateOwner, StateOwnerCodecV1, StateOwnerResolver, open_runtime_kv,
-    open_runtime_kv_with_directory, open_runtime_principal_store,
-    open_runtime_principal_store_with_directory,
+    ReadyStagedContent, RuntimePrincipalStore, StagedContentId, StagedContentWriter, StateOwner,
+    StateOwnerCodecV1, StateOwnerResolver, open_runtime_kv, open_runtime_kv_with_directory,
+    open_runtime_principal_store, open_runtime_principal_store_with_directory,
 };
 
 #[cfg(feature = "db")]

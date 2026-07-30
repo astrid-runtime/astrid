@@ -457,7 +457,7 @@ fn replace_catalog_with_legacy(
     let commit_id = Blake3ObjectIdentityV1.identify(&commit);
     engine
         .commit(RootTransaction::new(
-            owner.clone(),
+            *owner,
             Some(previous),
             commit_id,
             vec![
@@ -490,7 +490,7 @@ async fn install_legacy_catalog_fixtures(
         .iter()
         .map(|(owner, name, bytes)| {
             (
-                (*owner).clone(),
+                **owner,
                 (*name).clone(),
                 store.content().put(owner, name, bytes).unwrap(),
             )
@@ -751,7 +751,7 @@ async fn native_stage_acknowledges_before_ingest_and_publishes_on_a_blocking_wor
     let name = ContentName::new("workspace/target/release/game").unwrap();
     let mut writer = store
         .staging()
-        .begin(owner.clone(), name.clone(), ChunkingProfile::ASTRID_V1)
+        .begin(owner, name.clone(), ChunkingProfile::ASTRID_V1)
         .unwrap();
     writer.write_all(b"linux build.......").unwrap();
     writer.seek(SeekFrom::Start(12)).unwrap();
@@ -792,7 +792,7 @@ async fn staged_publication_retries_after_root_commit_before_cleanup() {
     let name = ContentName::new("workspace/retry.bin").unwrap();
     let mut writer = store
         .staging()
-        .begin(owner.clone(), name.clone(), ChunkingProfile::ASTRID_V1)
+        .begin(owner, name.clone(), ChunkingProfile::ASTRID_V1)
         .unwrap();
     writer.write_all(b"one identity").unwrap();
     let staged = writer.seal().unwrap();
@@ -822,13 +822,13 @@ async fn staged_publication_enforces_close_order_for_the_same_name() {
     let name = ContentName::new("workspace/order.txt").unwrap();
     let mut first = store
         .staging()
-        .begin(owner.clone(), name.clone(), ChunkingProfile::ASTRID_V1)
+        .begin(owner, name.clone(), ChunkingProfile::ASTRID_V1)
         .unwrap();
     first.write_all(b"first close").unwrap();
     let first = first.seal().unwrap();
     let mut second = store
         .staging()
-        .begin(owner.clone(), name.clone(), ChunkingProfile::ASTRID_V1)
+        .begin(owner, name.clone(), ChunkingProfile::ASTRID_V1)
         .unwrap();
     second.write_all(b"second close").unwrap();
     let second = second.seal().unwrap();

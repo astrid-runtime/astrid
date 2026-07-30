@@ -23,8 +23,8 @@ use astrid_core::identity::types::{AstridUserId, FrontendLink, normalize_platfor
 use astrid_core::identity::{PrincipalGenesis, PrincipalIdentity, PrincipalUid};
 use astrid_core::principal::PrincipalId;
 
+use crate::PrincipalDirectory;
 use crate::kv::ScopedKvStore;
-use crate::principal_state::PrincipalDirectory;
 
 mod persistence;
 use persistence::PersistedUser;

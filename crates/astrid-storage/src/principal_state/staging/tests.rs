@@ -186,7 +186,7 @@ fn interrupted_seal_is_promoted_but_unsealed_bytes_are_quarantined() {
     let intent = StagingIntent {
         sequence: area.allocate_sequence().unwrap(),
         id: sealed.id,
-        owner: sealed.owner.clone(),
+        owner: sealed.owner,
         name: sealed.name.clone(),
         profile: sealed.profile,
         logical_bytes: 10,
