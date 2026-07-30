@@ -194,7 +194,7 @@ impl Corpus {
             candidate,
             throughput: CorpusThroughput {
                 samples: u64::try_from(CORPUS_THROUGHPUT_SAMPLES)?,
-                scope: "median of alternating end-to-end corpus traversals including file I/O and the whole-file policy",
+                scope: self.throughput_scope(),
                 chunk_only,
                 chunk_and_blake3,
             },
@@ -204,6 +204,18 @@ impl Corpus {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    fn throughput_scope(&self) -> &'static str {
+        if self
+            .inputs
+            .iter()
+            .any(|input| matches!(input, Input::File { .. }))
+        {
+            "median of alternating end-to-end corpus traversals including file I/O and the whole-file policy"
+        } else {
+            "median of alternating in-memory corpus traversals including the whole-file policy"
+        }
     }
 
     fn measure_throughput_samples(&self, candidate: &Candidate) -> Result<(Timing, Timing)> {
@@ -446,11 +458,12 @@ fn collect_files(root: &Path, recursive: bool) -> Result<Vec<Input>> {
         .follow_links(false)
         .into_iter()
         .filter_entry(|entry| {
-            if entry.depth() != 1 {
-                return true;
-            }
-            let name = entry.file_name().to_string_lossy();
-            !EXCLUDED_TOP_LEVEL_DIRECTORIES.contains(&name.as_ref())
+            include_walker_entry(
+                recursive,
+                entry.depth(),
+                entry.file_type().is_dir(),
+                &entry.file_name().to_string_lossy(),
+            )
         });
     let mut inputs = Vec::new();
     for entry in walker {
@@ -464,6 +477,10 @@ fn collect_files(root: &Path, recursive: bool) -> Result<Vec<Input>> {
     }
     inputs.sort_by(|left, right| input_path(left).cmp(&input_path(right)));
     Ok(inputs)
+}
+
+fn include_walker_entry(recursive: bool, depth: usize, is_directory: bool, name: &str) -> bool {
+    !recursive || depth != 1 || !is_directory || !EXCLUDED_TOP_LEVEL_DIRECTORIES.contains(&name)
 }
 
 fn snapshot_file(path: &Path) -> Result<FileSnapshot> {
@@ -599,6 +616,35 @@ mod tests {
             assert!(validate_label(invalid).is_err());
         }
         validate_label("agent-state").unwrap();
+    }
+
+    #[test]
+    fn sensitive_names_exclude_only_top_level_snapshot_directories() {
+        for name in EXCLUDED_TOP_LEVEL_DIRECTORIES {
+            assert!(!include_walker_entry(true, 1, true, name));
+            assert!(include_walker_entry(true, 1, false, name));
+            assert!(include_walker_entry(false, 1, true, name));
+            assert!(include_walker_entry(true, 2, true, name));
+        }
+    }
+
+    #[test]
+    fn throughput_scope_distinguishes_file_and_memory_inputs() {
+        let in_memory = Corpus::synthetic_adversarial();
+        assert!(in_memory.throughput_scope().contains("in-memory"));
+
+        let file_backed = Corpus {
+            name: "file-backed".to_owned(),
+            kind: CorpusKind::DirectorySnapshot,
+            inputs: vec![Input::File {
+                path: PathBuf::from("not-opened-by-this-test"),
+                snapshot: FileSnapshot {
+                    logical_bytes: 0,
+                    identity: [0; 32],
+                },
+            }],
+        };
+        assert!(file_backed.throughput_scope().contains("file I/O"));
     }
 
     #[test]

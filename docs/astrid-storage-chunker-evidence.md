@@ -13,16 +13,16 @@ Keep `ChunkingProfile::ASTRID_V1`: FastCDC 2020, normalization level one,
 
 The measured alternatives do not justify changing durable identity:
 
-- the best matched MinCDC profile changes combined estimated retained cost by
-  -0.0105%, effectively a tie;
+- the empirical-compromise MinCDC profile changes combined estimated retained
+  cost by -0.0105%, effectively a tie;
 - the lowest-cost MinCDC profile improves that estimate by 0.1086% but creates
   41.58% more unique chunk objects across the two live corpora;
 - MinCDC is materially faster in the scalar CPU-only fixture, while the expanded
   local-edit study finds no material stability winner between FastCDC and the
-  distribution-matched MinCDC profile;
-- Moth's caterpillar encoding collapsed 60 records in the matched live-state
-  run and none in the workspace or captured history, a 2,400-byte directional
-  metadata estimate rather than a storage-architecture win; and
+  empirical-compromise MinCDC profile;
+- Moth's caterpillar encoding collapsed 60 records in the corresponding
+  live-state run and none in the workspace or captured history, a 2,400-byte
+  directional metadata estimate rather than a storage-architecture win; and
 - Chonkers does not currently have a licensed, byte-stream, independently
   reproducible reference profile that Astrid can freeze.
 
@@ -38,8 +38,8 @@ keeps boundary selection separate from representation:
 - `fastcdc-v2020-64k` is the production baseline;
 - MinCDC `narrow` uses 48–80 KiB bounds;
 - MinCDC `wide` uses 32–96 KiB bounds;
-- MinCDC `observed-match-96k` uses 32–160 KiB bounds, selected after the first
-  pass showed that FastCDC's observed large-file mean was not 64 KiB;
+- MinCDC `empirical-compromise-96k` uses 32–160 KiB bounds, selected after the
+  first pass showed that FastCDC's observed large-file mean was not 64 KiB;
 - MinCDC `fastcdc-bounds` uses the same 16–256 KiB bounds as production; and
 - each Moth entry uses the identical paired MinCDC boundaries, then separately
   counts its adjacent-identical-chunk run representation.
@@ -48,12 +48,21 @@ MinCDC records no invented average-size parameter. Its complete identity
 candidate is its window, inclusive min/max bounds, multiplier, addend, leftmost
 tie rule, and final-chunk rule.
 
+The empirical-compromise label is deliberately not `observed-match`. FastCDC's
+agent-state distribution has a 107.6 KiB mean and a 256 KiB p95/p99, while its
+workspace distribution has a 74.7 KiB mean, 143.5 KiB p95, and 193.5 KiB p99.
+MinCDC 32–160 KiB lands at 90.9/83.9 KiB means but cannot reproduce the agent
+tail. Giving MinCDC the same 256 KiB maximum recovers the agent tail, overshoots
+the workspace tail, and moves the means to 127.5/112.8 KiB. No tested bound
+pair matched both corpora; the reported profiles bracket the observed
+distributions instead of treating a nominal target as an empirical match.
+
 The corpora were:
 
 | Label | Shape | Logical size |
 |---|---:|---:|
 | `agent-state` | 230,086 files | 5.73 GB |
-| `dev-workspace` | 47,772 files | 2.47 GB |
+| `dev-workspace` | 47,783 files | 2.47 GB |
 | `captured-code` | 32 real `Cargo.lock` revisions read directly from Git | 8.14 MB |
 | `synthetic-version-chain-v1` | 16 controlled local edits | 67.1 MB |
 | `synthetic-adversarial-v1` | empty, short, zeros, all-ones, periodic, monotone, repeated, pseudorandom, and boundary-pressure inputs | 58.7 MB |
@@ -76,9 +85,9 @@ bytes.
 
 | Profile | Agent CDC mean | Workspace CDC mean | Agent saved | Workspace saved | Combined cost vs FastCDC | Unique objects vs FastCDC |
 |---|---:|---:|---:|---:|---:|---:|
-| FastCDC 16/64/256 | 110.1 KiB | 76.5 KiB | 51.38% | 26.10% | baseline | baseline |
-| MinCDC observed-match 32–160 | 93.1 KiB | 86.0 KiB | 51.38% | 26.18% | -0.0105% | +8.46% |
-| MinCDC wide 32–96 | 59.7 KiB | 59.1 KiB | 51.44% | 26.44% | -0.1086% | +41.58% |
+| FastCDC 16/64/256 | 107.6 KiB | 74.7 KiB | 51.38% | 26.10% | baseline | baseline |
+| MinCDC empirical compromise 32–160 | 90.9 KiB | 83.9 KiB | 51.38% | 26.18% | -0.0105% | +8.46% |
+| MinCDC wide 32–96 | 58.3 KiB | 57.7 KiB | 51.44% | 26.44% | -0.1086% | +41.58% |
 | MinCDC same bounds 16–256 | 130.5 KiB | 115.5 KiB | 51.35% | 25.86% | +0.1323% | -8.56% |
 
 The cost estimate is explicit and directional: unique chunk bytes plus 162
@@ -104,25 +113,25 @@ all resynchronized. Across every candidate, each edit preserved at least
 | Profile | Worst boundary survival | p95 resynchronization | Maximum resynchronization |
 |---|---:|---:|---:|
 | FastCDC 16/64/256 | 98.13% | 173,659 B | 173,916 B |
-| MinCDC observed-match 32–160 | 97.56% | 159,401 B | 200,899 B |
+| MinCDC empirical compromise 32–160 | 97.56% | 159,401 B | 200,899 B |
 | MinCDC wide 32–96 | 98.40% | 159,114 B | 164,628 B |
 | MinCDC same bounds 16–256 | 96.36% | 250,549 B | 410,992 B |
 
 The expanded measurement retracts the earlier single-midpoint claim that
-MinCDC had a 2.6–3.6 times longer resynchronization tail. The matched profile
-has a slightly shorter p95 and a 15.5% longer maximum than FastCDC; the wide
-profile is slightly better on both. Stability therefore does not decide the
-format. Retained cost, object population, implementation independence, and
-existing production behavior do.
+MinCDC had a 2.6–3.6 times longer resynchronization tail. The empirical
+compromise has a slightly shorter p95 and a 15.5% longer maximum than FastCDC;
+the wide profile is slightly better on both. Stability therefore does not
+decide the format. Retained cost, object population, implementation
+independence, and existing production behavior do.
 
 Each corpus/profile pair also has three alternating end-to-end passes per
 mode. These medians include file I/O and the whole-file policy:
 
 | Profile | Agent chunk only | Agent + BLAKE3 | Workspace chunk only | Workspace + BLAKE3 |
 |---|---:|---:|---:|---:|
-| FastCDC 16/64/256 | 315.85 MiB/s | 301.25 MiB/s | 855.79 MiB/s | 576.35 MiB/s |
-| MinCDC observed-match 32–160 | 234.42 MiB/s | 202.14 MiB/s | 1,214.72 MiB/s | 709.21 MiB/s |
-| Moth observed-match 32–160 | 208.37 MiB/s | 194.29 MiB/s | 1,141.75 MiB/s | 681.92 MiB/s |
+| FastCDC 16/64/256 | 234.23 MiB/s | 205.65 MiB/s | 890.13 MiB/s | 591.07 MiB/s |
+| MinCDC empirical compromise 32–160 | 226.21 MiB/s | 203.18 MiB/s | 1,160.00 MiB/s | 684.69 MiB/s |
+| Moth empirical compromise 32–160 | 227.10 MiB/s | 201.73 MiB/s | 1,170.09 MiB/s | 682.35 MiB/s |
 
 Alternating order prevents the second mode from inheriting a systematically
 warmer page cache. The results also show why CPU-only throughput is not a
@@ -134,9 +143,9 @@ the Apple M2 Ultra host with Rust 1.95.0:
 
 | Profile | Chunk only | Chunk + BLAKE3 |
 |---|---:|---:|
-| FastCDC 16/64/256 | 1,741.77 MiB/s | 881.70 MiB/s |
-| MinCDC observed-match 32–160 | 10,545.61 MiB/s | 1,520.67 MiB/s |
-| Moth observed-match 32–160 | 10,725.95 MiB/s | 1,539.49 MiB/s |
+| FastCDC 16/64/256 | 1,753.24 MiB/s | 885.60 MiB/s |
+| MinCDC empirical compromise 32–160 | 10,245.66 MiB/s | 1,463.27 MiB/s |
+| Moth empirical compromise 32–160 | 10,361.29 MiB/s | 1,495.56 MiB/s |
 
 MinCDC's compute result is real and worth retaining as evidence. It does not,
 by itself, outweigh an identity migration for effectively unchanged retained
@@ -192,8 +201,9 @@ The report contains wall-time measurements, so reruns are not byte-identical.
 Corpus counts, boundaries, identities, deduplication totals, representation
 counts, and stability outcomes are deterministic. CPU-only throughput uses
 three in-memory samples per profile. Corpus throughput uses three alternating
-end-to-end samples per mode and includes file I/O. Both must be interpreted
-within the recorded host/toolchain boundary.
+end-to-end samples per mode; directory snapshots include file I/O, while
+memory-backed synthetic and Git-history corpora do not. Both must be
+interpreted within the recorded host/toolchain boundary.
 
 ## Reopening the decision
 

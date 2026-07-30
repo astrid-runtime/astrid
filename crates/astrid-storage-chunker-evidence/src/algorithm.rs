@@ -159,12 +159,13 @@ pub fn candidates(target_kib: u32) -> Result<Vec<Candidate>> {
     let narrow_maximum = checked_ratio(target, 5, 4, "narrow MinCDC maximum")?;
     let wide_minimum = target / 2;
     let wide_maximum = checked_ratio(target, 3, 2, "wide MinCDC maximum")?;
-    let observed_match_minimum = target / 2;
-    let observed_match_maximum = checked_ratio(target, 5, 2, "observed-match MinCDC maximum")?;
-    let observed_match_kib = target_kib
+    let empirical_compromise_minimum = target / 2;
+    let empirical_compromise_maximum =
+        checked_ratio(target, 5, 2, "empirical-compromise MinCDC maximum")?;
+    let empirical_compromise_kib = target_kib
         .checked_mul(3)
         .and_then(|value| value.checked_div(2))
-        .ok_or_else(|| anyhow::anyhow!("observed-match label overflow"))?;
+        .ok_or_else(|| anyhow::anyhow!("empirical-compromise label overflow"))?;
 
     Ok(vec![
         Candidate {
@@ -205,14 +206,14 @@ pub fn candidates(target_kib: u32) -> Result<Vec<Candidate>> {
             wide_maximum,
         ),
         mincdc_candidate(
-            format!("mincdc-hash4-observed-match-{observed_match_kib}k"),
-            observed_match_minimum,
-            observed_match_maximum,
+            format!("mincdc-hash4-empirical-compromise-{empirical_compromise_kib}k"),
+            empirical_compromise_minimum,
+            empirical_compromise_maximum,
         ),
         mothcdc_candidate(
-            format!("moth-caterpillar-observed-match-{observed_match_kib}k"),
-            observed_match_minimum,
-            observed_match_maximum,
+            format!("moth-caterpillar-empirical-compromise-{empirical_compromise_kib}k"),
+            empirical_compromise_minimum,
+            empirical_compromise_maximum,
         ),
         mincdc_candidate(
             format!("mincdc-hash4-fastcdc-bounds-{target_kib}k"),
@@ -307,7 +308,7 @@ mod tests {
                     .contains("target_bytes")
             );
         }
-        let observed = candidate(&candidates, "mincdc-hash4-observed-match-96k");
+        let observed = candidate(&candidates, "mincdc-hash4-empirical-compromise-96k");
         assert_eq!(
             observed
                 .minimum_bytes
