@@ -11,6 +11,16 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Added
 
+- **The format-one content chunker now has a reproducible evidence gate.** A
+  non-published harness compares the pinned FastCDC profile with exact MinCDC
+  and Moth evidence oracles across live aggregate corpora, captured and
+  synthetic version chains, adversarial inputs, local-edit resynchronization,
+  whole-file versus chunk deduplication, object-cost estimates, and CPU-only
+  throughput. A scalar independent MinCDC reader pins constants and
+  tie/bound/final-chunk behavior; reports exclude input paths and file names.
+  The measurements retain FastCDC for format one, keep Moth representation
+  claims separate from boundary selection, and record why Chonkers is not yet
+  a licensed byte-exact candidate.
 - **Astrid has a content-addressed computation design contract.** A canonical
   invocation object now specifies the complete identity boundary for reusable
   deterministic work, including the exact transform closure, its registered

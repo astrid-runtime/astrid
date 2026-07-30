@@ -1,0 +1,26 @@
+[package]
+name = "astrid-storage-chunker-evidence"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Reproducible evidence harness for Astrid content chunking profiles"
+
+[dependencies]
+anyhow = { workspace = true }
+blake3 = { workspace = true }
+fastcdc = { workspace = true }
+mincdc = { workspace = true }
+mothcdc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+walkdir = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
