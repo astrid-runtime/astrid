@@ -45,7 +45,7 @@ REFERENCE_NAMES = ("Owns", "Evidence", "Lineage", "Derived")
 FORMAT_SPECIFICATION = (
     1,
     1,
-    bytes.fromhex("400f5d0982d8ad8eb5ecfb77f6b7d7b2c11e09e9595a6d25e150f7e707b37c17"),
+    bytes.fromhex("13f88f766dae2fc6a3d4accc902990add90a5f4b2d855e74889771b4aac7c4a8"),
 )
 CONTENT_CATALOG_SPECIFICATION = (
     1,

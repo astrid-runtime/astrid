@@ -326,13 +326,30 @@ fn profile_identity_is_deterministic_and_seeded() {
 }
 
 #[test]
-fn format_one_profile_rejects_an_odd_minimum() {
-    assert!(matches!(
-        ChunkingProfile::fastcdc_v2020(65, 256, 1024, 0),
-        Err(ContentError::InvalidProfile(
-            "minimum chunk size must be even"
-        ))
-    ));
+fn odd_minimum_profile_keeps_its_pre_freeze_boundaries() {
+    let bytes = deterministic_bytes(4096);
+    let profile = ChunkingProfile::fastcdc_v2020(65, 256, 1024, 0).unwrap();
+    let boundaries: Vec<_> = fastcdc::v2020::FastCDC::with_level_and_seed(
+        &bytes,
+        65,
+        256,
+        1024,
+        fastcdc::v2020::Normalization::Level1,
+        0,
+    )
+    .map(|chunk| chunk.length)
+    .collect();
+    assert_eq!(
+        boundaries,
+        vec![75, 301, 295, 297, 568, 412, 123, 169, 324, 294, 76, 358, 283, 483, 38]
+    );
+
+    let built = build_content(&TestIdentity, profile, &bytes).unwrap();
+    assert_eq!(built.descriptor().chunk_count(), boundaries.len() as u64);
+    assert_eq!(
+        read_content(&MapSource::new(built.records()), built.descriptor().file()).unwrap(),
+        bytes
+    );
 }
 
 #[test]

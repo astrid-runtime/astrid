@@ -106,11 +106,6 @@ impl ChunkingProfile {
                 "chunk sizes must satisfy minimum < average < maximum",
             ));
         }
-        if !minimum.is_multiple_of(2) {
-            return Err(ContentError::InvalidProfile(
-                "minimum chunk size must be even",
-            ));
-        }
         if !average.is_power_of_two() {
             return Err(ContentError::InvalidProfile(
                 "average chunk size must be a power of two",

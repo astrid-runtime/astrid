@@ -439,7 +439,7 @@ File:
 
   The ASTRID_V1 profile is minimum 16384, average 65536, maximum 262144,
   seed 0, and fanout 128. minimum < average < maximum; average is a power of
-  two; minimum is even. The accepted parameter ranges are:
+  two. The accepted parameter ranges are:
 
       64       <= minimum_chunk_bytes <= 1048576
       256      <= average_chunk_bytes <= 4194304
@@ -454,7 +454,8 @@ File:
 
   Algorithm 1, implementation revision 1 is the following exact unsigned
   64-bit FastCDC construction. All additions and left shifts wrap modulo 2^64.
-  Integer divisions round down.
+  Integer divisions round down. Odd minimum values are valid; minimum / 2
+  therefore starts at floor(minimum / 2).
 
   Define the base gear table for byte b in 0 through 255 as:
 

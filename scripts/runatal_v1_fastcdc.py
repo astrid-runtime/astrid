@@ -82,6 +82,23 @@ SEEDED_GOLDEN_LENGTHS = (
     69_996,
     8_001,
 )
+ODD_MINIMUM_GOLDEN_LENGTHS = (
+    75,
+    301,
+    295,
+    297,
+    568,
+    412,
+    123,
+    169,
+    324,
+    294,
+    76,
+    358,
+    283,
+    483,
+    38,
+)
 
 
 def validate_profile(profile):
@@ -96,8 +113,6 @@ def validate_profile(profile):
         raise ValueError("FastCDC maximum is outside format-1 bounds")
     if not minimum < average < maximum:
         raise ValueError("FastCDC sizes are not strictly increasing")
-    if minimum % 2:
-        raise ValueError("FastCDC minimum is not even")
     if average & (average - 1):
         raise ValueError("FastCDC average is not a power of two")
     if not 0 <= seed <= U64_MASK:
@@ -205,14 +220,6 @@ def golden_source(length):
 
 
 def verify_golden_vectors():
-    odd_minimum = ASTRID_V1[:3] + (16_385,) + ASTRID_V1[4:]
-    try:
-        validate_profile(odd_minimum)
-    except ValueError:
-        pass
-    else:
-        raise ValueError("FastCDC verifier accepted an odd minimum")
-
     source = golden_source(1024 * 1024)
     actual = chunk_lengths(source, ASTRID_V1)
     if actual != GOLDEN_LENGTHS:
@@ -229,6 +236,13 @@ def verify_golden_vectors():
     zero_lengths = chunk_lengths(bytes(1024 * 1024), ASTRID_V1)
     if zero_lengths != (262_144, 262_144, 262_144, 262_144):
         raise ValueError(f"FastCDC zero golden mismatch: got {zero_lengths}")
+    odd_minimum = (1, 1, 1, 65, 256, 1024, 0)
+    odd_actual = chunk_lengths(golden_source(4096), odd_minimum)
+    if odd_actual != ODD_MINIMUM_GOLDEN_LENGTHS:
+        raise ValueError(
+            "FastCDC odd-minimum golden mismatch: "
+            f"expected {ODD_MINIMUM_GOLDEN_LENGTHS}, got {odd_actual}"
+        )
 
     chunks = []
     offset = 0
