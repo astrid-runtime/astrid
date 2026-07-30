@@ -205,6 +205,8 @@ def validate_boundaries(chunks, profile):
         right_prefix = chunks[index + 1][:2]
         if not is_canonical_boundary(chunks[index], right_prefix, profile):
             raise ValueError(f"non-canonical FastCDC boundary at chunk {index}")
+    if len(chunks) > 1 and cut(chunks[-1], profile) != len(chunks[-1]):
+        raise ValueError("non-canonical FastCDC final chunk")
 
 
 def golden_source(length):
@@ -265,3 +267,16 @@ def verify_golden_vectors():
         pass
     else:
         raise ValueError("FastCDC verifier accepted a shifted golden boundary")
+
+    canonical_chunks = []
+    offset = 0
+    for length in GOLDEN_LENGTHS:
+        canonical_chunks.append(source[offset : offset + length])
+        offset += length
+    canonical_chunks[-2] += canonical_chunks.pop()
+    try:
+        validate_boundaries(canonical_chunks, ASTRID_V1)
+    except ValueError:
+        pass
+    else:
+        raise ValueError("FastCDC verifier accepted a merged final chunk")

@@ -10,6 +10,7 @@ from pathlib import Path
 from runatal_v1_blake3 import derive_key
 from runatal_v1_fastcdc import (
     ASTRID_V1,
+    cut,
     is_canonical_boundary,
     validate_profile,
     verify_golden_vectors,
@@ -45,7 +46,7 @@ REFERENCE_NAMES = ("Owns", "Evidence", "Lineage", "Derived")
 FORMAT_SPECIFICATION = (
     1,
     1,
-    bytes.fromhex("0f9a06bce643fb90e6446c4c0dc42144ba1446826e5c7c624cebeb661a479143"),
+    bytes.fromhex("eb32736259880e48df7c3249d1ef2037b83863a89011859c213ae1c39f7dd135"),
 )
 CONTENT_CATALOG_SPECIFICATION = (
     1,
@@ -419,7 +420,11 @@ def validate_file(objects, record):
         profile,
         True,
     )
-    content_summary(objects, content, shape, {}, {})
+    _, last_object, last_bytes = content_summary(objects, content, shape, {}, {})
+    if chunk_count > 1 and cut(last_bytes, profile) != len(last_bytes):
+        raise FormatError(
+            f"non-canonical FastCDC final chunk {identity_text(last_object)}"
+        )
 
 
 def verify_content_summary_vectors():

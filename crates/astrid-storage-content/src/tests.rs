@@ -528,6 +528,35 @@ fn invalid_profiles_and_ranges_are_rejected() {
 }
 
 #[test]
+fn merged_final_fastcdc_chunks_are_rejected() {
+    let profile = ChunkingProfile::ASTRID_V1;
+    let bytes = deterministic_bytes(1024 * 1024);
+    let mut chunks = Vec::new();
+    for chunk in fastcdc::v2020::FastCDC::with_level_and_seed(
+        &bytes,
+        profile.minimum_bytes() as usize,
+        profile.average_bytes() as usize,
+        profile.maximum_bytes() as usize,
+        fastcdc::v2020::Normalization::Level1,
+        profile.gear_seed(),
+    ) {
+        chunks.push(bytes[chunk.offset..chunk.offset + chunk.length].to_vec());
+    }
+    let final_chunk = chunks.pop().unwrap();
+    chunks.last_mut().unwrap().extend_from_slice(&final_chunk);
+    assert!(chunks.last().unwrap().len() <= profile.maximum_bytes() as usize);
+    let (file, source) = manual_content(profile, &chunks);
+
+    assert!(matches!(
+        read_content(&source, file),
+        Err(ContentReadError::Content(ContentError::InvalidObject {
+            detail: "final chunk violates the declared FastCDC profile",
+            ..
+        }))
+    ));
+}
+
+#[test]
 fn content_errors_preserve_typed_sources() {
     let content = ContentError::Model(ModelError::ArithmeticOverflow);
     let model_source = core::error::Error::source(&content).unwrap();

@@ -103,18 +103,14 @@ const GEAR: [u64; 256] = [
 ];
 
 #[allow(clippy::similar_names)]
-pub(crate) fn is_canonical_boundary(
-    left: &[u8],
-    right_prefix: &[u8],
-    profile: ChunkingProfile,
-) -> bool {
+fn cut_index(left: &[u8], right_prefix: &[u8], profile: ChunkingProfile) -> usize {
     let minimum = profile.minimum_bytes() as usize;
     let average = profile.average_bytes() as usize;
     let maximum = profile.maximum_bytes() as usize;
     let source_length = left.len().saturating_add(right_prefix.len());
     let remaining = source_length.min(maximum);
     if remaining <= minimum {
-        return false;
+        return remaining;
     }
     let center = average.min(remaining);
     let bits = average.trailing_zeros() as usize;
@@ -137,11 +133,11 @@ pub(crate) fn is_canonical_boundary(
         let at = index.saturating_mul(2);
         hash = (hash << 2).wrapping_add((GEAR[byte_at(at) as usize] << 1) ^ seed_ls);
         if hash & mask_s_ls == 0 {
-            return at == left.len();
+            return at;
         }
         hash = hash.wrapping_add(GEAR[byte_at(at.saturating_add(1)) as usize] ^ seed);
         if hash & mask_s == 0 {
-            return at.saturating_add(1) == left.len();
+            return at.saturating_add(1);
         }
         index = index.saturating_add(1);
     }
@@ -149,13 +145,27 @@ pub(crate) fn is_canonical_boundary(
         let at = index.saturating_mul(2);
         hash = (hash << 2).wrapping_add((GEAR[byte_at(at) as usize] << 1) ^ seed_ls);
         if hash & mask_l_ls == 0 {
-            return at == left.len();
+            return at;
         }
         hash = hash.wrapping_add(GEAR[byte_at(at.saturating_add(1)) as usize] ^ seed);
         if hash & mask_l == 0 {
-            return at.saturating_add(1) == left.len();
+            return at.saturating_add(1);
         }
         index = index.saturating_add(1);
     }
-    remaining == left.len()
+    remaining
+}
+
+pub(crate) fn is_canonical_boundary(
+    left: &[u8],
+    right_prefix: &[u8],
+    profile: ChunkingProfile,
+) -> bool {
+    !left.is_empty()
+        && !right_prefix.is_empty()
+        && cut_index(left, right_prefix, profile) == left.len()
+}
+
+pub(crate) fn is_canonical_final_chunk(bytes: &[u8], profile: ChunkingProfile) -> bool {
+    !bytes.is_empty() && cut_index(bytes, &[], profile) == bytes.len()
 }

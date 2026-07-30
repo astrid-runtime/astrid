@@ -7,7 +7,9 @@ use astrid_storage_model::{
 
 use crate::{
     CHUNK_TREE_FANOUT, CONTENT_LABEL, ChunkingProfile, ContentDescriptor, ContentError,
-    FORMAT_VERSION, boundary::is_canonical_boundary, decode_file_header,
+    FORMAT_VERSION,
+    boundary::{is_canonical_boundary, is_canonical_final_chunk},
+    decode_file_header,
 };
 
 /// Fallible object-loading boundary used for lazy content reconstruction.
@@ -271,6 +273,12 @@ impl BoundaryWindow {
             let next = load_chunk_at_offset(source, content, shape, 0, last_end)?;
             let prefix_length = next.bytes.len().min(2);
             validate_boundary(last, &next.bytes[..prefix_length], shape.profile)?;
+        } else if shape.chunk_count > 1 && !is_canonical_final_chunk(&last.bytes, shape.profile) {
+            return Err(ContentError::InvalidObject {
+                object: last.object,
+                detail: "final chunk violates the declared FastCDC profile",
+            }
+            .into());
         }
         Ok(())
     }

@@ -451,7 +451,10 @@ File:
   Chunk; FastCDC is used only above that threshold. Every chunk is at most the
   profile maximum. The effective minimum is
   2 * floor(minimum_chunk_bytes / 2). Every non-final chunk is at least that
-  effective minimum; the final chunk may contain 1 through maximum bytes.
+  effective minimum; the final chunk may contain 1 through maximum bytes. For
+  multi-chunk content, applying the cut function to the final chunk alone MUST
+  consume its full length. One-chunk content remains governed by the
+  whole-object threshold and does not perform this final-suffix check.
 
   Algorithm 1, implementation revision 1 is the following exact unsigned
   64-bit FastCDC construction. All additions and left shifts wrap modulo 2^64.
