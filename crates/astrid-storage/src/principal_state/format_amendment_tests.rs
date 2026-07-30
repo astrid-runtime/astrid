@@ -4,7 +4,10 @@
 
 use std::path::{Path, PathBuf};
 
-use astrid_storage_engine::RecoveryLimits;
+use astrid_storage_engine::{
+    CrossHashSigner, RecoveryLimits, RefineryBatchContext, RefineryPassDescriptorId,
+    RefineryResourceBudget, RefinerySnapshotId, attest_sha384_closure,
+};
 use astrid_storage_model::{
     AuthorityEpochId, CanonicalParametersId, ComputationSharingDomainId, DerivationContractId,
     DerivationEvidence, DerivationInvocation, DerivationOutput, DeterministicSeedId, EngineBuildId,
@@ -14,6 +17,7 @@ use astrid_storage_model::{
     RuntimeSemanticProfile, SemanticContractId, TensorLogicProofId, TransformId,
     VerifierEvidenceId,
 };
+use ed25519_dalek::{Signer, SigningKey};
 
 use super::bootstrap;
 use super::format_amendment::{STORE_METADATA_FILE, format_spec_record, store_metadata};
@@ -127,11 +131,62 @@ fn amendment_records() -> Vec<ObjectRecord> {
     ]
 }
 
+struct FixedCrossHashAuthority(SigningKey);
+
+impl CrossHashSigner for FixedCrossHashAuthority {
+    type Error = std::convert::Infallible;
+
+    fn public_key(&self) -> [u8; 32] {
+        self.0.verifying_key().to_bytes()
+    }
+
+    fn sign(&self, statement: &[u8]) -> Result<[u8; 64], Self::Error> {
+        Ok(self.0.sign(statement).to_bytes())
+    }
+}
+
+fn cross_hash_records() -> Vec<ObjectRecord> {
+    let source = ObjectRecord::new(
+        ObjectKind::Chunk,
+        ObjectFormatVersion::V1,
+        b"independent SHA-384 reader fixture".to_vec(),
+        Vec::new(),
+        37,
+        ObjectClass::Data,
+    )
+    .unwrap();
+    let source_id = Blake3ObjectIdentityV1.identify(&source);
+    let authority = FixedCrossHashAuthority(SigningKey::from_bytes(&[37; 32]));
+    let context = RefineryBatchContext::new(
+        RefinerySnapshotId::new(id(80)),
+        astrid_storage_model::PlacementEpoch::new(81),
+        RefineryResourceBudget::new(u64::MAX, u128::MAX, u64::MAX, u64::MAX, u64::MAX, u64::MAX),
+        None,
+    );
+    let mut records = vec![source.clone()];
+    records.extend(
+        attest_sha384_closure(
+            &Blake3ObjectIdentityV1,
+            &authority,
+            RefineryPassDescriptorId::new(id(82)),
+            context,
+            &[source_id],
+            &[(source_id, source)],
+        )
+        .unwrap()
+        .into_iter()
+        .map(|output| output.record().clone()),
+    );
+    records
+}
+
 #[test]
 fn independent_reader_decodes_all_derivation_amendment_schemas() {
     let directory = tempfile::tempdir().unwrap();
     let engine = open_fixture_store(directory.path());
-    engine.stage_objects(amendment_records()).unwrap();
+    let mut records = amendment_records();
+    records.extend(cross_hash_records());
+    engine.stage_objects(records).unwrap();
     engine.close().unwrap();
 
     let output = std::process::Command::new("python3")

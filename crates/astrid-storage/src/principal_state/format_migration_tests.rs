@@ -7,8 +7,9 @@ use astrid_storage_model::{ObjectId, ObjectIdentity};
 use super::bootstrap;
 use super::format_amendment::{
     DestinationFormat, PRE_COMPACTION_FORMAT_SPEC_ID, PRE_FASTCDC_FREEZE_FORMAT_SPEC_ID,
-    PRE_GC_OUTBOX_FORMAT_SPEC_ID, PRE_RUNATAL_NAMING_FORMAT_SPEC_ID, STORE_METADATA_FILE,
-    format_spec_record, legacy_store_metadata, prepare_destination, store_metadata,
+    PRE_GC_OUTBOX_FORMAT_SPEC_ID, PRE_RUNATAL_NAMING_FORMAT_SPEC_ID,
+    PRE_SHA384_ATTESTATION_FORMAT_SPEC_ID, STORE_METADATA_FILE, format_spec_record,
+    legacy_store_metadata, prepare_destination, store_metadata,
 };
 use super::{Blake3ObjectIdentityV1, KvQuotaResolver, StateOwner, open_runtime_kv};
 use astrid_core::dirs::AstridHome;
@@ -29,6 +30,7 @@ async fn completed_prior_v1_stores_are_selected_for_runatal_amendment() {
         PRE_GC_OUTBOX_FORMAT_SPEC_ID,
         PRE_RUNATAL_NAMING_FORMAT_SPEC_ID,
         PRE_FASTCDC_FREEZE_FORMAT_SPEC_ID,
+        PRE_SHA384_ATTESTATION_FORMAT_SPEC_ID,
     ] {
         assert_prior_format_is_selected(prior, false).await;
     }
