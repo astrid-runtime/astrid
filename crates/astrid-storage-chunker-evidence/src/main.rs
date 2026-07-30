@@ -8,6 +8,7 @@ use serde::Serialize;
 
 mod algorithm;
 mod corpus;
+mod environment;
 mod fixture;
 mod metrics;
 #[cfg(test)]
@@ -28,6 +29,7 @@ struct EvidenceReport {
     format_authority: &'static str,
     whole_file_policy: &'static str,
     corpus_privacy: &'static str,
+    benchmark_environment: environment::BenchmarkEnvironment,
     object_cost_model: &'static str,
     sources: [SourceRecord; 3],
     unavailable_candidates: [UnavailableCandidate; 1],
@@ -69,6 +71,7 @@ fn main() -> Result<()> {
         format_authority: "third-party implementations are evidence oracles; a selected profile requires an independently specified Astrid implementation and golden cuts",
         whole_file_policy: "inputs no larger than the candidate maximum remain one whole object",
         corpus_privacy: "reports contain aggregate labels and metrics only; no input path or file name is serialized",
+        benchmark_environment: environment::current(),
         object_cost_model: "unique chunk bytes + 162 bytes per unique chunk object + 40 bytes per physical reference record; compare directionally, not as an arena-format byte count",
         sources: source::source_records(),
         unavailable_candidates: source::unavailable_candidates(),

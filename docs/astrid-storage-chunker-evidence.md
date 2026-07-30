@@ -200,6 +200,9 @@ cargo run --release -p astrid-storage-chunker-evidence -- \
 ```
 
 The report contains wall-time measurements, so reruns are not byte-identical.
+Its `benchmark_environment` records the OS, architecture, host and target
+triples, CPU, exact Rust compiler, and Cargo build profile that bound those
+timings.
 Corpus counts, boundaries, identities, deduplication totals, representation
 counts, and stability outcomes are deterministic. CPU-only throughput uses
 three in-memory samples per profile. Corpus throughput uses four
