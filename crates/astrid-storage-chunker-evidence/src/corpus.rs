@@ -213,6 +213,22 @@ impl Corpus {
         &self.name
     }
 
+    pub fn kind(&self) -> CorpusKind {
+        self.kind
+    }
+
+    pub fn visit_inputs<F>(&self, mut visit: F) -> Result<()>
+    where
+        F: FnMut(&[u8]) -> Result<()>,
+    {
+        for input in &self.inputs {
+            let bytes = input.read_all()?;
+            input.validate_observation(FileSnapshot::from_bytes(&bytes)?)?;
+            visit(&bytes)?;
+        }
+        Ok(())
+    }
+
     fn throughput_scope(&self) -> &'static str {
         if self
             .inputs

@@ -13,12 +13,14 @@ mod fixture;
 mod metrics;
 #[cfg(test)]
 mod reference;
+mod sketch;
 mod source;
 mod stability;
 mod throughput;
 
 use algorithm::candidates;
 use corpus::{CandidateResult, Corpus};
+use sketch::SketchEvidenceResult;
 use source::{SourceRecord, UnavailableCandidate};
 use stability::StabilityResult;
 use throughput::ThroughputResult;
@@ -36,6 +38,7 @@ struct EvidenceReport {
     results: Vec<CandidateResult>,
     edit_stability: Vec<StabilityResult>,
     cpu_throughput: Vec<ThroughputResult>,
+    bottom_k_sketches: Vec<SketchEvidenceResult>,
 }
 
 #[derive(Debug)]
@@ -44,6 +47,7 @@ struct Options {
     version_chain_specs: Vec<(String, PathBuf)>,
     git_history_specs: Vec<(String, PathBuf, PathBuf)>,
     include_synthetic: bool,
+    sketch_only: bool,
     targets_kib: Vec<u32>,
     output: Option<PathBuf>,
 }
@@ -54,17 +58,24 @@ fn main() -> Result<()> {
     let mut results = Vec::new();
     let mut edit_stability = Vec::new();
     let mut cpu_throughput = Vec::new();
-    for target_kib in options.targets_kib {
-        for candidate in candidates(target_kib)? {
-            for corpus in &corpora {
-                eprintln!("measuring {} on {}", candidate.name, corpus.name());
-                results.push(corpus.measure(candidate.clone())?);
+    if !options.sketch_only {
+        for target_kib in options.targets_kib {
+            for candidate in candidates(target_kib)? {
+                for corpus in &corpora {
+                    eprintln!("measuring {} on {}", candidate.name, corpus.name());
+                    results.push(corpus.measure(candidate.clone())?);
+                }
+                eprintln!("measuring {} edit stability", candidate.name);
+                edit_stability.push(stability::measure(&candidate)?);
+                eprintln!("measuring {} CPU throughput", candidate.name);
+                cpu_throughput.push(throughput::measure(&candidate)?);
             }
-            eprintln!("measuring {} edit stability", candidate.name);
-            edit_stability.push(stability::measure(&candidate)?);
-            eprintln!("measuring {} CPU throughput", candidate.name);
-            cpu_throughput.push(throughput::measure(&candidate)?);
         }
+    }
+    let mut bottom_k_sketches = Vec::new();
+    for corpus in &corpora {
+        eprintln!("measuring bottom-k sketches on {}", corpus.name());
+        bottom_k_sketches.extend(sketch::measure(corpus)?);
     }
     let report = EvidenceReport {
         schema: "astrid-storage-chunker-evidence/v1",
@@ -78,6 +89,7 @@ fn main() -> Result<()> {
         results,
         edit_stability,
         cpu_throughput,
+        bottom_k_sketches,
     };
     write_report(options.output.as_ref(), &report)
 }
@@ -135,6 +147,7 @@ fn parse_options() -> Result<Options> {
     let mut version_chain_specs = Vec::new();
     let mut git_history_specs = Vec::new();
     let mut include_synthetic = true;
+    let mut sketch_only = false;
     let mut targets_kib = Vec::new();
     let mut output = None;
     let mut args = env::args().skip(1);
@@ -148,6 +161,7 @@ fn parse_options() -> Result<Options> {
                 git_history_specs.push(parse_git_specification(args.next())?);
             },
             "--no-synthetic" => include_synthetic = false,
+            "--sketch-only" => sketch_only = true,
             "--target-kib" => {
                 let target = args
                     .next()
@@ -179,6 +193,7 @@ fn parse_options() -> Result<Options> {
         version_chain_specs,
         git_history_specs,
         include_synthetic,
+        sketch_only,
         targets_kib,
         output,
     })
@@ -226,6 +241,7 @@ fn print_help() {
          \x20 --git-history NAME=REPO::RELATIVE_PATH\n\
          \x20                          Add up to 32 real versions without temporary files\n\
          \x20 --no-synthetic           Exclude deterministic public fixtures\n\
+         \x20 --sketch-only            Skip the CDC comparison and measure sketches only\n\
          \x20 --target-kib N           Compare profiles around N KiB (repeatable)\n\
          \x20 --output PATH            Write compact JSON to PATH instead of stdout\n\
          \x20 -h, --help               Print this help"

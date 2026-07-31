@@ -47,6 +47,11 @@ pub use muninn::{
     VerifiedDerivationEvidence, verify_derivation_evidence,
 };
 pub use projection::{PrincipalProjectionEngine, PrincipalProjectionError};
+#[cfg(not(target_family = "wasm"))]
+pub use refinery::{
+    BottomKSketch, BottomKSketchDescriptor, BottomKSketchError, SketchSampleSize, SketchScoreWidth,
+    build_bottom_k_sketch, verify_bottom_k_sketch,
+};
 pub use refinery::{
     CrossHashAttestation, CrossHashSigner, CrossHashVerifier, EngineCompactionPass,
     ProposedRefineryOutput, RefineryBatchContext, RefineryCheckpointId, RefineryOutputClass,

@@ -14,6 +14,7 @@ parking_lot = { workspace = true }
 sha2 = { workspace = true }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
+astrid-storage-content = { workspace = true }
 blake3 = { workspace = true }
 fs2 = { workspace = true }
 

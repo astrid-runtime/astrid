@@ -1107,6 +1107,77 @@ public key, and signature. It does not run a second hashing pipeline. An export
 request that lacks the required Evidence reports a typed prerequisite.
 
 
+7.10 Bottom-k resemblance metadata
+----------------------------------
+
+Bottom-k records are advisory, reproducible metadata. They can propose a
+physical delta base but never establish content equivalence, authorize a read,
+or change the source File identity. Admission of any representation selected
+through a sketch reconstructs the bytes and verifies the logical ObjectId.
+
+The pass descriptor is kind=10 Evidence, version=1, class=Metadata,
+logical_bytes=0, with no references. Its canonical_bytes are:
+
+  bytes "astrid-bottom-k-descriptor-v1\0"
+  u16   construction = 1
+  u16   score_hash = 1                       BLAKE3 derive-key
+  u16   score_width = 1 or 2                 128 or 256 bits
+  u16   duplicate_treatment = 1              set semantics
+  u16   ordering = 1                         unsigned lexicographic bytes
+  u16   sample_size                          non-zero
+  u16   empty_input = 1                      empty sample
+  u16   small_input = 1                      all distinct scores
+  u16   profile_binding = 1                  exact FastCDC fields
+  u16   score_domain_length
+  bytes score_domain = "astrid bottom-k chunk score v1"
+
+The current production descriptor uses score_width=1 and sample_size=256.
+Refinery scheduling materializes it only for Files with more than one logical
+chunk. The grammar still defines empty and one-chunk results so every accepted
+descriptor has total deterministic semantics.
+
+For every distinct Chunk object in the source File's complete Owns closure:
+
+  score_full = BLAKE3-DERIVE-KEY(
+      context = "astrid bottom-k chunk score v1",
+      material = u64_le(chunk_byte_length) || chunk_canonical_bytes)
+
+score is the first 16 or 32 bytes of score_full according to score_width.
+Scores use set semantics, are sorted as unsigned byte strings, and retain the
+lowest min(sample_size, distinct_score_count) values. Input traversal order,
+batch boundaries, and repeated references therefore do not affect the result.
+
+The result is kind=11 Derived, version=1, class=Metadata, logical_bytes=0. Its
+canonical_bytes are:
+
+  bytes          "astrid-bottom-k-sketch-v1\0"
+  u16            construction = 1
+  u16            score_width
+  u16            sample_size
+  u16            retained_score_count
+  TaggedIdentity pass_descriptor
+  TaggedIdentity source_file
+  u32            profile_minimum_bytes
+  u32            profile_average_bytes
+  u32            profile_maximum_bytes
+  u64            profile_gear_seed
+  u64            source_logical_bytes
+  u64            source_logical_chunk_count
+  u64            source_unique_chunk_objects
+  bytes           retained_scores[retained_score_count][score_width / 8]
+
+It has exactly these non-owning references, in order:
+
+  Evidence "00-pass-descriptor" -> pass_descriptor
+  Evidence "01-source-file"     -> source_file
+
+The tagged identities in canonical_bytes must byte-equal the reference
+targets. The profile and source totals must equal the canonical File. A reader
+that understands this schema recomputes the complete score set from the File
+closure and rejects any mismatch, non-canonical ordering, duplicate score,
+trailing byte, missing source, or altered descriptor.
+
+
 8. RECONSTRUCTION PROCEDURE
 ===========================
 
