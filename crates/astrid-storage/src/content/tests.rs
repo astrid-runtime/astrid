@@ -8,13 +8,14 @@ use astrid_storage_engine::{
     RootTransaction,
 };
 use astrid_storage_model::{
-    InsertOutcome, ModelError, ObjectClass, ObjectId, ObjectIdentity, ObjectRecord, ReferenceKind,
-    RootState,
+    InsertOutcome, ModelError, ObjectClass, ObjectId, ObjectIdentity, ObjectKind, ObjectRecord,
+    ObjectReference, ReferenceKind, ReferenceLabel, RootState,
 };
 
 use super::{ContentName, ContentNameError, PrincipalContentError, PrincipalContentStore};
 use crate::StorageError;
 use crate::kv::{KvStore, TreeKvStore};
+use crate::principal_graph::PRINCIPAL_GRAPH_VERSION;
 
 #[derive(Clone, Copy)]
 struct TestIdentity;
@@ -469,6 +470,99 @@ async fn kv_growth_accounts_for_existing_content() {
             .unwrap(),
         Some(vec![3_u8; 64])
     );
+}
+
+#[tokio::test]
+async fn content_write_revalidates_kv_quota_instead_of_trusting_the_head() {
+    let engine = Arc::new(Engine::new(TestIdentity));
+    let kv = TreeKvStore::<String, TestIdentity, _, _>::from_engine(
+        Arc::clone(&engine),
+        |namespace: &str| Ok(namespace.to_owned()),
+    );
+    kv.set("alice", "key", vec![1_u8; 64]).await.unwrap();
+    publish_forged_kv_quota(engine.as_ref(), &"alice".to_owned());
+
+    let content = PrincipalContentStore::from_engine(engine);
+    assert!(matches!(
+        content.put(
+            &"alice".to_owned(),
+            &ContentName::new("blob").unwrap(),
+            &[2_u8; 16]
+        ),
+        Err(PrincipalContentError::InvalidGraph {
+            detail: "invalid KV component accounting",
+            ..
+        })
+    ));
+}
+
+fn publish_forged_kv_quota(engine: &Engine, principal: &String) {
+    let root = engine.root(principal).unwrap();
+    let commit = engine.object(root.commit).unwrap();
+    let state_id = commit
+        .reference(&ReferenceLabel::new(b"state".to_vec()))
+        .unwrap()
+        .target();
+    let state = engine.object(state_id).unwrap();
+    let kv_id = state
+        .reference(&ReferenceLabel::new(b"kv".to_vec()))
+        .unwrap()
+        .target();
+    let kv = engine.object(kv_id).unwrap();
+    let mut bytes = kv.canonical_bytes().to_vec();
+    bytes[25..33].copy_from_slice(&0_u64.to_le_bytes());
+    let forged_kv = ObjectRecord::new(
+        ObjectKind::NamespaceMap,
+        PRINCIPAL_GRAPH_VERSION,
+        bytes,
+        kv.references().to_vec(),
+        kv.logical_bytes(),
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let forged_kv_id = engine.identify(&forged_kv);
+    let forged_state = ObjectRecord::new(
+        ObjectKind::PrincipalState,
+        PRINCIPAL_GRAPH_VERSION,
+        Vec::new(),
+        vec![ObjectReference::owns(
+            ReferenceLabel::new(b"kv".to_vec()),
+            forged_kv_id,
+        )],
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let forged_state_id = engine.identify(&forged_state);
+    let forged_commit = ObjectRecord::new(
+        ObjectKind::Commit,
+        PRINCIPAL_GRAPH_VERSION,
+        Vec::new(),
+        vec![
+            ObjectReference::new(
+                ReferenceLabel::new(b"parent".to_vec()),
+                root.commit,
+                ReferenceKind::Lineage,
+            ),
+            ObjectReference::owns(ReferenceLabel::new(b"state".to_vec()), forged_state_id),
+        ],
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let forged_commit_id = engine.identify(&forged_commit);
+    engine
+        .commit(RootTransaction::new(
+            principal.clone(),
+            Some(root),
+            forged_commit_id,
+            vec![
+                (forged_kv_id, forged_kv),
+                (forged_state_id, forged_state),
+                (forged_commit_id, forged_commit),
+            ],
+        ))
+        .unwrap();
 }
 
 #[test]

@@ -15,6 +15,7 @@ from runatal_v1_fastcdc import (
     validate_profile,
     verify_golden_vectors,
 )
+from runatal_v1_kv import validate_principal_kv
 from runatal_v1_sha384 import verify_cross_hash_attestations
 
 FRAME_CONTEXT = "astrid durable physical frame checksum v1"
@@ -47,7 +48,7 @@ REFERENCE_NAMES = ("Owns", "Evidence", "Lineage", "Derived")
 FORMAT_SPECIFICATION = (
     1,
     1,
-    bytes.fromhex("39eba259587f8cacbee042788f2cbdc3e8064b8c48fc8ba93800ba02c8c60d32"),
+    bytes.fromhex("3991b59002c981fd3b5603badd4ea5b31143253023cba98050cfc7e928638aff"),
 )
 CONTENT_CATALOG_SPECIFICATION = (
     1,
@@ -147,11 +148,6 @@ def identity(cursor):
 
 def identity_text(value):
     return f"{value[0]}:{value[1]}:{len(value[2])}:{value[2].hex()}"
-
-
-def encode_identity(value):
-    algorithm, construction, digest = value
-    return struct.pack("<HHI", algorithm, construction, len(digest)) + digest
 
 
 def object_material(record):
@@ -808,7 +804,7 @@ def parse_metadata(path):
         "identity": "blake3-object-identity-v1",
         "identity-wire": "tagged-identity-v1",
         "principal-codec": "principal-uid-v1",
-        "projection": "kv-tree-v3",
+        "projection": "kv-transition-bplus-v4",
     }
     for key, value in required.items():
         if entries.get(key) != value:
@@ -932,11 +928,15 @@ def recover(store, include_payloads):
                 raise FormatError(f"root generation mismatch for {name} at byte {offset}")
             roots[name] = replacement
     validated_files = set()
+    kv_projections = {}
     for name, root in roots.items():
         record = objects.get(identity_text(root[1]))
         if record is None or record["kind"] != 9:
             raise FormatError(f"principal {name} root is not a Commit")
         closure = validate_closure(objects, root[1])
+        kv_projections[name] = validate_principal_kv(
+            objects, root[1], include_payloads
+        )
         for key in closure:
             record = objects[key]
             if record["kind"] == 2 and key not in validated_files:
@@ -971,7 +971,11 @@ def recover(store, include_payloads):
         "content_catalog_spec_object": identity_text(catalog_specification),
         "objects": dumped_objects,
         "roots": {
-            name: {"generation": root[0], "commit": identity_text(root[1])}
+            name: {
+                "generation": root[0],
+                "commit": identity_text(root[1]),
+                "kv": kv_projections[name],
+            }
             for name, root in sorted(roots.items())
         },
     }

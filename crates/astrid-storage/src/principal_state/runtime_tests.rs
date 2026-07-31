@@ -210,7 +210,7 @@ fn format_specification_has_a_tagged_metadata_identity() {
     assert!(record.references().is_empty());
     assert_eq!(
         object_id_hex(id),
-        "39eba259587f8cacbee042788f2cbdc3e8064b8c48fc8ba93800ba02c8c60d32"
+        "3991b59002c981fd3b5603badd4ea5b31143253023cba98050cfc7e928638aff"
     );
     assert_eq!(
         object_id_hex(catalog_id),
@@ -218,6 +218,7 @@ fn format_specification_has_a_tagged_metadata_identity() {
     );
     assert!(metadata.contains("identity-wire=tagged-identity-v1\n"));
     assert!(metadata.contains("principal-codec=principal-uid-v1\n"));
+    assert!(metadata.contains("projection=kv-transition-bplus-v4\n"));
     assert!(metadata.contains(&format!(
         "format-spec-object=1:1:32:{}\n",
         object_id_hex(id)
@@ -524,14 +525,14 @@ async fn install_legacy_catalog_fixtures(
     legacy_roots
 }
 
-fn assert_catalog_tree_marker(home: &AstridHome) {
+fn assert_current_migration_marker(home: &AstridHome) {
     assert_eq!(
         std::fs::read(
             home.principal_store_path()
                 .join(migrations::MIGRATION_MARKER_FILE)
         )
         .unwrap(),
-        migrations::CATALOG_TREE_MARKER
+        migrations::KV_TRANSITION_CHECKPOINT_MARKER
     );
 }
 
@@ -702,7 +703,7 @@ async fn flat_content_catalog_migration_resumes_and_is_idempotent() {
             .unwrap()
     );
     migrated_engine.close().unwrap();
-    assert_catalog_tree_marker(&home);
+    assert_current_migration_marker(&home);
     let migrated_metadata =
         std::fs::read_to_string(home.principal_store_path().join(STORE_METADATA_FILE)).unwrap();
     assert!(migrated_metadata.contains("content-catalog-spec-object="));
@@ -737,7 +738,7 @@ async fn flat_content_catalog_migration_resumes_and_is_idempotent() {
         Some(migrated_alice_root)
     );
     assert_eq!(reopened_engine.root(&bob).unwrap(), Some(migrated_bob_root));
-    assert_catalog_tree_marker(&home);
+    assert_current_migration_marker(&home);
 }
 
 #[tokio::test]
@@ -879,6 +880,11 @@ async fn independent_reader_accepts_a_rust_produced_store() {
     );
     let decoded: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(decoded["roots"][alice.as_str()]["generation"], 1);
+    assert_eq!(decoded["roots"][alice.as_str()]["kv"]["entries"], 1);
+    assert_eq!(
+        decoded["roots"][alice.as_str()]["kv"]["logical_bytes"],
+        b"/workspace".len()
+    );
     assert!(
         decoded["roots"][alice.as_str()]["commit"]
             .as_str()

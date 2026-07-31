@@ -307,6 +307,7 @@ pub async fn open_runtime_principal_store_with_directory(
     let (engine, metadata_current) = opened;
     let engine = Arc::new(engine);
     let validated_catalogs = Arc::new(Mutex::new(BTreeMap::<StateOwner, CatalogValidation>::new()));
+    let validated_kv = Arc::new(crate::kv::KvValidationCache::default());
 
     migrations::apply_required(home, &store_path, &engine, &validated_catalogs, &principals)
         .await?;
@@ -326,6 +327,7 @@ pub async fn open_runtime_principal_store_with_directory(
             Arc::clone(&engine),
             StateOwnerResolver::new(principals.clone()),
             Arc::clone(&quota),
+            Arc::clone(&validated_kv),
             Arc::clone(&validated_catalogs),
         ));
     KvIdentityStore::with_principal_directory(
@@ -344,6 +346,7 @@ pub async fn open_runtime_principal_store_with_directory(
             Arc::clone(&engine),
             quota,
             validated_catalogs,
+            validated_kv,
         ),
     );
     let staging = Arc::new(NativeContentStagingArea::open(home.content_staging_path())?);

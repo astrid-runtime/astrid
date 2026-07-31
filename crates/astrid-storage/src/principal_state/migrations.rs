@@ -18,6 +18,7 @@ use super::{
 use super::{RuntimeStore, StateOwnerResolver, owner_migration};
 use crate::content::CatalogValidation;
 use crate::error::{StorageError, StorageResult};
+use crate::kv::migrate_legacy_avl;
 #[cfg(feature = "legacy-surrealkv")]
 use crate::kv::{KvPrincipalResolver, SurrealKvStore};
 use astrid_core::dirs::AstridHome;
@@ -25,13 +26,17 @@ use astrid_core::dirs::AstridHome;
 pub(super) const MIGRATION_MARKER_FILE: &str = "migration.complete";
 #[cfg(feature = "legacy-surrealkv")]
 const MIGRATION_PAGE_ENTRIES: usize = 512;
-const CURRENT_STORE_VERSION: u32 = 2;
+const CURRENT_STORE_VERSION: u32 = 3;
 const MINIMUM_SUPPORTED_STORE_VERSION: u32 = 1;
 pub(super) const LEGACY_TO_V1_MARKER: &[u8] =
     b"migration=surrealkv-to-principal-store\nfrom=legacy\nto=1\n";
 pub(super) const CATALOG_TREE_MARKER: &[u8] =
     b"migration=surrealkv-to-principal-store\nfrom=legacy\nto=1\n\
       migration=flat-content-catalog-to-radix-tree\nfrom=1\nto=2\n";
+pub(super) const KV_TRANSITION_CHECKPOINT_MARKER: &[u8] =
+    b"migration=surrealkv-to-principal-store\nfrom=legacy\nto=1\n\
+      migration=flat-content-catalog-to-radix-tree\nfrom=1\nto=2\n\
+      migration=principal-kv-avl-to-transition-checkpoints\nfrom=2\nto=3\n";
 
 /// Human-auditable record of the transforms compiled into this binary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,6 +60,12 @@ const MIGRATION_HISTORY: &[MigrationDescriptor] = &[
         to: 2,
         rollback: "old root remains in commit lineage until retention removes it",
     },
+    MigrationDescriptor {
+        id: "principal-kv-avl-to-transition-checkpoints",
+        from: "2",
+        to: 3,
+        rollback: "old root remains in commit lineage until retention removes it",
+    },
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,10 +73,14 @@ enum MigrationState {
     Uninitialized,
     PrincipalStore,
     CatalogTree,
+    KvTransitionCheckpoints,
 }
 
 fn migration_state(store_path: &Path) -> MigrationState {
     match std::fs::read(store_path.join(MIGRATION_MARKER_FILE)).as_deref() {
+        Ok(bytes) if bytes == KV_TRANSITION_CHECKPOINT_MARKER => {
+            MigrationState::KvTransitionCheckpoints
+        },
         Ok(bytes) if bytes == CATALOG_TREE_MARKER => MigrationState::CatalogTree,
         Ok(bytes) if bytes == LEGACY_TO_V1_MARKER => MigrationState::PrincipalStore,
         _ => MigrationState::Uninitialized,
@@ -96,7 +111,7 @@ pub(super) async fn apply_required(
     if first.id != "surrealkv-to-principal-store"
         || first.from != "legacy"
         || first.to != MINIMUM_SUPPORTED_STORE_VERSION
-        || last.id != "flat-content-catalog-to-radix-tree"
+        || last.id != "principal-kv-avl-to-transition-checkpoints"
         || last.to != CURRENT_STORE_VERSION
     {
         return Err(StorageError::Internal(
@@ -104,7 +119,7 @@ pub(super) async fn apply_required(
         ));
     }
     let state = migration_state(store_path);
-    if state == MigrationState::CatalogTree {
+    if state == MigrationState::KvTransitionCheckpoints {
         return Ok(());
     }
     let legacy_path = home.state_db_path();
@@ -131,8 +146,9 @@ pub(super) async fn apply_required(
         }
     }
     migrate_content_catalogs(engine, validated_catalogs).await?;
+    migrate_kv_trees(engine).await?;
     let marker = store_path.join(MIGRATION_MARKER_FILE);
-    run_blocking_migration(move || atomic_write(&marker, CATALOG_TREE_MARKER)).await
+    run_blocking_migration(move || atomic_write(&marker, KV_TRANSITION_CHECKPOINT_MARKER)).await
 }
 
 async fn migrate_content_catalogs(
@@ -153,6 +169,22 @@ async fn migrate_content_catalogs(
             content
                 .migrate_legacy_catalog(&principal)
                 .map_err(|error| StorageError::Serialization(error.to_string()))?;
+        }
+        engine
+            .flush()
+            .map_err(|error| StorageError::Internal(error.to_string()))
+    })
+    .await
+}
+
+async fn migrate_kv_trees(engine: &Arc<RuntimeEngine>) -> StorageResult<()> {
+    let engine = Arc::clone(engine);
+    run_blocking_migration(move || {
+        let principals = engine
+            .roots()
+            .map_err(|error| StorageError::Internal(error.to_string()))?;
+        for (principal, _) in principals {
+            migrate_legacy_avl(engine.as_ref(), &principal)?;
         }
         engine
             .flush()
@@ -328,14 +360,17 @@ mod tests {
     #[test]
     fn compiled_history_is_contiguous_and_bounded() {
         assert_eq!(MINIMUM_SUPPORTED_STORE_VERSION, 1);
-        assert_eq!(CURRENT_STORE_VERSION, 2);
-        assert_eq!(MIGRATION_HISTORY.len(), 2);
+        assert_eq!(CURRENT_STORE_VERSION, 3);
+        assert_eq!(MIGRATION_HISTORY.len(), 3);
         assert_eq!(MIGRATION_HISTORY[0].from, "legacy");
         assert_eq!(MIGRATION_HISTORY[0].to, MINIMUM_SUPPORTED_STORE_VERSION);
         assert_eq!(MIGRATION_HISTORY[1].from, "1");
-        assert_eq!(MIGRATION_HISTORY[1].to, CURRENT_STORE_VERSION);
+        assert_eq!(MIGRATION_HISTORY[1].to, 2);
+        assert_eq!(MIGRATION_HISTORY[2].from, "2");
+        assert_eq!(MIGRATION_HISTORY[2].to, CURRENT_STORE_VERSION);
         assert!(MIGRATION_HISTORY[0].rollback.contains("source preserved"));
         assert!(MIGRATION_HISTORY[1].rollback.contains("commit lineage"));
+        assert!(MIGRATION_HISTORY[2].rollback.contains("commit lineage"));
     }
 
     #[tokio::test(flavor = "current_thread")]

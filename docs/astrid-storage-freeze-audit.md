@@ -125,41 +125,57 @@ principal concept.
 - The live alias directory is populated atomically from validated identity
   records before a principal-owned namespace is served.
 
-## D3. Path-copy B+-tree for principal KV
+## D3. Canonical KV transitions with immutable B+-tree checkpoints
+
+**Status:** complete. Ordinary point mutations append constant-size canonical
+transition records. Background maintenance folds them into immutable,
+page-bounded B+-tree checkpoints and rebases concurrent transition tails before
+the root compare-and-swap.
 
 ### Decision
 
-Replace the persistent binary AVL KV projection with a path-copy B+-tree using
-approximately 2-4 KiB nodes and fanout around 32-64, depending on encoded key
-size.
+Replace the persistent binary AVL projection with a transition chain over
+immutable B+-tree checkpoints. Point mutations never rewrite checkpoint pages.
+B+-tree pages retain approximately 2-4 KiB and fan out up to 64 children,
+depending on encoded key size.
 
 Small values are inline in leaves. Values over a frozen threshold, initially
 proposed at 1 KiB, spill to owned value objects. Nodes retain cached subtree
 logical and quota totals.
 
-The tree remains history-dependent. Canonical packing is not claimed for KV:
-standard local split and merge behavior is the correct trade for random-key
-writes.
+Transition encodings, page encodings, counters, and decoded totals are
+canonical. Checkpoint page grouping is not a logical identity: multiple valid
+page packings may reconstruct the same map, and maintenance chooses one
+deterministically for its input snapshot.
 
 ### Rationale
 
-A binary tree at one million keys has depth around 17 and rewrites that many
-nodes per mutation. A fanout-32 tree has depth around three or four. Fat
-path-copy nodes reduce write amplification, object loads, and recovery work.
+The proposed direct path-copy B+-tree failed measurement. Rewriting fat
+immutable pages cost 10,804 bytes at 10k entries, 14,369 bytes at 100k, and
+17,420 bytes at one million for a 128-byte replacement. The existing AVL
+baseline was 2,883 bytes.
+
+The accepted transition record writes 948 authoritative bytes at all three
+cardinalities. B+-trees still provide compact checkpoints and shallow reads,
+but do not sit on the point-mutation write path.
 
 ### Work order
 
 - Freeze sorted leaf and internal-node encodings.
-- Freeze split, merge, and inline/spill rules.
+- Freeze transition ordering, counter, and inline/spill rules.
+- Freeze checkpoint page population and inline/spill rules.
 - Recompute and validate cached totals during decode.
 - Reject unsorted keys, invalid child bounds, and malformed occupancy.
+- Rebase transitions arriving during a checkpoint build without a long-held
+  mutation lock.
 - Update the RÚNATAL specification and independent reader.
 - Benchmark amplification, operations per second, and get latency at 10k,
   100k, and one million keys.
 
 ### Acceptance
 
-- At least a threefold reduction in bytes written per operation at 100k keys.
+- A 128-byte point replacement writes 948 authoritative bytes at 10k, 100k,
+  and one million entries: more than threefold below the 2,883-byte baseline.
 - No group-commit throughput regression.
 - Recovery and crash-prefix matrices pass.
 
@@ -389,7 +405,8 @@ implementation continuously testable against the simple full-scan oracle.
 ## Sequence
 
 1. Complete the cross-hash attestation and successor migration specification.
-2. Replace the persistent KV projection with the decided path-copy B+-tree.
+2. Replace the persistent KV projection with canonical transitions and
+   immutable B+-tree checkpoints.
 3. Record projection-only name folding and doctor behavior.
 4. Complete the Refinery sketch prototype with the chunker evidence tooling.
 5. Run the mechanical closing audit and declare the format frozen on GitHub.

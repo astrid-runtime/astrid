@@ -11,6 +11,16 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Added
 
+- **Principal KV point writes now use canonical transitions over immutable
+  B+-tree checkpoints.** The accepted wire layout reduces a 128-byte
+  replacement from the measured 2,883-byte AVL baseline to 948 authoritative
+  bytes at 10k, 100k, and one million entries. Page-bounded checkpoints retain
+  shallow reads and cached accounting; background construction rebases
+  concurrent transition tails before root publication. Full decode verifies
+  counters, no-op exclusion, page bounds, child summaries, quota totals, and
+  spilled values. Existing version-3 AVL roots migrate in place with commit
+  lineage, and the independent RÚNATAL reader reconstructs both predecessor
+  and current projections.
 - **Durable closures can carry construction-diverse custody evidence.** A
   verified Refinery pass streams one exact, canonically ordered Owns closure
   into a bounded-fanout SHA-384 tree, then emits an Ed25519-signed Evidence
