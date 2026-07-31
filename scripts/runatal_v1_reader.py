@@ -15,17 +15,16 @@ from runatal_v1_fastcdc import (
     validate_profile,
     verify_golden_vectors,
 )
+from runatal_v1_frames import frames
 from runatal_v1_kv import validate_principal_kv
 from runatal_v1_sha384 import verify_cross_hash_attestations
 from runatal_v1_sketch import verify_bottom_k_sketches
 
-FRAME_CONTEXT = "astrid durable physical frame checksum v1"
 OBJECT_CONTEXT = "astrid principal store object identity v1"
 ARENA_MAGIC = b"ASTOBJ1\0"
 ROOT_MAGIC = b"ASTROOT\0"
 ROOT_SNAPSHOT_SENTINEL = (1 << 64) - 1
 ROOT_SNAPSHOT_RECORD = 1
-HEADER_BYTES = 52
 KIND_NAMES = (
     "Chunk",
     "ChunkTree",
@@ -84,58 +83,6 @@ class Cursor:
     def done(self):
         if self.offset != len(self.data):
             raise FormatError("trailing payload bytes")
-
-
-def frame_checksum(magic, payload):
-    material = magic + struct.pack("<H", 1) + struct.pack("<Q", len(payload)) + payload
-    return derive_key(FRAME_CONTEXT, material)
-
-
-def physical_frame(data, magic, offset):
-    if len(data) - offset < HEADER_BYTES:
-        return None
-    header = data[offset : offset + HEADER_BYTES]
-    if header[:8] != magic:
-        return False
-    version, reserved, length = struct.unpack("<HHQ", header[8:20])
-    if version != 1 or reserved != 0:
-        raise FormatError(f"unsupported frame header at byte {offset}")
-    end = offset + HEADER_BYTES + length
-    if end > len(data):
-        return None
-    payload = data[offset + HEADER_BYTES : end]
-    if frame_checksum(magic, payload) != header[20:52]:
-        return False
-    return (end, payload)
-
-
-def valid_frame_follows(data, magic, offset):
-    candidate = data.find(magic, offset + 1)
-    while candidate >= 0:
-        try:
-            frame = physical_frame(data, magic, candidate)
-        except FormatError:
-            frame = False
-        if frame:
-            return True
-        candidate = data.find(magic, candidate + 1)
-    return False
-
-
-def frames(path, magic):
-    data = path.read_bytes()
-    offset = 0
-    while offset < len(data):
-        frame = physical_frame(data, magic, offset)
-        if frame is None:
-            break
-        if frame is False:
-            if valid_frame_follows(data, magic, offset):
-                raise FormatError(f"corrupt interior frame at byte {offset} in {path}")
-            break
-        end, payload = frame
-        yield offset, payload
-        offset = end
 
 
 def identity(cursor):
