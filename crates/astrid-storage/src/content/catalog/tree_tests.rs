@@ -76,6 +76,15 @@ fn apply_order(names: &[&str]) -> (CatalogRoot, BTreeMap<ObjectId, ObjectRecord>
 }
 
 #[test]
+fn format_two_catalog_discriminants_are_stable() {
+    assert_eq!(CATALOG_VERSION.get(), 2);
+    assert_eq!(LEAF_TAG, 0);
+    assert_eq!(BRANCH_TAG, 1);
+    assert_eq!(LEAF_FIXED_BYTES, 17);
+    assert_eq!(BRANCH_BYTES, 57);
+}
+
+#[test]
 fn insertion_order_does_not_change_the_canonical_root() {
     let (alpha, alpha_objects) = content_value(1, 1);
     let (alphabet, alphabet_objects) = content_value(2, 2);

@@ -387,6 +387,15 @@ mod tests {
         }
     }
 
+    #[test]
+    fn format_four_transition_discriminants_are_stable() {
+        assert_eq!(CHECKPOINT, 0);
+        assert_eq!(DELTA, 1);
+        assert_eq!(DELETE, 0);
+        assert_eq!(INLINE, 1);
+        assert_eq!(SPILLED, 2);
+    }
+
     fn rewrite(record: &ObjectRecord, bytes: Vec<u8>) -> ObjectRecord {
         ObjectRecord::new(
             record.kind(),

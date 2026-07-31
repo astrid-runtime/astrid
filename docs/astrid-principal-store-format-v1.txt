@@ -1272,4 +1272,133 @@ different tags are different identities. Never change store.meta to name a
 successor while leaving old bytes implicitly interpreted as the new algorithm.
 
 
+11. FORMAT AND POLICY BOUNDARIES
+================================
+
+This section classifies format-1 constants so an independent implementation
+can distinguish a durable decoding rule from an operator setting or disposable
+acceleration state.
+
+
+11.1 Semantic discriminants and reserved capacity
+--------------------------------------------------
+
+The following values are frozen semantic discriminants. Their numeric values
+are deliberately simple rather than performance-selected, but changing one
+changes the meaning of durable bytes:
+
+  - ObjectKind is u16 with the registered values in section 4.
+  - ObjectFormatVersion is a non-zero u16 scoped to one ObjectKind.
+  - ObjectClass is u8: Data=0, Metadata=1.
+  - ReferenceKind is u8: Owns=0, Evidence=1, Lineage=2, Derived=3.
+  - physical-frame version is u16 value 1; its following u16 is reserved zero.
+
+The widths reserve capacity and are not claims about present cardinality.
+Unknown discriminants fail an implementation that must interpret them.
+Self-delimiting outer records may be preserved by implementations that do not
+interpret an unknown kind-scoped schema.
+
+Reference labels have no independent format-1 byte ceiling. The object
+identity construction frames each label length as u128; an arena record frames
+it as u64; actual decoding is bounded by the containing frame and the process's
+addressable memory. Labels are opaque bytes and are strictly increasing by
+unsigned byte order. Runtime recovery allocation limits are deployment policy,
+not a smaller valid-wire grammar.
+
+The seven store.meta keys, their order, spelling, ASCII values, colon-separated
+tagged-identity grammar, and LF termination shown in section 1 are the frozen
+format-1 discovery record. A format amendment may name a new RÚNATAL object,
+but a decoder never silently assigns another meaning to an existing key or
+identity tag.
+
+The arena and root-journal magics, common frame layout, checksum construction,
+root transition and snapshot tags, principal codec tags, catalog and KV tags,
+canonical packing and ordering rules, and every domain-separation string are
+identity or recovery semantics. They are not operator tuning knobs.
+
+
+11.2 Evidence-selected behavior
+--------------------------------
+
+The following current behavior was selected with measured workload evidence
+and is semantic after selection:
+
+  - FastCDC 2020 revision 1, normalization 1, 16/64/256 KiB, seed zero;
+  - whole-object threshold 256 KiB and chunk-tree fanout 128;
+  - KV format-4 transitions with immutable checkpoints, inline values through
+    1024 bytes, a 4096 retained-byte page target, and at most 64 page entries;
+    and
+  - bottom-k format-1 128-bit scores with 256 retained distinct values.
+
+The KV maximum tree level of 16 is a deliberately generous structural guard,
+not a measured optimum. It is nevertheless part of the accepted format-4
+grammar; producing a deeper tree requires a successor kind-scoped version.
+
+
+11.3 Runtime policy is not decode semantics
+--------------------------------------------
+
+RecoveryLimits.max_frame_bytes limits one process allocation. The default is
+the largest payload representable by that process. A smaller configured value
+may reject an otherwise valid store on that deployment but does not make the
+wire invalid. Quotas, batching windows, durability policy, resident-memory
+budgets, scheduler rates, and concurrency limits are likewise operator policy
+unless an individual canonical object explicitly records one as evidence.
+
+
+11.4 Native publication staging intent
+---------------------------------------
+
+Native content staging is a crash-recovery surface, not an authoritative store
+file and not part of export_closure. A sealed version-2 intent named intent.v2
+is the following exact bytes:
+
+  u8[16] magic = "ASTRID-STAGE-V2" followed by NUL
+  u16    version = 2
+  u64    sequence
+  u8[16] staged_content_uuid
+  u64    owner_length
+  u8[]   owner[owner_length]
+  u64    name_length
+  u8[]   name[name_length]
+  u8     chunk_algorithm = 1
+  u16    chunk_implementation_revision = 1
+  u8     chunk_normalization = 1
+  u32    chunk_minimum_bytes
+  u32    chunk_average_bytes
+  u32    chunk_maximum_bytes
+  u64    chunk_gear_seed
+  u64    logical_bytes
+  u8[32] checksum
+
+The owner bytes use principal-uid-v1: System is one zero byte; a principal is
+one byte value 1 followed by its 32-byte PrincipalUid. The name is non-empty
+UTF-8 containing no NUL and remains an opaque content name. The chunk profile
+must satisfy the section 7.2 grammar. The checksum is BLAKE3 derive-key under
+the exact context "astrid native content staging intent v2" over every
+preceding intent byte.
+
+content.bin is flushed before the checksummed intent is atomically published.
+The ready-directory transition does not change the intent bytes. A version-1
+alias-owner intent remains migration input only; current writers never emit it.
+
+
+11.5 Local recovery and acceleration files
+-------------------------------------------
+
+The compaction intent uses common frame version 1 with magic "ASTCMP1" plus
+NUL. Its one payload is a canonical Evidence ObjectRecord whose canonical
+bytes are "astrid-gc-compaction-intent-v1" plus NUL and whose three non-owning
+Evidence references bind the operation contract, GcCommitEvidence, and exact
+successor placement. The GC delivery outbox uses common frame version 1 with
+magic "ASTGCO1" plus NUL and contains the eight canonical records described in
+section 7.8. These files exist to roll a local placement forward after a crash;
+the records, not the files or arena offsets, cross the archival boundary.
+
+objects.index uses magic "ASTIDX1" plus NUL. It is disposable acceleration
+state. A missing, stale, torn, or rejected index rebuilds from the authoritative
+arena and root journal; its encoding is outside format-1 archival authority.
+The same is true of locks, projection caches, and completed migration markers.
+
+
 END OF ASTRID PRINCIPAL STORE FORMAT 1

@@ -210,23 +210,22 @@ fn format_specification_has_a_tagged_metadata_identity() {
     assert!(record.references().is_empty());
     assert_eq!(
         object_id_hex(id),
-        "c3fd6c43a5b6a05ffe11c339502ce35090f6643ee3070177e5802fc155d2b8c0"
+        "82e46f53ba9bb2f52d6b942088d5965eaa17c2720e61ce842ed9d5e3c0d1219d"
     );
     assert_eq!(
         object_id_hex(catalog_id),
         "8f3999b066b666396259c4a92f9de7c5b8e67df9d38a69fb4fb824968b56ecdb"
     );
-    assert!(metadata.contains("identity-wire=tagged-identity-v1\n"));
-    assert!(metadata.contains("principal-codec=principal-uid-v1\n"));
-    assert!(metadata.contains("projection=kv-transition-bplus-v4\n"));
-    assert!(metadata.contains(&format!(
-        "format-spec-object=1:1:32:{}\n",
-        object_id_hex(id)
-    )));
-    assert!(metadata.contains(&format!(
-        "content-catalog-spec-object=1:1:32:{}\n",
-        object_id_hex(catalog_id)
-    )));
+    assert_eq!(
+        metadata,
+        "format=astrid-principal-store-v1\n\
+         identity=blake3-object-identity-v1\n\
+         identity-wire=tagged-identity-v1\n\
+         format-spec-object=1:1:32:82e46f53ba9bb2f52d6b942088d5965eaa17c2720e61ce842ed9d5e3c0d1219d\n\
+         content-catalog-spec-object=1:1:32:8f3999b066b666396259c4a92f9de7c5b8e67df9d38a69fb4fb824968b56ecdb\n\
+         principal-codec=principal-uid-v1\n\
+         projection=kv-transition-bplus-v4\n"
+    );
 }
 
 #[test]

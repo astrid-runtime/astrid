@@ -18,38 +18,42 @@ fn label(value: &[u8]) -> ReferenceLabel {
 
 #[test]
 fn stable_object_codes_round_trip_and_reject_unknown_values() {
-    for kind in [
-        ObjectKind::Chunk,
-        ObjectKind::ChunkTree,
-        ObjectKind::File,
-        ObjectKind::Symlink,
-        ObjectKind::Directory,
-        ObjectKind::KvLeaf,
-        ObjectKind::KvBranch,
-        ObjectKind::NamespaceMap,
-        ObjectKind::PrincipalState,
-        ObjectKind::Commit,
-        ObjectKind::Evidence,
-        ObjectKind::Derived,
-        ObjectKind::RuntimeSemanticProfile,
-        ObjectKind::DerivationInvocation,
-        ObjectKind::DerivationEvidence,
-        ObjectKind::GcPlanEvidence,
-        ObjectKind::GcCommitEvidence,
+    for (kind, code) in [
+        (ObjectKind::Chunk, 0),
+        (ObjectKind::ChunkTree, 1),
+        (ObjectKind::File, 2),
+        (ObjectKind::Symlink, 3),
+        (ObjectKind::Directory, 4),
+        (ObjectKind::KvLeaf, 5),
+        (ObjectKind::KvBranch, 6),
+        (ObjectKind::NamespaceMap, 7),
+        (ObjectKind::PrincipalState, 8),
+        (ObjectKind::Commit, 9),
+        (ObjectKind::Evidence, 10),
+        (ObjectKind::Derived, 11),
+        (ObjectKind::RuntimeSemanticProfile, 12),
+        (ObjectKind::DerivationInvocation, 13),
+        (ObjectKind::DerivationEvidence, 14),
+        (ObjectKind::GcPlanEvidence, 15),
+        (ObjectKind::GcCommitEvidence, 16),
     ] {
-        assert_eq!(ObjectKind::from_code(kind.code()), Some(kind));
+        assert_eq!(kind.code(), code);
+        assert_eq!(ObjectKind::from_code(code), Some(kind));
     }
-    for kind in [
-        ReferenceKind::Owns,
-        ReferenceKind::Evidence,
-        ReferenceKind::Lineage,
-        ReferenceKind::Derived,
+    for (kind, code) in [
+        (ReferenceKind::Owns, 0),
+        (ReferenceKind::Evidence, 1),
+        (ReferenceKind::Lineage, 2),
+        (ReferenceKind::Derived, 3),
     ] {
-        assert_eq!(ReferenceKind::from_code(kind.code()), Some(kind));
+        assert_eq!(kind.code(), code);
+        assert_eq!(ReferenceKind::from_code(code), Some(kind));
     }
-    for class in [ObjectClass::Data, ObjectClass::Metadata] {
-        assert_eq!(ObjectClass::from_code(class.code()), Some(class));
+    for (class, code) in [(ObjectClass::Data, 0), (ObjectClass::Metadata, 1)] {
+        assert_eq!(class.code(), code);
+        assert_eq!(ObjectClass::from_code(code), Some(class));
     }
+    assert_eq!(ObjectFormatVersion::V1.get(), 1);
     assert_eq!(ObjectKind::from_code(u16::MAX), None);
     assert_eq!(ReferenceKind::from_code(u8::MAX), None);
     assert_eq!(ObjectClass::from_code(u8::MAX), None);

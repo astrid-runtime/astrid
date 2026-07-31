@@ -75,6 +75,13 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   materialization to multi-chunk Files. The independent RÚNATAL reader
   recomputes the source closure and every score, and existing development
   stores amend in place to the successor in-band specification.
+- **The principal-store format-one review surface is mechanically frozen.**
+  The in-band RÚNATAL specification now classifies durable discriminants,
+  evidence-selected parameters, reserved capacity, runtime policy, native
+  staging, and disposable acceleration state. Exact-code and framed-magic
+  regressions prevent silent wire drift, `store.meta` is checked byte for byte,
+  and existing development stores amend from the immediately prior
+  specification identity without changing principal roots.
 - **Astrid has a content-addressed computation design contract.** A canonical
   invocation object now specifies the complete identity boundary for reusable
   deterministic work, including the exact transform closure, its registered

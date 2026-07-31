@@ -8,9 +8,10 @@ use super::bootstrap;
 use super::format_amendment::{
     DestinationFormat, PRE_BOTTOM_K_SKETCH_FORMAT_SPEC_ID, PRE_COMPACTION_FORMAT_SPEC_ID,
     PRE_FASTCDC_FREEZE_FORMAT_SPEC_ID, PRE_GC_OUTBOX_FORMAT_SPEC_ID,
-    PRE_KV_TRANSITION_FORMAT_SPEC_ID, PRE_RUNATAL_NAMING_FORMAT_SPEC_ID,
-    PRE_SHA384_ATTESTATION_FORMAT_SPEC_ID, STORE_METADATA_FILE, format_spec_record,
-    legacy_store_metadata, prepare_destination, previous_store_metadata, store_metadata,
+    PRE_KV_TRANSITION_FORMAT_SPEC_ID, PRE_MECHANICAL_AUDIT_FORMAT_SPEC_ID,
+    PRE_RUNATAL_NAMING_FORMAT_SPEC_ID, PRE_SHA384_ATTESTATION_FORMAT_SPEC_ID, STORE_METADATA_FILE,
+    format_spec_record, legacy_store_metadata, prepare_destination, previous_store_metadata,
+    store_metadata,
 };
 use super::{Blake3ObjectIdentityV1, KvQuotaResolver, StateOwner, open_runtime_kv};
 use astrid_core::dirs::AstridHome;
@@ -38,6 +39,7 @@ async fn completed_prior_v1_stores_are_selected_for_runatal_amendment() {
     assert_prior_format_is_selected(PRE_FASTCDC_FREEZE_FORMAT_SPEC_ID, true).await;
     assert_prior_format_is_selected(PRE_KV_TRANSITION_FORMAT_SPEC_ID, true).await;
     assert_prior_current_projection_is_selected(PRE_BOTTOM_K_SKETCH_FORMAT_SPEC_ID).await;
+    assert_prior_current_projection_is_selected(PRE_MECHANICAL_AUDIT_FORMAT_SPEC_ID).await;
 }
 
 async fn assert_prior_current_projection_is_selected(prior: ObjectId) {
