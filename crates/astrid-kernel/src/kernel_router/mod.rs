@@ -6,6 +6,7 @@ mod device_scope;
 /// `astrid-capsule-install` library so the daemon and the CLI reach
 /// disk through the same code path.
 mod install;
+mod projection_names;
 mod rate_limit;
 /// Kernel-response publishing envelope + the long-request keepalive pinger.
 mod response;
@@ -81,6 +82,10 @@ pub(crate) fn spawn_kernel_router(kernel: Arc<crate::Kernel>) -> astrid_runtime:
             let IpcPayload::RawJson(val) = &message.payload else {
                 continue;
             };
+
+            if projection_names::try_handle(&kernel, message, val).await {
+                continue;
+            }
 
             match serde_json::from_value::<KernelRequest>(val.clone()) {
                 Ok(req) => {

@@ -11,6 +11,13 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Added
 
+- **Hosted filesystem name projection is deterministic and reversible.**
+  Byte-exact principal content names now plan through typed target-volume
+  comparison and syntax policies, with collision-safe names for case,
+  normalization, reserved-name, length, and file/directory conflicts. Atomic
+  reservation prevents a late host-side collision from overwriting another
+  source, and `astrid doctor --projection-name-policy` reports only the
+  authenticated principal's collisions and escaped paths without repair.
 - **Principal KV point writes now use canonical transitions over immutable
   B+-tree checkpoints.** The accepted wire layout reduces a 128-byte
   replacement from the measured 2,883-byte AVL baseline to 948 authoritative

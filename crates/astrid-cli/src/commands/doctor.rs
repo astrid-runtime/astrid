@@ -9,8 +9,10 @@ use std::time::Duration;
 
 use anyhow::Result;
 use astrid_core::dirs::AstridHome;
-use astrid_core::kernel_api::{KernelRequest, KernelResponse};
-use clap::Args;
+use astrid_core::kernel_api::{
+    KernelRequest, KernelResponse, ProjectionNameDiagnostic, ProjectionNamePolicyPreset,
+};
+use clap::{Args, ValueEnum};
 use colored::Colorize;
 
 use crate::theme::Theme;
@@ -21,6 +23,37 @@ pub(crate) struct DoctorArgs {
     /// `astrid start`).
     #[arg(long = "no-daemon")]
     pub no_daemon: bool,
+    /// Inspect this principal's content names under a target-volume behavior
+    /// profile. The diagnostic is read-only and never repairs the catalog.
+    #[arg(
+        long = "projection-name-policy",
+        value_enum,
+        conflicts_with = "no_daemon"
+    )]
+    pub projection_name_policy: Option<ProjectionPolicyArg>,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub(crate) enum ProjectionPolicyArg {
+    /// Byte-exact POSIX-style volume.
+    PosixExactV1,
+    /// Canonical-equivalence, case-sensitive volume.
+    UnicodeCanonicalV1,
+    /// Canonical-equivalence, case-insensitive volume.
+    UnicodeCanonicalCaselessV1,
+    /// Case-insensitive Windows-compatible volume.
+    WindowsCaselessV1,
+}
+
+impl From<ProjectionPolicyArg> for ProjectionNamePolicyPreset {
+    fn from(policy: ProjectionPolicyArg) -> Self {
+        match policy {
+            ProjectionPolicyArg::PosixExactV1 => Self::PosixExactV1,
+            ProjectionPolicyArg::UnicodeCanonicalV1 => Self::UnicodeCanonicalV1,
+            ProjectionPolicyArg::UnicodeCanonicalCaselessV1 => Self::UnicodeCanonicalCaselessV1,
+            ProjectionPolicyArg::WindowsCaselessV1 => Self::WindowsCaselessV1,
+        }
+    }
 }
 
 /// Entry point for `astrid doctor`.
@@ -107,6 +140,22 @@ pub(crate) async fn run(args: DoctorArgs) -> Result<ExitCode> {
             // an older build that doesn't answer this request. Warn, don't fail.
             Err(e) => check_warn("Agent loop readiness", &format!("could not probe: {e}")),
         }
+
+        if let Some(policy) = args.projection_name_policy {
+            match projection_name_diagnostic(policy.into()).await {
+                Ok(report) => render_projection_name_diagnostic(&report),
+                Err(error) => {
+                    all_passed = false;
+                    check_fail("Projection names", &error.to_string());
+                },
+            }
+        }
+    } else if args.projection_name_policy.is_some() {
+        all_passed = false;
+        check_fail(
+            "Projection names",
+            "daemon endpoint is required for caller-scoped catalog inspection",
+        );
     }
 
     println!();
@@ -116,6 +165,44 @@ pub(crate) async fn run(args: DoctorArgs) -> Result<ExitCode> {
     } else {
         println!("{}", Theme::error("One or more checks failed."));
         Ok(ExitCode::from(1))
+    }
+}
+
+fn render_projection_name_diagnostic(report: &ProjectionNameDiagnostic) {
+    if report.collisions.is_empty() && report.escaped.is_empty() {
+        check_pass(
+            "Projection names",
+            &format!(
+                "{} name(s) are naturally representable under {}",
+                report.catalog_entries, report.policy
+            ),
+        );
+        return;
+    }
+
+    check_warn(
+        "Projection names",
+        &format!(
+            "{} collision group(s), {} escaped segment(s) under {}",
+            report.collisions.len(),
+            report.escaped.len(),
+            report.policy
+        ),
+    );
+    for collision in &report.collisions {
+        println!("         collision ({})", collision.kind);
+        for (source, projected) in collision.sources.iter().zip(&collision.projected_segments) {
+            println!("           {source:?} -> {}", projected.join("/"));
+        }
+    }
+    for escaped in &report.escaped {
+        println!(
+            "         escaped {:?} segment {} ({}) -> {}",
+            escaped.source,
+            escaped.segment_index,
+            escaped.reason,
+            escaped.projected_segments.join("/")
+        );
     }
 }
 
@@ -185,6 +272,23 @@ async fn agent_readiness() -> Result<astrid_core::kernel_api::AgentLoopReadiness
             "daemon did not return an agent-readiness response"
         )),
     }
+}
+
+async fn projection_name_diagnostic(
+    policy: ProjectionNamePolicyPreset,
+) -> Result<ProjectionNameDiagnostic> {
+    let mut client = tokio::time::timeout(
+        Duration::from_secs(5),
+        crate::socket_client::connect_kernel_for_workspace(None),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("connection timed out after 5s"))??;
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        client.projection_name_diagnostic(policy),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("projection-name response timed out after 30s"))?
 }
 
 /// Render the FAIL detail line for a not-ready report: each missing piece,

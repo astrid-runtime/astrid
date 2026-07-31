@@ -6,6 +6,8 @@
 
 mod catalog;
 mod kv_projection;
+#[cfg(not(target_family = "wasm"))]
+mod projection_names;
 mod store;
 #[cfg(test)]
 mod tests;
@@ -14,8 +16,17 @@ use std::{fmt, io};
 
 use astrid_storage_engine::PrincipalProjectionError;
 use astrid_storage_model::{ObjectId, RootState};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub use astrid_storage_content::{ChunkingProfile, ContentDescriptor};
+#[cfg(not(target_family = "wasm"))]
+pub use projection_names::{
+    AtomicProjectionNameReservation, ProjectedContentPath, ProjectedNameSegment,
+    ProjectionCollisionGroup, ProjectionCollisionKind, ProjectionEscapeReason,
+    ProjectionEscapedName, ProjectionNameComparison, ProjectionNameError, ProjectionNameMapping,
+    ProjectionNamePlan, ProjectionNamePolicy, ProjectionNameSyntax, ProjectionReservationOutcome,
+    plan_projection_names,
+};
 pub use store::PrincipalContentStore;
 
 use astrid_storage_content::ContentError;
@@ -31,6 +42,25 @@ use crate::error::StorageError;
 /// Canonical name of one principal-owned content value.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ContentName(String);
+
+impl Serialize for ContentName {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ContentName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
 
 /// Failure to validate a principal content name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

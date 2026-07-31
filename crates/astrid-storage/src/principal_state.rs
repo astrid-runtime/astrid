@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use astrid_core::dirs::AstridHome;
 use astrid_core::identity::PrincipalUid;
+use astrid_core::kernel_api::{ProjectionNameDiagnostic, ProjectionNamePolicyPreset};
 use astrid_core::principal::PrincipalId;
 use astrid_storage_engine::{
     DurableEngine, IdentityScheme, PersistentObjectIdentity, PrincipalCodec, RecoveryLimits,
@@ -19,7 +20,10 @@ use astrid_storage_model::{ObjectClass, ObjectId, ObjectIdentity, ObjectRecord, 
 use parking_lot::Mutex;
 
 pub use crate::PrincipalDirectory;
-use crate::content::{CatalogValidation, ContentWriteOutcome, PrincipalContentStore};
+use crate::content::{
+    CatalogValidation, ContentWriteOutcome, PrincipalContentStore, ProjectionNamePolicy,
+    plan_projection_names,
+};
 use crate::error::{StorageError, StorageResult};
 use crate::identity::{IdentityStore, KvIdentityStore};
 #[cfg(all(test, feature = "legacy-surrealkv"))]
@@ -37,6 +41,8 @@ mod format_migration_tests;
 mod migrations;
 mod native_io;
 mod owner_migration;
+#[cfg(test)]
+mod projection_name_tests;
 mod staging;
 
 #[cfg(test)]
@@ -217,6 +223,44 @@ impl RuntimePrincipalStore {
     #[must_use]
     pub fn principal_directory(&self) -> PrincipalDirectory {
         self.principals.clone()
+    }
+
+    /// Inspect one owner's exact catalog names under a target-volume policy.
+    ///
+    /// This is a read-only diagnostic. It never mutates the principal root or
+    /// disposable projection metadata and it never reports another owner
+    /// unless the caller already supplied that typed owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the authoritative catalog cannot be read
+    /// or the selected policy cannot produce a collision-free plan.
+    pub async fn projection_name_diagnostic(
+        &self,
+        owner: StateOwner,
+        preset: ProjectionNamePolicyPreset,
+    ) -> StorageResult<ProjectionNameDiagnostic> {
+        let content = Arc::clone(&self.content);
+        tokio::task::spawn_blocking(move || {
+            let entries = content.list(&owner).map_err(|error| {
+                StorageError::Internal(format!(
+                    "read principal content names for projection diagnosis: {error}"
+                ))
+            })?;
+            let names = entries
+                .into_iter()
+                .map(|entry| entry.name().clone())
+                .collect::<Vec<_>>();
+            plan_projection_names(ProjectionNamePolicy::from(preset), &names)
+                .map(ProjectionNameDiagnostic::from)
+                .map_err(|error| {
+                    StorageError::Internal(format!("plan target-volume projection names: {error}"))
+                })
+        })
+        .await
+        .map_err(|error| {
+            StorageError::Internal(format!("projection-name diagnostic worker failed: {error}"))
+        })?
     }
 
     /// Publish one sealed native write through the authoritative content store.

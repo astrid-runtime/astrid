@@ -8,7 +8,13 @@
 //! has no dependency on `astrid-core` — it must compile on
 //! `wasm32-unknown-unknown` without dragging in the kernel).
 
+mod projection_names;
 mod readiness;
+pub use projection_names::{
+    PROJECTION_NAME_DIAGNOSTIC_METHOD, PROJECTION_NAME_DIAGNOSTIC_TOPIC,
+    ProjectionNameCollisionDiagnostic, ProjectionNameDiagnostic, ProjectionNameEscapeDiagnostic,
+    ProjectionNamePolicyPreset,
+};
 pub use readiness::{AgentLoopReadiness, AgentReadinessProbe, CapsuleTopicProbe, MissingImport};
 
 use crate::PrincipalId;
