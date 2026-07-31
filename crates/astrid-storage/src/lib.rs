@@ -56,6 +56,14 @@ pub mod secret;
 #[cfg(feature = "db")]
 pub mod db;
 
+#[cfg(not(target_family = "wasm"))]
+pub use content::{
+    AtomicProjectionNameReservation, ProjectedContentPath, ProjectedNameSegment,
+    ProjectionCollisionGroup, ProjectionCollisionKind, ProjectionEscapeReason,
+    ProjectionEscapedName, ProjectionNameComparison, ProjectionNameError, ProjectionNameMapping,
+    ProjectionNamePlan, ProjectionNamePolicy, ProjectionNameSyntax, ProjectionReservationOutcome,
+    plan_projection_names,
+};
 pub use content::{
     ChunkingProfile, ContentDescriptor, ContentEntry, ContentName, ContentNameError,
     ContentWriteOutcome, PrincipalContentError, PrincipalContentStore,

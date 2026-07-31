@@ -509,6 +509,39 @@ async fn handle_request(
             let readiness = astrid_capsule::readiness::agent_loop_readiness(&manifests);
             KernelResponse::AgentReadiness(readiness)
         },
+        KernelRequest::GetProjectionNameDiagnostic { policy } => {
+            #[cfg(not(target_family = "wasm"))]
+            {
+                match kernel.principal_store.as_ref() {
+                    Some(store) => {
+                        let directory = store.principal_directory();
+                        match directory.uid_for(&caller) {
+                            Ok(uid) => match store
+                                .projection_name_diagnostic(
+                                    astrid_storage::StateOwner::Principal(uid),
+                                    policy,
+                                )
+                                .await
+                            {
+                                Ok(report) => KernelResponse::ProjectionNames(report),
+                                Err(error) => KernelResponse::Error(error.to_string()),
+                            },
+                            Err(error) => KernelResponse::Error(error.to_string()),
+                        }
+                    },
+                    None => KernelResponse::Error(
+                        "projection-name diagnosis is unavailable on this host".to_owned(),
+                    ),
+                }
+            }
+            #[cfg(target_family = "wasm")]
+            {
+                let _ = policy;
+                KernelResponse::Error(
+                    "projection-name diagnosis is unavailable on this host".to_owned(),
+                )
+            }
+        },
     };
 
     // Stop the keepalive before the terminal frame so it isn't preceded by a
@@ -661,7 +694,9 @@ pub fn resolve_scope(req: &KernelRequest, _caller: &PrincipalId) -> AuthoritySco
 pub fn required_capability(req: &KernelRequest, scope: AuthorityScope) -> &'static str {
     match (req, scope) {
         (KernelRequest::Shutdown { .. }, _) => "system:shutdown",
-        (KernelRequest::GetStatus, _) => "system:status",
+        (KernelRequest::GetStatus | KernelRequest::GetProjectionNameDiagnostic { .. }, _) => {
+            "system:status"
+        },
         (
             KernelRequest::ReloadCapsules | KernelRequest::ReloadCapsule { .. },
             AuthorityScope::Self_,
@@ -711,6 +746,7 @@ pub fn kernel_request_method(req: &KernelRequest) -> &'static str {
         KernelRequest::GetCommands => "GetCommands",
         KernelRequest::GetCapsuleMetadata => "GetCapsuleMetadata",
         KernelRequest::GetAgentReadiness => "GetAgentReadiness",
+        KernelRequest::GetProjectionNameDiagnostic { .. } => "GetProjectionNameDiagnostic",
         KernelRequest::Shutdown { .. } => "Shutdown",
         KernelRequest::GetStatus => "GetStatus",
     }

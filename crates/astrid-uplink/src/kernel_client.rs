@@ -176,6 +176,7 @@ pub const fn topic_suffix(req: &KernelRequest) -> &'static str {
         KernelRequest::GetCommands => "get_commands",
         KernelRequest::GetCapsuleMetadata => "metadata",
         KernelRequest::GetAgentReadiness => "agent_readiness",
+        KernelRequest::GetProjectionNameDiagnostic { .. } => "projection_names",
         KernelRequest::Shutdown { .. } => "shutdown",
         KernelRequest::GetStatus => "status",
     }

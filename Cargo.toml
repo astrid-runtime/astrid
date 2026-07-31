@@ -100,6 +100,7 @@ axum-server = { version = "0.8", features = ["tls-rustls"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 base64 = "0.22"
 blake3 = "1.5"
+caseless = "=0.2.2"
 # `default-features = false` strips chrono's `clock` feature, which on
 # `wasm32-unknown-unknown` would pull in `wasm-bindgen` + `js-sys` and
 # inject `__wbindgen_placeholder__` imports that `wit-component`
@@ -261,6 +262,7 @@ wit-component = "0.253"
 wit-parser = "0.253"
 wasmtime = { version = "46.0.2", features = ["component-model", "cranelift"] }
 wasmtime-wasi = "46.0.2"
+unicode-normalization = "=0.1.25"
 unicode-width = "0.2"
 which = "8"
 zeroize = { version = "1.8", features = ["derive"] }

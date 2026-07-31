@@ -232,6 +232,15 @@ fn required_capability_mapping_per_variant_self_scope() {
     );
     assert_eq!(
         required_capability(
+            &KernelRequest::GetProjectionNameDiagnostic {
+                policy: astrid_core::kernel_api::ProjectionNamePolicyPreset::UnicodeCanonicalV1,
+            },
+            AuthorityScope::Self_,
+        ),
+        "system:status"
+    );
+    assert_eq!(
+        required_capability(
             &KernelRequest::ApproveCapability {
                 request_id: String::new(),
                 signature: String::new(),

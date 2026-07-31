@@ -262,6 +262,66 @@ Hosted filesystem projections implement platform folding and deterministic
 collision disambiguation. `astrid doctor` reports names that collide under a
 target projection policy.
 
+The frozen projection profiles are behavior contracts rather than
+operating-system labels:
+
+- `byte-exact-v1`;
+- `unicode17-nfd-v1`;
+- `unicode16-default-fold-v1`; and
+- `unicode17-nfd-unicode16-default-fold-v1`.
+
+Canonical comparison pins Unicode 17.0 normalization tables and applies NFD.
+Caseless comparison pins Unicode 16.0 case-fold tables and applies full,
+non-Turkic default case folding. The combined profile applies Unicode 17.0
+NFD, Unicode 16.0 full folding, then Unicode 17.0 NFD. The differing table
+versions are part of the contract: the exact audited dependencies do not
+silently claim a newer fold table than they implement. Target syntax is
+independently `posix-utf8-v1` or `windows-utf16-v1`, with a detected non-zero
+segment-unit ceiling. This separation matters because case and normalization
+behavior can vary by volume or directory on one host.
+
+A provider selects the exact target behavior when it has a pinned comparison
+implementation, or a conservative superset when the host algorithm is not
+portable. Over-comparison may escape an extra display name but preserves every
+source; under-comparison can miss a real collision and is forbidden.
+
+Projection planning interprets `/` only at this compatibility boundary and
+builds a trie over exact source segments. It detects both equivalent sibling
+segments and file-versus-directory prefix conflicts. A safe singleton keeps
+its natural spelling. Every member of a collision, and every empty, `.`, `..`,
+reserved, invalid, trailing-dot/space, marker-containing, or overlong segment,
+receives:
+
+```text
+readable-prefix || "~astrid-" || role || "-" || hex(
+    BLAKE3-256("astrid projection name suffix v1",
+               exact-source-prefix, role, exact-segment)
+)
+```
+
+The derived-key input is byte-exact: `u128-le(prefix-segment-count)`, followed
+by each prefix segment as `u128-le(byte-length) || UTF-8 bytes`, a one-byte
+role (`0` file, `1` directory), then the final segment using the same
+length-prefixed encoding. This makes every path shape self-delimiting.
+
+The full suffix remains after syntax-aware truncation. The reserved marker is
+never accepted as a natural spelling. The planner compares final output again
+under the selected policy and fails closed on any digest or projected-path
+collision. Planning is deterministic for a fixed catalog and independent of
+input order.
+
+Disposable mapping metadata binds every projected path to its complete exact
+`ContentName`; a write handle carries that source identity. Adapters never
+infer authority by parsing a display path. Publication performs one atomic
+target-filesystem reservation that compares the stored exact source name.
+Preflight `exists()` followed by `create()` is forbidden, and a path reserved
+for another source is an error rather than an overwrite.
+
+`astrid doctor --projection-name-policy <profile>` evaluates only the
+authenticated caller's catalog, reports exact-source collision groups and
+escaped segments, and makes no repair. Providers may later supply a
+volume-detected policy through the same typed planner.
+
 ### Rationale
 
 Store-side folding is irreversible semantic loss. Projection-side policy is

@@ -146,6 +146,13 @@ pub struct Kernel {
     /// own backend; the shutdown flush goes through the trait's
     /// [`close`](astrid_storage::KvStore::close).
     pub kv: Arc<dyn astrid_storage::KvStore>,
+    /// Native principal projections sharing the same engine as [`Self::kv`].
+    ///
+    /// Portable hosts may inject only a [`KvStore`](astrid_storage::KvStore),
+    /// so management diagnostics fail closed when this native composition
+    /// resource is absent.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) principal_store: Option<astrid_storage::RuntimePrincipalStore>,
     /// Chain-linked cryptographic audit log with persistent storage.
     pub audit_log: Arc<AuditLog>,
     /// The runtime ed25519 signing key (issue #929).
@@ -463,13 +470,14 @@ impl Kernel {
 
         // Open the authoritative state store. First cutover imports and
         // verifies legacy SurrealKV under the singleton lock before serving.
-        let kv = astrid_storage::open_runtime_kv_with_directory(
+        let principal_store = astrid_storage::open_runtime_principal_store_with_directory(
             &home,
             quota,
             principal_directory.clone(),
         )
         .await
-        .map_err(|e| std::io::Error::other(format!("Failed to open KV store: {e}")))?;
+        .map_err(|e| std::io::Error::other(format!("Failed to open principal store: {e}")))?;
+        let kv = principal_store.kv();
         // TODO: clear ephemeral keys (e: prefix) on boot when the key
         // lifecycle tier convention is established.
 
@@ -520,6 +528,7 @@ impl Kernel {
             workspace_layout,
             Some(profile_cache),
             principal_directory,
+            Some(principal_store),
         )
         .await
     }
@@ -632,6 +641,8 @@ impl Kernel {
             workspace_layout,
             profile_cache,
             astrid_storage::PrincipalDirectory::default(),
+            #[cfg(not(target_family = "wasm"))]
+            None,
         )
         .await
     }
@@ -651,6 +662,9 @@ impl Kernel {
         workspace_layout: WorkspaceLayout,
         profile_cache: Option<Arc<PrincipalProfileCache>>,
         principal_directory: astrid_storage::PrincipalDirectory,
+        #[cfg(not(target_family = "wasm"))] principal_store: Option<
+            astrid_storage::RuntimePrincipalStore,
+        >,
     ) -> Result<Arc<Self>, std::io::Error> {
         // The native capsule engine uses `block_in_place`, which requires a
         // multi-thread runtime. The browser profile has no such runtime (and no
@@ -814,6 +828,8 @@ impl Kernel {
             cli_socket_listener,
             singleton_lock,
             kv,
+            #[cfg(not(target_family = "wasm"))]
+            principal_store,
             audit_log,
             runtime_key,
             active_connections: DashMap::new(),
@@ -2484,6 +2500,17 @@ async fn unload_loaded_capsule_after_source_disappeared(
 /// [`astrid_core::dirs::AstridHome`] so every call is fully isolated
 /// from the process-global `$ASTRID_HOME`.
 #[cfg(test)]
+async fn open_test_runtime_kv(
+    home: &astrid_core::dirs::AstridHome,
+) -> Arc<dyn astrid_storage::KvStore> {
+    let quota: Arc<dyn astrid_storage::KvQuotaResolver<astrid_storage::StateOwner>> =
+        Arc::new(|_: &astrid_storage::StateOwner| Ok(None));
+    astrid_storage::open_runtime_kv(home, quota)
+        .await
+        .expect("test kernel: open authoritative principal store")
+}
+
+#[cfg(test)]
 pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -> Arc<Kernel> {
     use astrid_capsule::profile_cache::PrincipalProfileCache;
 
@@ -2497,11 +2524,7 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
     // Use the same authoritative principal-store composition as native boot.
     // A test helper opening the legacy import source directly would let kernel
     // tests pass against a runtime topology that production cannot select.
-    let quota: Arc<dyn astrid_storage::KvQuotaResolver<astrid_storage::StateOwner>> =
-        Arc::new(|_: &astrid_storage::StateOwner| Ok(None));
-    let kv = astrid_storage::open_runtime_kv(&home, quota)
-        .await
-        .expect("test kernel: open authoritative principal store");
+    let kv = open_test_runtime_kv(&home).await;
     let capabilities = Arc::new(
         CapabilityStore::with_kv_store(Arc::clone(&kv))
             .await
@@ -2572,6 +2595,8 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         cli_socket_listener: None,
         singleton_lock: None,
         kv,
+        #[cfg(not(target_family = "wasm"))]
+        principal_store: None,
         audit_log,
         runtime_key,
         active_connections: DashMap::new(),

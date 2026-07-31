@@ -8,7 +8,12 @@
 //! has no dependency on `astrid-core` — it must compile on
 //! `wasm32-unknown-unknown` without dragging in the kernel).
 
+mod projection_names;
 mod readiness;
+pub use projection_names::{
+    ProjectionNameCollisionDiagnostic, ProjectionNameDiagnostic, ProjectionNameEscapeDiagnostic,
+    ProjectionNamePolicyPreset,
+};
 pub use readiness::{AgentLoopReadiness, AgentReadinessProbe, CapsuleTopicProbe, MissingImport};
 
 use crate::PrincipalId;
@@ -93,6 +98,12 @@ pub enum KernelRequest {
     /// Request agent-loop readiness: whether the loaded capsule set can serve
     /// an agent chat turn. Read-only, name-agnostic — see [`AgentLoopReadiness`].
     GetAgentReadiness,
+    /// Inspect this caller's exact content names under a selected target-volume
+    /// comparison policy. Never returns another principal's catalog.
+    GetProjectionNameDiagnostic {
+        /// Behavior profile matching the target volume or provider metadata.
+        policy: ProjectionNamePolicyPreset,
+    },
 }
 
 /// Management API responses from the core daemon.
@@ -111,6 +122,8 @@ pub enum KernelResponse {
     Status(DaemonStatus),
     /// Agent-loop readiness report.
     AgentReadiness(AgentLoopReadiness),
+    /// Caller-scoped projection-name report for `astrid doctor`.
+    ProjectionNames(ProjectionNameDiagnostic),
     /// The request requires user capability approval before it can proceed.
     ApprovalRequired {
         /// Unique ID for this specific action request.

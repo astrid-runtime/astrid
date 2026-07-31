@@ -339,6 +339,7 @@ fn admin_vs_agent_cross_tenant_matrix() {
         match req {
             KernelRequest::Shutdown { .. }
             | KernelRequest::GetStatus
+            | KernelRequest::GetProjectionNameDiagnostic { .. }
             | KernelRequest::ReloadCapsules
             | KernelRequest::InstallCapsule {
                 workspace: false, ..
