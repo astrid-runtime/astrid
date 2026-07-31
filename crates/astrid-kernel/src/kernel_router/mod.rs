@@ -24,7 +24,9 @@ use astrid_core::groups::GroupConfig;
 use astrid_core::principal::PrincipalId;
 use astrid_core::profile::{DeviceScope, PrincipalProfile};
 use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
-use astrid_events::kernel_api::{KernelRequest, KernelResponse};
+use astrid_events::kernel_api::{
+    KernelRequest, KernelResponse, PROJECTION_NAME_DIAGNOSTIC_METHOD, ProjectionNamePolicyPreset,
+};
 use tracing::{debug, info, warn};
 
 #[cfg(test)]
@@ -32,6 +34,17 @@ use caller::CallerResolutionError;
 use caller::{MANAGEMENT_CALLER_REQUIRED, resolve_caller, resolve_connection_principal};
 use device_scope::resolve_device_scope;
 use visibility::CapsuleVisibility;
+
+#[derive(serde::Deserialize)]
+struct ProjectionNameWireRequest {
+    method: String,
+    params: ProjectionNameWireParams,
+}
+
+#[derive(serde::Deserialize)]
+struct ProjectionNameWireParams {
+    policy: ProjectionNamePolicyPreset,
+}
 
 #[cfg(test)]
 mod capability_catalog_tests;
@@ -81,6 +94,51 @@ pub(crate) fn spawn_kernel_router(kernel: Arc<crate::Kernel>) -> astrid_runtime:
             let IpcPayload::RawJson(val) = &message.payload else {
                 continue;
             };
+
+            if val.get("method").and_then(serde_json::Value::as_str)
+                == Some(PROJECTION_NAME_DIAGNOSTIC_METHOD)
+            {
+                let request = match serde_json::from_value::<ProjectionNameWireRequest>(val.clone())
+                {
+                    Ok(request) if request.method == PROJECTION_NAME_DIAGNOSTIC_METHOD => request,
+                    Ok(_) | Err(_) => {
+                        publish_response(
+                            &kernel,
+                            response_topic_for(&message.topic),
+                            KernelResponse::Error(
+                                "invalid projection-name diagnostic request".to_owned(),
+                            ),
+                        );
+                        continue;
+                    },
+                };
+                let caller = match resolve_caller(message) {
+                    Ok(caller) => caller,
+                    Err(error) => {
+                        warn!(
+                            security_event = true,
+                            topic = %message.topic,
+                            reason = error.reason(),
+                            "Rejected projection-name diagnostic without a valid principal"
+                        );
+                        publish_response(
+                            &kernel,
+                            response_topic_for(&message.topic),
+                            KernelResponse::Error(MANAGEMENT_CALLER_REQUIRED.to_string()),
+                        );
+                        continue;
+                    },
+                };
+                handle_projection_name_diagnostic(
+                    &kernel,
+                    message.topic.clone(),
+                    caller,
+                    resolve_device_key_id(message),
+                    request.params.policy,
+                )
+                .await;
+                continue;
+            }
 
             match serde_json::from_value::<KernelRequest>(val.clone()) {
                 Ok(req) => {
@@ -232,6 +290,91 @@ fn response_topic_for(request_topic: &str) -> Topic {
     request_topic
         .strip_prefix("astrid.v1.request.")
         .map_or_else(|| Topic::from_raw(request_topic), Topic::kernel_response)
+}
+
+async fn handle_projection_name_diagnostic(
+    kernel: &Arc<crate::Kernel>,
+    topic: Topic,
+    caller: PrincipalId,
+    device_key_id: Option<String>,
+    policy: ProjectionNamePolicyPreset,
+) {
+    const REQUIRED_CAPABILITY: &str = "system:status";
+    let audit_params = Some(serde_json::json!({ "policy": policy }));
+
+    let response_topic = response_topic_for(&topic);
+    if let Err(error) = authorize_request(
+        kernel,
+        &caller,
+        device_key_id.as_deref(),
+        REQUIRED_CAPABILITY,
+    ) {
+        let reason = error.to_string();
+        record_admin_audit(
+            kernel,
+            AdminAuditEntry {
+                caller: &caller,
+                method: PROJECTION_NAME_DIAGNOSTIC_METHOD,
+                required_cap: REQUIRED_CAPABILITY,
+                device_key_id: device_key_id.as_deref(),
+                target_principal: None,
+                params: audit_params.clone(),
+                authorization: AuthorizationProof::Denied {
+                    reason: reason.clone(),
+                },
+                outcome: AuditOutcome::failure(reason.clone()),
+            },
+        )
+        .await;
+        publish_response(kernel, response_topic, KernelResponse::Error(reason));
+        return;
+    }
+
+    record_admin_audit(
+        kernel,
+        AdminAuditEntry {
+            caller: &caller,
+            method: PROJECTION_NAME_DIAGNOSTIC_METHOD,
+            required_cap: REQUIRED_CAPABILITY,
+            device_key_id: device_key_id.as_deref(),
+            target_principal: None,
+            params: audit_params,
+            authorization: AuthorizationProof::System {
+                reason: format!("policy allow: {caller} holds {REQUIRED_CAPABILITY}"),
+            },
+            outcome: AuditOutcome::success(),
+        },
+    )
+    .await;
+
+    #[cfg(not(target_family = "wasm"))]
+    let response = match kernel.principal_store.as_ref() {
+        Some(store) => {
+            let directory = store.principal_directory();
+            match directory.uid_for(&caller) {
+                Ok(uid) => match store
+                    .projection_name_diagnostic(astrid_storage::StateOwner::Principal(uid), policy)
+                    .await
+                {
+                    Ok(report) => match serde_json::to_value(report) {
+                        Ok(report) => KernelResponse::Success(report),
+                        Err(error) => KernelResponse::Error(error.to_string()),
+                    },
+                    Err(error) => KernelResponse::Error(error.to_string()),
+                },
+                Err(error) => KernelResponse::Error(error.to_string()),
+            }
+        },
+        None => KernelResponse::Error(
+            "projection-name diagnosis is unavailable on this host".to_owned(),
+        ),
+    };
+    #[cfg(target_family = "wasm")]
+    let response = {
+        let _ = policy;
+        KernelResponse::Error("projection-name diagnosis is unavailable on this host".to_owned())
+    };
+    publish_response(kernel, response_topic, response);
 }
 
 #[expect(clippy::too_many_lines)]
@@ -509,39 +652,6 @@ async fn handle_request(
             let readiness = astrid_capsule::readiness::agent_loop_readiness(&manifests);
             KernelResponse::AgentReadiness(readiness)
         },
-        KernelRequest::GetProjectionNameDiagnostic { policy } => {
-            #[cfg(not(target_family = "wasm"))]
-            {
-                match kernel.principal_store.as_ref() {
-                    Some(store) => {
-                        let directory = store.principal_directory();
-                        match directory.uid_for(&caller) {
-                            Ok(uid) => match store
-                                .projection_name_diagnostic(
-                                    astrid_storage::StateOwner::Principal(uid),
-                                    policy,
-                                )
-                                .await
-                            {
-                                Ok(report) => KernelResponse::ProjectionNames(report),
-                                Err(error) => KernelResponse::Error(error.to_string()),
-                            },
-                            Err(error) => KernelResponse::Error(error.to_string()),
-                        }
-                    },
-                    None => KernelResponse::Error(
-                        "projection-name diagnosis is unavailable on this host".to_owned(),
-                    ),
-                }
-            }
-            #[cfg(target_family = "wasm")]
-            {
-                let _ = policy;
-                KernelResponse::Error(
-                    "projection-name diagnosis is unavailable on this host".to_owned(),
-                )
-            }
-        },
     };
 
     // Stop the keepalive before the terminal frame so it isn't preceded by a
@@ -694,9 +804,7 @@ pub fn resolve_scope(req: &KernelRequest, _caller: &PrincipalId) -> AuthoritySco
 pub fn required_capability(req: &KernelRequest, scope: AuthorityScope) -> &'static str {
     match (req, scope) {
         (KernelRequest::Shutdown { .. }, _) => "system:shutdown",
-        (KernelRequest::GetStatus | KernelRequest::GetProjectionNameDiagnostic { .. }, _) => {
-            "system:status"
-        },
+        (KernelRequest::GetStatus, _) => "system:status",
         (
             KernelRequest::ReloadCapsules | KernelRequest::ReloadCapsule { .. },
             AuthorityScope::Self_,
@@ -746,7 +854,6 @@ pub fn kernel_request_method(req: &KernelRequest) -> &'static str {
         KernelRequest::GetCommands => "GetCommands",
         KernelRequest::GetCapsuleMetadata => "GetCapsuleMetadata",
         KernelRequest::GetAgentReadiness => "GetAgentReadiness",
-        KernelRequest::GetProjectionNameDiagnostic { .. } => "GetProjectionNameDiagnostic",
         KernelRequest::Shutdown { .. } => "Shutdown",
         KernelRequest::GetStatus => "GetStatus",
     }

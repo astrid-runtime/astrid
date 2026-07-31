@@ -2,6 +2,12 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Wire method for the additive caller-scoped projection diagnostic protocol.
+pub const PROJECTION_NAME_DIAGNOSTIC_METHOD: &str = "ProjectionNameDiagnosticV1";
+
+/// Topic suffix for projection diagnostic request/response correlation.
+pub const PROJECTION_NAME_DIAGNOSTIC_TOPIC: &str = "projection_names";
+
 /// Named target-volume policy accepted by `astrid doctor`.
 ///
 /// These are behavior profiles, not operating-system labels. The caller

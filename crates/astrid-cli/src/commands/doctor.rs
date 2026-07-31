@@ -283,21 +283,12 @@ async fn projection_name_diagnostic(
     )
     .await
     .map_err(|_| anyhow::anyhow!("connection timed out after 5s"))??;
-    match tokio::time::timeout(
+    tokio::time::timeout(
         Duration::from_secs(30),
-        client.request(KernelRequest::GetProjectionNameDiagnostic { policy }),
+        client.projection_name_diagnostic(policy),
     )
     .await
-    .map_err(|_| anyhow::anyhow!("projection-name response timed out after 30s"))??
-    {
-        KernelResponse::ProjectionNames(report) => Ok(report),
-        KernelResponse::Error(message) => Err(anyhow::anyhow!(
-            "daemon rejected projection diagnosis: {message}"
-        )),
-        _ => Err(anyhow::anyhow!(
-            "daemon returned an unexpected projection-name response"
-        )),
-    }
+    .map_err(|_| anyhow::anyhow!("projection-name response timed out after 30s"))?
 }
 
 /// Render the FAIL detail line for a not-ready report: each missing piece,

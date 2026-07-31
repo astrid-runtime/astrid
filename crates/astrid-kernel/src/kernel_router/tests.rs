@@ -232,15 +232,6 @@ fn required_capability_mapping_per_variant_self_scope() {
     );
     assert_eq!(
         required_capability(
-            &KernelRequest::GetProjectionNameDiagnostic {
-                policy: astrid_core::kernel_api::ProjectionNamePolicyPreset::UnicodeCanonicalV1,
-            },
-            AuthorityScope::Self_,
-        ),
-        "system:status"
-    );
-    assert_eq!(
-        required_capability(
             &KernelRequest::ApproveCapability {
                 request_id: String::new(),
                 signature: String::new(),
@@ -448,6 +439,51 @@ async fn management_router_denies_missing_and_invalid_principals_deterministical
         ));
         assert_eq!(kernel.total_connection_count(), 0);
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn projection_name_diagnostic_uses_named_wire_and_system_status_gate() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = astrid_core::dirs::AstridHome::from_path(dir.path());
+    let kernel = crate::test_kernel_with_home(home).await;
+    drop(spawn_kernel_router(Arc::clone(&kernel)));
+
+    let caller = PrincipalId::new("alice").expect("valid principal");
+    seed_profile(&kernel, &caller, &PrincipalProfile::default());
+    let request_topic = Topic::kernel_request("projection_names.test");
+    let response_topic = Topic::kernel_response("projection_names.test");
+    let mut receiver = kernel.event_bus.subscribe_topic(response_topic.as_str());
+    let mut message = IpcMessage::new(
+        request_topic,
+        IpcPayload::RawJson(serde_json::json!({
+            "method": PROJECTION_NAME_DIAGNOSTIC_METHOD,
+            "params": { "policy": ProjectionNamePolicyPreset::WindowsCaselessV1 },
+        })),
+        kernel.session_id.0,
+    );
+    message.principal = Some(caller.to_string());
+    let _ = kernel.event_bus.publish(astrid_events::AstridEvent::Ipc {
+        metadata: astrid_events::EventMetadata::new("test"),
+        message,
+    });
+
+    let value = astrid_runtime::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let event = receiver.recv().await.expect("response event");
+            if let astrid_events::AstridEvent::Ipc { message, .. } = &*event
+                && let IpcPayload::RawJson(value) = &message.payload
+            {
+                return value.clone();
+            }
+        }
+    })
+    .await
+    .expect("projection diagnostic response within 2s");
+    let response: KernelResponse = serde_json::from_value(value).expect("typed kernel response");
+    assert!(
+        matches!(response, KernelResponse::Error(reason) if reason.contains("system:status")),
+        "a caller without system:status must be rejected"
+    );
 }
 
 fn assert_authorization_denied(response: &KernelResponse, context: &str) {

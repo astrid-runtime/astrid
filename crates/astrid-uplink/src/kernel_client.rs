@@ -34,7 +34,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use astrid_core::PrincipalId;
-use astrid_core::kernel_api::{KernelRequest, KernelResponse};
+use astrid_core::kernel_api::{
+    KernelRequest, KernelResponse, PROJECTION_NAME_DIAGNOSTIC_METHOD,
+    PROJECTION_NAME_DIAGNOSTIC_TOPIC, ProjectionNameDiagnostic, ProjectionNamePolicyPreset,
+};
 use astrid_types::Topic;
 use astrid_types::ipc::{IpcMessage, IpcPayload};
 use tokio::time::Instant;
@@ -176,7 +179,6 @@ pub const fn topic_suffix(req: &KernelRequest) -> &'static str {
         KernelRequest::GetCommands => "get_commands",
         KernelRequest::GetCapsuleMetadata => "metadata",
         KernelRequest::GetAgentReadiness => "agent_readiness",
-        KernelRequest::GetProjectionNameDiagnostic { .. } => "projection_names",
         KernelRequest::Shutdown { .. } => "shutdown",
         KernelRequest::GetStatus => "status",
     }
@@ -210,18 +212,32 @@ fn build_request_message(
     device_key_id: Option<&str>,
     req: &KernelRequest,
 ) -> Result<(IpcMessage, Topic)> {
+    let payload = serde_json::to_value(req).context("serialise KernelRequest")?;
+    Ok(build_named_request_message(
+        caller,
+        device_key_id,
+        topic_suffix(req),
+        payload,
+    ))
+}
+
+fn build_named_request_message(
+    caller: &PrincipalId,
+    device_key_id: Option<&str>,
+    suffix: &str,
+    payload: serde_json::Value,
+) -> (IpcMessage, Topic) {
     let correlation = Uuid::new_v4().simple().to_string();
-    let suffix = format!("{}.{correlation}", topic_suffix(req));
+    let suffix = format!("{suffix}.{correlation}");
     let request_topic = Topic::kernel_request(&suffix);
     let want_response = Topic::kernel_response(&suffix);
 
-    let payload = serde_json::to_value(req).context("serialise KernelRequest")?;
     let mut msg = IpcMessage::new(request_topic, IpcPayload::RawJson(payload), Uuid::nil())
         .with_principal(caller.to_string());
     if let Some(kid) = device_key_id {
         msg = msg.with_device_key_id(kid);
     }
-    Ok((msg, want_response))
+    (msg, want_response)
 }
 
 impl KernelClient {
@@ -289,6 +305,43 @@ impl KernelClient {
         self.request_with_ceiling(req, MAX_TOTAL).await
     }
 
+    /// Inspect this caller's exact content names under a selected target-volume
+    /// comparison policy without extending the exhaustive management enums.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport, authorization, decoding, or daemon-side storage
+    /// error. The daemon never returns another principal's catalog.
+    pub async fn projection_name_diagnostic(
+        &mut self,
+        policy: ProjectionNamePolicyPreset,
+    ) -> Result<ProjectionNameDiagnostic> {
+        let payload = serde_json::json!({
+            "method": PROJECTION_NAME_DIAGNOSTIC_METHOD,
+            "params": { "policy": policy },
+        });
+        let (message, response_topic) = build_named_request_message(
+            &self.caller,
+            self.device_key_id.as_deref(),
+            PROJECTION_NAME_DIAGNOSTIC_TOPIC,
+            payload,
+        );
+        match self
+            .send_and_wait(message, response_topic, MAX_TOTAL)
+            .await?
+        {
+            KernelResponse::Success(value) => {
+                serde_json::from_value(value).context("decode projection-name diagnostic response")
+            },
+            KernelResponse::Error(message) => Err(anyhow!(
+                "kernel rejected projection-name diagnostic: {message}"
+            )),
+            _ => Err(anyhow!(
+                "kernel returned an unexpected projection-name diagnostic response"
+            )),
+        }
+    }
+
     /// [`request`](Self::request) with an explicit overall ceiling.
     ///
     /// The public entrypoint passes [`MAX_TOTAL`]; a test passes a short ceiling
@@ -302,6 +355,15 @@ impl KernelClient {
         let (msg, want_response) =
             build_request_message(&self.caller, self.device_key_id.as_deref(), &req)
                 .map_err(|source| KernelClientError::Build { source })?;
+        self.send_and_wait(msg, want_response, max_total).await
+    }
+
+    async fn send_and_wait(
+        &mut self,
+        msg: IpcMessage,
+        want_response: Topic,
+        max_total: Duration,
+    ) -> std::result::Result<KernelResponse, KernelClientError> {
         self.inner
             .send_message(msg)
             .await
@@ -465,6 +527,37 @@ mod tests {
         let (msg, _) =
             build_request_message(&caller, None, &KernelRequest::GetStatus).expect("build message");
         assert!(msg.device_key_id.is_none());
+    }
+
+    #[test]
+    fn projection_diagnostic_message_pins_named_wire_contract() {
+        let caller = PrincipalId::new("alice").unwrap();
+        let policy = ProjectionNamePolicyPreset::WindowsCaselessV1;
+        let payload = serde_json::json!({
+            "method": PROJECTION_NAME_DIAGNOSTIC_METHOD,
+            "params": { "policy": policy },
+        });
+        let (msg, want) = build_named_request_message(
+            &caller,
+            Some("device-1"),
+            PROJECTION_NAME_DIAGNOSTIC_TOPIC,
+            payload.clone(),
+        );
+
+        assert_eq!(msg.principal.as_deref(), Some("alice"));
+        assert_eq!(msg.device_key_id.as_deref(), Some("device-1"));
+        assert!(msg.topic.starts_with("astrid.v1.request.projection_names."));
+        assert!(
+            want.starts_with("astrid.v1.response.projection_names."),
+            "response topic must preserve the request correlation suffix"
+        );
+        assert_eq!(
+            msg.topic
+                .strip_prefix("astrid.v1.request.")
+                .map(|suffix| format!("astrid.v1.response.{suffix}")),
+            Some(want.to_string())
+        );
+        assert_eq!(msg.payload, IpcPayload::RawJson(payload));
     }
 
     #[test]

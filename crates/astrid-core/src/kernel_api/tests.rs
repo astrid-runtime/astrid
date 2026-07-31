@@ -2,7 +2,7 @@
 //! under the 1000-line CI threshold. Included as a `tests` submodule of
 //! `kernel_api`.
 
-use super::{CommandInfo, CommandKind, KernelRequest, KernelResponse, ProjectionNamePolicyPreset};
+use super::{CommandInfo, CommandKind, KernelResponse};
 
 #[test]
 fn kernel_response_working_serializes_as_status_working() {
@@ -62,28 +62,4 @@ fn command_info_default_kind_omitted_from_wire() {
     // Default kind is skipped so the wire shape is byte-compatible with
     // pre-field consumers.
     assert!(json.get("kind").is_none());
-}
-
-#[test]
-fn projection_name_request_pins_the_selected_behavior_profile() {
-    let request = KernelRequest::GetProjectionNameDiagnostic {
-        policy: ProjectionNamePolicyPreset::WindowsCaselessV1,
-    };
-    let json = serde_json::to_value(&request).unwrap();
-    assert_eq!(
-        json,
-        serde_json::json!({
-            "method": "GetProjectionNameDiagnostic",
-            "params": {
-                "policy": "windows-caseless-v1",
-            },
-        })
-    );
-    let decoded: KernelRequest = serde_json::from_value(json).unwrap();
-    assert!(matches!(
-        decoded,
-        KernelRequest::GetProjectionNameDiagnostic {
-            policy: ProjectionNamePolicyPreset::WindowsCaselessV1
-        }
-    ));
 }

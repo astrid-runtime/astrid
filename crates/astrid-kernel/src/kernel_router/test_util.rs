@@ -1,7 +1,5 @@
 use astrid_core::PrincipalId;
-use astrid_core::kernel_api::{
-    AdminRequestKind, KernelRequest, PairScopeArg, ProjectionNamePolicyPreset,
-};
+use astrid_core::kernel_api::{AdminRequestKind, KernelRequest, PairScopeArg};
 use astrid_core::profile::Quotas;
 
 pub(crate) fn all_kernel_request_variants() -> Vec<KernelRequest> {
@@ -21,9 +19,6 @@ pub(crate) fn all_kernel_request_variants() -> Vec<KernelRequest> {
         KernelRequest::GetCommands,
         KernelRequest::GetCapsuleMetadata,
         KernelRequest::GetAgentReadiness,
-        KernelRequest::GetProjectionNameDiagnostic {
-            policy: ProjectionNamePolicyPreset::PosixExactV1,
-        },
         KernelRequest::ApproveCapability {
             request_id: "r".into(),
             signature: "s".into(),
