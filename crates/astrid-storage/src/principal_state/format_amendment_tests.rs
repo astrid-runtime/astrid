@@ -4,9 +4,11 @@
 
 use std::path::{Path, PathBuf};
 
+use astrid_storage_content::{ChunkingProfile, build_content};
 use astrid_storage_engine::{
-    CrossHashSigner, RecoveryLimits, RefineryBatchContext, RefineryPassDescriptorId,
-    RefineryResourceBudget, RefinerySnapshotId, attest_sha384_closure,
+    BottomKSketchDescriptor, CrossHashSigner, RecoveryLimits, RefineryBatchContext,
+    RefineryPassDescriptorId, RefineryResourceBudget, RefinerySnapshotId, attest_sha384_closure,
+    build_bottom_k_sketch,
 };
 use astrid_storage_model::{
     AuthorityEpochId, CanonicalParametersId, ComputationSharingDomainId, DerivationContractId,
@@ -180,12 +182,47 @@ fn cross_hash_records() -> Vec<ObjectRecord> {
     records
 }
 
+fn bottom_k_records() -> Vec<ObjectRecord> {
+    let built = build_content(
+        &Blake3ObjectIdentityV1,
+        ChunkingProfile::ASTRID_V1,
+        &vec![0x41; 600 * 1024],
+    )
+    .unwrap();
+    let descriptor = BottomKSketchDescriptor::ASTRID_V1;
+    let output = build_bottom_k_sketch(
+        &Blake3ObjectIdentityV1,
+        descriptor,
+        RefineryBatchContext::new(
+            RefinerySnapshotId::new(id(90)),
+            astrid_storage_model::PlacementEpoch::new(91),
+            RefineryResourceBudget::new(
+                u64::MAX,
+                u128::MAX,
+                u64::MAX,
+                u64::MAX,
+                u64::MAX,
+                u64::MAX,
+            ),
+            None,
+        ),
+        built.descriptor().file(),
+        built.records(),
+    )
+    .unwrap();
+    let mut records = vec![descriptor.record().unwrap()];
+    records.extend(built.into_records().into_iter().map(|(_, record)| record));
+    records.extend(output.into_iter().map(|proposal| proposal.record().clone()));
+    records
+}
+
 #[test]
 fn independent_reader_decodes_all_derivation_amendment_schemas() {
     let directory = tempfile::tempdir().unwrap();
     let engine = open_fixture_store(directory.path());
     let mut records = amendment_records();
     records.extend(cross_hash_records());
+    records.extend(bottom_k_records());
     engine.stage_objects(records).unwrap();
     engine.close().unwrap();
 
@@ -212,12 +249,54 @@ fn independent_reader_decodes_all_derivation_amendment_schemas() {
         "DerivationEvidence",
         "GcPlanEvidence",
         "GcCommitEvidence",
+        "Derived",
     ] {
         assert!(
             kinds.contains(&expected),
             "missing decoded {expected} fixture"
         );
     }
+}
+
+#[test]
+fn independent_reader_rejects_recomputed_bottom_k_mismatch() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open_fixture_store(directory.path());
+    let mut records = bottom_k_records();
+    let sketch = records
+        .iter()
+        .find(|record| {
+            record.kind() == ObjectKind::Derived
+                && record
+                    .canonical_bytes()
+                    .starts_with(b"astrid-bottom-k-sketch-v1\0")
+        })
+        .unwrap();
+    let mut changed = sketch.canonical_bytes().to_vec();
+    *changed.last_mut().unwrap() ^= 1;
+    records.push(
+        ObjectRecord::new(
+            sketch.kind(),
+            sketch.format_version(),
+            changed,
+            sketch.references().to_vec(),
+            sketch.logical_bytes(),
+            sketch.class(),
+        )
+        .unwrap(),
+    );
+    engine.stage_objects(records).unwrap();
+    engine.close().unwrap();
+
+    let output = std::process::Command::new("python3")
+        .arg(reader())
+        .arg(directory.path())
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "independent reader accepted an identity-consistent sketch mismatch"
+    );
 }
 
 #[test]

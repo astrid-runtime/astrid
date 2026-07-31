@@ -333,7 +333,13 @@ replaceable and platform-specific.
 
 Bottom-k resemblance sketches are deterministic Derived metadata computed by a
 pinned Refinery transform during scrub or compaction. They are never
-identity-bearing and never computed in the ingest chunking scan.
+part of source-content identity and are never computed in the ingest chunking
+scan.
+
+The measured production descriptor retains the lowest 256 distinct 128-bit
+scores. Scores are BLAKE3 derive-key outputs over length-framed canonical Chunk
+bytes. The scheduler materializes sketches only for multi-chunk Files; the
+canonical grammar still defines empty and one-chunk inputs.
 
 ### Rationale
 
@@ -348,18 +354,40 @@ engineering improvement and the selected design-around.
 Lineage is the first delta-partner source: a catalog replacement already knows
 its predecessor. Cross-name resemblance is a secondary use of sketches.
 
-### Work order
+### Implementation
 
-- Define the pinned DF-1 transform and sketch grammar.
-- Measure non-duplicate chunks that find a useful overlap candidate.
-- Measure actual delta sizes against those candidates.
-- Keep sketches evictable and reproducible.
+- The pinned DF-1 transform and canonical sketch grammar are implemented in
+  `astrid-storage-engine`.
+- The shared evidence harness measures useful overlap and reconstructed
+  COPY/ADD delta sizes across the registered curve.
+- Sketches use non-owning references, remain evictable, and recompute
+  byte-identically after interruption.
 
 ### Acceptance
 
 - No ingest path computes or exposes similarity metadata.
 - Scrub emits reproducible sketches from verified chunk bytes.
 - Removing sketches changes neither identity nor authoritative reads.
+
+### Evidence
+
+The live 5.73 GB agent-state corpus contained 67 non-duplicate multi-chunk
+targets. At 256 samples, 25 found a useful cross-name base and verified encoded
+bytes fell from 2,987,909,629 raw bytes to 2,726,752,143 bytes. Gains stopped at
+128 samples on this corpus.
+
+The 1.41 GB development workspace contained 372 multi-chunk targets. At 256
+samples, 22 found a useful base and verified encoded bytes fell from
+995,290,622 to 987,623,522. Three of those candidates appeared between 128 and
+256 samples; 512 produced no further gain. Random candidates saved zero bytes
+on both corpora. The 128-bit and 256-bit score constructions selected identical
+candidates and byte totals throughout the sweep, so the wider score had cost
+without measured benefit. These curves select 128-bit scores and 256 samples.
+
+Computing a sketch for every single-chunk agent-state file would retain roughly
+73 MB of Derived metadata while adding no candidate information. That measured
+waste is why multi-chunk eligibility is scheduler policy rather than an ingest
+side effect.
 
 ## D7. Affirmed storage constants
 

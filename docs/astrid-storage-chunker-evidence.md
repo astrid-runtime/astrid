@@ -73,8 +73,11 @@ directory snapshots. Symlinks are never followed. The harness captures a
 length-and-BLAKE3 baseline for every file before measuring any candidate and
 immediately re-hashes each timed file outside the timed interval. It aborts if
 any later pass observes different bytes, including a same-length replacement.
-The checked-in live-corpus report was generated from temporary point-in-time
-APFS copies rather than actively changing source directories.
+The CDC comparison was generated from temporary point-in-time APFS copies.
+The later bottom-k extension used fresh baseline-validated directory snapshots;
+each input was rechecked as it was read and the run would have aborted on a
+concurrent byte change. The two sections therefore retain their exact measured
+file counts instead of pretending they were one observation.
 
 ## Storage results
 
@@ -154,6 +157,58 @@ by itself, outweigh an identity migration for effectively unchanged retained
 cost. Parallel publication can also move production chunking back below the
 device-read ceiling without changing the file format.
 
+## Bottom-k resemblance decision
+
+The same harness also runs the production Refinery bottom-k transform over
+exact format-one File DAGs and feeds the chosen candidate into a deterministic
+COPY/ADD encoder. Every measured delta is decoded and required to reconstruct
+the target bytes. This is candidate-selection evidence, not a new authoritative
+representation format.
+
+The selected descriptor is 256 retained 128-bit scores. The scheduler emits it
+only for multi-chunk Files.
+
+| Samples | Agent useful / 67 | Agent encoded bytes | Workspace useful / 372 | Workspace encoded bytes |
+|---:|---:|---:|---:|---:|
+| 16 | 18 | 2,740,491,968 | 17 | 988,699,412 |
+| 32 | 20 | 2,737,297,008 | 17 | 988,699,412 |
+| 64 | 21 | 2,730,497,897 | 19 | 988,389,366 |
+| 128 | 25 | 2,726,752,143 | 19 | 987,972,895 |
+| 256 | 25 | 2,726,752,143 | 22 | 987,623,522 |
+| 512 | 25 | 2,726,752,143 | 22 | 987,623,522 |
+
+The raw baselines were 2,987,909,629 and 995,290,622 bytes. Deterministic
+random candidates saved no bytes. At 256 samples the sketches retain 229,602
+bytes over the eligible agent-state Files and 308,259 bytes over the eligible
+workspace Files. Moving from 128 to 256 samples costs 64,208 aggregate sketch
+bytes and saves another 349,373 encoded bytes plus three avoided misses;
+moving to 512 adds 106,992 sketch bytes and changes no candidate or delta.
+
+The 256-bit construction selected exactly the same candidates and encoded byte
+totals at every sample size. At the selected sample size it retained 352,144
+more aggregate bytes, while a 128-bit score collision can at worst propose
+work that still fails exact reconstruction and ObjectId verification. The
+wider score therefore has no measured or correctness benefit in this advisory
+index.
+
+The production pass body sustained 577.65 MiB/s on eligible agent-state DAGs
+and 557.41 MiB/s on eligible workspace DAGs at the selected descriptor. These
+timings begin after the exact File DAG is available and exclude the independent
+verification pass. The pass keeps at most 8 KiB of score slots; the evidence
+harness separately verifies that its vector never grows beyond the initial
+bounded reservation.
+
+History fixtures preserve the causal ordering. The synthetic edit chain and
+the 32-version CHANGELOG chain found useful resemblance candidates, but none
+beat the immediate predecessor. The selected execution policy is therefore
+lineage first, sketches only for residual cross-name or cross-lineage search.
+
+An initial all-file measurement also quantified the scheduler rule: emitting
+one-score records for every agent-state file would retain roughly 73 MB of
+Derived metadata and add no search information. Multi-chunk-only scheduling
+reduces that selected-profile footprint to 230 KB without changing any useful
+candidate in the measured corpus.
+
 ## Reproducibility and trust boundary
 
 `Cargo.lock` pins the registry versions and package checksums used for the run.
@@ -186,6 +241,16 @@ Run the public fixtures:
 ```console
 cargo run --release -p astrid-storage-chunker-evidence -- \
   --target-kib 64 --output chunker-evidence.json
+```
+
+Run only the bottom-k curve when CDC comparisons are not being revisited:
+
+```console
+cargo run --release -p astrid-storage-chunker-evidence -- \
+  --sketch-only \
+  --corpus agent-state="$ASTRID_STATE" \
+  --corpus dev-workspace="$ASTRID_WORKSPACE" \
+  --output sketch-evidence.json
 ```
 
 Add private corpora without placing paths in the result:

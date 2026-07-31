@@ -3,10 +3,17 @@
 use astrid_storage_model::{ObjectId, ObjectIdentity, ObjectKind, ObjectRecord, PlacementEpoch};
 
 mod cross_hash;
+#[cfg(not(target_family = "wasm"))]
+mod sketch;
 
 pub use cross_hash::{
     CrossHashAttestation, CrossHashSigner, CrossHashVerifier, Sha384AttestationError,
     attest_sha384_closure, verify_sha384_attestation,
+};
+#[cfg(not(target_family = "wasm"))]
+pub use sketch::{
+    BottomKSketch, BottomKSketchDescriptor, BottomKSketchError, SketchSampleSize, SketchScoreWidth,
+    build_bottom_k_sketch, verify_bottom_k_sketch,
 };
 
 /// Identity of one pinned Refinery pass descriptor.

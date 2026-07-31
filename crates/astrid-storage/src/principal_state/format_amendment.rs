@@ -46,11 +46,15 @@ pub(super) const PRE_KV_TRANSITION_FORMAT_SPEC_ID: ObjectId = ObjectId::new([
     57, 235, 162, 89, 88, 127, 140, 172, 190, 224, 66, 120, 143, 44, 189, 195, 232, 6, 75, 140, 72,
     252, 139, 169, 56, 0, 186, 2, 200, 198, 13, 50,
 ]);
+pub(super) const PRE_BOTTOM_K_SKETCH_FORMAT_SPEC_ID: ObjectId = ObjectId::new([
+    57, 145, 181, 144, 2, 201, 129, 253, 59, 86, 3, 186, 221, 78, 165, 179, 17, 67, 37, 48, 35,
+    203, 169, 128, 80, 207, 199, 233, 40, 99, 138, 255,
+]);
 const CONTENT_CATALOG_FORMAT_SPEC_ID: ObjectId = ObjectId::new([
     143, 57, 153, 176, 102, 182, 102, 57, 98, 89, 196, 169, 47, 157, 231, 197, 184, 230, 125, 249,
     211, 138, 105, 251, 79, 184, 36, 150, 139, 86, 236, 219,
 ]);
-const PRIOR_V1_FORMAT_SPEC_IDS: [ObjectId; 7] = [
+const PRIOR_V1_FORMAT_SPEC_IDS: [ObjectId; 8] = [
     PRE_DERIVATION_FORMAT_SPEC_ID,
     PRE_COMPACTION_FORMAT_SPEC_ID,
     PRE_GC_OUTBOX_FORMAT_SPEC_ID,
@@ -58,6 +62,7 @@ const PRIOR_V1_FORMAT_SPEC_IDS: [ObjectId; 7] = [
     PRE_FASTCDC_FREEZE_FORMAT_SPEC_ID,
     PRE_SHA384_ATTESTATION_FORMAT_SPEC_ID,
     PRE_KV_TRANSITION_FORMAT_SPEC_ID,
+    PRE_BOTTOM_K_SKETCH_FORMAT_SPEC_ID,
 ];
 
 pub(super) fn format_spec_record() -> StorageResult<ObjectRecord> {
@@ -226,6 +231,7 @@ pub(super) fn prepare_destination(
                                 })
                             } else if actual
                                 == previous_store_metadata(candidate, current_catalog_spec)
+                                || actual == store_metadata(candidate, current_catalog_spec)
                             {
                                 Some(DestinationFormat::PriorV1 {
                                     format_spec: candidate,

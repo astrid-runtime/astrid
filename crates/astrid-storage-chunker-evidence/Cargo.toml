@@ -11,8 +11,13 @@ description = "Reproducible evidence harness for Astrid content chunking profile
 
 [dependencies]
 anyhow = { workspace = true }
+astrid-storage = { workspace = true }
+astrid-storage-content = { workspace = true }
+astrid-storage-engine = { workspace = true }
+astrid-storage-model = { workspace = true }
 blake3 = { workspace = true }
 fastcdc = { workspace = true }
+hex = { workspace = true }
 mincdc = { workspace = true }
 mothcdc = { workspace = true }
 serde = { workspace = true }

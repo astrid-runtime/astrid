@@ -144,7 +144,13 @@ co-scheduled with scrub or compaction.
 
 Runs the pinned DF-1 resemblance transform over verified chunk bytes and emits
 Derived sketch records. It is deliberately separate from ingest chunking.
-Sketches never participate in ObjectId or semantic identity.
+Sketches never participate in the source ObjectId or semantic identity.
+
+The selected descriptor retains 256 unsigned-lexicographic 128-bit scores.
+The scheduler requests it only for multi-chunk Files; exact whole-object dedup
+already handles empty and single-chunk content. The transform remains total for
+those inputs so replay and independent verification never depend on scheduler
+policy.
 
 ## Compaction as the representation-migration window
 

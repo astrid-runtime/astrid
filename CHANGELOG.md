@@ -66,6 +66,15 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   The measurements retain FastCDC for format one, keep Moth representation
   claims separate from boundary selection, and record why Chonkers is not yet
   a licensed byte-exact candidate.
+- **Refinery can emit measured, independently verifiable resemblance
+  sketches.** The canonical bottom-k transform retains 256 deterministic
+  128-bit scores over verified format-one Chunk objects in bounded memory and
+  emits evictable Derived metadata bound to the exact File and pass descriptor.
+  Live agent-state and workspace sweeps select the constants from actual
+  reconstructed COPY/ADD deltas, preserve lineage-first selection, and limit
+  materialization to multi-chunk Files. The independent RÚNATAL reader
+  recomputes the source closure and every score, and existing development
+  stores amend in place to the successor in-band specification.
 - **Astrid has a content-addressed computation design contract.** A canonical
   invocation object now specifies the complete identity boundary for reusable
   deterministic work, including the exact transform closure, its registered

@@ -887,8 +887,13 @@ name = "astrid-storage-chunker-evidence"
 version = "0.10.4"
 dependencies = [
  "anyhow",
+ "astrid-storage",
+ "astrid-storage-content",
+ "astrid-storage-engine",
+ "astrid-storage-model",
  "blake3",
  "fastcdc",
+ "hex",
  "mincdc",
  "mothcdc",
  "serde",
@@ -909,6 +914,7 @@ dependencies = [
 name = "astrid-storage-engine"
 version = "0.10.4"
 dependencies = [
+ "astrid-storage-content",
  "astrid-storage-model",
  "blake3",
  "ed25519-dalek 3.0.0",
