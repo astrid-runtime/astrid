@@ -10,6 +10,7 @@ use astrid_capsule::manifest::{CapsuleManifest, CommandDef, ExportDef, PackageDe
 use astrid_capsule::registry::WasmHash;
 use astrid_core::kernel_api::CommandKind;
 use astrid_core::profile::{AuthMethod, DeviceKey, DeviceScope, PrincipalProfile};
+use astrid_events::kernel_api::{PROJECTION_NAME_DIAGNOSTIC_METHOD, ProjectionNamePolicyPreset};
 use std::sync::atomic::AtomicBool;
 
 use super::test_util::all_kernel_request_variants;
