@@ -323,6 +323,12 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   Installed authority snapshots prevent later manifest edits from silently
   acquiring additional host capabilities. Closes #1318.
 
+### Security
+
+- **Wasmtime is updated to 46.0.2 across the runtime.** The patched release
+  addresses RUSTSEC-2026-0222 and RUSTSEC-2026-0223 while retaining the current
+  Wasmtime 46 compatibility line. Closes #1429.
+
 ### Fixed
 
 - **Production compaction retention preserves every standalone bootstrap
