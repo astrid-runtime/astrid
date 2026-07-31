@@ -42,17 +42,22 @@ pub(super) const PRE_SHA384_ATTESTATION_FORMAT_SPEC_ID: ObjectId = ObjectId::new
     155, 248, 23, 9, 199, 131, 17, 254, 161, 1, 17, 55, 248, 218, 179, 182, 205, 143, 254, 108,
     142, 166, 4, 12, 254, 199, 25, 46, 251, 137, 171, 160,
 ]);
+pub(super) const PRE_KV_TRANSITION_FORMAT_SPEC_ID: ObjectId = ObjectId::new([
+    57, 235, 162, 89, 88, 127, 140, 172, 190, 224, 66, 120, 143, 44, 189, 195, 232, 6, 75, 140, 72,
+    252, 139, 169, 56, 0, 186, 2, 200, 198, 13, 50,
+]);
 const CONTENT_CATALOG_FORMAT_SPEC_ID: ObjectId = ObjectId::new([
     143, 57, 153, 176, 102, 182, 102, 57, 98, 89, 196, 169, 47, 157, 231, 197, 184, 230, 125, 249,
     211, 138, 105, 251, 79, 184, 36, 150, 139, 86, 236, 219,
 ]);
-const PRIOR_V1_FORMAT_SPEC_IDS: [ObjectId; 6] = [
+const PRIOR_V1_FORMAT_SPEC_IDS: [ObjectId; 7] = [
     PRE_DERIVATION_FORMAT_SPEC_ID,
     PRE_COMPACTION_FORMAT_SPEC_ID,
     PRE_GC_OUTBOX_FORMAT_SPEC_ID,
     PRE_RUNATAL_NAMING_FORMAT_SPEC_ID,
     PRE_FASTCDC_FREEZE_FORMAT_SPEC_ID,
     PRE_SHA384_ATTESTATION_FORMAT_SPEC_ID,
+    PRE_KV_TRANSITION_FORMAT_SPEC_ID,
 ];
 
 pub(super) fn format_spec_record() -> StorageResult<ObjectRecord> {
@@ -72,6 +77,25 @@ pub(super) fn format_spec_record() -> StorageResult<ObjectRecord> {
 }
 
 pub(super) fn store_metadata(format_spec: ObjectId, catalog_spec: ObjectId) -> Vec<u8> {
+    let digest = object_id_hex(format_spec);
+    let catalog_digest = object_id_hex(catalog_spec);
+    format!(
+        "format=astrid-principal-store-v1\n\
+         identity=blake3-object-identity-v1\n\
+         identity-wire=tagged-identity-v1\n\
+         format-spec-object={}:{}:32:{digest}\n\
+         content-catalog-spec-object={}:{}:32:{catalog_digest}\n\
+         principal-codec=principal-uid-v1\n\
+         projection=kv-transition-bplus-v4\n",
+        BLAKE3_OBJECT_IDENTITY_V1_SCHEME.algorithm(),
+        BLAKE3_OBJECT_IDENTITY_V1_SCHEME.construction(),
+        BLAKE3_OBJECT_IDENTITY_V1_SCHEME.algorithm(),
+        BLAKE3_OBJECT_IDENTITY_V1_SCHEME.construction(),
+    )
+    .into_bytes()
+}
+
+pub(super) fn previous_store_metadata(format_spec: ObjectId, catalog_spec: ObjectId) -> Vec<u8> {
     let digest = object_id_hex(format_spec);
     let catalog_digest = object_id_hex(catalog_spec);
     format!(
@@ -200,7 +224,9 @@ pub(super) fn prepare_destination(
                                     format_spec: candidate,
                                     catalog_spec_was_declared: false,
                                 })
-                            } else if actual == store_metadata(candidate, current_catalog_spec) {
+                            } else if actual
+                                == previous_store_metadata(candidate, current_catalog_spec)
+                            {
                                 Some(DestinationFormat::PriorV1 {
                                     format_spec: candidate,
                                     catalog_spec_was_declared: true,

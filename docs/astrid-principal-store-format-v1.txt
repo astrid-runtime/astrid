@@ -42,7 +42,7 @@ The format-1 metadata entries are:
   format-spec-object=1:1:32:<64 lowercase hexadecimal digits>
   content-catalog-spec-object=1:1:32:<64 lowercase hexadecimal digits>
   principal-codec=principal-uid-v1
-  projection=kv-tree-v3
+  projection=kv-transition-bplus-v4
 
 The four colon-separated format-spec-object fields are identity algorithm,
 identity construction version, digest byte length, and digest bytes in
@@ -345,8 +345,175 @@ Derived.
 All schemas below still obey the outer strict reference-label ordering rule.
 
 
-7.1 Production KV tree and principal graph, object format version 3
--------------------------------------------------------------------
+7.1 Production KV transitions and checkpoints, object format version 4
+-----------------------------------------------------------------------
+
+The visible KV map is an immutable B+-tree checkpoint followed by zero or more
+ordered transition records. A point mutation appends a transition; it does not
+rewrite fat pages. Maintenance folds accumulated transitions into a new
+B+-tree and resets the chain counters. Checkpointing is representation-only and
+MUST NOT change the reconstructed map or its accounting.
+
+Composite keys are:
+
+  namespace UTF-8, non-empty and containing no NUL
+  00
+  key UTF-8, non-empty and containing no NUL
+
+All key and bound comparisons are unsigned bytewise comparisons over the full
+composite key.
+
+KvLeaf used as a spilled value:
+
+  kind=5, version=4, class=Data, logical_bytes=0
+  canonical_bytes = exact value bytes, length strictly greater than 1024
+  references = empty
+
+KvLeaf used as a B+-tree leaf page:
+
+  kind=5, version=4, class=Metadata, logical_bytes=0
+  canonical_bytes:
+      u8[24] magic = "astrid-kv-bplus-leaf-v1" followed by 00
+      u16 entry_count, little-endian, in 1..=64
+      u64 subtree_entry_count
+      u64 subtree_logical_bytes
+      u64 subtree_quota_bytes
+      repeated entry_count times in strictly increasing key order:
+          u32 key_length
+          u8[key_length] composite_key
+          u64 value_length
+          u8 storage_tag
+          if storage_tag = 0:
+              u8[value_length] inline_value, value_length <= 1024
+          if storage_tag = 1:
+              no value bytes; value_length > 1024
+              required Owns reference label:
+                  "value/" || u16 entry_index big-endian
+              target is a version-4 Data KvLeaf of value_length bytes
+
+  Only spilled entries have value references. No other references are allowed.
+  The three subtree totals equal the decoded entries. Quota bytes are the sum
+  of composite-key lengths and value lengths.
+
+KvBranch used as a B+-tree internal page:
+
+  kind=6, version=4, class=Metadata, logical_bytes=0
+  canonical_bytes:
+      u8[26] magic = "astrid-kv-bplus-branch-v1" followed by 00
+      u16 level, little-endian, in 1..=16
+      u16 child_count, little-endian, in 2..=64
+      u64 subtree_entry_count
+      u64 subtree_logical_bytes
+      u64 subtree_quota_bytes
+      repeated child_count times in strictly increasing bound order:
+          u32 lower_bound_length
+          u8[lower_bound_length] lower_bound_composite_key
+          u64 child_entry_count, non-zero
+          u64 child_logical_bytes
+          u64 child_quota_bytes
+
+  references contain exactly one Owns reference per child:
+      "child/" || u16 child_index big-endian -> KvLeaf or KvBranch version 4
+
+  A child's recorded lower bound equals its decoded minimum key. Its recorded
+  totals equal its decoded totals. Every child has level parent_level - 1.
+  Adjacent child key ranges do not overlap. The parent totals equal the sum of
+  child totals. A page identity may occur only once in a checkpoint tree;
+  cycles and page reuse fail validation.
+
+The stable retained size of a page is:
+
+  29 + canonical_byte_length
+     + sum(41 + reference_label_length)
+
+A page with more than 4096 retained bytes is rejected whenever it can be split
+without violating structural population: leaf pages with more than one entry
+and branch pages with more than three children must fit. This is a canonical
+admission bound, not an operator storage or memory quota.
+
+NamespaceMap checkpoint:
+
+  kind=7, version=4, class=Metadata
+  canonical_bytes:
+      u8 tag = 0
+      u64 visible_entry_count
+      u64 visible_quota_bytes
+  logical_bytes = visible value-byte total
+  references = empty for an empty checkpoint, otherwise exactly:
+      Owns label "root" -> version-4 B+-tree page
+
+The declared entry, logical, and quota totals equal the decoded B+-tree totals.
+
+NamespaceMap transition:
+
+  kind=7, version=4, class=Metadata
+  canonical_bytes:
+      u8 tag = 1
+      u64 depth_since_checkpoint, non-zero
+      u64 delta_payload_bytes_since_checkpoint
+      u64 visible_entry_count
+      u64 visible_quota_bytes
+      u32 mutation_count, non-zero
+      repeated mutation_count times in strictly increasing key order:
+          u32 key_length
+          u8[key_length] composite_key
+          u8 operation_tag
+          if operation_tag = 0:
+              delete; no following value field
+          if operation_tag = 1:
+              u64 value_length, <= 1024
+              u8[value_length] inline_value
+          if operation_tag = 2:
+              u64 value_length, > 1024
+              required Owns reference label:
+                  "value/" || u32 mutation_index big-endian
+              target is a version-4 Data KvLeaf of value_length bytes
+
+  logical_bytes = visible value-byte total after applying this transition
+  references additionally contain at most:
+      Owns label "previous" -> preceding version-4 NamespaceMap
+
+No references other than the exact predecessor and spilled-value references
+are allowed. The first transition may omit "previous", which denotes the
+implicit empty checkpoint. For each transition, depth is predecessor depth + 1
+and delta_payload_bytes is the predecessor total plus the sum of key byte
+lengths and replacement value lengths in this transition; deletion contributes
+no value bytes. Applying mutations oldest-first MUST change every named key (a
+no-op is invalid) and MUST reproduce each transition's declared entry, logical,
+and quota totals exactly.
+
+A checkpoint builder may observe later transitions while constructing pages.
+It rebases that transition tail over the new checkpoint and publishes the
+result through the ordinary principal-root compare-and-swap. It never holds the
+principal mutation authority for the duration of the page build.
+
+PrincipalState:
+
+  kind=8, version=4, class=Metadata, logical_bytes=0
+  canonical_bytes = empty
+  references are owning component slots. Current reserved labels are:
+      Owns label "kv"      -> NamespaceMap version 4
+      Owns label "content" -> Directory version 1
+  Other component labels may be preserved as typed opaque owned subtrees.
+
+Commit:
+
+  kind=9, version=4, class=Metadata, logical_bytes=0
+  canonical_bytes = empty
+  required reference:
+      Owns label "state" -> PrincipalState version 4
+  optional reference:
+      Lineage label "parent" -> previous Commit
+  Other non-state typed references may be preserved. The parent is
+  identity-bearing but non-owning, so default reconstruction does not require
+  historical commits.
+
+7.1.1 Predecessor AVL representation, object format version 3
+--------------------------------------------------------------
+
+Version 3 is read only by the ordered migration and the independent recovery
+reader. No live operation writes it after the version-4 migration marker is
+durable.
 
 KvLeaf:
 
@@ -958,8 +1125,9 @@ follows:
      principal-UID owners, and replay the compare-and-swap chain.
   5. For each current root, recursively follow Owns references. Reject a
      missing object, cycle, non-Commit root, or malformed understood schema.
-  6. Decode Commit -> PrincipalState. Decode the "kv" NamespaceMap and its AVL
-     tree into namespace/key/value entries. Decode the optional "content"
+  6. Decode Commit -> PrincipalState. Decode the "kv" NamespaceMap as either
+     the version-4 transition/checkpoint projection or migration-only version-3
+     AVL tree into namespace/key/value entries. Decode the optional "content"
      Directory catalog and each File content tree into named byte strings.
   7. Preserve every unknown typed object and owned subtree even when it cannot
      yet be projected into a human-visible representation.

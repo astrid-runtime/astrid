@@ -21,24 +21,23 @@ use super::catalog::{
     build_catalog, decode_legacy_catalog, delete, insert, list, lookup, root_from_record,
     validate_catalog,
 };
+use super::kv_projection::PrincipalKvAdapter;
 use super::{ContentEntry, ContentName, ContentWriteOutcome, PrincipalContentError};
-use crate::kv::KvQuotaResolver;
+use crate::kv::{KvQuotaResolver, KvValidationCache, validated_projection_quota};
+use crate::principal_graph::{LEGACY_PRINCIPAL_GRAPH_VERSION, PRINCIPAL_GRAPH_VERSION};
 
 const KV_COMPONENT_LABEL: &[u8] = b"kv";
 const PARENT_LABEL: &[u8] = b"parent";
 const STATE_LABEL: &[u8] = b"state";
 // Soft write-coalescing target, not a record, file, or deployment limit.
 const STAGING_BATCH_TARGET_BYTES: usize = 4 * 1024 * 1024;
-const PRINCIPAL_GRAPH_VERSION: ObjectFormatVersion = match ObjectFormatVersion::new(3) {
-    Some(version) => version,
-    None => unreachable!(),
-};
 
 /// Named content projection over one shared principal-state engine.
 pub struct PrincipalContentStore<P: Ord, E> {
     engine: Arc<E>,
     quota: Option<Arc<dyn KvQuotaResolver<P>>>,
     validated_catalogs: Arc<Mutex<BTreeMap<P, CatalogValidation>>>,
+    validated_kv: Arc<KvValidationCache<P>>,
 }
 
 impl<P: Ord, E> PrincipalContentStore<P, E> {
@@ -49,6 +48,7 @@ impl<P: Ord, E> PrincipalContentStore<P, E> {
             engine,
             quota: None,
             validated_catalogs: Arc::new(Mutex::new(BTreeMap::new())),
+            validated_kv: Arc::new(KvValidationCache::default()),
         }
     }
 
@@ -59,6 +59,7 @@ impl<P: Ord, E> PrincipalContentStore<P, E> {
             engine,
             quota: Some(quota),
             validated_catalogs: Arc::new(Mutex::new(BTreeMap::new())),
+            validated_kv: Arc::new(KvValidationCache::default()),
         }
     }
 
@@ -66,11 +67,13 @@ impl<P: Ord, E> PrincipalContentStore<P, E> {
         engine: Arc<E>,
         quota: Arc<dyn KvQuotaResolver<P>>,
         validated_catalogs: Arc<Mutex<BTreeMap<P, CatalogValidation>>>,
+        validated_kv: Arc<KvValidationCache<P>>,
     ) -> Self {
         Self {
             engine,
             quota: Some(quota),
             validated_catalogs,
+            validated_kv,
         }
     }
 
@@ -82,6 +85,7 @@ impl<P: Ord, E> PrincipalContentStore<P, E> {
             engine,
             quota: None,
             validated_catalogs,
+            validated_kv: Arc::new(KvValidationCache::default()),
         }
     }
 
@@ -117,15 +121,10 @@ where
             let Some(root) = self.engine.current_root(principal)? else {
                 return Ok(false);
             };
-            let commit =
-                self.load_typed(root.commit, ObjectKind::Commit, PRINCIPAL_GRAPH_VERSION)?;
+            let commit = self.load_migration_graph_object(root.commit, ObjectKind::Commit)?;
             require_structural(root.commit, &commit)?;
             let state_id = owned_target(root.commit, &commit, STATE_LABEL)?;
-            let state = self.load_typed(
-                state_id,
-                ObjectKind::PrincipalState,
-                PRINCIPAL_GRAPH_VERSION,
-            )?;
+            let state = self.load_migration_graph_object(state_id, ObjectKind::PrincipalState)?;
             require_structural(state_id, &state)?;
             let Some(content_reference) =
                 state.reference(&ReferenceLabel::new(CONTENT_COMPONENT_LABEL))
@@ -542,7 +541,7 @@ where
                 },
                 KV_COMPONENT_LABEL => {
                     other_quota_bytes = other_quota_bytes
-                        .checked_add(self.kv_quota(reference.target())?)
+                        .checked_add(self.kv_quota(&principal, reference.target())?)
                         .ok_or(PrincipalContentError::AccountingOverflow)?;
                     preserved_state.push(reference.clone());
                 },
@@ -571,17 +570,14 @@ where
         })
     }
 
-    fn kv_quota(&self, object: ObjectId) -> Result<u64, PrincipalContentError> {
-        let record = self.load_typed(object, ObjectKind::NamespaceMap, PRINCIPAL_GRAPH_VERSION)?;
-        if record.canonical_bytes().len() != 8 || record.class() != ObjectClass::Metadata {
-            return Err(invalid(object, "invalid KV component accounting"));
-        }
-        Ok(u64::from_le_bytes(
-            record
-                .canonical_bytes()
-                .try_into()
-                .map_err(|_| PrincipalContentError::AccountingOverflow)?,
-        ))
+    fn kv_quota(&self, principal: &P, object: ObjectId) -> Result<u64, PrincipalContentError> {
+        validated_projection_quota(
+            &PrincipalKvAdapter::new(self.engine.as_ref()),
+            principal,
+            object,
+            self.validated_kv.as_ref(),
+        )
+        .map_err(|_| invalid(object, "invalid KV component accounting"))
     }
 
     fn load_typed(
@@ -598,6 +594,27 @@ where
             return Err(invalid(
                 object,
                 "principal object has wrong kind or version",
+            ));
+        }
+        Ok(record)
+    }
+
+    fn load_migration_graph_object(
+        &self,
+        object: ObjectId,
+        kind: ObjectKind,
+    ) -> Result<ObjectRecord, PrincipalContentError> {
+        let record = self
+            .engine
+            .load_object(object)?
+            .ok_or(ContentError::MissingObject(object))?;
+        if record.kind() != kind
+            || (record.format_version() != PRINCIPAL_GRAPH_VERSION
+                && record.format_version() != LEGACY_PRINCIPAL_GRAPH_VERSION)
+        {
+            return Err(invalid(
+                object,
+                "principal migration object has wrong kind or version",
             ));
         }
         Ok(record)

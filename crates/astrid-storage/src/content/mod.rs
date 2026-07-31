@@ -5,6 +5,7 @@
 //! chunks or complete files are physically deduplicated.
 
 mod catalog;
+mod kv_projection;
 mod store;
 #[cfg(test)]
 mod tests;

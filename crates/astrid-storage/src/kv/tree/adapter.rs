@@ -40,8 +40,12 @@ where
         let owner = self.resolver.resolve(namespace)?;
         let composite = composite_key(namespace, key);
         let blocking = self.blocking_store();
-        run_blocking(move || blocking.read(owner, |context, tree| context.get(tree, &composite)))
-            .await
+        run_blocking(move || {
+            blocking.read(owner, |context, header| {
+                context.projected_get(header, &composite)
+            })
+        })
+        .await
     }
 
     async fn set(&self, namespace: &str, key: &str, value: Vec<u8>) -> StorageResult<()> {
@@ -51,15 +55,11 @@ where
         let composite = composite_key(namespace, key);
         let blocking = self.blocking_store();
         run_blocking(move || {
-            blocking.mutate(&owner, |context, tree| {
-                if context.get(tree, &composite)?.as_deref() == Some(value.as_slice()) {
-                    return Ok(((), tree, false));
+            blocking.mutate(&owner, |context, header| {
+                if context.projected_get(header, &composite)?.as_deref() == Some(value.as_slice()) {
+                    return Ok(((), Vec::new(), false));
                 }
-                let value_len = u64::try_from(value.len())
-                    .map_err(|_| StorageError::Internal("KV value length overflow".to_owned()))?;
-                let leaf = context.make_leaf(value.clone())?;
-                let tree = Some(context.set(tree, composite.clone(), leaf, value_len)?);
-                Ok(((), tree, true))
+                Ok(((), vec![(composite.clone(), Some(value.clone()))], true))
             })
         })
         .await
@@ -72,9 +72,16 @@ where
         let composite = composite_key(namespace, key);
         let blocking = self.blocking_store();
         run_blocking(move || {
-            blocking.mutate(&owner, |context, tree| {
-                let (tree, removed) = context.delete(tree, &composite)?;
-                Ok((removed, tree, removed))
+            blocking.mutate(&owner, |context, header| {
+                let removed = context.projected_get(header, &composite)?.is_some();
+                Ok((
+                    removed,
+                    removed
+                        .then(|| (composite.clone(), None))
+                        .into_iter()
+                        .collect(),
+                    removed,
+                ))
             })
         })
         .await
@@ -91,8 +98,8 @@ where
         let end = namespace_range_end(namespace);
         let blocking = self.blocking_store();
         run_blocking(move || {
-            blocking.read(owner, |context, tree| {
-                context.keys_in_range(tree, &start, &end, start.len())
+            blocking.read(owner, |context, header| {
+                context.projected_keys_in_range(header, &start, &end, start.len())
             })
         })
         .await
@@ -111,8 +118,8 @@ where
         let strip = namespace.len().saturating_add(1);
         let blocking = self.blocking_store();
         run_blocking(move || {
-            blocking.read(owner, |context, tree| {
-                context.keys_in_range(tree, &start, &end, strip)
+            blocking.read(owner, |context, header| {
+                context.projected_keys_in_range(header, &start, &end, strip)
             })
         })
         .await
@@ -132,19 +139,15 @@ where
         let expected = expected.map(<[u8]>::to_vec);
         let blocking = self.blocking_store();
         run_blocking(move || {
-            blocking.mutate(&owner, |context, tree| {
-                let current = context.get(tree, &composite)?;
+            blocking.mutate(&owner, |context, header| {
+                let current = context.projected_get(header, &composite)?;
                 if current.as_deref() != expected.as_deref() {
-                    return Ok((false, tree, false));
+                    return Ok((false, Vec::new(), false));
                 }
                 if current.as_deref() == Some(new.as_slice()) {
-                    return Ok((true, tree, false));
+                    return Ok((true, Vec::new(), false));
                 }
-                let value_len = u64::try_from(new.len())
-                    .map_err(|_| StorageError::Internal("KV value length overflow".to_owned()))?;
-                let leaf = context.make_leaf(new.clone())?;
-                let tree = Some(context.set(tree, composite.clone(), leaf, value_len)?);
-                Ok((true, tree, true))
+                Ok((true, vec![(composite.clone(), Some(new.clone()))], true))
             })
         })
         .await

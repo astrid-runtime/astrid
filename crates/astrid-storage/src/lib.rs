@@ -48,6 +48,7 @@ pub mod error;
 pub mod identity;
 pub mod kv;
 mod principal_directory;
+mod principal_graph;
 #[cfg(not(target_family = "wasm"))]
 pub mod principal_state;
 pub mod secret;

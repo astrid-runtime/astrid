@@ -296,6 +296,44 @@ into quantified acceptance gates:
 Physical bytes appended per logical byte and per operation are therefore
 release metrics, not diagnostics.
 
+### KV transition/checkpoint decision
+
+The first replacement prototype put point mutations directly through an
+immutable path-copy B+-tree. Exact wire accounting rejected it:
+
+| Existing entries | Checkpoint build | 128-byte replacement |
+| ---: | ---: | ---: |
+| 10,000 | 1,817,823 B | 10,804 B |
+| 100,000 | 18,169,931 B | 14,369 B |
+| 1,000,000 | 181,687,551 B | 17,420 B |
+
+Fat pages made reads shallow but made each changed immutable page expensive.
+The accepted layout uses the B+-tree as an immutable checkpoint and appends
+small canonical transition records between checkpoints. The same replacement
+writes **948 authoritative bytes** at all three cardinalities, including object
+frames and the root-journal frame and excluding objects already present. That
+is 3.04 times less than the 2,883-byte AVL baseline and 11.4-18.4 times less
+than the rejected direct B+-tree design.
+
+The 4 MiB maintenance target is a batching threshold, not a format or quota
+limit. It scales upward to at least the current live logical/quota size.
+Checkpoint construction does not hold the mutation lock: any transition tail
+that lands during the build is re-encoded over the new checkpoint and the
+combined projection is root-CAS published.
+
+The release-mode durable probe confirms that publication remains at the media
+flush floor rather than growing with the owned closure:
+
+| Existing entries | Replacement bytes | Replacement latency | Warm get | Reopen |
+| ---: | ---: | ---: | ---: | ---: |
+| 10,000 | 948 B | 8.56 ms | 73.2 µs | 12 ms |
+| 100,000 | 948 B | 8.47 ms | 91.4 µs | 100 ms |
+| 1,000,000 | 948 B | 10.86 ms | 112.2 µs | 1,019 ms |
+
+The durable engine reuses validated immutable closure evidence and stops at the
+checkpoint. An in-memory reference-oracle run that deliberately revalidates the
+entire closure is not representative of production publication latency.
+
 ## Optimization experiments
 
 Several optimization branches were measured independently before integration.

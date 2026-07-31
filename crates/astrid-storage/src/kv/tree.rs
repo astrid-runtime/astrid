@@ -1,67 +1,96 @@
-//! Height-bounded persistent key/value tree for the native principal store.
+//! Canonical key/value transitions over immutable B+-tree checkpoints.
 //!
-//! The compatibility projection rebuilds a principal's complete map and is
-//! intentionally retained only as a differential oracle. This implementation
-//! stores composite namespace/key entries in a persistent AVL tree. A point
-//! mutation copies one search path plus at most a constant number of rotation
-//! nodes, then publishes one principal-root CAS.
-use std::cmp::Ordering;
-use std::collections::BTreeMap;
+//! Point mutations append compact transition records. Background checkpointing
+//! folds accumulated transitions into page-bounded B+-trees without changing
+//! the logical projection.
+
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use astrid_storage_engine::{KvProjectionEngine, KvProjectionError, RootTransaction};
-use astrid_storage_model::{
-    ModelError, ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord,
-    ObjectReference, ReferenceKind,
-};
+use astrid_storage_engine::{KvProjectionEngine, KvProjectionError};
+use astrid_storage_model::ModelError;
 use parking_lot::Mutex;
 
+use self::context::TreeContext;
+use self::delta::Projection;
 use self::header::{TreeHeader, decode_header};
 #[cfg(all(feature = "legacy-surrealkv", not(target_family = "wasm")))]
 use super::KvEntry;
 #[cfg(all(feature = "legacy-surrealkv", not(target_family = "wasm")))]
 use super::composite_key;
 use super::principal::{KvPrincipalResolver, KvQuotaResolver};
-use super::tree_error::{exact_owned_reference, invalid, map_engine};
+use super::tree_error::map_engine;
 use crate::error::{StorageError, StorageResult};
+use crate::principal_graph::PRINCIPAL_GRAPH_VERSION;
 
 mod adapter;
+mod context;
+mod delta;
 mod header;
+mod legacy_avl;
+mod node;
+mod overlay;
 mod validation;
 
+pub(crate) use self::header::validated_projection_quota;
+pub(crate) use self::legacy_avl::migrate_principal as migrate_legacy_avl;
 pub(super) use self::validation::TreeValidation;
-use self::validation::validate_composite_key;
 
-pub(super) const FORMAT_VERSION: ObjectFormatVersion = match ObjectFormatVersion::new(3) {
-    Some(version) => version,
-    None => unreachable!(),
-};
+pub(super) const FORMAT_VERSION: astrid_storage_model::ObjectFormatVersion =
+    PRINCIPAL_GRAPH_VERSION;
 pub(super) const KV_LABEL: &[u8] = b"kv";
-pub(super) const LEFT_LABEL: &[u8] = b"left";
 const PARENT_LABEL: &[u8] = b"parent";
-const RIGHT_LABEL: &[u8] = b"right";
 pub(super) const ROOT_LABEL: &[u8] = b"root";
 pub(super) const STATE_LABEL: &[u8] = b"state";
-pub(super) const VALUE_LABEL: &[u8] = b"value";
-const NODE_FIXED_BYTES: usize = 28;
+// Soft maintenance batch target. This is neither a quota nor a format limit.
+const CHECKPOINT_MIN_DELTA_BYTES: u64 = 4 * 1024 * 1024;
+
+#[derive(Debug)]
+pub(crate) struct KvValidationCache<P: Ord> {
+    trees: Mutex<BTreeMap<P, TreeValidation>>,
+    projections: Mutex<BTreeMap<P, Projection>>,
+}
+
+impl<P: Ord> Default for KvValidationCache<P> {
+    fn default() -> Self {
+        Self {
+            trees: Mutex::new(BTreeMap::new()),
+            projections: Mutex::new(BTreeMap::new()),
+        }
+    }
+}
 
 /// Production point-operation KV adapter over a persistent balanced tree.
 pub struct TreeKvStore<P: Ord, I, R, E> {
     engine: Arc<E>,
     resolver: R,
     quota: Option<Arc<dyn KvQuotaResolver<P>>>,
-    validated_trees: Arc<Mutex<BTreeMap<P, TreeValidation>>>,
+    validation: Arc<KvValidationCache<P>>,
     validated_content: Arc<Mutex<BTreeMap<P, crate::content::CatalogValidation>>>,
+    checkpointing: Arc<Mutex<BTreeSet<P>>>,
     marker: PhantomData<fn() -> (P, I)>,
 }
 
 struct BlockingTreeStore<P: Ord, E> {
     engine: Arc<E>,
     quota: Option<Arc<dyn KvQuotaResolver<P>>>,
-    validated_trees: Arc<Mutex<BTreeMap<P, TreeValidation>>>,
+    validation: Arc<KvValidationCache<P>>,
     validated_content: Arc<Mutex<BTreeMap<P, crate::content::CatalogValidation>>>,
+    checkpointing: Arc<Mutex<BTreeSet<P>>>,
+}
+
+impl<P: Ord, E> Clone for BlockingTreeStore<P, E> {
+    fn clone(&self) -> Self {
+        Self {
+            engine: Arc::clone(&self.engine),
+            quota: self.quota.clone(),
+            validation: Arc::clone(&self.validation),
+            validated_content: Arc::clone(&self.validated_content),
+            checkpointing: Arc::clone(&self.checkpointing),
+        }
+    }
 }
 
 impl<P: Ord, I, R, E> TreeKvStore<P, I, R, E> {
@@ -72,8 +101,9 @@ impl<P: Ord, I, R, E> TreeKvStore<P, I, R, E> {
             engine,
             resolver,
             quota: None,
-            validated_trees: Arc::new(Mutex::new(BTreeMap::new())),
+            validation: Arc::new(KvValidationCache::default()),
             validated_content: Arc::new(Mutex::new(BTreeMap::new())),
+            checkpointing: Arc::new(Mutex::new(BTreeSet::new())),
             marker: PhantomData,
         }
     }
@@ -89,8 +119,9 @@ impl<P: Ord, I, R, E> TreeKvStore<P, I, R, E> {
             engine,
             resolver,
             quota: Some(quota),
-            validated_trees: Arc::new(Mutex::new(BTreeMap::new())),
+            validation: Arc::new(KvValidationCache::default()),
             validated_content: Arc::new(Mutex::new(BTreeMap::new())),
+            checkpointing: Arc::new(Mutex::new(BTreeSet::new())),
             marker: PhantomData,
         }
     }
@@ -99,14 +130,16 @@ impl<P: Ord, I, R, E> TreeKvStore<P, I, R, E> {
         engine: Arc<E>,
         resolver: R,
         quota: Arc<dyn KvQuotaResolver<P>>,
+        validation: Arc<KvValidationCache<P>>,
         validated_content: Arc<Mutex<BTreeMap<P, crate::content::CatalogValidation>>>,
     ) -> Self {
         Self {
             engine,
             resolver,
             quota: Some(quota),
-            validated_trees: Arc::new(Mutex::new(BTreeMap::new())),
+            validation,
             validated_content,
+            checkpointing: Arc::new(Mutex::new(BTreeSet::new())),
             marker: PhantomData,
         }
     }
@@ -115,8 +148,9 @@ impl<P: Ord, I, R, E> TreeKvStore<P, I, R, E> {
         BlockingTreeStore {
             engine: Arc::clone(&self.engine),
             quota: self.quota.clone(),
-            validated_trees: Arc::clone(&self.validated_trees),
+            validation: Arc::clone(&self.validation),
             validated_content: Arc::clone(&self.validated_content),
+            checkpointing: Arc::clone(&self.checkpointing),
         }
     }
 }
@@ -131,8 +165,8 @@ impl<P: Ord, I, R, E> fmt::Debug for TreeKvStore<P, I, R, E> {
 
 impl<P, E> BlockingTreeStore<P, E>
 where
-    P: Clone + Ord + Send + Sync,
-    E: KvProjectionEngine<P>,
+    P: Clone + Ord + Send + Sync + 'static,
+    E: KvProjectionEngine<P> + 'static,
 {
     fn header(&self, owner: P) -> StorageResult<TreeHeader<P>> {
         let Some(root) = self
@@ -146,7 +180,7 @@ where
             self.engine.as_ref(),
             owner,
             root,
-            self.validated_trees.as_ref(),
+            self.validation.as_ref(),
             self.validated_content.as_ref(),
         )
     }
@@ -154,11 +188,11 @@ where
     fn read<T>(
         &self,
         owner: P,
-        read: impl FnOnce(&mut TreeContext<'_, P, E>, Option<ObjectId>) -> StorageResult<T>,
+        read: impl FnOnce(&mut TreeContext<'_, P, E>, &TreeHeader<P>) -> StorageResult<T>,
     ) -> StorageResult<T> {
         let header = self.header(owner)?;
         let mut context = TreeContext::new(self.engine.as_ref());
-        read(&mut context, header.tree)
+        read(&mut context, &header)
     }
 
     fn mutate<T>(
@@ -166,18 +200,19 @@ where
         owner: &P,
         mut mutation: impl FnMut(
             &mut TreeContext<'_, P, E>,
-            Option<ObjectId>,
-        ) -> StorageResult<(T, Option<ObjectId>, bool)>,
+            &TreeHeader<P>,
+        ) -> StorageResult<(T, Vec<(Vec<u8>, Option<Vec<u8>>)>, bool)>,
     ) -> StorageResult<T> {
         loop {
             let header = self.header(owner.clone())?;
             let mut context = TreeContext::new(self.engine.as_ref());
-            let (result, tree, changed) = mutation(&mut context, header.tree)?;
+            let (result, mutations, changed) = mutation(&mut context, &header)?;
             if !changed {
                 return Ok(result);
             }
-            let logical_bytes = context.logical_total(tree)?;
-            let projection_used = context.quota_total(tree)?;
+            let projection = context.apply_mutations(&header, mutations)?;
+            let logical_bytes = projection.totals.logical_bytes;
+            let projection_used = projection.totals.quota_bytes;
             let used = projection_used
                 .checked_add(header.other_quota_bytes)
                 .ok_or_else(|| {
@@ -196,17 +231,27 @@ where
             {
                 return Err(StorageError::quota_exceeded(used, limit));
             }
-            let transaction = context.finish(header, tree, logical_bytes, projection_used)?;
+            let tree = projection.tree;
+            let validated_projection = projection.clone();
+            let transaction = context.finish_projection(header, &projection)?;
             match self.engine.commit_kv_root(transaction) {
                 Ok(_) => {
-                    self.validated_trees.lock().insert(
+                    self.validation.trees.lock().insert(
                         owner.clone(),
                         TreeValidation {
                             root: tree,
+                            entries: projection.totals.entries,
                             logical_bytes,
                             quota_bytes: projection_used,
                         },
                     );
+                    self.validation
+                        .projections
+                        .lock()
+                        .insert(owner.clone(), validated_projection);
+                    if should_checkpoint(&projection) {
+                        self.schedule_checkpoint(owner.clone());
+                    }
                     return Ok(result);
                 },
                 Err(KvProjectionError::Model(ModelError::RootConflict { .. })) => {},
@@ -216,23 +261,156 @@ where
     }
 
     fn clear_range(&self, owner: &P, start: &[u8], end: &[u8]) -> StorageResult<u64> {
-        self.mutate(owner, |context, tree| {
-            let keys = context.raw_keys_in_range(tree, start, end)?;
+        self.mutate(owner, |context, header| {
+            let mut keys = context
+                .raw_keys_in_range(header.tree, start, end)?
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+            for (key, value) in header.overlay.range(start, end) {
+                match value {
+                    Some(_) => {
+                        keys.insert(key);
+                    },
+                    None => {
+                        keys.remove(&key);
+                    },
+                }
+            }
             let count = u64::try_from(keys.len())
                 .map_err(|_| StorageError::Internal("KV key count overflow".to_owned()))?;
-            let mut updated = tree;
-            for key in &keys {
-                (updated, _) = context.delete(updated, key)?;
-            }
-            Ok((count, updated, count != 0))
+            let mutations = keys.into_iter().map(|key| (key, None)).collect();
+            Ok((count, mutations, count != 0))
         })
     }
+
+    fn schedule_checkpoint(&self, owner: P) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        self.schedule_checkpoint_on(owner, runtime);
+    }
+
+    fn schedule_checkpoint_on(&self, owner: P, runtime: tokio::runtime::Handle) {
+        if !self.checkpointing.lock().insert(owner.clone()) {
+            return;
+        }
+        let store = self.clone();
+        let spawn_runtime = runtime.clone();
+        let _task = spawn_runtime.spawn_blocking(move || {
+            let outcome = store.checkpoint_once(owner.clone(), false);
+            store.checkpointing.lock().remove(&owner);
+            let retry = if matches!(outcome.as_ref(), Ok(false)) {
+                match store.header(owner.clone()) {
+                    Ok(header) => should_checkpoint(&projection_from_header(&header)),
+                    Err(error) => {
+                        tracing::warn!(%error, "principal KV checkpoint retry check failed");
+                        false
+                    },
+                }
+            } else {
+                false
+            };
+            if let Err(error) = outcome {
+                tracing::warn!(%error, "principal KV checkpoint failed");
+            }
+            if retry {
+                std::thread::yield_now();
+                store.schedule_checkpoint_on(owner, runtime);
+            }
+        });
+    }
+
+    fn checkpoint_once(&self, owner: P, force: bool) -> StorageResult<bool> {
+        self.checkpoint_once_after(owner, force, || Ok(()))
+    }
+
+    fn checkpoint_once_after(
+        &self,
+        owner: P,
+        force: bool,
+        interleave: impl FnOnce() -> StorageResult<()>,
+    ) -> StorageResult<bool> {
+        let base = self.header(owner.clone())?;
+        let base_projection = projection_from_header(&base);
+        if !force && !should_checkpoint(&base_projection) {
+            return Ok(false);
+        }
+        let mut context = TreeContext::new(self.engine.as_ref());
+        let mut entries = BTreeMap::<Vec<u8>, Vec<u8>>::new();
+        context.visit_entries(base.tree, |key, value| {
+            entries.insert(key.to_vec(), value.to_vec());
+            Ok(())
+        })?;
+        for (key, value) in base.overlay.all() {
+            match value {
+                Some(value) => {
+                    entries.insert(key, value);
+                },
+                None => {
+                    entries.remove(&key);
+                },
+            }
+        }
+        let tree = context.build_sorted(entries.into_iter().collect())?;
+        let checkpoint_totals = base_projection.totals;
+        interleave()?;
+        let current = self.header(owner.clone())?;
+        let current_projection = projection_from_header(&current);
+        if !force && !should_checkpoint(&current_projection) {
+            return Ok(false);
+        }
+        let Some((transaction, rebased)) =
+            context.rebase_checkpoint(base.head, current, tree, checkpoint_totals)?
+        else {
+            return Ok(false);
+        };
+        match self.engine.commit_kv_root(transaction) {
+            Ok(_) => {
+                self.validation.trees.lock().insert(
+                    owner.clone(),
+                    TreeValidation {
+                        root: tree,
+                        entries: checkpoint_totals.entries,
+                        logical_bytes: checkpoint_totals.logical_bytes,
+                        quota_bytes: checkpoint_totals.quota_bytes,
+                    },
+                );
+                self.validation.projections.lock().insert(owner, rebased);
+                Ok(true)
+            },
+            Err(KvProjectionError::Model(ModelError::RootConflict { .. })) => Ok(false),
+            Err(error) => Err(map_engine(&error)),
+        }
+    }
+}
+
+fn projection_from_header<P>(header: &TreeHeader<P>) -> Projection {
+    Projection {
+        head: header.head,
+        tree: header.tree,
+        overlay: header.overlay.clone(),
+        depth: header.delta_depth,
+        delta_bytes: header.delta_bytes,
+        totals: crate::kv::tree::node::NodeTotals {
+            entries: header.entries,
+            logical_bytes: header.logical_bytes,
+            quota_bytes: header.quota_bytes,
+        },
+    }
+}
+
+fn should_checkpoint(projection: &Projection) -> bool {
+    let live_bytes = projection
+        .totals
+        .logical_bytes
+        .max(projection.totals.quota_bytes);
+    projection.delta_bytes >= CHECKPOINT_MIN_DELTA_BYTES.max(live_bytes)
 }
 
 impl<P, I, R, E> TreeKvStore<P, I, R, E>
 where
-    P: Clone + Ord + Send + Sync,
-    E: KvProjectionEngine<P>,
+    P: Clone + Ord + Send + Sync + 'static,
+    E: KvProjectionEngine<P> + 'static,
     R: KvPrincipalResolver<P>,
 {
     #[cfg(all(feature = "legacy-surrealkv", not(target_family = "wasm")))]
@@ -241,15 +419,17 @@ where
         owner: &P,
         entries: &[KvEntry],
     ) -> StorageResult<()> {
-        self.blocking_store().mutate(owner, |context, mut tree| {
-            for entry in entries {
-                let key = composite_key(&entry.namespace, &entry.key);
-                let value_len = u64::try_from(entry.value.len())
-                    .map_err(|_| StorageError::Internal("KV value length overflow".to_owned()))?;
-                let value = context.make_leaf(entry.value.clone())?;
-                tree = Some(context.set(tree, key, value, value_len)?);
-            }
-            Ok(((), tree, !entries.is_empty()))
+        self.blocking_store().mutate(owner, |_context, _header| {
+            let mutations = entries
+                .iter()
+                .map(|entry| {
+                    (
+                        composite_key(&entry.namespace, &entry.key),
+                        Some(entry.value.clone()),
+                    )
+                })
+                .collect();
+            Ok(((), mutations, !entries.is_empty()))
         })
     }
 
@@ -262,7 +442,18 @@ where
         let blocking = self.blocking_store();
         let header = blocking.header(owner.clone())?;
         let mut context = TreeContext::new(blocking.engine.as_ref());
+        let mut entries = BTreeMap::<Vec<u8>, Option<Vec<u8>>>::new();
         context.visit_entries(header.tree, |composite, value| {
+            entries.insert(composite.to_vec(), Some(value.to_vec()));
+            Ok(())
+        })?;
+        for (key, value) in header.overlay.all() {
+            entries.insert(key, value);
+        }
+        for (composite, value) in entries {
+            let Some(value) = value else {
+                continue;
+            };
             let separator = composite
                 .iter()
                 .position(|byte| *byte == 0)
@@ -275,15 +466,16 @@ where
                 .map_err(|error| StorageError::Serialization(error.to_string()))?;
             let key = std::str::from_utf8(&composite[separator.saturating_add(1)..])
                 .map_err(|error| StorageError::Serialization(error.to_string()))?;
-            visit(namespace, key, value)
-        })
+            visit(namespace, key, &value)?;
+        }
+        Ok(())
     }
 }
 
 impl<P, I, R, E> TreeKvStore<P, I, R, E>
 where
-    P: Clone + Ord + Send + Sync,
-    E: KvProjectionEngine<P>,
+    P: Clone + Ord + Send + Sync + 'static,
+    E: KvProjectionEngine<P> + 'static,
     R: KvPrincipalResolver<P>,
 {
     #[cfg(test)]
@@ -292,553 +484,59 @@ where
         let header = blocking.header(owner)?;
         TreeContext::new(blocking.engine.as_ref()).height(header.tree)
     }
-}
 
-#[derive(Clone, Debug)]
-struct TreeNode {
-    key: Vec<u8>,
-    value: ObjectId,
-    value_len: u64,
-    left: Option<ObjectId>,
-    right: Option<ObjectId>,
-    height: u32,
-    logical_total: u64,
-    quota_total: u64,
-}
-
-struct TreeContext<'a, P, E> {
-    engine: &'a E,
-    records: BTreeMap<ObjectId, ObjectRecord>,
-    nodes: BTreeMap<ObjectId, TreeNode>,
-    marker: PhantomData<fn() -> P>,
-}
-
-impl<'a, P, E> TreeContext<'a, P, E>
-where
-    P: Ord,
-    E: KvProjectionEngine<P>,
-{
-    fn new(engine: &'a E) -> Self {
-        Self {
-            engine,
-            records: BTreeMap::new(),
-            nodes: BTreeMap::new(),
-            marker: PhantomData,
-        }
+    #[cfg(test)]
+    pub(super) fn delta_depth_for_test(&self, owner: P) -> StorageResult<u64> {
+        self.blocking_store()
+            .header(owner)
+            .map(|header| header.delta_depth)
     }
 
-    fn record(&self, id: ObjectId) -> StorageResult<ObjectRecord> {
-        if let Some(record) = self.records.get(&id) {
-            return Ok(record.clone());
-        }
-        self.engine
-            .load_kv_object(id)
-            .map_err(|error| map_engine(&error))?
-            .ok_or_else(|| map_engine(&ModelError::MissingObject(id).into()))
+    #[cfg(test)]
+    pub(super) fn checkpoint_for_test(&self, owner: P) -> StorageResult<bool> {
+        self.blocking_store().checkpoint_once(owner, true)
     }
 
-    fn insert(&mut self, record: ObjectRecord) -> StorageResult<ObjectId> {
-        let id = self.engine.identify_kv_object(&record);
-        match self.records.get(&id) {
-            Some(existing) if existing == &record => {},
-            Some(_) => return Err(map_engine(&ModelError::ObjectCollision(id).into())),
-            None => {
-                self.records.insert(id, record);
-            },
-        }
-        Ok(id)
-    }
-
-    fn make_leaf(&mut self, value: Vec<u8>) -> StorageResult<ObjectId> {
-        let leaf = ObjectRecord::new(
-            ObjectKind::KvLeaf,
-            FORMAT_VERSION,
-            value,
-            Vec::new(),
-            0,
-            ObjectClass::Data,
-        )
-        .map_err(|error| map_engine(&error.into()))?;
-        self.insert(leaf)
-    }
-
-    fn node(&mut self, id: ObjectId) -> StorageResult<TreeNode> {
-        if let Some(node) = self.nodes.get(&id) {
-            return Ok(node.clone());
-        }
-        let record = self.record(id)?;
-        if record.kind() != ObjectKind::KvBranch
-            || record.format_version() != FORMAT_VERSION
-            || record.class() != ObjectClass::Metadata
-            || record.logical_bytes() != 0
-        {
-            return Err(invalid(id, "invalid persistent KV tree node"));
-        }
-        let bytes = record.canonical_bytes();
-        if bytes.len() < NODE_FIXED_BYTES {
-            return Err(invalid(id, "truncated persistent KV tree node"));
-        }
-        let height = u32::from_le_bytes(
-            bytes[0..4]
-                .try_into()
-                .map_err(|_| invalid(id, "invalid KV node height"))?,
-        );
-        let logical_total = u64::from_le_bytes(
-            bytes[4..12]
-                .try_into()
-                .map_err(|_| invalid(id, "invalid KV node logical total"))?,
-        );
-        let quota_total = u64::from_le_bytes(
-            bytes[12..20]
-                .try_into()
-                .map_err(|_| invalid(id, "invalid KV node quota total"))?,
-        );
-        let value_len = u64::from_le_bytes(
-            bytes[20..28]
-                .try_into()
-                .map_err(|_| invalid(id, "invalid KV node value length"))?,
-        );
-        let key = bytes[NODE_FIXED_BYTES..].to_vec();
-        if height == 0 {
-            return Err(invalid(id, "invalid persistent KV tree key"));
-        }
-        validate_composite_key(id, &key)?;
-        let value = exact_owned_reference(id, &record, VALUE_LABEL, true)?;
-        let left = exact_owned_reference(id, &record, LEFT_LABEL, false)?;
-        let right = exact_owned_reference(id, &record, RIGHT_LABEL, false)?;
-        if record.references().len()
-            != 1_usize
-                .saturating_add(usize::from(left.is_some()))
-                .saturating_add(usize::from(right.is_some()))
-        {
-            return Err(invalid(id, "unexpected persistent KV tree reference"));
-        }
-        let node = TreeNode {
-            key,
-            value: value.ok_or_else(|| invalid(id, "KV node value is missing"))?,
-            value_len,
-            left,
-            right,
-            height,
-            logical_total,
-            quota_total,
-        };
-        self.nodes.insert(id, node.clone());
-        Ok(node)
-    }
-
-    fn height(&mut self, node: Option<ObjectId>) -> StorageResult<u32> {
-        node.map_or(Ok(0), |id| self.node(id).map(|node| node.height))
-    }
-
-    fn logical_total(&mut self, node: Option<ObjectId>) -> StorageResult<u64> {
-        node.map_or(Ok(0), |id| self.node(id).map(|node| node.logical_total))
-    }
-
-    fn quota_total(&mut self, node: Option<ObjectId>) -> StorageResult<u64> {
-        node.map_or(Ok(0), |id| self.node(id).map(|node| node.quota_total))
-    }
-
-    fn make_node(
-        &mut self,
+    #[cfg(test)]
+    pub(super) fn checkpoint_after_mutation_for_test(
+        &self,
+        owner: P,
         key: Vec<u8>,
-        value: ObjectId,
-        value_len: u64,
-        left: Option<ObjectId>,
-        right: Option<ObjectId>,
-    ) -> StorageResult<ObjectId> {
-        let height = self
-            .height(left)?
-            .max(self.height(right)?)
-            .checked_add(1)
-            .ok_or_else(|| StorageError::Internal("KV tree height overflow".to_owned()))?;
-        let left_logical = self.logical_total(left)?;
-        let right_logical = self.logical_total(right)?;
-        let logical_total = left_logical
-            .checked_add(value_len)
-            .and_then(|sum| sum.checked_add(right_logical))
-            .ok_or_else(|| StorageError::Internal("KV tree logical bytes overflow".to_owned()))?;
-        let key_len = u64::try_from(key.len())
-            .map_err(|_| StorageError::Internal("KV tree key length overflow".to_owned()))?;
-        let left_quota = self.quota_total(left)?;
-        let right_quota = self.quota_total(right)?;
-        let quota_total = left_quota
-            .checked_add(value_len)
-            .and_then(|sum| sum.checked_add(key_len))
-            .and_then(|sum| sum.checked_add(right_quota))
-            .ok_or_else(|| StorageError::Internal("KV tree quota bytes overflow".to_owned()))?;
-        let mut bytes = Vec::with_capacity(NODE_FIXED_BYTES.saturating_add(key.len()));
-        bytes.extend_from_slice(&height.to_le_bytes());
-        bytes.extend_from_slice(&logical_total.to_le_bytes());
-        bytes.extend_from_slice(&quota_total.to_le_bytes());
-        bytes.extend_from_slice(&value_len.to_le_bytes());
-        bytes.extend_from_slice(&key);
-        let mut references = vec![ObjectReference::owns(VALUE_LABEL.to_vec().into(), value)];
-        if let Some(left) = left {
-            references.push(ObjectReference::owns(LEFT_LABEL.to_vec().into(), left));
-        }
-        if let Some(right) = right {
-            references.push(ObjectReference::owns(RIGHT_LABEL.to_vec().into(), right));
-        }
-        references.sort();
-        let record = ObjectRecord::new(
-            ObjectKind::KvBranch,
-            FORMAT_VERSION,
-            bytes,
-            references,
-            0,
-            ObjectClass::Metadata,
-        )
-        .map_err(|error| map_engine(&error.into()))?;
-        let id = self.insert(record)?;
-        self.nodes.insert(
-            id,
-            TreeNode {
-                key,
-                value,
-                value_len,
-                left,
-                right,
-                height,
-                logical_total,
-                quota_total,
-            },
-        );
-        Ok(id)
-    }
-
-    fn get(&mut self, mut root: Option<ObjectId>, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
-        while let Some(id) = root {
-            let node = self.node(id)?;
-            match key.cmp(node.key.as_slice()) {
-                Ordering::Less => root = node.left,
-                Ordering::Greater => root = node.right,
-                Ordering::Equal => {
-                    return self.value_bytes(id, &node).map(Some);
-                },
-            }
-        }
-        Ok(None)
-    }
-
-    fn value_bytes(&self, node_id: ObjectId, node: &TreeNode) -> StorageResult<Vec<u8>> {
-        let leaf = self.record(node.value)?;
-        if leaf.kind() != ObjectKind::KvLeaf
-            || leaf.format_version() != FORMAT_VERSION
-            || leaf.class() != ObjectClass::Data
-            || leaf.logical_bytes() != 0
-            || !leaf.references().is_empty()
-        {
-            return Err(invalid(node.value, "invalid persistent KV value leaf"));
-        }
-        if u64::try_from(leaf.canonical_bytes().len()).ok() != Some(node.value_len) {
-            return Err(invalid(node_id, "KV node value length does not match leaf"));
-        }
-        Ok(leaf.canonical_bytes().to_vec())
-    }
-
-    fn set(
-        &mut self,
-        root: Option<ObjectId>,
-        key: Vec<u8>,
-        value: ObjectId,
-        value_len: u64,
-    ) -> StorageResult<ObjectId> {
-        let Some(id) = root else {
-            return self.make_node(key, value, value_len, None, None);
-        };
-        let node = self.node(id)?;
-        let rebuilt = match key.as_slice().cmp(node.key.as_slice()) {
-            Ordering::Less => {
-                let left = Some(self.set(node.left, key, value, value_len)?);
-                self.make_node(node.key, node.value, node.value_len, left, node.right)?
-            },
-            Ordering::Greater => {
-                let right = Some(self.set(node.right, key, value, value_len)?);
-                self.make_node(node.key, node.value, node.value_len, node.left, right)?
-            },
-            Ordering::Equal => self.make_node(node.key, value, value_len, node.left, node.right)?,
-        };
-        self.rebalance(rebuilt)
-    }
-
-    fn delete(
-        &mut self,
-        root: Option<ObjectId>,
-        key: &[u8],
-    ) -> StorageResult<(Option<ObjectId>, bool)> {
-        let Some(id) = root else {
-            return Ok((None, false));
-        };
-        let node = self.node(id)?;
-        let rebuilt = match key.cmp(node.key.as_slice()) {
-            Ordering::Less => {
-                let (left, removed) = self.delete(node.left, key)?;
-                if !removed {
-                    return Ok((Some(id), false));
+        value: Vec<u8>,
+    ) -> StorageResult<bool> {
+        let blocking = self.blocking_store();
+        let interleaved = blocking.clone();
+        let mutation_owner = owner.clone();
+        blocking.checkpoint_once_after(owner, true, move || {
+            interleaved.mutate(&mutation_owner, |context, header| {
+                if context.projected_get(header, &key)?.as_deref() == Some(value.as_slice()) {
+                    return Ok(((), Vec::new(), false));
                 }
-                Some(self.make_node(node.key, node.value, node.value_len, left, node.right)?)
-            },
-            Ordering::Greater => {
-                let (right, removed) = self.delete(node.right, key)?;
-                if !removed {
-                    return Ok((Some(id), false));
-                }
-                Some(self.make_node(node.key, node.value, node.value_len, node.left, right)?)
-            },
-            Ordering::Equal => match (node.left, node.right) {
-                (None, right) => return Ok((right, true)),
-                (left, None) => return Ok((left, true)),
-                (left, Some(right)) => {
-                    let successor = self.minimum(right)?;
-                    let (new_right, removed) = self.delete(Some(right), &successor.key)?;
-                    debug_assert!(removed);
-                    Some(self.make_node(
-                        successor.key,
-                        successor.value,
-                        successor.value_len,
-                        left,
-                        new_right,
-                    )?)
-                },
-            },
-        };
-        Ok((rebuilt.map(|id| self.rebalance(id)).transpose()?, true))
-    }
-
-    fn minimum(&mut self, mut id: ObjectId) -> StorageResult<TreeNode> {
-        loop {
-            let node = self.node(id)?;
-            match node.left {
-                Some(left) => id = left,
-                None => return Ok(node),
-            }
-        }
-    }
-
-    fn rebalance(&mut self, id: ObjectId) -> StorageResult<ObjectId> {
-        let node = self.node(id)?;
-        let balance =
-            i64::from(self.height(node.left)?).saturating_sub(i64::from(self.height(node.right)?));
-        if balance > 1 {
-            let left_id = node
-                .left
-                .ok_or_else(|| invalid(id, "left-heavy KV node has no left child"))?;
-            let left = self.node(left_id)?;
-            if self.height(left.left)? < self.height(left.right)? {
-                let rotated = self.rotate_left(left_id)?;
-                let rebuilt = self.make_node(
-                    node.key,
-                    node.value,
-                    node.value_len,
-                    Some(rotated),
-                    node.right,
-                )?;
-                return self.rotate_right(rebuilt);
-            }
-            return self.rotate_right(id);
-        }
-        if balance < -1 {
-            let right_id = node
-                .right
-                .ok_or_else(|| invalid(id, "right-heavy KV node has no right child"))?;
-            let right = self.node(right_id)?;
-            if self.height(right.right)? < self.height(right.left)? {
-                let rotated = self.rotate_right(right_id)?;
-                let rebuilt = self.make_node(
-                    node.key,
-                    node.value,
-                    node.value_len,
-                    node.left,
-                    Some(rotated),
-                )?;
-                return self.rotate_left(rebuilt);
-            }
-            return self.rotate_left(id);
-        }
-        Ok(id)
-    }
-
-    fn rotate_left(&mut self, id: ObjectId) -> StorageResult<ObjectId> {
-        let node = self.node(id)?;
-        let right_id = node
-            .right
-            .ok_or_else(|| invalid(id, "KV left rotation has no right child"))?;
-        let right = self.node(right_id)?;
-        let left = self.make_node(node.key, node.value, node.value_len, node.left, right.left)?;
-        self.make_node(
-            right.key,
-            right.value,
-            right.value_len,
-            Some(left),
-            right.right,
-        )
-    }
-
-    fn rotate_right(&mut self, id: ObjectId) -> StorageResult<ObjectId> {
-        let node = self.node(id)?;
-        let left_id = node
-            .left
-            .ok_or_else(|| invalid(id, "KV right rotation has no left child"))?;
-        let left = self.node(left_id)?;
-        let right = self.make_node(node.key, node.value, node.value_len, left.right, node.right)?;
-        self.make_node(left.key, left.value, left.value_len, left.left, Some(right))
-    }
-
-    fn raw_keys_in_range(
-        &mut self,
-        root: Option<ObjectId>,
-        start: &[u8],
-        end: &[u8],
-    ) -> StorageResult<Vec<Vec<u8>>> {
-        let mut keys = Vec::new();
-        self.collect_range(root, start, end, &mut keys)?;
-        Ok(keys)
-    }
-
-    fn collect_range(
-        &mut self,
-        root: Option<ObjectId>,
-        start: &[u8],
-        end: &[u8],
-        keys: &mut Vec<Vec<u8>>,
-    ) -> StorageResult<()> {
-        let Some(id) = root else {
-            return Ok(());
-        };
-        let node = self.node(id)?;
-        if node.key.as_slice() >= start {
-            self.collect_range(node.left, start, end, keys)?;
-        }
-        if node.key.as_slice() >= start && node.key.as_slice() < end {
-            keys.push(node.key.clone());
-        }
-        if node.key.as_slice() < end {
-            self.collect_range(node.right, start, end, keys)?;
-        }
-        Ok(())
-    }
-
-    #[cfg(all(feature = "legacy-surrealkv", not(target_family = "wasm")))]
-    fn visit_entries(
-        &mut self,
-        root: Option<ObjectId>,
-        mut visit: impl FnMut(&[u8], &[u8]) -> StorageResult<()>,
-    ) -> StorageResult<()> {
-        let mut stack = Vec::new();
-        let mut current = root;
-        loop {
-            while let Some(id) = current {
-                let node = self.node(id)?;
-                stack.push(id);
-                current = node.left;
-            }
-            let Some(id) = stack.pop() else {
-                return Ok(());
-            };
-            let node = self.node(id)?;
-            let value = self.value_bytes(id, &node)?;
-            visit(&node.key, &value)?;
-            current = node.right;
-        }
-    }
-
-    fn keys_in_range(
-        &mut self,
-        root: Option<ObjectId>,
-        start: &[u8],
-        end: &[u8],
-        strip: usize,
-    ) -> StorageResult<Vec<String>> {
-        self.raw_keys_in_range(root, start, end)?
-            .into_iter()
-            .map(|key| {
-                key.get(strip..)
-                    .ok_or_else(|| invalid(ObjectId::new([0; 32]), "KV key prefix underflow"))
-                    .and_then(|key| {
-                        std::str::from_utf8(key)
-                            .map(str::to_owned)
-                            .map_err(|error| StorageError::Serialization(error.to_string()))
-                    })
+                Ok(((), vec![(key.clone(), Some(value.clone()))], true))
             })
-            .collect()
+        })
     }
 
-    fn finish(
-        mut self,
-        header: TreeHeader<P>,
-        tree: Option<ObjectId>,
-        logical_bytes: u64,
-        quota_bytes: u64,
-    ) -> StorageResult<RootTransaction<P>> {
-        let references = tree
-            .map(|tree| vec![ObjectReference::owns(ROOT_LABEL.to_vec().into(), tree)])
-            .unwrap_or_default();
-        let wrapper = ObjectRecord::new(
-            ObjectKind::NamespaceMap,
-            FORMAT_VERSION,
-            quota_bytes.to_le_bytes().to_vec(),
-            references,
-            logical_bytes,
-            ObjectClass::Metadata,
-        )
-        .map_err(|error| map_engine(&error.into()))?;
-        let wrapper = self.insert(wrapper)?;
-
-        let mut state_references = header.preserved_state;
-        state_references.push(ObjectReference::owns(KV_LABEL.to_vec().into(), wrapper));
-        state_references.sort();
-        let state = ObjectRecord::new(
-            ObjectKind::PrincipalState,
-            FORMAT_VERSION,
-            Vec::new(),
-            state_references,
-            0,
-            ObjectClass::Metadata,
-        )
-        .map_err(|error| map_engine(&error.into()))?;
-        let state = self.insert(state)?;
-
-        let mut commit_references = header.preserved_commit;
-        if let Some(previous) = header.root {
-            commit_references.push(ObjectReference::new(
-                PARENT_LABEL.to_vec().into(),
-                previous.commit,
-                ReferenceKind::Lineage,
+    #[cfg(test)]
+    pub(super) fn seed_sorted_for_test(
+        &self,
+        owner: P,
+        entries: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> StorageResult<()> {
+        let blocking = self.blocking_store();
+        let header = blocking.header(owner)?;
+        if header.tree.is_some() {
+            return Err(StorageError::Internal(
+                "KV benchmark seed requires an empty principal".to_owned(),
             ));
         }
-        commit_references.push(ObjectReference::owns(STATE_LABEL.to_vec().into(), state));
-        commit_references.sort();
-        let commit = ObjectRecord::new(
-            ObjectKind::Commit,
-            FORMAT_VERSION,
-            Vec::new(),
-            commit_references,
-            0,
-            ObjectClass::Metadata,
-        )
-        .map_err(|error| map_engine(&error.into()))?;
-        let commit = self.insert(commit)?;
-        self.retain_reachable(commit);
-        Ok(RootTransaction::new(
-            header.owner,
-            header.root,
-            commit,
-            self.records.into_iter().collect(),
-        ))
-    }
-
-    fn retain_reachable(&mut self, root: ObjectId) {
-        let mut reachable = std::collections::BTreeSet::new();
-        let mut stack = vec![root];
-        while let Some(id) = stack.pop() {
-            if !reachable.insert(id) {
-                continue;
-            }
-            if let Some(record) = self.records.get(&id) {
-                stack.extend(record.owning_references());
-            }
-        }
-        self.records.retain(|id, _| reachable.contains(id));
+        let mut context = TreeContext::new(blocking.engine.as_ref());
+        let tree = context.build_sorted(entries)?;
+        let transaction = context.finish(header, tree)?;
+        blocking
+            .engine
+            .commit_kv_root(transaction)
+            .map(|_| ())
+            .map_err(|error| map_engine(&error))
     }
 }
