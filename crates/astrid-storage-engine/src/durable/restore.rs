@@ -95,13 +95,13 @@ where
             inner.validated.extend(validated);
             inner.roots_by_principal = restore.roots;
             if let Err(error) = engine.advance_index_frontier(&mut inner, arena_len) {
-                inner.poisoned = true;
+                engine.mark_requires_recovery(&mut inner);
                 return Err(error);
             }
             Ok(())
         },
         Err(error) => {
-            inner.poisoned = true;
+            engine.mark_requires_recovery(&mut inner);
             Err(error)
         },
     }

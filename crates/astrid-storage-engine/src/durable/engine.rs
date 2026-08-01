@@ -1,15 +1,16 @@
 use super::{
     ARENA_FILE, ARENA_MAGIC, Arc, ArenaReader, BTreeMap, BTreeSet, CommitOutcome, DurableEngine,
     DurableError, DurableFiles, DurableInner, FaultInjector, FaultPoint, FileExt, INDEX_FILE,
-    IndexState, InsertOutcome, LOCK_FILE, ModelError, Mutex, NoFaults, ObjectCache,
-    ObjectCacheConfig, ObjectCacheStats, ObjectId, ObjectRecord, Path, Persisted,
-    PersistentObjectIdentity, Prepared, PrincipalCodec, PrincipalUsage, ProjectionCacheEntry,
-    ProjectionCacheKey, ROOT_FILE, ROOT_MAGIC, RecoveryLimits, RootGeneration, RootSnapshot,
-    RootState, RootTransaction, RwLock, Seek, SeekFrom, append_frame, encode_object_frame,
-    encode_root_record, ensure_payload_limit, ensure_usable, io, io_error, live_files_mut,
-    materialize_closure, open_rw, read_indexed_object, read_indexed_objects, recover_arena,
-    recover_index, recover_interrupted_compaction, recover_roots, replace_index,
-    sync_store_directory, usage_from_closure, validate_incremental_closure,
+    IndexState, InsertOutcome, LIFECYCLE_CLOSED, LIFECYCLE_REQUIRES_RECOVERY, LIFECYCLE_USABLE,
+    LOCK_FILE, ModelError, Mutex, NoFaults, ObjectCache, ObjectCacheConfig, ObjectCacheStats,
+    ObjectId, ObjectRecord, Path, Persisted, PersistentObjectIdentity, Prepared, PrincipalCodec,
+    PrincipalUsage, ProjectionCacheEntry, ProjectionCacheKey, ROOT_FILE, ROOT_MAGIC,
+    RecoveryLimits, RootGeneration, RootSnapshot, RootState, RootTransaction, RwLock, Seek,
+    SeekFrom, append_frame, encode_object_frame, encode_root_record, ensure_payload_limit,
+    ensure_usable, io, io_error, live_files_mut, materialize_closure, open_rw, read_indexed_object,
+    read_indexed_objects, recover_arena, recover_index, recover_interrupted_compaction,
+    recover_roots, replace_index, sync_store_directory, usage_from_closure,
+    validate_incremental_closure,
 };
 
 impl<P, I, C> DurableEngine<P, I, C>
@@ -167,10 +168,11 @@ where
             principal_codec,
             limits,
             faults,
-            arena_reader: RwLock::new(ArenaReader {
+            lifecycle: std::sync::atomic::AtomicU8::new(LIFECYCLE_USABLE),
+            arena_reader: RwLock::new(Some(ArenaReader {
                 file: arena_reader,
                 generation: 0,
-            }),
+            })),
             object_cache: ObjectCache::new(object_cache),
             inner: Mutex::new(DurableInner {
                 roots_by_principal,
@@ -223,7 +225,10 @@ where
                 };
                 (location, inner.arena_generation)
             };
-            let reader = self.arena_reader.read();
+            let reader_guard = self.arena_reader.read();
+            let Some(reader) = reader_guard.as_ref() else {
+                return Err(DurableError::Closed);
+            };
             if reader.generation != generation {
                 continue;
             }
@@ -269,6 +274,7 @@ where
         id: ObjectId,
     ) -> Result<Option<Arc<ObjectRecord>>, DurableError> {
         loop {
+            self.ensure_cached_read_usable()?;
             if let Some(record) = self.object_cache.get(principal, id) {
                 return Ok(Some(record));
             }
@@ -280,13 +286,16 @@ where
                 };
                 (location, inner.arena_generation)
             };
-            let reader = self.arena_reader.read();
+            let reader_guard = self.arena_reader.read();
+            let Some(reader) = reader_guard.as_ref() else {
+                return Err(DurableError::Closed);
+            };
             if reader.generation != generation {
                 continue;
             }
             let record =
                 read_indexed_object(&reader.file, id, location, &self.identity, self.limits)?;
-            drop(reader);
+            drop(reader_guard);
             if let Some(record) =
                 self.retain_loaded_object_if_current(principal, id, generation, record)?
             {
@@ -335,6 +344,7 @@ where
         principal: &P,
         ids: &[ObjectId],
     ) -> Result<Vec<Option<Arc<ObjectRecord>>>, DurableError> {
+        self.ensure_cached_read_usable()?;
         let mut results = vec![None; ids.len()];
         let mut missing = BTreeMap::<ObjectId, Vec<usize>>::new();
         for (index, id) in ids.iter().copied().enumerate() {
@@ -358,13 +368,16 @@ where
                     .collect::<Vec<_>>();
                 (locations, inner.arena_generation)
             };
-            let reader = self.arena_reader.read();
+            let reader_guard = self.arena_reader.read();
+            let Some(reader) = reader_guard.as_ref() else {
+                return Err(DurableError::Closed);
+            };
             if reader.generation != generation {
                 continue;
             }
             let loaded =
                 read_indexed_objects(&reader.file, &locations, &self.identity, self.limits)?;
-            drop(reader);
+            drop(reader_guard);
 
             let inner = self.inner.lock();
             ensure_usable(&inner)?;
@@ -400,6 +413,22 @@ where
         Ok(Some(self.object_cache.insert(principal, id, record)))
     }
 
+    fn ensure_cached_read_usable(&self) -> Result<(), DurableError> {
+        match self.lifecycle.load(std::sync::atomic::Ordering::Acquire) {
+            LIFECYCLE_USABLE => Ok(()),
+            LIFECYCLE_CLOSED => Err(DurableError::Closed),
+            _ => Err(DurableError::RequiresRecovery),
+        }
+    }
+
+    pub(super) fn mark_requires_recovery(&self, inner: &mut DurableInner<P>) {
+        inner.poisoned = true;
+        self.lifecycle.store(
+            LIFECYCLE_REQUIRES_RECOVERY,
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+
     /// Return privileged cache diagnostics.
     #[must_use]
     pub fn object_cache_stats(&self) -> ObjectCacheStats {
@@ -427,6 +456,7 @@ where
         object: ObjectId,
         key: ProjectionCacheKey,
     ) -> Option<ProjectionCacheEntry> {
+        self.ensure_cached_read_usable().ok()?;
         self.object_cache.projection(principal, object, key)
     }
 
@@ -442,6 +472,9 @@ where
         key: ProjectionCacheKey,
         value: ProjectionCacheEntry,
     ) -> bool {
+        if self.ensure_cached_read_usable().is_err() {
+            return false;
+        }
         self.object_cache
             .retain_projection(principal, object, key, value)
     }
@@ -453,6 +486,9 @@ where
         object: ObjectId,
         key: ProjectionCacheKey,
     ) -> bool {
+        if self.ensure_cached_read_usable().is_err() {
+            return false;
+        }
         self.object_cache.discard_projection(principal, object, key)
     }
 
@@ -505,12 +541,12 @@ where
                 match persisted {
                     Ok(arena_len) => {
                         if let Err(error) = self.advance_index_frontier(&mut inner, arena_len) {
-                            inner.poisoned = true;
+                            self.mark_requires_recovery(&mut inner);
                             return Err(error);
                         }
                     },
                     Err(error) => {
-                        inner.poisoned = true;
+                        self.mark_requires_recovery(&mut inner);
                         return Err(error);
                     },
                 }
@@ -547,13 +583,13 @@ where
                     live_files_mut(&mut inner.files)?.arena_len
                 );
                 if let Err(error) = self.advance_index_frontier(&mut inner, arena_len) {
-                    inner.poisoned = true;
+                    self.mark_requires_recovery(&mut inner);
                     return Err(error);
                 }
                 Ok((id, InsertOutcome::Inserted))
             },
             Err(error) => {
-                inner.poisoned = true;
+                self.mark_requires_recovery(&mut inner);
                 Err(error)
             },
         }
@@ -670,7 +706,7 @@ where
                     live_files_mut(&mut inner.files)?.arena_len
                 );
                 if let Err(error) = self.advance_index_frontier(&mut inner, persisted.arena_len) {
-                    inner.poisoned = true;
+                    self.mark_requires_recovery(&mut inner);
                     return Err(error);
                 }
                 Ok(CommitOutcome {
@@ -679,7 +715,7 @@ where
                 })
             },
             Err(error) => {
-                inner.poisoned = true;
+                self.mark_requires_recovery(&mut inner);
                 Err(error)
             },
         }

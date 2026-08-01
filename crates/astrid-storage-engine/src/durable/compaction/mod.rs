@@ -394,7 +394,7 @@ where
                 Err(DurableError::FaultInjected(_) | DurableError::Io { .. })
             )
         {
-            inner.poisoned = true;
+            self.mark_requires_recovery(&mut inner);
         }
         result
     }
@@ -805,10 +805,10 @@ where
             arena_len: replacement.arena_len,
             arena_tail: replacement.arena_tail,
         });
-        *self.arena_reader.write() = super::ArenaReader {
+        *self.arena_reader.write() = Some(super::ArenaReader {
             file: arena_reader,
             generation: arena_generation,
-        };
+        });
         inner.arena_generation = arena_generation;
         Ok(())
     }

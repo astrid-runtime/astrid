@@ -63,7 +63,7 @@ where
                 Ok((id, InsertOutcome::Inserted))
             },
             Err(error) => {
-                inner.poisoned = true;
+                self.mark_requires_recovery(&mut inner);
                 Err(error)
             },
         }
@@ -164,7 +164,7 @@ where
                 Ok(outcomes)
             },
             Err(error) => {
-                inner.poisoned = true;
+                self.mark_requires_recovery(&mut inner);
                 Err(error)
             },
         }

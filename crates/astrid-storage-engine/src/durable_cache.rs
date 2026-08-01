@@ -114,17 +114,16 @@ where
     pub(super) fn get(&self, principal: &P, object: ObjectId) -> Option<Arc<ObjectRecord>> {
         let global_capacity = self.controller.capacity();
         let principal_capacity = self.principal_budget.capacity(principal);
+        let mut state = self.state.lock();
+        state.trim_global(global_capacity);
+        state.trim_principal(principal, principal_capacity);
         if global_capacity == ObjectCacheCapacity::Disabled
             || principal_capacity == ObjectCacheCapacity::Disabled
         {
-            let mut state = self.state.lock();
             state.bypasses = state.bypasses.saturating_add(1);
             return None;
         }
 
-        let mut state = self.state.lock();
-        state.trim_global(global_capacity);
-        state.trim_principal(principal, principal_capacity);
         let Some(weight) = state.entries.get(&object).map(|entry| entry.weight) else {
             state.misses = state.misses.saturating_add(1);
             return None;
@@ -160,13 +159,13 @@ where
         let global_capacity = self.controller.capacity();
         let principal_capacity = self.principal_budget.capacity(principal);
         let initial_weight = weight.saturating_add(association_weight);
+        let mut state = self.state.lock();
+        state.trim_global(global_capacity);
+        state.trim_principal(principal, principal_capacity);
         if !global_capacity.accepts(initial_weight) || !principal_capacity.accepts(weight) {
             return record;
         }
 
-        let mut state = self.state.lock();
-        state.trim_global(global_capacity);
-        state.trim_principal(principal, principal_capacity);
         if state.entries.contains_key(&object) {
             if !state.is_attached(principal, object) {
                 state.evict_global_until_fits(association_weight, global_capacity, Some(object));
@@ -257,16 +256,15 @@ where
     ) -> Option<ProjectionCacheEntry> {
         let global_capacity = self.controller.capacity();
         let principal_capacity = self.principal_budget.capacity(principal);
-        if global_capacity == ObjectCacheCapacity::Disabled
-            || principal_capacity == ObjectCacheCapacity::Disabled
-        {
-            let mut state = self.state.lock();
-            state.projection_misses = state.projection_misses.saturating_add(1);
-            return None;
-        }
         let mut state = self.state.lock();
         state.trim_global(global_capacity);
         state.trim_principal(principal, principal_capacity);
+        if global_capacity == ObjectCacheCapacity::Disabled
+            || principal_capacity == ObjectCacheCapacity::Disabled
+        {
+            state.projection_misses = state.projection_misses.saturating_add(1);
+            return None;
+        }
         let value = state
             .principals
             .get(principal)
@@ -302,6 +300,9 @@ where
         let weight = projection_cache_weight(payload_weight);
         let global_capacity = self.controller.capacity();
         let principal_capacity = self.principal_budget.capacity(principal);
+        let mut state = self.state.lock();
+        state.trim_global(global_capacity);
+        state.trim_principal(principal, principal_capacity);
         if weight == u64::MAX
             || global_capacity == ObjectCacheCapacity::Disabled
             || principal_capacity == ObjectCacheCapacity::Disabled
@@ -309,9 +310,6 @@ where
             return false;
         }
 
-        let mut state = self.state.lock();
-        state.trim_global(global_capacity);
-        state.trim_principal(principal, principal_capacity);
         if !state.is_attached(principal, object) {
             return false;
         }
@@ -351,10 +349,6 @@ where
             .insert(key, CachedProjection { value, weight });
         partition.charged_bytes = partition
             .charged_bytes
-            .saturating_sub(replaced_weight)
-            .saturating_add(weight);
-        state.resident_association_bytes = state
-            .resident_association_bytes
             .saturating_sub(replaced_weight)
             .saturating_add(weight);
         state.resident_projection_bytes = state
@@ -398,6 +392,14 @@ where
             state.remove_physical(object);
         }
     }
+
+    pub(super) fn clear(&self) {
+        let mut state = self.state.lock();
+        let objects = state.entries.keys().copied().collect::<Vec<_>>();
+        for object in objects {
+            state.remove_physical(object);
+        }
+    }
 }
 
 impl<P> CacheState<P>
@@ -426,9 +428,6 @@ where
         if let Some(partition) = self.principals.get_mut(principal) {
             partition.charged_bytes = partition.charged_bytes.saturating_sub(removed.weight);
         }
-        self.resident_association_bytes = self
-            .resident_association_bytes
-            .saturating_sub(removed.weight);
         self.resident_projection_bytes = self
             .resident_projection_bytes
             .saturating_sub(removed.weight);
@@ -678,8 +677,7 @@ where
                 .saturating_sub(projection);
             self.resident_association_bytes = self
                 .resident_association_bytes
-                .saturating_sub(association_weight::<P>())
-                .saturating_sub(projection);
+                .saturating_sub(association_weight::<P>());
             self.resident_associations = self.resident_associations.saturating_sub(1);
             self.resident_projection_bytes =
                 self.resident_projection_bytes.saturating_sub(projection);
@@ -722,8 +720,7 @@ where
                     .saturating_sub(projection);
                 self.resident_association_bytes = self
                     .resident_association_bytes
-                    .saturating_sub(association_weight::<P>())
-                    .saturating_sub(projection);
+                    .saturating_sub(association_weight::<P>());
                 self.resident_associations = self.resident_associations.saturating_sub(1);
                 self.resident_projection_bytes =
                     self.resident_projection_bytes.saturating_sub(projection);
@@ -750,6 +747,7 @@ where
     fn resident_bytes(&self) -> u64 {
         self.resident_record_bytes
             .saturating_add(self.resident_association_bytes)
+            .saturating_add(self.resident_projection_bytes)
     }
 }
 

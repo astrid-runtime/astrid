@@ -160,8 +160,8 @@ pub struct ObjectCacheStats {
     pub evictions: u64,
     /// Current physical record count.
     pub resident_objects: u64,
-    /// Current total charged bytes, including decoded records and
-    /// principal-to-record association payloads.
+    /// Current total charged bytes, including decoded records,
+    /// principal-to-record association payloads, and projections.
     pub resident_bytes: u64,
     /// Current bytes charged for physically shared decoded records.
     pub resident_record_bytes: u64,

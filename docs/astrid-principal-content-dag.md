@@ -266,7 +266,10 @@ rejects any frame whose checksum or object identity changed after recovery.
 
 Objects are immutable, so a concurrent catalog update cannot change the bytes
 behind a descriptor. Durable garbage collection is not yet active. Once it is,
-long-running readers must pin a root or use a bounded read lease.
+a compaction caller must retain the descriptor closure as a `ReadHandle` root
+for the duration of its promised lease. Without that retention, a stale handle
+fails with `ContentError::MissingObject` after collection; it never retargets
+to the replacement catalog entry.
 
 ## Security and privacy
 

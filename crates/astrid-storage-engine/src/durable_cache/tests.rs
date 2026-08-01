@@ -1,5 +1,6 @@
 use std::num::NonZeroU64;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::ProjectionCachePayload;
 use astrid_storage_model::{
@@ -104,6 +105,56 @@ fn live_budget_reduction_evicts_without_failing_reads() {
     assert_eq!(cache.stats().resident_objects, 1);
     assert!(cache.stats().evictions >= 1);
     assert_lru_indexes(&cache);
+}
+
+#[test]
+fn disabling_the_global_budget_evicts_on_the_next_operation() {
+    let controller = ObjectCacheController::new(ObjectCacheCapacity::Unbounded);
+    let cache = cache(controller.clone(), 1024 * 1024);
+    let alice = "alice".to_owned();
+    let id = object(1);
+    cache.insert(&alice, id, record(1));
+    assert_eq!(cache.stats().resident_objects, 1);
+
+    controller.set_capacity(ObjectCacheCapacity::Disabled);
+    assert!(cache.get(&alice, id).is_none());
+
+    let stats = cache.stats();
+    assert_eq!(stats.resident_objects, 0);
+    assert_eq!(stats.resident_bytes, 0);
+    assert_eq!(cache.principal_charge(&alice), 0);
+}
+
+#[test]
+fn disabling_one_principal_evicts_only_that_principals_partition() {
+    let alice_enabled = Arc::new(AtomicBool::new(true));
+    let enabled = Arc::clone(&alice_enabled);
+    let principal_limit = NonZeroU64::new(1024 * 1024).unwrap();
+    let cache = ObjectCache::new(ObjectCacheConfig::new(
+        ObjectCacheController::new(ObjectCacheCapacity::Unbounded),
+        Arc::new(move |principal: &String| {
+            if principal == "alice" && !enabled.load(Ordering::Relaxed) {
+                ObjectCacheCapacity::Disabled
+            } else {
+                ObjectCacheCapacity::Bounded(principal_limit)
+            }
+        }),
+    ));
+    let alice = "alice".to_owned();
+    let bob = "bob".to_owned();
+    let id = object(2);
+    cache.insert(&alice, id, record(2));
+    assert!(cache.get(&bob, id).is_some());
+
+    alice_enabled.store(false, Ordering::Relaxed);
+    assert!(cache.get(&alice, id).is_none());
+
+    let stats = cache.stats();
+    assert_eq!(stats.resident_objects, 1);
+    assert_eq!(stats.resident_associations, 1);
+    assert_eq!(cache.principal_charge(&alice), 0);
+    assert!(cache.principal_charge(&bob) > 0);
+    assert!(cache.get(&bob, id).is_some());
 }
 
 #[test]
@@ -220,6 +271,14 @@ fn projection_values_share_the_object_cache_budget_and_principal_partition() {
     let stats = cache.stats();
     assert_eq!(stats.resident_projection_entries, 1);
     assert_eq!(stats.resident_projection_bytes, projection_weight);
+    assert_eq!(stats.resident_association_bytes, association);
+    assert_eq!(
+        stats.resident_bytes,
+        stats
+            .resident_record_bytes
+            .saturating_add(stats.resident_association_bytes)
+            .saturating_add(stats.resident_projection_bytes)
+    );
     assert_eq!(
         cache.principal_charge(&alice),
         record_weight.saturating_add(projection_weight)

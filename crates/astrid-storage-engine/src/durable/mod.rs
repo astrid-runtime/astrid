@@ -11,6 +11,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicU8;
 
 use astrid_storage_model::{
     InsertOutcome, ModelError, ObjectClass, ObjectFormatVersion, ObjectId, ObjectIdentity,
@@ -33,6 +34,9 @@ const FRAME_VERSION: u16 = 1;
 const FRAME_HEADER_LEN: u64 = 52;
 const FRAME_HEADER_LEN_USIZE: usize = 52;
 const CHECKSUM_START: usize = 20;
+const LIFECYCLE_USABLE: u8 = 0;
+const LIFECYCLE_REQUIRES_RECOVERY: u8 = 1;
+const LIFECYCLE_CLOSED: u8 = 2;
 
 /// Explicit durable-frame parser allocation boundary.
 ///
@@ -340,7 +344,8 @@ pub struct DurableEngine<P: Ord, I, C> {
     principal_codec: C,
     limits: RecoveryLimits,
     faults: Arc<dyn FaultInjector>,
-    arena_reader: RwLock<ArenaReader>,
+    lifecycle: AtomicU8,
+    arena_reader: RwLock<Option<ArenaReader>>,
     object_cache: ObjectCache<P>,
     inner: Mutex<DurableInner<P>>,
 }

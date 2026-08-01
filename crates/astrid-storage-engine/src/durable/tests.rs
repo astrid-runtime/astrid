@@ -505,6 +505,35 @@ fn adjacent_indexed_objects_share_one_positional_read_span() {
 }
 
 #[test]
+fn coalesced_positional_reads_respect_the_frame_allocation_boundary() {
+    let directory = tempfile::tempdir().unwrap();
+    let bounded = RecoveryLimits::new(256).unwrap();
+    let engine = DurableEngine::open(directory.path(), TestIdentity, Utf8Codec, bounded).unwrap();
+    let mut ids = Vec::new();
+    let mut expected = Vec::new();
+    for byte in 0_u8..8 {
+        let record = ObjectRecord::new(
+            ObjectKind::Evidence,
+            ObjectFormatVersion::V1,
+            vec![byte; 32],
+            Vec::new(),
+            0,
+            ObjectClass::Metadata,
+        )
+        .unwrap();
+        let (id, _) = engine.persist_standalone_object(&record).unwrap();
+        ids.push(id);
+        expected.push(Some(record));
+    }
+
+    assert_eq!(
+        engine.objects_for(&"alice".to_owned(), &ids).unwrap(),
+        expected
+    );
+    assert!(last_batch_spans() > 1);
+}
+
+#[test]
 fn standalone_bootstrap_object_cannot_own_principal_state() {
     let directory = tempfile::tempdir().unwrap();
     let engine = open(directory.path());
@@ -1407,6 +1436,75 @@ fn explicit_close_releases_files_while_engine_references_remain() {
 
     let reopened = open(directory.path());
     assert_eq!(reopened.object_count().unwrap(), 0);
+}
+
+#[test]
+fn explicit_close_releases_cached_records_and_positional_reader() {
+    let directory = tempfile::tempdir().unwrap();
+    let total = ObjectCacheCapacity::Bounded(std::num::NonZeroU64::new(1024 * 1024).unwrap());
+    let engine = open_with_cache(directory.path(), ObjectCacheController::new(total));
+    let record = ObjectRecord::new(
+        ObjectKind::Evidence,
+        ObjectFormatVersion::V1,
+        b"cached before close".to_vec(),
+        Vec::new(),
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let (id, _) = engine.persist_standalone_object(&record).unwrap();
+    let alice = "alice".to_owned();
+    assert_eq!(
+        engine.shared_object_for(&alice, id).unwrap().as_deref(),
+        Some(&record)
+    );
+    assert_eq!(engine.object_cache_stats().resident_objects, 1);
+
+    engine.close().unwrap();
+
+    assert!(matches!(
+        engine.shared_object_for(&alice, id),
+        Err(DurableError::Closed)
+    ));
+    assert!(matches!(
+        engine.shared_objects_for(&alice, &[id]),
+        Err(DurableError::Closed)
+    ));
+    assert!(engine.arena_reader.read().is_none());
+    assert_eq!(engine.object_cache_stats().resident_objects, 0);
+    assert_eq!(engine.object_cache_stats().resident_bytes, 0);
+}
+
+#[test]
+fn poisoned_engine_rejects_cached_reads() {
+    let directory = tempfile::tempdir().unwrap();
+    let total = ObjectCacheCapacity::Bounded(std::num::NonZeroU64::new(1024 * 1024).unwrap());
+    let engine = open_with_cache(directory.path(), ObjectCacheController::new(total));
+    let record = ObjectRecord::new(
+        ObjectKind::Evidence,
+        ObjectFormatVersion::V1,
+        b"cached before poison".to_vec(),
+        Vec::new(),
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let (id, _) = engine.persist_standalone_object(&record).unwrap();
+    let alice = "alice".to_owned();
+    assert!(engine.shared_object_for(&alice, id).unwrap().is_some());
+    {
+        let mut inner = engine.inner.lock();
+        engine.mark_requires_recovery(&mut inner);
+    }
+
+    assert!(matches!(
+        engine.shared_object_for(&alice, id),
+        Err(DurableError::RequiresRecovery)
+    ));
+    assert!(matches!(
+        engine.shared_objects_for(&alice, &[id]),
+        Err(DurableError::RequiresRecovery)
+    ));
 }
 
 #[test]

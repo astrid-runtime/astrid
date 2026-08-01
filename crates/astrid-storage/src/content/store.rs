@@ -52,8 +52,10 @@ pub struct PrincipalContentStore<P: Ord, E> {
 ///
 /// The handle captures the root generation and decoded file descriptor that
 /// authorized the open. Later catalog changes do not retarget an existing
-/// handle. The append-only engine keeps its immutable object closure readable;
-/// compaction must preserve that guarantee for open handles.
+/// handle. A compaction caller must retain the descriptor's closure as a
+/// `ReadHandle` root while it promises continued readability. Without that
+/// lease, collecting the closure makes later reads fail with
+/// [`ContentError::MissingObject`]; a handle never retargets to newer bytes.
 pub struct PrincipalContentReadHandle<P: Ord, E> {
     engine: Arc<E>,
     opened: OpenedContent,
@@ -93,7 +95,8 @@ where
     /// # Errors
     ///
     /// Returns a content or projection error when verification or allocation
-    /// fails.
+    /// fails. This includes [`ContentError::MissingObject`] if a compaction
+    /// caller allowed the opened closure to be collected.
     pub fn read(&self) -> Result<Vec<u8>, PrincipalContentError> {
         let source = EngineSource::<P, E>::new(self.engine.as_ref(), &self.principal);
         if let Some(verified) = self.verified() {
@@ -110,7 +113,9 @@ where
     /// # Errors
     ///
     /// Returns a content, projection, range, or allocation error when the
-    /// requested bytes cannot be reconstructed exactly.
+    /// requested bytes cannot be reconstructed exactly. This includes
+    /// [`ContentError::MissingObject`] if a compaction caller allowed the
+    /// opened closure to be collected.
     pub fn read_range(&self, offset: u64, length: u64) -> Result<Vec<u8>, PrincipalContentError> {
         let source = EngineSource::<P, E>::new(self.engine.as_ref(), &self.principal);
         if let Some(verified) = self.verified() {
@@ -562,7 +567,10 @@ where
     ///
     /// The principal root, catalog entry, and canonical file descriptor are
     /// resolved once. The resulting handle continues to address that immutable
-    /// generation when the same catalog name is later replaced or deleted.
+    /// generation when the same catalog name is later replaced or deleted. A
+    /// compaction caller that does not retain a `ReadHandle` root may collect
+    /// the old closure; subsequent reads then fail with
+    /// [`ContentError::MissingObject`] rather than returning newer bytes.
     ///
     /// # Errors
     ///
