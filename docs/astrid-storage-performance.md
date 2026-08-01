@@ -362,6 +362,7 @@ successor.
 | Integrated, format-frozen main (`c719da69`) | 64 KiB | 1,587 MiB/s | 1,530.2 MiB/s | 4,980.6 MiB/s |
 | Integrated, format-frozen main (`c719da69`) | 1 MiB | 1,612 MiB/s | 1,705.8 MiB/s | 6,482.8 MiB/s |
 | Integrated, format-frozen main (`c719da69`) | 8 MiB | 1,592 MiB/s | 1,702.5 MiB/s | 6,466.5 MiB/s |
+| Review-hardened integration (`eb5f8208`) | 64 KiB | 1,581 MiB/s | 1,510.9 MiB/s | 4,928.4 MiB/s |
 
 The pre-integration final 64 KiB run reached 98.5% of same-run verified-native
 throughput and the one-MiB run reached 107.7%. Repeating the matrix after
@@ -371,6 +372,13 @@ integration onto format-frozen main produced 96.4% at 64 KiB, 105.8% at
 verification evidence deliberately absent, it measured 319.6, 402.8, and
 409.5 MiB/s. Four-principal warm aggregate throughput was 3.25-3.80 times the
 single-principal result.
+
+The final 64 KiB rerun after lifecycle, cache-accounting, and bounded-span
+review fixes retained 95.6% of same-run verified-native throughput and 3.26×
+four-principal scaling. Its first/cache-fill and post-reopen reads were 491.3
+and 319.4 MiB/s. The 1.3% single-reader and 1.0% aggregate differences from
+the preceding integrated run are within the observed host variance; the new
+atomic lifecycle check did not restore the former mutex ceiling.
 
 Astrid may legitimately lead the verified-native comparator when it reuses
 immutable verified objects while the native reader hashes bytes again. These
