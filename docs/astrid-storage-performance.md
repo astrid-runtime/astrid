@@ -146,6 +146,7 @@ cargo +1.95 bench -p astrid-storage --bench storage_io -- \
   --small-files 64 \
   --small-file-bytes 4096 \
   --concurrent-principals 4 \
+  --object-cache-bytes 1073741824 \
   --output /tmp/astrid-storage-io.json
 ```
 
@@ -160,6 +161,12 @@ scaling, and the exact growth in `objects.arena` plus `roots.journal` for
 unique and duplicate publication. For even sample counts, the reported median
 is the midpoint of the two central observations. Arena growth is authoritative
 file length appended, not filesystem-allocated block count.
+
+`--object-cache-bytes` opts the benchmark into the governed immutable-object
+and verification cache. It is disabled when omitted. The example's 1 GiB is
+an explicit experiment budget, not a daemon default or a recommendation for
+production policy; the runtime must obtain its cache budget from the operator's
+resource authority.
 
 `--samples` applies to unique publication, duplicate publication, engine open
 and reopen, Astrid reads, native writes, seals, and the concurrent workloads.
@@ -352,12 +359,25 @@ successor.
 | Object/header cache (`d69309ef`) | 64 KiB | 1,607 MiB/s | 1,573.0 MiB/s | 5,416.8 MiB/s |
 | Governed cache (`e0bf4217`) | 64 KiB | 1,595 MiB/s | 1,570.0 MiB/s | 5,057.3 MiB/s |
 | Governed cache (`e0bf4217`) | 1 MiB | 1,615 MiB/s | 1,739.3 MiB/s | 6,517.9 MiB/s |
+| Integrated, format-frozen main (`c719da69`) | 64 KiB | 1,587 MiB/s | 1,530.2 MiB/s | 4,980.6 MiB/s |
+| Integrated, format-frozen main (`c719da69`) | 1 MiB | 1,612 MiB/s | 1,705.8 MiB/s | 6,482.8 MiB/s |
+| Integrated, format-frozen main (`c719da69`) | 8 MiB | 1,592 MiB/s | 1,702.5 MiB/s | 6,466.5 MiB/s |
 
-The final 64 KiB run reaches 98.5% of same-run verified-native throughput. The
-one-MiB hot run reaches 107.7%. Astrid may legitimately lead that comparator
-when it reuses immutable verified objects while the native reader hashes bytes
-again. This is not mounted-provider throughput and must be confirmed after
-integration.
+The pre-integration final 64 KiB run reached 98.5% of same-run verified-native
+throughput and the one-MiB run reached 107.7%. Repeating the matrix after
+integration onto format-frozen main produced 96.4% at 64 KiB, 105.8% at
+1 MiB, and 106.9% at 8 MiB. The integrated first/cache-fill pass measured
+492.0, 515.4, and 507.1 MiB/s respectively; after reopen, with process-local
+verification evidence deliberately absent, it measured 319.6, 402.8, and
+409.5 MiB/s. Four-principal warm aggregate throughput was 3.25-3.80 times the
+single-principal result.
+
+Astrid may legitimately lead the verified-native comparator when it reuses
+immutable verified objects while the native reader hashes bytes again. These
+are warm, governed-cache, verified-versus-verified engine measurements over a
+128 MiB deterministic random corpus with three samples on an M2 Ultra. They
+are not mounted-provider throughput, raw APFS throughput, or evidence that a
+cold device read is faster than the substrate.
 
 ### Publication and durability
 

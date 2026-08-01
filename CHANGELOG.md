@@ -267,8 +267,9 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   measured bottlenecks and defines the future read/write filesystem-provider
   matrix without presenting engine measurements as mounted throughput. Refs
   #1398, #1399, #1392, and #1391.
-  testable hypothesis. Durable object reads now use positional I/O after a
-  short index lookup instead of seeking under the engine write mutex.
+- **Principal storage reuses verified immutable reads under governed memory.**
+  Durable object reads now use positional I/O after a short index lookup
+  instead of seeking under the engine write mutex.
   Principal-scoped read handles resolve and validate a root generation,
   catalog entry, and file descriptor once, then preserve that immutable
   generation across later replacement or deletion of the catalog name.

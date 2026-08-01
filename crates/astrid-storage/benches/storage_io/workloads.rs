@@ -2,6 +2,7 @@ use std::convert::Infallible;
 use std::fs::{File, OpenOptions};
 use std::hint::black_box;
 use std::io::{Read, Write};
+use std::num::NonZeroU64;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -10,8 +11,9 @@ use astrid_core::dirs::AstridHome;
 use astrid_core::identity::PrincipalUid;
 use astrid_storage::{
     Blake3ObjectIdentityV1, ChunkingProfile, ContentName, KvQuotaResolver,
-    NativeContentStagingArea, NativePrincipalContentStore, RuntimePrincipalStore, StateOwner,
-    open_runtime_principal_store,
+    NativeContentStagingArea, NativePrincipalContentStore, ObjectCacheCapacity, ObjectCacheConfig,
+    ObjectCacheController, RuntimePrincipalStore, StateOwner, open_runtime_principal_store,
+    open_runtime_principal_store_with_object_cache,
 };
 use astrid_storage_content::{ContentObjectSink, build_content_streaming};
 use astrid_storage_model::{ObjectId, ObjectIdentity, ObjectRecord};
@@ -230,7 +232,7 @@ async fn benchmark_runtime(
         let home = AstridHome::from_path(home_path.clone());
         home.ensure()?;
         let started = Instant::now();
-        let store = open_store(&home).await?;
+        let store = open_store(&home, config.object_cache_bytes).await?;
         samples.fresh_open.push(started.elapsed());
 
         let publication = benchmark_publication(config, source, &store, &owner, &home).await?;
@@ -276,7 +278,7 @@ async fn benchmark_runtime(
 
         drop(store);
         let started = Instant::now();
-        let reopened = open_store(&home).await?;
+        let reopened = open_store(&home, config.object_cache_bytes).await?;
         samples.reopen.push(started.elapsed());
         samples.read_after_reopen.push(timed_content_read(
             reopened.content().as_ref(),
@@ -465,6 +467,7 @@ async fn benchmark_concurrent_principals(
         .ok_or("concurrent logical byte count overflow")?;
     let home_path = root.join("concurrent-home");
     let mut publish_samples = Vec::with_capacity(config.samples);
+    let mut read_first_samples = Vec::with_capacity(config.samples);
     let mut read_samples = Vec::with_capacity(config.samples);
     for sample in 0..config.samples {
         if sample != 0 {
@@ -472,7 +475,7 @@ async fn benchmark_concurrent_principals(
         }
         let home = AstridHome::from_path(home_path.clone());
         home.ensure()?;
-        let store = open_store(&home).await?;
+        let store = open_store(&home, config.object_cache_bytes).await?;
         let mut staged = Vec::with_capacity(config.concurrent_principals);
         let mut descriptors = Vec::with_capacity(config.concurrent_principals);
         for index in 0..config.concurrent_principals {
@@ -497,25 +500,26 @@ async fn benchmark_concurrent_principals(
         }
         publish_samples.push(started.elapsed());
 
-        let started = Instant::now();
-        let mut readers = Vec::with_capacity(descriptors.len());
-        for (owner, name) in descriptors {
-            let content = store.content();
-            readers.push(tokio::task::spawn_blocking(move || {
-                timed_content_read(
-                    content.as_ref(),
-                    &owner,
-                    &name,
-                    total_bytes,
-                    range_bytes,
-                    source_digest,
-                )
-            }));
-        }
-        for reader in readers {
-            black_box(reader.await??);
-        }
-        read_samples.push(started.elapsed());
+        read_first_samples.push(
+            timed_concurrent_content_read(
+                &store,
+                &descriptors,
+                total_bytes,
+                range_bytes,
+                source_digest,
+            )
+            .await?,
+        );
+        read_samples.push(
+            timed_concurrent_content_read(
+                &store,
+                &descriptors,
+                total_bytes,
+                range_bytes,
+                source_digest,
+            )
+            .await?,
+        );
         drop(store);
     }
     report.record_bytes(
@@ -524,11 +528,46 @@ async fn benchmark_concurrent_principals(
         publish_samples,
     );
     report.record_bytes(
+        "astrid_concurrent_shared_read_first",
+        logical_bytes,
+        read_first_samples,
+    );
+    report.record_bytes(
         "astrid_concurrent_shared_read_warm",
         logical_bytes,
         read_samples,
     );
     Ok(())
+}
+
+async fn timed_concurrent_content_read(
+    store: &RuntimePrincipalStore,
+    descriptors: &[(StateOwner, ContentName)],
+    total_bytes: u64,
+    range_bytes: usize,
+    source_digest: [u8; 32],
+) -> BenchResult<Duration> {
+    let started = Instant::now();
+    let mut readers = Vec::with_capacity(descriptors.len());
+    for (owner, name) in descriptors {
+        let content = store.content();
+        let owner = *owner;
+        let name = name.clone();
+        readers.push(tokio::task::spawn_blocking(move || {
+            timed_content_read(
+                content.as_ref(),
+                &owner,
+                &name,
+                total_bytes,
+                range_bytes,
+                source_digest,
+            )
+        }));
+    }
+    for reader in readers {
+        black_box(reader.await??);
+    }
+    Ok(started.elapsed())
 }
 
 fn reset_benchmark_home(path: &Path) -> BenchResult<()> {
@@ -573,11 +612,29 @@ fn stage_source(
     Ok((name, staged, write_duration, seal_duration))
 }
 
-async fn open_store(home: &AstridHome) -> BenchResult<RuntimePrincipalStore> {
+async fn open_store(
+    home: &AstridHome,
+    object_cache_bytes: Option<u64>,
+) -> BenchResult<RuntimePrincipalStore> {
     let quota: Arc<dyn KvQuotaResolver<StateOwner>> = Arc::new(|_: &StateOwner| Ok(None));
-    open_runtime_principal_store(home, quota)
-        .await
-        .map_err(Into::into)
+    let Some(bytes) = object_cache_bytes else {
+        return open_runtime_principal_store(home, quota)
+            .await
+            .map_err(Into::into);
+    };
+    let capacity = ObjectCacheCapacity::Bounded(
+        NonZeroU64::new(bytes).ok_or("object cache budget must be greater than zero")?,
+    );
+    open_runtime_principal_store_with_object_cache(
+        home,
+        quota,
+        ObjectCacheConfig::new(
+            ObjectCacheController::new(capacity),
+            Arc::new(move |_: &StateOwner| capacity),
+        ),
+    )
+    .await
+    .map_err(Into::into)
 }
 
 fn timed_native_read(path: &Path, block_bytes: usize, expected: [u8; 32]) -> BenchResult<Duration> {
