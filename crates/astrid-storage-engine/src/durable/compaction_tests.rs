@@ -217,6 +217,7 @@ fn compaction_discards_cached_objects_that_leave_the_authoritative_index() {
     let engine = open_with_cache(directory.path(), controller);
     let (first, current) = two_versions(&engine);
     let principal = "alice".to_owned();
+    let stale_record = engine.object(first.commit).unwrap().unwrap();
 
     assert!(
         engine
@@ -235,6 +236,14 @@ fn compaction_discards_cached_objects_that_leave_the_authoritative_index() {
     assert!(authorization.facts().condemned().contains(&first.commit));
 
     engine.compact(&authorization).unwrap();
+
+    assert!(
+        engine
+            .retain_loaded_object_if_current(&principal, first.commit, 0, stale_record)
+            .unwrap()
+            .is_none(),
+        "a read completed against the old arena generation was retained after compaction"
+    );
 
     assert!(
         engine

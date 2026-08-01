@@ -268,14 +268,31 @@ where
         principal: &P,
         id: ObjectId,
     ) -> Result<Option<Arc<ObjectRecord>>, DurableError> {
-        if let Some(record) = self.object_cache.get(principal, id) {
-            return Ok(Some(record));
+        loop {
+            if let Some(record) = self.object_cache.get(principal, id) {
+                return Ok(Some(record));
+            }
+            let (location, generation) = {
+                let inner = self.inner.lock();
+                ensure_usable(&inner)?;
+                let Some(location) = inner.index.get(&id).copied() else {
+                    return Ok(None);
+                };
+                (location, inner.arena_generation)
+            };
+            let reader = self.arena_reader.read();
+            if reader.generation != generation {
+                continue;
+            }
+            let record =
+                read_indexed_object(&reader.file, id, location, &self.identity, self.limits)?;
+            drop(reader);
+            if let Some(record) =
+                self.retain_loaded_object_if_current(principal, id, generation, record)?
+            {
+                return Ok(Some(record));
+            }
         }
-        let Some(record) = self.object(id)? else {
-            return Ok(None);
-        };
-        let record = self.object_cache.insert(principal, id, record);
-        Ok(Some(record))
     }
 
     /// Return immutable objects in request order through the
@@ -331,7 +348,7 @@ where
             return Ok(results);
         }
 
-        let loaded = loop {
+        loop {
             let (locations, generation) = {
                 let inner = self.inner.lock();
                 ensure_usable(&inner)?;
@@ -345,17 +362,42 @@ where
             if reader.generation != generation {
                 continue;
             }
-            break read_indexed_objects(&reader.file, &locations, &self.identity, self.limits)?;
-        };
-        for (id, record) in loaded {
-            let cached = self.object_cache.insert(principal, id, record);
-            if let Some(indices) = missing.get(&id) {
-                for index in indices {
-                    results[*index] = Some(Arc::clone(&cached));
+            let loaded =
+                read_indexed_objects(&reader.file, &locations, &self.identity, self.limits)?;
+            drop(reader);
+
+            let inner = self.inner.lock();
+            ensure_usable(&inner)?;
+            if inner.arena_generation != generation
+                || loaded.keys().any(|id| !inner.index.contains_key(id))
+            {
+                continue;
+            }
+            for (id, record) in loaded {
+                let cached = self.object_cache.insert(principal, id, record);
+                if let Some(indices) = missing.get(&id) {
+                    for index in indices {
+                        results[*index] = Some(Arc::clone(&cached));
+                    }
                 }
             }
+            return Ok(results);
         }
-        Ok(results)
+    }
+
+    pub(super) fn retain_loaded_object_if_current(
+        &self,
+        principal: &P,
+        id: ObjectId,
+        generation: u64,
+        record: ObjectRecord,
+    ) -> Result<Option<Arc<ObjectRecord>>, DurableError> {
+        let inner = self.inner.lock();
+        ensure_usable(&inner)?;
+        if inner.arena_generation != generation || !inner.index.contains_key(&id) {
+            return Ok(None);
+        }
+        Ok(Some(self.object_cache.insert(principal, id, record)))
     }
 
     /// Return privileged cache diagnostics.
