@@ -83,7 +83,13 @@ type TestProjectionMap = BTreeMap<TestProjectionKey, ProjectionCacheEntry>;
 #[test]
 fn projection_engine_trait_remains_object_safe() {
     let engine = Engine::new(TestIdentity);
-    let _erased: &dyn PrincipalProjectionEngine<String> = &engine;
+    let erased: &dyn PrincipalProjectionEngine<String> = &engine;
+    assert!(
+        erased
+            .current_root(&"object-safety".to_owned())
+            .unwrap()
+            .is_none()
+    );
 }
 
 struct ConflictOnceEngine {
