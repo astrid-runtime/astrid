@@ -146,7 +146,7 @@ fn open_with_fault(path: &Path, point: FaultPoint) -> TestEngine {
     .unwrap()
 }
 
-fn open_with_cache(path: &Path, controller: ObjectCacheController) -> TestEngine {
+pub(super) fn open_with_cache(path: &Path, controller: ObjectCacheController) -> TestEngine {
     let principal_capacity =
         ObjectCacheCapacity::Bounded(std::num::NonZeroU64::new(1024 * 1024).unwrap());
     DurableEngine::open_with_object_cache(

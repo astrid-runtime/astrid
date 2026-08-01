@@ -378,6 +378,26 @@ where
     ) -> bool {
         self.state.lock().remove_projection(principal, object, key)
     }
+
+    /// Discard cached objects absent from a newly installed authoritative
+    /// object set.
+    ///
+    /// Compaction is the only operation that removes objects from the arena.
+    /// Reconciling at installation keeps cache hits observationally identical
+    /// to uncached index lookups while preserving entries whose immutable
+    /// identities remain live at their new physical locations.
+    pub(super) fn retain_objects(&self, mut retain: impl FnMut(ObjectId) -> bool) {
+        let mut state = self.state.lock();
+        let discarded = state
+            .entries
+            .keys()
+            .copied()
+            .filter(|object| !retain(*object))
+            .collect::<Vec<_>>();
+        for object in discarded {
+            state.remove_physical(object);
+        }
+    }
 }
 
 impl<P> CacheState<P>

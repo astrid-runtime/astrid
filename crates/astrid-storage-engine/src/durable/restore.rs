@@ -226,13 +226,8 @@ where
     for (id, record) in records {
         if let Some(location) = inner.index.get(id).copied() {
             let files = live_files_mut(&mut inner.files)?;
-            let existing = read_indexed_object(
-                &mut files.arena,
-                *id,
-                location,
-                &engine.identity,
-                engine.limits,
-            )?;
+            let existing =
+                read_indexed_object(&files.arena, *id, location, &engine.identity, engine.limits)?;
             if existing != *record {
                 return Err(ModelError::ObjectCollision(*id).into());
             }
