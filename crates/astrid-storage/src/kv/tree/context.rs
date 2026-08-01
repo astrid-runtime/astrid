@@ -24,6 +24,7 @@ use crate::kv::tree_error::{invalid, map_engine};
 
 pub(super) struct TreeContext<'a, P, E> {
     engine: &'a E,
+    principal: &'a P,
     records: BTreeMap<ObjectId, ObjectRecord>,
     nodes: BTreeMap<ObjectId, NodeHandle>,
     marker: PhantomData<fn() -> P>,
@@ -34,9 +35,10 @@ where
     P: Ord,
     E: KvProjectionEngine<P>,
 {
-    pub(super) fn new(engine: &'a E) -> Self {
+    pub(super) fn new(engine: &'a E, principal: &'a P) -> Self {
         Self {
             engine,
+            principal,
             records: BTreeMap::new(),
             nodes: BTreeMap::new(),
             marker: PhantomData,
@@ -547,7 +549,7 @@ where
             return Ok(record.clone());
         }
         self.engine
-            .load_kv_object(object)
+            .load_kv_object_for(self.principal, object)
             .map_err(|error| map_engine(&error))?
             .ok_or_else(|| map_engine(&ModelError::MissingObject(object).into()))
     }

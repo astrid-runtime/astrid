@@ -8,7 +8,7 @@ use fastcdc::v2020::{FastCDC, Normalization};
 
 use crate::{
     CHUNK_TREE_FANOUT, CONTENT_LABEL, ChunkingProfile, ContentDescriptor, ContentError,
-    FORMAT_VERSION, encode_file_header, insert_record,
+    FORMAT_VERSION, OpenedContent, VerifiedContent, encode_file_header, insert_record,
 };
 
 /// Canonical records produced for one file.
@@ -17,7 +17,7 @@ use crate::{
 /// descriptor is the owning root of every returned record.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BuiltContent {
-    descriptor: ContentDescriptor,
+    verified: VerifiedContent,
     records: Vec<(ObjectId, ObjectRecord)>,
     unique_chunks: u64,
 }
@@ -26,7 +26,13 @@ impl BuiltContent {
     /// Return the canonical file descriptor.
     #[must_use]
     pub const fn descriptor(&self) -> ContentDescriptor {
-        self.descriptor
+        self.verified.descriptor()
+    }
+
+    /// Return proof that the canonical builder validated every file boundary.
+    #[must_use]
+    pub const fn verified_content(&self) -> VerifiedContent {
+        self.verified
     }
 
     /// Borrow every unique record required by the file closure.
@@ -121,8 +127,12 @@ pub fn build_content<I: ObjectIdentity>(
     let content = build_tree(identity, &mut records, chunks)?;
     let file = file_record(profile, logical_bytes, chunk_count, content)?;
     let file = insert_record(identity, &mut records, file)?;
+    let descriptor = ContentDescriptor::new(file, logical_bytes, chunk_count, profile);
     Ok(BuiltContent {
-        descriptor: ContentDescriptor::new(file, logical_bytes, chunk_count, profile),
+        verified: VerifiedContent::new(OpenedContent::new(
+            descriptor,
+            content.map(|child| child.id),
+        )),
         records: records.into_iter().collect(),
         unique_chunks: u64::try_from(unique_chunks.len())
             .map_err(|_| ContentError::LengthOverflow)?,

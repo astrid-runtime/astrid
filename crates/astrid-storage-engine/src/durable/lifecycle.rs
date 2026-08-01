@@ -1,9 +1,9 @@
 //! Explicit flush and close lifecycle for the durable engine.
 
 use super::{
-    DurableEngine, DurableError, DurableInner, FRAME_HEADER_LEN, IndexState,
-    PersistentObjectIdentity, PrincipalCodec, ensure_usable, io_error, live_files_mut,
-    replace_index,
+    DurableEngine, DurableError, DurableInner, FRAME_HEADER_LEN, IndexState, LIFECYCLE_CLOSED,
+    LIFECYCLE_REQUIRES_RECOVERY, PersistentObjectIdentity, PrincipalCodec, ensure_usable, io_error,
+    live_files_mut, replace_index,
 };
 
 impl<P, I, C> DurableEngine<P, I, C>
@@ -23,11 +23,11 @@ where
         ensure_usable(&inner)?;
         let files = live_files_mut(&mut inner.files)?;
         if let Err(source) = files.arena.sync_data() {
-            inner.poisoned = true;
+            self.mark_requires_recovery(&mut inner);
             return Err(io_error("flush object arena", source));
         }
         if let Err(source) = files.roots.sync_data() {
-            inner.poisoned = true;
+            self.mark_requires_recovery(&mut inner);
             return Err(io_error("flush root journal", source));
         }
         self.checkpoint_index(&mut inner);
@@ -69,6 +69,16 @@ where
             self.checkpoint_index(&mut inner);
         }
         drop(inner.files.take());
+        drop(self.arena_reader.write().take());
+        self.object_cache.clear();
+        self.lifecycle.store(
+            if poisoned {
+                LIFECYCLE_REQUIRES_RECOVERY
+            } else {
+                LIFECYCLE_CLOSED
+            },
+            std::sync::atomic::Ordering::Release,
+        );
         let unlock = match inner.lock.take() {
             Some(lock) => fs2::FileExt::unlock(&lock)
                 .map_err(|source| io_error("unlock principal store while closing", source)),

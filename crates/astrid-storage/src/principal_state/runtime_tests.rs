@@ -1,11 +1,12 @@
 use std::collections::BTreeMap;
 use std::io::{Seek as _, SeekFrom, Write as _};
+use std::num::NonZeroU64;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "legacy-surrealkv")]
 use astrid_core::profile::{DeviceKey, DeviceScope, PrincipalProfile};
-use astrid_storage_engine::RootTransaction;
+use astrid_storage_engine::{ObjectCacheCapacity, ObjectCacheController, RootTransaction};
 use astrid_storage_model::{
     ObjectClass, ObjectFormatVersion, ObjectKind, ObjectReference, ReferenceLabel, RootState,
 };
@@ -73,6 +74,56 @@ fn chunker_golden_source(length: usize) -> Vec<u8> {
             ((state >> 37) & 0xff) as u8
         })
         .collect()
+}
+
+#[tokio::test]
+async fn runtime_reports_principal_attributed_cache_residency() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    let capacity = ObjectCacheCapacity::Bounded(NonZeroU64::new(1024 * 1024).unwrap());
+    let store = open_runtime_principal_store_with_object_cache(
+        &home,
+        unlimited_quota(),
+        ObjectCacheConfig::new(
+            ObjectCacheController::new(capacity),
+            Arc::new(move |_: &StateOwner| capacity),
+        ),
+    )
+    .await
+    .unwrap();
+    let uid = create_test_principal(&store, "alice").await;
+    let owner = StateOwner::Principal(uid);
+
+    store
+        .kv()
+        .set("alice:capsule:shell", "cwd", b"/workspace".to_vec())
+        .await
+        .unwrap();
+    assert_eq!(
+        store.kv().get("alice:capsule:shell", "cwd").await.unwrap(),
+        Some(b"/workspace".to_vec())
+    );
+    let content_name = ContentName::new("models/cache-accounting.bin").unwrap();
+    let content = vec![0x5a; 512 * 1024];
+    store
+        .content()
+        .put(&owner, &content_name, &content)
+        .unwrap();
+    assert_eq!(
+        store
+            .content()
+            .read_range(&owner, &content_name, 1024, 4096)
+            .unwrap(),
+        Some(content[1024..5120].to_vec())
+    );
+
+    let stats = store.object_cache_stats();
+    assert!(stats.resident_objects > 0);
+    assert!(stats.resident_record_bytes > 0);
+    assert!(stats.resident_association_bytes > 0);
+    assert!(stats.resident_projection_entries > 0);
+    assert!(stats.resident_projection_bytes > 0);
+    assert!(store.object_cache_principal_charge(&owner) > 0);
 }
 
 #[cfg(not(target_os = "windows"))]

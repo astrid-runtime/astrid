@@ -146,6 +146,19 @@ fn open_with_fault(path: &Path, point: FaultPoint) -> TestEngine {
     .unwrap()
 }
 
+pub(super) fn open_with_cache(path: &Path, controller: ObjectCacheController) -> TestEngine {
+    let principal_capacity =
+        ObjectCacheCapacity::Bounded(std::num::NonZeroU64::new(1024 * 1024).unwrap());
+    DurableEngine::open_with_object_cache(
+        path,
+        TestIdentity,
+        Utf8Codec,
+        limits(),
+        ObjectCacheConfig::new(controller, Arc::new(move |_: &String| principal_capacity)),
+    )
+    .unwrap()
+}
+
 pub(super) fn transaction(
     principal: &str,
     expected: Option<RootState>,
@@ -417,6 +430,107 @@ fn standalone_bootstrap_object_is_durable_and_idempotent() {
     let reopened = open(directory.path());
     assert_eq!(reopened.object(id).unwrap(), Some(record));
     assert_eq!(reopened.object_count().unwrap(), 1);
+}
+
+#[test]
+fn indexed_object_read_does_not_move_the_append_cursor() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open(directory.path());
+    let record = ObjectRecord::new(
+        ObjectKind::Evidence,
+        ObjectFormatVersion::V1,
+        b"position-independent read".to_vec(),
+        Vec::new(),
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let (id, _) = engine.persist_standalone_object(&record).unwrap();
+    let cursor_before = {
+        let mut inner = engine.inner.lock();
+        let arena = &mut live_files_mut(&mut inner.files).unwrap().arena;
+        arena.seek(SeekFrom::Start(7)).unwrap();
+        arena.stream_position().unwrap()
+    };
+
+    assert_eq!(engine.object(id).unwrap(), Some(record));
+
+    let cursor_after = {
+        let mut inner = engine.inner.lock();
+        live_files_mut(&mut inner.files)
+            .unwrap()
+            .arena
+            .stream_position()
+            .unwrap()
+    };
+    assert_eq!(cursor_after, cursor_before);
+}
+
+#[test]
+fn adjacent_indexed_objects_share_one_positional_read_span() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open(directory.path());
+    let first = ObjectRecord::new(
+        ObjectKind::Evidence,
+        ObjectFormatVersion::V1,
+        b"first adjacent object".to_vec(),
+        Vec::new(),
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let second = ObjectRecord::new(
+        ObjectKind::Evidence,
+        ObjectFormatVersion::V1,
+        b"second adjacent object".to_vec(),
+        Vec::new(),
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let (first_id, _) = engine.persist_standalone_object(&first).unwrap();
+    let (second_id, _) = engine.persist_standalone_object(&second).unwrap();
+    let missing = ObjectId::new([0x55; 32]);
+
+    assert_eq!(
+        engine
+            .objects_for(
+                &"alice".to_owned(),
+                &[second_id, missing, first_id, second_id],
+            )
+            .unwrap(),
+        vec![Some(second.clone()), None, Some(first), Some(second),]
+    );
+    assert_eq!(last_batch_spans(), 1);
+}
+
+#[test]
+fn coalesced_positional_reads_respect_the_frame_allocation_boundary() {
+    let directory = tempfile::tempdir().unwrap();
+    let bounded = RecoveryLimits::new(256).unwrap();
+    let engine = DurableEngine::open(directory.path(), TestIdentity, Utf8Codec, bounded).unwrap();
+    let mut ids = Vec::new();
+    let mut expected = Vec::new();
+    for byte in 0_u8..8 {
+        let record = ObjectRecord::new(
+            ObjectKind::Evidence,
+            ObjectFormatVersion::V1,
+            vec![byte; 32],
+            Vec::new(),
+            0,
+            ObjectClass::Metadata,
+        )
+        .unwrap();
+        let (id, _) = engine.persist_standalone_object(&record).unwrap();
+        ids.push(id);
+        expected.push(Some(record));
+    }
+
+    assert_eq!(
+        engine.objects_for(&"alice".to_owned(), &ids).unwrap(),
+        expected
+    );
+    assert!(last_batch_spans() > 1);
 }
 
 #[test]
@@ -1267,6 +1381,50 @@ fn second_writer_cannot_open_the_same_store() {
 }
 
 #[test]
+fn governed_object_cache_verifies_once_and_charges_each_principal() {
+    let directory = tempfile::tempdir().unwrap();
+    let total = ObjectCacheCapacity::Bounded(std::num::NonZeroU64::new(2 * 1024 * 1024).unwrap());
+    let engine = open_with_cache(directory.path(), ObjectCacheController::new(total));
+    let record = ObjectRecord::new(
+        ObjectKind::Evidence,
+        ObjectFormatVersion::V1,
+        b"cacheable evidence".to_vec(),
+        Vec::new(),
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let (id, _) = engine.persist_standalone_object(&record).unwrap();
+    let alice = "alice".to_owned();
+    let bob = "bob".to_owned();
+
+    let alice_first = engine.shared_object_for(&alice, id).unwrap().unwrap();
+    let alice_second = engine.shared_object_for(&alice, id).unwrap().unwrap();
+    let bob_record = engine.shared_object_for(&bob, id).unwrap().unwrap();
+    assert_eq!(alice_first.as_ref(), &record);
+    assert!(Arc::ptr_eq(&alice_first, &alice_second));
+    assert!(Arc::ptr_eq(&alice_first, &bob_record));
+
+    let stats = engine.object_cache_stats();
+    assert_eq!(stats.misses, 1);
+    assert_eq!(stats.hits, 2);
+    assert_eq!(stats.insertions, 1);
+    assert_eq!(stats.resident_objects, 1);
+    assert!(stats.resident_bytes > 0);
+    assert_eq!(
+        engine.object_cache_principal_charge(&alice),
+        stats.resident_record_bytes
+    );
+    assert_eq!(
+        engine.object_cache_principal_charge(&bob),
+        stats.resident_record_bytes
+    );
+    assert_eq!(stats.resident_associations, 2);
+    assert!(stats.resident_association_bytes > 0);
+    assert_eq!(engine.object_for(&alice, id).unwrap(), Some(record));
+}
+
+#[test]
 fn explicit_close_releases_files_while_engine_references_remain() {
     let directory = tempfile::tempdir().unwrap();
     let engine = Arc::new(open(directory.path()));
@@ -1278,6 +1436,75 @@ fn explicit_close_releases_files_while_engine_references_remain() {
 
     let reopened = open(directory.path());
     assert_eq!(reopened.object_count().unwrap(), 0);
+}
+
+#[test]
+fn explicit_close_releases_cached_records_and_positional_reader() {
+    let directory = tempfile::tempdir().unwrap();
+    let total = ObjectCacheCapacity::Bounded(std::num::NonZeroU64::new(1024 * 1024).unwrap());
+    let engine = open_with_cache(directory.path(), ObjectCacheController::new(total));
+    let record = ObjectRecord::new(
+        ObjectKind::Evidence,
+        ObjectFormatVersion::V1,
+        b"cached before close".to_vec(),
+        Vec::new(),
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let (id, _) = engine.persist_standalone_object(&record).unwrap();
+    let alice = "alice".to_owned();
+    assert_eq!(
+        engine.shared_object_for(&alice, id).unwrap().as_deref(),
+        Some(&record)
+    );
+    assert_eq!(engine.object_cache_stats().resident_objects, 1);
+
+    engine.close().unwrap();
+
+    assert!(matches!(
+        engine.shared_object_for(&alice, id),
+        Err(DurableError::Closed)
+    ));
+    assert!(matches!(
+        engine.shared_objects_for(&alice, &[id]),
+        Err(DurableError::Closed)
+    ));
+    assert!(engine.arena_reader.read().is_none());
+    assert_eq!(engine.object_cache_stats().resident_objects, 0);
+    assert_eq!(engine.object_cache_stats().resident_bytes, 0);
+}
+
+#[test]
+fn poisoned_engine_rejects_cached_reads() {
+    let directory = tempfile::tempdir().unwrap();
+    let total = ObjectCacheCapacity::Bounded(std::num::NonZeroU64::new(1024 * 1024).unwrap());
+    let engine = open_with_cache(directory.path(), ObjectCacheController::new(total));
+    let record = ObjectRecord::new(
+        ObjectKind::Evidence,
+        ObjectFormatVersion::V1,
+        b"cached before poison".to_vec(),
+        Vec::new(),
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let (id, _) = engine.persist_standalone_object(&record).unwrap();
+    let alice = "alice".to_owned();
+    assert!(engine.shared_object_for(&alice, id).unwrap().is_some());
+    {
+        let mut inner = engine.inner.lock();
+        engine.mark_requires_recovery(&mut inner);
+    }
+
+    assert!(matches!(
+        engine.shared_object_for(&alice, id),
+        Err(DurableError::RequiresRecovery)
+    ));
+    assert!(matches!(
+        engine.shared_objects_for(&alice, &[id]),
+        Err(DurableError::RequiresRecovery)
+    ));
 }
 
 #[test]

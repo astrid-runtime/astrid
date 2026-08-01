@@ -394,7 +394,7 @@ where
                 Err(DurableError::FaultInjected(_) | DurableError::Io { .. })
             )
         {
-            inner.poisoned = true;
+            self.mark_requires_recovery(&mut inner);
         }
         result
     }
@@ -498,13 +498,8 @@ where
         let super::DurableInner { files, index, .. } = inner;
         let files = live_files_mut(files)?;
         for (id, location) in index.iter() {
-            let record = read_indexed_object(
-                &mut files.arena,
-                *id,
-                *location,
-                &self.identity,
-                self.limits,
-            )?;
+            let record =
+                read_indexed_object(&files.arena, *id, *location, &self.identity, self.limits)?;
             bytes.extend_from_slice(id.as_bytes());
             let count = u64::try_from(record.references().len())
                 .map_err(|_| DurableError::EncodingOverflow)?;
@@ -793,6 +788,12 @@ where
         roots
             .seek(SeekFrom::End(0))
             .map_err(|source| io_error("seek compacted root journal", source))?;
+        let arena_reader = arena
+            .try_clone()
+            .map_err(|source| io_error("clone compacted arena for positional reads", source))?;
+        let arena_generation = inner.arena_generation.wrapping_add(1);
+        self.object_cache
+            .retain_objects(|object| replacement.index.contains_key(&object));
         inner.roots_by_principal = replacement.roots;
         inner.index = replacement.index;
         inner.pending_index_locations.clear();
@@ -804,6 +805,11 @@ where
             arena_len: replacement.arena_len,
             arena_tail: replacement.arena_tail,
         });
+        *self.arena_reader.write() = Some(super::ArenaReader {
+            file: arena_reader,
+            generation: arena_generation,
+        });
+        inner.arena_generation = arena_generation;
         Ok(())
     }
 
@@ -822,7 +828,7 @@ where
                 .copied()
                 .ok_or(astrid_storage_model::ModelError::MissingObject(*id))?;
             let record =
-                read_indexed_object(&mut files.arena, *id, location, &self.identity, self.limits)?;
+                read_indexed_object(&files.arena, *id, location, &self.identity, self.limits)?;
             let payload = encode_object_frame(self.identity.scheme(), *id, &record)?;
             ensure_payload_limit(ARENA_FILE, 0, payload.len(), self.limits)?;
             let location = append_frame(&mut arena, ARENA_MAGIC, &payload)?;

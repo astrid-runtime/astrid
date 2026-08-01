@@ -27,7 +27,7 @@ pub use projection_names::{
     ProjectionNamePlan, ProjectionNamePolicy, ProjectionNameSyntax, ProjectionReservationOutcome,
     plan_projection_names,
 };
-pub use store::PrincipalContentStore;
+pub use store::{PrincipalContentReadHandle, PrincipalContentStore};
 
 use astrid_storage_content::ContentError;
 

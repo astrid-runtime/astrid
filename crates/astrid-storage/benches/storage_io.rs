@@ -34,8 +34,13 @@ async fn main() -> BenchResult<()> {
     prepare_root(&root)?;
     println!("benchmark root: {}", root.display());
     println!(
-        "corpus: {} bytes; block: {} bytes; range: {} bytes",
-        config.bytes, config.block_bytes, config.range_bytes
+        "corpus: {} bytes; block: {} bytes; range: {} bytes; object cache: {}",
+        config.bytes,
+        config.block_bytes,
+        config.range_bytes,
+        config
+            .object_cache_bytes
+            .map_or_else(|| "disabled".to_owned(), |bytes| format!("{bytes} bytes"))
     );
 
     let source = root.join("source.bin");

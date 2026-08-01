@@ -24,6 +24,7 @@ pub(super) struct Config {
     pub(super) small_files: usize,
     pub(super) small_file_bytes: usize,
     pub(super) concurrent_principals: usize,
+    pub(super) object_cache_bytes: Option<u64>,
     pub(super) root: Option<PathBuf>,
     pub(super) output: Option<PathBuf>,
 }
@@ -38,6 +39,7 @@ impl Config {
             small_files: DEFAULT_SMALL_FILES,
             small_file_bytes: DEFAULT_SMALL_FILE_BYTES,
             concurrent_principals: DEFAULT_CONCURRENT_PRINCIPALS,
+            object_cache_bytes: None,
             root: None,
             output: None,
         };
@@ -64,6 +66,10 @@ impl Config {
                     config.concurrent_principals =
                         parse_usize(&mut arguments, "--concurrent-principals")?;
                 },
+                "--object-cache-bytes" => {
+                    config.object_cache_bytes =
+                        Some(parse_u64(&mut arguments, "--object-cache-bytes")?);
+                },
                 "--root" => config.root = Some(parse_path(&mut arguments, "--root")?),
                 "--output" => config.output = Some(parse_path(&mut arguments, "--output")?),
                 "--help" | "-h" => {
@@ -75,6 +81,9 @@ impl Config {
         }
         if config.bytes == 0 {
             return Err("--bytes must be greater than zero".into());
+        }
+        if config.object_cache_bytes == Some(0) {
+            return Err("--object-cache-bytes must be greater than zero".into());
         }
         for (name, value) in [
             ("--block-bytes", config.block_bytes),
@@ -134,6 +143,7 @@ fn print_help() {
            --small-file-bytes N  bytes per small file (default {DEFAULT_SMALL_FILE_BYTES})\n\
            --concurrent-principals N\n\
                                  shared-content concurrency (default {DEFAULT_CONCURRENT_PRINCIPALS})\n\
+           --object-cache-bytes N decoded-object/projection cache budget (default disabled)\n\
            --root PATH           retain benchmark data under PATH\n\
            --output PATH         write the JSON report to PATH\n"
     );

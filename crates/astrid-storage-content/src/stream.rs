@@ -8,7 +8,10 @@ use astrid_storage_model::{ObjectId, ObjectRecord};
 use fastcdc::v2020::{Normalization, StreamCDC};
 
 use crate::build::{Child, chunk_record, file_record, tree_record};
-use crate::{CHUNK_TREE_FANOUT, ChunkingProfile, ContentDescriptor, ContentError};
+use crate::{
+    CHUNK_TREE_FANOUT, ChunkingProfile, ContentDescriptor, ContentError, OpenedContent,
+    VerifiedContent,
+};
 
 /// Sink for immutable records emitted during streaming content construction.
 ///
@@ -31,7 +34,7 @@ pub trait ContentObjectSink {
 /// Metadata produced by a streaming content build.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StreamedContent {
-    descriptor: ContentDescriptor,
+    verified: VerifiedContent,
     unique_chunks: u64,
 }
 
@@ -39,7 +42,13 @@ impl StreamedContent {
     /// Return the canonical file descriptor.
     #[must_use]
     pub const fn descriptor(self) -> ContentDescriptor {
-        self.descriptor
+        self.verified.descriptor()
+    }
+
+    /// Return proof that the streaming builder validated every file boundary.
+    #[must_use]
+    pub const fn verified_content(self) -> VerifiedContent {
+        self.verified
     }
 
     /// Return the number of distinct chunk identities in the file.
@@ -171,8 +180,12 @@ where
     let file = sink
         .stage_content_object(file)
         .map_err(ContentStreamError::Sink)?;
+    let descriptor = ContentDescriptor::new(file, logical_bytes, chunk_count, profile);
     Ok(StreamedContent {
-        descriptor: ContentDescriptor::new(file, logical_bytes, chunk_count, profile),
+        verified: VerifiedContent::new(OpenedContent::new(
+            descriptor,
+            content_root.map(|child| child.id),
+        )),
         unique_chunks: u64::try_from(unique_chunks.len())
             .map_err(content(ContentError::LengthOverflow))?,
     })

@@ -6,10 +6,15 @@ use std::sync::Arc;
 
 use astrid_storage_content::{
     BuiltContent, ChunkingProfile, ContentDescriptor, ContentError, ContentObjectSink,
-    ContentReadError, ContentSource, ContentStreamError, build_content, build_content_streaming,
-    describe_content, read_content, read_content_range,
+    ContentReadError, ContentSource, ContentStreamError, ContentVerificationState, OpenedContent,
+    VerifiedContent, build_content, build_content_streaming, describe_content, open_content,
+    read_opened_content_and_verify, read_opened_content_range_with_verification,
+    read_verified_content, read_verified_content_range,
 };
-use astrid_storage_engine::{PrincipalProjectionEngine, PrincipalProjectionError, RootTransaction};
+use astrid_storage_engine::{
+    PrincipalProjectionEngine, PrincipalProjectionError, ProjectionCacheEntry, ProjectionCacheKey,
+    ProjectionCachePayload, RootTransaction,
+};
 use astrid_storage_model::{
     InsertOutcome, ModelError, ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind,
     ObjectRecord, ObjectReference, ReferenceKind, ReferenceLabel, RootState,
@@ -31,6 +36,9 @@ const PARENT_LABEL: &[u8] = b"parent";
 const STATE_LABEL: &[u8] = b"state";
 // Soft write-coalescing target, not a record, file, or deployment limit.
 const STAGING_BATCH_TARGET_BYTES: usize = 4 * 1024 * 1024;
+const VERIFIED_CONTENT_CACHE_KEY: ProjectionCacheKey = ProjectionCacheKey::new(1);
+const PARTIAL_VERIFICATION_CACHE_KEY: ProjectionCacheKey = ProjectionCacheKey::new(2);
+const DECODED_HEADER_CACHE_KEY: ProjectionCacheKey = ProjectionCacheKey::new(3);
 
 /// Named content projection over one shared principal-state engine.
 pub struct PrincipalContentStore<P: Ord, E> {
@@ -38,6 +46,136 @@ pub struct PrincipalContentStore<P: Ord, E> {
     quota: Option<Arc<dyn KvQuotaResolver<P>>>,
     validated_catalogs: Arc<Mutex<BTreeMap<P, CatalogValidation>>>,
     validated_kv: Arc<KvValidationCache<P>>,
+}
+
+/// Principal-scoped immutable content handle for repeated verified reads.
+///
+/// The handle captures the root generation and decoded file descriptor that
+/// authorized the open. Later catalog changes do not retarget an existing
+/// handle. A compaction caller must retain the descriptor's closure as a
+/// `ReadHandle` root while it promises continued readability. Without that
+/// lease, collecting the closure makes later reads fail with
+/// [`ContentError::MissingObject`]; a handle never retargets to newer bytes.
+pub struct PrincipalContentReadHandle<P: Ord, E> {
+    engine: Arc<E>,
+    opened: OpenedContent,
+    principal: P,
+    principal_root: RootState,
+}
+
+impl<P: Ord, E> fmt::Debug for PrincipalContentReadHandle<P, E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PrincipalContentReadHandle")
+            .field("descriptor", &self.opened.descriptor())
+            .field("principal_root", &self.principal_root)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<P, E> PrincipalContentReadHandle<P, E>
+where
+    P: Clone + Ord,
+    E: PrincipalProjectionEngine<P>,
+{
+    /// Return the immutable descriptor validated when the handle was opened.
+    #[must_use]
+    pub const fn descriptor(&self) -> ContentDescriptor {
+        self.opened.descriptor()
+    }
+
+    /// Return the principal root generation that authorized this handle.
+    #[must_use]
+    pub const fn principal_root(&self) -> RootState {
+        self.principal_root
+    }
+
+    /// Reconstruct the complete opened value.
+    ///
+    /// # Errors
+    ///
+    /// Returns a content or projection error when verification or allocation
+    /// fails. This includes [`ContentError::MissingObject`] if a compaction
+    /// caller allowed the opened closure to be collected.
+    pub fn read(&self) -> Result<Vec<u8>, PrincipalContentError> {
+        let source = EngineSource::<P, E>::new(self.engine.as_ref(), &self.principal);
+        if let Some(verified) = self.verified() {
+            return read_verified_content(&source, verified).map_err(map_read_error);
+        }
+        let (bytes, verified) =
+            read_opened_content_and_verify(&source, self.opened).map_err(map_read_error)?;
+        self.mark_verified(verified);
+        Ok(bytes)
+    }
+
+    /// Reconstruct an exact range of the opened value.
+    ///
+    /// # Errors
+    ///
+    /// Returns a content, projection, range, or allocation error when the
+    /// requested bytes cannot be reconstructed exactly. This includes
+    /// [`ContentError::MissingObject`] if a compaction caller allowed the
+    /// opened closure to be collected.
+    pub fn read_range(&self, offset: u64, length: u64) -> Result<Vec<u8>, PrincipalContentError> {
+        let source = EngineSource::<P, E>::new(self.engine.as_ref(), &self.principal);
+        if let Some(verified) = self.verified() {
+            return read_verified_content_range(&source, verified, offset, length)
+                .map_err(map_read_error);
+        }
+        let file = self.opened.descriptor().file();
+        let known = self
+            .engine
+            .load_projection_cache(&self.principal, file, PARTIAL_VERIFICATION_CACHE_KEY)
+            .and_then(|entry| entry.downcast::<CachedPartialVerification>());
+        let empty = ContentVerificationState::default();
+        let (bytes, delta) = read_opened_content_range_with_verification(
+            &source,
+            self.opened,
+            known.as_deref().map_or(&empty, |known| &known.0),
+            offset,
+            length,
+        )
+        .map_err(map_read_error)?;
+        if !delta.is_empty() {
+            let mut next = known
+                .as_deref()
+                .map_or_else(ContentVerificationState::default, |known| known.0.clone());
+            next.merge(delta);
+            let _ = self.engine.retain_projection_cache(
+                &self.principal,
+                file,
+                PARTIAL_VERIFICATION_CACHE_KEY,
+                ProjectionCacheEntry::new(CachedPartialVerification(next)),
+            );
+        }
+        Ok(bytes)
+    }
+
+    fn verified(&self) -> Option<VerifiedContent> {
+        self.engine
+            .load_projection_cache(
+                &self.principal,
+                self.opened.descriptor().file(),
+                VERIFIED_CONTENT_CACHE_KEY,
+            )
+            .and_then(|entry| entry.downcast::<CachedVerifiedContent>())
+            .map(|verified| verified.0)
+    }
+
+    fn mark_verified(&self, verified: VerifiedContent) {
+        let file = verified.descriptor().file();
+        let _ = self.engine.discard_projection_cache(
+            &self.principal,
+            file,
+            PARTIAL_VERIFICATION_CACHE_KEY,
+        );
+        let _ = self.engine.retain_projection_cache(
+            &self.principal,
+            file,
+            VERIFIED_CONTENT_CACHE_KEY,
+            ProjectionCacheEntry::new(CachedVerifiedContent(verified)),
+        );
+    }
 }
 
 impl<P: Ord, E> PrincipalContentStore<P, E> {
@@ -150,9 +288,11 @@ where
             }
             let legacy = decode_legacy_catalog(catalog_id, &catalog_record)?;
             for entry in legacy.entries.values() {
-                let descriptor =
-                    describe_content(&EngineSource::<P, E>::new(self.engine.as_ref()), entry.file)
-                        .map_err(map_read_error)?;
+                let descriptor = describe_content(
+                    &EngineSource::<P, E>::new(self.engine.as_ref(), principal),
+                    entry.file,
+                )
+                .map_err(map_read_error)?;
                 if descriptor.logical_bytes() != entry.logical_bytes {
                     return Err(invalid(
                         entry.file,
@@ -179,7 +319,6 @@ where
                 .cloned()
                 .collect();
             let header = ContentHeader {
-                principal: principal.clone(),
                 root: Some(root),
                 catalog,
                 previous_catalog_quota_bytes: legacy.quota_bytes,
@@ -187,7 +326,8 @@ where
                 preserved_state,
                 preserved_commit,
             };
-            let transaction = self.encode_transaction(header, None, catalog_records)?;
+            let transaction =
+                self.encode_transaction(principal.clone(), header, None, catalog_records)?;
             match self.engine.commit_root(transaction) {
                 Ok(_) => {
                     self.validated_catalogs.lock().insert(
@@ -238,7 +378,7 @@ where
             profile,
             bytes,
         )?;
-        self.publish(principal, name, built.descriptor(), Some(&built), 0)
+        self.publish(principal, name, built.verified_content(), Some(&built), 0)
     }
 
     /// Stream bytes under `name` using Astrid's pinned chunking profile.
@@ -285,7 +425,7 @@ where
         self.publish(
             principal,
             name,
-            streamed.descriptor(),
+            streamed.verified_content(),
             None,
             sink.objects_inserted,
         )
@@ -295,22 +435,22 @@ where
         &self,
         principal: &P,
         name: &ContentName,
-        descriptor: ContentDescriptor,
+        verified: VerifiedContent,
         built: Option<&BuiltContent>,
         staged_objects_inserted: u64,
     ) -> Result<ContentWriteOutcome, PrincipalContentError> {
+        let descriptor = verified.descriptor();
         loop {
-            let mut header = self.header(principal.clone())?;
-            if self
-                .catalog_lookup(header.catalog, name)?
-                .is_some_and(|entry| entry.file == descriptor.file())
-            {
+            let mut header = self.header(principal)?.as_ref().clone();
+            let previous = self.catalog_lookup(principal, header.catalog, name)?;
+            if previous.is_some_and(|entry| entry.file == descriptor.file()) {
                 let root = header.root.ok_or_else(|| {
                     invalid(
                         descriptor.file(),
                         "catalog entry exists without a principal root",
                     )
                 })?;
+                self.mark_verified(principal, verified);
                 return Ok(ContentWriteOutcome::new(descriptor, root, 0));
             }
             let mutation = insert(
@@ -320,13 +460,14 @@ where
                     file: descriptor.file(),
                     logical_bytes: descriptor.logical_bytes(),
                 },
-                &mut |object| self.load_required(object),
+                &mut |object| self.load_required_for(principal, object),
                 &|record| self.engine.identify_object(record),
             )?;
             header.catalog = mutation.root;
             self.enforce_quota(principal, &header)?;
             let catalog = header.catalog;
-            let transaction = self.encode_transaction(header, built, mutation.records)?;
+            let transaction =
+                self.encode_transaction(principal.clone(), header, built, mutation.records)?;
             match self.engine.commit_root(transaction) {
                 Ok(outcome) => {
                     self.validated_catalogs.lock().insert(
@@ -336,6 +477,7 @@ where
                             summary: catalog.map_or(CatalogSummary::default(), |root| root.summary),
                         },
                     );
+                    self.mark_verified(principal, verified);
                     let objects_inserted = staged_objects_inserted
                         .checked_add(outcome.objects_inserted())
                         .ok_or(PrincipalContentError::AccountingOverflow)?;
@@ -362,19 +504,20 @@ where
     /// changing the catalog.
     pub fn delete(&self, principal: &P, name: &ContentName) -> Result<bool, PrincipalContentError> {
         loop {
-            let mut header = self.header(principal.clone())?;
+            let mut header = self.header(principal)?.as_ref().clone();
             let mutation = delete(
                 header.catalog,
                 name,
-                &mut |object| self.load_required(object),
+                &mut |object| self.load_required_for(principal, object),
                 &|record| self.engine.identify_object(record),
             )?;
-            if mutation.previous.is_none() {
+            let Some(_) = mutation.previous else {
                 return Ok(false);
-            }
+            };
             header.catalog = mutation.root;
             let catalog = header.catalog;
-            let transaction = self.encode_transaction(header, None, mutation.records)?;
+            let transaction =
+                self.encode_transaction(principal.clone(), header, None, mutation.records)?;
             match self.engine.commit_root(transaction) {
                 Ok(_) => {
                     self.validated_catalogs.lock().insert(
@@ -399,8 +542,10 @@ where
     /// Returns a principal-graph or projection error when the authoritative
     /// catalog cannot be decoded.
     pub fn list(&self, principal: &P) -> Result<Vec<ContentEntry>, PrincipalContentError> {
-        let header = self.header(principal.clone())?;
-        list(header.catalog, &mut |object| self.load_required(object))
+        let header = self.header(principal)?;
+        list(header.catalog, &mut |object| {
+            self.load_required_for(principal, object)
+        })
     }
 
     /// Describe one named value without reading its chunks.
@@ -414,20 +559,61 @@ where
         principal: &P,
         name: &ContentName,
     ) -> Result<Option<ContentDescriptor>, PrincipalContentError> {
-        let header = self.header(principal.clone())?;
-        let Some(entry) = self.catalog_lookup(header.catalog, name)? else {
+        self.open_read(principal, name)
+            .map(|handle| handle.map(|handle| handle.descriptor()))
+    }
+
+    /// Open one named value for repeated verified reads.
+    ///
+    /// The principal root, catalog entry, and canonical file descriptor are
+    /// resolved once. The resulting handle continues to address that immutable
+    /// generation when the same catalog name is later replaced or deleted. A
+    /// compaction caller that does not retain a `ReadHandle` root may collect
+    /// the old closure; subsequent reads then fail with
+    /// [`ContentError::MissingObject`] rather than returning newer bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a content, principal-graph, or projection error when metadata
+    /// is missing or invalid.
+    pub fn open_read(
+        &self,
+        principal: &P,
+        name: &ContentName,
+    ) -> Result<Option<PrincipalContentReadHandle<P, E>>, PrincipalContentError> {
+        let header = self.header(principal)?;
+        let Some(entry) = self.catalog_lookup(principal, header.catalog, name)? else {
             return Ok(None);
         };
-        let descriptor =
-            describe_content(&EngineSource::<P, E>::new(self.engine.as_ref()), entry.file)
-                .map_err(map_read_error)?;
+        let root = header
+            .root
+            .ok_or_else(|| invalid(entry.file, "catalog entry exists without a principal root"))?;
+        let verified = self
+            .engine
+            .load_projection_cache(principal, entry.file, VERIFIED_CONTENT_CACHE_KEY)
+            .and_then(|entry| entry.downcast::<CachedVerifiedContent>())
+            .map(|verified| verified.0);
+        let opened = match verified {
+            Some(verified) => verified.opened_content(),
+            None => open_content(
+                &EngineSource::<P, E>::new(self.engine.as_ref(), principal),
+                entry.file,
+            )
+            .map_err(map_read_error)?,
+        };
+        let descriptor = opened.descriptor();
         if descriptor.logical_bytes() != entry.logical_bytes {
             return Err(invalid(
                 entry.file,
                 "catalog and file logical lengths disagree",
             ));
         }
-        Ok(Some(descriptor))
+        Ok(Some(PrincipalContentReadHandle {
+            engine: Arc::clone(&self.engine),
+            opened,
+            principal: principal.clone(),
+            principal_root: root,
+        }))
     }
 
     /// Reconstruct one complete named value.
@@ -441,15 +627,10 @@ where
         principal: &P,
         name: &ContentName,
     ) -> Result<Option<Vec<u8>>, PrincipalContentError> {
-        let Some(descriptor) = self.describe(principal, name)? else {
+        let Some(handle) = self.open_read(principal, name)? else {
             return Ok(None);
         };
-        read_content(
-            &EngineSource::<P, E>::new(self.engine.as_ref()),
-            descriptor.file(),
-        )
-        .map(Some)
-        .map_err(map_read_error)
+        handle.read().map(Some)
     }
 
     /// Reconstruct an exact range of one named value.
@@ -465,17 +646,10 @@ where
         offset: u64,
         length: u64,
     ) -> Result<Option<Vec<u8>>, PrincipalContentError> {
-        let Some(descriptor) = self.describe(principal, name)? else {
+        let Some(handle) = self.open_read(principal, name)? else {
             return Ok(None);
         };
-        read_content_range(
-            &EngineSource::<P, E>::new(self.engine.as_ref()),
-            descriptor.file(),
-            offset,
-            length,
-        )
-        .map(Some)
-        .map_err(map_read_error)
+        handle.read_range(offset, length).map(Some)
     }
 
     /// Flush authoritative object and root records.
@@ -487,14 +661,68 @@ where
         self.engine.flush_projection().map_err(Into::into)
     }
 
-    fn header(&self, principal: P) -> Result<ContentHeader<P>, PrincipalContentError> {
-        let Some(root) = self.engine.current_root(&principal)? else {
-            return Ok(ContentHeader::empty(principal));
+    fn mark_verified(&self, principal: &P, verified: VerifiedContent) {
+        let file = verified.descriptor().file();
+        let _ = self.engine.load_shared_object_for(principal, file);
+        let _ =
+            self.engine
+                .discard_projection_cache(principal, file, PARTIAL_VERIFICATION_CACHE_KEY);
+        let _ = self.engine.retain_projection_cache(
+            principal,
+            file,
+            VERIFIED_CONTENT_CACHE_KEY,
+            ProjectionCacheEntry::new(CachedVerifiedContent(verified)),
+        );
+    }
+
+    fn header(&self, principal: &P) -> Result<Arc<ContentHeader>, PrincipalContentError> {
+        let root = self.engine.current_root(principal)?;
+        if let Some(root) = root
+            && let Some(header) = self
+                .engine
+                .load_projection_cache(principal, root.commit, DECODED_HEADER_CACHE_KEY)
+                .and_then(|entry| entry.downcast::<ContentHeader>())
+            && header.root == Some(root)
+        {
+            return Ok(header);
+        }
+        let header = self.decode_header(principal, root)?;
+        let Some(root) = root else {
+            return Ok(Arc::new(header));
         };
-        let commit = self.load_typed(root.commit, ObjectKind::Commit, PRINCIPAL_GRAPH_VERSION)?;
+        if self.engine.retain_projection_cache(
+            principal,
+            root.commit,
+            DECODED_HEADER_CACHE_KEY,
+            ProjectionCacheEntry::new(header.clone()),
+        ) && let Some(retained) = self
+            .engine
+            .load_projection_cache(principal, root.commit, DECODED_HEADER_CACHE_KEY)
+            .and_then(|entry| entry.downcast::<ContentHeader>())
+        {
+            return Ok(retained);
+        }
+        Ok(Arc::new(header))
+    }
+
+    fn decode_header(
+        &self,
+        principal: &P,
+        root: Option<RootState>,
+    ) -> Result<ContentHeader, PrincipalContentError> {
+        let Some(root) = root else {
+            return Ok(ContentHeader::empty());
+        };
+        let commit = self.load_typed(
+            principal,
+            root.commit,
+            ObjectKind::Commit,
+            PRINCIPAL_GRAPH_VERSION,
+        )?;
         require_structural(root.commit, &commit)?;
         let state_id = owned_target(root.commit, &commit, STATE_LABEL)?;
         let state = self.load_typed(
+            principal,
             state_id,
             ObjectKind::PrincipalState,
             PRINCIPAL_GRAPH_VERSION,
@@ -512,20 +740,21 @@ where
                 CONTENT_COMPONENT_LABEL => {
                     let record = self
                         .engine
-                        .load_object(reference.target())?
+                        .load_object_for(principal, reference.target())?
                         .ok_or_else(|| ContentError::MissingObject(reference.target()))?;
                     let root = root_from_record(reference.target(), &record)?;
                     let cached = self
                         .validated_catalogs
                         .lock()
-                        .get(&principal)
+                        .get(principal)
                         .copied()
                         .filter(|validation| validation.root == Some(root.object));
                     let validation = if let Some(validation) = cached {
                         validation
                     } else {
-                        let validation =
-                            validate_catalog(Some(root), &mut |object| self.load_required(object))?;
+                        let validation = validate_catalog(Some(root), &mut |object| {
+                            self.load_required_for(principal, object)
+                        })?;
                         self.validated_catalogs
                             .lock()
                             .insert(principal.clone(), validation);
@@ -541,7 +770,7 @@ where
                 },
                 KV_COMPONENT_LABEL => {
                     other_quota_bytes = other_quota_bytes
-                        .checked_add(self.kv_quota(&principal, reference.target())?)
+                        .checked_add(self.kv_quota(principal, reference.target())?)
                         .ok_or(PrincipalContentError::AccountingOverflow)?;
                     preserved_state.push(reference.clone());
                 },
@@ -560,7 +789,6 @@ where
             .cloned()
             .collect();
         Ok(ContentHeader {
-            principal,
             root: Some(root),
             previous_catalog_quota_bytes: catalog.map_or(0, |root| root.summary.quota_bytes),
             catalog,
@@ -582,13 +810,14 @@ where
 
     fn load_typed(
         &self,
+        principal: &P,
         object: ObjectId,
         kind: ObjectKind,
         version: ObjectFormatVersion,
     ) -> Result<ObjectRecord, PrincipalContentError> {
         let record = self
             .engine
-            .load_object(object)?
+            .load_object_for(principal, object)?
             .ok_or(ContentError::MissingObject(object))?;
         if record.kind() != kind || record.format_version() != version {
             return Err(invalid(
@@ -623,7 +852,7 @@ where
     fn enforce_quota(
         &self,
         principal: &P,
-        header: &ContentHeader<P>,
+        header: &ContentHeader,
     ) -> Result<(), PrincipalContentError> {
         let Some(quota) = &self.quota else {
             return Ok(());
@@ -650,7 +879,8 @@ where
 
     fn encode_transaction(
         &self,
-        header: ContentHeader<P>,
+        principal: P,
+        header: ContentHeader,
         built: Option<&BuiltContent>,
         catalog_records: BTreeMap<ObjectId, ObjectRecord>,
     ) -> Result<RootTransaction<P>, PrincipalContentError> {
@@ -703,7 +933,7 @@ where
         .map_err(PrincipalProjectionError::Model)?;
         let commit = self.insert(&mut records, commit)?;
         Ok(RootTransaction::new(
-            header.principal,
+            principal,
             header.root,
             commit,
             records.into_iter().collect(),
@@ -712,15 +942,28 @@ where
 
     fn catalog_lookup(
         &self,
+        principal: &P,
         root: Option<CatalogRoot>,
         name: &ContentName,
     ) -> Result<Option<CatalogValue>, PrincipalContentError> {
-        lookup(root, name, &mut |object| self.load_required(object))
+        lookup(root, name, &mut |object| {
+            self.load_required_for(principal, object)
+        })
     }
 
     fn load_required(&self, object: ObjectId) -> Result<ObjectRecord, PrincipalContentError> {
         self.engine
             .load_object(object)?
+            .ok_or_else(|| ContentError::MissingObject(object).into())
+    }
+
+    fn load_required_for(
+        &self,
+        principal: &P,
+        object: ObjectId,
+    ) -> Result<ObjectRecord, PrincipalContentError> {
+        self.engine
+            .load_object_for(principal, object)?
             .ok_or_else(|| ContentError::MissingObject(object).into())
     }
 
@@ -745,224 +988,9 @@ where
     }
 }
 
-struct ContentHeader<P> {
-    principal: P,
-    root: Option<RootState>,
-    catalog: Option<CatalogRoot>,
-    previous_catalog_quota_bytes: u64,
-    other_quota_bytes: u64,
-    preserved_state: Vec<ObjectReference>,
-    preserved_commit: Vec<ObjectReference>,
-}
+mod projection;
 
-impl<P> ContentHeader<P> {
-    fn empty(principal: P) -> Self {
-        Self {
-            principal,
-            root: None,
-            catalog: None,
-            previous_catalog_quota_bytes: 0,
-            other_quota_bytes: 0,
-            preserved_state: Vec::new(),
-            preserved_commit: Vec::new(),
-        }
-    }
-}
-
-struct EngineIdentity<'a, P, E> {
-    engine: &'a E,
-    marker: PhantomData<fn() -> P>,
-}
-
-impl<'a, P, E> EngineIdentity<'a, P, E> {
-    const fn new(engine: &'a E) -> Self {
-        Self {
-            engine,
-            marker: PhantomData,
-        }
-    }
-}
-
-impl<P, E> astrid_storage_model::ObjectIdentity for EngineIdentity<'_, P, E>
-where
-    E: PrincipalProjectionEngine<P>,
-{
-    fn identify(&self, record: &ObjectRecord) -> ObjectId {
-        self.engine.identify_object(record)
-    }
-}
-
-struct EngineSource<'a, P, E> {
-    engine: &'a E,
-    marker: PhantomData<fn() -> P>,
-}
-
-impl<'a, P, E> EngineSource<'a, P, E> {
-    const fn new(engine: &'a E) -> Self {
-        Self {
-            engine,
-            marker: PhantomData,
-        }
-    }
-}
-
-impl<P, E> ContentSource for EngineSource<'_, P, E>
-where
-    E: PrincipalProjectionEngine<P>,
-{
-    type Error = PrincipalProjectionError;
-
-    fn load_content_object(&self, id: ObjectId) -> Result<Option<ObjectRecord>, Self::Error> {
-        self.engine.load_object(id)
-    }
-}
-
-struct EngineSink<'a, P, E> {
-    engine: &'a E,
-    objects_inserted: u64,
-    pending_bytes: usize,
-    pending: BTreeMap<ObjectId, ObjectRecord>,
-    marker: PhantomData<fn() -> P>,
-}
-
-impl<'a, P, E> EngineSink<'a, P, E> {
-    const fn new(engine: &'a E) -> Self {
-        Self {
-            engine,
-            objects_inserted: 0,
-            pending_bytes: 0,
-            pending: BTreeMap::new(),
-            marker: PhantomData,
-        }
-    }
-}
-
-impl<P, E> EngineSink<'_, P, E>
-where
-    E: PrincipalProjectionEngine<P>,
-{
-    fn finish(&mut self) -> Result<(), PrincipalProjectionError> {
-        if self.pending.is_empty() {
-            return Ok(());
-        }
-        let pending = std::mem::take(&mut self.pending);
-        self.pending_bytes = 0;
-        let expected: Vec<_> = pending.keys().copied().collect();
-        let outcomes = self.engine.stage_objects(pending.into_values().collect())?;
-        if outcomes.len() != expected.len() {
-            return Err(PrincipalProjectionError::Engine(
-                "staging engine returned the wrong outcome count".to_owned(),
-            ));
-        }
-        for (expected, (computed, outcome)) in expected.into_iter().zip(outcomes) {
-            if computed != expected {
-                return Err(PrincipalProjectionError::Model(
-                    ModelError::ObjectIdentityMismatch {
-                        declared: expected,
-                        computed,
-                    },
-                ));
-            }
-            if outcome == InsertOutcome::Inserted {
-                self.objects_inserted =
-                    self.objects_inserted
-                        .checked_add(1)
-                        .ok_or(PrincipalProjectionError::Model(
-                            ModelError::ArithmeticOverflow,
-                        ))?;
-            }
-        }
-        Ok(())
-    }
-}
-
-impl<P, E> ContentObjectSink for EngineSink<'_, P, E>
-where
-    E: PrincipalProjectionEngine<P>,
-{
-    type Error = PrincipalProjectionError;
-
-    fn stage_content_object(&mut self, record: ObjectRecord) -> Result<ObjectId, Self::Error> {
-        let id = self.engine.identify_object(&record);
-        match self.pending.get(&id) {
-            Some(existing) if existing == &record => return Ok(id),
-            Some(_) => {
-                return Err(PrincipalProjectionError::Model(
-                    ModelError::ObjectCollision(id),
-                ));
-            },
-            None => {},
-        }
-        self.pending_bytes = self
-            .pending_bytes
-            .saturating_add(staged_record_size(&record));
-        self.pending.insert(id, record);
-        if self.pending_bytes >= STAGING_BATCH_TARGET_BYTES {
-            self.finish()?;
-        }
-        Ok(id)
-    }
-}
-
-fn staged_record_size(record: &ObjectRecord) -> usize {
-    record
-        .references()
-        .iter()
-        .fold(record.canonical_bytes().len(), |size, reference| {
-            size.saturating_add(reference.label().as_bytes().len())
-                .saturating_add(40)
-        })
-        .saturating_add(64)
-}
-
-fn map_read_error(error: ContentReadError<PrincipalProjectionError>) -> PrincipalContentError {
-    match error {
-        ContentReadError::Content(error) => error.into(),
-        ContentReadError::Source(error) => error.into(),
-    }
-}
-
-fn map_stream_error(error: ContentStreamError<PrincipalProjectionError>) -> PrincipalContentError {
-    match error {
-        ContentStreamError::Content(error) => error.into(),
-        ContentStreamError::Source(error) => PrincipalContentError::ContentSource(error),
-        ContentStreamError::Sink(error) => error.into(),
-    }
-}
-
-fn owned_target(
-    object: ObjectId,
-    record: &ObjectRecord,
-    label: &[u8],
-) -> Result<ObjectId, PrincipalContentError> {
-    let reference = record
-        .reference(&ReferenceLabel::new(label))
-        .ok_or_else(|| invalid(object, "required principal reference is missing"))?;
-    if reference.kind() != ReferenceKind::Owns {
-        return Err(invalid(
-            object,
-            "required principal reference is not owning",
-        ));
-    }
-    Ok(reference.target())
-}
-
-fn require_structural(
-    object: ObjectId,
-    record: &ObjectRecord,
-) -> Result<(), PrincipalContentError> {
-    if !record.canonical_bytes().is_empty()
-        || record.logical_bytes() != 0
-        || record.class() != ObjectClass::Metadata
-    {
-        return Err(invalid(
-            object,
-            "principal structural object carries payload",
-        ));
-    }
-    Ok(())
-}
-
-fn invalid(object: ObjectId, detail: &'static str) -> PrincipalContentError {
-    PrincipalContentError::InvalidGraph { object, detail }
-}
+use projection::{
+    CachedPartialVerification, CachedVerifiedContent, ContentHeader, EngineIdentity, EngineSink,
+    EngineSource, invalid, map_read_error, map_stream_error, owned_target, require_structural,
+};

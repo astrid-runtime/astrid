@@ -35,8 +35,9 @@ mod refinery;
 pub use durable::{
     CompactionEvidenceBundle, CompactionFacts, CompactionProofVerifier, CompactionReport,
     CompactionRetainedRoot, CompactionRetention, CompactionRootKind, DurableEngine, DurableError,
-    FaultInjector, FaultPoint, IdentityScheme, NoFaults, PersistentObjectIdentity, PrincipalCodec,
-    RecoveryLimits, VerifiedCompactionPlan,
+    FaultInjector, FaultPoint, IdentityScheme, NoFaults, ObjectCacheCapacity, ObjectCacheConfig,
+    ObjectCacheController, ObjectCacheStats, PersistentObjectIdentity, PrincipalCodec,
+    PrincipalObjectCacheBudget, RecoveryLimits, VerifiedCompactionPlan,
 };
 pub use kv::{
     KvProjectionEngine, KvProjectionError, KvState, KvStateSnapshot, commit_kv_with_engine,
@@ -46,7 +47,10 @@ pub use muninn::{
     InMemoryMuninnIndex, MuninnAdmission, MuninnHit, MuninnTrustState, MuninnVerificationError,
     VerifiedDerivationEvidence, verify_derivation_evidence,
 };
-pub use projection::{PrincipalProjectionEngine, PrincipalProjectionError};
+pub use projection::{
+    PrincipalProjectionEngine, PrincipalProjectionError, ProjectionCacheEntry, ProjectionCacheKey,
+    ProjectionCachePayload,
+};
 #[cfg(not(target_family = "wasm"))]
 pub use refinery::{
     BottomKSketch, BottomKSketchDescriptor, BottomKSketchError, SketchSampleSize, SketchScoreWidth,

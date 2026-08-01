@@ -10,7 +10,7 @@ use super::compaction::{
     ARENA_COMPACTING, ARENA_PREVIOUS, COMPACTION_INTENT_FILE, COMPACTION_INTENT_TEMP,
     ROOTS_COMPACTING, ROOTS_PREVIOUS,
 };
-use super::tests::{TestEngine, TestIdentity, Utf8Codec, limits, transaction};
+use super::tests::{TestEngine, TestIdentity, Utf8Codec, limits, open_with_cache, transaction};
 use super::*;
 
 #[derive(Clone, Copy, Debug)]
@@ -208,6 +208,55 @@ fn compaction_reclaims_only_unreachable_objects_and_preserves_root_generation() 
     let (_, next) = transaction("alice", Some(current), b"after-compaction");
     let next = reopened.commit(next).unwrap().root();
     assert_eq!(next.generation.get(), current.generation.get() + 1);
+}
+
+#[test]
+fn compaction_discards_cached_objects_that_leave_the_authoritative_index() {
+    let directory = tempfile::tempdir().unwrap();
+    let controller = ObjectCacheController::new(ObjectCacheCapacity::Unbounded);
+    let engine = open_with_cache(directory.path(), controller);
+    let (first, current) = two_versions(&engine);
+    let principal = "alice".to_owned();
+    let stale_record = engine.object(first.commit).unwrap().unwrap();
+
+    assert!(
+        engine
+            .object_for(&principal, first.commit)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        engine
+            .object_for(&principal, current.commit)
+            .unwrap()
+            .is_some()
+    );
+    let policy = evidence(b"retain-current-roots");
+    let authorization = plan(&engine, retention(&engine, &policy, []), policy);
+    assert!(authorization.facts().condemned().contains(&first.commit));
+
+    engine.compact(&authorization).unwrap();
+
+    assert!(
+        engine
+            .retain_loaded_object_if_current(&principal, first.commit, 0, stale_record)
+            .unwrap()
+            .is_none(),
+        "a read completed against the old arena generation was retained after compaction"
+    );
+
+    assert!(
+        engine
+            .object_for(&principal, first.commit)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        engine
+            .object_for(&principal, current.commit)
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[test]

@@ -233,9 +233,43 @@ tree nodes and chunks. Returned bytes are copied into caller-owned memory; the
 current API does not expose mapped arena storage or hand out raw engine
 references.
 
+An unverified range does not scan the complete file. It validates the
+FastCDC boundaries inside the requested range plus, when present, the
+immediately preceding and following chunk. Successful checks produce
+process-local edge evidence keyed by:
+
+- the immutable `ChunkTree` ObjectId;
+- the exact adjacent-child edge inside that node; and
+- every identity-bearing chunking-profile field.
+
+Each node uses one 128-bit bitmap, matching the canonical fanout. Repeated
+ranges can therefore skip already-proven FastCDC work and avoid loading a
+neighbour used only as boundary context, without creating one heavyweight
+token per chunk or requiring an O(file) first touch. Tree decoding, object
+identity, expected byte/chunk totals, chunk bounds, and requested-range checks
+remain active on every read.
+
+The principal store partitions this evidence by principal and file. Equal
+content in another principal cannot inherit warmth. Edge bitmaps, complete-file
+tokens, and decoded root/catalog headers live in the same operator-governed
+projection cache as decoded immutable objects: their resident bytes count
+against the total pool and the principal's logical cache share. Eviction or
+budget refusal only removes acceleration; the next read takes the complete
+verified path. An already-open generation may retain evidence after its catalog
+name is replaced or deleted because that handle remains a live read authority,
+but the evidence cannot outlive the cache association or its budget.
+
+The evidence is deliberately not durable; a future persistent form must be an
+authenticated `Evidence` object bound into the root-CAS graph, never an editable
+sidecar. A cold process therefore reloads the neighbour chunks it needs and
+rejects any frame whose checksum or object identity changed after recovery.
+
 Objects are immutable, so a concurrent catalog update cannot change the bytes
 behind a descriptor. Durable garbage collection is not yet active. Once it is,
-long-running readers must pin a root or use a bounded read lease.
+a compaction caller must retain the descriptor closure as a `ReadHandle` root
+for the duration of its promised lease. Without that retention, a stale handle
+fails with `ContentError::MissingObject` after collection; it never retargets
+to the replacement catalog entry.
 
 ## Security and privacy
 

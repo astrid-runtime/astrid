@@ -14,7 +14,8 @@ use astrid_core::identity::PrincipalUid;
 use astrid_core::kernel_api::{ProjectionNameDiagnostic, ProjectionNamePolicyPreset};
 use astrid_core::principal::PrincipalId;
 use astrid_storage_engine::{
-    DurableEngine, IdentityScheme, PersistentObjectIdentity, PrincipalCodec, RecoveryLimits,
+    DurableEngine, IdentityScheme, ObjectCacheConfig, ObjectCacheStats, PersistentObjectIdentity,
+    PrincipalCodec, RecoveryLimits,
 };
 use astrid_storage_model::{ObjectClass, ObjectId, ObjectIdentity, ObjectRecord, ReferenceKind};
 use parking_lot::Mutex;
@@ -201,6 +202,24 @@ pub struct RuntimePrincipalStore {
 }
 
 impl RuntimePrincipalStore {
+    /// Return privileged decoded-object cache diagnostics.
+    ///
+    /// These values are for kernel and operator accounting. Guest surfaces
+    /// must not expose cache residency because it can reveal cross-principal
+    /// reuse.
+    #[must_use]
+    pub fn object_cache_stats(&self) -> ObjectCacheStats {
+        self.engine.object_cache_stats()
+    }
+
+    /// Return one owner's current logical decoded-object cache charge.
+    ///
+    /// The charge is independent of whether physical records are shared.
+    #[must_use]
+    pub fn object_cache_principal_charge(&self, owner: &StateOwner) -> u64 {
+        self.engine.object_cache_principal_charge(owner)
+    }
+
     /// Clone the runtime KV projection.
     #[must_use]
     pub fn kv(&self) -> Arc<dyn KvStore> {
@@ -297,7 +316,13 @@ pub async fn open_runtime_principal_store(
     home: &AstridHome,
     quota: Arc<dyn KvQuotaResolver<StateOwner>>,
 ) -> StorageResult<RuntimePrincipalStore> {
-    open_runtime_principal_store_with_directory(home, quota, PrincipalDirectory::default()).await
+    open_runtime_principal_store_with_options(
+        home,
+        quota,
+        PrincipalDirectory::default(),
+        ObjectCacheConfig::disabled(),
+    )
+    .await
 }
 
 /// Open every native projection with an externally shared principal
@@ -315,6 +340,45 @@ pub async fn open_runtime_principal_store_with_directory(
     quota: Arc<dyn KvQuotaResolver<StateOwner>>,
     principals: PrincipalDirectory,
 ) -> StorageResult<RuntimePrincipalStore> {
+    open_runtime_principal_store_with_options(
+        home,
+        quota,
+        principals,
+        ObjectCacheConfig::disabled(),
+    )
+    .await
+}
+
+/// Open every native projection with an explicitly governed decoded-object
+/// cache.
+///
+/// The injected policy owns total and per-principal resident budgets. Cache
+/// misses, disabled policy, and eviction always fall back to verified arena
+/// reads.
+///
+/// # Errors
+///
+/// Returns the same errors as [`open_runtime_principal_store`].
+pub async fn open_runtime_principal_store_with_object_cache(
+    home: &AstridHome,
+    quota: Arc<dyn KvQuotaResolver<StateOwner>>,
+    object_cache: ObjectCacheConfig<StateOwner>,
+) -> StorageResult<RuntimePrincipalStore> {
+    open_runtime_principal_store_with_options(
+        home,
+        quota,
+        PrincipalDirectory::default(),
+        object_cache,
+    )
+    .await
+}
+
+async fn open_runtime_principal_store_with_options(
+    home: &AstridHome,
+    quota: Arc<dyn KvQuotaResolver<StateOwner>>,
+    principals: PrincipalDirectory,
+    object_cache: ObjectCacheConfig<StateOwner>,
+) -> StorageResult<RuntimePrincipalStore> {
     let store_path = home.principal_store_path();
     let open_path = store_path.clone();
     let format_spec = bootstrap::format_specification()?;
@@ -329,11 +393,12 @@ pub async fn open_runtime_principal_store_with_directory(
         let destination_format =
             prepare_destination(&open_path, &metadata_for_open, catalog_spec_id)?;
         let metadata_current = destination_format.metadata_is_current();
-        let engine = RuntimeEngine::open(
+        let engine = RuntimeEngine::open_with_object_cache(
             &open_path,
             Blake3ObjectIdentityV1,
             StateOwnerCodecV1,
             RecoveryLimits::process_addressable(),
+            object_cache,
         )
         .map_err(|error| {
             StorageError::Connection(format!("open durable principal store: {error}"))

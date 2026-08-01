@@ -69,10 +69,10 @@ where
     P: Clone + Ord,
     E: KvProjectionEngine<P>,
 {
-    let commit = load_typed(engine, root.commit, ObjectKind::Commit)?;
+    let commit = load_typed(engine, &owner, root.commit, ObjectKind::Commit)?;
     require_structural(root.commit, &commit)?;
     let state_id = owned_target(root.commit, &commit, STATE_LABEL)?;
-    let state = load_typed(engine, state_id, ObjectKind::PrincipalState)?;
+    let state = load_typed(engine, &owner, state_id, ObjectKind::PrincipalState)?;
     require_structural(state_id, &state)?;
     let projection = match state.reference(&ReferenceLabel::new(KV_LABEL)) {
         None => {
@@ -232,7 +232,7 @@ where
         ));
     }
     let record = engine
-        .load_kv_object(reference.target())
+        .load_kv_object_for(owner, reference.target())
         .map_err(|error| map_engine(&error))?
         .ok_or_else(|| map_engine(&ModelError::MissingObject(reference.target()).into()))?;
     let catalog_root = root_from_record(reference.target(), &record)
@@ -247,7 +247,7 @@ where
     } else {
         let validation = validate_catalog(Some(catalog_root), &mut |object| {
             engine
-                .load_kv_object(object)
+                .load_kv_object_for(owner, object)
                 .map_err(|error| {
                     PrincipalContentError::Projection(PrincipalProjectionError::Engine(
                         error.to_string(),
@@ -290,7 +290,7 @@ where
         if !visited.insert(object) {
             return Err(invalid(object, "KV delta chain contains a cycle"));
         }
-        let record = load_typed(engine, object, ObjectKind::NamespaceMap)?;
+        let record = load_typed(engine, owner, object, ObjectKind::NamespaceMap)?;
         match decode_head(object, &record)? {
             Head::Checkpoint { tree, totals } => break (tree, totals),
             Head::Delta {
@@ -316,7 +316,7 @@ where
     let validation = if let Some(validation) = cached {
         validation
     } else {
-        let mut context = TreeContext::<P, E>::new(engine);
+        let mut context = TreeContext::<P, E>::new(engine, owner);
         let validation = context.validate_tree(tree)?;
         validated_trees.lock().insert(owner.clone(), validation);
         validation
@@ -327,7 +327,7 @@ where
     {
         return Err(invalid(head_id, "KV checkpoint accounting totals disagree"));
     }
-    let mut context = TreeContext::<P, E>::new(engine);
+    let mut context = TreeContext::<P, E>::new(engine, owner);
     let mut overlay = OverlayMap::default();
     let mut totals = checkpoint_totals;
     let mut prior_depth = 0_u64;
@@ -439,12 +439,17 @@ fn update_totals(
     Ok(())
 }
 
-fn load_typed<P, E>(engine: &E, id: ObjectId, kind: ObjectKind) -> StorageResult<ObjectRecord>
+fn load_typed<P, E>(
+    engine: &E,
+    owner: &P,
+    id: ObjectId,
+    kind: ObjectKind,
+) -> StorageResult<ObjectRecord>
 where
     E: KvProjectionEngine<P>,
 {
     let record = engine
-        .load_kv_object(id)
+        .load_kv_object_for(owner, id)
         .map_err(|error| map_engine(&error))?
         .ok_or_else(|| map_engine(&ModelError::MissingObject(id).into()))?;
     if record.kind() != kind || record.format_version() != FORMAT_VERSION {

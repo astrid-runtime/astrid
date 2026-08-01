@@ -1,16 +1,20 @@
-use std::io::{self, Read};
+use std::collections::BTreeMap;
+use std::fs::OpenOptions;
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use astrid_storage_engine::{
     CommitOutcome, DurableEngine, IdentityScheme, InMemoryEngine, PersistentObjectIdentity,
-    PrincipalCodec, PrincipalProjectionEngine, PrincipalProjectionError, RecoveryLimits,
-    RootTransaction,
+    PrincipalCodec, PrincipalProjectionEngine, PrincipalProjectionError, ProjectionCacheEntry,
+    ProjectionCacheKey, RecoveryLimits, RootTransaction,
 };
 use astrid_storage_model::{
     InsertOutcome, ModelError, ObjectClass, ObjectId, ObjectIdentity, ObjectKind, ObjectRecord,
     ObjectReference, ReferenceKind, ReferenceLabel, RootState,
 };
+use fastcdc::v2020::{FastCDC, Normalization};
+use parking_lot::RwLock;
 
 use super::{ContentName, ContentNameError, PrincipalContentError, PrincipalContentStore};
 use crate::StorageError;
@@ -73,6 +77,20 @@ impl PrincipalCodec<String> for Utf8Codec {
 }
 
 type Engine = InMemoryEngine<String, TestIdentity>;
+type TestProjectionKey = (String, ObjectId, ProjectionCacheKey);
+type TestProjectionMap = BTreeMap<TestProjectionKey, ProjectionCacheEntry>;
+
+#[test]
+fn projection_engine_trait_remains_object_safe() {
+    let engine = Engine::new(TestIdentity);
+    let erased: &dyn PrincipalProjectionEngine<String> = &engine;
+    assert!(
+        erased
+            .current_root(&"object-safety".to_owned())
+            .unwrap()
+            .is_none()
+    );
+}
 
 struct ConflictOnceEngine {
     inner: Engine,
@@ -122,6 +140,107 @@ impl PrincipalProjectionEngine<String> for ConflictOnceEngine {
             }
             .into());
         }
+        self.inner.commit(transaction).map_err(Into::into)
+    }
+
+    fn flush_projection(&self) -> Result<(), PrincipalProjectionError> {
+        Ok(())
+    }
+}
+
+struct CountingEngine {
+    inner: Engine,
+    object_loads: AtomicUsize,
+    projection_cache: RwLock<TestProjectionMap>,
+}
+
+impl CountingEngine {
+    fn new() -> Self {
+        Self {
+            inner: Engine::new(TestIdentity),
+            object_loads: AtomicUsize::new(0),
+            projection_cache: RwLock::new(BTreeMap::new()),
+        }
+    }
+
+    fn reset_object_loads(&self) {
+        self.object_loads.store(0, Ordering::SeqCst);
+    }
+
+    fn object_loads(&self) -> usize {
+        self.object_loads.load(Ordering::SeqCst)
+    }
+
+    fn clear_projection_cache(&self) {
+        self.projection_cache.write().clear();
+    }
+}
+
+impl PrincipalProjectionEngine<String> for CountingEngine {
+    fn identify_object(&self, record: &ObjectRecord) -> ObjectId {
+        self.inner.identify(record)
+    }
+
+    fn stage_object(
+        &self,
+        record: ObjectRecord,
+    ) -> Result<(ObjectId, InsertOutcome), PrincipalProjectionError> {
+        self.inner.put_object(record).map_err(Into::into)
+    }
+
+    fn current_root(
+        &self,
+        principal: &String,
+    ) -> Result<Option<RootState>, PrincipalProjectionError> {
+        Ok(self.inner.root(principal))
+    }
+
+    fn load_object(&self, id: ObjectId) -> Result<Option<ObjectRecord>, PrincipalProjectionError> {
+        self.object_loads.fetch_add(1, Ordering::SeqCst);
+        Ok(self.inner.object(id))
+    }
+
+    fn load_projection_cache(
+        &self,
+        principal: &String,
+        object: ObjectId,
+        key: ProjectionCacheKey,
+    ) -> Option<ProjectionCacheEntry> {
+        self.projection_cache
+            .read()
+            .get(&(principal.clone(), object, key))
+            .cloned()
+    }
+
+    fn retain_projection_cache(
+        &self,
+        principal: &String,
+        object: ObjectId,
+        key: ProjectionCacheKey,
+        value: ProjectionCacheEntry,
+    ) -> bool {
+        self.projection_cache
+            .write()
+            .insert((principal.clone(), object, key), value);
+        true
+    }
+
+    fn discard_projection_cache(
+        &self,
+        principal: &String,
+        object: ObjectId,
+        key: ProjectionCacheKey,
+    ) -> bool {
+        self.projection_cache
+            .write()
+            .remove(&(principal.clone(), object, key))
+            .is_some()
+    }
+
+    fn commit_root(
+        &self,
+        transaction: RootTransaction<String>,
+    ) -> Result<CommitOutcome, PrincipalProjectionError> {
         self.inner.commit(transaction).map_err(Into::into)
     }
 
@@ -242,6 +361,195 @@ fn named_content_round_trips_lists_ranges_and_deletes() {
 }
 
 #[test]
+fn open_read_handle_remains_on_its_authorized_generation() {
+    let engine = Arc::new(Engine::new(TestIdentity));
+    let store = PrincipalContentStore::from_engine(engine);
+    let owner = "alice".to_owned();
+    let name = ContentName::new("models/current.bin").unwrap();
+    let original = bytes(2 * 1024 * 1024);
+    let replacement = bytes(1024 * 1024);
+    let first = store.put(&owner, &name, &original).unwrap();
+    let handle = store.open_read(&owner, &name).unwrap().unwrap();
+
+    assert_eq!(handle.descriptor(), first.descriptor());
+    assert_eq!(handle.principal_root(), first.principal_root());
+    assert_eq!(
+        handle.read_range(999_000, 12_345).unwrap(),
+        original[999_000..1_011_345]
+    );
+
+    store.put(&owner, &name, &replacement).unwrap();
+    assert_eq!(handle.read().unwrap(), original);
+    assert_eq!(store.read(&owner, &name).unwrap(), Some(replacement));
+
+    assert!(store.delete(&owner, &name).unwrap());
+    assert_eq!(handle.read_range(17, 4096).unwrap(), original[17..4113]);
+    assert!(store.open_read(&owner, &name).unwrap().is_none());
+}
+
+#[test]
+fn verified_handle_reuse_survives_an_unrelated_root_commit() {
+    let engine = Arc::new(CountingEngine::new());
+    let writer = PrincipalContentStore::from_engine(Arc::clone(&engine));
+    let reader = PrincipalContentStore::from_engine(Arc::clone(&engine));
+    let owner = "alice".to_owned();
+    let name = ContentName::new("models/stable.bin").unwrap();
+    let value = bytes(2 * 1024 * 1024);
+    writer.put(&owner, &name, &value).unwrap();
+    let handle = reader.open_read(&owner, &name).unwrap().unwrap();
+
+    writer
+        .put(
+            &owner,
+            &ContentName::new("state/unrelated.bin").unwrap(),
+            b"unrelated root movement",
+        )
+        .unwrap();
+    assert_ne!(
+        Some(handle.principal_root()),
+        engine.current_root(&owner).unwrap()
+    );
+    assert_eq!(handle.read().unwrap(), value);
+
+    engine.reset_object_loads();
+    assert_eq!(
+        handle.read_range(999_000, 12_345).unwrap(),
+        value[999_000..1_011_345]
+    );
+    let verified_loads = engine.object_loads();
+
+    engine.clear_projection_cache();
+    let uncached = PrincipalContentStore::from_engine(Arc::clone(&engine));
+    let uncached_handle = uncached.open_read(&owner, &name).unwrap().unwrap();
+    engine.reset_object_loads();
+    assert_eq!(
+        uncached_handle.read_range(999_000, 12_345).unwrap(),
+        value[999_000..1_011_345]
+    );
+    let validating_loads = engine.object_loads();
+
+    assert!(
+        verified_loads < validating_loads,
+        "verified handle loaded {verified_loads} objects; validating handle loaded {validating_loads}"
+    );
+}
+
+#[test]
+fn range_edge_proofs_are_principal_scoped_and_remain_safe_for_open_handles() {
+    let engine = Arc::new(CountingEngine::new());
+    let writer = PrincipalContentStore::from_engine(Arc::clone(&engine));
+    let reader = PrincipalContentStore::from_engine(Arc::clone(&engine));
+    let alice = "alice".to_owned();
+    let bob = "bob".to_owned();
+    let name = ContentName::new("models/shared.bin").unwrap();
+    let value = bytes(8 * 1024 * 1024);
+    writer.put(&alice, &name, &value).unwrap();
+    writer.put(&bob, &name, &value).unwrap();
+    engine.clear_projection_cache();
+    let alice_handle = reader.open_read(&alice, &name).unwrap().unwrap();
+    let bob_handle = reader.open_read(&bob, &name).unwrap().unwrap();
+    let offset = 4_000_000_u64;
+    let length = 64 * 1024_u64;
+    let start = usize::try_from(offset).unwrap();
+    let end = usize::try_from(offset + length).unwrap();
+
+    engine.reset_object_loads();
+    assert_eq!(
+        alice_handle.read_range(offset, length).unwrap(),
+        value[start..end]
+    );
+    let alice_first = engine.object_loads();
+
+    engine.reset_object_loads();
+    assert_eq!(
+        alice_handle.read_range(offset, length).unwrap(),
+        value[start..end]
+    );
+    let alice_reused = engine.object_loads();
+    assert!(
+        alice_reused < alice_first,
+        "reused range loaded {alice_reused} objects; first validation loaded {alice_first}"
+    );
+
+    engine.reset_object_loads();
+    assert_eq!(
+        bob_handle.read_range(offset, length).unwrap(),
+        value[start..end]
+    );
+    assert!(
+        engine.object_loads() >= alice_first,
+        "Bob reused Alice's verification evidence"
+    );
+
+    assert!(reader.delete(&alice, &name).unwrap());
+    engine.reset_object_loads();
+    assert_eq!(
+        alice_handle.read_range(offset, length).unwrap(),
+        value[start..end]
+    );
+    assert!(
+        engine.object_loads() <= alice_reused,
+        "an authorized open handle lost governed immutable evidence after catalog deletion"
+    );
+}
+
+#[test]
+fn one_shot_reads_reuse_the_current_decoded_header() {
+    let engine = Arc::new(CountingEngine::new());
+    let writer = PrincipalContentStore::from_engine(Arc::clone(&engine));
+    let reader = PrincipalContentStore::from_engine(Arc::clone(&engine));
+    let owner = "alice".to_owned();
+    let name = ContentName::new("catalog/target.bin").unwrap();
+    let value = bytes(2 * 1024 * 1024);
+    writer.put(&owner, &name, &value).unwrap();
+    for index in 0..64 {
+        writer
+            .put(
+                &owner,
+                &ContentName::new(format!("catalog/other-{index}.bin")).unwrap(),
+                format!("value-{index}").as_bytes(),
+            )
+            .unwrap();
+    }
+
+    engine.reset_object_loads();
+    assert_eq!(
+        reader.read_range(&owner, &name, 999_000, 12_345).unwrap(),
+        Some(value[999_000..1_011_345].to_vec())
+    );
+    let first_loads = engine.object_loads();
+
+    engine.reset_object_loads();
+    assert_eq!(
+        reader.read_range(&owner, &name, 999_000, 12_345).unwrap(),
+        Some(value[999_000..1_011_345].to_vec())
+    );
+    let cached_loads = engine.object_loads();
+    assert!(
+        cached_loads < first_loads,
+        "cached one-shot read loaded {cached_loads} objects; first read loaded {first_loads}"
+    );
+
+    writer
+        .put(
+            &owner,
+            &ContentName::new("catalog/new-generation.bin").unwrap(),
+            b"new root generation",
+        )
+        .unwrap();
+    engine.reset_object_loads();
+    assert_eq!(
+        reader.read_range(&owner, &name, 999_000, 12_345).unwrap(),
+        Some(value[999_000..1_011_345].to_vec())
+    );
+    let next_generation_loads = engine.object_loads();
+    assert!(
+        next_generation_loads > cached_loads,
+        "new generation loaded {next_generation_loads} objects; cached generation loaded {cached_loads}"
+    );
+}
+
+#[test]
 fn streamed_content_matches_slice_identity_and_round_trips() {
     let engine = Arc::new(Engine::new(TestIdentity));
     let store = PrincipalContentStore::from_engine(engine);
@@ -309,6 +617,94 @@ fn streamed_content_survives_durable_engine_reopen() {
         Some(outcome.descriptor())
     );
     assert_eq!(store.read(&owner, &name).unwrap(), Some(value));
+}
+
+#[test]
+fn cold_range_after_reopen_rejects_a_tampered_neighbour_chunk() {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = "alice".to_owned();
+    let name = ContentName::new("durable-neighbour").unwrap();
+    let value = bytes(8 * 1024 * 1024);
+    let profile = astrid_storage_content::ChunkingProfile::ASTRID_V1;
+    let chunks: Vec<_> = FastCDC::with_level_and_seed(
+        &value,
+        usize::try_from(profile.minimum_bytes()).unwrap(),
+        usize::try_from(profile.average_bytes()).unwrap(),
+        usize::try_from(profile.maximum_bytes()).unwrap(),
+        Normalization::Level1,
+        profile.gear_seed(),
+    )
+    .collect();
+    assert!(chunks.len() >= 3);
+    let selected = chunks.len() / 2;
+    let target = &chunks[selected];
+    let neighbour = &chunks[selected - 1];
+
+    let engine = Arc::new(
+        DurableEngine::open(
+            directory.path(),
+            TestIdentity,
+            Utf8Codec,
+            RecoveryLimits::new(1024 * 1024).unwrap(),
+        )
+        .unwrap(),
+    );
+    let store = PrincipalContentStore::from_engine(Arc::clone(&engine));
+    store.put(&owner, &name, &value).unwrap();
+    drop(store);
+    drop(engine);
+
+    let reopened = Arc::new(
+        DurableEngine::open(
+            directory.path(),
+            TestIdentity,
+            Utf8Codec,
+            RecoveryLimits::new(1024 * 1024).unwrap(),
+        )
+        .unwrap(),
+    );
+    let store = PrincipalContentStore::from_engine(reopened);
+    let arena_path = directory.path().join("objects.arena");
+    let arena = std::fs::read(&arena_path).unwrap();
+    let neighbour_end = neighbour.offset.checked_add(neighbour.length).unwrap();
+    let neighbour_bytes = &value[neighbour.offset..neighbour_end];
+    let needle = &neighbour_bytes[..64];
+    let matches: Vec<_> = arena
+        .windows(needle.len())
+        .enumerate()
+        .filter_map(|(offset, bytes)| (bytes == needle).then_some(offset))
+        .collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "test neighbour prefix must identify exactly one arena payload"
+    );
+    let corrupt_offset = matches[0].saturating_add(17);
+    let mut arena = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&arena_path)
+        .unwrap();
+    arena
+        .seek(SeekFrom::Start(u64::try_from(corrupt_offset).unwrap()))
+        .unwrap();
+    let mut byte = [0_u8; 1];
+    arena.read_exact(&mut byte).unwrap();
+    byte[0] ^= 0x80;
+    arena
+        .seek(SeekFrom::Start(u64::try_from(corrupt_offset).unwrap()))
+        .unwrap();
+    arena.write_all(&byte).unwrap();
+    arena.sync_data().unwrap();
+
+    let range_offset = u64::try_from(target.offset.saturating_add(8)).unwrap();
+    let error = store
+        .read_range(&owner, &name, range_offset, 32)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("checksum"),
+        "unexpected cold tamper error: {error}"
+    );
 }
 
 #[test]

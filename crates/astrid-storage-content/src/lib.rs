@@ -38,7 +38,11 @@ mod tests;
 #[cfg(feature = "std")]
 pub use build::{BuiltContent, build_content};
 pub use read::{
-    ContentReadError, ContentSource, describe_content, read_content, read_content_range,
+    ContentReadError, ContentSource, ContentVerificationDelta, ContentVerificationState,
+    describe_content, open_content, read_content, read_content_range, read_opened_content,
+    read_opened_content_and_verify, read_opened_content_range,
+    read_opened_content_range_with_verification, read_verified_content,
+    read_verified_content_range,
 };
 #[cfg(feature = "std")]
 pub use stream::{ContentObjectSink, ContentStreamError, StreamedContent, build_content_streaming};
@@ -196,6 +200,63 @@ impl ContentDescriptor {
     #[must_use]
     pub const fn profile(self) -> ChunkingProfile {
         self.profile
+    }
+}
+
+/// Decoded immutable file metadata reusable across content reads.
+///
+/// Opening validates the canonical file record once. Subsequent reads still
+/// verify every tree node and chunk they load from the backing source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpenedContent {
+    descriptor: ContentDescriptor,
+    content: Option<ObjectId>,
+}
+
+impl OpenedContent {
+    pub(crate) const fn new(descriptor: ContentDescriptor, content: Option<ObjectId>) -> Self {
+        Self {
+            descriptor,
+            content,
+        }
+    }
+
+    /// Return the validated immutable file descriptor.
+    #[must_use]
+    pub const fn descriptor(self) -> ContentDescriptor {
+        self.descriptor
+    }
+
+    pub(crate) const fn content(self) -> Option<ObjectId> {
+        self.content
+    }
+}
+
+/// Proof that one immutable file DAG has canonical content boundaries.
+///
+/// A token is produced only by Astrid's canonical builders or by a completed
+/// validating read. Because object identities bind the complete immutable
+/// closure, the proof remains valid for that exact file identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VerifiedContent {
+    opened: OpenedContent,
+}
+
+impl VerifiedContent {
+    pub(crate) const fn new(opened: OpenedContent) -> Self {
+        Self { opened }
+    }
+
+    /// Return the verified immutable file descriptor.
+    #[must_use]
+    pub const fn descriptor(self) -> ContentDescriptor {
+        self.opened.descriptor()
+    }
+
+    /// Return the opened file metadata carried by this proof.
+    #[must_use]
+    pub const fn opened_content(self) -> OpenedContent {
+        self.opened
     }
 }
 

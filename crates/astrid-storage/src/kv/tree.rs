@@ -191,7 +191,7 @@ where
         read: impl FnOnce(&mut TreeContext<'_, P, E>, &TreeHeader<P>) -> StorageResult<T>,
     ) -> StorageResult<T> {
         let header = self.header(owner)?;
-        let mut context = TreeContext::new(self.engine.as_ref());
+        let mut context = TreeContext::new(self.engine.as_ref(), &header.owner);
         read(&mut context, &header)
     }
 
@@ -205,7 +205,7 @@ where
     ) -> StorageResult<T> {
         loop {
             let header = self.header(owner.clone())?;
-            let mut context = TreeContext::new(self.engine.as_ref());
+            let mut context = TreeContext::new(self.engine.as_ref(), owner);
             let (result, mutations, changed) = mutation(&mut context, &header)?;
             if !changed {
                 return Ok(result);
@@ -335,7 +335,7 @@ where
         if !force && !should_checkpoint(&base_projection) {
             return Ok(false);
         }
-        let mut context = TreeContext::new(self.engine.as_ref());
+        let mut context = TreeContext::new(self.engine.as_ref(), &base.owner);
         let mut entries = BTreeMap::<Vec<u8>, Vec<u8>>::new();
         context.visit_entries(base.tree, |key, value| {
             entries.insert(key.to_vec(), value.to_vec());
@@ -441,7 +441,7 @@ where
     ) -> StorageResult<()> {
         let blocking = self.blocking_store();
         let header = blocking.header(owner.clone())?;
-        let mut context = TreeContext::new(blocking.engine.as_ref());
+        let mut context = TreeContext::new(blocking.engine.as_ref(), owner);
         let mut entries = BTreeMap::<Vec<u8>, Option<Vec<u8>>>::new();
         context.visit_entries(header.tree, |composite, value| {
             entries.insert(composite.to_vec(), Some(value.to_vec()));
@@ -482,7 +482,7 @@ where
     pub(super) fn height_for_test(&self, owner: P) -> StorageResult<u32> {
         let blocking = self.blocking_store();
         let header = blocking.header(owner)?;
-        TreeContext::new(blocking.engine.as_ref()).height(header.tree)
+        TreeContext::new(blocking.engine.as_ref(), &header.owner).height(header.tree)
     }
 
     #[cfg(test)]
@@ -530,7 +530,8 @@ where
                 "KV benchmark seed requires an empty principal".to_owned(),
             ));
         }
-        let mut context = TreeContext::new(blocking.engine.as_ref());
+        let principal = header.owner.clone();
+        let mut context = TreeContext::new(blocking.engine.as_ref(), &principal);
         let tree = context.build_sorted(entries)?;
         let transaction = context.finish(header, tree)?;
         blocking

@@ -267,6 +267,34 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   measured bottlenecks and defines the future read/write filesystem-provider
   matrix without presenting engine measurements as mounted throughput. Refs
   #1398, #1399, #1392, and #1391.
+- **Principal storage reuses verified immutable reads under governed memory.**
+  Durable object reads now use positional I/O after a short index lookup
+  instead of seeking under the engine write mutex.
+  Principal-scoped read handles resolve and validate a root generation,
+  catalog entry, and file descriptor once, then preserve that immutable
+  generation across later replacement or deletion of the catalog name.
+  Canonical builders and completed validating reads mint unforgeable
+  verification tokens, allowing later reads to skip redundant FastCDC
+  neighbour proofs while retaining object, shape, and range checks. Reuse is
+  partitioned by principal so cache timing cannot expose another principal's
+  equal content. A separately governed decoded-object cache shares immutable
+  allocations physically while charging every principal their complete
+  logical weight; cache exhaustion always falls back to verified arena reads.
+  Cache hits now remain shared through the projection and content-source
+  boundaries instead of cloning full records, physically adjacent frames are
+  verified from coalesced positional reads, and synchronized tick indexes make
+  global and per-principal eviction logarithmic rather than scanning the
+  cache under its mutex. Model-scale range reads retain successful local
+  boundary evidence as profile-bound 128-bit bitmaps per immutable chunk-tree
+  node, so a cold range still touches only its own chunks and neighbours while
+  later reads avoid neighbour-only I/O without first scanning the complete
+  file. Edge evidence, complete-file tokens, and decoded catalog headers are
+  principal/object-partitioned, fail-closed, process-local values inside the
+  same governed cache as decoded objects. Their physical bytes and
+  per-principal logical charges are bounded by the injected cache authority;
+  refusal or eviction always falls back to verified reads. Cold reopen tests
+  corrupt a neighbour frame after recovery and prove that no process-local
+  evidence can suppress its checksum failure. Closes #1399.
 - **Windows local transport uses authenticated per-user named pipes.** A pipe
   name derived only from the caller's operating-system SID replaces
   filesystem endpoint naming on Windows. Local-only byte-mode instances use a
