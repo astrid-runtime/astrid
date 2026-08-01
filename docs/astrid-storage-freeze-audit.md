@@ -1,10 +1,11 @@
 # Principal Storage Pre-Release Freeze Audit
 
-Status: decided work orders. The principal-store stack is merged, but no
-release has made these identity-bearing constants permanent. This document is
+Status: format one is frozen for review. No release has yet made these
+identity-bearing constants a public compatibility promise. This document is
 the durable successor to the freeze-audit scratch record.
 
-Each entry records a decision, rationale, work order, and acceptance evidence.
+Each entry records a decision, rationale, implementation state, and acceptance
+evidence where applicable.
 
 ## D1. BLAKE3-256 identity with mandatory SHA-384 cross-hash attestation
 
@@ -39,9 +40,9 @@ the bytes, so the Refinery computes SHA-384 on that cold path.
 SHA-384 provides implementation maturity, hardware support, and construction
 diversity from BLAKE3.
 
-### Work order
+### Implementation
 
-1. Extend re-attestation and scrub so each ceremony emits:
+1. Re-attestation and scrub emit:
 
    ```text
    Evidence {
@@ -51,11 +52,13 @@ diversity from BLAKE3.
    }
    ```
 
-2. Cover canonical object bytes and compute the tree while streaming.
-3. Specify how a successor identity is introduced under the tagged identity
-   envelope, how pre-break cross-hash evidence authorizes re-addressing, and
-   why old-to-new maps are immutable Lineage rather than aliases.
-4. Do not change the current ObjectId width, index, or v1 addressing hash.
+2. The observer covers canonical object bytes and computes the tree while
+   streaming.
+3. RÚNATAL specifies how a successor identity enters the tagged envelope, how
+   pre-break cross-hash evidence authorizes re-addressing, and why old-to-new
+   maps are immutable Lineage rather than aliases.
+4. The in-memory ObjectId width, index, and format-1 addressing hash remain
+   unchanged.
 
 ### Acceptance
 
@@ -105,16 +108,15 @@ Astrid must have one identity system. The genesis record is reconciled with
 the existing `astrid-identity` structures rather than introducing a parallel
 principal concept.
 
-### Work order
+### Implementation
 
-- Freeze the genesis-record encoding and domain separation.
-- Add the durable owner codec using the UID.
-- Update `store.meta`, the RÚNATAL specification, and the independent reader.
-- Reuse the kernel identity record if its canonical encoding is stable;
-  otherwise stabilize it as part of this work.
-- Rewrite alias-keyed root snapshots and publication intents under the
-  singleton runtime lock. Keep the old root journal as rollback evidence until
-  retention policy explicitly removes it.
+- The genesis-record encoding and domain separation are frozen.
+- The durable owner codec uses the stable UID.
+- `store.meta`, RÚNATAL, and the independent reader carry the same grammar.
+- The kernel identity record supplies the canonical genesis fields.
+- Migration rewrites alias-keyed root snapshots and publication intents under
+  the singleton runtime lock. The old root journal remains rollback evidence
+  until retention policy explicitly removes it.
 
 ### Acceptance
 
@@ -159,18 +161,17 @@ The accepted transition record writes 948 authoritative bytes at all three
 cardinalities. B+-trees still provide compact checkpoints and shallow reads,
 but do not sit on the point-mutation write path.
 
-### Work order
+### Implementation
 
-- Freeze sorted leaf and internal-node encodings.
-- Freeze transition ordering, counter, and inline/spill rules.
-- Freeze checkpoint page population and inline/spill rules.
-- Recompute and validate cached totals during decode.
-- Reject unsorted keys, invalid child bounds, and malformed occupancy.
-- Rebase transitions arriving during a checkpoint build without a long-held
-  mutation lock.
-- Update the RÚNATAL specification and independent reader.
-- Benchmark amplification, operations per second, and get latency at 10k,
-  100k, and one million keys.
+- Sorted leaf, internal-node, transition, counter, and inline/spill encodings
+  are frozen.
+- Decode recomputes cached totals and rejects unsorted keys, invalid child
+  bounds, and malformed occupancy.
+- Checkpoint construction rebases transitions arriving during the build
+  without holding the mutation lock for the full build.
+- RÚNATAL and the independent reader implement the same grammar.
+- The evidence harness measures amplification, operations per second, and get
+  latency at 10k, 100k, and one million keys.
 
 ### Acceptance
 
@@ -235,15 +236,15 @@ implementation revision 1, normalization 1, minimum/average/maximum sizes, and
 the gear seed. Unknown algorithms, revisions, normalization levels, and
 out-of-grammar parameters fail closed.
 
-### Work order
+### Implementation
 
-- Preserve the evidence harness and captured results.
-- Pin exact masks, gear-table derivation, wrapping arithmetic, seeded behavior,
-  whole-object threshold, and final-chunk behavior in RÚNATAL.
-- Keep literal golden boundary fixtures in production Rust and the independent
-  reader.
-- Validate every rooted File against the frozen construction during independent
-  recovery.
+- The evidence harness and captured results are checked in.
+- RÚNATAL pins exact masks, gear-table derivation, wrapping arithmetic, seeded
+  behavior, whole-object threshold, and final-chunk behavior.
+- Production Rust and the independent reader share literal golden boundary
+  fixtures.
+- Independent recovery validates every rooted File against the frozen
+  construction.
 
 ### Acceptance
 
@@ -407,8 +408,16 @@ The following remain deliberate:
 
 ## D8. Mechanical format audit
 
-Before the first release, the RÚNATAL specification records whether each
-constant is evidence-backed or deliberately arbitrary and harmless:
+**Status:** complete. RÚNATAL section 11 classifies every inventoried constant
+and records byte-exact native-staging and local compaction recovery surfaces.
+Focused regressions pin numeric discriminants, profile constants, metadata,
+framed magics, and the existing staging golden vector.
+
+### Classification
+
+The audit records whether each constant is evidence-selected behavior, a
+frozen semantic discriminant, deliberately generous capacity, runtime policy,
+or disposable acceleration state:
 
 - ObjectKind values;
 - ObjectFormatVersion width;
@@ -420,6 +429,17 @@ constant is evidence-backed or deliberately arbitrary and harmless:
 - staging-intent format;
 - `store.meta` keys; and
 - chunking-profile encodings.
+
+Reference labels have no hidden byte ceiling beyond the self-delimiting wire
+lengths and process addressability. Recovery allocation guards, quotas,
+durability modes, batching, memory budgets, and scheduling rates remain
+deployment policy. The persistent object index and projection caches remain
+disposable and outside identity and archival compatibility promises.
+
+Native staging and compaction recovery files are crash-critical local formats,
+but they are not the canonical archival unit. `export_closure` carries
+self-contained identified records and materialized bytes, never host paths,
+arena offsets, staging files, compaction intents, or cache indexes.
 
 ## D9. Object-index scaling requirements for compaction
 
@@ -490,12 +510,12 @@ implementation continuously testable against the simple full-scan oracle.
   independent of object-universe cardinality.
 - Existing format-1 plans, receipts, and audit records replay unchanged.
 
-## Sequence
+## Completion record
 
-1. Complete the cross-hash attestation and successor migration specification.
-2. Replace the persistent KV projection with canonical transitions and
-   immutable B+-tree checkpoints.
-3. Record projection-only name folding and doctor behavior.
-4. Complete the Refinery sketch prototype with the chunker evidence tooling.
-5. Run the mechanical closing audit and declare the format frozen on GitHub.
-6. Create the release tag only as part of the actual release workflow.
+1. Cross-hash attestation and successor migration specification: complete.
+2. Canonical KV transitions and immutable B+-tree checkpoints: complete.
+3. Projection-only name folding and doctor behavior: complete.
+4. Refinery bottom-k sketches and chunker evidence: complete.
+5. Mechanical closing audit and GitHub review freeze: complete.
+6. Release tag and public compatibility promise: deferred to the actual
+   release workflow.

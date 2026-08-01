@@ -125,6 +125,38 @@ fn only_ready_evidence(directory: &Path) -> PathBuf {
 }
 
 #[test]
+fn local_compaction_recovery_magics_are_stable() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = super::tests::open(directory.path());
+    two_versions(&engine);
+    let policy = evidence(b"retain-current-roots");
+    let authorization = plan(&engine, retention(&engine, &policy, []), policy);
+    drop(engine);
+
+    let interrupted = open_with_fault(directory.path(), FaultPoint::AfterCompactionIntentFlush);
+    assert!(interrupted.compact(&authorization).is_err());
+    drop(interrupted);
+
+    let intent = std::fs::read(directory.path().join(COMPACTION_INTENT_FILE)).unwrap();
+    assert_eq!(&intent[..8], b"ASTCMP1\0");
+    assert_eq!(&intent[8..10], &1_u16.to_le_bytes());
+    assert_eq!(&intent[10..12], &[0, 0]);
+
+    let prepared = std::fs::read_dir(directory.path().join("gc-outbox"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "prepared")
+        })
+        .unwrap();
+    let outbox = std::fs::read(prepared).unwrap();
+    assert_eq!(&outbox[..8], b"ASTGCO1\0");
+    assert_eq!(&outbox[8..10], &1_u16.to_le_bytes());
+    assert_eq!(&outbox[10..12], &[0, 0]);
+}
+
+#[test]
 fn compaction_reclaims_only_unreachable_objects_and_preserves_root_generation() {
     let directory = tempfile::tempdir().unwrap();
     let engine = super::tests::open(directory.path());

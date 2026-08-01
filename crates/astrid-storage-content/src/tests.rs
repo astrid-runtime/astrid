@@ -10,8 +10,9 @@ use astrid_storage_model::{
 };
 
 use crate::{
-    CONTENT_LABEL, ChunkingProfile, ContentError, ContentReadError, ContentSource, FORMAT_VERSION,
-    build_content, describe_content, encode_file_header, read_content, read_content_range,
+    CHUNK_TREE_FANOUT, CONTENT_LABEL, ChunkingProfile, ContentError, ContentReadError,
+    ContentSource, FILE_HEADER_BYTES, FORMAT_VERSION, build_content, describe_content,
+    encode_file_header, read_content, read_content_range,
 };
 
 #[derive(Clone, Copy)]
@@ -525,6 +526,17 @@ fn invalid_profiles_and_ranges_are_rejected() {
             ContentError::RangeOutOfBounds { .. }
         ))
     ));
+}
+
+#[test]
+fn format_one_content_constants_are_stable() {
+    let profile = ChunkingProfile::ASTRID_V1;
+    assert_eq!(profile.minimum_bytes(), 16 * 1024);
+    assert_eq!(profile.average_bytes(), 64 * 1024);
+    assert_eq!(profile.maximum_bytes(), 256 * 1024);
+    assert_eq!(profile.gear_seed(), 0);
+    assert_eq!(CHUNK_TREE_FANOUT, 128);
+    assert_eq!(FILE_HEADER_BYTES, 40);
 }
 
 #[test]

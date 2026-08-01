@@ -50,11 +50,15 @@ pub(super) const PRE_BOTTOM_K_SKETCH_FORMAT_SPEC_ID: ObjectId = ObjectId::new([
     57, 145, 181, 144, 2, 201, 129, 253, 59, 86, 3, 186, 221, 78, 165, 179, 17, 67, 37, 48, 35,
     203, 169, 128, 80, 207, 199, 233, 40, 99, 138, 255,
 ]);
+pub(super) const PRE_MECHANICAL_AUDIT_FORMAT_SPEC_ID: ObjectId = ObjectId::new([
+    195, 253, 108, 67, 165, 182, 160, 95, 254, 17, 195, 57, 80, 44, 227, 80, 144, 246, 100, 62,
+    227, 7, 1, 119, 229, 128, 47, 193, 85, 210, 184, 192,
+]);
 const CONTENT_CATALOG_FORMAT_SPEC_ID: ObjectId = ObjectId::new([
     143, 57, 153, 176, 102, 182, 102, 57, 98, 89, 196, 169, 47, 157, 231, 197, 184, 230, 125, 249,
     211, 138, 105, 251, 79, 184, 36, 150, 139, 86, 236, 219,
 ]);
-const PRIOR_V1_FORMAT_SPEC_IDS: [ObjectId; 8] = [
+const PRIOR_V1_FORMAT_SPEC_IDS: [ObjectId; 9] = [
     PRE_DERIVATION_FORMAT_SPEC_ID,
     PRE_COMPACTION_FORMAT_SPEC_ID,
     PRE_GC_OUTBOX_FORMAT_SPEC_ID,
@@ -63,6 +67,7 @@ const PRIOR_V1_FORMAT_SPEC_IDS: [ObjectId; 8] = [
     PRE_SHA384_ATTESTATION_FORMAT_SPEC_ID,
     PRE_KV_TRANSITION_FORMAT_SPEC_ID,
     PRE_BOTTOM_K_SKETCH_FORMAT_SPEC_ID,
+    PRE_MECHANICAL_AUDIT_FORMAT_SPEC_ID,
 ];
 
 pub(super) fn format_spec_record() -> StorageResult<ObjectRecord> {

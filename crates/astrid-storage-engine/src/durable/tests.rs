@@ -124,6 +124,17 @@ pub(super) fn open(path: &Path) -> TestEngine {
     DurableEngine::open(path, TestIdentity, Utf8Codec, limits()).unwrap()
 }
 
+#[test]
+fn physical_frame_discriminants_are_stable() {
+    assert_eq!(ARENA_MAGIC, *b"ASTOBJ1\0");
+    assert_eq!(ROOT_MAGIC, *b"ASTROOT\0");
+    assert_eq!(INDEX_MAGIC, *b"ASTIDX1\0");
+    assert_eq!(FRAME_VERSION, 1);
+    assert_eq!(FRAME_HEADER_LEN, 52);
+    assert_eq!(FRAME_HEADER_LEN_USIZE, 52);
+    assert_eq!(CHECKSUM_START, 20);
+}
+
 fn open_with_fault(path: &Path, point: FaultPoint) -> TestEngine {
     DurableEngine::open_with_faults(
         path,

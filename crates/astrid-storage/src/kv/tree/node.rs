@@ -552,6 +552,18 @@ mod tests {
     }
 
     #[test]
+    fn format_four_page_constants_are_stable() {
+        assert_eq!(INLINE_VALUE_MAX, 1_024);
+        assert_eq!(NODE_MAX_RETAINED_BYTES, 4_096);
+        assert_eq!(NODE_MAX_ENTRIES, 64);
+        assert_eq!(MAX_TREE_LEVEL, 16);
+        assert_eq!(LEAF_MAGIC, b"astrid-kv-bplus-leaf-v1\0");
+        assert_eq!(BRANCH_MAGIC, b"astrid-kv-bplus-branch-v1\0");
+        assert_eq!(INLINE_VALUE, 0);
+        assert_eq!(SPILLED_VALUE, 1);
+    }
+
+    #[test]
     fn leaf_decode_rejects_unsorted_and_duplicate_keys() {
         for entries in [
             vec![inline(b"n\0b", b"x"), inline(b"n\0a", b"y")],
