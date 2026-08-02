@@ -454,6 +454,8 @@ use validation::{
 #[cfg(test)]
 mod compaction_tests;
 #[cfg(test)]
+mod crash_replay_tests;
+#[cfg(test)]
 mod group_tests;
 #[cfg(test)]
 mod index_tests;

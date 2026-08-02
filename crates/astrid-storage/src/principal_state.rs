@@ -506,4 +506,6 @@ pub async fn open_runtime_kv_with_directory(
 }
 
 #[cfg(test)]
+mod crash_replay_reader_tests;
+#[cfg(test)]
 mod runtime_tests;

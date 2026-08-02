@@ -92,12 +92,38 @@ Delivered:
 5. The principal-store-backed `KvStore` adapter has differential tests
    against `MemoryKvStore` and `SurrealKvStore`.
 6. Durable segments, a disposable index, a checksummed root journal, fault
-   injection, recovery, a persistent tree projection, and quota enforcement
-   support the native KV cutover. Compaction remains future work.
+   injection, recovery, verified compaction receipts, a persistent tree
+   projection, and quota enforcement support the native KV cutover.
 7. A canonical FastCDC content DAG and named principal content catalog share
    the same object arena, root CAS, and aggregate quota as KV. Full/range reads,
    alias accounting, cross-principal physical reuse, and concurrent mutations
    have executable regression coverage.
+
+### Crash-prefix evidence
+
+Named fault points remain useful diagnostics, but they are not the crash
+model. A test-only recorder captures the authoritative arena and root journal
+at each append, completed durability barrier, and acknowledgement boundary. It
+then derives an explicit ordered trace and generates:
+
+- every byte prefix of each incomplete append;
+- complete-length tail frames with zeroed or stale payload blocks;
+- reordered blocks within the final frame; and
+- an invalid frame followed by a physically valid frame.
+
+The persistence policy preserves write order and never moves a write backward
+across a completed file barrier. It permits any prefix before that barrier,
+including complete valid unacknowledged root frames. Consequently, a grouped
+commit may recover a valid subset of roots after power loss, but no caller was
+acknowledged; after acknowledgement, every member of the group must recover.
+
+Every generated image reopens through the production reader twice. Success is
+accepted only when every visible root appeared in the trace and its complete
+owned closure validates. A repair must be idempotent. Interior corruption must
+fail without changing either authority file. Selected Rust-produced images are
+also checked by the independent RÚNATAL reader. The harness proves this encoded
+persistence model; platform power-loss testing remains responsible for proving
+that a filesystem implements its advertised barriers.
 
 Remaining:
 

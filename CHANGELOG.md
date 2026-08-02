@@ -383,6 +383,16 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   250-microsecond gather interval under concurrency. The native KV probe
   improves eight-principal throughput from 122.8 to 875.1 strict commits per
   second without changing the acknowledgement boundary. Closes #1388.
+- **Durable recovery is checked against every recorded write prefix.** A
+  test-only recorder turns the engine's actual arena and root-journal states at
+  append, flush, and acknowledgement boundaries into a deterministic trace.
+  Normal CI replays every byte prefix for single, sequential, and grouped
+  commits, plus complete-length zeroed, stale, reordered, and interior-corrupt
+  frames, through the production opener twice. Accepted images recover only an
+  observed old or new root with a complete owned closure; acknowledged roots
+  never roll back; interior corruption never truncates. Selected production
+  identity fixtures are cross-checked with the independent RÚNATAL reader.
+  Refs #1393.
 
 ### Security
 
