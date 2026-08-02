@@ -541,12 +541,13 @@ pub(super) fn append_frame(
     })
 }
 
-pub(super) fn append_frames(
+pub(super) fn append_frames<T: AsRef<[u8]>>(
     file: &mut File,
     magic: [u8; 8],
-    payloads: &[Vec<u8>],
+    payloads: &[T],
 ) -> Result<Vec<ArenaLocation>, DurableError> {
     let capacity = payloads.iter().try_fold(0_usize, |total, payload| {
+        let payload = payload.as_ref();
         total
             .checked_add(FRAME_HEADER_LEN_USIZE)
             .and_then(|value| value.checked_add(payload.len()))
@@ -564,6 +565,7 @@ pub(super) fn append_frames(
         .seek(SeekFrom::End(0))
         .map_err(|source| io_error("seek durable batch append", source))?;
     for payload in payloads {
+        let payload = payload.as_ref();
         let payload_len =
             u64::try_from(payload.len()).map_err(|_| DurableError::EncodingOverflow)?;
         let checksum = frame_checksum(magic, payload_len, payload);

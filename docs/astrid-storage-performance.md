@@ -11,7 +11,7 @@ Selected raw outputs are preserved in
 Status: convergence and native-path baselines recorded; mounted-provider
 measurements pending
 
-Last reviewed: 2026-07-29
+Last reviewed: 2026-08-02
 
 Tracking:
 [#1398](https://github.com/astrid-runtime/astrid/issues/1398),
@@ -395,12 +395,25 @@ cold device read is faster than the substrate.
 | One-pass pipeline (`4193217f`) | 275.0 MiB/s | 353.1 MiB/s | 578.3 MiB/s |
 | Governed record reuse (`97df6492`) | 427.4 MiB/s | 646.5 MiB/s | 1,065.4 MiB/s |
 
-The focused durability probes recorded:
+The #1388 port was remeasured against its exact current-main parent
+`474a17d4`. Each cell is the median of three release-mode runs with 64 strict
+128-byte KV updates per principal through the complete async `TreeKvStore`
+path:
 
-- strict KV group commit (`aed1b3aa`): eight writers rose from 135 to
-  802.5 operations/s while one writer remained at 117.3 operations/s; and
-- staging intent journal (`32dc52fb`): strict 4 KiB seals rose from 43.7 to
-  71.8 seals/s for one writer and from 78.3 to 186.4 seals/s for eight.
+| Principals | Main ops/s | Grouped ops/s | Throughput scaling | Main p95 | Grouped p95 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 122.9 | 114.6 | 0.93× | 8.93 ms | 9.88 ms |
+| 2 | 123.6 | 220.3 | 1.78× | 17.06 ms | 10.03 ms |
+| 4 | 122.2 | 436.3 | 3.57× | 48.99 ms | 10.11 ms |
+| 8 | 122.8 | 875.1 | 7.13× | 105.58 ms | 10.04 ms |
+
+The isolated writer pays the intentional 250-microsecond gather delay and
+remains in the same one-flush-round regime. At eight principals, one arena
+flush and one root-journal flush are shared per observed group: aggregate
+throughput rises 7.13 times while p95 latency falls 10.52 times. The staging
+intent-journal experiment (`32dc52fb`) remains separate: strict 4 KiB seals
+rose from 43.7 to 71.8 seals/s for one writer and from 78.3 to 186.4 seals/s
+for eight.
 
 ### Catalog scaling
 

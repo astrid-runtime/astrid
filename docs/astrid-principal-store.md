@@ -493,6 +493,50 @@ A crash before step 4 leaves unreachable garbage. A crash after step 4 leaves a
 complete visible state. Recovery may remove the garbage; it must not repair a
 visible root by guessing.
 
+### 8.1 Grouped strict durability
+
+Concurrent strict commits may share the physical flush pair without sharing
+validity. `DurableEngine` queues caller-owned transactions, elects one queued
+caller as a temporary leader, and prepares a finite group in queue order under
+the engine mutation lock. Preparation remains individual: identity, collision,
+closure, root compare-and-swap, and encoding failures reject only that
+transaction before group I/O; projection-layer quota validation already occurs
+before submission. A tentative root map gives two transactions for the same
+principal the same ordering that the root journal will recover.
+
+The accepted group is persisted in this order:
+
+1. append all distinct immutable object frames;
+2. append every distinct immutable commit frame;
+3. flush the arena once;
+4. append accepted root-journal frames in queue order;
+5. flush the root journal once;
+6. advance the disposable persistent-index frontier over every arena frame
+   staged since its preceding durable frontier; and
+7. update in-memory roots and acknowledge each accepted caller.
+
+No accepted caller completes before both authoritative flushes. Invalid or
+stale transactions do not cancel unrelated accepted transactions. Once group
+I/O begins, an append, flush, injected-crash, or index-frontier invariant
+failure is shared fate: the engine enters `RequiresRecovery`, one caller may
+receive the initiating error, and every other accepted caller receives the
+recovery requirement. Reopen determines the authoritative root-journal prefix;
+the coordinator never guesses which writes reached durable media.
+
+The queue is finite per leader. Callers arriving during I/O form the next group
+and leadership passes to its oldest member, preventing an active leader from
+servicing an unbounded stream. `GroupCommitPolicy` controls only the gather
+delay: the default waits 250 microseconds, then one additional 250-microsecond
+interval when the queue is busy. Immediate and fixed-delay policies retain the
+same ordering and crash contract. This policy is neither persistent format nor
+a storage quota.
+
+Physical duplicate admission stays below the guest API line. The first queued
+transaction receives the privileged insertion diagnostic for a shared object;
+later transactions do not expose whether their bytes were already present.
+Measured throughput and latency remain in
+[`astrid-storage-performance.md`](astrid-storage-performance.md).
+
 ## 9. Provenance
 
 Content addressing proves byte integrity, not authorship. Astrid provenance is
