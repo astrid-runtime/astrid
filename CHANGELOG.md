@@ -387,6 +387,16 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   an exact, digest-bound approval that displays capability expansion.
   Installed authority snapshots prevent later manifest edits from silently
   acquiring additional host capabilities. Closes #1318.
+- **Concurrent principal commits share strict durability flushes.**
+  `DurableEngine` validates queued transactions independently, coalesces their
+  immutable frames, and publishes accepted roots with one arena flush followed
+  by one root-journal flush. Invalid or conflicting transactions fail without
+  cancelling unrelated principals, while any durability failure retains the
+  existing poison-and-recover shared fate. A reusable adaptive latency policy
+  keeps isolated-write delay at 250 microseconds and permits one additional
+  250-microsecond gather interval under concurrency. The native KV probe
+  improves eight-principal throughput from 123.2 to 870.3 strict commits per
+  second without changing the acknowledgement boundary. Closes #1388.
 
 ### Security
 
