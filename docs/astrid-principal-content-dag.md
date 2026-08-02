@@ -168,17 +168,41 @@ async callers must dispatch it through a blocking-worker boundary.
 Windows, and Linux filesystem providers. It is deliberately not a mount:
 
 1. a provider derives the `StateOwner` from its authenticated host context and
-   opens a private random-access native file;
+   opens `generations/<uuid>.open`, a private random-access native file;
 2. ordinary writes, seeks, and truncation touch only that file;
-3. the durable acknowledgement path calls `seal`, which flushes the bytes and
-   a versioned, checksummed intent before moving the directory into the ready
-   queue;
-4. `seal` returning is the provider acknowledgement boundary; chunking and
+3. the explicit durable path calls `seal`, which appends a checksummed
+   intent footer, synchronizes the generation, and renames it to
+   `<sequence>-<uuid>.sealed`;
+4. concurrent seals share one `generations/` synchronization and one flush of
+   the checksummed `intents.v1.log` lifecycle journal;
+5. `seal` returns only after that group durability boundary; chunking and
    object admission have not run;
-5. an ordered background consumer streams the file through
+6. an ordered background consumer streams only the recorded logical byte
+   prefix through
    `PrincipalContentStore` on a blocking worker; and
-6. only a successful principal-root CAS writes the durable publication marker
+7. only a successful principal-root CAS appends and flushes a publication record
    and permits conservative cleanup.
+
+The staging layout is flat and private:
+
+```text
+content-staging/
+  generations/
+    <uuid>.open
+    <sequence>-<uuid>.sealed
+  quarantine/
+  intents.v1.log
+```
+
+The footer stores the typed owner, content name, chunking profile, logical byte
+length, close sequence, and generation UUID in the current canonical staging
+intent encoding. A fixed trailer identifies the footer and its exact length.
+The journal contains independently framed and checksummed `Sealed` and
+`Published` records. Directory durability precedes the corresponding journal
+flush, so an acknowledged journal entry cannot legitimately name a generation
+whose directory entry was never made durable. `GroupCommitPolicy` changes only
+the gather latency; immediate mode preserves the same ordering and crash
+semantics.
 
 The close-order sequence is allocated at seal rather than open. Publication
 rejects a later close while an earlier close for the same owner and content
@@ -193,14 +217,28 @@ separately. A hosted filesystem must state whether ordinary close waits for
 `seal`, whether only `fsync` does, and how a provider-process crash recovers a
 closed but not yet durably sealed working transaction.
 
-A process crash before the intent leaves unacknowledged bytes that startup
-preserves under `quarantine/`. A crash after the intent but before the
-directory rename promotes the sealed write on reopen. A crash after the root
-CAS but before cleanup safely repeats the operation: exact bytes reproduce the
-same file identity, the already-current catalog returns the same root, and no
-new objects are admitted. Redirected sources, malformed markers, changed
-lengths, non-canonical queue names, and unexpected directory members fail
-closed without deleting acknowledged bytes.
+A process crash before journal acknowledgement leaves an `.open` generation
+that startup preserves under `quarantine/`, or a sealed generation whose valid
+checksummed footer reconstructs a torn seal record. A physically invalid final
+journal frame is truncated; a valid later frame makes the damage interior corruption
+and open fails. Journalled generations must retain their canonical name,
+private regular-file boundary, exact logical length, and matching footer. A
+torn publication tail with an already-missing generation fails closed rather
+than guessing whether publication completed.
+
+A crash after the root CAS but before the `Published` record safely repeats the
+operation: exact bytes reproduce the same file identity, the already-current
+catalog returns the same root, and no new objects are admitted. Once the
+publication record is durable, cleanup may remove the generation and sync the
+directory idempotently. The journal truncates only after both pending and
+completed sets are empty.
+
+The former `writing/` and `ready/` directory queues migrate under the singleton
+runtime lock. Alias-bearing `intent.v1` records first migrate to the canonical
+UID-bearing `intent.v2`; content then moves to the flat generation, gains a
+footer, and becomes journalled before legacy evidence is removed. Missing,
+torn, and complete new footers all resume from the retained old evidence.
+Malformed publication markers and changed acknowledged bytes fail closed.
 
 This private area is never a guest path. A platform provider must bind each
 open handle to a host-stamped principal and that principal's live resource
@@ -208,7 +246,11 @@ lease before exposing writes. The current increment supplies the common
 crash-safe lifecycle; provider adapters, staged-byte reservation accounting,
 parallel chunk/hash workers, change detection, and adopting the staged file as
 a contiguous physical representation remain tracked in
-[#1392](https://github.com/astrid-runtime/astrid/issues/1392).
+[#1392](https://github.com/astrid-runtime/astrid/issues/1392). The measured
+strict-path throughput and latency matrix lives in
+[Storage Performance and Convergence](astrid-storage-performance.md); the
+remaining seal floor is each participating content file's own synchronization,
+not per-entry intent ceremony.
 
 Canonical 128-way packing is positional. Appends and size-preserving
 replacements rewrite only affected root-to-leaf paths, but a middle insertion

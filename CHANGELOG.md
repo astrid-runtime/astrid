@@ -208,13 +208,19 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   flushes objects before the root, and retries root conflicts without rereading
   the source. Source or sink failure never publishes a partial root. Hosted
   writable projections can now stage random-access writes in private native
-  files and acknowledge a close after durable bytes plus a checksummed intent,
-  without waiting for content addressing. Startup promotes sealed pre-rename
-  writes, preserves incomplete entries for diagnosis, and rejects redirected
-  or malformed ready entries without deleting acknowledged bytes. Background
+  files and acknowledge an explicit durable close after durable bytes plus a
+  checksummed intent, without waiting for content addressing. Sealed files now
+  carry recoverable intent footers, while concurrent seals share one
+  checksummed append-only intent journal and group durability boundary instead
+  of creating and synchronizing an intent file and directory chain per close.
+  Startup reconstructs torn seal tails from checksummed file-local evidence,
+  preserves incomplete entries for diagnosis, and rejects redirected or
+  malformed ready entries without deleting acknowledged bytes. The previous
+  per-generation-directory queue migrates crash-safely under the singleton
+  runtime lock. Background
   publication runs on a blocking worker, enforces close order per owner and
-  content name, and uses a durable post-root marker so a crash between the root
-  CAS and cleanup retries idempotently.
+  content name, and appends a durable post-root journal record so a crash
+  between the root CAS and cleanup retries idempotently.
   Full and range reconstruction validate the typed graph and load only
   overlapping chunks. `PrincipalContentStore` publishes named content through
   the same per-principal root CAS and durable object arena as KV, so identical

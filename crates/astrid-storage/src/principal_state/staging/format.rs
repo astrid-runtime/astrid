@@ -1,5 +1,7 @@
 //! Versioned, checksummed publication-intent encoding.
 
+use std::fs::OpenOptions;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use astrid_core::principal::PrincipalId;
@@ -17,6 +19,10 @@ const INTENT_VERSION: u16 = 2;
 const LEGACY_INTENT_MAGIC: &[u8; 16] = b"ASTRID-STAGE-V1\0";
 const LEGACY_INTENT_VERSION: u16 = 1;
 const CHECKSUM_BYTES: usize = 32;
+const FOOTER_MAGIC: &[u8; 16] = b"ASTRID-STAGE-F1\0";
+const FOOTER_VERSION: u16 = 1;
+const FOOTER_BYTES: u64 = 32;
+const FOOTER_BYTES_USIZE: usize = 32;
 const FASTCDC_2020_ALGORITHM: u8 = 1;
 const FASTCDC_IMPLEMENTATION_REVISION: u16 = 1;
 const FASTCDC_NORMALIZATION: u8 = 1;
@@ -136,6 +142,96 @@ pub(super) fn load_intent(path: &Path) -> StorageResult<StagingIntent> {
         .map_err(|error| connection(format!("read staged intent {}: {error}", path.display())))?;
     decode_intent(&bytes)
         .map_err(|error| connection(format!("decode staged intent {}: {error}", path.display())))
+}
+
+pub(super) fn append_generation_footer(
+    file: &mut std::fs::File,
+    intent: &StagingIntent,
+) -> StorageResult<()> {
+    let encoded = encode_intent(intent)?;
+    let encoded_len = u64::try_from(encoded.len())
+        .map_err(|_| connection("staged generation footer length overflow".to_owned()))?;
+    let mut trailer = [0_u8; FOOTER_BYTES_USIZE];
+    trailer[..FOOTER_MAGIC.len()].copy_from_slice(FOOTER_MAGIC);
+    trailer[16..18].copy_from_slice(&FOOTER_VERSION.to_le_bytes());
+    trailer[24..32].copy_from_slice(&encoded_len.to_le_bytes());
+    file.seek(SeekFrom::End(0))
+        .and_then(|_| file.write_all(&encoded))
+        .and_then(|()| file.write_all(&trailer))
+        .map_err(|error| connection(format!("append staged generation footer: {error}")))
+}
+
+pub(super) fn load_generation_footer(path: &Path) -> StorageResult<StagingIntent> {
+    let physical_bytes = validate_private_regular_file(path)?;
+    let trailer_offset = physical_bytes.checked_sub(FOOTER_BYTES).ok_or_else(|| {
+        connection(format!(
+            "staged generation {} has no footer",
+            path.display()
+        ))
+    })?;
+    let mut file = OpenOptions::new().read(true).open(path).map_err(|error| {
+        connection(format!(
+            "open staged generation footer {}: {error}",
+            path.display()
+        ))
+    })?;
+    file.seek(SeekFrom::Start(trailer_offset))
+        .map_err(|error| connection(format!("seek staged generation footer: {error}")))?;
+    let mut trailer = [0_u8; FOOTER_BYTES_USIZE];
+    file.read_exact(&mut trailer)
+        .map_err(|error| connection(format!("read staged generation footer: {error}")))?;
+    if trailer[..16] != FOOTER_MAGIC[..] {
+        return Err(connection(format!(
+            "staged generation {} footer magic mismatch",
+            path.display()
+        )));
+    }
+    if u16::from_le_bytes([trailer[16], trailer[17]]) != FOOTER_VERSION {
+        return Err(connection(format!(
+            "staged generation {} footer version is unsupported",
+            path.display()
+        )));
+    }
+    if trailer[18..24] != [0; 6] {
+        return Err(connection(format!(
+            "staged generation {} footer reserved bytes are non-zero",
+            path.display()
+        )));
+    }
+    let intent_bytes = u64::from_le_bytes(
+        trailer[24..32]
+            .try_into()
+            .map_err(|_| connection("staged footer length width mismatch".to_owned()))?,
+    );
+    let intent_offset = trailer_offset.checked_sub(intent_bytes).ok_or_else(|| {
+        connection(format!(
+            "staged generation {} footer length exceeds the file",
+            path.display()
+        ))
+    })?;
+    let intent_len = usize::try_from(intent_bytes)
+        .map_err(|_| connection("staged footer is not addressable".to_owned()))?;
+    let mut encoded = Vec::new();
+    encoded
+        .try_reserve_exact(intent_len)
+        .map_err(|_| connection("staged footer allocation failed".to_owned()))?;
+    encoded.resize(intent_len, 0);
+    file.seek(SeekFrom::Start(intent_offset))
+        .and_then(|_| file.read_exact(&mut encoded))
+        .map_err(|error| connection(format!("read staged generation intent footer: {error}")))?;
+    let intent = decode_intent(&encoded).map_err(|error| {
+        connection(format!(
+            "decode staged generation footer {}: {error}",
+            path.display()
+        ))
+    })?;
+    if intent.logical_bytes != intent_offset {
+        return Err(connection(format!(
+            "staged generation {} footer does not follow its logical bytes",
+            path.display()
+        )));
+    }
+    Ok(intent)
 }
 
 pub(super) fn decode_intent(bytes: &[u8]) -> Result<StagingIntent, &'static str> {

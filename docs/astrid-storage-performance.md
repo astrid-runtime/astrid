@@ -395,10 +395,25 @@ cold device read is faster than the substrate.
 | One-pass pipeline (`4193217f`) | 275.0 MiB/s | 353.1 MiB/s | 578.3 MiB/s |
 | Governed record reuse (`97df6492`) | 427.4 MiB/s | 646.5 MiB/s | 1,065.4 MiB/s |
 
-The focused durability probes recorded:
+#### Grouped staging seals
 
-- staging intent journal (`32dc52fb`): strict 4 KiB seals rose from 43.7 to
-  71.8 seals/s for one writer and from 78.3 to 186.4 seals/s for eight.
+An explicit durable seal still synchronizes each participating generation's
+bytes. Concurrent seals then share one generation-directory synchronization
+and one lifecycle-journal synchronization. Ordinary provider close remains a
+separate, weaker latency boundary; these numbers measure strict 4 KiB seals.
+
+The release-mode APFS probe performs 64 seals per writer and reports medians
+across three samples:
+
+| Writers | Per-entry intents | Grouped journal | Change | Grouped p95 | Maximum |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 43.7 seals/s | 71.0 seals/s | 1.62x | 14.60 ms | 14.96 ms |
+| 2 | 53.4 seals/s | 78.5 seals/s | 1.47x | 27.44 ms | 30.45 ms |
+| 4 | 61.5 seals/s | 133.4 seals/s | 2.17x | 38.55 ms | 46.45 ms |
+| 8 | 78.3 seals/s | 184.0 seals/s | 2.35x | 53.02 ms | 71.61 ms |
+
+The remaining strict-path floor is the per-generation file synchronization;
+shared intent ceremony is no longer multiplied per seal.
 
 #### Grouped strict commits
 
