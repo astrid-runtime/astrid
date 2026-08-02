@@ -1,12 +1,14 @@
 use std::collections::BTreeMap;
 use std::io::{self, Read};
 
-use astrid_storage_model::{ObjectId, ObjectRecord};
+use astrid_storage_model::{ObjectId, ObjectIdentity, ObjectKind, ObjectRecord};
 
 use super::tests::{TestIdentity, deterministic_bytes};
+use crate::build::{Child, tree_record};
+use crate::stream::TreeAccumulator;
 use crate::{
-    ChunkingProfile, ContentError, ContentObjectSink, ContentStreamError, build_content,
-    build_content_streaming, insert_record,
+    CHUNK_TREE_FANOUT, ChunkingProfile, ContentError, ContentObjectSink, ContentStreamError,
+    build_content, build_content_streaming, insert_record,
 };
 
 struct CollectingSink {
@@ -91,7 +93,6 @@ fn assert_stream_matches_slice(profile: ChunkingProfile, bytes: &[u8], fragment:
     let streamed = build_content_streaming(profile, &mut source, &mut sink).unwrap();
 
     assert_eq!(streamed.descriptor(), expected.descriptor());
-    assert_eq!(streamed.unique_chunks(), expected.unique_chunks());
     assert_eq!(
         sink.records.into_iter().collect::<Vec<_>>(),
         expected.records()
@@ -124,7 +125,112 @@ fn streaming_preserves_the_whole_small_file_rule() {
     let streamed = build_content_streaming(profile, bytes.as_slice(), &mut sink).unwrap();
 
     assert_eq!(streamed.descriptor().chunk_count(), 1);
-    assert_eq!(streamed.unique_chunks(), 1);
+    assert_eq!(streamed.peak_pending_tree_children(), 1);
+}
+
+fn synthetic_child(index: usize) -> Child {
+    let mut identity = [0x5a_u8; 32];
+    identity[..8].copy_from_slice(&u64::try_from(index).unwrap().to_le_bytes());
+    Child {
+        id: ObjectId::new(identity),
+        logical_bytes: u64::try_from(index % 17).unwrap().checked_add(1).unwrap(),
+        chunk_count: 1,
+    }
+}
+
+fn reference_tree(
+    sink: &mut CollectingSink,
+    mut level: Vec<Child>,
+) -> Result<Option<Child>, ContentError> {
+    if level.is_empty() {
+        return Ok(None);
+    }
+    if level.len() == 1 {
+        return Ok(level.pop());
+    }
+    while level.len() > 1 {
+        let mut next = Vec::with_capacity(level.len().div_ceil(CHUNK_TREE_FANOUT));
+        for children in level.chunks(CHUNK_TREE_FANOUT) {
+            let (record, logical_bytes, chunk_count) = tree_record(children)?;
+            let id = sink.stage_content_object(record)?;
+            next.push(Child {
+                id,
+                logical_bytes,
+                chunk_count,
+            });
+        }
+        level = next;
+    }
+    Ok(level.pop())
+}
+
+#[test]
+fn eager_tree_emission_matches_canonical_fanout_boundaries() {
+    for count in [
+        0,
+        1,
+        CHUNK_TREE_FANOUT - 1,
+        CHUNK_TREE_FANOUT,
+        CHUNK_TREE_FANOUT + 1,
+        CHUNK_TREE_FANOUT + 2,
+        CHUNK_TREE_FANOUT * CHUNK_TREE_FANOUT - 1,
+        CHUNK_TREE_FANOUT * CHUNK_TREE_FANOUT,
+        CHUNK_TREE_FANOUT * CHUNK_TREE_FANOUT + 1,
+    ] {
+        let children: Vec<_> = (0..count).map(synthetic_child).collect();
+        let mut expected_sink = CollectingSink::new();
+        let expected = reference_tree(&mut expected_sink, children.clone()).unwrap();
+        let mut actual_sink = CollectingSink::new();
+        let mut accumulator = TreeAccumulator::new();
+        for child in children {
+            accumulator.push(&mut actual_sink, child).unwrap();
+        }
+        let (actual, peak) = accumulator.finish(&mut actual_sink).unwrap();
+
+        assert_eq!(actual, expected, "root differs at {count} children");
+        assert_eq!(
+            actual_sink.records, expected_sink.records,
+            "records differ at {count} children"
+        );
+        assert!(
+            peak <= CHUNK_TREE_FANOUT.saturating_mul(4),
+            "retained {peak} children at {count} inputs"
+        );
+    }
+}
+
+struct DiscardingSink {
+    staged: usize,
+}
+
+impl ContentObjectSink for DiscardingSink {
+    type Error = ContentError;
+
+    fn stage_content_object(&mut self, record: ObjectRecord) -> Result<ObjectId, Self::Error> {
+        self.staged = self
+            .staged
+            .checked_add(1)
+            .ok_or(ContentError::LengthOverflow)?;
+        Ok(TestIdentity.identify(&record))
+    }
+}
+
+#[test]
+fn tree_metadata_stays_bounded_for_a_virtual_64_gib_stream() {
+    const VIRTUAL_CHUNKS: usize = 1024 * 1024;
+    let mut sink = DiscardingSink { staged: 0 };
+    let mut accumulator = TreeAccumulator::new();
+    for index in 0..VIRTUAL_CHUNKS {
+        accumulator.push(&mut sink, synthetic_child(index)).unwrap();
+    }
+    let (root, peak) = accumulator.finish(&mut sink).unwrap();
+
+    assert!(root.is_some());
+    assert!(sink.staged > VIRTUAL_CHUNKS / CHUNK_TREE_FANOUT);
+    assert!(
+        peak <= CHUNK_TREE_FANOUT.saturating_mul(4),
+        "one million chunks retained {peak} live child records"
+    );
 }
 
 #[test]
@@ -183,4 +289,35 @@ fn sink_failure_is_preserved_without_a_descriptor() {
     let result = build_content_streaming(profile, bytes.as_slice(), &mut sink);
 
     assert!(matches!(result, Err(ContentStreamError::Sink(SinkFailure))));
+}
+
+struct TreeFailingSink {
+    file_seen: bool,
+}
+
+impl ContentObjectSink for TreeFailingSink {
+    type Error = SinkFailure;
+
+    fn stage_content_object(&mut self, record: ObjectRecord) -> Result<ObjectId, Self::Error> {
+        match record.kind() {
+            ObjectKind::ChunkTree => Err(SinkFailure),
+            ObjectKind::File => {
+                self.file_seen = true;
+                Ok(TestIdentity.identify(&record))
+            },
+            _ => Ok(TestIdentity.identify(&record)),
+        }
+    }
+}
+
+#[test]
+fn eager_tree_sink_failure_never_emits_a_file_descriptor() {
+    let profile = ChunkingProfile::fastcdc_v2020(64, 256, 1024, 0).unwrap();
+    let bytes = deterministic_bytes(256 * 1024);
+    let mut sink = TreeFailingSink { file_seen: false };
+
+    let result = build_content_streaming(profile, bytes.as_slice(), &mut sink);
+
+    assert!(matches!(result, Err(ContentStreamError::Sink(SinkFailure))));
+    assert!(!sink.file_seen);
 }

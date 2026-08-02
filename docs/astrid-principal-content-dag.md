@@ -148,6 +148,12 @@ Source memory is bounded by a constant multiple of the profile maximum
 aggregate tree metadata remain proportional to the chunk count. Every reader
 fragmentation produces the same descriptor and canonical object DAG as the
 slice builder, including the one-whole-chunk rule at or below 256 KiB.
+Completed 128-child `ChunkTree` nodes are emitted eagerly. The builder retains
+only the unfinished right edge at each active level, so live tree metadata is
+`O(tree depth * fanout)` rather than `O(chunk count)`. It deliberately does not
+compute an exact distinct-chunk count: that diagnostic requires a set or spill
+state proportional to the chunk count and is not part of file identity. The
+whole-slice builder and offline evidence tools may still calculate it.
 
 `PrincipalContentStore::put_streaming` binds that sink to the shared projection
 engine. It buffers records to a four-MiB staging target; the durable engine

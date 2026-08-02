@@ -11,7 +11,7 @@ Selected raw outputs are preserved in
 Status: convergence and native-path baselines recorded; mounted-provider
 measurements pending
 
-Last reviewed: 2026-07-29
+Last reviewed: 2026-08-02
 
 Tracking:
 [#1398](https://github.com/astrid-runtime/astrid/issues/1398),
@@ -401,6 +401,27 @@ The focused durability probes recorded:
   802.5 operations/s while one writer remained at 117.3 operations/s; and
 - staging intent journal (`32dc52fb`): strict 4 KiB seals rose from 43.7 to
   71.8 seals/s for one writer and from 78.3 to 186.4 seals/s for eight.
+
+### Bounded streaming construction
+
+The #1392 streaming-builder change was compared directly with its exact parent
+`474a17d4` using a 128 MiB deterministic source, four-MiB input blocks, three
+release-mode samples, and the `astrid_content_build_compute` workload:
+
+| Code state | Median | Throughput | Live tree metadata |
+| --- | ---: | ---: | ---: |
+| Exact parent | 164.89 ms | 776.3 MiB/s | `O(chunk count)` |
+| Eager canonical tree emission | 159.04 ms | 804.8 MiB/s | `O(depth * 128)` |
+
+Throughput improved by 3.7% in this diagnostic; the important result is that
+the memory bound changed without a throughput regression. A synthetic
+1,048,576-chunk construction, equivalent to 64 GiB at the selected profile's
+64 KiB average, retained no more than 512 child summaries while producing the
+same canonical roots and nodes as the batch algorithm at every tested fanout
+boundary. Exact distinct-chunk counting was removed from the streaming path
+because an exact set is itself `O(chunk count)`; the offline evidence tool and
+whole-buffer builder retain that diagnostic. This compute-only result excludes
+durable admission, publication, and filesystem I/O.
 
 ### Catalog scaling
 
