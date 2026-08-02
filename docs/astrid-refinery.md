@@ -173,6 +173,9 @@ representations, and writes remain metered and reported.
 At least one recoverable representation of every live ObjectId remains
 reachable throughout publication. Compaction never exposes a window where the
 new placement is authoritative before its complete closure is durable.
+The binding catalog, dependency liveness, replacement order, and cost model are
+fixed by [Exact-Byte Physical Representations](astrid-physical-representations.md);
+Refinery passes do not define a second encoding path.
 
 ## Evidence shape
 

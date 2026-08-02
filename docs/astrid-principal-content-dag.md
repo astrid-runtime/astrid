@@ -395,7 +395,8 @@ This increment does not provide:
 - directory trees, symlinks, executable metadata, or atomic rename;
 - capsule WIT/host calls before the interface freeze is lifted;
 - staged-byte reservation accounting, bulk-ingest transactions, or staged-file
-  adoption as a physical representation;
+  adoption through the shared
+  [exact-byte physical-representation seam](astrid-physical-representations.md);
 - encryption and erasure-domain key management;
 - semantic equivalence contracts and trusted representation selection;
 - compaction or online garbage collection;

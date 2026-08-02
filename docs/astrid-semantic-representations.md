@@ -4,6 +4,11 @@ This document specifies how Astrid may recognize that different exact byte
 objects represent the same typed value without confusing equivalence with byte
 identity, similarity, authority, or safe interchangeability.
 
+[Exact-Byte Physical Representations](astrid-physical-representations.md)
+defines multiple encodings that reconstruct one unchanged `ObjectId`. This
+document begins only when distinct exact objects may be equal under a typed
+semantic contract.
+
 It is a design contract, not an activated capsule interface. The current
 principal content store identifies exact canonical object records only. A
 future capsule-facing transformation interface changes WIT and therefore
