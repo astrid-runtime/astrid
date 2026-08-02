@@ -1,0 +1,57 @@
+Astrid durable staging-seal benchmark
+======================================
+
+Host
+----
+macOS 26.2 (25C56), arm64, Apple M2 Ultra
+
+Comparison
+----------
+baseline:  d9af426f9988b43d85abb08409d7cc6087ef7e93
+candidate: a8f56dbd450af848567c878870476ec115958d3c
+
+The baseline worktree was detached at the exact candidate parent and differed
+only by the ignored probe copied from the candidate. Each revision used its
+own release target directory; no compiled benchmark binary was shared.
+
+Command
+-------
+cargo test --release -p astrid-storage native_seal_group_scale_probe -- --ignored --nocapture
+
+Workload
+--------
+For each concurrency point, every writer sealed 64 independent 4 KiB files.
+Each seal flushed the content and returned only after its implementation's
+durable intent boundary. Three fresh-directory samples were collected per
+point. Tables in the canonical performance document report the median sample
+for throughput and p95 latency independently.
+
+Baseline raw output
+-------------------
+native_seal_group writers=1 sample=0 operations=64 seals_per_second=43.0 p50_us=22766 p95_us=24653 max_us=27664 wall_ms=1487
+native_seal_group writers=1 sample=1 operations=64 seals_per_second=45.6 p50_us=21603 p95_us=23739 max_us=25739 wall_ms=1404
+native_seal_group writers=1 sample=2 operations=64 seals_per_second=47.3 p50_us=20656 p95_us=22695 max_us=23553 wall_ms=1354
+native_seal_group writers=2 sample=0 operations=128 seals_per_second=60.4 p50_us=32609 p95_us=37630 max_us=38598 wall_ms=2119
+native_seal_group writers=2 sample=1 operations=128 seals_per_second=59.8 p50_us=33581 p95_us=37793 max_us=39589 wall_ms=2140
+native_seal_group writers=2 sample=2 operations=128 seals_per_second=58.9 p50_us=33606 p95_us=38623 max_us=38814 wall_ms=2173
+native_seal_group writers=4 sample=0 operations=256 seals_per_second=61.1 p50_us=57481 p95_us=73083 max_us=82405 wall_ms=4187
+native_seal_group writers=4 sample=1 operations=256 seals_per_second=62.0 p50_us=56455 p95_us=67575 max_us=72649 wall_ms=4125
+native_seal_group writers=4 sample=2 operations=256 seals_per_second=61.9 p50_us=56505 p95_us=68677 max_us=74617 wall_ms=4133
+native_seal_group writers=8 sample=0 operations=512 seals_per_second=76.1 p50_us=81571 p95_us=107643 max_us=124362 wall_ms=6728
+native_seal_group writers=8 sample=1 operations=512 seals_per_second=76.7 p50_us=81584 p95_us=104616 max_us=124371 wall_ms=6672
+native_seal_group writers=8 sample=2 operations=512 seals_per_second=78.0 p50_us=79665 p95_us=101496 max_us=135182 wall_ms=6561
+
+Candidate raw output
+--------------------
+native_seal_group writers=1 sample=0 operations=64 seals_per_second=71.7 p50_us=13740 p95_us=14969 max_us=24502 wall_ms=892
+native_seal_group writers=1 sample=1 operations=64 seals_per_second=74.9 p50_us=12863 p95_us=13904 max_us=15740 wall_ms=853
+native_seal_group writers=1 sample=2 operations=64 seals_per_second=74.9 p50_us=12894 p95_us=13930 max_us=14938 wall_ms=854
+native_seal_group writers=2 sample=0 operations=128 seals_per_second=92.6 p50_us=20818 p95_us=26786 max_us=33759 wall_ms=1381
+native_seal_group writers=2 sample=1 operations=128 seals_per_second=110.2 p50_us=16889 p95_us=22703 max_us=26225 wall_ms=1162
+native_seal_group writers=2 sample=2 operations=128 seals_per_second=108.5 p50_us=16901 p95_us=25580 max_us=26722 wall_ms=1179
+native_seal_group writers=4 sample=0 operations=256 seals_per_second=154.2 p50_us=25783 p95_us=30671 max_us=38933 wall_ms=1660
+native_seal_group writers=4 sample=1 operations=256 seals_per_second=147.8 p50_us=26769 p95_us=29790 max_us=45856 wall_ms=1731
+native_seal_group writers=4 sample=2 operations=256 seals_per_second=151.0 p50_us=26585 p95_us=29620 max_us=39783 wall_ms=1694
+native_seal_group writers=8 sample=0 operations=512 seals_per_second=216.8 p50_us=34752 p95_us=48159 max_us=67414 wall_ms=2361
+native_seal_group writers=8 sample=1 operations=512 seals_per_second=207.2 p50_us=36305 p95_us=51250 max_us=71393 wall_ms=2471
+native_seal_group writers=8 sample=2 operations=512 seals_per_second=235.7 p50_us=32554 p95_us=43294 max_us=57185 wall_ms=2172

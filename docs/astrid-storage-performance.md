@@ -285,6 +285,22 @@ into quantified acceptance gates:
   amortization. Group commit in #1388 owns this gate. Warm KV reads were about
   20 microseconds and the `spawn_blocking` adapter floor was 3.8 microseconds;
   neither is an optimization target.
+- Native staging seals now batch the directory and intent-journal durability
+  boundaries. The exact-parent comparison used 64 independent 4 KiB seals per
+  writer, three samples per point, and reports the median sample:
+
+  | Concurrent writers | Per-entry baseline | Batched journal | Throughput gain | Baseline p95 | Batched p95 |
+  | ---: | ---: | ---: | ---: | ---: | ---: |
+  | 1 | 45.6 seals/s | 74.9 seals/s | 1.64x | 23.74 ms | 13.93 ms |
+  | 2 | 59.8 seals/s | 108.5 seals/s | 1.81x | 37.79 ms | 25.58 ms |
+  | 4 | 61.9 seals/s | 151.0 seals/s | 2.44x | 68.68 ms | 29.79 ms |
+  | 8 | 76.7 seals/s | 216.8 seals/s | 2.83x | 104.62 ms | 48.16 ms |
+
+  A lone durable seal is also faster because the flat journal removes the
+  per-entry temporary-intent and directory-flush sequence; concurrency then
+  amortizes the two remaining durability boundaries. Ordinary hosted close is
+  still a distinct provider policy decision and need not synchronously pay
+  this durable-seal cost.
 - Flat-catalog read cost measured 0.26 microseconds per entry per request:
   88 microseconds at 250 entries and 1,063 microseconds at 4,000. The slope
   extrapolates, but has not yet been measured, at about 60 milliseconds per
@@ -410,10 +426,10 @@ path:
 The isolated writer pays the intentional 250-microsecond gather delay and
 remains in the same one-flush-round regime. At eight principals, one arena
 flush and one root-journal flush are shared per observed group: aggregate
-throughput rises 7.06 times while p95 latency falls 10.46 times. The staging
-intent-journal experiment (`32dc52fb`) remains separate: strict 4 KiB seals
-rose from 43.7 to 71.8 seals/s for one writer and from 78.3 to 186.4 seals/s
-for eight.
+throughput rises 7.06 times while p95 latency falls 10.46 times. Staging uses
+the same gather-policy abstraction but a separate durability journal. Its
+exact-parent result in `a8f56dbd` raises strict 4 KiB seals from 45.6 to 74.9
+seals/s for one writer and from 76.7 to 216.8 seals/s for eight.
 
 ### Catalog scaling
 

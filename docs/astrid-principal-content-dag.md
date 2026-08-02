@@ -168,22 +168,35 @@ async callers must dispatch it through a blocking-worker boundary.
 Windows, and Linux filesystem providers. It is deliberately not a mount:
 
 1. a provider derives the `StateOwner` from its authenticated host context and
-   opens a private random-access native file;
+   opens a private `<uuid>.open` random-access native file;
 2. ordinary writes, seeks, and truncation touch only that file;
-3. the durable acknowledgement path calls `seal`, which flushes the bytes and
-   a versioned, checksummed intent before moving the directory into the ready
-   queue;
-4. `seal` returning is the provider acknowledgement boundary; chunking and
-   object admission have not run;
-5. an ordered background consumer streams the file through
+3. the durable acknowledgement path appends a versioned, checksummed intent
+   footer, synchronizes the generation, and renames it to
+   `<sequence>-<uuid>.sealed`;
+4. concurrent seals share one generation-directory synchronization followed
+   by one append and synchronization of `intents.v1.log`;
+5. `seal` returns only after both durability boundaries; chunking and object
+   admission have not run;
+6. an ordered background consumer streams only the recorded logical prefix
+   through
    `PrincipalContentStore` on a blocking worker; and
-6. only a successful principal-root CAS writes the durable publication marker
-   and permits conservative cleanup.
+7. only a successful principal-root CAS appends and synchronizes a `Published`
+   journal record before conservative cleanup.
+
+The journal uses independently checksummed, length-delimited frames. `Sealed`
+records contain the complete typed intent; `Published` records identify its
+sequence and UUID. The directory synchronization precedes the journal
+synchronization, so a durable intent cannot legitimately name a generation
+whose rename was not durable. A seal-group failure poisons staging until
+reopen, and no participant resolves before the journal synchronization.
+`GroupCommitPolicy` changes only the short gather window.
 
 The close-order sequence is allocated at seal rather than open. Publication
 rejects a later close while an earlier close for the same owner and content
-name remains queued, so a slow old handle cannot overwrite a newer result.
-Different names do not share this ordering dependency.
+name remains active or queued. A close that is still synchronizing therefore
+cannot disappear from the ordering check, and a slow old handle cannot
+overwrite a newer result. Different names do not share this ordering
+dependency.
 
 A provider must not silently equate this stronger durable acknowledgement with
 an ordinary host `close`. The benchmark contract in
@@ -193,14 +206,24 @@ separately. A hosted filesystem must state whether ordinary close waits for
 `seal`, whether only `fsync` does, and how a provider-process crash recovers a
 closed but not yet durably sealed working transaction.
 
-A process crash before the intent leaves unacknowledged bytes that startup
-preserves under `quarantine/`. A crash after the intent but before the
-directory rename promotes the sealed write on reopen. A crash after the root
-CAS but before cleanup safely repeats the operation: exact bytes reproduce the
+A process crash before the journal boundary leaves either an `.open`
+generation, which startup preserves under `quarantine/`, or a valid sealed
+generation whose authenticated footer can reconstruct a torn journal tail. A
+valid later journal frame turns damage into interior corruption and open fails
+rather than truncating it. A crash after the root CAS but before the durable
+`Published` record safely repeats the operation: exact bytes reproduce the
 same file identity, the already-current catalog returns the same root, and no
-new objects are admitted. Redirected sources, malformed markers, changed
-lengths, non-canonical queue names, and unexpected directory members fail
-closed without deleting acknowledged bytes.
+new objects are admitted. A durable `Published` record makes interrupted file
+cleanup idempotent. Redirected files, duplicate sequences or identifiers,
+changed footers, and non-canonical generation names fail closed without
+deleting acknowledged bytes.
+
+The former `writing/` and `ready/` directory queues migrate under the runtime
+singleton lock. Alias-owned intent v1 is first rewritten to the current
+UID-owned, tagged-profile intent by the registered owner migration. Staging
+then moves the legacy content, writes and synchronizes its footer, persists the
+flat namespace and journal record, and removes the old evidence last. A crash
+at any prefix resumes from either the legacy intent or the new footer.
 
 This private area is never a guest path. A platform provider must bind each
 open handle to a host-stamped principal and that principal's live resource
