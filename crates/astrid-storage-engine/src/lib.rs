@@ -35,9 +35,9 @@ mod refinery;
 pub use durable::{
     CompactionEvidenceBundle, CompactionFacts, CompactionProofVerifier, CompactionReport,
     CompactionRetainedRoot, CompactionRetention, CompactionRootKind, DurableEngine, DurableError,
-    FaultInjector, FaultPoint, IdentityScheme, NoFaults, ObjectCacheCapacity, ObjectCacheConfig,
-    ObjectCacheController, ObjectCacheStats, PersistentObjectIdentity, PrincipalCodec,
-    PrincipalObjectCacheBudget, RecoveryLimits, VerifiedCompactionPlan,
+    FaultInjector, FaultPoint, GroupCommitPolicy, IdentityScheme, NoFaults, ObjectCacheCapacity,
+    ObjectCacheConfig, ObjectCacheController, ObjectCacheStats, PersistentObjectIdentity,
+    PrincipalCodec, PrincipalObjectCacheBudget, RecoveryLimits, VerifiedCompactionPlan,
 };
 pub use kv::{
     KvProjectionEngine, KvProjectionError, KvState, KvStateSnapshot, commit_kv_with_engine,

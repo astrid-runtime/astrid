@@ -347,6 +347,8 @@ pub struct DurableEngine<P: Ord, I, C> {
     lifecycle: AtomicU8,
     arena_reader: RwLock<Option<ArenaReader>>,
     object_cache: ObjectCache<P>,
+    group_policy: GroupCommitPolicy,
+    commit_group: Mutex<CommitGroup<P>>,
     inner: Mutex<DurableInner<P>>,
 }
 
@@ -355,6 +357,7 @@ impl<P: Ord, I, C> fmt::Debug for DurableEngine<P, I, C> {
         formatter
             .debug_struct("DurableEngine")
             .field("limits", &self.limits)
+            .field("group_policy", &self.group_policy)
             .finish_non_exhaustive()
     }
 }
@@ -386,8 +389,8 @@ struct Prepared<P: Ord> {
     principal: P,
     root: RootState,
     objects_inserted: u64,
-    objects: Vec<(ObjectId, Vec<u8>)>,
-    commit: Option<(ObjectId, Vec<u8>)>,
+    objects: Vec<(ObjectId, Arc<[u8]>)>,
+    commit: Option<(ObjectId, Arc<[u8]>)>,
     journal: Vec<u8>,
     validated: BTreeSet<ObjectId>,
 }
@@ -413,6 +416,7 @@ mod cache;
 mod compaction;
 mod faults;
 mod format;
+mod group;
 mod index;
 mod lifecycle;
 mod restore;
@@ -438,6 +442,8 @@ use format::{
 };
 #[cfg(test)]
 use format::{frame_checksum, last_batch_spans};
+use group::CommitGroup;
+pub use group::GroupCommitPolicy;
 use index::{IndexState, recover_index, replace_index};
 use roots::{encode_root_record, encode_root_snapshot, recover_roots};
 use validation::{
@@ -447,6 +453,8 @@ use validation::{
 
 #[cfg(test)]
 mod compaction_tests;
+#[cfg(test)]
+mod group_tests;
 #[cfg(test)]
 mod index_tests;
 #[cfg(test)]

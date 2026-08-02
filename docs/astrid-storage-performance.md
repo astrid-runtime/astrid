@@ -397,10 +397,40 @@ cold device read is faster than the substrate.
 
 The focused durability probes recorded:
 
-- strict KV group commit (`aed1b3aa`): eight writers rose from 135 to
-  802.5 operations/s while one writer remained at 117.3 operations/s; and
 - staging intent journal (`32dc52fb`): strict 4 KiB seals rose from 43.7 to
   71.8 seals/s for one writer and from 78.3 to 186.4 seals/s for eight.
+
+#### Grouped strict commits
+
+Concurrent principal commits are prepared in queue order under the engine
+mutation lock. A validity failure remains local to its transaction; accepted
+transactions append their existing immutable frames without an aggregate
+payload copy, share one arena flush and one root-journal flush, and resolve
+only after the root flush. An I/O failure is shared fate for the accepted
+group and moves the engine to recovery-required state. The disposable
+persistent index advances only after authoritative root publication and
+contains every grouped arena location.
+
+The default latency policy waits 250 microseconds for an initial group and
+extends once by 250 microseconds when the queue is busy. Immediate and
+fixed-delay policies retain the same crash semantics. The queue is finite per
+leader handoff, so a writer arriving after the cutoff cannot be starved by an
+unbounded batch.
+
+The post-format-freeze integration was measured through the complete async
+`TreeKvStore` path on APFS: 64 strict 128-byte writes per principal, three
+release-mode samples. Throughput and latency below are medians across those
+samples.
+
+| Principals | Before ops/s | Grouped ops/s | Aggregate p95 | Maximum |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 117 | 114.0 | 9.96 ms | 11.83 ms |
+| 2 | 111 | 215.1 | 10.13 ms | 10.28 ms |
+| 4 | not recorded | 415.1 | 11.01 ms | 11.38 ms |
+| 8 | 135 | 802.4 | 11.10 ms | 11.28 ms |
+
+Eight-principal aggregate throughput is 5.94 times the prior serialized
+baseline while the single-principal result remains within host variance.
 
 ### Catalog scaling
 
