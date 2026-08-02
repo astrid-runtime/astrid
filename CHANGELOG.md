@@ -103,6 +103,17 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   freedom-to-operate records pin the associated format, chunking, identity,
   and public-layer research decisions without activating a capsule or WIT
   surface.
+- **The kernel resource model now has a shared resident-memory authority.**
+  Coarse RAII leases keep actual physical reservations separate from
+  per-principal logical charges, so shared bytes are reserved once but charged
+  in full to every user without creating a sharing oracle. Principal authority
+  attenuates through parent/child trees, concurrent admission cannot exceed
+  the operator pool, and live pool reductions request reclaim from evictable
+  leases without claiming bytes were released before consumers acknowledge
+  their actual footprint. Privileged snapshots reconcile leases, subsystems,
+  principal subtrees, requested reclaim, and physical totals. The primitive
+  selects no hidden machine-size default; daemon policy and subsystem adapters
+  remain explicit consumers.
 - **Principal storage now has a portable executable architecture model.** The
   `no_std` `astrid-storage-model` crate defines immutable logical objects,
   distinct encoded blob identities, atomic principal-root transitions,
