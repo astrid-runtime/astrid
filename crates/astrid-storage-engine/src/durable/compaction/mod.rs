@@ -310,8 +310,7 @@ where
         &self,
         retention: &CompactionRetention,
     ) -> Result<CompactionFacts, DurableError> {
-        let mut inner = self.inner.lock();
-        super::ensure_usable(&inner)?;
+        let mut inner = self.lock_usable()?;
         self.capture_facts_locked(&mut inner, retention)
             .map(|(facts, _)| facts)
     }
@@ -376,13 +375,13 @@ where
     /// # Errors
     ///
     /// Fails closed if roots, pins, handles, quarantine, or the object
-    /// universe changed after proof; I/O or injected faults require reopen.
+    /// universe changed after proof; after an I/O or injected fault, the next
+    /// operation attempts bounded in-process recovery.
     pub fn compact(
         &self,
         authorization: &VerifiedCompactionPlan,
     ) -> Result<CompactionReport, DurableError> {
-        let mut inner = self.inner.lock();
-        super::ensure_usable(&inner)?;
+        let mut inner = self.lock_usable()?;
         let (facts, live) = self.capture_facts_locked(&mut inner, &authorization.retention)?;
         if facts != authorization.facts {
             return Err(DurableError::CompactionSnapshotChanged);
@@ -410,8 +409,7 @@ where
     pub fn pending_compaction_evidence(
         &self,
     ) -> Result<Vec<CompactionEvidenceBundle>, DurableError> {
-        let inner = self.inner.lock();
-        super::ensure_usable(&inner)?;
+        let _inner = self.lock_usable()?;
         outbox::pending(&self.directory, &self.identity, self.limits)
     }
 
@@ -424,8 +422,7 @@ where
     ///
     /// Returns a recovery-required, I/O, framing, identity, or evidence error.
     pub fn acknowledge_compaction_evidence(&self, commit: GcCommitId) -> Result<(), DurableError> {
-        let inner = self.inner.lock();
-        super::ensure_usable(&inner)?;
+        let _inner = self.lock_usable()?;
         outbox::acknowledge(&self.directory, commit, &self.identity, self.limits)
     }
 

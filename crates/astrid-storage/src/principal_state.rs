@@ -14,8 +14,9 @@ use astrid_core::identity::PrincipalUid;
 use astrid_core::kernel_api::{ProjectionNameDiagnostic, ProjectionNamePolicyPreset};
 use astrid_core::principal::PrincipalId;
 use astrid_storage_engine::{
-    DurableEngine, IdentityScheme, ObjectCacheConfig, ObjectCacheStats, PersistentObjectIdentity,
-    PrincipalCodec, RecoveryLimits,
+    DurableEngine, DurableEnginePolicy, GroupCommitPolicy, IdentityScheme, ObjectCacheConfig,
+    ObjectCacheStats, PersistentObjectIdentity, PrincipalCodec, RecoveryLimits,
+    RecoveryRetryPolicy,
 };
 use astrid_storage_model::{ObjectClass, ObjectId, ObjectIdentity, ObjectRecord, ReferenceKind};
 use parking_lot::Mutex;
@@ -325,7 +326,7 @@ pub async fn open_runtime_principal_store(
         home,
         quota,
         PrincipalDirectory::default(),
-        ObjectCacheConfig::disabled(),
+        DurableEnginePolicy::default(),
     )
     .await
 }
@@ -349,7 +350,7 @@ pub async fn open_runtime_principal_store_with_directory(
         home,
         quota,
         principals,
-        ObjectCacheConfig::disabled(),
+        DurableEnginePolicy::default(),
     )
     .await
 }
@@ -373,16 +374,38 @@ pub async fn open_runtime_principal_store_with_object_cache(
         home,
         quota,
         PrincipalDirectory::default(),
-        object_cache,
+        DurableEnginePolicy::new(
+            GroupCommitPolicy::default(),
+            RecoveryRetryPolicy::default(),
+            object_cache,
+        ),
     )
     .await
+}
+
+/// Open every native projection with one complete operator-owned engine policy.
+///
+/// The policy controls durability batching, bounded in-process recovery, and
+/// disposable decoded-object memory. It does not alter the persistent format
+/// or principal quota semantics.
+///
+/// # Errors
+///
+/// Returns the same errors as [`open_runtime_principal_store`].
+pub async fn open_runtime_principal_store_with_policy(
+    home: &AstridHome,
+    quota: Arc<dyn KvQuotaResolver<StateOwner>>,
+    principals: PrincipalDirectory,
+    policy: DurableEnginePolicy<StateOwner>,
+) -> StorageResult<RuntimePrincipalStore> {
+    open_runtime_principal_store_with_options(home, quota, principals, policy).await
 }
 
 async fn open_runtime_principal_store_with_options(
     home: &AstridHome,
     quota: Arc<dyn KvQuotaResolver<StateOwner>>,
     principals: PrincipalDirectory,
-    object_cache: ObjectCacheConfig<StateOwner>,
+    policy: DurableEnginePolicy<StateOwner>,
 ) -> StorageResult<RuntimePrincipalStore> {
     let store_path = home.principal_store_path();
     let open_path = store_path.clone();
@@ -398,12 +421,12 @@ async fn open_runtime_principal_store_with_options(
         let destination_format =
             prepare_destination(&open_path, &metadata_for_open, catalog_spec_id)?;
         let metadata_current = destination_format.metadata_is_current();
-        let engine = RuntimeEngine::open_with_object_cache(
+        let engine = RuntimeEngine::open_with_policy(
             &open_path,
             Blake3ObjectIdentityV1,
             StateOwnerCodecV1,
             RecoveryLimits::process_addressable(),
-            object_cache,
+            policy,
         )
         .map_err(|error| {
             StorageError::Connection(format!("open durable principal store: {error}"))

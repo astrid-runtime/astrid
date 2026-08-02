@@ -200,11 +200,16 @@ lose the cache and trigger authoritative recovery, but cannot lose logical
 state. The cache format is not part of `export_closure` or the RÚNATAL promise
 and may change or disappear without migrating logical state.
 
-An interrupted engine is poisoned and refuses both reads and writes until
-reopen. When the persistent cache cannot be used, reopen performs the complete
-authoritative recovery path:
+An interrupted mutation poisons the engine until authoritative recovery has
+selected the durable prefix. The next operation performs that recovery in
+process while retaining the singleton store lock, replaces the stale arena and
+journal handles inside the existing engine, clears disposable decoded caches,
+and then proceeds through the same `Arc` values already held by KV and content
+projections. No daemon restart or projection reconstruction is required. When
+the persistent cache cannot be used, recovery performs the complete
+authoritative path:
 
-- takes an exclusive process lock;
+- runs under the already-held exclusive process lock;
 - scans and identity-checks every complete object frame;
 - rebuilds the `ObjectId`-to-arena-offset index without retaining payloads;
 - truncates an incomplete final frame, or a final frame with invalid physical
@@ -216,7 +221,18 @@ authoritative recovery path:
   verifies the recorded generation;
 - validates every final live root closure and then lazy-loads object payloads
   for point operations;
+- during in-process recovery, flushes the selected arena prefix before the
+  selected root-journal prefix so bytes left merely readable after an earlier
+  failed flush cannot become usable without regaining durable order;
 - flushes newly created directory entries on Unix.
+
+Recovery work is bounded per foreground operation by an injected
+`RecoveryRetryPolicy`. The default makes three attempts with 10 milliseconds
+between retryable filesystem failures. Structural corruption and model errors
+fail immediately. A later operation receives a new bounded attempt, so a long
+ENOSPC or transient device incident remains loud while it exists but does not
+permanently brick the process after the operator repairs it. The retry policy
+is runtime behavior, not persistent format or principal capacity.
 
 `RecoveryLimits` can impose an explicit parser allocation guard when an
 embedding needs one. Native Astrid instead accepts every process-addressable

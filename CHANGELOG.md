@@ -168,8 +168,11 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   staged frame cannot disappear behind a later durability boundary and commits
   do not rescan the complete object map. An exclusive store lock and
   poison-on-write-failure behavior prevent concurrent-process corruption and
-  stale in-memory reads. Named crash-boundary tests prove recovery to the old
-  or new complete root. Recovery keeps only
+  stale in-memory reads. A poisoned engine now retains its singleton lock and
+  reopens its authoritative files in place before the next operation, using a
+  bounded I/O-only retry policy; the ambiguous failed mutation is never
+  replayed. Named crash-boundary tests prove recovery to the old or new
+  complete root through the same engine handle. Recovery keeps only
   roots and arena offsets resident, while live reads load and checksum payloads
   lazily. Every persistent identity occurrence now carries an algorithm,
   construction version, and variable digest length with capacity for 384-bit

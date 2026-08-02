@@ -83,9 +83,14 @@ fn open_grouped(
         TestIdentity,
         Utf8Codec,
         limits(),
-        faults,
-        ObjectCacheConfig::disabled(),
-        policy,
+        EngineOpenOptions {
+            policy: DurableEnginePolicy::new(
+                policy,
+                RecoveryRetryPolicy::default(),
+                ObjectCacheConfig::disabled(),
+            ),
+            faults,
+        },
     )
     .unwrap()
 }
@@ -354,6 +359,40 @@ fn commits_queued_during_a_flush_form_the_next_group() {
 }
 
 #[test]
+fn every_group_member_observes_a_closed_engine_as_closed() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = Arc::new(open_grouped(
+        directory.path(),
+        Arc::new(NoFaults),
+        GroupCommitPolicy::immediate(),
+    ));
+    engine.close().unwrap();
+    let drain_reached = Arc::new(Barrier::new(2));
+    let drain_release = Arc::new(Barrier::new(2));
+    engine.gate_next_group_drain(Arc::clone(&drain_reached), Arc::clone(&drain_release));
+    let barrier = Arc::new(Barrier::new(5));
+    let mut handles = Vec::new();
+    for value in 0_u8..4 {
+        let engine = Arc::clone(&engine);
+        let barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            let principal = format!("principal-{value}");
+            let (_, transaction) = transaction(&principal, None, &[value]);
+            barrier.wait();
+            engine.commit(transaction)
+        }));
+    }
+    barrier.wait();
+    drain_reached.wait();
+    wait_for_queued_commits(&engine, 4);
+    drain_release.wait();
+
+    for handle in handles {
+        assert!(matches!(handle.join().unwrap(), Err(DurableError::Closed)));
+    }
+}
+
+#[test]
 fn grouped_faults_recover_only_complete_principal_roots() {
     for point in [
         FaultPoint::AfterObjectAppend,
@@ -400,12 +439,10 @@ fn grouped_faults_recover_only_complete_principal_roots() {
         }
         assert_eq!(precise, 1);
         assert_eq!(recovery, 3);
-        drop(engine);
 
-        let recovered = open(directory.path());
         for value in 0_u8..4 {
             let principal = format!("principal-{value}");
-            let visible = recovered.root(&principal).unwrap();
+            let visible = engine.root(&principal).unwrap();
             if point == FaultPoint::AfterRootCas {
                 assert!(visible.is_some(), "missing durable root for {principal}");
             } else {

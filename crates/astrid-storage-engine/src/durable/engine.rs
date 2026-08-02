@@ -1,16 +1,15 @@
 use super::{
     ARENA_FILE, ARENA_MAGIC, Arc, ArenaReader, BTreeMap, BTreeSet, CommitGroup, DurableEngine,
-    DurableError, DurableFiles, DurableInner, FaultInjector, FaultPoint, FileExt,
-    GroupCommitPolicy, INDEX_FILE, IndexState, InsertOutcome, LIFECYCLE_CLOSED,
-    LIFECYCLE_REQUIRES_RECOVERY, LIFECYCLE_USABLE, LOCK_FILE, ModelError, Mutex, NoFaults,
-    ObjectCache, ObjectCacheConfig, ObjectCacheStats, ObjectId, ObjectRecord, Path,
-    PersistentObjectIdentity, Prepared, PrincipalCodec, PrincipalUsage, ProjectionCacheEntry,
-    ProjectionCacheKey, ROOT_FILE, RecoveryLimits, RootGeneration, RootSnapshot, RootState,
-    RootTransaction, RwLock, Seek, SeekFrom, append_frame, encode_object_frame, encode_root_record,
-    ensure_payload_limit, ensure_usable, io, io_error, live_files_mut, materialize_closure,
-    open_rw, read_indexed_object, read_indexed_objects, recover_arena, recover_index,
-    recover_interrupted_compaction, recover_roots, replace_index, sync_store_directory,
-    usage_from_closure, validate_incremental_closure,
+    DurableEnginePolicy, DurableError, DurableInner, EngineOpenOptions, FaultInjector, FaultPoint,
+    FileExt, GroupCommitPolicy, InsertOutcome, LIFECYCLE_CLOSED, LIFECYCLE_REQUIRES_RECOVERY,
+    LIFECYCLE_USABLE, LOCK_FILE, ModelError, Mutex, NoFaults, ObjectCache, ObjectCacheConfig,
+    ObjectCacheStats, ObjectId, ObjectRecord, Path, PersistentObjectIdentity, Prepared,
+    PrincipalCodec, PrincipalUsage, ProjectionCacheEntry, ProjectionCacheKey, ROOT_FILE,
+    RecoveryLimits, RecoveryRetryPolicy, RecoveryScope, RootGeneration, RootSnapshot, RootState,
+    RootTransaction, RwLock, append_frame, encode_object_frame, encode_root_record,
+    ensure_payload_limit, io, io_error, live_files_mut, materialize_closure, open_rw,
+    read_indexed_object, read_indexed_objects, recover_store, usage_from_closure,
+    validate_incremental_closure,
 };
 
 impl<P, I, C> DurableEngine<P, I, C>
@@ -38,9 +37,10 @@ where
             identity,
             principal_codec,
             limits,
-            Arc::new(NoFaults),
-            ObjectCacheConfig::disabled(),
-            GroupCommitPolicy::default(),
+            EngineOpenOptions {
+                policy: DurableEnginePolicy::default(),
+                faults: Arc::new(NoFaults),
+            },
         )
     }
 
@@ -65,9 +65,14 @@ where
             identity,
             principal_codec,
             limits,
-            Arc::new(NoFaults),
-            ObjectCacheConfig::disabled(),
-            group_policy,
+            EngineOpenOptions {
+                policy: DurableEnginePolicy::new(
+                    group_policy,
+                    RecoveryRetryPolicy::default(),
+                    ObjectCacheConfig::disabled(),
+                ),
+                faults: Arc::new(NoFaults),
+            },
         )
     }
 
@@ -92,9 +97,72 @@ where
             identity,
             principal_codec,
             limits,
-            Arc::new(NoFaults),
-            object_cache,
-            GroupCommitPolicy::default(),
+            EngineOpenOptions {
+                policy: DurableEnginePolicy::new(
+                    GroupCommitPolicy::default(),
+                    RecoveryRetryPolicy::default(),
+                    object_cache,
+                ),
+                faults: Arc::new(NoFaults),
+            },
+        )
+    }
+
+    /// Open or create a durable store with an explicit in-process recovery
+    /// policy.
+    ///
+    /// The recovery policy bounds work performed by one foreground operation.
+    /// It does not cap future recovery attempts: a later operation starts a
+    /// fresh bounded attempt after an operator resolves a persistent I/O
+    /// incident.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::open`].
+    pub fn open_with_recovery_policy(
+        path: impl AsRef<Path>,
+        identity: I,
+        principal_codec: C,
+        limits: RecoveryLimits,
+        recovery_policy: RecoveryRetryPolicy,
+    ) -> Result<Self, DurableError> {
+        Self::open_with_options(
+            path,
+            identity,
+            principal_codec,
+            limits,
+            EngineOpenOptions {
+                policy: DurableEnginePolicy::new(
+                    GroupCommitPolicy::default(),
+                    recovery_policy,
+                    ObjectCacheConfig::disabled(),
+                ),
+                faults: Arc::new(NoFaults),
+            },
+        )
+    }
+
+    /// Open or create a durable store with one complete operating policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::open`].
+    pub fn open_with_policy(
+        path: impl AsRef<Path>,
+        identity: I,
+        principal_codec: C,
+        limits: RecoveryLimits,
+        policy: DurableEnginePolicy<P>,
+    ) -> Result<Self, DurableError> {
+        Self::open_with_options(
+            path,
+            identity,
+            principal_codec,
+            limits,
+            EngineOpenOptions {
+                policy,
+                faults: Arc::new(NoFaults),
+            },
         )
     }
 
@@ -115,9 +183,10 @@ where
             identity,
             principal_codec,
             limits,
-            faults,
-            ObjectCacheConfig::disabled(),
-            GroupCommitPolicy::default(),
+            EngineOpenOptions {
+                policy: DurableEnginePolicy::default(),
+                faults,
+            },
         )
     }
 
@@ -126,9 +195,7 @@ where
         identity: I,
         principal_codec: C,
         limits: RecoveryLimits,
-        faults: Arc<dyn FaultInjector>,
-        object_cache: ObjectCacheConfig<P>,
-        group_policy: GroupCommitPolicy,
+        options: EngineOpenOptions<P>,
     ) -> Result<Self, DurableError> {
         let path = path.as_ref().to_path_buf();
         std::fs::create_dir_all(&path)
@@ -142,83 +209,29 @@ where
             return Err(io_error("lock principal store", source));
         }
 
-        recover_interrupted_compaction(&path, &principal_codec, &identity, limits)?;
-        let mut arena = open_rw(&path.join(ARENA_FILE))?;
-        let mut roots = open_rw(&path.join(ROOT_FILE))?;
-        let mut index_cache = open_rw(&path.join(INDEX_FILE)).ok();
-        sync_store_directory(&path)?;
-        let scheme = identity.scheme();
-        let arena_len = arena
-            .metadata()
-            .map_err(|source| io_error("read object-arena metadata", source))?
-            .len();
-        let cached = index_cache
-            .as_mut()
-            .and_then(|file| recover_index(file, &mut arena, scheme, limits, arena_len));
-        let (index, arena_tail) = if let Some(state) = cached {
-            (state.objects, state.arena_tail)
-        } else {
-            let (index, arena_tail) = recover_arena(&mut arena, &identity, limits)?;
-            let state = IndexState {
-                arena_len: arena
-                    .metadata()
-                    .map_err(|source| io_error("read recovered arena metadata", source))?
-                    .len(),
-                arena_tail,
-                objects: index,
-            };
-            drop(index_cache.take());
-            index_cache = replace_index(&path, &state, scheme);
-            (state.objects, state.arena_tail)
-        };
-        let (roots_by_principal, validated) = recover_roots(
-            &mut roots,
-            &mut arena,
-            &index,
-            &principal_codec,
-            &identity,
-            limits,
-        )?;
-        let arena_len = arena
-            .metadata()
-            .map_err(|source| io_error("read recovered arena metadata", source))?
-            .len();
-        arena
-            .seek(SeekFrom::End(0))
-            .map_err(|source| io_error("seek object arena", source))?;
-        roots
-            .seek(SeekFrom::End(0))
-            .map_err(|source| io_error("seek root journal", source))?;
-        let arena_reader = arena
-            .try_clone()
-            .map_err(|source| io_error("clone object arena for positional reads", source))?;
+        let recovered = recover_store(&path, &principal_codec, &identity, limits)?;
 
         Ok(Self {
             directory: path,
             identity,
             principal_codec,
             limits,
-            faults,
-            group_policy,
-            commit_group: Mutex::new(CommitGroup::default()),
+            faults: options.faults,
             lifecycle: std::sync::atomic::AtomicU8::new(LIFECYCLE_USABLE),
             arena_reader: RwLock::new(Some(ArenaReader {
-                file: arena_reader,
+                file: recovered.arena_reader,
                 generation: 0,
             })),
-            object_cache: ObjectCache::new(object_cache),
+            object_cache: ObjectCache::new(options.policy.object_cache),
+            recovery_policy: options.policy.recovery,
+            group_policy: options.policy.group_commit,
+            commit_group: Mutex::new(CommitGroup::default()),
             inner: Mutex::new(DurableInner {
-                roots_by_principal,
-                index,
+                roots_by_principal: recovered.roots_by_principal,
+                index: recovered.index,
                 pending_index_locations: Vec::new(),
-                validated,
-                files: Some(DurableFiles {
-                    arena,
-                    roots,
-                    index_cache,
-                    arena_len,
-                    arena_tail,
-                }),
+                validated: recovered.validated,
+                files: Some(recovered.files),
                 lock: Some(lock),
                 poisoned: false,
                 arena_generation: 0,
@@ -236,10 +249,9 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`DurableError::RequiresRecovery`] after a failed write.
+    /// Returns a recovery error when authoritative reopen cannot complete.
     pub fn object_count(&self) -> Result<usize, DurableError> {
-        let inner = self.inner.lock();
-        ensure_usable(&inner)?;
+        let inner = self.lock_usable()?;
         Ok(inner.index.len())
     }
 
@@ -247,12 +259,12 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`DurableError::RequiresRecovery`] after a failed write.
+    /// Returns a recovery error when authoritative reopen cannot complete.
     pub fn object(&self, id: ObjectId) -> Result<Option<ObjectRecord>, DurableError> {
+        let mut recovery = RecoveryScope::default();
         loop {
             let (location, generation) = {
-                let inner = self.inner.lock();
-                ensure_usable(&inner)?;
+                let inner = self.lock_usable_with(&mut recovery)?;
                 let Some(location) = inner.index.get(&id).copied() else {
                     return Ok(None);
                 };
@@ -279,8 +291,8 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`DurableError::RequiresRecovery`] after a failed write, or a
-    /// frame/identity error when the arena cannot supply the requested object.
+    /// Returns a recovery error when authoritative reopen cannot complete, or
+    /// a frame/identity error when the arena cannot supply the requested object.
     pub fn object_for(
         &self,
         principal: &P,
@@ -299,21 +311,21 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`DurableError::RequiresRecovery`] after a failed write, or a
-    /// frame/identity error when the arena cannot supply the requested object.
+    /// Returns a recovery error when authoritative reopen cannot complete, or
+    /// a frame/identity error when the arena cannot supply the requested object.
     pub fn shared_object_for(
         &self,
         principal: &P,
         id: ObjectId,
     ) -> Result<Option<Arc<ObjectRecord>>, DurableError> {
+        let mut recovery = RecoveryScope::default();
         loop {
-            self.ensure_cached_read_usable()?;
+            self.ensure_cached_read_usable_with(&mut recovery)?;
             if let Some(record) = self.object_cache.get(principal, id) {
                 return Ok(Some(record));
             }
             let (location, generation) = {
-                let inner = self.inner.lock();
-                ensure_usable(&inner)?;
+                let inner = self.lock_usable_with(&mut recovery)?;
                 let Some(location) = inner.index.get(&id).copied() else {
                     return Ok(None);
                 };
@@ -329,9 +341,13 @@ where
             let record =
                 read_indexed_object(&reader.file, id, location, &self.identity, self.limits)?;
             drop(reader_guard);
-            if let Some(record) =
-                self.retain_loaded_object_if_current(principal, id, generation, record)?
-            {
+            if let Some(record) = self.retain_loaded_object_if_current_with(
+                principal,
+                id,
+                generation,
+                record,
+                &mut recovery,
+            )? {
                 return Ok(Some(record));
             }
         }
@@ -346,8 +362,8 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`DurableError::RequiresRecovery`] after a failed write, or a
-    /// frame/identity error when the arena cannot supply a requested object.
+    /// Returns a recovery error when authoritative reopen cannot complete, or
+    /// a frame/identity error when the arena cannot supply a requested object.
     pub fn objects_for(
         &self,
         principal: &P,
@@ -370,14 +386,15 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`DurableError::RequiresRecovery`] after a failed write, or a
-    /// frame/identity error when the arena cannot supply a requested object.
+    /// Returns a recovery error when authoritative reopen cannot complete, or
+    /// a frame/identity error when the arena cannot supply a requested object.
     pub fn shared_objects_for(
         &self,
         principal: &P,
         ids: &[ObjectId],
     ) -> Result<Vec<Option<Arc<ObjectRecord>>>, DurableError> {
-        self.ensure_cached_read_usable()?;
+        let mut recovery = RecoveryScope::default();
+        self.ensure_cached_read_usable_with(&mut recovery)?;
         let mut results = vec![None; ids.len()];
         let mut missing = BTreeMap::<ObjectId, Vec<usize>>::new();
         for (index, id) in ids.iter().copied().enumerate() {
@@ -393,8 +410,7 @@ where
 
         loop {
             let (locations, generation) = {
-                let inner = self.inner.lock();
-                ensure_usable(&inner)?;
+                let inner = self.lock_usable_with(&mut recovery)?;
                 let locations = missing
                     .keys()
                     .filter_map(|id| inner.index.get(id).copied().map(|location| (*id, location)))
@@ -412,8 +428,7 @@ where
                 read_indexed_objects(&reader.file, &locations, &self.identity, self.limits)?;
             drop(reader_guard);
 
-            let inner = self.inner.lock();
-            ensure_usable(&inner)?;
+            let inner = self.lock_usable_with(&mut recovery)?;
             if inner.arena_generation != generation
                 || loaded.keys().any(|id| !inner.index.contains_key(id))
             {
@@ -431,6 +446,7 @@ where
         }
     }
 
+    #[cfg(test)]
     pub(super) fn retain_loaded_object_if_current(
         &self,
         principal: &P,
@@ -438,8 +454,24 @@ where
         generation: u64,
         record: ObjectRecord,
     ) -> Result<Option<Arc<ObjectRecord>>, DurableError> {
-        let inner = self.inner.lock();
-        ensure_usable(&inner)?;
+        self.retain_loaded_object_if_current_with(
+            principal,
+            id,
+            generation,
+            record,
+            &mut RecoveryScope::default(),
+        )
+    }
+
+    fn retain_loaded_object_if_current_with(
+        &self,
+        principal: &P,
+        id: ObjectId,
+        generation: u64,
+        record: ObjectRecord,
+        recovery: &mut RecoveryScope,
+    ) -> Result<Option<Arc<ObjectRecord>>, DurableError> {
+        let inner = self.lock_usable_with(recovery)?;
         if inner.arena_generation != generation || !inner.index.contains_key(&id) {
             return Ok(None);
         }
@@ -447,10 +479,17 @@ where
     }
 
     fn ensure_cached_read_usable(&self) -> Result<(), DurableError> {
+        self.ensure_cached_read_usable_with(&mut RecoveryScope::default())
+    }
+
+    fn ensure_cached_read_usable_with(
+        &self,
+        recovery: &mut RecoveryScope,
+    ) -> Result<(), DurableError> {
         match self.lifecycle.load(std::sync::atomic::Ordering::Acquire) {
             LIFECYCLE_USABLE => Ok(()),
             LIFECYCLE_CLOSED => Err(DurableError::Closed),
-            _ => Err(DurableError::RequiresRecovery),
+            _ => self.lock_usable_with(recovery).map(|_| ()),
         }
     }
 
@@ -552,8 +591,7 @@ where
             return Err(DurableError::BootstrapObjectOwnsState);
         }
         let id = self.identify(record);
-        let mut inner = self.inner.lock();
-        ensure_usable(&inner)?;
+        let mut inner = self.lock_usable()?;
         if let Some(location) = inner.index.get(&id).copied() {
             let (existing, needs_flush) = {
                 let files = live_files_mut(&mut inner.files)?;
@@ -640,10 +678,9 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`DurableError::RequiresRecovery`] after a failed write.
+    /// Returns a recovery error when authoritative reopen cannot complete.
     pub fn root(&self, principal: &P) -> Result<Option<RootState>, DurableError> {
-        let inner = self.inner.lock();
-        ensure_usable(&inner)?;
+        let inner = self.lock_usable()?;
         Ok(inner.roots_by_principal.get(principal).copied())
     }
 
@@ -655,10 +692,9 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`DurableError::RequiresRecovery`] after a failed write.
+    /// Returns a recovery error when authoritative reopen cannot complete.
     pub fn roots(&self) -> Result<Vec<(P, RootState)>, DurableError> {
-        let inner = self.inner.lock();
-        ensure_usable(&inner)?;
+        let inner = self.lock_usable()?;
         Ok(inner
             .roots_by_principal
             .iter()
@@ -670,10 +706,9 @@ where
     ///
     /// # Errors
     ///
-    /// Returns a recovery-required or graph-validation error.
+    /// Returns an authoritative recovery or graph-validation error.
     pub fn snapshot(&self, principal: &P) -> Result<Option<RootSnapshot>, DurableError> {
-        let mut inner = self.inner.lock();
-        ensure_usable(&inner)?;
+        let mut inner = self.lock_usable()?;
         let Some(root) = inner.roots_by_principal.get(principal).copied() else {
             return Ok(None);
         };
@@ -694,11 +729,10 @@ where
     ///
     /// # Errors
     ///
-    /// Returns a recovery-required, missing-principal, graph, or arithmetic
+    /// Returns a recovery, missing-principal, graph, or arithmetic
     /// error.
     pub fn principal_usage(&self, principal: &P) -> Result<PrincipalUsage, DurableError> {
-        let mut inner = self.inner.lock();
-        ensure_usable(&inner)?;
+        let mut inner = self.lock_usable()?;
         let root = inner
             .roots_by_principal
             .get(principal)

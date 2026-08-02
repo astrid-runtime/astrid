@@ -475,30 +475,26 @@ fn every_named_compaction_crash_boundary_recovers_a_complete_authority_pair() {
             interrupted.compact(&authorization),
             Err(DurableError::FaultInjected(actual)) if actual == point
         ));
-        assert!(matches!(
-            interrupted.root(&"alice".to_owned()),
-            Err(DurableError::RequiresRecovery)
-        ));
-        drop(interrupted);
-
-        let recovered = super::tests::open(directory.path());
-        assert_eq!(recovered.root(&"alice".to_owned()).unwrap(), Some(current));
+        assert_eq!(
+            interrupted.root(&"alice".to_owned()).unwrap(),
+            Some(current)
+        );
         let transition_committed = !matches!(
             point,
             FaultPoint::AfterCompactionFilesFlush | FaultPoint::AfterCompactionEvidencePrepare
         );
         assert_eq!(
-            recovered.object(first.commit).unwrap().is_none(),
+            interrupted.object(first.commit).unwrap().is_none(),
             transition_committed,
             "recovery selected the wrong physical generation at {point:?}"
         );
         assert_eq!(
-            recovered.pending_compaction_evidence().unwrap().len(),
+            interrupted.pending_compaction_evidence().unwrap().len(),
             usize::from(transition_committed),
             "outbox readiness disagrees with physical publication at {point:?}"
         );
         let (_, next) = transaction("alice", Some(current), b"post-recovery");
-        recovered.commit(next).unwrap();
+        interrupted.commit(next).unwrap();
         for remnant in [
             COMPACTION_INTENT_FILE,
             COMPACTION_INTENT_TEMP,

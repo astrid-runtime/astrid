@@ -1,6 +1,11 @@
 //! Named durable-engine crash boundaries and injectable failure decisions.
 
-/// Crash boundary exposed by the durable engine.
+/// Durability boundary exposed by the durable engine.
+///
+/// Most points interrupt a mutation and leave the engine requiring recovery.
+/// The three `BeforeInProcessRecovery*` points instead inject retryable I/O
+/// into one recovery attempt; [`RecoveryRetryPolicy`](super::RecoveryRetryPolicy)
+/// decides whether the same foreground operation tries again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum FaultPoint {
@@ -36,11 +41,21 @@ pub enum FaultPoint {
     AfterCompactionEvidenceReady,
     /// Old generations are gone but the durable intent still protects cleanup recovery.
     BeforeCompactionIntentRemoval,
+    /// An in-process recovery attempt is about to reopen authoritative files.
+    BeforeInProcessRecoveryOpen,
+    /// In-process recovery is about to flush the selected object-arena prefix.
+    BeforeInProcessRecoveryArenaFlush,
+    /// In-process recovery is about to flush the selected root-journal prefix.
+    BeforeInProcessRecoveryRootFlush,
 }
 
 /// Injectable crash decision used by recovery tests and harnesses.
 pub trait FaultInjector: Send + Sync {
-    /// Return `true` to stop at `point` and require the engine to be reopened.
+    /// Return `true` to inject the failure associated with `point`.
+    ///
+    /// Mutation and compaction points stop the operation and require recovery.
+    /// In-process recovery points fail the current recovery attempt as I/O and
+    /// may be retried within the operation's configured retry budget.
     fn should_fail(&self, point: FaultPoint) -> bool;
 }
 
@@ -51,5 +66,39 @@ pub struct NoFaults;
 impl FaultInjector for NoFaults {
     fn should_fail(&self, _point: FaultPoint) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FaultPoint;
+
+    #[test]
+    fn published_fault_point_discriminants_stay_stable() {
+        let points = [
+            FaultPoint::AfterObjectAppend,
+            FaultPoint::AfterObjectFlush,
+            FaultPoint::AfterCommitAppend,
+            FaultPoint::AfterCommitFlush,
+            FaultPoint::BeforeRootCas,
+            FaultPoint::AfterRootCas,
+            FaultPoint::AfterCompactionFilesFlush,
+            FaultPoint::AfterCompactionEvidencePrepare,
+            FaultPoint::AfterCompactionIntentFlush,
+            FaultPoint::AfterCompactionArenaBackup,
+            FaultPoint::AfterCompactionArenaPromote,
+            FaultPoint::AfterCompactionRootsBackup,
+            FaultPoint::AfterCompactionRootsPromote,
+            FaultPoint::AfterCompactionDirectoryFlush,
+            FaultPoint::AfterCompactionEvidenceReady,
+            FaultPoint::BeforeCompactionIntentRemoval,
+            FaultPoint::BeforeInProcessRecoveryOpen,
+            FaultPoint::BeforeInProcessRecoveryArenaFlush,
+            FaultPoint::BeforeInProcessRecoveryRootFlush,
+        ];
+
+        for (expected, point) in points.into_iter().enumerate() {
+            assert_eq!(point as usize, expected);
+        }
     }
 }

@@ -158,10 +158,12 @@ Named fault injection covers:
 - evidence ready for independent delivery; and
 - cleanup durable immediately before intent removal.
 
-Every interruption requires dropping the poisoned engine instance. Reopen
-either recovers the exact receipted successor or fails closed. Successful
-recovery rebuilds the index, preserves every root generation, leaves one ready
-receipt, and accepts the next compare-and-swap transition.
+Every interruption poisons mutation until the engine's next operation runs
+bounded in-process recovery under the retained singleton lock. Recovery either
+selects the exact receipted successor or fails closed. Successful recovery
+rebuilds the index, preserves every root generation, leaves one ready receipt,
+and accepts the next compare-and-swap transition through the original engine
+handle.
 
 ## Evidence
 

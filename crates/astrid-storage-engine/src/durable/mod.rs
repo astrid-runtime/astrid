@@ -9,9 +9,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU8;
+use std::time::Duration;
 
 use astrid_storage_model::{
     InsertOutcome, ModelError, ObjectClass, ObjectFormatVersion, ObjectId, ObjectIdentity,
@@ -19,7 +21,7 @@ use astrid_storage_model::{
     RootGeneration, RootState,
 };
 use fs2::FileExt;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Mutex, MutexGuard, RwLock};
 
 use crate::{CommitOutcome, RootSnapshot, RootTransaction};
 use group::CommitGroup;
@@ -79,6 +81,94 @@ impl RecoveryLimits {
     #[must_use]
     pub const fn max_frame_bytes(self) -> u64 {
         self.max_frame_bytes
+    }
+}
+
+const DEFAULT_RECOVERY_ATTEMPTS: NonZeroU32 = match NonZeroU32::new(3) {
+    Some(attempts) => attempts,
+    None => panic!("the default recovery attempt count is non-zero"),
+};
+const DEFAULT_RECOVERY_BACKOFF: Duration = Duration::from_millis(10);
+
+/// Bounded policy for reopening a poisoned durable engine in process.
+///
+/// One foreground operation performs at most `attempts` recovery scans. Only
+/// filesystem I/O failures are retried; structural corruption fails
+/// immediately. A later operation may make a fresh bounded attempt, so a
+/// prolonged disk-full incident does not permanently disable the store after
+/// space is released.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecoveryRetryPolicy {
+    attempts: NonZeroU32,
+    backoff: Duration,
+}
+
+impl RecoveryRetryPolicy {
+    /// Construct a bounded fixed-backoff recovery policy.
+    #[must_use]
+    pub const fn new(attempts: NonZeroU32, backoff: Duration) -> Self {
+        Self { attempts, backoff }
+    }
+
+    /// Perform exactly one recovery attempt without intentional delay.
+    #[must_use]
+    pub const fn immediate() -> Self {
+        Self::new(NonZeroU32::MIN, Duration::ZERO)
+    }
+
+    /// Return the maximum attempts made by one foreground operation.
+    #[must_use]
+    pub const fn attempts(self) -> NonZeroU32 {
+        self.attempts
+    }
+
+    /// Return the fixed delay between retryable recovery failures.
+    #[must_use]
+    pub const fn backoff(self) -> Duration {
+        self.backoff
+    }
+}
+
+impl Default for RecoveryRetryPolicy {
+    fn default() -> Self {
+        Self::new(DEFAULT_RECOVERY_ATTEMPTS, DEFAULT_RECOVERY_BACKOFF)
+    }
+}
+
+/// Complete non-persistent operating policy for one durable engine instance.
+///
+/// These values govern latency, recovery work, and disposable resident memory.
+/// They never participate in object identity, durable framing, or principal
+/// storage quota.
+pub struct DurableEnginePolicy<P> {
+    group_commit: GroupCommitPolicy,
+    recovery: RecoveryRetryPolicy,
+    object_cache: ObjectCacheConfig<P>,
+}
+
+impl<P> DurableEnginePolicy<P> {
+    /// Combine explicit group-commit, recovery, and decoded-cache policies.
+    #[must_use]
+    pub const fn new(
+        group_commit: GroupCommitPolicy,
+        recovery: RecoveryRetryPolicy,
+        object_cache: ObjectCacheConfig<P>,
+    ) -> Self {
+        Self {
+            group_commit,
+            recovery,
+            object_cache,
+        }
+    }
+}
+
+impl<P> Default for DurableEnginePolicy<P> {
+    fn default() -> Self {
+        Self::new(
+            GroupCommitPolicy::default(),
+            RecoveryRetryPolicy::default(),
+            ObjectCacheConfig::disabled(),
+        )
     }
 }
 
@@ -278,7 +368,7 @@ impl fmt::Display for DurableError {
             },
             Self::FaultInjected(point) => write!(formatter, "fault injected at {point:?}"),
             Self::RequiresRecovery => {
-                formatter.write_str("durable engine must be dropped and reopened")
+                formatter.write_str("durable engine requires authoritative recovery")
             },
             Self::Closed => formatter.write_str("durable engine is closed"),
         }
@@ -335,6 +425,20 @@ struct ArenaReader {
     generation: u64,
 }
 
+#[derive(Debug)]
+struct RecoveredStore<P: Ord> {
+    roots_by_principal: BTreeMap<P, RootState>,
+    index: BTreeMap<ObjectId, ArenaLocation>,
+    validated: BTreeSet<ObjectId>,
+    files: DurableFiles,
+    arena_reader: File,
+}
+
+struct EngineOpenOptions<P> {
+    policy: DurableEnginePolicy<P>,
+    faults: Arc<dyn FaultInjector>,
+}
+
 /// Host-file durable principal-store engine.
 ///
 /// `P` remains a domain-bearing integration type. `I` computes logical object
@@ -351,6 +455,7 @@ pub struct DurableEngine<P: Ord, I, C> {
     lifecycle: AtomicU8,
     arena_reader: RwLock<Option<ArenaReader>>,
     object_cache: ObjectCache<P>,
+    recovery_policy: RecoveryRetryPolicy,
     inner: Mutex<DurableInner<P>>,
 }
 
@@ -359,6 +464,7 @@ impl<P: Ord, I, C> fmt::Debug for DurableEngine<P, I, C> {
         formatter
             .debug_struct("DurableEngine")
             .field("limits", &self.limits)
+            .field("recovery_policy", &self.recovery_policy)
             .field("group_policy", &self.group_policy)
             .finish_non_exhaustive()
     }
@@ -421,6 +527,7 @@ mod format;
 mod group;
 mod index;
 mod lifecycle;
+mod recovery;
 mod restore;
 mod roots;
 mod validation;
@@ -445,6 +552,7 @@ use format::{
 #[cfg(test)]
 use format::{frame_checksum, last_batch_spans};
 use index::{IndexState, recover_index, replace_index};
+use recovery::{RecoveryScope, recover_store};
 use roots::{encode_root_record, encode_root_snapshot, recover_roots};
 use validation::{
     materialize_closure, recovery_closure_error, usage_from_closure, validate_commit_closure,

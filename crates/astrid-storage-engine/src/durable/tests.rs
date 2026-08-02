@@ -1,5 +1,6 @@
 //! Tests for the native durable principal-state engine.
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
@@ -107,6 +108,75 @@ struct FailAt(FaultPoint);
 impl FaultInjector for FailAt {
     fn should_fail(&self, point: FaultPoint) -> bool {
         point == self.0
+    }
+}
+
+#[derive(Debug)]
+struct RecoveryIoFailures {
+    remaining: AtomicUsize,
+    attempts: AtomicUsize,
+}
+
+impl RecoveryIoFailures {
+    fn new(failures: usize) -> Self {
+        Self {
+            remaining: AtomicUsize::new(failures),
+            attempts: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RecoveryFlushFailure {
+    point: FaultPoint,
+    remaining: AtomicUsize,
+    observed: Mutex<Vec<FaultPoint>>,
+}
+
+impl RecoveryFlushFailure {
+    fn once(point: FaultPoint) -> Self {
+        Self {
+            point,
+            remaining: AtomicUsize::new(1),
+            observed: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn observed(&self) -> Vec<FaultPoint> {
+        self.observed.lock().clone()
+    }
+}
+
+impl FaultInjector for RecoveryFlushFailure {
+    fn should_fail(&self, point: FaultPoint) -> bool {
+        if matches!(
+            point,
+            FaultPoint::BeforeInProcessRecoveryArenaFlush
+                | FaultPoint::BeforeInProcessRecoveryRootFlush
+        ) {
+            self.observed.lock().push(point);
+        }
+        point == self.point
+            && self
+                .remaining
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+    }
+}
+
+impl FaultInjector for RecoveryIoFailures {
+    fn should_fail(&self, point: FaultPoint) -> bool {
+        if point != FaultPoint::BeforeInProcessRecoveryOpen {
+            return false;
+        }
+        self.attempts.fetch_add(1, Ordering::Relaxed);
+        self.remaining
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
     }
 }
 
@@ -940,22 +1010,7 @@ fn every_exposed_fault_recovers_old_or_new_complete_root() {
             interrupted.commit(update),
             Err(DurableError::FaultInjected(actual)) if actual == point
         ));
-        assert!(matches!(
-            interrupted.snapshot(&"alice".to_owned()),
-            Err(DurableError::RequiresRecovery)
-        ));
-        assert!(matches!(
-            interrupted.root(&"alice".to_owned()),
-            Err(DurableError::RequiresRecovery)
-        ));
-        assert!(matches!(
-            interrupted.object_count(),
-            Err(DurableError::RequiresRecovery)
-        ));
-        drop(interrupted);
-
-        let recovered = open(directory.path());
-        let visible = recovered.root(&"alice".to_owned()).unwrap().unwrap();
+        let visible = interrupted.root(&"alice".to_owned()).unwrap().unwrap();
         if point == FaultPoint::AfterRootCas {
             assert_eq!(
                 visible,
@@ -968,7 +1023,13 @@ fn every_exposed_fault_recovers_old_or_new_complete_root() {
         } else {
             assert_eq!(visible, old, "point {point:?}");
         }
-        assert!(recovered.snapshot(&"alice".to_owned()).unwrap().is_some());
+        assert!(interrupted.snapshot(&"alice".to_owned()).unwrap().is_some());
+        assert!(interrupted.object_count().unwrap() > 0);
+        assert!(!interrupted.recover_if_required().unwrap());
+        assert!(matches!(
+            DurableEngine::open(directory.path(), TestIdentity, Utf8Codec, limits()),
+            Err(DurableError::LockHeld(_))
+        ));
     }
 }
 
@@ -1476,7 +1537,28 @@ fn explicit_close_releases_cached_records_and_positional_reader() {
 }
 
 #[test]
-fn poisoned_engine_rejects_cached_reads() {
+fn explicit_close_of_a_poisoned_engine_stays_closed() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open(directory.path());
+    {
+        let mut inner = engine.inner.lock();
+        engine.mark_requires_recovery(&mut inner);
+    }
+
+    assert!(matches!(
+        engine.close(),
+        Err(DurableError::RequiresRecovery)
+    ));
+    assert!(matches!(engine.object_count(), Err(DurableError::Closed)));
+    assert!(matches!(
+        engine.recover_if_required(),
+        Err(DurableError::Closed)
+    ));
+    assert!(engine.close().is_ok());
+}
+
+#[test]
+fn poisoned_engine_recovers_before_serving_cached_reads() {
     let directory = tempfile::tempdir().unwrap();
     let total = ObjectCacheCapacity::Bounded(std::num::NonZeroU64::new(1024 * 1024).unwrap());
     let engine = open_with_cache(directory.path(), ObjectCacheController::new(total));
@@ -1492,19 +1574,282 @@ fn poisoned_engine_rejects_cached_reads() {
     let (id, _) = engine.persist_standalone_object(&record).unwrap();
     let alice = "alice".to_owned();
     assert!(engine.shared_object_for(&alice, id).unwrap().is_some());
+    let before = engine.object_cache_stats();
+    {
+        let mut inner = engine.inner.lock();
+        engine.mark_requires_recovery(&mut inner);
+    }
+
+    assert_eq!(engine.object_cache_stats().resident_objects, 1);
+    assert_eq!(
+        engine.shared_object_for(&alice, id).unwrap().as_deref(),
+        Some(&record)
+    );
+    assert_eq!(engine.object_cache_stats().resident_objects, 1);
+    assert_eq!(
+        engine.shared_objects_for(&alice, &[id]).unwrap()[0].as_deref(),
+        Some(&record)
+    );
+    let after = engine.object_cache_stats();
+    assert_eq!(after.misses, before.misses + 1);
+    assert_eq!(after.insertions, before.insertions + 1);
+}
+
+#[test]
+fn in_process_recovery_retries_transient_io_within_the_configured_budget() {
+    let directory = tempfile::tempdir().unwrap();
+    let failures = Arc::new(RecoveryIoFailures::new(2));
+    let engine = DurableEngine::open_with_options(
+        directory.path(),
+        TestIdentity,
+        Utf8Codec,
+        limits(),
+        EngineOpenOptions {
+            policy: DurableEnginePolicy::new(
+                GroupCommitPolicy::immediate(),
+                RecoveryRetryPolicy::new(
+                    std::num::NonZeroU32::new(3).unwrap(),
+                    Duration::from_millis(1),
+                ),
+                ObjectCacheConfig::disabled(),
+            ),
+            faults: failures.clone(),
+        },
+    )
+    .unwrap();
+    let (_, transaction) = transaction("alice", None, b"durable");
+    let root = engine.commit(transaction).unwrap().root();
+    {
+        let mut inner = engine.inner.lock();
+        engine.mark_requires_recovery(&mut inner);
+    }
+
+    assert_eq!(engine.root(&"alice".to_owned()).unwrap(), Some(root));
+    assert_eq!(failures.attempts.load(Ordering::Relaxed), 3);
+    assert!(!engine.recover_if_required().unwrap());
+}
+
+#[test]
+fn in_process_recovery_stops_at_the_budget_and_can_retry_later() {
+    let directory = tempfile::tempdir().unwrap();
+    let failures = Arc::new(RecoveryIoFailures::new(usize::MAX));
+    let engine = DurableEngine::open_with_options(
+        directory.path(),
+        TestIdentity,
+        Utf8Codec,
+        limits(),
+        EngineOpenOptions {
+            policy: DurableEnginePolicy::new(
+                GroupCommitPolicy::immediate(),
+                RecoveryRetryPolicy::new(std::num::NonZeroU32::new(2).unwrap(), Duration::ZERO),
+                ObjectCacheConfig::disabled(),
+            ),
+            faults: failures.clone(),
+        },
+    )
+    .unwrap();
     {
         let mut inner = engine.inner.lock();
         engine.mark_requires_recovery(&mut inner);
     }
 
     assert!(matches!(
-        engine.shared_object_for(&alice, id),
-        Err(DurableError::RequiresRecovery)
+        engine.object_count(),
+        Err(DurableError::Io { .. })
     ));
+    assert_eq!(failures.attempts.load(Ordering::Relaxed), 2);
+
+    failures.remaining.store(0, Ordering::Relaxed);
+    assert_eq!(engine.object_count().unwrap(), 0);
+    assert_eq!(failures.attempts.load(Ordering::Relaxed), 3);
+}
+
+#[test]
+fn in_process_recovery_does_not_retry_structural_failure() {
+    let directory = tempfile::tempdir().unwrap();
+    let recovery_attempts = Arc::new(RecoveryIoFailures::new(0));
+    let engine = DurableEngine::open_with_options(
+        directory.path(),
+        TestIdentity,
+        Utf8Codec,
+        limits(),
+        EngineOpenOptions {
+            policy: DurableEnginePolicy::new(
+                GroupCommitPolicy::immediate(),
+                RecoveryRetryPolicy::new(std::num::NonZeroU32::new(3).unwrap(), Duration::ZERO),
+                ObjectCacheConfig::disabled(),
+            ),
+            faults: recovery_attempts.clone(),
+        },
+    )
+    .unwrap();
+    let (_, transaction) = transaction("alice", None, b"durable");
+    let root = engine.commit(transaction).unwrap().root();
+    let arena = directory.path().join(ARENA_FILE);
+    let tail_len = std::fs::metadata(&arena).unwrap().len();
+    flip_byte(&arena, tail_len.saturating_sub(1));
+    {
+        let mut inner = engine.inner.lock();
+        engine.mark_requires_recovery(&mut inner);
+    }
+
     assert!(matches!(
-        engine.shared_objects_for(&alice, &[id]),
+        engine.object_count(),
+        Err(DurableError::RecoveryModel {
+            file: ROOT_FILE,
+            source: ModelError::MissingObject(missing),
+            ..
+        }) if missing == root.commit
+    ));
+    assert_eq!(recovery_attempts.attempts.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn in_process_recovery_retries_ordered_stabilization_flushes() {
+    for (point, expected) in [
+        (
+            FaultPoint::BeforeInProcessRecoveryArenaFlush,
+            vec![
+                FaultPoint::BeforeInProcessRecoveryArenaFlush,
+                FaultPoint::BeforeInProcessRecoveryArenaFlush,
+                FaultPoint::BeforeInProcessRecoveryRootFlush,
+            ],
+        ),
+        (
+            FaultPoint::BeforeInProcessRecoveryRootFlush,
+            vec![
+                FaultPoint::BeforeInProcessRecoveryArenaFlush,
+                FaultPoint::BeforeInProcessRecoveryRootFlush,
+                FaultPoint::BeforeInProcessRecoveryArenaFlush,
+                FaultPoint::BeforeInProcessRecoveryRootFlush,
+            ],
+        ),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let failure = Arc::new(RecoveryFlushFailure::once(point));
+        let engine = DurableEngine::open_with_options(
+            directory.path(),
+            TestIdentity,
+            Utf8Codec,
+            limits(),
+            EngineOpenOptions {
+                policy: DurableEnginePolicy::new(
+                    GroupCommitPolicy::immediate(),
+                    RecoveryRetryPolicy::new(std::num::NonZeroU32::new(2).unwrap(), Duration::ZERO),
+                    ObjectCacheConfig::disabled(),
+                ),
+                faults: failure.clone(),
+            },
+        )
+        .unwrap();
+        let (_, transaction) = transaction("alice", None, b"durable");
+        let root = engine.commit(transaction).unwrap().root();
+        {
+            let mut inner = engine.inner.lock();
+            engine.mark_requires_recovery(&mut inner);
+        }
+
+        assert_eq!(engine.root(&"alice".to_owned()).unwrap(), Some(root));
+        assert_eq!(failure.observed(), expected);
+    }
+}
+
+#[test]
+fn one_read_scope_never_enters_recovery_twice() {
+    let directory = tempfile::tempdir().unwrap();
+    let recovery_attempts = Arc::new(RecoveryIoFailures::new(0));
+    let engine = DurableEngine::open_with_options(
+        directory.path(),
+        TestIdentity,
+        Utf8Codec,
+        limits(),
+        EngineOpenOptions {
+            policy: DurableEnginePolicy::new(
+                GroupCommitPolicy::immediate(),
+                RecoveryRetryPolicy::immediate(),
+                ObjectCacheConfig::disabled(),
+            ),
+            faults: recovery_attempts.clone(),
+        },
+    )
+    .unwrap();
+    let mut recovery = RecoveryScope::default();
+    {
+        let mut inner = engine.inner.lock();
+        engine.mark_requires_recovery(&mut inner);
+    }
+    drop(engine.lock_usable_with(&mut recovery).unwrap());
+    {
+        let mut inner = engine.inner.lock();
+        engine.mark_requires_recovery(&mut inner);
+    }
+
+    assert!(matches!(
+        engine.lock_usable_with(&mut recovery),
         Err(DurableError::RequiresRecovery)
     ));
+    assert_eq!(recovery_attempts.attempts.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn concurrent_callers_share_one_in_process_recovery() {
+    let directory = tempfile::tempdir().unwrap();
+    let recovery_attempts = Arc::new(RecoveryIoFailures::new(0));
+    let engine = Arc::new(
+        DurableEngine::open_with_options(
+            directory.path(),
+            TestIdentity,
+            Utf8Codec,
+            limits(),
+            EngineOpenOptions {
+                policy: DurableEnginePolicy::new(
+                    GroupCommitPolicy::immediate(),
+                    RecoveryRetryPolicy::immediate(),
+                    ObjectCacheConfig::disabled(),
+                ),
+                faults: recovery_attempts.clone(),
+            },
+        )
+        .unwrap(),
+    );
+    let (_, transaction) = transaction("alice", None, b"durable");
+    let root = engine.commit(transaction).unwrap().root();
+    {
+        let mut inner = engine.inner.lock();
+        engine.mark_requires_recovery(&mut inner);
+    }
+
+    let barrier = Arc::new(Barrier::new(9));
+    let mut callers = Vec::new();
+    for _ in 0..8 {
+        let engine = Arc::clone(&engine);
+        let barrier = Arc::clone(&barrier);
+        callers.push(thread::spawn(move || {
+            barrier.wait();
+            engine.root(&"alice".to_owned())
+        }));
+    }
+    barrier.wait();
+    for caller in callers {
+        assert_eq!(caller.join().unwrap().unwrap(), Some(root));
+    }
+    assert_eq!(recovery_attempts.attempts.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn recovery_generation_wrap_invalidates_the_previous_reader() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open(directory.path());
+    {
+        let mut inner = engine.inner.lock();
+        inner.arena_generation = u64::MAX;
+        engine.arena_reader.write().as_mut().unwrap().generation = u64::MAX;
+        engine.mark_requires_recovery(&mut inner);
+    }
+
+    assert_eq!(engine.object_count().unwrap(), 0);
+    assert_eq!(engine.inner.lock().arena_generation, 0);
+    assert_eq!(engine.arena_reader.read().as_ref().unwrap().generation, 0);
 }
 
 #[test]

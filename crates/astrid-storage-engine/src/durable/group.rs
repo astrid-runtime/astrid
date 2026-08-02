@@ -167,14 +167,15 @@ where
     /// root-journal flush. Transactions are prepared in queue order;
     /// model/root-conflict failures append no bytes and do not cancel
     /// unrelated transactions in the same group. Once group I/O starts, any
-    /// error poisons this instance; drop and reopen it so recovery determines
-    /// the durable journal prefix.
+    /// error poisons this instance; the next operation reopens its data files
+    /// in place so recovery determines the durable journal prefix.
     ///
     /// # Errors
     ///
     /// Returns an identity, collision, graph, root-conflict, encoding, I/O, or
-    /// injected-fault error. A returned I/O/fault/recovery error requires
-    /// reopen.
+    /// injected-fault error. An I/O or injected fault leaves the engine
+    /// recovery-required; the next operation attempts bounded recovery before
+    /// it proceeds.
     pub fn commit(&self, transaction: RootTransaction<P>) -> Result<CommitOutcome, DurableError> {
         let receipt = Arc::new(CommitReceipt::default());
         let mut lead = {
@@ -256,17 +257,13 @@ where
 
     fn process_commit_group(&self, batch: Vec<QueuedCommit<P>>) {
         let mut completions = Vec::new();
-        let mut inner = self.inner.lock();
-        if inner.poisoned {
-            drop(inner);
-            complete_unavailable(batch, UnavailableEngine::RequiresRecovery);
-            return;
-        }
-        if inner.files.is_none() {
-            drop(inner);
-            complete_unavailable(batch, UnavailableEngine::Closed);
-            return;
-        }
+        let mut inner = match self.lock_usable() {
+            Ok(inner) => inner,
+            Err(error) => {
+                complete_unavailable_with_error(batch, error);
+                return;
+            },
+        };
 
         let mut accepted = Vec::new();
         let mut pending_roots = BTreeMap::new();
@@ -443,24 +440,19 @@ fn reserve_group_frames<P: Ord>(
     Ok(())
 }
 
-#[derive(Clone, Copy)]
-enum UnavailableEngine {
-    Closed,
-    RequiresRecovery,
-}
-
-impl UnavailableEngine {
-    const fn error(self) -> DurableError {
-        match self {
-            Self::Closed => DurableError::Closed,
-            Self::RequiresRecovery => DurableError::RequiresRecovery,
+fn complete_unavailable_with_error<P>(batch: Vec<QueuedCommit<P>>, error: DurableError) {
+    if matches!(error, DurableError::Closed) {
+        for request in batch {
+            request.receipt.complete(Err(DurableError::Closed));
         }
+        return;
     }
-}
 
-fn complete_unavailable<P>(batch: Vec<QueuedCommit<P>>, unavailable: UnavailableEngine) {
+    let mut first = Some(error);
     for request in batch {
-        request.receipt.complete(Err(unavailable.error()));
+        request
+            .receipt
+            .complete(Err(first.take().unwrap_or(DurableError::RequiresRecovery)));
     }
 }
 
