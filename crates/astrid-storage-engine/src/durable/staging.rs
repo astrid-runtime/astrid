@@ -6,8 +6,8 @@ use astrid_storage_model::{InsertOutcome, ModelError, ObjectId, ObjectRecord};
 
 use super::{
     ARENA_FILE, ARENA_MAGIC, DurableEngine, DurableError, PersistentObjectIdentity, PrincipalCodec,
-    append_frame, append_frames, encode_object_frame, ensure_payload_limit, ensure_usable,
-    live_files_mut, read_indexed_object,
+    append_frame, append_frames, encode_object_frame, ensure_payload_limit, live_files_mut,
+    read_indexed_object,
 };
 
 impl<P, I, C> DurableEngine<P, I, C>
@@ -38,8 +38,7 @@ where
         record: &ObjectRecord,
     ) -> Result<(ObjectId, InsertOutcome), DurableError> {
         let id = self.identify(record);
-        let mut inner = self.inner.lock();
-        ensure_usable(&inner)?;
+        let mut inner = self.lock_usable()?;
         if let Some(location) = inner.index.get(&id).copied() {
             let existing = {
                 let files = live_files_mut(&mut inner.files)?;
@@ -103,8 +102,7 @@ where
             incoming.insert(id, (record, payload));
         }
 
-        let mut inner = self.inner.lock();
-        ensure_usable(&inner)?;
+        let mut inner = self.lock_usable()?;
         let mut already_present = BTreeSet::new();
         for (id, (record, _)) in &incoming {
             if let Some(location) = inner.index.get(id).copied() {

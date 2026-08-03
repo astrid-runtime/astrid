@@ -87,8 +87,9 @@ pub use secret::{FallbackSecretStore, KeychainSecretStore};
 
 #[cfg(not(target_family = "wasm"))]
 pub use astrid_storage_engine::{
-    ObjectCacheCapacity, ObjectCacheConfig, ObjectCacheController, ObjectCacheMemoryBudget,
-    ObjectCacheStats, PrincipalObjectCacheBudget,
+    DurableEnginePolicy, GroupCommitPolicy, ObjectCacheCapacity, ObjectCacheConfig,
+    ObjectCacheController, ObjectCacheMemoryBudget, ObjectCacheStats, PrincipalObjectCacheBudget,
+    RecoveryRetryPolicy,
 };
 #[cfg(feature = "legacy-surrealkv")]
 pub use kv::SurrealKvStore;
@@ -98,7 +99,7 @@ pub use principal_state::{
     ReadyStagedContent, RuntimePrincipalStore, StagedContentId, StagedContentWriter, StateOwner,
     StateOwnerCodecV1, StateOwnerResolver, open_runtime_kv, open_runtime_kv_with_directory,
     open_runtime_principal_store, open_runtime_principal_store_with_directory,
-    open_runtime_principal_store_with_object_cache,
+    open_runtime_principal_store_with_object_cache, open_runtime_principal_store_with_policy,
 };
 #[cfg(not(target_family = "wasm"))]
 pub use resident_cache::GovernedObjectCache;

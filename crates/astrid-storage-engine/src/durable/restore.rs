@@ -9,8 +9,7 @@ use astrid_storage_model::{ModelError, ObjectId, ObjectRecord, RootState};
 use super::{
     ARENA_FILE, ARENA_MAGIC, DurableEngine, DurableError, DurableInner, PersistentObjectIdentity,
     PrincipalCodec, ROOT_FILE, ROOT_MAGIC, append_frame, encode_object_frame, encode_root_snapshot,
-    ensure_payload_limit, ensure_usable, io_error, live_files_mut, read_indexed_object,
-    recover_roots,
+    ensure_payload_limit, io_error, live_files_mut, read_indexed_object, recover_roots,
 };
 use crate::RootSnapshot;
 
@@ -30,8 +29,8 @@ where
     /// already be visible.
     ///
     /// Objects are flushed before one canonical root-snapshot frame makes the
-    /// restored roots authoritative. Any I/O failure poisons this engine
-    /// instance and requires reopen.
+    /// restored roots authoritative. Any I/O failure poisons this engine; the
+    /// next operation attempts bounded in-process recovery before proceeding.
     ///
     /// # Errors
     ///
@@ -76,8 +75,7 @@ where
     I: PersistentObjectIdentity,
     C: PrincipalCodec<P>,
 {
-    let mut inner = engine.inner.lock();
-    ensure_usable(&inner)?;
+    let mut inner = engine.lock_usable()?;
     ensure_empty_destination(&mut inner)?;
 
     let restore = collect_restore(engine, snapshots)?;
@@ -306,8 +304,7 @@ where
     D: PrincipalCodec<Q>,
     F: FnMut(&P) -> Result<Q, DurableError>,
 {
-    let mut inner = engine.inner.lock();
-    ensure_usable(&inner)?;
+    let mut inner = engine.lock_usable()?;
     let mut mapped = BTreeMap::new();
     for (principal, root) in &inner.roots_by_principal {
         if mapped.insert(map(principal)?, *root).is_some() {

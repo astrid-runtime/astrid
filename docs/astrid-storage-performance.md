@@ -448,6 +448,15 @@ the same gather-policy abstraction but a separate durability journal. Its
 exact-parent result in `ca1f72d8` raises strict 4 KiB seals from 45.6 to 74.4
 seals/s for one writer and from 76.7 to 234.1 seals/s for eight.
 
+Recovery-required is no longer a daemon-lifetime failure. The next engine
+operation reopens the authoritative files in place under the retained store
+lock and retries only the recovery scan, never the ambiguous failed mutation.
+Before serving the selected root, live recovery re-flushes the recovered arena
+and then its root journal; recovery is exceptional work, but it cannot turn
+readable bytes from a failed flush into an unstably visible root.
+Each foreground call has a configurable attempt count and backoff; later calls
+may try again after an operator clears ENOSPC or another transient I/O fault.
+
 ### Catalog scaling
 
 The path-copy catalog replaced the linear flat catalog in `d9a1463a`.

@@ -2,8 +2,7 @@
 
 use super::{
     DurableEngine, DurableError, DurableInner, FRAME_HEADER_LEN, IndexState, LIFECYCLE_CLOSED,
-    LIFECYCLE_REQUIRES_RECOVERY, PersistentObjectIdentity, PrincipalCodec, ensure_usable, io_error,
-    live_files_mut, replace_index,
+    PersistentObjectIdentity, PrincipalCodec, io_error, live_files_mut, replace_index,
 };
 
 impl<P, I, C> DurableEngine<P, I, C>
@@ -16,11 +15,10 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`DurableError::RequiresRecovery`] after a failed write or the
-    /// underlying filesystem error.
+    /// Returns an authoritative recovery error or the underlying filesystem
+    /// error.
     pub fn flush(&self) -> Result<(), DurableError> {
-        let mut inner = self.inner.lock();
-        ensure_usable(&inner)?;
+        let mut inner = self.lock_usable()?;
         let files = live_files_mut(&mut inner.files)?;
         if let Err(source) = files.arena.sync_data() {
             self.mark_requires_recovery(&mut inner);
@@ -71,14 +69,8 @@ where
         drop(inner.files.take());
         drop(self.arena_reader.write().take());
         self.object_cache.clear();
-        self.lifecycle.store(
-            if poisoned {
-                LIFECYCLE_REQUIRES_RECOVERY
-            } else {
-                LIFECYCLE_CLOSED
-            },
-            std::sync::atomic::Ordering::Release,
-        );
+        self.lifecycle
+            .store(LIFECYCLE_CLOSED, std::sync::atomic::Ordering::Release);
         let unlock = match inner.lock.take() {
             Some(lock) => fs2::FileExt::unlock(&lock)
                 .map_err(|source| io_error("unlock principal store while closing", source)),
