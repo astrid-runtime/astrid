@@ -1,0 +1,81 @@
+Astrid durable staging-seal benchmark
+======================================
+
+Host
+----
+macOS 26.2 (25C56), arm64, Apple M2 Ultra
+
+Comparison
+----------
+baseline:  d9af426f9988b43d85abb08409d7cc6087ef7e93
+candidate: ca1f72d88eb81a6ed2c785005978b7f3c160fd66
+
+The baseline worktree was detached at the exact candidate parent and differed
+only by the ignored probe copied from the candidate. Each revision used its
+own release target directory; no compiled benchmark binary was shared.
+
+Command
+-------
+cargo test --release -p astrid-storage native_seal_group_scale_probe -- --ignored --nocapture
+
+Workload
+--------
+For each concurrency point, every writer sealed 64 independent 4 KiB files.
+Each seal flushed the content and returned only after its implementation's
+durable intent boundary. Three fresh-directory samples were collected per
+point. Tables in the canonical performance document report the median sample
+for throughput and p95 latency independently.
+
+Baseline raw output
+-------------------
+native_seal_group writers=1 sample=0 operations=64 seals_per_second=43.0 p50_us=22766 p95_us=24653 max_us=27664 wall_ms=1487
+native_seal_group writers=1 sample=1 operations=64 seals_per_second=45.6 p50_us=21603 p95_us=23739 max_us=25739 wall_ms=1404
+native_seal_group writers=1 sample=2 operations=64 seals_per_second=47.3 p50_us=20656 p95_us=22695 max_us=23553 wall_ms=1354
+native_seal_group writers=2 sample=0 operations=128 seals_per_second=60.4 p50_us=32609 p95_us=37630 max_us=38598 wall_ms=2119
+native_seal_group writers=2 sample=1 operations=128 seals_per_second=59.8 p50_us=33581 p95_us=37793 max_us=39589 wall_ms=2140
+native_seal_group writers=2 sample=2 operations=128 seals_per_second=58.9 p50_us=33606 p95_us=38623 max_us=38814 wall_ms=2173
+native_seal_group writers=4 sample=0 operations=256 seals_per_second=61.1 p50_us=57481 p95_us=73083 max_us=82405 wall_ms=4187
+native_seal_group writers=4 sample=1 operations=256 seals_per_second=62.0 p50_us=56455 p95_us=67575 max_us=72649 wall_ms=4125
+native_seal_group writers=4 sample=2 operations=256 seals_per_second=61.9 p50_us=56505 p95_us=68677 max_us=74617 wall_ms=4133
+native_seal_group writers=8 sample=0 operations=512 seals_per_second=76.1 p50_us=81571 p95_us=107643 max_us=124362 wall_ms=6728
+native_seal_group writers=8 sample=1 operations=512 seals_per_second=76.7 p50_us=81584 p95_us=104616 max_us=124371 wall_ms=6672
+native_seal_group writers=8 sample=2 operations=512 seals_per_second=78.0 p50_us=79665 p95_us=101496 max_us=135182 wall_ms=6561
+
+Candidate raw output
+--------------------
+native_seal_group writers=1 sample=0 operations=64 seals_per_second=72.4 p50_us=13715 p95_us=14720 max_us=15570 wall_ms=884
+native_seal_group writers=1 sample=1 operations=64 seals_per_second=74.4 p50_us=12957 p95_us=13954 max_us=14687 wall_ms=859
+native_seal_group writers=1 sample=2 operations=64 seals_per_second=76.6 p50_us=12850 p95_us=13951 max_us=14796 wall_ms=836
+native_seal_group writers=2 sample=0 operations=128 seals_per_second=115.0 p50_us=16814 p95_us=20908 max_us=24791 wall_ms=1113
+native_seal_group writers=2 sample=1 operations=128 seals_per_second=114.3 p50_us=16787 p95_us=21714 max_us=25870 wall_ms=1119
+native_seal_group writers=2 sample=2 operations=128 seals_per_second=113.0 p50_us=16828 p95_us=21796 max_us=26817 wall_ms=1133
+native_seal_group writers=4 sample=0 operations=256 seals_per_second=172.8 p50_us=21678 p95_us=30241 max_us=42699 wall_ms=1481
+native_seal_group writers=4 sample=1 operations=256 seals_per_second=162.0 p50_us=24808 p95_us=26844 max_us=31724 wall_ms=1580
+native_seal_group writers=4 sample=2 operations=256 seals_per_second=151.0 p50_us=22695 p95_us=39546 max_us=58627 wall_ms=1695
+native_seal_group writers=8 sample=0 operations=512 seals_per_second=218.9 p50_us=34436 p95_us=48569 max_us=62500 wall_ms=2339
+native_seal_group writers=8 sample=1 operations=512 seals_per_second=245.8 p50_us=30808 p95_us=40571 max_us=51511 wall_ms=2082
+native_seal_group writers=8 sample=2 operations=512 seals_per_second=234.1 p50_us=31828 p95_us=44485 max_us=60706 wall_ms=2187
+
+Durability-flush confirmation
+-----------------------------
+revision: 5d6478c89357fa3e79637676acf361c43751a629
+
+The baseline seal path makes five filesystem durability calls for every
+operation: content file, intent temporary, intent directory, writing
+directory, and ready directory. The journal path makes one content-file call
+for every operation plus two calls per completed seal group: generations
+directory and intent journal. The candidate probe records completed groups;
+`durability_flushes = operations + (2 * seal_groups)`.
+
+native_seal_group writers=1 sample=0 operations=64 seal_groups=64 durability_flushes=192 flushes_per_seal=3.000 seals_per_second=71.3 p50_us=13508 p95_us=14438 max_us=15825 wall_ms=897
+native_seal_group writers=1 sample=1 operations=64 seal_groups=64 durability_flushes=192 flushes_per_seal=3.000 seals_per_second=71.2 p50_us=13509 p95_us=13971 max_us=14081 wall_ms=899
+native_seal_group writers=1 sample=2 operations=64 seal_groups=64 durability_flushes=192 flushes_per_seal=3.000 seals_per_second=72.1 p50_us=13462 p95_us=14108 max_us=14312 wall_ms=888
+native_seal_group writers=2 sample=0 operations=128 seal_groups=127 durability_flushes=382 flushes_per_seal=2.984 seals_per_second=80.9 p50_us=24604 p95_us=26819 max_us=31630 wall_ms=1582
+native_seal_group writers=2 sample=1 operations=128 seal_groups=126 durability_flushes=380 flushes_per_seal=2.969 seals_per_second=78.3 p50_us=25575 p95_us=28832 max_us=37621 wall_ms=1635
+native_seal_group writers=2 sample=2 operations=128 seal_groups=127 durability_flushes=382 flushes_per_seal=2.984 seals_per_second=77.7 p50_us=25543 p95_us=28563 max_us=29709 wall_ms=1646
+native_seal_group writers=4 sample=0 operations=256 seal_groups=133 durability_flushes=522 flushes_per_seal=2.039 seals_per_second=147.3 p50_us=25481 p95_us=36814 max_us=46325 wall_ms=1737
+native_seal_group writers=4 sample=1 operations=256 seal_groups=129 durability_flushes=514 flushes_per_seal=2.008 seals_per_second=156.9 p50_us=25506 p95_us=28599 max_us=39527 wall_ms=1631
+native_seal_group writers=4 sample=2 operations=256 seal_groups=131 durability_flushes=518 flushes_per_seal=2.023 seals_per_second=150.8 p50_us=25539 p95_us=30571 max_us=42901 wall_ms=1698
+native_seal_group writers=8 sample=0 operations=512 seal_groups=141 durability_flushes=794 flushes_per_seal=1.551 seals_per_second=202.7 p50_us=36636 p95_us=50275 max_us=69072 wall_ms=2526
+native_seal_group writers=8 sample=1 operations=512 seal_groups=141 durability_flushes=794 flushes_per_seal=1.551 seals_per_second=198.7 p50_us=36622 p95_us=50087 max_us=62834 wall_ms=2576
+native_seal_group writers=8 sample=2 operations=512 seal_groups=142 durability_flushes=796 flushes_per_seal=1.555 seals_per_second=204.2 p50_us=34661 p95_us=52931 max_us=63270 wall_ms=2506

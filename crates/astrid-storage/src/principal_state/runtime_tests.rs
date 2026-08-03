@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::io::{Seek as _, SeekFrom, Write as _};
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::num::NonZeroU64;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -941,6 +941,39 @@ async fn native_stage_acknowledges_before_ingest_and_publishes_on_a_blocking_wor
 }
 
 #[tokio::test]
+async fn staged_publication_rejects_a_generation_truncated_after_seal() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    let store = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let owner = test_owner("alice");
+    let name = ContentName::new("workspace/truncated.bin").unwrap();
+    let mut writer = store
+        .staging()
+        .begin(owner, name.clone(), ChunkingProfile::ASTRID_V1)
+        .unwrap();
+    writer.write_all(b"durable staged bytes").unwrap();
+    let staged = writer.seal().unwrap();
+    let path = staged.content_path();
+
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(staged.logical_bytes().saturating_sub(1))
+        .unwrap();
+
+    let error = store.publish_staged(staged).await.unwrap_err();
+    assert!(error.to_string().contains("footer"));
+    assert_eq!(store.content().describe(&owner, &name).unwrap(), None);
+    assert!(
+        path.exists(),
+        "failed publication must retain staged evidence"
+    );
+}
+
+#[tokio::test]
 async fn staged_publication_retries_after_root_commit_before_cleanup() {
     let directory = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(directory.path());
@@ -956,7 +989,9 @@ async fn staged_publication_retries_after_root_commit_before_cleanup() {
     writer.write_all(b"one identity").unwrap();
     let staged = writer.seal().unwrap();
 
-    let source = native_io::open_private_file(&staged.content_path()).unwrap();
+    let source = native_io::open_private_file(&staged.content_path())
+        .unwrap()
+        .take(staged.logical_bytes());
     let first = store
         .content()
         .put_streaming(&owner, &name, source)

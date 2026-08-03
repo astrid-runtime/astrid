@@ -1,222 +1,374 @@
-//! Native namespace recovery, validation, and conservative cleanup.
+//! Native staged-generation recovery and validation.
 
-use std::fs::{ReadDir, read_dir};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{DirEntry, ReadDir, read_dir};
 use std::path::{Path, PathBuf};
 
 use uuid::Uuid;
 
-use super::format::load_intent;
+use super::format::{StagingIntent, load_generation_footer};
+use super::journal::{
+    JournalRecord, StageKey, StageKey as JournalStageKey, append_records, flush_journal,
+};
+use super::retirement::{create_marker, remove as remove_generation};
 use super::{
-    CONTENT_FILE, INTENT_FILE, LEGACY_INTENT_FILE, PUBLISHED_FILE, PUBLISHED_MARKER,
-    ReadyStagedContent, StagedContentId, connection,
+    JournalState, ReadyStagedContent, StagedContentId, StagingFaultInjector, StagingFaultPoint,
+    claim_generation_key, connection, open_generation_name,
 };
 use crate::error::StorageResult;
-use crate::principal_state::native_io::{sync_directory, validate_private_regular_file};
+use crate::principal_state::native_io::{
+    rename_private_entry, sync_directory, validate_private_regular_file,
+};
 
-pub(super) enum ReadyRecoveryState {
-    Published,
-    Empty,
-    Pending,
+struct RecoveryScan {
+    recovered: Vec<StagingIntent>,
+    completed_with_sealed: BTreeSet<StageKey>,
+    namespace_changed: bool,
 }
 
-pub(super) fn recover_writing(
-    writing: &Path,
-    ready: &Path,
+struct RecoveryContext<'a> {
+    generations: &'a Path,
+    quarantine: &'a Path,
+    journal: &'a JournalState,
+    retired: &'a BTreeMap<StageKey, PathBuf>,
+    sequences: &'a mut BTreeMap<u64, StagedContentId>,
+    identifiers: &'a mut BTreeMap<StagedContentId, u64>,
+}
+
+/// Reconcile native generation names with the recovered intent journal.
+pub(super) fn recover_generations(
+    generations: &Path,
     quarantine: &Path,
+    journal: &mut JournalState,
+    faults: &dyn StagingFaultInjector,
 ) -> StorageResult<()> {
-    for entry in read_directory(writing)? {
-        let entry = entry.map_err(|error| {
+    let entries = collect_entries(generations)?;
+    let mut sequences = BTreeMap::new();
+    let mut identifiers = BTreeMap::new();
+    for key in journal.pending.keys().chain(journal.completed.iter()) {
+        claim_generation_key(&mut sequences, &mut identifiers, *key)?;
+    }
+    let retired = discover_retired(&entries, journal, &mut sequences, &mut identifiers)?;
+    let scan = scan_entries(
+        entries,
+        RecoveryContext {
+            generations,
+            quarantine,
+            journal,
+            retired: &retired,
+            sequences: &mut sequences,
+            identifiers: &mut identifiers,
+        },
+    )?;
+    let cleanup_changed = finish_retirements(generations, journal, &retired, &scan)?;
+    flush_recovery_namespace(
+        generations,
+        journal,
+        faults,
+        scan.namespace_changed || cleanup_changed,
+    )?;
+    publish_recovered(generations, journal, faults, scan.recovered)?;
+    validate_pending(generations, journal)
+}
+
+fn collect_entries(generations: &Path) -> StorageResult<Vec<DirEntry>> {
+    read_directory(generations)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
             connection(format!(
-                "enumerate incomplete staging writes {}: {error}",
-                writing.display()
+                "enumerate staged generations {}: {error}",
+                generations.display()
             ))
-        })?;
-        let path = entry.path();
-        let id = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| Uuid::parse_str(name).ok())
-            .map(StagedContentId);
-        let recovered = id
-            .and_then(|id| {
-                load_intent(&path.join(INTENT_FILE))
-                    .ok()
-                    .map(|intent| (id, intent))
-            })
-            .filter(|(id, intent)| *id == intent.id)
-            .and_then(|(id, intent)| {
-                validate_private_regular_file(&path.join(CONTENT_FILE))
-                    .ok()
-                    .filter(|length| *length == intent.logical_bytes)
-                    .map(|_| (id, intent))
-            });
-        let Some((id, intent)) = recovered else {
-            let destination = move_to_quarantine(&path, quarantine, "unsealed")?;
-            tracing::warn!(
-                source = %path.display(),
-                quarantine = %destination.display(),
-                "preserved incomplete native content staging entry"
-            );
+        })
+}
+
+fn discover_retired(
+    entries: &[DirEntry],
+    journal: &JournalState,
+    sequences: &mut BTreeMap<u64, StagedContentId>,
+    identifiers: &mut BTreeMap<StagedContentId, u64>,
+) -> StorageResult<BTreeMap<StageKey, PathBuf>> {
+    let mut retired = BTreeMap::new();
+    for entry in entries {
+        let name = entry.file_name();
+        let Ok(GenerationName::Retired(key)) = parse_generation_name(&name.to_string_lossy())
+        else {
             continue;
         };
-        let destination = ready.join(ready_name(intent.sequence, id));
-        if destination.exists() {
-            let quarantined = move_to_quarantine(&path, quarantine, "duplicate")?;
-            tracing::warn!(
-                source = %path.display(),
-                quarantine = %quarantined.display(),
-                "preserved duplicate sealed content staging entry"
-            );
+        if journal.pending.contains_key(&key) {
+            return Err(connection(format!(
+                "retired staged generation {} is still pending",
+                entry.path().display()
+            )));
+        }
+        claim_generation_key(sequences, identifiers, key)?;
+        validate_private_regular_file(&entry.path())?;
+        retired.insert(key, entry.path());
+    }
+    Ok(retired)
+}
+
+fn scan_entries(
+    entries: Vec<DirEntry>,
+    mut context: RecoveryContext<'_>,
+) -> StorageResult<RecoveryScan> {
+    let mut scan = RecoveryScan {
+        recovered: Vec::new(),
+        completed_with_sealed: BTreeSet::new(),
+        namespace_changed: false,
+    };
+    for entry in entries {
+        scan_entry(&entry, &mut context, &mut scan)?;
+    }
+    Ok(scan)
+}
+
+fn scan_entry(
+    entry: &DirEntry,
+    context: &mut RecoveryContext<'_>,
+    scan: &mut RecoveryScan,
+) -> StorageResult<()> {
+    let path = entry.path();
+    match parse_generation_name(&entry.file_name().to_string_lossy()) {
+        Ok(GenerationName::Open) => move_and_mark(scan, &path, context.quarantine, "unsealed"),
+        Ok(GenerationName::Retired(_)) => Ok(()),
+        Ok(GenerationName::Sealed(key)) if context.retired.contains_key(&key) => {
+            move_to_quarantine(&path, context.quarantine, "published")?;
+            scan.namespace_changed = true;
+            Ok(())
+        },
+        Ok(GenerationName::Sealed(key)) if context.journal.completed.contains(&key) => {
+            let tombstone = context
+                .generations
+                .join(retired_generation_name(key.sequence, key.id));
+            rename_private_entry(&path, &tombstone)?;
+            remove_generation(&tombstone)?;
+            scan.completed_with_sealed.insert(key);
+            scan.namespace_changed = true;
+            Ok(())
+        },
+        Ok(GenerationName::Sealed(key)) if context.journal.pending.contains_key(&key) => Ok(()),
+        Ok(GenerationName::Sealed(key)) => recover_or_quarantine(
+            scan,
+            &path,
+            context.quarantine,
+            key,
+            context.sequences,
+            context.identifiers,
+        ),
+        Err(_) => move_and_mark(scan, &path, context.quarantine, "orphan"),
+    }
+}
+
+fn move_and_mark(
+    scan: &mut RecoveryScan,
+    path: &Path,
+    quarantine: &Path,
+    classification: &str,
+) -> StorageResult<()> {
+    move_to_quarantine(path, quarantine, classification)?;
+    scan.namespace_changed = true;
+    Ok(())
+}
+
+fn recover_or_quarantine(
+    scan: &mut RecoveryScan,
+    path: &Path,
+    quarantine: &Path,
+    key: StageKey,
+    sequences: &mut BTreeMap<u64, StagedContentId>,
+    identifiers: &mut BTreeMap<StagedContentId, u64>,
+) -> StorageResult<()> {
+    let Ok(intent) = load_generation_footer(path) else {
+        return move_and_mark(scan, path, quarantine, "orphan");
+    };
+    if StageKey::from_intent(&intent) != key {
+        return Err(connection(format!(
+            "orphan staged generation footer disagrees with {}",
+            path.display()
+        )));
+    }
+    claim_generation_key(sequences, identifiers, key)?;
+    scan.recovered.push(intent);
+    Ok(())
+}
+
+fn finish_retirements(
+    generations: &Path,
+    journal: &JournalState,
+    retired: &BTreeMap<StageKey, PathBuf>,
+    scan: &RecoveryScan,
+) -> StorageResult<bool> {
+    let mut changed = false;
+    for key in journal.completed.iter().copied() {
+        if scan.completed_with_sealed.contains(&key) {
             continue;
         }
-        std::fs::rename(&path, &destination).map_err(|error| {
-            connection(format!(
-                "recover sealed staging entry {} as {}: {error}",
-                path.display(),
-                destination.display()
-            ))
-        })?;
-        sync_directory(writing)?;
-        sync_directory(ready)?;
+        if let Some(tombstone) = retired.get(&key) {
+            remove_generation(tombstone)?;
+            changed = true;
+        } else {
+            create_marker(generations, key)?;
+            remove_generation(&generations.join(retired_generation_name(key.sequence, key.id)))?;
+            changed = true;
+        }
+    }
+    for (key, tombstone) in retired {
+        if !journal.completed.contains(key) {
+            remove_generation(tombstone)?;
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
+fn flush_recovery_namespace(
+    generations: &Path,
+    journal: &JournalState,
+    faults: &dyn StagingFaultInjector,
+    namespace_changed: bool,
+) -> StorageResult<()> {
+    if !journal.completed.is_empty() {
+        // A durable retired name makes any generation bytes non-publishable on
+        // Windows; Unix additionally flushes the final directory state.
+        sync_directory(generations)?;
+        faults.fail(StagingFaultPoint::RecoveryCleanupDirectoryFlushed)
+    } else if namespace_changed {
+        sync_directory(generations)
+    } else {
+        Ok(())
+    }
+}
+
+fn publish_recovered(
+    generations: &Path,
+    journal: &mut JournalState,
+    faults: &dyn StagingFaultInjector,
+    mut recovered: Vec<StagingIntent>,
+) -> StorageResult<()> {
+    if recovered.is_empty() {
+        return Ok(());
+    }
+    sync_directory(generations)?;
+    faults.fail(StagingFaultPoint::RecoveryGenerationDirectoryFlushed)?;
+    recovered.sort_by_key(StageKey::from_intent);
+    let records = recovered
+        .iter()
+        .cloned()
+        .map(JournalRecord::Sealed)
+        .collect::<Vec<_>>();
+    append_records(&mut journal.file, &records)?;
+    flush_journal(&journal.file)?;
+    for intent in recovered {
+        journal
+            .pending
+            .insert(StageKey::from_intent(&intent), intent);
     }
     Ok(())
 }
 
-pub(super) fn next_sequence(ready: &Path) -> StorageResult<u64> {
-    let mut maximum = None::<u64>;
-    for entry in read_directory(ready)? {
-        let entry = entry.map_err(|error| {
-            connection(format!(
-                "enumerate staged write sequences {}: {error}",
-                ready.display()
-            ))
-        })?;
-        let (sequence, _) = parse_ready_name(&entry.file_name().to_string_lossy())?;
-        maximum = Some(maximum.map_or(sequence, |current| current.max(sequence)));
+fn validate_pending(generations: &Path, journal: &JournalState) -> StorageResult<()> {
+    for intent in journal.pending.values() {
+        let path = generations.join(sealed_generation_name(intent.sequence, intent.id));
+        validate_generation(&path, intent)?;
     }
-    match maximum {
-        Some(value) => value
-            .checked_add(1)
-            .ok_or_else(|| connection("staged-write sequence exhausted".to_owned())),
-        None => Ok(0),
-    }
+    Ok(())
 }
 
-pub(super) fn load_ready(
+pub(super) enum GenerationName {
+    Open,
+    Sealed(StageKey),
+    Retired(StageKey),
+}
+
+pub(super) fn load_generation(
     staging_root: &Path,
-    directory: PathBuf,
-    sequence: u64,
-    id: StagedContentId,
+    path: PathBuf,
+    intent: StagingIntent,
 ) -> StorageResult<ReadyStagedContent> {
-    ensure_existing_directory(&directory)?;
-    let intent = load_intent(&directory.join(INTENT_FILE))?;
-    if intent.sequence != sequence || intent.id != id {
-        return Err(connection(format!(
-            "staged intent does not match ready directory {}",
-            directory.display()
-        )));
-    }
-    let logical_bytes = validate_private_regular_file(&directory.join(CONTENT_FILE))?;
-    if logical_bytes != intent.logical_bytes {
-        return Err(connection(format!(
-            "staged content length changed after seal in {}",
-            directory.display()
-        )));
-    }
-    validate_stage_entries(&directory)?;
+    validate_generation(&path, &intent)?;
     Ok(ReadyStagedContent::from_intent(
         staging_root.to_path_buf(),
-        directory,
+        path,
         intent,
     ))
 }
 
-pub(super) fn ready_recovery_state(directory: &Path) -> StorageResult<ReadyRecoveryState> {
-    ensure_existing_directory(directory)?;
-    let marker_path = directory.join(PUBLISHED_FILE);
-    let marker = match std::fs::symlink_metadata(&marker_path) {
-        Ok(_) => {
-            validate_private_regular_file(&marker_path)?;
-            Some(std::fs::read(&marker_path).map_err(|error| {
-                connection(format!(
-                    "read staged publication marker {}: {error}",
-                    marker_path.display()
-                ))
-            })?)
-        },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => {
-            return Err(connection(format!(
-                "inspect staged publication marker {}: {error}",
-                marker_path.display()
-            )));
-        },
-    };
-    if marker.as_deref() == Some(PUBLISHED_MARKER) {
-        return Ok(ReadyRecoveryState::Published);
-    }
-
-    match read_directory(directory)?.next() {
-        None => Ok(ReadyRecoveryState::Empty),
-        Some(Ok(_)) => Ok(ReadyRecoveryState::Pending),
-        Some(Err(error)) => Err(connection(format!(
-            "enumerate staging entry {}: {error}",
-            directory.display()
-        ))),
-    }
-}
-
-pub(super) fn ready_name(sequence: u64, id: StagedContentId) -> String {
-    format!("{sequence:020}-{id}")
-}
-
-pub(super) fn parse_ready_name(name: &str) -> StorageResult<(u64, StagedContentId)> {
-    let Some((sequence, id)) = name.split_once('-') else {
+pub(super) fn validate_generation(path: &Path, intent: &StagingIntent) -> StorageResult<()> {
+    let expected = sealed_generation_name(intent.sequence, intent.id);
+    if path.file_name().and_then(|name| name.to_str()) != Some(expected.as_str()) {
         return Err(connection(format!(
-            "invalid staged-write directory name {name:?}"
+            "staged generation path is not canonical: {}",
+            path.display()
+        )));
+    }
+    let footer = load_generation_footer(path)?;
+    if &footer != intent {
+        return Err(connection(format!(
+            "staged generation footer changed after seal in {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+pub(super) fn sealed_generation_name(sequence: u64, id: StagedContentId) -> String {
+    format!("{sequence:020}-{id}.sealed")
+}
+
+pub(super) fn retired_generation_name(sequence: u64, id: StagedContentId) -> String {
+    format!("{sequence:020}-{id}.published")
+}
+
+pub(super) fn parse_generation_name(name: &str) -> StorageResult<GenerationName> {
+    if let Some(id) = name.strip_suffix(".open") {
+        let id = Uuid::parse_str(id)
+            .map(StagedContentId)
+            .map_err(|_| connection(format!("invalid open generation name {name:?}")))?;
+        if name != open_generation_name(id) {
+            return Err(connection(format!(
+                "non-canonical open generation name {name:?}"
+            )));
+        }
+        return Ok(GenerationName::Open);
+    }
+    let (stem, retired) = if let Some(stem) = name.strip_suffix(".sealed") {
+        (stem, false)
+    } else if let Some(stem) = name.strip_suffix(".published") {
+        (stem, true)
+    } else {
+        return Err(connection(format!(
+            "invalid staged generation name {name:?}"
+        )));
+    };
+    let Some((sequence, id)) = stem.split_once('-') else {
+        return Err(connection(format!(
+            "invalid sealed generation name {name:?}"
         )));
     };
     let sequence = sequence.parse::<u64>().map_err(|_| {
         connection(format!(
-            "invalid staged-write sequence in directory {name:?}"
+            "invalid staged-write sequence in generation {name:?}"
         ))
     })?;
     let id = Uuid::parse_str(id)
         .map(StagedContentId)
-        .map_err(|_| connection(format!("invalid staged-write id in directory {name:?}")))?;
-    if name != ready_name(sequence, id) {
+        .map_err(|_| connection(format!("invalid staged-write id in generation {name:?}")))?;
+    let canonical = if retired {
+        retired_generation_name(sequence, id)
+    } else {
+        sealed_generation_name(sequence, id)
+    };
+    if name != canonical {
         return Err(connection(format!(
-            "non-canonical staged-write directory name {name:?}"
+            "non-canonical staged generation name {name:?}"
         )));
     }
-    Ok((sequence, id))
-}
-
-pub(super) fn remove_known_stage_files(directory: &Path) -> StorageResult<()> {
-    validate_stage_entries(directory)?;
-    for name in [
-        CONTENT_FILE,
-        INTENT_FILE,
-        LEGACY_INTENT_FILE,
-        PUBLISHED_FILE,
-    ] {
-        let path = directory.join(name);
-        match std::fs::remove_file(&path) {
-            Ok(()) => {},
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
-            Err(error) => {
-                return Err(connection(format!(
-                    "remove staging file {}: {error}",
-                    path.display()
-                )));
-            },
-        }
-    }
-    std::fs::remove_dir(directory).map_err(|error| {
-        connection(format!(
-            "remove staging directory {}: {error}",
-            directory.display()
-        ))
+    let key = JournalStageKey { sequence, id };
+    Ok(if retired {
+        GenerationName::Retired(key)
+    } else {
+        GenerationName::Sealed(key)
     })
 }
 
@@ -229,7 +381,7 @@ pub(super) fn read_directory(path: &Path) -> StorageResult<ReadDir> {
     })
 }
 
-fn move_to_quarantine(
+pub(super) fn move_to_quarantine(
     source: &Path,
     quarantine: &Path,
     classification: &str,
@@ -248,62 +400,10 @@ fn move_to_quarantine(
             .checked_add(1)
             .ok_or_else(|| connection("staging quarantine sequence exhausted".to_owned()))?;
     };
-    std::fs::rename(source, &destination).map_err(|error| {
-        connection(format!(
-            "quarantine staging entry {} as {}: {error}",
-            source.display(),
-            destination.display()
-        ))
-    })?;
+    rename_private_entry(source, &destination)?;
     if let Some(parent) = source.parent() {
         sync_directory(parent)?;
     }
     sync_directory(quarantine)?;
     Ok(destination)
-}
-
-fn ensure_existing_directory(path: &Path) -> StorageResult<()> {
-    astrid_core::platform_fs::verify_no_redirects(path).map_err(|error| {
-        connection(format!(
-            "validate staging directory {}: {error}",
-            path.display()
-        ))
-    })?;
-    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
-        connection(format!(
-            "inspect staging directory {}: {error}",
-            path.display()
-        ))
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(connection(format!(
-            "staging entry {} is redirected or not a directory",
-            path.display()
-        )));
-    }
-    Ok(())
-}
-
-fn validate_stage_entries(directory: &Path) -> StorageResult<()> {
-    for entry in read_directory(directory)? {
-        let entry = entry.map_err(|error| {
-            connection(format!(
-                "enumerate staging entry {}: {error}",
-                directory.display()
-            ))
-        })?;
-        let name = entry.file_name();
-        if name != CONTENT_FILE
-            && name != INTENT_FILE
-            && name != LEGACY_INTENT_FILE
-            && name != PUBLISHED_FILE
-        {
-            return Err(connection(format!(
-                "unexpected file in staging entry {}",
-                entry.path().display()
-            )));
-        }
-        validate_private_regular_file(&entry.path())?;
-    }
-    Ok(())
 }
