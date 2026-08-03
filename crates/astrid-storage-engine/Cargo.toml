@@ -8,6 +8,12 @@ repository.workspace = true
 rust-version.workspace = true
 description = "User-space principal-store engine for Astrid"
 
+[features]
+default = []
+# Test-only byte-level persistence traces and crash-image generation. This is
+# opt-in so the recovery harness never enters production engine builds.
+crash-replay = []
+
 [dependencies]
 astrid-storage-model = { workspace = true }
 parking_lot = { workspace = true }

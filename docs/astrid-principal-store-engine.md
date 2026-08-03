@@ -234,6 +234,30 @@ ENOSPC or transient device incident remains loud while it exists but does not
 permanently brick the process after the operator repairs it. The retry policy
 is runtime behavior, not persistent format or principal capacity.
 
+The crash-recovery claim is checked at byte granularity rather than inferred
+from the named fault points. The opt-in `crash-replay` test module attaches a
+recorder to those production checkpoints and captures initial authoritative
+files, append/write/truncate effects with their pre-operation lengths,
+completed per-file barriers, root publications, and caller acknowledgements.
+Its conservative `sync_data` model generates every operation prefix and every
+byte prefix of the latest incomplete append, plus full-length zero, stale,
+torn, and pre-barrier block-order states. A completed barrier prevents any
+earlier state from being generated; the persistence policy is a named input,
+not an assumption hidden in the generator.
+
+Normal CI reopens every small generated image with the production reader. It
+requires an acknowledged or later durable root with a valid owned closure,
+permits repair only at a physical tail with no valid frame after it, requires
+interior corruption to fail closed, and opens every repaired image again to
+prove repair is idempotent. The same recorder covers coalesced multi-principal
+group commits, and generic logical file identifiers let staging or bulk-import
+markers join without another crash framework. A selected Rust-generated
+replay image is also accepted by the independent RÚNATAL reader. An unexpected
+result retains its exact files and prefix/ordinal manifest under the Cargo
+target directory for direct replay. This models the advertised barrier
+contract; separate power-loss testing remains the test of whether each hosted
+filesystem implements that contract.
+
 `RecoveryLimits` can impose an explicit parser allocation guard when an
 embedding needs one. Native Astrid instead accepts every process-addressable
 frame with fallible allocation, so this boundary is not a workspace, principal,
