@@ -30,20 +30,19 @@ mod journal;
 mod legacy;
 mod migration;
 mod recovery;
+mod retirement;
 #[cfg(test)]
 mod tests;
 
-use format::{StagingIntent, append_generation_footer, load_generation_footer};
+use format::{StagingIntent, append_generation_footer};
 use group::SealGroup;
 use journal::{
     JournalRecord, StageKey, append_records, flush_journal, open_journal, truncate_empty,
 };
 pub(super) use migration::migrate_alias_owner_intents;
 use migration::migrate_legacy;
-use recovery::{
-    load_generation, move_to_quarantine, parse_generation_name, read_directory,
-    sealed_generation_name, validate_generation,
-};
+use recovery::{load_generation, recover_generations, sealed_generation_name, validate_generation};
+use retirement::{establish as establish_retired_generation, remove as remove_generation};
 
 const GENERATIONS_DIRECTORY: &str = "generations";
 const QUARANTINE_DIRECTORY: &str = "quarantine";
@@ -143,6 +142,7 @@ enum StagingFaultPoint {
     SealJournalFlushed,
     PublicationJournalAppended,
     PublicationJournalFlushed,
+    GenerationRetired,
     GenerationCleaned,
 }
 
@@ -486,11 +486,9 @@ impl NativeContentStagingArea {
         }
         let cleanup = (|| {
             for key in &completed {
-                let path = self
-                    .inner
-                    .generations
-                    .join(sealed_generation_name(key.sequence, key.id));
-                remove_generation(&path)?;
+                let retired = establish_retired_generation(&self.inner.generations, *key)?;
+                self.fail_if(StagingFaultPoint::GenerationRetired)?;
+                remove_generation(&retired)?;
             }
             sync_directory(&self.inner.generations)?;
             self.fail_if(StagingFaultPoint::GenerationCleaned)
@@ -723,88 +721,6 @@ impl ReadyStagedContent {
     }
 }
 
-fn recover_generations(
-    generations: &Path,
-    quarantine: &Path,
-    journal: &mut JournalState,
-    faults: &dyn StagingFaultInjector,
-) -> StorageResult<()> {
-    let mut recovered = Vec::new();
-    let mut sequences = std::collections::BTreeMap::new();
-    let mut identifiers = std::collections::BTreeMap::new();
-    for key in journal.pending.keys().chain(journal.completed.iter()) {
-        claim_generation_key(&mut sequences, &mut identifiers, *key)?;
-    }
-    for entry in read_directory(generations)? {
-        let entry = entry.map_err(|error| {
-            connection(format!(
-                "enumerate staged generations {}: {error}",
-                generations.display()
-            ))
-        })?;
-        let path = entry.path();
-        match parse_generation_name(&entry.file_name().to_string_lossy()) {
-            Ok(recovery::GenerationName::Open) => {
-                move_to_quarantine(&path, quarantine, "unsealed")?;
-            },
-            Ok(recovery::GenerationName::Sealed(key)) if journal.completed.contains(&key) => {
-                remove_generation(&path)?;
-            },
-            Ok(recovery::GenerationName::Sealed(key)) if journal.pending.contains_key(&key) => {},
-            Ok(recovery::GenerationName::Sealed(key)) => {
-                let Ok(intent) = load_generation_footer(&path) else {
-                    move_to_quarantine(&path, quarantine, "orphan")?;
-                    continue;
-                };
-                if StageKey::from_intent(&intent) != key {
-                    return Err(connection(format!(
-                        "orphan staged generation footer disagrees with {}",
-                        path.display()
-                    )));
-                }
-                claim_generation_key(&mut sequences, &mut identifiers, key)?;
-                recovered.push(intent);
-            },
-            Err(_) => {
-                move_to_quarantine(&path, quarantine, "orphan")?;
-            },
-        }
-    }
-    if !journal.completed.is_empty() {
-        // A missing generation may be the visible half of an interrupted
-        // unlink whose directory entry is not durable yet. Retain the
-        // Published record until the absence itself crosses that boundary.
-        sync_directory(generations)?;
-        faults.fail(StagingFaultPoint::RecoveryCleanupDirectoryFlushed)?;
-    }
-    if !recovered.is_empty() {
-        // A rename that survived only a process restart has not necessarily
-        // crossed the directory durability boundary. Make the recovered name
-        // durable before the journal can make it authoritative across the
-        // next system crash.
-        sync_directory(generations)?;
-        faults.fail(StagingFaultPoint::RecoveryGenerationDirectoryFlushed)?;
-        recovered.sort_by_key(StageKey::from_intent);
-        let records: Vec<_> = recovered
-            .iter()
-            .cloned()
-            .map(JournalRecord::Sealed)
-            .collect();
-        append_records(&mut journal.file, &records)?;
-        flush_journal(&journal.file)?;
-        for intent in recovered {
-            journal
-                .pending
-                .insert(StageKey::from_intent(&intent), intent);
-        }
-    }
-    for intent in journal.pending.values() {
-        let path = generations.join(sealed_generation_name(intent.sequence, intent.id));
-        validate_generation(&path, intent)?;
-    }
-    Ok(())
-}
-
 fn claim_generation_key(
     sequences: &mut std::collections::BTreeMap<u64, StagedContentId>,
     identifiers: &mut std::collections::BTreeMap<StagedContentId, u64>,
@@ -831,17 +747,6 @@ fn claim_generation_key(
 
 fn open_generation_name(id: StagedContentId) -> String {
     format!("{id}.open")
-}
-
-fn remove_generation(path: &Path) -> StorageResult<()> {
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(connection(format!(
-            "remove staged generation {}: {error}",
-            path.display()
-        ))),
-    }
 }
 
 fn closed_writer() -> std::io::Error {

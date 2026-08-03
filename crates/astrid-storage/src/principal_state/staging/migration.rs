@@ -14,9 +14,9 @@ use super::format::{
 use super::journal::{JournalRecord, StageKey, append_records, flush_journal};
 use super::legacy::{self, LegacyReady};
 use super::recovery::{read_directory, sealed_generation_name, validate_generation};
+use super::retirement::remove as remove_generation;
 use super::{
     JournalState, StagingFaultInjector, StagingFaultPoint, claim_generation_key, connection,
-    remove_generation,
 };
 use crate::error::StorageResult;
 use crate::principal_state::StateOwner;

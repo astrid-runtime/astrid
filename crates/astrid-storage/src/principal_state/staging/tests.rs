@@ -14,6 +14,7 @@ use super::format::{
 use super::journal::{
     JournalRecord, StageKey, append_records, encoded_frame, flush_journal, refresh_frame_checksum,
 };
+use super::recovery::{read_directory, retired_generation_name};
 use super::*;
 use crate::principal_state::native_io::{atomic_write, sync_directory};
 
@@ -883,6 +884,7 @@ fn every_publication_cleanup_prefix_reopens_as_completed() {
     for point in [
         StagingFaultPoint::PublicationJournalAppended,
         StagingFaultPoint::PublicationJournalFlushed,
+        StagingFaultPoint::GenerationRetired,
         StagingFaultPoint::GenerationCleaned,
     ] {
         let directory = tempfile::tempdir().unwrap();
@@ -911,6 +913,53 @@ fn completed_publication_retry_finishes_cleanup_idempotently() {
     assert!(area.mark_published(&staged).is_ok());
     assert!(!staged.content_path().exists());
     assert!(area.ready().unwrap().is_empty());
+}
+
+#[test]
+fn retired_name_quarantines_reappeared_generation_without_republication() {
+    let directory = tempfile::tempdir().unwrap();
+    let area = open_area(directory.path());
+    let mut staged_writer = writer(&area, "published-tombstone");
+    staged_writer.write_all(b"published bytes").unwrap();
+    let staged = staged_writer.seal().unwrap();
+    let retired = area
+        .inner
+        .generations
+        .join(retired_generation_name(staged.sequence(), staged.id()));
+    std::fs::rename(staged.content_path(), &retired).unwrap();
+    std::fs::copy(&retired, staged.content_path()).unwrap();
+    drop(area);
+
+    let journal = directory.path().join(JOURNAL_FILE);
+    let journal_file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&journal)
+        .unwrap();
+    journal_file.set_len(0).unwrap();
+    journal_file.sync_all().unwrap();
+
+    let reopened = open_area(directory.path());
+    assert!(reopened.ready().unwrap().is_empty());
+    assert!(!staged.content_path().exists());
+    assert!(!retired.exists());
+    let quarantined = std::fs::read_dir(directory.path().join(QUARANTINE_DIRECTORY))
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .find(|entry| entry.file_name().to_string_lossy().contains("published"))
+        .expect("reappeared published bytes must be quarantined");
+    assert!(
+        std::fs::read(quarantined.path())
+            .unwrap()
+            .starts_with(b"published bytes")
+    );
+    reopened
+        .begin_with_id(
+            owner(),
+            ContentName::new("reusable.bin").unwrap(),
+            ChunkingProfile::ASTRID_V1,
+            staged.id(),
+        )
+        .unwrap();
 }
 
 #[test]
@@ -1241,7 +1290,6 @@ fn recovery_flushes_a_missing_completed_generation_before_dropping_its_record() 
             .len(),
         0
     );
-
     let reopened = open_area(directory.path());
     assert!(reopened.ready().unwrap().is_empty());
     assert_eq!(

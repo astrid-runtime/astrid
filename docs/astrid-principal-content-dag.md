@@ -214,9 +214,13 @@ rather than truncating it. A crash after the root CAS but before the durable
 `Published` record safely repeats the operation: exact bytes reproduce the
 same file identity, the already-current catalog returns the same root, and no
 new objects are admitted. A durable `Published` record makes interrupted file
-cleanup idempotent. Redirected files, duplicate sequences or identifiers,
-changed footers, and non-canonical generation names fail closed without
-deleting acknowledged bytes.
+cleanup idempotent. Cleanup first gives the sealed generation a write-through
+`.published` name, making its bytes permanently non-publishable before the
+journal record can drain; a reappeared tombstone causes any paired stale
+sealed name to be moved to quarantine before the tombstone is removed.
+Redirected files, duplicate sequences or identifiers, changed footers, and
+non-canonical generation names fail closed without deleting acknowledged
+bytes.
 
 The former `writing/` and `ready/` directory queues migrate under the runtime
 singleton lock. Alias-owned intent v1 is first rewritten to the current
