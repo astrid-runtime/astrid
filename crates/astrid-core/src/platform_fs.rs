@@ -136,6 +136,35 @@ pub fn ensure_private_directory(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Rename one filesystem entry with the strongest supported namespace
+/// durability for the host platform.
+///
+/// Windows uses `MoveFileExW(MOVEFILE_WRITE_THROUGH)`, which does not return
+/// until the move has been flushed. Unix callers must still synchronize the
+/// affected parent directories after this atomic rename.
+///
+/// Windows rejects an existing destination because the write-through move does
+/// not request replacement. Other platforms retain `std::fs::rename`
+/// replacement semantics. Security-sensitive callers remain responsible for
+/// serializing destination selection and validating both parent boundaries.
+///
+/// # Errors
+///
+/// Returns an error when either path is invalid or the operating system cannot
+/// complete the rename at its platform-specific durability boundary. Windows
+/// also returns an error when the destination already exists.
+pub fn rename_with_write_through(source: &Path, destination: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        windows::rename_with_write_through(source, destination)
+    }
+
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(source, destination)
+    }
+}
+
 /// Enforce and validate private access on an existing regular file.
 ///
 /// Unix retains its caller-owned mode behavior. Windows rejects reparse points

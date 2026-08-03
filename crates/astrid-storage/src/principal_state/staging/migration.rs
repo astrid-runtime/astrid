@@ -21,8 +21,8 @@ use super::{
 use crate::error::StorageResult;
 use crate::principal_state::StateOwner;
 use crate::principal_state::native_io::{
-    atomic_write, ensure_private_directory, open_private_file, sync_directory,
-    validate_private_regular_file,
+    atomic_write, ensure_private_directory, open_private_file, rename_private_entry,
+    sync_directory, validate_private_regular_file,
 };
 
 pub(super) const LEGACY_INTENT_FILE: &str = "intent.v1";
@@ -262,13 +262,7 @@ fn prepare_generation(
 ) -> StorageResult<()> {
     match (&entry.content, target.exists()) {
         (Some(source), false) => {
-            std::fs::rename(source, target).map_err(|error| {
-                connection(format!(
-                    "migrate legacy staged content {} as {}: {error}",
-                    source.display(),
-                    target.display()
-                ))
-            })?;
+            rename_private_entry(source, target)?;
             // The footer mutates the renamed inode. Make both sides of the
             // rename durable first, otherwise a crash can resurrect the inode
             // at its legacy name with a new-format footer that the legacy

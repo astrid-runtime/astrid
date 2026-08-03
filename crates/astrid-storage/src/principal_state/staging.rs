@@ -17,8 +17,8 @@ use astrid_storage_engine::GroupCommitPolicy;
 use uuid::Uuid;
 
 use super::native_io::{
-    create_private_file, ensure_private_directory, open_private_file, sync_directory,
-    validate_private_regular_file,
+    create_private_file, ensure_private_directory, open_private_file, rename_private_entry,
+    sync_directory, validate_private_regular_file,
 };
 use super::{NativePrincipalContentStore, StateOwner};
 use crate::content::{ChunkingProfile, ContentName, ContentWriteOutcome};
@@ -597,13 +597,7 @@ impl StagedContentWriter {
             .inner
             .generations
             .join(sealed_generation_name(sequence, self.id));
-        std::fs::rename(path, &sealed_path).map_err(|error| {
-            connection(format!(
-                "seal staged generation {} as {}: {error}",
-                path.display(),
-                sealed_path.display()
-            ))
-        })?;
+        rename_private_entry(path, &sealed_path)?;
         self.area.fail_if(StagingFaultPoint::GenerationRenamed)?;
         self.path = None;
         self.area.submit_seal(intent, sealed_path)

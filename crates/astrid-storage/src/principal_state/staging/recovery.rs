@@ -9,7 +9,7 @@ use super::format::{StagingIntent, load_generation_footer};
 use super::journal::{StageKey, StageKey as JournalStageKey};
 use super::{ReadyStagedContent, StagedContentId, connection, open_generation_name};
 use crate::error::StorageResult;
-use crate::principal_state::native_io::sync_directory;
+use crate::principal_state::native_io::{rename_private_entry, sync_directory};
 
 pub(super) enum GenerationName {
     Open,
@@ -117,13 +117,7 @@ pub(super) fn move_to_quarantine(
             .checked_add(1)
             .ok_or_else(|| connection("staging quarantine sequence exhausted".to_owned()))?;
     };
-    std::fs::rename(source, &destination).map_err(|error| {
-        connection(format!(
-            "quarantine staging entry {} as {}: {error}",
-            source.display(),
-            destination.display()
-        ))
-    })?;
+    rename_private_entry(source, &destination)?;
     if let Some(parent) = source.parent() {
         sync_directory(parent)?;
     }

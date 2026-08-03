@@ -11,7 +11,7 @@ use astrid_core::principal::PrincipalId;
 use astrid_storage_engine::{DurableEngine, DurableError, PrincipalCodec, RecoveryLimits};
 
 use super::format_amendment::{STORE_METADATA_FILE, is_supported_alias_owner_metadata};
-use super::native_io::{atomic_write, sync_directory};
+use super::native_io::{atomic_write, rename_private_entry, sync_directory};
 use super::staging;
 use super::{
     Blake3ObjectIdentityV1, PrincipalDirectory, RuntimeEngine, RuntimeStore, StateOwner,
@@ -547,13 +547,7 @@ fn recover_missing_active_root(store: &Path) -> StorageResult<()> {
             "principal owner migration lost every root-journal candidate".to_owned(),
         ));
     };
-    std::fs::rename(&source, &active).map_err(|error| {
-        StorageError::Connection(format!(
-            "recover principal root journal {} as {}: {error}",
-            source.display(),
-            active.display()
-        ))
-    })?;
+    rename_private_entry(&source, &active)?;
     sync_directory(store)
 }
 
@@ -567,19 +561,9 @@ fn promote_root_snapshot(store: &Path) -> StorageResult<()> {
             previous.display()
         )));
     }
-    std::fs::rename(&active, &previous).map_err(|error| {
-        StorageError::Connection(format!(
-            "backup alias-keyed root journal {}: {error}",
-            active.display()
-        ))
-    })?;
+    rename_private_entry(&active, &previous)?;
     sync_directory(store)?;
-    std::fs::rename(&replacement, &active).map_err(|error| {
-        StorageError::Connection(format!(
-            "promote UID-keyed root journal {}: {error}",
-            replacement.display()
-        ))
-    })?;
+    rename_private_entry(&replacement, &active)?;
     sync_directory(store)
 }
 

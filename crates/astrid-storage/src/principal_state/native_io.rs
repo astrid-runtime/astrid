@@ -178,15 +178,24 @@ pub(super) fn quarantine_directory(path: &Path, classification: &str) -> Storage
             .checked_add(1)
             .ok_or_else(|| connection("too many quarantined directories".to_owned()))?;
     };
-    std::fs::rename(path, &destination).map_err(|error| {
-        connection(format!(
-            "quarantine directory {} as {}: {error}",
-            path.display(),
-            destination.display()
-        ))
-    })?;
+    rename_private_entry(path, &destination)?;
     sync_directory(parent)?;
     Ok(destination)
+}
+
+/// Rename an entry at the platform's durable namespace boundary.
+///
+/// Windows has no portable parent-directory flush equivalent, so the rename
+/// itself must request write-through. Unix callers retain their existing
+/// parent-directory synchronization after this atomic transition.
+pub(super) fn rename_private_entry(source: &Path, destination: &Path) -> StorageResult<()> {
+    astrid_core::platform_fs::rename_with_write_through(source, destination).map_err(|error| {
+        connection(format!(
+            "rename private entry {} as {}: {error}",
+            source.display(),
+            destination.display()
+        ))
+    })
 }
 
 pub(super) fn sync_directory(path: &Path) -> StorageResult<()> {

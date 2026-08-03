@@ -9,7 +9,7 @@ use super::format::{StagingIntent, load_intent};
 use super::{StagedContentId, connection};
 use crate::error::StorageResult;
 use crate::principal_state::native_io::{
-    ensure_private_directory, sync_directory, validate_private_regular_file,
+    ensure_private_directory, rename_private_entry, sync_directory, validate_private_regular_file,
 };
 
 pub(super) const WRITING_DIRECTORY: &str = "writing";
@@ -258,13 +258,7 @@ fn recover_writing(writing: &Path, ready: &Path, quarantine: &Path) -> StorageRe
             move_to_quarantine(&path, quarantine, "legacy-duplicate")?;
             continue;
         }
-        std::fs::rename(&path, &destination).map_err(|error| {
-            connection(format!(
-                "recover legacy staging entry {} as {}: {error}",
-                path.display(),
-                destination.display()
-            ))
-        })?;
+        rename_private_entry(&path, &destination)?;
         sync_directory(writing)?;
         sync_directory(ready)?;
     }
@@ -392,13 +386,7 @@ fn move_to_quarantine(source: &Path, quarantine: &Path, classification: &str) ->
             .checked_add(1)
             .ok_or_else(|| connection("legacy quarantine sequence exhausted".to_owned()))?;
     };
-    std::fs::rename(source, &destination).map_err(|error| {
-        connection(format!(
-            "quarantine legacy staging entry {} as {}: {error}",
-            source.display(),
-            destination.display()
-        ))
-    })?;
+    rename_private_entry(source, &destination)?;
     if let Some(parent) = source.parent() {
         sync_directory(parent)?;
     }

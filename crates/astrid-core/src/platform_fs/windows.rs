@@ -14,6 +14,8 @@ mod path;
 mod prelude;
 #[path = "windows/private_file.rs"]
 mod private_file;
+#[path = "windows/rename.rs"]
+mod rename;
 
 pub(super) use executable::replace_executable_set;
 pub(super) use path::{
@@ -21,6 +23,7 @@ pub(super) use path::{
     validate_private_file, verify_no_redirects,
 };
 pub(super) use private_file::{atomic_write_private_file, read_private_file_to_string};
+pub(super) use rename::rename_with_write_through;
 
 #[cfg(test)]
 #[path = "windows/tests.rs"]

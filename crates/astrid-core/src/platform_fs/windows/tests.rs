@@ -18,6 +18,7 @@ use super::io::*;
 use super::path::*;
 use super::prelude::*;
 use super::private_file::*;
+use super::rename::*;
 use crate::groups::{BUILTIN_ADMIN, GroupConfig};
 use crate::profile::PrincipalProfile;
 use crate::session_token::SessionToken;
@@ -42,6 +43,33 @@ fn private_temp() -> tempfile::TempDir {
     apply_private_acl(root.path(), true).unwrap();
     validate_private_acl(root.path(), true).unwrap();
     root
+}
+
+#[test]
+fn write_through_rename_publishes_without_replacing() {
+    let _guard = serial_test_guard();
+    let root = private_temp();
+    let source = root.path().join("source.bin");
+    let destination = root.path().join("destination.bin");
+    std::fs::write(&source, b"durable namespace transition").unwrap();
+
+    rename_with_write_through(&source, &destination).unwrap();
+
+    assert!(!source.exists());
+    assert_eq!(
+        std::fs::read(&destination).unwrap(),
+        b"durable namespace transition"
+    );
+
+    let competing = root.path().join("competing.bin");
+    std::fs::write(&competing, b"must survive").unwrap();
+    let error = rename_with_write_through(&competing, &destination).unwrap_err();
+    assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+    assert_eq!(std::fs::read(&competing).unwrap(), b"must survive");
+    assert_eq!(
+        std::fs::read(&destination).unwrap(),
+        b"durable namespace transition"
+    );
 }
 
 fn update_tree() -> (tempfile::TempDir, PathBuf, PathBuf) {
