@@ -494,11 +494,13 @@ catalog.
 | `astrid-storage-publication-cache-after.json` | code `97df6492`, harness `09318a04` |
 | `astrid-storage-postcompaction.json` | `79d980d2` |
 
-The early report schema omitted Git revision and command line. These
-associations are reconstructed from dedicated worktrees, ancestry, names, and
-timestamps; they are historical evidence, not release attestation. The next
-schema must embed revision, dirty-tree state, command line, cache policy, and a
-result digest.
+The historical report schema omitted Git revision and executable arguments.
+Those associations are reconstructed from dedicated worktrees, ancestry,
+names, and timestamps; they are historical evidence, not release attestation.
+Format v2 embeds the revision, clean/dirty tree state, executable argument
+vector, cache policy, and a SHA-256 commitment to the complete measured
+payload. The report separately hashes the benchmark executable so the result
+remains bound to the measured binary even if a checkout later moves.
 
 ## Read-size sensitivity
 
