@@ -302,8 +302,9 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   the resulting old-length, current-length, changed-block, and torn-tail images
   through the production recovery path. Regressions enforce acknowledged-root
   survival, prohibit invented roots and dangling live closures, preserve hard
-  failure for corrupt interiors, and require repair to be idempotent. Closes
-  #1393.
+  failure for corrupt interiors, distinguish complete-looking oversized frames
+  from repairable incomplete oversized tails, and require repair to be
+  idempotent. Closes #1393.
 - **Principal storage reuses verified immutable reads under governed memory.**
   Durable object reads now use positional I/O after a short index lookup
   instead of seeking under the engine write mutex.

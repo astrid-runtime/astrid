@@ -23,8 +23,8 @@ impl TraceFileId {
     ///
     /// # Errors
     ///
-    /// Rejects empty names, path components, and the reserved `.` and `..`
-    /// components.
+    /// Rejects empty names, path components, Windows drive prefixes, and the
+    /// reserved `.` and `..` components.
     pub fn new(name: impl Into<String>) -> Result<Self, CrashReplayError> {
         let name = name.into();
         if name.is_empty()
@@ -32,6 +32,7 @@ impl TraceFileId {
             || name == ".."
             || name.contains('/')
             || name.contains('\\')
+            || name.contains(':')
         {
             return Err(CrashReplayError::InvalidFileId(name));
         }
@@ -470,5 +471,24 @@ impl std::error::Error for CrashReplayError {
             Self::Io { source, .. } => Some(source),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trace_file_ids_are_safe_single_components_on_every_host() {
+        for invalid in ["", ".", "..", "a/b", "a\\b", "C:outside", ":"] {
+            assert!(matches!(
+                TraceFileId::new(invalid),
+                Err(CrashReplayError::InvalidFileId(name)) if name == invalid
+            ));
+        }
+        assert_eq!(
+            TraceFileId::new("objects.arena").unwrap().as_str(),
+            "objects.arena"
+        );
     }
 }

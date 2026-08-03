@@ -213,10 +213,12 @@ authoritative path:
 - scans and identity-checks every complete object frame;
 - rebuilds the `ObjectId`-to-arena-offset index without retaining payloads;
 - truncates an incomplete final frame, or a final frame with invalid physical
-  magic/checksum only when no valid physical frame follows it;
-- rejects invalid interior frames and every unsupported-version, resource,
-  grammar, canonicality, identity, collision, or model failure with its file
-  and byte offset;
+  magic/checksum or an oversized declaration whose claimed frame cannot fit,
+  only when no valid physical frame follows it;
+- preserves a complete-looking frame above the recovery allocation policy as
+  `FrameTooLarge` without reading or allocating its payload, and rejects invalid
+  interior frames plus every unsupported-version, grammar, canonicality,
+  identity, collision, or model failure with its file and byte offset;
 - replays root records using the same model compare-and-swap transition and
   verifies the recorded generation;
 - validates every final live root closure and then lazy-loads object payloads
@@ -240,14 +242,16 @@ recorder to those production checkpoints and captures initial authoritative
 files, append/write/truncate effects with their pre-operation lengths,
 completed per-file barriers, root publications, and caller acknowledgements.
 Its conservative `sync_data` model generates every operation prefix and every
-byte prefix of the latest incomplete append, plus full-length zero, stale,
-torn, and pre-barrier block-order states. A completed barrier prevents any
-earlier state from being generated; the persistence policy is a named input,
-not an assumption hidden in the generator.
+byte prefix of the latest incomplete append, plus every changed-block subset
+from both zero-filled and deterministic non-zero stale baselines, both inode
+lengths across an unflushed truncate, and pre-barrier block-order states. A
+completed barrier prevents any earlier state from being generated; the
+persistence policy is a named input, not an assumption hidden in the generator.
 
-Normal CI reopens every small generated image with the production reader. It
-requires an acknowledged or later durable root with a valid owned closure,
-permits repair only at a physical tail with no valid frame after it, requires
+Normal CI reopens every small generated image with the production reader. The
+oracle admits a root only when its exact canonical journal frame exists in that
+image, requires quiescent acknowledged bytes to reopen, permits repair only at
+a physical tail with no valid frame after it, requires every classified
 interior corruption to fail closed, and opens every repaired image again to
 prove repair is idempotent. The same recorder covers coalesced multi-principal
 group commits, and generic logical file identifiers let staging or bulk-import

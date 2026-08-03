@@ -342,12 +342,22 @@ pub(super) fn scan_frames(
                 .map_err(|_| DurableError::EncodingOverflow)?,
         );
         if payload_len > limits.max_frame_bytes {
-            return Err(DurableError::FrameTooLarge {
+            let error = DurableError::FrameTooLarge {
                 file: file_name,
                 offset,
                 declared: payload_len,
                 limit: limits.max_frame_bytes,
-            });
+            };
+            let claimed_end = FRAME_HEADER_LEN
+                .checked_add(payload_len)
+                .and_then(|frame_len| offset.checked_add(frame_len));
+            if claimed_end.is_some_and(|end| end <= file_len)
+                || valid_frame_follows(file, magic, offset, file_len, limits)?
+            {
+                return Err(error);
+            }
+            truncate_tail(file, offset)?;
+            break;
         }
         let frame_len = FRAME_HEADER_LEN
             .checked_add(payload_len)
@@ -473,14 +483,14 @@ fn physical_frame_is_valid(
             .try_into()
             .map_err(|_| DurableError::EncodingOverflow)?,
     );
-    if payload_len > limits.max_frame_bytes {
-        return Ok(false);
-    }
     let frame_len = FRAME_HEADER_LEN
         .checked_add(payload_len)
         .ok_or(DurableError::EncodingOverflow)?;
     if frame_len > remaining {
         return Ok(false);
+    }
+    if payload_len > limits.max_frame_bytes {
+        return Ok(true);
     }
     let expected: [u8; 32] = header[CHECKSUM_START..]
         .try_into()

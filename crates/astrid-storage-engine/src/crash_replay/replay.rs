@@ -391,56 +391,86 @@ fn file_variants(
             limits.incomplete_append_bytes,
         )?;
         for written in 0..=len {
-            let end = start
+            let visible_len = start
                 .checked_add(written)
                 .ok_or(CrashReplayError::LengthOverflow)?;
-            variants.insert(state.visible[..end].to_vec());
+            insert_length_variants(&mut variants, state, visible_len, model, limits)?;
         }
-    }
-
-    if state.visible.len() >= state.durable.len() {
-        let full_len = state.visible.len();
-        let mut zero_prior = state.durable.clone();
-        zero_prior.resize(full_len, 0);
-        let mut stale_prior = state.durable.clone();
-        stale_prior.extend((state.durable.len()..full_len).map(|offset| model.stale_byte(offset)));
-        variants.insert(stale_prior);
-        let changed_blocks: Vec<_> = (0..full_len.div_ceil(model.block_bytes().get()))
-            .filter(|block| {
-                let start = block.saturating_mul(model.block_bytes().get());
-                let end = start
-                    .saturating_add(model.block_bytes().get())
-                    .min(full_len);
-                zero_prior[start..end] != state.visible[start..end]
-            })
-            .collect();
-        require_bound(
-            "volatile-blocks",
-            changed_blocks.len(),
-            usize::from(limits.volatile_blocks.get()),
-        )?;
-        let combinations = 1_usize
-            .checked_shl(
-                u32::try_from(changed_blocks.len())
-                    .map_err(|_| CrashReplayError::LengthOverflow)?,
-            )
-            .ok_or(CrashReplayError::LengthOverflow)?;
-        for mask in 0..combinations {
-            let mut torn = zero_prior.clone();
-            for (position, block) in changed_blocks.iter().copied().enumerate() {
-                if mask & (1_usize << position) == 0 {
-                    continue;
-                }
-                let start = block.saturating_mul(model.block_bytes().get());
-                let end = start
-                    .saturating_add(model.block_bytes().get())
-                    .min(full_len);
-                torn[start..end].copy_from_slice(&state.visible[start..end]);
-            }
-            variants.insert(torn);
-        }
+    } else {
+        insert_length_variants(&mut variants, state, state.visible.len(), model, limits)?;
     }
     Ok(variants.into_iter().collect())
+}
+
+fn insert_length_variants(
+    variants: &mut BTreeSet<Vec<u8>>,
+    state: &FileState,
+    visible_len: usize,
+    model: &impl PersistenceModel,
+    limits: ReplayLimits,
+) -> Result<(), CrashReplayError> {
+    let visible = state
+        .visible
+        .get(..visible_len)
+        .ok_or(CrashReplayError::LengthOverflow)?;
+    if visible_len >= state.durable.len() {
+        let mut zero_prior = state.durable.clone();
+        zero_prior.resize(visible_len, 0);
+        let mut stale_prior = state.durable.clone();
+        stale_prior
+            .extend((state.durable.len()..visible_len).map(|offset| model.stale_byte(offset)));
+        for baseline in [zero_prior, stale_prior] {
+            insert_block_subsets(variants, &baseline, visible, visible_len, model, limits)?;
+        }
+    } else {
+        for baseline in [state.durable.clone(), state.durable[..visible_len].to_vec()] {
+            insert_block_subsets(variants, &baseline, visible, visible_len, model, limits)?;
+        }
+    }
+    Ok(())
+}
+
+fn insert_block_subsets(
+    variants: &mut BTreeSet<Vec<u8>>,
+    baseline: &[u8],
+    visible: &[u8],
+    changed_len: usize,
+    model: &impl PersistenceModel,
+    limits: ReplayLimits,
+) -> Result<(), CrashReplayError> {
+    let block_bytes = model.block_bytes().get();
+    let changed_blocks: Vec<_> = (0..changed_len.div_ceil(block_bytes))
+        .filter(|block| {
+            let start = block.saturating_mul(block_bytes);
+            let end = start.saturating_add(block_bytes).min(changed_len);
+            baseline[start..end] != visible[start..end]
+        })
+        .collect();
+    require_bound(
+        "volatile-blocks",
+        changed_blocks.len(),
+        usize::from(limits.volatile_blocks.get()),
+    )?;
+    let combinations = 1_usize
+        .checked_shl(
+            u32::try_from(changed_blocks.len()).map_err(|_| CrashReplayError::LengthOverflow)?,
+        )
+        .ok_or(CrashReplayError::LengthOverflow)?;
+    for mask in 0..combinations {
+        let mut torn = baseline.to_vec();
+        for (position, block) in changed_blocks.iter().copied().enumerate() {
+            if mask & (1_usize << position) == 0 {
+                continue;
+            }
+            let start = block.saturating_mul(block_bytes);
+            let end = start.saturating_add(block_bytes).min(changed_len);
+            torn[start..end].copy_from_slice(&visible[start..end]);
+        }
+        if variants.insert(torn) {
+            require_bound("file-variants", variants.len(), limits.images.get())?;
+        }
+    }
+    Ok(())
 }
 
 fn require_bound(bound: &'static str, actual: usize, limit: usize) -> Result<(), CrashReplayError> {
@@ -492,6 +522,69 @@ mod tests {
         let mut stale = b"old".to_vec();
         stale.extend((3..11).map(|offset| model.stale_byte(offset)));
         assert!(bytes.contains(stale.as_slice()));
+        let mut stale_with_middle_block = stale;
+        stale_with_middle_block[4..8].copy_from_slice(b"bcde");
+        assert!(bytes.contains(stale_with_middle_block.as_slice()));
+    }
+
+    #[test]
+    fn truncate_crosses_inode_lengths_with_prior_write_blocks() {
+        let file = file();
+        let recorder = CrashTraceRecorder::new(
+            BTreeMap::from([(file.clone(), b"abcdefgh".to_vec())]),
+            std::iter::empty(),
+        )
+        .unwrap();
+        recorder.capture_bytes(&file, b"ABCD".to_vec()).unwrap();
+        let trace = recorder.trace().unwrap();
+        let images = trace
+            .replay(
+                &ConservativeDataSync::new(NonZeroUsize::new(4).unwrap()),
+                ReplayLimits::ci(),
+            )
+            .unwrap();
+        let bytes: BTreeSet<_> = images
+            .images()
+            .iter()
+            .filter(|image| image.operation_prefix() == 2)
+            .map(|image| image.files()[&file].clone())
+            .collect();
+        assert_eq!(
+            bytes,
+            BTreeSet::from([
+                b"ABCD".to_vec(),
+                b"ABCDefgh".to_vec(),
+                b"abcd".to_vec(),
+                b"abcdefgh".to_vec(),
+            ])
+        );
+    }
+
+    #[test]
+    fn append_prefixes_cross_prior_volatile_write_blocks() {
+        let file = file();
+        let recorder = CrashTraceRecorder::new(
+            BTreeMap::from([(file.clone(), b"old0".to_vec())]),
+            std::iter::empty(),
+        )
+        .unwrap();
+        recorder.capture_bytes(&file, b"NEW0abcd".to_vec()).unwrap();
+        let trace = recorder.trace().unwrap();
+        let images = trace
+            .replay(
+                &ConservativeDataSync::new(NonZeroUsize::new(4).unwrap()),
+                ReplayLimits::ci(),
+            )
+            .unwrap();
+        let bytes: BTreeSet<_> = images
+            .images()
+            .iter()
+            .filter(|image| image.operation_prefix() == 2)
+            .map(|image| image.files()[&file].clone())
+            .collect();
+
+        assert!(bytes.contains(b"old0a".as_slice()));
+        assert!(bytes.contains(b"NEW0\0".as_slice()));
     }
 
     #[test]

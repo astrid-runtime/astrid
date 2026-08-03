@@ -2,17 +2,134 @@
 
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::crash_replay::{
-    ConservativeDataSync, CrashImage, CrashTraceRecorder, ReplayLimits, TraceEffect, TraceFileId,
+    ConservativeDataSync, CrashImage, CrashTrace, CrashTraceRecorder, ReplayLimits, TraceEffect,
+    TraceFileId,
 };
 
-use super::tests::{TestEngine, TestIdentity, Utf8Codec, limits, open, transaction};
+use super::tests::{
+    TEST_IDENTITY_SCHEME, TestEngine, TestIdentity, Utf8Codec, limits, open, transaction,
+};
 use super::*;
+
+#[derive(Clone, Debug)]
+struct RecordedFrame {
+    file: TraceFileId,
+    offset: usize,
+    bytes: Vec<u8>,
+}
+
+impl RecordedFrame {
+    fn is_exact_in(&self, image: &CrashImage) -> bool {
+        let end = self.offset.checked_add(self.bytes.len()).unwrap();
+        image.files()[&self.file].get(self.offset..end) == Some(self.bytes.as_slice())
+    }
+
+    fn payload(&self) -> &[u8] {
+        &self.bytes[FRAME_HEADER_LEN_USIZE..]
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ExpectedRootFrame {
+    root: RootState,
+    frame: RecordedFrame,
+}
+
+fn recorded_frames(trace: &CrashTrace) -> Vec<RecordedFrame> {
+    let mut frames = Vec::new();
+    for effect in trace.effects() {
+        let TraceEffect::Append {
+            file,
+            pre_len,
+            bytes,
+        } = effect
+        else {
+            continue;
+        };
+        let magic = match file.as_str() {
+            ARENA_FILE => ARENA_MAGIC,
+            ROOT_FILE => ROOT_MAGIC,
+            other => panic!("unexpected framed trace file {other}"),
+        };
+        let mut cursor = 0_usize;
+        while cursor < bytes.len() {
+            let header_end = cursor.checked_add(FRAME_HEADER_LEN_USIZE).unwrap();
+            let header = bytes
+                .get(cursor..header_end)
+                .expect("recorded append contains a complete frame header");
+            assert_eq!(&header[..8], &magic);
+            let payload_len =
+                usize::try_from(u64::from_le_bytes(header[12..20].try_into().unwrap())).unwrap();
+            let frame_end = header_end.checked_add(payload_len).unwrap();
+            let frame = bytes
+                .get(cursor..frame_end)
+                .expect("recorded append contains a complete frame");
+            frames.push(RecordedFrame {
+                file: file.clone(),
+                offset: usize::try_from(*pre_len)
+                    .unwrap()
+                    .checked_add(cursor)
+                    .unwrap(),
+                bytes: frame.to_vec(),
+            });
+            cursor = frame_end;
+        }
+    }
+    frames
+}
+
+fn expected_root_frame(
+    frames: &[RecordedFrame],
+    principal: &str,
+    expected: Option<RootState>,
+    root: RootState,
+) -> ExpectedRootFrame {
+    let payload =
+        encode_root_record(TEST_IDENTITY_SCHEME, principal.as_bytes(), expected, root).unwrap();
+    let frame = frames
+        .iter()
+        .find(|frame| frame.file.as_str() == ROOT_FILE && frame.payload() == payload)
+        .expect("recorded trace contains expected canonical root frame")
+        .clone();
+    ExpectedRootFrame { root, frame }
+}
+
+fn has_invalid_interior(image: &CrashImage, frames: &[RecordedFrame]) -> bool {
+    frames.iter().enumerate().any(|(position, frame)| {
+        !frame.is_exact_in(image)
+            && frames.iter().skip(position).skip(1).any(|later| {
+                later.file == frame.file && later.offset > frame.offset && later.is_exact_in(image)
+            })
+    })
+}
+
+fn acknowledged_bytes_are_quiescent(trace: &CrashTrace, image: &CrashImage) -> bool {
+    let effects = &trace.effects()[..image.operation_prefix()];
+    let latest_acknowledgement = effects
+        .iter()
+        .rposition(|effect| matches!(effect, TraceEffect::AcknowledgedCommit { .. }));
+    let after_acknowledgement = latest_acknowledgement.map_or(effects, |position| {
+        &effects[position.checked_add(1).unwrap()..]
+    });
+    let has_acknowledgement =
+        latest_acknowledgement.is_some() || !trace.initial_acknowledgements().is_empty();
+    has_acknowledgement
+        && !after_acknowledgement.iter().any(|effect| {
+            matches!(
+                effect,
+                TraceEffect::Append { .. }
+                    | TraceEffect::Write { .. }
+                    | TraceEffect::Truncate { .. }
+            )
+        })
+}
 
 #[derive(Debug)]
 struct EngineTraceFaults {
@@ -133,6 +250,10 @@ fn authoritative_bytes(directory: &Path) -> (Vec<u8>, Vec<u8>) {
     )
 }
 
+fn materialize_replay_image(image: &CrashImage, directory: &Path) {
+    image.materialize(directory).unwrap();
+}
+
 fn retain_failure(image: &CrashImage, test: &str) -> PathBuf {
     let target = std::env::var_os("CARGO_TARGET_DIR").map_or_else(
         || Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target"),
@@ -159,31 +280,77 @@ fn retain_failure(image: &CrashImage, test: &str) -> PathBuf {
     directory
 }
 
-fn replay_image(
-    image: &CrashImage,
-    roots: &[RootState],
-    acknowledgement_floor: &BTreeMap<&str, RootGeneration>,
-) -> bool {
-    let directory = tempfile::tempdir().unwrap();
-    image.materialize(directory.path()).unwrap();
-    let opened = DurableEngine::open(directory.path(), TestIdentity, Utf8Codec, limits());
-    let engine = match opened {
-        Ok(engine) => engine,
-        Err(DurableError::Corrupt { .. }) => return false,
-        Err(error) => {
-            let retained = retain_failure(image, "single-multi-commit");
-            panic!(
-                "unexpected recovery result at prefix {} image {}: {error}; retained {}",
+fn with_retained_failure<T>(image: &CrashImage, test: &str, operation: impl FnOnce() -> T) -> T {
+    match catch_unwind(AssertUnwindSafe(operation)) {
+        Ok(result) => result,
+        Err(payload) => {
+            let retained = retain_failure(image, test);
+            eprintln!(
+                "retained failed crash image for prefix {} image {} at {}",
                 image.operation_prefix(),
                 image.ordinal(),
                 retained.display()
             );
+            resume_unwind(payload);
+        },
+    }
+}
+
+fn replay_image(
+    image: &CrashImage,
+    directory: &Path,
+    trace: &CrashTrace,
+    frames: &[RecordedFrame],
+    initial_root: RootState,
+    root_frames: &[ExpectedRootFrame],
+    acknowledgement_floor: &BTreeMap<&str, RootGeneration>,
+) -> bool {
+    materialize_replay_image(image, directory);
+    let invalid_interior = has_invalid_interior(image, frames);
+    let opened = DurableEngine::open(directory, TestIdentity, Utf8Codec, limits());
+    let engine = match opened {
+        Ok(engine) => {
+            assert!(
+                !invalid_interior,
+                "recovery accepted invalid interior at prefix {} image {}",
+                image.operation_prefix(),
+                image.ordinal()
+            );
+            engine
+        },
+        Err(DurableError::Corrupt { .. }) => {
+            assert!(
+                invalid_interior,
+                "recovery rejected a repairable image at prefix {} image {}",
+                image.operation_prefix(),
+                image.ordinal()
+            );
+            assert!(
+                !acknowledged_bytes_are_quiescent(trace, image),
+                "recovery rejected quiescent acknowledged bytes at prefix {} image {}",
+                image.operation_prefix(),
+                image.ordinal()
+            );
+            return false;
+        },
+        Err(error) => {
+            panic!(
+                "unexpected recovery result at prefix {} image {}: {error}",
+                image.operation_prefix(),
+                image.ordinal()
+            );
         },
     };
     let recovered = engine.root(&"alice".to_owned()).unwrap().unwrap();
+    let root_is_present = recovered == initial_root
+        || root_frames
+            .iter()
+            .any(|expected| expected.root == recovered && expected.frame.is_exact_in(image));
     assert!(
-        roots.contains(&recovered),
-        "recovery invented root {recovered:?}"
+        root_is_present,
+        "recovery invented root {recovered:?} at prefix {} image {}",
+        image.operation_prefix(),
+        image.ordinal()
     );
     let minimum = image
         .acknowledged_commits()
@@ -201,9 +368,9 @@ fn replay_image(
     assert!(engine.snapshot(&"alice".to_owned()).unwrap().is_some());
     drop(engine);
 
-    let repaired_once = authoritative_bytes(directory.path());
-    drop(open(directory.path()));
-    let repaired_twice = authoritative_bytes(directory.path());
+    let repaired_once = authoritative_bytes(directory);
+    drop(open(directory));
+    let repaired_twice = authoritative_bytes(directory);
     assert_eq!(
         repaired_once,
         repaired_twice,
@@ -236,61 +403,77 @@ fn production_recovery_accepts_every_single_and_multi_commit_prefix() {
     assert!(trace.effects().iter().any(
         |effect| matches!(effect, TraceEffect::AcknowledgedCommit { label } if label == "final")
     ));
-    let first_arena_appends: Vec<_> = trace
-        .effects()
-        .iter()
-        .filter_map(|effect| match effect {
-            TraceEffect::Append {
-                file,
-                pre_len,
-                bytes,
-            } if file.as_str() == ARENA_FILE => Some((*pre_len, bytes.as_slice())),
-            _ => None,
-        })
-        .take(2)
-        .collect();
-    assert_eq!(first_arena_appends.len(), 2);
+    let frames = recorded_frames(&trace);
+    let root_frames = [
+        expected_root_frame(&frames, "alice", Some(initial), middle),
+        expected_root_frame(&frames, "alice", Some(middle), final_root),
+    ];
     let images = trace
         .replay(
-            &ConservativeDataSync::new(NonZeroUsize::new(128).unwrap()),
+            &ConservativeDataSync::new(NonZeroUsize::new(4096).unwrap()),
             ReplayLimits::ci(),
         )
         .unwrap();
-    let known_roots = [initial, middle, final_root];
     let floors = BTreeMap::from([
         ("initial", initial.generation),
         ("middle", middle.generation),
         ("final", final_root.generation),
     ]);
     let mut recovered = 0_usize;
-    let mut refused = 0_usize;
-    let mut invalid_followed_by_valid_was_refused = false;
-    let arena_id = TraceFileId::new(ARENA_FILE).unwrap();
+    let replay = tempfile::tempdir().unwrap();
     for image in images.images() {
-        let arena = &image.files()[&arena_id];
-        let [(first_offset, first), (second_offset, second)] = first_arena_appends.as_slice()
-        else {
-            unreachable!();
-        };
-        let first_offset = usize::try_from(*first_offset).unwrap();
-        let second_offset = usize::try_from(*second_offset).unwrap();
-        let first_end = first_offset.checked_add(first.len()).unwrap();
-        let second_end = second_offset.checked_add(second.len()).unwrap();
-        let has_invalid_interior = arena.get(first_offset..first_end) != Some(*first)
-            && arena.get(second_offset..second_end) == Some(*second);
-        if replay_image(image, &known_roots, &floors) {
+        let did_recover = with_retained_failure(image, "single-multi-commit", || {
+            replay_image(
+                image,
+                replay.path(),
+                &trace,
+                &frames,
+                initial,
+                &root_frames,
+                &floors,
+            )
+        });
+        if did_recover {
             recovered = recovered.checked_add(1).unwrap();
-        } else {
-            refused = refused.checked_add(1).unwrap();
-            invalid_followed_by_valid_was_refused |= has_invalid_interior;
         }
     }
     assert!(recovered > 0);
-    assert!(refused > 0, "no invalid-interior crash image was generated");
-    assert!(
-        invalid_followed_by_valid_was_refused,
-        "no invalid frame followed by a valid frame was refused"
-    );
+}
+
+#[test]
+fn crash_replay_generates_an_interior_corruption_rejected_by_recovery() {
+    let directory = tempfile::tempdir().unwrap();
+    let initial_engine = open(directory.path());
+    let (_, initial_transaction) = transaction("alice", None, b"initial");
+    let initial = initial_engine.commit(initial_transaction).unwrap().root();
+    drop(initial_engine);
+
+    let faults = Arc::new(EngineTraceFaults::new(directory.path(), &["initial"]));
+    let engine = open_traced(directory.path(), Arc::clone(&faults));
+    let (_, transaction) = transaction("alice", Some(initial), b"next");
+    engine.commit(transaction).unwrap();
+    drop(engine);
+
+    let trace = faults.recorder.trace().unwrap();
+    let frames = recorded_frames(&trace);
+    let images = trace
+        .replay(
+            &ConservativeDataSync::new(NonZeroUsize::new(128).unwrap()),
+            ReplayLimits::ci(),
+        )
+        .unwrap();
+    let image = images
+        .images()
+        .iter()
+        .find(|image| has_invalid_interior(image, &frames))
+        .expect("small-block replay did not generate invalid interior data");
+    let replay = tempfile::tempdir().unwrap();
+    image.materialize(replay.path()).unwrap();
+
+    assert!(matches!(
+        DurableEngine::open(replay.path(), TestIdentity, Utf8Codec, limits()),
+        Err(DurableError::Corrupt { .. })
+    ));
 }
 
 #[test]
@@ -339,12 +522,12 @@ fn complete_length_zero_tail_is_generated_and_repaired() {
     );
 }
 
-#[test]
-fn multi_principal_group_commit_uses_the_same_prefix_replayer() {
-    let directory = tempfile::tempdir().unwrap();
-    drop(open(directory.path()));
-    let faults = Arc::new(EngineTraceFaults::new(directory.path(), &[]));
-    let engine = Arc::new(open_traced_group(directory.path(), Arc::clone(&faults)));
+fn record_multi_principal_group_commit(
+    directory: &Path,
+) -> (CrashTrace, BTreeMap<String, RootState>) {
+    drop(open(directory));
+    let faults = Arc::new(EngineTraceFaults::new(directory, &[]));
+    let engine = Arc::new(open_traced_group(directory, Arc::clone(&faults)));
     let drain_reached = Arc::new(Barrier::new(2));
     let drain_release = Arc::new(Barrier::new(2));
     engine.gate_next_group_drain(Arc::clone(&drain_reached), Arc::clone(&drain_release));
@@ -376,65 +559,133 @@ fn multi_principal_group_commit_uses_the_same_prefix_replayer() {
     }
     drop(engine);
 
-    let trace = faults.recorder.trace().unwrap();
+    (faults.recorder.trace().unwrap(), expected)
+}
+
+fn assert_one_group_flush_pair(trace: &CrashTrace) {
+    let barriers = trace
+        .effects()
+        .iter()
+        .filter(|effect| matches!(effect, TraceEffect::Barrier { .. }))
+        .count();
     assert_eq!(
-        trace
-            .effects()
-            .iter()
-            .filter(|effect| matches!(effect, TraceEffect::Barrier { .. }))
-            .count(),
-        2,
-        "one grouped transaction must share one arena/root flush pair"
+        barriers, 2,
+        "one group must share one arena/root flush pair"
     );
+}
+
+fn replay_group_image(
+    image: &CrashImage,
+    directory: &Path,
+    trace: &CrashTrace,
+    frames: &[RecordedFrame],
+    expected: &BTreeMap<String, RootState>,
+    root_frames: &BTreeMap<String, ExpectedRootFrame>,
+) -> Option<usize> {
+    materialize_replay_image(image, directory);
+    let invalid_interior = has_invalid_interior(image, frames);
+    let recovered = match DurableEngine::open(directory, TestIdentity, Utf8Codec, limits()) {
+        Ok(engine) => {
+            assert!(
+                !invalid_interior,
+                "group recovery accepted invalid interior at prefix {} image {}",
+                image.operation_prefix(),
+                image.ordinal()
+            );
+            engine
+        },
+        Err(DurableError::Corrupt { .. }) => {
+            assert!(
+                invalid_interior,
+                "group recovery rejected a repairable image at prefix {} image {}",
+                image.operation_prefix(),
+                image.ordinal()
+            );
+            assert!(
+                !acknowledged_bytes_are_quiescent(trace, image),
+                "group recovery rejected quiescent acknowledged bytes at prefix {} image {}",
+                image.operation_prefix(),
+                image.ordinal()
+            );
+            return None;
+        },
+        Err(error) => {
+            panic!(
+                "unexpected grouped recovery at prefix {} image {}: {error}",
+                image.operation_prefix(),
+                image.ordinal()
+            );
+        },
+    };
+    let mut visible = 0_usize;
+    for (principal, root) in expected {
+        let actual = recovered.root(principal).unwrap();
+        let root_frame = &root_frames[principal];
+        let allowed = root_frame.frame.is_exact_in(image).then_some(*root);
+        assert_eq!(
+            actual,
+            allowed,
+            "group recovery root did not match exact journal evidence for {principal} at prefix {} image {}",
+            image.operation_prefix(),
+            image.ordinal()
+        );
+        if actual.is_some() {
+            visible = visible.checked_add(1).unwrap();
+            assert!(recovered.snapshot(principal).unwrap().is_some());
+        }
+    }
+    if image.acknowledged_commits().len() == expected.len() {
+        assert_eq!(visible, expected.len(), "acknowledged group rolled back");
+    }
+    drop(recovered);
+    let repaired_once = authoritative_bytes(directory);
+    drop(open(directory));
+    assert_eq!(repaired_once, authoritative_bytes(directory));
+    Some(visible)
+}
+
+#[test]
+fn multi_principal_group_commit_uses_the_same_prefix_replayer() {
+    let directory = tempfile::tempdir().unwrap();
+    let (trace, expected) = record_multi_principal_group_commit(directory.path());
+
+    let frames = recorded_frames(&trace);
+    let root_frames: BTreeMap<_, _> = expected
+        .iter()
+        .map(|(principal, root)| {
+            (
+                principal.clone(),
+                expected_root_frame(&frames, principal, None, *root),
+            )
+        })
+        .collect();
+    assert_one_group_flush_pair(&trace);
     let images = trace
         .replay(
-            &ConservativeDataSync::new(NonZeroUsize::new(128).unwrap()),
+            &ConservativeDataSync::new(NonZeroUsize::new(4096).unwrap()),
             ReplayLimits::ci(),
         )
         .unwrap();
     let mut partial_group = false;
-    let mut refused = 0_usize;
+    let replay = tempfile::tempdir().unwrap();
     for image in images.images() {
-        let replay = tempfile::tempdir().unwrap();
-        image.materialize(replay.path()).unwrap();
-        let recovered = match DurableEngine::open(replay.path(), TestIdentity, Utf8Codec, limits())
-        {
-            Ok(engine) => engine,
-            Err(DurableError::Corrupt { .. }) => {
-                refused = refused.checked_add(1).unwrap();
-                continue;
-            },
-            Err(error) => {
-                let retained = retain_failure(image, "group-commit");
-                panic!(
-                    "unexpected grouped recovery at prefix {} image {}: {error}; retained {}",
-                    image.operation_prefix(),
-                    image.ordinal(),
-                    retained.display()
-                );
-            },
+        let visible = with_retained_failure(image, "group-commit", || {
+            replay_group_image(
+                image,
+                replay.path(),
+                &trace,
+                &frames,
+                &expected,
+                &root_frames,
+            )
+        });
+        let Some(visible) = visible else {
+            continue;
         };
-        let mut visible = 0_usize;
-        for (principal, root) in &expected {
-            let actual = recovered.root(principal).unwrap();
-            assert!(actual.is_none() || actual == Some(*root));
-            if actual.is_some() {
-                visible = visible.checked_add(1).unwrap();
-                assert!(recovered.snapshot(principal).unwrap().is_some());
-            }
-        }
         partial_group |= visible == 1;
-        if image.acknowledged_commits().len() == expected.len() {
-            assert_eq!(visible, expected.len(), "acknowledged group rolled back");
-        }
-        drop(recovered);
-        let repaired_once = authoritative_bytes(replay.path());
-        drop(open(replay.path()));
-        assert_eq!(repaired_once, authoritative_bytes(replay.path()));
     }
     assert!(
         partial_group,
         "no pre-barrier partial group image recovered"
     );
-    assert!(refused > 0, "no grouped interior corruption was refused");
 }
