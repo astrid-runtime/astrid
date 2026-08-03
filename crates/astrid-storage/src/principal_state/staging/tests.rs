@@ -1462,13 +1462,12 @@ fn native_seal_group_scale_probe() {
             latencies.sort_unstable();
             let operations = u32::from(writers) * u32::from(SEALS_PER_WRITER);
             let groups = area.inner.seal_groups_completed.load(Ordering::SeqCst);
-            let durability_flushes = u64::from(operations)
-                .checked_add(groups.saturating_mul(2))
-                .unwrap();
+            let group_flushes = u32::try_from(groups).unwrap().checked_mul(2).unwrap();
+            let durability_flushes = operations.checked_add(group_flushes).unwrap();
             let p95_index = latencies.len().saturating_mul(95).div_ceil(100) - 1;
             println!(
                 "native_seal_group writers={writers} sample={sample} operations={operations} seal_groups={groups} durability_flushes={durability_flushes} flushes_per_seal={:.3} seals_per_second={:.1} p50_us={} p95_us={} max_us={} wall_ms={}",
-                durability_flushes as f64 / f64::from(operations),
+                f64::from(durability_flushes) / f64::from(operations),
                 f64::from(operations) / elapsed.as_secs_f64(),
                 latencies[latencies.len() / 2].as_micros(),
                 latencies[p95_index].as_micros(),
