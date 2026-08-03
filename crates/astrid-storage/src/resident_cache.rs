@@ -61,20 +61,28 @@ impl GovernedObjectCache {
         )
     }
 
-    fn logical_pool(&self, principal: &StateOwner) -> ElasticLogicalMemoryPool<StateOwner> {
-        self.inner
-            .logical
-            .lock()
-            .entry(*principal)
-            .or_insert_with(|| {
-                ElasticLogicalMemoryPool::new(
-                    self.inner.authority.clone(),
-                    *principal,
-                    MemorySubsystem::StorageCache,
-                    MemoryClass::Evictable,
-                )
-            })
-            .clone()
+    fn logical_pool(&self, principal: &StateOwner) -> Option<ElasticLogicalMemoryPool<StateOwner>> {
+        self.inner.logical.lock().get(principal).cloned()
+    }
+
+    fn ensure_logical_capacity(&self, principal: &StateOwner, required: u64) -> u64 {
+        let mut logical = self.inner.logical.lock();
+        if let Some(pool) = logical.get(principal) {
+            return pool
+                .ensure_capacity(required)
+                .unwrap_or_else(|_| pool.requested_capacity());
+        }
+        let pool = ElasticLogicalMemoryPool::new(
+            self.inner.authority.clone(),
+            *principal,
+            MemorySubsystem::StorageCache,
+            MemoryClass::Evictable,
+        );
+        let Ok(bytes) = pool.ensure_capacity(required) else {
+            return 0;
+        };
+        logical.insert(*principal, pool);
+        bytes
     }
 }
 
@@ -103,26 +111,57 @@ impl ObjectCacheMemoryBudget for GovernedObjectCache {
 
 impl PrincipalObjectCacheBudget<StateOwner> for GovernedObjectCache {
     fn capacity(&self, principal: &StateOwner) -> ObjectCacheCapacity {
-        capacity(self.logical_pool(principal).requested_capacity())
+        self.logical_pool(principal)
+            .map_or(ObjectCacheCapacity::Disabled, |pool| {
+                capacity(pool.requested_capacity())
+            })
     }
 
     fn ensure_capacity(&self, principal: &StateOwner, required: u64) -> ObjectCacheCapacity {
-        let pool = self.logical_pool(principal);
-        let bytes = pool
-            .ensure_capacity(required)
-            .unwrap_or_else(|_| pool.requested_capacity());
-        capacity(bytes)
+        capacity(self.ensure_logical_capacity(principal, required))
     }
 
     fn reconcile(&self, principal: &StateOwner, charged_bytes: u64) {
-        let _ = self.logical_pool(principal).reconcile_usage(charged_bytes);
+        if let Some(pool) = self.logical_pool(principal) {
+            let _ = pool.reconcile_usage(charged_bytes);
+        }
     }
 
     fn release_unused(&self, principal: &StateOwner, charged_bytes: u64) {
-        let _ = self.logical_pool(principal).trim_to_usage(charged_bytes);
+        if let Some(pool) = self.logical_pool(principal) {
+            let _ = pool.trim_to_usage(charged_bytes);
+        }
     }
 }
 
 fn capacity(bytes: u64) -> ObjectCacheCapacity {
     NonZeroU64::new(bytes).map_or(ObjectCacheCapacity::Disabled, ObjectCacheCapacity::Bounded)
+}
+
+#[cfg(test)]
+mod tests {
+    use astrid_core::identity::PrincipalUid;
+
+    use super::*;
+
+    #[test]
+    fn unknown_principal_does_not_leave_an_empty_pool() {
+        let authority = ResidentMemoryAuthority::new(1024);
+        authority
+            .register_principal(StateOwner::System, None, 1024)
+            .unwrap();
+        let cache = GovernedObjectCache::new(authority.clone());
+        let unknown = StateOwner::Principal(PrincipalUid::from_bytes([7; 32]));
+
+        assert_eq!(
+            PrincipalObjectCacheBudget::capacity(&cache, &unknown),
+            ObjectCacheCapacity::Disabled
+        );
+        assert_eq!(
+            PrincipalObjectCacheBudget::ensure_capacity(&cache, &unknown, 64),
+            ObjectCacheCapacity::Disabled
+        );
+        assert!(cache.inner.logical.lock().is_empty());
+        assert!(authority.snapshot().logical_leases.is_empty());
+    }
 }
