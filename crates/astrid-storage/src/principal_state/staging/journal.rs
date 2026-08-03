@@ -88,11 +88,11 @@ pub(super) fn append_records(file: &mut File, records: &[JournalRecord]) -> Stor
         let payload = encode_record(record)?;
         let payload_len = u64::try_from(payload.len())
             .map_err(|_| connection("staging journal record length overflow".to_owned()))?;
-        let checksum = frame_checksum(payload_len, &payload);
         let mut header = [0_u8; JOURNAL_HEADER_BYTES];
         header[..8].copy_from_slice(&JOURNAL_MAGIC);
         header[8..10].copy_from_slice(&JOURNAL_VERSION.to_le_bytes());
         header[12..20].copy_from_slice(&payload_len.to_le_bytes());
+        let checksum = frame_checksum(&header, &payload);
         header[CHECKSUM_OFFSET..].copy_from_slice(&checksum);
         file.write_all(&header)
             .and_then(|()| file.write_all(&payload))
@@ -165,15 +165,6 @@ fn recover_frame(
     let mut header = [0_u8; JOURNAL_HEADER_BYTES];
     file.read_exact(&mut header)
         .map_err(|error| connection(format!("read staging journal header: {error}")))?;
-    if header[..8] != JOURNAL_MAGIC {
-        return recover_invalid_tail(file, offset, file_len, "magic mismatch");
-    }
-    if u16::from_le_bytes([header[8], header[9]]) != JOURNAL_VERSION {
-        return recover_invalid_tail(file, offset, file_len, "version mismatch");
-    }
-    if header[10..12] != [0, 0] {
-        return recover_invalid_tail(file, offset, file_len, "reserved bytes are non-zero");
-    }
     let payload_len = u64::from_le_bytes(
         header[12..20]
             .try_into()
@@ -198,8 +189,26 @@ fn recover_frame(
     let expected: [u8; 32] = header[CHECKSUM_OFFSET..]
         .try_into()
         .map_err(|_| connection("staging journal checksum width mismatch".to_owned()))?;
-    if frame_checksum(payload_len, &payload) != expected {
+    if frame_checksum(&header, &payload) != expected {
         return recover_invalid_tail(file, offset, file_len, "checksum mismatch");
+    }
+    // The checksum binds the physical header. A self-consistent unknown
+    // header is a newer or otherwise unsupported format, not a torn tail;
+    // fail without modifying it so an older binary cannot destroy it.
+    if header[..8] != JOURNAL_MAGIC {
+        return Err(connection(format!(
+            "unsupported staging journal magic at {offset}"
+        )));
+    }
+    if u16::from_le_bytes([header[8], header[9]]) != JOURNAL_VERSION {
+        return Err(connection(format!(
+            "unsupported staging journal version at {offset}"
+        )));
+    }
+    if header[10..12] != [0, 0] {
+        return Err(connection(format!(
+            "staging journal reserved bytes are non-zero at {offset}"
+        )));
     }
     let record = decode_record(&payload)
         .map_err(|detail| connection(format!("decode staging journal at {offset}: {detail}")))?;
@@ -365,8 +374,7 @@ fn valid_frame_follows(file: &mut File, invalid_offset: u64, file_len: u64) -> S
                 let expected: [u8; 32] = header[CHECKSUM_OFFSET..].try_into().map_err(|_| {
                     connection("staging journal checksum width mismatch".to_owned())
                 })?;
-                if frame_checksum(payload_len, &payload) == expected
-                    && decode_record(&payload).is_ok()
+                if frame_checksum(&header, &payload) == expected && decode_record(&payload).is_ok()
                 {
                     return Ok(true);
                 }
@@ -386,12 +394,14 @@ fn truncate_tail(file: &mut File, valid_len: u64) -> StorageResult<()> {
         .map_err(|error| connection(format!("truncate torn staging journal tail: {error}")))
 }
 
-fn frame_checksum(payload_len: u64, payload: &[u8]) -> [u8; 32] {
+fn frame_checksum(header: &[u8; JOURNAL_HEADER_BYTES], payload: &[u8]) -> [u8; 32] {
     let mut hasher =
         blake3::Hasher::new_derive_key("astrid native content staging journal frame v1");
-    hasher.update(&JOURNAL_MAGIC);
-    hasher.update(&JOURNAL_VERSION.to_le_bytes());
-    hasher.update(&payload_len.to_le_bytes());
+    // This physical-prefix construction is stable across journal record
+    // versions. Binding magic, version, reserved space, and length lets
+    // recovery distinguish an unfsynced/torn tail from a self-consistent
+    // future frame that an older binary must preserve.
+    hasher.update(&header[..CHECKSUM_OFFSET]);
     hasher.update(payload);
     *hasher.finalize().as_bytes()
 }
@@ -401,12 +411,26 @@ pub(super) fn encoded_frame(record: &JournalRecord) -> StorageResult<Vec<u8>> {
     let payload = encode_record(record)?;
     let payload_len = u64::try_from(payload.len())
         .map_err(|_| connection("staging journal record length overflow".to_owned()))?;
-    let checksum = frame_checksum(payload_len, &payload);
     let mut frame = vec![0_u8; JOURNAL_HEADER_BYTES];
     frame[..8].copy_from_slice(&JOURNAL_MAGIC);
     frame[8..10].copy_from_slice(&JOURNAL_VERSION.to_le_bytes());
     frame[12..20].copy_from_slice(&payload_len.to_le_bytes());
+    let header: &[u8; JOURNAL_HEADER_BYTES] = frame[..JOURNAL_HEADER_BYTES]
+        .try_into()
+        .map_err(|_| connection("staging journal test header width mismatch".to_owned()))?;
+    let checksum = frame_checksum(header, &payload);
     frame[CHECKSUM_OFFSET..JOURNAL_HEADER_BYTES].copy_from_slice(&checksum);
     frame.extend_from_slice(&payload);
     Ok(frame)
+}
+
+#[cfg(test)]
+pub(super) fn refresh_frame_checksum(frame: &mut [u8]) -> StorageResult<()> {
+    let (header, payload) = frame.split_at_mut(JOURNAL_HEADER_BYTES);
+    let header: &mut [u8; JOURNAL_HEADER_BYTES] = header
+        .try_into()
+        .map_err(|_| connection("staging journal test header width mismatch".to_owned()))?;
+    let checksum = frame_checksum(header, payload);
+    header[CHECKSUM_OFFSET..].copy_from_slice(&checksum);
+    Ok(())
 }

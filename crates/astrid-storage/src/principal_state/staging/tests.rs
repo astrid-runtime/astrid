@@ -11,7 +11,9 @@ use super::format::{
     LegacyStagingIntent, LegacyStagingOwner, StagingIntent, decode_intent, decode_legacy_intent,
     encode_intent, encode_legacy_intent,
 };
-use super::journal::{JournalRecord, StageKey, append_records, encoded_frame, flush_journal};
+use super::journal::{
+    JournalRecord, StageKey, append_records, encoded_frame, flush_journal, refresh_frame_checksum,
+};
 use super::*;
 use crate::principal_state::native_io::{atomic_write, sync_directory};
 
@@ -439,6 +441,49 @@ fn torn_physical_header_tail_is_truncated_without_losing_the_valid_prefix() {
         assert_eq!(
             std::fs::metadata(journal_path).unwrap().len(),
             valid_len,
+            "{field}"
+        );
+    }
+}
+
+#[test]
+fn self_consistent_future_header_fails_without_truncating_the_journal() {
+    for field in ["version", "reserved"] {
+        let directory = tempfile::tempdir().unwrap();
+        let area = open_area(directory.path());
+        let mut staged_writer = writer(&area, "current");
+        staged_writer.write_all(b"current").unwrap();
+        staged_writer.seal().unwrap();
+        let future_intent = StagingIntent {
+            sequence: 99,
+            id: StagedContentId(Uuid::new_v4()),
+            owner: owner(),
+            name: ContentName::new("future-header").unwrap(),
+            profile: ChunkingProfile::ASTRID_V1,
+            logical_bytes: 0,
+        };
+        let mut frame = encoded_frame(&JournalRecord::Sealed(future_intent)).unwrap();
+        if field == "version" {
+            frame[8..10].copy_from_slice(&2_u16.to_le_bytes());
+        } else {
+            frame[10] = 1;
+        }
+        refresh_frame_checksum(&mut frame).unwrap();
+        let journal_path = directory.path().join(JOURNAL_FILE);
+        {
+            let mut journal = area.inner.journal.lock();
+            journal.file.seek(SeekFrom::End(0)).unwrap();
+            journal.file.write_all(&frame).unwrap();
+            journal.file.sync_all().unwrap();
+        }
+        drop(area);
+        let bytes_before = std::fs::read(&journal_path).unwrap();
+
+        let error = open_area_result(directory.path()).unwrap_err();
+        assert!(error.to_string().contains(field), "{field}: {error}");
+        assert_eq!(
+            std::fs::read(journal_path).unwrap(),
+            bytes_before,
             "{field}"
         );
     }
