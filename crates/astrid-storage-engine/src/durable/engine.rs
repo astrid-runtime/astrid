@@ -444,6 +444,14 @@ where
         self.object_cache.principal_charge(principal)
     }
 
+    /// Evict decoded objects until the latest external memory targets hold.
+    ///
+    /// Cache exhaustion never changes authoritative reads; discarded entries
+    /// are reconstructed and verified from the arena on demand.
+    pub fn reclaim_object_cache(&self) {
+        self.object_cache.reclaim();
+    }
+
     /// Load one projection-owned process-local accelerator from governed
     /// cache memory.
     ///

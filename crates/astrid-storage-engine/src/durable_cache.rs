@@ -19,8 +19,8 @@ use parking_lot::Mutex;
 mod policy;
 
 pub use policy::{
-    ObjectCacheCapacity, ObjectCacheConfig, ObjectCacheController, ObjectCacheStats,
-    PrincipalObjectCacheBudget,
+    ObjectCacheCapacity, ObjectCacheConfig, ObjectCacheController, ObjectCacheMemoryBudget,
+    ObjectCacheStats, PrincipalObjectCacheBudget,
 };
 
 struct CachedObject<P: Ord> {
@@ -112,39 +112,68 @@ where
     }
 
     pub(super) fn get(&self, principal: &P, object: ObjectId) -> Option<Arc<ObjectRecord>> {
-        let global_capacity = self.controller.capacity();
-        let principal_capacity = self.principal_budget.capacity(principal);
+        let (global_required, principal_required) = {
+            let state = self.state.lock();
+            let weight = state.entries.get(&object).map_or(0, |entry| entry.weight);
+            if weight == 0 || state.is_attached(principal, object) {
+                (state.resident_bytes(), state.principal_charge(principal))
+            } else {
+                (
+                    state
+                        .resident_bytes()
+                        .saturating_add(association_weight::<P>()),
+                    state.principal_charge(principal).saturating_add(weight),
+                )
+            }
+        };
+        let global_capacity = self.controller.ensure_capacity(global_required);
+        let principal_capacity = if global_capacity == ObjectCacheCapacity::Disabled {
+            ObjectCacheCapacity::Disabled
+        } else {
+            self.principal_budget
+                .ensure_capacity(principal, principal_required)
+        };
         let mut state = self.state.lock();
         state.trim_global(global_capacity);
         state.trim_principal(principal, principal_capacity);
-        if global_capacity == ObjectCacheCapacity::Disabled
-            || principal_capacity == ObjectCacheCapacity::Disabled
-        {
-            state.bypasses = state.bypasses.saturating_add(1);
-            return None;
-        }
-
-        let Some(weight) = state.entries.get(&object).map(|entry| entry.weight) else {
-            state.misses = state.misses.saturating_add(1);
-            return None;
-        };
-        if !principal_capacity.accepts(weight) {
-            state.bypasses = state.bypasses.saturating_add(1);
-            return None;
-        }
-        if !state.is_attached(principal, object) {
-            let association_weight = association_weight::<P>();
-            state.evict_global_until_fits(association_weight, global_capacity, Some(object));
-            if !state.can_fit_global(association_weight, global_capacity)
-                || !state.attach_principal(principal, object, weight, principal_capacity)
+        let result = 'cache: {
+            if global_capacity == ObjectCacheCapacity::Disabled
+                || principal_capacity == ObjectCacheCapacity::Disabled
             {
                 state.bypasses = state.bypasses.saturating_add(1);
-                return None;
+                break 'cache None;
             }
-        }
-        let record = state.touch(principal, object)?;
-        state.hits = state.hits.saturating_add(1);
-        Some(record)
+
+            let Some(weight) = state.entries.get(&object).map(|entry| entry.weight) else {
+                state.misses = state.misses.saturating_add(1);
+                break 'cache None;
+            };
+            if !principal_capacity.accepts(weight) {
+                state.bypasses = state.bypasses.saturating_add(1);
+                break 'cache None;
+            }
+            if !state.is_attached(principal, object) {
+                let association_weight = association_weight::<P>();
+                state.evict_global_until_fits(association_weight, global_capacity, Some(object));
+                if !state.can_fit_global(association_weight, global_capacity)
+                    || !state.attach_principal(principal, object, weight, principal_capacity)
+                {
+                    state.bypasses = state.bypasses.saturating_add(1);
+                    break 'cache None;
+                }
+            }
+            let Some(record) = state.touch(principal, object) else {
+                break 'cache None;
+            };
+            state.hits = state.hits.saturating_add(1);
+            Some(record)
+        };
+        let resident = state.resident_bytes();
+        let charged = state.principal_charge(principal);
+        drop(state);
+        self.controller.reconcile(resident);
+        self.principal_budget.reconcile(principal, charged);
+        result
     }
 
     pub(super) fn insert(
@@ -156,66 +185,103 @@ where
         let record = Arc::new(record);
         let weight = cache_weight(&record);
         let association_weight = association_weight::<P>();
-        let global_capacity = self.controller.capacity();
-        let principal_capacity = self.principal_budget.capacity(principal);
         let initial_weight = weight.saturating_add(association_weight);
+        let (global_required, principal_required) = {
+            let state = self.state.lock();
+            if state.entries.contains_key(&object) {
+                if state.is_attached(principal, object) {
+                    (state.resident_bytes(), state.principal_charge(principal))
+                } else {
+                    (
+                        state.resident_bytes().saturating_add(association_weight),
+                        state.principal_charge(principal).saturating_add(weight),
+                    )
+                }
+            } else {
+                (
+                    state.resident_bytes().saturating_add(initial_weight),
+                    state.principal_charge(principal).saturating_add(weight),
+                )
+            }
+        };
+        let global_capacity = self.controller.ensure_capacity(global_required);
+        let principal_capacity = if global_capacity == ObjectCacheCapacity::Disabled {
+            ObjectCacheCapacity::Disabled
+        } else {
+            self.principal_budget
+                .ensure_capacity(principal, principal_required)
+        };
         let mut state = self.state.lock();
         state.trim_global(global_capacity);
         state.trim_principal(principal, principal_capacity);
-        if !global_capacity.accepts(initial_weight) || !principal_capacity.accepts(weight) {
-            return record;
-        }
-
-        if state.entries.contains_key(&object) {
-            if !state.is_attached(principal, object) {
-                state.evict_global_until_fits(association_weight, global_capacity, Some(object));
-                if !state.can_fit_global(association_weight, global_capacity)
-                    || !state.attach_principal(principal, object, weight, principal_capacity)
-                {
-                    return record;
-                }
+        let result = 'cache: {
+            if !global_capacity.accepts(initial_weight) || !principal_capacity.accepts(weight) {
+                break 'cache Arc::clone(&record);
             }
-            return state.touch(principal, object).unwrap_or(record);
-        }
 
-        state.evict_principal_until_fits(principal, weight, principal_capacity);
-        state.evict_global_until_fits(initial_weight, global_capacity, None);
-        if !state.can_fit_principal(principal, weight, principal_capacity)
-            || !state.can_fit_global(initial_weight, global_capacity)
-        {
-            return record;
-        }
+            if state.entries.contains_key(&object) {
+                if !state.is_attached(principal, object) {
+                    state.evict_global_until_fits(
+                        association_weight,
+                        global_capacity,
+                        Some(object),
+                    );
+                    if !state.can_fit_global(association_weight, global_capacity)
+                        || !state.attach_principal(principal, object, weight, principal_capacity)
+                    {
+                        break 'cache Arc::clone(&record);
+                    }
+                }
+                break 'cache state
+                    .touch(principal, object)
+                    .unwrap_or_else(|| Arc::clone(&record));
+            }
 
-        let tick = state.tick();
-        let mut principals = BTreeSet::new();
-        principals.insert(principal.clone());
-        state.entries.insert(
-            object,
-            CachedObject {
-                record: Arc::clone(&record),
-                weight,
-                last_access: tick,
-                principals,
-            },
-        );
-        state.lru.insert((tick, object));
-        let partition = state.principals.entry(principal.clone()).or_default();
-        partition.entries.insert(
-            object,
-            PrincipalEntry {
-                last_access: tick,
-                projections: BTreeMap::new(),
-            },
-        );
-        partition.lru.insert((tick, object));
-        partition.charged_bytes = partition.charged_bytes.saturating_add(weight);
-        state.resident_record_bytes = state.resident_record_bytes.saturating_add(weight);
-        state.resident_association_bytes = state
-            .resident_association_bytes
-            .saturating_add(association_weight);
-        state.resident_associations = state.resident_associations.saturating_add(1);
-        state.insertions = state.insertions.saturating_add(1);
-        record
+            state.evict_principal_until_fits(principal, weight, principal_capacity);
+            state.evict_global_until_fits(initial_weight, global_capacity, None);
+            if !state.can_fit_principal(principal, weight, principal_capacity)
+                || !state.can_fit_global(initial_weight, global_capacity)
+            {
+                break 'cache Arc::clone(&record);
+            }
+
+            let tick = state.tick();
+            let mut principals = BTreeSet::new();
+            principals.insert(principal.clone());
+            state.entries.insert(
+                object,
+                CachedObject {
+                    record: Arc::clone(&record),
+                    weight,
+                    last_access: tick,
+                    principals,
+                },
+            );
+            state.lru.insert((tick, object));
+            let partition = state.principals.entry(principal.clone()).or_default();
+            partition.entries.insert(
+                object,
+                PrincipalEntry {
+                    last_access: tick,
+                    projections: BTreeMap::new(),
+                },
+            );
+            partition.lru.insert((tick, object));
+            partition.charged_bytes = partition.charged_bytes.saturating_add(weight);
+            state.resident_record_bytes = state.resident_record_bytes.saturating_add(weight);
+            state.resident_association_bytes = state
+                .resident_association_bytes
+                .saturating_add(association_weight);
+            state.resident_associations = state.resident_associations.saturating_add(1);
+            state.insertions = state.insertions.saturating_add(1);
+            Arc::clone(&record)
+        };
+        let resident = state.resident_bytes();
+        let charged = state.principal_charge(principal);
+        drop(state);
+        self.controller.reconcile(resident);
+        self.principal_budget.reconcile(principal, charged);
+        result
     }
 
     pub(super) fn stats(&self) -> ObjectCacheStats {
@@ -298,70 +364,105 @@ where
     ) -> bool {
         let (value, payload_weight) = value.into_parts();
         let weight = projection_cache_weight(payload_weight);
-        let global_capacity = self.controller.capacity();
-        let principal_capacity = self.principal_budget.capacity(principal);
+        let (global_required, principal_required) = {
+            let state = self.state.lock();
+            let replaced = state
+                .principals
+                .get(principal)
+                .and_then(|partition| partition.entries.get(&object))
+                .and_then(|entry| entry.projections.get(&key))
+                .map_or(0, |entry| entry.weight);
+            (
+                state
+                    .resident_bytes()
+                    .saturating_sub(replaced)
+                    .saturating_add(weight),
+                state
+                    .principal_charge(principal)
+                    .saturating_sub(replaced)
+                    .saturating_add(weight),
+            )
+        };
+        let global_capacity = self.controller.ensure_capacity(global_required);
+        let principal_capacity = if global_capacity == ObjectCacheCapacity::Disabled {
+            ObjectCacheCapacity::Disabled
+        } else {
+            self.principal_budget
+                .ensure_capacity(principal, principal_required)
+        };
         let mut state = self.state.lock();
         state.trim_global(global_capacity);
         state.trim_principal(principal, principal_capacity);
-        if weight == u64::MAX
-            || global_capacity == ObjectCacheCapacity::Disabled
-            || principal_capacity == ObjectCacheCapacity::Disabled
-        {
-            return false;
-        }
+        let retained = 'cache: {
+            if weight == u64::MAX
+                || global_capacity == ObjectCacheCapacity::Disabled
+                || principal_capacity == ObjectCacheCapacity::Disabled
+                || !state.is_attached(principal, object)
+            {
+                break 'cache false;
+            }
+            let replaced_weight = state
+                .principals
+                .get(principal)
+                .and_then(|partition| partition.entries.get(&object))
+                .and_then(|entry| entry.projections.get(&key))
+                .map_or(0, |entry| entry.weight);
+            state.evict_principal_until_fits_with_credit(
+                principal,
+                weight,
+                replaced_weight,
+                principal_capacity,
+                object,
+            );
+            state.evict_global_until_fits_with_credit(
+                weight,
+                replaced_weight,
+                global_capacity,
+                object,
+            );
+            if !state.can_fit_principal_with_credit(
+                principal,
+                weight,
+                replaced_weight,
+                principal_capacity,
+            ) || !state.can_fit_global_with_credit(weight, replaced_weight, global_capacity)
+                || !state.is_attached(principal, object)
+            {
+                break 'cache false;
+            }
 
-        if !state.is_attached(principal, object) {
-            return false;
-        }
-        let replaced_weight = state
-            .principals
-            .get(principal)
-            .and_then(|partition| partition.entries.get(&object))
-            .and_then(|entry| entry.projections.get(&key))
-            .map_or(0, |entry| entry.weight);
-        state.evict_principal_until_fits_with_credit(
-            principal,
-            weight,
-            replaced_weight,
-            principal_capacity,
-            object,
-        );
-        state.evict_global_until_fits_with_credit(weight, replaced_weight, global_capacity, object);
-        if !state.can_fit_principal_with_credit(
-            principal,
-            weight,
-            replaced_weight,
-            principal_capacity,
-        ) || !state.can_fit_global_with_credit(weight, replaced_weight, global_capacity)
-            || !state.is_attached(principal, object)
-        {
-            return false;
-        }
-
-        let Some(partition) = state.principals.get_mut(principal) else {
-            return false;
+            let Some(partition) = state.principals.get_mut(principal) else {
+                break 'cache false;
+            };
+            let Some(entry) = partition.entries.get_mut(&object) else {
+                break 'cache false;
+            };
+            let replaced = entry
+                .projections
+                .insert(key, CachedProjection { value, weight });
+            partition.charged_bytes = partition
+                .charged_bytes
+                .saturating_sub(replaced_weight)
+                .saturating_add(weight);
+            state.resident_projection_bytes = state
+                .resident_projection_bytes
+                .saturating_sub(replaced_weight)
+                .saturating_add(weight);
+            if replaced.is_some() {
+                state.projection_evictions = state.projection_evictions.saturating_add(1);
+            } else {
+                state.resident_projection_entries =
+                    state.resident_projection_entries.saturating_add(1);
+            }
+            state.projection_insertions = state.projection_insertions.saturating_add(1);
+            state.touch(principal, object).is_some()
         };
-        let Some(entry) = partition.entries.get_mut(&object) else {
-            return false;
-        };
-        let replaced = entry
-            .projections
-            .insert(key, CachedProjection { value, weight });
-        partition.charged_bytes = partition
-            .charged_bytes
-            .saturating_sub(replaced_weight)
-            .saturating_add(weight);
-        state.resident_projection_bytes = state
-            .resident_projection_bytes
-            .saturating_sub(replaced_weight)
-            .saturating_add(weight);
-        if replaced.is_some() {
-            state.projection_evictions = state.projection_evictions.saturating_add(1);
-        } else {
-            state.resident_projection_entries = state.resident_projection_entries.saturating_add(1);
-        }
-        state.projection_insertions = state.projection_insertions.saturating_add(1);
-        state.touch(principal, object).is_some()
+        let resident = state.resident_bytes();
+        let charged = state.principal_charge(principal);
+        drop(state);
+        self.controller.reconcile(resident);
+        self.principal_budget.reconcile(principal, charged);
+        retained
     }
 
     pub(super) fn discard_projection(
@@ -399,6 +500,39 @@ where
         for object in objects {
             state.remove_physical(object);
         }
+        drop(state);
+        self.controller.reconcile(0);
+    }
+
+    /// Honor the latest external pressure targets and return released slabs.
+    pub(super) fn reclaim(&self) {
+        let principals = self
+            .state
+            .lock()
+            .principals
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let capacities = principals
+            .iter()
+            .map(|principal| (principal.clone(), self.principal_budget.capacity(principal)))
+            .collect::<Vec<_>>();
+        let global_capacity = self.controller.capacity();
+        let mut state = self.state.lock();
+        state.trim_global(global_capacity);
+        for (principal, capacity) in &capacities {
+            state.trim_principal(principal, *capacity);
+        }
+        let resident = state.resident_bytes();
+        let charges = principals
+            .iter()
+            .map(|principal| (principal.clone(), state.principal_charge(principal)))
+            .collect::<Vec<_>>();
+        drop(state);
+        self.controller.release_unused(resident);
+        for (principal, charged) in charges {
+            self.principal_budget.release_unused(&principal, charged);
+        }
     }
 }
 
@@ -406,6 +540,12 @@ impl<P> CacheState<P>
 where
     P: Clone + Ord,
 {
+    fn principal_charge(&self, principal: &P) -> u64 {
+        self.principals
+            .get(principal)
+            .map_or(0, |partition| partition.charged_bytes)
+    }
+
     fn tick(&mut self) -> u64 {
         self.clock = self.clock.saturating_add(1);
         self.clock

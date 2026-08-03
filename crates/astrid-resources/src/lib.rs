@@ -13,10 +13,12 @@
 
 mod authority;
 mod lease;
+mod pool;
 mod types;
 
 pub use authority::ResidentMemoryAuthority;
 pub use lease::{LogicalMemoryLease, PhysicalMemoryLease, ResidentMemoryLease};
+pub use pool::{ElasticLogicalMemoryPool, ElasticPhysicalMemoryPool};
 pub use types::{
     LeaseId, LogicalLeaseSnapshot, MemoryAuthorityError, MemoryAuthoritySnapshot, MemoryClass,
     MemoryPressure, MemorySubsystem, PhysicalLeaseSnapshot, PrincipalMemorySnapshot,

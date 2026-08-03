@@ -51,6 +51,8 @@ mod principal_directory;
 mod principal_graph;
 #[cfg(not(target_family = "wasm"))]
 pub mod principal_state;
+#[cfg(not(target_family = "wasm"))]
+mod resident_cache;
 pub mod secret;
 
 #[cfg(feature = "db")]
@@ -85,8 +87,8 @@ pub use secret::{FallbackSecretStore, KeychainSecretStore};
 
 #[cfg(not(target_family = "wasm"))]
 pub use astrid_storage_engine::{
-    ObjectCacheCapacity, ObjectCacheConfig, ObjectCacheController, ObjectCacheStats,
-    PrincipalObjectCacheBudget,
+    ObjectCacheCapacity, ObjectCacheConfig, ObjectCacheController, ObjectCacheMemoryBudget,
+    ObjectCacheStats, PrincipalObjectCacheBudget,
 };
 #[cfg(feature = "legacy-surrealkv")]
 pub use kv::SurrealKvStore;
@@ -98,6 +100,8 @@ pub use principal_state::{
     open_runtime_principal_store, open_runtime_principal_store_with_directory,
     open_runtime_principal_store_with_object_cache,
 };
+#[cfg(not(target_family = "wasm"))]
+pub use resident_cache::GovernedObjectCache;
 
 #[cfg(feature = "db")]
 pub use db::Database;

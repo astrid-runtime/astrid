@@ -220,6 +220,11 @@ impl RuntimePrincipalStore {
         self.engine.object_cache_principal_charge(owner)
     }
 
+    /// Honor current resident-memory pressure by evicting cache entries.
+    pub fn reclaim_object_cache(&self) {
+        self.engine.reclaim_object_cache();
+    }
+
     /// Clone the runtime KV projection.
     #[must_use]
     pub fn kv(&self) -> Arc<dyn KvStore> {

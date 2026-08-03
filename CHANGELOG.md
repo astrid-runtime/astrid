@@ -111,9 +111,12 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   the operator pool, and live pool reductions request reclaim from evictable
   leases without claiming bytes were released before consumers acknowledge
   their actual footprint. Privileged snapshots reconcile leases, subsystems,
-  principal subtrees, requested reclaim, and physical totals. The primitive
-  selects no hidden machine-size default; daemon policy and subsystem adapters
-  remain explicit consumers.
+  principal subtrees, requested reclaim, and physical totals. Storage's
+  decoded-object cache is the first consumer: geometric physical and logical
+  slabs keep authority traffic off cache hits, explicit pressure evicts and
+  returns unused reservations, and failed admission falls back to verified
+  arena reads. The primitive selects no hidden machine-size default; daemon
+  policy remains an explicit composition concern.
 - **Principal storage now has a portable executable architecture model.** The
   `no_std` `astrid-storage-model` crate defines immutable logical objects,
   distinct encoded blob identities, atomic principal-root transitions,

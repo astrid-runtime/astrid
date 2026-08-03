@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 #[cfg(feature = "legacy-surrealkv")]
 use astrid_core::profile::{DeviceKey, DeviceScope, PrincipalProfile};
+use astrid_resources::ResidentMemoryAuthority;
 use astrid_storage_engine::{ObjectCacheCapacity, ObjectCacheController, RootTransaction};
 use astrid_storage_model::{
     ObjectClass, ObjectFormatVersion, ObjectKind, ObjectReference, ReferenceLabel, RootState,
@@ -124,6 +125,81 @@ async fn runtime_reports_principal_attributed_cache_residency() {
     assert!(stats.resident_projection_entries > 0);
     assert!(stats.resident_projection_bytes > 0);
     assert!(store.object_cache_principal_charge(&owner) > 0);
+}
+
+#[tokio::test]
+async fn governed_cache_reclaims_under_pressure_without_failing_reads() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    let owner = test_owner("alice");
+    let authority = ResidentMemoryAuthority::new(2 * 1024 * 1024);
+    authority
+        .register_principal(StateOwner::System, None, u64::MAX)
+        .unwrap();
+    authority.register_principal(owner, None, u64::MAX).unwrap();
+    let cache = crate::GovernedObjectCache::new(authority.clone());
+    let store =
+        open_runtime_principal_store_with_object_cache(&home, unlimited_quota(), cache.config())
+            .await
+            .unwrap();
+    let name = ContentName::new("models/governed-cache.bin").unwrap();
+    let content = vec![0x5a; 512 * 1024];
+    store.content().put(&owner, &name, &content).unwrap();
+    assert_eq!(
+        store
+            .content()
+            .read_range(&owner, &name, 4096, 64 * 1024)
+            .unwrap(),
+        Some(content[4096..4096 + 64 * 1024].to_vec())
+    );
+
+    let warm = authority.snapshot();
+    assert!(warm.physical_reserved_bytes > 0);
+    assert!(
+        warm.principals
+            .iter()
+            .find(|account| account.principal == owner)
+            .unwrap()
+            .direct_logical_bytes
+            > 0
+    );
+
+    let pressure = authority.set_physical_limit(0);
+    assert!(pressure.reclaim_requested_bytes > 0);
+    store.reclaim_object_cache();
+    assert_eq!(store.object_cache_stats().resident_bytes, 0);
+    let reclaimed = authority.snapshot();
+    assert_eq!(reclaimed.physical_reserved_bytes, 0);
+    assert_eq!(
+        reclaimed
+            .principals
+            .iter()
+            .find(|account| account.principal == owner)
+            .unwrap()
+            .direct_logical_bytes,
+        0
+    );
+
+    assert_eq!(
+        store
+            .content()
+            .read_range(&owner, &name, 4096, 64 * 1024)
+            .unwrap(),
+        Some(content[4096..4096 + 64 * 1024].to_vec())
+    );
+    assert_eq!(store.object_cache_stats().resident_bytes, 0);
+    let after_uncached_read = authority.snapshot();
+    assert_eq!(after_uncached_read.physical_reserved_bytes, 0);
+    assert_eq!(
+        after_uncached_read
+            .principals
+            .iter()
+            .find(|account| account.principal == owner)
+            .unwrap()
+            .direct_logical_bytes,
+        0
+    );
+    authority.remove_principal(&owner).unwrap();
 }
 
 #[cfg(not(target_os = "windows"))]

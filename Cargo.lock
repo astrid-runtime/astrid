@@ -866,6 +866,7 @@ name = "astrid-storage"
 version = "0.10.4"
 dependencies = [
  "astrid-core",
+ "astrid-resources",
  "astrid-storage-content",
  "astrid-storage-engine",
  "astrid-storage-model",

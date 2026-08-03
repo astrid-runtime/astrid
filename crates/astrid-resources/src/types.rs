@@ -85,6 +85,26 @@ pub enum MemoryAuthorityError {
     /// The lease was already released.
     #[error("resident-memory lease is no longer active")]
     LeaseReleased,
+    /// An evictable pool is under pressure and cannot admit above its target.
+    #[error(
+        "resident-memory reclaim is pending: requested capacity {requested_capacity} bytes, target {target_capacity} bytes"
+    )]
+    ReclaimPending {
+        /// Capacity required by the consumer.
+        requested_capacity: u64,
+        /// Current post-pressure target.
+        target_capacity: u64,
+    },
+    /// A consumer reported more live bytes than its lease reserves.
+    #[error(
+        "resident-memory usage exceeds its reservation: {used_bytes} bytes used, {reserved_bytes} reserved"
+    )]
+    UsageExceedsReservation {
+        /// Bytes reported live by the consumer.
+        used_bytes: u64,
+        /// Bytes reserved by the lease.
+        reserved_bytes: u64,
+    },
 }
 
 /// Result of applying a lower physical or logical limit.
