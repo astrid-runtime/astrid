@@ -14,7 +14,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use astrid_storage_engine::GroupCommitPolicy;
-use parking_lot::Mutex;
 use uuid::Uuid;
 
 use super::native_io::{
@@ -70,10 +69,10 @@ pub struct NativeContentStagingArea {
 struct StagingInner {
     root: PathBuf,
     generations: PathBuf,
-    seal_order: Mutex<SealOrder>,
+    seal_order: PoisoningMutex<SealOrder>,
     group_policy: GroupCommitPolicy,
-    seal_group: Mutex<SealGroup>,
-    journal: Mutex<JournalState>,
+    seal_group: PoisoningMutex<SealGroup>,
+    journal: PoisoningMutex<JournalState>,
     faults: Arc<dyn StagingFaultInjector>,
     #[cfg(test)]
     seal_groups_completed: AtomicU64,
@@ -91,6 +90,27 @@ struct JournalState {
 struct SealOrder {
     next_sequence: u64,
     active: std::collections::BTreeMap<u64, (StateOwner, ContentName)>,
+}
+
+/// A poisoned coordination lock preserves the staging handles' unwind-safety.
+///
+/// Continuing through a panic while the seal queue or journal state was being
+/// mutated could acknowledge work against incomplete in-memory bookkeeping.
+/// Keep the standard mutex's poison boundary instead of silently recovering it.
+#[derive(Debug)]
+struct PoisoningMutex<T>(std::sync::Mutex<T>);
+
+impl<T> PoisoningMutex<T> {
+    fn new(value: T) -> Self {
+        Self(std::sync::Mutex::new(value))
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, T> {
+        match self.0.lock() {
+            Ok(guard) => guard,
+            Err(error) => panic!("staging coordination lock poisoned: {error}"),
+        }
+    }
 }
 
 struct ActiveSeal {
@@ -219,13 +239,13 @@ impl NativeContentStagingArea {
             inner: Arc::new(StagingInner {
                 root,
                 generations,
-                seal_order: Mutex::new(SealOrder {
+                seal_order: PoisoningMutex::new(SealOrder {
                     next_sequence,
                     active: std::collections::BTreeMap::new(),
                 }),
                 group_policy,
-                seal_group: Mutex::new(SealGroup::default()),
-                journal: Mutex::new(journal),
+                seal_group: PoisoningMutex::new(SealGroup::default()),
+                journal: PoisoningMutex::new(journal),
                 faults,
                 #[cfg(test)]
                 seal_groups_completed: AtomicU64::new(0),

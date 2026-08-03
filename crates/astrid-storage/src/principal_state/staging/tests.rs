@@ -28,6 +28,14 @@ fn owner() -> StateOwner {
     StateOwner::Principal(uid())
 }
 
+#[test]
+fn public_staging_handles_remain_unwind_safe() {
+    fn assert_unwind_safe<T: std::panic::RefUnwindSafe + std::panic::UnwindSafe>() {}
+
+    assert_unwind_safe::<NativeContentStagingArea>();
+    assert_unwind_safe::<StagedContentWriter>();
+}
+
 fn open_area(path: &Path) -> NativeContentStagingArea {
     open_area_result(path).unwrap()
 }
