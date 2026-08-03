@@ -14,7 +14,10 @@ use super::format::{
 use super::journal::{JournalRecord, StageKey, append_records, flush_journal};
 use super::legacy::{self, LegacyReady};
 use super::recovery::{read_directory, sealed_generation_name, validate_generation};
-use super::{JournalState, connection, remove_generation};
+use super::{
+    JournalState, StagingFaultInjector, StagingFaultPoint, claim_generation_key, connection,
+    remove_generation,
+};
 use crate::error::StorageResult;
 use crate::principal_state::StateOwner;
 use crate::principal_state::native_io::{
@@ -126,10 +129,12 @@ pub(super) fn migrate_legacy(
     generations: &Path,
     quarantine: &Path,
     journal: &mut JournalState,
+    faults: &dyn StagingFaultInjector,
 ) -> StorageResult<()> {
     let Some((legacy_ready, entries)) = legacy::recover(root, quarantine)? else {
         return Ok(());
     };
+    validate_migration_keys(journal, &entries)?;
     let mut new_entries = Vec::new();
     for entry in entries {
         let key = StageKey::from_intent(&entry.intent);
@@ -138,7 +143,7 @@ pub(super) fn migrate_legacy(
             remove_completed(&entry, &target)?;
             continue;
         }
-        prepare_generation(&entry, &target)?;
+        prepare_generation(&entry, &target, faults)?;
         sync_directory(generations)?;
         validate_generation(&target, &entry.intent)?;
         match journal.pending.get(&key) {
@@ -166,7 +171,11 @@ fn remove_completed(entry: &LegacyReady, target: &Path) -> StorageResult<()> {
     legacy::cleanup(&entry.directory)
 }
 
-fn prepare_generation(entry: &LegacyReady, target: &Path) -> StorageResult<()> {
+fn prepare_generation(
+    entry: &LegacyReady,
+    target: &Path,
+    faults: &dyn StagingFaultInjector,
+) -> StorageResult<()> {
     match (&entry.content, target.exists()) {
         (Some(source), false) => {
             std::fs::rename(source, target).map_err(|error| {
@@ -176,6 +185,17 @@ fn prepare_generation(entry: &LegacyReady, target: &Path) -> StorageResult<()> {
                     target.display()
                 ))
             })?;
+            // The footer mutates the renamed inode. Make both sides of the
+            // rename durable first, otherwise a crash can resurrect the inode
+            // at its legacy name with a new-format footer that the legacy
+            // reader correctly rejects.
+            if let Some(source_parent) = source.parent() {
+                sync_directory(source_parent)?;
+            }
+            if let Some(target_parent) = target.parent() {
+                sync_directory(target_parent)?;
+            }
+            faults.fail(StagingFaultPoint::MigrationNamespaceFlushed)?;
         },
         (Some(source), true) => {
             if !file_prefix_equal(source, target, entry.intent.logical_bytes)? {
@@ -200,6 +220,24 @@ fn prepare_generation(entry: &LegacyReady, target: &Path) -> StorageResult<()> {
         },
     }
     ensure_footer(target, entry)
+}
+
+fn validate_migration_keys(journal: &JournalState, entries: &[LegacyReady]) -> StorageResult<()> {
+    let mut sequences = std::collections::BTreeMap::new();
+    let mut identifiers = std::collections::BTreeMap::new();
+    for key in journal.pending.keys().chain(journal.completed.iter()) {
+        claim_generation_key(&mut sequences, &mut identifiers, *key)?;
+    }
+    for entry in entries {
+        let key = StageKey::from_intent(&entry.intent);
+        claim_generation_key(&mut sequences, &mut identifiers, key)?;
+        if let Some(existing) = journal.pending.get(&key)
+            && existing != &entry.intent
+        {
+            return Err(intent_disagreement(key));
+        }
+    }
+    Ok(())
 }
 
 fn ensure_footer(target: &Path, entry: &LegacyReady) -> StorageResult<()> {

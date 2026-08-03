@@ -112,6 +112,7 @@ impl Drop for ActiveSeal {
 enum StagingFaultPoint {
     ContentFlushed,
     GenerationRenamed,
+    MigrationNamespaceFlushed,
     RecoveryGenerationDirectoryFlushed,
     RecoveryCleanupDirectoryFlushed,
     GenerationDirectoryFlushed,
@@ -190,7 +191,13 @@ impl NativeContentStagingArea {
             completed: recovered.completed,
             poisoned: false,
         };
-        migrate_legacy(&root, &generations, &quarantine, &mut journal)?;
+        migrate_legacy(
+            &root,
+            &generations,
+            &quarantine,
+            &mut journal,
+            faults.as_ref(),
+        )?;
         recover_generations(&generations, &quarantine, &mut journal, faults.as_ref())?;
         let next_sequence = journal
             .pending
@@ -341,13 +348,18 @@ impl NativeContentStagingArea {
                 .any(|(sequence, (owner, name))| {
                     *sequence < staged.sequence && owner == &staged.owner && name == &staged.name
                 });
-        if earlier_active
-            || self.ready()?.iter().any(|queued| {
-                queued.owner == staged.owner
-                    && queued.name == staged.name
-                    && queued.sequence < staged.sequence
+        let earlier_pending = {
+            let journal = self.inner.journal.lock();
+            if journal.poisoned {
+                return Err(connection("staging journal requires recovery".to_owned()));
+            }
+            journal.pending.values().any(|intent| {
+                intent.owner == staged.owner
+                    && intent.name == staged.name
+                    && intent.sequence < staged.sequence
             })
-        {
+        };
+        if earlier_active || earlier_pending {
             return Err(connection(format!(
                 "staged write {} has an earlier close for the same owner and name",
                 staged.id

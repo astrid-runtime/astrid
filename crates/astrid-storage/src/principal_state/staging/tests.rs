@@ -318,6 +318,21 @@ fn a_later_close_cannot_publish_while_an_earlier_close_is_still_syncing() {
 }
 
 #[test]
+fn publication_order_does_not_validate_unrelated_generation_files() {
+    let directory = tempfile::tempdir().unwrap();
+    let area = open_area(directory.path());
+    let mut unrelated = writer(&area, "unrelated");
+    unrelated.write_all(b"unrelated").unwrap();
+    let unrelated = unrelated.seal().unwrap();
+    let mut candidate = writer(&area, "candidate");
+    candidate.write_all(b"candidate").unwrap();
+    let candidate = candidate.seal().unwrap();
+
+    std::fs::remove_file(unrelated.content_path()).unwrap();
+    area.ensure_publication_order(&candidate).unwrap();
+}
+
+#[test]
 fn unacknowledged_open_and_orphan_sealed_generations_are_quarantined() {
     let directory = tempfile::tempdir().unwrap();
     let area = open_area(directory.path());
@@ -958,6 +973,95 @@ fn legacy_migration_resumes_before_or_after_the_generation_footer() {
     }
 }
 
+#[test]
+fn legacy_migration_flushes_both_rename_namespaces_before_adding_a_footer() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let ready = root.join(legacy::READY_DIRECTORY);
+    std::fs::create_dir_all(&ready).unwrap();
+    let intent = legacy_entry(&ready, 21, "namespace-order", b"legacy bytes", false);
+    let legacy_directory = ready.join(format!("{:020}-{}", intent.sequence, intent.id));
+
+    let error = NativeContentStagingArea::open_configured(
+        root.to_path_buf(),
+        GroupCommitPolicy::immediate(),
+        Arc::new(FailOnce {
+            point: StagingFaultPoint::MigrationNamespaceFlushed,
+            fired: AtomicBool::new(false),
+        }),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("injected staging fault"));
+    assert!(!legacy_directory.join(legacy::CONTENT_FILE).exists());
+    let target = root
+        .join(GENERATIONS_DIRECTORY)
+        .join(sealed_generation_name(intent.sequence, intent.id));
+    assert_eq!(
+        std::fs::metadata(&target).unwrap().len(),
+        intent.logical_bytes
+    );
+
+    let reopened = open_area(root);
+    let entries = reopened.ready().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(read_logical(&entries[0]), b"legacy bytes");
+}
+
+#[test]
+fn malformed_legacy_keys_fail_before_migration_writes_or_cleanup() {
+    for collision in ["sequence", "identifier"] {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let ready = root.join(legacy::READY_DIRECTORY);
+        std::fs::create_dir_all(&ready).unwrap();
+        let shared_id = StagedContentId(Uuid::new_v4());
+        let (first_sequence, first_id, second_sequence, second_id) = if collision == "sequence" {
+            (31, StagedContentId(Uuid::new_v4()), 31, shared_id)
+        } else {
+            (31, shared_id, 32, shared_id)
+        };
+        let first =
+            legacy_entry_with_id(&ready, first_sequence, first_id, "first", b"first", false);
+        let second = legacy_entry_with_id(
+            &ready,
+            second_sequence,
+            second_id,
+            "second",
+            b"second",
+            false,
+        );
+
+        let error = open_area_result(root).unwrap_err();
+        assert!(
+            error.to_string().contains(collision),
+            "{collision}: {error}"
+        );
+        assert_eq!(
+            std::fs::metadata(root.join(JOURNAL_FILE)).unwrap().len(),
+            0,
+            "{collision}"
+        );
+        for intent in [first, second] {
+            let directory = ready.join(format!("{:020}-{}", intent.sequence, intent.id));
+            assert!(directory.join(legacy::CONTENT_FILE).exists(), "{collision}");
+            assert_eq!(
+                std::fs::metadata(directory.join(legacy::CONTENT_FILE))
+                    .unwrap()
+                    .len(),
+                intent.logical_bytes,
+                "{collision}"
+            );
+        }
+        assert!(
+            read_directory(&root.join(GENERATIONS_DIRECTORY))
+                .unwrap()
+                .next()
+                .is_none(),
+            "{collision}"
+        );
+    }
+}
+
 fn legacy_entry(
     ready: &Path,
     sequence: u64,
@@ -965,7 +1069,24 @@ fn legacy_entry(
     content: &[u8],
     published: bool,
 ) -> StagingIntent {
-    let id = StagedContentId(Uuid::new_v4());
+    legacy_entry_with_id(
+        ready,
+        sequence,
+        StagedContentId(Uuid::new_v4()),
+        name,
+        content,
+        published,
+    )
+}
+
+fn legacy_entry_with_id(
+    ready: &Path,
+    sequence: u64,
+    id: StagedContentId,
+    name: &str,
+    content: &[u8],
+    published: bool,
+) -> StagingIntent {
     let directory = ready.join(format!("{sequence:020}-{id}"));
     std::fs::create_dir(&directory).unwrap();
     let content_path = directory.join(legacy::CONTENT_FILE);
