@@ -411,7 +411,7 @@ pub(super) fn validate_stage_directory(path: &Path) -> StorageResult<()> {
     Ok(())
 }
 
-fn stage_entry_is_directory(path: &Path) -> StorageResult<bool> {
+pub(super) fn stage_entry_is_directory(path: &Path) -> StorageResult<bool> {
     let metadata = std::fs::symlink_metadata(path).map_err(|error| {
         connection(format!(
             "inspect legacy staging entry {}: {error}",

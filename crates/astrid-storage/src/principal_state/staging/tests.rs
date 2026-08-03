@@ -179,6 +179,9 @@ fn alias_intent_migration_is_crash_idempotent_and_reaches_the_flat_journal() {
     for path in [&writing, &ready, &quarantine] {
         std::fs::create_dir_all(path).unwrap();
     }
+    let malformed_id = StagedContentId(Uuid::new_v4());
+    let malformed = writing.join(malformed_id.to_string());
+    std::fs::write(&malformed, b"not a legacy staging directory").unwrap();
 
     let id = StagedContentId(Uuid::new_v4());
     let staging_directory = writing.join(id.to_string());
@@ -240,6 +243,12 @@ fn alias_intent_migration_is_crash_idempotent_and_reaches_the_flat_journal() {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].owner(), &owner());
     assert_eq!(read_logical(&entries[0]), b"durable staged bytes");
+    assert!(!malformed.exists());
+    assert!(
+        quarantine
+            .join(format!("{malformed_id}.legacy-unsealed.0"))
+            .exists()
+    );
 }
 
 #[test]
@@ -459,6 +468,37 @@ fn torn_physical_header_tail_is_truncated_without_losing_the_valid_prefix() {
             "{field}"
         );
     }
+}
+
+#[test]
+fn overflowing_torn_length_tail_is_truncated_without_losing_the_valid_prefix() {
+    let directory = tempfile::tempdir().unwrap();
+    let area = open_area(directory.path());
+    let mut first_writer = writer(&area, "first");
+    first_writer.write_all(b"first").unwrap();
+    let first = first_writer.seal().unwrap();
+    let torn_intent = StagingIntent {
+        sequence: first.sequence().checked_add(1).unwrap(),
+        id: StagedContentId(Uuid::new_v4()),
+        owner: owner(),
+        name: ContentName::new("overflowing-tail").unwrap(),
+        profile: ChunkingProfile::ASTRID_V1,
+        logical_bytes: 0,
+    };
+    let mut frame = encoded_frame(&JournalRecord::Sealed(torn_intent)).unwrap();
+    frame[12..20].copy_from_slice(&u64::MAX.to_le_bytes());
+    let journal_path = directory.path().join(JOURNAL_FILE);
+    let valid_len = std::fs::metadata(&journal_path).unwrap().len();
+    {
+        let mut journal = area.inner.journal.lock();
+        journal.file.seek(SeekFrom::End(0)).unwrap();
+        journal.file.write_all(&frame).unwrap();
+    }
+    drop(area);
+
+    let reopened = open_area(directory.path());
+    assert_eq!(reopened.ready().unwrap(), vec![first]);
+    assert_eq!(std::fs::metadata(journal_path).unwrap().len(), valid_len);
 }
 
 #[test]
@@ -686,7 +726,7 @@ fn corrupt_interior_journal_frame_fails_open() {
 }
 
 #[test]
-fn oversized_interior_frame_length_does_not_hide_a_valid_successor() {
+fn overflowing_interior_frame_length_does_not_hide_a_valid_successor() {
     let directory = tempfile::tempdir().unwrap();
     let area = open_area(directory.path());
     for name in ["first", "second"] {
@@ -699,12 +739,7 @@ fn oversized_interior_frame_length_does_not_hide_a_valid_successor() {
     let journal_path = directory.path().join(JOURNAL_FILE);
     let mut bytes = std::fs::read(&journal_path).unwrap();
     let original_len = bytes.len();
-    bytes[12..20].copy_from_slice(
-        &u64::try_from(original_len)
-            .unwrap()
-            .saturating_add(1)
-            .to_le_bytes(),
-    );
+    bytes[12..20].copy_from_slice(&u64::MAX.to_le_bytes());
     std::fs::write(&journal_path, bytes).unwrap();
 
     let error = open_area_result(directory.path()).unwrap_err();
@@ -1078,6 +1113,33 @@ fn malformed_legacy_keys_fail_before_migration_writes_or_cleanup() {
     }
 }
 
+#[test]
+fn disagreeing_legacy_intents_for_one_key_fail_before_migration_mutates() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let ready = root.join(legacy::READY_DIRECTORY);
+    let writing = root.join(legacy::WRITING_DIRECTORY);
+    std::fs::create_dir_all(&ready).unwrap();
+    std::fs::create_dir_all(&writing).unwrap();
+    let id = StagedContentId(Uuid::new_v4());
+    let ready_intent = legacy_entry_with_id(&ready, 41, id, "ready", b"ready", false);
+    let writing_intent = legacy_writing_entry_with_id(&writing, 41, id, "writing", b"writing");
+    let ready_directory = ready.join(format!("{:020}-{}", ready_intent.sequence, ready_intent.id));
+    let writing_directory = writing.join(writing_intent.id.to_string());
+
+    let error = open_area_result(root).unwrap_err();
+    assert!(error.to_string().contains("disagrees"), "{error}");
+    assert_eq!(std::fs::metadata(root.join(JOURNAL_FILE)).unwrap().len(), 0);
+    assert!(ready_directory.join(legacy::CONTENT_FILE).exists());
+    assert!(writing_directory.join(legacy::CONTENT_FILE).exists());
+    assert!(
+        read_directory(&root.join(GENERATIONS_DIRECTORY))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn legacy_ready_symlink_is_rejected_before_published_cleanup() {
@@ -1165,6 +1227,16 @@ fn legacy_writing_entry(
     content: &[u8],
 ) -> StagingIntent {
     let id = StagedContentId(Uuid::new_v4());
+    legacy_writing_entry_with_id(writing, sequence, id, name, content)
+}
+
+fn legacy_writing_entry_with_id(
+    writing: &Path,
+    sequence: u64,
+    id: StagedContentId,
+    name: &str,
+    content: &[u8],
+) -> StagingIntent {
     let directory = writing.join(id.to_string());
     std::fs::create_dir(&directory).unwrap();
     let content_path = directory.join(legacy::CONTENT_FILE);

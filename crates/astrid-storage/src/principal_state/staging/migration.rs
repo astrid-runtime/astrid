@@ -70,6 +70,9 @@ fn migrate_entry_intent(
     directory: &Path,
     resolve: &mut impl FnMut(&PrincipalId) -> StorageResult<PrincipalUid>,
 ) -> StorageResult<()> {
+    if !legacy::stage_entry_is_directory(directory)? {
+        return Ok(());
+    }
     legacy::validate_stage_directory(directory)?;
     let legacy_path = directory.join(LEGACY_INTENT_FILE);
     match std::fs::symlink_metadata(&legacy_path) {
@@ -228,12 +231,18 @@ fn prepare_generation(
 fn validate_migration_keys(journal: &JournalState, intents: &[StagingIntent]) -> StorageResult<()> {
     let mut sequences = std::collections::BTreeMap::new();
     let mut identifiers = std::collections::BTreeMap::new();
+    let mut legacy_intents = std::collections::BTreeMap::new();
     for key in journal.pending.keys().chain(journal.completed.iter()) {
         claim_generation_key(&mut sequences, &mut identifiers, *key)?;
     }
     for intent in intents {
         let key = StageKey::from_intent(intent);
         claim_generation_key(&mut sequences, &mut identifiers, key)?;
+        if let Some(existing) = legacy_intents.insert(key, intent)
+            && existing != intent
+        {
+            return Err(intent_disagreement(key));
+        }
         if let Some(existing) = journal.pending.get(&key)
             && existing != intent
         {

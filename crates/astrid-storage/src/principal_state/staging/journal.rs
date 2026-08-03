@@ -170,10 +170,12 @@ fn recover_frame(
             .try_into()
             .map_err(|_| connection("invalid staging journal payload length".to_owned()))?,
     );
-    let frame_end = offset
+    let Some(frame_end) = offset
         .checked_add(header_bytes)
         .and_then(|end| end.checked_add(payload_len))
-        .ok_or_else(|| connection("staging journal frame length overflow".to_owned()))?;
+    else {
+        return recover_invalid_tail(file, offset, file_len, "length overflows file");
+    };
     if frame_end > file_len {
         return recover_invalid_tail(file, offset, file_len, "length exceeds file");
     }
