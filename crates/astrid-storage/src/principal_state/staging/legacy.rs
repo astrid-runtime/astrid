@@ -25,6 +25,94 @@ pub(super) struct LegacyReady {
     pub(super) content: Option<PathBuf>,
 }
 
+/// Inspect every recoverable legacy key without mutating the filesystem.
+///
+/// Migration uses this pass to reject cross-entry key collisions before
+/// recovery promotes, quarantines, or cleans any legacy evidence.
+pub(super) fn inspect_migration_intents(root: &Path) -> StorageResult<Option<Vec<StagingIntent>>> {
+    let writing = root.join(WRITING_DIRECTORY);
+    let ready = root.join(READY_DIRECTORY);
+    if !writing.exists() && !ready.exists() {
+        return Ok(None);
+    }
+
+    let mut intents = Vec::new();
+    if writing.exists() {
+        validate_stage_directory(&writing)?;
+        for entry in read_directory(&writing)? {
+            let entry = entry.map_err(|error| {
+                connection(format!(
+                    "enumerate legacy staging writes {}: {error}",
+                    writing.display()
+                ))
+            })?;
+            let path = entry.path();
+            if !stage_entry_is_directory(&path)? {
+                continue;
+            }
+            validate_stage_directory(&path)?;
+            let Some(id) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| Uuid::parse_str(name).ok())
+                .map(StagedContentId)
+            else {
+                continue;
+            };
+            if let Ok(intent) = load_intent(&path.join(INTENT_FILE))
+                && intent.id == id
+                && validate_private_regular_file(&path.join(CONTENT_FILE))
+                    .is_ok_and(|length| length == intent.logical_bytes)
+            {
+                intents.push(intent);
+            }
+        }
+    }
+    if ready.exists() {
+        validate_stage_directory(&ready)?;
+        for entry in read_directory(&ready)? {
+            let entry = entry.map_err(|error| {
+                connection(format!(
+                    "enumerate legacy staging queue {}: {error}",
+                    ready.display()
+                ))
+            })?;
+            let directory = entry.path();
+            let (sequence, id) = parse_ready_name(&entry.file_name().to_string_lossy())?;
+            validate_stage_directory(&directory)?;
+            let intent_path = directory.join(INTENT_FILE);
+            match std::fs::symlink_metadata(&intent_path) {
+                Ok(_) => {
+                    let intent = load_intent(&intent_path)?;
+                    if intent.sequence != sequence || intent.id != id {
+                        return Err(connection(format!(
+                            "legacy staged intent does not match ready directory {}",
+                            directory.display()
+                        )));
+                    }
+                    intents.push(intent);
+                },
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && (published(&directory)? || directory_is_empty(&directory)?) => {},
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(connection(format!(
+                        "legacy staging directory {} is missing required entries",
+                        directory.display()
+                    )));
+                },
+                Err(error) => {
+                    return Err(connection(format!(
+                        "inspect legacy staged intent {}: {error}",
+                        intent_path.display()
+                    )));
+                },
+            }
+        }
+    }
+    Ok(Some(intents))
+}
+
 pub(super) fn recover(
     root: &Path,
     quarantine: &Path,
@@ -49,11 +137,11 @@ pub(super) fn recover(
         })?;
         let directory = entry.path();
         let (sequence, id) = parse_ready_name(&entry.file_name().to_string_lossy())?;
+        validate_stage_directory(&directory)?;
         if published(&directory)? || directory_is_empty(&directory)? {
             cleanup(&directory)?;
             continue;
         }
-        validate_stage_directory(&directory)?;
         let intent = load_intent(&directory.join(INTENT_FILE))?;
         if intent.sequence != sequence || intent.id != id {
             return Err(connection(format!(
@@ -122,6 +210,11 @@ fn recover_writing(writing: &Path, ready: &Path, quarantine: &Path) -> StorageRe
             ))
         })?;
         let path = entry.path();
+        if !stage_entry_is_directory(&path)? {
+            move_to_quarantine(&path, quarantine, "legacy-unsealed")?;
+            continue;
+        }
+        validate_stage_directory(&path)?;
         let id = entry
             .file_name()
             .to_str()
@@ -316,4 +409,20 @@ pub(super) fn validate_stage_directory(path: &Path) -> StorageResult<()> {
         )));
     }
     Ok(())
+}
+
+fn stage_entry_is_directory(path: &Path) -> StorageResult<bool> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        connection(format!(
+            "inspect legacy staging entry {}: {error}",
+            path.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(connection(format!(
+            "legacy staging entry {} is redirected",
+            path.display()
+        )));
+    }
+    Ok(metadata.is_dir())
 }

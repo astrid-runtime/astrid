@@ -131,10 +131,13 @@ pub(super) fn migrate_legacy(
     journal: &mut JournalState,
     faults: &dyn StagingFaultInjector,
 ) -> StorageResult<()> {
+    let Some(intents) = legacy::inspect_migration_intents(root)? else {
+        return Ok(());
+    };
+    validate_migration_keys(journal, &intents)?;
     let Some((legacy_ready, entries)) = legacy::recover(root, quarantine)? else {
         return Ok(());
     };
-    validate_migration_keys(journal, &entries)?;
     let mut new_entries = Vec::new();
     for entry in entries {
         let key = StageKey::from_intent(&entry.intent);
@@ -222,17 +225,17 @@ fn prepare_generation(
     ensure_footer(target, entry)
 }
 
-fn validate_migration_keys(journal: &JournalState, entries: &[LegacyReady]) -> StorageResult<()> {
+fn validate_migration_keys(journal: &JournalState, intents: &[StagingIntent]) -> StorageResult<()> {
     let mut sequences = std::collections::BTreeMap::new();
     let mut identifiers = std::collections::BTreeMap::new();
     for key in journal.pending.keys().chain(journal.completed.iter()) {
         claim_generation_key(&mut sequences, &mut identifiers, *key)?;
     }
-    for entry in entries {
-        let key = StageKey::from_intent(&entry.intent);
+    for intent in intents {
+        let key = StageKey::from_intent(intent);
         claim_generation_key(&mut sequences, &mut identifiers, key)?;
         if let Some(existing) = journal.pending.get(&key)
-            && existing != &entry.intent
+            && existing != intent
         {
             return Err(intent_disagreement(key));
         }

@@ -916,6 +916,8 @@ fn legacy_pending_published_and_unsealed_entries_migrate_without_loss() {
     let unsealed = writing.join(unsealed_id.to_string());
     std::fs::create_dir(&unsealed).unwrap();
     std::fs::write(unsealed.join(legacy::CONTENT_FILE), b"never acknowledged").unwrap();
+    let malformed_id = StagedContentId(Uuid::new_v4());
+    std::fs::write(writing.join(malformed_id.to_string()), b"not a directory").unwrap();
     sync_directory(&writing).unwrap();
 
     let area = open_area(root);
@@ -927,6 +929,11 @@ fn legacy_pending_published_and_unsealed_entries_migrate_without_loss() {
     assert!(
         quarantine
             .join(format!("{unsealed_id}.legacy-unsealed.0"))
+            .exists()
+    );
+    assert!(
+        quarantine
+            .join(format!("{malformed_id}.legacy-unsealed.0"))
             .exists()
     );
 }
@@ -1013,7 +1020,9 @@ fn malformed_legacy_keys_fail_before_migration_writes_or_cleanup() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         let ready = root.join(legacy::READY_DIRECTORY);
+        let writing = root.join(legacy::WRITING_DIRECTORY);
         std::fs::create_dir_all(&ready).unwrap();
+        std::fs::create_dir_all(&writing).unwrap();
         let shared_id = StagedContentId(Uuid::new_v4());
         let (first_sequence, first_id, second_sequence, second_id) = if collision == "sequence" {
             (31, StagedContentId(Uuid::new_v4()), 31, shared_id)
@@ -1022,14 +1031,16 @@ fn malformed_legacy_keys_fail_before_migration_writes_or_cleanup() {
         };
         let first =
             legacy_entry_with_id(&ready, first_sequence, first_id, "first", b"first", false);
-        let second = legacy_entry_with_id(
+        let published = legacy_entry_with_id(
             &ready,
             second_sequence,
             second_id,
             "second",
             b"second",
-            false,
+            true,
         );
+        let writing_intent = legacy_writing_entry(&writing, 40, "writing", b"writing");
+        let writing_directory = writing.join(writing_intent.id.to_string());
 
         let error = open_area_result(root).unwrap_err();
         assert!(
@@ -1041,7 +1052,7 @@ fn malformed_legacy_keys_fail_before_migration_writes_or_cleanup() {
             0,
             "{collision}"
         );
-        for intent in [first, second] {
+        for intent in [first, published] {
             let directory = ready.join(format!("{:020}-{}", intent.sequence, intent.id));
             assert!(directory.join(legacy::CONTENT_FILE).exists(), "{collision}");
             assert_eq!(
@@ -1052,6 +1063,11 @@ fn malformed_legacy_keys_fail_before_migration_writes_or_cleanup() {
                 "{collision}"
             );
         }
+        assert!(writing_directory.exists(), "{collision}");
+        assert!(
+            writing_directory.join(legacy::CONTENT_FILE).exists(),
+            "{collision}"
+        );
         assert!(
             read_directory(&root.join(GENERATIONS_DIRECTORY))
                 .unwrap()
@@ -1060,6 +1076,32 @@ fn malformed_legacy_keys_fail_before_migration_writes_or_cleanup() {
             "{collision}"
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_ready_symlink_is_rejected_before_published_cleanup() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("staging");
+    let ready = root.join(legacy::READY_DIRECTORY);
+    let outside = directory.path().join("outside");
+    std::fs::create_dir_all(&ready).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    let intent = legacy_entry(&outside, 51, "outside", b"must survive", true);
+    let name = format!("{:020}-{}", intent.sequence, intent.id);
+    let outside_entry = outside.join(&name);
+    symlink(&outside_entry, ready.join(&name)).unwrap();
+
+    let error = open_area_result(&root).unwrap_err();
+    assert!(error.to_string().contains("redirected"));
+    assert_eq!(
+        std::fs::read(outside_entry.join(legacy::CONTENT_FILE)).unwrap(),
+        b"must survive"
+    );
+    assert!(outside_entry.join(legacy::INTENT_FILE).exists());
+    assert!(outside_entry.join(legacy::PUBLISHED_FILE).exists());
 }
 
 fn legacy_entry(
@@ -1113,6 +1155,35 @@ fn legacy_entry_with_id(
         .unwrap();
     }
     sync_directory(ready).unwrap();
+    intent
+}
+
+fn legacy_writing_entry(
+    writing: &Path,
+    sequence: u64,
+    name: &str,
+    content: &[u8],
+) -> StagingIntent {
+    let id = StagedContentId(Uuid::new_v4());
+    let directory = writing.join(id.to_string());
+    std::fs::create_dir(&directory).unwrap();
+    let content_path = directory.join(legacy::CONTENT_FILE);
+    std::fs::write(&content_path, content).unwrap();
+    File::open(&content_path).unwrap().sync_all().unwrap();
+    let intent = StagingIntent {
+        sequence,
+        id,
+        owner: owner(),
+        name: ContentName::new(name).unwrap(),
+        profile: ChunkingProfile::ASTRID_V1,
+        logical_bytes: u64::try_from(content.len()).unwrap(),
+    };
+    atomic_write(
+        &directory.join(legacy::INTENT_FILE),
+        &encode_intent(&intent).unwrap(),
+    )
+    .unwrap();
+    sync_directory(writing).unwrap();
     intent
 }
 
