@@ -45,6 +45,27 @@ fn writer(area: &NativeContentStagingArea, name: &str) -> StagedContentWriter {
     .unwrap()
 }
 
+#[test]
+fn begin_collision_preserves_the_existing_generation() {
+    let directory = tempfile::tempdir().unwrap();
+    let area = open_area(directory.path());
+    let id = StagedContentId(Uuid::from_u128(42));
+    let path = area.inner.generations.join(open_generation_name(id));
+    std::fs::write(&path, b"other writer's bytes").unwrap();
+
+    let error = area
+        .begin_with_id(
+            owner(),
+            ContentName::new("collision.bin").unwrap(),
+            ChunkingProfile::ASTRID_V1,
+            id,
+        )
+        .unwrap_err();
+
+    assert!(error.to_string().contains("create private file"));
+    assert_eq!(std::fs::read(path).unwrap(), b"other writer's bytes");
+}
+
 fn wait_for_queued_seals(area: &NativeContentStagingArea, expected: usize) {
     let started = Instant::now();
     while area.queued_seal_count() < expected {
@@ -1440,9 +1461,14 @@ fn native_seal_group_scale_probe() {
             let elapsed = started.elapsed();
             latencies.sort_unstable();
             let operations = u32::from(writers) * u32::from(SEALS_PER_WRITER);
+            let groups = area.inner.seal_groups_completed.load(Ordering::SeqCst);
+            let durability_flushes = u64::from(operations)
+                .checked_add(groups.saturating_mul(2))
+                .unwrap();
             let p95_index = latencies.len().saturating_mul(95).div_ceil(100) - 1;
             println!(
-                "native_seal_group writers={writers} sample={sample} operations={operations} seals_per_second={:.1} p50_us={} p95_us={} max_us={} wall_ms={}",
+                "native_seal_group writers={writers} sample={sample} operations={operations} seal_groups={groups} durability_flushes={durability_flushes} flushes_per_seal={:.3} seals_per_second={:.1} p50_us={} p95_us={} max_us={} wall_ms={}",
+                durability_flushes as f64 / f64::from(operations),
                 f64::from(operations) / elapsed.as_secs_f64(),
                 latencies[latencies.len() / 2].as_micros(),
                 latencies[p95_index].as_micros(),

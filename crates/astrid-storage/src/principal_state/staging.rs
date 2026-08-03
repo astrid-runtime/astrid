@@ -7,6 +7,7 @@
 use std::fmt;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(test)]
@@ -123,7 +124,7 @@ enum StagingFaultPoint {
     GenerationCleaned,
 }
 
-trait StagingFaultInjector: fmt::Debug + Send + Sync {
+trait StagingFaultInjector: fmt::Debug + RefUnwindSafe + Send + Sync + UnwindSafe {
     fn fail(&self, point: StagingFaultPoint) -> StorageResult<()>;
 }
 
@@ -247,24 +248,28 @@ impl NativeContentStagingArea {
         name: ContentName,
         profile: ChunkingProfile,
     ) -> StorageResult<StagedContentWriter> {
-        let id = StagedContentId(Uuid::new_v4());
+        self.begin_with_id(owner, name, profile, StagedContentId(Uuid::new_v4()))
+    }
+
+    fn begin_with_id(
+        &self,
+        owner: StateOwner,
+        name: ContentName,
+        profile: ChunkingProfile,
+        id: StagedContentId,
+    ) -> StorageResult<StagedContentWriter> {
         let path = self.inner.generations.join(open_generation_name(id));
-        match create_private_file(&path) {
-            Ok(file) => Ok(StagedContentWriter {
-                area: self.clone(),
-                id,
-                owner,
-                name,
-                profile,
-                path: Some(path),
-                file: Some(file),
-                preserve_on_drop: false,
-            }),
-            Err(error) => {
-                let _ = std::fs::remove_file(&path);
-                Err(error)
-            },
-        }
+        let file = create_private_file(&path)?;
+        Ok(StagedContentWriter {
+            area: self.clone(),
+            id,
+            owner,
+            name,
+            profile,
+            path: Some(path),
+            file: Some(file),
+            preserve_on_drop: false,
+        })
     }
 
     /// Enumerate sealed writes in publication order.
@@ -323,6 +328,7 @@ impl NativeContentStagingArea {
         self.ensure_publication_order(&staged)?;
         let area = self.clone();
         tokio::task::spawn_blocking(move || {
+            validate_generation(&staged.content_path(), &staged.intent())?;
             let source = open_private_file(&staged.content_path())?.take(staged.logical_bytes);
             let outcome = content
                 .put_streaming_with_profile(&staged.owner, &staged.name, source, staged.profile)
@@ -603,6 +609,17 @@ impl ReadyStagedContent {
             name: intent.name,
             profile: intent.profile,
             logical_bytes: intent.logical_bytes,
+        }
+    }
+
+    fn intent(&self) -> StagingIntent {
+        StagingIntent {
+            sequence: self.sequence,
+            id: self.id,
+            owner: self.owner,
+            name: self.name.clone(),
+            profile: self.profile,
+            logical_bytes: self.logical_bytes,
         }
     }
 
