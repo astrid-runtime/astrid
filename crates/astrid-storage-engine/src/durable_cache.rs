@@ -102,6 +102,7 @@ impl<P: Ord> Default for CacheState<P> {
 pub(super) struct ObjectCache<P: Ord> {
     controller: ObjectCacheController,
     principal_budget: Arc<dyn PrincipalObjectCacheBudget<P>>,
+    accounting: Mutex<()>,
     state: Mutex<CacheState<P>>,
 }
 
@@ -113,11 +114,13 @@ where
         Self {
             controller: config.controller,
             principal_budget: config.principal_budget,
+            accounting: Mutex::new(()),
             state: Mutex::new(CacheState::default()),
         }
     }
 
     pub(super) fn get(&self, principal: &P, object: ObjectId) -> Option<Arc<ObjectRecord>> {
+        let _accounting = self.accounting.lock();
         let (global_required, principal_required) = {
             let state = self.state.lock();
             let weight = state.entries.get(&object).map_or(0, |entry| entry.weight);
@@ -178,9 +181,11 @@ where
         };
         let resident = state.resident_bytes();
         let charged = state.principal_charge(principal);
+        drop(state);
         // Reconciliation may acknowledge an authority pressure target and
-        // shrink a slab. Keep it serialized with cache mutation so it cannot
-        // publish a stale pre-admission byte count.
+        // shrink a slab. The accounting guard keeps this byte count ordered
+        // with every admission and explicit release without invoking an
+        // external policy while the cache-state lock is held.
         self.controller.reconcile(resident);
         self.principal_budget.reconcile(principal, charged);
         result
@@ -192,6 +197,7 @@ where
         object: ObjectId,
         record: ObjectRecord,
     ) -> Arc<ObjectRecord> {
+        let _accounting = self.accounting.lock();
         let record = Arc::new(record);
         let weight = cache_weight(&record);
         let association_weight = association_weight::<P>();
@@ -290,6 +296,7 @@ where
         };
         let resident = state.resident_bytes();
         let charged = state.principal_charge(principal);
+        drop(state);
         self.controller.reconcile(resident);
         self.principal_budget.reconcile(principal, charged);
         result
@@ -373,6 +380,7 @@ where
         key: ProjectionCacheKey,
         value: ProjectionCacheEntry,
     ) -> bool {
+        let _accounting = self.accounting.lock();
         let (value, payload_weight) = value.into_parts();
         let weight = projection_cache_weight(payload_weight);
         let (global_required, principal_required) = {
@@ -419,6 +427,7 @@ where
         );
         let resident = state.resident_bytes();
         let charged = state.principal_charge(principal);
+        drop(state);
         self.controller.reconcile(resident);
         self.principal_budget.reconcile(principal, charged);
         retained
@@ -454,17 +463,20 @@ where
     }
 
     pub(super) fn clear(&self) {
+        let _accounting = self.accounting.lock();
         let mut state = self.state.lock();
         let objects = state.entries.keys().copied().collect::<Vec<_>>();
         for object in objects {
             state.remove_physical(object);
         }
+        drop(state);
         self.controller.release_unused(0);
         self.principal_budget.release_unused_all(&BTreeMap::new());
     }
 
     /// Honor the latest external pressure targets and return released slabs.
     pub(super) fn reclaim(&self) {
+        let _accounting = self.accounting.lock();
         let mut state = self.state.lock();
         let principals = state.principals.keys().cloned().collect::<Vec<_>>();
         let capacities = principals
@@ -483,9 +495,10 @@ where
             .map(|(principal, partition)| (principal.clone(), partition.charged_bytes))
             .collect::<BTreeMap<_, _>>();
 
-        // Release while the cache state is locked. Admissions revalidate
-        // their capacity after acquiring this same lock, so a reservation
-        // obtained before reclaim cannot be committed after its slab shrinks.
+        drop(state);
+        // The accounting guard prevents an admission from committing between
+        // the live-byte snapshot and release. Admission also revalidates the
+        // authority target after acquiring the cache-state lock.
         self.controller.release_unused(resident);
         self.principal_budget.release_unused_all(&charges);
     }
