@@ -328,8 +328,8 @@ impl NativeContentStagingArea {
     /// Content ingestion, arena reads, appends, and flushes execute on a
     /// blocking worker. A crash before root publication retains the staging
     /// file for retry. A crash after publication is idempotent: the same bytes
-    /// publish the same file identity, and the durable publication marker
-    /// permits cleanup on the next scan.
+    /// publish the same file identity, and the durable `Published` journal
+    /// record permits cleanup on the next scan.
     ///
     /// # Errors
     ///
