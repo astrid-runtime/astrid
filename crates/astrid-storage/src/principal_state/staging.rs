@@ -90,6 +90,8 @@ struct JournalState {
 struct SealOrder {
     next_sequence: u64,
     active: std::collections::BTreeMap<u64, (StateOwner, ContentName)>,
+    reserved_identifiers: std::collections::BTreeSet<StagedContentId>,
+    reaped_identifiers: std::collections::BTreeSet<StagedContentId>,
 }
 
 /// A poisoned coordination lock preserves the staging handles' unwind-safety.
@@ -235,6 +237,12 @@ impl NativeContentStagingArea {
             truncate_empty(&mut journal.file)?;
             journal.completed.clear();
         }
+        let reserved_identifiers = journal
+            .pending
+            .keys()
+            .chain(journal.completed.iter())
+            .map(|key| key.id)
+            .collect();
         Ok(Self {
             inner: Arc::new(StagingInner {
                 root,
@@ -242,6 +250,8 @@ impl NativeContentStagingArea {
                 seal_order: PoisoningMutex::new(SealOrder {
                     next_sequence,
                     active: std::collections::BTreeMap::new(),
+                    reserved_identifiers,
+                    reaped_identifiers: std::collections::BTreeSet::new(),
                 }),
                 group_policy,
                 seal_group: PoisoningMutex::new(SealGroup::default()),
@@ -279,7 +289,21 @@ impl NativeContentStagingArea {
         id: StagedContentId,
     ) -> StorageResult<StagedContentWriter> {
         let path = self.inner.generations.join(open_generation_name(id));
-        let file = create_private_file(&path)?;
+        let file = {
+            let mut order = self.inner.seal_order.lock();
+            if !order.reserved_identifiers.insert(id) {
+                return Err(connection(format!(
+                    "staged-write identifier {id} is already reserved"
+                )));
+            }
+            match create_private_file(&path) {
+                Ok(file) => file,
+                Err(error) => {
+                    order.reserved_identifiers.remove(&id);
+                    return Err(error);
+                },
+            }
+        };
         Ok(StagedContentWriter {
             area: self.clone(),
             id,
@@ -427,6 +451,10 @@ impl NativeContentStagingArea {
             if journal.poisoned {
                 return Err(connection("staging journal requires recovery".to_owned()));
             }
+            if journal.completed.contains(&key) {
+                drop(journal);
+                return self.reap_completed();
+            }
             if !journal.pending.contains_key(&key) {
                 return Err(connection(format!(
                     "staged write {} is no longer pending",
@@ -448,33 +476,44 @@ impl NativeContentStagingArea {
     }
 
     fn reap_completed(&self) -> StorageResult<()> {
-        let completed: Vec<_> = {
-            let journal = self.inner.journal.lock();
-            journal.completed.iter().copied().collect()
-        };
+        let mut journal = self.inner.journal.lock();
+        if journal.poisoned {
+            return Err(connection("staging journal requires recovery".to_owned()));
+        }
+        let completed: Vec<_> = journal.completed.iter().copied().collect();
         if completed.is_empty() {
             return Ok(());
         }
+        let cleanup = (|| {
+            for key in &completed {
+                let path = self
+                    .inner
+                    .generations
+                    .join(sealed_generation_name(key.sequence, key.id));
+                remove_generation(&path)?;
+            }
+            sync_directory(&self.inner.generations)?;
+            self.fail_if(StagingFaultPoint::GenerationCleaned)
+        })();
+        cleanup?;
         for key in &completed {
-            let path = self
-                .inner
-                .generations
-                .join(sealed_generation_name(key.sequence, key.id));
-            remove_generation(&path)?;
+            journal.completed.remove(key);
         }
-        sync_directory(&self.inner.generations)?;
-        self.fail_if(StagingFaultPoint::GenerationCleaned)?;
-
-        let mut journal = self.inner.journal.lock();
-        for key in completed {
-            journal.completed.remove(&key);
-        }
-        if journal.pending.is_empty()
-            && journal.completed.is_empty()
-            && let Err(error) = truncate_empty(&mut journal.file)
-        {
+        let journal_drained = journal.pending.is_empty() && journal.completed.is_empty();
+        if journal_drained && let Err(error) = truncate_empty(&mut journal.file) {
             journal.poisoned = true;
             return Err(error);
+        }
+        drop(journal);
+        let mut order = self.inner.seal_order.lock();
+        for key in completed {
+            order.reaped_identifiers.insert(key.id);
+        }
+        if journal_drained {
+            let reaped = std::mem::take(&mut order.reaped_identifiers);
+            for id in reaped {
+                order.reserved_identifiers.remove(&id);
+            }
         }
         Ok(())
     }
@@ -602,6 +641,12 @@ impl Drop for StagedContentWriter {
         if let Some(path) = self.path.take() {
             let _ = std::fs::remove_file(path);
         }
+        self.area
+            .inner
+            .seal_order
+            .lock()
+            .reserved_identifiers
+            .remove(&self.id);
     }
 }
 

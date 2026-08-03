@@ -50,6 +50,7 @@ pub(in crate::principal_state) fn migrate_alias_owner_intents(
         },
     }
     let mut migrations = Vec::new();
+    let mut current_intents = Vec::new();
     for name in [legacy::WRITING_DIRECTORY, legacy::READY_DIRECTORY] {
         let queue = root.join(name);
         match std::fs::symlink_metadata(&queue) {
@@ -69,20 +70,42 @@ pub(in crate::principal_state) fn migrate_alias_owner_intents(
                     queue.display()
                 ))
             })?;
-            if let Some(migration) = inspect_alias_intent(&entry.path(), &mut resolve)? {
+            let path = entry.path();
+            if let Some(intent) = inspect_current_intent(&path)? {
+                current_intents.push(intent);
+            }
+            if let Some(migration) = inspect_alias_intent(&path, &mut resolve)? {
                 migrations.push(migration);
             }
         }
     }
-    let intents: Vec<_> = migrations
-        .iter()
-        .map(|migration| migration.migrated.clone())
-        .collect();
+    let mut intents = current_intents;
+    intents.extend(
+        migrations
+            .iter()
+            .map(|migration| migration.migrated.clone()),
+    );
     validate_intent_keys(None, &intents)?;
     for migration in migrations {
         apply_alias_intent_migration(&migration)?;
     }
     Ok(())
+}
+
+fn inspect_current_intent(directory: &Path) -> StorageResult<Option<StagingIntent>> {
+    if !legacy::stage_entry_is_directory(directory)? {
+        return Ok(None);
+    }
+    legacy::validate_stage_directory(directory)?;
+    let path = directory.join(legacy::INTENT_FILE);
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => load_intent(&path).map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(connection(format!(
+            "inspect UID staged intent {}: {error}",
+            path.display()
+        ))),
+    }
 }
 
 fn inspect_alias_intent(

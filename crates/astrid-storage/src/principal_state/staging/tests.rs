@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use super::format::{
     LegacyStagingIntent, LegacyStagingOwner, StagingIntent, decode_intent, decode_legacy_intent,
-    encode_intent, encode_legacy_intent,
+    encode_intent, encode_legacy_intent, load_intent,
 };
 use super::journal::{
     JournalRecord, StageKey, append_records, encoded_frame, flush_journal, refresh_frame_checksum,
@@ -72,6 +72,112 @@ fn begin_collision_preserves_the_existing_generation() {
 
     assert!(error.to_string().contains("create private file"));
     assert_eq!(std::fs::read(path).unwrap(), b"other writer's bytes");
+}
+
+#[test]
+fn begin_rejects_identifier_reserved_by_a_sealed_generation() {
+    let directory = tempfile::tempdir().unwrap();
+    let area = open_area(directory.path());
+    let id = StagedContentId(Uuid::from_u128(43));
+    let mut first = area
+        .begin_with_id(
+            owner(),
+            ContentName::new("first.bin").unwrap(),
+            ChunkingProfile::ASTRID_V1,
+            id,
+        )
+        .unwrap();
+    first.write_all(b"sealed bytes").unwrap();
+    let sealed = first.seal().unwrap();
+
+    let error = area
+        .begin_with_id(
+            owner(),
+            ContentName::new("second.bin").unwrap(),
+            ChunkingProfile::ASTRID_V1,
+            id,
+        )
+        .unwrap_err();
+
+    assert!(error.to_string().contains("already reserved"), "{error}");
+    assert_eq!(read_logical(&sealed), b"sealed bytes");
+    assert_eq!(area.ready().unwrap(), vec![sealed]);
+}
+
+#[test]
+fn dropping_an_unsealed_writer_releases_its_identifier() {
+    let directory = tempfile::tempdir().unwrap();
+    let area = open_area(directory.path());
+    let id = StagedContentId(Uuid::from_u128(44));
+    drop(
+        area.begin_with_id(
+            owner(),
+            ContentName::new("abandoned.bin").unwrap(),
+            ChunkingProfile::ASTRID_V1,
+            id,
+        )
+        .unwrap(),
+    );
+
+    assert!(
+        area.begin_with_id(
+            owner(),
+            ContentName::new("replacement.bin").unwrap(),
+            ChunkingProfile::ASTRID_V1,
+            id,
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn reaped_identifier_stays_reserved_until_the_journal_is_drained() {
+    let directory = tempfile::tempdir().unwrap();
+    let area = open_area(directory.path());
+    let first_id = StagedContentId(Uuid::from_u128(45));
+    let second_id = StagedContentId(Uuid::from_u128(46));
+    let mut first = area
+        .begin_with_id(
+            owner(),
+            ContentName::new("first.bin").unwrap(),
+            ChunkingProfile::ASTRID_V1,
+            first_id,
+        )
+        .unwrap();
+    first.write_all(b"first").unwrap();
+    let first = first.seal().unwrap();
+    let mut second = area
+        .begin_with_id(
+            owner(),
+            ContentName::new("second.bin").unwrap(),
+            ChunkingProfile::ASTRID_V1,
+            second_id,
+        )
+        .unwrap();
+    second.write_all(b"second").unwrap();
+    let second = second.seal().unwrap();
+
+    area.mark_published(&first).unwrap();
+    let error = area
+        .begin_with_id(
+            owner(),
+            ContentName::new("still-reserved.bin").unwrap(),
+            ChunkingProfile::ASTRID_V1,
+            first_id,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("already reserved"), "{error}");
+
+    area.mark_published(&second).unwrap();
+    assert!(
+        area.begin_with_id(
+            owner(),
+            ContentName::new("reusable.bin").unwrap(),
+            ChunkingProfile::ASTRID_V1,
+            first_id,
+        )
+        .is_ok()
+    );
 }
 
 fn wait_for_queued_seals(area: &NativeContentStagingArea, expected: usize) {
@@ -318,6 +424,58 @@ fn conflicting_alias_intents_fail_before_any_entry_is_migrated() {
         assert!(path.join(migration::LEGACY_INTENT_FILE).exists());
         assert!(!path.join(legacy::INTENT_FILE).exists());
     }
+}
+
+#[test]
+fn alias_migration_preflights_current_legacy_intents_before_mutation() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let writing = root.join(legacy::WRITING_DIRECTORY);
+    let ready = root.join(legacy::READY_DIRECTORY);
+    std::fs::create_dir_all(&writing).unwrap();
+    std::fs::create_dir_all(&ready).unwrap();
+
+    let id = StagedContentId(Uuid::new_v4());
+    let alias_directory = writing.join(id.to_string());
+    std::fs::create_dir(&alias_directory).unwrap();
+    let alias = LegacyStagingIntent {
+        sequence: 31,
+        id,
+        owner: LegacyStagingOwner::Principal(PrincipalId::new("alice").unwrap()),
+        name: ContentName::new("alias.bin").unwrap(),
+        profile: ChunkingProfile::ASTRID_V1,
+        logical_bytes: 0,
+    };
+    atomic_write(
+        &alias_directory.join(migration::LEGACY_INTENT_FILE),
+        &encode_legacy_intent(&alias).unwrap(),
+    )
+    .unwrap();
+
+    let current_directory = ready.join(format!("{:020}-{}", 32, id));
+    std::fs::create_dir(&current_directory).unwrap();
+    let current = StagingIntent {
+        sequence: 32,
+        id,
+        owner: owner(),
+        name: ContentName::new("current.bin").unwrap(),
+        profile: ChunkingProfile::ASTRID_V1,
+        logical_bytes: 0,
+    };
+    atomic_write(
+        &current_directory.join(legacy::INTENT_FILE),
+        &encode_intent(&current).unwrap(),
+    )
+    .unwrap();
+
+    let error = migrate_alias_owner_intents(root, |_| Ok(uid())).unwrap_err();
+    assert!(error.to_string().contains("identifier"), "{error}");
+    assert!(alias_directory.join(migration::LEGACY_INTENT_FILE).exists());
+    assert!(!alias_directory.join(legacy::INTENT_FILE).exists());
+    assert_eq!(
+        load_intent(&current_directory.join(legacy::INTENT_FILE)).unwrap(),
+        current
+    );
 }
 
 #[test]
@@ -739,6 +897,54 @@ fn every_publication_cleanup_prefix_reopens_as_completed() {
         assert!(reopened.ready().unwrap().is_empty(), "{point:?}");
         assert!(!staged.content_path().exists(), "{point:?}");
     }
+}
+
+#[test]
+fn completed_publication_retry_finishes_cleanup_idempotently() {
+    let directory = tempfile::tempdir().unwrap();
+    let area = open_with_fault(directory.path(), StagingFaultPoint::GenerationCleaned);
+    let mut staged_writer = writer(&area, "published-retry");
+    staged_writer.write_all(b"published bytes").unwrap();
+    let staged = staged_writer.seal().unwrap();
+
+    assert!(area.mark_published(&staged).is_err());
+    assert!(area.mark_published(&staged).is_ok());
+    assert!(!staged.content_path().exists());
+    assert!(area.ready().unwrap().is_empty());
+}
+
+#[test]
+fn poisoned_journal_never_reaps_completed_generations() {
+    let directory = tempfile::tempdir().unwrap();
+    let area = open_area(directory.path());
+    let mut staged_writer = writer(&area, "poisoned-cleanup");
+    staged_writer.write_all(b"retain until reopen").unwrap();
+    let staged = staged_writer.seal().unwrap();
+    let key = StageKey {
+        sequence: staged.sequence,
+        id: staged.id,
+    };
+    {
+        let mut journal = area.inner.journal.lock();
+        append_records(&mut journal.file, &[JournalRecord::Published(key)]).unwrap();
+        flush_journal(&journal.file).unwrap();
+        journal.pending.remove(&key);
+        journal.completed.insert(key);
+        journal.poisoned = true;
+    }
+    let journal_len = std::fs::metadata(directory.path().join(JOURNAL_FILE))
+        .unwrap()
+        .len();
+
+    let error = area.ready().unwrap_err();
+    assert!(error.to_string().contains("requires recovery"), "{error}");
+    assert!(staged.content_path().exists());
+    assert_eq!(
+        std::fs::metadata(directory.path().join(JOURNAL_FILE))
+            .unwrap()
+            .len(),
+        journal_len
+    );
 }
 
 #[test]
