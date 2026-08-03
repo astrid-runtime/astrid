@@ -289,6 +289,21 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   measured bottlenecks and defines the future read/write filesystem-provider
   matrix without presenting engine measurements as mounted throughput. Refs
   #1398, #1399, #1392, and #1391.
+- **Principal-storage performance evidence is bound to its exact run.** The
+  benchmark report now records canonical arguments, source revision and dirty
+  state, executable identity, and a digest over its payload; checked-in reports
+  and their checksums can therefore be reproduced or rejected rather than
+  trusted as detached JSON. The integrated post-stack baseline confirms
+  near-native staging and native-parity warm verified reads while retaining
+  publication as the measured throughput bottleneck.
+- **Durable storage recovery is exercised at every recorded write prefix.** An
+  opt-in test recorder captures exact append, overwrite, truncate, durability,
+  root-publication, and acknowledgement events, then deterministically reopens
+  the resulting old-length, current-length, changed-block, and torn-tail images
+  through the production recovery path. Regressions enforce acknowledged-root
+  survival, prohibit invented roots and dangling live closures, preserve hard
+  failure for corrupt interiors, and require repair to be idempotent. Closes
+  #1393.
 - **Principal storage reuses verified immutable reads under governed memory.**
   Durable object reads now use positional I/O after a short index lookup
   instead of seeking under the engine write mutex.
