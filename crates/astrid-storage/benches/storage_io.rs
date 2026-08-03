@@ -12,12 +12,15 @@ use std::path::Path;
 
 #[path = "storage_io/config.rs"]
 mod config;
+#[path = "storage_io/provenance.rs"]
+mod provenance;
 #[path = "storage_io/report.rs"]
 mod report;
 #[path = "storage_io/workloads.rs"]
 mod workloads;
 
 use config::Config;
+use provenance::RunProvenance;
 use report::Report;
 
 type BenchResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -25,6 +28,16 @@ type BenchResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> BenchResult<()> {
     let config = Config::from_args()?;
+    let provenance = RunProvenance::capture()?;
+    println!(
+        "revision: {} ({})",
+        provenance.revision(),
+        if provenance.is_clean() {
+            "clean"
+        } else {
+            "dirty"
+        }
+    );
     let temporary = config.root.is_none().then(tempfile::tempdir).transpose()?;
     let root = match (&config.root, &temporary) {
         (Some(root), _) => root.clone(),
@@ -46,11 +59,11 @@ async fn main() -> BenchResult<()> {
     let source = root.join("source.bin");
     workloads::prepare_source(&source, config.bytes, config.block_bytes)?;
     let source_digest = workloads::hash_native(&source, config.block_bytes)?;
-    let mut report = Report::new(config.clone());
+    let mut report = Report::new(config.clone(), provenance);
     workloads::run(&config, &root, &source, source_digest, &mut report).await?;
 
     report.print_table();
-    let encoded = serde_json::to_vec_pretty(&report)?;
+    let encoded = report.encode_evidence()?;
     if let Some(output) = &config.output {
         if let Some(parent) = output.parent() {
             std::fs::create_dir_all(parent)?;

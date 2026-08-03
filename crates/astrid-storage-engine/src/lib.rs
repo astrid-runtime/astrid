@@ -24,6 +24,8 @@ use astrid_storage_model::{
 };
 use parking_lot::RwLock;
 
+#[cfg(any(test, feature = "crash-replay"))]
+pub mod crash_replay;
 #[cfg(not(target_family = "wasm"))]
 mod durable;
 mod kv;

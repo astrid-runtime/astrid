@@ -3,12 +3,14 @@ use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use super::config::{Config, MEBIBYTE};
+use super::provenance::RunProvenance;
 
 #[derive(Debug, Serialize)]
 pub(super) struct Report {
-    format: &'static str,
+    provenance: RunProvenance,
     package_version: &'static str,
     os: &'static str,
     architecture: &'static str,
@@ -21,9 +23,9 @@ pub(super) struct Report {
 }
 
 impl Report {
-    pub(super) fn new(config: Config) -> Self {
+    pub(super) fn new(config: Config, provenance: RunProvenance) -> Self {
         Self {
-            format: "astrid-storage-io-benchmark-v1",
+            provenance,
             package_version: env!("CARGO_PKG_VERSION"),
             os: env::consts::OS,
             architecture: env::consts::ARCH,
@@ -34,6 +36,21 @@ impl Report {
             throughput_scaling: Vec::new(),
             write_amplifications: Vec::new(),
         }
+    }
+
+    pub(super) fn encode_evidence(&self) -> serde_json::Result<Vec<u8>> {
+        let payload_json = serde_json::to_string(self)?;
+        let digest = PayloadDigest {
+            algorithm: "sha-256",
+            scope: "utf8:payload_json:astrid-storage-io-benchmark-v2",
+            hex: hex::encode(Sha256::digest(payload_json.as_bytes())),
+        };
+        serde_json::to_vec_pretty(&EvidenceEnvelope {
+            format: "astrid-storage-io-benchmark-v2",
+            payload_digest: digest,
+            payload_json: &payload_json,
+            payload: self,
+        })
     }
 
     pub(super) fn record_bytes(&mut self, name: &'static str, bytes: u64, samples: Vec<Duration>) {
@@ -204,6 +221,21 @@ impl Report {
     fn metric(&self, name: &str) -> Option<&Metric> {
         self.metrics.iter().find(|metric| metric.name == name)
     }
+}
+
+#[derive(Debug, Serialize)]
+struct EvidenceEnvelope<'a> {
+    format: &'static str,
+    payload_digest: PayloadDigest,
+    payload_json: &'a str,
+    payload: &'a Report,
+}
+
+#[derive(Debug, Serialize)]
+struct PayloadDigest {
+    algorithm: &'static str,
+    scope: &'static str,
+    hex: String,
 }
 
 #[derive(Debug, Serialize)]

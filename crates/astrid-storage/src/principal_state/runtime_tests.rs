@@ -1,12 +1,18 @@
 use std::collections::BTreeMap;
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::num::NonZeroU64;
+#[cfg(not(target_os = "windows"))]
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "legacy-surrealkv")]
 use astrid_core::profile::{DeviceKey, DeviceScope, PrincipalProfile};
 use astrid_resources::ResidentMemoryAuthority;
+#[cfg(not(target_os = "windows"))]
+use astrid_storage_engine::crash_replay::{
+    ConservativeDataSync, CrashTraceRecorder, ReplayLimits, TraceFileId,
+};
 use astrid_storage_engine::{ObjectCacheCapacity, ObjectCacheController, RootTransaction};
 use astrid_storage_model::{
     ObjectClass, ObjectFormatVersion, ObjectKind, ObjectReference, ReferenceLabel, RootState,
@@ -1132,6 +1138,102 @@ async fn independent_reader_accepts_a_rust_produced_store() {
         !rejected.status.success(),
         "independent reader accepted a corrupt Rust-produced store"
     );
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tokio::test]
+async fn independent_reader_accepts_a_replayed_durable_prefix() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    let store = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let alice_uid = create_test_principal(&store, "alice").await;
+    store
+        .kv()
+        .set("alice:capsule:shell", "cwd", b"/workspace".to_vec())
+        .await
+        .unwrap();
+
+    let store_path = home.principal_store_path();
+    let arena = TraceFileId::new("objects.arena").unwrap();
+    let roots = TraceFileId::new("roots.journal").unwrap();
+    let metadata = TraceFileId::new(STORE_METADATA_FILE).unwrap();
+    let initial_root_len = std::fs::metadata(store_path.join(roots.as_str()))
+        .unwrap()
+        .len();
+    let recorder = CrashTraceRecorder::from_paths(
+        [
+            (arena.clone(), store_path.join(arena.as_str())),
+            (roots.clone(), store_path.join(roots.as_str())),
+            (metadata, store_path.join(STORE_METADATA_FILE)),
+        ],
+        ["initial".to_owned()],
+    )
+    .unwrap();
+
+    store
+        .kv()
+        .set("alice:capsule:shell", "theme", b"raven".to_vec())
+        .await
+        .unwrap();
+    recorder
+        .capture(&arena, &store_path.join(arena.as_str()))
+        .unwrap();
+    recorder.barrier(&arena).unwrap();
+    recorder
+        .capture(&roots, &store_path.join(roots.as_str()))
+        .unwrap();
+    recorder.barrier(&roots).unwrap();
+    let final_root_len = std::fs::metadata(store_path.join(roots.as_str()))
+        .unwrap()
+        .len();
+    recorder
+        .root_publication(
+            &roots,
+            initial_root_len,
+            final_root_len.checked_sub(initial_root_len).unwrap(),
+        )
+        .unwrap();
+    recorder.acknowledge("updated").unwrap();
+    drop(store);
+
+    let images = recorder
+        .trace()
+        .unwrap()
+        .replay(
+            &ConservativeDataSync::new(NonZeroUsize::new(4096).unwrap()),
+            ReplayLimits::ci(),
+        )
+        .unwrap();
+    let durable = images
+        .images()
+        .iter()
+        .find(|image| {
+            image
+                .acknowledged_commits()
+                .iter()
+                .any(|label| label == "updated")
+        })
+        .expect("replay omitted the acknowledged operation prefix");
+    let replay = tempfile::tempdir().unwrap();
+    durable.materialize(replay.path()).unwrap();
+
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/runatal_v1_reader.py");
+    let output = std::process::Command::new("python3")
+        .arg(script)
+        .arg(replay.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "independent reader rejected replayed prefix: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let decoded: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let alice = alice_uid.to_string();
+    assert_eq!(decoded["roots"][alice.as_str()]["generation"], 1);
+    assert_eq!(decoded["roots"][alice.as_str()]["kv"]["entries"], 2);
 }
 
 #[tokio::test]

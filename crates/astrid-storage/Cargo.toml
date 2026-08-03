@@ -38,10 +38,12 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+astrid-storage-engine = { workspace = true, features = ["crash-replay"] }
 blake3 = { workspace = true }
 ed25519-dalek = { workspace = true }
 fastcdc = { workspace = true }
 serde = { workspace = true }
+sha2 = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 

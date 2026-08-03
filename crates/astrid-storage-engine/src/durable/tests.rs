@@ -1344,12 +1344,8 @@ fn recovery_rejects_oversized_declaration_before_allocating_payload() {
     let directory = tempfile::tempdir().unwrap();
     drop(open(directory.path()));
     let arena = directory.path().join(ARENA_FILE);
-    let mut header = [0_u8; FRAME_HEADER_LEN_USIZE];
-    header[..8].copy_from_slice(&ARENA_MAGIC);
-    header[8..10].copy_from_slice(&FRAME_VERSION.to_le_bytes());
-    header[12..20].copy_from_slice(&1024_u64.to_le_bytes());
     let mut file = OpenOptions::new().append(true).open(arena).unwrap();
-    file.write_all(&header).unwrap();
+    append_frame(&mut file, ARENA_MAGIC, &[0_u8; 1024]).unwrap();
     file.sync_data().unwrap();
     drop(file);
     let tiny = RecoveryLimits::new(64).unwrap();
@@ -1362,6 +1358,53 @@ fn recovery_rejects_oversized_declaration_before_allocating_payload() {
             declared: 1024,
             limit: 64,
         })
+    ));
+}
+
+#[test]
+fn recovery_repairs_terminal_torn_oversized_declaration() {
+    let directory = tempfile::tempdir().unwrap();
+    drop(open(directory.path()));
+    let arena = directory.path().join(ARENA_FILE);
+    let mut header = [0_u8; FRAME_HEADER_LEN_USIZE];
+    header[..8].copy_from_slice(&ARENA_MAGIC);
+    header[8..10].copy_from_slice(&FRAME_VERSION.to_le_bytes());
+    header[12..20].copy_from_slice(&1024_u64.to_le_bytes());
+    let mut file = OpenOptions::new().append(true).open(&arena).unwrap();
+    file.write_all(&header).unwrap();
+    file.sync_data().unwrap();
+    drop(file);
+    let tiny = RecoveryLimits::new(64).unwrap();
+
+    drop(DurableEngine::open(directory.path(), TestIdentity, Utf8Codec, tiny).unwrap());
+    assert_eq!(std::fs::metadata(arena).unwrap().len(), 0);
+}
+
+#[test]
+fn recovery_rejects_torn_oversized_declaration_before_complete_oversized_frame() {
+    let directory = tempfile::tempdir().unwrap();
+    drop(open(directory.path()));
+    let arena = directory.path().join(ARENA_FILE);
+    let declared = 1_u64 << 20;
+    let mut header = [0_u8; FRAME_HEADER_LEN_USIZE];
+    header[..8].copy_from_slice(&ARENA_MAGIC);
+    header[8..10].copy_from_slice(&FRAME_VERSION.to_le_bytes());
+    header[12..20].copy_from_slice(&declared.to_le_bytes());
+    let mut file = OpenOptions::new().append(true).open(&arena).unwrap();
+    file.write_all(&header).unwrap();
+    append_frame(&mut file, ARENA_MAGIC, &[0_u8; 1024]).unwrap();
+    file.sync_data().unwrap();
+    drop(file);
+    let tiny = RecoveryLimits::new(64).unwrap();
+
+    assert!(matches!(
+        DurableEngine::open(directory.path(), TestIdentity, Utf8Codec, tiny),
+        Err(DurableError::FrameTooLarge {
+            file: ARENA_FILE,
+            offset: 0,
+            declared: actual,
+            limit: 64,
+        }) if actual == declared
     ));
 }
 
