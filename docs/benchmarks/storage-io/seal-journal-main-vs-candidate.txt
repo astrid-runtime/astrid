@@ -8,7 +8,7 @@ macOS 26.2 (25C56), arm64, Apple M2 Ultra
 Comparison
 ----------
 baseline:  d9af426f9988b43d85abb08409d7cc6087ef7e93
-candidate: a8f56dbd450af848567c878870476ec115958d3c
+candidate: ca1f72d88eb81a6ed2c785005978b7f3c160fd66
 
 The baseline worktree was detached at the exact candidate parent and differed
 only by the ignored probe copied from the candidate. Each revision used its
@@ -43,15 +43,15 @@ native_seal_group writers=8 sample=2 operations=512 seals_per_second=78.0 p50_us
 
 Candidate raw output
 --------------------
-native_seal_group writers=1 sample=0 operations=64 seals_per_second=71.7 p50_us=13740 p95_us=14969 max_us=24502 wall_ms=892
-native_seal_group writers=1 sample=1 operations=64 seals_per_second=74.9 p50_us=12863 p95_us=13904 max_us=15740 wall_ms=853
-native_seal_group writers=1 sample=2 operations=64 seals_per_second=74.9 p50_us=12894 p95_us=13930 max_us=14938 wall_ms=854
-native_seal_group writers=2 sample=0 operations=128 seals_per_second=92.6 p50_us=20818 p95_us=26786 max_us=33759 wall_ms=1381
-native_seal_group writers=2 sample=1 operations=128 seals_per_second=110.2 p50_us=16889 p95_us=22703 max_us=26225 wall_ms=1162
-native_seal_group writers=2 sample=2 operations=128 seals_per_second=108.5 p50_us=16901 p95_us=25580 max_us=26722 wall_ms=1179
-native_seal_group writers=4 sample=0 operations=256 seals_per_second=154.2 p50_us=25783 p95_us=30671 max_us=38933 wall_ms=1660
-native_seal_group writers=4 sample=1 operations=256 seals_per_second=147.8 p50_us=26769 p95_us=29790 max_us=45856 wall_ms=1731
-native_seal_group writers=4 sample=2 operations=256 seals_per_second=151.0 p50_us=26585 p95_us=29620 max_us=39783 wall_ms=1694
-native_seal_group writers=8 sample=0 operations=512 seals_per_second=216.8 p50_us=34752 p95_us=48159 max_us=67414 wall_ms=2361
-native_seal_group writers=8 sample=1 operations=512 seals_per_second=207.2 p50_us=36305 p95_us=51250 max_us=71393 wall_ms=2471
-native_seal_group writers=8 sample=2 operations=512 seals_per_second=235.7 p50_us=32554 p95_us=43294 max_us=57185 wall_ms=2172
+native_seal_group writers=1 sample=0 operations=64 seals_per_second=72.4 p50_us=13715 p95_us=14720 max_us=15570 wall_ms=884
+native_seal_group writers=1 sample=1 operations=64 seals_per_second=74.4 p50_us=12957 p95_us=13954 max_us=14687 wall_ms=859
+native_seal_group writers=1 sample=2 operations=64 seals_per_second=76.6 p50_us=12850 p95_us=13951 max_us=14796 wall_ms=836
+native_seal_group writers=2 sample=0 operations=128 seals_per_second=115.0 p50_us=16814 p95_us=20908 max_us=24791 wall_ms=1113
+native_seal_group writers=2 sample=1 operations=128 seals_per_second=114.3 p50_us=16787 p95_us=21714 max_us=25870 wall_ms=1119
+native_seal_group writers=2 sample=2 operations=128 seals_per_second=113.0 p50_us=16828 p95_us=21796 max_us=26817 wall_ms=1133
+native_seal_group writers=4 sample=0 operations=256 seals_per_second=172.8 p50_us=21678 p95_us=30241 max_us=42699 wall_ms=1481
+native_seal_group writers=4 sample=1 operations=256 seals_per_second=162.0 p50_us=24808 p95_us=26844 max_us=31724 wall_ms=1580
+native_seal_group writers=4 sample=2 operations=256 seals_per_second=151.0 p50_us=22695 p95_us=39546 max_us=58627 wall_ms=1695
+native_seal_group writers=8 sample=0 operations=512 seals_per_second=218.9 p50_us=34436 p95_us=48569 max_us=62500 wall_ms=2339
+native_seal_group writers=8 sample=1 operations=512 seals_per_second=245.8 p50_us=30808 p95_us=40571 max_us=51511 wall_ms=2082
+native_seal_group writers=8 sample=2 operations=512 seals_per_second=234.1 p50_us=31828 p95_us=44485 max_us=60706 wall_ms=2187

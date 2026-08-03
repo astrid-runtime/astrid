@@ -291,10 +291,10 @@ into quantified acceptance gates:
 
   | Concurrent writers | Per-entry baseline | Batched journal | Throughput gain | Baseline p95 | Batched p95 |
   | ---: | ---: | ---: | ---: | ---: | ---: |
-  | 1 | 45.6 seals/s | 74.9 seals/s | 1.64x | 23.74 ms | 13.93 ms |
-  | 2 | 59.8 seals/s | 108.5 seals/s | 1.81x | 37.79 ms | 25.58 ms |
-  | 4 | 61.9 seals/s | 151.0 seals/s | 2.44x | 68.68 ms | 29.79 ms |
-  | 8 | 76.7 seals/s | 216.8 seals/s | 2.83x | 104.62 ms | 48.16 ms |
+  | 1 | 45.6 seals/s | 74.4 seals/s | 1.63x | 23.74 ms | 13.95 ms |
+  | 2 | 59.8 seals/s | 114.3 seals/s | 1.91x | 37.79 ms | 21.71 ms |
+  | 4 | 61.9 seals/s | 162.0 seals/s | 2.62x | 68.68 ms | 30.24 ms |
+  | 8 | 76.7 seals/s | 234.1 seals/s | 3.05x | 104.62 ms | 44.49 ms |
 
   A lone durable seal is also faster because the flat journal removes the
   per-entry temporary-intent and directory-flush sequence; concurrency then
@@ -428,8 +428,8 @@ remains in the same one-flush-round regime. At eight principals, one arena
 flush and one root-journal flush are shared per observed group: aggregate
 throughput rises 7.06 times while p95 latency falls 10.46 times. Staging uses
 the same gather-policy abstraction but a separate durability journal. Its
-exact-parent result in `a8f56dbd` raises strict 4 KiB seals from 45.6 to 74.9
-seals/s for one writer and from 76.7 to 216.8 seals/s for eight.
+exact-parent result in `ca1f72d8` raises strict 4 KiB seals from 45.6 to 74.4
+seals/s for one writer and from 76.7 to 234.1 seals/s for eight.
 
 ### Catalog scaling
 
