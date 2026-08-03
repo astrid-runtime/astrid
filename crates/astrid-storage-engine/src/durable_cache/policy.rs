@@ -111,7 +111,7 @@ pub struct ObjectCacheController {
 }
 
 impl Clone for ObjectCacheController {
-    fn clone(&self) -> Self {
+    fn clone(&self) -> ObjectCacheController {
         Self {
             capacity: Arc::clone(&self.capacity),
             governed: self
