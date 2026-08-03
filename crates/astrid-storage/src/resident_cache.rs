@@ -132,6 +132,13 @@ impl PrincipalObjectCacheBudget<StateOwner> for GovernedObjectCache {
             let _ = pool.trim_to_usage(charged_bytes);
         }
     }
+
+    fn release_unused_all(&self, charged_bytes: &BTreeMap<StateOwner, u64>) {
+        self.inner.logical.lock().retain(|principal, pool| {
+            let used = charged_bytes.get(principal).copied().unwrap_or(0);
+            pool.trim_to_usage(used).is_err() || used != 0
+        });
+    }
 }
 
 fn capacity(bytes: u64) -> ObjectCacheCapacity {
@@ -163,5 +170,25 @@ mod tests {
         );
         assert!(cache.inner.logical.lock().is_empty());
         assert!(authority.snapshot().logical_leases.is_empty());
+    }
+
+    #[test]
+    fn complete_reclaim_releases_pools_without_live_partitions() {
+        let authority = ResidentMemoryAuthority::new(1024);
+        let owner = StateOwner::Principal(PrincipalUid::from_bytes([9; 32]));
+        authority.register_principal(owner, None, 1024).unwrap();
+        let cache = GovernedObjectCache::new(authority.clone());
+
+        assert_eq!(
+            PrincipalObjectCacheBudget::ensure_capacity(&cache, &owner, 64),
+            ObjectCacheCapacity::Bounded(NonZeroU64::new(64).unwrap())
+        );
+        assert_eq!(authority.snapshot().logical_leases.len(), 1);
+
+        PrincipalObjectCacheBudget::release_unused_all(&cache, &BTreeMap::new());
+
+        assert!(cache.inner.logical.lock().is_empty());
+        assert!(authority.snapshot().logical_leases.is_empty());
+        authority.remove_principal(&owner).unwrap();
     }
 }

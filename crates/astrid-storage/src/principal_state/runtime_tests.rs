@@ -202,6 +202,38 @@ async fn governed_cache_reclaims_under_pressure_without_failing_reads() {
     authority.remove_principal(&owner).unwrap();
 }
 
+#[tokio::test]
+async fn closing_a_governed_cache_releases_physical_and_logical_leases() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    let owner = test_owner("alice");
+    let authority = ResidentMemoryAuthority::new(2 * 1024 * 1024);
+    authority
+        .register_principal(StateOwner::System, None, u64::MAX)
+        .unwrap();
+    authority.register_principal(owner, None, u64::MAX).unwrap();
+    let cache = crate::GovernedObjectCache::new(authority.clone());
+    let store =
+        open_runtime_principal_store_with_object_cache(&home, unlimited_quota(), cache.config())
+            .await
+            .unwrap();
+    let name = ContentName::new("models/close-releases-cache.bin").unwrap();
+    let content = vec![0x5a; 128 * 1024];
+    store.content().put(&owner, &name, &content).unwrap();
+    assert_eq!(
+        store.content().read_range(&owner, &name, 0, 4096).unwrap(),
+        Some(content[..4096].to_vec())
+    );
+    assert!(authority.snapshot().physical_reserved_bytes > 0);
+
+    store.kv().close().await.unwrap();
+
+    let closed = authority.snapshot();
+    assert_eq!(closed.physical_reserved_bytes, 0);
+    assert!(closed.logical_leases.is_empty());
+    authority.remove_principal(&owner).unwrap();
+}
+
 #[cfg(not(target_os = "windows"))]
 fn assert_reader_rejects_substituted_format_specification(home: &AstridHome, script: &Path) {
     let format_spec_id =

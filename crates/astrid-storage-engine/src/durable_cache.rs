@@ -35,6 +35,12 @@ struct CachedProjection {
     weight: u64,
 }
 
+#[derive(Clone, Copy)]
+struct CacheAdmission {
+    global: ObjectCacheCapacity,
+    principal: ObjectCacheCapacity,
+}
+
 struct PrincipalEntry {
     last_access: u64,
     projections: BTreeMap<ProjectionCacheKey, CachedProjection>,
@@ -134,6 +140,8 @@ where
                 .ensure_capacity(principal, principal_required)
         };
         let mut state = self.state.lock();
+        let global_capacity = global_capacity.min(self.controller.capacity());
+        let principal_capacity = principal_capacity.min(self.principal_budget.capacity(principal));
         state.trim_global(global_capacity);
         state.trim_principal(principal, principal_capacity);
         let result = 'cache: {
@@ -170,7 +178,9 @@ where
         };
         let resident = state.resident_bytes();
         let charged = state.principal_charge(principal);
-        drop(state);
+        // Reconciliation may acknowledge an authority pressure target and
+        // shrink a slab. Keep it serialized with cache mutation so it cannot
+        // publish a stale pre-admission byte count.
         self.controller.reconcile(resident);
         self.principal_budget.reconcile(principal, charged);
         result
@@ -212,6 +222,8 @@ where
                 .ensure_capacity(principal, principal_required)
         };
         let mut state = self.state.lock();
+        let global_capacity = global_capacity.min(self.controller.capacity());
+        let principal_capacity = principal_capacity.min(self.principal_budget.capacity(principal));
         state.trim_global(global_capacity);
         state.trim_principal(principal, principal_capacity);
         let result = 'cache: {
@@ -278,7 +290,6 @@ where
         };
         let resident = state.resident_bytes();
         let charged = state.principal_charge(principal);
-        drop(state);
         self.controller.reconcile(resident);
         self.principal_budget.reconcile(principal, charged);
         result
@@ -391,75 +402,23 @@ where
                 .ensure_capacity(principal, principal_required)
         };
         let mut state = self.state.lock();
+        let global_capacity = global_capacity.min(self.controller.capacity());
+        let principal_capacity = principal_capacity.min(self.principal_budget.capacity(principal));
         state.trim_global(global_capacity);
         state.trim_principal(principal, principal_capacity);
-        let retained = 'cache: {
-            if weight == u64::MAX
-                || global_capacity == ObjectCacheCapacity::Disabled
-                || principal_capacity == ObjectCacheCapacity::Disabled
-                || !state.is_attached(principal, object)
-            {
-                break 'cache false;
-            }
-            let replaced_weight = state
-                .principals
-                .get(principal)
-                .and_then(|partition| partition.entries.get(&object))
-                .and_then(|entry| entry.projections.get(&key))
-                .map_or(0, |entry| entry.weight);
-            state.evict_principal_until_fits_with_credit(
-                principal,
-                weight,
-                replaced_weight,
-                principal_capacity,
-                object,
-            );
-            state.evict_global_until_fits_with_credit(
-                weight,
-                replaced_weight,
-                global_capacity,
-                object,
-            );
-            if !state.can_fit_principal_with_credit(
-                principal,
-                weight,
-                replaced_weight,
-                principal_capacity,
-            ) || !state.can_fit_global_with_credit(weight, replaced_weight, global_capacity)
-                || !state.is_attached(principal, object)
-            {
-                break 'cache false;
-            }
-
-            let Some(partition) = state.principals.get_mut(principal) else {
-                break 'cache false;
-            };
-            let Some(entry) = partition.entries.get_mut(&object) else {
-                break 'cache false;
-            };
-            let replaced = entry
-                .projections
-                .insert(key, CachedProjection { value, weight });
-            partition.charged_bytes = partition
-                .charged_bytes
-                .saturating_sub(replaced_weight)
-                .saturating_add(weight);
-            state.resident_projection_bytes = state
-                .resident_projection_bytes
-                .saturating_sub(replaced_weight)
-                .saturating_add(weight);
-            if replaced.is_some() {
-                state.projection_evictions = state.projection_evictions.saturating_add(1);
-            } else {
-                state.resident_projection_entries =
-                    state.resident_projection_entries.saturating_add(1);
-            }
-            state.projection_insertions = state.projection_insertions.saturating_add(1);
-            state.touch(principal, object).is_some()
-        };
+        let retained = state.insert_projection(
+            principal,
+            object,
+            key,
+            value,
+            weight,
+            CacheAdmission {
+                global: global_capacity,
+                principal: principal_capacity,
+            },
+        );
         let resident = state.resident_bytes();
         let charged = state.principal_charge(principal);
-        drop(state);
         self.controller.reconcile(resident);
         self.principal_budget.reconcile(principal, charged);
         retained
@@ -500,39 +459,35 @@ where
         for object in objects {
             state.remove_physical(object);
         }
-        drop(state);
-        self.controller.reconcile(0);
+        self.controller.release_unused(0);
+        self.principal_budget.release_unused_all(&BTreeMap::new());
     }
 
     /// Honor the latest external pressure targets and return released slabs.
     pub(super) fn reclaim(&self) {
-        let principals = self
-            .state
-            .lock()
-            .principals
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
+        let mut state = self.state.lock();
+        let principals = state.principals.keys().cloned().collect::<Vec<_>>();
         let capacities = principals
             .iter()
             .map(|principal| (principal.clone(), self.principal_budget.capacity(principal)))
             .collect::<Vec<_>>();
         let global_capacity = self.controller.capacity();
-        let mut state = self.state.lock();
         state.trim_global(global_capacity);
         for (principal, capacity) in &capacities {
             state.trim_principal(principal, *capacity);
         }
         let resident = state.resident_bytes();
-        let charges = principals
+        let charges = state
+            .principals
             .iter()
-            .map(|principal| (principal.clone(), state.principal_charge(principal)))
-            .collect::<Vec<_>>();
-        drop(state);
+            .map(|(principal, partition)| (principal.clone(), partition.charged_bytes))
+            .collect::<BTreeMap<_, _>>();
+
+        // Release while the cache state is locked. Admissions revalidate
+        // their capacity after acquiring this same lock, so a reservation
+        // obtained before reclaim cannot be committed after its slab shrinks.
         self.controller.release_unused(resident);
-        for (principal, charged) in charges {
-            self.principal_budget.release_unused(&principal, charged);
-        }
+        self.principal_budget.release_unused_all(&charges);
     }
 }
 
@@ -549,6 +504,73 @@ where
     fn tick(&mut self) -> u64 {
         self.clock = self.clock.saturating_add(1);
         self.clock
+    }
+
+    fn insert_projection(
+        &mut self,
+        principal: &P,
+        object: ObjectId,
+        key: ProjectionCacheKey,
+        value: Arc<dyn Any + Send + Sync>,
+        weight: u64,
+        capacity: CacheAdmission,
+    ) -> bool {
+        if weight == u64::MAX
+            || capacity.global == ObjectCacheCapacity::Disabled
+            || capacity.principal == ObjectCacheCapacity::Disabled
+            || !self.is_attached(principal, object)
+        {
+            return false;
+        }
+        let replaced_weight = self
+            .principals
+            .get(principal)
+            .and_then(|partition| partition.entries.get(&object))
+            .and_then(|entry| entry.projections.get(&key))
+            .map_or(0, |entry| entry.weight);
+        self.evict_principal_until_fits_with_credit(
+            principal,
+            weight,
+            replaced_weight,
+            capacity.principal,
+            object,
+        );
+        self.evict_global_until_fits_with_credit(weight, replaced_weight, capacity.global, object);
+        if !self.can_fit_principal_with_credit(
+            principal,
+            weight,
+            replaced_weight,
+            capacity.principal,
+        ) || !self.can_fit_global_with_credit(weight, replaced_weight, capacity.global)
+            || !self.is_attached(principal, object)
+        {
+            return false;
+        }
+
+        let Some(partition) = self.principals.get_mut(principal) else {
+            return false;
+        };
+        let Some(entry) = partition.entries.get_mut(&object) else {
+            return false;
+        };
+        let replaced = entry
+            .projections
+            .insert(key, CachedProjection { value, weight });
+        partition.charged_bytes = partition
+            .charged_bytes
+            .saturating_sub(replaced_weight)
+            .saturating_add(weight);
+        self.resident_projection_bytes = self
+            .resident_projection_bytes
+            .saturating_sub(replaced_weight)
+            .saturating_add(weight);
+        if replaced.is_some() {
+            self.projection_evictions = self.projection_evictions.saturating_add(1);
+        } else {
+            self.resident_projection_entries = self.resident_projection_entries.saturating_add(1);
+        }
+        self.projection_insertions = self.projection_insertions.saturating_add(1);
+        self.touch(principal, object).is_some()
     }
 
     fn remove_projection(

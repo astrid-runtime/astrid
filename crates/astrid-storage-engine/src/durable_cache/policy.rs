@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::num::NonZeroU64;
 use std::sync::Arc;
@@ -54,7 +55,7 @@ impl ObjectCacheCapacity {
         }
     }
 
-    const fn min(self, other: Self) -> Self {
+    pub(super) const fn min(self, other: Self) -> Self {
         match (self.limit(), other.limit()) {
             (None, None) => Self::Unbounded,
             (Some(0), _) | (_, Some(0)) => Self::Disabled,
@@ -201,6 +202,18 @@ pub trait PrincipalObjectCacheBudget<P>: Send + Sync {
     /// Return unused logical capacity during explicit reclaim.
     fn release_unused(&self, principal: &P, charged_bytes: u64) {
         self.reconcile(principal, charged_bytes);
+    }
+
+    /// Return unused capacity across every principal known to this budget.
+    ///
+    /// `charged_bytes` is the cache's complete live logical ledger. Budget
+    /// implementations that retain per-principal pools must also release
+    /// pools absent from this map; a global eviction can remove a partition
+    /// before explicit reclaim runs.
+    fn release_unused_all(&self, charged_bytes: &BTreeMap<P, u64>) {
+        for (principal, charged_bytes) in charged_bytes {
+            self.release_unused(principal, *charged_bytes);
+        }
     }
 }
 
