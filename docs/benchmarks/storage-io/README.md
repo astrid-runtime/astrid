@@ -7,6 +7,8 @@ This directory contains evidence only:
 
 - selected `astrid-storage-io-benchmark-v1` JSON outputs with raw nanosecond
   samples and complete workload configuration; and
+- focused probe transcripts whose headers pin the compared revisions, command,
+  host, and workload; and
 - `SHA256SUMS`, which fixes the imported result bytes.
 
 The early JSON schema did not embed Git revision, command line, dirty-tree

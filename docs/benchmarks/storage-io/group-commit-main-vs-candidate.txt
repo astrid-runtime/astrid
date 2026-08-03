@@ -1,0 +1,63 @@
+Astrid strict KV group-commit probe
+===================================
+
+Recorded: 2026-08-03
+Host: aarch64-apple-darwin, macOS 26.2
+Rust: 1.95.0
+Main: 0ba1181c5e94beeaab478b1c60af72c718020781
+Candidate production code: 8244f52bfb204d28b5484a12b9d389ed43f8f091
+Command: cargo test --release -p astrid-storage native_kv_group_commit_scale_probe -- --ignored --nocapture
+Workload: 64 strict 128-byte TreeKvStore updates per principal; 1, 2, 4, and 8 concurrent principals
+
+The candidate worktree contained only an additional non-production group
+handoff regression and formatting changes when measured. The production code
+compiled into this probe was byte-identical to the candidate commit above.
+
+Main run 1
+----------
+writers=1 ops_per_second=123.1 p50_us=8012 p95_us=8992 per_writer_p95_us=[8992] per_writer_max_us=[10705] wall_ms=519
+writers=2 ops_per_second=123.6 p50_us=16012 p95_us=17150 per_writer_p95_us=[17150,17107] per_writer_max_us=[25952,24044] wall_ms=1035
+writers=4 ops_per_second=122.1 p50_us=32034 p95_us=48077 per_writer_p95_us=[48102,48039,48008,48028] per_writer_max_us=[55921,64936,56969,49207] wall_ms=2095
+writers=8 ops_per_second=123.2 p50_us=63998 p95_us=96950 per_writer_p95_us=[96896,103931,97011,89137,96932,96803,89972,96029] per_writer_max_us=[106963,120032,127991,112936,121194,127961,104969,121021] wall_ms=4154
+
+Main run 2
+----------
+writers=1 ops_per_second=123.0 p50_us=8005 p95_us=9048 per_writer_p95_us=[9048] per_writer_max_us=[9124] wall_ms=520
+writers=2 ops_per_second=121.2 p50_us=16092 p95_us=17994 per_writer_p95_us=[17994,17934] per_writer_max_us=[19811,26956] wall_ms=1055
+writers=4 ops_per_second=120.1 p50_us=33024 p95_us=49223 per_writer_p95_us=[48016,43985,54052,43874] per_writer_max_us=[56957,56080,61039,60775] wall_ms=2131
+writers=8 ops_per_second=124.2 p50_us=63941 p95_us=104980 per_writer_p95_us=[98974,96076,112968,104920,97006,104968,103985,111928] per_writer_max_us=[119983,136091,124054,129016,121952,121972,129042,121136] wall_ms=4123
+
+Main run 3
+----------
+writers=1 ops_per_second=122.1 p50_us=8028 p95_us=9018 per_writer_p95_us=[9018] per_writer_max_us=[9070] wall_ms=524
+writers=2 ops_per_second=122.8 p50_us=16026 p95_us=17301 per_writer_p95_us=[17963,17125] per_writer_max_us=[23942,24856] wall_ms=1042
+writers=4 ops_per_second=120.3 p50_us=32044 p95_us=50250 per_writer_p95_us=[49996,51006,49973,50041] per_writer_max_us=[57011,72026,59027,51683] wall_ms=2128
+writers=8 ops_per_second=122.4 p50_us=63980 p95_us=107004 per_writer_p95_us=[119897,102929,103974,99222,104993,113970,115966,112011] per_writer_max_us=[133066,123929,130136,127981,123894,152979,129985,138984] wall_ms=4182
+
+Candidate run 1
+---------------
+writers=1 ops_per_second=122.2 p50_us=8007 p95_us=9042 per_writer_p95_us=[9042] per_writer_max_us=[9797] wall_ms=523
+writers=2 ops_per_second=220.7 p50_us=8995 p95_us=9140 per_writer_p95_us=[9140,9132] per_writer_max_us=[11006,10993] wall_ms=579
+writers=4 ops_per_second=435.1 p50_us=9021 p95_us=10058 per_writer_p95_us=[10051,10052,10047,10058] per_writer_max_us=[11905,11871,11885,11913] wall_ms=588
+writers=8 ops_per_second=877.1 p50_us=9006 p95_us=10027 per_writer_p95_us=[9959,10027,10028,10056,9990,9984,10018,10027] per_writer_max_us=[10052,10097,10078,10071,10086,10113,10063,10104] wall_ms=583
+
+Candidate run 2
+---------------
+writers=1 ops_per_second=121.0 p50_us=8009 p95_us=9038 per_writer_p95_us=[9038] per_writer_max_us=[11037] wall_ms=529
+writers=2 ops_per_second=219.9 p50_us=9008 p95_us=9965 per_writer_p95_us=[9953,9965] per_writer_max_us=[11029,11030] wall_ms=582
+writers=4 ops_per_second=439.7 p50_us=8997 p95_us=10006 per_writer_p95_us=[10004,10001,10006,10003] per_writer_max_us=[11153,11163,11177,11170] wall_ms=582
+writers=8 ops_per_second=869.5 p50_us=9015 p95_us=10058 per_writer_p95_us=[10043,10063,10009,10036,10056,10052,10058,10032] per_writer_max_us=[10966,11027,11004,11018,10979,10995,10971,10994] wall_ms=588
+
+Candidate run 3
+---------------
+writers=1 ops_per_second=118.5 p50_us=8064 p95_us=9048 per_writer_p95_us=[9048] per_writer_max_us=[9097] wall_ms=539
+writers=2 ops_per_second=221.1 p50_us=8998 p95_us=9320 per_writer_p95_us=[9318,9320] per_writer_max_us=[10064,10052] wall_ms=578
+writers=4 ops_per_second=443.7 p50_us=9001 p95_us=9161 per_writer_p95_us=[9157,9150,9161,9161] per_writer_max_us=[10040,10049,10044,10047] wall_ms=576
+writers=8 ops_per_second=870.3 p50_us=9019 p95_us=10040 per_writer_p95_us=[10037,10048,10040,10018,10038,10048,10038,10021] per_writer_max_us=[10285,10262,10254,10242,10247,10297,10214,10220] wall_ms=588
+
+Median summary
+--------------
+principals=1 main_ops_s=123.0 candidate_ops_s=121.0 throughput_ratio=0.98 main_p95_ms=9.02 candidate_p95_ms=9.04
+principals=2 main_ops_s=122.8 candidate_ops_s=220.7 throughput_ratio=1.80 main_p95_ms=17.30 candidate_p95_ms=9.32
+principals=4 main_ops_s=120.3 candidate_ops_s=439.7 throughput_ratio=3.66 main_p95_ms=49.22 candidate_p95_ms=10.01
+principals=8 main_ops_s=123.2 candidate_ops_s=870.3 throughput_ratio=7.06 main_p95_ms=104.98 candidate_p95_ms=10.04

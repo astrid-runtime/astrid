@@ -1,16 +1,16 @@
 use super::{
-    ARENA_FILE, ARENA_MAGIC, Arc, ArenaReader, BTreeMap, BTreeSet, CommitOutcome, DurableEngine,
-    DurableError, DurableFiles, DurableInner, FaultInjector, FaultPoint, FileExt, INDEX_FILE,
-    IndexState, InsertOutcome, LIFECYCLE_CLOSED, LIFECYCLE_REQUIRES_RECOVERY, LIFECYCLE_USABLE,
-    LOCK_FILE, ModelError, Mutex, NoFaults, ObjectCache, ObjectCacheConfig, ObjectCacheStats,
-    ObjectId, ObjectRecord, Path, Persisted, PersistentObjectIdentity, Prepared, PrincipalCodec,
-    PrincipalUsage, ProjectionCacheEntry, ProjectionCacheKey, ROOT_FILE, ROOT_MAGIC,
-    RecoveryLimits, RootGeneration, RootSnapshot, RootState, RootTransaction, RwLock, Seek,
-    SeekFrom, append_frame, encode_object_frame, encode_root_record, ensure_payload_limit,
-    ensure_usable, io, io_error, live_files_mut, materialize_closure, open_rw, read_indexed_object,
-    read_indexed_objects, recover_arena, recover_index, recover_interrupted_compaction,
-    recover_roots, replace_index, sync_store_directory, usage_from_closure,
-    validate_incremental_closure,
+    ARENA_FILE, ARENA_MAGIC, Arc, ArenaReader, BTreeMap, BTreeSet, CommitGroup, DurableEngine,
+    DurableError, DurableFiles, DurableInner, FaultInjector, FaultPoint, FileExt,
+    GroupCommitPolicy, INDEX_FILE, IndexState, InsertOutcome, LIFECYCLE_CLOSED,
+    LIFECYCLE_REQUIRES_RECOVERY, LIFECYCLE_USABLE, LOCK_FILE, ModelError, Mutex, NoFaults,
+    ObjectCache, ObjectCacheConfig, ObjectCacheStats, ObjectId, ObjectRecord, Path,
+    PersistentObjectIdentity, Prepared, PrincipalCodec, PrincipalUsage, ProjectionCacheEntry,
+    ProjectionCacheKey, ROOT_FILE, RecoveryLimits, RootGeneration, RootSnapshot, RootState,
+    RootTransaction, RwLock, Seek, SeekFrom, append_frame, encode_object_frame, encode_root_record,
+    ensure_payload_limit, ensure_usable, io, io_error, live_files_mut, materialize_closure,
+    open_rw, read_indexed_object, read_indexed_objects, recover_arena, recover_index,
+    recover_interrupted_compaction, recover_roots, replace_index, sync_store_directory,
+    usage_from_closure, validate_incremental_closure,
 };
 
 impl<P, I, C> DurableEngine<P, I, C>
@@ -40,6 +40,34 @@ where
             limits,
             Arc::new(NoFaults),
             ObjectCacheConfig::disabled(),
+            GroupCommitPolicy::default(),
+        )
+    }
+
+    /// Open or create a durable store with an explicit group-commit policy.
+    ///
+    /// Setting both delays to zero disables intentional waiting while still
+    /// allowing callers queued behind an active flush to share that caller's
+    /// next durability group.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::open`].
+    pub fn open_with_group_commit_policy(
+        path: impl AsRef<Path>,
+        identity: I,
+        principal_codec: C,
+        limits: RecoveryLimits,
+        group_policy: GroupCommitPolicy,
+    ) -> Result<Self, DurableError> {
+        Self::open_with_options(
+            path,
+            identity,
+            principal_codec,
+            limits,
+            Arc::new(NoFaults),
+            ObjectCacheConfig::disabled(),
+            group_policy,
         )
     }
 
@@ -66,6 +94,7 @@ where
             limits,
             Arc::new(NoFaults),
             object_cache,
+            GroupCommitPolicy::default(),
         )
     }
 
@@ -88,16 +117,18 @@ where
             limits,
             faults,
             ObjectCacheConfig::disabled(),
+            GroupCommitPolicy::default(),
         )
     }
 
-    fn open_with_options(
+    pub(super) fn open_with_options(
         path: impl AsRef<Path>,
         identity: I,
         principal_codec: C,
         limits: RecoveryLimits,
         faults: Arc<dyn FaultInjector>,
         object_cache: ObjectCacheConfig<P>,
+        group_policy: GroupCommitPolicy,
     ) -> Result<Self, DurableError> {
         let path = path.as_ref().to_path_buf();
         std::fs::create_dir_all(&path)
@@ -168,6 +199,8 @@ where
             principal_codec,
             limits,
             faults,
+            group_policy,
+            commit_group: Mutex::new(CommitGroup::default()),
             lifecycle: std::sync::atomic::AtomicU8::new(LIFECYCLE_USABLE),
             arena_reader: RwLock::new(Some(ArenaReader {
                 file: arena_reader,
@@ -684,55 +717,11 @@ where
         usage_from_closure(&records, root.commit).map_err(Into::into)
     }
 
-    /// Persist a complete immutable transaction and publish its root.
-    ///
-    /// Known-stale transactions and all model/encoding errors are rejected
-    /// before any bytes are appended. Once I/O starts, any error poisons this
-    /// instance; drop and reopen it so recovery can reconcile disk state.
-    ///
-    /// # Errors
-    ///
-    /// Returns an identity, collision, graph, root-conflict, encoding, I/O, or
-    /// injected-fault error. A returned I/O/fault error requires reopen.
-    pub fn commit(&self, transaction: RootTransaction<P>) -> Result<CommitOutcome, DurableError> {
-        let mut inner = self.inner.lock();
-        ensure_usable(&inner)?;
-        let prepared = self.prepare(&mut inner, transaction)?;
-        let previous_arena_len = live_files_mut(&mut inner.files)?.arena_len;
-        match self.persist(&mut inner, &prepared) {
-            Ok(persisted) => {
-                for location in persisted.locations {
-                    inner.index.insert(location.0, location.1);
-                    inner.pending_index_locations.push(location);
-                }
-                inner.validated.extend(prepared.validated.iter().copied());
-                inner
-                    .roots_by_principal
-                    .insert(prepared.principal.clone(), prepared.root);
-                debug_assert_eq!(
-                    previous_arena_len,
-                    live_files_mut(&mut inner.files)?.arena_len
-                );
-                if let Err(error) = self.advance_index_frontier(&mut inner, persisted.arena_len) {
-                    self.mark_requires_recovery(&mut inner);
-                    return Err(error);
-                }
-                Ok(CommitOutcome {
-                    root: prepared.root,
-                    objects_inserted: prepared.objects_inserted,
-                })
-            },
-            Err(error) => {
-                self.mark_requires_recovery(&mut inner);
-                Err(error)
-            },
-        }
-    }
-
-    fn prepare(
+    pub(super) fn prepare(
         &self,
         inner: &mut DurableInner<P>,
         transaction: RootTransaction<P>,
+        pending_roots: &BTreeMap<P, RootState>,
     ) -> Result<Prepared<P>, DurableError> {
         let RootTransaction {
             principal,
@@ -750,7 +739,10 @@ where
                 .into());
             }
         }
-        let actual = inner.roots_by_principal.get(&principal).copied();
+        let actual = pending_roots
+            .get(&principal)
+            .copied()
+            .or_else(|| inner.roots_by_principal.get(&principal).copied());
         if actual != expected {
             return Err(ModelError::RootConflict { expected, actual }.into());
         }
@@ -793,7 +785,8 @@ where
                 }
                 continue;
             }
-            let payload = encode_object_frame(self.identity.scheme(), id, &record)?;
+            let payload: Arc<[u8]> =
+                encode_object_frame(self.identity.scheme(), id, &record)?.into();
             ensure_payload_limit(ARENA_FILE, 0, payload.len(), self.limits)?;
             if id == commit_id {
                 commit_frame = Some((id, payload));
@@ -841,48 +834,6 @@ where
             &self.identity,
             self.limits,
         )
-    }
-
-    fn persist(
-        &self,
-        inner: &mut DurableInner<P>,
-        prepared: &Prepared<P>,
-    ) -> Result<Persisted, DurableError> {
-        let files = live_files_mut(&mut inner.files)?;
-        let mut locations = Vec::new();
-        for (id, payload) in &prepared.objects {
-            let location = append_frame(&mut files.arena, ARENA_MAGIC, payload)?;
-            locations.push((*id, location));
-        }
-        self.fail_if(FaultPoint::AfterObjectAppend)?;
-        if let Some((id, payload)) = &prepared.commit {
-            let location = append_frame(&mut files.arena, ARENA_MAGIC, payload)?;
-            locations.push((*id, location));
-        }
-        self.fail_if(FaultPoint::AfterCommitAppend)?;
-        files
-            .arena
-            .sync_data()
-            .map_err(|source| io_error("flush transaction object frames", source))?;
-        self.fail_if(FaultPoint::AfterObjectFlush)?;
-        self.fail_if(FaultPoint::AfterCommitFlush)?;
-        self.fail_if(FaultPoint::BeforeRootCas)?;
-
-        append_frame(&mut files.roots, ROOT_MAGIC, &prepared.journal)?;
-        files
-            .roots
-            .sync_data()
-            .map_err(|source| io_error("flush root-journal frame", source))?;
-        self.fail_if(FaultPoint::AfterRootCas)?;
-        let arena_len = files
-            .arena
-            .metadata()
-            .map_err(|source| io_error("read committed arena metadata", source))?
-            .len();
-        Ok(Persisted {
-            locations,
-            arena_len,
-        })
     }
 
     pub(super) fn fail_if(&self, point: FaultPoint) -> Result<(), DurableError> {
