@@ -422,8 +422,8 @@ mod validation;
 use crate::{ProjectionCacheEntry, ProjectionCacheKey};
 use cache::ObjectCache;
 pub use cache::{
-    ObjectCacheCapacity, ObjectCacheConfig, ObjectCacheController, ObjectCacheStats,
-    PrincipalObjectCacheBudget,
+    ObjectCacheCapacity, ObjectCacheConfig, ObjectCacheController, ObjectCacheMemoryBudget,
+    ObjectCacheStats, PrincipalObjectCacheBudget,
 };
 use compaction::recover_interrupted_compaction;
 pub use compaction::{

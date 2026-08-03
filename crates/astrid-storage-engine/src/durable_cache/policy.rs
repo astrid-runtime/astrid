@@ -1,4 +1,7 @@
+use std::collections::BTreeMap;
+use std::fmt;
 use std::num::NonZeroU64;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -52,12 +55,81 @@ impl ObjectCacheCapacity {
             Self::Unbounded => None,
         }
     }
+
+    pub(super) const fn min(self, other: Self) -> Self {
+        match (self.limit(), other.limit()) {
+            (None, None) => Self::Unbounded,
+            (Some(0), _) | (_, Some(0)) => Self::Disabled,
+            (Some(left), Some(right)) => {
+                match NonZeroU64::new(if left < right { left } else { right }) {
+                    Some(limit) => Self::Bounded(limit),
+                    None => Self::Disabled,
+                }
+            },
+            (Some(limit), None) | (None, Some(limit)) => match NonZeroU64::new(limit) {
+                Some(limit) => Self::Bounded(limit),
+                None => Self::Disabled,
+            },
+        }
+    }
+}
+
+/// External physical-memory lease behind the decoded-object cache.
+///
+/// Implementations may grow a coarse lease on admission and acknowledge
+/// reclaim after eviction. Any refusal leaves the cache at its current target;
+/// callers still execute the verified uncached read path.
+///
+/// Implementations must leave their internal state valid if a callback
+/// unwinds. A callback panic is an implementation bug; the controller keeps
+/// its historical unwind-safety contract for downstream callers.
+pub trait ObjectCacheMemoryBudget: Send + Sync {
+    /// Return the capacity the cache should currently honor.
+    fn capacity(&self) -> ObjectCacheCapacity;
+
+    /// Attempt to make `required` bytes available.
+    fn ensure_capacity(&self, required: u64) -> ObjectCacheCapacity {
+        let _ = required;
+        self.capacity()
+    }
+
+    /// Reconcile live cache bytes after an eviction pass.
+    fn reconcile(&self, resident_bytes: u64) {
+        let _ = resident_bytes;
+    }
+
+    /// Return unused coarse-lease capacity during explicit reclaim.
+    fn release_unused(&self, resident_bytes: u64) {
+        self.reconcile(resident_bytes);
+    }
 }
 
 /// Dynamically adjustable operator-owned total cache budget.
-#[derive(Clone, Debug)]
 pub struct ObjectCacheController {
     capacity: Arc<AtomicU64>,
+    governed: Option<AssertUnwindSafe<Arc<dyn ObjectCacheMemoryBudget>>>,
+}
+
+impl Clone for ObjectCacheController {
+    fn clone(&self) -> ObjectCacheController {
+        Self {
+            capacity: Arc::clone(&self.capacity),
+            governed: self
+                .governed
+                .as_ref()
+                .map(|budget| AssertUnwindSafe(Arc::clone(&budget.0))),
+        }
+    }
+}
+
+impl fmt::Debug for ObjectCacheController {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ObjectCacheController")
+            .field("capacity", &self.capacity())
+            .field("governed", &self.governed.is_some())
+            .finish()
+    }
 }
 
 impl ObjectCacheController {
@@ -66,6 +138,19 @@ impl ObjectCacheController {
     pub fn new(capacity: ObjectCacheCapacity) -> Self {
         Self {
             capacity: Arc::new(AtomicU64::new(capacity.encoded())),
+            governed: None,
+        }
+    }
+
+    /// Construct a controller backed by an external coarse memory lease.
+    ///
+    /// The local ceiling starts unbounded; [`set_capacity`](Self::set_capacity)
+    /// can still impose a tighter operator override.
+    #[must_use]
+    pub fn governed(budget: Arc<dyn ObjectCacheMemoryBudget>) -> Self {
+        Self {
+            capacity: Arc::new(AtomicU64::new(ObjectCacheCapacity::Unbounded.encoded())),
+            governed: Some(AssertUnwindSafe(budget)),
         }
     }
 
@@ -78,13 +163,35 @@ impl ObjectCacheController {
     /// Return the current operator capacity.
     #[must_use]
     pub fn capacity(&self) -> ObjectCacheCapacity {
-        ObjectCacheCapacity::from_encoded(self.capacity.load(Ordering::Relaxed))
+        let local = ObjectCacheCapacity::from_encoded(self.capacity.load(Ordering::Relaxed));
+        self.governed
+            .as_ref()
+            .map_or(local, |budget| local.min(budget.0.capacity()))
     }
 
     /// Replace the capacity. Existing entries are evicted lazily on the next
     /// cache operation so policy changes do not block the control plane.
     pub fn set_capacity(&self, capacity: ObjectCacheCapacity) {
         self.capacity.store(capacity.encoded(), Ordering::Relaxed);
+    }
+
+    pub(super) fn ensure_capacity(&self, required: u64) -> ObjectCacheCapacity {
+        let local = ObjectCacheCapacity::from_encoded(self.capacity.load(Ordering::Relaxed));
+        self.governed.as_ref().map_or(local, |budget| {
+            local.min(budget.0.ensure_capacity(required))
+        })
+    }
+
+    pub(super) fn reconcile(&self, resident_bytes: u64) {
+        if let Some(budget) = &self.governed {
+            budget.0.reconcile(resident_bytes);
+        }
+    }
+
+    pub(super) fn release_unused(&self, resident_bytes: u64) {
+        if let Some(budget) = &self.governed {
+            budget.0.release_unused(resident_bytes);
+        }
     }
 }
 
@@ -96,6 +203,34 @@ impl ObjectCacheController {
 pub trait PrincipalObjectCacheBudget<P>: Send + Sync {
     /// Return the principal's current cache share.
     fn capacity(&self, principal: &P) -> ObjectCacheCapacity;
+
+    /// Attempt to make `required` logical bytes available for `principal`.
+    fn ensure_capacity(&self, principal: &P, required: u64) -> ObjectCacheCapacity {
+        let _ = required;
+        self.capacity(principal)
+    }
+
+    /// Reconcile the principal's live logical cache charge after eviction.
+    fn reconcile(&self, principal: &P, charged_bytes: u64) {
+        let _ = (principal, charged_bytes);
+    }
+
+    /// Return unused logical capacity during explicit reclaim.
+    fn release_unused(&self, principal: &P, charged_bytes: u64) {
+        self.reconcile(principal, charged_bytes);
+    }
+
+    /// Return unused capacity across every principal known to this budget.
+    ///
+    /// `charged_bytes` is the cache's complete live logical ledger. Budget
+    /// implementations that retain per-principal pools must also release
+    /// pools absent from this map; a global eviction can remove a partition
+    /// before explicit reclaim runs.
+    fn release_unused_all(&self, charged_bytes: &BTreeMap<P, u64>) {
+        for (principal, charged_bytes) in charged_bytes {
+            self.release_unused(principal, *charged_bytes);
+        }
+    }
 }
 
 impl<P, F> PrincipalObjectCacheBudget<P> for F

@@ -34,6 +34,25 @@ fn cache(controller: ObjectCacheController, principal_bytes: u64) -> ObjectCache
     ))
 }
 
+struct ShrinksAfterReservation {
+    shrunk: AtomicBool,
+}
+
+impl ObjectCacheMemoryBudget for ShrinksAfterReservation {
+    fn capacity(&self) -> ObjectCacheCapacity {
+        if self.shrunk.load(Ordering::SeqCst) {
+            ObjectCacheCapacity::Disabled
+        } else {
+            ObjectCacheCapacity::Unbounded
+        }
+    }
+
+    fn ensure_capacity(&self, _required: u64) -> ObjectCacheCapacity {
+        self.shrunk.store(true, Ordering::SeqCst);
+        ObjectCacheCapacity::Unbounded
+    }
+}
+
 fn assert_lru_indexes(cache: &ObjectCache<String>) {
     let state = cache.state.lock();
     let expected_global: BTreeSet<_> = state
@@ -50,6 +69,13 @@ fn assert_lru_indexes(cache: &ObjectCache<String>) {
             .collect();
         assert_eq!(partition.lru, expected);
     }
+}
+
+#[test]
+fn cache_controller_preserves_public_unwind_safety() {
+    fn assert_unwind_safe<T: std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
+
+    assert_unwind_safe::<ObjectCacheController>();
 }
 
 #[test]
@@ -123,6 +149,20 @@ fn disabling_the_global_budget_evicts_on_the_next_operation() {
     assert_eq!(stats.resident_objects, 0);
     assert_eq!(stats.resident_bytes, 0);
     assert_eq!(cache.principal_charge(&alice), 0);
+}
+
+#[test]
+fn admission_revalidates_capacity_after_reservation() {
+    let budget = Arc::new(ShrinksAfterReservation {
+        shrunk: AtomicBool::new(false),
+    });
+    let cache = cache(ObjectCacheController::governed(budget), 1024 * 1024);
+
+    let returned = cache.insert(&"alice".to_owned(), object(1), record(1));
+
+    assert_eq!(returned.as_ref(), &record(1));
+    assert_eq!(cache.stats().resident_objects, 0);
+    assert_eq!(cache.stats().resident_bytes, 0);
 }
 
 #[test]
