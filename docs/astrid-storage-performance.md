@@ -296,6 +296,23 @@ into quantified acceptance gates:
   | 4 | 61.9 seals/s | 162.0 seals/s | 2.62x | 68.68 ms | 30.24 ms |
   | 8 | 76.7 seals/s | 234.1 seals/s | 3.05x | 104.62 ms | 44.49 ms |
 
+  A follow-up run at `5d6478c8` counted the durability calls crossed by the
+  same workload. The baseline performs five filesystem flushes per seal. The
+  journal implementation performs one content-file flush per seal plus one
+  generation-directory flush and one journal flush per completed group:
+
+  | Concurrent writers | Operations | Baseline flushes/seal | Median seal groups | Journal flushes/seal | Reduction |
+  | ---: | ---: | ---: | ---: | ---: | ---: |
+  | 1 | 64 | 5.000 | 64 | 3.000 | 40.0% |
+  | 2 | 128 | 5.000 | 127 | 2.984 | 40.3% |
+  | 4 | 256 | 5.000 | 131 | 2.023 | 59.5% |
+  | 8 | 512 | 5.000 | 141 | 1.551 | 69.0% |
+
+  These are successful filesystem durability calls, not inferred hardware
+  cache flushes: the probe counts completed groups and combines them with the
+  content-file flush executed by every seal. The raw counts and formula are in
+  `docs/benchmarks/storage-io/seal-journal-main-vs-candidate.txt`.
+
   A lone durable seal is also faster because the flat journal removes the
   per-entry temporary-intent and directory-flush sequence; concurrency then
   amortizes the two remaining durability boundaries. Ordinary hosted close is
@@ -526,12 +543,13 @@ inferred from throughput alone:
   Under the lock remain duplicate-object readback, frame checksums and batch
   assembly, append, closure validation, and commit durability. Profiling must
   apportion those current costs before changing the authority boundary.
-- **One seal performs at least five durability operations.** It flushes the
-  content file, flushes and renames an intent temporary, flushes that
-  directory, renames the staged directory, and flushes both the writing and
-  ready directories. This is deliberately strong but cannot be mapped onto
-  every ordinary close. Provider `close`, `fsync`, sealed-generation
-  publication, and grouped intent durability need distinct contracts.
+- **Durable seals now share namespace and intent flushes.** Every seal flushes
+  its own content file; a completed seal group then shares one generations
+  directory flush and one intent-journal flush. The measured cost falls from
+  five flush calls per seal to 1.551 at eight writers. The remaining
+  per-content flush is deliberately strong and cannot be mapped onto every
+  ordinary close. Provider `close`, `fsync`, sealed-generation publication,
+  and grouped intent durability retain distinct contracts.
 - **Reopen scans the entire arena and journal on current `main`.** It verifies
   and rebuilds the in-memory index from write history. The persistent-index
   work in #1386 changes this to a verified checkpoint plus tail; compaction and

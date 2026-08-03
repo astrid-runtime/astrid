@@ -55,3 +55,27 @@ native_seal_group writers=4 sample=2 operations=256 seals_per_second=151.0 p50_u
 native_seal_group writers=8 sample=0 operations=512 seals_per_second=218.9 p50_us=34436 p95_us=48569 max_us=62500 wall_ms=2339
 native_seal_group writers=8 sample=1 operations=512 seals_per_second=245.8 p50_us=30808 p95_us=40571 max_us=51511 wall_ms=2082
 native_seal_group writers=8 sample=2 operations=512 seals_per_second=234.1 p50_us=31828 p95_us=44485 max_us=60706 wall_ms=2187
+
+Durability-flush confirmation
+-----------------------------
+revision: 5d6478c89357fa3e79637676acf361c43751a629
+
+The baseline seal path makes five filesystem durability calls for every
+operation: content file, intent temporary, intent directory, writing
+directory, and ready directory. The journal path makes one content-file call
+for every operation plus two calls per completed seal group: generations
+directory and intent journal. The candidate probe records completed groups;
+`durability_flushes = operations + (2 * seal_groups)`.
+
+native_seal_group writers=1 sample=0 operations=64 seal_groups=64 durability_flushes=192 flushes_per_seal=3.000 seals_per_second=71.3 p50_us=13508 p95_us=14438 max_us=15825 wall_ms=897
+native_seal_group writers=1 sample=1 operations=64 seal_groups=64 durability_flushes=192 flushes_per_seal=3.000 seals_per_second=71.2 p50_us=13509 p95_us=13971 max_us=14081 wall_ms=899
+native_seal_group writers=1 sample=2 operations=64 seal_groups=64 durability_flushes=192 flushes_per_seal=3.000 seals_per_second=72.1 p50_us=13462 p95_us=14108 max_us=14312 wall_ms=888
+native_seal_group writers=2 sample=0 operations=128 seal_groups=127 durability_flushes=382 flushes_per_seal=2.984 seals_per_second=80.9 p50_us=24604 p95_us=26819 max_us=31630 wall_ms=1582
+native_seal_group writers=2 sample=1 operations=128 seal_groups=126 durability_flushes=380 flushes_per_seal=2.969 seals_per_second=78.3 p50_us=25575 p95_us=28832 max_us=37621 wall_ms=1635
+native_seal_group writers=2 sample=2 operations=128 seal_groups=127 durability_flushes=382 flushes_per_seal=2.984 seals_per_second=77.7 p50_us=25543 p95_us=28563 max_us=29709 wall_ms=1646
+native_seal_group writers=4 sample=0 operations=256 seal_groups=133 durability_flushes=522 flushes_per_seal=2.039 seals_per_second=147.3 p50_us=25481 p95_us=36814 max_us=46325 wall_ms=1737
+native_seal_group writers=4 sample=1 operations=256 seal_groups=129 durability_flushes=514 flushes_per_seal=2.008 seals_per_second=156.9 p50_us=25506 p95_us=28599 max_us=39527 wall_ms=1631
+native_seal_group writers=4 sample=2 operations=256 seal_groups=131 durability_flushes=518 flushes_per_seal=2.023 seals_per_second=150.8 p50_us=25539 p95_us=30571 max_us=42901 wall_ms=1698
+native_seal_group writers=8 sample=0 operations=512 seal_groups=141 durability_flushes=794 flushes_per_seal=1.551 seals_per_second=202.7 p50_us=36636 p95_us=50275 max_us=69072 wall_ms=2526
+native_seal_group writers=8 sample=1 operations=512 seal_groups=141 durability_flushes=794 flushes_per_seal=1.551 seals_per_second=198.7 p50_us=36622 p95_us=50087 max_us=62834 wall_ms=2576
+native_seal_group writers=8 sample=2 operations=512 seal_groups=142 durability_flushes=796 flushes_per_seal=1.555 seals_per_second=204.2 p50_us=34661 p95_us=52931 max_us=63270 wall_ms=2506
