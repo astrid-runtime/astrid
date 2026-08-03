@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::num::NonZeroU64;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -78,6 +79,10 @@ impl ObjectCacheCapacity {
 /// Implementations may grow a coarse lease on admission and acknowledge
 /// reclaim after eviction. Any refusal leaves the cache at its current target;
 /// callers still execute the verified uncached read path.
+///
+/// Implementations must leave their internal state valid if a callback
+/// unwinds. A callback panic is an implementation bug; the controller keeps
+/// its historical unwind-safety contract for downstream callers.
 pub trait ObjectCacheMemoryBudget: Send + Sync {
     /// Return the capacity the cache should currently honor.
     fn capacity(&self) -> ObjectCacheCapacity;
@@ -100,10 +105,21 @@ pub trait ObjectCacheMemoryBudget: Send + Sync {
 }
 
 /// Dynamically adjustable operator-owned total cache budget.
-#[derive(Clone)]
 pub struct ObjectCacheController {
     capacity: Arc<AtomicU64>,
-    governed: Option<Arc<dyn ObjectCacheMemoryBudget>>,
+    governed: Option<AssertUnwindSafe<Arc<dyn ObjectCacheMemoryBudget>>>,
+}
+
+impl Clone for ObjectCacheController {
+    fn clone(&self) -> Self {
+        Self {
+            capacity: Arc::clone(&self.capacity),
+            governed: self
+                .governed
+                .as_ref()
+                .map(|budget| AssertUnwindSafe(Arc::clone(&budget.0))),
+        }
+    }
 }
 
 impl fmt::Debug for ObjectCacheController {
@@ -134,7 +150,7 @@ impl ObjectCacheController {
     pub fn governed(budget: Arc<dyn ObjectCacheMemoryBudget>) -> Self {
         Self {
             capacity: Arc::new(AtomicU64::new(ObjectCacheCapacity::Unbounded.encoded())),
-            governed: Some(budget),
+            governed: Some(AssertUnwindSafe(budget)),
         }
     }
 
@@ -150,7 +166,7 @@ impl ObjectCacheController {
         let local = ObjectCacheCapacity::from_encoded(self.capacity.load(Ordering::Relaxed));
         self.governed
             .as_ref()
-            .map_or(local, |budget| local.min(budget.capacity()))
+            .map_or(local, |budget| local.min(budget.0.capacity()))
     }
 
     /// Replace the capacity. Existing entries are evicted lazily on the next
@@ -161,20 +177,20 @@ impl ObjectCacheController {
 
     pub(super) fn ensure_capacity(&self, required: u64) -> ObjectCacheCapacity {
         let local = ObjectCacheCapacity::from_encoded(self.capacity.load(Ordering::Relaxed));
-        self.governed
-            .as_ref()
-            .map_or(local, |budget| local.min(budget.ensure_capacity(required)))
+        self.governed.as_ref().map_or(local, |budget| {
+            local.min(budget.0.ensure_capacity(required))
+        })
     }
 
     pub(super) fn reconcile(&self, resident_bytes: u64) {
         if let Some(budget) = &self.governed {
-            budget.reconcile(resident_bytes);
+            budget.0.reconcile(resident_bytes);
         }
     }
 
     pub(super) fn release_unused(&self, resident_bytes: u64) {
         if let Some(budget) = &self.governed {
-            budget.release_unused(resident_bytes);
+            budget.0.release_unused(resident_bytes);
         }
     }
 }

@@ -72,6 +72,13 @@ fn assert_lru_indexes(cache: &ObjectCache<String>) {
 }
 
 #[test]
+fn cache_controller_preserves_public_unwind_safety() {
+    fn assert_unwind_safe<T: std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
+
+    assert_unwind_safe::<ObjectCacheController>();
+}
+
+#[test]
 fn shares_one_physical_record_but_charges_each_principal_fully() {
     let controller = ObjectCacheController::new(ObjectCacheCapacity::Unbounded);
     let cache = cache(controller, 1024 * 1024);
