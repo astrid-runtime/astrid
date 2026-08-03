@@ -252,6 +252,46 @@ fn alias_intent_migration_is_crash_idempotent_and_reaches_the_flat_journal() {
 }
 
 #[test]
+fn conflicting_alias_intents_fail_before_any_entry_is_migrated() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let writing = root.join(legacy::WRITING_DIRECTORY);
+    let ready = root.join(legacy::READY_DIRECTORY);
+    std::fs::create_dir_all(&writing).unwrap();
+    std::fs::create_dir_all(&ready).unwrap();
+    let id = StagedContentId(Uuid::new_v4());
+    let sequence = 17;
+    let alias = PrincipalId::new("alice").unwrap();
+    let entries = [
+        (writing.join(id.to_string()), "writing"),
+        (ready.join(format!("{sequence:020}-{id}")), "ready"),
+    ];
+    for (path, name) in &entries {
+        std::fs::create_dir(path).unwrap();
+        let intent = LegacyStagingIntent {
+            sequence,
+            id,
+            owner: LegacyStagingOwner::Principal(alias.clone()),
+            name: ContentName::new(*name).unwrap(),
+            profile: ChunkingProfile::ASTRID_V1,
+            logical_bytes: 0,
+        };
+        atomic_write(
+            &path.join(migration::LEGACY_INTENT_FILE),
+            &encode_legacy_intent(&intent).unwrap(),
+        )
+        .unwrap();
+    }
+
+    let error = migrate_alias_owner_intents(root, |_| Ok(uid())).unwrap_err();
+    assert!(error.to_string().contains("disagrees"), "{error}");
+    for (path, _) in entries {
+        assert!(path.join(migration::LEGACY_INTENT_FILE).exists());
+        assert!(!path.join(legacy::INTENT_FILE).exists());
+    }
+}
+
+#[test]
 fn legacy_intent_decoder_does_not_accept_uid_intents() {
     let intent = StagingIntent {
         sequence: 7,
@@ -542,6 +582,51 @@ fn self_consistent_future_header_fails_without_truncating_the_journal() {
             "{field}"
         );
     }
+}
+
+#[test]
+fn future_envelope_after_a_corrupt_frame_prevents_tail_truncation() {
+    let directory = tempfile::tempdir().unwrap();
+    let area = open_area(directory.path());
+    let mut staged_writer = writer(&area, "current");
+    staged_writer.write_all(b"current").unwrap();
+    let current = staged_writer.seal().unwrap();
+    let next_sequence = current.sequence().checked_add(1).unwrap();
+    let corrupt_intent = StagingIntent {
+        sequence: next_sequence,
+        id: StagedContentId(Uuid::new_v4()),
+        owner: owner(),
+        name: ContentName::new("corrupt").unwrap(),
+        profile: ChunkingProfile::ASTRID_V1,
+        logical_bytes: 0,
+    };
+    let future_intent = StagingIntent {
+        sequence: next_sequence.checked_add(1).unwrap(),
+        id: StagedContentId(Uuid::new_v4()),
+        owner: owner(),
+        name: ContentName::new("future").unwrap(),
+        profile: ChunkingProfile::ASTRID_V1,
+        logical_bytes: 0,
+    };
+    let mut corrupt = encoded_frame(&JournalRecord::Sealed(corrupt_intent)).unwrap();
+    corrupt[20] ^= 0x80;
+    let mut future = encoded_frame(&JournalRecord::Sealed(future_intent)).unwrap();
+    future[8..10].copy_from_slice(&2_u16.to_le_bytes());
+    refresh_frame_checksum(&mut future).unwrap();
+    let journal_path = directory.path().join(JOURNAL_FILE);
+    {
+        let mut journal = area.inner.journal.lock();
+        journal.file.seek(SeekFrom::End(0)).unwrap();
+        journal.file.write_all(&corrupt).unwrap();
+        journal.file.write_all(&future).unwrap();
+        journal.file.sync_all().unwrap();
+    }
+    drop(area);
+    let bytes_before = std::fs::read(&journal_path).unwrap();
+
+    let error = open_area_result(directory.path()).unwrap_err();
+    assert!(error.to_string().contains("corrupt interior"), "{error}");
+    assert_eq!(std::fs::read(journal_path).unwrap(), bytes_before);
 }
 
 #[test]
@@ -1164,6 +1249,29 @@ fn legacy_ready_symlink_is_rejected_before_published_cleanup() {
     );
     assert!(outside_entry.join(legacy::INTENT_FILE).exists());
     assert!(outside_entry.join(legacy::PUBLISHED_FILE).exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn dangling_legacy_queue_symlinks_are_not_treated_as_absent() {
+    use std::os::unix::fs::symlink;
+
+    for name in [legacy::WRITING_DIRECTORY, legacy::READY_DIRECTORY] {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("staging");
+        std::fs::create_dir(&root).unwrap();
+        let queue = root.join(name);
+        symlink(directory.path().join("missing"), &queue).unwrap();
+
+        let error = open_area_result(&root).unwrap_err();
+        assert!(error.to_string().contains("redirected"), "{name}: {error}");
+        assert!(
+            std::fs::symlink_metadata(queue)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
 }
 
 fn legacy_entry(

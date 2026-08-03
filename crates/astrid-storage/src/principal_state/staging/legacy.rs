@@ -32,13 +32,14 @@ pub(super) struct LegacyReady {
 pub(super) fn inspect_migration_intents(root: &Path) -> StorageResult<Option<Vec<StagingIntent>>> {
     let writing = root.join(WRITING_DIRECTORY);
     let ready = root.join(READY_DIRECTORY);
-    if !writing.exists() && !ready.exists() {
+    let writing_exists = legacy_queue_exists(&writing)?;
+    let ready_exists = legacy_queue_exists(&ready)?;
+    if !writing_exists && !ready_exists {
         return Ok(None);
     }
 
     let mut intents = Vec::new();
-    if writing.exists() {
-        validate_stage_directory(&writing)?;
+    if writing_exists {
         for entry in read_directory(&writing)? {
             let entry = entry.map_err(|error| {
                 connection(format!(
@@ -68,8 +69,7 @@ pub(super) fn inspect_migration_intents(root: &Path) -> StorageResult<Option<Vec
             }
         }
     }
-    if ready.exists() {
-        validate_stage_directory(&ready)?;
+    if ready_exists {
         for entry in read_directory(&ready)? {
             let entry = entry.map_err(|error| {
                 connection(format!(
@@ -119,7 +119,9 @@ pub(super) fn recover(
 ) -> StorageResult<Option<(PathBuf, Vec<LegacyReady>)>> {
     let writing = root.join(WRITING_DIRECTORY);
     let ready = root.join(READY_DIRECTORY);
-    if !writing.exists() && !ready.exists() {
+    let writing_exists = legacy_queue_exists(&writing)?;
+    let ready_exists = legacy_queue_exists(&ready)?;
+    if !writing_exists && !ready_exists {
         return Ok(None);
     }
     ensure_private_directory(&writing)?;
@@ -177,6 +179,20 @@ pub(super) fn recover(
         });
     }
     Ok(Some((ready, pending)))
+}
+
+fn legacy_queue_exists(path: &Path) -> StorageResult<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {
+            validate_stage_directory(path)?;
+            Ok(true)
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(connection(format!(
+            "inspect legacy staging queue {}: {error}",
+            path.display()
+        ))),
+    }
 }
 
 pub(super) fn cleanup(directory: &Path) -> StorageResult<()> {

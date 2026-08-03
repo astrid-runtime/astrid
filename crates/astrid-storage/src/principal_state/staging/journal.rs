@@ -326,22 +326,6 @@ fn decode_record(bytes: &[u8]) -> Result<JournalRecord, &'static str> {
     }
 }
 
-fn physical_header(header: &[u8; JOURNAL_HEADER_BYTES]) -> Result<u64, &'static str> {
-    if header[..8] != JOURNAL_MAGIC {
-        return Err("magic mismatch");
-    }
-    if u16::from_le_bytes([header[8], header[9]]) != JOURNAL_VERSION {
-        return Err("unsupported version");
-    }
-    if header[10..12] != [0, 0] {
-        return Err("reserved bytes are non-zero");
-    }
-    header[12..20]
-        .try_into()
-        .map(u64::from_le_bytes)
-        .map_err(|_| "invalid payload length")
-}
-
 fn valid_frame_follows(file: &mut File, invalid_offset: u64, file_len: u64) -> StorageResult<bool> {
     let Some(mut candidate) = invalid_offset.checked_add(1) else {
         return Ok(false);
@@ -357,30 +341,33 @@ fn valid_frame_follows(file: &mut File, invalid_offset: u64, file_len: u64) -> S
         let mut header = [0_u8; JOURNAL_HEADER_BYTES];
         file.read_exact(&mut header)
             .map_err(|error| connection(format!("read staging recovery candidate: {error}")))?;
-        if let Ok(payload_len) = physical_header(&header) {
-            let frame_end = candidate
-                .checked_add(header_len)
-                .and_then(|value| value.checked_add(payload_len));
-            if let Some(frame_end) = frame_end.filter(|end| *end <= file_len) {
-                let payload_bytes = usize::try_from(payload_len).map_err(|_| {
-                    connection("staging journal payload is not addressable".to_owned())
-                })?;
-                let mut payload = Vec::new();
-                payload.try_reserve_exact(payload_bytes).map_err(|_| {
-                    connection("staging journal payload allocation failed".to_owned())
-                })?;
-                payload.resize(payload_bytes, 0);
-                file.read_exact(&mut payload).map_err(|error| {
-                    connection(format!("read staging recovery payload: {error}"))
-                })?;
-                let expected: [u8; 32] = header[CHECKSUM_OFFSET..].try_into().map_err(|_| {
-                    connection("staging journal checksum width mismatch".to_owned())
-                })?;
-                if frame_checksum(&header, &payload) == expected && decode_record(&payload).is_ok()
-                {
-                    return Ok(true);
-                }
-                let _ = frame_end;
+        let payload_len = u64::from_le_bytes(
+            header[12..20]
+                .try_into()
+                .map_err(|_| connection("invalid staging recovery payload length".to_owned()))?,
+        );
+        let frame_end = candidate
+            .checked_add(header_len)
+            .and_then(|value| value.checked_add(payload_len));
+        if frame_end.is_some_and(|end| end <= file_len) {
+            let payload_bytes = usize::try_from(payload_len)
+                .map_err(|_| connection("staging journal payload is not addressable".to_owned()))?;
+            let mut payload = Vec::new();
+            payload
+                .try_reserve_exact(payload_bytes)
+                .map_err(|_| connection("staging journal payload allocation failed".to_owned()))?;
+            payload.resize(payload_bytes, 0);
+            file.read_exact(&mut payload)
+                .map_err(|error| connection(format!("read staging recovery payload: {error}")))?;
+            let expected: [u8; 32] = header[CHECKSUM_OFFSET..]
+                .try_into()
+                .map_err(|_| connection("staging journal checksum width mismatch".to_owned()))?;
+            // This scan is a truncation barrier, not an acceptance path. A
+            // checksum-valid envelope proves that durable bytes follow the
+            // damaged frame even when this binary does not understand the
+            // envelope's header or record version.
+            if frame_checksum(&header, &payload) == expected {
+                return Ok(true);
             }
         }
         candidate = candidate

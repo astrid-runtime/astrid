@@ -2,14 +2,14 @@
 
 use std::fs::OpenOptions;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use astrid_core::identity::PrincipalUid;
 use astrid_core::principal::PrincipalId;
 
 use super::format::{
-    LegacyStagingOwner, StagingIntent, append_generation_footer, encode_intent,
-    load_generation_footer, load_intent, load_legacy_intent,
+    LegacyStagingIntent, LegacyStagingOwner, StagingIntent, append_generation_footer,
+    encode_intent, load_generation_footer, load_intent, load_legacy_intent,
 };
 use super::journal::{JournalRecord, StageKey, append_records, flush_journal};
 use super::legacy::{self, LegacyReady};
@@ -27,6 +27,14 @@ use crate::principal_state::native_io::{
 
 pub(super) const LEGACY_INTENT_FILE: &str = "intent.v1";
 
+struct AliasIntentMigration {
+    directory: PathBuf,
+    legacy_path: PathBuf,
+    current_path: PathBuf,
+    legacy: LegacyStagingIntent,
+    migrated: StagingIntent,
+}
+
 pub(in crate::principal_state) fn migrate_alias_owner_intents(
     root: &Path,
     mut resolve: impl FnMut(&PrincipalId) -> StorageResult<PrincipalUid>,
@@ -41,6 +49,7 @@ pub(in crate::principal_state) fn migrate_alias_owner_intents(
             )));
         },
     }
+    let mut migrations = Vec::new();
     for name in [legacy::WRITING_DIRECTORY, legacy::READY_DIRECTORY] {
         let queue = root.join(name);
         match std::fs::symlink_metadata(&queue) {
@@ -60,23 +69,33 @@ pub(in crate::principal_state) fn migrate_alias_owner_intents(
                     queue.display()
                 ))
             })?;
-            migrate_entry_intent(&entry.path(), &mut resolve)?;
+            if let Some(migration) = inspect_alias_intent(&entry.path(), &mut resolve)? {
+                migrations.push(migration);
+            }
         }
+    }
+    let intents: Vec<_> = migrations
+        .iter()
+        .map(|migration| migration.migrated.clone())
+        .collect();
+    validate_intent_keys(None, &intents)?;
+    for migration in migrations {
+        apply_alias_intent_migration(&migration)?;
     }
     Ok(())
 }
 
-fn migrate_entry_intent(
+fn inspect_alias_intent(
     directory: &Path,
     resolve: &mut impl FnMut(&PrincipalId) -> StorageResult<PrincipalUid>,
-) -> StorageResult<()> {
+) -> StorageResult<Option<AliasIntentMigration>> {
     if !legacy::stage_entry_is_directory(directory)? {
-        return Ok(());
+        return Ok(None);
     }
     legacy::validate_stage_directory(directory)?;
     let legacy_path = directory.join(LEGACY_INTENT_FILE);
     match std::fs::symlink_metadata(&legacy_path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             return Err(connection(format!(
                 "inspect legacy staged intent {}: {error}",
@@ -94,7 +113,7 @@ fn migrate_entry_intent(
         sequence: legacy.sequence,
         id: legacy.id,
         owner,
-        name: legacy.name,
+        name: legacy.name.clone(),
         profile: legacy.profile,
         logical_bytes: legacy.logical_bytes,
     };
@@ -108,9 +127,7 @@ fn migrate_entry_intent(
                 )));
             }
         },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            atomic_write(&current_path, &encode_intent(&migrated)?)?;
-        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
         Err(error) => {
             return Err(connection(format!(
                 "inspect UID staged intent {}: {error}",
@@ -118,13 +135,51 @@ fn migrate_entry_intent(
             )));
         },
     }
-    std::fs::remove_file(&legacy_path).map_err(|error| {
+    Ok(Some(AliasIntentMigration {
+        directory: directory.to_path_buf(),
+        legacy_path,
+        current_path,
+        legacy,
+        migrated,
+    }))
+}
+
+fn apply_alias_intent_migration(migration: &AliasIntentMigration) -> StorageResult<()> {
+    if load_legacy_intent(&migration.legacy_path)? != migration.legacy {
+        return Err(connection(format!(
+            "legacy staged intent changed during migration in {}",
+            migration.directory.display()
+        )));
+    }
+    match std::fs::symlink_metadata(&migration.current_path) {
+        Ok(_) => {
+            if load_intent(&migration.current_path)? != migration.migrated {
+                return Err(connection(format!(
+                    "legacy and UID staging intents disagree in {}",
+                    migration.directory.display()
+                )));
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            atomic_write(
+                &migration.current_path,
+                &encode_intent(&migration.migrated)?,
+            )?;
+        },
+        Err(error) => {
+            return Err(connection(format!(
+                "inspect UID staged intent {}: {error}",
+                migration.current_path.display()
+            )));
+        },
+    }
+    std::fs::remove_file(&migration.legacy_path).map_err(|error| {
         connection(format!(
             "remove migrated staged intent {}: {error}",
-            legacy_path.display()
+            migration.legacy_path.display()
         ))
     })?;
-    sync_directory(directory)
+    sync_directory(&migration.directory)
 }
 
 pub(super) fn migrate_legacy(
@@ -137,7 +192,7 @@ pub(super) fn migrate_legacy(
     let Some(intents) = legacy::inspect_migration_intents(root)? else {
         return Ok(());
     };
-    validate_migration_keys(journal, &intents)?;
+    validate_intent_keys(Some(journal), &intents)?;
     let Some((legacy_ready, entries)) = legacy::recover(root, quarantine)? else {
         return Ok(());
     };
@@ -228,22 +283,28 @@ fn prepare_generation(
     ensure_footer(target, entry)
 }
 
-fn validate_migration_keys(journal: &JournalState, intents: &[StagingIntent]) -> StorageResult<()> {
+fn validate_intent_keys(
+    journal: Option<&JournalState>,
+    intents: &[StagingIntent],
+) -> StorageResult<()> {
     let mut sequences = std::collections::BTreeMap::new();
     let mut identifiers = std::collections::BTreeMap::new();
     let mut legacy_intents = std::collections::BTreeMap::new();
-    for key in journal.pending.keys().chain(journal.completed.iter()) {
-        claim_generation_key(&mut sequences, &mut identifiers, *key)?;
+    if let Some(journal) = journal {
+        for key in journal.pending.keys().chain(journal.completed.iter()) {
+            claim_generation_key(&mut sequences, &mut identifiers, *key)?;
+        }
     }
     for intent in intents {
         let key = StageKey::from_intent(intent);
         claim_generation_key(&mut sequences, &mut identifiers, key)?;
-        if let Some(existing) = legacy_intents.insert(key, intent)
-            && existing != intent
+        if let Some(existing) = legacy_intents.insert(key, intent.clone())
+            && existing != *intent
         {
             return Err(intent_disagreement(key));
         }
-        if let Some(existing) = journal.pending.get(&key)
+        if let Some(journal) = journal
+            && let Some(existing) = journal.pending.get(&key)
             && existing != intent
         {
             return Err(intent_disagreement(key));
@@ -382,7 +443,7 @@ fn read_for_comparison(
 
 fn intent_disagreement(key: StageKey) -> crate::error::StorageError {
     connection(format!(
-        "legacy staged intent disagrees with journal for {}-{}",
+        "staged intent disagrees with another record for {}-{}",
         key.sequence, key.id
     ))
 }
