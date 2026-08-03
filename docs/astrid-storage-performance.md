@@ -374,6 +374,57 @@ The durable engine reuses validated immutable closure evidence and stops at the
 checkpoint. An in-memory reference-oracle run that deliberately revalidates the
 entire closure is not representative of production publication latency.
 
+## Integrated post-stack measurement
+
+The first canonical format-v2 run measures the complete merged storage stack:
+compaction and persistent indexes, path-copy catalogs, governed cached reads,
+group commit, seal journaling, and in-process recovery. Commit `404a9d69` is
+`2855d440` (`#1442` on `main`) plus the evidence-envelope-only benchmark change;
+no measured storage implementation differs from that main commit. The report
+records a clean tree, exact executable arguments, and independent SHA-256
+commitments to both the measured executable and complete payload.
+
+The run used the documented 512 MiB corpus, three samples, one-MiB ranges,
+64 small files, four principals, and an explicit one-GiB governed cache budget
+on the same M2 Ultra and APFS volume as the initial measurement:
+
+| Operation | Median | Throughput | Relative result |
+|---|---:|---:|---:|
+| Native cached write | 100.41 ms | 5,098.9 MiB/s | substrate |
+| Astrid cached staging write | 103.45 ms | 4,949.0 MiB/s | 1.030× elapsed |
+| Astrid durable staging seal | 131.08 ms | separate durability | different contract |
+| Content construction | 652.84 ms | 784.3 MiB/s | compute-only |
+| Unique publication | 2,465.88 ms | 207.6 MiB/s | background |
+| Duplicate publication | 2,026.84 ms | 252.6 MiB/s | background |
+| Native warm verified read | 307.56 ms | 1,664.7 MiB/s | substrate |
+| Astrid first verified read | 1,005.27 ms | 509.3 MiB/s | cache fill |
+| Astrid warm verified read | 303.21 ms | 1,688.6 MiB/s | 0.986× elapsed |
+| Astrid post-reopen verified read | 1,268.77 ms | 403.5 MiB/s | process evidence cold |
+| Four-principal shared publication | 7,868.06 ms | 260.3 MiB/s aggregate | 1.254× single |
+| Four-principal warm verified read | 314.47 ms | 6,512.5 MiB/s aggregate | 3.857× single |
+| Populated reopen | 1,109.83 ms | not a byte rate | current checkpoint path |
+
+The hosted foreground boundary is now effectively native: staging retained
+97.1% of same-run cached-write throughput, and warm verified reads were 1.4%
+faster than the comparator because immutable verification work was reused.
+Four-principal warm reads scaled to 6.51 GiB/s without weakening principal-
+partitioned verification or memory accounting.
+
+Physical admission is also exact about repetition. Unique incompressible
+content appended 538,140,607 authoritative bytes for 536,870,912 logical bytes
+(1.002365×). Re-publishing the same 512 MiB appended only 1,092 bytes: about
+491,640 times fewer authoritative bytes than the logical input. That is exact
+deduplication plus root/catalog metadata, not a compression estimate.
+
+Publication remains the integrated bottleneck. The 207.6/252.6 MiB/s unique
+and duplicate results are close to the earlier governed-cache run but do not
+inherit the 427/646 MiB/s result from the isolated record-reuse experiment.
+That experiment remains evidence for the #1392 pipeline work, not a current-
+main claim. Small strict seals reached 73.6 files/s versus 204.4 native
+write-and-sync operations/s; ordinary provider close must therefore retain the
+staged acknowledgement boundary rather than synchronously impersonating
+`seal`.
+
 ## Optimization experiments
 
 Several optimization branches were measured independently before integration.
@@ -493,6 +544,7 @@ catalog.
 | `astrid-storage-publication-cache-before.json` | `bcc45eef` |
 | `astrid-storage-publication-cache-after.json` | code `97df6492`, harness `09318a04` |
 | `astrid-storage-postcompaction.json` | `79d980d2` |
+| `astrid-storage-main-404a9d69.json` | clean `404a9d69`; storage tree equals main `2855d440` plus evidence-only harness changes |
 
 The historical report schema omitted Git revision and executable arguments.
 Those associations are reconstructed from dedicated worktrees, ancestry,
