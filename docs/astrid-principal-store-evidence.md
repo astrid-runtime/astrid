@@ -5,7 +5,8 @@ Status: proposed falsifiability contract
 Last reviewed: 2026-07-25
 
 Companions:
-[principal-store architecture](astrid-principal-store.md) and
+[principal-store architecture](astrid-principal-store.md),
+[physical representation contract](astrid-physical-representations.md), and
 [semantic representations](astrid-semantic-representations.md)
 
 This document separates three kinds of confidence:
@@ -210,6 +211,34 @@ Required invariants:
 | STO-MOD-27 | Adding or correcting a representation contract cannot redefine existing semantic identities |
 | STO-MOD-28 | A transform capsule can access only host-selected bounded streams and cannot select a principal, path, contract, or identity |
 | STO-MOD-29 | An encoding whose decoded canonical value differs is a derived semantic object, never an equal representation |
+| STO-MOD-30 | Every live exact ObjectId has at least one complete durable representation closure |
+| STO-MOD-31 | Physical representation dependencies change no principal ownership, logical quota, root, or default export |
+| STO-MOD-32 | Representation replacement publishes and verifies a new path before the old final path becomes reclaimable |
+| STO-MOD-33 | A reverse-index miss cannot establish representation absence; only the authoritative catalogue can |
+| STO-MOD-34 | Root commits and open read handles pin their chosen representation through publication or handle release |
+| STO-MOD-35 | Every admitted profile remains recovery-usable with its complete dependency closure until all dependent final paths are replaced |
+| STO-MOD-36 | One representation-journal CAS binds each representation catalogue root to exactly one placement set; neither half activates alone |
+| STO-MOD-37 | Compact File coverage fields equal the canonical File descriptor and ownership edge exactly |
+| STO-MOD-38 | File coverage retains File and ChunkTree metadata while treating covered Chunk leaves as outputs rather than dependencies |
+| STO-MOD-39 | Adoption excludes staging trailers and never overwrites an existing final BlobId path |
+| STO-MOD-40 | Configured checkpoint tail limits bound recovery replay; prior state lineage is not a physical-liveness edge |
+| STO-MOD-41 | Reconstruction bounds have one canonical wire, cover canonical output, and bound depth, fanout, encoded input, output, fuel, memory, and time |
+| STO-MOD-42 | Blob collision comparison covers the identity envelope, profile, encoded length, and complete encoded bytes |
+| STO-MOD-43 | File and ChunkTree metadata are durable before any representation state that depends on them activates |
+| STO-MOD-44 | Physical usage counts every distinct live host allocation exactly once, including replicas, metadata, disposable caches, and transient work |
+| STO-MOD-45 | Authoritative physical maps have one key-directed shape and point updates rewrite only the bounded radix path |
+| STO-MOD-46 | Physical metadata uses its own arena and representation state uses its own journal; neither can be reinterpreted as logical objects or principal-root transitions |
+| STO-MOD-47 | Logical usage remains the sum of ObjectRecord logical-byte contributions in the domain's owning closure |
+| STO-MOD-48 | An activated implicit-direct representation names its exact arena generation, offset, payload length, and frame checksum |
+| STO-MOD-49 | Durability counts distinct storage nodes while physical accounting counts every distinct allocated replica extent |
+| STO-MOD-50 | The in-band format-spec object is the sole reader-compatibility marker authorizing legacy-arena removal or downgrade |
+| STO-MOD-51 | Generated recovery binds canonical derivation evidence to the exact invocation, output ordinal, and covered ObjectId |
+| STO-MOD-52 | Format-spec bootstrap objects remain terminal pinned arena frames and never depend on profile-backed recovery |
+| STO-MOD-53 | Revocation is durable signed operator policy that blocks admission and preference but never removes an existing recovery path |
+| STO-MOD-54 | Representation-aware activation persists and verifies an exact direct mapping for every non-bootstrap arena object before changing the format-spec marker |
+| STO-MOD-55 | Adoption source mutation begins only after one per-owner/name checksummed intent is durable and independently discoverable |
+| STO-MOD-56 | Every physical identity uses registered scheme 1/2/32 with its exact BLAKE3 derive-key context and canonical material |
+| STO-MOD-57 | Adoption intent keys, staging duplicates, and Unix/Windows source identities have one byte-exact encoding |
 
 Every discovered counterexample becomes a minimized checked-in trace and a Rust
 regression test.
@@ -258,6 +287,37 @@ specification functions.
 | STO-PROP-34 | Adding or replacing a representation contract preserves existing semantic identities whenever canonical output is equal |
 | STO-PROP-35 | Transform streams enforce confinement, backpressure, and execution bounds without admitting partial output |
 | STO-PROP-36 | Lossy encode/decode produces a distinct semantic identity and typed derivation rather than an equal representation binding |
+| STO-PROP-37 | Reconstructing any accepted direct, sliced, contiguous, compressed, delta, or generated representation recomputes the declared exact ObjectId |
+| STO-PROP-38 | Every crash prefix of representation publication recovers old, old-plus-new, or new placement, never a live object with no path |
+| STO-PROP-39 | Dropping the final representation, a transitive recipe dependency, or a leased placement is rejected before physical deletion |
+| STO-PROP-40 | Arena-only stores synthesize direct representations without changing any ObjectId, root, export, or quota |
+| STO-PROP-41 | Full export materializes the same canonical closure regardless of the locally selected physical representation |
+| STO-PROP-42 | A missing, unregistered, or dependency-incomplete profile makes every dependent candidate unavailable |
+| STO-PROP-43 | Any mismatch between compact coverage fields and the named canonical File is rejected at admission |
+| STO-PROP-44 | Every crash prefix around state publication activates the complete old pair or complete new pair, never mixed catalogue and placement roots |
+| STO-PROP-45 | Coverage traversal retains all File/ChunkTree metadata and never creates a dependency edge from a representation to its covered Chunk outputs |
+| STO-PROP-46 | Every adoption crash prefix recovers a sealed generation, non-authoritative incoming file, exact raw blob, or verified pre-existing blob without overwriting live bytes |
+| STO-PROP-47 | Temporary-file checkpoint replacement preserves the valid old or new active state across every crash prefix, and append rolls over before either configured tail bound is exceeded |
+| STO-PROP-48 | Non-canonical, zero, output-understating, or exceeded reconstruction bounds reject the candidate without admitting partial output |
+| STO-PROP-49 | A forced BlobId digest collision with any unequal preimage field is fatal and never deduplicates |
+| STO-PROP-50 | Every adoption crash prefix before metadata durability leaves the new representation state inactive |
+| STO-PROP-51 | Every allocator-visible creation or removal changes physical usage by that distinct extent's allocated bytes without changing logical usage |
+| STO-PROP-52 | Any insertion order yields the same physical-map root, and a point update replaces no node outside its radix path |
+| STO-PROP-53 | Metadata-arena, representation-journal, checkpoint, and CURRENT frames reject swapped magics, payload tags, identities, generations, and trailing bytes |
+| STO-PROP-54 | Representation selection, deduplication, and replica count leave existing principal logical-usage results unchanged |
+| STO-PROP-55 | Activating an arena-only store produces authoritative direct placements for every synthesized representation without changing logical roots |
+| STO-PROP-56 | A forced collision at an occupied final BlobId path preserves the existing bytes and publishes no representation |
+| STO-PROP-57 | Multiple same-node replicas consume physical bytes but cannot satisfy a distinct-node durability requirement |
+| STO-PROP-58 | Any enum discriminator not encoded as its assigned single-byte tag is rejected as non-canonical |
+| STO-PROP-59 | Catalogue profile and representation counts equal their verified map totals, including the absent-root zero case |
+| STO-PROP-60 | Generated admission rejects unrelated evidence, invocation drift, out-of-range ordinals, and mismatched outputs |
+| STO-PROP-61 | Compaction retains current and downgrade-predecessor format specifications as direct arena frames across every crash prefix |
+| STO-PROP-62 | Restart without revocation policy blocks new transform admission while preserving reads through every admitted final path |
+| STO-PROP-63 | Every activation crash prefix uses complete implicit arena authority or a complete explicit direct catalogue, never a partial mapping |
+| STO-PROP-64 | Adoption recovery rejects wrong intent names, checksums, staging identities, namespace generations, modes, and trailing bytes without blocking unrelated keys |
+| STO-PROP-65 | File and ChunkTree records required by contiguous coverage receive direct placements in the same state CAS as that coverage |
+| STO-PROP-66 | Hashing a context as message bytes or changing any physical identity scheme field disagrees with every registered golden vector |
+| STO-PROP-67 | Adoption rejects any outer/embedded staging mismatch, unknown source platform, altered file identity, or non-canonical key path before source mutation |
 
 The deliberate tiny digest model must generate collisions and assert byte
 comparison rejects them. Production collision probability is not a substitute
@@ -510,3 +570,127 @@ the only witness to its own correctness.
 
 Production documentation may say a property is held only after the corresponding
 evidence runs against the shipped artifact and storage format.
+
+## 14. Physical representation recovery and reads
+
+Open-time recovery verifies the active `RepresentationStateId`, both roots it
+binds, blob existence and declared length, complete dependency closure,
+canonical records, and retained admission evidence. It does not treat an
+editable sidecar or filesystem timestamp as proof that every byte of a
+multi-terabyte blob is still unchanged.
+
+Direct arena frames retain their physical checksum validation. A contiguous
+blob is reverified per covered Chunk before bytes cross the logical read
+boundary; background scrub can recompute its whole BlobId, and an operator may
+require a full open-time pass. On a failed slice, the reader first discards any
+disposable slice offset, re-derives it from canonical coverage, and retries.
+A repeated physical mismatch, frame-checksum failure, or whole-BlobId mismatch
+quarantines only that `ReplicaV1`; every remaining replica for the same blob is
+tried. The representation is quarantined only when independently verified blob
+bytes fail its deterministic recipe, coverage, evidence, or canonical output.
+If every replica for the final recoverable path fails, the read returns an
+integrity error and audit records loss rather than returning unverified bytes.
+
+An authenticated Evidence object proves what admission observed and binds the
+normalized representation subject, BlobId, coverage, and runtime/profile
+inputs. It supports audit and process-local memo reconstruction; it does not
+claim that storage media can never decay after the observation.
+
+Selection occurs after authorization and before physical I/O:
+
+```text
+authorized ObjectId
+    -> authoritative candidate lookup
+    -> hard constraint filtering
+    -> bounded cost selection
+    -> acquire representation and placement lease
+    -> reconstruct or read slice
+    -> recompute canonical ObjectId on the verification boundary
+    -> return bytes
+```
+
+Hard constraints precede scoring: privacy and trust domains, complete placed
+dependency closure, distinct-node durability, decoder availability, bounds,
+leases, and caller resource authority. A physical failure follows the
+replica-isolation procedure above; a representation-level validation failure
+quarantines that record. Selection continues only with another complete path.
+
+For a contiguous range, the File DAG supplies boundaries and identities. Cold
+reads obtain complete overlapping chunks, validate slices, reconstruct Chunk
+records, and recompute each `ObjectId`. Boundary-neighbor checks follow the
+content grammar. Process-local principal evidence may skip proven work;
+durable state must be authenticated Evidence bound to File, representation,
+and BlobId.
+
+The blob's whole identity is verified at adoption and by scrub. This permits
+sequential read-ahead while chunk identities retain bounded random-read
+verification. A hosted `mmap` promise requires a provider-specific immutable
+handle and tamper/degradation story. Prior whole-blob verification is not
+protection against privileged mutation of a mapped host file.
+
+## 15. Physical representation failure matrix
+
+| Event or attack | Required outcome |
+|---|---|
+| Crash before blob durability | Candidate discarded; old path remains |
+| Blob durable, record absent | Orphan quarantined and resumable/reclaimable |
+| Record durable, representation-state CAS absent | Record remains unselected staging |
+| Catalogue published, principal root absent | Valid unowned cache entry; root unchanged |
+| Principal root proposed without a live representation | Commit fails closed |
+| Profile record absent or unregistered | Dependent representation is unusable |
+| File coverage field differs from the canonical File | Admission rejects the representation |
+| File coverage traversal reaches a Chunk | Record it as output and stop; never add a self-dependency |
+| Catalogue or placement root differs from the state record | Recovery fails closed; neither half activates |
+| Crash while replacing a representation checkpoint | `CURRENT` selects the complete old or complete new generation |
+| Crash during replacement | Recovery selects old or old-plus-new, never neither |
+| ENOSPC during adoption or compaction | Old bytes/root survive; engine reopens in process |
+| Blob digest collision with unequal bytes | Fatal collision; no catalogue mutation |
+| Blob digest matches but profile or length differs | Fatal collision; no deduplication |
+| Final BlobId path already exists | No-replace preserves it; exact preimage reuses it, mismatch is fatal |
+| Reconstruction bound is zero, malformed, or exceeded | Candidate rejected; partial output discarded |
+| Slice overflow, gap, wrong order, or wrong chunk | Representation rejected |
+| Staged-file symlink, reparse, or identity swap | Adoption rejected; bytes preserved |
+| Staged trailer remains after incoming rename | Placement stays unpublished; recovery truncates and reverifies or quarantines |
+| Crash before File/ChunkTree/Evidence flush | Source is unchanged; representation state remains inactive |
+| Delta cycle or excessive chain | Candidate rejected before execution |
+| Decompression/generator expansion bomb | Bounded execution fails without publication |
+| Nondeterministic generator replay | Mismatch is an audit event; result not trusted |
+| Guest supplies a cheaper cost or preferred recipe | Hint ignored; kernel policy selects |
+| GC races a dedup hit | Commit lease preserves or resurrects the representation |
+| Compaction races an open reader | Old placement remains until the read lease drains |
+| One live slice retains a huge blob | Account amplification; materialize before dropping |
+| Corrupt disposable index | Rebuild or slower verified path; never false bytes |
+| Another principal already has equal content | Same logical charge and API result |
+| Final representation selected for deletion | Native liveness proof rejects the batch |
+
+## 16. Physical representation implementation gates
+
+Implementation follows this evidence order:
+
+1. Add canonical model types, golden vectors, decode/re-encode tests, and a
+   primitive independent reader for the representation catalogue.
+2. Model existing arena frames as implicit direct representations and add the
+   authoritative catalogue plus disposable reverse index without deleting any
+   arena bytes.
+3. Add representation and placement leases, final-path liveness proofs, and
+   crash-prefix enumeration.
+4. Implement contiguous staged-file adoption and verified file-range reads.
+5. Teach compaction to choose between retained contiguous blobs and
+   materialized chunks while preserving receipts.
+6. Add compressed, delta, and generated profiles only with pinned decoders,
+   bounds, and corpus evidence.
+
+The benchmark matrix compares direct arena, packed slice, contiguous file,
+compressed, delta, and generated paths. It records ingest and reconstruction
+throughput, latency by range size, physical bytes read/written, CPU, peak
+resident memory, retained byte-time, metadata bytes, read amplification,
+first-touch verification, warm verification, post-reopen behavior, and
+compaction cost. Required workloads include random and repetitive files,
+version chains, model-scale content, one-live-slice amplification, cache-cold
+reads, concurrent principals, ENOSPC, and every named crash boundary.
+
+No representation may replace the last direct arena path until independent
+recovery, full materialized export/import, adversarial bounds, crash-prefix
+testing, and the final-representation liveness proof all pass. A candidate
+profile fails if it relies on a hard total-size ceiling, unbounded RAM, or a
+workload-specific ratio presented as a general claim.

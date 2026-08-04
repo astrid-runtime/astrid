@@ -268,15 +268,19 @@ guesses for predictable content.
 Identity of encoded bytes actually placed on storage:
 
 ```text
-BlobId = H(
-    "astrid-blob" ||
-    encoding_profile ||
-    encoded_bytes
-)
+BlobId = TaggedIdentity(1, 2, 32,
+    BLAKE3_DERIVE_KEY("astrid-blob-identity-v1\0",
+        encode(RepresentationProfileId) || encoded_length_u64_le || encoded_bytes)[0..32])
 ```
 
 Compression, encryption, erasure coding, or a future encoding migration may
 produce a new `BlobId` for the same `ObjectId`. Logical roots do not change.
+
+The exact profile-bound BlobId grammar, many-object contiguous coverage,
+representation catalogue, recovery leases, accounting, and staged-file
+adoption protocol are specified in [Exact Physical
+Representations](astrid-physical-representations.md). Semantic equivalence
+remains a separate layer.
 
 ### 6.3 `SemanticId`
 
