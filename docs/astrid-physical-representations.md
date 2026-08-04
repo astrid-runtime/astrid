@@ -375,9 +375,8 @@ representations:
 The profile map is authoritative. An identifier without its verified profile
 record is not a usable recovery path. Profile records and all dependencies
 reachable from them remain live while any admitted representation names that
-profile. Revocation blocks new admission or selection, never recovery through
-an admitted path. Recovery use and the record remain until every dependent
-final path is replaced and its leases drain.
+profile. Revocation blocks new admission only; admitted paths remain eligible
+for reads and recovery until every dependent final path is replaced and leases drain.
 
 All three authoritative maps use one frozen path-copy node grammar:
 
@@ -493,9 +492,9 @@ absence at generation zero with no prior digest. A CAS requires expected to
 equal active; replacement names expected as `previous` and advances by one.
 Blobs and metadata flush before the CAS frame, whose flush acknowledges it.
 Recovery validates both selected closures and never activates either alone.
-Tail limits are non-zero operator recovery budgets. Recovery counts frames and
-wrapper bytes after the checkpoint; publication rolls over before exceeding
-either. A frame larger than the byte budget is rejected.
+Tail limits are non-zero operator recovery budgets fixed for that generation.
+Recovery counts frames and wrapper bytes after the checkpoint; publication
+rolls over before exceeding either. A frame larger than the budget is rejected.
 `previous` authenticates ordering but is not a liveness edge. Journal
 compaction captures active state under the mutation fence and starts the next
 generation with a checkpoint digesting every preceding journal byte. It flushes,
@@ -684,10 +683,11 @@ Protocol:
 4. Atomically rename the sealed generation to a non-authoritative incoming
    blob name and flush both namespaces. Truncate that inode to `logical_bytes`,
    flush it, and recompute its length and `BlobId`; then install it at the final
-   BlobId path with atomic no-replace semantics. If it exists, never mutate it:
-   verify its complete BlobId preimage and reuse only an exact match; inequality
-   is fatal. Without no-replace rename, exclusive-create and flush the final
-   copy while retaining the sealed original; it stays non-authoritative.
+   BlobId path atomically with no-replace semantics. If it exists, open it
+   no-follow below the pinned directory and never mutate it. Verify its complete
+   preimage and reuse only an exact match; inequality is fatal. Without
+   no-replace rename, exclusive-create and flush the final copy while retaining
+   the sealed original; it stays non-authoritative.
 5. Stage and flush every canonical File and ChunkTree metadata record required
    by coverage-aware traversal.
 6. Publish the verified representation and placement. No placement ever names
