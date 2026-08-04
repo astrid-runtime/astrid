@@ -20,6 +20,7 @@ pub(super) struct Report {
     substrate_comparisons: Vec<SubstrateComparison>,
     throughput_scaling: Vec<ThroughputScaling>,
     write_amplifications: Vec<WriteAmplification>,
+    representation_metadata: Vec<RepresentationMetadata>,
 }
 
 impl Report {
@@ -35,6 +36,7 @@ impl Report {
             substrate_comparisons: Vec::new(),
             throughput_scaling: Vec::new(),
             write_amplifications: Vec::new(),
+            representation_metadata: Vec::new(),
         }
     }
 
@@ -167,6 +169,47 @@ impl Report {
         Ok(())
     }
 
+    pub(super) fn record_representation_metadata(
+        &mut self,
+        name: &'static str,
+        samples: Vec<(u64, u64)>,
+    ) -> Result<(), String> {
+        if samples.is_empty() {
+            return Err(format!(
+                "representation metadata metric {name:?} has no samples"
+            ));
+        }
+        if samples.iter().any(|(objects, _)| *objects == 0) {
+            return Err(format!(
+                "representation metadata metric {name:?} has a zero-object sample"
+            ));
+        }
+        let mut encoded = samples
+            .into_iter()
+            .map(
+                |(new_objects, authoritative_bytes_appended)| RepresentationMetadataSample {
+                    new_objects,
+                    authoritative_bytes_appended,
+                    bytes_per_new_object: ratio(authoritative_bytes_appended, new_objects),
+                },
+            )
+            .collect::<Vec<_>>();
+        encoded.sort_by(|left, right| {
+            left.bytes_per_new_object
+                .total_cmp(&right.bytes_per_new_object)
+        });
+        let ratios = encoded
+            .iter()
+            .map(|sample| sample.bytes_per_new_object)
+            .collect::<Vec<_>>();
+        self.representation_metadata.push(RepresentationMetadata {
+            name,
+            median_bytes_per_new_object: median_f64(&ratios),
+            samples: encoded,
+        });
+        Ok(())
+    }
+
     pub(super) fn print_table(&self) {
         println!(
             "{:<38} {:>12} {:>12} {:>12}",
@@ -213,6 +256,19 @@ impl Report {
                     amplification.name,
                     amplification.median_authoritative_bytes_appended,
                     amplification.median_physical_to_logical_ratio
+                );
+            }
+        }
+        if !self.representation_metadata.is_empty() {
+            println!();
+            println!(
+                "{:<38} {:>24}",
+                "representation publication", "median bytes/new object"
+            );
+            for metadata in &self.representation_metadata {
+                println!(
+                    "{:<38} {:>24.1}",
+                    metadata.name, metadata.median_bytes_per_new_object
                 );
             }
         }
@@ -276,6 +332,20 @@ struct WriteAmplification {
     median_authoritative_bytes_appended: u64,
     maximum_authoritative_bytes_appended: u64,
     median_physical_to_logical_ratio: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct RepresentationMetadata {
+    name: &'static str,
+    samples: Vec<RepresentationMetadataSample>,
+    median_bytes_per_new_object: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct RepresentationMetadataSample {
+    new_objects: u64,
+    authoritative_bytes_appended: u64,
+    bytes_per_new_object: f64,
 }
 
 impl Metric {
@@ -354,6 +424,20 @@ fn median_u64(sorted: &[u64]) -> u64 {
             lower
                 .checked_add(half_difference)
                 .expect("the midpoint is bounded by the upper integer")
+        },
+    }
+}
+
+fn median_f64(sorted: &[f64]) -> f64 {
+    match sorted.len() {
+        0 => 0.0,
+        length if length % 2 == 1 => sorted[length / 2],
+        length => {
+            let middle = length / 2;
+            let lower = middle
+                .checked_sub(1)
+                .expect("a nonempty even slice has a lower midpoint");
+            sorted[lower].midpoint(sorted[middle])
         },
     }
 }

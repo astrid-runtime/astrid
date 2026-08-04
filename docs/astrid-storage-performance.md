@@ -382,7 +382,12 @@ group commit, seal journaling, and in-process recovery. Commit `404a9d69` is
 `2855d440` (`#1442` on `main`) plus the evidence-envelope-only benchmark change;
 no measured storage implementation differs from that main commit. The report
 records a clean tree, exact executable arguments, and independent SHA-256
-commitments to both the measured executable and complete payload.
+commitments to both the measured executable and complete payload. Current
+reports count representation metadata and journals in authoritative-byte
+growth, report that growth per newly admitted object, and time direct-catalogue
+activation over the populated sample store. Activation timing includes engine
+reopen plus catalogue construction and validation; ordinary reopen remains a
+separate metric.
 
 The run used the documented 512 MiB corpus, three samples, one-MiB ranges,
 64 small files, four principals, and an explicit one-GiB governed cache budget

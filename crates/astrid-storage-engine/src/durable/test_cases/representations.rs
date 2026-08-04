@@ -51,7 +51,6 @@ fn direct_representation_activation_reopens_and_tracks_later_commits() {
     assert!(representations.contains_direct(second_commit));
     assert!(!representations.contains_direct(specification_id));
 }
-
 #[test]
 fn direct_representation_activation_quarantines_an_unpublished_attempt() {
     let directory = tempfile::tempdir().unwrap();
@@ -533,4 +532,3 @@ fn standalone_ack_covers_an_earlier_staged_prefix() {
     assert!(representations.contains_direct(earlier_id));
     assert!(representations.contains_direct(later_id));
 }
-
