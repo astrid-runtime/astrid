@@ -9,7 +9,7 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
-### Added
+### Removed
 
 - **The unused SurrealDB query wrapper and its dormant dependency graph have
   been removed from `astrid-storage`.** No workspace crate selected the `db`
@@ -17,6 +17,8 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   dependencies in `Cargo.lock`. Removing the unused surface eliminates both
   RustSec exceptions and keeps the audit gate strict. The native principal
   store and live legacy-SurrealKV migration reader are unchanged. Closes #1448.
+
+### Added
 
 - **Exact ObjectIds can use multiple verified physical representations without
   changing principal state.** The design contract separates profile-bound
