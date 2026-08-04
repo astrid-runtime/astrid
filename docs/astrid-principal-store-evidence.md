@@ -571,7 +571,64 @@ the only witness to its own correctness.
 Production documentation may say a property is held only after the corresponding
 evidence runs against the shipped artifact and storage format.
 
-## 14. Physical representation implementation gates
+## 14. Physical representation recovery and reads
+
+Open-time recovery verifies the active `RepresentationStateId`, both roots it
+binds, blob existence and declared length, complete dependency closure,
+canonical records, and retained admission evidence. It does not treat an
+editable sidecar or filesystem timestamp as proof that every byte of a
+multi-terabyte blob is still unchanged.
+
+Direct arena frames retain their physical checksum validation. A contiguous
+blob is reverified per covered Chunk before bytes cross the logical read
+boundary; background scrub can recompute its whole BlobId, and an operator may
+require a full open-time pass. On a failed slice, the reader first discards any
+disposable slice offset, re-derives it from canonical coverage, and retries.
+A repeated physical mismatch, frame-checksum failure, or whole-BlobId mismatch
+quarantines only that `ReplicaV1`; every remaining replica for the same blob is
+tried. The representation is quarantined only when independently verified blob
+bytes fail its deterministic recipe, coverage, evidence, or canonical output.
+If every replica for the final recoverable path fails, the read returns an
+integrity error and audit records loss rather than returning unverified bytes.
+
+An authenticated Evidence object proves what admission observed and binds the
+normalized representation subject, BlobId, coverage, and runtime/profile
+inputs. It supports audit and process-local memo reconstruction; it does not
+claim that storage media can never decay after the observation.
+
+Selection occurs after authorization and before physical I/O:
+
+```text
+authorized ObjectId
+    -> authoritative candidate lookup
+    -> hard constraint filtering
+    -> bounded cost selection
+    -> acquire representation and placement lease
+    -> reconstruct or read slice
+    -> recompute canonical ObjectId on the verification boundary
+    -> return bytes
+```
+
+Hard constraints precede scoring: privacy and trust domains, complete placed
+dependency closure, distinct-node durability, decoder availability, bounds,
+leases, and caller resource authority. A physical failure follows the
+replica-isolation procedure above; a representation-level validation failure
+quarantines that record. Selection continues only with another complete path.
+
+For a contiguous range, the File DAG supplies boundaries and identities. Cold
+reads obtain complete overlapping chunks, validate slices, reconstruct Chunk
+records, and recompute each `ObjectId`. Boundary-neighbor checks follow the
+content grammar. Process-local principal evidence may skip proven work;
+durable state must be authenticated Evidence bound to File, representation,
+and BlobId.
+
+The blob's whole identity is verified at adoption and by scrub. This permits
+sequential read-ahead while chunk identities retain bounded random-read
+verification. A hosted `mmap` promise requires a provider-specific immutable
+handle and tamper/degradation story. Prior whole-blob verification is not
+protection against privileged mutation of a mapped host file.
+
+## 15. Physical representation implementation gates
 
 Implementation follows this evidence order:
 

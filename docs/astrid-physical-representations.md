@@ -505,9 +505,23 @@ Placement has `blob_count == map entries` and `replica_extent_count == checked s
 lengths`; durability instead counts distinct `StorageNodeId`s, so same-node copies never satisfy
 redundancy. Replicas sort by node, locator tag, then bytes. Arena generation zero denotes verified `objects.arena` at activation;
 its locator matches the durable index tuple. Each compaction
-publishes a successor generation in the same placement CAS. A loose path derives
-from `(namespace_generation, BlobId)` below an already-open private directory;
-host paths never enter the wire. Pack ranges are in-bounds and non-overlapping.
+publishes a successor generation in the same placement CAS. `StorageNodeId`
+selects a signed operator-configured, already-open storage root. Beneath that
+root, locator paths are canonical ASCII and never supplied by an index:
+
+```text
+ArenaFrame generation 0:  objects.arena
+ArenaFrame generation N:  representations/blobs/arenas/<N:016x>.arena
+LooseBlob generation N:   representations/blobs/loose/<N:016x>/<BlobId>.blob
+PackFrame generation N:   representations/blobs/packs/<N:016x>.pack
+```
+
+`<BlobId>` is lowercase hex of the complete canonical tagged-identity envelope;
+generations use exactly 16 lowercase hex digits. Resolution walks no-follow
+directory handles below the selected root and rejects extra components,
+symlinks, aliases, and non-canonical spelling. A missing configured storage
+node or file makes that replica unavailable; it never falls back to an ambient
+host path. Pack ranges are in-bounds and non-overlapping.
 Locators agree with frame headers; profile and length reproduce the BlobId
 preimage. Counts never trust a disposable index. Tags are arena `0`, loose `1`,
 and pack `2`.
@@ -593,55 +607,15 @@ verified object frames; no eager rewrite or logical migration is required.
 
 ### Recovery versus lazy byte verification
 
-Open-time recovery verifies the active `RepresentationStateId`, both roots it
-binds, blob existence and declared length, complete dependency closure,
-canonical records, and retained admission evidence. It does not silently treat
-an editable sidecar or filesystem timestamp as proof that every byte of a
-multi-terabyte blob is still unchanged.
-
-Direct arena frames retain their physical checksum validation. A contiguous
-blob is reverified per covered Chunk before bytes cross the logical read
-boundary; background scrub can recompute its whole BlobId, and an operator may
-require a full open-time pass. A failed slice or whole-blob check quarantines
-that representation and tries another path. If it was the final path, the read
-fails with integrity error and the audit records loss rather than returning
-unverified bytes.
-
-An authenticated Evidence object proves what admission observed and binds the
-exact representation, BlobId, File, and runtime/profile inputs. It supports
-audit and process-local memo reconstruction; it does not claim that storage
-media can never decay after the observation.
+The replica-isolated corruption policy, verification boundary, and read-path
+evidence requirements are normative in
+[astrid-principal-store-evidence.md](astrid-principal-store-evidence.md#14-physical-representation-recovery-and-reads).
 
 ## Read and verification path
 
-Selection occurs after authorization and before physical I/O:
-
-```text
-authorized ObjectId
-    -> authoritative candidate lookup
-    -> hard constraint filtering
-    -> bounded cost selection
-    -> acquire representation and placement lease
-    -> reconstruct or read slice
-    -> recompute canonical ObjectId on the verification boundary
-    -> return bytes
-```
-
-Hard constraints precede scoring: privacy and trust domains, complete placed dependency closure,
-distinct-node durability, decoder availability, bounds, leases, and caller resource authority.
-A failed candidate is quarantined; selection continues only with another complete path.
-
-For a contiguous range, the File DAG supplies boundaries and identities. Cold reads obtain complete
-overlapping chunks, validate slices, reconstruct Chunk records, and recompute each `ObjectId`.
-Boundary-neighbor checks follow the content grammar. Process-local principal evidence may skip proven
-work; durable state must be authenticated Evidence bound to File, representation, and BlobId.
-
-The blob's whole identity is verified at adoption and by scrub. This permits
-sequential read-ahead while chunk identities retain bounded random-read
-verification. A hosted `mmap` promise requires a provider-specific immutable
-handle and tamper/degradation story. This design does not silently convert a
-prior whole-blob verification into protection against privileged mutation of
-a mapped host file.
+The authorized selection and verified-read state machine is specified by the
+same evidence section. Implementations distinguish replica failure from
+representation failure; neither is an untyped "candidate" failure.
 
 ## Costed selection
 
@@ -987,4 +961,4 @@ surface requires a separate RFC after the interface freeze.
 
 The implementation sequence, benchmark matrix, and replacement gates live with
 the rest of the store's proof obligations in
-[astrid-principal-store-evidence.md](astrid-principal-store-evidence.md#14-physical-representation-implementation-gates).
+[astrid-principal-store-evidence.md](astrid-principal-store-evidence.md#15-physical-representation-implementation-gates).
