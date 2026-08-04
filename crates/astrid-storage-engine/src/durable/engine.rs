@@ -230,6 +230,7 @@ where
                 roots_by_principal: recovered.roots_by_principal,
                 index: recovered.index,
                 pending_index_locations: Vec::new(),
+                pending_direct_objects: BTreeMap::new(),
                 validated: recovered.validated,
                 files: Some(recovered.files),
                 representations: recovered.representations,

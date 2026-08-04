@@ -797,6 +797,7 @@ where
         inner.roots_by_principal = replacement.roots;
         inner.index = replacement.index;
         inner.pending_index_locations.clear();
+        inner.pending_direct_objects.clear();
         inner.validated = replacement.validated;
         inner.files = Some(DurableFiles {
             arena,
@@ -871,7 +872,7 @@ where
     fn open_replacement_files(&self) -> Result<ReplacementState<P>, DurableError> {
         let mut arena = open_rw(&self.directory.join(ARENA_FILE))?;
         let mut roots = open_rw(&self.directory.join(ROOT_FILE))?;
-        let (index, arena_tail) = recover_arena(&mut arena, &self.identity, self.limits)?;
+        let (index, arena_tail) = recover_arena(&mut arena, &self.identity, self.limits, 0)?;
         let (roots_by_principal, validated) = recover_roots(
             &mut roots,
             &mut arena,
@@ -958,7 +959,7 @@ where
     I: PersistentObjectIdentity,
     C: PrincipalCodec<P>,
 {
-    let (recovered, arena_tail) = recover_arena(arena, identity, limits)?;
+    let (recovered, arena_tail) = recover_arena(arena, identity, limits, 0)?;
     if &recovered != expected_index {
         return Err(DurableError::InvalidCompactionEvidence(
             "replacement arena index changed during verification",

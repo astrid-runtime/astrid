@@ -325,7 +325,7 @@ where
 {
     let mut arena = open_rw(arena_path)?;
     let mut roots = open_rw(root_path)?;
-    let (index, _) = recover_arena(&mut arena, identity, limits)?;
+    let (index, _) = recover_arena(&mut arena, identity, limits, 0)?;
     let (roots_by_principal, _) =
         recover_roots(&mut roots, &mut arena, &index, codec, identity, limits)?;
     let arena_bytes = arena

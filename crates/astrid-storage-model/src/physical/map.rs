@@ -479,6 +479,96 @@ impl CanonicalPhysicalMap {
         })
     }
 
+    /// Atomically rebuild the active canonical trie with additional entries.
+    ///
+    /// The resulting root is byte-identical to [`Self::build`] over the
+    /// complete entry set. Historical nodes remain available for older roots,
+    /// while only nodes reachable from the replacement root become active.
+    /// This is intended for batches whose final-tree construction is cheaper
+    /// than repeated path copying.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unequal bytes under one key, malformed existing state, physical
+    /// node-identity collisions, and arithmetic overflow without changing the
+    /// active map.
+    pub fn rebuild_with_entries<I: PhysicalIdentity>(
+        &mut self,
+        identity: &I,
+        additions: Vec<(PhysicalMapKey, Vec<u8>)>,
+    ) -> Result<u64, PhysicalModelError> {
+        let mut entries = BTreeMap::<PhysicalMapKey, Vec<u8>>::new();
+        if let Some(root) = self.root {
+            let mut stack = vec![root];
+            let mut visited = BTreeSet::new();
+            while let Some(node_id) = stack.pop() {
+                if !visited.insert(node_id) {
+                    return Err(PhysicalModelError::InvalidMap(
+                        "active map traversal revisited a node",
+                    ));
+                }
+                match self
+                    .nodes
+                    .get(&node_id)
+                    .ok_or(PhysicalModelError::InvalidMap("missing active map node"))?
+                {
+                    PhysicalMapNode::Leaf { key, value, .. } => {
+                        if entries.insert(*key, value.clone()).is_some() {
+                            return Err(PhysicalModelError::InvalidMap(
+                                "active map has duplicate leaf keys",
+                            ));
+                        }
+                    },
+                    PhysicalMapNode::Branch { zero, one, .. } => {
+                        stack.push(*one);
+                        stack.push(*zero);
+                    },
+                }
+            }
+        }
+        if u64::try_from(entries.len()).map_err(|_| PhysicalModelError::LengthOverflow)?
+            != self.entry_count
+        {
+            return Err(PhysicalModelError::InvalidMap(
+                "active map count does not match its leaves",
+            ));
+        }
+
+        let mut inserted = 0_u64;
+        for (key, value) in additions {
+            match entries.get(&key) {
+                Some(existing) if existing == &value => {},
+                Some(_) => {
+                    return Err(PhysicalModelError::InvalidMap(
+                        "leaf key has unequal canonical bytes",
+                    ));
+                },
+                None => {
+                    entries.insert(key, value);
+                    inserted = inserted
+                        .checked_add(1)
+                        .ok_or(PhysicalModelError::LengthOverflow)?;
+                },
+            }
+        }
+        if inserted == 0 {
+            return Ok(0);
+        }
+
+        let rebuilt = Self::build(identity, self.domain, entries.into_iter().collect())?;
+        for (id, node) in &rebuilt.nodes {
+            if self.nodes.get(id).is_some_and(|existing| existing != node) {
+                return Err(PhysicalModelError::InvalidMap(
+                    "physical map-node identity collision",
+                ));
+            }
+        }
+        self.nodes.extend(rebuilt.nodes);
+        self.root = rebuilt.root;
+        self.entry_count = rebuilt.entry_count;
+        Ok(inserted)
+    }
+
     /// Return the authenticated root, or `None` for an empty map.
     #[must_use]
     pub const fn root(&self) -> Option<PhysicalMapNodeId> {

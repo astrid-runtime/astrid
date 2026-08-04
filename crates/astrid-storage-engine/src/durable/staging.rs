@@ -57,8 +57,29 @@ where
         };
         match appended {
             Ok(location) => {
+                let direct = inner
+                    .representations
+                    .as_ref()
+                    .map(|representations| {
+                        representations.describe_direct(
+                            id,
+                            super::canonical_record_bytes(&payload, self.identity.scheme())?,
+                            location,
+                        )
+                    })
+                    .transpose();
+                let direct = match direct {
+                    Ok(direct) => direct,
+                    Err(error) => {
+                        self.mark_requires_recovery(&mut inner);
+                        return Err(error);
+                    },
+                };
                 inner.index.insert(id, location);
                 inner.pending_index_locations.push((id, location));
+                if let Some(direct) = direct {
+                    inner.pending_direct_objects.insert(id, direct);
+                }
                 Ok((id, InsertOutcome::Inserted))
             },
             Err(error) => {
@@ -155,9 +176,35 @@ where
         };
         match appended {
             Ok(locations) => {
-                for location in ids.into_iter().zip(locations) {
-                    inner.index.insert(location.0, location.1);
-                    inner.pending_index_locations.push(location);
+                let direct = if let Some(representations) = &inner.representations {
+                    ids.iter()
+                        .copied()
+                        .zip(payloads.iter())
+                        .zip(locations.iter().copied())
+                        .map(|((id, payload), location)| {
+                            representations.describe_direct(
+                                id,
+                                super::canonical_record_bytes(payload, self.identity.scheme())?,
+                                location,
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                } else {
+                    Ok(Vec::new())
+                };
+                let direct = match direct {
+                    Ok(direct) => direct,
+                    Err(error) => {
+                        self.mark_requires_recovery(&mut inner);
+                        return Err(error);
+                    },
+                };
+                for (id, location) in ids.into_iter().zip(locations) {
+                    inner.index.insert(id, location);
+                    inner.pending_index_locations.push((id, location));
+                }
+                for object in direct {
+                    inner.pending_direct_objects.insert(object.object, object);
                 }
                 Ok(outcomes)
             },

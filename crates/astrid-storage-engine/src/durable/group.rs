@@ -13,7 +13,7 @@ use super::representations::{PendingDirectUpdate, RepresentationStore};
 use super::{
     ARENA_MAGIC, CommitOutcome, DurableEngine, DurableError, DurableInner, FaultPoint, Persisted,
     PersistentObjectIdentity, Prepared, PrincipalCodec, ROOT_MAGIC, RootTransaction, append_frames,
-    canonical_record_bytes, encode_object_frame, io_error, live_files_mut, read_indexed_object,
+    canonical_record_bytes, io_error, live_files_mut, read_indexed_object_with_payload,
 };
 
 const DEFAULT_INITIAL_DELAY: Duration = Duration::from_micros(250);
@@ -355,6 +355,7 @@ where
             files,
             representations,
             pending_index_locations,
+            pending_direct_objects,
             index,
             ..
         } = inner;
@@ -403,6 +404,7 @@ where
                 &files.arena,
                 representations,
                 pending_index_locations,
+                pending_direct_objects,
                 accepted.iter().flat_map(|commit| {
                     commit
                         .prepared
@@ -457,6 +459,7 @@ where
         arena: &File,
         representations: &mut RepresentationStore,
         pending: &[(ObjectId, super::ArenaLocation)],
+        pending_direct: &BTreeMap<ObjectId, super::representations::DirectArenaObject>,
         required: impl Iterator<Item = (ObjectId, super::ArenaLocation)>,
         appended: impl Iterator<Item = (ObjectId, &'a [u8], super::ArenaLocation)>,
     ) -> Result<Option<PendingDirectUpdate>, DurableError> {
@@ -464,13 +467,25 @@ where
         direct
             .try_reserve(pending.len())
             .map_err(|_| DurableError::EncodingOverflow)?;
+        let required = required.collect::<BTreeMap<_, _>>();
         let mut seen = std::collections::BTreeSet::new();
-        for (id, location) in pending.iter().copied().chain(required) {
+        for (id, location) in pending
+            .iter()
+            .copied()
+            .chain(required.iter().map(|(id, location)| (*id, *location)))
+        {
             if !seen.insert(id) || representations.contains_direct(id) {
                 continue;
             }
-            let record = read_indexed_object(arena, id, location, &self.identity, self.limits)?;
-            let payload = encode_object_frame(self.identity.scheme(), id, &record)?;
+            if required.contains_key(&id)
+                && let Some(cached) = pending_direct.get(&id)
+                && cached.location == location
+            {
+                direct.push(cached.clone());
+                continue;
+            }
+            let (_, payload) =
+                read_indexed_object_with_payload(arena, id, location, &self.identity, self.limits)?;
             direct.push(representations.describe_direct(
                 id,
                 canonical_record_bytes(&payload, self.identity.scheme())?,

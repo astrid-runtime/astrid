@@ -7,8 +7,11 @@ use astrid_storage_model::{ObjectId, RepresentationStateId};
 use super::representations::{DirectArenaObject, PendingDirectUpdate, RepresentationStore};
 use super::{
     DurableEngine, DurableError, DurableInner, PersistentObjectIdentity, PrincipalCodec,
-    canonical_record_bytes, encode_object_frame, live_files_mut, read_indexed_object,
+    canonical_record_bytes, live_files_mut, read_indexed_object_with_payload,
+    visit_indexed_objects,
 };
+
+const ACTIVATION_READ_TARGET_BYTES: u64 = 8 * 1024 * 1024;
 
 impl<P, I, C> DurableEngine<P, I, C>
 where
@@ -51,32 +54,36 @@ where
         let representations = {
             let DurableInner { files, index, .. } = &mut *inner;
             let files = live_files_mut(files)?;
-            let objects = index.iter().filter_map(|(object, location)| {
-                if excluded.contains(object) {
-                    return None;
-                }
-                let record = read_indexed_object(
-                    &files.arena,
-                    *object,
-                    *location,
-                    &self.identity,
-                    self.limits,
-                );
-                Some(record.and_then(|record| {
-                    let payload = encode_object_frame(scheme, *object, &record)?;
-                    DirectArenaObject::identify(
+            let requested = index
+                .iter()
+                .filter(|(object, _)| !excluded.contains(object))
+                .map(|(object, location)| (*object, *location))
+                .collect::<Vec<_>>();
+            let mut objects = Vec::new();
+            objects
+                .try_reserve_exact(requested.len())
+                .map_err(|_| DurableError::EncodingOverflow)?;
+            visit_indexed_objects(
+                &files.arena,
+                &requested,
+                ACTIVATION_READ_TARGET_BYTES,
+                &self.identity,
+                self.limits,
+                |object, location, _record, payload| {
+                    objects.push(DirectArenaObject::identify(
                         direct_profile,
-                        *object,
-                        canonical_record_bytes(&payload, scheme)?,
-                        *location,
-                    )
-                }))
-            });
+                        object,
+                        canonical_record_bytes(payload, scheme)?,
+                        location,
+                    )?);
+                    Ok(())
+                },
+            )?;
             RepresentationStore::activate(
                 &self.directory,
                 self.limits,
                 frozen_specification,
-                objects,
+                objects.into_iter().map(Ok),
             )?
         };
         let active = representations.active();
@@ -130,14 +137,13 @@ where
             missing
                 .into_iter()
                 .map(|(object, location)| {
-                    let record = read_indexed_object(
+                    let (_, payload) = read_indexed_object_with_payload(
                         &files.arena,
                         object,
                         location,
                         &self.identity,
                         self.limits,
                     )?;
-                    let payload = encode_object_frame(scheme, object, &record)?;
                     representations.describe_direct(
                         object,
                         canonical_record_bytes(&payload, scheme)?,
@@ -192,25 +198,29 @@ where
             .try_reserve(pending_index_locations.len().saturating_add(appended.len()))
             .map_err(|_| DurableError::EncodingOverflow)?;
         let mut seen = BTreeSet::new();
-        for (id, location) in pending_index_locations.iter().copied() {
-            if !seen.insert(id) || representations.contains_direct(id) {
-                continue;
-            }
-            let record =
-                read_indexed_object(&files.arena, id, location, &self.identity, self.limits)?;
-            let payload = encode_object_frame(self.identity.scheme(), id, &record)?;
-            direct.push(representations.describe_direct(
-                id,
-                canonical_record_bytes(&payload, self.identity.scheme())?,
-                location,
-            )?);
-        }
         direct.extend(
             appended
                 .iter()
                 .filter(|object| seen.insert(object.object))
                 .cloned(),
         );
+        for (id, location) in pending_index_locations.iter().copied() {
+            if !seen.insert(id) || representations.contains_direct(id) {
+                continue;
+            }
+            let (_, payload) = read_indexed_object_with_payload(
+                &files.arena,
+                id,
+                location,
+                &self.identity,
+                self.limits,
+            )?;
+            direct.push(representations.describe_direct(
+                id,
+                canonical_record_bytes(&payload, self.identity.scheme())?,
+                location,
+            )?);
+        }
         representations.append_direct_update(&direct)
     }
 }

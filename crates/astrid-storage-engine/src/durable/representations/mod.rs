@@ -13,9 +13,8 @@ use astrid_storage_model::{
 };
 
 use super::{
-    ArenaLocation, DurableError, PersistentObjectIdentity, RecoveryLimits, append_frame,
-    append_frames, canonical_record_bytes, encode_object_frame, io_error, open_rw,
-    read_indexed_object, sync_store_directory,
+    ArenaLocation, DurableError, FRAME_HEADER_LEN, RecoveryLimits, append_frame, append_frames,
+    io_error, open_rw, sync_store_directory,
 };
 use format::{
     Blake3PhysicalIdentity, CurrentPointer, JOURNAL_MAGIC, JournalEntry, METADATA_MAGIC,
@@ -91,6 +90,13 @@ pub(super) struct PendingDirectUpdate {
     catalogue: RepresentationCatalogueRoot,
     placements: PlacementSet,
     reverse_additions: Vec<(ObjectId, RepresentationRecordId)>,
+}
+
+struct DirectMapEntry {
+    object: ObjectId,
+    representation: (PhysicalMapKey, Vec<u8>),
+    representation_id: RepresentationRecordId,
+    placement: (PhysicalMapKey, Vec<u8>),
 }
 
 impl RepresentationStore {
@@ -240,17 +246,58 @@ impl RepresentationStore {
         objects: &[DirectArenaObject],
     ) -> Result<Option<PendingDirectUpdate>, DurableError> {
         let mut metadata = Vec::new();
-        let mut reverse_additions = Vec::new();
         let durable_representation_nodes = self.representations.nodes().keys().copied().collect();
         let durable_placement_nodes = self.placement_entries.nodes().keys().copied().collect();
+        let profile = RepresentationProfile::decode(
+            self.profiles
+                .get(PhysicalMapKey::from(self.direct_profile))
+                .ok_or(DurableError::InvalidRepresentationState(
+                    "direct representation profile disappeared",
+                ))?,
+        )?;
+        let mut entries = Vec::new();
         for object in objects {
-            if let Some(addition) = self.append_direct_object(object, &mut metadata)? {
-                reverse_additions.push(addition);
+            if !self.contains_direct(object.object) {
+                entries.push(self.prepare_direct_entry(object, &profile)?);
             }
         }
-        if reverse_additions.is_empty() {
+        if entries.is_empty() {
             return Ok(None);
         }
+        let rebuild_representations =
+            bulk_rebuild_is_cheaper(self.representations.entry_count(), entries.len())?;
+        let rebuild_placements =
+            bulk_rebuild_is_cheaper(self.placement_entries.entry_count(), entries.len())?;
+        let representation_entries = entries
+            .iter()
+            .map(|entry| entry.representation.clone())
+            .collect::<Vec<_>>();
+        let placement_entries = entries
+            .iter()
+            .map(|entry| entry.placement.clone())
+            .collect::<Vec<_>>();
+        if rebuild_representations {
+            self.representations
+                .rebuild_with_entries(&Blake3PhysicalIdentity, representation_entries)?;
+        } else {
+            for (key, value) in representation_entries {
+                self.representations
+                    .insert(&Blake3PhysicalIdentity, key, value)?;
+            }
+        }
+        if rebuild_placements {
+            self.placement_entries
+                .rebuild_with_entries(&Blake3PhysicalIdentity, placement_entries)?;
+        } else {
+            for (key, value) in placement_entries {
+                self.placement_entries
+                    .insert(&Blake3PhysicalIdentity, key, value)?;
+            }
+        }
+        let reverse_additions = entries
+            .into_iter()
+            .map(|entry| (entry.object, entry.representation_id))
+            .collect();
         append_new_reachable_map_nodes(
             &mut metadata,
             &self.representations,
@@ -283,14 +330,11 @@ impl RepresentationStore {
         }))
     }
 
-    fn append_direct_object(
-        &mut self,
+    fn prepare_direct_entry(
+        &self,
         object: &DirectArenaObject,
-        metadata: &mut Vec<MetadataFrame>,
-    ) -> Result<Option<(ObjectId, RepresentationRecordId)>, DurableError> {
-        if self.contains_direct(object.object) {
-            return Ok(None);
-        }
+        profile: &RepresentationProfile,
+    ) -> Result<DirectMapEntry, DurableError> {
         let record = RepresentationRecord::new(
             self.direct_profile,
             Coverage::exact(object.object, object.canonical_length)?,
@@ -299,24 +343,8 @@ impl RepresentationStore {
             object.canonical_length,
             None,
         )?;
-        let profile = RepresentationProfile::decode(
-            self.profiles
-                .get(PhysicalMapKey::from(self.direct_profile))
-                .ok_or(DurableError::InvalidRepresentationState(
-                    "direct representation profile disappeared",
-                ))?,
-        )?;
-        record.validate_against_profile(&Blake3PhysicalIdentity, &profile)?;
+        record.validate_against_profile(&Blake3PhysicalIdentity, profile)?;
         let record_id = record.identify(&Blake3PhysicalIdentity)?;
-        metadata.push(MetadataFrame::representation(
-            &Blake3PhysicalIdentity,
-            &record,
-        )?);
-        self.representations.insert(
-            &Blake3PhysicalIdentity,
-            PhysicalMapKey::from(record_id),
-            record.encode()?,
-        )?;
         let replica = Replica::new(
             LOCAL_STORAGE_NODE,
             ReplicaLocator::ArenaFrame {
@@ -332,12 +360,12 @@ impl RepresentationStore {
             object.canonical_length,
             vec![replica],
         )?;
-        self.placement_entries.insert(
-            &Blake3PhysicalIdentity,
-            PhysicalMapKey::from(object.blob),
-            placement.encode()?,
-        )?;
-        Ok(Some((object.object, record_id)))
+        Ok(DirectMapEntry {
+            object: object.object,
+            representation: (PhysicalMapKey::from(record_id), record.encode()?),
+            representation_id: record_id,
+            placement: (PhysicalMapKey::from(object.blob), placement.encode()?),
+        })
     }
 
     fn next_authority(
@@ -402,14 +430,37 @@ impl RepresentationStore {
             .map_err(|source| io_error("flush representation state journal", source))
     }
 
-    pub(super) fn validate_generation_zero_arena<I: PersistentObjectIdentity>(
+    /// Return the arena prefix proven durable by published physical state.
+    ///
+    /// A malformed frame below this boundary is corruption, not a repairable
+    /// uncommitted tail. Recovery consults this value before it may truncate
+    /// the logical arena.
+    pub(super) fn generation_zero_protected_len(&self) -> Result<u64, DurableError> {
+        self.direct_arena_locations()?
+            .into_iter()
+            .try_fold(0_u64, |protected, (_, location)| {
+                let end = location
+                    .offset
+                    .checked_add(FRAME_HEADER_LEN)
+                    .and_then(|value| value.checked_add(location.payload_len))
+                    .ok_or(DurableError::EncodingOverflow)?;
+                Ok(protected.max(end))
+            })
+    }
+
+    /// Validate that generation-zero placements name the recovered arena
+    /// index exactly.
+    ///
+    /// This is mount-time topology validation, not an implicit full-store
+    /// scrub. Authoritative object reads verify the named frame checksum,
+    /// canonical encoding, and logical identity before returning bytes. A
+    /// scheduled refinery pass owns proactive full-corpus re-attestation.
+    pub(super) fn validate_generation_zero_index(
         &self,
-        arena: &File,
         index: &BTreeMap<ObjectId, ArenaLocation>,
-        identity: &I,
-        limits: RecoveryLimits,
     ) -> Result<(), DurableError> {
-        for (object, records) in &self.reverse {
+        let direct = self.direct_arena_locations()?;
+        for object in self.reverse.keys() {
             let location =
                 index
                     .get(object)
@@ -417,6 +468,21 @@ impl RepresentationStore {
                     .ok_or(DurableError::InvalidRepresentationState(
                         "direct representation names a missing logical object",
                     ))?;
+            if !direct
+                .iter()
+                .any(|(covered, candidate)| *covered == *object && *candidate == location)
+            {
+                return Err(DurableError::InvalidRepresentationState(
+                    "generation-zero placement disagrees with the arena index",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn direct_arena_locations(&self) -> Result<Vec<(ObjectId, ArenaLocation)>, DurableError> {
+        let mut direct = Vec::new();
+        for (object, records) in &self.reverse {
             let record = records
                 .iter()
                 .filter_map(|id| {
@@ -440,33 +506,32 @@ impl RepresentationStore {
                     "direct representation placement disappeared",
                 ))?;
             let placement = PlacementEntry::decode(placement)?;
-            if !placement.replicas().iter().any(|replica| {
-                matches!(
-                    replica.locator(),
-                    ReplicaLocator::ArenaFrame {
-                        arena_generation: 0,
-                        offset,
-                        payload_length,
-                        frame_checksum,
-                    } if offset == location.offset
-                        && payload_length == location.payload_len
-                        && frame_checksum == location.checksum
-                )
-            }) {
-                return Err(DurableError::InvalidRepresentationState(
-                    "generation-zero placement disagrees with the arena index",
-                ));
+            let before = direct.len();
+            for replica in placement.replicas() {
+                if let ReplicaLocator::ArenaFrame {
+                    arena_generation: 0,
+                    offset,
+                    payload_length,
+                    frame_checksum,
+                } = replica.locator()
+                {
+                    direct.push((
+                        *object,
+                        ArenaLocation {
+                            offset,
+                            payload_len: payload_length,
+                            checksum: frame_checksum,
+                        },
+                    ));
+                }
             }
-            let logical = read_indexed_object(arena, *object, location, identity, limits)?;
-            let payload = encode_object_frame(identity.scheme(), *object, &logical)?;
-            let canonical = canonical_record_bytes(&payload, identity.scheme())?;
-            if BlobId::identify(&Blake3PhysicalIdentity, self.direct_profile, canonical)? != *blob {
+            if direct.len() == before {
                 return Err(DurableError::InvalidRepresentationState(
-                    "generation-zero blob identity does not match logical bytes",
+                    "direct representation has no generation-zero arena placement",
                 ));
             }
         }
-        Ok(())
+        Ok(direct)
     }
 
     fn from_recovered(
@@ -532,6 +597,21 @@ impl RepresentationStore {
             reverse,
         })
     }
+}
+
+fn bulk_rebuild_is_cheaper(existing: u64, additions: usize) -> Result<bool, DurableError> {
+    let additions = u64::try_from(additions).map_err(|_| DurableError::EncodingOverflow)?;
+    let total = existing
+        .checked_add(additions)
+        .ok_or(DurableError::EncodingOverflow)?;
+    let estimated_path_nodes = additions
+        .checked_mul(u64::from(total.max(2).ilog2()).saturating_add(2))
+        .ok_or(DurableError::EncodingOverflow)?;
+    let final_tree_nodes = total
+        .checked_mul(2)
+        .and_then(|nodes| nodes.checked_sub(1))
+        .ok_or(DurableError::EncodingOverflow)?;
+    Ok(estimated_path_nodes > final_tree_nodes)
 }
 
 fn read_all(file: &mut File, operation: &'static str) -> Result<Vec<u8>, DurableError> {

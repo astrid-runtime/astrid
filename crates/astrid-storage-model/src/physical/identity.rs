@@ -97,6 +97,24 @@ impl PlacementSetId {
 pub trait PhysicalIdentity {
     /// Hash canonical physical `material` under the exact derive-key context.
     fn identify(&self, context: &'static str, material: &[u8]) -> [u8; 32];
+
+    /// Hash the exact concatenation of canonical material segments.
+    ///
+    /// Implementations with an incremental primitive should override this to
+    /// avoid materializing large representation bytes a second time. The
+    /// default preserves source compatibility for injected test and successor
+    /// identities by presenting [`Self::identify`] with the same concatenated
+    /// preimage as before.
+    fn identify_parts(&self, context: &'static str, parts: &[&[u8]]) -> [u8; 32] {
+        let capacity = parts
+            .iter()
+            .fold(0_usize, |total, part| total.saturating_add(part.len()));
+        let mut material = Vec::with_capacity(capacity);
+        for part in parts {
+            material.extend_from_slice(part);
+        }
+        self.identify(context, &material)
+    }
 }
 
 pub(super) fn encode_object_id(encoder: &mut Encoder, id: ObjectId) {
@@ -258,11 +276,11 @@ impl BlobId {
     ) -> Result<Self, PhysicalModelError> {
         let length =
             u64::try_from(encoded_bytes.len()).map_err(|_| PhysicalModelError::LengthOverflow)?;
-        let mut material = tagged_profile_bytes(profile);
-        material.extend_from_slice(&length.to_le_bytes());
-        material.extend_from_slice(encoded_bytes);
-        Ok(Self::new(
-            identity.identify("astrid-blob-identity-v1\0", &material),
-        ))
+        let mut prefix = tagged_profile_bytes(profile);
+        prefix.extend_from_slice(&length.to_le_bytes());
+        Ok(Self::new(identity.identify_parts(
+            "astrid-blob-identity-v1\0",
+            &[&prefix, encoded_bytes],
+        )))
     }
 }

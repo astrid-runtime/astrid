@@ -487,6 +487,229 @@ fn activated_flush_publishes_direct_paths_for_staged_prefix() {
 }
 
 #[test]
+fn verified_staged_closure_consumes_direct_description_witnesses() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open(directory.path());
+    let specification = ObjectRecord::new(
+        ObjectKind::Evidence,
+        ObjectFormatVersion::V1,
+        b"format specification".to_vec(),
+        Vec::new(),
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let (specification_id, _) = engine.persist_standalone_object(&specification).unwrap();
+    engine
+        .ensure_direct_representation_catalogue(specification_id, &[specification_id])
+        .unwrap();
+    let (commit, transaction) = transaction("alice", None, b"staged direct witnesses");
+    let records = transaction
+        .records()
+        .iter()
+        .map(|(_, record)| record.clone())
+        .collect::<Vec<_>>();
+    let object_ids = transaction
+        .records()
+        .iter()
+        .map(|(object, _)| *object)
+        .collect::<Vec<_>>();
+
+    engine.stage_objects(records).unwrap();
+    assert_eq!(engine.inner.lock().pending_direct_objects.len(), 2);
+    engine
+        .commit(RootTransaction::new(
+            "alice".to_owned(),
+            None,
+            commit,
+            Vec::new(),
+        ))
+        .unwrap();
+
+    let inner = engine.inner.lock();
+    assert!(inner.pending_direct_objects.is_empty());
+    let representations = inner.representations.as_ref().unwrap();
+    assert!(
+        object_ids
+            .into_iter()
+            .all(|object| representations.contains_direct(object))
+    );
+}
+
+#[test]
+fn unverified_staged_witness_cannot_hide_arena_tampering() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open(directory.path());
+    let specification = ObjectRecord::new(
+        ObjectKind::Evidence,
+        ObjectFormatVersion::V1,
+        b"format specification".to_vec(),
+        Vec::new(),
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let (specification_id, _) = engine.persist_standalone_object(&specification).unwrap();
+    engine
+        .ensure_direct_representation_catalogue(specification_id, &[specification_id])
+        .unwrap();
+    let staged = ObjectRecord::new(
+        ObjectKind::Evidence,
+        ObjectFormatVersion::V1,
+        b"unreachable staged object".to_vec(),
+        Vec::new(),
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let (staged_id, _) = engine.stage_object(&staged).unwrap();
+    let location = engine.inner.lock().index[&staged_id];
+    let byte_offset = location
+        .offset
+        .checked_add(FRAME_HEADER_LEN)
+        .and_then(|offset| offset.checked_add(location.payload_len - 1))
+        .unwrap();
+    let mut arena = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(directory.path().join(ARENA_FILE))
+        .unwrap();
+    arena.seek(SeekFrom::Start(byte_offset)).unwrap();
+    let mut byte = [0_u8; 1];
+    arena.read_exact(&mut byte).unwrap();
+    arena.seek(SeekFrom::Start(byte_offset)).unwrap();
+    arena.write_all(&[byte[0] ^ 0x80]).unwrap();
+
+    assert!(matches!(engine.flush(), Err(DurableError::Corrupt { .. })));
+}
+
+#[test]
+fn published_direct_tail_corruption_is_not_truncated() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open(directory.path());
+    let specification = ObjectRecord::new(
+        ObjectKind::Evidence,
+        ObjectFormatVersion::V1,
+        b"format specification".to_vec(),
+        Vec::new(),
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let (specification_id, _) = engine.persist_standalone_object(&specification).unwrap();
+    engine
+        .ensure_direct_representation_catalogue(specification_id, &[specification_id])
+        .unwrap();
+    let staged = ObjectRecord::new(
+        ObjectKind::Evidence,
+        ObjectFormatVersion::V1,
+        b"scrubbed when accessed".to_vec(),
+        Vec::new(),
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let (staged_id, _) = engine.stage_object(&staged).unwrap();
+    let location = engine.inner.lock().index[&staged_id];
+    engine.close().unwrap();
+    drop(engine);
+
+    let arena_path = directory.path().join(ARENA_FILE);
+    let published_len = std::fs::metadata(&arena_path).unwrap().len();
+    let byte_offset = location
+        .offset
+        .checked_add(FRAME_HEADER_LEN)
+        .and_then(|offset| offset.checked_add(location.payload_len - 1))
+        .unwrap();
+    let mut arena = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&arena_path)
+        .unwrap();
+    arena.seek(SeekFrom::Start(byte_offset)).unwrap();
+    let mut byte = [0_u8; 1];
+    arena.read_exact(&mut byte).unwrap();
+    arena.seek(SeekFrom::Start(byte_offset)).unwrap();
+    arena.write_all(&[byte[0] ^ 0x80]).unwrap();
+    arena.sync_data().unwrap();
+
+    assert!(matches!(
+        DurableEngine::open(directory.path(), TestIdentity, Utf8Codec, limits()),
+        Err(DurableError::Corrupt { .. })
+    ));
+    assert_eq!(std::fs::metadata(arena_path).unwrap().len(), published_len);
+}
+
+#[test]
+fn reopen_defers_unreachable_interior_frame_scrub_until_read() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open(directory.path());
+    let specification = ObjectRecord::new(
+        ObjectKind::Evidence,
+        ObjectFormatVersion::V1,
+        b"format specification".to_vec(),
+        Vec::new(),
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let (specification_id, _) = engine.persist_standalone_object(&specification).unwrap();
+    engine
+        .ensure_direct_representation_catalogue(specification_id, &[specification_id])
+        .unwrap();
+    let records = [b"scrubbed when accessed one".as_slice(), b"later valid tail"].map(|bytes| {
+        ObjectRecord::new(
+            ObjectKind::Evidence,
+            ObjectFormatVersion::V1,
+            bytes.to_vec(),
+            Vec::new(),
+            0,
+            ObjectClass::Metadata,
+        )
+        .unwrap()
+    });
+    let ids = engine
+        .stage_objects(records.into_iter().collect())
+        .unwrap()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect::<Vec<_>>();
+    engine.flush().unwrap();
+    let (corrupt_id, location) = {
+        let inner = engine.inner.lock();
+        ids.into_iter()
+            .map(|id| (id, inner.index[&id]))
+            .min_by_key(|(_, location)| location.offset)
+            .unwrap()
+    };
+    engine.close().unwrap();
+    drop(engine);
+
+    let byte_offset = location
+        .offset
+        .checked_add(FRAME_HEADER_LEN)
+        .and_then(|offset| offset.checked_add(location.payload_len - 1))
+        .unwrap();
+    let mut arena = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(directory.path().join(ARENA_FILE))
+        .unwrap();
+    arena.seek(SeekFrom::Start(byte_offset)).unwrap();
+    let mut byte = [0_u8; 1];
+    arena.read_exact(&mut byte).unwrap();
+    arena.seek(SeekFrom::Start(byte_offset)).unwrap();
+    arena.write_all(&[byte[0] ^ 0x80]).unwrap();
+    arena.sync_data().unwrap();
+
+    let reopened = open(directory.path());
+    assert!(matches!(
+        reopened.object(corrupt_id),
+        Err(DurableError::Corrupt { .. })
+    ));
+}
+
+#[test]
 fn standalone_ack_covers_an_earlier_staged_prefix() {
     let directory = tempfile::tempdir().unwrap();
     let engine = open(directory.path());
@@ -589,7 +812,8 @@ fn direct_batch_persists_only_its_final_reachable_map_nodes() {
     )
     .unwrap();
 
-    // Each map has 64 leaves and 63 branches. The batch also records one
-    // representation per object plus the catalogue, placement, and state.
-    assert_eq!(appended_frames, 2 * (64 + 63) + 64 + 3);
+    // Each map has 64 leaves and 63 branches. Representation records live in
+    // the authenticated map leaves; only the catalogue, placement, and state
+    // are additional frames.
+    assert_eq!(appended_frames, 2 * (64 + 63) + 3);
 }

@@ -36,6 +36,10 @@ where
     C: PrincipalCodec<P>,
 {
     recover_interrupted_compaction(path, principal_codec, identity, limits)?;
+    let representations = super::representations::RepresentationStore::open(path, limits)?;
+    let protected_arena_len = representations
+        .as_ref()
+        .map_or(Ok(0), |store| store.generation_zero_protected_len())?;
     let mut arena = open_rw(&path.join(ARENA_FILE))?;
     let mut roots = open_rw(&path.join(ROOT_FILE))?;
     let mut index_cache = open_rw(&path.join(INDEX_FILE)).ok();
@@ -51,7 +55,7 @@ where
     let (index, arena_tail) = if let Some(state) = cached {
         (state.objects, state.arena_tail)
     } else {
-        let (index, arena_tail) = recover_arena(&mut arena, identity, limits)?;
+        let (index, arena_tail) = recover_arena(&mut arena, identity, limits, protected_arena_len)?;
         let state = IndexState {
             arena_len: arena
                 .metadata()
@@ -85,9 +89,8 @@ where
     let arena_reader = arena
         .try_clone()
         .map_err(|source| io_error("clone object arena for positional reads", source))?;
-    let representations = super::representations::RepresentationStore::open(path, limits)?;
     if let Some(representations) = &representations {
-        representations.validate_generation_zero_arena(&arena, &index, identity, limits)?;
+        representations.validate_generation_zero_index(&index)?;
     }
 
     Ok(RecoveredStore {
@@ -214,6 +217,7 @@ where
                     inner.roots_by_principal = recovered.roots_by_principal;
                     inner.index = recovered.index;
                     inner.pending_index_locations.clear();
+                    inner.pending_direct_objects.clear();
                     inner.validated = recovered.validated;
                     inner.files = Some(recovered.files);
                     inner.representations = recovered.representations;

@@ -86,6 +86,14 @@ impl PhysicalIdentity for Blake3PhysicalIdentityV1 {
         hasher.update(material);
         *hasher.finalize().as_bytes()
     }
+
+    fn identify_parts(&self, context: &'static str, parts: &[&[u8]]) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new_derive_key(context);
+        for part in parts {
+            hasher.update(part);
+        }
+        *hasher.finalize().as_bytes()
+    }
 }
 
 const BLAKE3_OBJECT_IDENTITY_V1_SCHEME: IdentityScheme = match IdentityScheme::new(1, 1) {

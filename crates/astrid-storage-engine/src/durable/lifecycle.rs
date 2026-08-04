@@ -122,5 +122,6 @@ where
         files.arena_len = arena_len;
         files.arena_tail = arena_tail;
         inner.pending_index_locations.clear();
+        inner.pending_direct_objects.clear();
     }
 }

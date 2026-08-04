@@ -47,7 +47,6 @@ pub(super) fn build_initial_state(
             None,
         )?;
         let record_id = record.identify(&identity)?;
-        metadata.push(MetadataFrame::representation(&identity, &record)?);
         representation_entries.push((PhysicalMapKey::from(record_id), record.encode()?));
 
         let replica = Replica::new(

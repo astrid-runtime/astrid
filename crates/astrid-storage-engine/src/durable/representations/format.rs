@@ -77,18 +77,6 @@ impl MetadataFrame {
         ))
     }
 
-    pub(super) fn representation<I: PhysicalIdentity>(
-        identity: &I,
-        value: &RepresentationRecord,
-    ) -> Result<Self, DurableError> {
-        let id = value.identify(identity)?;
-        Ok(Self::new(
-            MetadataKind::Representation,
-            *id.as_bytes(),
-            value.encode()?,
-        ))
-    }
-
     pub(super) fn map_node<I: PhysicalIdentity>(
         identity: &I,
         value: &PhysicalMapNode,
@@ -315,6 +303,14 @@ impl PhysicalIdentity for Blake3PhysicalIdentity {
     fn identify(&self, context: &'static str, material: &[u8]) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new_derive_key(context);
         hasher.update(material);
+        *hasher.finalize().as_bytes()
+    }
+
+    fn identify_parts(&self, context: &'static str, parts: &[&[u8]]) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new_derive_key(context);
+        for part in parts {
+            hasher.update(part);
+        }
         *hasher.finalize().as_bytes()
     }
 }

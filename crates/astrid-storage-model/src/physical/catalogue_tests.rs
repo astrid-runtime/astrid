@@ -396,6 +396,61 @@ fn path_copy_insertion_matches_a_clean_rebuild_and_keeps_old_roots() {
 }
 
 #[test]
+fn bulk_rebuild_matches_sequential_insertion_and_keeps_old_roots() {
+    let initial = vec![(key(1), vec![10]), (key(4), vec![40])];
+    let additions = vec![(key(2), vec![20]), (key(3), vec![30]), (key(5), vec![50])];
+    let mut bulk = CanonicalPhysicalMap::build(
+        &Blake3PhysicalIdentity,
+        PhysicalMapDomain::Representation,
+        initial.clone(),
+    )
+    .unwrap();
+    let old_root = bulk.root().unwrap();
+    let mut sequential = CanonicalPhysicalMap::build(
+        &Blake3PhysicalIdentity,
+        PhysicalMapDomain::Representation,
+        initial,
+    )
+    .unwrap();
+    for (key, value) in additions.iter().cloned() {
+        assert!(
+            sequential
+                .insert(&Blake3PhysicalIdentity, key, value)
+                .unwrap()
+        );
+    }
+
+    assert_eq!(
+        bulk.rebuild_with_entries(&Blake3PhysicalIdentity, additions)
+            .unwrap(),
+        3
+    );
+    assert_eq!(bulk.root(), sequential.root());
+    assert_eq!(bulk.entry_count(), 5);
+    assert!(bulk.nodes().contains_key(&old_root));
+    assert_eq!(
+        CanonicalPhysicalMap::validate_root(
+            &Blake3PhysicalIdentity,
+            PhysicalMapDomain::Representation,
+            Some(old_root),
+            bulk.nodes(),
+        )
+        .unwrap(),
+        2
+    );
+    assert_eq!(
+        CanonicalPhysicalMap::validate_root(
+            &Blake3PhysicalIdentity,
+            PhysicalMapDomain::Representation,
+            bulk.root(),
+            bulk.nodes(),
+        )
+        .unwrap(),
+        5
+    );
+}
+
+#[test]
 fn canonical_map_rejects_duplicate_keys_and_forged_summaries() {
     assert!(matches!(
         CanonicalPhysicalMap::build(
