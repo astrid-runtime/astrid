@@ -230,6 +230,7 @@ Required invariants:
 | STO-MOD-46 | Physical metadata uses its own arena and representation state uses its own journal; neither can be reinterpreted as logical objects or principal-root transitions |
 | STO-MOD-47 | Logical usage remains the sum of ObjectRecord logical-byte contributions in the domain's owning closure |
 | STO-MOD-48 | An activated implicit-direct representation names its exact arena generation, offset, payload length, and frame checksum |
+| STO-MOD-49 | Durability counts distinct storage nodes while physical accounting counts every distinct allocated replica extent |
 
 Every discovered counterexample becomes a minimized checked-in trace and a Rust
 regression test.
@@ -288,7 +289,7 @@ specification functions.
 | STO-PROP-44 | Every crash prefix around state publication activates the complete old pair or complete new pair, never mixed catalogue and placement roots |
 | STO-PROP-45 | Coverage traversal retains all File/ChunkTree metadata and never creates a dependency edge from a representation to its covered Chunk outputs |
 | STO-PROP-46 | Every adoption crash prefix recovers a sealed generation, non-authoritative incoming file, exact raw blob, or verified pre-existing blob without overwriting live bytes |
-| STO-PROP-47 | Checkpoint replacement preserves active state across every crash prefix, and append rolls over before either configured tail bound is exceeded |
+| STO-PROP-47 | Temporary-file checkpoint replacement preserves the valid old or new active state across every crash prefix, and append rolls over before either configured tail bound is exceeded |
 | STO-PROP-48 | Non-canonical, zero, output-understating, or exceeded reconstruction bounds reject the candidate without admitting partial output |
 | STO-PROP-49 | A forced BlobId digest collision with any unequal preimage field is fatal and never deduplicates |
 | STO-PROP-50 | Every adoption crash prefix before metadata durability leaves the new representation state inactive |
@@ -298,6 +299,7 @@ specification functions.
 | STO-PROP-54 | Representation selection, deduplication, and replica count leave existing principal logical-usage results unchanged |
 | STO-PROP-55 | Activating an arena-only store produces authoritative direct placements for every synthesized representation without changing logical roots |
 | STO-PROP-56 | A forced collision at an occupied final BlobId path preserves the existing bytes and publishes no representation |
+| STO-PROP-57 | Multiple same-node replicas consume physical bytes but cannot satisfy a distinct-node durability requirement |
 
 The deliberate tiny digest model must generate collisions and assert byte
 comparison rejects them. Production collision probability is not a substitute

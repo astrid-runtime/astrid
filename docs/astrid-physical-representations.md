@@ -86,7 +86,7 @@ RepresentationProfileV1 {
     version: u16 = 1,
     kind: direct-canonical | packed-canonical | contiguous-file | transform,
     decoder_or_generator: Option<ObjectId>,
-    transform_closure: Option<ObjectId>,
+    transform_contract: Option<ObjectId>,
     runtime_semantic_profile: Option<ObjectId>,
     canonical_parameters: length-prefixed bytes,
     immutable_dependencies: sorted unique DependencyV1[],
@@ -143,15 +143,12 @@ Profile and recipe compatibility is closed in format one:
 | `contiguous-file` | `ContiguousFile` | `CanonicalFileChunks` | all absent |
 | `transform` | `Compressed`, `Delta`, or `Generated` | `Exact` | all present |
 
-For built-in profiles, `canonical_parameters` is the frozen empty value and
-`frozen_specification` identifies the corresponding engine grammar. For a
-transform profile, `decoder_or_generator`, `transform_closure`, and
-`runtime_semantic_profile` are all present and included in
-`immutable_dependencies`. `Generated` additionally requires that the
-invocation's transform and runtime profile equal those profile fields.
-Compressed and delta recipes treat the named transform as their decoder.
-Every other field combination, recipe pairing, or coverage pairing is invalid
-even if its bytes otherwise decode canonically.
+For built-in profiles, `canonical_parameters` is empty and `frozen_specification` identifies
+the engine grammar. Transform profiles include `decoder_or_generator`, `transform_contract`,
+and `runtime_semantic_profile` in `immutable_dependencies`. `Generated` requires
+`invocation.transform == decoder_or_generator`, `invocation.transform_contract == transform_contract`,
+and `invocation.runtime_semantic_profile == runtime_semantic_profile`.
+Compressed and delta recipes use the named decoder; every other field, recipe, or coverage combination is invalid even if canonically encoded.
 
 ```text
 BlobId = TaggedIdentity(
@@ -345,12 +342,10 @@ reconstructs each covered canonical Chunk record. `Compressed`, `Delta`, and
 `Generated` must produce a complete canonical record before identity
 validation.
 
-A delta names a logical base rather than a preferred base representation. The
-selector independently finds a valid path to that `ObjectId`. Admission rejects
-self-reference and cycles across representation, profile, logical-object, and
-invocation dependencies and caps the complete dependency depth. Generated
-recipes use the format-one invocation contract; effectful invocations are
-ineligible because replay must not repeat side effects.
+A delta names a logical base, not a preferred representation; the selector finds a path to
+that `ObjectId`. Admission rejects cycles across representation, profile, logical-object,
+and invocation dependencies and caps total depth. Generated recipes admit only format-one's
+memoizable `Pure` and `SnapshotBound` classes; `Effectful` and `Nondeterministic` are rejected.
 
 ## Authoritative catalogue and disposable indexes
 
@@ -421,7 +416,7 @@ PlacementSetV1 {
     epoch: u64,
     entries_root: Option<PhysicalMapNodeId>,
     blob_count: u64,
-    replica_count: u64,
+    replica_extent_count: u64,
 }
 
 PlacementEntryV1 {
@@ -441,9 +436,10 @@ ReplicaV1 {
 }
 ```
 
-Placement leaves are keyed by `blob`; replicas sort by storage node, locator
-tag, then locator bytes. Arena generation zero denotes verified `objects.arena`
-at activation; its locator matches the durable index tuple. Each compaction
+Placement leaves are keyed by `blob`; replicas sort by node, locator tag, then bytes. Extent
+count includes every entry; durability counts distinct `StorageNodeId`s, so same-node copies
+never satisfy redundancy. Arena generation zero denotes verified `objects.arena` at activation;
+its locator matches the durable index tuple. Each compaction
 publishes a successor generation in the same placement CAS. A loose path derives
 from `(namespace_generation, BlobId)` below an already-open private directory;
 host paths never enter the wire. Pack ranges are in-bounds and non-overlapping.
@@ -499,7 +495,11 @@ before frame or wrapper-byte count exceeds them, and rejects an oversized frame.
 `previous` authenticates ordering but is not live. Under the mutation fence,
 compaction copies the active metadata closure into a successor generation and
 checkpoints the prior journal digest. Both files flush, reopen, and verify before
-`CURRENT` changes. The old generation survives until lease drain; audit history
+`CURRENT` changes. Replacement exclusively creates `CURRENT.tmp`, writes its frame, flushes and
+reopens it, atomically renames it over `CURRENT`, then flushes the parent directory; it never edits
+in place. Before that directory flush, recovery may select the valid old or new pointer; after
+acknowledgement it must select new. A leftover temporary is never a candidate and is quarantined
+only after valid `CURRENT` selection. The old generation survives until lease drain; audit history
 does not extend startup replay.
 
 Activation installs an amended RÚNATAL object specifying these files. After the
