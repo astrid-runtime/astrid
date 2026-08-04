@@ -1,8 +1,6 @@
 use std::collections::BTreeMap;
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::num::NonZeroU64;
-#[cfg(not(target_os = "windows"))]
-use std::num::NonZeroUsize;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -11,13 +9,13 @@ use astrid_core::profile::{DeviceKey, DeviceScope, PrincipalProfile};
 use astrid_resources::ResidentMemoryAuthority;
 #[cfg(not(target_os = "windows"))]
 use astrid_storage_engine::crash_replay::{
-    ConservativeDataSync, CrashTraceRecorder, ReplayLimits, TraceFileId,
+    CrashTrace, CrashTraceRecorder, TraceEffect, TraceFileId,
 };
 use astrid_storage_engine::{ObjectCacheCapacity, ObjectCacheController, RootTransaction};
 use astrid_storage_model::{
     CanonicalChunkingProfile, ObjectClass, ObjectFormatVersion, ObjectKind, ObjectReference,
     PhysicalIdentity, ProfileKind, ReconstructionBounds, ReferenceLabel, RepresentationProfile,
-    RootState,
+    RootGeneration, RootState,
 };
 
 use super::*;
@@ -71,6 +69,91 @@ async fn create_test_principal(store: &RuntimePrincipalStore, alias: &str) -> Pr
         .unwrap()
         .unwrap()
         .uid
+}
+
+#[cfg(not(target_os = "windows"))]
+struct DurablePrefixTrace {
+    recorder: CrashTraceRecorder,
+    arena: TraceFileId,
+    roots: TraceFileId,
+    representation_metadata: TraceFileId,
+    representation_journal: TraceFileId,
+}
+
+#[cfg(not(target_os = "windows"))]
+impl DurablePrefixTrace {
+    fn begin(store_path: &Path) -> (Self, u64) {
+        let arena = TraceFileId::new("objects.arena").unwrap();
+        let roots = TraceFileId::new("roots.journal").unwrap();
+        let representation_metadata =
+            TraceFileId::new("representations/generations/0000000000000001/metadata.arena")
+                .unwrap();
+        let representation_journal =
+            TraceFileId::new("representations/generations/0000000000000001/state.journal").unwrap();
+        let files = [
+            arena.clone(),
+            roots.clone(),
+            TraceFileId::new(STORE_METADATA_FILE).unwrap(),
+            TraceFileId::new(migrations::MIGRATION_MARKER_FILE).unwrap(),
+            TraceFileId::new("representations/CURRENT").unwrap(),
+            representation_metadata.clone(),
+            representation_journal.clone(),
+        ];
+        let initial_root_len = std::fs::metadata(store_path.join(roots.as_str()))
+            .unwrap()
+            .len();
+        let recorder = CrashTraceRecorder::from_paths(
+            files
+                .into_iter()
+                .map(|file| (file.clone(), store_path.join(file.as_str()))),
+            ["initial".to_owned()],
+        )
+        .unwrap();
+        (
+            Self {
+                recorder,
+                arena,
+                roots,
+                representation_metadata,
+                representation_journal,
+            },
+            initial_root_len,
+        )
+    }
+
+    fn capture_commit(&self, store_path: &Path, initial_root_len: u64) {
+        self.recorder
+            .capture(&self.arena, &store_path.join(self.arena.as_str()))
+            .unwrap();
+        self.recorder.barrier(&self.arena).unwrap();
+        self.recorder
+            .capture(
+                &self.representation_metadata,
+                &store_path.join(self.representation_metadata.as_str()),
+            )
+            .unwrap();
+        self.recorder
+            .capture(
+                &self.representation_journal,
+                &store_path.join(self.representation_journal.as_str()),
+            )
+            .unwrap();
+        self.recorder
+            .capture(&self.roots, &store_path.join(self.roots.as_str()))
+            .unwrap();
+        self.recorder.barrier(&self.roots).unwrap();
+        let final_root_len = std::fs::metadata(store_path.join(self.roots.as_str()))
+            .unwrap()
+            .len();
+        self.recorder
+            .root_publication(
+                &self.roots,
+                initial_root_len,
+                final_root_len.checked_sub(initial_root_len).unwrap(),
+            )
+            .unwrap();
+        self.recorder.acknowledge("updated").unwrap();
+    }
 }
 
 fn chunker_golden_source(length: usize) -> Vec<u8> {
@@ -416,7 +499,7 @@ fn format_specification_has_a_tagged_metadata_identity() {
     assert!(record.references().is_empty());
     assert_eq!(
         object_id_hex(id),
-        "82e46f53ba9bb2f52d6b942088d5965eaa17c2720e61ce842ed9d5e3c0d1219d"
+        "900d1eface3294bc9e47369c0fcb64dca56ff334dfbc1288f349090e10c09e6f"
     );
     assert_eq!(
         object_id_hex(catalog_id),
@@ -427,8 +510,9 @@ fn format_specification_has_a_tagged_metadata_identity() {
         "format=astrid-principal-store-v1\n\
          identity=blake3-object-identity-v1\n\
          identity-wire=tagged-identity-v1\n\
-         format-spec-object=1:1:32:82e46f53ba9bb2f52d6b942088d5965eaa17c2720e61ce842ed9d5e3c0d1219d\n\
+         format-spec-object=1:1:32:900d1eface3294bc9e47369c0fcb64dca56ff334dfbc1288f349090e10c09e6f\n\
          content-catalog-spec-object=1:1:32:8f3999b066b666396259c4a92f9de7c5b8e67df9d38a69fb4fb824968b56ecdb\n\
+         representations=authoritative-direct-v1\n\
          principal-codec=principal-uid-v1\n\
          projection=kv-transition-bplus-v4\n"
     );
@@ -590,6 +674,14 @@ async fn new_store_persists_and_verifies_the_in_band_specification() {
     let record = bootstrap::format_specification().unwrap();
     let id = Blake3ObjectIdentityV1.identify(&record);
     let arena = std::fs::read(home.principal_store_path().join("objects.arena")).unwrap();
+    let metadata =
+        std::fs::read_to_string(home.principal_store_path().join(STORE_METADATA_FILE)).unwrap();
+    assert!(metadata.contains("representations=authoritative-direct-v1\n"));
+    assert!(
+        home.principal_store_path()
+            .join("representations/CURRENT")
+            .is_file()
+    );
     assert_eq!(&arena[52..54], &1_u16.to_le_bytes());
     assert_eq!(&arena[54..56], &1_u16.to_le_bytes());
     assert_eq!(&arena[56..60], &32_u32.to_le_bytes());
@@ -604,6 +696,23 @@ async fn new_store_persists_and_verifies_the_in_band_specification() {
     .unwrap();
     assert_eq!(engine.object(id).unwrap(), Some(record));
     drop(store);
+}
+
+#[tokio::test]
+async fn representation_activation_without_its_metadata_marker_resumes() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    let store = open_runtime_kv(&home, unlimited_quota()).await.unwrap();
+    store.close().await.unwrap();
+    drop(store);
+
+    let metadata = home.principal_store_path().join(STORE_METADATA_FILE);
+    std::fs::remove_file(&metadata).unwrap();
+    let reopened = open_runtime_kv(&home, unlimited_quota()).await.unwrap();
+    reopened.close().await.unwrap();
+
+    let restored = std::fs::read_to_string(metadata).unwrap();
+    assert!(restored.contains("representations=authoritative-direct-v1\n"));
 }
 
 fn replace_catalog_with_legacy(
@@ -1197,73 +1306,74 @@ async fn independent_reader_accepts_a_replayed_durable_prefix() {
         .unwrap();
 
     let store_path = home.principal_store_path();
-    let arena = TraceFileId::new("objects.arena").unwrap();
-    let roots = TraceFileId::new("roots.journal").unwrap();
-    let metadata = TraceFileId::new(STORE_METADATA_FILE).unwrap();
-    let initial_root_len = std::fs::metadata(store_path.join(roots.as_str()))
-        .unwrap()
-        .len();
-    let recorder = CrashTraceRecorder::from_paths(
-        [
-            (arena.clone(), store_path.join(arena.as_str())),
-            (roots.clone(), store_path.join(roots.as_str())),
-            (metadata, store_path.join(STORE_METADATA_FILE)),
-        ],
-        ["initial".to_owned()],
-    )
-    .unwrap();
+    let (trace, initial_root_len) = DurablePrefixTrace::begin(&store_path);
 
     store
         .kv()
         .set("alice:capsule:shell", "theme", b"raven".to_vec())
         .await
         .unwrap();
-    recorder
-        .capture(&arena, &store_path.join(arena.as_str()))
-        .unwrap();
-    recorder.barrier(&arena).unwrap();
-    recorder
-        .capture(&roots, &store_path.join(roots.as_str()))
-        .unwrap();
-    recorder.barrier(&roots).unwrap();
-    let final_root_len = std::fs::metadata(store_path.join(roots.as_str()))
-        .unwrap()
-        .len();
-    recorder
-        .root_publication(
-            &roots,
-            initial_root_len,
-            final_root_len.checked_sub(initial_root_len).unwrap(),
-        )
-        .unwrap();
-    recorder.acknowledge("updated").unwrap();
+    trace.capture_commit(&store_path, initial_root_len);
     drop(store);
 
-    let images = recorder
-        .trace()
-        .unwrap()
-        .replay(
-            &ConservativeDataSync::new(NonZeroUsize::new(4096).unwrap()),
-            ReplayLimits::ci(),
-        )
-        .unwrap();
-    let durable = images
-        .images()
-        .iter()
-        .find(|image| {
-            image
-                .acknowledged_commits()
-                .iter()
-                .any(|label| label == "updated")
-        })
-        .expect("replay omitted the acknowledged operation prefix");
+    let recorded = trace.recorder.trace().unwrap();
+    assert!(
+        recorded.effects().iter().any(
+            |effect| matches!(effect, TraceEffect::Append { file, .. } if file == &trace.arena)
+        ),
+        "traced commit did not append object frames"
+    );
+    assert!(
+        recorded.effects().iter().any(
+            |effect| matches!(effect, TraceEffect::Append { file, .. } if file == &trace.roots)
+        ),
+        "traced commit did not append a root frame"
+    );
+    let final_files = trace_final_files(&recorded);
     let replay = tempfile::tempdir().unwrap();
-    durable.materialize(replay.path()).unwrap();
+    let replay_home = AstridHome::from_path(replay.path());
+    let replay_store = replay_home.principal_store_path();
+    for (file, bytes) in recorded.initial_files() {
+        let destination = replay_store.join(file.as_str());
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        std::fs::write(destination, bytes).unwrap();
+    }
+    for file in [&trace.arena, &trace.representation_journal, &trace.roots] {
+        std::fs::write(replay_store.join(file.as_str()), &final_files[file]).unwrap();
+    }
+
+    let recovered_engine = RuntimeEngine::open(
+        &replay_store,
+        Blake3ObjectIdentityV1,
+        StateOwnerCodecV1,
+        RecoveryLimits::process_addressable(),
+    )
+    .unwrap();
+    assert_eq!(
+        recovered_engine
+            .root(&StateOwner::Principal(alice_uid))
+            .unwrap()
+            .unwrap()
+            .generation,
+        RootGeneration::new(1)
+    );
+    drop(recovered_engine);
+
+    let repaired = open_runtime_principal_store(&replay_home, unlimited_quota())
+        .await
+        .unwrap();
+    drop(repaired);
+    let repaired_once = representation_snapshot(&replay_store);
+    let reopened = open_runtime_principal_store(&replay_home, unlimited_quota())
+        .await
+        .unwrap();
+    drop(reopened);
+    assert_eq!(repaired_once, representation_snapshot(&replay_store));
 
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/runatal_v1_reader.py");
     let output = std::process::Command::new("python3")
         .arg(script)
-        .arg(replay.path())
+        .arg(&replay_store)
         .output()
         .unwrap();
     assert!(
@@ -1273,8 +1383,80 @@ async fn independent_reader_accepts_a_replayed_durable_prefix() {
     );
     let decoded: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let alice = alice_uid.to_string();
-    assert_eq!(decoded["roots"][alice.as_str()]["generation"], 1);
-    assert_eq!(decoded["roots"][alice.as_str()]["kv"]["entries"], 2);
+    assert_eq!(
+        decoded["roots"][alice.as_str()]["generation"],
+        1,
+        "unexpected repaired reader output: {decoded}"
+    );
+    assert_eq!(
+        decoded["roots"][alice.as_str()]["kv"]["entries"],
+        2,
+        "unexpected repaired reader output: {decoded}"
+    );
+}
+
+#[cfg(not(target_os = "windows"))]
+fn representation_snapshot(store: &Path) -> BTreeMap<String, Vec<u8>> {
+    let root = store.join("representations");
+    let mut snapshot = BTreeMap::new();
+    let mut pending = vec![root.clone()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            let metadata = entry.metadata().unwrap();
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            } else if metadata.is_file() {
+                let relative = entry
+                    .path()
+                    .strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                snapshot.insert(relative, std::fs::read(entry.path()).unwrap());
+            }
+        }
+    }
+    snapshot
+}
+
+#[cfg(not(target_os = "windows"))]
+fn trace_final_files(trace: &CrashTrace) -> BTreeMap<TraceFileId, Vec<u8>> {
+    let mut files = trace.initial_files().clone();
+    for effect in trace.effects() {
+        match effect {
+            TraceEffect::Append {
+                file,
+                pre_len,
+                bytes,
+            } => {
+                let current = files.get_mut(file).unwrap();
+                assert_eq!(u64::try_from(current.len()).unwrap(), *pre_len);
+                current.extend_from_slice(bytes);
+            },
+            TraceEffect::Write {
+                file,
+                offset,
+                previous,
+                bytes,
+            } => {
+                let current = files.get_mut(file).unwrap();
+                let start = usize::try_from(*offset).unwrap();
+                let end = start.checked_add(bytes.len()).unwrap();
+                assert_eq!(&current[start..end], previous);
+                current[start..end].copy_from_slice(bytes);
+            },
+            TraceEffect::Truncate { file, pre_len, len } => {
+                let current = files.get_mut(file).unwrap();
+                assert_eq!(u64::try_from(current.len()).unwrap(), *pre_len);
+                current.truncate(usize::try_from(*len).unwrap());
+            },
+            TraceEffect::Barrier { .. }
+            | TraceEffect::RootPublication { .. }
+            | TraceEffect::AcknowledgedCommit { .. } => {},
+        }
+    }
+    files
 }
 
 #[tokio::test]
@@ -1627,6 +1809,12 @@ async fn native_kv_group_commit_scale_probe() {
             )
             .unwrap(),
         );
+        let specification = bootstrap::format_specification().unwrap();
+        let specification_id = engine.identify(&specification);
+        engine.persist_standalone_object(&specification).unwrap();
+        engine
+            .ensure_direct_representation_catalogue(specification_id, &[specification_id])
+            .unwrap();
         let store = Arc::new(RuntimeStore::from_engine(
             Arc::clone(&engine),
             StateOwnerResolver::new(test_directory(&alias_refs)),
