@@ -18,11 +18,11 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   recovery; and makes final-path liveness, reader/commit leases, double-ledger
   accounting, materialized export, and crash-safe replacement explicit.
   Canonical profile records and placement maps become authoritative only
-  through one root-journal state transition, preventing mixed recovery
+  through one representation-journal state transition, preventing mixed recovery
   generations.
-  Contiguous staged-file adoption covers canonical Chunk records through the
-  existing File DAG, avoiding both a second full data write and one persistent
-  slice record per chunk. Existing arena-only stores remain implicit direct
+  Same-volume staged-file adoption covers canonical Chunk records through the
+  existing File DAG, avoiding a second full data write and persistent slice
+  records per chunk. Existing arena-only stores remain implicit direct
   representations with no ObjectId or root migration. Refs #1396.
 - **Hosted filesystem name projection is deterministic and reversible.**
   Byte-exact principal content names now plan through typed target-volume

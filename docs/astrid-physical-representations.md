@@ -402,11 +402,16 @@ are exact, and leaf values re-derive their keys. The key set determines one
 shape independent of insertion order. A point update path-copies at most the
 search-key bit length. Empty maps have no root. Domain tags are profile `0`,
 representation `1`, and placement `2`.
-The domain participates in the node identity, so a profile page cannot be
-reinterpreted as a placement page. The catalogue root, map nodes, profile
-records, representation records, placement set, and state record are always
-stored as direct canonical arena frames; metadata that explains an alternate
-path never depends solely on that path.
+The node identity includes its domain, so cross-map reinterpretation fails.
+Physical metadata never enters logical `objects.arena`. Each generation's
+`metadata.arena` uses the format-one header, magic `ASTRPM1\0`, and payload:
+
+```text
+MetadataFrameV1 = kind:u8 || identity:TaggedIdentity || value_bytes:u64 || canonical_value[value_bytes]
+```
+Kinds are profile `0`, representation `1`, map node `2`, catalogue root `3`, placement `4`,
+and state `5`. Recovery round-trips values and re-derives IDs; exact duplicates collapse.
+Unequal values under one `(kind, identity)` or missing references fail. The scan index is disposable and not authoritative; frames never depend on their paths.
 
 Placement is a third authoritative map rooted by one placement set:
 
@@ -469,43 +474,37 @@ respectively, `astrid-physical-map-node-v1\0`,
 `astrid-placement-set-v1\0`, and `astrid-representation-state-v1\0`. The
 in-band specification freezes their golden vectors before activation.
 
-Representation state never enters the principal `roots.journal`. Authority is
-in `representations/CURRENT` and
-`representations/generations/<16-lowercase-hex>/state.journal`. Both use the
-format-one 52-byte checksum-bearing header with magics `ASTCUR1\0` and
-`ASTREP1\0`. `CURRENT` has one frame: `(journal_generation:u64,
+Representation state never enters principal `roots.journal`. Authority is in
+`representations/CURRENT` and each
+`generations/<16-lowercase-hex>/{metadata.arena,state.journal}`. `CURRENT` and
+the journal use the format-one header with magics `ASTCUR1\0` and `ASTREP1\0`.
+`CURRENT` has one frame: `(journal_generation:u64,
 checkpoint_digest:TaggedIdentity, max_tail_frames:u32, max_tail_bytes:u64)`.
 A journal payload is one of:
 
 ```text
 StateCasV1 = 0:u8 || journal_generation:u64 || expected:Option<RepresentationStateId> || replacement:RepresentationStateId
 CheckpointV1 = 1:u8 || journal_generation:u64
-    || active:Option<RepresentationStateId> || state_generation:u64 ||
-       prior_journal_digest:Option<TaggedIdentity>
+    || active:Option<RepresentationStateId> || state_generation:u64 || prior_journal_digest:Option<TaggedIdentity>
 ```
-Options use tag `0` for absent and `1` plus the identity for present. Other tags,
-trailing bytes, generation mismatches, or wrong file magics are invalid.
-Every frame generation equals its directory name; `CURRENT`'s digest covers
-the exact first checkpoint frame. Journal digests use derive key
-`astrid-representation-journal-bytes-v1\0`. The first generation checkpoints
-absence at generation zero with no prior digest. A CAS requires expected to
-equal active; replacement names expected as `previous` and advances by one.
-Blobs and metadata flush before the CAS frame, whose flush acknowledges it.
-Recovery validates both selected closures and never activates either alone.
-Tail limits are non-zero operator recovery budgets fixed for that generation.
-Recovery counts frames and wrapper bytes after the checkpoint; publication
-rolls over before exceeding either. A frame larger than the budget is rejected.
-`previous` authenticates ordering but is not a liveness edge. Journal
-compaction captures active state under the mutation fence and starts the next
-generation with a checkpoint digesting every preceding journal byte. It flushes,
-reopens, and verifies the journal before atomically replacing `CURRENT`. The old
-generation remains authoritative until then and is reclaimed only after lease
-drain. The audit chain retains history without extending startup replay.
+Options use tag `0` for absent and `1` plus identity; other tags, trailing bytes,
+generation mismatches, or wrong magics fail. Frame generation equals directory;
+`CURRENT` digests its first checkpoint. Journal digests use derive key
+`astrid-representation-journal-bytes-v1\0`. Generation one checkpoints absence
+at state generation zero with no prior digest. A CAS requires expected to equal
+active; replacement names it as `previous` and advances by one. Metadata and
+blobs flush before the acknowledging CAS flush. Recovery validates both roots.
+Non-zero operator tail budgets are fixed per generation; publication rolls over
+before frame or wrapper-byte count exceeds them, and rejects an oversized frame.
+`previous` authenticates ordering but is not live. Under the mutation fence,
+compaction copies the active metadata closure into a successor generation and
+checkpoints the prior journal digest. Both files flush, reopen, and verify before
+`CURRENT` changes. The old generation survives until lease drain; audit history
+does not extend startup replay.
 
-Activation installs an amended in-band RÚNATAL object specifying these files.
-After the new journal and `CURRENT` are durable it atomically changes
-`store.meta`'s existing `format-spec-object`. Old readers reject that unknown
-specification; until the change, implicit-direct mode remains authoritative.
+Activation installs an amended RÚNATAL object specifying these files. After the
+journal and `CURRENT` are durable it atomically changes `format-spec-object` in
+`store.meta`. Old readers reject it; until then, implicit-direct mode governs.
 
 The following are disposable and may be rebuilt from the catalogue,
 placement set, and self-identifying blobs:
@@ -752,12 +751,13 @@ metadata, and writes remain measured rather than called free.
 
 ## Accounting and privacy
 
-The accounting surface has five dimensions:
+The accounting surface has six dimensions:
 
 ```text
 logical ownership bytes
 resident byte-time
 CPU-time
+physical allocated bytes
 physical bytes written
 retention byte-time
 ```

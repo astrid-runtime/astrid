@@ -227,7 +227,7 @@ Required invariants:
 | STO-MOD-43 | File and ChunkTree metadata are durable before any representation state that depends on them activates |
 | STO-MOD-44 | Physical usage counts every distinct live host allocation exactly once, including replicas, metadata, disposable caches, and transient work |
 | STO-MOD-45 | Authoritative physical maps have one key-directed shape and point updates rewrite only the bounded radix path |
-| STO-MOD-46 | Representation state uses its own discriminated journal and checkpoint grammar; principal-root frames cannot be reinterpreted as representation transitions |
+| STO-MOD-46 | Physical metadata uses its own arena and representation state uses its own journal; neither can be reinterpreted as logical objects or principal-root transitions |
 | STO-MOD-47 | Logical usage remains the sum of ObjectRecord logical-byte contributions in the domain's owning closure |
 | STO-MOD-48 | An activated implicit-direct representation names its exact arena generation, offset, payload length, and frame checksum |
 
@@ -294,7 +294,7 @@ specification functions.
 | STO-PROP-50 | Every adoption crash prefix before metadata durability leaves the new representation state inactive |
 | STO-PROP-51 | Every allocator-visible creation or removal changes physical usage by that distinct extent's allocated bytes without changing logical usage |
 | STO-PROP-52 | Any insertion order yields the same physical-map root, and a point update replaces no node outside its radix path |
-| STO-PROP-53 | Representation journal, checkpoint, and CURRENT frames reject swapped magics, payload tags, generations, and trailing bytes |
+| STO-PROP-53 | Metadata-arena, representation-journal, checkpoint, and CURRENT frames reject swapped magics, payload tags, identities, generations, and trailing bytes |
 | STO-PROP-54 | Representation selection, deduplication, and replica count leave existing principal logical-usage results unchanged |
 | STO-PROP-55 | Activating an arena-only store produces authoritative direct placements for every synthesized representation without changing logical roots |
 | STO-PROP-56 | A forced collision at an occupied final BlobId path preserves the existing bytes and publishes no representation |
