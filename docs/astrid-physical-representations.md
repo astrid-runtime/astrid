@@ -94,6 +94,17 @@ RepresentationProfileV1 {
     frozen_specification: ObjectId,
 }
 
+ReconstructionBoundsV1 {
+    version: u16 = 1,
+    maximum_dependency_depth: u32,
+    maximum_dependency_fanout: u32,
+    maximum_encoded_bytes: u64,
+    maximum_output_bytes: u64,
+    maximum_fuel: u64,
+    maximum_resident_bytes: u64,
+    maximum_elapsed_micros: u64,
+}
+
 RepresentationProfileId = TaggedIdentity(
     algorithm,
     construction_version,
@@ -104,6 +115,15 @@ RepresentationProfileId = TaggedIdentity(
     )
 )
 ```
+
+Bounds encode in the field order shown, little-endian, with no padding. Every
+maximum is non-zero. Admission requires direct fanout and transitive depth to
+fit, the sum of encoded inputs to fit `maximum_encoded_bytes`, and both
+`canonical_output_bytes` and `maximum_reconstruction_bytes` to fit
+`maximum_output_bytes`. The sandbox meters fuel, peak resident bytes, and
+elapsed time and discards partial output on any breach. An operator may impose
+stricter limits by making the candidate unavailable, never by accepting a
+different result under the same profile.
 
 The profile pins the encoding grammar, decoder or generator closure,
 deterministic runtime profile, dictionaries and other immutable data,
@@ -148,8 +168,11 @@ BlobId = TaggedIdentity(
 ```
 
 Including the profile prevents the same bytes under two incompatible decoders
-from sharing a physical name. Blob admission streams the hash and encoded-byte
-comparison; it does not require a whole-buffer allocation.
+from sharing a physical name. A candidate-equal admission compares the complete
+preimage: tagged identity envelope, profile identifier, encoded length, and all
+encoded bytes. Placement retains the profile and length needed for that check.
+Any unequal field is a fatal collision, never a dedup hit. Comparison streams
+the bytes and does not require a whole-buffer allocation.
 
 A representation record has its own canonical physical grammar rather than a
 new logical `ObjectKind`. This keeps physical migration out of `ObjectId`
@@ -397,6 +420,7 @@ PlacementSetV1 {
 
 PlacementEntryV1 {
     blob: BlobId,
+    profile: RepresentationProfileId,
     encoded_length: u64,
     replicas: sorted non-empty unique ReplicaV1[],
 }
@@ -418,7 +442,9 @@ tag, then canonical locator bytes. A loose path is derived from
 `(namespace_generation, BlobId)` beneath an already-open private directory;
 host paths and guest names never enter the wire. Pack ranges must be in bounds,
 non-overlapping for distinct frames, and agree with their self-identifying
-headers. Counts and lengths are checked without trusting the disposable index.
+headers. The retained profile and length must reproduce the BlobId preimage
+used by every referring recipe. Counts and lengths are checked without trusting
+the disposable index.
 Locator tags are loose blob `0` and pack frame `1`.
 
 The catalogue and placement roots become authoritative only as one pair:
@@ -646,14 +672,15 @@ Protocol:
    flush it, and recompute its length and `BlobId`; then rename it to the final
    BlobId-derived loose path and flush that namespace. If same-volume rename is
    unavailable, copy only the logical prefix and retain the sealed original.
-5. Publish the verified representation and placement. No placement ever names
+5. Stage and flush every canonical File and ChunkTree metadata record required
+   by coverage-aware traversal.
+6. Publish the verified representation and placement. No placement ever names
    the incoming file or a file that still contains the staging trailer. Crash
    recovery uses the intent and physical length to validate and resume either
    the footer-bearing or truncated state, or quarantines an unrecognized one.
-6. Stage only canonical metadata records not recoverable from the contiguous
-   blob, then publish the principal root. The commit fence rechecks that the
-   representation remains live.
-7. Write the ordinary durable publication marker and reap the staging
+7. Publish the principal root. The commit fence rechecks the complete metadata
+   and representation closure and the active `RepresentationStateId`.
+8. Write the ordinary durable publication marker and reap the staging
    generation. A root conflict retries the catalog/root mutation without
    rereading the blob.
 
@@ -875,9 +902,12 @@ garbage collection
 | Crash during replacement | Recovery selects old or old-plus-new, never neither |
 | ENOSPC during adoption or compaction | Old bytes/root survive; engine reopens in process |
 | Blob digest collision with unequal bytes | Fatal collision; no catalogue mutation |
+| Blob digest matches but profile or length differs | Fatal collision; no deduplication |
+| Reconstruction bound is zero, malformed, or exceeded | Candidate rejected; partial output discarded |
 | Slice overflow, gap, wrong order, or wrong chunk | Representation rejected |
 | Staged-file symlink, reparse, or identity swap | Adoption rejected; bytes preserved |
 | Staged trailer remains after incoming rename | Placement stays unpublished; recovery truncates and reverifies or quarantines |
+| Crash before File/ChunkTree metadata flush | Representation state remains inactive |
 | Delta cycle or excessive chain | Candidate rejected before execution |
 | Decompression/generator expansion bomb | Bounded execution fails without publication |
 | Nondeterministic generator replay | Mismatch is an audit event; result not trusted |

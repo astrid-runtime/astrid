@@ -221,6 +221,9 @@ Required invariants:
 | STO-MOD-38 | File coverage retains File and ChunkTree metadata while treating covered Chunk leaves as outputs rather than dependencies |
 | STO-MOD-39 | Adoption excludes staging recovery trailers from BlobId, encoded length, and every published loose placement |
 | STO-MOD-40 | A representation checkpoint bounds recovery replay; prior state lineage is not a physical-liveness edge |
+| STO-MOD-41 | Reconstruction bounds have one canonical wire and bound depth, fanout, encoded input, output, fuel, resident memory, and elapsed time |
+| STO-MOD-42 | Blob collision comparison covers the identity envelope, profile, encoded length, and complete encoded bytes |
+| STO-MOD-43 | File and ChunkTree metadata are durable before any representation state that depends on them activates |
 
 Every discovered counterexample becomes a minimized checked-in trace and a Rust
 regression test.
@@ -280,6 +283,9 @@ specification functions.
 | STO-PROP-45 | Coverage traversal retains all File/ChunkTree metadata and never creates a dependency edge from a representation to its covered Chunk outputs |
 | STO-PROP-46 | Every adoption crash prefix recovers a valid sealed generation, non-authoritative incoming file, or exact raw blob without exposing trailer bytes |
 | STO-PROP-47 | Checkpoint replacement preserves the active state across every crash prefix and bounds subsequent replay to the checkpoint tail |
+| STO-PROP-48 | Non-canonical, zero, or exceeded reconstruction bounds reject the candidate without admitting partial output |
+| STO-PROP-49 | A forced BlobId digest collision with any unequal preimage field is fatal and never deduplicates |
+| STO-PROP-50 | Every adoption crash prefix before metadata durability leaves the new representation state inactive |
 
 The deliberate tiny digest model must generate collisions and assert byte
 comparison rejects them. Production collision probability is not a substitute
