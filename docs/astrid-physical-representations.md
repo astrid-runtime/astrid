@@ -191,11 +191,13 @@ DependencyV1 =
 ```
 
 They are ordered first by tag and then by canonical identity bytes. The
-dependency list is the complete set of direct reconstruction dependencies;
-recursive traversal produces the complete closure. References omitted from a
-record cannot be fetched ambiently during replay. Every representation record
-includes its profile as a `Profile` dependency, and every profile includes its
-decoder, specification, runtime, dictionary, and other direct dependencies.
+dependency list is the complete set of direct profile, recipe, and evidence
+dependencies; recursive traversal produces their complete closure. Coverage
+has the separate deterministic traversal defined below and is not duplicated
+in this array. Every representation record includes its profile as a `Profile`
+dependency, and every profile includes its decoder, specification, runtime,
+dictionary, and other direct dependencies. Nothing else may be fetched
+ambiently during replay.
 
 The canonical wire follows the existing format-one discipline:
 
@@ -225,13 +227,13 @@ overflow, and decode-then-re-encode inequality.
 the unique objects in `coverage`; repeated chunk occurrences count once.
 `maximum_reconstruction_bytes` is an admission bound for one complete replay,
 not a quota or total-store ceiling. The dependency array must equal the sorted
-direct set derived from the profile identifier, coverage, recipe, and evidence
-fields. The profile record supplies its own direct dependencies; they are
-traversed rather than repeated in every representation. Omitting or adding a
-dependency is non-canonical rather than a second representation of the same
-record. New alternate representations require evidence. Existing implicit
-arena records use the arena's ordinary admission/recovery proof and encode no
-invented evidence identifier.
+direct set derived from the profile identifier, recipe, and evidence fields.
+The profile record and coverage grammar supply their own deterministic edges;
+they are traversed rather than repeated in every representation. Omitting or
+adding an array dependency is non-canonical rather than a second representation
+of the same record. New alternate representations require evidence. Existing
+implicit arena records use the arena's ordinary admission/recovery proof and
+encode no invented evidence identifier.
 
 ### Coverage
 
@@ -266,6 +268,16 @@ its ownership edge exactly. It then validates the complete canonical tree
 shape and totals. A mismatch is rejected; readers never choose between the
 coverage copy and the File. This makes one accepted coverage encoding name one
 File DAG.
+
+Coverage traversal is output-aware. It retains the File record and every
+reachable ChunkTree record as physical metadata dependencies, validates their
+canonical shape, and stops whenever an ownership edge reaches a Chunk. That
+Chunk is a covered output, not a dependency of the representation that
+reconstructs it. For a single-chunk File the content edge therefore stops
+immediately; for an empty File there are no outputs. Ordinary owning-closure
+traversal must not be substituted here, because it would turn covered Chunk
+leaves into a self-dependency. The derived metadata set is canonical and need
+not be serialized per chunk.
 
 The File and ChunkTree metadata remain ordinary canonical records. They are
 small and are not replaced by the raw file blob. If the File ceases to be
@@ -439,8 +451,22 @@ The engine root journal compare-and-swaps the expected previous
 node, catalogue root, placement set, and state record, then appends and flushes
 one root-journal frame. A crash before that frame leaves the old pair
 authoritative; a crash after it exposes the complete new pair. Recovery replays
-the state CAS chain and validates both closures before serving reads. It never
-activates a catalogue generation or placement epoch independently.
+the state CAS tail from its last checkpoint and validates both closures before
+serving reads. It never activates a catalogue generation or placement epoch
+independently.
+
+`previous` authenticates CAS ordering but is not a liveness edge. Root-journal
+compaction captures the active state under the mutation fence and writes a new
+generation containing a canonical checkpoint
+`(version = 1, RepresentationStateId, state_generation,
+prior_journal_digest)` plus a fresh journal whose first frame binds that
+checkpoint. Both files are flushed and independently reopened before one
+atomically replaced `CURRENT` marker activates the generation; the old
+generation remains authoritative until that marker and its directory are
+durable. Recovery starts at the selected checkpoint and replays only its tail.
+After activation and lease drain, state/map records reachable only from the
+discarded journal are reclaimable. The independent audit chain retains any
+required historical transition evidence without making startup replay it.
 
 The following are disposable and may be rebuilt from the catalogue,
 placement set, and self-identifying blobs:
@@ -603,19 +629,27 @@ Preconditions:
 
 Protocol:
 
-1. Stream the sealed file once through FastCDC and the object identity
-   builders. In the same pass compute the raw-content `BlobId`, emit the small
-   File/ChunkTree records, and construct `CanonicalFileChunks` coverage.
+1. Validate the staging footer and require physical length to equal the
+   declared logical prefix plus its encoded intent and 32-byte trailer. Stream
+   exactly `logical_bytes` through FastCDC and the identity builders; the
+   footer is never hashed as content. In the same pass compute the raw-content
+   `BlobId`, emit File/ChunkTree records, and construct coverage.
 2. Recheck the sealed generation and file identity. Any mutation rejects the
    attempt without publishing a root.
-3. Write and flush an adoption intent naming the stage generation, BlobId,
-   representation record, expected principal root, and target blob path.
-4. Atomically rename the staged content file into private blob placement and
-   flush both namespace transitions. If same-volume rename is unavailable,
-   retain the original and use the ordinary copy path.
-5. Publish the verified representation and placement. A crash before this
-   point leaves an identifiable orphan blob; recovery resumes from the intent
-   or quarantines it.
+3. Write and flush an adoption intent naming the stage generation, logical and
+   physical lengths, canonical encoded staging intent and its digest, source
+   file identity, BlobId, representation record, expected principal root, and
+   target path. This record preserves the complete recovery metadata before
+   the in-file footer is lost.
+4. Atomically rename the sealed generation to a non-authoritative incoming
+   blob name and flush both namespaces. Truncate that inode to `logical_bytes`,
+   flush it, and recompute its length and `BlobId`; then rename it to the final
+   BlobId-derived loose path and flush that namespace. If same-volume rename is
+   unavailable, copy only the logical prefix and retain the sealed original.
+5. Publish the verified representation and placement. No placement ever names
+   the incoming file or a file that still contains the staging trailer. Crash
+   recovery uses the intent and physical length to validate and resume either
+   the footer-bearing or truncated state, or quarantines an unrecognized one.
 6. Stage only canonical metadata records not recoverable from the contiguous
    blob, then publish the principal root. The commit fence rechecks that the
    representation remains live.
@@ -835,12 +869,15 @@ garbage collection
 | Principal root proposed without a live representation | Commit fails closed |
 | Profile record absent or unregistered | Dependent representation is unusable |
 | File coverage field differs from the canonical File | Admission rejects the representation |
+| File coverage traversal reaches a Chunk | Record it as output and stop; never add a self-dependency |
 | Catalogue or placement root differs from the state record | Recovery fails closed; neither half activates |
+| Crash while replacing a representation checkpoint | `CURRENT` selects the complete old or complete new generation |
 | Crash during replacement | Recovery selects old or old-plus-new, never neither |
 | ENOSPC during adoption or compaction | Old bytes/root survive; engine reopens in process |
 | Blob digest collision with unequal bytes | Fatal collision; no catalogue mutation |
 | Slice overflow, gap, wrong order, or wrong chunk | Representation rejected |
 | Staged-file symlink, reparse, or identity swap | Adoption rejected; bytes preserved |
+| Staged trailer remains after incoming rename | Placement stays unpublished; recovery truncates and reverifies or quarantines |
 | Delta cycle or excessive chain | Candidate rejected before execution |
 | Decompression/generator expansion bomb | Bounded execution fails without publication |
 | Nondeterministic generator replay | Mismatch is an audit event; result not trusted |

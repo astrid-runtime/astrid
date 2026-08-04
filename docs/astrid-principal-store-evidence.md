@@ -218,6 +218,9 @@ Required invariants:
 | STO-MOD-35 | Every admitted representation profile is recoverable from the authoritative catalogue and retains its complete dependency closure |
 | STO-MOD-36 | One root-journal CAS binds each representation catalogue root to exactly one placement set; neither half activates alone |
 | STO-MOD-37 | Compact File coverage fields equal the canonical File descriptor and ownership edge exactly |
+| STO-MOD-38 | File coverage retains File and ChunkTree metadata while treating covered Chunk leaves as outputs rather than dependencies |
+| STO-MOD-39 | Adoption excludes staging recovery trailers from BlobId, encoded length, and every published loose placement |
+| STO-MOD-40 | A representation checkpoint bounds recovery replay; prior state lineage is not a physical-liveness edge |
 
 Every discovered counterexample becomes a minimized checked-in trace and a Rust
 regression test.
@@ -274,6 +277,9 @@ specification functions.
 | STO-PROP-42 | A missing, unregistered, or dependency-incomplete profile makes every dependent candidate unavailable |
 | STO-PROP-43 | Any mismatch between compact coverage fields and the named canonical File is rejected at admission |
 | STO-PROP-44 | Every crash prefix around state publication activates the complete old pair or complete new pair, never mixed catalogue and placement roots |
+| STO-PROP-45 | Coverage traversal retains all File/ChunkTree metadata and never creates a dependency edge from a representation to its covered Chunk outputs |
+| STO-PROP-46 | Every adoption crash prefix recovers a valid sealed generation, non-authoritative incoming file, or exact raw blob without exposing trailer bytes |
+| STO-PROP-47 | Checkpoint replacement preserves the active state across every crash prefix and bounds subsequent replay to the checkpoint tail |
 
 The deliberate tiny digest model must generate collisions and assert byte
 comparison rejects them. Production collision probability is not a substitute
