@@ -41,6 +41,25 @@ pub struct ToolDescriptor {
 /// sage-mcp broker) has its generated dispatch *deny* the unknown action with
 /// "unknown hook action: tool_describe". Both mean "no tools", not a failure.
 ///
+/// # Errors
+///
+/// Returns an error if the interceptor errors for any reason other than "not
+/// implemented", genuinely denies (a reason other than the unknown-action one),
+/// or returns a payload that is present but not the expected JSON shape.
+///
+/// Preserves the original signature: a pool-less run-loop capsule's *unknown*
+/// surface collapses to an empty vec here. Callers that must distinguish
+/// "unknown" from "empty" — to drive the describe fan-out (#1198) — use
+/// [`describe_loaded_capsule_status`] instead.
+pub async fn describe_loaded_capsule(capsule: &dyn Capsule) -> anyhow::Result<Vec<ToolDescriptor>> {
+    Ok(describe_loaded_capsule_status(capsule)
+        .await?
+        .unwrap_or_default())
+}
+
+/// Like [`describe_loaded_capsule`], but preserves the "surface unknown" signal
+/// the load-time capture needs.
+///
 /// Returns:
 /// - `Ok(Some(tools))` — the describe ran and returned a (possibly empty) tool
 ///   surface; the caller injects it into the `capsules_loaded` meta.
@@ -53,10 +72,8 @@ pub struct ToolDescriptor {
 ///
 /// # Errors
 ///
-/// Returns an error if the interceptor errors for any reason other than "not
-/// implemented", genuinely denies (a reason other than the unknown-action one),
-/// or returns a payload that is present but not the expected JSON shape.
-pub async fn describe_loaded_capsule(
+/// Same as [`describe_loaded_capsule`].
+pub async fn describe_loaded_capsule_status(
     capsule: &dyn Capsule,
 ) -> anyhow::Result<Option<Vec<ToolDescriptor>>> {
     interpret_describe_result(capsule.invoke_interceptor("tool_describe", &[], None).await)

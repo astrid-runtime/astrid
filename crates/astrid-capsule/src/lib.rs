@@ -51,7 +51,10 @@ pub use memory_ledger::MemoryLedger;
 // `StoreMemoryMeter` is the Wasmtime `ResourceLimiter`; native-only.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub use memory_ledger::StoreMemoryMeter;
-pub use tool_discovery::{ToolDescriptor, describe_loaded_capsule, tools_missing_execute_route};
+pub use tool_discovery::{
+    ToolDescriptor, describe_loaded_capsule, describe_loaded_capsule_status,
+    tools_missing_execute_route,
+};
 
 /// Test-only access to security boundaries that integration tests must drive
 /// through real operating-system transports.

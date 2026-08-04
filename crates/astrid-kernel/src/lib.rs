@@ -1789,7 +1789,7 @@ impl Kernel {
             // Probe the live instance for its tool surface and inject it. Best-
             // effort: a describe (or serialize) failure leaves `tools` absent
             // and the consumer falls back to its fan-out for this cycle.
-            match astrid_capsule::describe_loaded_capsule(capsule.as_ref()).await {
+            match astrid_capsule::describe_loaded_capsule_status(capsule.as_ref()).await {
                 Ok(Some(tools)) => {
                     // A tool advertises straight from its `#[astrid::tool]`
                     // annotation, but only EXECUTES if the manifest `[subscribe]`s
