@@ -225,11 +225,13 @@ overflow, and decode-then-re-encode inequality.
 the unique objects in `coverage`; repeated chunk occurrences count once.
 `maximum_reconstruction_bytes` is an admission bound for one complete replay,
 not a quota or total-store ceiling. The dependency array must equal the sorted
-set derived from the profile, coverage, recipe, and evidence fields. Omitting
-or adding a dependency is non-canonical rather than a second representation of
-the same record. New alternate representations require evidence. Existing
-implicit arena records use the arena's ordinary admission/recovery proof and
-encode no invented evidence identifier.
+direct set derived from the profile identifier, coverage, recipe, and evidence
+fields. The profile record supplies its own direct dependencies; they are
+traversed rather than repeated in every representation. Omitting or adding a
+dependency is non-canonical rather than a second representation of the same
+record. New alternate representations require evidence. Existing implicit
+arena records use the arena's ordinary admission/recovery proof and encode no
+invented evidence identifier.
 
 ### Coverage
 
@@ -388,7 +390,7 @@ PlacementEntryV1 {
 }
 
 ReplicaV1 {
-    storage_node: u32,
+    storage_node: StorageNodeId,      // canonical wire is u32
     locator: LooseBlob { namespace_generation: u64 }
            | PackFrame {
                  pack_generation: u64,
