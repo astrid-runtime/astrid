@@ -73,6 +73,7 @@ jobs:
           check_section "Summary"
           check_section "Changes"
           check_section_any "Verification" "Test Plan"
+          check_section "AI / Tool Assistance"
 
           has_traceability_exception_label() {
             printf '%s\n' "$PR_LABELS" | grep -qiE '^(no-issue|maintenance|docs-only|release|deps|dependencies)$'
@@ -140,10 +141,6 @@ jobs:
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
-          # Temporary escape hatch while maintainers allow first-time contributors
-          # to proceed without a newcomer-approved label. Set the repository
-          # variable ENFORCE_NEWCOMER_APPROVAL to "true" when maintainers want
-          # that label to block new-contributor PRs again.
           ENFORCE_NEWCOMER_APPROVAL: ${{ vars.ENFORCE_NEWCOMER_APPROVAL || 'false' }}
         run: |
           CONTRIBUTORS_FILE=".github/contributors.yml"
@@ -172,6 +169,18 @@ jobs:
 
           echo "Author: $PR_AUTHOR"
           echo "Tier: $TIER"
+
+          # Repository members and collaborators with at least read access are
+          # already inside the project's trust boundary. Fail closed if the
+          # permission lookup is unavailable.
+          COLLABORATOR_PERMISSION=$(gh api "repos/$REPO/collaborators/$PR_AUTHOR/permission" --jq '.permission' 2>/dev/null || true)
+          TRUSTED_MEMBER=false
+          case "$COLLABORATOR_PERMISSION" in
+            pull|triage|push|maintain|admin)
+              TRUSTED_MEMBER=true
+              ;;
+          esac
+          echo "Repository permission: ${COLLABORATOR_PERMISSION:-unknown}"
 
           LABELS=$(gh api "repos/$REPO/issues/$PR_NUMBER/labels" --jq '.[].name' 2>/dev/null || echo "")
 
@@ -210,7 +219,7 @@ jobs:
           done
 
           # New contributors: require approval label
-          if [ "$TIER" = "new" ]; then
+          if [ "$TIER" = "new" ] && [ "$TRUSTED_MEMBER" != "true" ]; then
             if [ "$ENFORCE_NEWCOMER_APPROVAL" = "true" ]; then
               if printf '%s\n' "$LABELS" | grep -qxF "newcomer-approved"; then
                 echo "New contributor approved by a maintainer."
@@ -219,8 +228,10 @@ jobs:
                 exit 1
               fi
             else
-              echo "::notice::New contributor approval gate is temporarily disabled."
+              echo "::notice::New contributor approval gate is disabled."
             fi
+          elif [ "$TIER" = "new" ]; then
+            echo "Repository member/collaborator - newcomer approval label not required."
           fi
 
           # Astrinauts cannot touch security or core paths
@@ -507,3 +518,31 @@ jobs:
           if [ "$PUBLIC_REPOS" -eq 0 ] && [ "$FOLLOWERS" -eq 0 ]; then
             echo "::warning::Account has no public repos and no followers. Possible spam account."
           fi
+
+  dco:
+    name: DCO sign-off
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout DCO checker
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          sparse-checkout: scripts/check_dco.py
+
+      - name: Fetch pull request commit metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh api --paginate --slurp --jq 'add' \
+            "repos/$REPO/pulls/$PR_NUMBER/commits?per_page=100" \
+            > "$RUNNER_TEMP/pr-commits.json"
+          python3 scripts/check_dco.py "$RUNNER_TEMP/pr-commits.json"

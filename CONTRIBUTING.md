@@ -58,10 +58,48 @@ also when a maintainer evaluates whether the task is a good fit for a first cont
 All PRs require at least one maintainer review. Expect feedback - this is a security project and
 review is thorough. Address all comments before requesting re-review.
 
+## Contribution Quality and AI-Assisted Submissions
+
+Astrid does not accept bulk audits, speculative findings, or drive-by issues and PRs generated
+without the contributor checking them. AI output is a drafting aid, not evidence.
+
+Before opening an issue, reproduce the problem where possible and include the affected version or
+commit, exact steps, expected and actual behavior, and supporting evidence. Before opening a PR,
+understand the complete diff, explain why the change is needed, run the relevant tests, and be
+prepared to answer review questions or narrow the scope. Maintainers may close submissions that
+do not meet this bar or temporarily restrict further submissions while a contributor establishes
+that they can participate constructively.
+
+## Developer Certificate of Origin and Tool-Assisted Contributions
+
+Every non-bot, non-merge commit must include a `Signed-off-by` trailer whose email matches
+the commit author. Add it with Git's sign-off option:
+
+```bash
+git commit -s -m "fix(scope): describe the change"
+```
+
+The sign-off is a human certification. An AI or other tool must not add it on the contributor's
+behalf. See the [Developer Certificate of Origin](https://developercertificate.org/) for the
+full terms.
+
+Astrid permits tool-assisted contributions when the human contributor remains accountable for
+the complete submission. For meaningful tool-generated content, disclose the tool or model,
+the affected areas, the nature of the assistance, and the review and validation performed in
+the PR's **AI / Tool Assistance** section. Use an attribution such as
+`Assisted-by: Codex: MODEL_VERSION` there. For longer sessions, include a concise summary of
+the prompts or instructions that materially shaped the result. Trivial autocomplete,
+formatting, and mechanical transformations are outside this disclosure requirement.
+
+Before requesting review, the contributor must understand every change, be able to explain its
+design and risks, defend the implementation, and respond meaningfully to review comments.
+Maintainers may request a walkthrough, additional tests, or a narrower change set when the
+submission is not sufficiently understood or validated.
+
 ## What We Will Not Accept
 
 - **Drive-by PRs** with no linked issue or prior discussion
-- **AI-generated bulk submissions** that lack understanding of the codebase
+- **Tool-generated bulk submissions** that the contributor cannot explain, defend, or validate
 - **Refactors** from non-maintainers. If you see something that needs refactoring, open an issue
 - **Changes to security-critical crates** without the appropriate tier
 
