@@ -542,7 +542,7 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
         run: |
-          gh api --paginate --slurp --jq 'add' \
+          gh api --paginate --slurp \
             "repos/$REPO/pulls/$PR_NUMBER/commits?per_page=100" \
             > "$RUNNER_TEMP/pr-commits.json"
           python3 scripts/check_dco.py "$RUNNER_TEMP/pr-commits.json"
