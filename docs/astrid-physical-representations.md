@@ -223,8 +223,13 @@ retains the invocation record, its complete `Owns` closure, the optional
 and each such target's complete `Owns` closure. It does not retain derived
 outputs. This rule makes replay inputs and a SnapshotBound observation live
 even though the logical invocation deliberately records them as non-owning
-evidence edges. GC and export apply this same traversal; a generic owning-only
-walk is invalid for a generated representation.
+evidence edges. Representation GC applies this traversal; a generic owning-only
+walk is invalid for generated-representation liveness. Default
+`export_closure` does not apply this traversal: it materializes only the
+principal's logical owning closure and omits physical recipes, evidence, and
+their non-owned inputs. An explicitly selected and separately authorized
+recipe/evidence export may include the replay closure; it is not the default
+full export.
 
 The canonical wire follows the existing format-one discipline:
 

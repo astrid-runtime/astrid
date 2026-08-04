@@ -67,7 +67,8 @@ SourceIdentityV1 = Unix { tag:u8 = 0, device:u64, inode:u64 }
 Unix covers Linux and macOS opened-handle `st_dev/st_ino`; Windows matches its three live u32 fields.
 Unknown tags, trailing bytes, or conversion overflow reject. `mode` is rename `0` or copy `1`.
 The final target is the canonical loose-blob path from the representation
-contract. Before that publication, both modes use exactly:
+contract. Before that publication, the canonical storage-node-root-relative
+incoming path for both modes is exactly:
 
 ```text
 representations/blobs/incoming/<namespace_generation:016x>/<BlobId>.<OwnerNameKeyId>.<stage_generation:016x>.incoming
