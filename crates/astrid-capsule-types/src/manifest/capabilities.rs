@@ -92,6 +92,45 @@ pub struct CapabilityExpansion {
 }
 
 impl CapabilitiesDef {
+    /// Merge another capability set into this one — the field-by-field UNION of
+    /// both (allowlists concatenated, flags OR-ed). Used by discovery to fold
+    /// each `[[component]].capabilities` into the root `[capabilities]` so the
+    /// security gate — which reads only the root — sees everything a component
+    /// declared.
+    ///
+    /// EXHAUSTIVE by construction: the destructuring `let` binds every field
+    /// with no `..` rest pattern, so adding a field to `CapabilitiesDef` fails
+    /// to compile here until it is handled. This is the guard against the
+    /// silent-drop bug (#1232) where a hand-enumerated merge forgot fields
+    /// (`net_connect`, `identity`, `bind_workers`, …), granting them nothing at
+    /// load time even though `astrid capsule show` displayed them.
+    pub fn merge_from(&mut self, other: &CapabilitiesDef) {
+        let CapabilitiesDef {
+            uplink,
+            net,
+            kv,
+            fs_read,
+            fs_write,
+            host_process,
+            allow_persistent,
+            net_bind,
+            net_connect,
+            identity,
+            allow_prompt_injection,
+        } = other;
+        self.uplink |= *uplink;
+        self.allow_persistent |= *allow_persistent;
+        self.allow_prompt_injection |= *allow_prompt_injection;
+        self.net.extend(net.iter().cloned());
+        self.kv.extend(kv.iter().cloned());
+        self.fs_read.extend(fs_read.iter().cloned());
+        self.fs_write.extend(fs_write.iter().cloned());
+        self.host_process.extend(host_process.iter().cloned());
+        self.net_bind.extend(net_bind.iter().cloned());
+        self.net_connect.extend(net_connect.iter().cloned());
+        self.identity.extend(identity.iter().cloned());
+    }
+
     /// Whether a serialized capability field counts as HELD: a non-empty
     /// allowlist (`Vec` → JSON array) or an enabled flag (`bool` → JSON
     /// `true`). Any other JSON shape is fail-closed (`false`) — a future
@@ -209,6 +248,58 @@ fn display_value(value: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1232 regression + exhaustiveness guard: `merge_from` unions EVERY field.
+    /// Both source structs are fully-populated literals (no `..Default`), so
+    /// adding a field to `CapabilitiesDef` fails to compile here until this test
+    /// covers it — the same forcing function `merge_from` itself relies on.
+    #[test]
+    fn merge_from_unions_every_field() {
+        let mut base = CapabilitiesDef {
+            uplink: true,
+            net: vec!["a.example".into()],
+            kv: vec!["k1".into()],
+            fs_read: vec!["/r1".into()],
+            fs_write: vec!["/w1".into()],
+            host_process: vec!["/bin/a".into()],
+            allow_persistent: true,
+            net_bind: vec!["127.0.0.1:1".into()],
+            net_connect: vec!["h1:1".into()],
+            identity: vec!["resolve".into()],
+            allow_prompt_injection: true,
+        };
+        let other = CapabilitiesDef {
+            uplink: false,
+            net: vec!["b.example".into()],
+            kv: vec!["k2".into()],
+            fs_read: vec!["/r2".into()],
+            fs_write: vec!["/w2".into()],
+            host_process: vec!["/bin/b".into()],
+            allow_persistent: false,
+            net_bind: vec!["127.0.0.1:2".into()],
+            net_connect: vec!["h2:2".into()],
+            identity: vec!["link".into()],
+            allow_prompt_injection: false,
+        };
+        base.merge_from(&other);
+
+        // Allowlists are the concatenated union of both.
+        assert_eq!(base.net, ["a.example", "b.example"].map(String::from));
+        assert_eq!(base.kv, ["k1", "k2"].map(String::from));
+        assert_eq!(base.fs_read, ["/r1", "/r2"].map(String::from));
+        assert_eq!(base.fs_write, ["/w1", "/w2"].map(String::from));
+        assert_eq!(base.host_process, ["/bin/a", "/bin/b"].map(String::from));
+        assert_eq!(
+            base.net_bind,
+            ["127.0.0.1:1", "127.0.0.1:2"].map(String::from)
+        );
+        assert_eq!(base.net_connect, ["h1:1", "h2:2"].map(String::from)); // the field #1232 dropped
+        assert_eq!(base.identity, ["resolve", "link"].map(String::from));
+        // Flags are OR-ed (a component may request a flag the root did not).
+        assert!(base.uplink);
+        assert!(base.allow_persistent);
+        assert!(base.allow_prompt_injection);
+    }
 
     /// A fully-populated set: every list non-empty, every bool true. Every
     /// name must be reported by `held_names` AND answer true to `has`.

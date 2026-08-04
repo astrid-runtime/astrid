@@ -272,14 +272,12 @@ pub fn load_manifest(path: &Path) -> CapsuleResult<CapsuleManifest> {
     // the security gate reads from there.
     for component in &manifest.components {
         if let Some(ref caps) = component.capabilities {
-            manifest.capabilities.fs_read.extend(caps.fs_read.clone());
-            manifest.capabilities.fs_write.extend(caps.fs_write.clone());
-            manifest
-                .capabilities
-                .host_process
-                .extend(caps.host_process.clone());
-            manifest.capabilities.net.extend(caps.net.clone());
-            manifest.capabilities.net_bind.extend(caps.net_bind.clone());
+            // Exhaustive field-by-field union (see `CapabilitiesDef::merge_from`).
+            // A previous hand-enumerated merge here silently dropped every field
+            // it forgot to list — net_connect, uplink, kv, identity,
+            // allow_persistent, allow_prompt_injection — so a component-only
+            // declaration granted nothing at the security gate (#1232).
+            manifest.capabilities.merge_from(caps);
         }
     }
 
@@ -404,6 +402,38 @@ mod tests {
 name = "test-capsule"
 version = "0.1.0"
 "#;
+
+    /// #1232 regression at the discovery seam: a capability declared ONLY at the
+    /// `[[component]].capabilities` level must surface in the root
+    /// `manifest.capabilities` — the struct the security gate reads. Before the
+    /// fix the hand-enumerated merge dropped `net_connect`, so a component-only
+    /// declaration granted nothing at load time.
+    #[test]
+    fn component_level_capabilities_merge_into_root() {
+        let toml = format!(
+            "{VALID_HEADER}\n\
+             [[component]]\n\
+             id = \"c\"\n\
+             file = \"c.wasm\"\n\
+             type = \"executable\"\n\
+             capabilities = {{ net_connect = [\"lm:1234\"], net_bind = [\"127.0.0.1:8788\"] }}\n"
+        );
+        let manifest = load_from_toml(&toml).expect("valid manifest with component caps");
+        assert!(
+            manifest
+                .capabilities
+                .net_connect
+                .contains(&"lm:1234".to_string()),
+            "component-level net_connect must merge into the root capabilities (#1232)"
+        );
+        assert!(
+            manifest
+                .capabilities
+                .net_bind
+                .contains(&"127.0.0.1:8788".to_string()),
+            "the union carries net_bind (merged before the fix) too"
+        );
+    }
 
     #[test]
     fn discovery_uses_only_the_injected_workspace_layout() {
