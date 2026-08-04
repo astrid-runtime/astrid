@@ -441,8 +441,13 @@ def decode_fixture(path):
         raise FormatError("representation exceeds its profile output bound")
     if record["recipe"][0] <= 4 and record["recipe"][1] != blob_id:
         raise FormatError("representation primary blob does not match fixture blob")
-    if record["recipe"][0] == 0 and len(encoded_blob) != record["canonical_output_bytes"]:
-        raise FormatError("direct blob length differs from canonical output")
+    if record["recipe"][0] == 0:
+        if len(encoded_blob) > profile["bounds"][2]:
+            raise FormatError("direct blob exceeds its profile input bound")
+        if len(encoded_blob) != record["canonical_output_bytes"]:
+            raise FormatError("direct blob length differs from canonical output")
+    if record["recipe"][0] == 2 and len(encoded_blob) != record["coverage"][3]:
+        raise FormatError("contiguous blob length differs from logical file length")
     return {
         "profile": identity_text(profile_id),
         "blob": identity_text(blob_id),

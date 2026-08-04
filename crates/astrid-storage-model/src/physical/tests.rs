@@ -724,3 +724,60 @@ fn independent_reader_rejects_a_direct_blob_length_mismatch() {
             .success()
     );
 }
+
+#[test]
+fn independent_reader_enforces_the_direct_input_bound() {
+    let tight_bounds = ReconstructionBounds::new(8, 32, 4, 64, 1_000_000, 64, 5_000_000).unwrap();
+    let profile =
+        RepresentationProfile::new_builtin(ProfileKind::DirectCanonical, tight_bounds, object(1))
+            .unwrap();
+    let profile_id = profile.identify(&Blake3PhysicalIdentity).unwrap();
+    let encoded_blob = b"longer than four bytes";
+    let blob_id = BlobId::identify(&Blake3PhysicalIdentity, profile_id, encoded_blob).unwrap();
+    let output_bytes = u64::try_from(encoded_blob.len()).unwrap();
+    let record = RepresentationRecord::new(
+        profile_id,
+        Coverage::exact(object(2), output_bytes).unwrap(),
+        Recipe::DirectCanonical { blob: blob_id },
+        output_bytes,
+        output_bytes,
+        None,
+    )
+    .unwrap();
+    assert!(
+        !run_independent_fixture(&fixture_for(&profile, encoded_blob, &record))
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn independent_reader_rejects_a_contiguous_blob_length_mismatch() {
+    let profile =
+        RepresentationProfile::new_builtin(ProfileKind::ContiguousFile, bounds(), object(1))
+            .unwrap();
+    let profile_id = profile.identify(&Blake3PhysicalIdentity).unwrap();
+    let encoded_blob = b"short file";
+    let blob_id = BlobId::identify(&Blake3PhysicalIdentity, profile_id, encoded_blob).unwrap();
+    let record = RepresentationRecord::new(
+        profile_id,
+        Coverage::canonical_file_chunks(
+            object(2),
+            Some(object(3)),
+            64,
+            1,
+            CanonicalChunkingProfile::ASTRID_V1,
+        )
+        .unwrap(),
+        Recipe::ContiguousFile { blob: blob_id },
+        64,
+        64,
+        Some(object(4)),
+    )
+    .unwrap();
+    assert!(
+        !run_independent_fixture(&fixture_for(&profile, encoded_blob, &record))
+            .status
+            .success()
+    );
+}
