@@ -222,6 +222,7 @@ ambiently during replay.
 The canonical wire follows the existing format-one discipline:
 
 - every integer is fixed-width little-endian;
+- every discriminant is one `u8` unless its field explicitly states another width;
 - every tagged identity is `u16 algorithm`, `u16 construction`, `u32 digest
   length`, then exactly that many digest bytes;
 - every byte string and sequence begins with a `u64` byte or item count;
@@ -231,8 +232,7 @@ The canonical wire follows the existing format-one discipline:
 - coverage tags are exact `0` and canonical-file-chunks `1`;
 - recipe tags are direct `0`, packed slice `1`, contiguous file `2`,
   compressed `3`, delta `4`, and generated `5`; and
-- dependency tags are logical object `0`, physical blob `1`, representation
-  `2`, profile `3`, invocation `4`, and evidence `5`.
+- dependency tags are logical object `0`, physical blob `1`, representation `2`, profile `3`, invocation `4`, and evidence `5`.
 
 Counts must equal the bytes or items consumed, reserved values are rejected,
 and there is no alignment padding. The eventual in-band specification freezes
@@ -436,9 +436,9 @@ ReplicaV1 {
 }
 ```
 
-Placement leaves are keyed by `blob`; replicas sort by node, locator tag, then bytes. Extent
-count includes every entry; durability counts distinct `StorageNodeId`s, so same-node copies
-never satisfy redundancy. Arena generation zero denotes verified `objects.arena` at activation;
+Placement has `blob_count == map entries` and `replica_extent_count == checked sum of replica-list
+lengths`; durability instead counts distinct `StorageNodeId`s, so same-node copies never satisfy
+redundancy. Replicas sort by node, locator tag, then bytes. Arena generation zero denotes verified `objects.arena` at activation;
 its locator matches the durable index tuple. Each compaction
 publishes a successor generation in the same placement CAS. A loose path derives
 from `(namespace_generation, BlobId)` below an already-open private directory;
@@ -857,15 +857,15 @@ Arena-only stores require no principal migration:
 
 1. Open verifies the existing arena and synthesizes implicit
    `DirectCanonical` candidates.
-2. Creating an explicit representation catalogue is additive. Until its
-   activation marker is durable, the arena remains the required recovery path.
+2. Creating an explicit representation catalogue is additive. Until the amended
+   `format-spec-object` marker is durable, the arena remains the required recovery path.
 3. Alternate representations may be populated without changing roots.
-4. Compaction may remove the final arena copy only after the store records a
-   minimum-reader capability that understands the representation catalogue.
-5. Downgrade after that point materializes canonical arena records from the
-   active representations before clearing the capability marker.
+4. Compaction may remove the final arena copy only after `store.meta` atomically
+   names the amended RÚNATAL `format-spec-object` that defines the catalogue.
+5. Downgrade materializes, flushes, and verifies canonical arena records before
+   atomically restoring the predecessor `format-spec-object`; only then may it reclaim representation state.
 
-The activation marker, catalogue, and placement formats are engine-local
+The format-spec marker, catalogue, and placement formats are engine-local
 recovery state. They receive the same torn-tail and byte-prefix crash testing
 as the arena. Before activation, the store's in-band RÚNATAL specification and
 independent reader must learn their byte-exact grammar and be able to enumerate

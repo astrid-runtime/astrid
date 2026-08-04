@@ -231,6 +231,7 @@ Required invariants:
 | STO-MOD-47 | Logical usage remains the sum of ObjectRecord logical-byte contributions in the domain's owning closure |
 | STO-MOD-48 | An activated implicit-direct representation names its exact arena generation, offset, payload length, and frame checksum |
 | STO-MOD-49 | Durability counts distinct storage nodes while physical accounting counts every distinct allocated replica extent |
+| STO-MOD-50 | The in-band format-spec object is the sole reader-compatibility marker authorizing legacy-arena removal or downgrade |
 
 Every discovered counterexample becomes a minimized checked-in trace and a Rust
 regression test.
@@ -300,6 +301,7 @@ specification functions.
 | STO-PROP-55 | Activating an arena-only store produces authoritative direct placements for every synthesized representation without changing logical roots |
 | STO-PROP-56 | A forced collision at an occupied final BlobId path preserves the existing bytes and publishes no representation |
 | STO-PROP-57 | Multiple same-node replicas consume physical bytes but cannot satisfy a distinct-node durability requirement |
+| STO-PROP-58 | Any enum discriminator not encoded as its assigned single-byte tag is rejected as non-canonical |
 
 The deliberate tiny digest model must generate collisions and assert byte
 comparison rejects them. Production collision probability is not a substitute
