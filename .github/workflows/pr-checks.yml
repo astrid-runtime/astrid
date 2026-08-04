@@ -49,7 +49,7 @@ jobs:
             # Extract text between this section header and the next ## header.
             # The closing header is removed by pattern (not `$d`) so a section that
             # happens to be the last one in the body keeps its final content line.
-            echo "$PR_BODY" | sed -n "/^## $1/,/^## /p" | sed '1d' | sed '/^## /d' | sed '/^<!--.*-->$/d' | sed '/^\s*$/d'
+            echo "$PR_BODY" | sed -n "\|^## $1|,\|^## |p" | sed '1d' | sed '/^## /d' | sed '/^<!--.*-->$/d' | sed '/^\s*$/d'
           }
 
           check_section() {
