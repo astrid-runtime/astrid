@@ -30,6 +30,7 @@ def _flatten_commits(payload: object) -> Iterable[Mapping[str, object]]:
 
 
 def _is_bot(commit: Mapping[str, object]) -> bool:
+    # `author.login` is GitHub's API identity field, not commit-message text.
     author = commit.get("author")
     return isinstance(author, dict) and str(author.get("login", "")).endswith("[bot]")
 

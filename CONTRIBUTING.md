@@ -83,11 +83,15 @@ The sign-off is a human certification. An AI or other tool must not add it on th
 behalf. See the [Developer Certificate of Origin](https://developercertificate.org/) for the
 full terms.
 
+For this check, a bot is an author that GitHub identifies with a login ending in `[bot]`, such as
+`dependabot[bot]`; `[bot]` is not required in a commit message. Bot-generated commits are exempt
+from the human sign-off requirement, while human-authored commits must still be signed off.
+
 Astrid permits tool-assisted contributions when the human contributor remains accountable for
 the complete submission. For meaningful tool-generated content, disclose the tool or model,
 the affected areas, the nature of the assistance, and the review and validation performed in
 the PR's **AI / Tool Assistance** section. Use an attribution such as
-`Assisted-by: Codex: MODEL_VERSION` there. For longer sessions, include a concise summary of
+`Assisted-by: TOOL_OR_AGENT: MODEL_VERSION` there. For longer sessions, include a concise summary of
 the prompts or instructions that materially shaped the result. Trivial autocomplete,
 formatting, and mechanical transformations are outside this disclosure requirement.
 
