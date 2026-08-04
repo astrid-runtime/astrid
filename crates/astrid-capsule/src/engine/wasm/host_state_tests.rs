@@ -554,6 +554,50 @@ fn recv_path_owner_gets_own_overlay_not_fallback() {
     );
 }
 
+/// #1197 / #1224 regression: a run-loop (`#[astrid::run]`) capsule's OWN context
+/// must resolve to the owner's per-principal overlays, not the neutral store.
+/// Before the fix nothing installed them before the `run` export, so KV / secrets
+/// / env / `home://` all sat at the neutral deny-all floor — background writes
+/// misrouted to the neutral store (invisible to the owner's tools, lost on reload).
+#[test]
+fn run_loop_owner_context_installs_owner_overlay_not_neutral() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let mut state = minimal_host_state(rt.handle().clone());
+    let owner = state.principal.clone();
+    assert_eq!(owner, astrid_core::PrincipalId::default());
+
+    // A freshly-loaded run loop starts at the neutral fail-closed floor.
+    assert!(state.invocation_kv.is_none());
+    assert_eq!(
+        state.effective_kv().namespace(),
+        HostState::NEUTRAL_KV_NAMESPACE
+    );
+
+    // Exactly what the `has_run` path now does before spawning the `run` task.
+    rt.block_on(state.install_run_loop_owner_context(&owner));
+
+    assert!(
+        state.invocation_kv.is_some(),
+        "run loop must get the owner's KV overlay, not the neutral store (#1197)"
+    );
+    assert_eq!(
+        state.effective_kv().namespace(),
+        format!("{owner}:capsule:{}", state.capsule_id),
+        "run loop's own writes resolve to the owner's scoped namespace"
+    );
+    assert_ne!(
+        state.effective_kv().namespace(),
+        HostState::NEUTRAL_KV_NAMESPACE,
+        "run loop must not fall through to the neutral placeholder"
+    );
+    assert!(
+        state.invocation_secret_store.is_some(),
+        "and the owner's secret store overlay (#1224)"
+    );
+}
+
 /// The KV overlay a caller receives is backed by the SHARED real backend
 /// (`kv_backend`), so writes persist to the principal's real namespace — the
 /// neutral fallback store is a SEPARATE physical store and must not be involved.
