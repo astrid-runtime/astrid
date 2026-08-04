@@ -800,6 +800,15 @@ jobs:
       - name: Verify lockfile
         run: cargo metadata --locked --no-deps > /dev/null
 
+      - name: Verify ignored rkyv advisory is unreachable
+        run: |
+          reachable="$(cargo tree --locked --workspace --all-features --target all --invert rkyv@0.7.46 2>/dev/null)"
+          if [ -n "$reachable" ]; then
+            echo "::error::RUSTSEC-2026-0235 is ignored only while rkyv 0.7.46 is absent from every build graph."
+            echo "$reachable"
+            exit 1
+          fi
+
       - name: Install cargo-audit
         run: cargo install cargo-audit --version 0.22.2 --locked
 

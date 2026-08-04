@@ -12,6 +12,15 @@ ignore = [
     # Mitigation: Astrid uses ed25519 for all auth/signing (astrid-crypto). RSA is only
     # used internally by SurrealDB for JWT in embedded mode, not exposed to network attackers.
     "RUSTSEC-2023-0071",
+
+    # rkyv 0.7 archive validation can accept conflicting Rc/Arc metadata.
+    # rust_decimal retains rkyv 0.7.46 as an optional dependency, so Cargo.lock
+    # records it through the optional SurrealDB query surface even though no
+    # Astrid feature activates it. The Security Audit job independently proves
+    # that the package is absent from the workspace's all-feature/all-target
+    # build graph. Remove this exception when rust_decimal drops or upgrades
+    # the optional edge; fail CI immediately if the edge becomes reachable.
+    "RUSTSEC-2026-0235",
 ]
 informational_warnings = []
 

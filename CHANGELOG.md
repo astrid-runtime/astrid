@@ -11,6 +11,13 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Added
 
+- **The RustSec gate now distinguishes an unreachable optional archive codec
+  from shipped code.** `rkyv 0.7.46` remains recorded only as
+  `rust_decimal`'s dormant optional dependency under the optional SurrealDB
+  query surface; no Astrid feature activates it. The advisory exception is
+  paired with an all-feature, all-target dependency-graph assertion that fails
+  CI if the vulnerable package ever becomes reachable. Closes #1448.
+
 - **Exact ObjectIds can use multiple verified physical representations without
   changing principal state.** The design contract separates profile-bound
   BlobIds, canonical representation records, and placement epochs; specifies
