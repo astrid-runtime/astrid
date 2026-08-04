@@ -381,26 +381,27 @@ every dependent final path.
 All three authoritative maps use one frozen path-copy node grammar:
 
 ```text
-PhysicalMapNodeV1 {
-    version: u16 = 1,
-    domain: profile | representation | placement,
-    level: u16,                       // zero is a leaf
-    entry_count: u16,
-    subtree_entries: u64,
-    entries: leaf[(TaggedIdentity key, u64 value_bytes, value_bytes)]
-           | branch[(TaggedIdentity maximum_key, PhysicalMapNodeId child)],
-}
+PhysicalMapNodeV1 =
+    Leaf {
+        version: u16 = 1, domain, tag: u8 = 0,
+        key: TaggedIdentity, value_bytes: u64, value,
+    }
+  | Branch {
+        version: u16 = 1, domain, tag: u8 = 1,
+        prefix_bits: u32, prefix: ceil(prefix_bits / 8) bytes,
+        zero: PhysicalMapNodeId, one: PhysicalMapNodeId,
+        subtree_entries: u64,
+    }
 ```
 
-Keys are strictly increasing unsigned canonical identity bytes. Branch ranges
-are non-overlapping, every non-final node has the frozen fill required by the
-map profile, `subtree_entries` is exact, and leaf values re-derive their keys.
-Domain tags are profile `0`, representation `1`, and placement `2`; `level`
-selects the leaf grammar at zero and the branch grammar otherwise.
-Format one packs at most 128 entries per node, fills every node except the
-rightmost node at each level, uses the shallowest possible tree, and requires
-each branch `maximum_key` to equal its child's final key. Empty maps use an
-absent root. Alternative groupings are non-canonical.
+The search key is the big-endian u32 byte length of a tagged identity followed
+by its canonical bytes. This compressed binary radix trie stores the longest
+common descendant prefix at each branch; the next bit selects `zero` or `one`.
+Unused final-byte bits are zero, unary branches are forbidden, subtree counts
+are exact, and leaf values re-derive their keys. The key set determines one
+shape independent of insertion order. A point update path-copies at most the
+search-key bit length. Empty maps have no root. Domain tags are profile `0`,
+representation `1`, and placement `2`.
 The domain participates in the node identity, so a profile page cannot be
 reinterpreted as a placement page. The catalogue root, map nodes, profile
 records, representation records, placement set, and state record are always
@@ -472,27 +473,41 @@ respectively, `astrid-physical-map-node-v1\0`,
 `astrid-placement-set-v1\0`, and `astrid-representation-state-v1\0`. The
 in-band specification freezes their golden vectors before activation.
 
-The engine root journal compare-and-swaps the expected previous
-`RepresentationStateId` to the replacement. It first flushes every blob, map
-node, catalogue root, placement set, and state record, then appends and flushes
-one root-journal frame. A crash before that frame leaves the old pair
-authoritative; a crash after it exposes the complete new pair. Recovery replays
-the state CAS tail from its last checkpoint and validates both closures before
-serving reads. It never activates a catalogue generation or placement epoch
-independently.
+Representation state never enters the principal `roots.journal`. Authority is
+in `representations/CURRENT` and
+`representations/generations/<16-lowercase-hex>/state.journal`. Both use the
+format-one 52-byte frame and checksum with eight-byte magics `ASTCUR1\0` and
+`ASTREP1\0`. `CURRENT` has one frame: `(journal_generation: u64,
+checkpoint_digest: TaggedIdentity)`. A journal payload is exactly one of:
 
-`previous` authenticates CAS ordering but is not a liveness edge. Root-journal
-compaction captures the active state under the mutation fence and writes a new
-generation containing a canonical checkpoint
-`(version = 1, RepresentationStateId, state_generation,
-prior_journal_digest)` plus a fresh journal whose first frame binds that
-checkpoint. Both files are flushed and independently reopened before one
-atomically replaced `CURRENT` marker activates the generation; the old
-generation remains authoritative until that marker and its directory are
-durable. Recovery starts at the selected checkpoint and replays only its tail.
-After activation and lease drain, state/map records reachable only from the
-discarded journal are reclaimable. The independent audit chain retains any
-required historical transition evidence without making startup replay it.
+```text
+StateCasV1 = 0:u8 || journal_generation:u64
+    || expected:Option<RepresentationStateId> || replacement:RepresentationStateId
+CheckpointV1 = 1:u8 || journal_generation:u64
+    || active:Option<RepresentationStateId> || state_generation:u64
+    || prior_journal_digest:Option<TaggedIdentity>
+```
+Options use tag `0` for absent and `1` plus the identity for present. Other tags,
+trailing bytes, generation mismatches, or wrong file magics are invalid.
+Every frame generation equals its directory name; `CURRENT`'s digest covers
+the exact first checkpoint frame. Journal digests use derive key
+`astrid-representation-journal-bytes-v1\0`. The first generation checkpoints
+absence at generation zero with no prior digest. A CAS requires expected to
+equal active; replacement names expected as `previous` and advances by one.
+Blobs and metadata flush before the CAS frame, whose flush acknowledges it.
+Recovery validates both selected closures and never activates either alone.
+`previous` authenticates ordering but is not a liveness edge. Journal
+compaction captures active state under the mutation fence and starts the next
+generation with a checkpoint digesting every preceding journal byte. It flushes,
+reopens, and verifies the journal before atomically replacing `CURRENT`. The old
+generation remains authoritative until then and is reclaimed only after lease
+drain. The audit chain retains history without extending startup replay.
+
+Activation installs an amended in-band RÚNATAL object specifying these files.
+Only after the new journal and `CURRENT` are durable does it atomically change
+`store.meta`'s existing `format-spec-object` value. Old readers reject that
+unknown specification rather than ignore new authority; until the metadata
+change, the prior specification and implicit-direct mode remain authoritative.
 
 The following are disposable and may be rebuilt from the catalogue,
 placement set, and self-identifying blobs:
@@ -610,7 +625,7 @@ General representation publication uses this order:
    nodes, placement nodes, and their candidate roots;
 6. under the representation mutation fence, recheck dependencies, limits, and
    the expected `RepresentationStateId`;
-7. append and flush one state record and root-journal CAS binding the new
+7. append and flush one state record and representation-journal CAS binding the new
    catalogue root and placement set;
 8. release temporary reservations; and
 9. retire replaced representations only after reader and transaction leases
@@ -750,10 +765,12 @@ For accounting interval `t`:
 
 ```text
 logical_charge(domain, t)
-    = sum(retained canonical bytes of each ObjectId owned by the domain at t)
+    = sum(record.logical_bytes for each distinct ObjectRecord
+          in the domain's owning closure at t)
 
 physical_pool_bytes(t)
-    = sum(unique placed blob bytes + authoritative physical metadata)
+    = sum(allocated bytes of each distinct placed replica extent)
+      + authoritative physical metadata bytes
 
 retention_byte_time(domain, [a,b])
     = integral from a to b of bytes retained solely by that domain's pins,
@@ -763,9 +780,10 @@ request_compute(principal)
     = measured CPU-time + resident byte-time used to reconstruct its request
 ```
 
-The logical sum may intentionally exceed the physical pool because sharing is
-not exposed through price. Physical totals must never be derived by summing
-principal charges.
+The logical sum is the existing identity-bearing accounting rule: structural
+chunks and metadata may contribute zero, while catalogue records charge visible
+occurrences. It may intentionally exceed the physical pool because sharing is
+not exposed through price. Physical totals never sum principal charges.
 
 Logical ownership is charged from the principal closure exactly as today,
 independent of deduplication or selected representation. Within a declared
@@ -775,11 +793,13 @@ Across domains each principal or domain is charged full logical freight. The
 difference between logical charges and physical cost is the operator's sharing
 dividend, never a guest-visible discount.
 
-Physical accounting records actual blob, representation-metadata, placement,
-staging, and compaction bytes once. Temporary replacement reserves the
-worst-case overlap. Same-volume staged adoption reclassifies the existing
-sealed bytes and does not reserve a fictional second copy; fallback copy must
-reserve both source and destination until publication completes.
+Physical accounting records every distinct replica extent and its allocated
+bytes. Loose extents key by `(node, namespace generation, BlobId)`; pack extents
+key by `(node, pack generation, offset, length)`. Two replicas of one BlobId
+count twice while aliases of one extent count once. Representation metadata,
+pack overhead, staging, and compaction allocations are counted once. Temporary
+replacement reserves worst-case overlap. Same-volume staged adoption
+reclassifies sealed bytes; fallback copy reserves both copies until publication.
 
 Reconstruction compute and resident memory are charged to the requesting
 principal/domain even when another principal made the representation warm.
@@ -891,7 +911,7 @@ garbage collection
 |---|---|
 | Crash before blob durability | Candidate discarded; old path remains |
 | Blob durable, record absent | Orphan quarantined and resumable/reclaimable |
-| Record durable, catalogue CAS absent | Record remains unselected staging |
+| Record durable, representation-state CAS absent | Record remains unselected staging |
 | Catalogue published, principal root absent | Valid unowned cache entry; root unchanged |
 | Principal root proposed without a live representation | Commit fails closed |
 | Profile record absent or unregistered | Dependent representation is unusable |
