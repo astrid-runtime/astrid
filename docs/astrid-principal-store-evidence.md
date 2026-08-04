@@ -237,6 +237,8 @@ Required invariants:
 | STO-MOD-53 | Revocation is durable signed operator policy that blocks admission and preference but never removes an existing recovery path |
 | STO-MOD-54 | Representation-aware activation persists and verifies an exact direct mapping for every non-bootstrap arena object before changing the format-spec marker |
 | STO-MOD-55 | Adoption source mutation begins only after one per-owner/name checksummed intent is durable and independently discoverable |
+| STO-MOD-56 | Every physical identity uses registered scheme 1/2/32 with its exact BLAKE3 derive-key context and canonical material |
+| STO-MOD-57 | Adoption intent keys, staging duplicates, and Unix/Windows source identities have one byte-exact encoding |
 
 Every discovered counterexample becomes a minimized checked-in trace and a Rust
 regression test.
@@ -314,6 +316,8 @@ specification functions.
 | STO-PROP-63 | Every activation crash prefix uses complete implicit arena authority or a complete explicit direct catalogue, never a partial mapping |
 | STO-PROP-64 | Adoption recovery rejects wrong intent names, checksums, staging identities, namespace generations, modes, and trailing bytes without blocking unrelated keys |
 | STO-PROP-65 | File and ChunkTree records required by contiguous coverage receive direct placements in the same state CAS as that coverage |
+| STO-PROP-66 | Hashing a context as message bytes or changing any physical identity scheme field disagrees with every registered golden vector |
+| STO-PROP-67 | Adoption rejects any outer/embedded staging mismatch, unknown source platform, altered file identity, or non-canonical key path before source mutation |
 
 The deliberate tiny digest model must generate collisions and assert byte
 comparison rejects them. Production collision probability is not a substitute

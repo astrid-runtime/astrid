@@ -61,6 +61,19 @@ grammar already required by format one. The in-memory newtypes may remain
 32-byte BLAKE3 values while the wire admits tagged 48-byte and longer
 successors.
 
+Every physical ID introduced here uses registered tuple `(algorithm=1,
+construction_version=2, digest_length=32)`, meaning BLAKE3 physical identity v1:
+
+```text
+PhysicalId(context, material) = TaggedIdentity(1, 2, 32,
+    BLAKE3_DERIVE_KEY(context, material)[0..32])
+```
+
+`context` is the exact UTF-8 derive-key string shown, including its terminal NUL;
+`material` is only the following canonical bytes. The context is never prefixed
+to message data. BLAKE3 uses DERIVE_KEY_CONTEXT then DERIVE_KEY_MATERIAL as in
+RÚNATAL. Logical `ObjectId` remains registered tuple `(1,1,32)`.
+
 `RepresentationProfileId` identifies one immutable canonical physical-profile
 record:
 
@@ -88,15 +101,7 @@ ReconstructionBoundsV1 {
     maximum_elapsed_micros: u64,
 }
 
-RepresentationProfileId = TaggedIdentity(
-    algorithm,
-    construction_version,
-    digest_length,
-    H(
-        "astrid-representation-profile-v1\0" ||
-        canonical_profile_bytes
-    )
-)
+RepresentationProfileId = PhysicalId("astrid-representation-profile-v1\0", canonical_profile_bytes)
 ```
 
 Bounds encode in the field order shown, little-endian, with no padding. Every
@@ -137,17 +142,8 @@ downgrade predecessors remain pinned direct `objects.arena` frames. Loaded befor
 copied by compaction, they have no profile-backed representation, preventing a recovery cycle.
 
 ```text
-BlobId = TaggedIdentity(
-    algorithm,
-    construction_version,
-    digest_length,
-    H(
-        "astrid-blob-identity-v1\0" ||
-        encode(RepresentationProfileId) ||
-        encoded_length_u64_le ||
-        encoded_bytes
-    )
-)
+BlobId = PhysicalId("astrid-blob-identity-v1\0",
+    encode(RepresentationProfileId) || encoded_length_u64_le || encoded_bytes)
 ```
 
 Including the profile prevents the same bytes under two incompatible decoders
@@ -173,15 +169,7 @@ RepresentationRecordV1 {
     verification_evidence: Option<ObjectId>,
 }
 
-RepresentationRecordId = TaggedIdentity(
-    algorithm,
-    construction_version,
-    digest_length,
-    H(
-        "astrid-representation-record-v1\0" ||
-        canonical_record_bytes
-    )
-)
+RepresentationRecordId = PhysicalId("astrid-representation-record-v1\0", canonical_record_bytes)
 ```
 
 Dependencies have an explicit tag and canonical tagged identity:
@@ -420,7 +408,7 @@ ReplicaV1 {
                           payload_length: u64, frame_checksum: [u8; 32] }
            | LooseBlob { namespace_generation: u64 }
            | PackFrame { pack_generation: u64, offset: u64,
-                         frame_length: u64, frame_checksum: TaggedIdentity },
+                         frame_length: u64, frame_checksum: [u8; 32] },
 }
 ```
 
@@ -450,10 +438,8 @@ starts at one. Catalogue generations and placement epochs increase by exactly
 one when their respective map changes and remain equal when that map is reused.
 
 `PhysicalMapNodeId`, `RepresentationCatalogueRootId`, `PlacementSetId`, and
-`RepresentationStateId` each use the full
-`TaggedIdentity(algorithm, construction_version, digest_length, H(domain ||
-canonical_bytes))` envelope. Their format-one derive-key strings are,
-respectively, `astrid-physical-map-node-v1\0`,
+`RepresentationStateId` use `PhysicalId(context, canonical_bytes)`. Their contexts are
+`astrid-physical-map-node-v1\0`,
 `astrid-representation-catalogue-root-v1\0`,
 `astrid-placement-set-v1\0`, and `astrid-representation-state-v1\0`. The
 in-band specification freezes their golden vectors before activation.
@@ -473,8 +459,8 @@ CheckpointV1 = 1:u8 || journal_generation:u64
 ```
 Options use tag `0` for absent and `1` plus identity; other tags, trailing bytes,
 generation mismatches, or wrong magics fail. Frame generation equals directory;
-`CURRENT` digests its first checkpoint. Journal digests use derive key
-`astrid-representation-journal-bytes-v1\0`. Generation one checkpoints absence
+`CURRENT` and prior-journal digests use `PhysicalId("astrid-representation-journal-bytes-v1\0",
+exact_journal_bytes)` over the first checkpoint or complete preceding journal. Generation one checkpoints absence
 at state generation zero with no prior digest. A CAS requires expected to equal
 active; replacement names it as `previous` and advances by one. Metadata and
 blobs flush before the acknowledging CAS flush. Recovery validates both roots.
@@ -649,9 +635,11 @@ Preconditions:
 - an operation lease pins the staged generation until root publication or
   retry completes.
 
-The durable intent lives at `representations/adoption/<OwnerNameKeyId>.intent`; the name is lowercase
-hex of the tagged ID hashing `"astrid-adoption-key-v1\0" || len(owner) || owner || len(name) || name`.
-One key lock permits one intent; an occupied unequal owner/name is a fatal collision. Its format-one frame uses magic `ASTADI1\0` and payload:
+The durable intent lives at `representations/adoption/<OwnerNameKeyId>.intent`.
+`OwnerNameKeyId = PhysicalId("astrid-adoption-key-v1\0", u64_le(owner.len) || owner ||
+u64_le(name.len) || name)`, where owner is `StateOwnerCodecV1` and name is canonical
+`ContentName` UTF-8. The filename is lowercase hex of the complete tagged identity. One key lock
+permits one intent; an occupied unequal owner/name is fatal. Its frame magic is `ASTADI1\0`:
 
 ```text
 AdoptionIntentV1 = version:u16 || owner:bytes || content_name:bytes || stage_generation:u64
@@ -660,9 +648,20 @@ AdoptionIntentV1 = version:u16 || owner:bytes || content_name:bytes || stage_gen
     || namespace_generation:u64 || mode:u8
 ```
 
-`mode` is same-volume `0` or copy `1`; source identity is platform-tagged canonical opened-handle
-data. Target and incoming names derive from namespace generation and BlobId. Creation is exclusive
-and no-follow; file and parent directory flush before mutation. Recovery verifies name, frame,
+The embedded staging intent must decode and byte-exactly re-encode as `StagingIntent` v2. Outer
+owner/name equal its canonical fields; `stage_generation` equals `sequence`, `logical_length` equals
+`logical_bytes`, and `physical_length == logical_length + staging_intent.len + 32`; mismatch rejects
+before mutation. Source identity is:
+
+```text
+SourceIdentityV1 = Unix { tag:u8 = 0, device:u64, inode:u64 }
+                 | Windows { tag:u8 = 1, volume_serial:u32, index_high:u32, index_low:u32 }
+```
+
+Unix covers Linux and macOS opened-handle `st_dev/st_ino`; Windows matches its three live u32 fields.
+Unknown tags, trailing bytes, or conversion overflow reject. `mode` is rename `0` or copy `1`.
+Target and incoming names derive from namespace generation and BlobId. Creation is exclusive and
+no-follow; file and parent directory flush before mutation. Recovery verifies name, frame,
 staging checksum, and source identity, then resumes idempotently. Roots and representation state are
 always re-read under their fences, never trusted from an intent. The intent survives until the ordinary
 publication marker; cleanup checks that marker first, removes the intent, and flushes its directory.
