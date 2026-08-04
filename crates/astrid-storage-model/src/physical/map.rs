@@ -292,6 +292,34 @@ pub struct CanonicalPhysicalMap {
     entry_count: u64,
 }
 
+/// Result of one path-copy map insertion.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PhysicalMapUpdate {
+    inserted: bool,
+    root: PhysicalMapNodeId,
+    new_nodes: Vec<(PhysicalMapNodeId, PhysicalMapNode)>,
+}
+
+impl PhysicalMapUpdate {
+    /// Return whether the key was newly inserted.
+    #[must_use]
+    pub const fn inserted(&self) -> bool {
+        self.inserted
+    }
+
+    /// Return the resulting authenticated root.
+    #[must_use]
+    pub const fn root(&self) -> PhysicalMapNodeId {
+        self.root
+    }
+
+    /// Borrow exactly the newly emitted path-copy nodes.
+    #[must_use]
+    pub fn new_nodes(&self) -> &[(PhysicalMapNodeId, PhysicalMapNode)] {
+        &self.new_nodes
+    }
+}
+
 impl CanonicalPhysicalMap {
     /// Build the unique canonical trie for a complete key/value set.
     ///
@@ -375,6 +403,26 @@ impl CanonicalPhysicalMap {
         Ok(rebuilt.entry_count)
     }
 
+    /// Recover one active map while retaining historical arena nodes.
+    ///
+    /// # Errors
+    ///
+    /// Applies the same complete canonical validation as [`Self::validate_root`].
+    pub fn recover<I: PhysicalIdentity>(
+        identity: &I,
+        domain: PhysicalMapDomain,
+        root: Option<PhysicalMapNodeId>,
+        nodes: BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
+    ) -> Result<Self, PhysicalModelError> {
+        let entry_count = Self::validate_root(identity, domain, root, &nodes)?;
+        Ok(Self {
+            domain,
+            root,
+            nodes,
+            entry_count,
+        })
+    }
+
     /// Insert one immutable entry by path-copying only the affected trie path.
     ///
     /// Historical nodes remain available for older catalogue generations. An
@@ -391,16 +439,32 @@ impl CanonicalPhysicalMap {
         key: PhysicalMapKey,
         value: Vec<u8>,
     ) -> Result<bool, PhysicalModelError> {
-        let Some(root) = self.root else {
-            let leaf = PhysicalMapNode::leaf(self.domain, key, value);
-            let root = leaf.identify(identity)?;
-            self.nodes.insert(root, leaf);
-            self.root = Some(root);
-            self.entry_count = 1;
-            return Ok(true);
+        self.insert_with_delta(identity, key, value)
+            .map(|update| update.inserted)
+    }
+
+    /// Insert one entry and return exactly the newly emitted path-copy nodes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::insert`] without changing the root
+    /// when validation fails.
+    pub fn insert_with_delta<I: PhysicalIdentity>(
+        &mut self,
+        identity: &I,
+        key: PhysicalMapKey,
+        value: Vec<u8>,
+    ) -> Result<PhysicalMapUpdate, PhysicalModelError> {
+        let mut insertion = MapInsertion {
+            identity,
+            domain: self.domain,
+            nodes: &mut self.nodes,
+            new_nodes: Vec::new(),
         };
-        let (replacement, inserted) =
-            insert_at(identity, self.domain, root, key, value, &mut self.nodes)?;
+        let (replacement, inserted) = match self.root {
+            Some(root) => insertion.insert_at(root, key, value)?,
+            None => (insertion.insert_leaf(key, value)?, true),
+        };
         if inserted {
             self.root = Some(replacement);
             self.entry_count = self
@@ -408,7 +472,11 @@ impl CanonicalPhysicalMap {
                 .checked_add(1)
                 .ok_or(PhysicalModelError::LengthOverflow)?;
         }
-        Ok(inserted)
+        Ok(PhysicalMapUpdate {
+            inserted,
+            root: replacement,
+            new_nodes: insertion.new_nodes,
+        })
     }
 
     /// Return the authenticated root, or `None` for an empty map.
@@ -466,101 +534,9 @@ impl CanonicalPhysicalMap {
     }
 }
 
-fn insert_at<I: PhysicalIdentity>(
-    identity: &I,
-    domain: PhysicalMapDomain,
-    node_id: PhysicalMapNodeId,
-    key: PhysicalMapKey,
-    value: Vec<u8>,
-    nodes: &mut BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
-) -> Result<(PhysicalMapNodeId, bool), PhysicalModelError> {
-    let node = nodes
-        .get(&node_id)
-        .cloned()
-        .ok_or(PhysicalModelError::InvalidMap("missing insertion node"))?;
-    if node.domain() != domain {
-        return Err(PhysicalModelError::InvalidMap(
-            "insertion crossed a map domain",
-        ));
-    }
-    match node {
-        PhysicalMapNode::Leaf {
-            key: existing_key,
-            value: existing_value,
-            ..
-        } => insert_at_leaf(
-            identity,
-            domain,
-            node_id,
-            &LeafParts {
-                key: existing_key,
-                value: existing_value,
-            },
-            key,
-            value,
-            nodes,
-        ),
-        PhysicalMapNode::Branch {
-            prefix_bits,
-            prefix,
-            zero,
-            one,
-            subtree_entries,
-            ..
-        } => insert_at_branch(
-            identity,
-            domain,
-            node_id,
-            BranchParts {
-                prefix_bits,
-                prefix,
-                zero,
-                one,
-                subtree_entries,
-            },
-            key,
-            value,
-            nodes,
-        ),
-    }
-}
-
 struct LeafParts {
     key: PhysicalMapKey,
     value: Vec<u8>,
-}
-
-fn insert_at_leaf<I: PhysicalIdentity>(
-    identity: &I,
-    domain: PhysicalMapDomain,
-    node_id: PhysicalMapNodeId,
-    existing: &LeafParts,
-    key: PhysicalMapKey,
-    value: Vec<u8>,
-    nodes: &mut BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
-) -> Result<(PhysicalMapNodeId, bool), PhysicalModelError> {
-    if existing.key == key {
-        if existing.value == value {
-            return Ok((node_id, false));
-        }
-        return Err(PhysicalModelError::InvalidMap(
-            "leaf key has unequal canonical bytes",
-        ));
-    }
-    let existing_search = existing.key.search_key();
-    let new_search = key.search_key();
-    let prefix_bits = common_prefix_bits(&existing_search, &new_search)?;
-    let new_leaf_id = insert_leaf(identity, domain, key, value, nodes)?;
-    let (zero, one) = ordered_children(node_id, new_leaf_id, &new_search, prefix_bits);
-    let branch = PhysicalMapNode::branch(
-        domain,
-        prefix_bits,
-        canonical_prefix(&new_search, prefix_bits)?,
-        zero,
-        one,
-        2,
-    )?;
-    insert_node(identity, branch, nodes).map(|replacement| (replacement, true))
 }
 
 struct BranchParts {
@@ -571,82 +547,183 @@ struct BranchParts {
     subtree_entries: u64,
 }
 
-fn insert_at_branch<I: PhysicalIdentity>(
-    identity: &I,
+struct MapInsertion<'a, I> {
+    identity: &'a I,
     domain: PhysicalMapDomain,
-    node_id: PhysicalMapNodeId,
-    branch: BranchParts,
-    key: PhysicalMapKey,
-    value: Vec<u8>,
-    nodes: &mut BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
-) -> Result<(PhysicalMapNodeId, bool), PhysicalModelError> {
-    let search = key.search_key();
-    let common = common_prefix_with_prefix(&search, branch.prefix_bits, &branch.prefix)?;
-    if common < branch.prefix_bits {
-        let new_leaf_id = insert_leaf(identity, domain, key, value, nodes)?;
-        if bit(&branch.prefix, common) == bit(&search, common) {
+    nodes: &'a mut BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
+    new_nodes: Vec<(PhysicalMapNodeId, PhysicalMapNode)>,
+}
+
+impl<I: PhysicalIdentity> MapInsertion<'_, I> {
+    fn insert_at(
+        &mut self,
+        node_id: PhysicalMapNodeId,
+        key: PhysicalMapKey,
+        value: Vec<u8>,
+    ) -> Result<(PhysicalMapNodeId, bool), PhysicalModelError> {
+        let node = self
+            .nodes
+            .get(&node_id)
+            .cloned()
+            .ok_or(PhysicalModelError::InvalidMap("missing insertion node"))?;
+        if node.domain() != self.domain {
+            return Err(PhysicalModelError::InvalidMap(
+                "insertion crossed a map domain",
+            ));
+        }
+        match node {
+            PhysicalMapNode::Leaf {
+                key: old,
+                value: old_value,
+                ..
+            } => self.insert_at_leaf(
+                node_id,
+                &LeafParts {
+                    key: old,
+                    value: old_value,
+                },
+                key,
+                value,
+            ),
+            PhysicalMapNode::Branch {
+                prefix_bits,
+                prefix,
+                zero,
+                one,
+                subtree_entries,
+                ..
+            } => self.insert_at_branch(
+                node_id,
+                BranchParts {
+                    prefix_bits,
+                    prefix,
+                    zero,
+                    one,
+                    subtree_entries,
+                },
+                key,
+                value,
+            ),
+        }
+    }
+
+    fn insert_at_leaf(
+        &mut self,
+        node_id: PhysicalMapNodeId,
+        existing: &LeafParts,
+        key: PhysicalMapKey,
+        value: Vec<u8>,
+    ) -> Result<(PhysicalMapNodeId, bool), PhysicalModelError> {
+        if existing.key == key {
+            if existing.value == value {
+                return Ok((node_id, false));
+            }
+            return Err(PhysicalModelError::InvalidMap(
+                "leaf key has unequal canonical bytes",
+            ));
+        }
+        let existing_search = existing.key.search_key();
+        let new_search = key.search_key();
+        let prefix_bits = common_prefix_bits(&existing_search, &new_search)?;
+        let new_leaf_id = self.insert_leaf(key, value)?;
+        let (zero, one) = ordered_children(node_id, new_leaf_id, &new_search, prefix_bits);
+        let branch = PhysicalMapNode::branch(
+            self.domain,
+            prefix_bits,
+            canonical_prefix(&new_search, prefix_bits)?,
+            zero,
+            one,
+            2,
+        )?;
+        self.insert_node(branch)
+            .map(|replacement| (replacement, true))
+    }
+
+    fn insert_at_branch(
+        &mut self,
+        node_id: PhysicalMapNodeId,
+        branch: BranchParts,
+        key: PhysicalMapKey,
+        value: Vec<u8>,
+    ) -> Result<(PhysicalMapNodeId, bool), PhysicalModelError> {
+        let search = key.search_key();
+        let common = common_prefix_with_prefix(&search, branch.prefix_bits, &branch.prefix)?;
+        if common < branch.prefix_bits {
+            return self.split_branch(node_id, &branch, key, value, &search, common);
+        }
+        let descend_one = bit(&search, branch.prefix_bits);
+        let child = if descend_one { branch.one } else { branch.zero };
+        let (child_replacement, inserted) = self.insert_at(child, key, value)?;
+        if !inserted {
+            return Ok((node_id, false));
+        }
+        let parent = PhysicalMapNode::branch(
+            self.domain,
+            branch.prefix_bits,
+            branch.prefix,
+            if descend_one {
+                branch.zero
+            } else {
+                child_replacement
+            },
+            if descend_one {
+                child_replacement
+            } else {
+                branch.one
+            },
+            increment_count(branch.subtree_entries)?,
+        )?;
+        self.insert_node(parent)
+            .map(|replacement| (replacement, true))
+    }
+
+    fn split_branch(
+        &mut self,
+        node_id: PhysicalMapNodeId,
+        branch: &BranchParts,
+        key: PhysicalMapKey,
+        value: Vec<u8>,
+        search: &[u8],
+        common: u32,
+    ) -> Result<(PhysicalMapNodeId, bool), PhysicalModelError> {
+        let new_leaf_id = self.insert_leaf(key, value)?;
+        if bit(&branch.prefix, common) == bit(search, common) {
             return Err(PhysicalModelError::InvalidMap(
                 "branch prefix split did not diverge",
             ));
         }
-        let (new_zero, new_one) = ordered_children(node_id, new_leaf_id, &search, common);
+        let (zero, one) = ordered_children(node_id, new_leaf_id, search, common);
         let parent = PhysicalMapNode::branch(
-            domain,
+            self.domain,
             common,
-            canonical_prefix(&search, common)?,
-            new_zero,
-            new_one,
+            canonical_prefix(search, common)?,
+            zero,
+            one,
             increment_count(branch.subtree_entries)?,
         )?;
-        let replacement = insert_node(identity, parent, nodes)?;
-        return Ok((replacement, true));
+        self.insert_node(parent)
+            .map(|replacement| (replacement, true))
     }
 
-    let descend_one = bit(&search, branch.prefix_bits);
-    let child = if descend_one { branch.one } else { branch.zero };
-    let (child_replacement, inserted) = insert_at(identity, domain, child, key, value, nodes)?;
-    if !inserted {
-        return Ok((node_id, false));
+    fn insert_leaf(
+        &mut self,
+        key: PhysicalMapKey,
+        value: Vec<u8>,
+    ) -> Result<PhysicalMapNodeId, PhysicalModelError> {
+        self.insert_node(PhysicalMapNode::leaf(self.domain, key, value))
     }
-    let parent = PhysicalMapNode::branch(
-        domain,
-        branch.prefix_bits,
-        branch.prefix,
-        if descend_one {
-            branch.zero
-        } else {
-            child_replacement
-        },
-        if descend_one {
-            child_replacement
-        } else {
-            branch.one
-        },
-        increment_count(branch.subtree_entries)?,
-    )?;
-    let replacement = insert_node(identity, parent, nodes)?;
-    Ok((replacement, true))
-}
 
-fn insert_leaf<I: PhysicalIdentity>(
-    identity: &I,
-    domain: PhysicalMapDomain,
-    key: PhysicalMapKey,
-    value: Vec<u8>,
-    nodes: &mut BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
-) -> Result<PhysicalMapNodeId, PhysicalModelError> {
-    let leaf = PhysicalMapNode::leaf(domain, key, value);
-    insert_node(identity, leaf, nodes)
-}
-
-fn insert_node<I: PhysicalIdentity>(
-    identity: &I,
-    node: PhysicalMapNode,
-    nodes: &mut BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
-) -> Result<PhysicalMapNodeId, PhysicalModelError> {
-    let id = node.identify(identity)?;
-    nodes.insert(id, node);
-    Ok(id)
+    fn insert_node(
+        &mut self,
+        node: PhysicalMapNode,
+    ) -> Result<PhysicalMapNodeId, PhysicalModelError> {
+        let id = node.identify(self.identity)?;
+        if !self.nodes.contains_key(&id) {
+            self.new_nodes.push((id, node.clone()));
+            self.nodes.insert(id, node);
+        }
+        Ok(id)
+    }
 }
 
 fn ordered_children(

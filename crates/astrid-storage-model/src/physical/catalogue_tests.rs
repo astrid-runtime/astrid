@@ -352,9 +352,17 @@ fn path_copy_insertion_matches_a_clean_rebuild_and_keeps_old_roots() {
     )
     .unwrap();
     let old_root = map.root().unwrap();
+    let update = map
+        .insert_with_delta(&Blake3PhysicalIdentity, key(2), vec![20])
+        .unwrap();
+    assert!(update.inserted());
+    assert_eq!(update.root(), map.root().unwrap());
+    assert!(!update.new_nodes().is_empty());
     assert!(
-        map.insert(&Blake3PhysicalIdentity, key(2), vec![20])
-            .unwrap()
+        update
+            .new_nodes()
+            .iter()
+            .all(|(id, node)| node.identify(&Blake3PhysicalIdentity).unwrap() == *id)
     );
     assert!(
         !map.insert(&Blake3PhysicalIdentity, key(2), vec![20])

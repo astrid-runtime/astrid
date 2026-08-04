@@ -20,7 +20,9 @@ pub use identity::{
     PhysicalIdentity, PhysicalMapNodeId, PlacementSetId, RepresentationCatalogueRootId,
     RepresentationProfileId, RepresentationRecordId, RepresentationStateId,
 };
-pub use map::{CanonicalPhysicalMap, PhysicalMapDomain, PhysicalMapKey, PhysicalMapNode};
+pub use map::{
+    CanonicalPhysicalMap, PhysicalMapDomain, PhysicalMapKey, PhysicalMapNode, PhysicalMapUpdate,
+};
 pub use placement::{PlacementEntry, PlacementSet, Replica, ReplicaLocator};
 pub use profile::{
     Dependency, ProfileDependency, ProfileKind, ReconstructionBounds, RepresentationProfile,
