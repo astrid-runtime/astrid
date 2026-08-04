@@ -233,6 +233,10 @@ Required invariants:
 | STO-MOD-49 | Durability counts distinct storage nodes while physical accounting counts every distinct allocated replica extent |
 | STO-MOD-50 | The in-band format-spec object is the sole reader-compatibility marker authorizing legacy-arena removal or downgrade |
 | STO-MOD-51 | Generated recovery binds canonical derivation evidence to the exact invocation, output ordinal, and covered ObjectId |
+| STO-MOD-52 | Format-spec bootstrap objects remain terminal pinned arena frames and never depend on profile-backed recovery |
+| STO-MOD-53 | Revocation is durable signed operator policy that blocks admission and preference but never removes an existing recovery path |
+| STO-MOD-54 | Representation-aware activation persists and verifies an exact direct mapping for every non-bootstrap arena object before changing the format-spec marker |
+| STO-MOD-55 | Adoption source mutation begins only after one per-owner/name checksummed intent is durable and independently discoverable |
 
 Every discovered counterexample becomes a minimized checked-in trace and a Rust
 regression test.
@@ -305,6 +309,11 @@ specification functions.
 | STO-PROP-58 | Any enum discriminator not encoded as its assigned single-byte tag is rejected as non-canonical |
 | STO-PROP-59 | Catalogue profile and representation counts equal their verified map totals, including the absent-root zero case |
 | STO-PROP-60 | Generated admission rejects unrelated evidence, invocation drift, out-of-range ordinals, and mismatched outputs |
+| STO-PROP-61 | Compaction retains current and downgrade-predecessor format specifications as direct arena frames across every crash prefix |
+| STO-PROP-62 | Restart without revocation policy blocks new transform admission while preserving reads through every admitted final path |
+| STO-PROP-63 | Every activation crash prefix uses complete implicit arena authority or a complete explicit direct catalogue, never a partial mapping |
+| STO-PROP-64 | Adoption recovery rejects wrong intent names, checksums, staging identities, namespace generations, modes, and trailing bytes without blocking unrelated keys |
+| STO-PROP-65 | File and ChunkTree records required by contiguous coverage receive direct placements in the same state CAS as that coverage |
 
 The deliberate tiny digest model must generate collisions and assert byte
 comparison rejects them. Production collision probability is not a substitute

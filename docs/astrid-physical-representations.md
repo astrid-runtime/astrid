@@ -33,43 +33,26 @@ PlacementEpoch
     Where are the BlobIds needed by the active representation set?
 ```
 
-`SemanticId` remains above this boundary. A semantic contract may establish
-that different exact objects contain the same typed value; a physical
-representation must reproduce the exact `ObjectRecord` identified by its
-`ObjectId`. Similarity changes neither identity nor recoverability.
-
-The current model's `BlobId -> ObjectId` relation is therefore a strict subset
-of the design here. It remains valid for direct one-object representations,
-but a contiguous file may efficiently cover many chunk objects and one
-logical object may depend on several physical blobs.
+`SemanticId` remains above this boundary. A semantic contract may equate typed values, but a
+physical representation reproduces the exact `ObjectRecord` named by `ObjectId`; similarity
+changes neither identity nor recoverability. The current `BlobId -> ObjectId` relation remains
+the direct-one-object subset; contiguous files may cover many chunks and objects may use many blobs.
 
 ## Binding invariants
 
-1. Every live `ObjectId` has at least one complete, durable, recoverable
-   representation at every publication and collection boundary.
-2. A representation is admitted only after the engine reconstructs the target
-   canonical record and recomputes its `ObjectId`. A supplied identity,
-   checksum, recipe, size, or cost is never trusted as the result.
-3. A digest match is candidate equality. Existing bytes are compared before a
-   second binding collapses into the first.
-4. Physical dependencies do not create principal ownership. They affect
-   representation liveness and physical accounting, not logical closure,
-   quota, export, fork, or erasure authority.
-5. A new representation is verified and durable before it is published. The
-   old final recovery path remains placed until publication is durable and all
-   readers, commits, and maintenance passes that pinned it have released it.
-6. Full export materializes canonical object records. A self-contained recipe
-   may accompany them, but RÚNATAL promises only the materialized form.
-7. Representation selection is kernel-side, bounded, and metered. Guests do
-   not choose recipes, observe dedup outcomes, or learn which representation
-   served an operation.
-8. Cache exhaustion or representation rejection never invalidates a readable
-   object. The selector tries another verified path; absence of every valid
-   path is integrity failure, not a cache miss.
-9. Reconstruction graphs are acyclic and bounded in depth, fanout, input
-   bytes, output bytes, fuel, resident memory, and wall-clock policy.
-10. No engine-local representation format changes the `ObjectId`, principal
-    root, or canonical export of existing content.
+1. Every live `ObjectId` has a complete durable representation at publication and collection.
+2. Admission reconstructs the canonical record and recomputes `ObjectId`; supplied identity,
+   checksum, recipe, size, and cost are never trusted as results.
+3. A digest match is only candidate equality; existing bytes compare before collapse.
+4. Physical dependencies affect liveness and accounting, never principal ownership, logical
+   closure, quota, export, fork, or erasure authority.
+5. New paths verify and become durable before publication. The old final path remains through
+   durability and release of every reader, commit, and maintenance lease.
+6. Full export materializes canonical records; recipes may accompany them, but RÚNATAL promises bytes.
+7. Selection is kernel-side, bounded, and metered; guests cannot choose or observe representations.
+8. Cache exhaustion or candidate rejection tries another verified path; no path is integrity failure.
+9. Reconstruction graphs bound acyclic depth, fanout, input/output bytes, fuel, memory, and time.
+10. Physical formats change no `ObjectId`, principal root, or canonical export.
 
 ## Identity constructions
 
@@ -149,6 +132,9 @@ and `runtime_semantic_profile` in `immutable_dependencies`. `Generated` requires
 `invocation.transform == decoder_or_generator`, `invocation.transform_contract == transform_contract`,
 and `invocation.runtime_semantic_profile == runtime_semantic_profile`.
 Compressed and delta recipes use the named decoder; every other field, recipe, or coverage combination is invalid even if canonically encoded.
+Bootstrap specification objects are terminal: the current `store.meta` specification and recognized
+downgrade predecessors remain pinned direct `objects.arena` frames. Loaded before selection and
+copied by compaction, they have no profile-backed representation, preventing a recovery cycle.
 
 ```text
 BlobId = TaggedIdentity(
@@ -373,8 +359,10 @@ representations:
 Each count equals its map's verified root `subtree_entries`, or zero exactly when its root is
 absent; arithmetic overflow fails. The profile map is authoritative: an identifier without its
 verified record is unusable. Profile records and dependencies stay live while referenced.
-Revocation blocks new admission and preference; existing paths remain selectable until replaced
-and their leases drain.
+Revocation is signed operator policy keyed by profile and authority epoch, not catalogue state. It
+survives restart, blocks new admission and preference, but never recovery; unavailable policy
+fails closed for new transform admission. The profile remains until every path is replaced and
+leases drain.
 
 All three authoritative maps use one frozen path-copy node grammar:
 
@@ -502,9 +490,11 @@ acknowledgement it must select new. A leftover temporary is never a candidate an
 only after valid `CURRENT` selection. The old generation survives until lease drain; audit history
 does not extend startup replay.
 
-Activation installs an amended RÚNATAL object specifying these files. After the
-journal and `CURRENT` are durable it atomically changes `format-spec-object` in
-`store.meta`. Old readers reject it; until then, implicit-direct mode governs.
+Activation first flushes amended RÚNATAL as a terminal bootstrap frame, then writes direct records
+and exact `ArenaFrame` placements for every non-bootstrap object in the recovered arena index. It
+checkpoints, reopens, and closure-validates that state under implicit-direct mode before `store.meta`
+atomically names the amended spec. A crash before the marker uses implicit arena recovery; afterward
+every indexed object has an explicit path. Old readers reject the amended spec.
 
 The following are disposable and may be rebuilt from the catalogue,
 placement set, and self-identifying blobs:
@@ -562,19 +552,14 @@ authorized ObjectId
     -> return bytes
 ```
 
-Hard constraints precede scoring: privacy domain, trust state, complete placed
-dependency closure at the required replica count, decoder availability,
-bounds, lease acquisition, and caller resource authority. A
-failed candidate is quarantined and the selector continues only when another
-complete path exists.
+Hard constraints precede scoring: privacy and trust domains, complete placed dependency closure,
+distinct-node durability, decoder availability, bounds, leases, and caller resource authority.
+A failed candidate is quarantined; selection continues only with another complete path.
 
-For a contiguous file range, the File DAG supplies chunk boundaries and
-identities. A cold read obtains complete overlapping chunks, validates slice
-bounds, reconstructs their Chunk records, and recomputes each `ObjectId`.
-Boundary-neighbor checks follow the existing content grammar. Process-local
-principal-scoped verification evidence may skip work already proven; durable
-verification state, if added, is an authenticated Evidence object bound to the
-exact File, representation record, and BlobId, never an editable sidecar bit.
+For a contiguous range, the File DAG supplies boundaries and identities. Cold reads obtain complete
+overlapping chunks, validate slices, reconstruct Chunk records, and recompute each `ObjectId`.
+Boundary-neighbor checks follow the content grammar. Process-local principal evidence may skip proven
+work; durable state must be authenticated Evidence bound to File, representation, and BlobId.
 
 The blob's whole identity is verified at adoption and by scrub. This permits
 sequential read-ahead while chunk identities retain bounded random-read
@@ -657,13 +642,31 @@ instead of copying its bytes into the object arena.
 
 Preconditions:
 
-- the staged generation is sealed, durable, and no longer writable;
-- its intent, owner, content name, generation, length, and source file identity
-  are canonical and verified;
+- the staged generation is sealed, durable, immutable, and has canonical verified intent,
+  owner, content name, generation, length, and source file identity;
 - the blob store and staging area share an atomic-rename domain, or the engine
   explicitly falls back to copy publication; and
 - an operation lease pins the staged generation until root publication or
   retry completes.
+
+The durable intent lives at `representations/adoption/<OwnerNameKeyId>.intent`; the name is lowercase
+hex of the tagged ID hashing `"astrid-adoption-key-v1\0" || len(owner) || owner || len(name) || name`.
+One key lock permits one intent; an occupied unequal owner/name is a fatal collision. Its format-one frame uses magic `ASTADI1\0` and payload:
+
+```text
+AdoptionIntentV1 = version:u16 || owner:bytes || content_name:bytes || stage_generation:u64
+    || logical_length:u64 || physical_length:u64 || staging_intent:bytes
+    || source_identity:bytes || blob:BlobId || representation:RepresentationRecordId
+    || namespace_generation:u64 || mode:u8
+```
+
+`mode` is same-volume `0` or copy `1`; source identity is platform-tagged canonical opened-handle
+data. Target and incoming names derive from namespace generation and BlobId. Creation is exclusive
+and no-follow; file and parent directory flush before mutation. Recovery verifies name, frame,
+staging checksum, and source identity, then resumes idempotently. Roots and representation state are
+always re-read under their fences, never trusted from an intent. The intent survives until the ordinary
+publication marker; cleanup checks that marker first, removes the intent, and flushes its directory.
+Malformed intent blocks only its owner/name key.
 
 Protocol:
 
@@ -674,12 +677,9 @@ Protocol:
    `BlobId`, emit File/ChunkTree records, and construct coverage.
 2. Recheck the sealed generation and file identity. Any mutation rejects the
    attempt without publishing a root.
-3. Write and flush an adoption intent naming the stage generation, logical and
-   physical lengths, canonical encoded staging intent and its digest, source
-   file identity, BlobId, representation record, expected principal root, and
-   target path. This record preserves the complete recovery metadata before
-   the in-file footer is lost.
-4. Choose the publication branch before mutating the source. On the same-volume
+3. Choose the publication mode and durably create its adoption intent before the in-file footer is
+   lost.
+4. Execute the recorded branch before mutating the source. On the same-volume
    branch, rename it to a non-authoritative incoming name, flush both namespaces,
    truncate to `logical_bytes`, flush, and recompute length and `BlobId`. On the
    fallback branch, retain the footer-bearing sealed source and copy only its
@@ -687,9 +687,9 @@ Protocol:
 5. Install the incoming file at the final BlobId path atomically with no-replace.
    If it exists, open it no-follow below the pinned directory and never mutate
    it; reuse only after complete-preimage equality, otherwise fail fatally.
-6. Stage and flush every canonical File and ChunkTree metadata record required
-   by coverage-aware traversal.
-7. Publish the verified representation and placement. No placement ever names
+6. Stage and flush every canonical File and ChunkTree metadata record required by coverage, plus
+   their direct representation records and exact arena placements in the candidate state.
+7. Publish all metadata, the verified contiguous representation, and placements in one CAS. None names
    the incoming file or a file that still contains the staging trailer. Crash
    recovery uses the intent and physical length to validate a footer-bearing
    source, copied incoming file, or truncated state; anything else quarantines.
