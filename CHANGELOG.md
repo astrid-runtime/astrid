@@ -9,6 +9,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Component-level capsule capabilities are no longer silently dropped at the discovery seam.** `[[component]].capabilities` now merges into the root manifest via an exhaustive `CapabilitiesDef::merge_from` (destructure-guarded, so a newly added field cannot be forgotten), replacing a hand-enumerated merge that dropped `net_connect`/`uplink`/`kv`/`identity`/`allow_persistent`/`allow_prompt_injection`. Closes #1232.
+
 ### Added
 
 - **Windows local transport uses authenticated per-user named pipes.** A pipe
