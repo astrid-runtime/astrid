@@ -550,7 +550,26 @@ generations use exactly 16 lowercase hex digits. Resolution walks no-follow
 directory handles below the selected root and rejects extra components,
 symlinks, aliases, and non-canonical spelling. A missing configured storage
 node or file makes that replica unavailable; it never falls back to an ambient
-host path. Pack ranges are in-bounds and non-overlapping.
+host path.
+
+Nonzero blob arenas and packs are sequences of the common 52-byte format-one
+physical frame. Arena magic is `ASTBLA1\0`; pack magic is `ASTBLP1\0`.
+Frame version, reserved bytes, checksum context/material, and torn-tail rules
+are exactly those in `astrid-principal-store-format-v1.txt` section 2. Both use:
+
+```text
+BlobFrameV1 = blob:BlobId || profile:RepresentationProfileId
+    || encoded_length:u64 || encoded_bytes[encoded_length]
+```
+
+There is no payload padding or trailing data. For `ArenaFrame`, `offset` names
+the header byte, locator `payload_length` equals the header payload length, and
+`frame_checksum` equals the header checksum. For `PackFrame`, `offset` likewise
+names the header, `frame_length == 52 + payload_length` with checked arithmetic,
+and the checksum equals the header. Payload blob, profile, and encoded length
+must equal the `PlacementEntryV1`; the encoded bytes reproduce the BlobId.
+Generation-zero arena locators instead read the existing `ASTOBJ1\0` object
+frame grammar. Pack ranges are in-bounds and non-overlapping.
 Locators agree with frame headers; profile and length reproduce the BlobId
 preimage. Counts never trust a disposable index. Tags are arena `0`, loose `1`,
 and pack `2`.
@@ -578,7 +597,7 @@ in-band specification freezes their golden vectors before activation.
 
 Representation state never enters principal `roots.journal`. Authority is in
 `representations/CURRENT` and each
-`generations/<16-lowercase-hex>/{metadata.arena,state.journal}`. `CURRENT` and
+`representations/generations/<16-lowercase-hex>/{metadata.arena,state.journal}`. `CURRENT` and
 the journal use the format-one header with magics `ASTCUR1\0` and `ASTREP1\0`.
 `CURRENT` has one frame: `(journal_generation:u64,
 checkpoint_digest:TaggedIdentity, max_tail_frames:u32, max_tail_bytes:u64)`.
