@@ -49,7 +49,10 @@ The reserved bytes are not checksum material.
 ```text
 AdoptionIntentV1 = version:u16 = 1 || owner:bytes || content_name:bytes || stage_generation:u64
     || logical_length:u64 || physical_length:u64 || staging_intent:bytes
-    || source_identity:bytes || blob:BlobId || representation:RepresentationRecordId
+    || source_identity:bytes || blob:BlobId || profile:RepresentationProfileId
+    || profile_record:bytes || representation:RepresentationRecordId
+    || representation_record:bytes || admission_evidence:ObjectId
+    || admission_evidence_record:bytes
     || namespace_generation:u64 || mode:u8
 ```
 
@@ -57,7 +60,14 @@ Every `bytes` field is prefixed by its `u64` byte length. The embedded staging
 intent must decode and byte-exactly re-encode as `StagingIntent` v2. Outer
 owner/name equal its canonical fields; `stage_generation` equals `sequence`, `logical_length` equals
 `logical_bytes`, and `physical_length == logical_length + staging_intent.len + 32`; mismatch rejects
-before mutation. Source identity is:
+before mutation. `profile_record` and `representation_record` are the complete
+canonical physical values whose derived IDs equal `profile` and
+`representation`. `admission_evidence_record` is the evidence object's complete
+canonical `ObjectRecord` encoding; server-side identity must equal
+`admission_evidence`, the representation must name that evidence, and all three
+records must satisfy the profile, coverage, and subject rules. These bytes are
+retained specifically so recovery can recreate and collision-compare the exact
+candidate after the staged source has changed shape. Source identity is:
 
 ```text
 SourceIdentityV1 = Unix { tag:u8 = 0, device:u64, inode:u64 }
@@ -103,28 +113,35 @@ checks that marker first, removes the intent, and flushes its directory.
    declared logical prefix plus its encoded intent and 32-byte trailer. Stream
    exactly `logical_bytes` through FastCDC and the identity builders; the
    footer is never hashed as content. In the same pass compute the raw-content
-   `BlobId`, emit File/ChunkTree records, and construct coverage.
+   `BlobId`, emit File/ChunkTree records, construct coverage, and derive the
+   exact profile, representation, and admission-evidence records.
 2. Recheck the sealed generation and file identity. Any mutation rejects the
    attempt without publishing a root.
-3. Choose the publication mode and durably create its adoption intent before the in-file footer is
-   lost.
-4. Execute the recorded branch before mutating the source. On the same-volume
+3. Server-identify and append every File, ChunkTree, and admission Evidence
+   `ObjectRecord` to `objects.arena`, flush it, and retain their verified arena
+   locations for direct paths in the candidate state. Orphaned frames are safe;
+   no representation state or principal root names them yet.
+4. Choose the publication mode and durably create its adoption intent before the in-file footer is
+   lost. The source may not be mutated before both this intent and step 3 are durable.
+5. Execute the recorded branch before mutating the source. On the same-volume
    branch, rename it to a non-authoritative incoming name, flush both namespaces,
    truncate to `logical_bytes`, flush, and recompute length and `BlobId`. On the
    fallback branch, retain the footer-bearing sealed source and copy only its
    logical prefix into a flushed, reverified incoming file.
-5. Install the incoming file at the final BlobId path atomically with no-replace.
+6. Install the incoming file at the final BlobId path atomically with no-replace.
    If it exists, open it no-follow below the pinned directory and never mutate
    it; reuse only after complete-preimage equality, otherwise fail fatally.
-6. Stage and flush every canonical File and ChunkTree metadata record required by coverage, plus
-   their direct representation records and exact arena placements in the candidate state.
-7. Publish all metadata, the verified contiguous representation, and placements in one CAS. None names
+7. Decode and re-derive the intent's exact physical records, then stage and
+   flush their catalogue nodes plus direct arena and final-blob placements.
+   Recovery rebuilds any lost disposable locations from the verified arena.
+8. Publish all metadata, the verified contiguous representation, and placements in one CAS. None names
    the incoming file or a file that still contains the staging trailer. Crash
-   recovery uses the intent and physical length to validate a footer-bearing
-   source, copied incoming file, or truncated state; anything else quarantines.
-8. Publish the principal root. The commit fence rechecks the complete metadata
+   recovery uses the intent's canonical records and physical length to validate
+   a footer-bearing source, copied incoming file, or truncated state; anything
+   else quarantines.
+9. Publish the principal root. The commit fence rechecks the complete metadata
    and representation closure and the active `RepresentationStateId`.
-9. Write the ordinary durable publication marker and reap the staging
+10. Write the ordinary durable publication marker and reap the staging
    generation. A root conflict retries the catalogue/root mutation without
    rereading the blob.
 

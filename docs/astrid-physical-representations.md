@@ -485,7 +485,13 @@ MetadataFrameV1 = kind:u8 || identity:TaggedIdentity || value_bytes:u64 || canon
 ```
 Kinds are profile `0`, representation `1`, map node `2`, catalogue root `3`, placement `4`,
 and state `5`. Recovery round-trips values and re-derives IDs; exact duplicates collapse.
-Unequal values under one `(kind, identity)` or missing references fail. The scan index is disposable and not authoritative; frames never depend on their paths.
+Unequal values under one `(kind, identity)` or missing material references fail.
+`RepresentationStateV1.previous` is the sole exception: it is a lineage scalar,
+not a metadata-closure edge. Recovery validates it against the journal CAS
+predecessor while replaying a generation; a checkpoint may retain only the
+active state and validates earlier lineage through `prior_journal_digest` and
+the state generation. It never resolves `previous` as a copied metadata object.
+The scan index is disposable and not authoritative; frames never depend on their paths.
 
 Placement is a third authoritative map rooted by one placement set:
 
@@ -590,7 +596,7 @@ active; replacement names it as `previous` and advances by one. Metadata and
 blobs flush before the acknowledging CAS flush. Recovery validates both roots.
 Non-zero operator tail budgets are fixed per generation; publication rolls over
 before frame or wrapper-byte count exceeds them, and rejects an oversized frame.
-`previous` authenticates ordering but is not live. Under the mutation fence,
+`previous` authenticates journal ordering but is neither live nor a metadata reference. Under the mutation fence,
 compaction copies the active metadata closure into a successor generation and
 checkpoints the prior journal digest. Both files flush, reopen, and verify before
 `CURRENT` changes. Replacement exclusively creates `CURRENT.tmp`, writes its frame, flushes and
@@ -672,15 +678,20 @@ General representation publication uses this order:
 2. create or locate candidate blobs without making them authoritative;
 3. recompute every `BlobId`, reconstruct every declared target, compare
    candidate-equal existing bytes, and produce verification evidence;
-4. flush all new blobs and their containing directories;
-5. append and flush new profile/representation records, path-copy catalogue
+4. server-identify and append every new verification Evidence `ObjectRecord`
+   and other logical dependency to `objects.arena`, flush it, and add each
+   object's direct representation and exact arena placement to the candidate
+   physical state;
+5. flush all new blobs and their containing directories;
+6. append and flush new profile/representation records, path-copy catalogue
    nodes, placement nodes, and their candidate roots;
-6. under the representation mutation fence, recheck dependencies, limits, and
+7. under the representation mutation fence, recheck that every evidence object
+   and its direct recovery path is present, plus all other dependencies, limits, and
    the expected `RepresentationStateId`;
-7. append and flush one state record and representation-journal CAS binding the new
+8. append and flush one state record and representation-journal CAS binding the new
    catalogue root and placement set;
-8. release temporary reservations; and
-9. retire replaced representations only after reader and transaction leases
+9. release temporary reservations; and
+10. retire replaced representations only after reader and transaction leases
    drain.
 
 Publishing an alternate representation before any principal references its
@@ -916,38 +927,8 @@ garbage collection
 
 ## Failure and adversarial matrix
 
-| Event or attack | Required outcome |
-|---|---|
-| Crash before blob durability | Candidate discarded; old path remains |
-| Blob durable, record absent | Orphan quarantined and resumable/reclaimable |
-| Record durable, representation-state CAS absent | Record remains unselected staging |
-| Catalogue published, principal root absent | Valid unowned cache entry; root unchanged |
-| Principal root proposed without a live representation | Commit fails closed |
-| Profile record absent or unregistered | Dependent representation is unusable |
-| File coverage field differs from the canonical File | Admission rejects the representation |
-| File coverage traversal reaches a Chunk | Record it as output and stop; never add a self-dependency |
-| Catalogue or placement root differs from the state record | Recovery fails closed; neither half activates |
-| Crash while replacing a representation checkpoint | `CURRENT` selects the complete old or complete new generation |
-| Crash during replacement | Recovery selects old or old-plus-new, never neither |
-| ENOSPC during adoption or compaction | Old bytes/root survive; engine reopens in process |
-| Blob digest collision with unequal bytes | Fatal collision; no catalogue mutation |
-| Blob digest matches but profile or length differs | Fatal collision; no deduplication |
-| Final BlobId path already exists | No-replace preserves it; exact preimage reuses it, mismatch is fatal |
-| Reconstruction bound is zero, malformed, or exceeded | Candidate rejected; partial output discarded |
-| Slice overflow, gap, wrong order, or wrong chunk | Representation rejected |
-| Staged-file symlink, reparse, or identity swap | Adoption rejected; bytes preserved |
-| Staged trailer remains after incoming rename | Placement stays unpublished; recovery truncates and reverifies or quarantines |
-| Crash before File/ChunkTree metadata flush | Representation state remains inactive |
-| Delta cycle or excessive chain | Candidate rejected before execution |
-| Decompression/generator expansion bomb | Bounded execution fails without publication |
-| Nondeterministic generator replay | Mismatch is an audit event; result not trusted |
-| Guest supplies a cheaper cost or preferred recipe | Hint ignored; kernel policy selects |
-| GC races a dedup hit | Commit lease preserves or resurrects the representation |
-| Compaction races an open reader | Old placement remains until the read lease drains |
-| One live slice retains a huge blob | Account amplification; materialize before dropping |
-| Corrupt disposable index | Rebuild or slower verified path; never false bytes |
-| Another principal already has equal content | Same logical charge and API result |
-| Final representation selected for deletion | Native liveness proof rejects the batch |
+The crash and adversarial outcomes live with the executable store obligations
+in [astrid-principal-store-evidence.md](astrid-principal-store-evidence.md#15-physical-representation-failure-matrix).
 
 ## Internal API boundary
 
@@ -984,4 +965,4 @@ surface requires a separate RFC after the interface freeze.
 
 The implementation sequence, benchmark matrix, and replacement gates live with
 the rest of the store's proof obligations in
-[astrid-principal-store-evidence.md](astrid-principal-store-evidence.md#15-physical-representation-implementation-gates).
+[astrid-principal-store-evidence.md](astrid-principal-store-evidence.md#16-physical-representation-implementation-gates).

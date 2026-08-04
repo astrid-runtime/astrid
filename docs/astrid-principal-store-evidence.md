@@ -628,7 +628,42 @@ verification. A hosted `mmap` promise requires a provider-specific immutable
 handle and tamper/degradation story. Prior whole-blob verification is not
 protection against privileged mutation of a mapped host file.
 
-## 15. Physical representation implementation gates
+## 15. Physical representation failure matrix
+
+| Event or attack | Required outcome |
+|---|---|
+| Crash before blob durability | Candidate discarded; old path remains |
+| Blob durable, record absent | Orphan quarantined and resumable/reclaimable |
+| Record durable, representation-state CAS absent | Record remains unselected staging |
+| Catalogue published, principal root absent | Valid unowned cache entry; root unchanged |
+| Principal root proposed without a live representation | Commit fails closed |
+| Profile record absent or unregistered | Dependent representation is unusable |
+| File coverage field differs from the canonical File | Admission rejects the representation |
+| File coverage traversal reaches a Chunk | Record it as output and stop; never add a self-dependency |
+| Catalogue or placement root differs from the state record | Recovery fails closed; neither half activates |
+| Crash while replacing a representation checkpoint | `CURRENT` selects the complete old or complete new generation |
+| Crash during replacement | Recovery selects old or old-plus-new, never neither |
+| ENOSPC during adoption or compaction | Old bytes/root survive; engine reopens in process |
+| Blob digest collision with unequal bytes | Fatal collision; no catalogue mutation |
+| Blob digest matches but profile or length differs | Fatal collision; no deduplication |
+| Final BlobId path already exists | No-replace preserves it; exact preimage reuses it, mismatch is fatal |
+| Reconstruction bound is zero, malformed, or exceeded | Candidate rejected; partial output discarded |
+| Slice overflow, gap, wrong order, or wrong chunk | Representation rejected |
+| Staged-file symlink, reparse, or identity swap | Adoption rejected; bytes preserved |
+| Staged trailer remains after incoming rename | Placement stays unpublished; recovery truncates and reverifies or quarantines |
+| Crash before File/ChunkTree/Evidence flush | Source is unchanged; representation state remains inactive |
+| Delta cycle or excessive chain | Candidate rejected before execution |
+| Decompression/generator expansion bomb | Bounded execution fails without publication |
+| Nondeterministic generator replay | Mismatch is an audit event; result not trusted |
+| Guest supplies a cheaper cost or preferred recipe | Hint ignored; kernel policy selects |
+| GC races a dedup hit | Commit lease preserves or resurrects the representation |
+| Compaction races an open reader | Old placement remains until the read lease drains |
+| One live slice retains a huge blob | Account amplification; materialize before dropping |
+| Corrupt disposable index | Rebuild or slower verified path; never false bytes |
+| Another principal already has equal content | Same logical charge and API result |
+| Final representation selected for deletion | Native liveness proof rejects the batch |
+
+## 16. Physical representation implementation gates
 
 Implementation follows this evidence order:
 
