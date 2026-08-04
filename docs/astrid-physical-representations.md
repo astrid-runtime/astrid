@@ -346,6 +346,9 @@ A delta names a logical base, not a preferred representation; the selector finds
 that `ObjectId`. Admission rejects cycles across representation, profile, logical-object,
 and invocation dependencies and caps total depth. Generated recipes admit only format-one's
 memoizable `Pure` and `SnapshotBound` classes; `Effectful` and `Nondeterministic` are rejected.
+Their evidence must decode canonically as `DerivationEvidence`, identify itself, and validate
+the named invocation. `output_ordinal` is zero-based and in-bounds; its evidence output must equal
+the sole `Exact` coverage ObjectId. Any mismatch makes the representation inadmissible.
 
 ## Authoritative catalogue and disposable indexes
 
@@ -367,11 +370,11 @@ representations:
     RepresentationRecordId -> RepresentationRecordV1
 ```
 
-The profile map is authoritative. An identifier without its verified profile
-record is not a usable recovery path. Profile records and all dependencies
-reachable from them remain live while any admitted representation names that
-profile. Revocation blocks new admission and preference; admitted paths remain
-selectable until all replacements publish and their leases drain.
+Each count equals its map's verified root `subtree_entries`, or zero exactly when its root is
+absent; arithmetic overflow fails. The profile map is authoritative: an identifier without its
+verified record is unusable. Profile records and dependencies stay live while referenced.
+Revocation blocks new admission and preference; existing paths remain selectable until replaced
+and their leases drain.
 
 All three authoritative maps use one frozen path-copy node grammar:
 
@@ -389,14 +392,11 @@ PhysicalMapNodeV1 =
     }
 ```
 
-The search key is the big-endian u32 byte length of a tagged identity followed
-by its canonical bytes. This compressed binary radix trie stores the longest
-common descendant prefix at each branch; the next bit selects `zero` or `one`.
-Unused final-byte bits are zero, unary branches are forbidden, subtree counts
-are exact, and leaf values re-derive their keys. The key set determines one
-shape independent of insertion order. A point update path-copies at most the
-search-key bit length. Empty maps have no root. Domain tags are profile `0`,
-representation `1`, and placement `2`.
+The search key is its big-endian u32 byte length followed by tagged-identity bytes. The trie stores
+the longest common descendant prefix; the next bit selects `zero` or `one`. Unused final bits are
+zero, unary branches are forbidden, subtree counts are exact, and leaves re-derive keys. The key
+set determines one shape regardless of insertion order. Point updates copy at most the key's bit
+length. Empty maps have no root. Domain tags are profile `0`, representation `1`, and placement `2`.
 The node identity includes its domain, so cross-map reinterpretation fails.
 Physical metadata never enters logical `objects.arena`. Each generation's
 `metadata.arena` uses the format-one header, magic `ASTRPM1\0`, and payload:
