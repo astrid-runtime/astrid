@@ -26,7 +26,7 @@ BlobId
     Which exact encoded byte string under which physical profile is this?
 
 RepresentationRecordId
-    Which verified recipe maps one or more BlobIds and dependencies back to
+    Which verified recipe maps zero or more BlobIds and dependencies back to
     exact ObjectIds?
 
 PlacementEpoch
@@ -375,8 +375,9 @@ representations:
 The profile map is authoritative. An identifier without its verified profile
 record is not a usable recovery path. Profile records and all dependencies
 reachable from them remain live while any admitted representation names that
-profile. Revocation can prevent new use, but removal requires replacement of
-every dependent final path.
+profile. Revocation blocks new admission or selection, never recovery through
+an admitted path. Recovery use and the record remain until every dependent
+final path is replaced and its leases drain.
 
 All three authoritative maps use one frozen path-copy node grammar:
 
@@ -428,35 +429,31 @@ PlacementEntryV1 {
 
 ReplicaV1 {
     storage_node: StorageNodeId,      // canonical wire is u32
-    locator: LooseBlob { namespace_generation: u64 }
-           | PackFrame {
-                 pack_generation: u64,
-                 offset: u64,
-                 frame_length: u64,
-                 frame_checksum: TaggedIdentity,
-             },
+    locator: ArenaFrame { arena_generation: u64, offset: u64,
+                          payload_length: u64, frame_checksum: [u8; 32] }
+           | LooseBlob { namespace_generation: u64 }
+           | PackFrame { pack_generation: u64, offset: u64,
+                         frame_length: u64, frame_checksum: TaggedIdentity },
 }
 ```
 
-Placement leaves are keyed by `blob`. Replicas sort by storage node, locator
-tag, then canonical locator bytes. A loose path is derived from
-`(namespace_generation, BlobId)` beneath an already-open private directory;
-host paths and guest names never enter the wire. Pack ranges must be in bounds,
-non-overlapping for distinct frames, and agree with their self-identifying
-headers. The retained profile and length must reproduce the BlobId preimage
-used by every referring recipe. Counts and lengths are checked without trusting
-the disposable index.
-Locator tags are loose blob `0` and pack frame `1`.
+Placement leaves are keyed by `blob`; replicas sort by storage node, locator
+tag, then locator bytes. Arena generation zero denotes verified `objects.arena`
+at activation; its locator matches the durable index tuple. Each compaction
+publishes a successor generation in the same placement CAS. A loose path derives
+from `(namespace_generation, BlobId)` below an already-open private directory;
+host paths never enter the wire. Pack ranges are in-bounds and non-overlapping.
+Locators agree with frame headers; profile and length reproduce the BlobId
+preimage. Counts never trust a disposable index. Tags are arena `0`, loose `1`,
+and pack `2`.
 
 The catalogue and placement roots become authoritative only as one pair:
 
 ```text
 RepresentationStateV1 {
     version: u16 = 1,
-    generation: u64,
-    previous: Option<RepresentationStateId>,
-    catalogue: RepresentationCatalogueRootId,
-    placements: PlacementSetId,
+    generation: u64, previous: Option<RepresentationStateId>,
+    catalogue: RepresentationCatalogueRootId, placements: PlacementSetId,
 }
 ```
 
@@ -477,15 +474,15 @@ Representation state never enters the principal `roots.journal`. Authority is
 in `representations/CURRENT` and
 `representations/generations/<16-lowercase-hex>/state.journal`. Both use the
 format-one 52-byte frame and checksum with eight-byte magics `ASTCUR1\0` and
-`ASTREP1\0`. `CURRENT` has one frame: `(journal_generation: u64,
-checkpoint_digest: TaggedIdentity)`. A journal payload is exactly one of:
+`ASTREP1\0`. `CURRENT` has one frame: `(journal_generation:u64,
+checkpoint_digest:TaggedIdentity, max_tail_frames:u32, max_tail_bytes:u64)`.
+A journal payload is one of:
 
 ```text
-StateCasV1 = 0:u8 || journal_generation:u64
-    || expected:Option<RepresentationStateId> || replacement:RepresentationStateId
+StateCasV1 = 0:u8 || journal_generation:u64 || expected:Option<RepresentationStateId> || replacement:RepresentationStateId
 CheckpointV1 = 1:u8 || journal_generation:u64
-    || active:Option<RepresentationStateId> || state_generation:u64
-    || prior_journal_digest:Option<TaggedIdentity>
+    || active:Option<RepresentationStateId> || state_generation:u64 ||
+       prior_journal_digest:Option<TaggedIdentity>
 ```
 Options use tag `0` for absent and `1` plus the identity for present. Other tags,
 trailing bytes, generation mismatches, or wrong file magics are invalid.
@@ -496,6 +493,9 @@ absence at generation zero with no prior digest. A CAS requires expected to
 equal active; replacement names expected as `previous` and advances by one.
 Blobs and metadata flush before the CAS frame, whose flush acknowledges it.
 Recovery validates both selected closures and never activates either alone.
+Tail limits are non-zero operator recovery budgets. Recovery counts frames and
+wrapper bytes after the checkpoint; publication rolls over before exceeding
+either. A frame larger than the byte budget is rejected.
 `previous` authenticates ordering but is not a liveness edge. Journal
 compaction captures active state under the mutation fence and starts the next
 generation with a checkpoint digesting every preceding journal byte. It flushes,
@@ -504,10 +504,9 @@ generation remains authoritative until then and is reclaimed only after lease
 drain. The audit chain retains history without extending startup replay.
 
 Activation installs an amended in-band RÚNATAL object specifying these files.
-Only after the new journal and `CURRENT` are durable does it atomically change
-`store.meta`'s existing `format-spec-object` value. Old readers reject that
-unknown specification rather than ignore new authority; until the metadata
-change, the prior specification and implicit-direct mode remain authoritative.
+After the new journal and `CURRENT` are durable it atomically changes
+`store.meta`'s existing `format-spec-object`. Old readers reject that unknown
+specification; until the change, implicit-direct mode remains authoritative.
 
 The following are disposable and may be rebuilt from the catalogue,
 placement set, and self-identifying blobs:
@@ -684,9 +683,11 @@ Protocol:
    the in-file footer is lost.
 4. Atomically rename the sealed generation to a non-authoritative incoming
    blob name and flush both namespaces. Truncate that inode to `logical_bytes`,
-   flush it, and recompute its length and `BlobId`; then rename it to the final
-   BlobId-derived loose path and flush that namespace. If same-volume rename is
-   unavailable, copy only the logical prefix and retain the sealed original.
+   flush it, and recompute its length and `BlobId`; then install it at the final
+   BlobId path with atomic no-replace semantics. If it exists, never mutate it:
+   verify its complete BlobId preimage and reuse only an exact match; inequality
+   is fatal. Without no-replace rename, exclusive-create and flush the final
+   copy while retaining the sealed original; it stays non-authoritative.
 5. Stage and flush every canonical File and ChunkTree metadata record required
    by coverage-aware traversal.
 6. Publish the verified representation and placement. No placement ever names
@@ -769,8 +770,7 @@ logical_charge(domain, t)
           in the domain's owning closure at t)
 
 physical_pool_bytes(t)
-    = sum(allocated bytes of each distinct placed replica extent)
-      + metadata, staging, and compaction bytes not already in those extents
+    = sum(allocator-reported bytes for every distinct live host extent at t)
 
 retention_byte_time(domain, [a,b])
     = integral from a to b of bytes retained solely by that domain's pins,
@@ -793,13 +793,12 @@ Across domains each principal or domain is charged full logical freight. The
 difference between logical charges and physical cost is the operator's sharing
 dividend, never a guest-visible discount.
 
-Physical accounting records every distinct replica extent and its allocated
-bytes. Loose extents key by `(node, namespace generation, BlobId)`; pack extents
-key by `(node, pack generation, offset, length)`. Two replicas of one BlobId
-count twice while aliases of one extent count once. Representation metadata,
-pack overhead, staging, and compaction allocations are counted once. Temporary
-replacement reserves worst-case overlap. Same-volume staged adoption
-reclassifies sealed bytes; fallback copy reserves both copies until publication.
+The operator ledger includes replicas, arena/journal metadata, pack slack,
+disposable indexes/caches, staging, compaction, and temporary files. Loose
+extents key by `(node, namespace generation, BlobId)`; pack extents key by
+`(node, pack generation, offset, length)`. Replicas count separately; aliases
+do not. Shared backing allocations charge at their container. Replacement
+reserves overlap; same-volume adoption reclassifies sealed bytes.
 
 Reconstruction compute and resident memory are charged to the requesting
 principal/domain even when another principal made the representation warm.
@@ -923,6 +922,7 @@ garbage collection
 | ENOSPC during adoption or compaction | Old bytes/root survive; engine reopens in process |
 | Blob digest collision with unequal bytes | Fatal collision; no catalogue mutation |
 | Blob digest matches but profile or length differs | Fatal collision; no deduplication |
+| Final BlobId path already exists | No-replace preserves it; exact preimage reuses it, mismatch is fatal |
 | Reconstruction bound is zero, malformed, or exceeded | Candidate rejected; partial output discarded |
 | Slice overflow, gap, wrong order, or wrong chunk | Representation rejected |
 | Staged-file symlink, reparse, or identity swap | Adoption rejected; bytes preserved |

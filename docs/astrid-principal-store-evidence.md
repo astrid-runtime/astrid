@@ -215,19 +215,20 @@ Required invariants:
 | STO-MOD-32 | Representation replacement publishes and verifies a new path before the old final path becomes reclaimable |
 | STO-MOD-33 | A reverse-index miss cannot establish representation absence; only the authoritative catalogue can |
 | STO-MOD-34 | Root commits and open read handles pin their chosen representation through publication or handle release |
-| STO-MOD-35 | Every admitted representation profile is recoverable from the authoritative catalogue and retains its complete dependency closure |
+| STO-MOD-35 | Every admitted profile remains recovery-usable with its complete dependency closure until all dependent final paths are replaced |
 | STO-MOD-36 | One representation-journal CAS binds each representation catalogue root to exactly one placement set; neither half activates alone |
 | STO-MOD-37 | Compact File coverage fields equal the canonical File descriptor and ownership edge exactly |
 | STO-MOD-38 | File coverage retains File and ChunkTree metadata while treating covered Chunk leaves as outputs rather than dependencies |
-| STO-MOD-39 | Adoption excludes staging recovery trailers from BlobId, encoded length, and every published loose placement |
-| STO-MOD-40 | A representation checkpoint bounds recovery replay; prior state lineage is not a physical-liveness edge |
+| STO-MOD-39 | Adoption excludes staging trailers and never overwrites an existing final BlobId path |
+| STO-MOD-40 | Configured checkpoint tail limits bound recovery replay; prior state lineage is not a physical-liveness edge |
 | STO-MOD-41 | Reconstruction bounds have one canonical wire and bound depth, fanout, encoded input, output, fuel, resident memory, and elapsed time |
 | STO-MOD-42 | Blob collision comparison covers the identity envelope, profile, encoded length, and complete encoded bytes |
 | STO-MOD-43 | File and ChunkTree metadata are durable before any representation state that depends on them activates |
-| STO-MOD-44 | Physical usage counts each distinct allocated replica extent, including multiple replicas of one BlobId, exactly once |
+| STO-MOD-44 | Physical usage counts every distinct live host allocation exactly once, including replicas, metadata, disposable caches, and transient work |
 | STO-MOD-45 | Authoritative physical maps have one key-directed shape and point updates rewrite only the bounded radix path |
 | STO-MOD-46 | Representation state uses its own discriminated journal and checkpoint grammar; principal-root frames cannot be reinterpreted as representation transitions |
 | STO-MOD-47 | Logical usage remains the sum of ObjectRecord logical-byte contributions in the domain's owning closure |
+| STO-MOD-48 | An activated implicit-direct representation names its exact arena generation, offset, payload length, and frame checksum |
 
 Every discovered counterexample becomes a minimized checked-in trace and a Rust
 regression test.
@@ -285,15 +286,17 @@ specification functions.
 | STO-PROP-43 | Any mismatch between compact coverage fields and the named canonical File is rejected at admission |
 | STO-PROP-44 | Every crash prefix around state publication activates the complete old pair or complete new pair, never mixed catalogue and placement roots |
 | STO-PROP-45 | Coverage traversal retains all File/ChunkTree metadata and never creates a dependency edge from a representation to its covered Chunk outputs |
-| STO-PROP-46 | Every adoption crash prefix recovers a valid sealed generation, non-authoritative incoming file, or exact raw blob without exposing trailer bytes |
-| STO-PROP-47 | Checkpoint replacement preserves the active state across every crash prefix and bounds subsequent replay to the checkpoint tail |
+| STO-PROP-46 | Every adoption crash prefix recovers a sealed generation, non-authoritative incoming file, exact raw blob, or verified pre-existing blob without overwriting live bytes |
+| STO-PROP-47 | Checkpoint replacement preserves active state across every crash prefix, and append rolls over before either configured tail bound is exceeded |
 | STO-PROP-48 | Non-canonical, zero, or exceeded reconstruction bounds reject the candidate without admitting partial output |
 | STO-PROP-49 | A forced BlobId digest collision with any unequal preimage field is fatal and never deduplicates |
 | STO-PROP-50 | Every adoption crash prefix before metadata durability leaves the new representation state inactive |
-| STO-PROP-51 | Adding or removing a replica changes physical usage by that extent's allocated bytes without changing logical usage |
+| STO-PROP-51 | Every allocator-visible creation or removal changes physical usage by that distinct extent's allocated bytes without changing logical usage |
 | STO-PROP-52 | Any insertion order yields the same physical-map root, and a point update replaces no node outside its radix path |
 | STO-PROP-53 | Representation journal, checkpoint, and CURRENT frames reject swapped magics, payload tags, generations, and trailing bytes |
 | STO-PROP-54 | Representation selection, deduplication, and replica count leave existing principal logical-usage results unchanged |
+| STO-PROP-55 | Activating an arena-only store produces authoritative direct placements for every synthesized representation without changing logical roots |
+| STO-PROP-56 | A forced collision at an occupied final BlobId path preserves the existing bytes and publishes no representation |
 
 The deliberate tiny digest model must generate collisions and assert byte
 comparison rejects them. Production collision probability is not a substitute
