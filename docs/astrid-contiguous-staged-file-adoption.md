@@ -53,7 +53,7 @@ AdoptionIntentV1 = version:u16 = 1 || owner:bytes || content_name:bytes || stage
     || profile_record:bytes || representation:RepresentationRecordId
     || representation_record:bytes || admission_evidence:ObjectId
     || admission_evidence_record:bytes
-    || namespace_generation:u64 || mode:u8
+    || storage_node:u32 || namespace_generation:u64 || mode:u8
 ```
 
 Every `bytes` field is prefixed by its `u64` byte length. The embedded staging
@@ -92,7 +92,10 @@ byte-exact same intent and one of its specified recovery states; an unequal
 intent is a fatal collision. A partial copy for the same intent restarts from
 the retained sealed source. The rename branch resumes only after source
 identity, physical length, and permitted footer/truncated state validate; it is
-never overwritten from another operation.
+never overwritten from another operation. `storage_node` selects the exact
+signed operator-configured root for both incoming and final paths. Recovery
+never scans other storage roots; a missing mapping makes the operation
+unavailable until operator configuration is restored.
 
 Publication exclusively creates `<OwnerNameKeyId>.intent.tmp` no-follow,
 writes the complete frame, flushes it, reopens and verifies it byte-for-byte,

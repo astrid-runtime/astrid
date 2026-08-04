@@ -204,9 +204,10 @@ dependency list is the complete set of direct profile, recipe, and evidence
 dependencies; recursive traversal produces their complete closure. Coverage
 has the separate deterministic traversal defined below and is not duplicated
 in this array. Every representation record includes its profile as a `Profile`
-dependency, and every profile includes its decoder, specification, runtime,
-dictionary, and other direct dependencies. Nothing else may be fetched
-ambiently during replay.
+dependency. Profile traversal follows exactly its validated
+`immutable_dependencies`: a built-in profile retains only its frozen
+specification, while a transform profile retains the role-typed set derived
+above. Nothing else may be fetched ambiently during replay.
 
 The record array is exactly the sorted unique union of `Profile(profile)` and
 these recipe-derived entries: direct, packed, and contiguous add
@@ -318,8 +319,9 @@ not be serialized per chunk.
 The File and ChunkTree metadata remain ordinary canonical records. They are
 small and are not replaced by the raw file blob. If the File ceases to be
 logically live while one of its chunks remains live elsewhere, representation
-GC may retain the metadata as a physical dependency, retain the whole blob, or
-materialize the surviving chunks before dropping the file-wide representation.
+GC must either retain the complete canonical File and ChunkTree metadata
+together with the whole blob, or materialize every surviving chunk before
+dropping the file-wide representation and its metadata.
 Physical retention does not revive the dead File in a principal closure.
 
 New coverage grammars require new tags. A decoder must never reinterpret an
