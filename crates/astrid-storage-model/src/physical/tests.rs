@@ -117,8 +117,8 @@ const PROFILE_ID_HEX: &str = "59c09924b3b07212c4bc103535cfbbe10deee31d1b157d2153
 const BLOB_ID_HEX: &str = "7cd5487139ce9f70b5f679a47b4eba03d3b703d498a72edc0a825163d36c9e7a";
 const BLOB_BYTES_HEX: &str =
     "41737472696420706879736963616c20726570726573656e746174696f6e20766563746f72";
-const RECORD_HEX: &str = "0100010002002000000059c09924b3b07212c4bc103535cfbbe10deee31d1b157d21538b177595235804000100010020000000020202020202020202020202020202020202020202020202020202020202020200020000000000000001000200200000007cd5487139ce9f70b5f679a47b4eba03d3b703d498a72edc0a825163d36c9e7a02000000000000000101000200200000007cd5487139ce9f70b5f679a47b4eba03d3b703d498a72edc0a825163d36c9e7a03010002002000000059c09924b3b07212c4bc103535cfbbe10deee31d1b157d21538b1775952358040002000000000000000200000000000000";
-const RECORD_ID_HEX: &str = "27f6e8261c0dfbb649bf84cc3b44ed98ae128d6dab3d1c05cb310543d97681e2";
+const RECORD_HEX: &str = "0100010002002000000059c09924b3b07212c4bc103535cfbbe10deee31d1b157d21538b177595235804000100010020000000020202020202020202020202020202020202020202020202020202020202020225000000000000000001000200200000007cd5487139ce9f70b5f679a47b4eba03d3b703d498a72edc0a825163d36c9e7a02000000000000000101000200200000007cd5487139ce9f70b5f679a47b4eba03d3b703d498a72edc0a825163d36c9e7a03010002002000000059c09924b3b07212c4bc103535cfbbe10deee31d1b157d21538b1775952358042500000000000000250000000000000000";
+const RECORD_ID_HEX: &str = "f49a7eb05222dac2f79d2c1ecca2c379d20deb8ecabde0e76369710323a2a381";
 
 #[test]
 fn reconstruction_bounds_reject_every_zero_field() {
@@ -546,12 +546,13 @@ fn format_one_golden_vectors_are_frozen_and_shared_with_the_second_reader() {
     let profile_id = profile.identify(&Blake3PhysicalIdentity).unwrap();
     let encoded_blob = b"Astrid physical representation vector";
     let blob_id = BlobId::identify(&Blake3PhysicalIdentity, profile_id, encoded_blob).unwrap();
+    let output_bytes = u64::try_from(encoded_blob.len()).unwrap();
     let record = RepresentationRecord::new(
         profile_id,
-        Coverage::exact(object(2), 512).unwrap(),
+        Coverage::exact(object(2), output_bytes).unwrap(),
         Recipe::DirectCanonical { blob: blob_id },
-        512,
-        512,
+        output_bytes,
+        output_bytes,
         None,
     )
     .unwrap();
@@ -690,6 +691,28 @@ fn independent_reader_rejects_an_unconnected_primary_blob() {
         profile_id,
         Coverage::exact(object(2), 64).unwrap(),
         Recipe::DirectCanonical { blob: blob(99) },
+        64,
+        64,
+        None,
+    )
+    .unwrap();
+    assert!(
+        !run_independent_fixture(&fixture_for(&profile, encoded_blob, &record))
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn independent_reader_rejects_a_direct_blob_length_mismatch() {
+    let profile = direct_profile();
+    let profile_id = profile.identify(&Blake3PhysicalIdentity).unwrap();
+    let encoded_blob = b"short fixture blob";
+    let blob_id = BlobId::identify(&Blake3PhysicalIdentity, profile_id, encoded_blob).unwrap();
+    let record = RepresentationRecord::new(
+        profile_id,
+        Coverage::exact(object(2), 64).unwrap(),
+        Recipe::DirectCanonical { blob: blob_id },
         64,
         64,
         None,
