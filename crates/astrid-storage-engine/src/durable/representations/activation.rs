@@ -1,5 +1,6 @@
 //! Construction and publication of the first physical authority generation.
 
+use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::path::Path;
 
@@ -129,6 +130,35 @@ pub(super) fn append_map_nodes(
             &Blake3PhysicalIdentity,
             node.node(),
         )?);
+    }
+    Ok(())
+}
+
+pub(super) fn append_new_reachable_map_nodes(
+    metadata: &mut Vec<MetadataFrame>,
+    map: &CanonicalPhysicalMap,
+    durable: &BTreeSet<astrid_storage_model::PhysicalMapNodeId>,
+) -> Result<(), DurableError> {
+    let Some(root) = map.root() else {
+        return Ok(());
+    };
+    let mut pending = vec![root];
+    let mut visited = BTreeSet::new();
+    while let Some(id) = pending.pop() {
+        if !visited.insert(id) || durable.contains(&id) {
+            continue;
+        }
+        let node = map
+            .nodes()
+            .get(&id)
+            .ok_or(DurableError::InvalidRepresentationState(
+                "active physical map is missing a reachable node",
+            ))?;
+        metadata.push(MetadataFrame::map_node(&Blake3PhysicalIdentity, node)?);
+        if let PhysicalMapNode::Branch { zero, one, .. } = node {
+            pending.push(*one);
+            pending.push(*zero);
+        }
     }
     Ok(())
 }

@@ -532,3 +532,64 @@ fn standalone_ack_covers_an_earlier_staged_prefix() {
     assert!(representations.contains_direct(earlier_id));
     assert!(representations.contains_direct(later_id));
 }
+
+#[test]
+fn direct_batch_persists_only_its_final_reachable_map_nodes() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open(directory.path());
+    let specification = ObjectRecord::new(
+        ObjectKind::Evidence,
+        ObjectFormatVersion::V1,
+        b"format specification".to_vec(),
+        Vec::new(),
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let (specification_id, _) = engine.persist_standalone_object(&specification).unwrap();
+    engine
+        .ensure_direct_representation_catalogue(specification_id, &[specification_id])
+        .unwrap();
+    let metadata_path = directory
+        .path()
+        .join("representations/generations/0000000000000001/metadata.arena");
+    let initial_length = std::fs::metadata(&metadata_path).unwrap().len();
+    let records = (0_u32..64)
+        .map(|ordinal| {
+            ObjectRecord::new(
+                ObjectKind::Evidence,
+                ObjectFormatVersion::V1,
+                ordinal.to_le_bytes().to_vec(),
+                Vec::new(),
+                0,
+                ObjectClass::Metadata,
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+
+    engine.stage_objects(records).unwrap();
+    engine.flush().unwrap();
+
+    let mut metadata = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(metadata_path)
+        .unwrap();
+    let mut appended_frames = 0_usize;
+    scan_frames(
+        &mut metadata,
+        "representations/metadata.arena",
+        *b"ASTRPM1\0",
+        limits(),
+        |offset, _payload| {
+            appended_frames += usize::from(offset >= initial_length);
+            Ok(())
+        },
+    )
+    .unwrap();
+
+    // Each map has 64 leaves and 63 branches. The batch also records one
+    // representation per object plus the catalogue, placement, and state.
+    assert_eq!(appended_frames, 2 * (64 + 63) + 64 + 3);
+}

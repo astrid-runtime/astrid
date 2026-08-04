@@ -27,8 +27,8 @@ mod format;
 mod recovery;
 
 use activation::{
-    append_map_nodes, build_initial_state, create_new, generation_name, publish_current,
-    quarantine_incomplete_root, quarantine_temporary_current,
+    append_new_reachable_map_nodes, build_initial_state, create_new, generation_name,
+    publish_current, quarantine_incomplete_root, quarantine_temporary_current,
 };
 use recovery::{
     MetadataIndex, read_current, recover_journal, recover_metadata, validate_profiles,
@@ -241,6 +241,8 @@ impl RepresentationStore {
     ) -> Result<Option<PendingDirectUpdate>, DurableError> {
         let mut metadata = Vec::new();
         let mut reverse_additions = Vec::new();
+        let durable_representation_nodes = self.representations.nodes().keys().copied().collect();
+        let durable_placement_nodes = self.placement_entries.nodes().keys().copied().collect();
         for object in objects {
             if let Some(addition) = self.append_direct_object(object, &mut metadata)? {
                 reverse_additions.push(addition);
@@ -249,6 +251,16 @@ impl RepresentationStore {
         if reverse_additions.is_empty() {
             return Ok(None);
         }
+        append_new_reachable_map_nodes(
+            &mut metadata,
+            &self.representations,
+            &durable_representation_nodes,
+        )?;
+        append_new_reachable_map_nodes(
+            &mut metadata,
+            &self.placement_entries,
+            &durable_placement_nodes,
+        )?;
         let (catalogue, placements, state) = self.next_authority()?;
         let state_id = state.identify(&Blake3PhysicalIdentity);
         metadata.push(MetadataFrame::catalogue(&Blake3PhysicalIdentity, catalogue));
@@ -300,12 +312,11 @@ impl RepresentationStore {
             &Blake3PhysicalIdentity,
             &record,
         )?);
-        let update = self.representations.insert_with_delta(
+        self.representations.insert(
             &Blake3PhysicalIdentity,
             PhysicalMapKey::from(record_id),
             record.encode()?,
         )?;
-        append_map_nodes(metadata, update.new_nodes())?;
         let replica = Replica::new(
             LOCAL_STORAGE_NODE,
             ReplicaLocator::ArenaFrame {
@@ -321,12 +332,11 @@ impl RepresentationStore {
             object.canonical_length,
             vec![replica],
         )?;
-        let update = self.placement_entries.insert_with_delta(
+        self.placement_entries.insert(
             &Blake3PhysicalIdentity,
             PhysicalMapKey::from(object.blob),
             placement.encode()?,
         )?;
-        append_map_nodes(metadata, update.new_nodes())?;
         Ok(Some((object.object, record_id)))
     }
 
