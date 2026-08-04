@@ -22,7 +22,16 @@ Closes #<!-- issue number -->
      - Docs / CI / chore: how you checked the result (rendered output, workflow run, dry-run, etc.).
      Include manual verification steps for a reviewer where they add signal. -->
 
+## AI / Tool Assistance
+
+<!-- Enter "None" for no meaningful tool-generated content. Otherwise include an Assisted-by: TOOL:MODEL line, describe the affected areas and assistance, and explain how you reviewed and validated the result. Trivial autocomplete, formatting, and mechanical edits do not need disclosure. -->
+
+None
+
 ## Checklist
 
 - [ ] Linked to an issue
 - [ ] CHANGELOG.md updated (entry under `[Unreleased]` — or `[Unreleased]` rolled into a version section for a release PR; not applicable to docs/CI-only changes)
+- [ ] I understand every change in this PR and can explain its design, risks, and validation.
+- [ ] I reviewed and tested any meaningful tool-generated output included in this PR.
+- [ ] Every non-bot, non-merge commit has a matching `Signed-off-by` trailer.

@@ -9,7 +9,7 @@ contributor system to protect the project while welcoming new contributors who f
 
 | Tier | Who | What they can do |
 |------|-----|------------------|
-| **New** | Anyone not yet in `contributors.yml` | Must open an issue first, wait for assignment, and have a maintainer add the `newcomer-approved` label to their PR |
+| **New** | Anyone not yet in `contributors.yml` and without repository read access | Must open an issue first, wait for assignment, and have a maintainer add the `newcomer-approved` label to their PR |
 | **Astrinaut** | Promoted after a successful first contribution | Can self-claim issues and submit PRs to non-core crates (CLI, SDK, capsules, docs, tests) |
 | **Core** | Promoted after sustained quality contributions | Can work on core crates (kernel, events, hooks, config). Security-critical paths still require maintainer co-review |
 | **Maintainer** | Project leads | Full access including security paths, refactors, and releases |
@@ -51,17 +51,59 @@ also when a maintainer evaluates whether the task is a good fit for a first cont
 
 - Fill in the PR template completely. PRs with empty sections will be rejected by CI
 - Link your PR to the issue using `Closes #N`
-- New contributors: a maintainer will review and add the `newcomer-approved` label
+- New contributors without repository read access: a maintainer will review and add the `newcomer-approved` label
 
 ### 6. Review
 
 All PRs require at least one maintainer review. Expect feedback - this is a security project and
 review is thorough. Address all comments before requesting re-review.
 
+## Contribution Quality and AI-Assisted Submissions
+
+Astrid does not accept bulk audits, speculative findings, or drive-by issues and PRs generated
+without the contributor checking them. AI output is a drafting aid, not evidence.
+
+Before opening an issue, reproduce the problem where possible and include the affected version or
+commit, exact steps, expected and actual behavior, and supporting evidence. Before opening a PR,
+understand the complete diff, explain why the change is needed, run the relevant tests, and be
+prepared to answer review questions or narrow the scope. Maintainers may close submissions that
+do not meet this bar or temporarily restrict further submissions while a contributor establishes
+that they can participate constructively.
+
+## Developer Certificate of Origin and Tool-Assisted Contributions
+
+Every non-bot, non-merge commit must include a `Signed-off-by` trailer whose email matches
+the commit author. Add it with Git's sign-off option:
+
+```bash
+git commit -s -m "fix(scope): describe the change"
+```
+
+The sign-off is a human certification. An AI or other tool must not add it on the contributor's
+behalf. See the [Developer Certificate of Origin](https://developercertificate.org/) for the
+full terms.
+
+For this check, a bot is an author that GitHub identifies with a login ending in `[bot]`, such as
+`dependabot[bot]`; `[bot]` is not required in a commit message. Bot-generated commits are exempt
+from the human sign-off requirement, while human-authored commits must still be signed off.
+
+Astrid permits tool-assisted contributions when the human contributor remains accountable for
+the complete submission. For meaningful tool-generated content, disclose the tool or model,
+the affected areas, the nature of the assistance, and the review and validation performed in
+the PR's **AI / Tool Assistance** section. Use an attribution such as
+`Assisted-by: TOOL_OR_AGENT: MODEL_VERSION` there. For longer sessions, include a concise summary of
+the prompts or instructions that materially shaped the result. Trivial autocomplete,
+formatting, and mechanical transformations are outside this disclosure requirement.
+
+Before requesting review, the contributor must understand every change, be able to explain its
+design and risks, defend the implementation, and respond meaningfully to review comments.
+Maintainers may request a walkthrough, additional tests, or a narrower change set when the
+submission is not sufficiently understood or validated.
+
 ## What We Will Not Accept
 
 - **Drive-by PRs** with no linked issue or prior discussion
-- **AI-generated bulk submissions** that lack understanding of the codebase
+- **Tool-generated bulk submissions** that the contributor cannot explain, defend, or validate
 - **Refactors** from non-maintainers. If you see something that needs refactoring, open an issue
 - **Changes to security-critical crates** without the appropriate tier
 

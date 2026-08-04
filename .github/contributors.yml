@@ -6,7 +6,7 @@
 #   core        - Can work on core crates. Security paths need maintainer co-review.
 #   maintainer  - Full access. Refactors, security paths, releases.
 #
-# Anyone not listed here is treated as new.
+# Anyone not listed here and without repository read access is treated as new.
 
 maintainers:
   - username: joshuajbouw

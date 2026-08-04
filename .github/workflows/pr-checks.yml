@@ -49,7 +49,7 @@ jobs:
             # Extract text between this section header and the next ## header.
             # The closing header is removed by pattern (not `$d`) so a section that
             # happens to be the last one in the body keeps its final content line.
-            echo "$PR_BODY" | sed -n "/^## $1/,/^## /p" | sed '1d' | sed '/^## /d' | sed '/^<!--.*-->$/d' | sed '/^\s*$/d'
+            echo "$PR_BODY" | sed -n "\|^## $1|,\|^## |p" | sed '1d' | sed '/^## /d' | sed '/^<!--.*-->$/d' | sed '/^\s*$/d'
           }
 
           check_section() {
@@ -73,6 +73,7 @@ jobs:
           check_section "Summary"
           check_section "Changes"
           check_section_any "Verification" "Test Plan"
+          check_section "AI / Tool Assistance"
 
           has_traceability_exception_label() {
             printf '%s\n' "$PR_LABELS" | grep -qiE '^(no-issue|maintenance|docs-only|release|deps|dependencies)$'
@@ -140,10 +141,6 @@ jobs:
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
-          # Temporary escape hatch while maintainers allow first-time contributors
-          # to proceed without a newcomer-approved label. Set the repository
-          # variable ENFORCE_NEWCOMER_APPROVAL to "true" when maintainers want
-          # that label to block new-contributor PRs again.
           ENFORCE_NEWCOMER_APPROVAL: ${{ vars.ENFORCE_NEWCOMER_APPROVAL || 'false' }}
         run: |
           CONTRIBUTORS_FILE=".github/contributors.yml"
@@ -172,6 +169,18 @@ jobs:
 
           echo "Author: $PR_AUTHOR"
           echo "Tier: $TIER"
+
+          # Repository members and collaborators with at least read access are
+          # already inside the project's trust boundary. Fail closed if the
+          # permission lookup is unavailable.
+          COLLABORATOR_PERMISSION=$(gh api "repos/$REPO/collaborators/$PR_AUTHOR/permission" --jq '.permission' 2>/dev/null || true)
+          TRUSTED_MEMBER=false
+          case "$COLLABORATOR_PERMISSION" in
+            read|triage|write|maintain|admin|pull|push)
+              TRUSTED_MEMBER=true
+              ;;
+          esac
+          echo "Repository permission: ${COLLABORATOR_PERMISSION:-unknown}"
 
           LABELS=$(gh api "repos/$REPO/issues/$PR_NUMBER/labels" --jq '.[].name' 2>/dev/null || echo "")
 
@@ -210,7 +219,7 @@ jobs:
           done
 
           # New contributors: require approval label
-          if [ "$TIER" = "new" ]; then
+          if [ "$TIER" = "new" ] && [ "$TRUSTED_MEMBER" != "true" ]; then
             if [ "$ENFORCE_NEWCOMER_APPROVAL" = "true" ]; then
               if printf '%s\n' "$LABELS" | grep -qxF "newcomer-approved"; then
                 echo "New contributor approved by a maintainer."
@@ -219,8 +228,10 @@ jobs:
                 exit 1
               fi
             else
-              echo "::notice::New contributor approval gate is temporarily disabled."
+              echo "::notice::New contributor approval gate is disabled."
             fi
+          elif [ "$TIER" = "new" ]; then
+            echo "Repository member/collaborator - newcomer approval label not required."
           fi
 
           # Astrinauts cannot touch security or core paths
@@ -506,4 +517,74 @@ jobs:
 
           if [ "$PUBLIC_REPOS" -eq 0 ] && [ "$FOLLOWERS" -eq 0 ]; then
             echo "::warning::Account has no public repos and no followers. Possible spam account."
+          fi
+
+  dco:
+    name: DCO sign-off
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout trusted DCO checker
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: trusted-dco
+          sparse-checkout: scripts/check_dco.py
+          sparse-checkout-cone-mode: false
+
+      - name: Fetch pull request commit metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh api --paginate --slurp \
+            "repos/$REPO/pulls/$PR_NUMBER/commits?per_page=100" \
+            > "$RUNNER_TEMP/pr-commits.json"
+          if [ -f trusted-dco/scripts/check_dco.py ]; then
+            python3 trusted-dco/scripts/check_dco.py "$RUNNER_TEMP/pr-commits.json"
+          else
+            # Bootstrap path for the PR that first introduces the checker.
+            # Future PRs execute the copy from the trusted base commit above.
+            python3 - "$RUNNER_TEMP/pr-commits.json" <<'PY'
+          import json
+          import re
+          import sys
+
+          payload = json.load(open(sys.argv[1], encoding="utf-8"))
+          signoff = re.compile(r"(?im)^Signed-off-by:\s*[^<\n]+<([^>\n]+)>\s*$")
+
+          def commits(items):
+              for item in items:
+                  if isinstance(item, list):
+                      yield from commits(item)
+                  elif isinstance(item, dict):
+                      yield item
+                  else:
+                      raise ValueError("invalid GitHub commits response")
+
+          errors = []
+          for commit in commits(payload):
+              if len(commit.get("parents", [])) > 1:
+                  continue
+              if str((commit.get("author") or {}).get("login", "")).endswith("[bot]"):
+                  continue
+              metadata = commit.get("commit") or {}
+              author_email = str((metadata.get("author") or {}).get("email", "")).strip()
+              signoffs = {email.strip().casefold() for email in signoff.findall(str(metadata.get("message", "")))}
+              if not author_email or author_email.casefold() not in signoffs:
+                  errors.append(str(commit.get("sha", "unknown"))[:12])
+
+          if errors:
+              print("::error::Missing matching DCO sign-off in: " + ", ".join(errors))
+              raise SystemExit(1)
+          print("DCO sign-off check passed (bootstrap path).")
+          PY
           fi
