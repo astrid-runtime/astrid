@@ -23,7 +23,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   Same-volume staged-file adoption covers canonical Chunk records through the
   existing File DAG, avoiding a second full data write and persistent slice
   records per chunk. Existing arena-only stores remain implicit direct
-  representations with no ObjectId or root migration. Refs #1396.
+  representations with no ObjectId or root migration. The executable
+  `no_std` model now freezes the profile, BlobId, coverage, recipe,
+  dependency, and representation-record grammar with shared golden vectors
+  and an independent RÚNATAL decoder. Refs #1396.
 - **Hosted filesystem name projection is deterministic and reversible.**
   Byte-exact principal content names now plan through typed target-volume
   comparison and syntax policies, with collision-safe names for case,

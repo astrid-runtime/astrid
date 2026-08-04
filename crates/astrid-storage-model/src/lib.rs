@@ -617,6 +617,7 @@ pub trait ObjectIdentity {
 mod derivation;
 mod derivation_evidence;
 mod gc_evidence;
+mod physical;
 mod proof;
 
 pub use derivation::{
@@ -632,6 +633,11 @@ pub use derivation_evidence::{
 pub use gc_evidence::{
     GcCommitEvidence, GcCommitId, GcEvidenceError, GcFactSnapshotId, GcPlanEvidence, GcPlanId,
     PlacementSetId, RetentionPolicyId, TensorLogicProofId,
+};
+pub use physical::{
+    CanonicalChunkingProfile, Coverage, Dependency, PhysicalIdentity, PhysicalModelError,
+    ProfileDependency, ProfileKind, Recipe, ReconstructionBounds, RepresentationProfile,
+    RepresentationProfileId, RepresentationRecord, RepresentationRecordId,
 };
 pub use proof::{
     OwnedSubtreePatch, ReferencePath, StateSelector, StateViewProof, TransitionWitness,

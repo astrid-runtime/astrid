@@ -15,7 +15,9 @@ use astrid_storage_engine::crash_replay::{
 };
 use astrid_storage_engine::{ObjectCacheCapacity, ObjectCacheController, RootTransaction};
 use astrid_storage_model::{
-    ObjectClass, ObjectFormatVersion, ObjectKind, ObjectReference, ReferenceLabel, RootState,
+    CanonicalChunkingProfile, ObjectClass, ObjectFormatVersion, ObjectKind, ObjectReference,
+    PhysicalIdentity, ProfileKind, ReconstructionBounds, ReferenceLabel, RepresentationProfile,
+    RootState,
 };
 
 use super::*;
@@ -360,6 +362,45 @@ fn object_identity_v1_has_a_stable_golden_vector() {
             27, 237, 250, 91, 151, 7, 135, 21, 99, 27, 128, 55,
         ]
     );
+}
+
+#[test]
+fn physical_identity_v1_matches_the_runatal_golden_vector() {
+    let profile = RepresentationProfile::new_builtin(
+        ProfileKind::DirectCanonical,
+        ReconstructionBounds::new(
+            8,
+            32,
+            8 * 1024 * 1024,
+            16 * 1024 * 1024,
+            1_000_000,
+            32 * 1024 * 1024,
+            5_000_000,
+        )
+        .unwrap(),
+        ObjectId::new([1; 32]),
+    )
+    .unwrap()
+    .encode()
+    .unwrap();
+    assert_eq!(
+        Blake3PhysicalIdentityV1.identify("astrid-representation-profile-v1\0", &profile),
+        [
+            0x59, 0xc0, 0x99, 0x24, 0xb3, 0xb0, 0x72, 0x12, 0xc4, 0xbc, 0x10, 0x35, 0x35, 0xcf,
+            0xbb, 0xe1, 0x0d, 0xee, 0xe3, 0x1d, 0x1b, 0x15, 0x7d, 0x21, 0x53, 0x8b, 0x17, 0x75,
+            0x95, 0x23, 0x58, 0x04,
+        ]
+    );
+}
+
+#[test]
+fn physical_chunking_profile_matches_the_canonical_content_profile() {
+    let content = ChunkingProfile::ASTRID_V1;
+    let physical = CanonicalChunkingProfile::ASTRID_V1;
+    assert_eq!(physical.minimum_bytes(), content.minimum_bytes());
+    assert_eq!(physical.average_bytes(), content.average_bytes());
+    assert_eq!(physical.maximum_bytes(), content.maximum_bytes());
+    assert_eq!(physical.gear_seed(), content.gear_seed());
 }
 
 #[test]
