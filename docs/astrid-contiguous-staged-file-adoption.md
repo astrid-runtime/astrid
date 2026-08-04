@@ -66,7 +66,22 @@ SourceIdentityV1 = Unix { tag:u8 = 0, device:u64, inode:u64 }
 
 Unix covers Linux and macOS opened-handle `st_dev/st_ino`; Windows matches its three live u32 fields.
 Unknown tags, trailing bytes, or conversion overflow reject. `mode` is rename `0` or copy `1`.
-Target and incoming names derive from namespace generation and BlobId.
+The final target is the canonical loose-blob path from the representation
+contract. Before that publication, both modes use exactly:
+
+```text
+representations/blobs/incoming/<namespace_generation:016x>/<BlobId>.<OwnerNameKeyId>.<stage_generation:016x>.incoming
+```
+
+Generations are exactly 16 lowercase hex digits and both identities are
+lowercase hex of their complete tagged envelopes. The
+owner/name key and staged generation prevent concurrent equal-Blob adoptions
+from sharing an incoming path. An occupied path is reusable only for the
+byte-exact same intent and one of its specified recovery states; an unequal
+intent is a fatal collision. A partial copy for the same intent restarts from
+the retained sealed source. The rename branch resumes only after source
+identity, physical length, and permitted footer/truncated state validate; it is
+never overwritten from another operation.
 
 Publication exclusively creates `<OwnerNameKeyId>.intent.tmp` no-follow,
 writes the complete frame, flushes it, reopens and verifies it byte-for-byte,

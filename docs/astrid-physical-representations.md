@@ -403,6 +403,12 @@ canonical-record byte length as `u64`. Counts and lengths are checked. The
 observed byte fields equal the primary placement's encoded length and the
 record's `canonical_output_bytes` respectively.
 
+For `Exact`, the transcript has one output. For `CanonicalFileChunks`, traversal
+is the File DAG's logical chunk-occurrence order and emits an ObjectId only on
+its first occurrence; later occurrences of the same ObjectId are skipped.
+`covered_output_count` is therefore the unique emitted count, without sorting,
+and agrees with the unique-object rule for `canonical_output_bytes`.
+
 The engine reconstructs the outputs, recomputes the evidence, and admits only
 the identical ObjectId; a guest or importer never supplies a trusted claim.
 The evidence records an observation and does not replace lazy read verification
@@ -433,9 +439,12 @@ representations:
     RepresentationRecordId -> RepresentationRecordV1
 ```
 
-Each count equals its map's verified root `subtree_entries`, or zero exactly when its root is
-absent; arithmetic overflow fails. The profile map is authoritative: an identifier without its
-verified record is unusable. Profile records and dependencies stay live while referenced.
+The verified entry count is zero for an absent root, one for a Leaf root, and
+the authenticated `subtree_entries` for a Branch root. Each catalogue count,
+and the placement `blob_count` below, equals that value for its respective map;
+arithmetic overflow fails. The profile map is authoritative: an identifier
+without its verified record is unusable. Profile records and dependencies stay
+live while referenced.
 Revocation is signed operator policy keyed by profile and authority epoch, not catalogue state. It
 survives restart, blocks new admission and preference, but never recovery; unavailable policy
 fails closed for new transform admission. The profile remains until every path is replaced and
@@ -476,6 +485,13 @@ Unequal values under one `(kind, identity)` or missing references fail. The scan
 Placement is a third authoritative map rooted by one placement set:
 
 ```text
+placements:
+    BlobId -> PlacementEntryV1
+```
+
+The leaf key must equal the embedded `PlacementEntryV1.blob`.
+
+```text
 PlacementSetV1 {
     version: u16 = 1,
     epoch: u64,
@@ -501,8 +517,8 @@ ReplicaV1 {
 }
 ```
 
-Placement has `blob_count == map entries` and `replica_extent_count == checked sum of replica-list
-lengths`; durability instead counts distinct `StorageNodeId`s, so same-node copies never satisfy
+Placement has `replica_extent_count == checked sum of replica-list lengths`;
+durability instead counts distinct `StorageNodeId`s, so same-node copies never satisfy
 redundancy. Replicas sort by node, locator tag, then bytes. Arena generation zero denotes verified `objects.arena` at activation;
 its locator matches the durable index tuple. Each compaction
 publishes a successor generation in the same placement CAS. `StorageNodeId`
@@ -768,9 +784,11 @@ request_compute(principal)
 ```
 
 The logical sum is the existing identity-bearing accounting rule: structural
-chunks and metadata may contribute zero, while catalogue records charge visible
-occurrences. It may intentionally exceed the physical pool because sharing is
-not exposed through price. Physical totals never sum principal charges.
+chunks and metadata may contribute zero, while principal content-catalog leaf
+records charge visible occurrences. Physical representation-catalogue records
+never create logical ownership. The logical sum may intentionally exceed the
+physical pool because sharing is not exposed through price. Physical totals
+never sum principal charges.
 
 Logical ownership is charged from the principal closure exactly as today,
 independent of deduplication or selected representation. Within a declared
