@@ -268,17 +268,9 @@ guesses for predictable content.
 Identity of encoded bytes actually placed on storage:
 
 ```text
-BlobId = TaggedIdentity(
-    algorithm,
-    construction_version,
-    digest_length,
-    H(
-        "astrid-blob-identity-v1\0" ||
-        encode(RepresentationProfileId) ||
-        encoded_length_u64_le ||
-        encoded_bytes
-    )
-)
+BlobId = TaggedIdentity(1, 2, 32,
+    BLAKE3_DERIVE_KEY("astrid-blob-identity-v1\0",
+        encode(RepresentationProfileId) || encoded_length_u64_le || encoded_bytes)[0..32])
 ```
 
 Compression, encryption, erasure coding, or a future encoding migration may

@@ -642,7 +642,7 @@ u64_le(name.len) || name)`, where owner is `StateOwnerCodecV1` and name is canon
 permits one intent; an occupied unequal owner/name is fatal. Its frame magic is `ASTADI1\0`:
 
 ```text
-AdoptionIntentV1 = version:u16 || owner:bytes || content_name:bytes || stage_generation:u64
+AdoptionIntentV1 = version:u16 = 1 || owner:bytes || content_name:bytes || stage_generation:u64
     || logical_length:u64 || physical_length:u64 || staging_intent:bytes
     || source_identity:bytes || blob:BlobId || representation:RepresentationRecordId
     || namespace_generation:u64 || mode:u8
