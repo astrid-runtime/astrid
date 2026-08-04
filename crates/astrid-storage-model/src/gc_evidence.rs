@@ -3,6 +3,7 @@
 use alloc::{vec, vec::Vec};
 use core::fmt;
 
+use super::physical::PlacementSetId;
 use super::{
     ExecutionMeasurementsId, ModelError, ObjectClass, ObjectFormatVersion, ObjectId,
     ObjectIdentity, ObjectKind, ObjectRecord, ObjectReference, ReferenceKind, ReferenceLabel,
@@ -56,10 +57,6 @@ gc_id_newtype!(
 gc_id_newtype!(
     /// Identity of one canonical garbage-collection plan.
     GcPlanId
-);
-gc_id_newtype!(
-    /// Identity of a complete physical placement-set description.
-    PlacementSetId
 );
 gc_id_newtype!(
     /// Identity of one canonical garbage-collection commit receipt.
