@@ -6,7 +6,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Unified storage integration for Astrid principal state, raw KV, and query storage"
+description = "Unified storage integration for Astrid principal state and raw KV"
 
 [features]
 default = []
@@ -14,9 +14,8 @@ default = []
 # store; this remains only so existing downstream feature selections compile.
 kv = []
 legacy-surrealkv = ["dep:surrealkv"]
-db = ["dep:surrealdb"]
 keychain = ["dep:keyring"]
-full = ["kv", "legacy-surrealkv", "db"]
+full = ["kv", "legacy-surrealkv"]
 
 [dependencies]
 astrid-core = { workspace = true }
@@ -31,7 +30,6 @@ parking_lot = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 surrealkv = { workspace = true, optional = true }
-surrealdb = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync"] }
 tracing = { workspace = true }

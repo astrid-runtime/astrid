@@ -5,19 +5,20 @@
 
 **The persistence layer. Disk for the OS.**
 
-An operating system needs disk. Astrid has a raw key-value contract projected onto typed, durable per-principal roots, plus an optional query engine. The legacy SurrealKV reader remains available only during the migration window.
+An operating system needs disk. Astrid has a raw key-value contract projected
+onto typed, durable per-principal roots. The legacy SurrealKV reader remains
+available only during the migration window.
 
-## Why two tiers
+## Storage model
 
-Capsules and kernel services need fast, isolated byte storage. Some optional
-services need relations, graph traversal, or richer queries. Forcing both
-shapes through one interface wastes either simplicity or power, so the crate
-keeps the principal-state KV contract separate from the optional query engine.
+Capsules and kernel services need fast, isolated byte storage. The native
+object store supplies that contract directly; query services belong above this
+crate rather than inside its persistence substrate.
 
-| Deployment | KV backend | DB backend |
-|---|---|---|
-| Dev / single-agent | Durable principal store | SurrealDB (embedded, SurrealKV) |
-| Production / multi-node | Durable principal store plus future placement execution | Deployment-selected query service |
+| Deployment | KV backend |
+|---|---|
+| Dev / single-agent | Durable principal store |
+| Production / multi-node | Durable principal store plus future placement execution |
 
 Distributed placement for the principal store remains implementation work; it
 is not exposed as a runtime backend selector.
@@ -47,9 +48,8 @@ The `build_secret_store` convenience constructor picks the best available backen
 | Feature | Enables |
 |---|---|
 | `legacy-surrealkv` | Legacy `SurrealKvStore` reader and migrator |
-| `db` | `Database` (SurrealDB query engine) |
 | `keychain` | `KeychainSecretStore` + `FallbackSecretStore` |
-| `full` | `legacy-surrealkv` + `db` |
+| `full` | Legacy compatibility features |
 
 The KV contract is never feature-gated. `KvStore`, `MemoryKvStore`,
 `ScopedKvStore`, `KvSecretStore`, and the principal-store adapter are always

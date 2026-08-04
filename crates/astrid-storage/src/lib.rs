@@ -1,8 +1,8 @@
 //! Astrid Storage — unified persistence layer.
 //!
-//! Provides two tiers of storage for the Astrid runtime:
+//! Provides raw key-value storage for the Astrid runtime.
 //!
-//! # Tier 1: Raw Key-Value ([`KvStore`])
+//! # Raw Key-Value ([`KvStore`])
 //!
 //! Direct byte-level `get`/`set`/`delete` over an injected backend. Native
 //! Astrid uses the durable principal store; `SurrealKV` remains available only
@@ -10,31 +10,20 @@
 //!
 //! Primary use case: WASM guest storage with scoped namespaces per plugin.
 //!
-//! # Tier 2: Query Engine ([`Database`])
-//!
-//! Full **`SurrealDB`** with `SurrealQL` — document-graph database supporting
-//! relations, graph traversal, computed fields, and complex queries.
-//!
-//! Primary use case: optional relational and query-heavy services.
-//!
-//! Enable with the **`db`** feature.
-//!
 //! # Scaling
 //!
-//! | Deployment | KV backend | DB backend |
-//! |------------|------------|------------|
-//! | Dev / single-agent | Durable principal store | `SurrealDB` (embedded, `SurrealKV`) |
-//! | Production / multi-node | Durable principal store plus future placement execution | Deployment-selected query service |
+//! | Deployment | KV backend |
+//! |------------|------------|
+//! | Dev / single-agent | Durable principal store |
+//! | Production / multi-node | Durable principal store plus future placement execution |
 //!
-//! Both tiers retain stable interfaces, but distributed placement for the
-//! principal store remains separate implementation work rather than a backend
-//! setting.
+//! Distributed placement for the principal store remains separate
+//! implementation work rather than a backend setting.
 //!
 //! # Feature Flags
 //!
 //! - **`legacy-surrealkv`** — legacy `SurrealKV` reader and migrator
-//! - **`db`** — `SurrealDB` full query engine
-//! - **`full`** — Both `legacy-surrealkv` and `db`
+//! - **`full`** — legacy compatibility features
 
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
@@ -54,9 +43,6 @@ pub mod principal_state;
 #[cfg(not(target_family = "wasm"))]
 mod resident_cache;
 pub mod secret;
-
-#[cfg(feature = "db")]
-pub mod db;
 
 #[cfg(not(target_family = "wasm"))]
 pub use content::{
@@ -104,6 +90,3 @@ pub use principal_state::{
 };
 #[cfg(not(target_family = "wasm"))]
 pub use resident_cache::GovernedObjectCache;
-
-#[cfg(feature = "db")]
-pub use db::Database;

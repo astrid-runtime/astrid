@@ -9,6 +9,15 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+### Removed
+
+- **The unused SurrealDB query wrapper and its dormant dependency graph have
+  been removed from `astrid-storage`.** No workspace crate selected the `db`
+  feature, while resolving it retained unsupported `rkyv 0.7.46` and RSA
+  dependencies in `Cargo.lock`. Removing the unused surface eliminates both
+  RustSec exceptions and keeps the audit gate strict. The native principal
+  store and live legacy-SurrealKV migration reader are unchanged. Closes #1448.
+
 ### Added
 
 - **Exact ObjectIds can use multiple verified physical representations without

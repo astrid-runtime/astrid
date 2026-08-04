@@ -1,18 +1,11 @@
 # cargo-audit configuration
 # https://github.com/rustsec/rustsec/tree/main/cargo-audit
 #
-# All ignored advisories are transitive dependencies we cannot patch directly.
-# Each entry documents the risk assessment and our defensive measures.
-# Re-evaluate on every surrealdb or wasmtime major version bump.
+# Advisory exceptions must be accompanied by a documented risk assessment and
+# an enforceable condition for removal.
 
 [advisories]
-ignore = [
-    # rsa timing sidechannel (medium, 5.9) - transitive via surrealdb -> jsonwebtoken.
-    # No upstream fix available.
-    # Mitigation: Astrid uses ed25519 for all auth/signing (astrid-crypto). RSA is only
-    # used internally by SurrealDB for JWT in embedded mode, not exposed to network attackers.
-    "RUSTSEC-2023-0071",
-]
+ignore = []
 informational_warnings = []
 
 [yanked]
