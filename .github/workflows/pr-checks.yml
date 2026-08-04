@@ -176,7 +176,7 @@ jobs:
           COLLABORATOR_PERMISSION=$(gh api "repos/$REPO/collaborators/$PR_AUTHOR/permission" --jq '.permission' 2>/dev/null || true)
           TRUSTED_MEMBER=false
           case "$COLLABORATOR_PERMISSION" in
-            pull|triage|push|maintain|admin)
+            read|triage|write|maintain|admin|pull|push)
               TRUSTED_MEMBER=true
               ;;
           esac
@@ -531,10 +531,13 @@ jobs:
         with:
           egress-policy: audit
 
-      - name: Checkout DCO checker
+      - name: Checkout trusted DCO checker
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: trusted-dco
           sparse-checkout: scripts/check_dco.py
+          sparse-checkout-cone-mode: false
 
       - name: Fetch pull request commit metadata
         env:
@@ -545,4 +548,43 @@ jobs:
           gh api --paginate --slurp \
             "repos/$REPO/pulls/$PR_NUMBER/commits?per_page=100" \
             > "$RUNNER_TEMP/pr-commits.json"
-          python3 scripts/check_dco.py "$RUNNER_TEMP/pr-commits.json"
+          if [ -f trusted-dco/scripts/check_dco.py ]; then
+            python3 trusted-dco/scripts/check_dco.py "$RUNNER_TEMP/pr-commits.json"
+          else
+            # Bootstrap path for the PR that first introduces the checker.
+            # Future PRs execute the copy from the trusted base commit above.
+            python3 - "$RUNNER_TEMP/pr-commits.json" <<'PY'
+          import json
+          import re
+          import sys
+
+          payload = json.load(open(sys.argv[1], encoding="utf-8"))
+          signoff = re.compile(r"(?im)^Signed-off-by:\s*[^<\n]+<([^>\n]+)>\s*$")
+
+          def commits(items):
+              for item in items:
+                  if isinstance(item, list):
+                      yield from commits(item)
+                  elif isinstance(item, dict):
+                      yield item
+                  else:
+                      raise ValueError("invalid GitHub commits response")
+
+          errors = []
+          for commit in commits(payload):
+              if len(commit.get("parents", [])) > 1:
+                  continue
+              if str((commit.get("author") or {}).get("login", "")).endswith("[bot]"):
+                  continue
+              metadata = commit.get("commit") or {}
+              author_email = str((metadata.get("author") or {}).get("email", "")).strip()
+              signoffs = {email.strip().casefold() for email in signoff.findall(str(metadata.get("message", "")))}
+              if not author_email or author_email.casefold() not in signoffs:
+                  errors.append(str(commit.get("sha", "unknown"))[:12])
+
+          if errors:
+              print("::error::Missing matching DCO sign-off in: " + ", ".join(errors))
+              raise SystemExit(1)
+          print("DCO sign-off check passed (bootstrap path).")
+          PY
+          fi

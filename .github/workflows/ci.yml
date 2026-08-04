@@ -11,6 +11,8 @@ on:
       - 'scripts/test_musl_release_manifest.py'
       - 'scripts/check_glibc.py'
       - 'scripts/test_check_glibc.py'
+      - 'scripts/check_dco.py'
+      - 'scripts/test_check_dco.py'
       - 'scripts/check_static_elf.py'
       - 'scripts/test_check_static_elf.py'
       - 'scripts/release_publication.py'
@@ -40,6 +42,8 @@ on:
       - 'scripts/test_musl_release_manifest.py'
       - 'scripts/check_glibc.py'
       - 'scripts/test_check_glibc.py'
+      - 'scripts/check_dco.py'
+      - 'scripts/test_check_dco.py'
       - 'scripts/check_static_elf.py'
       - 'scripts/test_check_static_elf.py'
       - 'scripts/release_publication.py'
@@ -242,6 +246,7 @@ jobs:
           python3 scripts/test_release_manifest.py
           python3 scripts/test_musl_release_manifest.py
           python3 scripts/test_check_glibc.py
+          python3 scripts/test_check_dco.py
           python3 scripts/test_check_static_elf.py
           python3 scripts/test_release_publication.py
           python3 scripts/test_release_draft_recovery.py

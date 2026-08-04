@@ -9,7 +9,7 @@ contributor system to protect the project while welcoming new contributors who f
 
 | Tier | Who | What they can do |
 |------|-----|------------------|
-| **New** | Anyone not yet in `contributors.yml` | Must open an issue first, wait for assignment, and have a maintainer add the `newcomer-approved` label to their PR |
+| **New** | Anyone not yet in `contributors.yml` and without repository read access | Must open an issue first, wait for assignment, and have a maintainer add the `newcomer-approved` label to their PR |
 | **Astrinaut** | Promoted after a successful first contribution | Can self-claim issues and submit PRs to non-core crates (CLI, SDK, capsules, docs, tests) |
 | **Core** | Promoted after sustained quality contributions | Can work on core crates (kernel, events, hooks, config). Security-critical paths still require maintainer co-review |
 | **Maintainer** | Project leads | Full access including security paths, refactors, and releases |
@@ -51,7 +51,7 @@ also when a maintainer evaluates whether the task is a good fit for a first cont
 
 - Fill in the PR template completely. PRs with empty sections will be rejected by CI
 - Link your PR to the issue using `Closes #N`
-- New contributors: a maintainer will review and add the `newcomer-approved` label
+- New contributors without repository read access: a maintainer will review and add the `newcomer-approved` label
 
 ### 6. Review
 
