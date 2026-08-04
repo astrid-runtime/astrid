@@ -163,15 +163,12 @@ impl Coverage {
         object: ObjectId,
         canonical_record_bytes: u64,
     ) -> Result<Self, PhysicalModelError> {
-        if canonical_record_bytes == 0 {
-            return Err(PhysicalModelError::InvalidCoverage(
-                "exact canonical record length is zero",
-            ));
-        }
-        Ok(Self::Exact {
+        let coverage = Self::Exact {
             object,
             canonical_record_bytes,
-        })
+        };
+        coverage.validate()?;
+        Ok(coverage)
     }
 
     /// Construct compact canonical File/Chunk coverage.
@@ -187,32 +184,59 @@ impl Coverage {
         chunk_count: u64,
         chunking_profile: CanonicalChunkingProfile,
     ) -> Result<Self, PhysicalModelError> {
-        if logical_bytes == 0 {
-            if content_root.is_some() || chunk_count != 0 {
-                return Err(PhysicalModelError::InvalidCoverage(
-                    "empty file has content coverage",
-                ));
-            }
-        } else {
-            if content_root.is_none() || chunk_count == 0 {
-                return Err(PhysicalModelError::InvalidCoverage(
-                    "non-empty file omits content coverage",
-                ));
-            }
-            let fits_one_chunk = logical_bytes <= u64::from(chunking_profile.maximum_bytes());
-            if (chunk_count == 1) != fits_one_chunk {
-                return Err(PhysicalModelError::InvalidCoverage(
-                    "file violates the whole-object chunk threshold",
-                ));
-            }
-        }
-        Ok(Self::CanonicalFileChunks {
+        let coverage = Self::CanonicalFileChunks {
             file,
             content_root,
             logical_bytes,
             chunk_count,
             chunking_profile,
-        })
+        };
+        coverage.validate()?;
+        Ok(coverage)
+    }
+
+    fn validate(&self) -> Result<(), PhysicalModelError> {
+        match self {
+            Self::Exact {
+                canonical_record_bytes,
+                ..
+            } => {
+                if *canonical_record_bytes == 0 {
+                    return Err(PhysicalModelError::InvalidCoverage(
+                        "exact canonical record length is zero",
+                    ));
+                }
+            },
+            Self::CanonicalFileChunks {
+                content_root,
+                logical_bytes,
+                chunk_count,
+                chunking_profile,
+                ..
+            } => {
+                if *logical_bytes == 0 {
+                    if content_root.is_some() || *chunk_count != 0 {
+                        return Err(PhysicalModelError::InvalidCoverage(
+                            "empty file has content coverage",
+                        ));
+                    }
+                } else {
+                    if content_root.is_none() || *chunk_count == 0 {
+                        return Err(PhysicalModelError::InvalidCoverage(
+                            "non-empty file omits content coverage",
+                        ));
+                    }
+                    let fits_one_chunk =
+                        *logical_bytes <= u64::from(chunking_profile.maximum_bytes());
+                    if (*chunk_count == 1) != fits_one_chunk {
+                        return Err(PhysicalModelError::InvalidCoverage(
+                            "file violates the whole-object chunk threshold",
+                        ));
+                    }
+                }
+            },
+        }
+        Ok(())
     }
 
     fn encode_into(&self, encoder: &mut Encoder) {
@@ -420,6 +444,7 @@ impl RepresentationRecord {
         maximum_reconstruction_bytes: u64,
         verification_evidence: Option<ObjectId>,
     ) -> Result<Self, PhysicalModelError> {
+        coverage.validate()?;
         validate_recipe(
             &coverage,
             &recipe,

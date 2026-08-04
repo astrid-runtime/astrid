@@ -309,6 +309,42 @@ fn representation_derives_the_only_valid_dependency_set() {
 }
 
 #[test]
+fn representation_revalidates_public_coverage_variants() {
+    let profile_id = direct_profile().identify(&Blake3PhysicalIdentity).unwrap();
+    assert!(matches!(
+        RepresentationRecord::new(
+            profile_id,
+            Coverage::Exact {
+                object: object(2),
+                canonical_record_bytes: 0,
+            },
+            Recipe::DirectCanonical { blob: blob(3) },
+            0,
+            1,
+            None,
+        ),
+        Err(PhysicalModelError::InvalidCoverage(_))
+    ));
+    assert!(matches!(
+        RepresentationRecord::new(
+            profile_id,
+            Coverage::CanonicalFileChunks {
+                file: object(4),
+                content_root: None,
+                logical_bytes: 1,
+                chunk_count: 1,
+                chunking_profile: CanonicalChunkingProfile::ASTRID_V1,
+            },
+            Recipe::ContiguousFile { blob: blob(5) },
+            1,
+            1,
+            Some(object(6)),
+        ),
+        Err(PhysicalModelError::InvalidCoverage(_))
+    ));
+}
+
+#[test]
 fn alternate_and_generated_recipes_require_exact_evidence() {
     let profile_id = direct_profile().identify(&Blake3PhysicalIdentity).unwrap();
     let exact = Coverage::exact(object(2), 64).unwrap();
