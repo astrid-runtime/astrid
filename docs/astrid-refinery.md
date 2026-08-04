@@ -16,6 +16,11 @@ stream live stored bytes:
 - future recompression; and
 - optional contiguous representation materialization.
 
+The representation records, liveness rules, and selector that these passes
+consume are defined in [Exact Physical
+Representations](astrid-physical-representations.md). The Refinery schedules
+and measures migration; it does not define a second encoding model.
+
 These are one operational machine: a frozen live snapshot is traversed under
 one scheduler, one resource authority, and one evidence grammar. No subsystem
 grows a private background loop.

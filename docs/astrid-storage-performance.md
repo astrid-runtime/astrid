@@ -581,6 +581,12 @@ a verified contiguous representation lets the provider serve ordinary
 sequential and `mmap`-compatible reads without rebuilding the file for every
 request.
 
+The exact contract is documented in [Exact Physical
+Representations](astrid-physical-representations.md). A contiguous staging file
+covers the canonical Chunk records selected by its File DAG while the small
+File and ChunkTree records remain materialized. This avoids both a second full
+data write and one persistent slice record per chunk.
+
 ## Current bottleneck map
 
 These causes are verified against the code at the measured baseline, not

@@ -210,6 +210,11 @@ Required invariants:
 | STO-MOD-27 | Adding or correcting a representation contract cannot redefine existing semantic identities |
 | STO-MOD-28 | A transform capsule can access only host-selected bounded streams and cannot select a principal, path, contract, or identity |
 | STO-MOD-29 | An encoding whose decoded canonical value differs is a derived semantic object, never an equal representation |
+| STO-MOD-30 | Every live exact ObjectId has at least one complete durable representation closure |
+| STO-MOD-31 | Physical representation dependencies change no principal ownership, logical quota, root, or default export |
+| STO-MOD-32 | Representation replacement publishes and verifies a new path before the old final path becomes reclaimable |
+| STO-MOD-33 | A reverse-index miss cannot establish representation absence; only the authoritative catalogue can |
+| STO-MOD-34 | Root commits and open read handles pin their chosen representation through publication or handle release |
 
 Every discovered counterexample becomes a minimized checked-in trace and a Rust
 regression test.
@@ -258,6 +263,11 @@ specification functions.
 | STO-PROP-34 | Adding or replacing a representation contract preserves existing semantic identities whenever canonical output is equal |
 | STO-PROP-35 | Transform streams enforce confinement, backpressure, and execution bounds without admitting partial output |
 | STO-PROP-36 | Lossy encode/decode produces a distinct semantic identity and typed derivation rather than an equal representation binding |
+| STO-PROP-37 | Reconstructing any accepted direct, sliced, contiguous, compressed, delta, or generated representation recomputes the declared exact ObjectId |
+| STO-PROP-38 | Every crash prefix of representation publication recovers old, old-plus-new, or new placement, never a live object with no path |
+| STO-PROP-39 | Dropping the final representation, a transitive recipe dependency, or a leased placement is rejected before physical deletion |
+| STO-PROP-40 | Arena-only stores synthesize direct representations without changing any ObjectId, root, export, or quota |
+| STO-PROP-41 | Full export materializes the same canonical closure regardless of the locally selected physical representation |
 
 The deliberate tiny digest model must generate collisions and assert byte
 comparison rejects them. Production collision probability is not a substitute

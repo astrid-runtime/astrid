@@ -11,6 +11,16 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Added
 
+- **Exact ObjectIds can use multiple verified physical representations without
+  changing principal state.** The design contract separates profile-bound
+  BlobIds, canonical representation records, and placement epochs; specifies
+  bounded direct, packed, contiguous, compressed, delta, and generated
+  recovery; and makes final-path liveness, reader/commit leases, double-ledger
+  accounting, materialized export, and crash-safe replacement explicit.
+  Contiguous staged-file adoption covers canonical Chunk records through the
+  existing File DAG, avoiding both a second full data write and one persistent
+  slice record per chunk. Existing arena-only stores remain implicit direct
+  representations with no ObjectId or root migration. Refs #1396.
 - **Hosted filesystem name projection is deterministic and reversible.**
   Byte-exact principal content names now plan through typed target-volume
   comparison and syntax policies, with collision-safe names for case,
