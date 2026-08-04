@@ -938,6 +938,10 @@ dependencies = [
 [[package]]
 name = "astrid-storage-model"
 version = "0.10.4"
+dependencies = [
+ "blake3",
+ "tempfile",
+]
 
 [[package]]
 name = "astrid-telemetry"

@@ -18,7 +18,9 @@ use astrid_storage_engine::{
     ObjectCacheStats, PersistentObjectIdentity, PrincipalCodec, RecoveryLimits,
     RecoveryRetryPolicy,
 };
-use astrid_storage_model::{ObjectClass, ObjectId, ObjectIdentity, ObjectRecord, ReferenceKind};
+use astrid_storage_model::{
+    ObjectClass, ObjectId, ObjectIdentity, ObjectRecord, PhysicalIdentity, ReferenceKind,
+};
 use parking_lot::Mutex;
 
 pub use crate::PrincipalDirectory;
@@ -73,6 +75,18 @@ pub enum StateOwner {
 /// Version-one canonical BLAKE3 identity for typed storage objects.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Blake3ObjectIdentityV1;
+
+/// Canonical BLAKE3 construction two identity for physical store records.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Blake3PhysicalIdentityV1;
+
+impl PhysicalIdentity for Blake3PhysicalIdentityV1 {
+    fn identify(&self, context: &'static str, material: &[u8]) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new_derive_key(context);
+        hasher.update(material);
+        *hasher.finalize().as_bytes()
+    }
+}
 
 const BLAKE3_OBJECT_IDENTITY_V1_SCHEME: IdentityScheme = match IdentityScheme::new(1, 1) {
     Some(scheme) => scheme,

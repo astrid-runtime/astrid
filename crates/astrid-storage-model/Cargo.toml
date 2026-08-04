@@ -10,3 +10,7 @@ description = "Portable executable model for Astrid principal state, import, GC,
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+blake3 = { workspace = true }
+tempfile = { workspace = true }
