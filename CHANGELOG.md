@@ -9,6 +9,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Run-loop capsules now receive their owner's per-principal resources before `run`.** A `#[astrid::run]` capsule's env overlay, secret store, `home://`, and KV are installed before the `run` export instead of sitting at the neutral deny-all floor, so the loop's autonomous writes land in the owner's store rather than the neutral store (where they were invisible to tool calls and lost on reload). Closes #1224; refs #1197. Run+recv publisher-identity follow-up tracked in #1454.
+
 ### Added
 
 - **Windows local transport uses authenticated per-user named pipes.** A pipe
