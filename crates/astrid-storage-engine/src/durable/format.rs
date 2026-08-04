@@ -672,6 +672,19 @@ pub(super) fn encode_object_frame(
     Ok(bytes)
 }
 
+pub(super) fn canonical_record_bytes(
+    frame_payload: &[u8],
+    scheme: IdentityScheme,
+) -> Result<&[u8], DurableError> {
+    let mut reader = SliceReader::new(frame_payload);
+    reader
+        .identity(scheme)
+        .map_err(|detail| corrupt(ARENA_FILE, 0, detail))?;
+    frame_payload
+        .get(reader.offset..)
+        .ok_or(DurableError::EncodingOverflow)
+}
+
 pub(super) fn decode_object_frame(
     bytes: &[u8],
     scheme: IdentityScheme,

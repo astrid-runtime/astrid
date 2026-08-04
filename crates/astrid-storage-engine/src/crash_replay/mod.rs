@@ -14,26 +14,29 @@ mod replay;
 
 pub use replay::{ConservativeDataSync, CrashImage, CrashImageSet, PersistenceModel, ReplayLimits};
 
-/// Stable logical name of one file in a crash trace.
+/// Stable relative path of one file in a crash trace.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TraceFileId(String);
 
 impl TraceFileId {
-    /// Construct a safe single-component trace file name.
+    /// Construct a safe relative trace path.
     ///
     /// # Errors
     ///
-    /// Rejects empty names, path components, Windows drive prefixes, and the
-    /// reserved `.` and `..` components.
+    /// Rejects empty, absolute, parent-relative, current-directory, Windows
+    /// separator, and drive-prefixed paths.
     pub fn new(name: impl Into<String>) -> Result<Self, CrashReplayError> {
         let name = name.into();
-        if name.is_empty()
-            || name == "."
-            || name == ".."
-            || name.contains('/')
-            || name.contains('\\')
-            || name.contains(':')
-        {
+        let safe = !name.is_empty()
+            && !name.contains('\\')
+            && !name.contains(':')
+            && name
+                .split('/')
+                .all(|component| !component.is_empty() && component != "." && component != "..")
+            && std::path::Path::new(&name)
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_)));
+        if !safe {
             return Err(CrashReplayError::InvalidFileId(name));
         }
         Ok(Self(name))
@@ -479,8 +482,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn trace_file_ids_are_safe_single_components_on_every_host() {
-        for invalid in ["", ".", "..", "a/b", "a\\b", "C:outside", ":"] {
+    fn trace_file_ids_are_safe_relative_paths_on_every_host() {
+        for invalid in [
+            "",
+            ".",
+            "..",
+            "../a",
+            "/a",
+            "a//b",
+            "a\\b",
+            "C:outside",
+            ":",
+        ] {
             assert!(matches!(
                 TraceFileId::new(invalid),
                 Err(CrashReplayError::InvalidFileId(name)) if name == invalid
@@ -489,6 +502,12 @@ mod tests {
         assert_eq!(
             TraceFileId::new("objects.arena").unwrap().as_str(),
             "objects.arena"
+        );
+        assert_eq!(
+            TraceFileId::new("representations/generations/0000000000000001/state.journal")
+                .unwrap()
+                .as_str(),
+            "representations/generations/0000000000000001/state.journal"
         );
     }
 }

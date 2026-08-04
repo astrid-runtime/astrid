@@ -211,6 +211,26 @@ fn compaction_reclaims_only_unreachable_objects_and_preserves_root_generation() 
 }
 
 #[test]
+fn direct_authority_rejects_retirement_until_final_path_liveness_exists() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = super::tests::open(directory.path());
+    two_versions(&engine);
+    let policy = evidence(b"retain-current-roots");
+    let authorization = plan(&engine, retention(&engine, &policy, []), policy);
+    let specification = evidence(b"physical format specification");
+    let (specification_id, _) = engine.persist_standalone_object(&specification).unwrap();
+    engine
+        .ensure_direct_representation_catalogue(specification_id, &[specification_id])
+        .unwrap();
+
+    assert!(matches!(
+        engine.compact(&authorization),
+        Err(DurableError::RepresentationRetirementUnsupported)
+    ));
+    assert!(engine.object_count().unwrap() > 0);
+}
+
+#[test]
 fn compaction_discards_cached_objects_that_leave_the_authoritative_index() {
     let directory = tempfile::tempdir().unwrap();
     let controller = ObjectCacheController::new(ObjectCacheCapacity::Unbounded);

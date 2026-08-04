@@ -153,6 +153,13 @@ impl CrashImage {
         })?;
         for (file, bytes) in &self.files {
             let path = directory.join(file.as_str());
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|source| CrashReplayError::Io {
+                    operation: "create crash-image parent directory",
+                    path: parent.to_path_buf(),
+                    source,
+                })?;
+            }
             std::fs::write(&path, bytes).map_err(|source| CrashReplayError::Io {
                 operation: "write crash-image file",
                 path,

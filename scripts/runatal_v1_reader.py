@@ -17,6 +17,7 @@ from runatal_v1_fastcdc import (
 )
 from runatal_v1_frames import frames
 from runatal_v1_kv import validate_principal_kv
+from runatal_v1_physical import decode_store as decode_physical_store
 from runatal_v1_sha384 import verify_cross_hash_attestations
 from runatal_v1_sketch import verify_bottom_k_sketches
 
@@ -48,7 +49,7 @@ REFERENCE_NAMES = ("Owns", "Evidence", "Lineage", "Derived")
 FORMAT_SPECIFICATION = (
     1,
     1,
-    bytes.fromhex("82e46f53ba9bb2f52d6b942088d5965eaa17c2720e61ce842ed9d5e3c0d1219d"),
+    bytes.fromhex("900d1eface3294bc9e47369c0fcb64dca56ff334dfbc1288f349090e10c09e6f"),
 )
 CONTENT_CATALOG_SPECIFICATION = (
     1,
@@ -751,6 +752,7 @@ def parse_metadata(path):
         "format": "astrid-principal-store-v1",
         "identity": "blake3-object-identity-v1",
         "identity-wire": "tagged-identity-v1",
+        "representations": "authoritative-direct-v1",
         "principal-codec": "principal-uid-v1",
         "projection": "kv-transition-bplus-v4",
     }
@@ -819,6 +821,7 @@ def recover(store, include_payloads):
     verify_golden_vectors()
     verify_content_summary_vectors()
     specification, catalog_specification = parse_metadata(store / "store.meta")
+    decode_physical_store(store)
     objects = {}
     offsets = {}
     for offset, payload in frames(store / "objects.arena", ARENA_MAGIC):

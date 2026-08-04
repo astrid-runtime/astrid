@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 from runatal_v1_blake3 import derive_key
+from runatal_v1_frames import frame_checksum, frames, physical_frame
 
 LOGICAL_SCHEME = (1, 1, 32)
 PHYSICAL_SCHEME = (1, 2, 32)
@@ -18,6 +19,11 @@ MAP_CONTEXT = "astrid-physical-map-node-v1\0"
 CATALOGUE_CONTEXT = "astrid-representation-catalogue-root-v1\0"
 PLACEMENT_CONTEXT = "astrid-placement-set-v1\0"
 STATE_CONTEXT = "astrid-representation-state-v1\0"
+JOURNAL_CONTEXT = "astrid-representation-journal-bytes-v1\0"
+ARENA_MAGIC = b"ASTOBJ1\0"
+METADATA_MAGIC = b"ASTRPM1\0"
+JOURNAL_MAGIC = b"ASTREP1\0"
+CURRENT_MAGIC = b"ASTCUR1\0"
 
 
 class FormatError(Exception):
@@ -825,12 +831,19 @@ def decode_fixture(path):
     return result
 
 
+def decode_store(store):
+    from runatal_v1_physical_store import decode_store as decode_authoritative_store
+
+    return decode_authoritative_store(store)
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("fixture", type=Path)
+    parser.add_argument("path", type=Path)
+    parser.add_argument("--store", action="store_true")
     arguments = parser.parse_args()
     try:
-        result = decode_fixture(arguments.fixture)
+        result = decode_store(arguments.path) if arguments.store else decode_fixture(arguments.path)
     except (FormatError, OSError, UnicodeError, ValueError, KeyError, json.JSONDecodeError) as error:
         print(f"runatal-v1-physical: {error}", file=sys.stderr)
         return 1

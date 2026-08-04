@@ -1,16 +1,19 @@
 //! Caller-coordinated durability batching for principal-root commits.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::fs::File;
 use std::sync::Arc;
 use std::time::Duration;
 
 use astrid_storage_model::{ModelError, ObjectId};
 use parking_lot::{Condvar, Mutex};
 
+use super::representations::{PendingDirectUpdate, RepresentationStore};
+
 use super::{
     ARENA_MAGIC, CommitOutcome, DurableEngine, DurableError, DurableInner, FaultPoint, Persisted,
     PersistentObjectIdentity, Prepared, PrincipalCodec, ROOT_MAGIC, RootTransaction, append_frames,
-    io_error, live_files_mut,
+    canonical_record_bytes, encode_object_frame, io_error, live_files_mut, read_indexed_object,
 };
 
 const DEFAULT_INITIAL_DELAY: Duration = Duration::from_micros(250);
@@ -348,7 +351,14 @@ where
         inner: &mut DurableInner<P>,
         accepted: &[AcceptedCommit<P>],
     ) -> Result<Persisted, DurableError> {
-        let files = live_files_mut(&mut inner.files)?;
+        let DurableInner {
+            files,
+            representations,
+            pending_index_locations,
+            index,
+            ..
+        } = inner;
+        let files = live_files_mut(files)?;
         let mut ids = Vec::new();
         let mut payloads = Vec::new();
         for accepted in accepted {
@@ -370,12 +380,50 @@ where
         }
         let commit_locations = append_frames(&mut files.arena, ARENA_MAGIC, &commit_payloads)?;
         self.fail_if(FaultPoint::AfterCommitAppend)?;
+        let representation_update = if let Some(representations) = representations {
+            let appended = ids
+                .iter()
+                .copied()
+                .zip(payloads.iter().copied())
+                .zip(object_locations.iter().copied())
+                .chain(
+                    commit_ids
+                        .iter()
+                        .copied()
+                        .zip(commit_payloads.iter().copied())
+                        .zip(commit_locations.iter().copied()),
+                )
+                .map(|((id, payload), location)| (id, payload, location));
+            debug_assert!(
+                pending_index_locations
+                    .iter()
+                    .all(|(id, location)| index.get(id) == Some(location))
+            );
+            self.append_group_representations(
+                &files.arena,
+                representations,
+                pending_index_locations,
+                accepted.iter().flat_map(|commit| {
+                    commit
+                        .prepared
+                        .validated
+                        .iter()
+                        .filter_map(|id| index.get(id).map(|location| (*id, *location)))
+                }),
+                appended,
+            )?
+        } else {
+            None
+        };
         files
             .arena
             .sync_data()
             .map_err(|source| io_error("flush grouped transaction object frames", source))?;
         self.fail_if(FaultPoint::AfterObjectFlush)?;
         self.fail_if(FaultPoint::AfterCommitFlush)?;
+        if let (Some(representations), Some(update)) = (representations, representation_update) {
+            representations.publish_direct_update(update)?;
+        }
         self.fail_if(FaultPoint::BeforeRootCas)?;
 
         let journals: Vec<_> = accepted
@@ -402,6 +450,44 @@ where
                 .collect(),
             arena_len,
         })
+    }
+
+    fn append_group_representations<'a>(
+        &self,
+        arena: &File,
+        representations: &mut RepresentationStore,
+        pending: &[(ObjectId, super::ArenaLocation)],
+        required: impl Iterator<Item = (ObjectId, super::ArenaLocation)>,
+        appended: impl Iterator<Item = (ObjectId, &'a [u8], super::ArenaLocation)>,
+    ) -> Result<Option<PendingDirectUpdate>, DurableError> {
+        let mut direct = Vec::new();
+        direct
+            .try_reserve(pending.len())
+            .map_err(|_| DurableError::EncodingOverflow)?;
+        let mut seen = std::collections::BTreeSet::new();
+        for (id, location) in pending.iter().copied().chain(required) {
+            if !seen.insert(id) || representations.contains_direct(id) {
+                continue;
+            }
+            let record = read_indexed_object(arena, id, location, &self.identity, self.limits)?;
+            let payload = encode_object_frame(self.identity.scheme(), id, &record)?;
+            direct.push(representations.describe_direct(
+                id,
+                canonical_record_bytes(&payload, self.identity.scheme())?,
+                location,
+            )?);
+        }
+        for (id, payload, location) in appended {
+            if !seen.insert(id) {
+                continue;
+            }
+            direct.push(representations.describe_direct(
+                id,
+                canonical_record_bytes(payload, self.identity.scheme())?,
+                location,
+            )?);
+        }
+        representations.append_direct_update(&direct)
     }
 }
 

@@ -382,6 +382,9 @@ where
         authorization: &VerifiedCompactionPlan,
     ) -> Result<CompactionReport, DurableError> {
         let mut inner = self.lock_usable()?;
+        if inner.representations.is_some() {
+            return Err(DurableError::RepresentationRetirementUnsupported);
+        }
         let (facts, live) = self.capture_facts_locked(&mut inner, &authorization.retention)?;
         if facts != authorization.facts {
             return Err(DurableError::CompactionSnapshotChanged);

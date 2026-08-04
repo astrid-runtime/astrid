@@ -17,8 +17,8 @@ use std::time::Duration;
 
 use astrid_storage_model::{
     InsertOutcome, ModelError, ObjectClass, ObjectFormatVersion, ObjectId, ObjectIdentity,
-    ObjectKind, ObjectRecord, ObjectReference, PrincipalUsage, ReferenceKind, ReferenceLabel,
-    RootGeneration, RootState,
+    ObjectKind, ObjectRecord, ObjectReference, PhysicalModelError, PrincipalUsage, ReferenceKind,
+    ReferenceLabel, RootGeneration, RootState,
 };
 use fs2::FileExt;
 use parking_lot::{Mutex, MutexGuard, RwLock};
@@ -240,6 +240,8 @@ pub trait PersistentObjectIdentity: ObjectIdentity {
 pub enum DurableError {
     /// The portable state model rejected an operation.
     Model(ModelError),
+    /// The canonical physical-representation model rejected an operation.
+    PhysicalModel(PhysicalModelError),
     /// A filesystem operation failed.
     Io {
         /// Operation being attempted.
@@ -294,6 +296,10 @@ pub enum DurableError {
     /// A destination-only snapshot restore violated its empty-store or
     /// canonical-closure contract.
     InvalidRestore(&'static str),
+    /// Physical representation metadata or its authority journal was invalid.
+    InvalidRepresentationState(&'static str),
+    /// Arena retirement was requested before representation liveness is implemented.
+    RepresentationRetirementUnsupported,
     /// Compaction evidence, retention, or its native fact snapshot was invalid.
     InvalidCompactionEvidence(&'static str),
     /// The native liveness snapshot changed between proof and physical rewrite.
@@ -314,6 +320,7 @@ impl fmt::Display for DurableError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Model(error) => write!(formatter, "{error}"),
+            Self::PhysicalModel(error) => write!(formatter, "{error}"),
             Self::Io { operation, source } => write!(formatter, "{operation}: {source}"),
             Self::LockHeld(path) => {
                 write!(formatter, "principal store is locked: {}", path.display())
@@ -354,6 +361,12 @@ impl fmt::Display for DurableError {
                 formatter.write_str("standalone bootstrap object must not own other objects")
             },
             Self::InvalidRestore(detail) => write!(formatter, "invalid snapshot restore: {detail}"),
+            Self::InvalidRepresentationState(detail) => {
+                write!(formatter, "invalid representation state: {detail}")
+            },
+            Self::RepresentationRetirementUnsupported => formatter.write_str(
+                "arena retirement requires representation leases and final-path liveness",
+            ),
             Self::InvalidCompactionEvidence(detail) => {
                 write!(formatter, "invalid compaction evidence: {detail}")
             },
@@ -379,6 +392,7 @@ impl std::error::Error for DurableError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Model(error) | Self::RecoveryModel { source: error, .. } => Some(error),
+            Self::PhysicalModel(error) => Some(error),
             Self::Io { source, .. } => Some(source),
             _ => None,
         }
@@ -388,6 +402,12 @@ impl std::error::Error for DurableError {
 impl From<ModelError> for DurableError {
     fn from(error: ModelError) -> Self {
         Self::Model(error)
+    }
+}
+
+impl From<PhysicalModelError> for DurableError {
+    fn from(error: PhysicalModelError) -> Self {
+        Self::PhysicalModel(error)
     }
 }
 
@@ -405,6 +425,7 @@ struct DurableInner<P: Ord> {
     pending_index_locations: Vec<(ObjectId, ArenaLocation)>,
     validated: BTreeSet<ObjectId>,
     files: Option<DurableFiles>,
+    representations: Option<representations::RepresentationStore>,
     lock: Option<File>,
     poisoned: bool,
     arena_generation: u64,
@@ -431,6 +452,7 @@ struct RecoveredStore<P: Ord> {
     index: BTreeMap<ObjectId, ArenaLocation>,
     validated: BTreeSet<ObjectId>,
     files: DurableFiles,
+    representations: Option<representations::RepresentationStore>,
     arena_reader: File,
 }
 
@@ -528,6 +550,8 @@ mod group;
 mod index;
 mod lifecycle;
 mod recovery;
+mod representation_engine;
+mod representations;
 mod restore;
 mod roots;
 mod validation;
@@ -545,9 +569,10 @@ pub use compaction::{
 };
 pub use faults::{FaultInjector, FaultPoint, NoFaults};
 use format::{
-    append_frame, append_frames, corrupt, decode_object_frame, encode_object_frame,
-    ensure_payload_limit, io_error, open_rw, read_indexed_object, read_indexed_objects,
-    recover_arena, scan_frames, sync_store_directory, verify_indexed_location, verify_indexed_tail,
+    append_frame, append_frames, canonical_record_bytes, corrupt, decode_object_frame,
+    encode_object_frame, ensure_payload_limit, io_error, open_rw, read_indexed_object,
+    read_indexed_objects, recover_arena, scan_frames, sync_store_directory,
+    verify_indexed_location, verify_indexed_tail,
 };
 #[cfg(test)]
 use format::{frame_checksum, last_batch_spans};

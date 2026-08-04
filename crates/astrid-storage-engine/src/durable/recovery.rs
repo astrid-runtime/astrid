@@ -85,6 +85,10 @@ where
     let arena_reader = arena
         .try_clone()
         .map_err(|source| io_error("clone object arena for positional reads", source))?;
+    let representations = super::representations::RepresentationStore::open(path, limits)?;
+    if let Some(representations) = &representations {
+        representations.validate_generation_zero_arena(&arena, &index, identity, limits)?;
+    }
 
     Ok(RecoveredStore {
         roots_by_principal,
@@ -97,6 +101,7 @@ where
             arena_len,
             arena_tail,
         },
+        representations,
         arena_reader,
     })
 }
@@ -126,7 +131,11 @@ fn stabilize_recovered_store<P: Ord>(
         .files
         .roots
         .sync_data()
-        .map_err(|source| io_error("flush recovered root journal", source))
+        .map_err(|source| io_error("flush recovered root journal", source))?;
+    if let Some(representations) = &mut recovered.representations {
+        representations.flush()?;
+    }
+    Ok(())
 }
 
 impl<P, I, C> DurableEngine<P, I, C>
@@ -173,6 +182,7 @@ where
         }
 
         drop(inner.files.take());
+        drop(inner.representations.take());
         drop(self.arena_reader.write().take());
         self.object_cache.clear();
         let next_generation = inner.arena_generation.wrapping_add(1);
@@ -206,6 +216,7 @@ where
                     inner.pending_index_locations.clear();
                     inner.validated = recovered.validated;
                     inner.files = Some(recovered.files);
+                    inner.representations = recovered.representations;
                     inner.poisoned = false;
                     inner.arena_generation = next_generation;
                     *self.arena_reader.write() = Some(ArenaReader {
