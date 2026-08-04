@@ -448,11 +448,20 @@ pub enum AdminRequestKind {
         allow_admin_clone: bool,
     },
     /// Delete an existing agent identity. The `default` principal is
-    /// rejected unconditionally. The principal's home directory is NOT
-    /// scrubbed — reclamation is an ops concern.
+    /// rejected unconditionally. By default the principal's on-disk
+    /// footprint (home tree, signing key, secrets) is left behind —
+    /// reclamation is an ops concern. Set `purge_home` to reclaim it,
+    /// which is what a throwaway/ephemeral spawn wants (#1217).
     AgentDelete {
         /// Principal to delete.
         principal: PrincipalId,
+        /// Also reclaim the principal's persistent on-disk footprint:
+        /// the home tree (`home/{principal}/`), the signing key
+        /// (`keys/{principal}.key`), and the secrets dir
+        /// (`secrets/{principal}/`). Best-effort; defaults to `false`
+        /// so the plain-delete contract is unchanged.
+        #[serde(default)]
+        purge_home: bool,
     },
     /// Set `enabled = true` on the target principal's profile.
     AgentEnable {

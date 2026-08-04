@@ -467,6 +467,7 @@ async fn agent_delete_of_default_always_rejected() {
         &astrid_core::PrincipalId::default(),
         AdminRequestKind::AgentDelete {
             principal: PrincipalId::default(),
+            purge_home: false,
         },
     )
     .await;
@@ -500,6 +501,7 @@ async fn agent_delete_removes_identity_profile_and_invalidates_cache() {
         &astrid_core::PrincipalId::default(),
         AdminRequestKind::AgentDelete {
             principal: pid("bob"),
+            purge_home: false,
         },
     )
     .await;
@@ -521,6 +523,118 @@ async fn agent_delete_removes_identity_profile_and_invalidates_cache() {
     assert!(after.groups.is_empty());
     assert!(after.grants.is_empty());
     assert!(after.revokes.is_empty());
+}
+
+/// Materialize the on-disk footprint a real principal accumulates
+/// *outside* its `profile.toml`: the home tree, the signing key (global
+/// `keys/{p}.key`), and the secrets dir (global `secrets/{p}/`). Returns
+/// the three paths so a test can assert on their fate after delete.
+fn seed_principal_footprint(
+    kernel: &Arc<Kernel>,
+    principal: &PrincipalId,
+) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    let home = kernel
+        .astrid_home
+        .principal_home(principal)
+        .root()
+        .to_path_buf();
+    let key = kernel
+        .astrid_home
+        .keys_dir()
+        .join(format!("{principal}.key"));
+    let secrets = kernel.astrid_home.secrets_dir().join(principal.as_str());
+
+    std::fs::create_dir_all(home.join(".local/kv")).unwrap();
+    std::fs::write(home.join(".local/kv/state.db"), b"kv").unwrap();
+    std::fs::create_dir_all(key.parent().unwrap()).unwrap();
+    std::fs::write(&key, b"signing-key").unwrap();
+    std::fs::create_dir_all(&secrets).unwrap();
+    std::fs::write(secrets.join("api_key"), b"secret").unwrap();
+
+    assert!(home.exists() && key.exists() && secrets.exists());
+    (home, key, secrets)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_delete_purge_home_reclaims_home_key_and_secrets() {
+    let (_dir, kernel) = fixture().await;
+    handlers::dispatch(
+        &kernel,
+        &PrincipalId::default(),
+        AdminRequestKind::AgentCreate {
+            name: "ghost".into(),
+            groups: Vec::new(),
+            grants: Vec::new(),
+            inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
+        },
+    )
+    .await;
+    let (home, key, secrets) = seed_principal_footprint(&kernel, &pid("ghost"));
+
+    let res = handlers::dispatch(
+        &kernel,
+        &PrincipalId::default(),
+        AdminRequestKind::AgentDelete {
+            principal: pid("ghost"),
+            purge_home: true,
+        },
+    )
+    .await;
+    assert_success(&res);
+
+    // The whole persistent footprint is gone, not just the profile.
+    assert!(
+        !home.exists(),
+        "home tree must be reclaimed under purge_home"
+    );
+    assert!(
+        !key.exists(),
+        "signing key must be reclaimed under purge_home"
+    );
+    assert!(
+        !secrets.exists(),
+        "secrets dir must be reclaimed under purge_home"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_delete_without_purge_leaves_footprint() {
+    let (_dir, kernel) = fixture().await;
+    handlers::dispatch(
+        &kernel,
+        &PrincipalId::default(),
+        AdminRequestKind::AgentCreate {
+            name: "keeper".into(),
+            groups: Vec::new(),
+            grants: Vec::new(),
+            inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
+        },
+    )
+    .await;
+    let (home, key, secrets) = seed_principal_footprint(&kernel, &pid("keeper"));
+
+    let res = handlers::dispatch(
+        &kernel,
+        &PrincipalId::default(),
+        AdminRequestKind::AgentDelete {
+            principal: pid("keeper"),
+            purge_home: false,
+        },
+    )
+    .await;
+    assert_success(&res);
+
+    // Default delete deliberately leaves the footprint (ops concern).
+    assert!(home.exists(), "home tree must survive a non-purge delete");
+    assert!(key.exists(), "signing key must survive a non-purge delete");
+    assert!(
+        secrets.exists(),
+        "secrets dir must survive a non-purge delete"
+    );
 }
 
 // ── Phantom-principal rejection (Gemini follow-up + R-thirteen) ──

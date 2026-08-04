@@ -46,6 +46,7 @@ fn identity_and_policy_variants(principal: &PrincipalId) -> Vec<AdminRequestKind
         },
         AdminRequestKind::AgentDelete {
             principal: principal.clone(),
+            purge_home: false,
         },
         AdminRequestKind::AgentEnable {
             principal: principal.clone(),
