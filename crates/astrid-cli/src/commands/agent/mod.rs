@@ -188,11 +188,6 @@ pub(crate) struct DeleteArgs {
     /// Skip the interactive confirmation.
     #[arg(short = 'y', long)]
     pub yes: bool,
-    /// Also reclaim the agent's on-disk footprint — home tree, signing
-    /// key, and secrets. Default delete leaves these behind; use this
-    /// for a throwaway agent you want fully gone.
-    #[arg(long)]
-    pub purge_home: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -665,12 +660,10 @@ fn print_agent_detail(agent: &AgentSummary) {
 async fn run_delete(args: DeleteArgs) -> Result<ExitCode> {
     let principal = PrincipalId::new(&args.name).context("invalid agent name")?;
     if !args.yes {
-        let footprint = if args.purge_home {
-            "home directory, signing key, and secrets WILL be removed"
-        } else {
-            "home directory is NOT removed"
-        };
-        eprint!("Delete agent '{principal}' ({footprint}) [y/N]? ");
+        eprint!(
+            "Delete agent '{principal}' \
+             (home directory, signing key, and secrets are reclaimed) [y/N]? "
+        );
         std::io::Write::flush(&mut std::io::stderr()).ok();
         let mut buf = String::new();
         std::io::stdin().read_line(&mut buf).ok();
@@ -681,12 +674,19 @@ async fn run_delete(args: DeleteArgs) -> Result<ExitCode> {
     }
     let mut client = crate::admin_client::connect_as_active_agent().await?;
     let body = client
-        .request(AdminRequestKind::AgentDelete {
-            principal,
-            purge_home: args.purge_home,
-        })
+        .request(AdminRequestKind::AgentDelete { principal })
         .await?;
-    let _ = into_result(body)?;
+    let outcome = into_result(body)?;
+    // Surface any footprint-reclamation failures the kernel reported
+    // (delete closes authz regardless; leftovers are an ops follow-up).
+    if let AdminResponseBody::Success(v) = &outcome
+        && let Some(errs) = v.get("cleanup_errors").and_then(|e| e.as_array())
+        && !errs.is_empty()
+    {
+        for e in errs.iter().filter_map(|e| e.as_str()) {
+            eprintln!("warning: footprint cleanup: {e}");
+        }
+    }
     println!(
         "{}",
         Theme::success(&format!("Deleted agent '{}'", args.name))

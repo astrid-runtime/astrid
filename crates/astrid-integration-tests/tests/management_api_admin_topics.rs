@@ -75,7 +75,6 @@ fn all_admin_variants() -> Vec<AdminRequestKind> {
         },
         AdminRequestKind::AgentDelete {
             principal: pid("target"),
-            purge_home: false,
         },
         AdminRequestKind::AgentEnable {
             principal: pid("target"),

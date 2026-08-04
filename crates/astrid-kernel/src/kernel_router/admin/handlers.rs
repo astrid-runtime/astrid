@@ -100,10 +100,7 @@ async fn dispatch_inner(
 ) -> AdminResponseBody {
     match req {
         req @ AdminRequestKind::AgentCreate { .. } => agent_create_from_req(kernel, req).await,
-        AdminRequestKind::AgentDelete {
-            principal,
-            purge_home,
-        } => agent_delete(kernel, principal, purge_home).await,
+        AdminRequestKind::AgentDelete { principal } => agent_delete(kernel, principal).await,
         AdminRequestKind::AgentEnable { principal } => {
             agent_set_enabled(kernel, principal, true).await
         },
@@ -355,11 +352,7 @@ async fn agent_create(
     .await
 }
 
-async fn agent_delete(
-    kernel: &Arc<crate::Kernel>,
-    principal: PrincipalId,
-    purge_home: bool,
-) -> AdminResponseBody {
+async fn agent_delete(kernel: &Arc<crate::Kernel>, principal: PrincipalId) -> AdminResponseBody {
     if principal == PrincipalId::default() {
         return err_bad_input(
             "cannot delete the `default` principal — it is the single-tenant bootstrap anchor"
@@ -394,12 +387,10 @@ async fn agent_delete(
     }
 
     // Remove the policy file. Without this, traffic claiming this
-    // principal would re-load the old profile from disk via the
-    // cache and continue to satisfy authz checks against the old
-    // grants/groups. The home directory itself (capsule data, KV
-    // namespace, audit chain) is NOT scrubbed — reclamation is an
-    // ops concern. Best-effort delete: if the file is already gone
-    // (concurrent admin or never existed) we proceed.
+    // principal would re-load the old profile from disk via the cache and
+    // continue to satisfy authz checks against the old grants/groups.
+    // Best-effort delete: if the file is already gone (concurrent admin or
+    // never existed) we proceed.
     let path = principal_profile_path(kernel, &principal);
     if let Err(e) = std::fs::remove_file(&path)
         && e.kind() != std::io::ErrorKind::NotFound
@@ -411,57 +402,73 @@ async fn agent_delete(
     }
 
     // Invalidate cache so subsequent authz checks for this principal
-    // re-resolve from disk and observe the deletion (next resolve
-    // returns Default, which under the Layer 5 enforcement preamble
-    // grants no capabilities).
+    // re-resolve from disk and observe the deletion (next resolve returns
+    // Default, which under the Layer 5 enforcement preamble grants no
+    // capabilities).
     kernel.profile_cache.invalidate(&principal);
 
-    // Optional footprint reclamation for throwaway/ephemeral principals
-    // (#1217). Plain delete deliberately leaves the home tree, signing
-    // key, and secrets on disk. A short-lived spawn wants them gone so a
-    // stale keypair or leftover state can't outlive the job. Best-effort:
-    // authz is already closed by the unlink + profile removal above, so a
-    // failed reclamation is logged, not surfaced as an error.
-    if purge_home {
-        let home = kernel.astrid_home.principal_home(&principal);
-        best_effort_remove_dir_all(home.root(), &principal, "home tree");
-        best_effort_remove_file(
-            &kernel
-                .astrid_home
-                .keys_dir()
-                .join(format!("{principal}.key")),
-            &principal,
-            "signing key",
-        );
-        best_effort_remove_dir_all(
-            &kernel.astrid_home.secrets_dir().join(principal.as_str()),
-            &principal,
-            "secrets dir",
-        );
+    // Fence-then-reclaim contract (#1217). Authz is now CLOSED: the steps
+    // above ran under `admin_write_lock`, so the principal resolves to
+    // Default = no capabilities. Any in-flight invocation for it fails
+    // closed on its next capability check, and no new invocation can
+    // start — the reclamation below cannot re-open access. (There is no
+    // per-principal in-flight counter to gate on, so fence-via-authz-close
+    // is the guarantee, not a refuse-if-active check.)
+    //
+    // We then reclaim the principal's whole on-disk footprint — the home
+    // tree plus the signing key and secrets, which live in the GLOBAL
+    // `keys/` and `secrets/` trees OUTSIDE the home dir. Reclamation is
+    // best-effort (a leftover file can't grant access post-fence), but
+    // failures are RETURNED in `cleanup_errors` so an operator can follow
+    // up — not merely logged.
+    let home = kernel.astrid_home.principal_home(&principal);
+    let key = kernel
+        .astrid_home
+        .keys_dir()
+        .join(format!("{principal}.key"));
+    let secrets = kernel.astrid_home.secrets_dir().join(principal.as_str());
+
+    let mut reclaimed: Vec<&str> = Vec::new();
+    let mut cleanup_errors: Vec<String> = Vec::new();
+    for (what, outcome) in [
+        ("home", reclaim_dir_all(home.root())),
+        ("keys", reclaim_file(&key)),
+        ("secrets", reclaim_dir_all(&secrets)),
+    ] {
+        match outcome {
+            Ok(()) => reclaimed.push(what),
+            Err(msg) => {
+                warn!(%principal, %what, error = %msg, "agent.delete: footprint reclamation failed");
+                cleanup_errors.push(format!("{what}: {msg}"));
+            },
+        }
     }
 
-    info!(%principal, purge_home, "Layer 6 agent.delete");
-    success_json(serde_json::json!({ "principal": principal.as_str() }))
+    info!(%principal, ?reclaimed, ?cleanup_errors, "Layer 6 agent.delete");
+    success_json(serde_json::json!({
+        "principal": principal.as_str(),
+        "reclaimed": reclaimed,
+        "cleanup_errors": cleanup_errors,
+    }))
 }
 
-/// Best-effort recursive directory removal for principal footprint
-/// reclamation. A missing path is success (already gone); any other
-/// error is logged and swallowed — authz is already closed by the time
-/// this runs, so reclamation failure must not fail the delete.
-fn best_effort_remove_dir_all(path: &Path, principal: &PrincipalId, what: &str) {
-    if let Err(e) = std::fs::remove_dir_all(path)
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        warn!(%principal, %what, path = %path.display(), error = %e, "agent.delete purge: failed to reclaim");
+/// Reclaim a directory tree during agent delete. A missing path is
+/// success (already gone); any other error is returned so the caller can
+/// surface it in the response's `cleanup_errors`.
+fn reclaim_dir_all(path: &Path) -> Result<(), String> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("{}: {e}", path.display())),
     }
 }
 
-/// Best-effort single-file removal; see [`best_effort_remove_dir_all`].
-fn best_effort_remove_file(path: &Path, principal: &PrincipalId, what: &str) {
-    if let Err(e) = std::fs::remove_file(path)
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        warn!(%principal, %what, path = %path.display(), error = %e, "agent.delete purge: failed to reclaim");
+/// Reclaim a single file during agent delete; see [`reclaim_dir_all`].
+fn reclaim_file(path: &Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("{}: {e}", path.display())),
     }
 }
 

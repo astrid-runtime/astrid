@@ -221,10 +221,7 @@ pub async fn delete_principal(
     let caller = caller_from(&req)?;
     let client = state.admin_client_for(caller)?;
     let resp = client
-        .request(AdminRequestKind::AgentDelete {
-            principal,
-            purge_home: false,
-        })
+        .request(AdminRequestKind::AgentDelete { principal })
         .await
         .map_err(daemon_internal)?;
     match resp {

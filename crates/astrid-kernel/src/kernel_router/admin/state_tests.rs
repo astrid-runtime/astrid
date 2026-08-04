@@ -467,7 +467,6 @@ async fn agent_delete_of_default_always_rejected() {
         &astrid_core::PrincipalId::default(),
         AdminRequestKind::AgentDelete {
             principal: PrincipalId::default(),
-            purge_home: false,
         },
     )
     .await;
@@ -501,7 +500,6 @@ async fn agent_delete_removes_identity_profile_and_invalidates_cache() {
         &astrid_core::PrincipalId::default(),
         AdminRequestKind::AgentDelete {
             principal: pid("bob"),
-            purge_home: false,
         },
     )
     .await;
@@ -556,7 +554,7 @@ fn seed_principal_footprint(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn agent_delete_purge_home_reclaims_home_key_and_secrets() {
+async fn agent_delete_reclaims_home_key_and_secrets_and_reports_them() {
     let (_dir, kernel) = fixture().await;
     handlers::dispatch(
         &kernel,
@@ -578,36 +576,45 @@ async fn agent_delete_purge_home_reclaims_home_key_and_secrets() {
         &PrincipalId::default(),
         AdminRequestKind::AgentDelete {
             principal: pid("ghost"),
-            purge_home: true,
         },
     )
     .await;
     assert_success(&res);
 
-    // The whole persistent footprint is gone, not just the profile.
-    assert!(
-        !home.exists(),
-        "home tree must be reclaimed under purge_home"
-    );
-    assert!(
-        !key.exists(),
-        "signing key must be reclaimed under purge_home"
-    );
-    assert!(
-        !secrets.exists(),
-        "secrets dir must be reclaimed under purge_home"
-    );
+    // The whole persistent footprint is reclaimed, not just the profile.
+    assert!(!home.exists(), "home tree must be reclaimed on delete");
+    assert!(!key.exists(), "signing key must be reclaimed on delete");
+    assert!(!secrets.exists(), "secrets dir must be reclaimed on delete");
+
+    // Reclamation is observable: the response lists what it reclaimed and
+    // reports no cleanup errors.
+    let AdminResponseBody::Success(v) = &res else {
+        panic!("expected Success, got {res:?}");
+    };
+    let reclaimed: Vec<&str> = v["reclaimed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_str().unwrap())
+        .collect();
+    assert_eq!(reclaimed, ["home", "keys", "secrets"]);
+    assert!(v["cleanup_errors"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn agent_delete_without_purge_leaves_footprint() {
+async fn agent_delete_fences_authz_before_reclaiming() {
+    // The cleanup contract for an active principal: authz is closed FIRST
+    // (unlink + profile removal + cache invalidate under the write lock),
+    // so the principal resolves to Default = no caps before its footprint
+    // is reclaimed. A racing in-flight invocation therefore cannot re-open
+    // access, and the footprint is gone afterward.
     let (_dir, kernel) = fixture().await;
     handlers::dispatch(
         &kernel,
         &PrincipalId::default(),
         AdminRequestKind::AgentCreate {
-            name: "keeper".into(),
-            groups: Vec::new(),
+            name: "active".into(),
+            groups: vec![BUILTIN_AGENT.to_string()],
             grants: Vec::new(),
             inherit_from: None,
             clone_from: None,
@@ -615,26 +622,28 @@ async fn agent_delete_without_purge_leaves_footprint() {
         },
     )
     .await;
-    let (home, key, secrets) = seed_principal_footprint(&kernel, &pid("keeper"));
+    let (home, key, secrets) = seed_principal_footprint(&kernel, &pid("active"));
+    // Warm the cache so the principal is "live" pre-delete.
+    let warm = kernel.profile_cache.resolve(&pid("active")).unwrap();
+    assert_eq!(warm.groups, vec![BUILTIN_AGENT.to_string()]);
 
     let res = handlers::dispatch(
         &kernel,
         &PrincipalId::default(),
         AdminRequestKind::AgentDelete {
-            principal: pid("keeper"),
-            purge_home: false,
+            principal: pid("active"),
         },
     )
     .await;
     assert_success(&res);
 
-    // Default delete deliberately leaves the footprint (ops concern).
-    assert!(home.exists(), "home tree must survive a non-purge delete");
-    assert!(key.exists(), "signing key must survive a non-purge delete");
-    assert!(
-        secrets.exists(),
-        "secrets dir must survive a non-purge delete"
-    );
+    // Fenced: authz re-resolves to Default (no groups/grants).
+    let after = kernel.profile_cache.resolve(&pid("active")).unwrap();
+    assert!(after.groups.is_empty(), "authz must be fenced to Default");
+    assert!(after.grants.is_empty());
+
+    // Reclaimed: the footprint is gone.
+    assert!(!home.exists() && !key.exists() && !secrets.exists());
 }
 
 // ── Phantom-principal rejection (Gemini follow-up + R-thirteen) ──

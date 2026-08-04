@@ -9,6 +9,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+### Changed
+
+- **`agent delete` now reclaims the deleted principal's full on-disk footprint.** Delete closes authz first (unlink + profile removal + cache invalidate), then reclaims the home tree plus the signing key (`keys/{principal}.key`) and secrets (`secrets/{principal}/`) — which live in the global `keys/`/`secrets/` trees outside the home dir. Reclamation is best-effort; failures are reported in the response's `cleanup_errors`. Replaces the previous "reclamation is an ops concern" leave-behind, and drops the interim `--purge-home` flag. Part of #1217.
+
 ### Added
 
 - **Windows local transport uses authenticated per-user named pipes.** A pipe
