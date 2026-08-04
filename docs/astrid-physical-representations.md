@@ -770,7 +770,7 @@ logical_charge(domain, t)
 
 physical_pool_bytes(t)
     = sum(allocated bytes of each distinct placed replica extent)
-      + authoritative physical metadata bytes
+      + metadata, staging, and compaction bytes not already in those extents
 
 retention_byte_time(domain, [a,b])
     = integral from a to b of bytes retained solely by that domain's pins,
