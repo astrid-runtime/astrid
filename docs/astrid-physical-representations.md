@@ -117,10 +117,10 @@ RepresentationProfileId = TaggedIdentity(
 ```
 
 Bounds encode in the field order shown, little-endian, with no padding. Every
-maximum is non-zero. Admission requires direct fanout and transitive depth to
-fit, the sum of encoded inputs to fit `maximum_encoded_bytes`, and both
-`canonical_output_bytes` and `maximum_reconstruction_bytes` to fit
-`maximum_output_bytes`. The sandbox meters fuel, peak resident bytes, and
+maximum is non-zero. Admission requires fanout and depth to fit, encoded-input
+sum to fit `maximum_encoded_bytes`, and `canonical_output_bytes` <=
+`maximum_reconstruction_bytes` <= `maximum_output_bytes`. The sandbox meters
+fuel, peak resident bytes, and
 elapsed time and discards partial output on any breach. An operator may impose
 stricter limits by making the candidate unavailable, never by accepting a
 different result under the same profile.
@@ -375,8 +375,8 @@ representations:
 The profile map is authoritative. An identifier without its verified profile
 record is not a usable recovery path. Profile records and all dependencies
 reachable from them remain live while any admitted representation names that
-profile. Revocation blocks new admission only; admitted paths remain eligible
-for reads and recovery until every dependent final path is replaced and leases drain.
+profile. Revocation blocks new admission and preference; admitted paths remain
+selectable until all replacements publish and their leases drain.
 
 All three authoritative maps use one frozen path-copy node grammar:
 
@@ -472,7 +472,7 @@ in-band specification freezes their golden vectors before activation.
 Representation state never enters the principal `roots.journal`. Authority is
 in `representations/CURRENT` and
 `representations/generations/<16-lowercase-hex>/state.journal`. Both use the
-format-one 52-byte frame and checksum with eight-byte magics `ASTCUR1\0` and
+format-one 52-byte checksum-bearing header with magics `ASTCUR1\0` and
 `ASTREP1\0`. `CURRENT` has one frame: `(journal_generation:u64,
 checkpoint_digest:TaggedIdentity, max_tail_frames:u32, max_tail_bytes:u64)`.
 A journal payload is one of:
@@ -564,8 +564,8 @@ authorized ObjectId
 ```
 
 Hard constraints precede scoring: privacy domain, trust state, complete placed
-dependency closure at the required replica count, decoder and key-epoch
-availability, bounds, lease acquisition, and caller resource authority. A
+dependency closure at the required replica count, decoder availability,
+bounds, lease acquisition, and caller resource authority. A
 failed candidate is quarantined and the selector continues only when another
 complete path exists.
 
@@ -680,30 +680,30 @@ Protocol:
    file identity, BlobId, representation record, expected principal root, and
    target path. This record preserves the complete recovery metadata before
    the in-file footer is lost.
-4. Atomically rename the sealed generation to a non-authoritative incoming
-   blob name and flush both namespaces. Truncate that inode to `logical_bytes`,
-   flush it, and recompute its length and `BlobId`; then install it at the final
-   BlobId path atomically with no-replace semantics. If it exists, open it
-   no-follow below the pinned directory and never mutate it. Verify its complete
-   preimage and reuse only an exact match; inequality is fatal. Without
-   no-replace rename, exclusive-create and flush the final copy while retaining
-   the sealed original; it stays non-authoritative.
-5. Stage and flush every canonical File and ChunkTree metadata record required
+4. Choose the publication branch before mutating the source. On the same-volume
+   branch, rename it to a non-authoritative incoming name, flush both namespaces,
+   truncate to `logical_bytes`, flush, and recompute length and `BlobId`. On the
+   fallback branch, retain the footer-bearing sealed source and copy only its
+   logical prefix into a flushed, reverified incoming file.
+5. Install the incoming file at the final BlobId path atomically with no-replace.
+   If it exists, open it no-follow below the pinned directory and never mutate
+   it; reuse only after complete-preimage equality, otherwise fail fatally.
+6. Stage and flush every canonical File and ChunkTree metadata record required
    by coverage-aware traversal.
-6. Publish the verified representation and placement. No placement ever names
+7. Publish the verified representation and placement. No placement ever names
    the incoming file or a file that still contains the staging trailer. Crash
-   recovery uses the intent and physical length to validate and resume either
-   the footer-bearing or truncated state, or quarantines an unrecognized one.
-7. Publish the principal root. The commit fence rechecks the complete metadata
+   recovery uses the intent and physical length to validate a footer-bearing
+   source, copied incoming file, or truncated state; anything else quarantines.
+8. Publish the principal root. The commit fence rechecks the complete metadata
    and representation closure and the active `RepresentationStateId`.
-8. Write the ordinary durable publication marker and reap the staging
+9. Write the ordinary durable publication marker and reap the staging
    generation. A root conflict retries the catalog/root mutation without
    rereading the blob.
 
-This path writes the source bytes once. It still writes bounded metadata and
-durability records. Dropping one small file into a mounted filesystem remains
-native staging work followed by asynchronous publication; large-file adoption
-removes the second full-byte arena append measured in #1392.
+The same-volume rename path writes source bytes once plus bounded metadata. The
+fallback performs one additional full-data write. Mounted writes still
+acknowledge at native staging speed; the optimized branch removes the second
+full-byte arena append measured in #1392.
 
 ## Liveness, GC, and compaction
 

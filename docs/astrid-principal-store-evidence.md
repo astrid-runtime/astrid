@@ -5,7 +5,8 @@ Status: proposed falsifiability contract
 Last reviewed: 2026-07-25
 
 Companions:
-[principal-store architecture](astrid-principal-store.md) and
+[principal-store architecture](astrid-principal-store.md),
+[physical representation contract](astrid-physical-representations.md), and
 [semantic representations](astrid-semantic-representations.md)
 
 This document separates three kinds of confidence:
@@ -221,7 +222,7 @@ Required invariants:
 | STO-MOD-38 | File coverage retains File and ChunkTree metadata while treating covered Chunk leaves as outputs rather than dependencies |
 | STO-MOD-39 | Adoption excludes staging trailers and never overwrites an existing final BlobId path |
 | STO-MOD-40 | Configured checkpoint tail limits bound recovery replay; prior state lineage is not a physical-liveness edge |
-| STO-MOD-41 | Reconstruction bounds have one canonical wire and bound depth, fanout, encoded input, output, fuel, resident memory, and elapsed time |
+| STO-MOD-41 | Reconstruction bounds have one canonical wire, cover canonical output, and bound depth, fanout, encoded input, output, fuel, memory, and time |
 | STO-MOD-42 | Blob collision comparison covers the identity envelope, profile, encoded length, and complete encoded bytes |
 | STO-MOD-43 | File and ChunkTree metadata are durable before any representation state that depends on them activates |
 | STO-MOD-44 | Physical usage counts every distinct live host allocation exactly once, including replicas, metadata, disposable caches, and transient work |
@@ -288,7 +289,7 @@ specification functions.
 | STO-PROP-45 | Coverage traversal retains all File/ChunkTree metadata and never creates a dependency edge from a representation to its covered Chunk outputs |
 | STO-PROP-46 | Every adoption crash prefix recovers a sealed generation, non-authoritative incoming file, exact raw blob, or verified pre-existing blob without overwriting live bytes |
 | STO-PROP-47 | Checkpoint replacement preserves active state across every crash prefix, and append rolls over before either configured tail bound is exceeded |
-| STO-PROP-48 | Non-canonical, zero, or exceeded reconstruction bounds reject the candidate without admitting partial output |
+| STO-PROP-48 | Non-canonical, zero, output-understating, or exceeded reconstruction bounds reject the candidate without admitting partial output |
 | STO-PROP-49 | A forced BlobId digest collision with any unequal preimage field is fatal and never deduplicates |
 | STO-PROP-50 | Every adoption crash prefix before metadata durability leaves the new representation state inactive |
 | STO-PROP-51 | Every allocator-visible creation or removal changes physical usage by that distinct extent's allocated bytes without changing logical usage |
