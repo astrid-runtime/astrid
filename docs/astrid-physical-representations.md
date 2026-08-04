@@ -131,11 +131,26 @@ Profile and recipe compatibility is closed in format one:
 | `contiguous-file` | `ContiguousFile` | `CanonicalFileChunks` | all absent |
 | `transform` | `Compressed`, `Delta`, or `Generated` | `Exact` | all present |
 
-For built-in profiles, `canonical_parameters` is empty and `frozen_specification` identifies
-the engine grammar. Transform profiles include `decoder_or_generator`, `transform_contract`,
-and `runtime_semantic_profile` in `immutable_dependencies`. `Generated` requires
-`invocation.transform == decoder_or_generator`, `invocation.transform_contract == transform_contract`,
-and `invocation.runtime_semantic_profile == runtime_semantic_profile`.
+For built-in profiles, `canonical_parameters` is empty and
+`immutable_dependencies` is exactly
+`[LogicalObject(frozen_specification)]`. Transform profiles require exactly one
+value in each named transform field. Their dependency array is the sorted
+unique union of `LogicalObject(decoder_or_generator)`,
+`LogicalObject(transform_contract)`,
+`LogicalObject(runtime_semantic_profile)`,
+`LogicalObject(frozen_specification)`, and the dependency slots required by the
+frozen transform contract. An ObjectId slot always contributes
+`LogicalObject`; a BlobId slot, including a profile-wide dictionary,
+contributes `PhysicalBlob`. Other dependency tags are invalid in a profile.
+`canonical_parameters` contains scalar canonical values only: every additional
+identity is a typed contract slot and contributes to the array. The contract
+fixes slot count and type; missing, extra, differently tagged, or duplicate
+entries reject. When one identity fills several named roles, role multiplicity
+remains in the named fields while the sorted array contains one typed entry.
+
+`Generated` requires `invocation.transform == decoder_or_generator`,
+`invocation.transform_contract == transform_contract`, and
+`invocation.runtime_semantic_profile == runtime_semantic_profile`.
 Compressed and delta recipes use the named decoder; every other field, recipe, or coverage combination is invalid even if canonically encoded.
 Bootstrap specification objects are terminal: the current `store.meta` specification and recognized
 downgrade predecessors remain pinned direct `objects.arena` frames. Loaded before selection and
@@ -192,6 +207,24 @@ in this array. Every representation record includes its profile as a `Profile`
 dependency, and every profile includes its decoder, specification, runtime,
 dictionary, and other direct dependencies. Nothing else may be fetched
 ambiently during replay.
+
+The record array is exactly the sorted unique union of `Profile(profile)` and
+these recipe-derived entries: direct, packed, and contiguous add
+`PhysicalBlob(blob)`; compressed adds `PhysicalBlob(blob)` and its optional
+`PhysicalBlob(dictionary)`; delta adds `PhysicalBlob(patch)` and
+`LogicalObject(base)`; generated adds `Invocation(invocation)` and
+`Evidence(evidence)`. A present `verification_evidence` adds
+`Evidence(verification_evidence)`, collapsing only when it is the generated
+recipe's same evidence ObjectId. No other entry is admitted.
+
+An `Invocation` dependency has a specialized replay-liveness traversal. It
+retains the invocation record, its complete `Owns` closure, the optional
+`05-provenance-snapshot` Evidence target, every `10-input/` Evidence target,
+and each such target's complete `Owns` closure. It does not retain derived
+outputs. This rule makes replay inputs and a SnapshotBound observation live
+even though the logical invocation deliberately records them as non-owning
+evidence edges. GC and export apply this same traversal; a generic owning-only
+walk is invalid for a generated representation.
 
 The canonical wire follows the existing format-one discipline:
 
@@ -256,6 +289,10 @@ Chunk record without persisting a second `(ObjectId, offset, length)` record
 for every chunk. A disposable reverse index may cache those slices.
 
 The coverage fields are assertions, not an alternate File descriptor.
+For `Exact`, `canonical_record_bytes` equals the byte length of the target
+ObjectId's complete canonical `ObjectRecord` encoding produced by replay;
+admission and recovery reconstruct, identify, and compare that record before
+accepting the length. An arbitrary claimed length is invalid.
 Admission decodes `file` and requires `content_root`, `logical_bytes`,
 `chunk_count`, and `chunking_profile` to equal the canonical File fields and
 its ownership edge exactly. It then validates the complete canonical tree
@@ -316,6 +353,12 @@ reconstructs each covered canonical Chunk record. `Compressed`, `Delta`, and
 `Generated` must produce a complete canonical record before identity
 validation.
 
+For direct, packed, contiguous, compressed, and delta recipes, the
+`PlacementEntry.profile` of the primary `blob` or `patch` must equal
+`RepresentationRecordV1.profile`. A dictionary and any other dependency blob
+retains its own profile. A mismatch is invalid rather than an opportunity to
+run one profile's decoder over bytes named by another.
+
 A delta names a logical base, not a preferred representation; the selector finds a path to
 that `ObjectId`. Admission rejects cycles across representation, profile, logical-object,
 and invocation dependencies and caps total depth. Generated recipes admit only format-one's
@@ -323,6 +366,52 @@ memoizable `Pure` and `SnapshotBound` classes; `Effectful` and `Nondeterministic
 Their evidence must decode canonically as `DerivationEvidence`, identify itself, and validate
 the named invocation. `output_ordinal` is zero-based and in-bounds; its evidence output must equal
 the sole `Exact` coverage ObjectId. Any mismatch makes the representation inadmissible.
+
+### Admission evidence
+
+Non-generated alternate encodings use one closed evidence grammar. The
+evidence is an `ObjectKind::Evidence` (kind 10), format version 1, Metadata
+class, `logical_bytes = 0`, with no references and canonical bytes:
+
+```text
+RepresentationAdmissionEvidenceV1 {
+    magic: [u8; 8] = "ASTRAE1\0",
+    version: u16 = 1,
+    subject: RepresentationAdmissionSubjectId,
+    method: u8,
+    primary_blob: BlobId,
+    observed_encoded_bytes: u64,
+    observed_output_bytes: u64,
+    transcript: TaggedIdentity,
+}
+```
+
+Method tags are direct `0`, packed slice `1`, contiguous file `2`, compressed
+`3`, and delta `4`, and must match the recipe. The subject is
+`PhysicalId("astrid-representation-admission-subject-v1\0", bytes)` where
+`bytes` is the candidate representation's canonical encoding normalized by
+setting `verification_evidence` absent and removing precisely its derived
+Evidence dependency. This breaks the otherwise circular evidence-to-record
+identity while binding every profile, coverage, recipe, bound, and remaining
+dependency field.
+
+The transcript is
+`PhysicalId("astrid-representation-admission-transcript-v1\0", material)`,
+where material is `covered_output_count:u64` followed, in the coverage-defined
+traversal order, by each recomputed output ObjectId envelope and its complete
+canonical-record byte length as `u64`. Counts and lengths are checked. The
+observed byte fields equal the primary placement's encoded length and the
+record's `canonical_output_bytes` respectively.
+
+The engine reconstructs the outputs, recomputes the evidence, and admits only
+the identical ObjectId; a guest or importer never supplies a trusted claim.
+The evidence records an observation and does not replace lazy read verification
+or scrub. A direct representation of the exact canonical bytes already stored
+in a checksummed `objects.arena` frame may omit evidence because ordinary
+server-side object admission is its proof and it is not an alternate encoding.
+Every other non-generated representation requires this evidence. A generated
+record instead requires `verification_evidence == Some(recipe.evidence)` and
+that object must be the canonical `DerivationEvidence` validated above.
 
 ## Authoritative catalogue and disposable indexes
 
@@ -622,86 +711,11 @@ through the existing recovery path before another mutation.
 
 ## Contiguous staged-file adoption
 
-The native staging file is already the one physical write made on the
-user-visible path. Adoption turns that sealed file into the raw-content blob
-instead of copying its bytes into the object arena.
-
-Preconditions:
-
-- the staged generation is sealed, durable, immutable, and has canonical verified intent,
-  owner, content name, generation, length, and source file identity;
-- the blob store and staging area share an atomic-rename domain, or the engine
-  explicitly falls back to copy publication; and
-- an operation lease pins the staged generation until root publication or
-  retry completes.
-
-The durable intent lives at `representations/adoption/<OwnerNameKeyId>.intent`.
-`OwnerNameKeyId = PhysicalId("astrid-adoption-key-v1\0", u64_le(owner.len) || owner ||
-u64_le(name.len) || name)`, where owner is `StateOwnerCodecV1` and name is canonical
-`ContentName` UTF-8. The filename is lowercase hex of the complete tagged identity. One key lock
-permits one intent; an occupied unequal owner/name is fatal. Its frame magic is `ASTADI1\0`:
-
-```text
-AdoptionIntentV1 = version:u16 = 1 || owner:bytes || content_name:bytes || stage_generation:u64
-    || logical_length:u64 || physical_length:u64 || staging_intent:bytes
-    || source_identity:bytes || blob:BlobId || representation:RepresentationRecordId
-    || namespace_generation:u64 || mode:u8
-```
-
-The embedded staging intent must decode and byte-exactly re-encode as `StagingIntent` v2. Outer
-owner/name equal its canonical fields; `stage_generation` equals `sequence`, `logical_length` equals
-`logical_bytes`, and `physical_length == logical_length + staging_intent.len + 32`; mismatch rejects
-before mutation. Source identity is:
-
-```text
-SourceIdentityV1 = Unix { tag:u8 = 0, device:u64, inode:u64 }
-                 | Windows { tag:u8 = 1, volume_serial:u32, index_high:u32, index_low:u32 }
-```
-
-Unix covers Linux and macOS opened-handle `st_dev/st_ino`; Windows matches its three live u32 fields.
-Unknown tags, trailing bytes, or conversion overflow reject. `mode` is rename `0` or copy `1`.
-Target and incoming names derive from namespace generation and BlobId. Creation is exclusive and
-no-follow; file and parent directory flush before mutation. Recovery verifies name, frame,
-staging checksum, and source identity, then resumes idempotently. Roots and representation state are
-always re-read under their fences, never trusted from an intent. The intent survives until the ordinary
-publication marker; cleanup checks that marker first, removes the intent, and flushes its directory.
-Malformed intent blocks only its owner/name key.
-
-Protocol:
-
-1. Validate the staging footer and require physical length to equal the
-   declared logical prefix plus its encoded intent and 32-byte trailer. Stream
-   exactly `logical_bytes` through FastCDC and the identity builders; the
-   footer is never hashed as content. In the same pass compute the raw-content
-   `BlobId`, emit File/ChunkTree records, and construct coverage.
-2. Recheck the sealed generation and file identity. Any mutation rejects the
-   attempt without publishing a root.
-3. Choose the publication mode and durably create its adoption intent before the in-file footer is
-   lost.
-4. Execute the recorded branch before mutating the source. On the same-volume
-   branch, rename it to a non-authoritative incoming name, flush both namespaces,
-   truncate to `logical_bytes`, flush, and recompute length and `BlobId`. On the
-   fallback branch, retain the footer-bearing sealed source and copy only its
-   logical prefix into a flushed, reverified incoming file.
-5. Install the incoming file at the final BlobId path atomically with no-replace.
-   If it exists, open it no-follow below the pinned directory and never mutate
-   it; reuse only after complete-preimage equality, otherwise fail fatally.
-6. Stage and flush every canonical File and ChunkTree metadata record required by coverage, plus
-   their direct representation records and exact arena placements in the candidate state.
-7. Publish all metadata, the verified contiguous representation, and placements in one CAS. None names
-   the incoming file or a file that still contains the staging trailer. Crash
-   recovery uses the intent and physical length to validate a footer-bearing
-   source, copied incoming file, or truncated state; anything else quarantines.
-8. Publish the principal root. The commit fence rechecks the complete metadata
-   and representation closure and the active `RepresentationStateId`.
-9. Write the ordinary durable publication marker and reap the staging
-   generation. A root conflict retries the catalog/root mutation without
-   rereading the blob.
-
-The same-volume rename path writes source bytes once plus bounded metadata. The
-fallback performs one additional full-data write. Mounted writes still
-acknowledge at native staging speed; the optimized branch removes the second
-full-byte arena append measured in #1392.
+The byte-exact intent grammar, crash protocol, and one-write adoption path are
+normative in
+[astrid-contiguous-staged-file-adoption.md](astrid-contiguous-staged-file-adoption.md).
+Adoption is a consumer of this representation contract, never a second
+publication path.
 
 ## Liveness, GC, and compaction
 
@@ -971,28 +985,6 @@ surface requires a separate RFC after the interface freeze.
 
 ## Implementation and evidence order
 
-1. Add canonical model types, golden vectors, decode/re-encode tests, and a
-   primitive independent reader for the representation catalogue.
-2. Model existing arena frames as implicit direct representations and add the
-   authoritative catalogue plus disposable reverse index without deleting any
-   arena bytes.
-3. Add representation and placement leases, final-path liveness proofs, and
-   crash-prefix enumeration.
-4. Implement contiguous staged-file adoption and verified file-range reads.
-5. Teach compaction to choose between retained contiguous blobs and
-   materialized chunks while preserving receipts.
-6. Add compressed, delta, and generated profiles only with pinned decoders,
-   bounds, and corpus evidence.
-
-The benchmark matrix compares direct arena, packed slice, contiguous file,
-compressed, delta, and generated paths. It records ingest and reconstruction
-throughput, latency by range size, physical bytes read/written, CPU, peak
-resident memory, retained byte-time, metadata bytes, read amplification,
-first-touch verification, warm verification, post-reopen behavior, and
-compaction cost. Required workloads include random and repetitive files,
-version chains, model-scale content, one-live-slice amplification, cache-cold
-reads, concurrent principals, ENOSPC, and every named crash boundary.
-
-No representation may replace the last direct arena path until independent
-recovery, full materialized export/import, adversarial bounds, crash-prefix
-testing, and the final-representation liveness proof all pass.
+The implementation sequence, benchmark matrix, and replacement gates live with
+the rest of the store's proof obligations in
+[astrid-principal-store-evidence.md](astrid-principal-store-evidence.md#14-physical-representation-implementation-gates).

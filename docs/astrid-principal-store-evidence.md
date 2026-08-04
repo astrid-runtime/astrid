@@ -570,3 +570,35 @@ the only witness to its own correctness.
 
 Production documentation may say a property is held only after the corresponding
 evidence runs against the shipped artifact and storage format.
+
+## 14. Physical representation implementation gates
+
+Implementation follows this evidence order:
+
+1. Add canonical model types, golden vectors, decode/re-encode tests, and a
+   primitive independent reader for the representation catalogue.
+2. Model existing arena frames as implicit direct representations and add the
+   authoritative catalogue plus disposable reverse index without deleting any
+   arena bytes.
+3. Add representation and placement leases, final-path liveness proofs, and
+   crash-prefix enumeration.
+4. Implement contiguous staged-file adoption and verified file-range reads.
+5. Teach compaction to choose between retained contiguous blobs and
+   materialized chunks while preserving receipts.
+6. Add compressed, delta, and generated profiles only with pinned decoders,
+   bounds, and corpus evidence.
+
+The benchmark matrix compares direct arena, packed slice, contiguous file,
+compressed, delta, and generated paths. It records ingest and reconstruction
+throughput, latency by range size, physical bytes read/written, CPU, peak
+resident memory, retained byte-time, metadata bytes, read amplification,
+first-touch verification, warm verification, post-reopen behavior, and
+compaction cost. Required workloads include random and repetitive files,
+version chains, model-scale content, one-live-slice amplification, cache-cold
+reads, concurrent principals, ENOSPC, and every named crash boundary.
+
+No representation may replace the last direct arena path until independent
+recovery, full materialized export/import, adversarial bounds, crash-prefix
+testing, and the final-representation liveness proof all pass. A candidate
+profile fails if it relies on a hard total-size ceiling, unbounded RAM, or a
+workload-specific ratio presented as a general claim.
