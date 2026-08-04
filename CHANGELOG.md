@@ -17,6 +17,9 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   bounded direct, packed, contiguous, compressed, delta, and generated
   recovery; and makes final-path liveness, reader/commit leases, double-ledger
   accounting, materialized export, and crash-safe replacement explicit.
+  Canonical profile records and placement maps become authoritative only
+  through one root-journal state transition, preventing mixed recovery
+  generations.
   Contiguous staged-file adoption covers canonical Chunk records through the
   existing File DAG, avoiding both a second full data write and one persistent
   slice record per chunk. Existing arena-only stores remain implicit direct

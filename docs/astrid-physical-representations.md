@@ -84,7 +84,7 @@ record:
 ```text
 RepresentationProfileV1 {
     version: u16 = 1,
-    kind: built-in-direct | built-in-contiguous | transform,
+    kind: direct-canonical | packed-canonical | contiguous-file | transform,
     decoder_or_generator: Option<ObjectId>,
     transform_closure: Option<ObjectId>,
     runtime_semantic_profile: Option<ObjectId>,
@@ -95,18 +95,43 @@ RepresentationProfileV1 {
 }
 
 RepresentationProfileId = TaggedIdentity(
-    H("astrid-representation-profile-v1\0" || canonical_profile_bytes)
+    algorithm,
+    construction_version,
+    digest_length,
+    H(
+        "astrid-representation-profile-v1\0" ||
+        canonical_profile_bytes
+    )
 )
 ```
 
 The profile pins the encoding grammar, decoder or generator closure,
 deterministic runtime profile, dictionaries and other immutable data,
 reconstruction-visible failure behavior, and reconstruction bounds. Built-in
-direct and contiguous profiles pin their frozen engine grammar rather than a
-transform capsule.
+direct, packed, and contiguous profiles pin their frozen engine grammar rather
+than a transform capsule.
 Registering a transform-backed profile is operator/signature authority: exact
 output verification prevents substitution, but an untrusted decoder can still
 waste resources or attack its sandbox.
+
+Profile and recipe compatibility is closed in format one:
+
+| Profile kind | Allowed recipe | Allowed coverage | Transform fields |
+|---|---|---|---|
+| `direct-canonical` | `DirectCanonical` | `Exact` | all absent |
+| `packed-canonical` | `PackedSlice` | `Exact` | all absent |
+| `contiguous-file` | `ContiguousFile` | `CanonicalFileChunks` | all absent |
+| `transform` | `Compressed`, `Delta`, or `Generated` | `Exact` | all present |
+
+For built-in profiles, `canonical_parameters` is the frozen empty value and
+`frozen_specification` identifies the corresponding engine grammar. For a
+transform profile, `decoder_or_generator`, `transform_closure`, and
+`runtime_semantic_profile` are all present and included in
+`immutable_dependencies`. `Generated` additionally requires that the
+invocation's transform and runtime profile equal those profile fields.
+Compressed and delta recipes treat the named transform as their decoder.
+Every other field combination, recipe pairing, or coverage pairing is invalid
+even if its bytes otherwise decode canonically.
 
 ```text
 BlobId = TaggedIdentity(
@@ -133,7 +158,7 @@ construction and avoids reopening the frozen object-kind table.
 ```text
 RepresentationRecordV1 {
     version: u16 = 1,
-    profile: TaggedIdentity,
+    profile: RepresentationProfileId,
     coverage: CoverageV1,
     recipe: RecipeV1,
     dependencies: sorted unique DependencyV1[],
@@ -160,14 +185,17 @@ DependencyV1 =
     LogicalObject(ObjectId)
   | PhysicalBlob(BlobId)
   | Representation(RepresentationRecordId)
+  | Profile(RepresentationProfileId)
   | Invocation(InvocationId)
   | Evidence(ObjectId)
-  | KeyEpoch(KeyEpochId)
 ```
 
 They are ordered first by tag and then by canonical identity bytes. The
-dependency list is the complete reconstruction closure; references omitted
-from it cannot be fetched ambiently during replay.
+dependency list is the complete set of direct reconstruction dependencies;
+recursive traversal produces the complete closure. References omitted from a
+record cannot be fetched ambiently during replay. Every representation record
+includes its profile as a `Profile` dependency, and every profile includes its
+decoder, specification, runtime, dictionary, and other direct dependencies.
 
 The canonical wire follows the existing format-one discipline:
 
@@ -176,12 +204,13 @@ The canonical wire follows the existing format-one discipline:
   length`, then exactly that many digest bytes;
 - every byte string and sequence begins with a `u64` byte or item count;
 - every option is one byte (`0` absent, `1` present) followed by the value;
-- profile-kind tags are direct `0`, contiguous `1`, and transform `2`;
+- profile-kind tags are direct canonical `0`, packed canonical `1`,
+  contiguous file `2`, and transform `3`;
 - coverage tags are exact `0` and canonical-file-chunks `1`;
 - recipe tags are direct `0`, packed slice `1`, contiguous file `2`,
   compressed `3`, delta `4`, and generated `5`; and
 - dependency tags are logical object `0`, physical blob `1`, representation
-  `2`, invocation `3`, evidence `4`, and key epoch `5`.
+  `2`, profile `3`, invocation `4`, and evidence `5`.
 
 Counts must equal the bytes or items consumed, reserved values are rejected,
 and there is no alignment padding. The eventual in-band specification freezes
@@ -228,6 +257,14 @@ payload bytes in exactly that order. The representation therefore covers each
 Chunk record without persisting a second `(ObjectId, offset, length)` record
 for every chunk. A disposable reverse index may cache those slices.
 
+The coverage fields are assertions, not an alternate File descriptor.
+Admission decodes `file` and requires `content_root`, `logical_bytes`,
+`chunk_count`, and `chunking_profile` to equal the canonical File fields and
+its ownership edge exactly. It then validates the complete canonical tree
+shape and totals. A mismatch is rejected; readers never choose between the
+coverage copy and the File. This makes one accepted coverage encoding name one
+File DAG.
+
 The File and ChunkTree metadata remain ordinary canonical records. They are
 small and are not replaced by the raw file blob. If the File ceases to be
 logically live while one of its chunks remains live elsewhere, representation
@@ -273,25 +310,138 @@ validation.
 
 A delta names a logical base rather than a preferred base representation. The
 selector independently finds a valid path to that `ObjectId`. Admission rejects
-self-reference and cycles over `(RepresentationRecordId, ObjectId)` and caps
-the complete dependency depth. Generated recipes use the format-one invocation
-contract; effectful invocations are ineligible because replay must not repeat
-side effects.
+self-reference and cycles across representation, profile, logical-object, and
+invocation dependencies and caps the complete dependency depth. Generated
+recipes use the format-one invocation contract; effectful invocations are
+ineligible because replay must not repeat side effects.
 
 ## Authoritative catalogue and disposable indexes
 
-The persistent representation catalogue is a canonical path-copy set of
-`RepresentationRecordId -> RepresentationRecordV1`, rooted by a monotonic
-representation generation. It is engine authority for alternate recovery
-paths. A publication names the expected generation and compare-and-swaps one
-new root.
+The persistent catalogue contains two canonical path-copy maps:
 
-Placement is separate. A placement epoch maps each referenced `BlobId` to its
-replicas or local sealed file. The representation catalogue says how bytes can
-recover objects; placement says where those bytes currently exist.
+```text
+RepresentationCatalogueRootV1 {
+    version: u16 = 1,
+    generation: u64,
+    profiles_root: Option<PhysicalMapNodeId>,
+    profile_count: u64,
+    representations_root: Option<PhysicalMapNodeId>,
+    representation_count: u64,
+}
+
+profiles:
+    RepresentationProfileId -> RepresentationProfileV1
+representations:
+    RepresentationRecordId -> RepresentationRecordV1
+```
+
+The profile map is authoritative. An identifier without its verified profile
+record is not a usable recovery path. Profile records and all dependencies
+reachable from them remain live while any admitted representation names that
+profile. Revocation can prevent new use, but removal requires replacement of
+every dependent final path.
+
+All three authoritative maps use one frozen path-copy node grammar:
+
+```text
+PhysicalMapNodeV1 {
+    version: u16 = 1,
+    domain: profile | representation | placement,
+    level: u16,                       // zero is a leaf
+    entry_count: u16,
+    subtree_entries: u64,
+    entries: leaf[(TaggedIdentity key, u64 value_bytes, value_bytes)]
+           | branch[(TaggedIdentity maximum_key, PhysicalMapNodeId child)],
+}
+```
+
+Keys are strictly increasing unsigned canonical identity bytes. Branch ranges
+are non-overlapping, every non-final node has the frozen fill required by the
+map profile, `subtree_entries` is exact, and leaf values re-derive their keys.
+Domain tags are profile `0`, representation `1`, and placement `2`; `level`
+selects the leaf grammar at zero and the branch grammar otherwise.
+Format one packs at most 128 entries per node, fills every node except the
+rightmost node at each level, uses the shallowest possible tree, and requires
+each branch `maximum_key` to equal its child's final key. Empty maps use an
+absent root. Alternative groupings are non-canonical.
+The domain participates in the node identity, so a profile page cannot be
+reinterpreted as a placement page. The catalogue root, map nodes, profile
+records, representation records, placement set, and state record are always
+stored as direct canonical arena frames; metadata that explains an alternate
+path never depends solely on that path.
+
+Placement is a third authoritative map rooted by one placement set:
+
+```text
+PlacementSetV1 {
+    version: u16 = 1,
+    epoch: u64,
+    entries_root: Option<PhysicalMapNodeId>,
+    blob_count: u64,
+    replica_count: u64,
+}
+
+PlacementEntryV1 {
+    blob: BlobId,
+    encoded_length: u64,
+    replicas: sorted non-empty unique ReplicaV1[],
+}
+
+ReplicaV1 {
+    storage_node: u32,
+    locator: LooseBlob { namespace_generation: u64 }
+           | PackFrame {
+                 pack_generation: u64,
+                 offset: u64,
+                 frame_length: u64,
+                 frame_checksum: TaggedIdentity,
+             },
+}
+```
+
+Placement leaves are keyed by `blob`. Replicas sort by storage node, locator
+tag, then canonical locator bytes. A loose path is derived from
+`(namespace_generation, BlobId)` beneath an already-open private directory;
+host paths and guest names never enter the wire. Pack ranges must be in bounds,
+non-overlapping for distinct frames, and agree with their self-identifying
+headers. Counts and lengths are checked without trusting the disposable index.
+Locator tags are loose blob `0` and pack frame `1`.
+
+The catalogue and placement roots become authoritative only as one pair:
+
+```text
+RepresentationStateV1 {
+    version: u16 = 1,
+    generation: u64,
+    previous: Option<RepresentationStateId>,
+    catalogue: RepresentationCatalogueRootId,
+    placements: PlacementSetId,
+}
+```
+
+State generations increase by exactly one from the previous state; creation
+starts at one. Catalogue generations and placement epochs increase by exactly
+one when their respective map changes and remain equal when that map is reused.
+
+`PhysicalMapNodeId`, `RepresentationCatalogueRootId`, `PlacementSetId`, and
+`RepresentationStateId` each use the full
+`TaggedIdentity(algorithm, construction_version, digest_length, H(domain ||
+canonical_bytes))` envelope. Their format-one derive-key strings are,
+respectively, `astrid-physical-map-node-v1\0`,
+`astrid-representation-catalogue-root-v1\0`,
+`astrid-placement-set-v1\0`, and `astrid-representation-state-v1\0`. The
+in-band specification freezes their golden vectors before activation.
+
+The engine root journal compare-and-swaps the expected previous
+`RepresentationStateId` to the replacement. It first flushes every blob, map
+node, catalogue root, placement set, and state record, then appends and flushes
+one root-journal frame. A crash before that frame leaves the old pair
+authoritative; a crash after it exposes the complete new pair. Recovery replays
+the state CAS chain and validates both closures before serving reads. It never
+activates a catalogue generation or placement epoch independently.
 
 The following are disposable and may be rebuilt from the catalogue,
-placements, and self-identifying blobs:
+placement set, and self-identifying blobs:
 
 - `ObjectId -> candidate RepresentationRecordId[]` reverse lookup;
 - chunk slice offsets derived from `CanonicalFileChunks` traversal;
@@ -312,8 +462,8 @@ verified object frames; no eager rewrite or logical migration is required.
 
 ### Recovery versus lazy byte verification
 
-Open-time recovery verifies the representation catalogue, active placement
-epoch, blob existence and declared length, complete dependency closure,
+Open-time recovery verifies the active `RepresentationStateId`, both roots it
+binds, blob existence and declared length, complete dependency closure,
 canonical records, and retained admission evidence. It does not silently treat
 an editable sidecar or filesystem timestamp as proof that every byte of a
 multi-terabyte blob is still unchanged.
@@ -402,10 +552,12 @@ General representation publication uses this order:
 3. recompute every `BlobId`, reconstruct every declared target, compare
    candidate-equal existing bytes, and produce verification evidence;
 4. flush all new blobs and their containing directories;
-5. append and flush canonical representation records;
-6. under the representation mutation fence, recheck dependencies, placement,
-   limits, and the expected catalogue generation;
-7. publish the new catalogue generation and placement epoch;
+5. append and flush new profile/representation records, path-copy catalogue
+   nodes, placement nodes, and their candidate roots;
+6. under the representation mutation fence, recheck dependencies, limits, and
+   the expected `RepresentationStateId`;
+7. append and flush one state record and root-journal CAS binding the new
+   catalogue root and placement set;
 8. release temporary reservations; and
 9. retire replaced representations only after reader and transaction leases
    drain.
@@ -484,8 +636,9 @@ L is a subset of union(coverage(r) for r in R)
 
 and
 
-every transitive blob, object, representation, invocation, dictionary,
-delta-base, and generator dependency of each r in R is placed and recoverable.
+every transitive blob, object, profile, representation, invocation,
+dictionary, delta-base, and generator dependency of each r in R is placed and
+recoverable.
 ```
 
 Logical reachability and representation reachability are separate fact
@@ -583,11 +736,15 @@ blob survives while any live object needs it. A domain requiring independent
 cryptographic erasure uses domain-specific encryption and gives up cross-domain
 deduplication for those encodings.
 
-An encryption profile identifies its privacy domain, algorithm, and key epoch,
-but never embeds key material in the profile or representation record. The key
-authority is a liveness dependency: losing its final unwrap path makes the
-representation unrecoverable, and destroying it is the cryptographic-erasure
-operation for that domain.
+Format one deliberately defines no encryption recipe or `KeyEpochId` wire
+tag. A future encryption extension must allocate new profile, recipe, and
+dependency tags; define the canonical key-authority record and its tagged
+identity; specify how recovery proves an unwrap path is available; and teach
+RÚNATAL that grammar before activation. It may never smuggle an opaque key
+identifier into format one. Once defined, the key authority is a liveness
+dependency: losing its final unwrap path makes the representation
+unrecoverable, and destroying it is the cryptographic-erasure operation for
+that privacy domain.
 
 ## Export, import, and longevity
 
@@ -674,6 +831,9 @@ garbage collection
 | Record durable, catalogue CAS absent | Record remains unselected staging |
 | Catalogue published, principal root absent | Valid unowned cache entry; root unchanged |
 | Principal root proposed without a live representation | Commit fails closed |
+| Profile record absent or unregistered | Dependent representation is unusable |
+| File coverage field differs from the canonical File | Admission rejects the representation |
+| Catalogue or placement root differs from the state record | Recovery fails closed; neither half activates |
 | Crash during replacement | Recovery selects old or old-plus-new, never neither |
 | ENOSPC during adoption or compaction | Old bytes/root survive; engine reopens in process |
 | Blob digest collision with unequal bytes | Fatal collision; no catalogue mutation |
@@ -698,7 +858,8 @@ guest host functions:
 ```text
 RepresentationCatalogue
     candidates(ObjectId) -> verified candidate descriptors
-    publish(expected_generation, verified_records) -> generation
+    publish(expected_state, verified_profiles, verified_records, placements)
+        -> RepresentationStateId
 
 RepresentationLease
     pins record, blobs, dependencies, and placement epoch

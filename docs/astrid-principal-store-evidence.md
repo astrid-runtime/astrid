@@ -215,6 +215,9 @@ Required invariants:
 | STO-MOD-32 | Representation replacement publishes and verifies a new path before the old final path becomes reclaimable |
 | STO-MOD-33 | A reverse-index miss cannot establish representation absence; only the authoritative catalogue can |
 | STO-MOD-34 | Root commits and open read handles pin their chosen representation through publication or handle release |
+| STO-MOD-35 | Every admitted representation profile is recoverable from the authoritative catalogue and retains its complete dependency closure |
+| STO-MOD-36 | One root-journal CAS binds each representation catalogue root to exactly one placement set; neither half activates alone |
+| STO-MOD-37 | Compact File coverage fields equal the canonical File descriptor and ownership edge exactly |
 
 Every discovered counterexample becomes a minimized checked-in trace and a Rust
 regression test.
@@ -268,6 +271,9 @@ specification functions.
 | STO-PROP-39 | Dropping the final representation, a transitive recipe dependency, or a leased placement is rejected before physical deletion |
 | STO-PROP-40 | Arena-only stores synthesize direct representations without changing any ObjectId, root, export, or quota |
 | STO-PROP-41 | Full export materializes the same canonical closure regardless of the locally selected physical representation |
+| STO-PROP-42 | A missing, unregistered, or dependency-incomplete profile makes every dependent candidate unavailable |
+| STO-PROP-43 | Any mismatch between compact coverage fields and the named canonical File is rejected at admission |
+| STO-PROP-44 | Every crash prefix around state publication activates the complete old pair or complete new pair, never mixed catalogue and placement roots |
 
 The deliberate tiny digest model must generate collisions and assert byte
 comparison rejects them. Production collision probability is not a substitute
