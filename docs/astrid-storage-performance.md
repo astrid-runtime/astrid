@@ -430,6 +430,47 @@ write-and-sync operations/s; ordinary provider close must therefore retain the
 staged acknowledgement boundary rather than synchronously impersonating
 `seal`.
 
+### Authoritative physical-catalogue cost
+
+Issue #1450 was measured against a clean `94e7cea7` main checkout and twice on
+the physical-catalogue branch: first at `d6bc3d06`, then at `0d5a42b3` after
+batch admission stopped persisting intermediate path-copy map nodes. All three
+runs used the same 512 MiB corpus and command-line configuration as the
+integrated measurement above. The evidence envelopes are
+`astrid-storage-main-94e7cea7.json`,
+`astrid-storage-physical-catalogue-d6bc3d06.json`, and
+`astrid-storage-physical-catalogue-0d5a42b3.json`.
+
+| Operation | Main `94e7cea7` | Physical catalogue `0d5a42b3` | Change |
+|---|---:|---:|---:|
+| Unique publication | 208.2 MiB/s | 129.8 MiB/s | 37.7% lower |
+| Duplicate publication | 260.3 MiB/s | 252.2 MiB/s | 3.1% lower |
+| Warm verified read | 1,683.6 MiB/s | 1,681.8 MiB/s | 0.1% lower |
+| Four-principal warm verified read | 6,549.9 MiB/s | 6,359.9 MiB/s | 2.9% lower |
+| Four-principal shared publication | 438.2 MiB/s | 322.7 MiB/s | 26.4% lower |
+| Populated reopen | 1,098.2 ms | 2,698.0 ms | 2.46× elapsed |
+| Direct-catalogue activation | not applicable | 2,651.9 ms | one-time migration |
+
+The paired substrate comparison remains favorable: staging took 0.982× the
+native cached-write time and a warm Astrid verified read took 0.961× the native
+BLAKE3-verified read time. The physical catalogue therefore leaves the hosted
+read path at parity while making representation placement independently
+recoverable and auditable.
+
+The first implementation appended 39,945,425 bytes of representation metadata
+for 6,748 admitted objects, or 5,919.6 bytes per object. Persisting only the
+final reachable map nodes reduced that to 9,878,706 bytes, or 1,463.9 bytes per
+object: a 75.3% reduction. Total unique authoritative growth fell from 1.07677×
+to 1.02077× logical bytes. A duplicate 512 MiB publication appended 25,786
+bytes, 0.004803% of the logical input; this is exact same-content admission plus
+new catalogue/root metadata, not an estimate of corpus-wide convergence.
+
+The remaining costs are explicit rather than hidden. Unique admission performs
+the new canonical map construction and metadata writes, and reopen validates
+the independently durable physical graph. Those paths are the next
+optimization targets; warm reads and the two-flush KV durability path do not
+need to be traded away to improve them.
+
 ## Optimization experiments
 
 Several optimization branches were measured independently before integration.

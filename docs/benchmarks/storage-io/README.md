@@ -15,6 +15,11 @@ This directory contains evidence only:
   host, and workload; and
 - `SHA256SUMS`, which fixes the imported result bytes.
 
+The `94e7cea7` main and `d6bc3d06`/`0d5a42b3` physical-catalogue envelopes are
+a paired three-run series. They establish the pre-change baseline, expose the
+initial physical-metadata amplification, and measure the final-node-only batch
+admission correction under an otherwise identical workload.
+
 The historical schema did not embed Git revision, executable arguments,
 dirty-tree state, or cache policy. The canonical document records reconstructed
 ancestry and explicitly prevents independent experiment branches from being
