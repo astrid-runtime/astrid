@@ -60,7 +60,9 @@ Every `bytes` field is prefixed by its `u64` byte length. The embedded staging
 intent must decode and byte-exactly re-encode as `StagingIntent` v2. Outer
 owner/name equal its canonical fields; `stage_generation` equals `sequence`, `logical_length` equals
 `logical_bytes`, and `physical_length == logical_length + staging_intent.len + 32`; mismatch rejects
-before mutation. `profile_record` and `representation_record` are the complete
+before mutation. The decoded staging chunking profile must equal both the
+canonical File's profile and `CanonicalFileChunks.chunking_profile`; recovery
+never substitutes another profile. `profile_record` and `representation_record` are the complete
 canonical physical values whose derived IDs equal `profile` and
 `representation`. `admission_evidence_record` is the evidence object's complete
 canonical `ObjectRecord` encoding; server-side identity must equal

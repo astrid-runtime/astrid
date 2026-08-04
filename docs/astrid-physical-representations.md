@@ -473,9 +473,11 @@ PhysicalMapNodeV1 =
     }
 ```
 
-The search key is its big-endian u32 byte length followed by tagged-identity bytes. The trie stores
-the longest common descendant prefix; the next bit selects `zero` or `one`. Unused final bits are
-zero, unary branches are forbidden, subtree counts are exact, and leaves re-derive keys. The key
+The search key is its big-endian u32 byte length followed by tagged-identity bytes; this length is
+the sole exception to the general little-endian integer rule. Trie traversal is most-significant
+bit first within each byte (`0x80` through `0x01`), beginning with the length prefix. The trie stores
+the longest common descendant prefix; the next bit selects `zero` or `one`. Unused low bits in the
+final prefix byte are zero, unary branches are forbidden, subtree counts are exact, and leaves re-derive keys. The key
 set determines one shape regardless of insertion order. Point updates copy at most the key's bit
 length. Empty maps have no root. Domain tags are profile `0`, representation `1`, and placement `2`.
 The node identity includes its domain, so cross-map reinterpretation fails.
@@ -570,6 +572,26 @@ and the checksum equals the header. Payload blob, profile, and encoded length
 must equal the `PlacementEntryV1`; the encoded bytes reproduce the BlobId.
 Generation-zero arena locators instead read the existing `ASTOBJ1\0` object
 frame grammar. Pack ranges are in-bounds and non-overlapping.
+
+A `LooseBlob` keeps encoded bytes raw for zero-copy adoption and requires the
+sibling `<BlobId>.meta` beside `<BlobId>.blob`. The metadata is one common
+format-one frame with magic `ASTBLM1\0` and payload:
+
+```text
+LooseBlobMetaV1 = version:u16 = 1 || blob:BlobId
+    || profile:RepresentationProfileId || encoded_length:u64
+```
+
+Metadata publishes first via exclusive `<BlobId>.meta.tmp`, file flush,
+reopen verification, no-replace rename, and directory flush; only then may the
+raw blob install no-replace. Equal occupied metadata is reusable after exact
+frame comparison; unequal metadata is a fatal collision. A raw blob without
+valid metadata is unattributed and never reused. The placement CAS follows
+verification of both files. Thus a crash before the CAS retains the original
+profile preimage, and admission can stream the exact raw length to collision-
+compare and rederive the BlobId. Adoption recovery additionally binds this
+metadata to its durable intent.
+
 Locators agree with frame headers; profile and length reproduce the BlobId
 preimage. Counts never trust a disposable index. Tags are arena `0`, loose `1`,
 and pack `2`.
@@ -667,28 +689,8 @@ representation failure; neither is an untyped "candidate" failure.
 
 ## Costed selection
 
-The selector minimizes an operator policy over measured candidates:
-
-```text
-cost(r) =
-    w_read       * expected_physical_bytes_read(r)
-  + w_write      * expected_physical_bytes_written(r)
-  + w_cpu        * expected_cpu_time(r)
-  + w_latency    * expected_tail_latency(r)
-  + w_memory     * peak_resident_bytes(r)
-  + w_retention  * retained_byte_time(r)
-```
-
-The weights and observations are deployment policy, not identity. The
-selection receipt records the policy identity and actual resource
-measurements. A recipe's own cost claim is only a hint; the engine applies
-hard ceilings and charges actual execution. A small recipe with unbounded
-reconstruction is rejected rather than preferred.
-
-The search is a bounded traversal over representation dependencies. Cycles,
-missing nodes, expired placements, depth overflow, or budget exhaustion make
-that candidate unavailable. They never change the requested `ObjectId` or
-fall through to unverified bytes.
+The operator policy, bounded search, and measurement contract are normative in
+[astrid-storage-performance.md](astrid-storage-performance.md#representation-selection-cost-model).
 
 ## Publication and replacement
 
@@ -859,6 +861,14 @@ plus representation GC deletes only uniquely owned physical closures. A shared
 blob survives while any live object needs it. A domain requiring independent
 cryptographic erasure uses domain-specific encryption and gives up cross-domain
 deduplication for those encodings.
+
+A generated representation and every replay-required invocation input and
+snapshot must belong to one erasure domain. Cross-domain replay dependencies
+require an explicit source-domain grant into an erasure-waived retention class;
+without it admission fails. Before acknowledging hard erasure, the mutation
+fence finds every external recipe that depends on the condemned domain and
+materializes or replaces its outputs, or removes that recipe. Another domain's
+physical optimization may never delay an acknowledged source-domain erasure.
 
 Format one deliberately defines no encryption recipe or `KeyEpochId` wire
 tag. A future encryption extension must allocate new profile, recipe, and

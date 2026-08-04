@@ -646,6 +646,31 @@ persistent indexing and compaction, a path-copy catalog, bounded builder
 metadata, group publication, and representation adoption. The benchmark must
 be rerun after each change instead of treating the projection as a promise.
 
+## Representation selection cost model
+
+Physical representation selection minimizes an operator policy over measured
+candidates:
+
+```text
+cost(r) =
+    w_read       * expected_physical_bytes_read(r)
+  + w_write      * expected_physical_bytes_written(r)
+  + w_cpu        * expected_cpu_time(r)
+  + w_latency    * expected_tail_latency(r)
+  + w_memory     * peak_resident_bytes(r)
+  + w_retention  * retained_byte_time(r)
+```
+
+Weights and observations are deployment policy, not identity. The selection
+receipt records policy identity and actual resource measurements. Recipe cost
+claims are hints; the engine applies hard ceilings and charges actual execution.
+A small recipe with unbounded reconstruction is rejected rather than preferred.
+
+Search is a bounded traversal over representation dependencies. Cycles,
+missing nodes, expired placements, depth overflow, or budget exhaustion make a
+candidate unavailable. They never change the requested `ObjectId` or fall
+through to unverified bytes.
+
 ## Product-level workload scoreboard
 
 The synthetic cliff-finder remains mandatory, but performance claims about the
