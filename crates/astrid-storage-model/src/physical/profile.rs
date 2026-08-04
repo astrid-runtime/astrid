@@ -345,7 +345,7 @@ impl RepresentationProfile {
                 "transform profile requires pinned transform fields",
             ));
         }
-        Ok(Self {
+        let profile = Self {
             kind,
             decoder_or_generator: None,
             transform_contract: None,
@@ -356,7 +356,9 @@ impl RepresentationProfile {
             )],
             reconstruction_bounds,
             frozen_specification,
-        })
+        };
+        profile.validate_parts()?;
+        Ok(profile)
     }
 
     /// Construct a transform profile and canonicalize its dependency set.
@@ -364,7 +366,11 @@ impl RepresentationProfile {
     /// Named transform fields and the frozen specification are inserted as
     /// logical dependencies. `contract_dependencies` adds only the typed slots
     /// required by the pinned transform contract.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PhysicalModelError::InvalidProfile`] when the complete
+    /// immutable dependency set exceeds the profile's own fanout bound.
     pub fn new_transform(
         decoder_or_generator: ObjectId,
         transform_contract: ObjectId,
@@ -373,7 +379,7 @@ impl RepresentationProfile {
         mut contract_dependencies: Vec<ProfileDependency>,
         reconstruction_bounds: ReconstructionBounds,
         frozen_specification: ObjectId,
-    ) -> Self {
+    ) -> Result<Self, PhysicalModelError> {
         contract_dependencies.extend_from_slice(&[
             ProfileDependency::LogicalObject(decoder_or_generator),
             ProfileDependency::LogicalObject(transform_contract),
@@ -382,7 +388,7 @@ impl RepresentationProfile {
         ]);
         contract_dependencies.sort_unstable();
         contract_dependencies.dedup();
-        Self {
+        let profile = Self {
             kind: ProfileKind::Transform,
             decoder_or_generator: Some(decoder_or_generator),
             transform_contract: Some(transform_contract),
@@ -391,7 +397,9 @@ impl RepresentationProfile {
             immutable_dependencies: contract_dependencies,
             reconstruction_bounds,
             frozen_specification,
-        }
+        };
+        profile.validate_parts()?;
+        Ok(profile)
     }
 
     /// Return the profile family.
@@ -497,15 +505,6 @@ impl RepresentationProfile {
         let reconstruction_bounds = ReconstructionBounds::decode_from(&mut decoder)?;
         let frozen_specification = decode_object_id(&mut decoder)?;
         decoder.finish()?;
-        validate_profile_parts(
-            kind,
-            decoder_or_generator,
-            transform_contract,
-            runtime_semantic_profile,
-            &canonical_parameters,
-            &immutable_dependencies,
-            frozen_specification,
-        )?;
         let profile = Self {
             kind,
             decoder_or_generator,
@@ -516,6 +515,7 @@ impl RepresentationProfile {
             reconstruction_bounds,
             frozen_specification,
         };
+        profile.validate_parts()?;
         if profile.encode()?.as_slice() != bytes {
             return Err(PhysicalModelError::NonCanonicalEncoding);
         }
@@ -537,6 +537,64 @@ impl RepresentationProfile {
             &self.encode()?,
         )))
     }
+
+    fn validate_parts(&self) -> Result<(), PhysicalModelError> {
+        if self
+            .immutable_dependencies
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        {
+            return Err(PhysicalModelError::NonCanonicalCollection(
+                "profile dependency",
+            ));
+        }
+        let frozen = ProfileDependency::LogicalObject(self.frozen_specification);
+        if self.kind == ProfileKind::Transform {
+            let required = [
+                self.decoder_or_generator,
+                self.transform_contract,
+                self.runtime_semantic_profile,
+            ];
+            if required.iter().any(Option::is_none) {
+                return Err(PhysicalModelError::InvalidProfile(
+                    "transform profile omitted a pinned transform field",
+                ));
+            }
+            for object in required.into_iter().flatten() {
+                if self
+                    .immutable_dependencies
+                    .binary_search(&ProfileDependency::LogicalObject(object))
+                    .is_err()
+                {
+                    return Err(PhysicalModelError::InvalidProfile(
+                        "transform field is absent from immutable dependencies",
+                    ));
+                }
+            }
+            if self.immutable_dependencies.binary_search(&frozen).is_err() {
+                return Err(PhysicalModelError::InvalidProfile(
+                    "frozen specification is absent from immutable dependencies",
+                ));
+            }
+        } else if self.decoder_or_generator.is_some()
+            || self.transform_contract.is_some()
+            || self.runtime_semantic_profile.is_some()
+            || !self.canonical_parameters.is_empty()
+            || self.immutable_dependencies != [frozen]
+        {
+            return Err(PhysicalModelError::InvalidProfile(
+                "built-in profile carried transform-only fields",
+            ));
+        }
+        let dependency_count = u32::try_from(self.immutable_dependencies.len())
+            .map_err(|_| PhysicalModelError::LengthOverflow)?;
+        if dependency_count > self.reconstruction_bounds.maximum_dependency_fanout() {
+            return Err(PhysicalModelError::InvalidProfile(
+                "profile dependencies exceed reconstruction fanout",
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn encode_optional_object(encoder: &mut Encoder, value: Option<ObjectId>) {
@@ -547,61 +605,4 @@ fn encode_optional_object(encoder: &mut Encoder, value: Option<ObjectId>) {
         },
         None => encoder.u8(0),
     }
-}
-
-fn validate_profile_parts(
-    kind: ProfileKind,
-    decoder_or_generator: Option<ObjectId>,
-    transform_contract: Option<ObjectId>,
-    runtime_semantic_profile: Option<ObjectId>,
-    canonical_parameters: &[u8],
-    immutable_dependencies: &[ProfileDependency],
-    frozen_specification: ObjectId,
-) -> Result<(), PhysicalModelError> {
-    if immutable_dependencies
-        .windows(2)
-        .any(|pair| pair[0] >= pair[1])
-    {
-        return Err(PhysicalModelError::NonCanonicalCollection(
-            "profile dependency",
-        ));
-    }
-    let frozen = ProfileDependency::LogicalObject(frozen_specification);
-    if kind == ProfileKind::Transform {
-        let required = [
-            decoder_or_generator,
-            transform_contract,
-            runtime_semantic_profile,
-        ];
-        if required.iter().any(Option::is_none) {
-            return Err(PhysicalModelError::InvalidProfile(
-                "transform profile omitted a pinned transform field",
-            ));
-        }
-        for object in required.into_iter().flatten() {
-            if immutable_dependencies
-                .binary_search(&ProfileDependency::LogicalObject(object))
-                .is_err()
-            {
-                return Err(PhysicalModelError::InvalidProfile(
-                    "transform field is absent from immutable dependencies",
-                ));
-            }
-        }
-        if immutable_dependencies.binary_search(&frozen).is_err() {
-            return Err(PhysicalModelError::InvalidProfile(
-                "frozen specification is absent from immutable dependencies",
-            ));
-        }
-    } else if decoder_or_generator.is_some()
-        || transform_contract.is_some()
-        || runtime_semantic_profile.is_some()
-        || !canonical_parameters.is_empty()
-        || immutable_dependencies != [frozen]
-    {
-        return Err(PhysicalModelError::InvalidProfile(
-            "built-in profile carried transform-only fields",
-        ));
-    }
-    Ok(())
 }

@@ -123,6 +123,8 @@ def decode_profile(data):
     cursor.done()
     if not all(bounds):
         raise FormatError("zero reconstruction bound")
+    if len(dependencies) > bounds[1]:
+        raise FormatError("profile exceeds its reconstruction fanout bound")
     encoded_dependencies = [encode_profile_dependency(value) for value in dependencies]
     if any(
         left >= right
@@ -428,6 +430,17 @@ def decode_fixture(path):
     )
     if not compatible:
         raise FormatError("profile, recipe, and coverage are incompatible")
+    maximum_fanout = profile["bounds"][1]
+    maximum_output_bytes = profile["bounds"][3]
+    if len(record["dependencies"]) > maximum_fanout:
+        raise FormatError("representation exceeds its reconstruction fanout bound")
+    if (
+        record["canonical_output_bytes"] > maximum_output_bytes
+        or record["maximum_reconstruction_bytes"] > maximum_output_bytes
+    ):
+        raise FormatError("representation exceeds its profile output bound")
+    if record["recipe"][0] <= 4 and record["recipe"][1] != blob_id:
+        raise FormatError("representation primary blob does not match fixture blob")
     return {
         "profile": identity_text(profile_id),
         "blob": identity_text(blob_id),

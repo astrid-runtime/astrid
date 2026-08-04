@@ -6,7 +6,7 @@ use alloc::{string::String, vec};
 use std::format;
 use std::io::Write;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output};
 
 use crate::{BlobId, InvocationId, ObjectId};
 
@@ -60,6 +60,56 @@ fn to_hex(bytes: &[u8]) -> String {
         output.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
     }
     output
+}
+
+fn fixture_for(
+    profile: &RepresentationProfile,
+    encoded_blob: &[u8],
+    record: &RepresentationRecord,
+) -> String {
+    let profile_bytes = profile.encode().unwrap();
+    let profile_id = profile.identify(&Blake3PhysicalIdentity).unwrap();
+    let blob_id = BlobId::identify(&Blake3PhysicalIdentity, profile_id, encoded_blob).unwrap();
+    let record_bytes = record.encode().unwrap();
+    let record_id = record.identify(&Blake3PhysicalIdentity).unwrap();
+    format!(
+        concat!(
+            "{{\n",
+            "  \"profile\": {{\n",
+            "    \"id\": \"1:2:32:{}\",\n",
+            "    \"canonical_hex\": \"{}\"\n",
+            "  }},\n",
+            "  \"blob\": {{\n",
+            "    \"id\": \"1:2:32:{}\",\n",
+            "    \"profile\": \"1:2:32:{}\",\n",
+            "    \"encoded_hex\": \"{}\"\n",
+            "  }},\n",
+            "  \"representation\": {{\n",
+            "    \"id\": \"1:2:32:{}\",\n",
+            "    \"canonical_hex\": \"{}\"\n",
+            "  }}\n",
+            "}}\n",
+        ),
+        to_hex(profile_id.as_bytes()),
+        to_hex(&profile_bytes),
+        to_hex(blob_id.as_bytes()),
+        to_hex(profile_id.as_bytes()),
+        to_hex(encoded_blob),
+        to_hex(record_id.as_bytes()),
+        to_hex(&record_bytes),
+    )
+}
+
+fn run_independent_fixture(fixture: &str) -> Output {
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    file.write_all(fixture.as_bytes()).unwrap();
+    file.flush().unwrap();
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    Command::new("python3")
+        .arg(repository.join("scripts/runatal_v1_physical.py"))
+        .arg(file.path())
+        .output()
+        .unwrap()
 }
 
 const PROFILE_HEX: &str = "010000000000000000000000000001000000000000000001000100200000000101010101010101010101010101010101010101010101010101010101010101010008000000200000000000800000000000000000010000000040420f00000000000000000200000000404b4c000000000001000100200000000101010101010101010101010101010101010101010101010101010101010101";
@@ -126,7 +176,8 @@ fn transform_profile_dependencies_are_canonical_and_complete() {
         ],
         bounds(),
         object(7),
-    );
+    )
+    .unwrap();
     assert!(
         profile
             .immutable_dependencies()
@@ -137,6 +188,32 @@ fn transform_profile_dependencies_are_canonical_and_complete() {
         RepresentationProfile::decode(&profile.encode().unwrap()).unwrap(),
         profile
     );
+}
+
+#[test]
+fn transform_profile_rejects_its_own_dependency_fanout() {
+    let narrow_bounds = ReconstructionBounds::new(
+        8,
+        3,
+        8 * 1024 * 1024,
+        16 * 1024 * 1024,
+        1_000_000,
+        32 * 1024 * 1024,
+        5_000_000,
+    )
+    .unwrap();
+    assert!(matches!(
+        RepresentationProfile::new_transform(
+            object(4),
+            object(5),
+            object(6),
+            vec![],
+            vec![],
+            narrow_bounds,
+            object(7),
+        ),
+        Err(PhysicalModelError::InvalidProfile(_))
+    ));
 }
 
 #[test]
@@ -349,7 +426,8 @@ fn transform_recipe_families_round_trip_under_the_transform_profile() {
         vec![ProfileDependency::PhysicalBlob(blob(7))],
         bounds(),
         object(1),
-    );
+    )
+    .unwrap();
     for recipe in [
         Recipe::Compressed {
             blob: blob(13),
@@ -450,32 +528,7 @@ fn format_one_golden_vectors_are_frozen_and_shared_with_the_second_reader() {
     assert_eq!(to_hex(&record_bytes), RECORD_HEX);
     assert_eq!(to_hex(record_id.as_bytes()), RECORD_ID_HEX);
 
-    let expected_fixture = format!(
-        concat!(
-            "{{\n",
-            "  \"profile\": {{\n",
-            "    \"id\": \"1:2:32:{}\",\n",
-            "    \"canonical_hex\": \"{}\"\n",
-            "  }},\n",
-            "  \"blob\": {{\n",
-            "    \"id\": \"1:2:32:{}\",\n",
-            "    \"profile\": \"1:2:32:{}\",\n",
-            "    \"encoded_hex\": \"{}\"\n",
-            "  }},\n",
-            "  \"representation\": {{\n",
-            "    \"id\": \"1:2:32:{}\",\n",
-            "    \"canonical_hex\": \"{}\"\n",
-            "  }}\n",
-            "}}\n",
-        ),
-        PROFILE_ID_HEX,
-        PROFILE_HEX,
-        BLOB_ID_HEX,
-        PROFILE_ID_HEX,
-        BLOB_BYTES_HEX,
-        RECORD_ID_HEX,
-        RECORD_HEX,
-    );
+    let expected_fixture = fixture_for(&profile, encoded_blob, &record);
     assert_eq!(
         include_str!("../../../../scripts/fixtures/runatal-physical-v1.json"),
         expected_fixture
@@ -507,18 +560,108 @@ fn independent_reader_rejects_profile_tampering() {
         1,
     );
     assert_ne!(tampered, fixture);
-    let mut file = tempfile::NamedTempFile::new().unwrap();
-    file.write_all(tampered.as_bytes()).unwrap();
-    file.flush().unwrap();
-
-    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let output = Command::new("python3")
-        .arg(repository.join("scripts/runatal_v1_physical.py"))
-        .arg(file.path())
-        .output()
-        .unwrap();
+    let output = run_independent_fixture(&tampered);
     assert!(
         !output.status.success(),
         "independent physical reader accepted a mutated profile"
+    );
+}
+
+#[test]
+fn independent_reader_enforces_profile_output_bounds() {
+    let tight_bounds = ReconstructionBounds::new(
+        8,
+        32,
+        8 * 1024 * 1024,
+        32,
+        1_000_000,
+        32 * 1024 * 1024,
+        5_000_000,
+    )
+    .unwrap();
+    let profile =
+        RepresentationProfile::new_builtin(ProfileKind::DirectCanonical, tight_bounds, object(1))
+            .unwrap();
+    let profile_id = profile.identify(&Blake3PhysicalIdentity).unwrap();
+    let encoded_blob = b"self-consistent but too large for the profile";
+    let blob_id = BlobId::identify(&Blake3PhysicalIdentity, profile_id, encoded_blob).unwrap();
+    let record = RepresentationRecord::new(
+        profile_id,
+        Coverage::exact(object(2), 64).unwrap(),
+        Recipe::DirectCanonical { blob: blob_id },
+        64,
+        64,
+        None,
+    )
+    .unwrap();
+    assert!(
+        record
+            .validate_against_profile(&Blake3PhysicalIdentity, &profile)
+            .is_err()
+    );
+    assert!(
+        !run_independent_fixture(&fixture_for(&profile, encoded_blob, &record))
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn independent_reader_enforces_record_dependency_fanout() {
+    let narrow_bounds = ReconstructionBounds::new(
+        8,
+        1,
+        8 * 1024 * 1024,
+        16 * 1024 * 1024,
+        1_000_000,
+        32 * 1024 * 1024,
+        5_000_000,
+    )
+    .unwrap();
+    let profile =
+        RepresentationProfile::new_builtin(ProfileKind::DirectCanonical, narrow_bounds, object(1))
+            .unwrap();
+    let profile_id = profile.identify(&Blake3PhysicalIdentity).unwrap();
+    let encoded_blob = b"record fanout fixture";
+    let blob_id = BlobId::identify(&Blake3PhysicalIdentity, profile_id, encoded_blob).unwrap();
+    let record = RepresentationRecord::new(
+        profile_id,
+        Coverage::exact(object(2), 64).unwrap(),
+        Recipe::DirectCanonical { blob: blob_id },
+        64,
+        64,
+        None,
+    )
+    .unwrap();
+    assert!(
+        record
+            .validate_against_profile(&Blake3PhysicalIdentity, &profile)
+            .is_err()
+    );
+    assert!(
+        !run_independent_fixture(&fixture_for(&profile, encoded_blob, &record))
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn independent_reader_rejects_an_unconnected_primary_blob() {
+    let profile = direct_profile();
+    let profile_id = profile.identify(&Blake3PhysicalIdentity).unwrap();
+    let encoded_blob = b"fixture blob";
+    let record = RepresentationRecord::new(
+        profile_id,
+        Coverage::exact(object(2), 64).unwrap(),
+        Recipe::DirectCanonical { blob: blob(99) },
+        64,
+        64,
+        None,
+    )
+    .unwrap();
+    assert!(
+        !run_independent_fixture(&fixture_for(&profile, encoded_blob, &record))
+            .status
+            .success()
     );
 }
