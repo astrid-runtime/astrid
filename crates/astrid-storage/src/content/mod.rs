@@ -5,6 +5,7 @@
 //! chunks or complete files are physically deduplicated.
 
 mod catalog;
+mod change_detection;
 mod kv_projection;
 #[cfg(not(target_family = "wasm"))]
 mod projection_names;
@@ -20,6 +21,10 @@ use astrid_storage_model::{ObjectId, RootState};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub use astrid_storage_content::{ChunkingProfile, ContentDescriptor};
+pub use change_detection::{
+    ContentChangeCache, SourceEpoch, SourceFingerprint, SourceObservation, SourceScopeId,
+    SourceTrust, StableSourceId,
+};
 #[cfg(not(target_family = "wasm"))]
 pub use projection_names::{
     AtomicProjectionNameReservation, ProjectedContentPath, ProjectedNameSegment,
@@ -213,6 +218,7 @@ pub struct ContentIngest<R> {
     name: ContentName,
     source: R,
     profile: ChunkingProfile,
+    observation: Option<SourceObservation>,
 }
 
 /// Operator-selectable CPU parallelism for bulk content construction.
@@ -228,14 +234,6 @@ impl BulkIngestPolicy {
         Self { worker_threads }
     }
 
-    /// Derive local-mode parallelism from the host's available CPU authority.
-    #[must_use]
-    pub fn host_default() -> Self {
-        Self {
-            worker_threads: std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN),
-        }
-    }
-
     /// Return the maximum number of concurrent source workers.
     #[must_use]
     pub const fn worker_threads(self) -> NonZeroUsize {
@@ -245,7 +243,10 @@ impl BulkIngestPolicy {
 
 impl Default for BulkIngestPolicy {
     fn default() -> Self {
-        Self::host_default()
+        // Library code cannot infer how much of the host belongs to this
+        // principal. Runtimes inject an explicit limit after resource
+        // admission; the implicit path remains bounded and serial.
+        Self::new(NonZeroUsize::MIN)
     }
 }
 
@@ -257,6 +258,7 @@ impl<R> ContentIngest<R> {
             name,
             source,
             profile: ChunkingProfile::ASTRID_V1,
+            observation: None,
         }
     }
 
@@ -267,12 +269,29 @@ impl<R> ContentIngest<R> {
             name,
             source,
             profile,
+            observation: None,
         }
     }
 
-    pub(crate) fn into_parts(self) -> (ContentName, R, ChunkingProfile) {
-        (self.name, self.source, self.profile)
+    /// Attach the platform adapter's source-version observation.
+    #[must_use]
+    pub fn with_observation(mut self, observation: SourceObservation) -> Self {
+        self.observation = Some(observation);
+        self
     }
+
+    pub(crate) fn into_parts(self) -> (ContentName, R, ChunkingProfile, Option<SourceObservation>) {
+        (self.name, self.source, self.profile, self.observation)
+    }
+}
+
+/// Evidence for why a batch entry did or did not require byte reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContentObservation {
+    /// The builder directly observed and identified every source byte.
+    BytesObserved,
+    /// A trusted unchanged token reused a prior byte-verified descriptor.
+    ChangeTokenObserved,
 }
 
 /// One name and immutable descriptor published by a batch.
@@ -280,11 +299,20 @@ impl<R> ContentIngest<R> {
 pub struct ContentBatchEntry {
     name: ContentName,
     descriptor: ContentDescriptor,
+    observation: ContentObservation,
 }
 
 impl ContentBatchEntry {
-    pub(crate) const fn new(name: ContentName, descriptor: ContentDescriptor) -> Self {
-        Self { name, descriptor }
+    pub(crate) const fn new(
+        name: ContentName,
+        descriptor: ContentDescriptor,
+        observation: ContentObservation,
+    ) -> Self {
+        Self {
+            name,
+            descriptor,
+            observation,
+        }
     }
 
     /// Borrow the published name.
@@ -297,6 +325,12 @@ impl ContentBatchEntry {
     #[must_use]
     pub const fn descriptor(&self) -> ContentDescriptor {
         self.descriptor
+    }
+
+    /// Return whether bytes or a trusted unchanged token established reuse.
+    #[must_use]
+    pub const fn observation(&self) -> ContentObservation {
+        self.observation
     }
 }
 

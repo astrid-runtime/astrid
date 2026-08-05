@@ -14,6 +14,7 @@ const DEFAULT_SAMPLES: usize = 3;
 const DEFAULT_SMALL_FILES: usize = 64;
 const DEFAULT_SMALL_FILE_BYTES: usize = 4096;
 const DEFAULT_CONCURRENT_PRINCIPALS: usize = 4;
+const DEFAULT_BULK_FILES: usize = 100;
 
 #[derive(Clone, Debug, Serialize)]
 pub(super) struct Config {
@@ -24,6 +25,8 @@ pub(super) struct Config {
     pub(super) small_files: usize,
     pub(super) small_file_bytes: usize,
     pub(super) concurrent_principals: usize,
+    pub(super) bulk_workers: usize,
+    pub(super) bulk_files: usize,
     pub(super) object_cache_bytes: Option<u64>,
     pub(super) root: Option<PathBuf>,
     pub(super) output: Option<PathBuf>,
@@ -39,6 +42,8 @@ impl Config {
             small_files: DEFAULT_SMALL_FILES,
             small_file_bytes: DEFAULT_SMALL_FILE_BYTES,
             concurrent_principals: DEFAULT_CONCURRENT_PRINCIPALS,
+            bulk_workers: std::thread::available_parallelism().map_or(1, NonZeroUsize::get),
+            bulk_files: DEFAULT_BULK_FILES,
             object_cache_bytes: None,
             root: None,
             output: None,
@@ -66,6 +71,12 @@ impl Config {
                     config.concurrent_principals =
                         parse_usize(&mut arguments, "--concurrent-principals")?;
                 },
+                "--bulk-workers" => {
+                    config.bulk_workers = parse_usize(&mut arguments, "--bulk-workers")?;
+                },
+                "--bulk-files" => {
+                    config.bulk_files = parse_usize(&mut arguments, "--bulk-files")?;
+                },
                 "--object-cache-bytes" => {
                     config.object_cache_bytes =
                         Some(parse_u64(&mut arguments, "--object-cache-bytes")?);
@@ -92,6 +103,8 @@ impl Config {
             ("--small-files", config.small_files),
             ("--small-file-bytes", config.small_file_bytes),
             ("--concurrent-principals", config.concurrent_principals),
+            ("--bulk-workers", config.bulk_workers),
+            ("--bulk-files", config.bulk_files),
         ] {
             if NonZeroUsize::new(value).is_none() {
                 return Err(format!("{name} must be greater than zero").into());
@@ -143,6 +156,8 @@ fn print_help() {
            --small-file-bytes N  bytes per small file (default {DEFAULT_SMALL_FILE_BYTES})\n\
            --concurrent-principals N\n\
                                  shared-content concurrency (default {DEFAULT_CONCURRENT_PRINCIPALS})\n\
+           --bulk-workers N      bounded ingest workers (default host available CPUs)\n\
+           --bulk-files N        files in the bulk corpus (default {DEFAULT_BULK_FILES})\n\
            --object-cache-bytes N decoded-object/projection cache budget (default disabled)\n\
            --root PATH           retain benchmark data under PATH\n\
            --output PATH         write the JSON report to PATH\n"

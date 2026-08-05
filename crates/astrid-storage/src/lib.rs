@@ -54,8 +54,10 @@ pub use content::{
 };
 pub use content::{
     BulkIngestPolicy, ChunkingProfile, ContentBatchEntry, ContentBatchWriteOutcome,
-    ContentDescriptor, ContentEntry, ContentIngest, ContentName, ContentNameError,
-    ContentWriteOutcome, PrincipalContentError, PrincipalContentReadHandle, PrincipalContentStore,
+    ContentChangeCache, ContentDescriptor, ContentEntry, ContentIngest, ContentName,
+    ContentNameError, ContentObservation, ContentWriteOutcome, PrincipalContentError,
+    PrincipalContentReadHandle, PrincipalContentStore, SourceEpoch, SourceFingerprint,
+    SourceObservation, SourceScopeId, SourceTrust, StableSourceId,
 };
 pub use error::{StorageError, StorageResult};
 pub use identity::{IdentityError, IdentityStore, KvIdentityStore};

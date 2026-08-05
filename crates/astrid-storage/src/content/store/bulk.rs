@@ -13,9 +13,15 @@ use super::{
     insert, invalid, lookup, map_stream_error,
 };
 use crate::content::{
-    BulkIngestPolicy, ContentBatchEntry, ContentBatchWriteOutcome, ContentIngest, ContentName,
-    PrincipalContentError,
+    BulkIngestPolicy, ContentBatchEntry, ContentBatchWriteOutcome, ContentChangeCache,
+    ContentIngest, ContentName, ContentObservation, PrincipalContentError,
 };
+
+#[derive(Clone)]
+struct PreparedContent {
+    verified: VerifiedContent,
+    observation: ContentObservation,
+}
 
 impl<P, E> PrincipalContentStore<P, E>
 where
@@ -44,7 +50,7 @@ where
         R: Read + Send,
         I: IntoIterator<Item = ContentIngest<R>>,
     {
-        self.put_streaming_batch_with_policy(principal, ingests, BulkIngestPolicy::default())
+        self.put_streaming_batch_internal(principal, ingests, BulkIngestPolicy::default(), None)
     }
 
     /// Stream and atomically publish a batch with explicit worker policy.
@@ -67,10 +73,51 @@ where
         R: Read + Send,
         I: IntoIterator<Item = ContentIngest<R>>,
     {
+        self.put_streaming_batch_internal(principal, ingests, policy, None)
+    }
+
+    /// Stream a batch with trusted change-token reuse and explicit policy.
+    ///
+    /// A cache hit is possible only for an ingest carrying a trusted source
+    /// observation that exactly matches a prior byte-verified build. Untrusted
+    /// metadata always falls through to the source reader. The cache is a
+    /// bounded process-local accelerator and never enters a root or export.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::put_streaming_batch`].
+    pub fn put_streaming_batch_with_change_cache<R, I>(
+        &self,
+        principal: &P,
+        ingests: I,
+        policy: BulkIngestPolicy,
+        cache: &ContentChangeCache,
+    ) -> Result<ContentBatchWriteOutcome, PrincipalContentError>
+    where
+        R: Read + Send,
+        I: IntoIterator<Item = ContentIngest<R>>,
+    {
+        self.put_streaming_batch_internal(principal, ingests, policy, Some(cache))
+    }
+
+    fn put_streaming_batch_internal<R, I>(
+        &self,
+        principal: &P,
+        ingests: I,
+        policy: BulkIngestPolicy,
+        cache: Option<&ContentChangeCache>,
+    ) -> Result<ContentBatchWriteOutcome, PrincipalContentError>
+    where
+        R: Read + Send,
+        I: IntoIterator<Item = ContentIngest<R>>,
+    {
         let mut ordered = BTreeMap::new();
         for ingest in ingests {
-            let (name, source, profile) = ingest.into_parts();
-            if ordered.insert(name.clone(), (source, profile)).is_some() {
+            let (name, source, profile, observation) = ingest.into_parts();
+            if ordered
+                .insert(name.clone(), (source, profile, observation))
+                .is_some()
+            {
                 return Err(PrincipalContentError::DuplicateBatchName(name));
             }
         }
@@ -78,8 +125,30 @@ where
             return Err(PrincipalContentError::EmptyBatch);
         }
 
-        let worker_count = policy.worker_threads().get().min(ordered.len());
-        let queue = Arc::new(Mutex::new(VecDeque::from_iter(ordered)));
+        let mut completed = BTreeMap::new();
+        let mut pending = VecDeque::new();
+        for (name, (source, profile, observation)) in ordered {
+            let cached = cache
+                .zip(observation.as_ref())
+                .and_then(|(cache, observation)| cache.lookup(observation));
+            if let Some(verified) = cached {
+                completed.insert(
+                    name,
+                    PreparedContent {
+                        verified,
+                        observation: ContentObservation::ChangeTokenObserved,
+                    },
+                );
+            } else {
+                pending.push_back((name, (source, profile, observation)));
+            }
+        }
+        if pending.is_empty() {
+            return self.publish_batch(principal, &completed, 0);
+        }
+
+        let worker_count = policy.worker_threads().get().min(pending.len());
+        let queue = Arc::new(Mutex::new(pending));
         let cancelled = Arc::new(AtomicBool::new(false));
         let results = std::thread::scope(|scope| {
             let mut handles = Vec::with_capacity(worker_count);
@@ -94,7 +163,7 @@ where
                             break;
                         }
                         let next = queue.lock().pop_front();
-                        let Some((name, (source, profile))) = next else {
+                        let Some((name, (source, profile, observation))) = next else {
                             break;
                         };
                         let streamed = match build_content_streaming(profile, source, &mut sink) {
@@ -104,7 +173,7 @@ where
                                 return Err(map_stream_error(error));
                             },
                         };
-                        completed.push((name, streamed.verified_content()));
+                        completed.push((name, streamed.verified_content(), observation));
                     }
                     sink.finish()?;
                     Ok((completed, sink.objects_inserted))
@@ -122,13 +191,25 @@ where
                 .collect::<Result<Vec<_>, PrincipalContentError>>()
         })?;
 
-        let mut completed = BTreeMap::new();
         let mut objects_inserted = 0_u64;
         for (worker_entries, worker_objects_inserted) in results {
             objects_inserted = objects_inserted
                 .checked_add(worker_objects_inserted)
                 .ok_or(PrincipalContentError::AccountingOverflow)?;
-            completed.extend(worker_entries);
+            for (name, verified, observation) in worker_entries {
+                if let Some((cache, observation)) = cache.zip(observation.as_ref()) {
+                    // A token can only become reusable after every pending
+                    // record from this worker was admitted successfully.
+                    cache.record(observation, verified);
+                }
+                completed.insert(
+                    name,
+                    PreparedContent {
+                        verified,
+                        observation: ContentObservation::BytesObserved,
+                    },
+                );
+            }
         }
         self.publish_batch(principal, &completed, objects_inserted)
     }
@@ -136,15 +217,15 @@ where
     fn publish_batch(
         &self,
         principal: &P,
-        completed: &BTreeMap<ContentName, VerifiedContent>,
+        completed: &BTreeMap<ContentName, PreparedContent>,
         staged_objects_inserted: u64,
     ) -> Result<ContentBatchWriteOutcome, PrincipalContentError> {
         loop {
             let mut header = self.header(principal)?.as_ref().clone();
             let mut catalog_records = BTreeMap::new();
             let mut changed = false;
-            for (name, verified) in completed {
-                let descriptor = verified.descriptor();
+            for (name, prepared) in completed {
+                let descriptor = prepared.verified.descriptor();
                 let previous = lookup(header.catalog, name, &mut |object| {
                     catalog_records
                         .get(&object)
@@ -183,12 +264,12 @@ where
                     .ok_or(PrincipalContentError::EmptyBatch)?;
                 let root = header.root.ok_or_else(|| {
                     invalid(
-                        first.descriptor().file(),
+                        first.verified.descriptor().file(),
                         "unchanged batch exists without a principal root",
                     )
                 })?;
-                for verified in completed.values().copied() {
-                    self.mark_verified(principal, verified);
+                for prepared in completed.values() {
+                    self.mark_verified(principal, prepared.verified);
                 }
                 return Ok(batch_outcome(completed, root, staged_objects_inserted));
             }
@@ -206,8 +287,8 @@ where
                             summary: catalog.map_or(CatalogSummary::default(), |root| root.summary),
                         },
                     );
-                    for verified in completed.values().copied() {
-                        self.mark_verified(principal, verified);
+                    for prepared in completed.values() {
+                        self.mark_verified(principal, prepared.verified);
                     }
                     let objects_inserted = staged_objects_inserted
                         .checked_add(outcome.objects_inserted())
@@ -222,13 +303,19 @@ where
 }
 
 fn batch_outcome(
-    completed: &BTreeMap<ContentName, VerifiedContent>,
+    completed: &BTreeMap<ContentName, PreparedContent>,
     root: astrid_storage_model::RootState,
     objects_inserted: u64,
 ) -> ContentBatchWriteOutcome {
     let entries = completed
         .iter()
-        .map(|(name, verified)| ContentBatchEntry::new(name.clone(), verified.descriptor()))
+        .map(|(name, prepared)| {
+            ContentBatchEntry::new(
+                name.clone(),
+                prepared.verified.descriptor(),
+                prepared.observation,
+            )
+        })
         .collect();
     ContentBatchWriteOutcome::new(entries, root, objects_inserted)
 }

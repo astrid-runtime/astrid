@@ -27,6 +27,8 @@ fn config() -> Config {
         small_files: 1,
         small_file_bytes: 1,
         concurrent_principals: 4,
+        bulk_workers: 4,
+        bulk_files: 100,
         object_cache_bytes: None,
         root: Some(PathBuf::from("unused")),
         output: None,
