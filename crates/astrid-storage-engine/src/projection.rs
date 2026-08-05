@@ -102,6 +102,7 @@ impl PreparedProjectionBatch {
         }
     }
 
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) fn engine<T: Any + Send>(payload: T, retained_bytes: usize) -> Self {
         Self {
             payload: Box::new(payload),
@@ -120,6 +121,7 @@ impl PreparedProjectionBatch {
             })
     }
 
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) fn into_engine_payload<T: Any + Send>(self) -> Option<T> {
         self.payload.downcast::<T>().ok().map(|payload| *payload)
     }

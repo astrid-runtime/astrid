@@ -5,7 +5,9 @@ use super::{
     PrincipalProjectionError, ProjectionCachePayload, ReferenceKind, ReferenceLabel, RootState,
     STAGING_BATCH_TARGET_BYTES, VerifiedContent,
 };
-use astrid_storage_engine::{PreparedProjectionBatch, ProjectionObserver};
+#[cfg(not(target_family = "wasm"))]
+use astrid_storage_engine::PreparedProjectionBatch;
+use astrid_storage_engine::ProjectionObserver;
 
 #[derive(Clone)]
 pub(super) struct ContentHeader {
@@ -277,6 +279,7 @@ where
     validate_admission_outcomes(expected, outcomes)
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub(super) fn admit_prepared_object_batch<P, E>(
     engine: &E,
     expected: Vec<ObjectId>,
