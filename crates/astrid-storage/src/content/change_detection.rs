@@ -206,6 +206,9 @@ impl ContentChangeCache {
     }
 
     pub(super) fn record(&self, observation: &SourceObservation, verified: VerifiedContent) {
+        if observation.trust != SourceTrust::TrustedChangeToken {
+            return;
+        }
         let locator = observation.fingerprint.locator();
         let retained_bytes = observation
             .fingerprint

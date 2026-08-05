@@ -982,6 +982,34 @@ fn untrusted_or_changed_metadata_never_skips_source_bytes() {
 }
 
 #[test]
+fn untrusted_metadata_never_consumes_change_cache_capacity() {
+    let engine = Arc::new(Engine::new(TestIdentity));
+    let store = PrincipalContentStore::from_engine(engine);
+    let cache = ContentChangeCache::new(NonZeroU64::new(1024 * 1024).unwrap());
+    let value = bytes(128 * 1024);
+    let observation = SourceObservation::untrusted(source_fingerprint(
+        "/imports/untrusted.bin",
+        value.len() as u64,
+        9,
+    ));
+
+    store
+        .put_streaming_batch_with_change_cache(
+            &"alice".to_owned(),
+            [
+                ContentIngest::new(ContentName::new("untrusted").unwrap(), value.as_slice())
+                    .with_observation(observation),
+            ],
+            BulkIngestPolicy::new(NonZeroUsize::MIN),
+            &cache,
+        )
+        .unwrap();
+
+    assert_eq!(cache.entry_count(), 0);
+    assert_eq!(cache.retained_bytes(), 0);
+}
+
+#[test]
 fn change_cache_capacity_is_a_retention_limit_not_an_ingest_limit() {
     let engine = Arc::new(Engine::new(TestIdentity));
     let store = PrincipalContentStore::from_engine(engine);
