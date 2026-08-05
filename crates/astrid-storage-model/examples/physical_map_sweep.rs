@@ -54,16 +54,16 @@ impl Construction {
 
 fn main() {
     println!("scenario,construction,entries,nodes,authoritative_bytes,build_us");
-    scenario("sparse", random_entries(8));
-    scenario("full", random_entries(65_536));
-    scenario("adversarial-prefix", adversarial_entries(4_096));
-    incremental("incremental", random_entries(6_748), random_entry(6_748));
+    scenario("sparse", &random_entries(8));
+    scenario("full", &random_entries(65_536));
+    scenario("adversarial-prefix", &adversarial_entries(4_096));
+    incremental("incremental", random_entries(6_748), &random_entry(6_748));
 }
 
-fn scenario(name: &str, entries: Vec<(PhysicalMapKey, Vec<u8>)>) {
+fn scenario(name: &str, entries: &[(PhysicalMapKey, Vec<u8>)]) {
     for construction in [Construction::Legacy, Construction::Dense] {
         let started = Instant::now();
-        let map = construction.build(entries.clone());
+        let map = construction.build(entries.to_vec());
         print_measurement(name, construction, &map, started.elapsed());
     }
 }
@@ -71,7 +71,7 @@ fn scenario(name: &str, entries: Vec<(PhysicalMapKey, Vec<u8>)>) {
 fn incremental(
     name: &str,
     mut entries: Vec<(PhysicalMapKey, Vec<u8>)>,
-    addition: (PhysicalMapKey, Vec<u8>),
+    addition: &(PhysicalMapKey, Vec<u8>),
 ) {
     for construction in [Construction::Legacy, Construction::Dense] {
         let mut after = construction.build(entries.clone());
@@ -90,7 +90,7 @@ fn incremental(
             .nodes()
             .iter()
             .filter(|(id, _)| !prior.contains(id))
-            .map(|(_, node)| node_bytes(node.encode().expect("node must encode")))
+            .map(|(_, node)| node_bytes(&node.encode().expect("node must encode")))
             .sum::<usize>();
         println!(
             "{},{},{},{},{},{}",
@@ -118,7 +118,7 @@ fn print_measurement(
     let bytes = map
         .nodes()
         .values()
-        .map(|node| node_bytes(node.encode().expect("node must encode")))
+        .map(|node| node_bytes(&node.encode().expect("node must encode")))
         .sum::<usize>();
     println!(
         "{},{},{},{},{},{}",
@@ -131,7 +131,7 @@ fn print_measurement(
     );
 }
 
-fn node_bytes(encoded: Vec<u8>) -> usize {
+fn node_bytes(encoded: &[u8]) -> usize {
     FRAME_AND_WRAPPER_BYTES.saturating_add(encoded.len())
 }
 

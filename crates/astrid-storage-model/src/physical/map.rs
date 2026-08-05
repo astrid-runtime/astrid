@@ -243,7 +243,7 @@ impl PhysicalMapNode {
 
     /// Return the exact leaf count authenticated by this node.
     #[must_use]
-    pub fn subtree_entries(&self) -> u64 {
+    pub const fn subtree_entries(&self) -> u64 {
         match self {
             Self::Leaf { .. } => 1,
             Self::Branch {
@@ -252,7 +252,7 @@ impl PhysicalMapNode {
             | Self::Radix {
                 subtree_entries, ..
             } => *subtree_entries,
-            Self::Page { entries, .. } => u64::try_from(entries.len()).unwrap_or(u64::MAX),
+            Self::Page { entries, .. } => entries.len() as u64,
         }
     }
 

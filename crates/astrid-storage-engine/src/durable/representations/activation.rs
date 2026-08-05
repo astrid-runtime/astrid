@@ -252,6 +252,30 @@ pub(super) fn quarantine_incomplete_root(store: &Path, root: &Path) -> Result<()
     ))
 }
 
+pub(super) fn quarantine_temporary_current(root: &Path) -> Result<(), DurableError> {
+    let temporary = root.join(CURRENT_TEMP_PATH);
+    if !temporary.exists() {
+        return Ok(());
+    }
+    for ordinal in 0_u32..=u32::MAX {
+        let quarantine = root.join(format!("{CURRENT_TEMP_PATH}.incomplete.{ordinal:08x}"));
+        if quarantine.exists() {
+            continue;
+        }
+        fs::rename(&temporary, quarantine)
+            .map_err(|source| io_error("quarantine stale representation pointer", source))?;
+        sync_store_directory(root)?;
+        return Ok(());
+    }
+    Err(DurableError::InvalidRepresentationState(
+        "representation pointer quarantine namespace is exhausted",
+    ))
+}
+
+pub(super) fn generation_name(generation: u64) -> String {
+    format!("{generation:016x}")
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
@@ -325,28 +349,4 @@ mod tests {
             }));
         }
     }
-}
-
-pub(super) fn quarantine_temporary_current(root: &Path) -> Result<(), DurableError> {
-    let temporary = root.join(CURRENT_TEMP_PATH);
-    if !temporary.exists() {
-        return Ok(());
-    }
-    for ordinal in 0_u32..=u32::MAX {
-        let quarantine = root.join(format!("{CURRENT_TEMP_PATH}.incomplete.{ordinal:08x}"));
-        if quarantine.exists() {
-            continue;
-        }
-        fs::rename(&temporary, quarantine)
-            .map_err(|source| io_error("quarantine stale representation pointer", source))?;
-        sync_store_directory(root)?;
-        return Ok(());
-    }
-    Err(DurableError::InvalidRepresentationState(
-        "representation pointer quarantine namespace is exhausted",
-    ))
-}
-
-pub(super) fn generation_name(generation: u64) -> String {
-    format!("{generation:016x}")
 }
