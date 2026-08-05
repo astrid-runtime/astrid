@@ -5,6 +5,7 @@
 //! chunks or complete files are physically deduplicated.
 
 mod catalog;
+mod change_detection;
 mod kv_projection;
 #[cfg(not(target_family = "wasm"))]
 mod projection_names;
@@ -12,6 +13,7 @@ mod store;
 #[cfg(test)]
 mod tests;
 
+use std::num::NonZeroUsize;
 use std::{fmt, io};
 
 use astrid_storage_engine::PrincipalProjectionError;
@@ -19,6 +21,10 @@ use astrid_storage_model::{ObjectId, RootState};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub use astrid_storage_content::{ChunkingProfile, ContentDescriptor};
+pub use change_detection::{
+    ContentChangeCache, SourceEpoch, SourceFingerprint, SourceObservation, SourceScopeId,
+    SourceTrust, StableSourceId,
+};
 #[cfg(not(target_family = "wasm"))]
 pub use projection_names::{
     AtomicProjectionNameReservation, ProjectedContentPath, ProjectedNameSegment,
@@ -207,6 +213,170 @@ pub struct ContentWriteOutcome {
     objects_inserted: u64,
 }
 
+/// One blocking byte source prepared for atomic batch publication.
+pub struct ContentIngest<R> {
+    name: ContentName,
+    source: R,
+    profile: ChunkingProfile,
+    observation: Option<SourceObservation>,
+}
+
+/// Operator-selectable CPU parallelism for bulk content construction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BulkIngestPolicy {
+    worker_threads: NonZeroUsize,
+}
+
+impl BulkIngestPolicy {
+    /// Construct an explicit worker limit.
+    #[must_use]
+    pub const fn new(worker_threads: NonZeroUsize) -> Self {
+        Self { worker_threads }
+    }
+
+    /// Return the maximum number of concurrent source workers.
+    #[must_use]
+    pub const fn worker_threads(self) -> NonZeroUsize {
+        self.worker_threads
+    }
+}
+
+impl Default for BulkIngestPolicy {
+    fn default() -> Self {
+        // Library code cannot infer how much of the host belongs to this
+        // principal. Runtimes inject an explicit limit after resource
+        // admission; the implicit path remains bounded and serial.
+        Self::new(NonZeroUsize::MIN)
+    }
+}
+
+impl<R> ContentIngest<R> {
+    /// Prepare a source under Astrid's pinned content profile.
+    #[must_use]
+    pub const fn new(name: ContentName, source: R) -> Self {
+        Self {
+            name,
+            source,
+            profile: ChunkingProfile::ASTRID_V1,
+            observation: None,
+        }
+    }
+
+    /// Prepare a source under an explicit persistent chunking profile.
+    #[must_use]
+    pub const fn with_profile(name: ContentName, source: R, profile: ChunkingProfile) -> Self {
+        Self {
+            name,
+            source,
+            profile,
+            observation: None,
+        }
+    }
+
+    /// Attach the platform adapter's source-version observation.
+    #[must_use]
+    pub fn with_observation(mut self, observation: SourceObservation) -> Self {
+        self.observation = Some(observation);
+        self
+    }
+
+    pub(crate) fn into_parts(self) -> (ContentName, R, ChunkingProfile, Option<SourceObservation>) {
+        (self.name, self.source, self.profile, self.observation)
+    }
+}
+
+/// Evidence for why a batch entry did or did not require byte reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContentObservation {
+    /// The builder directly observed and identified every source byte.
+    BytesObserved,
+    /// A trusted unchanged token reused a prior byte-verified descriptor.
+    ChangeTokenObserved,
+}
+
+/// One name and immutable descriptor published by a batch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContentBatchEntry {
+    name: ContentName,
+    descriptor: ContentDescriptor,
+    observation: ContentObservation,
+}
+
+impl ContentBatchEntry {
+    pub(crate) const fn new(
+        name: ContentName,
+        descriptor: ContentDescriptor,
+        observation: ContentObservation,
+    ) -> Self {
+        Self {
+            name,
+            descriptor,
+            observation,
+        }
+    }
+
+    /// Borrow the published name.
+    #[must_use]
+    pub const fn name(&self) -> &ContentName {
+        &self.name
+    }
+
+    /// Return the immutable descriptor published under the name.
+    #[must_use]
+    pub const fn descriptor(&self) -> ContentDescriptor {
+        self.descriptor
+    }
+
+    /// Return whether bytes or a trusted unchanged token established reuse.
+    #[must_use]
+    pub const fn observation(&self) -> ContentObservation {
+        self.observation
+    }
+}
+
+/// Result of atomically publishing a batch of named content.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContentBatchWriteOutcome {
+    entries: Vec<ContentBatchEntry>,
+    principal_root: RootState,
+    objects_inserted: u64,
+}
+
+impl ContentBatchWriteOutcome {
+    pub(crate) const fn new(
+        entries: Vec<ContentBatchEntry>,
+        principal_root: RootState,
+        objects_inserted: u64,
+    ) -> Self {
+        Self {
+            entries,
+            principal_root,
+            objects_inserted,
+        }
+    }
+
+    /// Borrow entries in canonical content-name order.
+    #[must_use]
+    pub fn entries(&self) -> &[ContentBatchEntry] {
+        &self.entries
+    }
+
+    /// Return the single principal root authorizing the complete batch.
+    #[must_use]
+    pub const fn principal_root(&self) -> RootState {
+        self.principal_root
+    }
+
+    /// Return privileged physical-admission diagnostics for the batch.
+    ///
+    /// This value must remain below guest-visible boundaries because it can
+    /// reveal cross-principal deduplication.
+    #[must_use]
+    pub const fn objects_inserted(&self) -> u64 {
+        self.objects_inserted
+    }
+}
+
 impl ContentWriteOutcome {
     pub(crate) const fn new(
         descriptor: ContentDescriptor,
@@ -247,6 +417,10 @@ impl ContentWriteOutcome {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum PrincipalContentError {
+    /// Atomic batch publication requires at least one source.
+    EmptyBatch,
+    /// An atomic batch named the same catalog entry more than once.
+    DuplicateBatchName(ContentName),
     /// Content name validation failed.
     InvalidName(ContentNameError),
     /// Canonical content-DAG construction or decoding failed.
@@ -278,6 +452,10 @@ pub enum PrincipalContentError {
 impl fmt::Display for PrincipalContentError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::EmptyBatch => formatter.write_str("principal content batch is empty"),
+            Self::DuplicateBatchName(name) => {
+                write!(formatter, "principal content batch repeats name {name}")
+            },
             Self::InvalidName(error) => error.fmt(formatter),
             Self::Content(error) => error.fmt(formatter),
             Self::ContentSource(error) => write!(formatter, "principal content source: {error}"),

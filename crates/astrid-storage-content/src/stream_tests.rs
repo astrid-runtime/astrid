@@ -4,9 +4,11 @@ use std::io::{self, Read};
 use astrid_storage_model::{ObjectId, ObjectRecord};
 
 use super::tests::{TestIdentity, deterministic_bytes};
+use crate::build::{Child, tree_record};
+use crate::stream::StreamingTree;
 use crate::{
-    ChunkingProfile, ContentError, ContentObjectSink, ContentStreamError, build_content,
-    build_content_streaming, insert_record,
+    CHUNK_TREE_FANOUT, ChunkingProfile, ContentError, ContentObjectSink, ContentStreamError,
+    build_content, build_content_streaming, insert_record,
 };
 
 struct CollectingSink {
@@ -91,7 +93,6 @@ fn assert_stream_matches_slice(profile: ChunkingProfile, bytes: &[u8], fragment:
     let streamed = build_content_streaming(profile, &mut source, &mut sink).unwrap();
 
     assert_eq!(streamed.descriptor(), expected.descriptor());
-    assert_eq!(streamed.unique_chunks(), expected.unique_chunks());
     assert_eq!(
         sink.records.into_iter().collect::<Vec<_>>(),
         expected.records()
@@ -124,7 +125,77 @@ fn streaming_preserves_the_whole_small_file_rule() {
     let streamed = build_content_streaming(profile, bytes.as_slice(), &mut sink).unwrap();
 
     assert_eq!(streamed.descriptor().chunk_count(), 1);
-    assert_eq!(streamed.unique_chunks(), 1);
+}
+
+fn reference_tree(
+    sink: &mut CollectingSink,
+    mut level: Vec<Child>,
+) -> Result<Option<Child>, ContentError> {
+    if level.len() <= 1 {
+        return Ok(level.pop());
+    }
+    while level.len() > 1 {
+        let mut next = Vec::with_capacity(level.len().div_ceil(CHUNK_TREE_FANOUT));
+        for children in level.chunks(CHUNK_TREE_FANOUT) {
+            let (record, logical_bytes, chunk_count) = tree_record(children)?;
+            let id = sink.stage_content_object(record)?;
+            next.push(Child {
+                id,
+                logical_bytes,
+                chunk_count,
+            });
+        }
+        level = next;
+    }
+    Ok(level.pop())
+}
+
+#[test]
+fn streaming_tree_matches_canonical_packing_at_every_fanout_edge() {
+    for count in [
+        0,
+        1,
+        2,
+        CHUNK_TREE_FANOUT - 1,
+        CHUNK_TREE_FANOUT,
+        CHUNK_TREE_FANOUT + 1,
+        CHUNK_TREE_FANOUT + 2,
+        CHUNK_TREE_FANOUT * CHUNK_TREE_FANOUT,
+        CHUNK_TREE_FANOUT * CHUNK_TREE_FANOUT + 1,
+    ] {
+        let children = (0..count)
+            .map(|index| {
+                let mut id = [0_u8; 32];
+                id[..8].copy_from_slice(&u64::try_from(index).unwrap().to_le_bytes());
+                Child {
+                    id: ObjectId::new(id),
+                    logical_bytes: 1,
+                    chunk_count: 1,
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut expected_sink = CollectingSink::new();
+        let expected = reference_tree(&mut expected_sink, children.clone()).unwrap();
+        let mut actual_sink = CollectingSink::new();
+        let mut tree = StreamingTree::default();
+        for child in children {
+            tree.push(&mut actual_sink, child).unwrap();
+        }
+        assert!(
+            tree.pending_children()
+                <= tree
+                    .levels_for_test()
+                    .saturating_mul(CHUNK_TREE_FANOUT.saturating_sub(1)),
+            "chunk count {count}"
+        );
+        let actual = tree.finish(&mut actual_sink).unwrap();
+
+        assert_eq!(actual, expected, "chunk count {count}");
+        assert_eq!(
+            actual_sink.records, expected_sink.records,
+            "chunk count {count}"
+        );
+    }
 }
 
 #[test]

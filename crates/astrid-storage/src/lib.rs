@@ -53,8 +53,11 @@ pub use content::{
     plan_projection_names,
 };
 pub use content::{
-    ChunkingProfile, ContentDescriptor, ContentEntry, ContentName, ContentNameError,
-    ContentWriteOutcome, PrincipalContentError, PrincipalContentReadHandle, PrincipalContentStore,
+    BulkIngestPolicy, ChunkingProfile, ContentBatchEntry, ContentBatchWriteOutcome,
+    ContentChangeCache, ContentDescriptor, ContentEntry, ContentIngest, ContentName,
+    ContentNameError, ContentObservation, ContentWriteOutcome, PrincipalContentError,
+    PrincipalContentReadHandle, PrincipalContentStore, SourceEpoch, SourceFingerprint,
+    SourceObservation, SourceScopeId, SourceTrust, StableSourceId,
 };
 pub use error::{StorageError, StorageResult};
 pub use identity::{IdentityError, IdentityStore, KvIdentityStore};

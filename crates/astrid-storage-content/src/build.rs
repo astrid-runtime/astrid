@@ -54,7 +54,7 @@ impl BuiltContent {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Child {
     pub(super) id: ObjectId,
     pub(super) logical_bytes: u64,

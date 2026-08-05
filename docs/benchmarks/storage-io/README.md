@@ -43,6 +43,28 @@ The machine-readable source is
 `astrid-storage-dense-radix-ce756e1e.json`. These are engine/substrate
 measurements, not mounted-provider results or a compressibility estimate.
 
+## Bulk-ingest checkpoint
+
+Clean commit `eca9c20a` adds the first delta-proportional bulk-ingest evidence.
+The same 512 MiB deterministic corpus was divided into 100 independently
+fingerprinted sources. Three samples used eight explicitly granted workers;
+the single-worker comparator exercised the same batch API.
+
+| Operation | Median | Source bytes observed |
+|---|---:|---:|
+| Single-worker first ingest | 2.985 s, 171.5 MiB/s | 512 MiB |
+| Eight-worker first ingest | 2.278 s, 224.8 MiB/s | 512 MiB |
+| Unchanged re-ingest | 25.1 ms | 0 B |
+| One-file delta | 67.5 ms | 5.12 MiB |
+
+Parallel construction is 1.311 times the serial batch throughput. The
+unchanged path proves every cached file's complete immutable closure still
+exists before reuse, while source work remains proportional to changed inputs.
+The result does not yet meet #1392's read-bound first-ingest target. The
+remaining limit is authoritative object/representation admission behind the
+workers. The machine-readable source is
+`astrid-storage-bulk-ingest-eca9c20a.json`.
+
 The historical schema did not embed Git revision, executable arguments,
 dirty-tree state, or cache policy. The canonical document records reconstructed
 ancestry and explicitly prevents independent experiment branches from being

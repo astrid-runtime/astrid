@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::sync::Arc;
+use std::num::{NonZeroU64, NonZeroUsize};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier};
 
 use astrid_storage_engine::{
     CommitOutcome, DurableEngine, IdentityScheme, InMemoryEngine, PersistentObjectIdentity,
@@ -16,7 +18,11 @@ use astrid_storage_model::{
 use fastcdc::v2020::{FastCDC, Normalization};
 use parking_lot::RwLock;
 
-use super::{ContentName, ContentNameError, PrincipalContentError, PrincipalContentStore};
+use super::{
+    BulkIngestPolicy, ContentChangeCache, ContentIngest, ContentName, ContentNameError,
+    ContentObservation, PrincipalContentError, PrincipalContentStore, SourceEpoch,
+    SourceFingerprint, SourceObservation, SourceScopeId, StableSourceId,
+};
 use crate::StorageError;
 use crate::kv::{KvStore, TreeKvStore};
 use crate::principal_graph::PRINCIPAL_GRAPH_VERSION;
@@ -140,6 +146,62 @@ impl PrincipalProjectionEngine<String> for ConflictOnceEngine {
             }
             .into());
         }
+        self.inner.commit(transaction).map_err(Into::into)
+    }
+
+    fn flush_projection(&self) -> Result<(), PrincipalProjectionError> {
+        Ok(())
+    }
+}
+
+struct MissingObjectEngine {
+    inner: Engine,
+    missing: RwLock<Option<ObjectId>>,
+}
+
+impl MissingObjectEngine {
+    fn new() -> Self {
+        Self {
+            inner: Engine::new(TestIdentity),
+            missing: RwLock::new(None),
+        }
+    }
+
+    fn hide(&self, object: ObjectId) {
+        *self.missing.write() = Some(object);
+    }
+}
+
+impl PrincipalProjectionEngine<String> for MissingObjectEngine {
+    fn identify_object(&self, record: &ObjectRecord) -> ObjectId {
+        self.inner.identify(record)
+    }
+
+    fn stage_object(
+        &self,
+        record: ObjectRecord,
+    ) -> Result<(ObjectId, InsertOutcome), PrincipalProjectionError> {
+        self.inner.put_object(record).map_err(Into::into)
+    }
+
+    fn current_root(
+        &self,
+        principal: &String,
+    ) -> Result<Option<RootState>, PrincipalProjectionError> {
+        Ok(self.inner.root(principal))
+    }
+
+    fn load_object(&self, id: ObjectId) -> Result<Option<ObjectRecord>, PrincipalProjectionError> {
+        if *self.missing.read() == Some(id) {
+            return Ok(None);
+        }
+        Ok(self.inner.object(id))
+    }
+
+    fn commit_root(
+        &self,
+        transaction: RootTransaction<String>,
+    ) -> Result<CommitOutcome, PrincipalProjectionError> {
         self.inner.commit(transaction).map_err(Into::into)
     }
 
@@ -301,6 +363,33 @@ impl Read for CountingReader {
         output[..length].copy_from_slice(&self.bytes[self.offset..end]);
         self.offset = end;
         self.bytes_read.fetch_add(length, Ordering::SeqCst);
+        Ok(length)
+    }
+}
+
+struct RendezvousReader {
+    bytes: Vec<u8>,
+    offset: usize,
+    first_read: Arc<Barrier>,
+}
+
+impl Read for RendezvousReader {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if self.offset == 0 {
+            self.first_read.wait();
+        }
+        let length = output
+            .len()
+            .min(self.bytes.len().saturating_sub(self.offset));
+        if length == 0 {
+            return Ok(0);
+        }
+        let end = self
+            .offset
+            .checked_add(length)
+            .ok_or(io::Error::other("test reader position overflow"))?;
+        output[..length].copy_from_slice(&self.bytes[self.offset..end]);
+        self.offset = end;
         Ok(length)
     }
 }
@@ -751,6 +840,571 @@ fn root_conflict_retries_publication_without_rereading_the_source() {
 
     assert_eq!(bytes_read.load(Ordering::SeqCst), value.len());
     assert_eq!(store.read(&owner, &name).unwrap(), Some(value));
+}
+
+#[test]
+fn streaming_batch_publishes_every_name_under_one_root() {
+    let engine = Arc::new(Engine::new(TestIdentity));
+    let store = PrincipalContentStore::from_engine(Arc::clone(&engine));
+    let owner = "alice".to_owned();
+    let alpha = bytes(2 * 1024 * 1024);
+    let middle = bytes(257 * 1024);
+    let zeta = b"last in canonical order".to_vec();
+
+    let outcome = store
+        .put_streaming_batch(
+            &owner,
+            [
+                ContentIngest::new(ContentName::new("zeta").unwrap(), zeta.as_slice()),
+                ContentIngest::new(ContentName::new("alpha").unwrap(), alpha.as_slice()),
+                ContentIngest::new(ContentName::new("middle").unwrap(), middle.as_slice()),
+            ],
+        )
+        .unwrap();
+
+    assert_eq!(outcome.principal_root().generation.get(), 0);
+    assert_eq!(
+        outcome
+            .entries()
+            .iter()
+            .map(|entry| entry.name().as_str())
+            .collect::<Vec<_>>(),
+        ["alpha", "middle", "zeta"]
+    );
+    for (name, expected) in [("alpha", alpha), ("middle", middle), ("zeta", zeta)] {
+        assert_eq!(
+            store
+                .read(&owner, &ContentName::new(name).unwrap())
+                .unwrap(),
+            Some(expected)
+        );
+    }
+}
+
+#[test]
+fn streaming_batch_honors_explicit_source_parallelism() {
+    let engine = Arc::new(Engine::new(TestIdentity));
+    let store = PrincipalContentStore::from_engine(engine);
+    let first_read = Arc::new(Barrier::new(2));
+    let source = |value| RendezvousReader {
+        bytes: value,
+        offset: 0,
+        first_read: Arc::clone(&first_read),
+    };
+
+    let outcome = store
+        .put_streaming_batch_with_policy(
+            &"alice".to_owned(),
+            [
+                ContentIngest::new(
+                    ContentName::new("first").unwrap(),
+                    source(bytes(1024 * 1024)),
+                ),
+                ContentIngest::new(
+                    ContentName::new("second").unwrap(),
+                    source(bytes(1024 * 1024 + 1)),
+                ),
+            ],
+            BulkIngestPolicy::new(NonZeroUsize::new(2).unwrap()),
+        )
+        .unwrap();
+
+    assert_eq!(outcome.entries().len(), 2);
+}
+
+fn source_fingerprint(
+    path: &str,
+    logical_bytes: u64,
+    modified_nanoseconds: i128,
+) -> SourceFingerprint {
+    SourceFingerprint::new(
+        SourceScopeId::new([0x11; 32]),
+        PathBuf::from(path),
+        logical_bytes,
+        modified_nanoseconds,
+        StableSourceId::new([0x22; 16]),
+        SourceEpoch::new([0x33; 32]),
+    )
+}
+
+#[test]
+fn trusted_change_token_reuses_a_byte_verified_descriptor_without_reading() {
+    let engine = Arc::new(Engine::new(TestIdentity));
+    let store = PrincipalContentStore::from_engine(engine);
+    let cache = ContentChangeCache::new(NonZeroU64::new(1024 * 1024).unwrap());
+    let value = bytes(2 * 1024 * 1024);
+    let fingerprint = source_fingerprint("/workspace/model.bin", value.len() as u64, 42);
+    let observation = SourceObservation::trusted(fingerprint);
+    let first_reads = Arc::new(AtomicUsize::new(0));
+    let first = CountingReader {
+        bytes: value.clone(),
+        offset: 0,
+        bytes_read: Arc::clone(&first_reads),
+    };
+    let name = ContentName::new("model.bin").unwrap();
+
+    let first_outcome = store
+        .put_streaming_batch_with_change_cache(
+            &"alice".to_owned(),
+            [ContentIngest::new(name.clone(), first).with_observation(observation.clone())],
+            BulkIngestPolicy::new(NonZeroUsize::MIN),
+            &cache,
+        )
+        .unwrap();
+    assert_eq!(first_reads.load(Ordering::SeqCst), value.len());
+    assert_eq!(
+        first_outcome.entries()[0].observation(),
+        ContentObservation::BytesObserved
+    );
+
+    let repeated_reads = Arc::new(AtomicUsize::new(0));
+    let repeated = CountingReader {
+        bytes: value,
+        offset: 0,
+        bytes_read: Arc::clone(&repeated_reads),
+    };
+    let repeated_outcome = store
+        .put_streaming_batch_with_change_cache(
+            &"alice".to_owned(),
+            [ContentIngest::new(name, repeated).with_observation(observation)],
+            BulkIngestPolicy::new(NonZeroUsize::MIN),
+            &cache,
+        )
+        .unwrap();
+
+    assert_eq!(repeated_reads.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        repeated_outcome.entries()[0].observation(),
+        ContentObservation::ChangeTokenObserved
+    );
+    assert_eq!(cache.entry_count(), 1);
+    assert!(cache.retained_bytes() > 0);
+}
+
+#[test]
+fn change_token_never_crosses_chunking_profiles() {
+    let engine = Arc::new(Engine::new(TestIdentity));
+    let store = PrincipalContentStore::from_engine(engine);
+    let cache = ContentChangeCache::new(NonZeroU64::new(1024 * 1024).unwrap());
+    let value = bytes(2 * 1024 * 1024);
+    let observation = SourceObservation::trusted(source_fingerprint(
+        "/workspace/profile.bin",
+        value.len() as u64,
+        42,
+    ));
+    let name = ContentName::new("profile.bin").unwrap();
+    store
+        .put_streaming_batch_with_change_cache(
+            &"alice".to_owned(),
+            [ContentIngest::new(name.clone(), value.as_slice())
+                .with_observation(observation.clone())],
+            BulkIngestPolicy::new(NonZeroUsize::MIN),
+            &cache,
+        )
+        .unwrap();
+
+    let alternate = super::ChunkingProfile::fastcdc_v2020(
+        8 * 1024,
+        32 * 1024,
+        128 * 1024,
+        super::ChunkingProfile::ASTRID_V1.gear_seed(),
+    )
+    .unwrap();
+    let bytes_read = Arc::new(AtomicUsize::new(0));
+    let outcome = store
+        .put_streaming_batch_with_change_cache(
+            &"alice".to_owned(),
+            [ContentIngest::with_profile(
+                name,
+                CountingReader {
+                    bytes: value.clone(),
+                    offset: 0,
+                    bytes_read: Arc::clone(&bytes_read),
+                },
+                alternate,
+            )
+            .with_observation(observation)],
+            BulkIngestPolicy::new(NonZeroUsize::MIN),
+            &cache,
+        )
+        .unwrap();
+
+    assert_eq!(bytes_read.load(Ordering::SeqCst), value.len());
+    assert_eq!(outcome.entries()[0].descriptor().profile(), alternate);
+    assert_eq!(
+        outcome.entries()[0].observation(),
+        ContentObservation::BytesObserved
+    );
+}
+
+#[test]
+fn change_cache_entry_missing_from_this_engine_falls_back_to_source_bytes() {
+    let cache = ContentChangeCache::new(NonZeroU64::new(1024 * 1024).unwrap());
+    let value = bytes(512 * 1024);
+    let observation = SourceObservation::trusted(source_fingerprint(
+        "/workspace/reopened-elsewhere.bin",
+        value.len() as u64,
+        73,
+    ));
+    let first = PrincipalContentStore::from_engine(Arc::new(Engine::new(TestIdentity)));
+    first
+        .put_streaming_batch_with_change_cache(
+            &"alice".to_owned(),
+            [
+                ContentIngest::new(ContentName::new("first").unwrap(), value.as_slice())
+                    .with_observation(observation.clone()),
+            ],
+            BulkIngestPolicy::new(NonZeroUsize::MIN),
+            &cache,
+        )
+        .unwrap();
+
+    let second = PrincipalContentStore::from_engine(Arc::new(Engine::new(TestIdentity)));
+    let bytes_read = Arc::new(AtomicUsize::new(0));
+    second
+        .put_streaming_batch_with_change_cache(
+            &"alice".to_owned(),
+            [ContentIngest::new(
+                ContentName::new("second").unwrap(),
+                CountingReader {
+                    bytes: value.clone(),
+                    offset: 0,
+                    bytes_read: Arc::clone(&bytes_read),
+                },
+            )
+            .with_observation(observation)],
+            BulkIngestPolicy::new(NonZeroUsize::MIN),
+            &cache,
+        )
+        .unwrap();
+
+    assert_eq!(bytes_read.load(Ordering::SeqCst), value.len());
+}
+
+#[test]
+fn change_cache_with_a_missing_descendant_falls_back_to_source_bytes() {
+    let engine = Arc::new(MissingObjectEngine::new());
+    let store = PrincipalContentStore::from_engine(Arc::clone(&engine));
+    let cache = ContentChangeCache::new(NonZeroU64::new(1024 * 1024).unwrap());
+    let value = bytes(2 * 1024 * 1024);
+    let observation = SourceObservation::trusted(source_fingerprint(
+        "/workspace/incomplete.bin",
+        value.len() as u64,
+        91,
+    ));
+    let name = ContentName::new("incomplete.bin").unwrap();
+    let first = store
+        .put_streaming_batch_with_change_cache(
+            &"alice".to_owned(),
+            [ContentIngest::new(name.clone(), value.as_slice())
+                .with_observation(observation.clone())],
+            BulkIngestPolicy::new(NonZeroUsize::MIN),
+            &cache,
+        )
+        .unwrap();
+    let file = engine
+        .inner
+        .object(first.entries()[0].descriptor().file())
+        .unwrap();
+    let descendant = file
+        .references()
+        .iter()
+        .find(|reference| reference.kind() == ReferenceKind::Owns)
+        .expect("a nonempty file owns its content root")
+        .target();
+    engine.hide(descendant);
+
+    let bytes_read = Arc::new(AtomicUsize::new(0));
+    let outcome = store
+        .put_streaming_batch_with_change_cache(
+            &"alice".to_owned(),
+            [ContentIngest::new(
+                name,
+                CountingReader {
+                    bytes: value.clone(),
+                    offset: 0,
+                    bytes_read: Arc::clone(&bytes_read),
+                },
+            )
+            .with_observation(observation)],
+            BulkIngestPolicy::new(NonZeroUsize::MIN),
+            &cache,
+        )
+        .unwrap();
+
+    assert_eq!(bytes_read.load(Ordering::SeqCst), value.len());
+    assert_eq!(
+        outcome.entries()[0].observation(),
+        ContentObservation::BytesObserved
+    );
+}
+
+#[test]
+fn untrusted_or_changed_metadata_never_skips_source_bytes() {
+    let engine = Arc::new(Engine::new(TestIdentity));
+    let store = PrincipalContentStore::from_engine(engine);
+    let cache = ContentChangeCache::new(NonZeroU64::new(1024 * 1024).unwrap());
+    let value = bytes(1024 * 1024);
+    let name = ContentName::new("source.bin").unwrap();
+    let trusted = SourceObservation::trusted(source_fingerprint(
+        "/imports/source.bin",
+        value.len() as u64,
+        7,
+    ));
+    store
+        .put_streaming_batch_with_change_cache(
+            &"alice".to_owned(),
+            [ContentIngest::new(name.clone(), value.as_slice()).with_observation(trusted)],
+            BulkIngestPolicy::new(NonZeroUsize::MIN),
+            &cache,
+        )
+        .unwrap();
+
+    for observation in [
+        SourceObservation::untrusted(source_fingerprint(
+            "/imports/source.bin",
+            value.len() as u64,
+            7,
+        )),
+        SourceObservation::trusted(source_fingerprint(
+            "/imports/source.bin",
+            value.len() as u64,
+            8,
+        )),
+    ] {
+        let bytes_read = Arc::new(AtomicUsize::new(0));
+        let reader = CountingReader {
+            bytes: value.clone(),
+            offset: 0,
+            bytes_read: Arc::clone(&bytes_read),
+        };
+        let outcome = store
+            .put_streaming_batch_with_change_cache(
+                &"alice".to_owned(),
+                [ContentIngest::new(name.clone(), reader).with_observation(observation)],
+                BulkIngestPolicy::new(NonZeroUsize::MIN),
+                &cache,
+            )
+            .unwrap();
+
+        assert_eq!(bytes_read.load(Ordering::SeqCst), value.len());
+        assert_eq!(
+            outcome.entries()[0].observation(),
+            ContentObservation::BytesObserved
+        );
+    }
+}
+
+#[test]
+fn untrusted_metadata_never_consumes_change_cache_capacity() {
+    let engine = Arc::new(Engine::new(TestIdentity));
+    let store = PrincipalContentStore::from_engine(engine);
+    let cache = ContentChangeCache::new(NonZeroU64::new(1024 * 1024).unwrap());
+    let value = bytes(128 * 1024);
+    let observation = SourceObservation::untrusted(source_fingerprint(
+        "/imports/untrusted.bin",
+        value.len() as u64,
+        9,
+    ));
+
+    store
+        .put_streaming_batch_with_change_cache(
+            &"alice".to_owned(),
+            [
+                ContentIngest::new(ContentName::new("untrusted").unwrap(), value.as_slice())
+                    .with_observation(observation),
+            ],
+            BulkIngestPolicy::new(NonZeroUsize::MIN),
+            &cache,
+        )
+        .unwrap();
+
+    assert_eq!(cache.entry_count(), 0);
+    assert_eq!(cache.retained_bytes(), 0);
+}
+
+#[test]
+fn change_cache_capacity_is_a_retention_limit_not_an_ingest_limit() {
+    let engine = Arc::new(Engine::new(TestIdentity));
+    let store = PrincipalContentStore::from_engine(engine);
+    let cache = ContentChangeCache::new(NonZeroU64::MIN);
+    let value = bytes(128 * 1024);
+    let observation = SourceObservation::trusted(source_fingerprint(
+        "/workspace/too-large-for-cache.bin",
+        value.len() as u64,
+        1,
+    ));
+
+    store
+        .put_streaming_batch_with_change_cache(
+            &"alice".to_owned(),
+            [
+                ContentIngest::new(ContentName::new("first").unwrap(), value.as_slice())
+                    .with_observation(observation.clone()),
+            ],
+            BulkIngestPolicy::new(NonZeroUsize::MIN),
+            &cache,
+        )
+        .unwrap();
+    assert_eq!(cache.entry_count(), 0);
+    assert_eq!(cache.retained_bytes(), 0);
+
+    let bytes_read = Arc::new(AtomicUsize::new(0));
+    store
+        .put_streaming_batch_with_change_cache(
+            &"alice".to_owned(),
+            [ContentIngest::new(
+                ContentName::new("second").unwrap(),
+                CountingReader {
+                    bytes: value.clone(),
+                    offset: 0,
+                    bytes_read: Arc::clone(&bytes_read),
+                },
+            )
+            .with_observation(observation)],
+            BulkIngestPolicy::new(NonZeroUsize::MIN),
+            &cache,
+        )
+        .unwrap();
+
+    assert_eq!(bytes_read.load(Ordering::SeqCst), value.len());
+}
+
+#[test]
+fn failed_batch_never_teaches_the_change_cache() {
+    let engine = Arc::new(Engine::new(TestIdentity));
+    let store = PrincipalContentStore::from_engine(engine);
+    let cache = ContentChangeCache::new(NonZeroU64::new(1024 * 1024).unwrap());
+    let value = bytes(2 * 1024 * 1024);
+    let observation = SourceObservation::trusted(source_fingerprint(
+        "/workspace/interrupted.bin",
+        value.len() as u64,
+        11,
+    ));
+
+    let error = store
+        .put_streaming_batch_with_change_cache(
+            &"alice".to_owned(),
+            [ContentIngest::new(
+                ContentName::new("interrupted").unwrap(),
+                FailAfter {
+                    bytes: value.clone(),
+                    offset: 0,
+                    limit: value.len() / 2,
+                },
+            )
+            .with_observation(observation.clone())],
+            BulkIngestPolicy::new(NonZeroUsize::MIN),
+            &cache,
+        )
+        .unwrap_err();
+    assert!(matches!(error, PrincipalContentError::ContentSource(_)));
+    assert_eq!(cache.entry_count(), 0);
+
+    let bytes_read = Arc::new(AtomicUsize::new(0));
+    store
+        .put_streaming_batch_with_change_cache(
+            &"alice".to_owned(),
+            [ContentIngest::new(
+                ContentName::new("recovered").unwrap(),
+                CountingReader {
+                    bytes: value.clone(),
+                    offset: 0,
+                    bytes_read: Arc::clone(&bytes_read),
+                },
+            )
+            .with_observation(observation)],
+            BulkIngestPolicy::new(NonZeroUsize::MIN),
+            &cache,
+        )
+        .unwrap();
+    assert_eq!(bytes_read.load(Ordering::SeqCst), value.len());
+}
+
+#[test]
+fn streaming_batch_rejects_duplicate_names_before_reading() {
+    let engine = Arc::new(Engine::new(TestIdentity));
+    let store = PrincipalContentStore::from_engine(engine);
+    let bytes_read = Arc::new(AtomicUsize::new(0));
+    let source = || CountingReader {
+        bytes: bytes(1024),
+        offset: 0,
+        bytes_read: Arc::clone(&bytes_read),
+    };
+    let name = ContentName::new("same").unwrap();
+
+    let error = store
+        .put_streaming_batch(
+            &"alice".to_owned(),
+            [
+                ContentIngest::new(name.clone(), source()),
+                ContentIngest::new(name.clone(), source()),
+            ],
+        )
+        .unwrap_err();
+
+    assert!(matches!(error, PrincipalContentError::DuplicateBatchName(found) if found == name));
+    assert_eq!(bytes_read.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn streaming_batch_source_failure_publishes_nothing() {
+    let engine = Arc::new(Engine::new(TestIdentity));
+    let store = PrincipalContentStore::from_engine(Arc::clone(&engine));
+    let owner = "alice".to_owned();
+    let first = FailAfter {
+        bytes: bytes(2 * 1024 * 1024),
+        offset: 0,
+        limit: usize::MAX,
+    };
+    let second = FailAfter {
+        bytes: bytes(8 * 1024 * 1024),
+        offset: 0,
+        limit: 3 * 1024 * 1024,
+    };
+
+    let error = store
+        .put_streaming_batch(
+            &owner,
+            [
+                ContentIngest::new(ContentName::new("first").unwrap(), first),
+                ContentIngest::new(ContentName::new("second").unwrap(), second),
+            ],
+        )
+        .unwrap_err();
+
+    assert!(matches!(error, PrincipalContentError::ContentSource(_)));
+    assert_eq!(engine.root(&owner), None);
+    assert!(store.list(&owner).unwrap().is_empty());
+}
+
+#[test]
+fn streaming_batch_root_conflict_does_not_reread_sources() {
+    let engine = Arc::new(ConflictOnceEngine::new());
+    let store = PrincipalContentStore::from_engine(engine);
+    let first = bytes(2 * 1024 * 1024);
+    let second = bytes(3 * 1024 * 1024);
+    let bytes_read = Arc::new(AtomicUsize::new(0));
+    let reader = |value: Vec<u8>| CountingReader {
+        bytes: value,
+        offset: 0,
+        bytes_read: Arc::clone(&bytes_read),
+    };
+
+    store
+        .put_streaming_batch(
+            &"alice".to_owned(),
+            [
+                ContentIngest::new(ContentName::new("first").unwrap(), reader(first.clone())),
+                ContentIngest::new(ContentName::new("second").unwrap(), reader(second.clone())),
+            ],
+        )
+        .unwrap();
+
+    assert_eq!(
+        bytes_read.load(Ordering::SeqCst),
+        first.len() + second.len()
+    );
 }
 
 #[test]

@@ -23,6 +23,11 @@ use super::config::Config;
 use super::report::Report;
 use crate::BenchResult;
 
+#[path = "workloads/bulk.rs"]
+mod bulk;
+
+use bulk::benchmark_bulk_ingest;
+
 pub(super) async fn run(
     config: &Config,
     root: &Path,
@@ -33,6 +38,7 @@ pub(super) async fn run(
     benchmark_native_large_writes(config, root, source, report)?;
     benchmark_staging_large_writes(config, root, source, report)?;
     benchmark_content_compute(config, source, report)?;
+    benchmark_bulk_ingest(config, root, source, source_digest, report).await?;
     benchmark_small_files(config, root, report)?;
     benchmark_runtime(config, root, source, source_digest, report).await?;
     benchmark_concurrent_principals(config, root, source, source_digest, report).await?;

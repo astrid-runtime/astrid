@@ -1113,6 +1113,93 @@ async fn native_stage_acknowledges_before_ingest_and_publishes_on_a_blocking_wor
 }
 
 #[tokio::test]
+async fn native_staging_batch_publishes_one_atomic_root_and_reaps_together() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    let store = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let owner = test_owner("alice");
+    let values = [
+        ("workspace/a.txt", b"alpha".as_slice()),
+        ("workspace/b.txt", b"bravo".as_slice()),
+        ("workspace/c.txt", b"charlie".as_slice()),
+    ];
+    let mut staged = Vec::new();
+    for (name, value) in values {
+        let mut writer = store
+            .staging()
+            .begin(
+                owner,
+                ContentName::new(name).unwrap(),
+                ChunkingProfile::ASTRID_V1,
+            )
+            .unwrap();
+        writer.write_all(value).unwrap();
+        staged.push(writer.seal().unwrap());
+    }
+
+    let outcome = store.publish_staged_batch(staged).await.unwrap();
+
+    assert_eq!(outcome.principal_root().generation, RootGeneration::INITIAL);
+    assert_eq!(outcome.entries().len(), values.len());
+    assert!(store.staging().ready().unwrap().is_empty());
+    for (name, value) in values {
+        assert_eq!(
+            store
+                .content()
+                .read(&owner, &ContentName::new(name).unwrap())
+                .unwrap(),
+            Some(value.to_vec())
+        );
+    }
+    drop(store);
+
+    let reopened = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    for (name, value) in values {
+        assert_eq!(
+            reopened
+                .content()
+                .read(&owner, &ContentName::new(name).unwrap())
+                .unwrap(),
+            Some(value.to_vec())
+        );
+    }
+}
+
+#[tokio::test]
+async fn native_staging_batch_rejects_mixed_owners_without_consuming_generations() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    let store = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let mut staged = Vec::new();
+    for owner in [test_owner("alice"), test_owner("bob")] {
+        let mut writer = store
+            .staging()
+            .begin(
+                owner,
+                ContentName::new("workspace/shared.txt").unwrap(),
+                ChunkingProfile::ASTRID_V1,
+            )
+            .unwrap();
+        writer.write_all(b"owner-specific bytes").unwrap();
+        staged.push(writer.seal().unwrap());
+    }
+
+    let error = store
+        .publish_staged_batch(staged.clone())
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("multiple owners"));
+    assert_eq!(store.staging().ready().unwrap(), staged);
+}
+
+#[tokio::test]
 async fn staged_publication_rejects_a_generation_truncated_after_seal() {
     let directory = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(directory.path());

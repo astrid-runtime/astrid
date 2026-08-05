@@ -1,6 +1,5 @@
 //! Bounded-source-memory construction of canonical content DAGs.
 
-use std::collections::BTreeSet;
 use std::fmt;
 use std::io::{self, Cursor, Read};
 
@@ -35,7 +34,6 @@ pub trait ContentObjectSink {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StreamedContent {
     verified: VerifiedContent,
-    unique_chunks: u64,
 }
 
 impl StreamedContent {
@@ -49,12 +47,6 @@ impl StreamedContent {
     #[must_use]
     pub const fn verified_content(self) -> VerifiedContent {
         self.verified
-    }
-
-    /// Return the number of distinct chunk identities in the file.
-    #[must_use]
-    pub const fn unique_chunks(self) -> u64 {
-        self.unique_chunks
     }
 }
 
@@ -96,9 +88,12 @@ where
 ///
 /// Source memory is bounded by a constant multiple of the profile maximum:
 /// prefetch, `FastCDC`'s internal buffer, and the current emitted chunk. The
-/// builder retains only chunk identities and aggregate metadata while the sink
-/// stages chunk and tree records. The resulting file descriptor and object
-/// graph are byte-for-byte identical to
+/// builder retains only the open right edge of the content tree and aggregate
+/// metadata while the sink stages chunk and tree records. Exact distinct-chunk
+/// accounting is intentionally delegated to the sink or store: computing it
+/// inside the builder would retain one identity per unique chunk and defeat
+/// the bounded-memory contract. The resulting file descriptor and object graph
+/// are byte-for-byte identical to
 /// [`build_content`](crate::build_content), independent of source read
 /// fragmentation.
 ///
@@ -138,18 +133,12 @@ where
         .read_to_end(&mut prefix)
         .map_err(ContentStreamError::Source)?;
 
-    let mut chunks = Vec::new();
-    let mut unique_chunks = BTreeSet::new();
+    let mut tree = StreamingTree::default();
     let mut logical_bytes = 0_u64;
     if prefix.len() <= maximum {
         if !prefix.is_empty() {
-            stage_chunk(
-                sink,
-                &prefix,
-                &mut chunks,
-                &mut unique_chunks,
-                &mut logical_bytes,
-            )?;
+            let child = stage_chunk(sink, &prefix, &mut logical_bytes)?;
+            tree.push(sink, child)?;
         }
     } else {
         let chunker = StreamCDC::with_level_and_seed(
@@ -163,18 +152,13 @@ where
         for result in chunker {
             let chunk =
                 result.map_err(|error| ContentStreamError::Source(io::Error::from(error)))?;
-            stage_chunk(
-                sink,
-                &chunk.data,
-                &mut chunks,
-                &mut unique_chunks,
-                &mut logical_bytes,
-            )?;
+            let child = stage_chunk(sink, &chunk.data, &mut logical_bytes)?;
+            tree.push(sink, child)?;
         }
     }
 
-    let chunk_count = u64::try_from(chunks.len()).map_err(content(ContentError::LengthOverflow))?;
-    let content_root = stage_tree(sink, chunks)?;
+    let chunk_count = tree.chunk_count();
+    let content_root = tree.finish(sink)?;
     let file = file_record(profile, logical_bytes, chunk_count, content_root)
         .map_err(ContentStreamError::Content)?;
     let file = sink
@@ -186,18 +170,14 @@ where
             descriptor,
             content_root.map(|child| child.id),
         )),
-        unique_chunks: u64::try_from(unique_chunks.len())
-            .map_err(content(ContentError::LengthOverflow))?,
     })
 }
 
 fn stage_chunk<S: ContentObjectSink>(
     sink: &mut S,
     bytes: &[u8],
-    chunks: &mut Vec<Child>,
-    unique_chunks: &mut BTreeSet<ObjectId>,
     logical_bytes: &mut u64,
-) -> Result<(), ContentStreamError<S::Error>> {
+) -> Result<Child, ContentStreamError<S::Error>> {
     let record = chunk_record(bytes).map_err(ContentStreamError::Content)?;
     let id = sink
         .stage_content_object(record)
@@ -206,42 +186,127 @@ fn stage_chunk<S: ContentObjectSink>(
     *logical_bytes = logical_bytes
         .checked_add(length)
         .ok_or_else(|| ContentStreamError::Content(ContentError::LengthOverflow))?;
-    unique_chunks.insert(id);
-    chunks.push(Child {
+    Ok(Child {
         id,
         logical_bytes: length,
         chunk_count: 1,
-    });
-    Ok(())
+    })
 }
 
-fn stage_tree<S: ContentObjectSink>(
-    sink: &mut S,
-    mut level: Vec<Child>,
-) -> Result<Option<Child>, ContentStreamError<S::Error>> {
-    if level.is_empty() {
-        return Ok(None);
+/// Incremental canonical tree packer.
+///
+/// Every complete fanout group is emitted as soon as it fills. Only the open
+/// right edge remains resident, so metadata is bounded by
+/// `tree depth * CHUNK_TREE_FANOUT` rather than source chunk count.
+#[derive(Default)]
+pub(super) struct StreamingTree {
+    levels: Vec<Vec<Child>>,
+    chunk_count: u64,
+}
+
+impl StreamingTree {
+    pub(super) const fn chunk_count(&self) -> u64 {
+        self.chunk_count
     }
-    if level.len() == 1 {
-        return Ok(level.pop());
+
+    #[cfg(test)]
+    pub(super) fn pending_children(&self) -> usize {
+        self.levels.iter().map(Vec::len).sum()
     }
-    while level.len() > 1 {
-        let mut next = Vec::with_capacity(level.len().div_ceil(CHUNK_TREE_FANOUT));
-        for children in level.chunks(CHUNK_TREE_FANOUT) {
-            let (record, logical_bytes, chunk_count) =
-                tree_record(children).map_err(ContentStreamError::Content)?;
-            let id = sink
-                .stage_content_object(record)
-                .map_err(ContentStreamError::Sink)?;
-            next.push(Child {
-                id,
-                logical_bytes,
-                chunk_count,
-            });
+
+    #[cfg(test)]
+    pub(super) const fn levels_for_test(&self) -> usize {
+        self.levels.len()
+    }
+
+    pub(super) fn push<S: ContentObjectSink>(
+        &mut self,
+        sink: &mut S,
+        child: Child,
+    ) -> Result<(), ContentStreamError<S::Error>> {
+        self.chunk_count = self
+            .chunk_count
+            .checked_add(child.chunk_count)
+            .ok_or_else(|| ContentStreamError::Content(ContentError::LengthOverflow))?;
+        self.push_at_level(sink, 0, child)
+    }
+
+    fn push_at_level<S: ContentObjectSink>(
+        &mut self,
+        sink: &mut S,
+        mut level: usize,
+        mut child: Child,
+    ) -> Result<(), ContentStreamError<S::Error>> {
+        loop {
+            if self.levels.len() <= level {
+                self.levels.push(Vec::with_capacity(CHUNK_TREE_FANOUT));
+            }
+            let children = &mut self.levels[level];
+            children.push(child);
+            if children.len() < CHUNK_TREE_FANOUT {
+                return Ok(());
+            }
+            child = stage_tree_node(sink, children)?;
+            children.clear();
+            level = level
+                .checked_add(1)
+                .ok_or_else(|| ContentStreamError::Content(ContentError::LengthOverflow))?;
         }
-        level = next;
     }
-    Ok(level.pop())
+
+    pub(super) fn finish<S: ContentObjectSink>(
+        mut self,
+        sink: &mut S,
+    ) -> Result<Option<Child>, ContentStreamError<S::Error>> {
+        if self.chunk_count == 0 {
+            return Ok(None);
+        }
+        let mut level = 0_usize;
+        loop {
+            let has_higher = self
+                .levels
+                .get(level.saturating_add(1)..)
+                .is_some_and(|levels| levels.iter().any(|children| !children.is_empty()));
+            let children = self
+                .levels
+                .get_mut(level)
+                .ok_or_else(|| ContentStreamError::Content(ContentError::LengthOverflow))?;
+            if children.is_empty() {
+                level = level
+                    .checked_add(1)
+                    .ok_or_else(|| ContentStreamError::Content(ContentError::LengthOverflow))?;
+                continue;
+            }
+            if children.len() == 1 && !has_higher {
+                return Ok(children.pop());
+            }
+            let parent = stage_tree_node(sink, children)?;
+            children.clear();
+            let parent_level = level
+                .checked_add(1)
+                .ok_or_else(|| ContentStreamError::Content(ContentError::LengthOverflow))?;
+            self.push_at_level(sink, parent_level, parent)?;
+            level = level
+                .checked_add(1)
+                .ok_or_else(|| ContentStreamError::Content(ContentError::LengthOverflow))?;
+        }
+    }
+}
+
+fn stage_tree_node<S: ContentObjectSink>(
+    sink: &mut S,
+    children: &[Child],
+) -> Result<Child, ContentStreamError<S::Error>> {
+    let (record, logical_bytes, chunk_count) =
+        tree_record(children).map_err(ContentStreamError::Content)?;
+    let id = sink
+        .stage_content_object(record)
+        .map_err(ContentStreamError::Sink)?;
+    Ok(Child {
+        id,
+        logical_bytes,
+        chunk_count,
+    })
 }
 
 fn content<SinkError, SourceError>(

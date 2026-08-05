@@ -21,7 +21,9 @@ use super::native_io::{
     sync_directory, validate_private_regular_file,
 };
 use super::{NativePrincipalContentStore, StateOwner};
-use crate::content::{ChunkingProfile, ContentName, ContentWriteOutcome};
+use crate::content::{
+    ChunkingProfile, ContentBatchWriteOutcome, ContentIngest, ContentName, ContentWriteOutcome,
+};
 use crate::error::{StorageError, StorageResult};
 
 mod format;
@@ -388,7 +390,75 @@ impl NativeContentStagingArea {
         })?
     }
 
+    /// Publish several sealed writes through one authoritative root commit.
+    ///
+    /// Every entry must belong to this staging area and the same owner. The
+    /// batch is visible atomically: content construction may stage unreachable
+    /// objects, but only one root compare-and-swap authorizes all names. After
+    /// that root is durable, one journal append and flush acknowledges every
+    /// staged generation for cleanup.
+    ///
+    /// # Errors
+    ///
+    /// Returns a staging or content-publication error while retaining every
+    /// unacknowledged generation for idempotent retry.
+    pub async fn publish_batch(
+        &self,
+        staged: Vec<ReadyStagedContent>,
+        content: Arc<NativePrincipalContentStore>,
+    ) -> StorageResult<ContentBatchWriteOutcome> {
+        let first = staged
+            .first()
+            .ok_or_else(|| connection("staged publication batch is empty".to_owned()))?;
+        let owner = first.owner;
+        for entry in &staged {
+            if entry.staging_root != self.inner.root {
+                return Err(connection(
+                    "staged write belongs to a different staging area".to_owned(),
+                ));
+            }
+            if entry.owner != owner {
+                return Err(connection(
+                    "staged publication batch spans multiple owners".to_owned(),
+                ));
+            }
+            self.ensure_publication_order_excluding(entry, &staged)?;
+        }
+        let area = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut ingests = Vec::with_capacity(staged.len());
+            for entry in &staged {
+                validate_generation(&entry.content_path(), &entry.intent())?;
+                let source = open_private_file(&entry.content_path())?.take(entry.logical_bytes);
+                ingests.push(ContentIngest::with_profile(
+                    entry.name.clone(),
+                    source,
+                    entry.profile,
+                ));
+            }
+            let outcome = content
+                .put_streaming_batch(&owner, ingests)
+                .map_err(|error| {
+                    StorageError::Internal(format!("publish staged content batch: {error}"))
+                })?;
+            area.mark_published_batch(&staged)?;
+            Ok(outcome)
+        })
+        .await
+        .map_err(|error| {
+            StorageError::Internal(format!("staged content batch worker failed: {error}"))
+        })?
+    }
+
     fn ensure_publication_order(&self, staged: &ReadyStagedContent) -> StorageResult<()> {
+        self.ensure_publication_order_excluding(staged, std::slice::from_ref(staged))
+    }
+
+    fn ensure_publication_order_excluding(
+        &self,
+        staged: &ReadyStagedContent,
+        included: &[ReadyStagedContent],
+    ) -> StorageResult<()> {
         let earlier_active =
             self.inner
                 .seal_order
@@ -407,6 +477,9 @@ impl NativeContentStagingArea {
                 intent.owner == staged.owner
                     && intent.name == staged.name
                     && intent.sequence < staged.sequence
+                    && !included
+                        .iter()
+                        .any(|entry| entry.sequence == intent.sequence && entry.id == intent.id)
             })
         };
         if earlier_active || earlier_pending {
@@ -442,26 +515,38 @@ impl NativeContentStagingArea {
     }
 
     fn mark_published(&self, staged: &ReadyStagedContent) -> StorageResult<()> {
-        let key = StageKey {
-            sequence: staged.sequence,
-            id: staged.id,
-        };
+        self.mark_published_batch(std::slice::from_ref(staged))
+    }
+
+    fn mark_published_batch(&self, staged: &[ReadyStagedContent]) -> StorageResult<()> {
+        let keys = staged
+            .iter()
+            .map(|staged| StageKey {
+                sequence: staged.sequence,
+                id: staged.id,
+            })
+            .collect::<Vec<_>>();
         {
             let mut journal = self.inner.journal.lock();
             if journal.poisoned {
                 return Err(connection("staging journal requires recovery".to_owned()));
             }
-            if journal.completed.contains(&key) {
+            if keys.iter().all(|key| journal.completed.contains(key)) {
                 drop(journal);
                 return self.reap_completed();
             }
-            if !journal.pending.contains_key(&key) {
+            if let Some(missing) = keys.iter().find(|key| !journal.pending.contains_key(key)) {
                 return Err(connection(format!(
                     "staged write {} is no longer pending",
-                    staged.id
+                    missing.id
                 )));
             }
-            let durable = append_records(&mut journal.file, &[JournalRecord::Published(key)])
+            let records = keys
+                .iter()
+                .copied()
+                .map(JournalRecord::Published)
+                .collect::<Vec<_>>();
+            let durable = append_records(&mut journal.file, &records)
                 .and_then(|()| self.fail_if(StagingFaultPoint::PublicationJournalAppended))
                 .and_then(|()| flush_journal(&journal.file))
                 .and_then(|()| self.fail_if(StagingFaultPoint::PublicationJournalFlushed));
@@ -469,8 +554,10 @@ impl NativeContentStagingArea {
                 journal.poisoned = true;
                 return Err(error);
             }
-            journal.pending.remove(&key);
-            journal.completed.insert(key);
+            for key in keys {
+                journal.pending.remove(&key);
+                journal.completed.insert(key);
+            }
         }
         self.reap_completed()
     }
