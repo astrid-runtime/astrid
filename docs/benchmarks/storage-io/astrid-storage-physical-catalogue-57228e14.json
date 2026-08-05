@@ -1,0 +1,535 @@
+{
+  "format": "astrid-storage-io-benchmark-v2",
+  "payload_digest": {
+    "algorithm": "sha-256",
+    "scope": "utf8:payload_json:astrid-storage-io-benchmark-v2",
+    "hex": "fc3d3def92258a540940f95332621266edee8056862557f9906367e5dd6bc92d"
+  },
+  "payload_json": "{\"provenance\":{\"repository\":\"astrid-runtime/astrid\",\"git_revision\":\"57228e1474a3e4275ee22d1f83d46501d08a8b92\",\"git_tree\":{\"state\":\"clean\"},\"executable_argv\":[\"/private/tmp/astrid-storage-representation-substrate/target/release/deps/storage_io-01bff4bb8daa4238\",\"--bytes\",\"536870912\",\"--block-bytes\",\"4194304\",\"--range-bytes\",\"1048576\",\"--samples\",\"3\",\"--small-files\",\"64\",\"--small-file-bytes\",\"4096\",\"--concurrent-principals\",\"4\",\"--object-cache-bytes\",\"1073741824\",\"--output\",\"/private/tmp/astrid-storage-physical-catalogue-57228e14-rerun.json\",\"--bench\"],\"executable\":{\"bytes\":4992848,\"sha256\":\"41dfd904047541c3281386c2a361808d026fbcb36a5626bb650e430837e372ba\"}},\"package_version\":\"0.10.4\",\"os\":\"macos\",\"architecture\":\"aarch64\",\"logical_cpus\":24,\"config\":{\"bytes\":536870912,\"block_bytes\":4194304,\"range_bytes\":1048576,\"samples\":3,\"small_files\":64,\"small_file_bytes\":4096,\"concurrent_principals\":4,\"object_cache_bytes\":1073741824,\"root\":null,\"output\":\"/private/tmp/astrid-storage-physical-catalogue-57228e14-rerun.json\"},\"metrics\":[{\"name\":\"native_write\",\"bytes_per_sample\":536870912,\"operations_per_sample\":null,\"samples_nanoseconds\":[103705667,104881084,107060250],\"minimum_milliseconds\":103.705667,\"median_milliseconds\":104.881084,\"maximum_milliseconds\":107.06025,\"median_mib_per_second\":4881.7191858924725,\"median_operations_per_second\":null},{\"name\":\"native_sync_after_write\",\"bytes_per_sample\":null,\"operations_per_sample\":1,\"samples_nanoseconds\":[88950208,102349583,106333625],\"minimum_milliseconds\":88.950208,\"median_milliseconds\":102.349583,\"maximum_milliseconds\":106.333625,\"median_mib_per_second\":null,\"median_operations_per_second\":9.770435508271685},{\"name\":\"astrid_stage_write\",\"bytes_per_sample\":536870912,\"operations_per_sample\":null,\"samples_nanoseconds\":[101508375,104495083,106281917],\"minimum_milliseconds\":101.508375,\"median_milliseconds\":104.49508300000001,\"maximum_milliseconds\":106.281917,\"median_mib_per_second\":4899.752077329801,\"median_operations_per_second\":null},{\"name\":\"astrid_stage_seal\",\"bytes_per_sample\":536870912,\"operations_per_sample\":null,\"samples_nanoseconds\":[137653084,139196875,146406167],\"minimum_milliseconds\":137.653084,\"median_milliseconds\":139.196875,\"maximum_milliseconds\":146.406167,\"median_mib_per_second\":3678.2434950497272,\"median_operations_per_second\":null},{\"name\":\"astrid_content_build_compute\",\"bytes_per_sample\":536870912,\"operations_per_sample\":null,\"samples_nanoseconds\":[648383375,653739292,656844542],\"minimum_milliseconds\":648.383375,\"median_milliseconds\":653.739292,\"maximum_milliseconds\":656.8445419999999,\"median_mib_per_second\":783.1868242669434,\"median_operations_per_second\":null},{\"name\":\"native_small_write_close\",\"bytes_per_sample\":null,\"operations_per_sample\":64,\"samples_nanoseconds\":[4544292,4709458,5058542],\"minimum_milliseconds\":4.544292,\"median_milliseconds\":4.709458,\"maximum_milliseconds\":5.058542,\"median_mib_per_second\":null,\"median_operations_per_second\":13589.674225781397},{\"name\":\"native_small_write_sync\",\"bytes_per_sample\":null,\"operations_per_sample\":64,\"samples_nanoseconds\":[274012167,279957709,283000334],\"minimum_milliseconds\":274.012167,\"median_milliseconds\":279.957709,\"maximum_milliseconds\":283.000334,\"median_mib_per_second\":null,\"median_operations_per_second\":228.60595705189172},{\"name\":\"astrid_small_write_seal\",\"bytes_per_sample\":null,\"operations_per_sample\":64,\"samples_nanoseconds\":[881033625,889045583,892983458],\"minimum_milliseconds\":881.033625,\"median_milliseconds\":889.0455830000001,\"maximum_milliseconds\":892.983458,\"median_mib_per_second\":null,\"median_operations_per_second\":71.98731001400184},{\"name\":\"native_read_first\",\"bytes_per_sample\":536870912,\"operations_per_sample\":null,\"samples_nanoseconds\":[342514916],\"minimum_milliseconds\":342.514916,\"median_milliseconds\":342.514916,\"maximum_milliseconds\":342.514916,\"median_mib_per_second\":1494.82541075671,\"median_operations_per_second\":null},{\"name\":\"native_read_warm\",\"bytes_per_sample\":536870912,\"operations_per_sample\":null,\"samples_nanoseconds\":[314184334,320764250,321159708],\"minimum_milliseconds\":314.18433400000004,\"median_milliseconds\":320.76424999999995,\"maximum_milliseconds\":321.15970799999997,\"median_mib_per_second\":1596.1878544756783,\"median_operations_per_second\":null},{\"name\":\"astrid_fresh_open\",\"bytes_per_sample\":null,\"operations_per_sample\":1,\"samples_nanoseconds\":[118892667,131354500,132771500],\"minimum_milliseconds\":118.89266699999999,\"median_milliseconds\":131.3545,\"maximum_milliseconds\":132.77149999999997,\"median_mib_per_second\":null,\"median_operations_per_second\":7.612986231914399},{\"name\":\"astrid_publish_unique\",\"bytes_per_sample\":536870912,\"operations_per_sample\":null,\"samples_nanoseconds\":[2855222833,2856749959,2908245000],\"minimum_milliseconds\":2855.222833,\"median_milliseconds\":2856.749959,\"maximum_milliseconds\":2908.245,\"median_mib_per_second\":179.22464596069327,\"median_operations_per_second\":null},{\"name\":\"astrid_unique_end_to_end\",\"bytes_per_sample\":536870912,\"operations_per_sample\":null,\"samples_nanoseconds\":[3065205874,3072596500,3156924251],\"minimum_milliseconds\":3065.205874,\"median_milliseconds\":3072.5965,\"maximum_milliseconds\":3156.924251,\"median_mib_per_second\":166.63431075313665,\"median_operations_per_second\":null},{\"name\":\"astrid_duplicate_stage_write\",\"bytes_per_sample\":536870912,\"operations_per_sample\":null,\"samples_nanoseconds\":[104305208,159241292,340861042],\"minimum_milliseconds\":104.305208,\"median_milliseconds\":159.24129200000002,\"maximum_milliseconds\":340.861042,\"median_mib_per_second\":3215.2464575582567,\"median_operations_per_second\":null},{\"name\":\"astrid_duplicate_stage_seal\",\"bytes_per_sample\":536870912,\"operations_per_sample\":null,\"samples_nanoseconds\":[32827500,83296875,118272458],\"minimum_milliseconds\":32.8275,\"median_milliseconds\":83.296875,\"maximum_milliseconds\":118.272458,\"median_mib_per_second\":6146.689176514725,\"median_operations_per_second\":null},{\"name\":\"astrid_publish_duplicate\",\"bytes_per_sample\":536870912,\"operations_per_sample\":null,\"samples_nanoseconds\":[1936478042,1984087833,2046013208],\"minimum_milliseconds\":1936.478042,\"median_milliseconds\":1984.087833,\"maximum_milliseconds\":2046.0132080000003,\"median_mib_per_second\":258.0530919469632,\"median_operations_per_second\":null},{\"name\":\"astrid_duplicate_end_to_end\",\"bytes_per_sample\":536870912,\"operations_per_sample\":null,\"samples_nanoseconds\":[2179016209,2206665499,2419701750],\"minimum_milliseconds\":2179.016209,\"median_milliseconds\":2206.665499,\"maximum_milliseconds\":2419.7017499999997,\"median_mib_per_second\":232.02429196089042,\"median_operations_per_second\":null},{\"name\":\"astrid_read_first\",\"bytes_per_sample\":536870912,\"operations_per_sample\":null,\"samples_nanoseconds\":[965943208,1010227000,1026534791],\"minimum_milliseconds\":965.943208,\"median_milliseconds\":1010.227,\"maximum_milliseconds\":1026.534791,\"median_mib_per_second\":506.8167847424391,\"median_operations_per_second\":null},{\"name\":\"astrid_read_warm\",\"bytes_per_sample\":536870912,\"operations_per_sample\":null,\"samples_nanoseconds\":[287946042,300059416,303938541],\"minimum_milliseconds\":287.94604200000003,\"median_milliseconds\":300.059416,\"maximum_milliseconds\":303.938541,\"median_mib_per_second\":1706.3287225753982,\"median_operations_per_second\":null},{\"name\":\"astrid_reopen\",\"bytes_per_sample\":null,\"operations_per_sample\":1,\"samples_nanoseconds\":[1353126875,1393376416,1421981250],\"minimum_milliseconds\":1353.1268750000002,\"median_milliseconds\":1393.376416,\"maximum_milliseconds\":1421.98125,\"median_mib_per_second\":null,\"median_operations_per_second\":0.7176811581688204},{\"name\":\"astrid_read_after_reopen\",\"bytes_per_sample\":536870912,\"operations_per_sample\":null,\"samples_nanoseconds\":[1238400375,1259832208,1268368875],\"minimum_milliseconds\":1238.400375,\"median_milliseconds\":1259.832208,\"maximum_milliseconds\":1268.368875,\"median_mib_per_second\":406.403326370586,\"median_operations_per_second\":null},{\"name\":\"astrid_representation_activation\",\"bytes_per_sample\":null,\"operations_per_sample\":1,\"samples_nanoseconds\":[2329633167,2369879542,2387349208],\"minimum_milliseconds\":2329.633167,\"median_milliseconds\":2369.879542,\"maximum_milliseconds\":2387.3492079999996,\"median_mib_per_second\":null,\"median_operations_per_second\":0.4219623749973702},{\"name\":\"astrid_concurrent_shared_publish\",\"bytes_per_sample\":2147483648,\"operations_per_sample\":null,\"samples_nanoseconds\":[5162681291,5167947584,5269627333],\"minimum_milliseconds\":5162.681291,\"median_milliseconds\":5167.9475840000005,\"maximum_milliseconds\":5269.627332999999,\"median_mib_per_second\":396.2888490472739,\"median_operations_per_second\":null},{\"name\":\"astrid_concurrent_shared_read_first\",\"bytes_per_sample\":2147483648,\"operations_per_sample\":null,\"samples_nanoseconds\":[1026415917,1026583708,1037813000],\"minimum_milliseconds\":1026.415917,\"median_milliseconds\":1026.583708,\"maximum_milliseconds\":1037.813,\"median_mib_per_second\":1994.966395862577,\"median_operations_per_second\":null},{\"name\":\"astrid_concurrent_shared_read_warm\",\"bytes_per_sample\":2147483648,\"operations_per_sample\":null,\"samples_nanoseconds\":[318490541,320291417,322562833],\"minimum_milliseconds\":318.490541,\"median_milliseconds\":320.291417,\"maximum_milliseconds\":322.562833,\"median_mib_per_second\":6394.1769629124965,\"median_operations_per_second\":null}],\"substrate_comparisons\":[{\"name\":\"cached_staging_write\",\"astrid_metric\":\"astrid_stage_write\",\"substrate_metric\":\"native_write\",\"median_elapsed_ratio\":0.9963196318604031},{\"name\":\"warm_verified_read\",\"astrid_metric\":\"astrid_read_warm\",\"substrate_metric\":\"native_read_warm\",\"median_elapsed_ratio\":0.9354515535942676}],\"throughput_scaling\":[{\"name\":\"concurrent_shared_publication\",\"aggregate_metric\":\"astrid_concurrent_shared_publish\",\"single_principal_metric\":\"astrid_publish_unique\",\"median_throughput_ratio\":2.211129205601478},{\"name\":\"concurrent_shared_warm_read\",\"aggregate_metric\":\"astrid_concurrent_shared_read_warm\",\"single_principal_metric\":\"astrid_read_warm\",\"median_throughput_ratio\":3.747330088461284}],\"write_amplifications\":[{\"name\":\"astrid_publish_unique\",\"logical_bytes_per_sample\":536870912,\"authoritative_bytes_appended\":[545724993,545724993,545724993],\"minimum_authoritative_bytes_appended\":545724993,\"median_authoritative_bytes_appended\":545724993,\"maximum_authoritative_bytes_appended\":545724993,\"median_physical_to_logical_ratio\":1.016492011025548},{\"name\":\"astrid_publish_duplicate\",\"logical_bytes_per_sample\":536870912,\"authoritative_bytes_appended\":[24426,24426,24426],\"minimum_authoritative_bytes_appended\":24426,\"median_authoritative_bytes_appended\":24426,\"maximum_authoritative_bytes_appended\":24426,\"median_physical_to_logical_ratio\":0.000045496970415115356}],\"representation_metadata\":[{\"name\":\"astrid_publish_unique\",\"samples\":[{\"new_objects\":6748,\"authoritative_bytes_appended\":7584386,\"bytes_per_new_object\":1123.9457617071726},{\"new_objects\":6748,\"authoritative_bytes_appended\":7584386,\"bytes_per_new_object\":1123.9457617071726},{\"new_objects\":6748,\"authoritative_bytes_appended\":7584386,\"bytes_per_new_object\":1123.9457617071726}],\"median_bytes_per_new_object\":1123.9457617071726},{\"name\":\"astrid_publish_duplicate\",\"samples\":[{\"new_objects\":4,\"authoritative_bytes_appended\":23334,\"bytes_per_new_object\":5833.5},{\"new_objects\":4,\"authoritative_bytes_appended\":23334,\"bytes_per_new_object\":5833.5},{\"new_objects\":4,\"authoritative_bytes_appended\":23334,\"bytes_per_new_object\":5833.5}],\"median_bytes_per_new_object\":5833.5}]}",
+  "payload": {
+    "provenance": {
+      "repository": "astrid-runtime/astrid",
+      "git_revision": "57228e1474a3e4275ee22d1f83d46501d08a8b92",
+      "git_tree": {
+        "state": "clean"
+      },
+      "executable_argv": [
+        "/private/tmp/astrid-storage-representation-substrate/target/release/deps/storage_io-01bff4bb8daa4238",
+        "--bytes",
+        "536870912",
+        "--block-bytes",
+        "4194304",
+        "--range-bytes",
+        "1048576",
+        "--samples",
+        "3",
+        "--small-files",
+        "64",
+        "--small-file-bytes",
+        "4096",
+        "--concurrent-principals",
+        "4",
+        "--object-cache-bytes",
+        "1073741824",
+        "--output",
+        "/private/tmp/astrid-storage-physical-catalogue-57228e14-rerun.json",
+        "--bench"
+      ],
+      "executable": {
+        "bytes": 4992848,
+        "sha256": "41dfd904047541c3281386c2a361808d026fbcb36a5626bb650e430837e372ba"
+      }
+    },
+    "package_version": "0.10.4",
+    "os": "macos",
+    "architecture": "aarch64",
+    "logical_cpus": 24,
+    "config": {
+      "bytes": 536870912,
+      "block_bytes": 4194304,
+      "range_bytes": 1048576,
+      "samples": 3,
+      "small_files": 64,
+      "small_file_bytes": 4096,
+      "concurrent_principals": 4,
+      "object_cache_bytes": 1073741824,
+      "root": null,
+      "output": "/private/tmp/astrid-storage-physical-catalogue-57228e14-rerun.json"
+    },
+    "metrics": [
+      {
+        "name": "native_write",
+        "bytes_per_sample": 536870912,
+        "operations_per_sample": null,
+        "samples_nanoseconds": [
+          103705667,
+          104881084,
+          107060250
+        ],
+        "minimum_milliseconds": 103.705667,
+        "median_milliseconds": 104.881084,
+        "maximum_milliseconds": 107.06025,
+        "median_mib_per_second": 4881.7191858924725,
+        "median_operations_per_second": null
+      },
+      {
+        "name": "native_sync_after_write",
+        "bytes_per_sample": null,
+        "operations_per_sample": 1,
+        "samples_nanoseconds": [
+          88950208,
+          102349583,
+          106333625
+        ],
+        "minimum_milliseconds": 88.950208,
+        "median_milliseconds": 102.349583,
+        "maximum_milliseconds": 106.333625,
+        "median_mib_per_second": null,
+        "median_operations_per_second": 9.770435508271685
+      },
+      {
+        "name": "astrid_stage_write",
+        "bytes_per_sample": 536870912,
+        "operations_per_sample": null,
+        "samples_nanoseconds": [
+          101508375,
+          104495083,
+          106281917
+        ],
+        "minimum_milliseconds": 101.508375,
+        "median_milliseconds": 104.49508300000001,
+        "maximum_milliseconds": 106.281917,
+        "median_mib_per_second": 4899.752077329801,
+        "median_operations_per_second": null
+      },
+      {
+        "name": "astrid_stage_seal",
+        "bytes_per_sample": 536870912,
+        "operations_per_sample": null,
+        "samples_nanoseconds": [
+          137653084,
+          139196875,
+          146406167
+        ],
+        "minimum_milliseconds": 137.653084,
+        "median_milliseconds": 139.196875,
+        "maximum_milliseconds": 146.406167,
+        "median_mib_per_second": 3678.2434950497272,
+        "median_operations_per_second": null
+      },
+      {
+        "name": "astrid_content_build_compute",
+        "bytes_per_sample": 536870912,
+        "operations_per_sample": null,
+        "samples_nanoseconds": [
+          648383375,
+          653739292,
+          656844542
+        ],
+        "minimum_milliseconds": 648.383375,
+        "median_milliseconds": 653.739292,
+        "maximum_milliseconds": 656.8445419999999,
+        "median_mib_per_second": 783.1868242669434,
+        "median_operations_per_second": null
+      },
+      {
+        "name": "native_small_write_close",
+        "bytes_per_sample": null,
+        "operations_per_sample": 64,
+        "samples_nanoseconds": [
+          4544292,
+          4709458,
+          5058542
+        ],
+        "minimum_milliseconds": 4.544292,
+        "median_milliseconds": 4.709458,
+        "maximum_milliseconds": 5.058542,
+        "median_mib_per_second": null,
+        "median_operations_per_second": 13589.674225781397
+      },
+      {
+        "name": "native_small_write_sync",
+        "bytes_per_sample": null,
+        "operations_per_sample": 64,
+        "samples_nanoseconds": [
+          274012167,
+          279957709,
+          283000334
+        ],
+        "minimum_milliseconds": 274.012167,
+        "median_milliseconds": 279.957709,
+        "maximum_milliseconds": 283.000334,
+        "median_mib_per_second": null,
+        "median_operations_per_second": 228.60595705189172
+      },
+      {
+        "name": "astrid_small_write_seal",
+        "bytes_per_sample": null,
+        "operations_per_sample": 64,
+        "samples_nanoseconds": [
+          881033625,
+          889045583,
+          892983458
+        ],
+        "minimum_milliseconds": 881.033625,
+        "median_milliseconds": 889.0455830000001,
+        "maximum_milliseconds": 892.983458,
+        "median_mib_per_second": null,
+        "median_operations_per_second": 71.98731001400184
+      },
+      {
+        "name": "native_read_first",
+        "bytes_per_sample": 536870912,
+        "operations_per_sample": null,
+        "samples_nanoseconds": [
+          342514916
+        ],
+        "minimum_milliseconds": 342.514916,
+        "median_milliseconds": 342.514916,
+        "maximum_milliseconds": 342.514916,
+        "median_mib_per_second": 1494.82541075671,
+        "median_operations_per_second": null
+      },
+      {
+        "name": "native_read_warm",
+        "bytes_per_sample": 536870912,
+        "operations_per_sample": null,
+        "samples_nanoseconds": [
+          314184334,
+          320764250,
+          321159708
+        ],
+        "minimum_milliseconds": 314.18433400000004,
+        "median_milliseconds": 320.76424999999995,
+        "maximum_milliseconds": 321.15970799999997,
+        "median_mib_per_second": 1596.1878544756783,
+        "median_operations_per_second": null
+      },
+      {
+        "name": "astrid_fresh_open",
+        "bytes_per_sample": null,
+        "operations_per_sample": 1,
+        "samples_nanoseconds": [
+          118892667,
+          131354500,
+          132771500
+        ],
+        "minimum_milliseconds": 118.89266699999999,
+        "median_milliseconds": 131.3545,
+        "maximum_milliseconds": 132.77149999999997,
+        "median_mib_per_second": null,
+        "median_operations_per_second": 7.612986231914399
+      },
+      {
+        "name": "astrid_publish_unique",
+        "bytes_per_sample": 536870912,
+        "operations_per_sample": null,
+        "samples_nanoseconds": [
+          2855222833,
+          2856749959,
+          2908245000
+        ],
+        "minimum_milliseconds": 2855.222833,
+        "median_milliseconds": 2856.749959,
+        "maximum_milliseconds": 2908.245,
+        "median_mib_per_second": 179.22464596069327,
+        "median_operations_per_second": null
+      },
+      {
+        "name": "astrid_unique_end_to_end",
+        "bytes_per_sample": 536870912,
+        "operations_per_sample": null,
+        "samples_nanoseconds": [
+          3065205874,
+          3072596500,
+          3156924251
+        ],
+        "minimum_milliseconds": 3065.205874,
+        "median_milliseconds": 3072.5965,
+        "maximum_milliseconds": 3156.924251,
+        "median_mib_per_second": 166.63431075313665,
+        "median_operations_per_second": null
+      },
+      {
+        "name": "astrid_duplicate_stage_write",
+        "bytes_per_sample": 536870912,
+        "operations_per_sample": null,
+        "samples_nanoseconds": [
+          104305208,
+          159241292,
+          340861042
+        ],
+        "minimum_milliseconds": 104.305208,
+        "median_milliseconds": 159.24129200000002,
+        "maximum_milliseconds": 340.861042,
+        "median_mib_per_second": 3215.2464575582567,
+        "median_operations_per_second": null
+      },
+      {
+        "name": "astrid_duplicate_stage_seal",
+        "bytes_per_sample": 536870912,
+        "operations_per_sample": null,
+        "samples_nanoseconds": [
+          32827500,
+          83296875,
+          118272458
+        ],
+        "minimum_milliseconds": 32.8275,
+        "median_milliseconds": 83.296875,
+        "maximum_milliseconds": 118.272458,
+        "median_mib_per_second": 6146.689176514725,
+        "median_operations_per_second": null
+      },
+      {
+        "name": "astrid_publish_duplicate",
+        "bytes_per_sample": 536870912,
+        "operations_per_sample": null,
+        "samples_nanoseconds": [
+          1936478042,
+          1984087833,
+          2046013208
+        ],
+        "minimum_milliseconds": 1936.478042,
+        "median_milliseconds": 1984.087833,
+        "maximum_milliseconds": 2046.0132080000003,
+        "median_mib_per_second": 258.0530919469632,
+        "median_operations_per_second": null
+      },
+      {
+        "name": "astrid_duplicate_end_to_end",
+        "bytes_per_sample": 536870912,
+        "operations_per_sample": null,
+        "samples_nanoseconds": [
+          2179016209,
+          2206665499,
+          2419701750
+        ],
+        "minimum_milliseconds": 2179.016209,
+        "median_milliseconds": 2206.665499,
+        "maximum_milliseconds": 2419.7017499999997,
+        "median_mib_per_second": 232.02429196089042,
+        "median_operations_per_second": null
+      },
+      {
+        "name": "astrid_read_first",
+        "bytes_per_sample": 536870912,
+        "operations_per_sample": null,
+        "samples_nanoseconds": [
+          965943208,
+          1010227000,
+          1026534791
+        ],
+        "minimum_milliseconds": 965.943208,
+        "median_milliseconds": 1010.227,
+        "maximum_milliseconds": 1026.534791,
+        "median_mib_per_second": 506.8167847424391,
+        "median_operations_per_second": null
+      },
+      {
+        "name": "astrid_read_warm",
+        "bytes_per_sample": 536870912,
+        "operations_per_sample": null,
+        "samples_nanoseconds": [
+          287946042,
+          300059416,
+          303938541
+        ],
+        "minimum_milliseconds": 287.94604200000003,
+        "median_milliseconds": 300.059416,
+        "maximum_milliseconds": 303.938541,
+        "median_mib_per_second": 1706.3287225753982,
+        "median_operations_per_second": null
+      },
+      {
+        "name": "astrid_reopen",
+        "bytes_per_sample": null,
+        "operations_per_sample": 1,
+        "samples_nanoseconds": [
+          1353126875,
+          1393376416,
+          1421981250
+        ],
+        "minimum_milliseconds": 1353.1268750000002,
+        "median_milliseconds": 1393.376416,
+        "maximum_milliseconds": 1421.98125,
+        "median_mib_per_second": null,
+        "median_operations_per_second": 0.7176811581688204
+      },
+      {
+        "name": "astrid_read_after_reopen",
+        "bytes_per_sample": 536870912,
+        "operations_per_sample": null,
+        "samples_nanoseconds": [
+          1238400375,
+          1259832208,
+          1268368875
+        ],
+        "minimum_milliseconds": 1238.400375,
+        "median_milliseconds": 1259.832208,
+        "maximum_milliseconds": 1268.368875,
+        "median_mib_per_second": 406.403326370586,
+        "median_operations_per_second": null
+      },
+      {
+        "name": "astrid_representation_activation",
+        "bytes_per_sample": null,
+        "operations_per_sample": 1,
+        "samples_nanoseconds": [
+          2329633167,
+          2369879542,
+          2387349208
+        ],
+        "minimum_milliseconds": 2329.633167,
+        "median_milliseconds": 2369.879542,
+        "maximum_milliseconds": 2387.3492079999996,
+        "median_mib_per_second": null,
+        "median_operations_per_second": 0.4219623749973702
+      },
+      {
+        "name": "astrid_concurrent_shared_publish",
+        "bytes_per_sample": 2147483648,
+        "operations_per_sample": null,
+        "samples_nanoseconds": [
+          5162681291,
+          5167947584,
+          5269627333
+        ],
+        "minimum_milliseconds": 5162.681291,
+        "median_milliseconds": 5167.9475840000005,
+        "maximum_milliseconds": 5269.627332999999,
+        "median_mib_per_second": 396.2888490472739,
+        "median_operations_per_second": null
+      },
+      {
+        "name": "astrid_concurrent_shared_read_first",
+        "bytes_per_sample": 2147483648,
+        "operations_per_sample": null,
+        "samples_nanoseconds": [
+          1026415917,
+          1026583708,
+          1037813000
+        ],
+        "minimum_milliseconds": 1026.415917,
+        "median_milliseconds": 1026.583708,
+        "maximum_milliseconds": 1037.813,
+        "median_mib_per_second": 1994.966395862577,
+        "median_operations_per_second": null
+      },
+      {
+        "name": "astrid_concurrent_shared_read_warm",
+        "bytes_per_sample": 2147483648,
+        "operations_per_sample": null,
+        "samples_nanoseconds": [
+          318490541,
+          320291417,
+          322562833
+        ],
+        "minimum_milliseconds": 318.490541,
+        "median_milliseconds": 320.291417,
+        "maximum_milliseconds": 322.562833,
+        "median_mib_per_second": 6394.1769629124965,
+        "median_operations_per_second": null
+      }
+    ],
+    "substrate_comparisons": [
+      {
+        "name": "cached_staging_write",
+        "astrid_metric": "astrid_stage_write",
+        "substrate_metric": "native_write",
+        "median_elapsed_ratio": 0.9963196318604031
+      },
+      {
+        "name": "warm_verified_read",
+        "astrid_metric": "astrid_read_warm",
+        "substrate_metric": "native_read_warm",
+        "median_elapsed_ratio": 0.9354515535942676
+      }
+    ],
+    "throughput_scaling": [
+      {
+        "name": "concurrent_shared_publication",
+        "aggregate_metric": "astrid_concurrent_shared_publish",
+        "single_principal_metric": "astrid_publish_unique",
+        "median_throughput_ratio": 2.211129205601478
+      },
+      {
+        "name": "concurrent_shared_warm_read",
+        "aggregate_metric": "astrid_concurrent_shared_read_warm",
+        "single_principal_metric": "astrid_read_warm",
+        "median_throughput_ratio": 3.747330088461284
+      }
+    ],
+    "write_amplifications": [
+      {
+        "name": "astrid_publish_unique",
+        "logical_bytes_per_sample": 536870912,
+        "authoritative_bytes_appended": [
+          545724993,
+          545724993,
+          545724993
+        ],
+        "minimum_authoritative_bytes_appended": 545724993,
+        "median_authoritative_bytes_appended": 545724993,
+        "maximum_authoritative_bytes_appended": 545724993,
+        "median_physical_to_logical_ratio": 1.016492011025548
+      },
+      {
+        "name": "astrid_publish_duplicate",
+        "logical_bytes_per_sample": 536870912,
+        "authoritative_bytes_appended": [
+          24426,
+          24426,
+          24426
+        ],
+        "minimum_authoritative_bytes_appended": 24426,
+        "median_authoritative_bytes_appended": 24426,
+        "maximum_authoritative_bytes_appended": 24426,
+        "median_physical_to_logical_ratio": 0.000045496970415115356
+      }
+    ],
+    "representation_metadata": [
+      {
+        "name": "astrid_publish_unique",
+        "samples": [
+          {
+            "new_objects": 6748,
+            "authoritative_bytes_appended": 7584386,
+            "bytes_per_new_object": 1123.9457617071726
+          },
+          {
+            "new_objects": 6748,
+            "authoritative_bytes_appended": 7584386,
+            "bytes_per_new_object": 1123.9457617071726
+          },
+          {
+            "new_objects": 6748,
+            "authoritative_bytes_appended": 7584386,
+            "bytes_per_new_object": 1123.9457617071726
+          }
+        ],
+        "median_bytes_per_new_object": 1123.9457617071726
+      },
+      {
+        "name": "astrid_publish_duplicate",
+        "samples": [
+          {
+            "new_objects": 4,
+            "authoritative_bytes_appended": 23334,
+            "bytes_per_new_object": 5833.5
+          },
+          {
+            "new_objects": 4,
+            "authoritative_bytes_appended": 23334,
+            "bytes_per_new_object": 5833.5
+          },
+          {
+            "new_objects": 4,
+            "authoritative_bytes_appended": 23334,
+            "bytes_per_new_object": 5833.5
+          }
+        ],
+        "median_bytes_per_new_object": 5833.5
+      }
+    ]
+  }
+}
