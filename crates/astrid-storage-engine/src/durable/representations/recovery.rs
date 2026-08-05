@@ -237,8 +237,12 @@ fn map_closure_complete(
         let Some(node) = nodes.get(&id) else {
             return false;
         };
-        if let PhysicalMapNode::Branch { zero, one, .. } = node {
-            pending.extend([*zero, *one]);
+        match node {
+            PhysicalMapNode::Branch { zero, one, .. } => pending.extend([*zero, *one]),
+            PhysicalMapNode::Radix { children, .. } => {
+                pending.extend(children.iter().copied());
+            },
+            PhysicalMapNode::Leaf { .. } | PhysicalMapNode::Page { .. } => {},
         }
     }
     true
@@ -453,6 +457,17 @@ fn active_entries(
             PhysicalMapNode::Branch { zero, one, .. } => {
                 stack.push(*one);
                 stack.push(*zero);
+            },
+            PhysicalMapNode::Page {
+                entries: page_entries,
+                ..
+            } => entries.extend(
+                page_entries
+                    .iter()
+                    .map(|(key, value)| (*key, value.as_slice())),
+            ),
+            PhysicalMapNode::Radix { children, .. } => {
+                stack.extend(children.iter().rev().copied());
             },
         }
     }

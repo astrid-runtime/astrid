@@ -49,7 +49,7 @@ REFERENCE_NAMES = ("Owns", "Evidence", "Lineage", "Derived")
 FORMAT_SPECIFICATION = (
     1,
     1,
-    bytes.fromhex("900d1eface3294bc9e47369c0fcb64dca56ff334dfbc1288f349090e10c09e6f"),
+    bytes.fromhex("9d701dc87360e634b25b7b7f5d5e79315f9f27bcf4d50e09c2181e439b0c7d75"),
 )
 CONTENT_CATALOG_SPECIFICATION = (
     1,
@@ -70,6 +70,7 @@ LEGACY_FORMAT_SPECIFICATIONS = {
         "3991b59002c981fd3b5603badd4ea5b31143253023cba98050cfc7e928638aff",
         "c3fd6c43a5b6a05ffe11c339502ce35090f6643ee3070177e5802fc155d2b8c0",
         "82e46f53ba9bb2f52d6b942088d5965eaa17c2720e61ce842ed9d5e3c0d1219d",
+        "900d1eface3294bc9e47369c0fcb64dca56ff334dfbc1288f349090e10c09e6f",
     )
 }
 CHUNK_TREE_FANOUT = 128

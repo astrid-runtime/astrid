@@ -16,6 +16,7 @@ PROFILE_CONTEXT = "astrid-representation-profile-v1\0"
 BLOB_CONTEXT = "astrid-blob-identity-v1\0"
 RECORD_CONTEXT = "astrid-representation-record-v1\0"
 MAP_CONTEXT = "astrid-physical-map-node-v1\0"
+RADIX_MAP_CONTEXT = "astrid-physical-radix-map-node-v1\0"
 CATALOGUE_CONTEXT = "astrid-representation-catalogue-root-v1\0"
 PLACEMENT_CONTEXT = "astrid-placement-set-v1\0"
 STATE_CONTEXT = "astrid-representation-state-v1\0"
@@ -416,9 +417,9 @@ def decode_map_node(data):
     version = cursor.integer(2)
     domain = cursor.integer(1)
     tag = cursor.integer(1)
-    if version != 1 or domain > 2:
+    if version not in (1, 2) or domain > 2:
         raise FormatError("unsupported physical map node")
-    if tag == 0:
+    if version == 1 and tag == 0:
         node = {
             "version": version,
             "domain": domain,
@@ -426,7 +427,7 @@ def decode_map_node(data):
             "key": identity(cursor, PHYSICAL_SCHEME),
             "value": cursor.byte_string(),
         }
-    elif tag == 1:
+    elif version == 1 and tag == 1:
         prefix_bits = cursor.integer(4)
         if prefix_bits >= 352:
             raise FormatError("physical map prefix consumes key")
@@ -448,6 +449,46 @@ def decode_map_node(data):
             "one": one,
             "subtree_entries": subtree_entries,
         }
+    elif version == 2 and tag == 0:
+        count = cursor.integer(1)
+        if count != 1:
+            raise FormatError("physical radix page count is outside its bound")
+        entries = []
+        for _ in range(count):
+            entries.append((identity(cursor, PHYSICAL_SCHEME), cursor.byte_string()))
+        if any(identity_bytes(left[0]) >= identity_bytes(right[0]) for left, right in zip(entries, entries[1:])):
+            raise FormatError("physical radix page keys are not strictly ordered")
+        node = {
+            "version": version,
+            "domain": domain,
+            "tag": tag,
+            "entries": entries,
+        }
+    elif version == 2 and tag == 1:
+        prefix_nibbles = cursor.integer(1)
+        if prefix_nibbles >= 64:
+            raise FormatError("physical radix prefix consumes key")
+        prefix = cursor.take((prefix_nibbles + 1) // 2)
+        if prefix_nibbles % 2 and prefix[-1] & 0x0F:
+            raise FormatError("physical radix prefix has a non-zero unused nibble")
+        child_bitmap = cursor.integer(2)
+        child_count = child_bitmap.bit_count()
+        if child_count < 2:
+            raise FormatError("physical radix branch is unary")
+        children = [identity(cursor, PHYSICAL_SCHEME) for _ in range(child_count)]
+        subtree_entries = cursor.integer(8)
+        if subtree_entries <= 1:
+            raise FormatError("physical radix branch should be a page")
+        node = {
+            "version": version,
+            "domain": domain,
+            "tag": tag,
+            "prefix_nibbles": prefix_nibbles,
+            "prefix": prefix,
+            "child_bitmap": child_bitmap,
+            "children": children,
+            "subtree_entries": subtree_entries,
+        }
     else:
         raise FormatError("unknown physical map node tag")
     cursor.done()
@@ -458,14 +499,30 @@ def decode_map_node(data):
 
 def encode_map_node(node):
     output = bytearray(struct.pack("<HBB", node["version"], node["domain"], node["tag"]))
-    if node["tag"] == 0:
+    if node["version"] == 1 and node["tag"] == 0:
         output += identity_bytes(node["key"])
         output += struct.pack("<Q", len(node["value"])) + node["value"]
-    else:
+    elif node["version"] == 1:
         output += struct.pack("<I", node["prefix_bits"]) + node["prefix"]
         output += identity_bytes(node["zero"]) + identity_bytes(node["one"])
         output += struct.pack("<Q", node["subtree_entries"])
+    elif node["tag"] == 0:
+        output += struct.pack("<B", len(node["entries"]))
+        for key, value in node["entries"]:
+            output += identity_bytes(key)
+            output += struct.pack("<Q", len(value)) + value
+    else:
+        output += struct.pack("<B", node["prefix_nibbles"]) + node["prefix"]
+        output += struct.pack("<H", node["child_bitmap"])
+        for child in node["children"]:
+            output += identity_bytes(child)
+        output += struct.pack("<Q", node["subtree_entries"])
     return bytes(output)
+
+
+def map_node_identity(node, data):
+    context = MAP_CONTEXT if node["version"] == 1 else RADIX_MAP_CONTEXT
+    return physical_identity(context, data)
 
 
 def decode_catalogue_root(data):
@@ -646,6 +703,25 @@ def canonical_prefix(key, bits):
     return bytes(prefix)
 
 
+def key_nibble(key, offset):
+    byte = key[offset // 2]
+    return byte >> 4 if offset % 2 == 0 else byte & 0x0F
+
+
+def common_prefix_nibbles(left, right):
+    offset = 0
+    while offset < 64 and key_nibble(left, offset) == key_nibble(right, offset):
+        offset += 1
+    return offset
+
+
+def canonical_nibble_prefix(key, nibbles):
+    prefix = bytearray(key[: (nibbles + 1) // 2])
+    if nibbles % 2:
+        prefix[-1] &= 0xF0
+    return bytes(prefix)
+
+
 def validate_map(root, expected_domain, expected_count, nodes, decode_value):
     if root is None:
         if expected_count:
@@ -659,11 +735,11 @@ def validate_map(root, expected_domain, expected_count, nodes, decode_value):
         key_id = identity_bytes(node_id)
         if expanded:
             node = nodes[key_id]
-            if node["tag"] == 0:
+            if node.get("version", 1) == 1 and node["tag"] == 0:
                 key = search_key(node["key"])
                 complete[key_id] = (1, key, key)
                 decode_value(node["key"], node["value"])
-            else:
+            elif node.get("version", 1) == 1:
                 zero = complete[identity_bytes(node["zero"])]
                 one = complete[identity_bytes(node["one"])]
                 count = zero[0] + one[0]
@@ -679,6 +755,27 @@ def validate_map(root, expected_domain, expected_count, nodes, decode_value):
                 if not key_bit(one[1], node["prefix_bits"]) or not key_bit(one[2], node["prefix_bits"]):
                     raise FormatError("physical map one child crosses split")
                 complete[key_id] = (count, minimum, maximum)
+            elif node["tag"] == 0:
+                for key, value in node["entries"]:
+                    decode_value(key, value)
+                minimum = node["entries"][0][0][2]
+                maximum = node["entries"][-1][0][2]
+                complete[key_id] = (len(node["entries"]), minimum, maximum)
+            else:
+                selectors = [index for index in range(16) if node["child_bitmap"] & (1 << index)]
+                children = [complete[identity_bytes(child)] for child in node["children"]]
+                count = sum(child[0] for child in children)
+                if count != node["subtree_entries"]:
+                    raise FormatError("physical radix subtree count mismatch")
+                minimum, maximum = children[0][1], children[-1][2]
+                if common_prefix_nibbles(minimum, maximum) != node["prefix_nibbles"]:
+                    raise FormatError("physical radix branch is not the longest common prefix")
+                if canonical_nibble_prefix(minimum, node["prefix_nibbles"]) != node["prefix"]:
+                    raise FormatError("physical radix prefix bytes are not canonical")
+                for selector, child in zip(selectors, children):
+                    if key_nibble(child[1], node["prefix_nibbles"]) != selector or key_nibble(child[2], node["prefix_nibbles"]) != selector:
+                        raise FormatError("physical radix child crosses its selector")
+                complete[key_id] = (count, minimum, maximum)
             visiting.remove(key_id)
             continue
         if key_id in visiting or key_id in complete:
@@ -688,9 +785,12 @@ def validate_map(root, expected_domain, expected_count, nodes, decode_value):
             raise FormatError("physical map node is missing or in the wrong domain")
         visiting.add(key_id)
         stack.append((node_id, True))
-        if node["tag"] == 1:
+        if node.get("version", 1) == 1 and node["tag"] == 1:
             stack.append((node["one"], False))
             stack.append((node["zero"], False))
+        elif node.get("version", 1) == 2 and node["tag"] == 1:
+            for child in reversed(node["children"]):
+                stack.append((child, False))
     if complete[identity_bytes(root)][0] != expected_count:
         raise FormatError("physical map root count mismatch")
 
@@ -701,7 +801,7 @@ def decode_catalogue_fixture(fixture, profile_id, profile_bytes, record_id, reco
     for encoded_node in section["nodes"]:
         data = bytes.fromhex(encoded_node["canonical_hex"])
         node = decode_map_node(data)
-        node_id = physical_identity(MAP_CONTEXT, data)
+        node_id = map_node_identity(node, data)
         if identity_text(node_id) != encoded_node["id"] or identity_bytes(node_id) in nodes:
             raise FormatError("physical map node identity mismatch or duplicate")
         nodes[identity_bytes(node_id)] = node

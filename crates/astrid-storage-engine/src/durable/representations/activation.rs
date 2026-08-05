@@ -28,7 +28,7 @@ pub(super) fn build_initial_state(
     let identity = Blake3PhysicalIdentity;
     let (profile, direct_profile) = direct_profile(frozen_specification)?;
     let mut metadata = Vec::new();
-    let profiles = CanonicalPhysicalMap::build(
+    let profiles = CanonicalPhysicalMap::build_dense(
         &identity,
         PhysicalMapDomain::Profile,
         vec![(PhysicalMapKey::from(direct_profile), profile.encode()?)],
@@ -66,14 +66,17 @@ pub(super) fn build_initial_state(
         )?;
         placement_entries.push((PhysicalMapKey::from(object.blob), placement.encode()?));
     }
-    let representations = CanonicalPhysicalMap::build(
+    let representations = CanonicalPhysicalMap::build_dense(
         &identity,
         PhysicalMapDomain::Representation,
         representation_entries,
     )?;
     append_map_nodes(&mut metadata, representations.nodes())?;
-    let placements =
-        CanonicalPhysicalMap::build(&identity, PhysicalMapDomain::Placement, placement_entries)?;
+    let placements = CanonicalPhysicalMap::build_dense(
+        &identity,
+        PhysicalMapDomain::Placement,
+        placement_entries,
+    )?;
     append_map_nodes(&mut metadata, placements.nodes())?;
     let catalogue = RepresentationCatalogueRoot::new(
         1,
@@ -137,6 +140,7 @@ pub(super) fn append_new_reachable_map_nodes(
     metadata: &mut Vec<MetadataFrame>,
     map: &CanonicalPhysicalMap,
     durable: &BTreeSet<astrid_storage_model::PhysicalMapNodeId>,
+    appended: &mut BTreeSet<astrid_storage_model::PhysicalMapNodeId>,
 ) -> Result<(), DurableError> {
     let Some(root) = map.root() else {
         return Ok(());
@@ -144,7 +148,7 @@ pub(super) fn append_new_reachable_map_nodes(
     let mut pending = vec![root];
     let mut visited = BTreeSet::new();
     while let Some(id) = pending.pop() {
-        if !visited.insert(id) || durable.contains(&id) {
+        if !visited.insert(id) || durable.contains(&id) || appended.contains(&id) {
             continue;
         }
         let node = map
@@ -154,9 +158,16 @@ pub(super) fn append_new_reachable_map_nodes(
                 "active physical map is missing a reachable node",
             ))?;
         metadata.push(MetadataFrame::map_node(&Blake3PhysicalIdentity, node)?);
-        if let PhysicalMapNode::Branch { zero, one, .. } = node {
-            pending.push(*one);
-            pending.push(*zero);
+        appended.insert(id);
+        match node {
+            PhysicalMapNode::Branch { zero, one, .. } => {
+                pending.push(*one);
+                pending.push(*zero);
+            },
+            PhysicalMapNode::Radix { children, .. } => {
+                pending.extend(children.iter().rev().copied());
+            },
+            PhysicalMapNode::Leaf { .. } | PhysicalMapNode::Page { .. } => {},
         }
     }
     Ok(())

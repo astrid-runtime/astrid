@@ -35,6 +35,7 @@ from runatal_v1_physical import (
     optional_identity,
     physical_frame,
     physical_identity,
+    map_node_identity,
     validate_map,
 )
 
@@ -95,7 +96,11 @@ def decode_metadata_arena(path):
         value = cursor.byte_string()
         cursor.done()
         decoders[kind](value)
-        computed = physical_identity(contexts[kind], value)
+        computed = (
+            map_node_identity(decode_map_node(value), value)
+            if kind == 2
+            else physical_identity(contexts[kind], value)
+        )
         if declared != computed:
             raise FormatError("physical metadata identity mismatch")
         key = (kind, identity_bytes(declared))

@@ -852,8 +852,8 @@ fn direct_batch_persists_only_its_final_reachable_map_nodes() {
     )
     .unwrap();
 
-    // Each map has 64 leaves and 63 branches. Representation records live in
-    // the authenticated map leaves; only the catalogue, placement, and state
-    // are additional frames.
-    assert_eq!(appended_frames, 2 * (64 + 63) + 3);
+    // The radix leaves and their branches need 174 reachable frames for
+    // these two 64-entry maps. Only the catalogue, placement, and state are
+    // additional; historical path-copy nodes must not leak into the batch.
+    assert_eq!(appended_frames, 174 + 3);
 }

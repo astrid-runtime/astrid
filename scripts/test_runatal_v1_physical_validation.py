@@ -66,6 +66,39 @@ class PhysicalValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(FormatError, "placement length"):
             validate_direct_lengths(record, placement, 64)
 
+    def test_radix_map_rejects_a_child_under_the_wrong_selector(self):
+        zero_entries = [(tagged(1), b"zero")]
+        eight_entries = [(tagged(0x81), b"eight")]
+        zero_id = tagged(0x11)
+        eight_id = tagged(0x22)
+        root_id = tagged(0x33)
+        nodes = {
+            identity_bytes(zero_id): {
+                "version": 2,
+                "domain": 0,
+                "tag": 0,
+                "entries": zero_entries,
+            },
+            identity_bytes(eight_id): {
+                "version": 2,
+                "domain": 0,
+                "tag": 0,
+                "entries": eight_entries,
+            },
+            identity_bytes(root_id): {
+                "version": 2,
+                "domain": 0,
+                "tag": 1,
+                "prefix_nibbles": 0,
+                "prefix": b"",
+                "child_bitmap": (1 << 1) | (1 << 8),
+                "children": [zero_id, eight_id],
+                "subtree_entries": 2,
+            },
+        }
+        with self.assertRaisesRegex(FormatError, "child crosses its selector"):
+            validate_map(root_id, 0, 2, nodes, lambda _key, _value: None)
+
     def test_direct_coverage_exempts_only_declared_bootstrap_objects(self):
         bootstrap = b"bootstrap"
         represented = b"represented"
