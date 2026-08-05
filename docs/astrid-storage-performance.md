@@ -435,7 +435,7 @@ staged acknowledgement boundary rather than synchronously impersonating
 Issue #1450 was measured against a clean `94e7cea7` main checkout and three
 points on the physical-catalogue branch: `d6bc3d06`, `0d5a42b3` after batch
 admission stopped persisting intermediate path-copy nodes, and audited commit
-`57228e14` after conserving canonical description work, using segmented
+`603d260b` after conserving canonical description work, using segmented
 physical identity, coalescing activation reads, and pruning redundant profile
 and iteration-only records. All four runs used the same 512 MiB corpus and
 command-line configuration as the integrated measurement above. The evidence
@@ -443,25 +443,25 @@ envelopes are
 `astrid-storage-main-94e7cea7.json`,
 `astrid-storage-physical-catalogue-d6bc3d06.json`, and
 `astrid-storage-physical-catalogue-0d5a42b3.json`, and
-`astrid-storage-physical-catalogue-57228e14.json`.
+`astrid-storage-physical-catalogue-603d260b.json`.
 
-| Operation | Main `94e7cea7` | First corrected `0d5a42b3` | Audited `57228e14` | Final vs main |
+| Operation | Main `94e7cea7` | First corrected `0d5a42b3` | Audited `603d260b` | Final vs main |
 |---|---:|---:|---:|---:|
-| Unique publication | 208.2 MiB/s | 129.8 MiB/s | 179.2 MiB/s | 13.9% lower |
-| Duplicate publication | 260.3 MiB/s | 252.2 MiB/s | 258.1 MiB/s | 0.8% lower |
-| Warm verified read | 1,683.6 MiB/s | 1,681.8 MiB/s | 1,706.3 MiB/s | 1.3% higher |
-| Four-principal warm verified read | 6,549.9 MiB/s | 6,359.9 MiB/s | 6,394.2 MiB/s | 2.4% lower |
-| Four-principal shared publication | 438.2 MiB/s | 322.7 MiB/s | 396.3 MiB/s | 9.6% lower |
-| Populated reopen | 1,098.2 ms | 2,698.0 ms | 1,393.4 ms | 1.27× elapsed |
-| Direct-catalogue activation | not applicable | 2,651.9 ms | 2,369.9 ms | one-time migration |
+| Unique publication | 208.2 MiB/s | 129.8 MiB/s | 179.1 MiB/s | 14.0% lower |
+| Duplicate publication | 260.3 MiB/s | 252.2 MiB/s | 258.3 MiB/s | 0.8% lower |
+| Warm verified read | 1,683.6 MiB/s | 1,681.8 MiB/s | 1,798.5 MiB/s | 6.8% higher |
+| Four-principal warm verified read | 6,549.9 MiB/s | 6,359.9 MiB/s | 6,337.0 MiB/s | 3.3% lower |
+| Four-principal shared publication | 438.2 MiB/s | 322.7 MiB/s | 386.3 MiB/s | 11.8% lower |
+| Populated reopen | 1,098.2 ms | 2,698.0 ms | 1,368.0 ms | 1.25× elapsed |
+| Direct-catalogue activation | not applicable | 2,651.9 ms | 2,328.0 ms | one-time migration |
 
 The audited paired substrate comparison remains favorable: staging took
-0.996× the native cached-write time and a warm Astrid verified read took
-0.935× the native BLAKE3-verified read time. The physical catalogue therefore
+1.078× the native cached-write time and a warm Astrid verified read took
+0.887× the native BLAKE3-verified read time. The physical catalogue therefore
 leaves the hosted read path at parity while making representation placement
 independently recoverable and auditable. Four-principal publication recovered
-from 322.7 to 396.3 MiB/s and now provides 2.211× the single-principal
-throughput; it remains 9.6% below the main baseline and is not presented as a
+from 322.7 to 386.3 MiB/s and now provides 2.158× the single-principal
+throughput; it remains 11.8% below the main baseline and is not presented as a
 closed optimization target.
 
 The first implementation appended 39,945,425 bytes of representation metadata
