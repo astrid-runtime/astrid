@@ -22,7 +22,10 @@ use astrid_storage_model::{
 use ed25519_dalek::{Signer, SigningKey};
 
 use super::bootstrap;
-use super::format_amendment::{STORE_METADATA_FILE, format_spec_record, store_metadata};
+use super::format_amendment::{
+    STORE_METADATA_FILE, format_spec_record, pre_representation_store_metadata,
+    representation_bootstrap_objects, store_metadata,
+};
 use super::{Blake3ObjectIdentityV1, RuntimeEngine, StateOwnerCodecV1};
 
 fn id(value: u8) -> ObjectId {
@@ -55,10 +58,28 @@ fn open_fixture_store(path: &Path) -> RuntimeEngine {
         .unwrap();
     std::fs::write(
         path.join(STORE_METADATA_FILE),
-        store_metadata(specification_id, catalog_specification_id),
+        pre_representation_store_metadata(specification_id, catalog_specification_id),
     )
     .unwrap();
     engine
+}
+
+fn finish_fixture_store(engine: &RuntimeEngine, path: &Path) {
+    let specification_id = Blake3ObjectIdentityV1.identify(&format_spec_record().unwrap());
+    let catalog_specification_id = Blake3ObjectIdentityV1
+        .identify(&bootstrap::content_catalog_format_specification().unwrap());
+    engine
+        .ensure_direct_representation_catalogue(
+            specification_id,
+            &representation_bootstrap_objects(specification_id, catalog_specification_id),
+        )
+        .unwrap();
+    std::fs::write(
+        path.join(STORE_METADATA_FILE),
+        store_metadata(specification_id, catalog_specification_id),
+    )
+    .unwrap();
+    engine.close().unwrap();
 }
 
 fn amendment_records() -> Vec<ObjectRecord> {
@@ -224,7 +245,7 @@ fn independent_reader_decodes_all_derivation_amendment_schemas() {
     records.extend(cross_hash_records());
     records.extend(bottom_k_records());
     engine.stage_objects(records).unwrap();
-    engine.close().unwrap();
+    finish_fixture_store(&engine, directory.path());
 
     let output = std::process::Command::new("python3")
         .arg(reader())
@@ -286,7 +307,7 @@ fn independent_reader_rejects_recomputed_bottom_k_mismatch() {
         .unwrap(),
     );
     engine.stage_objects(records).unwrap();
-    engine.close().unwrap();
+    finish_fixture_store(&engine, directory.path());
 
     let output = std::process::Command::new("python3")
         .arg(reader())
@@ -321,7 +342,7 @@ fn independent_reader_rejects_malformed_fixture_for_every_amendment_schema() {
         )
         .unwrap();
         engine.persist_standalone_object(&record).unwrap();
-        engine.close().unwrap();
+        finish_fixture_store(&engine, directory.path());
 
         let output = std::process::Command::new("python3")
             .arg(reader())

@@ -63,10 +63,12 @@ where
         }
         if arena_len == previous_arena_len {
             debug_assert!(inner.pending_index_locations.is_empty());
+            debug_assert!(inner.pending_direct_objects.is_empty());
             return Ok(());
         }
 
         let locations = std::mem::take(&mut inner.pending_index_locations);
+        inner.pending_direct_objects.clear();
         let Some(arena_tail) = locations.last().map(|(_, location)| *location) else {
             return Err(DurableError::Corrupt {
                 file: ARENA_FILE,

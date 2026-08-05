@@ -80,6 +80,21 @@ fn report_serializes_concurrent_to_single_principal_scaling() {
 }
 
 #[test]
+fn report_serializes_representation_bytes_per_new_object() {
+    let mut report = Report::new(config(), provenance());
+    report
+        .record_representation_metadata("direct", vec![(4, 100), (5, 150)])
+        .expect("nonzero object samples are valid");
+
+    let encoded = serde_json::to_value(report).expect("report serializes");
+    let metadata = &encoded["representation_metadata"][0];
+    assert_eq!(metadata["name"], "direct");
+    assert_eq!(metadata["median_bytes_per_new_object"], 27.5);
+    assert_eq!(metadata["samples"][0]["new_objects"], 4);
+    assert_eq!(metadata["samples"][1]["authoritative_bytes_appended"], 150);
+}
+
+#[test]
 fn evidence_envelope_binds_the_complete_payload() {
     let provenance = provenance();
     let revision = provenance.revision().to_owned();

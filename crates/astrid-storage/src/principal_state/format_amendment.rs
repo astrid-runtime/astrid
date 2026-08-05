@@ -7,7 +7,7 @@ use astrid_storage_model::InsertOutcome;
 use astrid_storage_model::{ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord};
 
 use super::migrations;
-use super::native_io::{atomic_write, quarantine_directory};
+use super::native_io::quarantine_directory;
 use super::{BLAKE3_OBJECT_IDENTITY_V1_SCHEME, RuntimeEngine};
 use crate::error::{StorageError, StorageResult};
 
@@ -54,11 +54,15 @@ pub(super) const PRE_MECHANICAL_AUDIT_FORMAT_SPEC_ID: ObjectId = ObjectId::new([
     195, 253, 108, 67, 165, 182, 160, 95, 254, 17, 195, 57, 80, 44, 227, 80, 144, 246, 100, 62,
     227, 7, 1, 119, 229, 128, 47, 193, 85, 210, 184, 192,
 ]);
+pub(super) const PRE_PHYSICAL_CATALOGUE_FORMAT_SPEC_ID: ObjectId = ObjectId::new([
+    130, 228, 111, 83, 186, 155, 178, 245, 45, 107, 148, 32, 136, 213, 150, 94, 170, 23, 194, 114,
+    14, 97, 206, 132, 46, 217, 213, 227, 192, 209, 33, 157,
+]);
 const CONTENT_CATALOG_FORMAT_SPEC_ID: ObjectId = ObjectId::new([
     143, 57, 153, 176, 102, 182, 102, 57, 98, 89, 196, 169, 47, 157, 231, 197, 184, 230, 125, 249,
     211, 138, 105, 251, 79, 184, 36, 150, 139, 86, 236, 219,
 ]);
-const PRIOR_V1_FORMAT_SPEC_IDS: [ObjectId; 9] = [
+const PRIOR_V1_FORMAT_SPEC_IDS: [ObjectId; 10] = [
     PRE_DERIVATION_FORMAT_SPEC_ID,
     PRE_COMPACTION_FORMAT_SPEC_ID,
     PRE_GC_OUTBOX_FORMAT_SPEC_ID,
@@ -68,6 +72,7 @@ const PRIOR_V1_FORMAT_SPEC_IDS: [ObjectId; 9] = [
     PRE_KV_TRANSITION_FORMAT_SPEC_ID,
     PRE_BOTTOM_K_SKETCH_FORMAT_SPEC_ID,
     PRE_MECHANICAL_AUDIT_FORMAT_SPEC_ID,
+    PRE_PHYSICAL_CATALOGUE_FORMAT_SPEC_ID,
 ];
 
 pub(super) fn format_spec_record() -> StorageResult<ObjectRecord> {
@@ -95,6 +100,7 @@ pub(super) fn store_metadata(format_spec: ObjectId, catalog_spec: ObjectId) -> V
          identity-wire=tagged-identity-v1\n\
          format-spec-object={}:{}:32:{digest}\n\
          content-catalog-spec-object={}:{}:32:{catalog_digest}\n\
+         representations=authoritative-direct-v1\n\
          principal-codec=principal-uid-v1\n\
          projection=kv-transition-bplus-v4\n",
         BLAKE3_OBJECT_IDENTITY_V1_SCHEME.algorithm(),
@@ -103,6 +109,43 @@ pub(super) fn store_metadata(format_spec: ObjectId, catalog_spec: ObjectId) -> V
         BLAKE3_OBJECT_IDENTITY_V1_SCHEME.construction(),
     )
     .into_bytes()
+}
+
+pub(super) fn pre_representation_store_metadata(
+    format_spec: ObjectId,
+    catalog_spec: ObjectId,
+) -> Vec<u8> {
+    let digest = object_id_hex(format_spec);
+    let catalog_digest = object_id_hex(catalog_spec);
+    format!(
+        "format=astrid-principal-store-v1\n\
+         identity=blake3-object-identity-v1\n\
+         identity-wire=tagged-identity-v1\n\
+         format-spec-object={}:{}:32:{digest}\n\
+         content-catalog-spec-object={}:{}:32:{catalog_digest}\n\
+         principal-codec=principal-uid-v1\n\
+         projection=kv-transition-bplus-v4\n",
+        BLAKE3_OBJECT_IDENTITY_V1_SCHEME.algorithm(),
+        BLAKE3_OBJECT_IDENTITY_V1_SCHEME.construction(),
+        BLAKE3_OBJECT_IDENTITY_V1_SCHEME.algorithm(),
+        BLAKE3_OBJECT_IDENTITY_V1_SCHEME.construction(),
+    )
+    .into_bytes()
+}
+
+pub(super) fn representation_bootstrap_objects(
+    current_format_spec: ObjectId,
+    catalog_spec: ObjectId,
+) -> Vec<ObjectId> {
+    let mut objects = PRIOR_V1_FORMAT_SPEC_IDS.to_vec();
+    objects.extend([
+        PRE_PRINCIPAL_UID_FORMAT_SPEC_ID,
+        current_format_spec,
+        catalog_spec,
+    ]);
+    objects.sort_unstable();
+    objects.dedup();
+    objects
 }
 
 pub(super) fn previous_store_metadata(format_spec: ObjectId, catalog_spec: ObjectId) -> Vec<u8> {
@@ -191,7 +234,7 @@ pub(super) enum DestinationFormat {
 
 impl DestinationFormat {
     pub(super) const fn metadata_is_current(self) -> bool {
-        matches!(self, Self::New | Self::Current)
+        matches!(self, Self::Current)
     }
 }
 
@@ -236,6 +279,11 @@ pub(super) fn prepare_destination(
                                 })
                             } else if actual
                                 == previous_store_metadata(candidate, current_catalog_spec)
+                                || actual
+                                    == pre_representation_store_metadata(
+                                        candidate,
+                                        current_catalog_spec,
+                                    )
                                 || actual == store_metadata(candidate, current_catalog_spec)
                             {
                                 Some(DestinationFormat::PriorV1 {
@@ -252,12 +300,13 @@ pub(super) fn prepare_destination(
             return Err(unsupported_format_error(&metadata));
         }
     } else if existing_complete {
+        if path.join("representations").join("CURRENT").is_file() {
+            return validate_authoritative_files(path).map(|()| DestinationFormat::New);
+        }
         return Err(StorageError::Connection(format!(
             "completed principal store at {} is missing format metadata",
             path.display()
         )));
-    } else {
-        atomic_write(&metadata, expected_metadata)?;
     }
     if existing_complete {
         validate_authoritative_files(path)?;

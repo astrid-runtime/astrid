@@ -12,10 +12,11 @@ use astrid_core::identity::PrincipalUid;
 use astrid_storage::{
     Blake3ObjectIdentityV1, ChunkingProfile, ContentName, KvQuotaResolver,
     NativeContentStagingArea, NativePrincipalContentStore, ObjectCacheCapacity, ObjectCacheConfig,
-    ObjectCacheController, RuntimePrincipalStore, StateOwner, open_runtime_principal_store,
-    open_runtime_principal_store_with_object_cache,
+    ObjectCacheController, RuntimePrincipalStore, StateOwner, StateOwnerCodecV1,
+    open_runtime_principal_store, open_runtime_principal_store_with_object_cache,
 };
 use astrid_storage_content::{ContentObjectSink, build_content_streaming};
+use astrid_storage_engine::{DurableEngine, RecoveryLimits};
 use astrid_storage_model::{ObjectId, ObjectIdentity, ObjectRecord};
 
 use super::config::Config;
@@ -240,6 +241,10 @@ async fn benchmark_runtime(
         samples
             .unique_authoritative_bytes
             .push(publication.unique_authoritative_bytes);
+        samples.unique_representation_metadata.push((
+            publication.unique_objects_inserted,
+            publication.unique_representation_bytes,
+        ));
         samples
             .unique_end_to_end
             .push(publication.unique_end_to_end);
@@ -255,6 +260,10 @@ async fn benchmark_runtime(
         samples
             .duplicate_authoritative_bytes
             .push(publication.duplicate_authoritative_bytes);
+        samples.duplicate_representation_metadata.push((
+            publication.duplicate_objects_inserted,
+            publication.duplicate_representation_bytes,
+        ));
         samples
             .duplicate_end_to_end
             .push(publication.duplicate_end_to_end);
@@ -289,6 +298,10 @@ async fn benchmark_runtime(
             source_digest,
         )?);
         drop(reopened);
+
+        samples
+            .activation
+            .push(benchmark_representation_activation(&home)?);
     }
     samples.record(config, report)?;
     Ok(())
@@ -304,13 +317,19 @@ async fn benchmark_publication(
     let (unique_name, unique_staged, stage_write, stage_seal) =
         stage_source(store, source, owner, "large/unique.bin", config.block_bytes)?;
     let authoritative_before = authoritative_store_bytes(home)?;
+    let representation_before = representation_authority_bytes(home)?;
     let started = Instant::now();
-    black_box(store.publish_staged(unique_staged).await?);
+    let unique_outcome = store.publish_staged(unique_staged).await?;
+    black_box(unique_outcome);
     let unique_publish = started.elapsed();
     let authoritative_after_unique = authoritative_store_bytes(home)?;
+    let representation_after_unique = representation_authority_bytes(home)?;
     let unique_authoritative_bytes = authoritative_after_unique
         .checked_sub(authoritative_before)
         .ok_or("authoritative store shrank during unique publication")?;
+    let unique_representation_bytes = representation_after_unique
+        .checked_sub(representation_before)
+        .ok_or("representation authority shrank during unique publication")?;
     let unique_end_to_end = sum_durations(&[stage_write, stage_seal, unique_publish])?;
 
     let (_, duplicate_staged, duplicate_write, duplicate_seal) = stage_source(
@@ -321,22 +340,32 @@ async fn benchmark_publication(
         config.block_bytes,
     )?;
     let authoritative_before_duplicate = authoritative_store_bytes(home)?;
+    let representation_before_duplicate = representation_authority_bytes(home)?;
     let started = Instant::now();
-    black_box(store.publish_staged(duplicate_staged).await?);
+    let duplicate_outcome = store.publish_staged(duplicate_staged).await?;
+    black_box(duplicate_outcome);
     let duplicate_publish = started.elapsed();
     let authoritative_after_duplicate = authoritative_store_bytes(home)?;
+    let representation_after_duplicate = representation_authority_bytes(home)?;
     let duplicate_authoritative_bytes = authoritative_after_duplicate
         .checked_sub(authoritative_before_duplicate)
         .ok_or("authoritative store shrank during duplicate publication")?;
+    let duplicate_representation_bytes = representation_after_duplicate
+        .checked_sub(representation_before_duplicate)
+        .ok_or("representation authority shrank during duplicate publication")?;
     Ok(PublicationSample {
         unique_name,
         unique_publish,
         unique_authoritative_bytes,
+        unique_objects_inserted: unique_outcome.objects_inserted(),
+        unique_representation_bytes,
         unique_end_to_end,
         duplicate_stage_write: duplicate_write,
         duplicate_stage_seal: duplicate_seal,
         duplicate_publish,
         duplicate_authoritative_bytes,
+        duplicate_objects_inserted: duplicate_outcome.objects_inserted(),
+        duplicate_representation_bytes,
         duplicate_end_to_end: sum_durations(&[duplicate_write, duplicate_seal, duplicate_publish])?,
     })
 }
@@ -345,11 +374,15 @@ struct PublicationSample {
     unique_name: ContentName,
     unique_publish: Duration,
     unique_authoritative_bytes: u64,
+    unique_objects_inserted: u64,
+    unique_representation_bytes: u64,
     unique_end_to_end: Duration,
     duplicate_stage_write: Duration,
     duplicate_stage_seal: Duration,
     duplicate_publish: Duration,
     duplicate_authoritative_bytes: u64,
+    duplicate_objects_inserted: u64,
+    duplicate_representation_bytes: u64,
     duplicate_end_to_end: Duration,
 }
 
@@ -358,16 +391,19 @@ struct RuntimeSamples {
     fresh_open: Vec<Duration>,
     unique_publish: Vec<Duration>,
     unique_authoritative_bytes: Vec<u64>,
+    unique_representation_metadata: Vec<(u64, u64)>,
     unique_end_to_end: Vec<Duration>,
     duplicate_stage_write: Vec<Duration>,
     duplicate_stage_seal: Vec<Duration>,
     duplicate_publish: Vec<Duration>,
     duplicate_authoritative_bytes: Vec<u64>,
+    duplicate_representation_metadata: Vec<(u64, u64)>,
     duplicate_end_to_end: Vec<Duration>,
     read_first: Vec<Duration>,
     read_warm: Vec<Duration>,
     reopen: Vec<Duration>,
     read_after_reopen: Vec<Duration>,
+    activation: Vec<Duration>,
 }
 
 impl RuntimeSamples {
@@ -378,6 +414,10 @@ impl RuntimeSamples {
             "astrid_publish_unique",
             config.bytes,
             self.unique_authoritative_bytes,
+        )?;
+        report.record_representation_metadata(
+            "astrid_publish_unique",
+            self.unique_representation_metadata,
         )?;
         report.record_bytes(
             "astrid_unique_end_to_end",
@@ -404,6 +444,10 @@ impl RuntimeSamples {
             config.bytes,
             self.duplicate_authoritative_bytes,
         )?;
+        report.record_representation_metadata(
+            "astrid_publish_duplicate",
+            self.duplicate_representation_metadata,
+        )?;
         report.record_bytes(
             "astrid_duplicate_end_to_end",
             config.bytes,
@@ -417,19 +461,90 @@ impl RuntimeSamples {
             config.bytes,
             self.read_after_reopen,
         );
+        report.record_operations("astrid_representation_activation", 1, self.activation);
         Ok(())
     }
 }
 
 fn authoritative_store_bytes(home: &AstridHome) -> BenchResult<u64> {
-    ["objects.arena", "roots.journal"]
-        .into_iter()
-        .try_fold(0_u64, |total, file_name| {
+    let logical = ["objects.arena", "roots.journal"].into_iter().try_fold(
+        0_u64,
+        |total, file_name| -> BenchResult<u64> {
             let bytes = std::fs::metadata(home.principal_store_path().join(file_name))?.len();
             total
                 .checked_add(bytes)
                 .ok_or_else(|| "authoritative store byte count overflow".into())
-        })
+        },
+    )?;
+    logical
+        .checked_add(representation_authority_bytes(home)?)
+        .ok_or_else(|| "authoritative store byte count overflow".into())
+}
+
+fn representation_authority_bytes(home: &AstridHome) -> BenchResult<u64> {
+    directory_file_bytes(&home.principal_store_path().join("representations"))
+}
+
+fn directory_file_bytes(path: &Path) -> BenchResult<u64> {
+    let mut total = 0_u64;
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        let bytes = if metadata.is_dir() {
+            directory_file_bytes(&entry.path())?
+        } else if metadata.is_file() {
+            metadata.len()
+        } else {
+            return Err(format!(
+                "authoritative representation path is not a regular file: {}",
+                entry.path().display()
+            )
+            .into());
+        };
+        total = total
+            .checked_add(bytes)
+            .ok_or("representation authority byte count overflow")?;
+    }
+    Ok(total)
+}
+
+fn benchmark_representation_activation(home: &AstridHome) -> BenchResult<Duration> {
+    let store = home.principal_store_path();
+    let representations = store.join("representations");
+    let metadata = std::fs::symlink_metadata(&representations)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("representation authority is redirected or not a directory".into());
+    }
+    std::fs::remove_dir_all(representations)?;
+    let metadata = std::fs::read_to_string(store.join("store.meta"))?;
+    let format_spec = metadata_object_id(&metadata, "format-spec-object=")?;
+    let catalog_spec = metadata_object_id(&metadata, "content-catalog-spec-object=")?;
+
+    let started = Instant::now();
+    let engine = DurableEngine::<StateOwner, Blake3ObjectIdentityV1, StateOwnerCodecV1>::open(
+        store,
+        Blake3ObjectIdentityV1,
+        StateOwnerCodecV1,
+        RecoveryLimits::process_addressable(),
+    )?;
+    engine.ensure_direct_representation_catalogue(format_spec, &[format_spec, catalog_spec])?;
+    let elapsed = started.elapsed();
+    drop(engine);
+    Ok(elapsed)
+}
+
+fn metadata_object_id(metadata: &str, prefix: &str) -> BenchResult<ObjectId> {
+    let encoded = metadata
+        .lines()
+        .find_map(|line| line.strip_prefix(prefix))
+        .ok_or_else(|| format!("store metadata omitted {prefix}"))?;
+    let (_, digest) = encoded
+        .rsplit_once(':')
+        .ok_or_else(|| format!("store metadata has malformed {prefix}"))?;
+    let decoded = hex::decode(digest)?;
+    let bytes = <[u8; 32]>::try_from(decoded)
+        .map_err(|_| format!("store metadata has non-256-bit {prefix}"))?;
+    Ok(ObjectId::new(bytes))
 }
 
 fn benchmark_native_reads(

@@ -8,12 +8,22 @@ import sys
 from pathlib import Path
 
 from runatal_v1_blake3 import derive_key
+from runatal_v1_frames import frame_checksum, frames, physical_frame
 
 LOGICAL_SCHEME = (1, 1, 32)
 PHYSICAL_SCHEME = (1, 2, 32)
 PROFILE_CONTEXT = "astrid-representation-profile-v1\0"
 BLOB_CONTEXT = "astrid-blob-identity-v1\0"
 RECORD_CONTEXT = "astrid-representation-record-v1\0"
+MAP_CONTEXT = "astrid-physical-map-node-v1\0"
+CATALOGUE_CONTEXT = "astrid-representation-catalogue-root-v1\0"
+PLACEMENT_CONTEXT = "astrid-placement-set-v1\0"
+STATE_CONTEXT = "astrid-representation-state-v1\0"
+JOURNAL_CONTEXT = "astrid-representation-journal-bytes-v1\0"
+ARENA_MAGIC = b"ASTOBJ1\0"
+METADATA_MAGIC = b"ASTRPM1\0"
+JOURNAL_MAGIC = b"ASTREP1\0"
+CURRENT_MAGIC = b"ASTCUR1\0"
 
 
 class FormatError(Exception):
@@ -401,6 +411,362 @@ def physical_identity(context, material):
     return (1, 2, derive_key(context, material))
 
 
+def decode_map_node(data):
+    cursor = Cursor(data)
+    version = cursor.integer(2)
+    domain = cursor.integer(1)
+    tag = cursor.integer(1)
+    if version != 1 or domain > 2:
+        raise FormatError("unsupported physical map node")
+    if tag == 0:
+        node = {
+            "version": version,
+            "domain": domain,
+            "tag": tag,
+            "key": identity(cursor, PHYSICAL_SCHEME),
+            "value": cursor.byte_string(),
+        }
+    elif tag == 1:
+        prefix_bits = cursor.integer(4)
+        if prefix_bits >= 352:
+            raise FormatError("physical map prefix consumes key")
+        prefix = cursor.take((prefix_bits + 7) // 8)
+        if prefix_bits % 8 and prefix[-1] & ((1 << (8 - prefix_bits % 8)) - 1):
+            raise FormatError("physical map prefix has non-zero unused bits")
+        zero = identity(cursor, PHYSICAL_SCHEME)
+        one = identity(cursor, PHYSICAL_SCHEME)
+        subtree_entries = cursor.integer(8)
+        if zero == one or subtree_entries < 2:
+            raise FormatError("physical map branch is unary")
+        node = {
+            "version": version,
+            "domain": domain,
+            "tag": tag,
+            "prefix_bits": prefix_bits,
+            "prefix": prefix,
+            "zero": zero,
+            "one": one,
+            "subtree_entries": subtree_entries,
+        }
+    else:
+        raise FormatError("unknown physical map node tag")
+    cursor.done()
+    if encode_map_node(node) != data:
+        raise FormatError("non-canonical physical map node")
+    return node
+
+
+def encode_map_node(node):
+    output = bytearray(struct.pack("<HBB", node["version"], node["domain"], node["tag"]))
+    if node["tag"] == 0:
+        output += identity_bytes(node["key"])
+        output += struct.pack("<Q", len(node["value"])) + node["value"]
+    else:
+        output += struct.pack("<I", node["prefix_bits"]) + node["prefix"]
+        output += identity_bytes(node["zero"]) + identity_bytes(node["one"])
+        output += struct.pack("<Q", node["subtree_entries"])
+    return bytes(output)
+
+
+def decode_catalogue_root(data):
+    cursor = Cursor(data)
+    version = cursor.integer(2)
+    if version != 1:
+        raise FormatError("unsupported representation catalogue root")
+    value = {
+        "version": version,
+        "generation": cursor.integer(8),
+        "profiles_root": optional_identity(cursor, PHYSICAL_SCHEME),
+        "profile_count": cursor.integer(8),
+        "representations_root": optional_identity(cursor, PHYSICAL_SCHEME),
+        "representation_count": cursor.integer(8),
+    }
+    cursor.done()
+    for root, count in (
+        (value["profiles_root"], value["profile_count"]),
+        (value["representations_root"], value["representation_count"]),
+    ):
+        if (root is None) != (count == 0):
+            raise FormatError("catalogue map root and count disagree")
+    if encode_catalogue_root(value) != data:
+        raise FormatError("non-canonical catalogue root")
+    return value
+
+
+def encode_catalogue_root(value):
+    return (
+        struct.pack("<HQ", value["version"], value["generation"])
+        + encode_optional(value["profiles_root"])
+        + struct.pack("<Q", value["profile_count"])
+        + encode_optional(value["representations_root"])
+        + struct.pack("<Q", value["representation_count"])
+    )
+
+
+def decode_locator(cursor):
+    tag = cursor.integer(1)
+    if tag == 0:
+        locator = (tag, cursor.integer(8), cursor.integer(8), cursor.integer(8), cursor.take(32))
+        if not locator[3]:
+            raise FormatError("arena locator has zero payload")
+        return locator
+    if tag == 1:
+        return (tag, cursor.integer(8))
+    if tag == 2:
+        locator = (tag, cursor.integer(8), cursor.integer(8), cursor.integer(8), cursor.take(32))
+        if locator[3] <= 52:
+            raise FormatError("pack locator has no payload")
+        return locator
+    raise FormatError("unknown replica locator")
+
+
+def encode_locator(locator):
+    output = bytearray([locator[0]])
+    if locator[0] == 1:
+        output += struct.pack("<Q", locator[1])
+    else:
+        output += struct.pack("<QQQ", locator[1], locator[2], locator[3]) + locator[4]
+    return bytes(output)
+
+
+def decode_placement_entry(data):
+    cursor = Cursor(data)
+    value = {
+        "blob": identity(cursor, PHYSICAL_SCHEME),
+        "profile": identity(cursor, PHYSICAL_SCHEME),
+        "encoded_length": cursor.integer(8),
+        "replicas": [],
+    }
+    for _ in range(cursor.integer(8)):
+        value["replicas"].append((cursor.integer(4), decode_locator(cursor)))
+    cursor.done()
+    encoded = [encode_replica(replica) for replica in value["replicas"]]
+    sort_keys = [(replica[0], replica[1][0], encode_locator(replica[1])) for replica in value["replicas"]]
+    if not encoded or any(left >= right for left, right in zip(sort_keys, sort_keys[1:])):
+        raise FormatError("non-canonical replica set")
+    if encode_placement_entry(value) != data:
+        raise FormatError("non-canonical placement entry")
+    return value
+
+
+def encode_replica(replica):
+    return struct.pack("<I", replica[0]) + encode_locator(replica[1])
+
+
+def encode_placement_entry(value):
+    output = bytearray(identity_bytes(value["blob"]) + identity_bytes(value["profile"]))
+    output += struct.pack("<QQ", value["encoded_length"], len(value["replicas"]))
+    for replica in value["replicas"]:
+        output += encode_replica(replica)
+    return bytes(output)
+
+
+def decode_placement_set(data):
+    cursor = Cursor(data)
+    version = cursor.integer(2)
+    if version != 1:
+        raise FormatError("unsupported placement set")
+    value = {
+        "version": version,
+        "epoch": cursor.integer(8),
+        "entries_root": optional_identity(cursor, PHYSICAL_SCHEME),
+        "blob_count": cursor.integer(8),
+        "replica_extent_count": cursor.integer(8),
+    }
+    cursor.done()
+    if (value["entries_root"] is None) != (value["blob_count"] == 0):
+        raise FormatError("placement root and blob count disagree")
+    if (value["blob_count"] == 0) != (value["replica_extent_count"] == 0):
+        raise FormatError("placement blob and replica counts disagree")
+    if value["replica_extent_count"] < value["blob_count"]:
+        raise FormatError("placement replica count is too small")
+    if encode_placement_set(value) != data:
+        raise FormatError("non-canonical placement set")
+    return value
+
+
+def encode_placement_set(value):
+    return (
+        struct.pack("<HQ", value["version"], value["epoch"])
+        + encode_optional(value["entries_root"])
+        + struct.pack("<QQ", value["blob_count"], value["replica_extent_count"])
+    )
+
+
+def decode_representation_state(data):
+    cursor = Cursor(data)
+    version = cursor.integer(2)
+    if version != 1:
+        raise FormatError("unsupported representation state")
+    value = {
+        "version": version,
+        "generation": cursor.integer(8),
+        "previous": optional_identity(cursor, PHYSICAL_SCHEME),
+        "catalogue": identity(cursor, PHYSICAL_SCHEME),
+        "placements": identity(cursor, PHYSICAL_SCHEME),
+    }
+    cursor.done()
+    if not value["generation"] or ((value["generation"] == 1) != (value["previous"] is None)):
+        raise FormatError("representation-state generation shape is invalid")
+    if encode_representation_state(value) != data:
+        raise FormatError("non-canonical representation state")
+    return value
+
+
+def encode_representation_state(value):
+    return (
+        struct.pack("<HQ", value["version"], value["generation"])
+        + encode_optional(value["previous"])
+        + identity_bytes(value["catalogue"])
+        + identity_bytes(value["placements"])
+    )
+
+
+def search_key(tagged):
+    encoded = identity_bytes(tagged)
+    return len(encoded).to_bytes(4, "big") + encoded
+
+
+def key_bit(key, offset):
+    return bool(key[offset // 8] & (1 << (7 - offset % 8)))
+
+
+def prefix_bits(left, right):
+    for index, (left_byte, right_byte) in enumerate(zip(left, right)):
+        if left_byte != right_byte:
+            return index * 8 + (left_byte ^ right_byte).bit_length().__rsub__(8)
+    return len(left) * 8
+
+
+def canonical_prefix(key, bits):
+    prefix = bytearray(key[: (bits + 7) // 8])
+    remainder = bits % 8
+    if remainder:
+        prefix[-1] &= 0xFF << (8 - remainder)
+    return bytes(prefix)
+
+
+def validate_map(root, expected_domain, expected_count, nodes, decode_value):
+    if root is None:
+        if expected_count:
+            raise FormatError("absent map has a positive count")
+        return
+    stack = [(root, False)]
+    visiting = set()
+    complete = {}
+    while stack:
+        node_id, expanded = stack.pop()
+        key_id = identity_bytes(node_id)
+        if expanded:
+            node = nodes[key_id]
+            if node["tag"] == 0:
+                key = search_key(node["key"])
+                complete[key_id] = (1, key, key)
+                decode_value(node["key"], node["value"])
+            else:
+                zero = complete[identity_bytes(node["zero"])]
+                one = complete[identity_bytes(node["one"])]
+                count = zero[0] + one[0]
+                if count != node["subtree_entries"]:
+                    raise FormatError("physical map subtree count mismatch")
+                minimum, maximum = zero[1], one[2]
+                if prefix_bits(minimum, maximum) != node["prefix_bits"]:
+                    raise FormatError("physical map branch is not the longest common prefix")
+                if canonical_prefix(minimum, node["prefix_bits"]) != node["prefix"]:
+                    raise FormatError("physical map branch prefix bytes are not canonical")
+                if key_bit(zero[1], node["prefix_bits"]) or key_bit(zero[2], node["prefix_bits"]):
+                    raise FormatError("physical map zero child crosses split")
+                if not key_bit(one[1], node["prefix_bits"]) or not key_bit(one[2], node["prefix_bits"]):
+                    raise FormatError("physical map one child crosses split")
+                complete[key_id] = (count, minimum, maximum)
+            visiting.remove(key_id)
+            continue
+        if key_id in visiting or key_id in complete:
+            raise FormatError("physical map node is cyclic or shared")
+        node = nodes.get(key_id)
+        if node is None or node["domain"] != expected_domain:
+            raise FormatError("physical map node is missing or in the wrong domain")
+        visiting.add(key_id)
+        stack.append((node_id, True))
+        if node["tag"] == 1:
+            stack.append((node["one"], False))
+            stack.append((node["zero"], False))
+    if complete[identity_bytes(root)][0] != expected_count:
+        raise FormatError("physical map root count mismatch")
+
+
+def decode_catalogue_fixture(fixture, profile_id, profile_bytes, record_id, record_bytes, blob_id):
+    section = fixture["catalogue"]
+    nodes = {}
+    for encoded_node in section["nodes"]:
+        data = bytes.fromhex(encoded_node["canonical_hex"])
+        node = decode_map_node(data)
+        node_id = physical_identity(MAP_CONTEXT, data)
+        if identity_text(node_id) != encoded_node["id"] or identity_bytes(node_id) in nodes:
+            raise FormatError("physical map node identity mismatch or duplicate")
+        nodes[identity_bytes(node_id)] = node
+
+    catalogue_bytes = bytes.fromhex(section["root"]["canonical_hex"])
+    catalogue = decode_catalogue_root(catalogue_bytes)
+    catalogue_id = physical_identity(CATALOGUE_CONTEXT, catalogue_bytes)
+    if identity_text(catalogue_id) != section["root"]["id"]:
+        raise FormatError("catalogue-root identity mismatch")
+
+    def check_profile(key, value):
+        decoded = decode_profile(value)
+        actual = physical_identity(PROFILE_CONTEXT, value)
+        if key != actual:
+            raise FormatError("profile map leaf does not rederive its key")
+        if key == profile_id and value != profile_bytes:
+            raise FormatError("fixture profile differs from catalogue profile")
+        return decoded
+
+    def check_record(key, value):
+        decode_representation(value)
+        actual = physical_identity(RECORD_CONTEXT, value)
+        if key != actual:
+            raise FormatError("representation map leaf does not rederive its key")
+        if key == record_id and value != record_bytes:
+            raise FormatError("fixture record differs from catalogue record")
+
+    validate_map(catalogue["profiles_root"], 0, catalogue["profile_count"], nodes, check_profile)
+    validate_map(
+        catalogue["representations_root"],
+        1,
+        catalogue["representation_count"],
+        nodes,
+        check_record,
+    )
+
+    placement_bytes = bytes.fromhex(section["placement_set"]["canonical_hex"])
+    placement = decode_placement_set(placement_bytes)
+    placement_id = physical_identity(PLACEMENT_CONTEXT, placement_bytes)
+    if identity_text(placement_id) != section["placement_set"]["id"]:
+        raise FormatError("placement-set identity mismatch")
+
+    replica_total = 0
+
+    def check_placement(key, value):
+        nonlocal replica_total
+        entry = decode_placement_entry(value)
+        if key != entry["blob"] or key != blob_id:
+            raise FormatError("placement leaf key does not match its blob")
+        replica_total += len(entry["replicas"])
+
+    validate_map(placement["entries_root"], 2, placement["blob_count"], nodes, check_placement)
+    if replica_total != placement["replica_extent_count"]:
+        raise FormatError("placement replica extent count mismatch")
+
+    state_bytes = bytes.fromhex(section["state"]["canonical_hex"])
+    state = decode_representation_state(state_bytes)
+    state_id = physical_identity(STATE_CONTEXT, state_bytes)
+    if identity_text(state_id) != section["state"]["id"]:
+        raise FormatError("representation-state identity mismatch")
+    if state["catalogue"] != catalogue_id or state["placements"] != placement_id:
+        raise FormatError("representation state does not bind the fixture roots")
+    return (catalogue_id, placement_id, state_id)
+
+
 def decode_fixture(path):
     fixture = json.loads(path.read_text(encoding="utf-8"))
     profile_bytes = bytes.fromhex(fixture["profile"]["canonical_hex"])
@@ -448,7 +814,7 @@ def decode_fixture(path):
             raise FormatError("direct blob length differs from canonical output")
     if record["recipe"][0] == 2 and len(encoded_blob) != record["coverage"][3]:
         raise FormatError("contiguous blob length differs from logical file length")
-    return {
+    result = {
         "profile": identity_text(profile_id),
         "blob": identity_text(blob_id),
         "representation": identity_text(record_id),
@@ -456,14 +822,48 @@ def decode_fixture(path):
         "recipe_kind": record["recipe"][0],
         "coverage_kind": record["coverage"][0],
     }
+    if "catalogue" in fixture:
+        catalogue_id, placement_id, state_id = decode_catalogue_fixture(
+            fixture,
+            profile_id,
+            profile_bytes,
+            record_id,
+            record_bytes,
+            blob_id,
+        )
+        result.update(
+            {
+                "catalogue": identity_text(catalogue_id),
+                "placements": identity_text(placement_id),
+                "state": identity_text(state_id),
+            }
+        )
+    return result
+
+
+def decode_store(store, bootstrap_objects=None):
+    from runatal_v1_physical_store import decode_store as decode_authoritative_store
+
+    if bootstrap_objects is None:
+        from runatal_v1_reader import LEGACY_FORMAT_SPECIFICATIONS, parse_metadata
+
+        specification, catalog_specification = parse_metadata(store / "store.meta")
+        bootstrap_objects = {
+            identity_bytes(identifier)
+            for identifier in LEGACY_FORMAT_SPECIFICATIONS | {specification}
+        }
+        if catalog_specification is not None:
+            bootstrap_objects.add(identity_bytes(catalog_specification))
+    return decode_authoritative_store(store, bootstrap_objects)
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("fixture", type=Path)
+    parser.add_argument("path", type=Path)
+    parser.add_argument("--store", action="store_true")
     arguments = parser.parse_args()
     try:
-        result = decode_fixture(arguments.fixture)
+        result = decode_store(arguments.path) if arguments.store else decode_fixture(arguments.path)
     except (FormatError, OSError, UnicodeError, ValueError, KeyError, json.JSONDecodeError) as error:
         print(f"runatal-v1-physical: {error}", file=sys.stderr)
         return 1

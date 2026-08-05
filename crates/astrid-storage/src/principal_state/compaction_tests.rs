@@ -74,7 +74,7 @@ fn evidence(bytes: &[u8]) -> ObjectRecord {
 }
 
 #[tokio::test]
-async fn production_retention_preserves_every_registered_bootstrap_object() {
+async fn production_retention_preserves_bootstraps_while_retirement_is_deferred() {
     let directory = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(directory.path());
     let store = open_runtime_principal_store(&home, unlimited_quota())
@@ -136,7 +136,14 @@ async fn production_retention_preserves_every_registered_bootstrap_object() {
             &AcceptCompactionProof,
         )
         .unwrap();
-    store.engine.compact(&plan).unwrap();
+    assert!(matches!(
+        store.engine.compact(&plan),
+        Err(astrid_storage_engine::DurableError::RepresentationRetirementUnsupported)
+    ));
+    assert_eq!(
+        store.engine.object(orphan).unwrap(),
+        Some(evidence(b"collect-me"))
+    );
     store.engine.close().unwrap();
     drop(store);
 
@@ -172,7 +179,7 @@ async fn production_retention_preserves_every_registered_bootstrap_object() {
 }
 
 #[tokio::test]
-async fn raw_engine_retention_can_omit_bootstrap_but_runtime_constructor_fails_closed() {
+async fn raw_retention_cannot_bypass_the_representation_retirement_gate() {
     let directory = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(directory.path());
     let store = open_runtime_principal_store(&home, unlimited_quota())
@@ -209,21 +216,22 @@ async fn raw_engine_retention_can_omit_bootstrap_but_runtime_constructor_fails_c
             &AcceptCompactionProof,
         )
         .unwrap();
-    store.engine.compact(&plan).unwrap();
+    assert!(matches!(
+        store.engine.compact(&plan),
+        Err(astrid_storage_engine::DurableError::RepresentationRetirementUnsupported)
+    ));
 
     let policy = evidence(b"subsequent-runtime-retention");
-    let error = store
+    let retention = store
         .prepare_compaction_retention(
             ObjectId::new([0xC0; 32]),
             RetentionPolicyId::new(store.engine.identify(&policy)),
             Vec::new(),
         )
         .await
-        .unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("protected RÚNATAL format specification is missing")
-    );
+        .unwrap();
+    assert!(retention.additional_roots().iter().any(|root| {
+        root.kind() == CompactionRootKind::System && root.object() == format_spec_id
+    }));
     store.engine.close().unwrap();
 }

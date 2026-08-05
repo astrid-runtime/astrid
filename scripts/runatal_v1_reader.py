@@ -17,6 +17,7 @@ from runatal_v1_fastcdc import (
 )
 from runatal_v1_frames import frames
 from runatal_v1_kv import validate_principal_kv
+from runatal_v1_physical import decode_store as decode_physical_store, identity_bytes
 from runatal_v1_sha384 import verify_cross_hash_attestations
 from runatal_v1_sketch import verify_bottom_k_sketches
 
@@ -48,13 +49,29 @@ REFERENCE_NAMES = ("Owns", "Evidence", "Lineage", "Derived")
 FORMAT_SPECIFICATION = (
     1,
     1,
-    bytes.fromhex("82e46f53ba9bb2f52d6b942088d5965eaa17c2720e61ce842ed9d5e3c0d1219d"),
+    bytes.fromhex("900d1eface3294bc9e47369c0fcb64dca56ff334dfbc1288f349090e10c09e6f"),
 )
 CONTENT_CATALOG_SPECIFICATION = (
     1,
     1,
     bytes.fromhex("8f3999b066b666396259c4a92f9de7c5b8e67df9d38a69fb4fb824968b56ecdb"),
 )
+LEGACY_FORMAT_SPECIFICATIONS = {
+    (1, 1, bytes.fromhex(digest))
+    for digest in (
+        "62cded9a5b01fe75d7781b66303f5ffe8ced55a43025a0389eefaea5a0c58fe2",
+        "35b446fbd19ca4ad0b1343b40c1a32b2eed8eef795034261a4092a0a2ae806fe",
+        "d8f2cb250736799fd8b26f307e20c4d949d6cea1836614a5547210e82bbfcec1",
+        "86390e5573cd6248eceeb5904bf9decb8929fe67aae638d531ab119418000e19",
+        "32379c2a9e1d0fe166ac37f30d8772bd88d6c99a6ae31bb75cc7e8a8f4ce4307",
+        "55c88679f00f3f8249eaf847fe4fba889f3f9f09e01048f5eb00e2d0d80c8e93",
+        "9bf81709c78311fea1011137f8dab3b6cd8ffe6c8ea6040cfec7192efb89aba0",
+        "39eba259587f8cacbee042788f2cbdc3e8064b8c48fc8ba93800ba02c8c60d32",
+        "3991b59002c981fd3b5603badd4ea5b31143253023cba98050cfc7e928638aff",
+        "c3fd6c43a5b6a05ffe11c339502ce35090f6643ee3070177e5802fc155d2b8c0",
+        "82e46f53ba9bb2f52d6b942088d5965eaa17c2720e61ce842ed9d5e3c0d1219d",
+    )
+}
 CHUNK_TREE_FANOUT = 128
 CONTENT_LABEL = b"content"
 U64_MAX = (1 << 64) - 1
@@ -751,6 +768,7 @@ def parse_metadata(path):
         "format": "astrid-principal-store-v1",
         "identity": "blake3-object-identity-v1",
         "identity-wire": "tagged-identity-v1",
+        "representations": "authoritative-direct-v1",
         "principal-codec": "principal-uid-v1",
         "projection": "kv-transition-bplus-v4",
     }
@@ -819,6 +837,13 @@ def recover(store, include_payloads):
     verify_golden_vectors()
     verify_content_summary_vectors()
     specification, catalog_specification = parse_metadata(store / "store.meta")
+    bootstrap_objects = {
+        identity_bytes(identifier)
+        for identifier in LEGACY_FORMAT_SPECIFICATIONS | {specification}
+    }
+    if catalog_specification is not None:
+        bootstrap_objects.add(identity_bytes(catalog_specification))
+    decode_physical_store(store, bootstrap_objects)
     objects = {}
     offsets = {}
     for offset, payload in frames(store / "objects.arena", ARENA_MAGIC):

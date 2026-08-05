@@ -6,9 +6,9 @@ use super::{
     ObjectCacheStats, ObjectId, ObjectRecord, Path, PersistentObjectIdentity, Prepared,
     PrincipalCodec, PrincipalUsage, ProjectionCacheEntry, ProjectionCacheKey, ROOT_FILE,
     RecoveryLimits, RecoveryRetryPolicy, RecoveryScope, RootGeneration, RootSnapshot, RootState,
-    RootTransaction, RwLock, append_frame, encode_object_frame, encode_root_record,
-    ensure_payload_limit, io, io_error, live_files_mut, materialize_closure, open_rw,
-    read_indexed_object, read_indexed_objects, recover_store, usage_from_closure,
+    RootTransaction, RwLock, append_frame, canonical_record_bytes, encode_object_frame,
+    encode_root_record, ensure_payload_limit, io, io_error, live_files_mut, materialize_closure,
+    open_rw, read_indexed_object, read_indexed_objects, recover_store, usage_from_closure,
     validate_incremental_closure,
 };
 
@@ -230,8 +230,10 @@ where
                 roots_by_principal: recovered.roots_by_principal,
                 index: recovered.index,
                 pending_index_locations: Vec::new(),
+                pending_direct_objects: BTreeMap::new(),
                 validated: recovered.validated,
                 files: Some(recovered.files),
+                representations: recovered.representations,
                 lock: Some(lock),
                 poisoned: false,
                 arena_generation: 0,
@@ -593,85 +595,143 @@ where
         let id = self.identify(record);
         let mut inner = self.lock_usable()?;
         if let Some(location) = inner.index.get(&id).copied() {
-            let (existing, needs_flush) = {
-                let files = live_files_mut(&mut inner.files)?;
-                let existing =
-                    read_indexed_object(&files.arena, id, location, &self.identity, self.limits)?;
-                (existing, location.offset >= files.arena_len)
-            };
-            if &existing != record {
-                return Err(ModelError::ObjectCollision(id).into());
-            }
-            if needs_flush {
-                let persisted = {
-                    let files = live_files_mut(&mut inner.files)?;
-                    (|| {
-                        files
-                            .arena
-                            .sync_data()
-                            .map_err(|source| io_error("flush standalone object frame", source))?;
-                        files
-                            .arena
-                            .metadata()
-                            .map_err(|source| io_error("read standalone arena metadata", source))
-                            .map(|metadata| metadata.len())
-                    })()
-                };
-                match persisted {
-                    Ok(arena_len) => {
-                        if let Err(error) = self.advance_index_frontier(&mut inner, arena_len) {
-                            self.mark_requires_recovery(&mut inner);
-                            return Err(error);
-                        }
-                    },
-                    Err(error) => {
-                        self.mark_requires_recovery(&mut inner);
-                        return Err(error);
-                    },
-                }
-            }
-            return Ok((id, InsertOutcome::AlreadyPresent));
+            return self.persist_existing_standalone(&mut inner, id, location, record);
         }
+        self.persist_new_standalone(&mut inner, id, record)
+    }
+
+    fn persist_existing_standalone(
+        &self,
+        inner: &mut DurableInner<P>,
+        id: ObjectId,
+        location: super::ArenaLocation,
+        record: &ObjectRecord,
+    ) -> Result<(ObjectId, InsertOutcome), DurableError> {
+        let (existing, needs_flush) = {
+            let files = live_files_mut(&mut inner.files)?;
+            let existing =
+                read_indexed_object(&files.arena, id, location, &self.identity, self.limits)?;
+            (existing, location.offset >= files.arena_len)
+        };
+        if &existing != record {
+            return Err(ModelError::ObjectCollision(id).into());
+        }
+        let payload = encode_object_frame(self.identity.scheme(), id, &existing)?;
+        let appended = if let Some(representations) = &inner.representations
+            && !representations.contains_direct(id)
+        {
+            vec![representations.describe_direct(
+                id,
+                canonical_record_bytes(&payload, self.identity.scheme())?,
+                location,
+            )?]
+        } else {
+            Vec::new()
+        };
+        let representation_update = match self.append_pending_direct_update(inner, &appended) {
+            Ok(update) => update,
+            Err(error) => {
+                self.mark_requires_recovery(inner);
+                return Err(error);
+            },
+        };
+        if needs_flush || representation_update.is_some() {
+            let persisted = Self::flush_standalone(inner, representation_update);
+            match persisted {
+                Ok(arena_len) if needs_flush => {
+                    if let Err(error) = self.advance_index_frontier(inner, arena_len) {
+                        self.mark_requires_recovery(inner);
+                        return Err(error);
+                    }
+                },
+                Ok(_) => {},
+                Err(error) => {
+                    self.mark_requires_recovery(inner);
+                    return Err(error);
+                },
+            }
+        }
+        Ok((id, InsertOutcome::AlreadyPresent))
+    }
+
+    fn persist_new_standalone(
+        &self,
+        inner: &mut DurableInner<P>,
+        id: ObjectId,
+        record: &ObjectRecord,
+    ) -> Result<(ObjectId, InsertOutcome), DurableError> {
         let payload = encode_object_frame(self.identity.scheme(), id, record)?;
         ensure_payload_limit(ARENA_FILE, 0, payload.len(), self.limits)?;
-        let (previous_arena_len, persisted) = {
+        let previous_arena_len = live_files_mut(&mut inner.files)?.arena_len;
+        let location = match (|| {
             let files = live_files_mut(&mut inner.files)?;
-            let previous_arena_len = files.arena_len;
-            let persisted = (|| {
-                let location = append_frame(&mut files.arena, ARENA_MAGIC, &payload)?;
-                files
-                    .arena
-                    .sync_data()
-                    .map_err(|source| io_error("flush standalone object frame", source))?;
-                let arena_len = files
-                    .arena
-                    .metadata()
-                    .map_err(|source| io_error("read standalone arena metadata", source))?
-                    .len();
-                Ok((location, arena_len))
-            })();
-            (previous_arena_len, persisted)
-        };
-        match persisted {
-            Ok((location, arena_len)) => {
-                inner.index.insert(id, location);
-                inner.pending_index_locations.push((id, location));
-                inner.validated.insert(id);
-                debug_assert_eq!(
-                    previous_arena_len,
-                    live_files_mut(&mut inner.files)?.arena_len
-                );
-                if let Err(error) = self.advance_index_frontier(&mut inner, arena_len) {
-                    self.mark_requires_recovery(&mut inner);
-                    return Err(error);
-                }
-                Ok((id, InsertOutcome::Inserted))
-            },
+            append_frame(&mut files.arena, ARENA_MAGIC, &payload)
+        })() {
+            Ok(location) => location,
             Err(error) => {
-                self.mark_requires_recovery(&mut inner);
-                Err(error)
+                self.mark_requires_recovery(inner);
+                return Err(error);
             },
+        };
+        let appended = if let Some(representations) = &inner.representations {
+            vec![representations.describe_direct(
+                id,
+                canonical_record_bytes(&payload, self.identity.scheme())?,
+                location,
+            )?]
+        } else {
+            Vec::new()
+        };
+        let representation_update = match self.append_pending_direct_update(inner, &appended) {
+            Ok(update) => update,
+            Err(error) => {
+                self.mark_requires_recovery(inner);
+                return Err(error);
+            },
+        };
+        let arena_len = match Self::flush_standalone(inner, representation_update) {
+            Ok(arena_len) => arena_len,
+            Err(error) => {
+                self.mark_requires_recovery(inner);
+                return Err(error);
+            },
+        };
+        inner.index.insert(id, location);
+        inner.pending_index_locations.push((id, location));
+        inner.validated.insert(id);
+        debug_assert_eq!(
+            previous_arena_len,
+            live_files_mut(&mut inner.files)?.arena_len
+        );
+        if let Err(error) = self.advance_index_frontier(inner, arena_len) {
+            self.mark_requires_recovery(inner);
+            return Err(error);
         }
+        Ok((id, InsertOutcome::Inserted))
+    }
+
+    pub(super) fn flush_standalone(
+        inner: &mut DurableInner<P>,
+        representation_update: Option<super::representations::PendingDirectUpdate>,
+    ) -> Result<u64, DurableError> {
+        let DurableInner {
+            files,
+            representations,
+            ..
+        } = inner;
+        let files = live_files_mut(files)?;
+        files
+            .arena
+            .sync_data()
+            .map_err(|source| io_error("flush standalone object frame", source))?;
+        if let (Some(representations), Some(update)) = (representations, representation_update) {
+            representations.publish_direct_update(update)?;
+        }
+        files
+            .arena
+            .metadata()
+            .map_err(|source| io_error("read standalone arena metadata", source))
+            .map(|metadata| metadata.len())
     }
 
     /// Return the current durable root for one principal.

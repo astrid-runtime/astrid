@@ -66,3 +66,10 @@ unicode-normalization = { workspace = true }
 
 [lints]
 workspace = true
+
+# The wasm-only direct edge enables getrandom's wasm backend for UUID's
+# transitive getrandom 0.4 dependency. It is feature unification rather than a
+# symbol referenced by this crate, so source-only dependency scanners cannot
+# observe the use.
+[package.metadata.cargo-machete]
+ignored = ["getrandom"]

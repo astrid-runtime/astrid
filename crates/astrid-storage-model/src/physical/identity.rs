@@ -42,6 +42,52 @@ physical_id_newtype!(
     /// Identity of one exact physical representation recipe and coverage record.
     RepresentationRecordId
 );
+physical_id_newtype!(
+    /// Identity of one canonical authenticated physical-map node.
+    PhysicalMapNodeId
+);
+physical_id_newtype!(
+    /// Identity of one canonical representation-catalogue root.
+    RepresentationCatalogueRootId
+);
+physical_id_newtype!(
+    /// Identity of one atomic representation catalogue and placement pair.
+    RepresentationStateId
+);
+
+/// Identity of one complete physical placement set.
+///
+/// The `ObjectId` constructor and accessor retain source compatibility with
+/// the pre-catalogue GC evidence grammar. New physical-state code should use
+/// [`Self::from_digest`] and [`Self::as_bytes`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PlacementSetId([u8; 32]);
+
+impl PlacementSetId {
+    /// Construct the identifier from the legacy logical wrapper.
+    #[must_use]
+    pub const fn new(object: ObjectId) -> Self {
+        Self(*object.as_bytes())
+    }
+
+    /// Construct an identifier from the current physical digest bytes.
+    #[must_use]
+    pub const fn from_digest(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Borrow the current physical digest bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// Return the legacy logical wrapper used by GC evidence records.
+    #[must_use]
+    pub const fn object_id(self) -> ObjectId {
+        ObjectId::new(self.0)
+    }
+}
 
 /// Computes current domain-separated physical identities.
 ///
@@ -51,6 +97,24 @@ physical_id_newtype!(
 pub trait PhysicalIdentity {
     /// Hash canonical physical `material` under the exact derive-key context.
     fn identify(&self, context: &'static str, material: &[u8]) -> [u8; 32];
+
+    /// Hash the exact concatenation of canonical material segments.
+    ///
+    /// Implementations with an incremental primitive should override this to
+    /// avoid materializing large representation bytes a second time. The
+    /// default preserves source compatibility for injected test and successor
+    /// identities by presenting [`Self::identify`] with the same concatenated
+    /// preimage as before.
+    fn identify_parts(&self, context: &'static str, parts: &[&[u8]]) -> [u8; 32] {
+        let capacity = parts
+            .iter()
+            .fold(0_usize, |total, part| total.saturating_add(part.len()));
+        let mut material = Vec::with_capacity(capacity);
+        for part in parts {
+            material.extend_from_slice(part);
+        }
+        self.identify(context, &material)
+    }
 }
 
 pub(super) fn encode_object_id(encoder: &mut Encoder, id: ObjectId) {
@@ -104,6 +168,46 @@ pub(super) fn encode_record_id(encoder: &mut Encoder, id: RepresentationRecordId
     );
 }
 
+pub(super) fn encode_map_node_id(encoder: &mut Encoder, id: PhysicalMapNodeId) {
+    encode_physical_digest(encoder, id.as_bytes());
+}
+
+pub(super) fn decode_map_node_id(
+    decoder: &mut Decoder<'_>,
+) -> Result<PhysicalMapNodeId, PhysicalModelError> {
+    decode_physical_digest(decoder).map(PhysicalMapNodeId::new)
+}
+
+pub(super) fn encode_catalogue_root_id(encoder: &mut Encoder, id: RepresentationCatalogueRootId) {
+    encode_physical_digest(encoder, id.as_bytes());
+}
+
+pub(super) fn decode_catalogue_root_id(
+    decoder: &mut Decoder<'_>,
+) -> Result<RepresentationCatalogueRootId, PhysicalModelError> {
+    decode_physical_digest(decoder).map(RepresentationCatalogueRootId::new)
+}
+
+pub(super) fn encode_placement_set_id(encoder: &mut Encoder, id: PlacementSetId) {
+    encode_physical_digest(encoder, id.as_bytes());
+}
+
+pub(super) fn decode_placement_set_id(
+    decoder: &mut Decoder<'_>,
+) -> Result<PlacementSetId, PhysicalModelError> {
+    decode_physical_digest(decoder).map(PlacementSetId::from_digest)
+}
+
+pub(super) fn encode_state_id(encoder: &mut Encoder, id: RepresentationStateId) {
+    encode_physical_digest(encoder, id.as_bytes());
+}
+
+pub(super) fn decode_state_id(
+    decoder: &mut Decoder<'_>,
+) -> Result<RepresentationStateId, PhysicalModelError> {
+    decode_physical_digest(decoder).map(RepresentationStateId::new)
+}
+
 pub(super) fn decode_record_id(
     decoder: &mut Decoder<'_>,
 ) -> Result<RepresentationRecordId, PhysicalModelError> {
@@ -121,6 +225,16 @@ fn encode_tagged(encoder: &mut Encoder, algorithm: u16, construction: u16, diges
     encoder.u16(construction);
     encoder.u32(CURRENT_DIGEST_BYTES);
     encoder.raw(digest);
+}
+
+pub(super) fn encode_physical_digest(encoder: &mut Encoder, digest: &[u8; 32]) {
+    encode_tagged(encoder, BLAKE3_ALGORITHM, PHYSICAL_CONSTRUCTION, digest);
+}
+
+pub(super) fn decode_physical_digest(
+    decoder: &mut Decoder<'_>,
+) -> Result<[u8; 32], PhysicalModelError> {
+    decode_tagged(decoder, BLAKE3_ALGORITHM, PHYSICAL_CONSTRUCTION)
 }
 
 fn decode_tagged(
@@ -162,11 +276,11 @@ impl BlobId {
     ) -> Result<Self, PhysicalModelError> {
         let length =
             u64::try_from(encoded_bytes.len()).map_err(|_| PhysicalModelError::LengthOverflow)?;
-        let mut material = tagged_profile_bytes(profile);
-        material.extend_from_slice(&length.to_le_bytes());
-        material.extend_from_slice(encoded_bytes);
-        Ok(Self::new(
-            identity.identify("astrid-blob-identity-v1\0", &material),
-        ))
+        let mut prefix = tagged_profile_bytes(profile);
+        prefix.extend_from_slice(&length.to_le_bytes());
+        Ok(Self::new(identity.identify_parts(
+            "astrid-blob-identity-v1\0",
+            &[&prefix, encoded_bytes],
+        )))
     }
 }

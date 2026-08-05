@@ -60,8 +60,12 @@ building; only the transition dependency is optional.
 
 ```toml
 [dependencies]
-astrid-storage = { workspace = true, features = ["full"] }
+astrid-storage = { workspace = true }
 ```
+
+Enable `legacy-surrealkv` only in a binary responsible for importing an
+existing SurrealKV store. New deployments and ordinary consumers do not need
+the transition dependency.
 
 ```rust
 use std::sync::Arc;
@@ -74,6 +78,44 @@ scoped.set("config", b"{}".to_vec()).await?;
 scoped.set_json("prefs", &serde_json::json!({"key": "value"})).await?;
 let loaded: serde_json::Value = scoped.get_json("prefs").await?.unwrap();
 ```
+
+## Performance
+
+The current physical-catalogue implementation was measured from clean commit
+`603d260b` on an M2 Ultra/APFS host. Each reported median covers three runs over
+a deterministic 512 MiB incompressible corpus, with one-MiB reads, four
+principals, and a governed one-GiB object-cache budget. Native comparisons are
+same-run substrate measurements; the verified-read comparator reads and
+BLAKE3-verifies the same bytes.
+
+| Operation | Median result | Interpretation |
+|---|---:|---|
+| Native cached write | 5,105.6 MiB/s | APFS substrate |
+| Astrid staging write | 4,734.7 MiB/s | 1.078× native elapsed time |
+| Native warm verified read | 1,595.6 MiB/s | read plus BLAKE3 |
+| Astrid warm verified read | 1,798.5 MiB/s | 0.887× native elapsed time |
+| Astrid first verified read | 496.4 MiB/s | process-local evidence cold |
+| Astrid post-reopen verified read | 411.8 MiB/s | evidence rebuilt after reopen |
+| Unique publication | 179.1 MiB/s | asynchronous authoritative admission |
+| Duplicate publication | 258.3 MiB/s | exact same-content admission |
+| Four-principal shared publication | 386.3 MiB/s aggregate | 2.158× single-principal throughput |
+| Four-principal warm verified read | 6,337.0 MiB/s aggregate | 3.523× single-principal throughput |
+| Populated reopen | 1.368 s | index plus physical-catalogue recovery |
+| Direct-catalogue activation | 2.328 s | one-time migration of the populated store |
+
+Unique random content appended 1.016492 physical bytes per logical byte,
+including authenticated representation metadata. Republishing the identical
+512 MiB appended 24,426 bytes (0.004550%): exact deduplication plus the new
+principal root and catalogue metadata. Strict small-file seals measured 70.3
+files/s versus 215.0 native write-and-sync operations/s, so ordinary hosted
+close remains the native-speed staging boundary while publication proceeds in
+the background.
+
+These are engine and APFS-substrate measurements, not mounted-provider results
+or corpus-wide compression claims. The full methodology, historical baselines,
+raw samples, and content-bound evidence envelope live in
+[`../../docs/astrid-storage-performance.md`](../../docs/astrid-storage-performance.md)
+and [`../../docs/benchmarks/storage-io/`](../../docs/benchmarks/storage-io/).
 
 ## Development
 

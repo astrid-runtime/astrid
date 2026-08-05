@@ -19,14 +19,9 @@ where
     /// error.
     pub fn flush(&self) -> Result<(), DurableError> {
         let mut inner = self.lock_usable()?;
-        let files = live_files_mut(&mut inner.files)?;
-        if let Err(source) = files.arena.sync_data() {
+        if let Err(error) = self.flush_authority(&mut inner) {
             self.mark_requires_recovery(&mut inner);
-            return Err(io_error("flush object arena", source));
-        }
-        if let Err(source) = files.roots.sync_data() {
-            self.mark_requires_recovery(&mut inner);
-            return Err(io_error("flush root journal", source));
+            return Err(error);
         }
         self.checkpoint_index(&mut inner);
         Ok(())
@@ -48,15 +43,11 @@ where
             return Ok(());
         }
         let poisoned = inner.poisoned;
-        let result = if let Some(files) = inner.files.as_mut() {
+        let result = if inner.files.is_some() {
             if poisoned {
                 Err(DurableError::RequiresRecovery)
-            } else if let Err(source) = files.arena.sync_data() {
-                Err(io_error("flush object arena while closing", source))
-            } else if let Err(source) = files.roots.sync_data() {
-                Err(io_error("flush root journal while closing", source))
             } else {
-                Ok(())
+                self.flush_authority(&mut inner)
             }
         } else if poisoned {
             Err(DurableError::RequiresRecovery)
@@ -66,6 +57,7 @@ where
         if result.is_ok() && inner.files.is_some() {
             self.checkpoint_index(&mut inner);
         }
+        drop(inner.representations.take());
         drop(inner.files.take());
         drop(self.arena_reader.write().take());
         self.object_cache.clear();
@@ -77,6 +69,30 @@ where
             None => Ok(()),
         };
         result.and(unlock)
+    }
+
+    fn flush_authority(&self, inner: &mut DurableInner<P>) -> Result<(), DurableError> {
+        let representation_update = self.append_pending_direct_update(inner, &[])?;
+        let DurableInner {
+            files,
+            representations,
+            ..
+        } = inner;
+        let files = live_files_mut(files)?;
+        files
+            .arena
+            .sync_data()
+            .map_err(|source| io_error("flush object arena", source))?;
+        if let Some(representations) = representations {
+            if let Some(update) = representation_update {
+                representations.publish_direct_update(update)?;
+            }
+            representations.flush()?;
+        }
+        files
+            .roots
+            .sync_data()
+            .map_err(|source| io_error("flush root journal", source))
     }
 
     fn checkpoint_index(&self, inner: &mut DurableInner<P>) {
@@ -106,5 +122,6 @@ where
         files.arena_len = arena_len;
         files.arena_tail = arena_tail;
         inner.pending_index_locations.clear();
+        inner.pending_direct_objects.clear();
     }
 }

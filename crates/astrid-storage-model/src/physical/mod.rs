@@ -6,16 +6,27 @@
 
 use core::fmt;
 
+mod catalogue;
 mod codec;
 mod identity;
+mod map;
+mod placement;
 mod profile;
 mod representation;
+mod state;
 
-pub use identity::{PhysicalIdentity, RepresentationProfileId, RepresentationRecordId};
+pub use catalogue::RepresentationCatalogueRoot;
+pub use identity::{
+    PhysicalIdentity, PhysicalMapNodeId, PlacementSetId, RepresentationCatalogueRootId,
+    RepresentationProfileId, RepresentationRecordId, RepresentationStateId,
+};
+pub use map::{CanonicalPhysicalMap, PhysicalMapDomain, PhysicalMapKey, PhysicalMapNode};
+pub use placement::{PlacementEntry, PlacementSet, Replica, ReplicaLocator};
 pub use profile::{
     Dependency, ProfileDependency, ProfileKind, ReconstructionBounds, RepresentationProfile,
 };
 pub use representation::{CanonicalChunkingProfile, Coverage, Recipe, RepresentationRecord};
+pub use state::RepresentationState;
 
 /// Validation or canonical-wire failure in the physical representation model.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,6 +62,14 @@ pub enum PhysicalModelError {
     ReconstructionBoundTooSmall,
     /// Decoding and canonical re-encoding did not reproduce the input bytes.
     NonCanonicalEncoding,
+    /// An authenticated physical map violated its canonical trie grammar.
+    InvalidMap(&'static str),
+    /// A representation catalogue root contradicted its map roots or counts.
+    InvalidCatalogue(&'static str),
+    /// A blob placement or placement set violated its canonical grammar.
+    InvalidPlacement(&'static str),
+    /// A representation-state transition violated generation or pairing rules.
+    InvalidRepresentationState(&'static str),
 }
 
 impl fmt::Display for PhysicalModelError {
@@ -81,11 +100,21 @@ impl fmt::Display for PhysicalModelError {
             Self::NonCanonicalEncoding => {
                 formatter.write_str("physical value has a second non-canonical encoding")
             },
+            Self::InvalidMap(detail) => write!(formatter, "invalid physical map: {detail}"),
+            Self::InvalidCatalogue(detail) => {
+                write!(formatter, "invalid representation catalogue: {detail}")
+            },
+            Self::InvalidPlacement(detail) => write!(formatter, "invalid placement: {detail}"),
+            Self::InvalidRepresentationState(detail) => {
+                write!(formatter, "invalid representation state: {detail}")
+            },
         }
     }
 }
 
 impl core::error::Error for PhysicalModelError {}
 
+#[cfg(test)]
+mod catalogue_tests;
 #[cfg(test)]
 mod tests;

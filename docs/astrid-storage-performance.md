@@ -382,7 +382,12 @@ group commit, seal journaling, and in-process recovery. Commit `404a9d69` is
 `2855d440` (`#1442` on `main`) plus the evidence-envelope-only benchmark change;
 no measured storage implementation differs from that main commit. The report
 records a clean tree, exact executable arguments, and independent SHA-256
-commitments to both the measured executable and complete payload.
+commitments to both the measured executable and complete payload. Current
+reports count representation metadata and journals in authoritative-byte
+growth, report that growth per newly admitted object, and time direct-catalogue
+activation over the populated sample store. Activation timing includes engine
+reopen plus catalogue construction and validation; ordinary reopen remains a
+separate metric.
 
 The run used the documented 512 MiB corpus, three samples, one-MiB ranges,
 64 small files, four principals, and an explicit one-GiB governed cache budget
@@ -424,6 +429,57 @@ main claim. Small strict seals reached 73.6 files/s versus 204.4 native
 write-and-sync operations/s; ordinary provider close must therefore retain the
 staged acknowledgement boundary rather than synchronously impersonating
 `seal`.
+
+### Authoritative physical-catalogue cost
+
+Issue #1450 was measured against a clean `94e7cea7` main checkout and three
+points on the physical-catalogue branch: `d6bc3d06`, `0d5a42b3` after batch
+admission stopped persisting intermediate path-copy nodes, and audited commit
+`603d260b` after conserving canonical description work, using segmented
+physical identity, coalescing activation reads, and pruning redundant profile
+and iteration-only records. All four runs used the same 512 MiB corpus and
+command-line configuration as the integrated measurement above. The evidence
+envelopes are
+`astrid-storage-main-94e7cea7.json`,
+`astrid-storage-physical-catalogue-d6bc3d06.json`, and
+`astrid-storage-physical-catalogue-0d5a42b3.json`, and
+`astrid-storage-physical-catalogue-603d260b.json`.
+
+| Operation | Main `94e7cea7` | First corrected `0d5a42b3` | Audited `603d260b` | Final vs main |
+|---|---:|---:|---:|---:|
+| Unique publication | 208.2 MiB/s | 129.8 MiB/s | 179.1 MiB/s | 14.0% lower |
+| Duplicate publication | 260.3 MiB/s | 252.2 MiB/s | 258.3 MiB/s | 0.8% lower |
+| Warm verified read | 1,683.6 MiB/s | 1,681.8 MiB/s | 1,798.5 MiB/s | 6.8% higher |
+| Four-principal warm verified read | 6,549.9 MiB/s | 6,359.9 MiB/s | 6,337.0 MiB/s | 3.3% lower |
+| Four-principal shared publication | 438.2 MiB/s | 322.7 MiB/s | 386.3 MiB/s | 11.8% lower |
+| Populated reopen | 1,098.2 ms | 2,698.0 ms | 1,368.0 ms | 1.25× elapsed |
+| Direct-catalogue activation | not applicable | 2,651.9 ms | 2,328.0 ms | one-time migration |
+
+The audited paired substrate comparison remains favorable: staging took
+1.078× the native cached-write time and a warm Astrid verified read took
+0.887× the native BLAKE3-verified read time. The physical catalogue therefore
+leaves the hosted read path at parity while making representation placement
+independently recoverable and auditable. Four-principal publication recovered
+from 322.7 to 386.3 MiB/s and now provides 2.158× the single-principal
+throughput; it remains 11.8% below the main baseline and is not presented as a
+closed optimization target.
+
+The first implementation appended 39,945,425 bytes of representation metadata
+for 6,748 admitted objects, or 5,919.6 bytes per object. Persisting only the
+final reachable map nodes reduced that to 9,878,706 bytes, or 1,463.9 bytes per
+object: a 75.3% reduction. The audited implementation reduces it again to
+7,584,386 bytes, or 1,123.9 bytes per newly admitted object: 23.2% below the
+first corrected implementation and 81.0% below the initial one. Total unique
+authoritative growth is now 1.016492× logical bytes. A duplicate 512 MiB
+publication appends 24,426 bytes, 0.004550% of the logical input; this is exact
+same-content admission plus new catalogue/root metadata, not an estimate of
+corpus-wide convergence.
+
+The remaining costs are explicit rather than hidden. Unique admission still
+performs canonical map construction and metadata writes, and reopen validates
+the independently durable physical graph. A denser authenticated-map encoding
+and governed parallel physical hashing remain measured follow-ups; neither
+requires trading away warm reads or the two-flush KV durability path.
 
 ## Optimization experiments
 

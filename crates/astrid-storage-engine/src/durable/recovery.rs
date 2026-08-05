@@ -36,6 +36,11 @@ where
     C: PrincipalCodec<P>,
 {
     recover_interrupted_compaction(path, principal_codec, identity, limits)?;
+    let representations = super::representations::RepresentationStore::open(path, limits)?;
+    let protected_arena_len = representations.as_ref().map_or(
+        Ok(0),
+        super::representations::RepresentationStore::generation_zero_protected_len,
+    )?;
     let mut arena = open_rw(&path.join(ARENA_FILE))?;
     let mut roots = open_rw(&path.join(ROOT_FILE))?;
     let mut index_cache = open_rw(&path.join(INDEX_FILE)).ok();
@@ -51,7 +56,7 @@ where
     let (index, arena_tail) = if let Some(state) = cached {
         (state.objects, state.arena_tail)
     } else {
-        let (index, arena_tail) = recover_arena(&mut arena, identity, limits)?;
+        let (index, arena_tail) = recover_arena(&mut arena, identity, limits, protected_arena_len)?;
         let state = IndexState {
             arena_len: arena
                 .metadata()
@@ -85,6 +90,9 @@ where
     let arena_reader = arena
         .try_clone()
         .map_err(|source| io_error("clone object arena for positional reads", source))?;
+    if let Some(representations) = &representations {
+        representations.validate_generation_zero_index(&index)?;
+    }
 
     Ok(RecoveredStore {
         roots_by_principal,
@@ -97,6 +105,7 @@ where
             arena_len,
             arena_tail,
         },
+        representations,
         arena_reader,
     })
 }
@@ -126,7 +135,11 @@ fn stabilize_recovered_store<P: Ord>(
         .files
         .roots
         .sync_data()
-        .map_err(|source| io_error("flush recovered root journal", source))
+        .map_err(|source| io_error("flush recovered root journal", source))?;
+    if let Some(representations) = &mut recovered.representations {
+        representations.flush()?;
+    }
+    Ok(())
 }
 
 impl<P, I, C> DurableEngine<P, I, C>
@@ -173,6 +186,7 @@ where
         }
 
         drop(inner.files.take());
+        drop(inner.representations.take());
         drop(self.arena_reader.write().take());
         self.object_cache.clear();
         let next_generation = inner.arena_generation.wrapping_add(1);
@@ -204,8 +218,10 @@ where
                     inner.roots_by_principal = recovered.roots_by_principal;
                     inner.index = recovered.index;
                     inner.pending_index_locations.clear();
+                    inner.pending_direct_objects.clear();
                     inner.validated = recovered.validated;
                     inner.files = Some(recovered.files);
+                    inner.representations = recovered.representations;
                     inner.poisoned = false;
                     inner.arena_generation = next_generation;
                     *self.arena_reader.write() = Some(ArenaReader {

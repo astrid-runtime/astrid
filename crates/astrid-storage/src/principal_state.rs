@@ -56,7 +56,7 @@ use format_amendment::{
 };
 use format_amendment::{
     STORE_METADATA_FILE, prepare_catalog_specification, prepare_destination,
-    prepare_format_specification, store_metadata,
+    prepare_format_specification, representation_bootstrap_objects, store_metadata,
 };
 use native_io::atomic_write;
 pub use staging::{
@@ -84,6 +84,14 @@ impl PhysicalIdentity for Blake3PhysicalIdentityV1 {
     fn identify(&self, context: &'static str, material: &[u8]) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new_derive_key(context);
         hasher.update(material);
+        *hasher.finalize().as_bytes()
+    }
+
+    fn identify_parts(&self, context: &'static str, parts: &[&[u8]]) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new_derive_key(context);
+        for part in parts {
+            hasher.update(part);
+        }
         *hasher.finalize().as_bytes()
     }
 }
@@ -447,6 +455,14 @@ async fn open_runtime_principal_store_with_options(
         })?;
         prepare_format_specification(&engine, destination_format, &format_spec, format_spec_id)?;
         prepare_catalog_specification(&engine, destination_format, &catalog_spec, catalog_spec_id)?;
+        let bootstrap_objects = representation_bootstrap_objects(format_spec_id, catalog_spec_id);
+        engine
+            .ensure_direct_representation_catalogue(format_spec_id, &bootstrap_objects)
+            .map_err(|error| {
+                StorageError::Connection(format!(
+                    "activate direct representation catalogue: {error}"
+                ))
+            })?;
         Ok((engine, metadata_current))
     })
     .await

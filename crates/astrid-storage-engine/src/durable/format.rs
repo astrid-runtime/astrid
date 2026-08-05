@@ -19,7 +19,10 @@ mod indexed;
 
 #[cfg(test)]
 pub(super) use indexed::last_batch_spans;
-pub(super) use indexed::{read_indexed_object, read_indexed_objects};
+pub(super) use indexed::{
+    read_indexed_object, read_indexed_object_with_payload, read_indexed_objects,
+    visit_indexed_objects,
+};
 
 pub(super) fn verify_indexed_location(
     arena: &mut File,
@@ -250,45 +253,53 @@ pub(super) fn recover_arena<I: PersistentObjectIdentity>(
     arena: &mut File,
     identity: &I,
     limits: RecoveryLimits,
+    protected_len: u64,
 ) -> Result<(BTreeMap<ObjectId, ArenaLocation>, Option<ArenaLocation>), DurableError> {
     let scheme = identity.scheme();
     let mut index = BTreeMap::<ObjectId, ArenaLocation>::new();
     let mut tail = None;
-    scan_frames(arena, ARENA_FILE, ARENA_MAGIC, limits, |offset, payload| {
-        let (id, record) = decode_object_frame(payload, scheme)
-            .map_err(|detail| corrupt(ARENA_FILE, offset, detail))?;
-        let computed = identity.identify(&record);
-        if computed != id {
-            return Err(corrupt(ARENA_FILE, offset, "object identity mismatch"));
-        }
-        if encode_object_frame(scheme, id, &record)? != payload {
-            return Err(corrupt(ARENA_FILE, offset, "object frame is not canonical"));
-        }
-        let payload_len =
-            u64::try_from(payload.len()).map_err(|_| DurableError::EncodingOverflow)?;
-        let checksum = frame_checksum(ARENA_MAGIC, payload_len, payload);
-        let location = ArenaLocation {
-            offset,
-            payload_len,
-            checksum,
-        };
-        match index.get(&id) {
-            Some(existing)
-                if existing.payload_len == payload_len && existing.checksum == checksum => {},
-            Some(_) => {
-                return Err(DurableError::RecoveryModel {
-                    file: ARENA_FILE,
-                    offset,
-                    source: ModelError::ObjectCollision(id),
-                });
-            },
-            None => {
-                index.insert(id, location);
-            },
-        }
-        tail = Some(location);
-        Ok(())
-    })?;
+    scan_frames_with_protected_prefix(
+        arena,
+        ARENA_FILE,
+        ARENA_MAGIC,
+        limits,
+        protected_len,
+        |offset, payload| {
+            let (id, record) = decode_object_frame(payload, scheme)
+                .map_err(|detail| corrupt(ARENA_FILE, offset, detail))?;
+            let computed = identity.identify(&record);
+            if computed != id {
+                return Err(corrupt(ARENA_FILE, offset, "object identity mismatch"));
+            }
+            if encode_object_frame(scheme, id, &record)? != payload {
+                return Err(corrupt(ARENA_FILE, offset, "object frame is not canonical"));
+            }
+            let payload_len =
+                u64::try_from(payload.len()).map_err(|_| DurableError::EncodingOverflow)?;
+            let checksum = frame_checksum(ARENA_MAGIC, payload_len, payload);
+            let location = ArenaLocation {
+                offset,
+                payload_len,
+                checksum,
+            };
+            match index.get(&id) {
+                Some(existing)
+                    if existing.payload_len == payload_len && existing.checksum == checksum => {},
+                Some(_) => {
+                    return Err(DurableError::RecoveryModel {
+                        file: ARENA_FILE,
+                        offset,
+                        source: ModelError::ObjectCollision(id),
+                    });
+                },
+                None => {
+                    index.insert(id, location);
+                },
+            }
+            tail = Some(location);
+            Ok(())
+        },
+    )?;
     Ok((index, tail))
 }
 
@@ -297,18 +308,39 @@ pub(super) fn scan_frames(
     file_name: &'static str,
     magic: [u8; 8],
     limits: RecoveryLimits,
+    accept: impl FnMut(u64, &[u8]) -> Result<(), DurableError>,
+) -> Result<(), DurableError> {
+    scan_frames_with_protected_prefix(file, file_name, magic, limits, 0, accept)
+}
+
+fn scan_frames_with_protected_prefix(
+    file: &mut File,
+    file_name: &'static str,
+    magic: [u8; 8],
+    limits: RecoveryLimits,
+    protected_len: u64,
     mut accept: impl FnMut(u64, &[u8]) -> Result<(), DurableError>,
 ) -> Result<(), DurableError> {
-    let file_len = file
-        .metadata()
-        .map_err(|source| io_error("read principal-store metadata", source))?
-        .len();
+    let file_len = validated_file_len(file, file_name, protected_len)?;
+    let policy = FrameScanPolicy {
+        magic,
+        limits,
+        protected_len,
+        file_len,
+    };
     let mut offset = 0_u64;
     while offset < file_len {
         let remaining = file_len
             .checked_sub(offset)
             .ok_or(DurableError::EncodingOverflow)?;
         if remaining < FRAME_HEADER_LEN {
+            if offset < protected_len {
+                return Err(corrupt(
+                    file_name,
+                    offset,
+                    "published frame header is truncated",
+                ));
+            }
             truncate_tail(file, offset)?;
             break;
         }
@@ -318,29 +350,17 @@ pub(super) fn scan_frames(
         file.read_exact(&mut header)
             .map_err(|source| io_error("read durable frame header", source))?;
         if header[..8] != magic {
-            let error = corrupt(file_name, offset, "frame magic mismatch");
-            if valid_frame_follows(file, magic, offset, file_len, limits)? {
-                return Err(error);
-            }
-            truncate_tail(file, offset)?;
+            truncate_unpublished_tail_or_fail(
+                file,
+                policy,
+                offset,
+                false,
+                corrupt(file_name, offset, "frame magic mismatch"),
+            )?;
             break;
         }
-        let version = u16::from_le_bytes([header[8], header[9]]);
-        if version != FRAME_VERSION {
-            return Err(corrupt(file_name, offset, "unsupported frame version"));
-        }
-        if header[10..12] != [0, 0] {
-            return Err(corrupt(
-                file_name,
-                offset,
-                "reserved header bytes are non-zero",
-            ));
-        }
-        let payload_len = u64::from_le_bytes(
-            header[12..20]
-                .try_into()
-                .map_err(|_| DurableError::EncodingOverflow)?,
-        );
+        let decoded = decode_frame_header(file_name, offset, &header)?;
+        let payload_len = decoded.payload_len;
         if payload_len > limits.max_frame_bytes {
             let error = DurableError::FrameTooLarge {
                 file: file_name,
@@ -348,15 +368,19 @@ pub(super) fn scan_frames(
                 declared: payload_len,
                 limit: limits.max_frame_bytes,
             };
+            if offset < protected_len {
+                return Err(error);
+            }
             let claimed_end = FRAME_HEADER_LEN
                 .checked_add(payload_len)
                 .and_then(|frame_len| offset.checked_add(frame_len));
-            if claimed_end.is_some_and(|end| end <= file_len)
-                || valid_frame_follows(file, magic, offset, file_len, limits)?
-            {
-                return Err(error);
-            }
-            truncate_tail(file, offset)?;
+            truncate_unpublished_tail_or_fail(
+                file,
+                policy,
+                offset,
+                claimed_end.is_some_and(|end| end <= file_len),
+                error,
+            )?;
             break;
         }
         let frame_len = FRAME_HEADER_LEN
@@ -366,27 +390,25 @@ pub(super) fn scan_frames(
             .checked_add(frame_len)
             .ok_or(DurableError::EncodingOverflow)?;
         if frame_end > file_len {
+            if offset < protected_len {
+                return Err(corrupt(
+                    file_name,
+                    offset,
+                    "published frame payload is truncated",
+                ));
+            }
             truncate_tail(file, offset)?;
             break;
         }
-        let payload_usize =
-            usize::try_from(payload_len).map_err(|_| DurableError::EncodingOverflow)?;
-        let mut payload = Vec::new();
-        payload
-            .try_reserve_exact(payload_usize)
-            .map_err(|_| DurableError::EncodingOverflow)?;
-        payload.resize(payload_usize, 0);
-        file.read_exact(&mut payload)
-            .map_err(|source| io_error("read durable frame payload", source))?;
-        let checksum: [u8; 32] = header[CHECKSUM_START..]
-            .try_into()
-            .map_err(|_| DurableError::EncodingOverflow)?;
-        if frame_checksum(magic, payload_len, &payload) != checksum {
-            let error = corrupt(file_name, offset, "frame checksum mismatch");
-            if valid_frame_follows(file, magic, offset, file_len, limits)? {
-                return Err(error);
-            }
-            truncate_tail(file, offset)?;
+        let payload = read_frame_payload(file, payload_len)?;
+        if frame_checksum(magic, payload_len, &payload) != decoded.checksum {
+            truncate_unpublished_tail_or_fail(
+                file,
+                policy,
+                offset,
+                false,
+                corrupt(file_name, offset, "frame checksum mismatch"),
+            )?;
             break;
         }
         accept(offset, &payload)?;
@@ -395,6 +417,95 @@ pub(super) fn scan_frames(
     file.seek(SeekFrom::End(0))
         .map_err(|source| io_error("seek durable file tail", source))?;
     Ok(())
+}
+
+fn validated_file_len(
+    file: &File,
+    file_name: &'static str,
+    protected_len: u64,
+) -> Result<u64, DurableError> {
+    let file_len = file
+        .metadata()
+        .map_err(|source| io_error("read principal-store metadata", source))?
+        .len();
+    if file_len < protected_len {
+        return Err(corrupt(
+            file_name,
+            file_len,
+            "published durable prefix is truncated",
+        ));
+    }
+    Ok(file_len)
+}
+
+#[derive(Clone, Copy)]
+struct DecodedFrameHeader {
+    payload_len: u64,
+    checksum: [u8; 32],
+}
+
+#[derive(Clone, Copy)]
+struct FrameScanPolicy {
+    magic: [u8; 8],
+    limits: RecoveryLimits,
+    protected_len: u64,
+    file_len: u64,
+}
+
+fn decode_frame_header(
+    file_name: &'static str,
+    offset: u64,
+    header: &[u8; FRAME_HEADER_LEN_USIZE],
+) -> Result<DecodedFrameHeader, DurableError> {
+    let version = u16::from_le_bytes([header[8], header[9]]);
+    if version != FRAME_VERSION {
+        return Err(corrupt(file_name, offset, "unsupported frame version"));
+    }
+    if header[10..12] != [0, 0] {
+        return Err(corrupt(
+            file_name,
+            offset,
+            "reserved header bytes are non-zero",
+        ));
+    }
+    Ok(DecodedFrameHeader {
+        payload_len: u64::from_le_bytes(
+            header[12..20]
+                .try_into()
+                .map_err(|_| DurableError::EncodingOverflow)?,
+        ),
+        checksum: header[CHECKSUM_START..]
+            .try_into()
+            .map_err(|_| DurableError::EncodingOverflow)?,
+    })
+}
+
+fn read_frame_payload(file: &mut File, payload_len: u64) -> Result<Vec<u8>, DurableError> {
+    let payload_usize = usize::try_from(payload_len).map_err(|_| DurableError::EncodingOverflow)?;
+    let mut payload = Vec::new();
+    payload
+        .try_reserve_exact(payload_usize)
+        .map_err(|_| DurableError::EncodingOverflow)?;
+    payload.resize(payload_usize, 0);
+    file.read_exact(&mut payload)
+        .map_err(|source| io_error("read durable frame payload", source))?;
+    Ok(payload)
+}
+
+fn truncate_unpublished_tail_or_fail(
+    file: &mut File,
+    policy: FrameScanPolicy,
+    offset: u64,
+    known_interior: bool,
+    error: DurableError,
+) -> Result<(), DurableError> {
+    if offset < policy.protected_len
+        || known_interior
+        || valid_frame_follows(file, policy.magic, offset, policy.file_len, policy.limits)?
+    {
+        return Err(error);
+    }
+    truncate_tail(file, offset)
 }
 
 fn valid_frame_follows(
@@ -670,6 +781,19 @@ pub(super) fn encode_object_frame(
         bytes.push(reference.kind().code());
     }
     Ok(bytes)
+}
+
+pub(super) fn canonical_record_bytes(
+    frame_payload: &[u8],
+    scheme: IdentityScheme,
+) -> Result<&[u8], DurableError> {
+    let mut reader = SliceReader::new(frame_payload);
+    reader
+        .identity(scheme)
+        .map_err(|detail| corrupt(ARENA_FILE, 0, detail))?;
+    frame_payload
+        .get(reader.offset..)
+        .ok_or(DurableError::EncodingOverflow)
 }
 
 pub(super) fn decode_object_frame(

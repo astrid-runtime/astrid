@@ -632,12 +632,15 @@ pub use derivation_evidence::{
 };
 pub use gc_evidence::{
     GcCommitEvidence, GcCommitId, GcEvidenceError, GcFactSnapshotId, GcPlanEvidence, GcPlanId,
-    PlacementSetId, RetentionPolicyId, TensorLogicProofId,
+    RetentionPolicyId, TensorLogicProofId,
 };
 pub use physical::{
-    CanonicalChunkingProfile, Coverage, Dependency, PhysicalIdentity, PhysicalModelError,
-    ProfileDependency, ProfileKind, Recipe, ReconstructionBounds, RepresentationProfile,
-    RepresentationProfileId, RepresentationRecord, RepresentationRecordId,
+    CanonicalChunkingProfile, CanonicalPhysicalMap, Coverage, Dependency, PhysicalIdentity,
+    PhysicalMapDomain, PhysicalMapKey, PhysicalMapNode, PhysicalMapNodeId, PhysicalModelError,
+    PlacementEntry, PlacementSet, PlacementSetId, ProfileDependency, ProfileKind, Recipe,
+    ReconstructionBounds, Replica, ReplicaLocator, RepresentationCatalogueRoot,
+    RepresentationCatalogueRootId, RepresentationProfile, RepresentationProfileId,
+    RepresentationRecord, RepresentationRecordId, RepresentationState, RepresentationStateId,
 };
 pub use proof::{
     OwnedSubtreePatch, ReferencePath, StateSelector, StateViewProof, TransitionWitness,

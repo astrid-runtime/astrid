@@ -27,6 +27,23 @@ impl PhysicalIdentity for Blake3PhysicalIdentity {
     }
 }
 
+#[derive(Clone, Copy)]
+struct StreamingBlake3PhysicalIdentity;
+
+impl PhysicalIdentity for StreamingBlake3PhysicalIdentity {
+    fn identify(&self, context: &'static str, material: &[u8]) -> [u8; 32] {
+        Blake3PhysicalIdentity.identify(context, material)
+    }
+
+    fn identify_parts(&self, context: &'static str, parts: &[&[u8]]) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new_derive_key(context);
+        for part in parts {
+            hasher.update(part);
+        }
+        *hasher.finalize().as_bytes()
+    }
+}
+
 fn object(value: u8) -> ObjectId {
     ObjectId::new([value; 32])
 }
@@ -269,6 +286,17 @@ fn blob_identity_binds_profile_length_and_bytes() {
     .unwrap();
     assert_ne!(first, second);
     assert_ne!(first, extended);
+}
+
+#[test]
+fn segmented_blob_identity_preserves_the_canonical_preimage() {
+    let profile = direct_profile().identify(&Blake3PhysicalIdentity).unwrap();
+    let bytes = vec![0x5a; 1024 * 1024];
+
+    assert_eq!(
+        BlobId::identify(&Blake3PhysicalIdentity, profile, &bytes).unwrap(),
+        BlobId::identify(&StreamingBlake3PhysicalIdentity, profile, &bytes).unwrap()
+    );
 }
 
 #[test]

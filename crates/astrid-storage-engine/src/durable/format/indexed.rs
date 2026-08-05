@@ -21,6 +21,21 @@ pub(in crate::durable) fn read_indexed_object<I: PersistentObjectIdentity>(
     identity: &I,
     limits: RecoveryLimits,
 ) -> Result<ObjectRecord, DurableError> {
+    read_indexed_object_with_payload(arena, expected_id, location, identity, limits)
+        .map(|(record, _)| record)
+}
+
+/// Read and verify one object while retaining its canonical frame payload.
+///
+/// Physical consumers use the returned payload to derive representation
+/// identity without serializing the decoded record a second time.
+pub(in crate::durable) fn read_indexed_object_with_payload<I: PersistentObjectIdentity>(
+    arena: &File,
+    expected_id: ObjectId,
+    location: ArenaLocation,
+    identity: &I,
+    limits: RecoveryLimits,
+) -> Result<(ObjectRecord, Vec<u8>), DurableError> {
     let scheme = identity.scheme();
     let payload = read_frame_at(arena, ARENA_FILE, ARENA_MAGIC, location.offset, limits)?;
     let payload_len = u64::try_from(payload.len()).map_err(|_| DurableError::EncodingOverflow)?;
@@ -49,7 +64,7 @@ pub(in crate::durable) fn read_indexed_object<I: PersistentObjectIdentity>(
             "indexed object identity does not match its canonical record",
         ));
     }
-    Ok(record)
+    Ok((record, payload))
 }
 
 pub(in crate::durable) fn read_indexed_objects<I: PersistentObjectIdentity>(
@@ -58,14 +73,31 @@ pub(in crate::durable) fn read_indexed_objects<I: PersistentObjectIdentity>(
     identity: &I,
     limits: RecoveryLimits,
 ) -> Result<BTreeMap<ObjectId, ObjectRecord>, DurableError> {
-    // A batch may coalesce many adjacent frames, but its temporary allocation
-    // may never exceed one maximally sized frame under the caller's existing
-    // parser authority. This avoids turning object count into an implicit
-    // second allocation limit.
-    let max_span_bytes = FRAME_HEADER_LEN.saturating_add(limits.max_frame_bytes);
+    let mut records = BTreeMap::new();
+    visit_indexed_objects(
+        arena,
+        requested,
+        FRAME_HEADER_LEN.saturating_add(limits.max_frame_bytes),
+        identity,
+        limits,
+        |expected_id, _location, record, _payload| {
+            records.insert(expected_id, record);
+            Ok(())
+        },
+    )?;
+    Ok(records)
+}
+
+pub(in crate::durable) fn visit_indexed_objects<I: PersistentObjectIdentity>(
+    arena: &File,
+    requested: &[(ObjectId, ArenaLocation)],
+    target_span_bytes: u64,
+    identity: &I,
+    limits: RecoveryLimits,
+    mut accept: impl FnMut(ObjectId, ArenaLocation, ObjectRecord, &[u8]) -> Result<(), DurableError>,
+) -> Result<(), DurableError> {
     let mut ordered = requested.to_vec();
     ordered.sort_unstable_by_key(|(_, location)| location.offset);
-    let mut records = BTreeMap::new();
     let mut first = 0_usize;
     #[cfg(test)]
     let mut spans = 0_usize;
@@ -79,6 +111,7 @@ pub(in crate::durable) fn read_indexed_objects<I: PersistentObjectIdentity>(
                 limit: limits.max_frame_bytes,
             });
         }
+        let max_span_bytes = target_span_bytes.max(frame_len(first_location)?);
         #[cfg(test)]
         {
             spans = spans.saturating_add(1);
@@ -126,13 +159,16 @@ pub(in crate::durable) fn read_indexed_objects<I: PersistentObjectIdentity>(
                 .get(relative..relative_end)
                 .ok_or(DurableError::EncodingOverflow)?;
             let record = decode_indexed_frame(frame, *expected_id, *location, identity, limits)?;
-            records.insert(*expected_id, record);
+            let payload = frame
+                .get(FRAME_HEADER_LEN_USIZE..)
+                .ok_or(DurableError::EncodingOverflow)?;
+            accept(*expected_id, *location, record, payload)?;
         }
         first = end;
     }
     #[cfg(test)]
     LAST_BATCH_SPANS.set(spans);
-    Ok(records)
+    Ok(())
 }
 
 #[cfg(test)]
