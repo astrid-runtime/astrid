@@ -20,6 +20,14 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Added
 
+- **New physical catalogues use a denser canonical nibble-radix map while
+  legacy roots remain byte-exactly recoverable.** The construction preserves
+  insertion-order-independent roots, bounded path-copy updates, logical
+  ObjectIds, principal roots, and the two-flush acknowledgement boundary. On
+  the canonical 512 MiB workload it reduces representation metadata from
+  1,123.9 to 903.0 bytes per admitted object, duplicate authoritative growth
+  from 24,426 to 18,032 bytes, and populated reopen time by 6.7%, while unique
+  publication and warm verified reads remain flat. Closes #1455.
 - **Existing arena objects can activate as authoritative direct physical
   representations without changing principal state.** Generation-scoped
   metadata and journals publish the canonical representation catalogue and
