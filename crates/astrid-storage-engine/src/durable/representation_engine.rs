@@ -37,6 +37,33 @@ where
         frozen_specification: ObjectId,
         bootstrap_objects: &[ObjectId],
     ) -> Result<RepresentationStateId, DurableError> {
+        self.ensure_direct_representation_catalogue_compatible_with(
+            frozen_specification,
+            &[],
+            bootstrap_objects,
+        )
+    }
+
+    /// Ensure the direct catalogue while retaining an explicitly compatible
+    /// predecessor profile.
+    ///
+    /// Physical-format amendments can change the in-band specification
+    /// without changing the direct-canonical recipe. Existing catalogues keep
+    /// their original profile identity; callers must name every predecessor
+    /// specification whose semantics remain valid. The active specification
+    /// must still be a persisted bootstrap object.
+    ///
+    /// # Errors
+    ///
+    /// Applies the same recovery checks as
+    /// [`Self::ensure_direct_representation_catalogue`] and rejects an active
+    /// profile not explicitly named by either specification argument.
+    pub fn ensure_direct_representation_catalogue_compatible_with(
+        &self,
+        frozen_specification: ObjectId,
+        compatible_frozen_specifications: &[ObjectId],
+        bootstrap_objects: &[ObjectId],
+    ) -> Result<RepresentationStateId, DurableError> {
         let mut inner = self.lock_usable()?;
         let excluded: BTreeSet<_> = bootstrap_objects.iter().copied().collect();
         if !excluded.contains(&frozen_specification)
@@ -47,7 +74,12 @@ where
             ));
         }
         if inner.representations.is_some() {
-            return self.repair_direct_coverage(&mut inner, frozen_specification, &excluded);
+            return self.repair_direct_coverage(
+                &mut inner,
+                frozen_specification,
+                compatible_frozen_specifications,
+                &excluded,
+            );
         }
         let scheme = self.identity.scheme();
         let direct_profile = RepresentationStore::direct_profile_for(frozen_specification)?;
@@ -95,6 +127,7 @@ where
         &self,
         inner: &mut DurableInner<P>,
         frozen_specification: ObjectId,
+        compatible_frozen_specifications: &[ObjectId],
         excluded: &BTreeSet<ObjectId>,
     ) -> Result<RepresentationStateId, DurableError> {
         let representations =
@@ -104,9 +137,19 @@ where
                 .ok_or(DurableError::InvalidRepresentationState(
                     "active representation store disappeared",
                 ))?;
-        if representations.frozen_specification()? != frozen_specification {
+        let active_specification = representations.frozen_specification()?;
+        if active_specification != frozen_specification
+            && !compatible_frozen_specifications.contains(&active_specification)
+        {
             return Err(DurableError::InvalidRepresentationState(
                 "active direct profile names a different frozen specification",
+            ));
+        }
+        if !excluded.contains(&active_specification)
+            || !inner.index.contains_key(&active_specification)
+        {
+            return Err(DurableError::InvalidRepresentationState(
+                "active direct profile specification is not a persisted bootstrap object",
             ));
         }
         let missing = inner

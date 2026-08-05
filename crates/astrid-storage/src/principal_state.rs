@@ -55,8 +55,9 @@ use format_amendment::{
     object_id_hex, persist_format_specification,
 };
 use format_amendment::{
-    STORE_METADATA_FILE, prepare_catalog_specification, prepare_destination,
-    prepare_format_specification, representation_bootstrap_objects, store_metadata,
+    PRE_DENSE_RADIX_FORMAT_SPEC_ID, STORE_METADATA_FILE, prepare_catalog_specification,
+    prepare_destination, prepare_format_specification, representation_bootstrap_objects,
+    store_metadata,
 };
 use native_io::atomic_write;
 pub use staging::{
@@ -457,7 +458,11 @@ async fn open_runtime_principal_store_with_options(
         prepare_catalog_specification(&engine, destination_format, &catalog_spec, catalog_spec_id)?;
         let bootstrap_objects = representation_bootstrap_objects(format_spec_id, catalog_spec_id);
         engine
-            .ensure_direct_representation_catalogue(format_spec_id, &bootstrap_objects)
+            .ensure_direct_representation_catalogue_compatible_with(
+                format_spec_id,
+                &[PRE_DENSE_RADIX_FORMAT_SPEC_ID],
+                &bootstrap_objects,
+            )
             .map_err(|error| {
                 StorageError::Connection(format!(
                     "activate direct representation catalogue: {error}"

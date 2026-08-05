@@ -99,6 +99,39 @@ class PhysicalValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(FormatError, "child crosses its selector"):
             validate_map(root_id, 0, 2, nodes, lambda _key, _value: None)
 
+    def test_radix_map_rejects_legacy_children(self):
+        zero_id = tagged(0x11)
+        eight_id = tagged(0x22)
+        root_id = tagged(0x33)
+        nodes = {
+            identity_bytes(zero_id): {
+                "version": 1,
+                "domain": 0,
+                "tag": 0,
+                "key": tagged(0x01),
+                "value": b"zero",
+            },
+            identity_bytes(eight_id): {
+                "version": 1,
+                "domain": 0,
+                "tag": 0,
+                "key": tagged(0x81),
+                "value": b"eight",
+            },
+            identity_bytes(root_id): {
+                "version": 2,
+                "domain": 0,
+                "tag": 1,
+                "prefix_nibbles": 0,
+                "prefix": b"",
+                "child_bitmap": (1 << 0) | (1 << 8),
+                "children": [zero_id, eight_id],
+                "subtree_entries": 2,
+            },
+        }
+        with self.assertRaisesRegex(FormatError, "mixes node constructions"):
+            validate_map(root_id, 0, 2, nodes, lambda _key, _value: None)
+
     def test_direct_coverage_exempts_only_declared_bootstrap_objects(self):
         bootstrap = b"bootstrap"
         represented = b"represented"

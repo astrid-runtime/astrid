@@ -145,10 +145,23 @@ pub(super) fn append_new_reachable_map_nodes(
     let Some(root) = map.root() else {
         return Ok(());
     };
-    let mut pending = vec![root];
+    let mut pending = vec![(root, false)];
     let mut visited = BTreeSet::new();
-    while let Some(id) = pending.pop() {
-        if !visited.insert(id) || durable.contains(&id) || appended.contains(&id) {
+    while let Some((id, expanded)) = pending.pop() {
+        if expanded {
+            if !durable.contains(&id) && !appended.contains(&id) {
+                let node = map
+                    .nodes()
+                    .get(&id)
+                    .ok_or(DurableError::InvalidRepresentationState(
+                        "active physical map is missing a reachable node",
+                    ))?;
+                metadata.push(MetadataFrame::map_node(&Blake3PhysicalIdentity, node)?);
+                appended.insert(id);
+            }
+            continue;
+        }
+        if !visited.insert(id) {
             continue;
         }
         let node = map
@@ -157,15 +170,14 @@ pub(super) fn append_new_reachable_map_nodes(
             .ok_or(DurableError::InvalidRepresentationState(
                 "active physical map is missing a reachable node",
             ))?;
-        metadata.push(MetadataFrame::map_node(&Blake3PhysicalIdentity, node)?);
-        appended.insert(id);
+        pending.push((id, true));
         match node {
             PhysicalMapNode::Branch { zero, one, .. } => {
-                pending.push(*one);
-                pending.push(*zero);
+                pending.push((*one, false));
+                pending.push((*zero, false));
             },
             PhysicalMapNode::Radix { children, .. } => {
-                pending.extend(children.iter().rev().copied());
+                pending.extend(children.iter().rev().map(|child| (*child, false)));
             },
             PhysicalMapNode::Leaf { .. } | PhysicalMapNode::Page { .. } => {},
         }
@@ -238,6 +250,81 @@ pub(super) fn quarantine_incomplete_root(store: &Path, root: &Path) -> Result<()
     Err(DurableError::InvalidRepresentationState(
         "representation quarantine namespace is exhausted",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use astrid_storage_model::{
+        CanonicalPhysicalMap, PhysicalMapDomain, PhysicalMapKey, PhysicalMapNode,
+    };
+
+    use super::{Blake3PhysicalIdentity, append_new_reachable_map_nodes};
+
+    fn dense_map() -> CanonicalPhysicalMap {
+        CanonicalPhysicalMap::build_dense(
+            &Blake3PhysicalIdentity,
+            PhysicalMapDomain::Representation,
+            (0_u32..32)
+                .map(|ordinal| {
+                    let key = blake3::hash(&ordinal.to_le_bytes());
+                    (
+                        PhysicalMapKey::new(*key.as_bytes()),
+                        ordinal.to_le_bytes().to_vec(),
+                    )
+                })
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn durable_parent_does_not_hide_missing_descendants() {
+        let map = dense_map();
+        let root = map.root().unwrap();
+        let mut metadata = Vec::new();
+        let mut appended = BTreeSet::new();
+
+        append_new_reachable_map_nodes(&mut metadata, &map, &BTreeSet::from([root]), &mut appended)
+            .unwrap();
+
+        assert!(!appended.contains(&root));
+        assert_eq!(appended.len(), map.nodes().len().checked_sub(1).unwrap());
+        assert_eq!(metadata.len(), appended.len());
+    }
+
+    #[test]
+    fn new_map_nodes_are_emitted_children_before_parents() {
+        let map = dense_map();
+        let root = map.root().unwrap();
+        let mut metadata = Vec::new();
+        let mut appended = BTreeSet::new();
+        append_new_reachable_map_nodes(&mut metadata, &map, &BTreeSet::new(), &mut appended)
+            .unwrap();
+
+        let positions = metadata
+            .iter()
+            .enumerate()
+            .map(|(position, frame)| (frame.identity, position))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(metadata.last().unwrap().identity, *root.as_bytes());
+        for (parent, node) in map.nodes() {
+            let Some(parent_position) = positions.get(parent.as_bytes()) else {
+                continue;
+            };
+            let children = match node {
+                PhysicalMapNode::Branch { zero, one, .. } => vec![*zero, *one],
+                PhysicalMapNode::Radix { children, .. } => children.clone(),
+                PhysicalMapNode::Leaf { .. } | PhysicalMapNode::Page { .. } => Vec::new(),
+            };
+            assert!(children.iter().all(|child| {
+                positions
+                    .get(child.as_bytes())
+                    .is_some_and(|child_position| child_position < parent_position)
+            }));
+        }
+    }
 }
 
 pub(super) fn quarantine_temporary_current(root: &Path) -> Result<(), DurableError> {

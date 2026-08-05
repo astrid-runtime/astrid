@@ -786,11 +786,16 @@ def validate_map(root, expected_domain, expected_count, nodes, decode_value):
         visiting.add(key_id)
         stack.append((node_id, True))
         if node.get("version", 1) == 1 and node["tag"] == 1:
-            stack.append((node["one"], False))
-            stack.append((node["zero"], False))
+            children = [node["zero"], node["one"]]
         elif node.get("version", 1) == 2 and node["tag"] == 1:
-            for child in reversed(node["children"]):
-                stack.append((child, False))
+            children = node["children"]
+        else:
+            children = []
+        for child in reversed(children):
+            child_node = nodes.get(identity_bytes(child))
+            if child_node is not None and child_node.get("version", 1) != node.get("version", 1):
+                raise FormatError("physical map mixes node constructions")
+            stack.append((child, False))
     if complete[identity_bytes(root)][0] != expected_count:
         raise FormatError("physical map root count mismatch")
 
