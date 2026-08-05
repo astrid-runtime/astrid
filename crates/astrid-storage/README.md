@@ -102,15 +102,17 @@ BLAKE3-verifies the same bytes.
 | Populated reopen | 1.276 s | dense physical-catalogue recovery |
 | Direct-catalogue activation | 2.243 s | one-time migration of the populated store |
 
-The bounded bulk-ingest checkpoint at clean commit `eca9c20a` split the same
-512 MiB corpus into 100 independently fingerprinted sources. Eight explicitly
-granted workers completed first ingest at 224.8 MiB/s, 1.311 times the serial
-batch path. An unchanged re-ingest verified the complete cached closures in
-25.1 ms without reading source bytes; changing one file reread exactly its
-5.12 MiB partition and completed in 67.5 ms. This proves delta-proportional
-source work, not the final read-bound
-first-ingest target: authoritative representation admission remains the
-bottleneck.
+The current bounded bulk-ingest checkpoint at clean commit `0d6a8366` split
+the same 512 MiB corpus into 128 independently fingerprinted 4 MiB sources.
+Preparing frame checksums and direct physical identities outside the durable
+engine's single-appender critical section raised eight-worker first ingest from
+261.1 to 361.8 MiB/s against exact parent `3d61052b`, while worker scaling rose
+from 1.500 to 2.044 times the serial batch path. Duplicate and four-principal
+publication remained materially unchanged. The earlier source-change evidence
+still applies: an unchanged re-ingest reads no source bytes and a changed token
+reads only its source partition. At 361.8 MiB/s, first ingest still does not meet
+the read-bound target; canonical object construction and authoritative physical
+map publication remain visible costs.
 
 Unique random content appended 1.013715 physical bytes per logical byte,
 including authenticated representation metadata. Republishing the identical

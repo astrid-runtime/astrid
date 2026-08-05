@@ -573,34 +573,42 @@ cold device read is faster than the substrate.
 
 ### Bulk ingest and change detection
 
-Clean commit `eca9c20a` measured the bounded batch path over the same 512 MiB
-deterministic incompressible corpus, split into 100 independently fingerprinted
-sources. Three release-mode samples used eight explicitly granted workers and
-a one-GiB governed object cache. The source-byte counters are assertions in
-the harness, not estimates.
+Clean commit `0d6a8366` was compared directly with parent `3d61052b` over a
+512 MiB deterministic incompressible corpus split into 128 independently
+fingerprinted 4 MiB sources. Three release-mode samples used eight explicitly
+granted workers and a governed 512 MiB object cache.
 
-| Workload | Median | Throughput | Source bytes observed |
+| Workload | Parent | Prepared admission | Change |
 |---|---:|---:|---:|
-| Single-worker first ingest | 2,984.9 ms | 171.5 MiB/s | 512 MiB |
-| Eight-worker first ingest | 2,277.5 ms | 224.8 MiB/s | 512 MiB |
-| Unchanged re-ingest | 25.1 ms | 39.8 complete batch checks/s | 0 B |
-| One changed file of 100 | 67.5 ms | 75.8 MiB/s changed bytes | 5.12 MiB |
+| Single-worker first ingest | 2,941.3 ms, 174.1 MiB/s | 2,892.8 ms, 177.0 MiB/s | +1.7% throughput |
+| Eight-worker first ingest | 1,961.2 ms, 261.1 MiB/s | 1,415.2 ms, 361.8 MiB/s | +38.6% throughput |
+| Worker scaling | 1.500× | 2.044× | +36.3% |
+| Duplicate publication | 2,026.7 ms, 252.6 MiB/s | 2,076.8 ms, 246.5 MiB/s | -2.4% throughput |
+| Four-principal shared publication | 390.5 MiB/s | 390.6 MiB/s | unchanged |
 
-Parallel construction improves first-ingest throughput 1.311 times. The
-unchanged run reuses only an exact trusted source token previously attached to
-a successful byte-observed build, after confirming every object in the cached
-file closure still exists. Untrusted metadata, a changed token, an incomplete
-closure, cache refusal, and failed construction all fall back to source reads.
-The cache is bounded, process-local, absent from roots and exports, and records
-observation type without exposing dedup admission results.
+The engine now performs an authoritative dedup probe before expensive physical
+preparation. Missing objects receive their canonical frame checksum and direct
+Blob identity outside the mutation lock; a second locked probe closes races
+before the prepared frames are appended. All-dedup batches return after the
+first probe. A bounded vectored writer appends the unchanged header/payload
+pairs without allocating and copying one additional corpus-sized buffer. A
+wire-equivalence regression compares this path byte-for-byte with the frozen
+frame encoder, and a catalogue-activation race test requires every newly staged
+object to retain its direct-representation witness.
 
-This closes the delta-proportional source-work mechanism, not #1392's complete
-performance target. Extrapolating 224.8 MiB/s would still put one TiB at about
-78 minutes. First ingest remains limited by serialized authoritative
-object/representation admission behind the workers. Native durable batch
-markers, stable-handle mutation checks, explicit barrier policy, governed
-scheduler leases, and larger-than-RAM/cold-corpus evidence remain separate
-work before the issue can close.
+The prior `eca9c20a` record established the source-work invariant: exact trusted
+tokens may skip source reads only after their complete immutable closure is
+confirmed, while a changed token reads only that source partition. Untrusted
+metadata, incomplete closure, cache refusal, and failed construction still
+fall back to source reads. The cache remains bounded, process-local, absent from
+roots and exports, and does not expose dedup outcomes.
+
+This closes the serialized admission increment, not #1392's full performance
+target. Extrapolating 361.8 MiB/s puts one TiB at about 48 minutes. Canonical
+construction and authoritative physical-map publication remain visible costs;
+native durable batch markers, stable-handle mutation checks, explicit barrier
+policy, governed scheduler leases, and larger-than-RAM/cold-corpus evidence
+remain separate work.
 
 The #1388 port was remeasured against its exact current-main parent
 `0ba1181c`. Each cell is the median of three release-mode runs with 64 strict
