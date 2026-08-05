@@ -293,14 +293,13 @@ where
         let mut pending_roots = BTreeMap::new();
         let mut pending_frames = BTreeMap::<ObjectId, Arc<[u8]>>::new();
         for request in batch {
-            let preparation_started = Instant::now();
-            match self.prepare(&mut inner, request.transaction, &pending_roots) {
+            match self.prepare(
+                &mut inner,
+                request.transaction,
+                &pending_roots,
+                request.observer.as_deref(),
+            ) {
                 Ok(mut prepared) => {
-                    record_one(
-                        request.observer.as_deref(),
-                        ProjectionPhase::ClosureValidation,
-                        preparation_started,
-                    );
                     if let Err(error) = reserve_group_frames(&mut prepared, &mut pending_frames) {
                         completions.push((request.receipt, Err(error)));
                         continue;
@@ -312,14 +311,7 @@ where
                         observer: request.observer,
                     });
                 },
-                Err(error) => {
-                    record_one(
-                        request.observer.as_deref(),
-                        ProjectionPhase::ClosureValidation,
-                        preparation_started,
-                    );
-                    completions.push((request.receipt, Err(error)));
-                },
+                Err(error) => completions.push((request.receipt, Err(error))),
             }
         }
 
@@ -562,12 +554,6 @@ where
             )?);
         }
         representations.append_direct_update(&direct)
-    }
-}
-
-fn record_one(observer: Option<&dyn ProjectionObserver>, phase: ProjectionPhase, started: Instant) {
-    if let Some(observer) = observer {
-        observer.record(phase, started.elapsed());
     }
 }
 

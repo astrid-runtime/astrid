@@ -175,6 +175,7 @@ pub(super) struct EngineSink<'a, P, E, A = DirectAdmission> {
     admission: A,
     pub(super) objects_inserted: u64,
     pending_bytes: usize,
+    peak_pending_bytes: usize,
     pending: BTreeMap<ObjectId, ObjectRecord>,
     marker: PhantomData<fn() -> P>,
 }
@@ -192,6 +193,7 @@ impl<'a, P, E, A> EngineSink<'a, P, E, A> {
             admission,
             objects_inserted: 0,
             pending_bytes: 0,
+            peak_pending_bytes: 0,
             pending: BTreeMap::new(),
             marker: PhantomData,
         }
@@ -199,6 +201,10 @@ impl<'a, P, E, A> EngineSink<'a, P, E, A> {
 
     pub(super) const fn admission(&self) -> &A {
         &self.admission
+    }
+
+    pub(super) const fn peak_pending_bytes(&self) -> usize {
+        self.peak_pending_bytes
     }
 }
 
@@ -246,6 +252,7 @@ where
         self.pending_bytes = self
             .pending_bytes
             .saturating_add(staged_record_size(&record));
+        self.peak_pending_bytes = self.peak_pending_bytes.max(self.pending_bytes);
         self.pending.insert(id, record);
         if self.pending_bytes >= STAGING_BATCH_TARGET_BYTES {
             self.finish()?;

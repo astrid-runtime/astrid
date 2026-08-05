@@ -38,6 +38,7 @@ pub(super) struct WorkerBuild {
     objects_inserted: u64,
     source_build_elapsed: Duration,
     admission_elapsed: Duration,
+    peak_pending_bytes: usize,
 }
 
 struct BulkExecution {
@@ -198,19 +199,7 @@ where
         let (mut completed, pending) = self.partition_cached_ingests(principal, ordered, cache)?;
         let pipeline_started = Instant::now();
         if pending.is_empty() {
-            let publication_started = Instant::now();
-            let outcome = self.publish_batch(principal, &completed, 0, phase_observer.as_ref())?;
-            return Ok(BulkExecution {
-                outcome,
-                diagnostics: BulkIngestDiagnostics::new(
-                    pipeline_started.elapsed(),
-                    Duration::ZERO,
-                    Duration::ZERO,
-                    publication_started.elapsed(),
-                    0,
-                    phase_durations(phase_observer.as_deref()),
-                ),
-            });
+            return self.publish_cached_batch(principal, &completed, phase_observer.as_ref());
         }
 
         let worker_count = policy.worker_threads().get().min(pending.len());
@@ -223,7 +212,8 @@ where
                     None => build_worker(self, &queue, &cancelled)?,
                 };
                 let admission_elapsed = build.admission_elapsed;
-                (vec![build], 0_u64, 0_usize, admission_elapsed)
+                let peak_pending_bytes = build.peak_pending_bytes;
+                (vec![build], 0_u64, peak_pending_bytes, admission_elapsed)
             } else {
                 #[cfg(target_family = "wasm")]
                 return Err(PrincipalContentError::Projection(
@@ -295,6 +285,27 @@ where
                 publication_started.elapsed(),
                 peak_pending_bytes,
                 phase_durations(phase_observer.as_deref()),
+            ),
+        })
+    }
+
+    fn publish_cached_batch(
+        &self,
+        principal: &P,
+        completed: &BTreeMap<ContentName, PreparedContent>,
+        observer: Option<&Arc<BulkPhaseObserver>>,
+    ) -> Result<BulkExecution, PrincipalContentError> {
+        let publication_started = Instant::now();
+        let outcome = self.publish_batch(principal, completed, 0, observer)?;
+        Ok(BulkExecution {
+            outcome,
+            diagnostics: BulkIngestDiagnostics::new(
+                Duration::ZERO,
+                Duration::ZERO,
+                Duration::ZERO,
+                publication_started.elapsed(),
+                0,
+                phase_durations(observer.map(Arc::as_ref)),
             ),
         })
     }
@@ -557,6 +568,7 @@ where
         objects_inserted: sink.objects_inserted,
         source_build_elapsed,
         admission_elapsed: Duration::ZERO,
+        peak_pending_bytes: sink.peak_pending_bytes(),
     })
 }
 
@@ -617,6 +629,7 @@ where
         objects_inserted: sink.objects_inserted,
         source_build_elapsed,
         admission_elapsed,
+        peak_pending_bytes: sink.peak_pending_bytes(),
     })
 }
 

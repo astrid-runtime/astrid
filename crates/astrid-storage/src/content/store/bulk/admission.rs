@@ -159,6 +159,7 @@ where
             objects_inserted: 0,
             source_build_elapsed,
             admission_elapsed: Duration::ZERO,
+            peak_pending_bytes: sink.peak_pending_bytes(),
         });
     }
     sink.finish()?;
@@ -167,6 +168,7 @@ where
         objects_inserted: 0,
         source_build_elapsed,
         admission_elapsed: Duration::ZERO,
+        peak_pending_bytes: sink.peak_pending_bytes(),
     })
 }
 

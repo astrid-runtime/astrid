@@ -91,13 +91,18 @@ pub struct PreparedProjectionBatch {
     retained_bytes: usize,
 }
 
+struct InMemoryPreparedBatch {
+    authority: Arc<()>,
+    records: Vec<ObjectRecord>,
+}
+
 impl PreparedProjectionBatch {
-    fn portable(records: Vec<ObjectRecord>) -> Self {
+    fn in_memory(authority: Arc<()>, records: Vec<ObjectRecord>) -> Self {
         let retained_bytes = records.iter().fold(0_usize, |total, record| {
             total.saturating_add(record.canonical_bytes().len())
         });
         Self {
-            payload: Box::new(records),
+            payload: Box::new(InMemoryPreparedBatch { authority, records }),
             retained_bytes,
         }
     }
@@ -119,6 +124,17 @@ impl PreparedProjectionBatch {
                     "prepared object batch does not belong to this engine".to_owned(),
                 )
             })
+    }
+
+    fn into_in_memory(
+        self,
+        authority: &Arc<()>,
+    ) -> Result<Vec<ObjectRecord>, PrincipalProjectionError> {
+        let prepared = self.into_payload::<InMemoryPreparedBatch>()?;
+        if !Arc::ptr_eq(authority, &prepared.authority) {
+            return Err(foreign_preparation());
+        }
+        Ok(prepared.records)
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -274,18 +290,15 @@ pub trait PrincipalProjectionEngine<P>: Send + Sync {
 
     /// Prepare immutable objects for later authoritative admission.
     ///
-    /// The default retains canonical records for engines without a distinct
-    /// preparation boundary.
-    ///
     /// # Errors
     ///
-    /// Returns a projection error when preparation cannot encode or validate
-    /// an object.
+    /// Returns a projection error when this engine does not implement an
+    /// engine-bound preparation path or cannot validate an object.
     fn prepare_objects(
         &self,
-        records: Vec<ObjectRecord>,
+        _records: Vec<ObjectRecord>,
     ) -> Result<PreparedProjectionBatch, PrincipalProjectionError> {
-        Ok(PreparedProjectionBatch::portable(records))
+        Err(unsupported_preparation())
     }
 
     /// Prepare immutable objects while reporting privileged phase measurements.
@@ -312,9 +325,9 @@ pub trait PrincipalProjectionEngine<P>: Send + Sync {
     /// collision, encoding failure, or append failure.
     fn stage_prepared_objects(
         &self,
-        prepared: PreparedProjectionBatch,
+        _prepared: PreparedProjectionBatch,
     ) -> Result<Vec<(ObjectId, InsertOutcome)>, PrincipalProjectionError> {
-        self.stage_objects(prepared.into_payload::<Vec<ObjectRecord>>()?)
+        Err(unsupported_preparation())
     }
 
     /// Admit a prepared batch while reporting privileged phase measurements.
@@ -531,6 +544,23 @@ where
             .collect()
     }
 
+    fn prepare_objects(
+        &self,
+        records: Vec<ObjectRecord>,
+    ) -> Result<PreparedProjectionBatch, PrincipalProjectionError> {
+        Ok(PreparedProjectionBatch::in_memory(
+            Arc::clone(&self.preparation_authority),
+            records,
+        ))
+    }
+
+    fn stage_prepared_objects(
+        &self,
+        prepared: PreparedProjectionBatch,
+    ) -> Result<Vec<(ObjectId, InsertOutcome)>, PrincipalProjectionError> {
+        self.stage_objects(prepared.into_in_memory(&self.preparation_authority)?)
+    }
+
     fn current_root(&self, principal: &P) -> Result<Option<RootState>, PrincipalProjectionError> {
         Ok(self.root(principal))
     }
@@ -711,4 +741,16 @@ pub(crate) fn map_durable(error: DurableError) -> PrincipalProjectionError {
         DurableError::Model(model) => PrincipalProjectionError::Model(model),
         other => PrincipalProjectionError::Engine(other.to_string()),
     }
+}
+
+fn foreign_preparation() -> PrincipalProjectionError {
+    PrincipalProjectionError::Engine(
+        "prepared object batch does not belong to this engine".to_owned(),
+    )
+}
+
+fn unsupported_preparation() -> PrincipalProjectionError {
+    PrincipalProjectionError::Engine(
+        "projection engine does not support prepared object admission".to_owned(),
+    )
 }

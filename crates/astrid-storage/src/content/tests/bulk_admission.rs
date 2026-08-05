@@ -1,4 +1,5 @@
 use super::*;
+use astrid_storage_engine::PreparedProjectionBatch;
 
 struct RejectFirstBatchEngine {
     inner: Engine,
@@ -39,6 +40,25 @@ impl PrincipalProjectionEngine<String> for RejectFirstBatchEngine {
             .into_iter()
             .map(|record| self.inner.put_object(record).map_err(Into::into))
             .collect()
+    }
+
+    fn prepare_objects(
+        &self,
+        records: Vec<ObjectRecord>,
+    ) -> Result<PreparedProjectionBatch, PrincipalProjectionError> {
+        <Engine as PrincipalProjectionEngine<String>>::prepare_objects(&self.inner, records)
+    }
+
+    fn stage_prepared_objects(
+        &self,
+        prepared: PreparedProjectionBatch,
+    ) -> Result<Vec<(ObjectId, InsertOutcome)>, PrincipalProjectionError> {
+        if self.reject.swap(false, Ordering::SeqCst) {
+            return Err(PrincipalProjectionError::Engine(
+                "injected bulk appender failure".to_owned(),
+            ));
+        }
+        <Engine as PrincipalProjectionEngine<String>>::stage_prepared_objects(&self.inner, prepared)
     }
 
     fn current_root(
@@ -105,6 +125,62 @@ fn parallel_admission_reports_a_source_independent_pending_bound() {
                 .saturating_add(2)
                 .saturating_mul(per_worker_bound)
     );
+}
+
+#[test]
+fn single_worker_diagnostics_measure_the_staging_batch_peak() {
+    let store = PrincipalContentStore::from_engine(Arc::new(Engine::new(TestIdentity)));
+    let (_, diagnostics) = store
+        .put_streaming_batch_with_operator_diagnostics(
+            &"alice".to_owned(),
+            [ContentIngest::new(
+                ContentName::new("single").unwrap(),
+                io::Cursor::new(bytes(5 * 1024 * 1024)),
+            )],
+            BulkIngestPolicy::new(NonZeroUsize::MIN),
+            None,
+        )
+        .unwrap();
+
+    assert!(diagnostics.peak_pending_admission_bytes() > 0);
+}
+
+#[test]
+fn cache_only_diagnostics_report_no_source_admission_pipeline() {
+    let store = PrincipalContentStore::from_engine(Arc::new(Engine::new(TestIdentity)));
+    let cache = ContentChangeCache::new(NonZeroU64::new(1024 * 1024).unwrap());
+    let value = bytes(2 * 1024 * 1024);
+    let observation = SourceObservation::trusted(source_fingerprint(
+        "/workspace/cached-only.bin",
+        value.len() as u64,
+        42,
+    ));
+    let name = ContentName::new("cached-only.bin").unwrap();
+    store
+        .put_streaming_batch_with_operator_diagnostics(
+            &"alice".to_owned(),
+            [
+                ContentIngest::new(name.clone(), io::Cursor::new(value.clone()))
+                    .with_observation(observation.clone()),
+            ],
+            BulkIngestPolicy::new(NonZeroUsize::MIN),
+            Some(&cache),
+        )
+        .unwrap();
+
+    let (_, diagnostics) = store
+        .put_streaming_batch_with_operator_diagnostics(
+            &"alice".to_owned(),
+            [ContentIngest::new(name, io::Cursor::new(value)).with_observation(observation)],
+            BulkIngestPolicy::new(NonZeroUsize::MIN),
+            Some(&cache),
+        )
+        .unwrap();
+
+    assert!(diagnostics.pipeline_elapsed().is_zero());
+    assert!(diagnostics.source_build_elapsed().is_zero());
+    assert!(diagnostics.admission_elapsed().is_zero());
+    assert_eq!(diagnostics.peak_pending_admission_bytes(), 0);
 }
 
 #[test]

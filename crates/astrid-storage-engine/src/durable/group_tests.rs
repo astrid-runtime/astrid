@@ -75,10 +75,11 @@ fn prepared_projection_batches_are_bound_to_the_preparing_engine() {
         .map(|(_, record)| record.clone())
         .collect();
 
-    let prepared = first.prepare_objects_for_projection(records, None).unwrap();
-    let error = second
-        .stage_prepared_for_projection(prepared, None)
-        .unwrap_err();
+    let prepared =
+        crate::PrincipalProjectionEngine::<String>::prepare_objects(&first, records).unwrap();
+    let error =
+        crate::PrincipalProjectionEngine::<String>::stage_prepared_objects(&second, prepared)
+            .unwrap_err();
 
     assert!(
         error
