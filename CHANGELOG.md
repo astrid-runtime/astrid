@@ -20,6 +20,17 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Added
 
+- **Principal content can be constructed in bounded parallel batches and
+  republished from trusted source-change evidence without rereading unchanged
+  inputs.** Canonical tree construction now retains only one partial fanout per
+  active level, while multi-name publication uses one principal-root CAS and
+  retries conflicts without rereading sources. The disposable change cache is
+  bound to source scope, complete change token, chunking profile, and active
+  engine; untrusted metadata and every mismatch fall back to byte observation.
+  On the clean 512 MiB benchmark, eight workers reached 241.8 MiB/s versus
+  171.7 MiB/s serial, unchanged re-ingest read zero source bytes in 1.050 ms,
+  and a one-file delta reread exactly its 5.12 MiB partition in 42.2 ms. Closes
+  #1459; the remaining first-ingest and native recovery work stays in #1392.
 - **New physical catalogues use a denser canonical nibble-radix map while
   legacy roots remain byte-exactly recoverable.** The construction preserves
   insertion-order-independent roots, bounded path-copy updates, logical
