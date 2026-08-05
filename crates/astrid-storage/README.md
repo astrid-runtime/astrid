@@ -60,8 +60,12 @@ building; only the transition dependency is optional.
 
 ```toml
 [dependencies]
-astrid-storage = { workspace = true, features = ["full"] }
+astrid-storage = { workspace = true }
 ```
+
+Enable `legacy-surrealkv` only in a binary responsible for importing an
+existing SurrealKV store. New deployments and ordinary consumers do not need
+the transition dependency.
 
 ```rust
 use std::sync::Arc;

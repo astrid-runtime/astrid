@@ -65,6 +65,7 @@ pub(super) struct MetadataFrame {
 }
 
 impl MetadataFrame {
+    #[cfg(test)]
     pub(super) fn profile<I: PhysicalIdentity>(
         identity: &I,
         value: &RepresentationProfile,

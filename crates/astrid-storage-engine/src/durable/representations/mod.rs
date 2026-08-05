@@ -43,6 +43,43 @@ const CURRENT_TEMP_PATH: &str = "CURRENT.tmp";
 const FIRST_JOURNAL_GENERATION: u64 = 1;
 const LOCAL_STORAGE_NODE: StorageNodeId = StorageNodeId::new(0);
 
+#[cfg(test)]
+pub(super) fn profile_frame_count(
+    path: &Path,
+    limits: RecoveryLimits,
+) -> Result<usize, DurableError> {
+    let mut metadata = open_rw(path)?;
+    let mut count = 0_usize;
+    super::scan_frames(
+        &mut metadata,
+        format::METADATA_FILE,
+        METADATA_MAGIC,
+        limits,
+        |_offset, payload| {
+            let frame = MetadataFrame::decode(payload)?;
+            count = count
+                .checked_add(usize::from(frame.kind == MetadataKind::Profile))
+                .ok_or(DurableError::EncodingOverflow)?;
+            Ok(())
+        },
+    )?;
+    Ok(count)
+}
+
+#[cfg(test)]
+pub(super) fn append_legacy_profile_frame(
+    path: &Path,
+    frozen_specification: ObjectId,
+) -> Result<(), DurableError> {
+    let (profile, _) = activation::direct_profile(frozen_specification)?;
+    let frame = MetadataFrame::profile(&Blake3PhysicalIdentity, &profile)?;
+    let mut metadata = open_rw(path)?;
+    append_frame(&mut metadata, METADATA_MAGIC, &frame.encode()?)?;
+    metadata
+        .sync_data()
+        .map_err(|source| io_error("flush legacy profile frame", source))
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct DirectArenaObject {
     pub(super) object: ObjectId,

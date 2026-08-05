@@ -181,15 +181,6 @@ impl PhysicalMapNode {
         }
     }
 
-    /// Borrow this leaf's key and value, or return `None` for a branch.
-    #[must_use]
-    pub fn leaf_entry(&self) -> Option<(PhysicalMapKey, &[u8])> {
-        match self {
-            Self::Leaf { key, value, .. } => Some((*key, value)),
-            Self::Branch { .. } => None,
-        }
-    }
-
     /// Encode the byte-exact format-one node grammar.
     ///
     /// # Errors
@@ -290,34 +281,6 @@ pub struct CanonicalPhysicalMap {
     root: Option<PhysicalMapNodeId>,
     nodes: BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
     entry_count: u64,
-}
-
-/// Result of one path-copy map insertion.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PhysicalMapUpdate {
-    inserted: bool,
-    root: PhysicalMapNodeId,
-    new_nodes: Vec<(PhysicalMapNodeId, PhysicalMapNode)>,
-}
-
-impl PhysicalMapUpdate {
-    /// Return whether the key was newly inserted.
-    #[must_use]
-    pub const fn inserted(&self) -> bool {
-        self.inserted
-    }
-
-    /// Return the resulting authenticated root.
-    #[must_use]
-    pub const fn root(&self) -> PhysicalMapNodeId {
-        self.root
-    }
-
-    /// Borrow exactly the newly emitted path-copy nodes.
-    #[must_use]
-    pub fn new_nodes(&self) -> &[(PhysicalMapNodeId, PhysicalMapNode)] {
-        &self.new_nodes
-    }
 }
 
 impl CanonicalPhysicalMap {
@@ -439,27 +402,10 @@ impl CanonicalPhysicalMap {
         key: PhysicalMapKey,
         value: Vec<u8>,
     ) -> Result<bool, PhysicalModelError> {
-        self.insert_with_delta(identity, key, value)
-            .map(|update| update.inserted)
-    }
-
-    /// Insert one entry and return exactly the newly emitted path-copy nodes.
-    ///
-    /// # Errors
-    ///
-    /// Returns the same errors as [`Self::insert`] without changing the root
-    /// when validation fails.
-    pub fn insert_with_delta<I: PhysicalIdentity>(
-        &mut self,
-        identity: &I,
-        key: PhysicalMapKey,
-        value: Vec<u8>,
-    ) -> Result<PhysicalMapUpdate, PhysicalModelError> {
         let mut insertion = MapInsertion {
             identity,
             domain: self.domain,
             nodes: &mut self.nodes,
-            new_nodes: Vec::new(),
         };
         let (replacement, inserted) = match self.root {
             Some(root) => insertion.insert_at(root, key, value)?,
@@ -472,11 +418,7 @@ impl CanonicalPhysicalMap {
                 .checked_add(1)
                 .ok_or(PhysicalModelError::LengthOverflow)?;
         }
-        Ok(PhysicalMapUpdate {
-            inserted,
-            root: replacement,
-            new_nodes: insertion.new_nodes,
-        })
+        Ok(inserted)
     }
 
     /// Atomically rebuild the active canonical trie with additional entries.
@@ -641,7 +583,6 @@ struct MapInsertion<'a, I> {
     identity: &'a I,
     domain: PhysicalMapDomain,
     nodes: &'a mut BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
-    new_nodes: Vec<(PhysicalMapNodeId, PhysicalMapNode)>,
 }
 
 impl<I: PhysicalIdentity> MapInsertion<'_, I> {
@@ -808,10 +749,7 @@ impl<I: PhysicalIdentity> MapInsertion<'_, I> {
         node: PhysicalMapNode,
     ) -> Result<PhysicalMapNodeId, PhysicalModelError> {
         let id = node.identify(self.identity)?;
-        if !self.nodes.contains_key(&id) {
-            self.new_nodes.push((id, node.clone()));
-            self.nodes.insert(id, node);
-        }
+        self.nodes.entry(id).or_insert(node);
         Ok(id)
     }
 }

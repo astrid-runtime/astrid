@@ -352,17 +352,9 @@ fn path_copy_insertion_matches_a_clean_rebuild_and_keeps_old_roots() {
     )
     .unwrap();
     let old_root = map.root().unwrap();
-    let update = map
-        .insert_with_delta(&Blake3PhysicalIdentity, key(2), vec![20])
-        .unwrap();
-    assert!(update.inserted());
-    assert_eq!(update.root(), map.root().unwrap());
-    assert!(!update.new_nodes().is_empty());
     assert!(
-        update
-            .new_nodes()
-            .iter()
-            .all(|(id, node)| node.identify(&Blake3PhysicalIdentity).unwrap() == *id)
+        map.insert(&Blake3PhysicalIdentity, key(2), vec![20])
+            .unwrap()
     );
     assert!(
         !map.insert(&Blake3PhysicalIdentity, key(2), vec![20])
@@ -658,7 +650,7 @@ fn map_validation_fails_closed_on_missing_children() {
     let mut nodes: BTreeMap<_, _> = map.nodes().clone();
     let leaf = nodes
         .iter()
-        .find_map(|(id, node)| node.leaf_entry().map(|_| *id))
+        .find_map(|(id, node)| matches!(node, PhysicalMapNode::Leaf { .. }).then_some(*id))
         .unwrap();
     nodes.remove(&leaf);
     assert!(matches!(

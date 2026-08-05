@@ -636,12 +636,11 @@ pub use gc_evidence::{
 };
 pub use physical::{
     CanonicalChunkingProfile, CanonicalPhysicalMap, Coverage, Dependency, PhysicalIdentity,
-    PhysicalMapDomain, PhysicalMapKey, PhysicalMapNode, PhysicalMapNodeId, PhysicalMapUpdate,
-    PhysicalModelError, PlacementEntry, PlacementSet, PlacementSetId, ProfileDependency,
-    ProfileKind, Recipe, ReconstructionBounds, Replica, ReplicaLocator,
-    RepresentationCatalogueRoot, RepresentationCatalogueRootId, RepresentationProfile,
-    RepresentationProfileId, RepresentationRecord, RepresentationRecordId, RepresentationState,
-    RepresentationStateId,
+    PhysicalMapDomain, PhysicalMapKey, PhysicalMapNode, PhysicalMapNodeId, PhysicalModelError,
+    PlacementEntry, PlacementSet, PlacementSetId, ProfileDependency, ProfileKind, Recipe,
+    ReconstructionBounds, Replica, ReplicaLocator, RepresentationCatalogueRoot,
+    RepresentationCatalogueRootId, RepresentationProfile, RepresentationProfileId,
+    RepresentationRecord, RepresentationRecordId, RepresentationState, RepresentationStateId,
 };
 pub use proof::{
     OwnedSubtreePatch, ReferencePath, StateSelector, StateViewProof, TransitionWitness,

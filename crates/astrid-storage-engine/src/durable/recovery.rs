@@ -37,9 +37,10 @@ where
 {
     recover_interrupted_compaction(path, principal_codec, identity, limits)?;
     let representations = super::representations::RepresentationStore::open(path, limits)?;
-    let protected_arena_len = representations
-        .as_ref()
-        .map_or(Ok(0), |store| store.generation_zero_protected_len())?;
+    let protected_arena_len = representations.as_ref().map_or(
+        Ok(0),
+        super::representations::RepresentationStore::generation_zero_protected_len,
+    )?;
     let mut arena = open_rw(&path.join(ARENA_FILE))?;
     let mut roots = open_rw(&path.join(ROOT_FILE))?;
     let mut index_cache = open_rw(&path.join(INDEX_FILE)).ok();

@@ -51,6 +51,46 @@ fn direct_representation_activation_reopens_and_tracks_later_commits() {
     assert!(representations.contains_direct(second_commit));
     assert!(!representations.contains_direct(specification_id));
 }
+
+#[test]
+fn direct_profile_lives_in_the_map_while_legacy_profile_frames_still_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open(directory.path());
+    let specification = ObjectRecord::new(
+        ObjectKind::Evidence,
+        ObjectFormatVersion::V1,
+        b"physical format specification".to_vec(),
+        Vec::new(),
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let (specification_id, _) = engine.persist_standalone_object(&specification).unwrap();
+    let state = engine
+        .ensure_direct_representation_catalogue(specification_id, &[specification_id])
+        .unwrap();
+    engine.close().unwrap();
+    drop(engine);
+
+    let metadata_path = directory
+        .path()
+        .join("representations/generations/0000000000000001/metadata.arena");
+    assert_eq!(
+        super::representations::profile_frame_count(&metadata_path, limits()).unwrap(),
+        0
+    );
+    super::representations::append_legacy_profile_frame(&metadata_path, specification_id)
+        .unwrap();
+
+    let reopened = open(directory.path());
+    assert_eq!(
+        reopened
+            .ensure_direct_representation_catalogue(specification_id, &[specification_id])
+            .unwrap(),
+        state
+    );
+}
+
 #[test]
 fn direct_representation_activation_quarantines_an_unpublished_attempt() {
     let directory = tempfile::tempdir().unwrap();

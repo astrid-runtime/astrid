@@ -27,7 +27,7 @@ pub(super) fn build_initial_state(
 ) -> Result<InitialState, DurableError> {
     let identity = Blake3PhysicalIdentity;
     let (profile, direct_profile) = direct_profile(frozen_specification)?;
-    let mut metadata = vec![MetadataFrame::profile(&identity, &profile)?];
+    let mut metadata = Vec::new();
     let profiles = CanonicalPhysicalMap::build(
         &identity,
         PhysicalMapDomain::Profile,

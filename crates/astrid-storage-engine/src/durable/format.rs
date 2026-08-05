@@ -321,17 +321,13 @@ fn scan_frames_with_protected_prefix(
     protected_len: u64,
     mut accept: impl FnMut(u64, &[u8]) -> Result<(), DurableError>,
 ) -> Result<(), DurableError> {
-    let file_len = file
-        .metadata()
-        .map_err(|source| io_error("read principal-store metadata", source))?
-        .len();
-    if file_len < protected_len {
-        return Err(corrupt(
-            file_name,
-            file_len,
-            "published durable prefix is truncated",
-        ));
-    }
+    let file_len = validated_file_len(file, file_name, protected_len)?;
+    let policy = FrameScanPolicy {
+        magic,
+        limits,
+        protected_len,
+        file_len,
+    };
     let mut offset = 0_u64;
     while offset < file_len {
         let remaining = file_len
@@ -354,32 +350,17 @@ fn scan_frames_with_protected_prefix(
         file.read_exact(&mut header)
             .map_err(|source| io_error("read durable frame header", source))?;
         if header[..8] != magic {
-            let error = corrupt(file_name, offset, "frame magic mismatch");
-            if offset < protected_len {
-                return Err(error);
-            }
-            if valid_frame_follows(file, magic, offset, file_len, limits)? {
-                return Err(error);
-            }
-            truncate_tail(file, offset)?;
+            truncate_unpublished_tail_or_fail(
+                file,
+                policy,
+                offset,
+                false,
+                corrupt(file_name, offset, "frame magic mismatch"),
+            )?;
             break;
         }
-        let version = u16::from_le_bytes([header[8], header[9]]);
-        if version != FRAME_VERSION {
-            return Err(corrupt(file_name, offset, "unsupported frame version"));
-        }
-        if header[10..12] != [0, 0] {
-            return Err(corrupt(
-                file_name,
-                offset,
-                "reserved header bytes are non-zero",
-            ));
-        }
-        let payload_len = u64::from_le_bytes(
-            header[12..20]
-                .try_into()
-                .map_err(|_| DurableError::EncodingOverflow)?,
-        );
+        let decoded = decode_frame_header(file_name, offset, &header)?;
+        let payload_len = decoded.payload_len;
         if payload_len > limits.max_frame_bytes {
             let error = DurableError::FrameTooLarge {
                 file: file_name,
@@ -393,12 +374,13 @@ fn scan_frames_with_protected_prefix(
             let claimed_end = FRAME_HEADER_LEN
                 .checked_add(payload_len)
                 .and_then(|frame_len| offset.checked_add(frame_len));
-            if claimed_end.is_some_and(|end| end <= file_len)
-                || valid_frame_follows(file, magic, offset, file_len, limits)?
-            {
-                return Err(error);
-            }
-            truncate_tail(file, offset)?;
+            truncate_unpublished_tail_or_fail(
+                file,
+                policy,
+                offset,
+                claimed_end.is_some_and(|end| end <= file_len),
+                error,
+            )?;
             break;
         }
         let frame_len = FRAME_HEADER_LEN
@@ -418,27 +400,15 @@ fn scan_frames_with_protected_prefix(
             truncate_tail(file, offset)?;
             break;
         }
-        let payload_usize =
-            usize::try_from(payload_len).map_err(|_| DurableError::EncodingOverflow)?;
-        let mut payload = Vec::new();
-        payload
-            .try_reserve_exact(payload_usize)
-            .map_err(|_| DurableError::EncodingOverflow)?;
-        payload.resize(payload_usize, 0);
-        file.read_exact(&mut payload)
-            .map_err(|source| io_error("read durable frame payload", source))?;
-        let checksum: [u8; 32] = header[CHECKSUM_START..]
-            .try_into()
-            .map_err(|_| DurableError::EncodingOverflow)?;
-        if frame_checksum(magic, payload_len, &payload) != checksum {
-            let error = corrupt(file_name, offset, "frame checksum mismatch");
-            if offset < protected_len {
-                return Err(error);
-            }
-            if valid_frame_follows(file, magic, offset, file_len, limits)? {
-                return Err(error);
-            }
-            truncate_tail(file, offset)?;
+        let payload = read_frame_payload(file, payload_len)?;
+        if frame_checksum(magic, payload_len, &payload) != decoded.checksum {
+            truncate_unpublished_tail_or_fail(
+                file,
+                policy,
+                offset,
+                false,
+                corrupt(file_name, offset, "frame checksum mismatch"),
+            )?;
             break;
         }
         accept(offset, &payload)?;
@@ -447,6 +417,95 @@ fn scan_frames_with_protected_prefix(
     file.seek(SeekFrom::End(0))
         .map_err(|source| io_error("seek durable file tail", source))?;
     Ok(())
+}
+
+fn validated_file_len(
+    file: &File,
+    file_name: &'static str,
+    protected_len: u64,
+) -> Result<u64, DurableError> {
+    let file_len = file
+        .metadata()
+        .map_err(|source| io_error("read principal-store metadata", source))?
+        .len();
+    if file_len < protected_len {
+        return Err(corrupt(
+            file_name,
+            file_len,
+            "published durable prefix is truncated",
+        ));
+    }
+    Ok(file_len)
+}
+
+#[derive(Clone, Copy)]
+struct DecodedFrameHeader {
+    payload_len: u64,
+    checksum: [u8; 32],
+}
+
+#[derive(Clone, Copy)]
+struct FrameScanPolicy {
+    magic: [u8; 8],
+    limits: RecoveryLimits,
+    protected_len: u64,
+    file_len: u64,
+}
+
+fn decode_frame_header(
+    file_name: &'static str,
+    offset: u64,
+    header: &[u8; FRAME_HEADER_LEN_USIZE],
+) -> Result<DecodedFrameHeader, DurableError> {
+    let version = u16::from_le_bytes([header[8], header[9]]);
+    if version != FRAME_VERSION {
+        return Err(corrupt(file_name, offset, "unsupported frame version"));
+    }
+    if header[10..12] != [0, 0] {
+        return Err(corrupt(
+            file_name,
+            offset,
+            "reserved header bytes are non-zero",
+        ));
+    }
+    Ok(DecodedFrameHeader {
+        payload_len: u64::from_le_bytes(
+            header[12..20]
+                .try_into()
+                .map_err(|_| DurableError::EncodingOverflow)?,
+        ),
+        checksum: header[CHECKSUM_START..]
+            .try_into()
+            .map_err(|_| DurableError::EncodingOverflow)?,
+    })
+}
+
+fn read_frame_payload(file: &mut File, payload_len: u64) -> Result<Vec<u8>, DurableError> {
+    let payload_usize = usize::try_from(payload_len).map_err(|_| DurableError::EncodingOverflow)?;
+    let mut payload = Vec::new();
+    payload
+        .try_reserve_exact(payload_usize)
+        .map_err(|_| DurableError::EncodingOverflow)?;
+    payload.resize(payload_usize, 0);
+    file.read_exact(&mut payload)
+        .map_err(|source| io_error("read durable frame payload", source))?;
+    Ok(payload)
+}
+
+fn truncate_unpublished_tail_or_fail(
+    file: &mut File,
+    policy: FrameScanPolicy,
+    offset: u64,
+    known_interior: bool,
+    error: DurableError,
+) -> Result<(), DurableError> {
+    if offset < policy.protected_len
+        || known_interior
+        || valid_frame_follows(file, policy.magic, offset, policy.file_len, policy.limits)?
+    {
+        return Err(error);
+    }
+    truncate_tail(file, offset)
 }
 
 fn valid_frame_follows(
