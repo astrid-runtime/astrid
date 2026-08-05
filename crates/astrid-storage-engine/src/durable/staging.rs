@@ -8,7 +8,7 @@ use astrid_storage_model::{
 
 use super::representations::{PreparedDirectArenaObject, RepresentationStore};
 use super::{
-    ARENA_FILE, ARENA_MAGIC, ArenaLocation, DurableEngine, DurableError, DurableInner,
+    ARENA_FILE, ARENA_MAGIC, ArenaLocation, DurableEngine, DurableError, DurableInner, File,
     PersistentObjectIdentity, PreparedFrame, PrincipalCodec, append_frame, append_prepared_frames,
     encode_object_frame, ensure_payload_limit, live_files_mut, read_indexed_object,
 };
@@ -245,7 +245,7 @@ where
         }
     }
 
-    /// Stage a batch of immutable objects with one coalesced arena write.
+    /// Stage a batch of immutable objects with bounded vectored arena writes.
     ///
     /// Results correspond to input order. Duplicate equal records are
     /// idempotent; all identities, existing-object bytes, encodings, and frame
@@ -260,6 +260,29 @@ where
         &self,
         records: Vec<ObjectRecord>,
     ) -> Result<Vec<(ObjectId, InsertOutcome)>, DurableError> {
+        self.stage_objects_with_appender(records, append_prepared_frames)
+    }
+
+    #[cfg(test)]
+    pub(super) fn stage_objects_with_test_appender<A>(
+        &self,
+        records: Vec<ObjectRecord>,
+        appender: A,
+    ) -> Result<Vec<(ObjectId, InsertOutcome)>, DurableError>
+    where
+        A: FnMut(&mut File, &[PreparedFrame]) -> Result<Vec<ArenaLocation>, DurableError>,
+    {
+        self.stage_objects_with_appender(records, appender)
+    }
+
+    fn stage_objects_with_appender<A>(
+        &self,
+        records: Vec<ObjectRecord>,
+        mut write_batch: A,
+    ) -> Result<Vec<(ObjectId, InsertOutcome)>, DurableError>
+    where
+        A: FnMut(&mut File, &[PreparedFrame]) -> Result<Vec<ArenaLocation>, DurableError>,
+    {
         let mut prepared = PreparedStagingBatch::new(&self.identity, records, self.limits)?;
         loop {
             let mut inner = self.lock_usable()?;
@@ -287,11 +310,11 @@ where
                 continue;
             }
             let append = prepared.finish(&already_present)?;
-            let appended = {
+            let append_result = {
                 let files = live_files_mut(&mut inner.files)?;
-                append_prepared_frames(&mut files.arena, &append.frames)
+                write_batch(&mut files.arena, &append.frames)
             };
-            match appended {
+            match append_result {
                 Ok(locations) => {
                     self.install_appended_batch(
                         &mut inner,

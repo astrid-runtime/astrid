@@ -87,12 +87,21 @@ pub(in crate::durable) fn append_prepared_frames(
     Ok(locations)
 }
 
-fn write_all_vectored(file: &mut File, slices: &mut [IoSlice<'_>]) -> Result<(), DurableError> {
+fn write_all_vectored<W: Write + ?Sized>(
+    writer: &mut W,
+    slices: &mut [IoSlice<'_>],
+) -> Result<(), DurableError> {
     let mut remaining = slices;
     while !remaining.is_empty() {
-        let written = file
-            .write_vectored(remaining)
-            .map_err(|source| io_error("append prepared durable frame batch", source))?;
+        let written = loop {
+            match writer.write_vectored(remaining) {
+                Ok(written) => break written,
+                Err(source) if source.kind() == io::ErrorKind::Interrupted => {},
+                Err(source) => {
+                    return Err(io_error("append prepared durable frame batch", source));
+                },
+            }
+        };
         if written == 0 {
             return Err(io_error(
                 "append prepared durable frame batch",
@@ -130,6 +139,56 @@ mod tests {
 
         assert_eq!(actual_locations, expected_locations);
         assert_eq!(read_all(&mut actual), read_all(&mut expected));
+    }
+
+    #[test]
+    fn vectored_append_retries_interrupted_and_short_writes() {
+        let mut writer = InterruptedShortWriter::default();
+        let first = b"prepared ";
+        let second = b"frame";
+        let mut slices = [IoSlice::new(first), IoSlice::new(second)];
+
+        write_all_vectored(&mut writer, &mut slices).unwrap();
+
+        assert!(writer.interrupted);
+        assert!(writer.successful_writes > 1);
+        assert_eq!(writer.bytes, [first.as_slice(), second.as_slice()].concat());
+    }
+
+    #[derive(Default)]
+    struct InterruptedShortWriter {
+        bytes: Vec<u8>,
+        interrupted: bool,
+        successful_writes: usize,
+    }
+
+    impl Write for InterruptedShortWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.write_vectored(&[IoSlice::new(bytes)])
+        }
+
+        fn write_vectored(&mut self, slices: &[IoSlice<'_>]) -> io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(io::Error::from(io::ErrorKind::Interrupted));
+            }
+            let mut remaining = 3_usize;
+            let before = self.bytes.len();
+            for slice in slices {
+                let take = remaining.min(slice.len());
+                self.bytes.extend_from_slice(&slice[..take]);
+                remaining = remaining.checked_sub(take).unwrap();
+                if remaining == 0 {
+                    break;
+                }
+            }
+            self.successful_writes = self.successful_writes.checked_add(1).unwrap();
+            Ok(self.bytes.len().checked_sub(before).unwrap())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     fn read_all(file: &mut File) -> Vec<u8> {
