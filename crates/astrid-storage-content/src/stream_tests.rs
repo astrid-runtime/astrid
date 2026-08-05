@@ -93,7 +93,6 @@ fn assert_stream_matches_slice(profile: ChunkingProfile, bytes: &[u8], fragment:
     let streamed = build_content_streaming(profile, &mut source, &mut sink).unwrap();
 
     assert_eq!(streamed.descriptor(), expected.descriptor());
-    assert_eq!(streamed.unique_chunks(), expected.unique_chunks());
     assert_eq!(
         sink.records.into_iter().collect::<Vec<_>>(),
         expected.records()
@@ -126,7 +125,6 @@ fn streaming_preserves_the_whole_small_file_rule() {
     let streamed = build_content_streaming(profile, bytes.as_slice(), &mut sink).unwrap();
 
     assert_eq!(streamed.descriptor().chunk_count(), 1);
-    assert_eq!(streamed.unique_chunks(), 1);
 }
 
 fn reference_tree(

@@ -1,6 +1,5 @@
 //! Bounded-source-memory construction of canonical content DAGs.
 
-use std::collections::BTreeSet;
 use std::fmt;
 use std::io::{self, Cursor, Read};
 
@@ -35,7 +34,6 @@ pub trait ContentObjectSink {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StreamedContent {
     verified: VerifiedContent,
-    unique_chunks: u64,
 }
 
 impl StreamedContent {
@@ -49,12 +47,6 @@ impl StreamedContent {
     #[must_use]
     pub const fn verified_content(self) -> VerifiedContent {
         self.verified
-    }
-
-    /// Return the number of distinct chunk identities in the file.
-    #[must_use]
-    pub const fn unique_chunks(self) -> u64 {
-        self.unique_chunks
     }
 }
 
@@ -96,9 +88,12 @@ where
 ///
 /// Source memory is bounded by a constant multiple of the profile maximum:
 /// prefetch, `FastCDC`'s internal buffer, and the current emitted chunk. The
-/// builder retains only chunk identities and aggregate metadata while the sink
-/// stages chunk and tree records. The resulting file descriptor and object
-/// graph are byte-for-byte identical to
+/// builder retains only the open right edge of the content tree and aggregate
+/// metadata while the sink stages chunk and tree records. Exact distinct-chunk
+/// accounting is intentionally delegated to the sink or store: computing it
+/// inside the builder would retain one identity per unique chunk and defeat
+/// the bounded-memory contract. The resulting file descriptor and object graph
+/// are byte-for-byte identical to
 /// [`build_content`](crate::build_content), independent of source read
 /// fragmentation.
 ///
@@ -139,11 +134,10 @@ where
         .map_err(ContentStreamError::Source)?;
 
     let mut tree = StreamingTree::default();
-    let mut unique_chunks = BTreeSet::new();
     let mut logical_bytes = 0_u64;
     if prefix.len() <= maximum {
         if !prefix.is_empty() {
-            let child = stage_chunk(sink, &prefix, &mut unique_chunks, &mut logical_bytes)?;
+            let child = stage_chunk(sink, &prefix, &mut logical_bytes)?;
             tree.push(sink, child)?;
         }
     } else {
@@ -158,7 +152,7 @@ where
         for result in chunker {
             let chunk =
                 result.map_err(|error| ContentStreamError::Source(io::Error::from(error)))?;
-            let child = stage_chunk(sink, &chunk.data, &mut unique_chunks, &mut logical_bytes)?;
+            let child = stage_chunk(sink, &chunk.data, &mut logical_bytes)?;
             tree.push(sink, child)?;
         }
     }
@@ -176,15 +170,12 @@ where
             descriptor,
             content_root.map(|child| child.id),
         )),
-        unique_chunks: u64::try_from(unique_chunks.len())
-            .map_err(content(ContentError::LengthOverflow))?,
     })
 }
 
 fn stage_chunk<S: ContentObjectSink>(
     sink: &mut S,
     bytes: &[u8],
-    unique_chunks: &mut BTreeSet<ObjectId>,
     logical_bytes: &mut u64,
 ) -> Result<Child, ContentStreamError<S::Error>> {
     let record = chunk_record(bytes).map_err(ContentStreamError::Content)?;
@@ -195,7 +186,6 @@ fn stage_chunk<S: ContentObjectSink>(
     *logical_bytes = logical_bytes
         .checked_add(length)
         .ok_or_else(|| ContentStreamError::Content(ContentError::LengthOverflow))?;
-    unique_chunks.insert(id);
     Ok(Child {
         id,
         logical_bytes: length,

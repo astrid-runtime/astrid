@@ -8,9 +8,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use parking_lot::Mutex;
 
 use super::{
-    CatalogSummary, CatalogValidation, CatalogValue, EngineSink, ModelError, PrincipalContentStore,
-    PrincipalProjectionEngine, PrincipalProjectionError, VerifiedContent, build_content_streaming,
-    insert, invalid, lookup, map_stream_error,
+    CatalogSummary, CatalogValidation, CatalogValue, EngineSink, ModelError, ObjectReference,
+    PrincipalContentStore, PrincipalProjectionEngine, PrincipalProjectionError, ReferenceKind,
+    VerifiedContent, build_content_streaming, insert, invalid, lookup, map_stream_error,
 };
 use crate::content::{
     BulkIngestPolicy, ChunkingProfile, ContentBatchEntry, ContentBatchWriteOutcome,
@@ -137,12 +137,7 @@ where
                 .zip(observation.as_ref())
                 .and_then(|(cache, observation)| cache.lookup(observation, profile));
             let cached = match cached {
-                Some(verified)
-                    if self
-                        .engine
-                        .load_object_for(principal, verified.descriptor().file())?
-                        .is_some() =>
-                {
+                Some(verified) if self.cached_closure_available(principal, verified)? => {
                     Some(verified)
                 },
                 Some(_) | None => None,
@@ -219,6 +214,35 @@ where
             }
         }
         self.publish_batch(principal, &completed, objects_inserted)
+    }
+
+    /// Confirm that every immutable object named by a cached file still exists.
+    ///
+    /// Change-cache entries are disposable observations, not liveness pins. A
+    /// compaction or a different engine instance may therefore retain the file
+    /// object while dropping one of its descendants. The builder minted the
+    /// descriptor from a canonical acyclic content DAG, so walking owning edges
+    /// needs only a bounded work list; repeated chunk identities may be probed
+    /// more than once rather than retaining an unbounded visited set.
+    fn cached_closure_available(
+        &self,
+        principal: &P,
+        verified: VerifiedContent,
+    ) -> Result<bool, PrincipalContentError> {
+        let mut pending = vec![verified.descriptor().file()];
+        while let Some(object) = pending.pop() {
+            let Some(record) = self.engine.load_object_for(principal, object)? else {
+                return Ok(false);
+            };
+            pending.extend(
+                record
+                    .references()
+                    .iter()
+                    .filter(|reference| reference.kind() == ReferenceKind::Owns)
+                    .map(ObjectReference::target),
+            );
+        }
+        Ok(true)
     }
 
     fn publish_batch(

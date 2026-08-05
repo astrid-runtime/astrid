@@ -154,6 +154,62 @@ impl PrincipalProjectionEngine<String> for ConflictOnceEngine {
     }
 }
 
+struct MissingObjectEngine {
+    inner: Engine,
+    missing: RwLock<Option<ObjectId>>,
+}
+
+impl MissingObjectEngine {
+    fn new() -> Self {
+        Self {
+            inner: Engine::new(TestIdentity),
+            missing: RwLock::new(None),
+        }
+    }
+
+    fn hide(&self, object: ObjectId) {
+        *self.missing.write() = Some(object);
+    }
+}
+
+impl PrincipalProjectionEngine<String> for MissingObjectEngine {
+    fn identify_object(&self, record: &ObjectRecord) -> ObjectId {
+        self.inner.identify(record)
+    }
+
+    fn stage_object(
+        &self,
+        record: ObjectRecord,
+    ) -> Result<(ObjectId, InsertOutcome), PrincipalProjectionError> {
+        self.inner.put_object(record).map_err(Into::into)
+    }
+
+    fn current_root(
+        &self,
+        principal: &String,
+    ) -> Result<Option<RootState>, PrincipalProjectionError> {
+        Ok(self.inner.root(principal))
+    }
+
+    fn load_object(&self, id: ObjectId) -> Result<Option<ObjectRecord>, PrincipalProjectionError> {
+        if *self.missing.read() == Some(id) {
+            return Ok(None);
+        }
+        Ok(self.inner.object(id))
+    }
+
+    fn commit_root(
+        &self,
+        transaction: RootTransaction<String>,
+    ) -> Result<CommitOutcome, PrincipalProjectionError> {
+        self.inner.commit(transaction).map_err(Into::into)
+    }
+
+    fn flush_projection(&self) -> Result<(), PrincipalProjectionError> {
+        Ok(())
+    }
+}
+
 struct CountingEngine {
     inner: Engine,
     object_loads: AtomicUsize,
@@ -1023,6 +1079,64 @@ fn change_cache_entry_missing_from_this_engine_falls_back_to_source_bytes() {
         .unwrap();
 
     assert_eq!(bytes_read.load(Ordering::SeqCst), value.len());
+}
+
+#[test]
+fn change_cache_with_a_missing_descendant_falls_back_to_source_bytes() {
+    let engine = Arc::new(MissingObjectEngine::new());
+    let store = PrincipalContentStore::from_engine(Arc::clone(&engine));
+    let cache = ContentChangeCache::new(NonZeroU64::new(1024 * 1024).unwrap());
+    let value = bytes(2 * 1024 * 1024);
+    let observation = SourceObservation::trusted(source_fingerprint(
+        "/workspace/incomplete.bin",
+        value.len() as u64,
+        91,
+    ));
+    let name = ContentName::new("incomplete.bin").unwrap();
+    let first = store
+        .put_streaming_batch_with_change_cache(
+            &"alice".to_owned(),
+            [ContentIngest::new(name.clone(), value.as_slice())
+                .with_observation(observation.clone())],
+            BulkIngestPolicy::new(NonZeroUsize::MIN),
+            &cache,
+        )
+        .unwrap();
+    let file = engine
+        .inner
+        .object(first.entries()[0].descriptor().file())
+        .unwrap();
+    let descendant = file
+        .references()
+        .iter()
+        .find(|reference| reference.kind() == ReferenceKind::Owns)
+        .expect("a nonempty file owns its content root")
+        .target();
+    engine.hide(descendant);
+
+    let bytes_read = Arc::new(AtomicUsize::new(0));
+    let outcome = store
+        .put_streaming_batch_with_change_cache(
+            &"alice".to_owned(),
+            [ContentIngest::new(
+                name,
+                CountingReader {
+                    bytes: value.clone(),
+                    offset: 0,
+                    bytes_read: Arc::clone(&bytes_read),
+                },
+            )
+            .with_observation(observation)],
+            BulkIngestPolicy::new(NonZeroUsize::MIN),
+            &cache,
+        )
+        .unwrap();
+
+    assert_eq!(bytes_read.load(Ordering::SeqCst), value.len());
+    assert_eq!(
+        outcome.entries()[0].observation(),
+        ContentObservation::BytesObserved
+    );
 }
 
 #[test]
