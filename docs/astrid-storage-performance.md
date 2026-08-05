@@ -477,9 +477,37 @@ corpus-wide convergence.
 
 The remaining costs are explicit rather than hidden. Unique admission still
 performs canonical map construction and metadata writes, and reopen validates
-the independently durable physical graph. A denser authenticated-map encoding
-and governed parallel physical hashing remain measured follow-ups; neither
-requires trading away warm reads or the two-flush KV durability path.
+the independently durable physical graph. Governed parallel physical hashing
+remains a measured follow-up; it does not require trading away warm reads or
+the two-flush KV durability path.
+
+### Dense canonical physical maps
+
+Issue #1455 replaced new binary Patricia roots with a canonical compressed
+nibble-radix construction while retaining byte-exact recovery of every legacy
+root. The identity context distinguishes the constructions; logical ObjectIds
+and principal roots do not change. Clean commit `ce756e1e` used the identical
+512 MiB configuration and produced
+`astrid-storage-dense-radix-ce756e1e.json`.
+
+| Operation | Binary `603d260b` | Dense `ce756e1e` | Change |
+|---|---:|---:|---:|
+| Representation metadata/new object | 1,123.9 B | 903.0 B | 19.7% less |
+| Duplicate authoritative append | 24,426 B | 18,032 B | 26.2% less |
+| Unique publication | 179.1 MiB/s | 179.5 MiB/s | flat |
+| Warm verified read | 1,798.5 MiB/s | 1,778.5 MiB/s | flat within run variance |
+| Four-principal publication | 386.3 MiB/s | 380.9 MiB/s | flat within run variance |
+| Populated reopen | 1,368.0 ms | 1,276.3 ms | 6.7% faster |
+| Direct-catalogue activation | 2,328.0 ms | 2,243.4 ms | 3.6% faster |
+
+The reproducible `physical_map_sweep` example also exercises sparse, full,
+adversarial-prefix, and incremental populations. Dense authoritative bytes
+fell 16.6%, 20.5%, 31.6%, and 9.9% respectively. For 65,536 entries the dense
+builder emitted 29,353,695 bytes instead of 36,909,972 and completed in 97.2
+ms instead of 153.9 ms. The adversarial-prefix case emitted 1,660,995 bytes
+instead of 2,428,656. A 6,748-entry point update wrote five nodes instead of
+fourteen. These are representation savings only; they neither estimate real-
+corpus convergence nor alter the acknowledgement boundary.
 
 ## Optimization experiments
 
