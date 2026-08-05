@@ -11,7 +11,7 @@ Selected raw outputs are preserved in
 Status: convergence and native-path baselines recorded; mounted-provider
 measurements pending
 
-Last reviewed: 2026-08-03
+Last reviewed: 2026-08-05
 
 Tracking:
 [#1398](https://github.com/astrid-runtime/astrid/issues/1398),
@@ -146,6 +146,8 @@ cargo +1.95 bench -p astrid-storage --bench storage_io -- \
   --small-files 64 \
   --small-file-bytes 4096 \
   --concurrent-principals 4 \
+  --bulk-workers 8 \
+  --bulk-files 100 \
   --object-cache-bytes 1073741824 \
   --output /tmp/astrid-storage-io.json
 ```
@@ -167,6 +169,12 @@ and verification cache. It is disabled when omitted. The example's 1 GiB is
 an explicit experiment budget, not a daemon default or a recommendation for
 production policy; the runtime must obtain its cache budget from the operator's
 resource authority.
+
+`--bulk-workers` is the explicit worker grant used by the bulk-ingest
+workload; library defaults remain serial because a storage crate cannot infer
+how much host CPU belongs to a principal. `--bulk-files` divides the corpus
+into independently fingerprinted sources. The unchanged case must observe no
+source bytes, while the one-file delta must observe exactly one partition.
 
 `--samples` applies to unique publication, duplicate publication, engine open
 and reopen, Astrid reads, native writes, seals, and the concurrent workloads.
@@ -563,6 +571,36 @@ cold device read is faster than the substrate.
 | One-pass pipeline (`4193217f`) | 275.0 MiB/s | 353.1 MiB/s | 578.3 MiB/s |
 | Governed record reuse (`97df6492`) | 427.4 MiB/s | 646.5 MiB/s | 1,065.4 MiB/s |
 
+### Bulk ingest and change detection
+
+Clean commit `a4bc7979` measured the bounded batch path over the same 512 MiB
+deterministic incompressible corpus, split into 100 independently fingerprinted
+sources. Three release-mode samples used eight explicitly granted workers and
+a one-GiB governed object cache. The source-byte counters are assertions in
+the harness, not estimates.
+
+| Workload | Median | Throughput | Source bytes observed |
+|---|---:|---:|---:|
+| Single-worker first ingest | 3,063.5 ms | 167.1 MiB/s | 512 MiB |
+| Eight-worker first ingest | 2,092.1 ms | 244.7 MiB/s | 512 MiB |
+| Unchanged re-ingest | 0.937 ms | not a byte-rate claim | 0 B |
+| One changed file of 100 | 39.8 ms | 128.5 MiB/s changed bytes | 5.12 MiB |
+
+Parallel construction improves first-ingest throughput 1.464 times. The
+unchanged run reuses only an exact trusted source token previously attached to
+a successful byte-observed build. Untrusted metadata, a changed token, cache
+refusal, and failed construction all fall back to source reads. The cache is
+bounded, process-local, absent from roots and exports, and records observation
+type without exposing dedup admission results.
+
+This closes the delta-proportional source-work mechanism, not #1392's complete
+performance target. Extrapolating 244.7 MiB/s would still put one TiB at about
+71 minutes. First ingest remains limited by serialized authoritative
+object/representation admission behind the workers. Native durable batch
+markers, stable-handle mutation checks, explicit barrier policy, governed
+scheduler leases, and larger-than-RAM/cold-corpus evidence remain separate
+work before the issue can close.
+
 The #1388 port was remeasured against its exact current-main parent
 `0ba1181c`. Each cell is the median of three release-mode runs with 64 strict
 128-byte KV updates per principal through the complete async `TreeKvStore`
@@ -622,6 +660,7 @@ catalog.
 | `astrid-storage-read-path-64k.json` | `8dfd6938` |
 | `astrid-storage-verified-64k.json` | `1d2679ef` |
 | `astrid-storage-cache-final-64k.json` | `d69309ef` |
+| `astrid-storage-bulk-ingest-a4bc7979.json` | clean `a4bc7979`; bounded batch and delta-proportional re-ingest |
 | `astrid-storage-governed-hot-64k.json`, `astrid-storage-governed-hot-1m.json` | `e0bf4217` |
 | `astrid-storage-publication-before.json` | code `3d44cbd6`, harness `ee6990d4` |
 | `astrid-storage-publication-after.json` | code `4193217f`, harness `63d0125e` |

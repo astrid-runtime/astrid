@@ -13,9 +13,14 @@ use super::{
     insert, invalid, lookup, map_stream_error,
 };
 use crate::content::{
-    BulkIngestPolicy, ContentBatchEntry, ContentBatchWriteOutcome, ContentChangeCache,
-    ContentIngest, ContentName, ContentObservation, PrincipalContentError,
+    BulkIngestPolicy, ChunkingProfile, ContentBatchEntry, ContentBatchWriteOutcome,
+    ContentChangeCache, ContentIngest, ContentName, ContentObservation, PrincipalContentError,
+    SourceObservation,
 };
+
+type PendingIngest<R> = (ContentName, (R, ChunkingProfile, Option<SourceObservation>));
+type WorkerEntry = (ContentName, VerifiedContent, Option<SourceObservation>);
+type WorkerResult = Result<(Vec<WorkerEntry>, u64), PrincipalContentError>;
 
 #[derive(Clone)]
 struct PreparedContent {
@@ -150,46 +155,37 @@ where
         let worker_count = policy.worker_threads().get().min(pending.len());
         let queue = Arc::new(Mutex::new(pending));
         let cancelled = Arc::new(AtomicBool::new(false));
-        let results = std::thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(worker_count);
-            for _ in 0..worker_count {
-                let queue = Arc::clone(&queue);
-                let cancelled = Arc::clone(&cancelled);
-                handles.push(scope.spawn(move || {
-                    let mut sink = EngineSink::<P, E>::new(self.engine.as_ref());
-                    let mut completed = Vec::new();
-                    loop {
-                        if cancelled.load(Ordering::Acquire) {
-                            break;
-                        }
-                        let next = queue.lock().pop_front();
-                        let Some((name, (source, profile, observation))) = next else {
-                            break;
-                        };
-                        let streamed = match build_content_streaming(profile, source, &mut sink) {
-                            Ok(streamed) => streamed,
-                            Err(error) => {
-                                cancelled.store(true, Ordering::Release);
-                                return Err(map_stream_error(error));
-                            },
-                        };
-                        completed.push((name, streamed.verified_content(), observation));
-                    }
-                    sink.finish()?;
-                    Ok((completed, sink.objects_inserted))
-                }));
-            }
-            handles
-                .into_iter()
-                .map(|handle| {
-                    handle.join().map_err(|_| {
-                        PrincipalContentError::Projection(PrincipalProjectionError::Engine(
-                            "bulk content worker panicked".to_owned(),
-                        ))
-                    })?
-                })
-                .collect::<Result<Vec<_>, PrincipalContentError>>()
-        })?;
+        let results = if worker_count == 1 {
+            vec![build_worker(self, queue.as_ref(), cancelled.as_ref())?]
+        } else {
+            #[cfg(target_family = "wasm")]
+            return Err(PrincipalContentError::Projection(
+                PrincipalProjectionError::Engine(
+                    "parallel bulk ingestion requires host worker authority".to_owned(),
+                ),
+            ));
+            #[cfg(not(target_family = "wasm"))]
+            std::thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(worker_count);
+                for _ in 0..worker_count {
+                    let queue = Arc::clone(&queue);
+                    let cancelled = Arc::clone(&cancelled);
+                    handles.push(
+                        scope.spawn(move || build_worker(self, queue.as_ref(), cancelled.as_ref())),
+                    );
+                }
+                handles
+                    .into_iter()
+                    .map(|handle| {
+                        handle.join().map_err(|_| {
+                            PrincipalContentError::Projection(PrincipalProjectionError::Engine(
+                                "bulk content worker panicked".to_owned(),
+                            ))
+                        })?
+                    })
+                    .collect::<Result<Vec<_>, PrincipalContentError>>()
+            })?
+        };
 
         let mut objects_inserted = 0_u64;
         for (worker_entries, worker_objects_inserted) in results {
@@ -300,6 +296,39 @@ where
             }
         }
     }
+}
+
+fn build_worker<P, E, R>(
+    store: &PrincipalContentStore<P, E>,
+    queue: &Mutex<VecDeque<PendingIngest<R>>>,
+    cancelled: &AtomicBool,
+) -> WorkerResult
+where
+    P: Clone + Ord + Send + Sync,
+    E: PrincipalProjectionEngine<P>,
+    R: Read + Send,
+{
+    let mut sink = EngineSink::<P, E>::new(store.engine.as_ref());
+    let mut completed = Vec::new();
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            break;
+        }
+        let next = queue.lock().pop_front();
+        let Some((name, (source, profile, observation))) = next else {
+            break;
+        };
+        let streamed = match build_content_streaming(profile, source, &mut sink) {
+            Ok(streamed) => streamed,
+            Err(error) => {
+                cancelled.store(true, Ordering::Release);
+                return Err(map_stream_error(error));
+            },
+        };
+        completed.push((name, streamed.verified_content(), observation));
+    }
+    sink.finish()?;
+    Ok((completed, sink.objects_inserted))
 }
 
 fn batch_outcome(
