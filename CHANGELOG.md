@@ -20,6 +20,16 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Added
 
+- **Bulk immutable-object admission prepares integrity evidence before entering
+  the single-appender critical section.** Missing objects receive their frozen
+  frame checksum and direct physical identity off-lock, then a second
+  authoritative probe closes concurrent admission and catalogue-activation
+  races before bounded vectored append. All-dedup batches return after the
+  first probe without redundant physical hashing. Against exact parent
+  `3d61052b`, the three-sample 512 MiB benchmark raises eight-worker ingest from
+  261.1 to 361.8 MiB/s and worker scaling from 1.500 to 2.044 times, while
+  duplicate and four-principal publication remain materially unchanged. Closes
+  #1461.
 - **Principal content can be constructed in bounded parallel batches and
   republished from trusted source-change evidence without rereading unchanged
   inputs.** Canonical tree construction now retains only one partial fanout per
