@@ -20,6 +20,17 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Added
 
+- **Bounded bulk ingest now carries engine-bound prepared objects from worker
+  threads to one authoritative appender.** Workers perform source reads,
+  canonical construction, frame checksums, and direct physical identities;
+  the appender rechecks engine ownership, identities, collisions, and active
+  representation policy before writing. Operator-only diagnostics report each
+  pipeline phase and peak retained admission memory without exposing dedup
+  outcomes to principals. Against exact parent `279c9342`, the clean
+  three-sample 512 MiB run raises eight-worker ingest from 387.1 to 394.8 MiB/s
+  and scaling from 2.080 to 2.135 times, with a 58.8 MB median pending-memory
+  peak. The same evidence identifies closure validation, not admission, as the
+  next dominant cost. Closes #1461.
 - **Bulk immutable-object admission prepares integrity evidence before entering
   the single-appender critical section.** Missing objects receive their frozen
   frame checksum and direct physical identity off-lock, then a second

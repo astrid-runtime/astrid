@@ -610,6 +610,35 @@ native durable batch markers, stable-handle mutation checks, explicit barrier
 policy, governed scheduler leases, and larger-than-RAM/cold-corpus evidence
 remain separate work.
 
+The subsequent bounded-pipeline checkpoint compares clean candidate
+`0a333716` with exact parent `279c9342`, which already contains the prepared
+admission work above. The workload and grants are otherwise identical.
+
+| Workload | Exact parent | Bounded pipeline | Change |
+|---|---:|---:|---:|
+| Single-worker first ingest | 2,751.4 ms, 186.1 MiB/s | 2,769.0 ms, 184.9 MiB/s | -0.6% throughput |
+| Eight-worker first ingest | 1,322.5 ms, 387.1 MiB/s | 1,296.9 ms, 394.8 MiB/s | +2.0% throughput |
+| Worker scaling | 2.080× | 2.135× | +2.6% |
+| Median pending prepared bytes | not measured | 58,805,531 bytes | explicitly bounded |
+
+The new measurement surface divides the candidate into source
+read/chunk/build, object preparation, authoritative admission, physical-map
+update, closure validation, root-journal append, and durable flush. Worker
+phase durations are cumulative work and may overlap; `pipeline` and root
+publication are wall-clock boundaries. The parallel pipeline takes 226.0 ms,
+including 83.9 ms in the single appender. Root publication takes 1,067.2 ms,
+including 974.6 ms of closure validation. Thus wider admission alone cannot
+make first ingest read-bound: the next measured target is eliminating redundant
+closure work while preserving canonical identity and fail-closed publication.
+At 394.8 MiB/s, one TiB extrapolates to about 44 minutes.
+
+Prepared batches are opaque and bound to the engine instance that produced
+them. The appender re-probes every identity and collision under its mutation
+authority, and a regression rejects cross-engine replay before any object is
+admitted. The channel is bounded, source and appender failures publish no root,
+worker schedules preserve the canonical batch root, and diagnostics remain
+operator-only so physical dedup does not become a principal-visible oracle.
+
 The #1388 port was remeasured against its exact current-main parent
 `0ba1181c`. Each cell is the median of three release-mode runs with 64 strict
 128-byte KV updates per principal through the complete async `TreeKvStore`

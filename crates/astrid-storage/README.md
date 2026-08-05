@@ -102,17 +102,19 @@ BLAKE3-verifies the same bytes.
 | Populated reopen | 1.276 s | dense physical-catalogue recovery |
 | Direct-catalogue activation | 2.243 s | one-time migration of the populated store |
 
-The current bounded bulk-ingest checkpoint at clean commit `0d6a8366` split
+The current bounded bulk-ingest checkpoint at clean commit `0a333716` split
 the same 512 MiB corpus into 128 independently fingerprinted 4 MiB sources.
-Preparing frame checksums and direct physical identities outside the durable
-engine's single-appender critical section raised eight-worker first ingest from
-261.1 to 361.8 MiB/s against exact parent `3d61052b`, while worker scaling rose
-from 1.500 to 2.044 times the serial batch path. Duplicate and four-principal
-publication remained materially unchanged. The earlier source-change evidence
-still applies: an unchanged re-ingest reads no source bytes and a changed token
-reads only its source partition. At 361.8 MiB/s, first ingest still does not meet
-the read-bound target; canonical object construction and authoritative physical
-map publication remain visible costs.
+Workers now carry engine-bound prepared batches through a bounded channel to
+one authoritative appender. Against exact parent `279c9342`, eight-worker first
+ingest rises from 387.1 to 394.8 MiB/s and scaling from 2.080 to 2.135 times the
+serial path; the median retained prepared-admission peak is 58.8 MB. The
+operator-only phase matrix measures 226.0 ms in the parallel pipeline versus
+1,067.2 ms in root publication, including 974.6 ms of closure validation.
+These phase totals are diagnostics, not guest-visible dedup signals. The
+earlier source-change invariant still applies: unchanged re-ingest reads no
+source bytes and a changed token reads only its source partition. At 394.8
+MiB/s, one TiB extrapolates to about 44 minutes; closure validation is now the
+dominant measured first-ingest cost.
 
 Unique random content appended 1.013715 physical bytes per logical byte,
 including authenticated representation metadata. Republishing the identical
