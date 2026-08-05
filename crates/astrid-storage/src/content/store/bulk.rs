@@ -135,7 +135,18 @@ where
         for (name, (source, profile, observation)) in ordered {
             let cached = cache
                 .zip(observation.as_ref())
-                .and_then(|(cache, observation)| cache.lookup(observation));
+                .and_then(|(cache, observation)| cache.lookup(observation, profile));
+            let cached = match cached {
+                Some(verified)
+                    if self
+                        .engine
+                        .load_object_for(principal, verified.descriptor().file())?
+                        .is_some() =>
+                {
+                    Some(verified)
+                },
+                Some(_) | None => None,
+            };
             if let Some(verified) = cached {
                 completed.insert(
                     name,

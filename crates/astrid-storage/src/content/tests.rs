@@ -926,6 +926,106 @@ fn trusted_change_token_reuses_a_byte_verified_descriptor_without_reading() {
 }
 
 #[test]
+fn change_token_never_crosses_chunking_profiles() {
+    let engine = Arc::new(Engine::new(TestIdentity));
+    let store = PrincipalContentStore::from_engine(engine);
+    let cache = ContentChangeCache::new(NonZeroU64::new(1024 * 1024).unwrap());
+    let value = bytes(2 * 1024 * 1024);
+    let observation = SourceObservation::trusted(source_fingerprint(
+        "/workspace/profile.bin",
+        value.len() as u64,
+        42,
+    ));
+    let name = ContentName::new("profile.bin").unwrap();
+    store
+        .put_streaming_batch_with_change_cache(
+            &"alice".to_owned(),
+            [ContentIngest::new(name.clone(), value.as_slice())
+                .with_observation(observation.clone())],
+            BulkIngestPolicy::new(NonZeroUsize::MIN),
+            &cache,
+        )
+        .unwrap();
+
+    let alternate = super::ChunkingProfile::fastcdc_v2020(
+        8 * 1024,
+        32 * 1024,
+        128 * 1024,
+        super::ChunkingProfile::ASTRID_V1.gear_seed(),
+    )
+    .unwrap();
+    let bytes_read = Arc::new(AtomicUsize::new(0));
+    let outcome = store
+        .put_streaming_batch_with_change_cache(
+            &"alice".to_owned(),
+            [ContentIngest::with_profile(
+                name,
+                CountingReader {
+                    bytes: value.clone(),
+                    offset: 0,
+                    bytes_read: Arc::clone(&bytes_read),
+                },
+                alternate,
+            )
+            .with_observation(observation)],
+            BulkIngestPolicy::new(NonZeroUsize::MIN),
+            &cache,
+        )
+        .unwrap();
+
+    assert_eq!(bytes_read.load(Ordering::SeqCst), value.len());
+    assert_eq!(outcome.entries()[0].descriptor().profile(), alternate);
+    assert_eq!(
+        outcome.entries()[0].observation(),
+        ContentObservation::BytesObserved
+    );
+}
+
+#[test]
+fn change_cache_entry_missing_from_this_engine_falls_back_to_source_bytes() {
+    let cache = ContentChangeCache::new(NonZeroU64::new(1024 * 1024).unwrap());
+    let value = bytes(512 * 1024);
+    let observation = SourceObservation::trusted(source_fingerprint(
+        "/workspace/reopened-elsewhere.bin",
+        value.len() as u64,
+        73,
+    ));
+    let first = PrincipalContentStore::from_engine(Arc::new(Engine::new(TestIdentity)));
+    first
+        .put_streaming_batch_with_change_cache(
+            &"alice".to_owned(),
+            [
+                ContentIngest::new(ContentName::new("first").unwrap(), value.as_slice())
+                    .with_observation(observation.clone()),
+            ],
+            BulkIngestPolicy::new(NonZeroUsize::MIN),
+            &cache,
+        )
+        .unwrap();
+
+    let second = PrincipalContentStore::from_engine(Arc::new(Engine::new(TestIdentity)));
+    let bytes_read = Arc::new(AtomicUsize::new(0));
+    second
+        .put_streaming_batch_with_change_cache(
+            &"alice".to_owned(),
+            [ContentIngest::new(
+                ContentName::new("second").unwrap(),
+                CountingReader {
+                    bytes: value.clone(),
+                    offset: 0,
+                    bytes_read: Arc::clone(&bytes_read),
+                },
+            )
+            .with_observation(observation)],
+            BulkIngestPolicy::new(NonZeroUsize::MIN),
+            &cache,
+        )
+        .unwrap();
+
+    assert_eq!(bytes_read.load(Ordering::SeqCst), value.len());
+}
+
+#[test]
 fn untrusted_or_changed_metadata_never_skips_source_bytes() {
     let engine = Arc::new(Engine::new(TestIdentity));
     let store = PrincipalContentStore::from_engine(engine);

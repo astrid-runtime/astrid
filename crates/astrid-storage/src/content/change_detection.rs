@@ -5,7 +5,7 @@ use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use astrid_storage_content::VerifiedContent;
+use astrid_storage_content::{ChunkingProfile, VerifiedContent};
 use parking_lot::Mutex;
 
 /// Identity of a source namespace whose change tokens share one trust policy.
@@ -186,14 +186,20 @@ impl ContentChangeCache {
         self.state.lock().retained_bytes
     }
 
-    pub(super) fn lookup(&self, observation: &SourceObservation) -> Option<VerifiedContent> {
+    pub(super) fn lookup(
+        &self,
+        observation: &SourceObservation,
+        expected_profile: ChunkingProfile,
+    ) -> Option<VerifiedContent> {
         if observation.trust != SourceTrust::TrustedChangeToken {
             return None;
         }
         let locator = observation.fingerprint.locator();
         let mut state = self.state.lock();
         let cached = state.entries.get(&locator)?.clone();
-        if cached.fingerprint != observation.fingerprint {
+        if cached.fingerprint != observation.fingerprint
+            || cached.verified.descriptor().profile() != expected_profile
+        {
             return None;
         }
         state.eviction.remove(&(cached.tick, locator.clone()));
