@@ -11,8 +11,9 @@ use std::time::{Duration, Instant};
 
 use astrid_core::dirs::AstridHome;
 use astrid_storage::{
-    BulkIngestPolicy, ContentChangeCache, ContentIngest, ContentName, NativePrincipalContentStore,
-    SourceEpoch, SourceFingerprint, SourceObservation, SourceScopeId, StableSourceId, StateOwner,
+    BulkIngestDiagnostics, BulkIngestPolicy, ContentChangeCache, ContentIngest, ContentName,
+    NativePrincipalContentStore, SourceEpoch, SourceFingerprint, SourceObservation, SourceScopeId,
+    StableSourceId, StateOwner,
 };
 
 use super::{Config, Report, benchmark_owner, open_store};
@@ -40,6 +41,8 @@ pub(super) async fn benchmark_bulk_ingest(
     let mut parallel = Vec::with_capacity(config.samples);
     let mut unchanged = Vec::with_capacity(config.samples);
     let mut one_file_delta = Vec::with_capacity(config.samples);
+    let mut single_phases = Vec::with_capacity(config.samples);
+    let mut parallel_phases = Vec::with_capacity(config.samples);
     let changed_part = parts / 2;
     let delta_bytes = partition_bounds(config.bytes, parts, changed_part)?.1;
     let plan = BulkSamplePlan {
@@ -55,12 +58,26 @@ pub(super) async fn benchmark_bulk_ingest(
         parallel.push(result.parallel);
         unchanged.push(result.unchanged);
         one_file_delta.push(result.one_file_delta);
+        single_phases.push(result.single_phases);
+        parallel_phases.push(result.parallel_phases);
     }
     report.record_bytes(
         "astrid_bulk_publish_single_worker",
         config.bytes,
         single_worker,
     );
+    record_phase_metrics(
+        report,
+        &single_phases,
+        &SINGLE_PHASE_METRICS,
+        "bulk_single_peak_pending_admission_bytes",
+    )?;
+    record_phase_metrics(
+        report,
+        &parallel_phases,
+        &PARALLEL_PHASE_METRICS,
+        "bulk_parallel_peak_pending_admission_bytes",
+    )?;
     report.record_bytes("astrid_bulk_publish_parallel", config.bytes, parallel);
     report.record_operations("astrid_bulk_reingest_unchanged", 1, unchanged);
     report.record_bytes(
@@ -81,7 +98,56 @@ struct BulkSample {
     parallel: Duration,
     unchanged: Duration,
     one_file_delta: Duration,
+    single_phases: BulkPhases,
+    parallel_phases: BulkPhases,
 }
+
+#[derive(Clone, Copy)]
+struct BulkPhases {
+    pipeline: Duration,
+    source_build: Duration,
+    admission: Duration,
+    publication: Duration,
+    peak_pending_admission_bytes: u64,
+    object_preparation: Duration,
+    admission_probe: Duration,
+    direct_identity: Duration,
+    arena_append: Duration,
+    physical_map: Duration,
+    closure_validation: Duration,
+    root_journal: Duration,
+    flush: Duration,
+}
+
+const SINGLE_PHASE_METRICS: [&str; 12] = [
+    "bulk_single_phase_pipeline",
+    "bulk_single_phase_source_read_chunk_build",
+    "bulk_single_phase_object_admission",
+    "bulk_single_phase_root_publication",
+    "bulk_single_phase_object_preparation",
+    "bulk_single_phase_admission_probe",
+    "bulk_single_phase_direct_identity",
+    "bulk_single_phase_arena_append",
+    "bulk_single_phase_physical_map",
+    "bulk_single_phase_closure_validation",
+    "bulk_single_phase_root_journal_append",
+    "bulk_single_phase_durable_flush",
+];
+
+const PARALLEL_PHASE_METRICS: [&str; 12] = [
+    "bulk_parallel_phase_pipeline",
+    "bulk_parallel_phase_source_read_chunk_build",
+    "bulk_parallel_phase_object_admission",
+    "bulk_parallel_phase_root_publication",
+    "bulk_parallel_phase_object_preparation",
+    "bulk_parallel_phase_admission_probe",
+    "bulk_parallel_phase_direct_identity",
+    "bulk_parallel_phase_arena_append",
+    "bulk_parallel_phase_physical_map",
+    "bulk_parallel_phase_closure_validation",
+    "bulk_parallel_phase_root_journal_append",
+    "bulk_parallel_phase_durable_flush",
+];
 
 #[derive(Clone, Copy)]
 struct BulkSamplePlan {
@@ -105,11 +171,14 @@ async fn run_bulk_sample(
     let single = open_store(&single_home, config.object_cache_bytes).await?;
     let (sources, _) = bulk_sources(source, config.bytes, plan.parts, None)?;
     let started = Instant::now();
-    let outcome = single.content().put_streaming_batch_with_policy(
-        &benchmark_owner(),
-        sources,
-        BulkIngestPolicy::new(NonZeroUsize::MIN),
-    )?;
+    let (outcome, single_diagnostics) = single
+        .content()
+        .put_streaming_batch_with_operator_diagnostics(
+            &benchmark_owner(),
+            sources,
+            BulkIngestPolicy::new(NonZeroUsize::MIN),
+            None,
+        )?;
     let single_worker = started.elapsed();
     verify_bulk_content(
         single.content().as_ref(),
@@ -127,13 +196,13 @@ async fn run_bulk_sample(
     let cache = ContentChangeCache::new(plan.change_cache_bytes);
     let (sources, _) = bulk_sources(source, config.bytes, plan.parts, None)?;
     let started = Instant::now();
-    let outcome = parallel_store
+    let (outcome, diagnostics) = parallel_store
         .content()
-        .put_streaming_batch_with_change_cache(
+        .put_streaming_batch_with_operator_diagnostics(
             &benchmark_owner(),
             sources,
             BulkIngestPolicy::new(plan.worker_count),
-            &cache,
+            Some(&cache),
         )?;
     let parallel = started.elapsed();
     verify_bulk_content(
@@ -184,7 +253,65 @@ async fn run_bulk_sample(
         parallel,
         unchanged,
         one_file_delta,
+        single_phases: BulkPhases::from_diagnostics(single_diagnostics)?,
+        parallel_phases: BulkPhases::from_diagnostics(diagnostics)?,
     })
+}
+
+impl BulkPhases {
+    fn from_diagnostics(diagnostics: BulkIngestDiagnostics) -> BenchResult<Self> {
+        Ok(Self {
+            pipeline: diagnostics.pipeline_elapsed(),
+            source_build: diagnostics.source_build_elapsed(),
+            admission: diagnostics.admission_elapsed(),
+            publication: diagnostics.publication_elapsed(),
+            peak_pending_admission_bytes: u64::try_from(
+                diagnostics.peak_pending_admission_bytes(),
+            )?,
+            object_preparation: diagnostics.object_preparation_elapsed(),
+            admission_probe: diagnostics.admission_probe_elapsed(),
+            direct_identity: diagnostics.direct_identity_elapsed(),
+            arena_append: diagnostics.arena_append_elapsed(),
+            physical_map: diagnostics.physical_map_update_elapsed(),
+            closure_validation: diagnostics.closure_validation_elapsed(),
+            root_journal: diagnostics.root_publication_elapsed(),
+            flush: diagnostics.flush_elapsed(),
+        })
+    }
+}
+
+fn record_phase_metrics(
+    report: &mut Report,
+    phases: &[BulkPhases],
+    names: &'static [&'static str; 12],
+    peak_name: &'static str,
+) -> BenchResult<()> {
+    let durations = |select: fn(&BulkPhases) -> Duration| phases.iter().map(select).collect();
+    let selectors = [
+        (|p: &BulkPhases| p.pipeline) as fn(&BulkPhases) -> Duration,
+        |p: &BulkPhases| p.source_build,
+        |p: &BulkPhases| p.admission,
+        |p: &BulkPhases| p.publication,
+        |p: &BulkPhases| p.object_preparation,
+        |p: &BulkPhases| p.admission_probe,
+        |p: &BulkPhases| p.direct_identity,
+        |p: &BulkPhases| p.arena_append,
+        |p: &BulkPhases| p.physical_map,
+        |p: &BulkPhases| p.closure_validation,
+        |p: &BulkPhases| p.root_journal,
+        |p: &BulkPhases| p.flush,
+    ];
+    for (name, select) in names.iter().zip(selectors) {
+        report.record_operations(name, 1, durations(select));
+    }
+    report.record_resource_peak(
+        peak_name,
+        phases
+            .iter()
+            .map(|phase| phase.peak_pending_admission_bytes)
+            .collect(),
+    )?;
+    Ok(())
 }
 
 fn bulk_sources(

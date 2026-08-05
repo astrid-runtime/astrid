@@ -21,6 +21,7 @@ pub(super) struct Report {
     throughput_scaling: Vec<ThroughputScaling>,
     write_amplifications: Vec<WriteAmplification>,
     representation_metadata: Vec<RepresentationMetadata>,
+    resource_peaks: Vec<ResourcePeak>,
 }
 
 impl Report {
@@ -37,6 +38,7 @@ impl Report {
             throughput_scaling: Vec::new(),
             write_amplifications: Vec::new(),
             representation_metadata: Vec::new(),
+            resource_peaks: Vec::new(),
         }
     }
 
@@ -210,6 +212,29 @@ impl Report {
         Ok(())
     }
 
+    pub(super) fn record_resource_peak(
+        &mut self,
+        name: &'static str,
+        mut samples_bytes: Vec<u64>,
+    ) -> Result<(), String> {
+        if samples_bytes.is_empty() {
+            return Err(format!("resource peak {name:?} has no samples"));
+        }
+        samples_bytes.sort_unstable();
+        let maximum_bytes = samples_bytes
+            .last()
+            .copied()
+            .ok_or_else(|| format!("resource peak {name:?} has no maximum"))?;
+        self.resource_peaks.push(ResourcePeak {
+            name,
+            minimum_bytes: samples_bytes[0],
+            median_bytes: median_u64(&samples_bytes),
+            maximum_bytes,
+            samples_bytes,
+        });
+        Ok(())
+    }
+
     pub(super) fn print_table(&self) {
         println!(
             "{:<38} {:>12} {:>12} {:>12}",
@@ -272,11 +297,27 @@ impl Report {
                 );
             }
         }
+        if !self.resource_peaks.is_empty() {
+            println!();
+            println!("{:<38} {:>18}", "resource peak", "median bytes");
+            for peak in &self.resource_peaks {
+                println!("{:<38} {:>18}", peak.name, peak.median_bytes);
+            }
+        }
     }
 
     fn metric(&self, name: &str) -> Option<&Metric> {
         self.metrics.iter().find(|metric| metric.name == name)
     }
+}
+
+#[derive(Debug, Serialize)]
+struct ResourcePeak {
+    name: &'static str,
+    samples_bytes: Vec<u64>,
+    minimum_bytes: u64,
+    median_bytes: u64,
+    maximum_bytes: u64,
 }
 
 #[derive(Debug, Serialize)]

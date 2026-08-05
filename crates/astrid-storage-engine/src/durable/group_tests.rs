@@ -8,6 +8,86 @@ use std::time::{Duration, Instant};
 use super::tests::{TestIdentity, Utf8Codec, limits, transaction};
 use super::*;
 
+#[derive(Default)]
+struct RecordingProjectionObserver {
+    phases: Mutex<BTreeSet<crate::ProjectionPhase>>,
+}
+
+impl crate::ProjectionObserver for RecordingProjectionObserver {
+    fn record(&self, phase: crate::ProjectionPhase, _elapsed: Duration) {
+        self.phases.lock().insert(phase);
+    }
+}
+
+#[test]
+fn observed_staging_and_publication_report_the_durable_phases() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = DurableEngine::open(directory.path(), TestIdentity, Utf8Codec, limits()).unwrap();
+    let observer = Arc::new(RecordingProjectionObserver::default());
+    let (commit, transaction) = transaction("alice", None, b"observed");
+
+    let prepared = engine
+        .prepare_objects_for_projection(
+            transaction
+                .records()
+                .iter()
+                .map(|(_, record)| record.clone())
+                .collect(),
+            Some(observer.as_ref()),
+        )
+        .unwrap();
+    engine
+        .stage_prepared_for_projection(prepared, Some(observer.as_ref()))
+        .unwrap();
+    engine
+        .commit_observed(
+            RootTransaction::new("alice".to_owned(), None, commit, Vec::new()),
+            Arc::clone(&observer) as Arc<dyn crate::ProjectionObserver>,
+        )
+        .unwrap();
+
+    let phases = observer.phases.lock();
+    for expected in [
+        crate::ProjectionPhase::ObjectPreparation,
+        crate::ProjectionPhase::AdmissionProbe,
+        crate::ProjectionPhase::ArenaAppend,
+        crate::ProjectionPhase::PhysicalMapUpdate,
+        crate::ProjectionPhase::ClosureValidation,
+        crate::ProjectionPhase::RootPublication,
+        crate::ProjectionPhase::Flush,
+    ] {
+        assert!(phases.contains(&expected), "missing phase {expected:?}");
+    }
+}
+
+#[test]
+fn prepared_projection_batches_are_bound_to_the_preparing_engine() {
+    let first_directory = tempfile::tempdir().unwrap();
+    let second_directory = tempfile::tempdir().unwrap();
+    let first =
+        DurableEngine::open(first_directory.path(), TestIdentity, Utf8Codec, limits()).unwrap();
+    let second =
+        DurableEngine::open(second_directory.path(), TestIdentity, Utf8Codec, limits()).unwrap();
+    let (_, transaction) = transaction("alice", None, b"engine-bound");
+    let records = transaction
+        .records()
+        .iter()
+        .map(|(_, record)| record.clone())
+        .collect();
+
+    let prepared = first.prepare_objects_for_projection(records, None).unwrap();
+    let error = second
+        .stage_prepared_for_projection(prepared, None)
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("prepared object batch does not belong to this engine")
+    );
+    assert_eq!(second.object_count().unwrap(), 0);
+}
+
 #[derive(Debug, Default)]
 struct CountFlushes {
     arena: AtomicUsize,

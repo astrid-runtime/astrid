@@ -224,6 +224,7 @@ where
             })),
             object_cache: ObjectCache::new(options.policy.object_cache),
             recovery_policy: options.policy.recovery,
+            preparation_authority: Arc::new(()),
             group_policy: options.policy.group_commit,
             commit_group: Mutex::new(CommitGroup::default()),
             inner: Mutex::new(DurableInner {

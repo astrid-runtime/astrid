@@ -14,6 +14,7 @@ mod store;
 mod tests;
 
 use std::num::NonZeroUsize;
+use std::time::Duration;
 use std::{fmt, io};
 
 use astrid_storage_engine::PrincipalProjectionError;
@@ -340,6 +341,134 @@ pub struct ContentBatchWriteOutcome {
     entries: Vec<ContentBatchEntry>,
     principal_root: RootState,
     objects_inserted: u64,
+}
+
+/// Operator-only timing and memory evidence for one bulk ingest.
+///
+/// These measurements describe shared engine work and must never cross a
+/// capsule, mount, or other principal-visible boundary. In particular, a
+/// caller must not turn admission timing into a deduplication oracle.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BulkIngestDiagnostics {
+    pipeline_elapsed: Duration,
+    source_build_elapsed: Duration,
+    admission_elapsed: Duration,
+    publication_elapsed: Duration,
+    peak_pending_admission_bytes: usize,
+    phases: BulkIngestPhaseDurations,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct BulkIngestPhaseDurations {
+    pub(crate) object_preparation: Duration,
+    pub(crate) admission_probe: Duration,
+    pub(crate) direct_identity: Duration,
+    pub(crate) arena_append: Duration,
+    pub(crate) physical_map_update: Duration,
+    pub(crate) closure_validation: Duration,
+    pub(crate) root_publication: Duration,
+    pub(crate) flush: Duration,
+}
+
+impl BulkIngestDiagnostics {
+    pub(crate) const fn new(
+        pipeline_elapsed: Duration,
+        source_build_elapsed: Duration,
+        admission_elapsed: Duration,
+        publication_elapsed: Duration,
+        peak_pending_admission_bytes: usize,
+        phases: BulkIngestPhaseDurations,
+    ) -> Self {
+        Self {
+            pipeline_elapsed,
+            source_build_elapsed,
+            admission_elapsed,
+            publication_elapsed,
+            peak_pending_admission_bytes,
+            phases,
+        }
+    }
+
+    /// Return wall time from the first uncached source build through admission.
+    #[must_use]
+    pub const fn pipeline_elapsed(self) -> Duration {
+        self.pipeline_elapsed
+    }
+
+    /// Return cumulative worker time spent reading, chunking, and building DAGs.
+    ///
+    /// Concurrent workers overlap, so this is a work total rather than
+    /// end-to-end wall time.
+    #[must_use]
+    pub const fn source_build_elapsed(self) -> Duration {
+        self.source_build_elapsed
+    }
+
+    /// Return cumulative time spent in the authoritative object appender.
+    #[must_use]
+    pub const fn admission_elapsed(self) -> Duration {
+        self.admission_elapsed
+    }
+
+    /// Return wall time spent validating and publishing the principal root.
+    #[must_use]
+    pub const fn publication_elapsed(self) -> Duration {
+        self.publication_elapsed
+    }
+
+    /// Return the maximum bytes awaiting or undergoing object admission.
+    #[must_use]
+    pub const fn peak_pending_admission_bytes(self) -> usize {
+        self.peak_pending_admission_bytes
+    }
+
+    /// Return canonical object validation, identity, and frame-preparation time.
+    #[must_use]
+    pub const fn object_preparation_elapsed(self) -> Duration {
+        self.phases.object_preparation
+    }
+
+    /// Return authoritative existing-object probe time.
+    #[must_use]
+    pub const fn admission_probe_elapsed(self) -> Duration {
+        self.phases.admission_probe
+    }
+
+    /// Return direct physical-identity construction time.
+    #[must_use]
+    pub const fn direct_identity_elapsed(self) -> Duration {
+        self.phases.direct_identity
+    }
+
+    /// Return immutable arena-append time.
+    #[must_use]
+    pub const fn arena_append_elapsed(self) -> Duration {
+        self.phases.arena_append
+    }
+
+    /// Return physical representation-map update time.
+    #[must_use]
+    pub const fn physical_map_update_elapsed(self) -> Duration {
+        self.phases.physical_map_update
+    }
+
+    /// Return owning-closure validation time.
+    #[must_use]
+    pub const fn closure_validation_elapsed(self) -> Duration {
+        self.phases.closure_validation
+    }
+
+    /// Return authoritative root-journal append time.
+    #[must_use]
+    pub const fn root_publication_elapsed(self) -> Duration {
+        self.phases.root_publication
+    }
+
+    /// Return durable media-flush time.
+    #[must_use]
+    pub const fn flush_elapsed(self) -> Duration {
+        self.phases.flush
+    }
 }
 
 impl ContentBatchWriteOutcome {

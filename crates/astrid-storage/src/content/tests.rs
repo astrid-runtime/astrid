@@ -927,6 +927,8 @@ fn source_fingerprint(
     )
 }
 
+mod bulk_admission;
+
 #[test]
 fn trusted_change_token_reuses_a_byte_verified_descriptor_without_reading() {
     let engine = Arc::new(Engine::new(TestIdentity));

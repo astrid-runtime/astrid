@@ -51,8 +51,9 @@ pub use muninn::{
     VerifiedDerivationEvidence, verify_derivation_evidence,
 };
 pub use projection::{
-    PrincipalProjectionEngine, PrincipalProjectionError, ProjectionCacheEntry, ProjectionCacheKey,
-    ProjectionCachePayload,
+    PreparedProjectionBatch, PrincipalProjectionEngine, PrincipalProjectionError,
+    ProjectionCacheEntry, ProjectionCacheKey, ProjectionCachePayload, ProjectionObserver,
+    ProjectionPhase,
 };
 #[cfg(not(target_family = "wasm"))]
 pub use refinery::{
