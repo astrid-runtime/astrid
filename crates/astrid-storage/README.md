@@ -102,18 +102,19 @@ BLAKE3-verifies the same bytes.
 | Populated reopen | 1.276 s | dense physical-catalogue recovery |
 | Direct-catalogue activation | 2.243 s | one-time migration of the populated store |
 
-The current bounded bulk-ingest checkpoint at clean commit `0a333716` split
+The current bounded bulk-ingest checkpoint at clean commit `02968196` split
 the same 512 MiB corpus into 128 independently fingerprinted 4 MiB sources.
 Workers now carry engine-bound prepared batches through a bounded channel to
 one authoritative appender. Against exact parent `279c9342`, eight-worker first
-ingest rises from 387.1 to 394.8 MiB/s and scaling from 2.080 to 2.135 times the
-serial path; the median retained prepared-admission peak is 58.8 MB. The
-operator-only phase matrix measures 226.0 ms in the parallel pipeline versus
-1,067.2 ms in root publication, including 974.6 ms of closure validation.
+ingest holds at 388.3 MiB/s and scaling at 2.105 times the serial path while
+making both memory bounds observable: 4,207,436 bytes single-worker and a
+58,853,269-byte median with eight workers. The operator-only phase matrix
+measures 250.7 ms in the parallel pipeline versus 1,067.7 ms in root
+publication, including 979.1 ms of exact closure validation.
 These phase totals are diagnostics, not guest-visible dedup signals. The
 earlier source-change invariant still applies: unchanged re-ingest reads no
-source bytes and a changed token reads only its source partition. At 394.8
-MiB/s, one TiB extrapolates to about 44 minutes; closure validation is now the
+source bytes and a changed token reads only its source partition. At 388.3
+MiB/s, one TiB extrapolates to about 45 minutes; closure validation is now the
 dominant measured first-ingest cost.
 
 Unique random content appended 1.013715 physical bytes per logical byte,
