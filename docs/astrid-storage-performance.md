@@ -573,7 +573,7 @@ cold device read is faster than the substrate.
 
 ### Bulk ingest and change detection
 
-Clean commit `47104249` measured the bounded batch path over the same 512 MiB
+Clean commit `eca9c20a` measured the bounded batch path over the same 512 MiB
 deterministic incompressible corpus, split into 100 independently fingerprinted
 sources. Three release-mode samples used eight explicitly granted workers and
 a one-GiB governed object cache. The source-byte counters are assertions in
@@ -581,21 +581,22 @@ the harness, not estimates.
 
 | Workload | Median | Throughput | Source bytes observed |
 |---|---:|---:|---:|
-| Single-worker first ingest | 2,981.1 ms | 171.7 MiB/s | 512 MiB |
-| Eight-worker first ingest | 2,117.6 ms | 241.8 MiB/s | 512 MiB |
-| Unchanged re-ingest | 1.050 ms | not a byte-rate claim | 0 B |
-| One changed file of 100 | 42.2 ms | 121.3 MiB/s changed bytes | 5.12 MiB |
+| Single-worker first ingest | 2,984.9 ms | 171.5 MiB/s | 512 MiB |
+| Eight-worker first ingest | 2,277.5 ms | 224.8 MiB/s | 512 MiB |
+| Unchanged re-ingest | 25.1 ms | 39.8 complete batch checks/s | 0 B |
+| One changed file of 100 | 67.5 ms | 75.8 MiB/s changed bytes | 5.12 MiB |
 
-Parallel construction improves first-ingest throughput 1.408 times. The
+Parallel construction improves first-ingest throughput 1.311 times. The
 unchanged run reuses only an exact trusted source token previously attached to
-a successful byte-observed build. Untrusted metadata, a changed token, cache
-refusal, and failed construction all fall back to source reads. The cache is
-bounded, process-local, absent from roots and exports, and records observation
-type without exposing dedup admission results.
+a successful byte-observed build, after confirming every object in the cached
+file closure still exists. Untrusted metadata, a changed token, an incomplete
+closure, cache refusal, and failed construction all fall back to source reads.
+The cache is bounded, process-local, absent from roots and exports, and records
+observation type without exposing dedup admission results.
 
 This closes the delta-proportional source-work mechanism, not #1392's complete
-performance target. Extrapolating 241.8 MiB/s would still put one TiB at about
-72 minutes. First ingest remains limited by serialized authoritative
+performance target. Extrapolating 224.8 MiB/s would still put one TiB at about
+78 minutes. First ingest remains limited by serialized authoritative
 object/representation admission behind the workers. Native durable batch
 markers, stable-handle mutation checks, explicit barrier policy, governed
 scheduler leases, and larger-than-RAM/cold-corpus evidence remain separate
@@ -660,7 +661,7 @@ catalog.
 | `astrid-storage-read-path-64k.json` | `8dfd6938` |
 | `astrid-storage-verified-64k.json` | `1d2679ef` |
 | `astrid-storage-cache-final-64k.json` | `d69309ef` |
-| `astrid-storage-bulk-ingest-47104249.json` | clean `47104249`; bounded batch and delta-proportional re-ingest |
+| `astrid-storage-bulk-ingest-eca9c20a.json` | clean `eca9c20a`; bounded batch and closure-checked delta-proportional re-ingest |
 | `astrid-storage-governed-hot-64k.json`, `astrid-storage-governed-hot-1m.json` | `e0bf4217` |
 | `astrid-storage-publication-before.json` | code `3d44cbd6`, harness `ee6990d4` |
 | `astrid-storage-publication-after.json` | code `4193217f`, harness `63d0125e` |
