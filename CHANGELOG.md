@@ -20,6 +20,16 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Added
 
+- **Existing arena objects can activate as authoritative direct physical
+  representations without changing principal state.** Generation-scoped
+  metadata and journals publish the canonical representation catalogue and
+  placement map through one recoverable state transition, while the reverse
+  lookup remains disposable. Recovery protects every published arena frame,
+  rejects mixed or incomplete physical generations, and retains all legacy
+  format migrations. Clean M2 Ultra measurements keep staging and warm
+  verified reads at substrate parity, reduce representation metadata to
+  1,123.9 bytes per admitted object, and append only 24,426 authoritative bytes
+  when republishing an identical 512 MiB object. Refs #1450.
 - **Exact ObjectIds can use multiple verified physical representations without
   changing principal state.** The design contract separates profile-bound
   BlobIds, canonical representation records, and placement epochs; specifies
