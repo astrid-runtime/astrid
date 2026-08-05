@@ -1,6 +1,6 @@
 //! Authoritative physical representation catalogue and placement state.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -117,6 +117,7 @@ pub(super) struct RepresentationStore {
     profiles: CanonicalPhysicalMap,
     representations: CanonicalPhysicalMap,
     placement_entries: CanonicalPhysicalMap,
+    persisted_map_nodes: BTreeSet<astrid_storage_model::PhysicalMapNodeId>,
     direct_profile: RepresentationProfileId,
     reverse: BTreeMap<ObjectId, Vec<RepresentationRecordId>>,
 }
@@ -283,8 +284,6 @@ impl RepresentationStore {
         objects: &[DirectArenaObject],
     ) -> Result<Option<PendingDirectUpdate>, DurableError> {
         let mut metadata = Vec::new();
-        let durable_representation_nodes = self.representations.nodes().keys().copied().collect();
-        let durable_placement_nodes = self.placement_entries.nodes().keys().copied().collect();
         let profile = RepresentationProfile::decode(
             self.profiles
                 .get(PhysicalMapKey::from(self.direct_profile))
@@ -335,15 +334,18 @@ impl RepresentationStore {
             .into_iter()
             .map(|entry| (entry.object, entry.representation_id))
             .collect();
+        let mut appended_map_nodes = BTreeSet::new();
         append_new_reachable_map_nodes(
             &mut metadata,
             &self.representations,
-            &durable_representation_nodes,
+            &self.persisted_map_nodes,
+            &mut appended_map_nodes,
         )?;
         append_new_reachable_map_nodes(
             &mut metadata,
             &self.placement_entries,
-            &durable_placement_nodes,
+            &self.persisted_map_nodes,
+            &mut appended_map_nodes,
         )?;
         let (catalogue, placements, state) = self.next_authority()?;
         let state_id = state.identify(&Blake3PhysicalIdentity);
@@ -358,6 +360,7 @@ impl RepresentationStore {
             .map(MetadataFrame::encode)
             .collect::<Result<Vec<_>, _>>()?;
         append_frames(&mut self.metadata, METADATA_MAGIC, &payloads)?;
+        self.persisted_map_nodes.extend(appended_map_nodes);
         Ok(Some(PendingDirectUpdate {
             state,
             state_id,
@@ -630,6 +633,7 @@ impl RepresentationStore {
             profiles,
             representations,
             placement_entries,
+            persisted_map_nodes: index.nodes.keys().copied().collect(),
             direct_profile,
             reverse,
         })

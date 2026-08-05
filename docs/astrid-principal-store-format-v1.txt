@@ -1447,7 +1447,11 @@ Format 1 registers:
 
   PhysicalMapNodeId:
     context  "astrid-physical-map-node-v1" followed by NUL
-    material canonical PhysicalMapNodeV1 bytes
+    material canonical legacy PhysicalMapNodeV1 bytes
+
+  PhysicalRadixMapNodeId:
+    context  "astrid-physical-radix-map-node-v1" followed by NUL
+    material canonical PhysicalRadixMapNodeV1 bytes
 
   RepresentationCatalogueRootId:
     context  "astrid-representation-catalogue-root-v1" followed by NUL
@@ -1577,9 +1581,10 @@ profile and verification evidence; Generated evidence equals recipe.evidence.
 -------------------------------------------------
 
 Three maps use one immutable path-copy trie. Their domains are profiles=0,
-representations=1, and placements=2. The search key is a big-endian u32 value
-40 followed by the key's complete 40-byte TaggedIdentity envelope. Bits are
-read most-significant first. Map nodes are:
+representations=1, and placements=2. Legacy roots use a binary Patricia trie.
+Its search key is a big-endian u32 value 40 followed by the key's complete
+40-byte TaggedIdentity envelope. Bits are read most-significant first. Legacy
+map nodes are:
 
   Leaf:
     u16 version = 1
@@ -1605,6 +1610,41 @@ final prefix byte. The next search-key bit selects zero or one. Node domain is
 inside its identity. Subtree counts are exact. Rebuilding from all reachable
 leaves produces byte-identical nodes and the identical root; cyclic, shared,
 missing, unary, non-longest-prefix, or alternative shapes are invalid.
+
+New roots use the dense nibble-radix construction. Routing reads the current
+32-byte digest from most-significant nibble to least-significant nibble; the
+algorithm/construction/length envelope remains in every page entry but is not
+part of the route because format 1 accepts only scheme 1/2/32. Nodes are:
+
+  Page:
+    u16 version = 2
+    u8  domain
+    u8  tag = 0
+    u8  entry_count = 1
+    (TaggedIdentity key, u64 value_bytes, u8[] canonical_value)[]
+
+  Radix:
+    u16 version = 2
+    u8  domain
+    u8  tag = 1
+    u8  prefix_nibbles, 0..63
+    u8[] prefix[ceil(prefix_nibbles / 2)]
+    u16 child_bitmap
+    PhysicalMapNodeId children[popcount(child_bitmap)]
+    u64 subtree_entries
+
+Each Page contains exactly one entry. A Radix has at least two children and
+stores children in increasing set-bit order. Its prefix is the longest common
+digest-nibble prefix of all descendants; an unused low nibble is zero. Each
+child contains exactly the keys selected by its bitmap nibble. Counts are
+exact. Rebuilding the reachable entries with the same construction reproduces
+the identical root. Mixed-construction, cyclic, shared, missing, unary,
+non-longest-prefix, overfull-page, and alternative shapes are invalid.
+
+Legacy and dense roots may coexist as historical metadata and both remain
+readable. One active map root selects exactly one construction. Migrating a
+map publishes a new physical root and state CAS; it never rewrites logical
+ObjectIds or principal roots.
 
 Map leaf key and value pairs are:
 

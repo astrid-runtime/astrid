@@ -612,7 +612,8 @@ one when their respective map changes and remain equal when that map is reused.
 
 `PhysicalMapNodeId`, `RepresentationCatalogueRootId`, `PlacementSetId`, and
 `RepresentationStateId` use `PhysicalId(context, canonical_bytes)`. Their contexts are
-`astrid-physical-map-node-v1\0`,
+`astrid-physical-map-node-v1\0` for legacy binary nodes,
+`astrid-physical-radix-map-node-v1\0` for dense radix nodes,
 `astrid-representation-catalogue-root-v1\0`,
 `astrid-placement-set-v1\0`, and `astrid-representation-state-v1\0`. The
 in-band specification freezes their golden vectors before activation.

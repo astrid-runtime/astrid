@@ -53,6 +53,85 @@ fn direct_representation_activation_reopens_and_tracks_later_commits() {
 }
 
 #[test]
+fn compatible_format_amendment_reopens_an_existing_direct_profile() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open(directory.path());
+    let old_specification = ObjectRecord::new(
+        ObjectKind::Evidence,
+        ObjectFormatVersion::V1,
+        b"pre-amendment physical specification".to_vec(),
+        Vec::new(),
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let new_specification = ObjectRecord::new(
+        ObjectKind::Evidence,
+        ObjectFormatVersion::V1,
+        b"successor physical specification".to_vec(),
+        Vec::new(),
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let (old_specification_id, _) = engine
+        .persist_standalone_object(&old_specification)
+        .unwrap();
+    let (new_specification_id, _) = engine
+        .persist_standalone_object(&new_specification)
+        .unwrap();
+    let (first_commit, first) = transaction("alice", None, b"before format amendment");
+    let first_root = engine.commit(first).unwrap().root();
+    engine
+        .ensure_direct_representation_catalogue(
+            old_specification_id,
+            &[old_specification_id, new_specification_id],
+        )
+        .unwrap();
+    engine.close().unwrap();
+    drop(engine);
+
+    let reopened = open(directory.path());
+    assert!(
+        reopened
+            .ensure_direct_representation_catalogue(
+                new_specification_id,
+                &[old_specification_id, new_specification_id],
+            )
+            .is_err()
+    );
+    reopened
+        .ensure_direct_representation_catalogue_compatible_with(
+            new_specification_id,
+            &[old_specification_id],
+            &[old_specification_id, new_specification_id],
+        )
+        .unwrap();
+    let (second_commit, second) =
+        transaction("alice", Some(first_root), b"after format amendment");
+    reopened.commit(second).unwrap();
+    reopened.close().unwrap();
+    drop(reopened);
+
+    let reopened_again = open(directory.path());
+    reopened_again
+        .ensure_direct_representation_catalogue_compatible_with(
+            new_specification_id,
+            &[old_specification_id],
+            &[old_specification_id, new_specification_id],
+        )
+        .unwrap();
+    let inner = reopened_again.inner.lock();
+    let representations = inner.representations.as_ref().unwrap();
+    assert_eq!(
+        representations.frozen_specification().unwrap(),
+        old_specification_id
+    );
+    assert!(representations.contains_direct(first_commit));
+    assert!(representations.contains_direct(second_commit));
+}
+
+#[test]
 fn direct_profile_lives_in_the_map_while_legacy_profile_frames_still_reopen() {
     let directory = tempfile::tempdir().unwrap();
     let engine = open(directory.path());
@@ -852,8 +931,8 @@ fn direct_batch_persists_only_its_final_reachable_map_nodes() {
     )
     .unwrap();
 
-    // Each map has 64 leaves and 63 branches. Representation records live in
-    // the authenticated map leaves; only the catalogue, placement, and state
-    // are additional frames.
-    assert_eq!(appended_frames, 2 * (64 + 63) + 3);
+    // The radix leaves and their branches need 174 reachable frames for
+    // these two 64-entry maps. Only the catalogue, placement, and state are
+    // additional; historical path-copy nodes must not leak into the batch.
+    assert_eq!(appended_frames, 174 + 3);
 }

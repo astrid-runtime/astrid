@@ -13,7 +13,13 @@ use super::identity::{
     decode_map_node_id, decode_physical_digest, encode_map_node_id, encode_physical_digest,
 };
 
-const MAP_NODE_VERSION: u16 = 1;
+mod legacy;
+mod radix;
+
+const LEGACY_MAP_NODE_VERSION: u16 = 1;
+const RADIX_MAP_NODE_VERSION: u16 = 2;
+const RADIX_PAGE_CAPACITY: usize = 1;
+const DIGEST_NIBBLES: u8 = 64;
 const TAGGED_PHYSICAL_IDENTITY_BYTES: usize = 40;
 const SEARCH_KEY_BYTES: usize = 4 + TAGGED_PHYSICAL_IDENTITY_BYTES;
 const SEARCH_KEY_BITS: u32 = 352;
@@ -129,9 +135,38 @@ pub enum PhysicalMapNode {
         /// Exact number of reachable leaves.
         subtree_entries: u64,
     },
+    /// A bounded, sorted page in the dense nibble-radix construction.
+    Page {
+        /// Map domain, included in node identity.
+        domain: PhysicalMapDomain,
+        /// Exactly one complete entry.
+        entries: Vec<(PhysicalMapKey, Vec<u8>)>,
+    },
+    /// A compressed nibble-radix branch with two or more children.
+    Radix {
+        /// Map domain, included in node identity.
+        domain: PhysicalMapDomain,
+        /// Number of complete key nibbles shared by every child.
+        prefix_nibbles: u8,
+        /// Shared digest prefix, with an unused low nibble cleared.
+        prefix: Vec<u8>,
+        /// Child selectors; identities follow set-bit order.
+        child_bitmap: u16,
+        /// Child identities in increasing selector order.
+        children: Vec<PhysicalMapNodeId>,
+        /// Exact number of reachable entries.
+        subtree_entries: u64,
+    },
 }
 
 impl PhysicalMapNode {
+    const fn construction(&self) -> MapConstruction {
+        match self {
+            Self::Leaf { .. } | Self::Branch { .. } => MapConstruction::LegacyBinary,
+            Self::Page { .. } | Self::Radix { .. } => MapConstruction::DenseRadix,
+        }
+    }
+
     /// Construct a canonical leaf.
     #[must_use]
     pub fn leaf(domain: PhysicalMapDomain, key: PhysicalMapKey, value: Vec<u8>) -> Self {
@@ -151,7 +186,7 @@ impl PhysicalMapNode {
         one: PhysicalMapNodeId,
         subtree_entries: u64,
     ) -> Result<Self, PhysicalModelError> {
-        validate_branch(prefix_bits, &prefix, zero, one, subtree_entries)?;
+        legacy::validate_branch(prefix_bits, &prefix, zero, one, subtree_entries)?;
         Ok(Self::Branch {
             domain,
             prefix_bits,
@@ -162,11 +197,47 @@ impl PhysicalMapNode {
         })
     }
 
+    fn page(
+        domain: PhysicalMapDomain,
+        entries: Vec<(PhysicalMapKey, Vec<u8>)>,
+    ) -> Result<Self, PhysicalModelError> {
+        validate_page(&entries)?;
+        Ok(Self::Page { domain, entries })
+    }
+
+    fn radix(
+        domain: PhysicalMapDomain,
+        prefix_nibbles: u8,
+        prefix: Vec<u8>,
+        child_bitmap: u16,
+        children: Vec<PhysicalMapNodeId>,
+        subtree_entries: u64,
+    ) -> Result<Self, PhysicalModelError> {
+        validate_radix(
+            prefix_nibbles,
+            &prefix,
+            child_bitmap,
+            &children,
+            subtree_entries,
+        )?;
+        Ok(Self::Radix {
+            domain,
+            prefix_nibbles,
+            prefix,
+            child_bitmap,
+            children,
+            subtree_entries,
+        })
+    }
+
     /// Return the map domain included in this node's identity.
     #[must_use]
     pub const fn domain(&self) -> PhysicalMapDomain {
         match self {
-            Self::Leaf { domain, .. } | Self::Branch { domain, .. } => *domain,
+            Self::Leaf { domain, .. }
+            | Self::Branch { domain, .. }
+            | Self::Page { domain, .. }
+            | Self::Radix { domain, .. } => *domain,
         }
     }
 
@@ -177,7 +248,11 @@ impl PhysicalMapNode {
             Self::Leaf { .. } => 1,
             Self::Branch {
                 subtree_entries, ..
+            }
+            | Self::Radix {
+                subtree_entries, ..
             } => *subtree_entries,
+            Self::Page { entries, .. } => entries.len() as u64,
         }
     }
 
@@ -188,7 +263,10 @@ impl PhysicalMapNode {
     /// Returns a length overflow when a leaf value cannot fit `u64`.
     pub fn encode(&self) -> Result<Vec<u8>, PhysicalModelError> {
         let mut encoder = Encoder::new();
-        encoder.u16(MAP_NODE_VERSION);
+        encoder.u16(match self {
+            Self::Leaf { .. } | Self::Branch { .. } => LEGACY_MAP_NODE_VERSION,
+            Self::Page { .. } | Self::Radix { .. } => RADIX_MAP_NODE_VERSION,
+        });
         encoder.u8(self.domain().code());
         match self {
             Self::Leaf { key, value, .. } => {
@@ -211,6 +289,33 @@ impl PhysicalMapNode {
                 encode_map_node_id(&mut encoder, *one);
                 encoder.u64(*subtree_entries);
             },
+            Self::Page { entries, .. } => {
+                encoder.u8(0);
+                encoder
+                    .u8(u8::try_from(entries.len())
+                        .map_err(|_| PhysicalModelError::LengthOverflow)?);
+                for (key, value) in entries {
+                    encode_physical_digest(&mut encoder, key.as_bytes());
+                    encoder.bytes(value)?;
+                }
+            },
+            Self::Radix {
+                prefix_nibbles,
+                prefix,
+                child_bitmap,
+                children,
+                subtree_entries,
+                ..
+            } => {
+                encoder.u8(1);
+                encoder.u8(*prefix_nibbles);
+                encoder.raw(prefix);
+                encoder.u16(*child_bitmap);
+                for child in children {
+                    encode_map_node_id(&mut encoder, *child);
+                }
+                encoder.u64(*subtree_entries);
+            },
         }
         Ok(encoder.finish())
     }
@@ -222,31 +327,35 @@ impl PhysicalMapNode {
     /// Rejects invalid fields, trailing bytes, and second encodings.
     pub fn decode(bytes: &[u8]) -> Result<Self, PhysicalModelError> {
         let mut decoder = Decoder::new(bytes);
-        if decoder.u16()? != MAP_NODE_VERSION {
-            return Err(PhysicalModelError::InvalidMap(
-                "unsupported map-node version",
-            ));
-        }
+        let version = decoder.u16()?;
         let domain = PhysicalMapDomain::from_code(decoder.u8()?)?;
-        let node = match decoder.u8()? {
-            0 => Self::leaf(
-                domain,
-                PhysicalMapKey::new(decode_physical_digest(&mut decoder)?),
-                decoder.bytes()?.to_vec(),
-            ),
-            1 => {
-                let prefix_bits = decoder.u32()?;
-                let prefix_bytes = prefix_byte_len(prefix_bits)?;
-                Self::branch(
+        let node = match version {
+            LEGACY_MAP_NODE_VERSION => match decoder.u8()? {
+                0 => Self::leaf(
                     domain,
-                    prefix_bits,
-                    decoder.take(prefix_bytes)?.to_vec(),
-                    decode_map_node_id(&mut decoder)?,
-                    decode_map_node_id(&mut decoder)?,
-                    decoder.u64()?,
-                )?
+                    PhysicalMapKey::new(decode_physical_digest(&mut decoder)?),
+                    decoder.bytes()?.to_vec(),
+                ),
+                1 => {
+                    let prefix_bits = decoder.u32()?;
+                    let prefix_bytes = legacy::prefix_byte_len(prefix_bits)?;
+                    Self::branch(
+                        domain,
+                        prefix_bits,
+                        decoder.take(prefix_bytes)?.to_vec(),
+                        decode_map_node_id(&mut decoder)?,
+                        decode_map_node_id(&mut decoder)?,
+                        decoder.u64()?,
+                    )?
+                },
+                tag => return Err(PhysicalModelError::UnknownTag("physical-map-node", tag)),
             },
-            tag => return Err(PhysicalModelError::UnknownTag("physical-map-node", tag)),
+            RADIX_MAP_NODE_VERSION => decode_radix_node(&mut decoder, domain)?,
+            _ => {
+                return Err(PhysicalModelError::InvalidMap(
+                    "unsupported map-node version",
+                ));
+            },
         };
         decoder.finish()?;
         if node.encode()?.as_slice() != bytes {
@@ -264,10 +373,13 @@ impl PhysicalMapNode {
         &self,
         identity: &I,
     ) -> Result<PhysicalMapNodeId, PhysicalModelError> {
-        Ok(PhysicalMapNodeId::new(identity.identify(
-            "astrid-physical-map-node-v1\0",
-            &self.encode()?,
-        )))
+        let context = match self {
+            Self::Leaf { .. } | Self::Branch { .. } => "astrid-physical-map-node-v1\0",
+            Self::Page { .. } | Self::Radix { .. } => "astrid-physical-radix-map-node-v1\0",
+        };
+        Ok(PhysicalMapNodeId::new(
+            identity.identify(context, &self.encode()?),
+        ))
     }
 }
 
@@ -278,9 +390,16 @@ impl PhysicalMapNode {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CanonicalPhysicalMap {
     domain: PhysicalMapDomain,
+    construction: MapConstruction,
     root: Option<PhysicalMapNodeId>,
     nodes: BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
     entry_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MapConstruction {
+    LegacyBinary,
+    DenseRadix,
 }
 
 impl CanonicalPhysicalMap {
@@ -292,9 +411,31 @@ impl CanonicalPhysicalMap {
     pub fn build<I: PhysicalIdentity>(
         identity: &I,
         domain: PhysicalMapDomain,
-        mut entries: Vec<(PhysicalMapKey, Vec<u8>)>,
+        entries: Vec<(PhysicalMapKey, Vec<u8>)>,
     ) -> Result<Self, PhysicalModelError> {
-        entries.sort_by_key(|(key, _)| key.search_key());
+        Self::build_with_construction(identity, domain, entries, MapConstruction::LegacyBinary)
+    }
+
+    /// Build the dense canonical nibble-radix construction.
+    ///
+    /// # Errors
+    ///
+    /// Rejects duplicate keys and arithmetic overflow.
+    pub fn build_dense<I: PhysicalIdentity>(
+        identity: &I,
+        domain: PhysicalMapDomain,
+        entries: Vec<(PhysicalMapKey, Vec<u8>)>,
+    ) -> Result<Self, PhysicalModelError> {
+        Self::build_with_construction(identity, domain, entries, MapConstruction::DenseRadix)
+    }
+
+    fn build_with_construction<I: PhysicalIdentity>(
+        identity: &I,
+        domain: PhysicalMapDomain,
+        mut entries: Vec<(PhysicalMapKey, Vec<u8>)>,
+        construction: MapConstruction,
+    ) -> Result<Self, PhysicalModelError> {
+        entries.sort_by_key(|(key, _)| *key);
         if entries.windows(2).any(|pair| pair[0].0 == pair[1].0) {
             return Err(PhysicalModelError::InvalidMap("duplicate leaf key"));
         }
@@ -304,10 +445,18 @@ impl CanonicalPhysicalMap {
         let root = if entries.is_empty() {
             None
         } else {
-            Some(build_range(identity, domain, &entries, &mut nodes)?)
+            Some(match construction {
+                MapConstruction::LegacyBinary => {
+                    legacy::build(identity, domain, &entries, &mut nodes)?
+                },
+                MapConstruction::DenseRadix => {
+                    radix::build(identity, domain, &entries, &mut nodes)?
+                },
+            })
         };
         Ok(Self {
             domain,
+            construction,
             root,
             nodes,
             entry_count,
@@ -329,6 +478,10 @@ impl CanonicalPhysicalMap {
         let Some(root) = root else {
             return Ok(0);
         };
+        let construction = nodes
+            .get(&root)
+            .ok_or(PhysicalModelError::InvalidMap("missing map root"))?
+            .construction();
         let mut stack = vec![root];
         let mut visited = BTreeSet::new();
         let mut entries = Vec::new();
@@ -355,9 +508,16 @@ impl CanonicalPhysicalMap {
                     stack.push(*one);
                     stack.push(*zero);
                 },
+                PhysicalMapNode::Page {
+                    entries: page_entries,
+                    ..
+                } => entries.extend(page_entries.iter().cloned()),
+                PhysicalMapNode::Radix { children, .. } => {
+                    stack.extend(children.iter().rev().copied());
+                },
             }
         }
-        let rebuilt = Self::build(identity, domain, entries)?;
+        let rebuilt = Self::build_with_construction(identity, domain, entries, construction)?;
         if rebuilt.root != Some(root) {
             return Err(PhysicalModelError::InvalidMap(
                 "node graph is not the unique canonical trie",
@@ -378,8 +538,12 @@ impl CanonicalPhysicalMap {
         nodes: BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
     ) -> Result<Self, PhysicalModelError> {
         let entry_count = Self::validate_root(identity, domain, root, &nodes)?;
+        let construction = root
+            .and_then(|root| nodes.get(&root))
+            .map_or(MapConstruction::DenseRadix, PhysicalMapNode::construction);
         Ok(Self {
             domain,
+            construction,
             root,
             nodes,
             entry_count,
@@ -402,14 +566,25 @@ impl CanonicalPhysicalMap {
         key: PhysicalMapKey,
         value: Vec<u8>,
     ) -> Result<bool, PhysicalModelError> {
-        let mut insertion = MapInsertion {
-            identity,
-            domain: self.domain,
-            nodes: &mut self.nodes,
-        };
-        let (replacement, inserted) = match self.root {
-            Some(root) => insertion.insert_at(root, key, value)?,
-            None => (insertion.insert_leaf(key, value)?, true),
+        let (replacement, inserted) = if let Some(root) = self.root {
+            match self.construction {
+                MapConstruction::LegacyBinary => {
+                    legacy::insert(identity, self.domain, &mut self.nodes, root, key, value)?
+                },
+                MapConstruction::DenseRadix => {
+                    radix::insert(identity, self.domain, &mut self.nodes, root, key, value)?
+                },
+            }
+        } else {
+            let node = match self.construction {
+                MapConstruction::LegacyBinary => PhysicalMapNode::leaf(self.domain, key, value),
+                MapConstruction::DenseRadix => {
+                    PhysicalMapNode::page(self.domain, vec![(key, value)])?
+                },
+            };
+            let id = node.identify(identity)?;
+            self.nodes.insert(id, node);
+            (id, true)
         };
         if inserted {
             self.root = Some(replacement);
@@ -465,6 +640,21 @@ impl CanonicalPhysicalMap {
                         stack.push(*one);
                         stack.push(*zero);
                     },
+                    PhysicalMapNode::Page {
+                        entries: page_entries,
+                        ..
+                    } => {
+                        for (key, value) in page_entries {
+                            if entries.insert(*key, value.clone()).is_some() {
+                                return Err(PhysicalModelError::InvalidMap(
+                                    "active map has duplicate page keys",
+                                ));
+                            }
+                        }
+                    },
+                    PhysicalMapNode::Radix { children, .. } => {
+                        stack.extend(children.iter().rev().copied());
+                    },
                 }
             }
         }
@@ -497,7 +687,12 @@ impl CanonicalPhysicalMap {
             return Ok(0);
         }
 
-        let rebuilt = Self::build(identity, self.domain, entries.into_iter().collect())?;
+        let rebuilt = Self::build_with_construction(
+            identity,
+            self.domain,
+            entries.into_iter().collect(),
+            self.construction,
+        )?;
         for (id, node) in &rebuilt.nodes {
             if self.nodes.get(id).is_some_and(|existing| existing != node) {
                 return Err(PhysicalModelError::InvalidMap(
@@ -546,14 +741,39 @@ impl CanonicalPhysicalMap {
                     one,
                     ..
                 } => {
-                    if !matches_prefix(&search, *prefix_bits, prefix) {
+                    if !legacy::matches_prefix(&search, *prefix_bits, prefix) {
                         return None;
                     }
-                    current = if bit(&search, *prefix_bits) {
+                    current = if legacy::bit(&search, *prefix_bits) {
                         *one
                     } else {
                         *zero
                     };
+                },
+                PhysicalMapNode::Page { entries, .. } => {
+                    return entries
+                        .binary_search_by_key(&key, |(stored, _)| *stored)
+                        .ok()
+                        .map(|index| entries[index].1.as_slice());
+                },
+                PhysicalMapNode::Radix {
+                    prefix_nibbles,
+                    prefix,
+                    child_bitmap,
+                    children,
+                    ..
+                } => {
+                    if radix_common_prefix(key, *prefix_nibbles, prefix) < *prefix_nibbles {
+                        return None;
+                    }
+                    let selector = radix::nibble(key, *prefix_nibbles);
+                    let mask = 1_u16 << selector;
+                    if child_bitmap & mask == 0 {
+                        return None;
+                    }
+                    let index =
+                        usize::try_from((child_bitmap & mask.wrapping_sub(1)).count_ones()).ok()?;
+                    current = *children.get(index)?;
                 },
             }
         }
@@ -566,359 +786,132 @@ impl CanonicalPhysicalMap {
     }
 }
 
-struct LeafParts {
-    key: PhysicalMapKey,
-    value: Vec<u8>,
-}
-
-struct BranchParts {
-    prefix_bits: u32,
-    prefix: Vec<u8>,
-    zero: PhysicalMapNodeId,
-    one: PhysicalMapNodeId,
-    subtree_entries: u64,
-}
-
-struct MapInsertion<'a, I> {
-    identity: &'a I,
+fn decode_radix_node(
+    decoder: &mut Decoder<'_>,
     domain: PhysicalMapDomain,
-    nodes: &'a mut BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
-}
-
-impl<I: PhysicalIdentity> MapInsertion<'_, I> {
-    fn insert_at(
-        &mut self,
-        node_id: PhysicalMapNodeId,
-        key: PhysicalMapKey,
-        value: Vec<u8>,
-    ) -> Result<(PhysicalMapNodeId, bool), PhysicalModelError> {
-        let node = self
-            .nodes
-            .get(&node_id)
-            .cloned()
-            .ok_or(PhysicalModelError::InvalidMap("missing insertion node"))?;
-        if node.domain() != self.domain {
-            return Err(PhysicalModelError::InvalidMap(
-                "insertion crossed a map domain",
-            ));
-        }
-        match node {
-            PhysicalMapNode::Leaf {
-                key: old,
-                value: old_value,
-                ..
-            } => self.insert_at_leaf(
-                node_id,
-                &LeafParts {
-                    key: old,
-                    value: old_value,
-                },
-                key,
-                value,
-            ),
-            PhysicalMapNode::Branch {
-                prefix_bits,
-                prefix,
-                zero,
-                one,
-                subtree_entries,
-                ..
-            } => self.insert_at_branch(
-                node_id,
-                BranchParts {
-                    prefix_bits,
-                    prefix,
-                    zero,
-                    one,
-                    subtree_entries,
-                },
-                key,
-                value,
-            ),
-        }
-    }
-
-    fn insert_at_leaf(
-        &mut self,
-        node_id: PhysicalMapNodeId,
-        existing: &LeafParts,
-        key: PhysicalMapKey,
-        value: Vec<u8>,
-    ) -> Result<(PhysicalMapNodeId, bool), PhysicalModelError> {
-        if existing.key == key {
-            if existing.value == value {
-                return Ok((node_id, false));
+) -> Result<PhysicalMapNode, PhysicalModelError> {
+    match decoder.u8()? {
+        0 => {
+            let count = usize::from(decoder.u8()?);
+            if count == 0 || count > RADIX_PAGE_CAPACITY {
+                return Err(PhysicalModelError::InvalidMap(
+                    "radix page count is outside its bound",
+                ));
             }
-            return Err(PhysicalModelError::InvalidMap(
-                "leaf key has unequal canonical bytes",
-            ));
-        }
-        let existing_search = existing.key.search_key();
-        let new_search = key.search_key();
-        let prefix_bits = common_prefix_bits(&existing_search, &new_search)?;
-        let new_leaf_id = self.insert_leaf(key, value)?;
-        let (zero, one) = ordered_children(node_id, new_leaf_id, &new_search, prefix_bits);
-        let branch = PhysicalMapNode::branch(
-            self.domain,
-            prefix_bits,
-            canonical_prefix(&new_search, prefix_bits)?,
-            zero,
-            one,
-            2,
-        )?;
-        self.insert_node(branch)
-            .map(|replacement| (replacement, true))
-    }
-
-    fn insert_at_branch(
-        &mut self,
-        node_id: PhysicalMapNodeId,
-        branch: BranchParts,
-        key: PhysicalMapKey,
-        value: Vec<u8>,
-    ) -> Result<(PhysicalMapNodeId, bool), PhysicalModelError> {
-        let search = key.search_key();
-        let common = common_prefix_with_prefix(&search, branch.prefix_bits, &branch.prefix)?;
-        if common < branch.prefix_bits {
-            return self.split_branch(node_id, &branch, key, value, &search, common);
-        }
-        let descend_one = bit(&search, branch.prefix_bits);
-        let child = if descend_one { branch.one } else { branch.zero };
-        let (child_replacement, inserted) = self.insert_at(child, key, value)?;
-        if !inserted {
-            return Ok((node_id, false));
-        }
-        let parent = PhysicalMapNode::branch(
-            self.domain,
-            branch.prefix_bits,
-            branch.prefix,
-            if descend_one {
-                branch.zero
-            } else {
-                child_replacement
-            },
-            if descend_one {
-                child_replacement
-            } else {
-                branch.one
-            },
-            increment_count(branch.subtree_entries)?,
-        )?;
-        self.insert_node(parent)
-            .map(|replacement| (replacement, true))
-    }
-
-    fn split_branch(
-        &mut self,
-        node_id: PhysicalMapNodeId,
-        branch: &BranchParts,
-        key: PhysicalMapKey,
-        value: Vec<u8>,
-        search: &[u8],
-        common: u32,
-    ) -> Result<(PhysicalMapNodeId, bool), PhysicalModelError> {
-        let new_leaf_id = self.insert_leaf(key, value)?;
-        if bit(&branch.prefix, common) == bit(search, common) {
-            return Err(PhysicalModelError::InvalidMap(
-                "branch prefix split did not diverge",
-            ));
-        }
-        let (zero, one) = ordered_children(node_id, new_leaf_id, search, common);
-        let parent = PhysicalMapNode::branch(
-            self.domain,
-            common,
-            canonical_prefix(search, common)?,
-            zero,
-            one,
-            increment_count(branch.subtree_entries)?,
-        )?;
-        self.insert_node(parent)
-            .map(|replacement| (replacement, true))
-    }
-
-    fn insert_leaf(
-        &mut self,
-        key: PhysicalMapKey,
-        value: Vec<u8>,
-    ) -> Result<PhysicalMapNodeId, PhysicalModelError> {
-        self.insert_node(PhysicalMapNode::leaf(self.domain, key, value))
-    }
-
-    fn insert_node(
-        &mut self,
-        node: PhysicalMapNode,
-    ) -> Result<PhysicalMapNodeId, PhysicalModelError> {
-        let id = node.identify(self.identity)?;
-        self.nodes.entry(id).or_insert(node);
-        Ok(id)
+            let mut entries = Vec::new();
+            entries
+                .try_reserve_exact(count)
+                .map_err(|_| PhysicalModelError::LengthOverflow)?;
+            for _ in 0..count {
+                entries.push((
+                    PhysicalMapKey::new(decode_physical_digest(decoder)?),
+                    decoder.bytes()?.to_vec(),
+                ));
+            }
+            PhysicalMapNode::page(domain, entries)
+        },
+        1 => {
+            let prefix_nibbles = decoder.u8()?;
+            let prefix = decoder
+                .take(nibble_prefix_byte_len(prefix_nibbles))?
+                .to_vec();
+            let child_bitmap = decoder.u16()?;
+            let child_count = usize::try_from(child_bitmap.count_ones())
+                .map_err(|_| PhysicalModelError::LengthOverflow)?;
+            let mut children = Vec::new();
+            children
+                .try_reserve_exact(child_count)
+                .map_err(|_| PhysicalModelError::LengthOverflow)?;
+            for _ in 0..child_count {
+                children.push(decode_map_node_id(decoder)?);
+            }
+            PhysicalMapNode::radix(
+                domain,
+                prefix_nibbles,
+                prefix,
+                child_bitmap,
+                children,
+                decoder.u64()?,
+            )
+        },
+        tag => Err(PhysicalModelError::UnknownTag(
+            "physical-radix-map-node",
+            tag,
+        )),
     }
 }
 
-fn ordered_children(
-    existing: PhysicalMapNodeId,
-    inserted: PhysicalMapNodeId,
-    inserted_key: &[u8],
-    split_bit: u32,
-) -> (PhysicalMapNodeId, PhysicalMapNodeId) {
-    if bit(inserted_key, split_bit) {
-        (existing, inserted)
-    } else {
-        (inserted, existing)
-    }
-}
-
-fn increment_count(count: u64) -> Result<u64, PhysicalModelError> {
-    count
-        .checked_add(1)
-        .ok_or(PhysicalModelError::LengthOverflow)
-}
-
-fn build_range<I: PhysicalIdentity>(
-    identity: &I,
-    domain: PhysicalMapDomain,
-    entries: &[(PhysicalMapKey, Vec<u8>)],
-    nodes: &mut BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
-) -> Result<PhysicalMapNodeId, PhysicalModelError> {
-    if entries.len() == 1 {
-        let node = PhysicalMapNode::leaf(domain, entries[0].0, entries[0].1.clone());
-        let id = node.identify(identity)?;
-        nodes.insert(id, node);
-        return Ok(id);
-    }
-
-    let first = entries
-        .first()
-        .ok_or(PhysicalModelError::InvalidMap("empty branch range"))?
-        .0
-        .search_key();
-    let last = entries
-        .last()
-        .ok_or(PhysicalModelError::InvalidMap("empty branch range"))?
-        .0
-        .search_key();
-    let prefix_bits = common_prefix_bits(&first, &last)?;
-    if prefix_bits >= SEARCH_KEY_BITS {
-        return Err(PhysicalModelError::InvalidMap("duplicate branch key"));
-    }
-    let split = entries.partition_point(|(key, _)| !bit(&key.search_key(), prefix_bits));
-    if split == 0 || split == entries.len() {
-        return Err(PhysicalModelError::InvalidMap("canonical branch is unary"));
-    }
-    let zero = build_range(identity, domain, &entries[..split], nodes)?;
-    let one = build_range(identity, domain, &entries[split..], nodes)?;
-    let node = PhysicalMapNode::branch(
-        domain,
-        prefix_bits,
-        canonical_prefix(&first, prefix_bits)?,
-        zero,
-        one,
-        u64::try_from(entries.len()).map_err(|_| PhysicalModelError::LengthOverflow)?,
-    )?;
-    let id = node.identify(identity)?;
-    nodes.insert(id, node);
-    Ok(id)
-}
-
-fn validate_branch(
-    prefix_bits: u32,
-    prefix: &[u8],
-    zero: PhysicalMapNodeId,
-    one: PhysicalMapNodeId,
-    subtree_entries: u64,
-) -> Result<(), PhysicalModelError> {
-    if prefix_bits >= SEARCH_KEY_BITS {
-        return Err(PhysicalModelError::InvalidMap("branch prefix consumes key"));
-    }
-    if prefix.len() != prefix_byte_len(prefix_bits)? {
+fn validate_page(entries: &[(PhysicalMapKey, Vec<u8>)]) -> Result<(), PhysicalModelError> {
+    if entries.is_empty() || entries.len() > RADIX_PAGE_CAPACITY {
         return Err(PhysicalModelError::InvalidMap(
-            "branch prefix length mismatch",
+            "radix page count is outside its bound",
         ));
     }
-    let remainder = prefix_bits % 8;
-    if !prefix_bits.is_multiple_of(8)
-        && prefix.last().is_some_and(|last| {
-            let unused = 8_u32.saturating_sub(remainder);
-            let unused_mask = 1_u8
-                .checked_shl(unused)
-                .and_then(|value| value.checked_sub(1))
-                .unwrap_or(u8::MAX);
-            *last & unused_mask != 0
-        })
-    {
+    if entries.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
         return Err(PhysicalModelError::InvalidMap(
-            "branch prefix has non-zero unused bits",
+            "radix page keys are not strictly ordered",
         ));
-    }
-    if zero == one {
-        return Err(PhysicalModelError::InvalidMap(
-            "branch aliases its children",
-        ));
-    }
-    if subtree_entries < 2 {
-        return Err(PhysicalModelError::InvalidMap("branch is unary"));
     }
     Ok(())
 }
 
-fn prefix_byte_len(bits: u32) -> Result<usize, PhysicalModelError> {
-    usize::try_from(bits.div_ceil(8)).map_err(|_| PhysicalModelError::LengthOverflow)
-}
-
-fn common_prefix_bits(left: &[u8], right: &[u8]) -> Result<u32, PhysicalModelError> {
-    let equal_bytes = left
-        .iter()
-        .zip(right)
-        .position(|(left, right)| left != right)
-        .unwrap_or(left.len());
-    let equal_bits = u32::try_from(equal_bytes)
-        .map_err(|_| PhysicalModelError::LengthOverflow)?
-        .checked_mul(8)
-        .ok_or(PhysicalModelError::LengthOverflow)?;
-    if equal_bytes == left.len() {
-        return Ok(equal_bits);
-    }
-    let differing = left[equal_bytes] ^ right[equal_bytes];
-    equal_bits
-        .checked_add(differing.leading_zeros())
-        .ok_or(PhysicalModelError::LengthOverflow)
-}
-
-fn common_prefix_with_prefix(
-    key: &[u8],
-    prefix_bits: u32,
+pub(super) fn validate_radix(
+    prefix_nibbles: u8,
     prefix: &[u8],
-) -> Result<u32, PhysicalModelError> {
-    let mut common = 0_u32;
-    while common < prefix_bits {
-        if bit(key, common) != bit(prefix, common) {
-            return Ok(common);
-        }
-        common = common
-            .checked_add(1)
-            .ok_or(PhysicalModelError::LengthOverflow)?;
+    child_bitmap: u16,
+    children: &[PhysicalMapNodeId],
+    subtree_entries: u64,
+) -> Result<(), PhysicalModelError> {
+    if prefix_nibbles >= DIGEST_NIBBLES {
+        return Err(PhysicalModelError::InvalidMap(
+            "radix prefix consumes the key",
+        ));
     }
-    Ok(common)
-}
-
-fn canonical_prefix(key: &[u8], bits: u32) -> Result<Vec<u8>, PhysicalModelError> {
-    let byte_len = prefix_byte_len(bits)?;
-    let mut prefix = key[..byte_len].to_vec();
-    if !bits.is_multiple_of(8)
-        && let Some(last) = prefix.last_mut()
+    if prefix.len() != nibble_prefix_byte_len(prefix_nibbles) {
+        return Err(PhysicalModelError::InvalidMap(
+            "radix prefix length mismatch",
+        ));
+    }
+    if !prefix_nibbles.is_multiple_of(2) && prefix.last().is_some_and(|last| last & 0x0f != 0) {
+        return Err(PhysicalModelError::InvalidMap(
+            "radix prefix has a non-zero unused nibble",
+        ));
+    }
+    let child_count = usize::try_from(child_bitmap.count_ones())
+        .map_err(|_| PhysicalModelError::LengthOverflow)?;
+    if child_count < 2
+        || child_count != children.len()
+        || subtree_entries <= RADIX_PAGE_CAPACITY as u64
     {
-        *last &= u8::MAX
-            .checked_shl(8_u32.saturating_sub(bits % 8))
-            .unwrap_or(0);
+        return Err(PhysicalModelError::InvalidMap(
+            "radix branch is non-canonical or incomplete",
+        ));
     }
-    Ok(prefix)
+    if children.iter().copied().collect::<BTreeSet<_>>().len() != children.len() {
+        return Err(PhysicalModelError::InvalidMap(
+            "radix branch aliases its children",
+        ));
+    }
+    Ok(())
 }
 
-fn matches_prefix(key: &[u8], bits: u32, expected: &[u8]) -> bool {
-    canonical_prefix(key, bits).is_ok_and(|prefix| prefix == expected)
+fn nibble_prefix_byte_len(nibbles: u8) -> usize {
+    usize::from(nibbles.div_ceil(2))
 }
 
-fn bit(key: &[u8], offset: u32) -> bool {
-    let byte = usize::try_from(offset / 8).unwrap_or(usize::MAX);
-    let shift = 7_u32.saturating_sub(offset % 8);
-    key.get(byte).is_some_and(|value| value & (1 << shift) != 0)
+fn radix_common_prefix(key: PhysicalMapKey, prefix_nibbles: u8, prefix: &[u8]) -> u8 {
+    let mut common = 0;
+    while common < prefix_nibbles {
+        let byte = prefix[usize::from(common / 2)];
+        let expected = if common.is_multiple_of(2) {
+            byte >> 4
+        } else {
+            byte & 0x0f
+        };
+        if radix::nibble(key, common) != expected {
+            break;
+        }
+        common = common.saturating_add(1);
+    }
+    common
 }

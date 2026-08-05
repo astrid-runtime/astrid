@@ -15,31 +15,32 @@ This directory contains evidence only:
   host, and workload; and
 - `SHA256SUMS`, which fixes the imported result bytes.
 
-The `94e7cea7` main and `d6bc3d06`/`0d5a42b3`/`603d260b`
-physical-catalogue envelopes are a four-point lineage. They establish the
-pre-change baseline, expose the initial physical-metadata amplification,
-measure final-node-only batch admission, and finish with the audited work-
-conserving implementation under an otherwise identical workload.
+The `94e7cea7` main, `d6bc3d06`/`0d5a42b3`/`603d260b`
+physical-catalogue, and `ce756e1e` dense-radix envelopes form one lineage. They
+establish the pre-change baseline, expose the initial physical-metadata
+amplification, measure final-node-only batch admission, and finish with the
+audited work-conserving and denser canonical implementations under an
+otherwise identical workload.
 
 ## Current headline result
 
-Clean commit `603d260b` used a deterministic 512 MiB incompressible corpus,
+Clean commit `ce756e1e` used a deterministic 512 MiB incompressible corpus,
 three samples, one-MiB read ranges, four principals, and a governed one-GiB
 object cache on an M2 Ultra/APFS host.
 
 | Operation | Median result | Same-run context |
 |---|---:|---|
-| Astrid staging write | 4,734.7 MiB/s | 1.078× native cached-write elapsed |
-| Astrid warm verified read | 1,798.5 MiB/s | 0.887× native BLAKE3-verified elapsed |
-| Unique publication | 179.1 MiB/s | 1.016492 authoritative/logical bytes |
-| Duplicate publication | 258.3 MiB/s | 24,426 authoritative bytes for 512 MiB |
-| Four-principal shared publication | 386.3 MiB/s | 2.158× single-principal throughput |
-| Four-principal warm verified read | 6,337.0 MiB/s | 3.523× single-principal throughput |
-| Populated reopen | 1.368 s | physical catalogue enabled |
-| Direct-catalogue activation | 2.328 s | one-time populated-store migration |
+| Astrid staging write | 4,443.2 MiB/s | native-speed acknowledgement path |
+| Astrid warm verified read | 1,778.5 MiB/s | 0.898× native BLAKE3-verified elapsed |
+| Unique publication | 179.5 MiB/s | 1.013715 authoritative/logical bytes |
+| Duplicate publication | 256.5 MiB/s | 18,032 authoritative bytes for 512 MiB |
+| Four-principal shared publication | 380.9 MiB/s | 2.122× single-principal throughput |
+| Four-principal warm verified read | 6,285.1 MiB/s | 3.534× single-principal throughput |
+| Populated reopen | 1.276 s | dense physical catalogue enabled |
+| Direct-catalogue activation | 2.243 s | one-time populated-store migration |
 
 The machine-readable source is
-`astrid-storage-physical-catalogue-603d260b.json`. These are engine/substrate
+`astrid-storage-dense-radix-ce756e1e.json`. These are engine/substrate
 measurements, not mounted-provider results or a compressibility estimate.
 
 The historical schema did not embed Git revision, executable arguments,

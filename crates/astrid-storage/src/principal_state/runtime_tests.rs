@@ -499,7 +499,7 @@ fn format_specification_has_a_tagged_metadata_identity() {
     assert!(record.references().is_empty());
     assert_eq!(
         object_id_hex(id),
-        "900d1eface3294bc9e47369c0fcb64dca56ff334dfbc1288f349090e10c09e6f"
+        "9d701dc87360e634b25b7b7f5d5e79315f9f27bcf4d50e09c2181e439b0c7d75"
     );
     assert_eq!(
         object_id_hex(catalog_id),
@@ -510,7 +510,7 @@ fn format_specification_has_a_tagged_metadata_identity() {
         "format=astrid-principal-store-v1\n\
          identity=blake3-object-identity-v1\n\
          identity-wire=tagged-identity-v1\n\
-         format-spec-object=1:1:32:900d1eface3294bc9e47369c0fcb64dca56ff334dfbc1288f349090e10c09e6f\n\
+         format-spec-object=1:1:32:9d701dc87360e634b25b7b7f5d5e79315f9f27bcf4d50e09c2181e439b0c7d75\n\
          content-catalog-spec-object=1:1:32:8f3999b066b666396259c4a92f9de7c5b8e67df9d38a69fb4fb824968b56ecdb\n\
          representations=authoritative-direct-v1\n\
          principal-codec=principal-uid-v1\n\
@@ -854,6 +854,7 @@ fn assert_current_migration_marker(home: &AstridHome) {
 struct CatalogWorkloadMetrics {
     arena_bytes: u64,
     root_journal_bytes: u64,
+    representation_metadata_bytes: u64,
     publication_time: Duration,
     reopen_time: Duration,
 }
@@ -862,6 +863,15 @@ fn durable_file_len(home: &AstridHome, name: &str) -> u64 {
     std::fs::metadata(home.principal_store_path().join(name))
         .unwrap()
         .len()
+}
+
+fn representation_metadata_len(home: &AstridHome) -> u64 {
+    std::fs::metadata(
+        home.principal_store_path()
+            .join("representations/generations/0000000000000001/metadata.arena"),
+    )
+    .unwrap()
+    .len()
 }
 
 async fn measure_catalog_publications(unique_content: bool) -> CatalogWorkloadMetrics {
@@ -880,6 +890,7 @@ async fn measure_catalog_publications(unique_content: bool) -> CatalogWorkloadMe
     .unwrap();
     let arena_before = durable_file_len(&home, "objects.arena");
     let roots_before = durable_file_len(&home, "roots.journal");
+    let representation_metadata_before = representation_metadata_len(&home);
     let started = Instant::now();
     for index in 0..PUBLICATIONS {
         let name = ContentName::new(format!("workspace/fixture/{index:04}")).unwrap();
@@ -895,6 +906,9 @@ async fn measure_catalog_publications(unique_content: bool) -> CatalogWorkloadMe
         .unwrap();
     let root_journal_bytes = durable_file_len(&home, "roots.journal")
         .checked_sub(roots_before)
+        .unwrap();
+    let representation_metadata_bytes = representation_metadata_len(&home)
+        .checked_sub(representation_metadata_before)
         .unwrap();
     drop(store);
 
@@ -912,6 +926,7 @@ async fn measure_catalog_publications(unique_content: bool) -> CatalogWorkloadMe
     CatalogWorkloadMetrics {
         arena_bytes,
         root_journal_bytes,
+        representation_metadata_bytes,
         publication_time,
         reopen_time,
     }
@@ -939,9 +954,10 @@ async fn catalog_durable_performance_probe() {
     let unique = measure_catalog_publications(true).await;
     for (name, metrics) in [("duplicate", duplicate), ("unique", unique)] {
         eprintln!(
-            "{name}: arena={} roots={} publication={:?} reopen={:?}",
+            "{name}: arena={} roots={} representations={} publication={:?} reopen={:?}",
             metrics.arena_bytes,
             metrics.root_journal_bytes,
+            metrics.representation_metadata_bytes,
             metrics.publication_time,
             metrics.reopen_time
         );

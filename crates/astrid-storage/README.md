@@ -81,35 +81,36 @@ let loaded: serde_json::Value = scoped.get_json("prefs").await?.unwrap();
 
 ## Performance
 
-The current physical-catalogue implementation was measured from clean commit
-`603d260b` on an M2 Ultra/APFS host. Each reported median covers three runs over
-a deterministic 512 MiB incompressible corpus, with one-MiB reads, four
+The current dense physical-catalogue implementation was measured from clean
+commit `ce756e1e` on an M2 Ultra/APFS host. Each reported median covers three
+runs over a deterministic 512 MiB incompressible corpus, with one-MiB reads, four
 principals, and a governed one-GiB object-cache budget. Native comparisons are
 same-run substrate measurements; the verified-read comparator reads and
 BLAKE3-verifies the same bytes.
 
 | Operation | Median result | Interpretation |
 |---|---:|---|
-| Native cached write | 5,105.6 MiB/s | APFS substrate |
-| Astrid staging write | 4,734.7 MiB/s | 1.078× native elapsed time |
-| Native warm verified read | 1,595.6 MiB/s | read plus BLAKE3 |
-| Astrid warm verified read | 1,798.5 MiB/s | 0.887× native elapsed time |
-| Astrid first verified read | 496.4 MiB/s | process-local evidence cold |
-| Astrid post-reopen verified read | 411.8 MiB/s | evidence rebuilt after reopen |
-| Unique publication | 179.1 MiB/s | asynchronous authoritative admission |
-| Duplicate publication | 258.3 MiB/s | exact same-content admission |
-| Four-principal shared publication | 386.3 MiB/s aggregate | 2.158× single-principal throughput |
-| Four-principal warm verified read | 6,337.0 MiB/s aggregate | 3.523× single-principal throughput |
-| Populated reopen | 1.368 s | index plus physical-catalogue recovery |
-| Direct-catalogue activation | 2.328 s | one-time migration of the populated store |
+| Astrid staging write | 4,443.2 MiB/s | native-speed acknowledgement path |
+| Native warm verified read | 1,596.8 MiB/s | read plus BLAKE3 |
+| Astrid warm verified read | 1,778.5 MiB/s | 0.898× native elapsed time |
+| Astrid first verified read | 518.2 MiB/s | process-local evidence cold |
+| Astrid post-reopen verified read | 404.3 MiB/s | evidence rebuilt after reopen |
+| Unique publication | 179.5 MiB/s | asynchronous authoritative admission |
+| Duplicate publication | 256.5 MiB/s | exact same-content admission |
+| Four-principal shared publication | 380.9 MiB/s aggregate | 2.122× single-principal throughput |
+| Four-principal warm verified read | 6,285.1 MiB/s aggregate | 3.534× single-principal throughput |
+| Populated reopen | 1.276 s | dense physical-catalogue recovery |
+| Direct-catalogue activation | 2.243 s | one-time migration of the populated store |
 
-Unique random content appended 1.016492 physical bytes per logical byte,
+Unique random content appended 1.013715 physical bytes per logical byte,
 including authenticated representation metadata. Republishing the identical
-512 MiB appended 24,426 bytes (0.004550%): exact deduplication plus the new
-principal root and catalogue metadata. Strict small-file seals measured 70.3
-files/s versus 215.0 native write-and-sync operations/s, so ordinary hosted
+512 MiB appended 18,032 bytes (0.003359%): exact deduplication plus the new
+principal root and catalogue metadata. Strict small-file seals measured 71.6
+files/s versus 230.2 native write-and-sync operations/s, so ordinary hosted
 close remains the native-speed staging boundary while publication proceeds in
-the background.
+the background. The dense map uses 903.0 representation-metadata bytes per new
+object, 19.7% below the preceding canonical binary map, while preserving
+legacy-root recovery and logical identities.
 
 These are engine and APFS-substrate measurements, not mounted-provider results
 or corpus-wide compression claims. The full methodology, historical baselines,

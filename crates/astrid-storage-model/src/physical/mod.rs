@@ -117,4 +117,6 @@ impl core::error::Error for PhysicalModelError {}
 #[cfg(test)]
 mod catalogue_tests;
 #[cfg(test)]
+mod radix_tests;
+#[cfg(test)]
 mod tests;
