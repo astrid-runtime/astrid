@@ -638,6 +638,14 @@ def prefix_bits(left, right):
     return len(left) * 8
 
 
+def canonical_prefix(key, bits):
+    prefix = bytearray(key[: (bits + 7) // 8])
+    remainder = bits % 8
+    if remainder:
+        prefix[-1] &= 0xFF << (8 - remainder)
+    return bytes(prefix)
+
+
 def validate_map(root, expected_domain, expected_count, nodes, decode_value):
     if root is None:
         if expected_count:
@@ -664,6 +672,8 @@ def validate_map(root, expected_domain, expected_count, nodes, decode_value):
                 minimum, maximum = zero[1], one[2]
                 if prefix_bits(minimum, maximum) != node["prefix_bits"]:
                     raise FormatError("physical map branch is not the longest common prefix")
+                if canonical_prefix(minimum, node["prefix_bits"]) != node["prefix"]:
+                    raise FormatError("physical map branch prefix bytes are not canonical")
                 if key_bit(zero[1], node["prefix_bits"]) or key_bit(zero[2], node["prefix_bits"]):
                     raise FormatError("physical map zero child crosses split")
                 if not key_bit(one[1], node["prefix_bits"]) or not key_bit(one[2], node["prefix_bits"]):
@@ -831,10 +841,20 @@ def decode_fixture(path):
     return result
 
 
-def decode_store(store):
+def decode_store(store, bootstrap_objects=None):
     from runatal_v1_physical_store import decode_store as decode_authoritative_store
 
-    return decode_authoritative_store(store)
+    if bootstrap_objects is None:
+        from runatal_v1_reader import LEGACY_FORMAT_SPECIFICATIONS, parse_metadata
+
+        specification, catalog_specification = parse_metadata(store / "store.meta")
+        bootstrap_objects = {
+            identity_bytes(identifier)
+            for identifier in LEGACY_FORMAT_SPECIFICATIONS | {specification}
+        }
+        if catalog_specification is not None:
+            bootstrap_objects.add(identity_bytes(catalog_specification))
+    return decode_authoritative_store(store, bootstrap_objects)
 
 
 def main():

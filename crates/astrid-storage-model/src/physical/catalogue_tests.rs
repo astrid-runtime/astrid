@@ -279,6 +279,20 @@ fn run_catalogue_fixture(fixture: &str) -> Output {
 }
 
 #[test]
+fn independent_physical_validation_regressions_pass() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let output = Command::new("python3")
+        .arg(repository.join("scripts/test_runatal_v1_physical_validation.py"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "independent physical validation regressions failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn catalogue_golden_vector_is_shared_with_the_independent_reader() {
     let fixture = catalogue_fixture();
     assert_eq!(

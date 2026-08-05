@@ -39,7 +39,7 @@ from runatal_v1_physical import (
 )
 
 
-def decode_store(store):
+def decode_store(store, bootstrap_objects=()):
     """Recover and independently validate one authoritative physical store."""
     current_frames = list(frames(store / "representations" / "CURRENT", CURRENT_MAGIC))
     if len(current_frames) != 1 or current_frames[0][0] != 0:
@@ -62,7 +62,7 @@ def decode_store(store):
         max_tail_bytes,
         metadata,
     )
-    summary = validate_active_state(store, active, metadata)
+    summary = validate_active_state(store, active, metadata, set(bootstrap_objects))
     summary["journal_generation"] = generation
     return summary
 
@@ -193,7 +193,7 @@ def validate_root_generations(previous, current, metadata):
         raise FormatError("physical root generation does not match identity change")
 
 
-def validate_active_state(store, active, metadata):
+def validate_active_state(store, active, metadata, bootstrap_objects):
     state_bytes = metadata_value(metadata, 5, active)
     state = decode_representation_state(state_bytes)
     if physical_identity(STATE_CONTEXT, state_bytes) != active:
@@ -261,7 +261,14 @@ def validate_active_state(store, active, metadata):
     if len(direct_profiles) != 1:
         raise FormatError("catalogue does not contain exactly one direct profile")
     direct_profile = (1, 2, direct_profiles[0][8:])
-    validate_direct_arena(store, direct_profile, profiles, records, placements)
+    validate_direct_arena(
+        store,
+        direct_profile,
+        profiles,
+        records,
+        placements,
+        bootstrap_objects,
+    )
     return {
         "state": identity_text(active),
         "catalogue_generation": catalogue["generation"],
@@ -270,13 +277,21 @@ def validate_active_state(store, active, metadata):
     }
 
 
-def validate_direct_arena(store, direct_profile, profiles, records, placements):
+def validate_direct_arena(
+    store,
+    direct_profile,
+    profiles,
+    records,
+    placements,
+    bootstrap_objects,
+):
     arena = store / "objects.arena"
     objects = {}
     for offset, payload in frames(arena, ARENA_MAGIC):
         cursor = Cursor(payload)
         object_id = identity(cursor, LOGICAL_SCHEME)
         objects[identity_bytes(object_id)] = (offset, payload, cursor.offset)
+    covered = set()
     for record in records.values():
         if identity_bytes(record["profile"]) not in profiles:
             raise FormatError("representation profile is missing")
@@ -293,6 +308,7 @@ def validate_direct_arena(store, direct_profile, profiles, records, placements):
         except KeyError as error:
             raise FormatError("direct representation logical object is missing") from error
         canonical = payload[canonical_offset:]
+        canonical_length = len(canonical)
         blob_material = identity_bytes(direct_profile) + struct.pack("<Q", len(canonical)) + canonical
         blob = physical_identity(BLOB_CONTEXT, blob_material)
         if blob != record["recipe"][1]:
@@ -300,6 +316,7 @@ def validate_direct_arena(store, direct_profile, profiles, records, placements):
         placement = placements.get(identity_bytes(blob))
         if placement is None or placement["profile"] != direct_profile:
             raise FormatError("direct blob placement is missing")
+        validate_direct_lengths(record, placement, canonical_length)
         expected_checksum = frame_checksum(ARENA_MAGIC, payload)
         if not any(
             node == 0
@@ -311,3 +328,18 @@ def validate_direct_arena(store, direct_profile, profiles, records, placements):
             for node, locator in placement["replicas"]
         ):
             raise FormatError("generation-zero placement disagrees with objects.arena")
+        covered.add(identity_bytes(object_id))
+    validate_direct_coverage(set(objects), covered, bootstrap_objects)
+
+
+def validate_direct_lengths(record, placement, canonical_length):
+    if canonical_length != record["coverage"][2]:
+        raise FormatError("direct coverage length disagrees with canonical object bytes")
+    if placement["encoded_length"] != canonical_length:
+        raise FormatError("direct placement length disagrees with canonical object bytes")
+
+
+def validate_direct_coverage(objects, covered, bootstrap_objects):
+    expected = objects.difference(bootstrap_objects)
+    if covered != expected:
+        raise FormatError("direct catalogue does not cover every non-bootstrap arena object")
