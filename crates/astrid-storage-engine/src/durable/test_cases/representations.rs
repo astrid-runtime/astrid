@@ -656,6 +656,62 @@ fn verified_staged_closure_consumes_direct_description_witnesses() {
 }
 
 #[test]
+fn staged_batch_uses_catalogue_activated_during_object_identification() {
+    let directory = tempfile::tempdir().unwrap();
+    let bootstrap = open(directory.path());
+    let specification = ObjectRecord::new(
+        ObjectKind::Evidence,
+        ObjectFormatVersion::V1,
+        b"format specification".to_vec(),
+        Vec::new(),
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let (specification_id, _) = bootstrap
+        .persist_standalone_object(&specification)
+        .unwrap();
+    bootstrap.close().unwrap();
+    drop(bootstrap);
+
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let engine = Arc::new(
+        DurableEngine::<String, BlockingIdentity, Utf8Codec>::open(
+            directory.path(),
+            BlockingIdentity {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            },
+            Utf8Codec,
+            limits(),
+        )
+        .unwrap(),
+    );
+    let record = ObjectRecord::new(
+        ObjectKind::Evidence,
+        ObjectFormatVersion::V1,
+        b"prepared while representations activate".to_vec(),
+        Vec::new(),
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let staging_engine = Arc::clone(&engine);
+    let staging = thread::spawn(move || staging_engine.stage_objects(vec![record]));
+    entered.wait();
+
+    engine
+        .ensure_direct_representation_catalogue(specification_id, &[specification_id])
+        .unwrap();
+    release.wait();
+    let staged_id = staging.join().unwrap().unwrap()[0].0;
+
+    let inner = engine.inner.lock();
+    assert!(inner.pending_direct_objects.contains_key(&staged_id));
+}
+
+#[test]
 fn unverified_staged_witness_cannot_hide_arena_tampering() {
     let directory = tempfile::tempdir().unwrap();
     let engine = open(directory.path());

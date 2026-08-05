@@ -2,24 +2,38 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use astrid_storage_model::{InsertOutcome, ModelError, ObjectId, ObjectRecord};
-
-use super::representations::DirectArenaObject;
-use super::{
-    ARENA_FILE, ARENA_MAGIC, ArenaLocation, DurableEngine, DurableError, DurableInner,
-    PersistentObjectIdentity, PrincipalCodec, append_frame, append_frames, encode_object_frame,
-    ensure_payload_limit, live_files_mut, read_indexed_object,
+use astrid_storage_model::{
+    InsertOutcome, ModelError, ObjectId, ObjectRecord, RepresentationProfileId,
 };
 
+use super::representations::{PreparedDirectArenaObject, RepresentationStore};
+use super::{
+    ARENA_FILE, ARENA_MAGIC, ArenaLocation, DurableEngine, DurableError, DurableInner,
+    PersistentObjectIdentity, PreparedFrame, PrincipalCodec, append_frame, append_prepared_frames,
+    encode_object_frame, ensure_payload_limit, live_files_mut, read_indexed_object,
+};
+
+struct PreparedStagingObject {
+    record: ObjectRecord,
+    payload: Vec<u8>,
+    append: Option<PreparedStagingAppend>,
+}
+
+struct PreparedStagingAppend {
+    frame: PreparedFrame,
+    direct: Option<PreparedDirectArenaObject>,
+}
+
 struct PreparedStagingBatch {
-    unique: BTreeMap<ObjectId, (ObjectRecord, Vec<u8>)>,
+    unique: BTreeMap<ObjectId, PreparedStagingObject>,
     input_order: Vec<ObjectId>,
 }
 
 struct StagingBatchAppend {
     outcomes: Vec<(ObjectId, InsertOutcome)>,
     ids: Vec<ObjectId>,
-    payloads: Vec<Vec<u8>>,
+    frames: Vec<PreparedFrame>,
+    direct: Vec<Option<PreparedDirectArenaObject>>,
 }
 
 impl PreparedStagingBatch {
@@ -28,7 +42,7 @@ impl PreparedStagingBatch {
         records: Vec<ObjectRecord>,
         limits: super::RecoveryLimits,
     ) -> Result<Self, DurableError> {
-        let mut unique = BTreeMap::<ObjectId, (ObjectRecord, Vec<u8>)>::new();
+        let mut unique = BTreeMap::<ObjectId, PreparedStagingObject>::new();
         let mut input_order = Vec::new();
         input_order
             .try_reserve_exact(records.len())
@@ -36,20 +50,65 @@ impl PreparedStagingBatch {
         for record in records {
             let id = identity.identify(&record);
             input_order.push(id);
-            if let Some((existing, _)) = unique.get(&id) {
-                if existing != &record {
+            if let Some(existing) = unique.get(&id) {
+                if existing.record != record {
                     return Err(ModelError::ObjectCollision(id).into());
                 }
                 continue;
             }
             let payload = encode_object_frame(identity.scheme(), id, &record)?;
             ensure_payload_limit(ARENA_FILE, 0, payload.len(), limits)?;
-            unique.insert(id, (record, payload));
+            unique.insert(
+                id,
+                PreparedStagingObject {
+                    record,
+                    payload,
+                    append: None,
+                },
+            );
         }
         Ok(Self {
             unique,
             input_order,
         })
+    }
+
+    fn prepare_missing<I: PersistentObjectIdentity>(
+        &mut self,
+        identity: &I,
+        already_present: &BTreeSet<ObjectId>,
+        direct_profile: Option<RepresentationProfileId>,
+    ) -> Result<(), DurableError> {
+        for (id, prepared) in &mut self.unique {
+            if already_present.contains(id) {
+                continue;
+            }
+            let canonical_record = match &prepared.append {
+                Some(append) => {
+                    super::canonical_record_bytes(append.frame.payload(), identity.scheme())?
+                },
+                None => super::canonical_record_bytes(&prepared.payload, identity.scheme())?,
+            };
+            let direct = direct_profile
+                .map(|profile| PreparedDirectArenaObject::identify(profile, *id, canonical_record))
+                .transpose()?;
+            if let Some(append) = &mut prepared.append {
+                append.direct = direct;
+            } else {
+                let payload = std::mem::take(&mut prepared.payload);
+                prepared.append = Some(PreparedStagingAppend {
+                    frame: PreparedFrame::new(ARENA_MAGIC, payload)?,
+                    direct,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn every_missing_object_is_prepared(&self, already_present: &BTreeSet<ObjectId>) -> bool {
+        self.unique
+            .iter()
+            .all(|(id, prepared)| already_present.contains(id) || prepared.append.is_some())
     }
 
     fn finish(
@@ -76,22 +135,33 @@ impl PreparedStagingBatch {
             .checked_sub(already_present.len())
             .ok_or(DurableError::EncodingOverflow)?;
         let mut ids = Vec::new();
-        let mut payloads = Vec::new();
+        let mut frames = Vec::new();
+        let mut direct = Vec::new();
         ids.try_reserve_exact(append_count)
             .map_err(|_| DurableError::EncodingOverflow)?;
-        payloads
+        frames
             .try_reserve_exact(append_count)
             .map_err(|_| DurableError::EncodingOverflow)?;
-        for (id, (_, payload)) in self.unique {
+        direct
+            .try_reserve_exact(append_count)
+            .map_err(|_| DurableError::EncodingOverflow)?;
+        for (id, prepared) in self.unique {
             if !already_present.contains(&id) {
+                let prepared = prepared
+                    .append
+                    .ok_or(DurableError::InvalidRepresentationState(
+                        "missing staging object was not prepared for append",
+                    ))?;
                 ids.push(id);
-                payloads.push(payload);
+                frames.push(prepared.frame);
+                direct.push(prepared.direct);
             }
         }
         Ok(StagingBatchAppend {
             outcomes,
             ids,
-            payloads,
+            frames,
+            direct,
         })
     }
 }
@@ -190,33 +260,62 @@ where
         &self,
         records: Vec<ObjectRecord>,
     ) -> Result<Vec<(ObjectId, InsertOutcome)>, DurableError> {
-        let prepared = PreparedStagingBatch::new(&self.identity, records, self.limits)?;
-        let mut inner = self.lock_usable()?;
-        let already_present = self.verify_existing_batch(&mut inner, &prepared.unique)?;
-        let append = prepared.finish(&already_present)?;
-        let appended = {
-            let files = live_files_mut(&mut inner.files)?;
-            append_frames(&mut files.arena, ARENA_MAGIC, &append.payloads)
-        };
-        match appended {
-            Ok(locations) => {
-                self.install_appended_batch(&mut inner, &append.ids, &append.payloads, &locations)?;
-                Ok(append.outcomes)
-            },
-            Err(error) => {
-                self.mark_requires_recovery(&mut inner);
-                Err(error)
-            },
+        let mut prepared = PreparedStagingBatch::new(&self.identity, records, self.limits)?;
+        loop {
+            let mut inner = self.lock_usable()?;
+            let direct_profile = inner
+                .representations
+                .as_ref()
+                .map(RepresentationStore::direct_profile);
+            let already_present = self.verify_existing_batch(&mut inner, &prepared.unique)?;
+            if already_present.len() == prepared.unique.len() {
+                return Ok(prepared.finish(&already_present)?.outcomes);
+            }
+            drop(inner);
+            prepared.prepare_missing(&self.identity, &already_present, direct_profile)?;
+
+            let mut inner = self.lock_usable()?;
+            let active_profile = inner
+                .representations
+                .as_ref()
+                .map(RepresentationStore::direct_profile);
+            let already_present = self.verify_existing_batch(&mut inner, &prepared.unique)?;
+            if active_profile != direct_profile
+                || !prepared.every_missing_object_is_prepared(&already_present)
+            {
+                drop(inner);
+                continue;
+            }
+            let append = prepared.finish(&already_present)?;
+            let appended = {
+                let files = live_files_mut(&mut inner.files)?;
+                append_prepared_frames(&mut files.arena, &append.frames)
+            };
+            match appended {
+                Ok(locations) => {
+                    self.install_appended_batch(
+                        &mut inner,
+                        &append.ids,
+                        append.direct,
+                        &locations,
+                    )?;
+                    return Ok(append.outcomes);
+                },
+                Err(error) => {
+                    self.mark_requires_recovery(&mut inner);
+                    return Err(error);
+                },
+            }
         }
     }
 
     fn verify_existing_batch(
         &self,
         inner: &mut DurableInner<P>,
-        unique: &BTreeMap<ObjectId, (ObjectRecord, Vec<u8>)>,
+        unique: &BTreeMap<ObjectId, PreparedStagingObject>,
     ) -> Result<BTreeSet<ObjectId>, DurableError> {
         let mut already_present = BTreeSet::new();
-        for (id, (record, _)) in unique {
+        for (id, prepared) in unique {
             let Some(location) = inner.index.get(id).copied() else {
                 continue;
             };
@@ -224,7 +323,7 @@ where
                 let files = live_files_mut(&mut inner.files)?;
                 read_indexed_object(&files.arena, *id, location, &self.identity, self.limits)?
             };
-            if &existing != record {
+            if existing != prepared.record {
                 return Err(ModelError::ObjectCollision(*id).into());
             }
             already_present.insert(*id);
@@ -236,48 +335,24 @@ where
         &self,
         inner: &mut DurableInner<P>,
         ids: &[ObjectId],
-        payloads: &[Vec<u8>],
+        direct: Vec<Option<PreparedDirectArenaObject>>,
         locations: &[ArenaLocation],
     ) -> Result<(), DurableError> {
-        let direct = self.describe_appended_batch(inner, ids, payloads, locations);
-        let direct = match direct {
-            Ok(direct) => direct,
-            Err(error) => {
-                self.mark_requires_recovery(inner);
-                return Err(error);
-            },
-        };
+        if ids.len() != locations.len() || ids.len() != direct.len() {
+            self.mark_requires_recovery(inner);
+            return Err(DurableError::InvalidRepresentationState(
+                "prepared staging batch lengths disagree",
+            ));
+        }
         for (id, location) in ids.iter().copied().zip(locations.iter().copied()) {
             inner.index.insert(id, location);
             inner.pending_index_locations.push((id, location));
         }
-        for object in direct {
-            inner.pending_direct_objects.insert(object.object, object);
+        for (prepared, location) in direct.into_iter().zip(locations.iter().copied()) {
+            if let Some(object) = prepared.map(|prepared| prepared.place(location)) {
+                inner.pending_direct_objects.insert(object.object, object);
+            }
         }
         Ok(())
-    }
-
-    fn describe_appended_batch(
-        &self,
-        inner: &DurableInner<P>,
-        ids: &[ObjectId],
-        payloads: &[Vec<u8>],
-        locations: &[ArenaLocation],
-    ) -> Result<Vec<DirectArenaObject>, DurableError> {
-        let Some(representations) = &inner.representations else {
-            return Ok(Vec::new());
-        };
-        ids.iter()
-            .copied()
-            .zip(payloads)
-            .zip(locations.iter().copied())
-            .map(|((id, payload), location)| {
-                representations.describe_direct(
-                    id,
-                    super::canonical_record_bytes(payload, self.identity.scheme())?,
-                    location,
-                )
-            })
-            .collect()
     }
 }

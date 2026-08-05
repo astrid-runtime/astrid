@@ -570,10 +570,11 @@ pub use compaction::{
 };
 pub use faults::{FaultInjector, FaultPoint, NoFaults};
 use format::{
-    append_frame, append_frames, canonical_record_bytes, corrupt, decode_object_frame,
-    encode_object_frame, ensure_payload_limit, io_error, open_rw, read_indexed_object,
-    read_indexed_object_with_payload, read_indexed_objects, recover_arena, scan_frames,
-    sync_store_directory, verify_indexed_location, verify_indexed_tail, visit_indexed_objects,
+    PreparedFrame, append_frame, append_frames, append_prepared_frames, canonical_record_bytes,
+    corrupt, decode_object_frame, encode_object_frame, ensure_payload_limit, io_error, open_rw,
+    read_indexed_object, read_indexed_object_with_payload, read_indexed_objects, recover_arena,
+    scan_frames, sync_store_directory, verify_indexed_location, verify_indexed_tail,
+    visit_indexed_objects,
 };
 #[cfg(test)]
 use format::{frame_checksum, last_batch_spans};

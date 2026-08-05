@@ -6,8 +6,8 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use astrid_storage_model::{
-    BlobId, CanonicalPhysicalMap, Coverage, ObjectId, PhysicalMapDomain, PhysicalMapKey,
-    PlacementEntry, PlacementSet, Recipe, Replica, ReplicaLocator, RepresentationCatalogueRoot,
+    CanonicalPhysicalMap, Coverage, ObjectId, PhysicalMapDomain, PhysicalMapKey, PlacementEntry,
+    PlacementSet, Recipe, Replica, ReplicaLocator, RepresentationCatalogueRoot,
     RepresentationProfile, RepresentationProfileId, RepresentationRecord, RepresentationRecordId,
     RepresentationState, RepresentationStateId, StorageNodeId,
 };
@@ -33,6 +33,10 @@ use recovery::{
     MetadataIndex, read_current, recover_journal, recover_metadata, validate_profiles,
     validate_representations,
 };
+
+mod direct;
+
+pub(super) use direct::{DirectArenaObject, PreparedDirectArenaObject};
 
 const DIRECTORY: &str = "representations";
 const GENERATIONS_DIRECTORY: &str = "generations";
@@ -78,31 +82,6 @@ pub(super) fn append_legacy_profile_frame(
     metadata
         .sync_data()
         .map_err(|source| io_error("flush legacy profile frame", source))
-}
-
-#[derive(Clone, Debug)]
-pub(super) struct DirectArenaObject {
-    pub(super) object: ObjectId,
-    pub(super) blob: BlobId,
-    pub(super) canonical_length: u64,
-    pub(super) location: ArenaLocation,
-}
-
-impl DirectArenaObject {
-    pub(super) fn identify(
-        profile: RepresentationProfileId,
-        object: ObjectId,
-        canonical_record: &[u8],
-        location: ArenaLocation,
-    ) -> Result<Self, DurableError> {
-        Ok(Self {
-            object,
-            blob: BlobId::identify(&Blake3PhysicalIdentity, profile, canonical_record)?,
-            canonical_length: u64::try_from(canonical_record.len())
-                .map_err(|_| DurableError::EncodingOverflow)?,
-            location,
-        })
-    }
 }
 
 #[derive(Debug)]
@@ -248,6 +227,10 @@ impl RepresentationStore {
         location: ArenaLocation,
     ) -> Result<DirectArenaObject, DurableError> {
         DirectArenaObject::identify(self.direct_profile, object, canonical_record, location)
+    }
+
+    pub(super) const fn direct_profile(&self) -> RepresentationProfileId {
+        self.direct_profile
     }
 
     pub(super) const fn active(&self) -> RepresentationStateId {

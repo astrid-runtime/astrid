@@ -16,6 +16,10 @@ const MIN_REFERENCE_WIRE_BYTES: usize =
 
 #[path = "format/indexed.rs"]
 mod indexed;
+#[path = "format/prepared.rs"]
+mod prepared;
+#[path = "format/reader.rs"]
+mod reader;
 
 #[cfg(test)]
 pub(super) use indexed::last_batch_spans;
@@ -23,6 +27,8 @@ pub(super) use indexed::{
     read_indexed_object, read_indexed_object_with_payload, read_indexed_objects,
     visit_indexed_objects,
 };
+pub(super) use prepared::{PreparedFrame, append_prepared_frames};
+use reader::SliceReader;
 
 pub(super) fn verify_indexed_location(
     arena: &mut File,
@@ -842,82 +848,4 @@ pub(super) fn decode_object_frame(
     )
     .map_err(|_| "non-canonical object references")?;
     Ok((id, record))
-}
-
-struct SliceReader<'a> {
-    bytes: &'a [u8],
-    offset: usize,
-}
-
-impl<'a> SliceReader<'a> {
-    const fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, offset: 0 }
-    }
-
-    fn remaining(&self) -> usize {
-        self.bytes.len().saturating_sub(self.offset)
-    }
-
-    fn take(&mut self, len: usize) -> Result<&'a [u8], &'static str> {
-        let end = self
-            .offset
-            .checked_add(len)
-            .ok_or("frame length overflow")?;
-        let value = self
-            .bytes
-            .get(self.offset..end)
-            .ok_or("truncated frame payload")?;
-        self.offset = end;
-        Ok(value)
-    }
-
-    fn u8(&mut self) -> Result<u8, &'static str> {
-        self.take(1)?.first().copied().ok_or("truncated u8 field")
-    }
-
-    fn u16(&mut self) -> Result<u16, &'static str> {
-        Ok(u16::from_le_bytes(
-            self.take(2)?
-                .try_into()
-                .map_err(|_| "truncated u16 field")?,
-        ))
-    }
-
-    fn u32(&mut self) -> Result<u32, &'static str> {
-        Ok(u32::from_le_bytes(
-            self.take(4)?
-                .try_into()
-                .map_err(|_| "truncated u32 field")?,
-        ))
-    }
-
-    fn u64(&mut self) -> Result<u64, &'static str> {
-        Ok(u64::from_le_bytes(
-            self.take(8)?
-                .try_into()
-                .map_err(|_| "truncated u64 field")?,
-        ))
-    }
-
-    fn usize_len(&mut self) -> Result<usize, &'static str> {
-        usize::try_from(self.u64()?).map_err(|_| "length is not process-addressable")
-    }
-
-    fn identity(&mut self, scheme: IdentityScheme) -> Result<ObjectId, &'static str> {
-        let algorithm = self.u16()?;
-        let construction = self.u16()?;
-        let digest_len =
-            usize::try_from(self.u32()?).map_err(|_| "identity digest length overflow")?;
-        if algorithm == 0 || construction == 0 || digest_len == 0 {
-            return Err("identity tag fields must be non-zero");
-        }
-        let digest = self.take(digest_len)?;
-        if algorithm != scheme.algorithm() || construction != scheme.construction() {
-            return Err("unsupported identity algorithm or construction version");
-        }
-        digest
-            .try_into()
-            .map(ObjectId::new)
-            .map_err(|_| "identity digest length does not match the supported scheme")
-    }
 }
