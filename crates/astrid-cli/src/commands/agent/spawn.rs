@@ -11,9 +11,8 @@
 //!      throwaway (its keypair was minted by create), submit the prompt, drain
 //!      the response. This command is the wall-clock watchdog; nothing in the
 //!      runtime bounds a multi-turn react loop by wall-clock.
-//!   3. **tear down** — delete the throwaway and purge its on-disk footprint
-//!      (the `AgentDelete { purge_home }` flag), on success, failure, or
-//!      timeout alike.
+//!   3. **tear down** — delete the throwaway; `AgentDelete` reclaims its
+//!      on-disk footprint (#1217), on success, failure, or timeout alike.
 //!
 //! The security posture ("locked down, can't exfiltrate") is delivered by that
 //! empty capsule allow-list — NOT by `network.egress`, which the runtime does
@@ -48,17 +47,12 @@ pub(crate) struct SpawnArgs {
     #[arg(long)]
     pub name: Option<String>,
 
-    /// Group membership for the throwaway (repeatable). Defaults to `agent`:
-    /// self-scoped, no capsule/tool access — the locked-down posture.
-    #[arg(long = "group", value_name = "NAME")]
-    pub groups: Vec<String>,
-
     /// Wall-clock ceiling in seconds. The command blocks for the job's response
     /// up to this long, then cancels the turn and tears down regardless.
     #[arg(long, default_value_t = 300)]
     pub timeout: u64,
 
-    /// Leave the throwaway principal in place instead of purging it (debug).
+    /// Leave the throwaway principal in place instead of deleting it (debug).
     #[arg(long)]
     pub keep: bool,
 }
@@ -80,11 +74,16 @@ pub(crate) async fn run(args: SpawnArgs) -> Result<ExitCode> {
 
     let mut admin = crate::admin_client::connect_as_active_agent().await?;
 
-    // 1. Create the derived, least-privilege throwaway.
+    // 1. Create the derived, least-privilege throwaway. The group is FIXED —
+    //    empty `groups` resolves to the kernel's default `agent` group
+    //    (self-scoped, no capsule access, no egress). There is no `--group`
+    //    override, so "locked down" is an INVARIANT of `spawn`, not a default a
+    //    caller can flip off. A privileged ephemeral principal is `agent create`
+    //    + run, not `spawn`.
     let create = admin
         .request(AdminRequestKind::AgentCreate {
             name: derived_name.clone(),
-            groups: args.groups.clone(),
+            groups: Vec::new(),
             grants: Vec::new(),
             inherit_from: Some(derive_from.clone()),
             clone_from: None,
@@ -101,11 +100,11 @@ pub(crate) async fn run(args: SpawnArgs) -> Result<ExitCode> {
     //    out — hence the outcome is captured, not `?`-propagated here.
     let outcome = run_job_under(&derived, &session, &args.job, args.timeout).await;
 
-    // 3. Teardown (+ footprint purge) unless --keep.
+    // 3. Teardown (delete reclaims the footprint) unless --keep.
     if args.keep {
         eprintln!(
             "[spawn] --keep set: leaving '{derived}' in place \
-             (reclaim with `astrid agent delete {derived} --purge-home`)"
+             (reclaim with `astrid agent delete {derived}`)"
         );
     } else {
         teardown(&mut admin, &derived).await;
@@ -156,7 +155,7 @@ async fn run_job_under(
         Ok(inner) => inner,
         Err(_elapsed) => {
             // Cooperative cancel so the react capsule aborts the in-flight turn
-            // promptly; delete + purge is the hard stop regardless.
+            // promptly; delete (which reclaims) is the hard stop regardless.
             let _ = send_cancel(&mut client, session).await;
             Err(anyhow!(
                 "job exceeded the {timeout_secs}s wall-clock ceiling"
@@ -225,24 +224,23 @@ async fn send_cancel(client: &mut SocketClient, session: &SessionId) -> Result<(
     Ok(())
 }
 
-/// Delete the throwaway and reclaim its footprint. Best-effort and never
-/// propagates: authz is already closed by the delete itself, so a purge hiccup
-/// must not mask the job's real outcome — it's surfaced as a warning.
+/// Delete the throwaway. `AgentDelete` always reclaims the footprint (#1217)
+/// and closes authz first, so a reclamation hiccup can't re-open access or mask
+/// the job's real outcome — it's surfaced as a warning.
 async fn teardown(admin: &mut AdminClient, derived: &PrincipalId) {
     match admin
         .request(AdminRequestKind::AgentDelete {
             principal: derived.clone(),
-            purge_home: true,
         })
         .await
     {
         Ok(body) => match into_result(body) {
-            Ok(_) => eprintln!("[spawn] tore down '{derived}' (footprint purged)"),
+            Ok(_) => eprintln!("[spawn] tore down '{derived}' (footprint reclaimed)"),
             Err(e) => eprintln!("[spawn] WARNING: teardown of '{derived}' reported: {e:#}"),
         },
         Err(e) => eprintln!(
             "[spawn] WARNING: could not tear down '{derived}': {e:#} — \
-             reclaim with `astrid agent delete {derived} --purge-home`"
+             reclaim with `astrid agent delete {derived}`"
         ),
     }
 }

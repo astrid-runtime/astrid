@@ -9,6 +9,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+### Added
+
+- **`astrid agent spawn` — atomic locked-down throwaway session.** Creates a derived least-privilege principal (fixed locked-down group: no capsule/tool access, no egress — inheriting only the derive-from principal's env/secrets so its loop can reach the model), runs one bounded job under it, then deletes it (reclaiming the footprint per #1217). The command is the wall-clock watchdog; approval requests are auto-denied. Part of #1217.
+
 ### Changed
 
 - **`agent delete` now reclaims the deleted principal's full on-disk footprint.** Delete closes authz first (unlink + profile removal + cache invalidate), then reclaims the home tree plus the signing key (`keys/{principal}.key`) and secrets (`secrets/{principal}/`) — which live in the global `keys/`/`secrets/` trees outside the home dir. Reclamation is best-effort; failures are reported in the response's `cleanup_errors`. Replaces the previous "reclamation is an ops concern" leave-behind, and drops the interim `--purge-home` flag. Part of #1217.
