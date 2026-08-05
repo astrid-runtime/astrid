@@ -902,6 +902,34 @@ fn every_publication_cleanup_prefix_reopens_as_completed() {
 }
 
 #[test]
+fn every_batched_publication_cleanup_prefix_reopens_all_as_completed() {
+    for point in [
+        StagingFaultPoint::PublicationJournalAppended,
+        StagingFaultPoint::PublicationJournalFlushed,
+        StagingFaultPoint::GenerationRetired,
+        StagingFaultPoint::GenerationCleaned,
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let area = open_with_fault(directory.path(), point);
+        let mut staged = Vec::new();
+        for name in ["published-a", "published-b", "published-c"] {
+            let mut staged_writer = writer(&area, name);
+            staged_writer.write_all(name.as_bytes()).unwrap();
+            staged.push(staged_writer.seal().unwrap());
+        }
+
+        assert!(area.mark_published_batch(&staged).is_err(), "{point:?}");
+        drop(area);
+
+        let reopened = open_area(directory.path());
+        assert!(reopened.ready().unwrap().is_empty(), "{point:?}");
+        for entry in &staged {
+            assert!(!entry.content_path().exists(), "{point:?}");
+        }
+    }
+}
+
+#[test]
 fn completed_publication_retry_finishes_cleanup_idempotently() {
     let directory = tempfile::tempdir().unwrap();
     let area = open_with_fault(directory.path(), StagingFaultPoint::GenerationCleaned);

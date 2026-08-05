@@ -988,6 +988,7 @@ where
     }
 }
 
+mod bulk;
 mod projection;
 
 use projection::{

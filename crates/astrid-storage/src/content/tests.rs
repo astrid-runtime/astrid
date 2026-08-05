@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::sync::Arc;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier};
 
 use astrid_storage_engine::{
     CommitOutcome, DurableEngine, IdentityScheme, InMemoryEngine, PersistentObjectIdentity,
@@ -16,7 +17,10 @@ use astrid_storage_model::{
 use fastcdc::v2020::{FastCDC, Normalization};
 use parking_lot::RwLock;
 
-use super::{ContentName, ContentNameError, PrincipalContentError, PrincipalContentStore};
+use super::{
+    BulkIngestPolicy, ContentIngest, ContentName, ContentNameError, PrincipalContentError,
+    PrincipalContentStore,
+};
 use crate::StorageError;
 use crate::kv::{KvStore, TreeKvStore};
 use crate::principal_graph::PRINCIPAL_GRAPH_VERSION;
@@ -301,6 +305,33 @@ impl Read for CountingReader {
         output[..length].copy_from_slice(&self.bytes[self.offset..end]);
         self.offset = end;
         self.bytes_read.fetch_add(length, Ordering::SeqCst);
+        Ok(length)
+    }
+}
+
+struct RendezvousReader {
+    bytes: Vec<u8>,
+    offset: usize,
+    first_read: Arc<Barrier>,
+}
+
+impl Read for RendezvousReader {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if self.offset == 0 {
+            self.first_read.wait();
+        }
+        let length = output
+            .len()
+            .min(self.bytes.len().saturating_sub(self.offset));
+        if length == 0 {
+            return Ok(0);
+        }
+        let end = self
+            .offset
+            .checked_add(length)
+            .ok_or(io::Error::other("test reader position overflow"))?;
+        output[..length].copy_from_slice(&self.bytes[self.offset..end]);
+        self.offset = end;
         Ok(length)
     }
 }
@@ -751,6 +782,162 @@ fn root_conflict_retries_publication_without_rereading_the_source() {
 
     assert_eq!(bytes_read.load(Ordering::SeqCst), value.len());
     assert_eq!(store.read(&owner, &name).unwrap(), Some(value));
+}
+
+#[test]
+fn streaming_batch_publishes_every_name_under_one_root() {
+    let engine = Arc::new(Engine::new(TestIdentity));
+    let store = PrincipalContentStore::from_engine(Arc::clone(&engine));
+    let owner = "alice".to_owned();
+    let alpha = bytes(2 * 1024 * 1024);
+    let middle = bytes(257 * 1024);
+    let zeta = b"last in canonical order".to_vec();
+
+    let outcome = store
+        .put_streaming_batch(
+            &owner,
+            [
+                ContentIngest::new(ContentName::new("zeta").unwrap(), zeta.as_slice()),
+                ContentIngest::new(ContentName::new("alpha").unwrap(), alpha.as_slice()),
+                ContentIngest::new(ContentName::new("middle").unwrap(), middle.as_slice()),
+            ],
+        )
+        .unwrap();
+
+    assert_eq!(outcome.principal_root().generation.get(), 0);
+    assert_eq!(
+        outcome
+            .entries()
+            .iter()
+            .map(|entry| entry.name().as_str())
+            .collect::<Vec<_>>(),
+        ["alpha", "middle", "zeta"]
+    );
+    for (name, expected) in [("alpha", alpha), ("middle", middle), ("zeta", zeta)] {
+        assert_eq!(
+            store
+                .read(&owner, &ContentName::new(name).unwrap())
+                .unwrap(),
+            Some(expected)
+        );
+    }
+}
+
+#[test]
+fn streaming_batch_honors_explicit_source_parallelism() {
+    let engine = Arc::new(Engine::new(TestIdentity));
+    let store = PrincipalContentStore::from_engine(engine);
+    let first_read = Arc::new(Barrier::new(2));
+    let source = |value| RendezvousReader {
+        bytes: value,
+        offset: 0,
+        first_read: Arc::clone(&first_read),
+    };
+
+    let outcome = store
+        .put_streaming_batch_with_policy(
+            &"alice".to_owned(),
+            [
+                ContentIngest::new(
+                    ContentName::new("first").unwrap(),
+                    source(bytes(1024 * 1024)),
+                ),
+                ContentIngest::new(
+                    ContentName::new("second").unwrap(),
+                    source(bytes(1024 * 1024 + 1)),
+                ),
+            ],
+            BulkIngestPolicy::new(NonZeroUsize::new(2).unwrap()),
+        )
+        .unwrap();
+
+    assert_eq!(outcome.entries().len(), 2);
+}
+
+#[test]
+fn streaming_batch_rejects_duplicate_names_before_reading() {
+    let engine = Arc::new(Engine::new(TestIdentity));
+    let store = PrincipalContentStore::from_engine(engine);
+    let bytes_read = Arc::new(AtomicUsize::new(0));
+    let source = || CountingReader {
+        bytes: bytes(1024),
+        offset: 0,
+        bytes_read: Arc::clone(&bytes_read),
+    };
+    let name = ContentName::new("same").unwrap();
+
+    let error = store
+        .put_streaming_batch(
+            &"alice".to_owned(),
+            [
+                ContentIngest::new(name.clone(), source()),
+                ContentIngest::new(name.clone(), source()),
+            ],
+        )
+        .unwrap_err();
+
+    assert!(matches!(error, PrincipalContentError::DuplicateBatchName(found) if found == name));
+    assert_eq!(bytes_read.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn streaming_batch_source_failure_publishes_nothing() {
+    let engine = Arc::new(Engine::new(TestIdentity));
+    let store = PrincipalContentStore::from_engine(Arc::clone(&engine));
+    let owner = "alice".to_owned();
+    let first = FailAfter {
+        bytes: bytes(2 * 1024 * 1024),
+        offset: 0,
+        limit: usize::MAX,
+    };
+    let second = FailAfter {
+        bytes: bytes(8 * 1024 * 1024),
+        offset: 0,
+        limit: 3 * 1024 * 1024,
+    };
+
+    let error = store
+        .put_streaming_batch(
+            &owner,
+            [
+                ContentIngest::new(ContentName::new("first").unwrap(), first),
+                ContentIngest::new(ContentName::new("second").unwrap(), second),
+            ],
+        )
+        .unwrap_err();
+
+    assert!(matches!(error, PrincipalContentError::ContentSource(_)));
+    assert_eq!(engine.root(&owner), None);
+    assert!(store.list(&owner).unwrap().is_empty());
+}
+
+#[test]
+fn streaming_batch_root_conflict_does_not_reread_sources() {
+    let engine = Arc::new(ConflictOnceEngine::new());
+    let store = PrincipalContentStore::from_engine(engine);
+    let first = bytes(2 * 1024 * 1024);
+    let second = bytes(3 * 1024 * 1024);
+    let bytes_read = Arc::new(AtomicUsize::new(0));
+    let reader = |value: Vec<u8>| CountingReader {
+        bytes: value,
+        offset: 0,
+        bytes_read: Arc::clone(&bytes_read),
+    };
+
+    store
+        .put_streaming_batch(
+            &"alice".to_owned(),
+            [
+                ContentIngest::new(ContentName::new("first").unwrap(), reader(first.clone())),
+                ContentIngest::new(ContentName::new("second").unwrap(), reader(second.clone())),
+            ],
+        )
+        .unwrap();
+
+    assert_eq!(
+        bytes_read.load(Ordering::SeqCst),
+        first.len() + second.len()
+    );
 }
 
 #[test]

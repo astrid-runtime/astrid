@@ -53,7 +53,8 @@ pub use content::{
     plan_projection_names,
 };
 pub use content::{
-    ChunkingProfile, ContentDescriptor, ContentEntry, ContentName, ContentNameError,
+    BulkIngestPolicy, ChunkingProfile, ContentBatchEntry, ContentBatchWriteOutcome,
+    ContentDescriptor, ContentEntry, ContentIngest, ContentName, ContentNameError,
     ContentWriteOutcome, PrincipalContentError, PrincipalContentReadHandle, PrincipalContentStore,
 };
 pub use error::{StorageError, StorageResult};

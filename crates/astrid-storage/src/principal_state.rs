@@ -25,8 +25,8 @@ use parking_lot::Mutex;
 
 pub use crate::PrincipalDirectory;
 use crate::content::{
-    CatalogValidation, ContentWriteOutcome, PrincipalContentStore, ProjectionNamePolicy,
-    plan_projection_names,
+    CatalogValidation, ContentBatchWriteOutcome, ContentWriteOutcome, PrincipalContentStore,
+    ProjectionNamePolicy, plan_projection_names,
 };
 use crate::error::{StorageError, StorageResult};
 use crate::identity::{IdentityStore, KvIdentityStore};
@@ -323,6 +323,21 @@ impl RuntimePrincipalStore {
     ) -> StorageResult<ContentWriteOutcome> {
         self.staging
             .publish(staged, Arc::clone(&self.content))
+            .await
+    }
+
+    /// Publish sealed native writes atomically under one principal root.
+    ///
+    /// # Errors
+    ///
+    /// Returns a staging or content-publication error while retaining the
+    /// unacknowledged generations for retry.
+    pub async fn publish_staged_batch(
+        &self,
+        staged: Vec<ReadyStagedContent>,
+    ) -> StorageResult<ContentBatchWriteOutcome> {
+        self.staging
+            .publish_batch(staged, Arc::clone(&self.content))
             .await
     }
 
