@@ -43,27 +43,33 @@ The machine-readable source is
 `astrid-storage-dense-radix-ce756e1e.json`. These are engine/substrate
 measurements, not mounted-provider results or a compressibility estimate.
 
-## Bulk-ingest checkpoint
+## Bulk-ingest and admission checkpoint
 
-Clean commit `eca9c20a` adds the first delta-proportional bulk-ingest evidence.
-The same 512 MiB deterministic corpus was divided into 100 independently
-fingerprinted sources. Three samples used eight explicitly granted workers;
-the single-worker comparator exercised the same batch API.
+Clean commit `0d6a8366` was compared directly with parent `3d61052b` over the
+same deterministic 512 MiB incompressible corpus, divided into 128 independently
+fingerprinted 4 MiB sources. Each value is the median of three samples with
+eight explicitly granted workers and a governed 512 MiB object cache.
 
-| Operation | Median | Source bytes observed |
+| Operation | Parent | Prepared admission |
 |---|---:|---:|
-| Single-worker first ingest | 2.985 s, 171.5 MiB/s | 512 MiB |
-| Eight-worker first ingest | 2.278 s, 224.8 MiB/s | 512 MiB |
-| Unchanged re-ingest | 25.1 ms | 0 B |
-| One-file delta | 67.5 ms | 5.12 MiB |
+| Single-worker first ingest | 2.941 s, 174.1 MiB/s | 2.893 s, 177.0 MiB/s |
+| Eight-worker first ingest | 1.961 s, 261.1 MiB/s | 1.415 s, 361.8 MiB/s |
+| Worker scaling | 1.500× | 2.044× |
+| Duplicate publication | 2.027 s, 252.6 MiB/s | 2.077 s, 246.5 MiB/s |
+| Four-principal shared publication | 390.5 MiB/s | 390.6 MiB/s |
 
-Parallel construction is 1.311 times the serial batch throughput. The
-unchanged path proves every cached file's complete immutable closure still
-exists before reuse, while source work remains proportional to changed inputs.
-The result does not yet meet #1392's read-bound first-ingest target. The
-remaining limit is authoritative object/representation admission behind the
-workers. The machine-readable source is
-`astrid-storage-bulk-ingest-eca9c20a.json`.
+Preparing frame checksums and direct physical identities before entering the
+single-appender critical section raises eight-worker throughput 38.6% without
+changing single-worker or dedup throughput materially. A cheap authoritative
+probe comes first, so an all-dedup batch never performs that preparation.
+Vectored append avoids rebuilding all prepared frames into another contiguous
+buffer, while preserving the frozen frame bytes exactly.
+
+The earlier `astrid-storage-bulk-ingest-eca9c20a.json` remains the first
+delta-proportional source-work record. In both generations, unchanged sources
+read zero bytes and a one-file mutation reads only its partition. The new exact
+comparison is recorded in `astrid-storage-admission-before-3d61052b.json` and
+`astrid-storage-admission-after-0d6a8366.json`.
 
 The historical schema did not embed Git revision, executable arguments,
 dirty-tree state, or cache policy. The canonical document records reconstructed

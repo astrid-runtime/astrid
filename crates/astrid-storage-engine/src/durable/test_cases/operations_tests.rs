@@ -316,6 +316,42 @@ fn staged_batch_collision_appends_nothing() {
 }
 
 #[test]
+fn staged_batch_appender_failure_installs_no_authority() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open(directory.path());
+    let (_, transaction) = transaction("alice", None, b"partial append");
+    let records = transaction
+        .records()
+        .iter()
+        .map(|(_, record)| record.clone())
+        .collect::<Vec<_>>();
+    let ids = records
+        .iter()
+        .map(|record| engine.identify(record))
+        .collect::<Vec<_>>();
+
+    let error = engine
+        .stage_objects_with_test_appender(records, |arena, frames| {
+            append_prepared_frames(arena, &frames[..1])?;
+            Err(DurableError::Io {
+                operation: "injected prepared batch append",
+                source: std::io::Error::other("injected appender failure"),
+            })
+        })
+        .unwrap_err();
+
+    assert!(matches!(error, DurableError::Io { .. }));
+    let inner = engine.inner.lock();
+    assert!(inner.poisoned);
+    assert!(inner.roots_by_principal.is_empty());
+    assert!(ids.iter().all(|id| !inner.index.contains_key(id)));
+    assert_eq!(
+        engine.lifecycle.load(Ordering::Acquire),
+        LIFECYCLE_REQUIRES_RECOVERY
+    );
+}
+
+#[test]
 fn commit_flush_reopen_rebuilds_index_and_root() {
     let directory = tempfile::tempdir().unwrap();
     let engine = open(directory.path());
