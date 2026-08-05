@@ -23,7 +23,6 @@ use astrid_storage_model::{
     PrincipalUsage, RootState, World,
 };
 use parking_lot::RwLock;
-use std::sync::Arc;
 
 #[cfg(any(test, feature = "crash-replay"))]
 pub mod crash_replay;
@@ -181,7 +180,7 @@ impl RootSnapshot {
 pub struct InMemoryEngine<P: Ord, I> {
     identity: I,
     world: RwLock<World<P>>,
-    preparation_authority: Arc<()>,
+    preparation_authority: std::sync::Arc<()>,
 }
 
 impl<P: Ord, I> InMemoryEngine<P, I> {
@@ -191,7 +190,7 @@ impl<P: Ord, I> InMemoryEngine<P, I> {
         Self {
             identity,
             world: RwLock::new(World::new()),
-            preparation_authority: Arc::new(()),
+            preparation_authority: std::sync::Arc::new(()),
         }
     }
 
@@ -518,27 +517,6 @@ mod tests {
         );
         let commit_id = engine.identify(&commit);
         (commit_id, vec![(leaf_id, leaf), (commit_id, commit)])
-    }
-
-    #[test]
-    fn prepared_projection_batches_are_bound_to_the_in_memory_engine() {
-        let first = InMemoryEngine::<String, _>::new(TestIdentity);
-        let second = InMemoryEngine::<String, _>::new(TestIdentity);
-        let prepared = PrincipalProjectionEngine::<String>::prepare_objects(
-            &first,
-            vec![data(b"engine-bound")],
-        )
-        .unwrap();
-
-        let error = PrincipalProjectionEngine::<String>::stage_prepared_objects(&second, prepared)
-            .unwrap_err();
-
-        assert!(
-            error
-                .to_string()
-                .contains("prepared object batch does not belong to this engine")
-        );
-        assert_eq!(second.object_count(), 0);
     }
 
     fn identity_base(target: ObjectId) -> ObjectRecord {
@@ -1009,16 +987,5 @@ mod tests {
                 assert_eq!(engine.root(&"alice"), expected_root);
             }
         }
-    }
-
-    #[test]
-    fn projection_model_error_preserves_typed_source() {
-        let error = PrincipalProjectionError::from(ModelError::ArithmeticOverflow);
-        let source = std::error::Error::source(&error).unwrap();
-
-        assert_eq!(
-            source.downcast_ref::<ModelError>(),
-            Some(&ModelError::ArithmeticOverflow)
-        );
     }
 }

@@ -754,3 +754,56 @@ fn unsupported_preparation() -> PrincipalProjectionError {
         "projection engine does not support prepared object admission".to_owned(),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use astrid_storage_model::{ObjectClass, ObjectFormatVersion, ObjectIdentity, ObjectKind};
+
+    #[derive(Clone, Copy)]
+    struct TestIdentity;
+
+    impl ObjectIdentity for TestIdentity {
+        fn identify(&self, _record: &ObjectRecord) -> ObjectId {
+            ObjectId::new([42; 32])
+        }
+    }
+
+    #[test]
+    fn prepared_projection_batches_are_bound_to_the_in_memory_engine() {
+        let first = InMemoryEngine::<String, _>::new(TestIdentity);
+        let second = InMemoryEngine::<String, _>::new(TestIdentity);
+        let record = ObjectRecord::new(
+            ObjectKind::Chunk,
+            ObjectFormatVersion::V1,
+            b"engine-bound".to_vec(),
+            Vec::new(),
+            12,
+            ObjectClass::Data,
+        )
+        .unwrap();
+        let prepared =
+            PrincipalProjectionEngine::<String>::prepare_objects(&first, vec![record]).unwrap();
+
+        let error = PrincipalProjectionEngine::<String>::stage_prepared_objects(&second, prepared)
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("prepared object batch does not belong to this engine")
+        );
+        assert_eq!(second.object_count(), 0);
+    }
+
+    #[test]
+    fn projection_model_error_preserves_typed_source() {
+        let error = PrincipalProjectionError::from(ModelError::ArithmeticOverflow);
+        let source = std::error::Error::source(&error).unwrap();
+
+        assert_eq!(
+            source.downcast_ref::<ModelError>(),
+            Some(&ModelError::ArithmeticOverflow)
+        );
+    }
+}
