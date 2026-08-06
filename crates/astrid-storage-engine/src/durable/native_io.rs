@@ -41,6 +41,114 @@ pub(super) fn create_private(directory: &Dir, name: &Path) -> Result<File, Durab
     Ok(file)
 }
 
+pub(super) fn open_directory(
+    parent: &Dir,
+    name: &Path,
+    create: bool,
+) -> Result<Option<Dir>, DurableError> {
+    let open = || -> io::Result<Dir> {
+        validate_directory_entry(parent, name)?;
+        let first = parent.open_dir(name)?;
+        validate_directory_entry(parent, name)?;
+        let second = parent.open_dir(name)?;
+        if directory_identity(&first)? != directory_identity(&second)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "principal-store directory changed while it was opened",
+            ));
+        }
+        Ok(first)
+    };
+    match open() {
+        Ok(directory) => Ok(Some(directory)),
+        Err(source) if source.kind() == io::ErrorKind::NotFound && !create => Ok(None),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            parent
+                .create_dir(name)
+                .or_else(|error| {
+                    (error.kind() == io::ErrorKind::AlreadyExists)
+                        .then_some(())
+                        .ok_or(error)
+                })
+                .map_err(|source| {
+                    io_error("create principal-store capability directory", source)
+                })?;
+            sync_directory(parent)?;
+            open()
+                .map(Some)
+                .map_err(|source| io_error("open principal-store capability directory", source))
+        },
+        Err(source) => Err(io_error(
+            "open principal-store capability directory",
+            source,
+        )),
+    }
+}
+
+fn validate_directory_entry(parent: &Dir, name: &Path) -> io::Result<()> {
+    let metadata = parent.symlink_metadata(name)?;
+    if !metadata.is_dir() || directory_entry_is_redirected(&metadata) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "principal-store capability entry is redirected or not a directory",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn directory_entry_is_redirected(metadata: &cap_std::fs::Metadata) -> bool {
+    use cap_std::fs::MetadataExt as _;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    metadata.file_type().is_symlink()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn directory_entry_is_redirected(metadata: &cap_std::fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+fn directory_identity(directory: &Dir) -> io::Result<(u64, u64)> {
+    let file = directory.try_clone()?.into_std_file();
+    file_identity(&file)
+}
+
+#[cfg(unix)]
+fn file_identity(file: &File) -> io::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    let metadata = file.metadata()?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(windows)]
+fn file_identity(file: &File) -> io::Result<(u64, u64)> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `file` owns a live Windows handle and `info` is writable.
+    #[allow(unsafe_code)]
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &raw mut info) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((
+        u64::from(info.dwVolumeSerialNumber),
+        (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_identity(_file: &File) -> io::Result<(u64, u64)> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "stable private directory identity is unavailable",
+    ))
+}
+
 fn configure_no_follow(options: &mut OpenOptions) {
     #[cfg(unix)]
     {

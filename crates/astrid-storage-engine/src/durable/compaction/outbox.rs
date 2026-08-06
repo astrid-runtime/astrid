@@ -1,15 +1,18 @@
 //! Crash-safe delivery outbox for independently anchored GC evidence.
 
-use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+use cap_std::fs::Dir;
 
 use astrid_storage_model::{GcCommitId, ObjectId};
 
 use super::evidence::{CompactionEvidenceBundle, validate_bundle};
 use super::{
-    DurableError, PersistentObjectIdentity, RecoveryLimits, append_frame, decode_object_frame,
-    encode_object_frame, ensure_payload_limit, io_error, scan_frames, sync_store_directory,
+    DurableError, PersistentObjectIdentity, RecoveryLimits, append_frame,
+    create_private_file_capability, decode_object_frame, encode_object_frame, ensure_payload_limit,
+    io_error, open_directory_capability, open_rw_capability, scan_frames,
+    sync_store_directory_capability,
 };
 
 pub(super) const OUTBOX_DIRECTORY: &str = "gc-outbox";
@@ -20,85 +23,76 @@ const READY_SUFFIX: &str = ".ready";
 const TEMP_SUFFIX: &str = ".tmp";
 
 pub(super) fn prepare<I: PersistentObjectIdentity>(
-    directory: &Path,
+    directory: &Dir,
     bundle: &CompactionEvidenceBundle,
     identity: &I,
     limits: RecoveryLimits,
 ) -> Result<(), DurableError> {
     let outbox = ensure_outbox_directory(directory)?;
-    let ready = bundle_path(&outbox, bundle.commit_id(), READY_SUFFIX);
-    if ready.try_exists().map_err(|source| {
-        io_error(
-            "inspect ready GC evidence before outbox preparation",
-            source,
-        )
-    })? {
-        require_same_bundle(&ready, bundle, identity, limits)?;
+    let ready = bundle_name(bundle.commit_id(), READY_SUFFIX);
+    if entry_exists(&outbox, &ready)? {
+        require_same_bundle(&outbox, &ready, bundle, identity, limits)?;
         return Ok(());
     }
 
-    let prepared = bundle_path(&outbox, bundle.commit_id(), PREPARED_SUFFIX);
-    if prepared.try_exists().map_err(|source| {
-        io_error(
-            "inspect prepared GC evidence before outbox preparation",
-            source,
-        )
-    })? {
-        require_same_bundle(&prepared, bundle, identity, limits)?;
+    let prepared = bundle_name(bundle.commit_id(), PREPARED_SUFFIX);
+    if entry_exists(&outbox, &prepared)? {
+        require_same_bundle(&outbox, &prepared, bundle, identity, limits)?;
         return Ok(());
     }
 
-    let temporary = bundle_path(&outbox, bundle.commit_id(), TEMP_SUFFIX);
-    remove_file_if_exists(&temporary, "remove stale GC evidence temporary file")?;
-    write_bundle(&temporary, bundle, identity, limits)?;
-    std::fs::rename(&temporary, &prepared)
+    let temporary = bundle_name(bundle.commit_id(), TEMP_SUFFIX);
+    remove_file_if_exists(
+        &outbox,
+        &temporary,
+        "remove stale GC evidence temporary file",
+    )?;
+    write_bundle(&outbox, &temporary, bundle, identity, limits)?;
+    outbox
+        .rename(&temporary, &outbox, &prepared)
         .map_err(|source| io_error("publish prepared GC evidence", source))?;
-    sync_store_directory(&outbox)
+    sync_store_directory_capability(&outbox)
 }
 
 pub(super) fn mark_ready<I: PersistentObjectIdentity>(
-    directory: &Path,
+    directory: &Dir,
     commit: GcCommitId,
     identity: &I,
     limits: RecoveryLimits,
 ) -> Result<CompactionEvidenceBundle, DurableError> {
     let outbox = require_outbox_directory(directory)?;
-    let ready = bundle_path(&outbox, commit, READY_SUFFIX);
-    if ready
-        .try_exists()
-        .map_err(|source| io_error("inspect ready GC evidence", source))?
-    {
-        let bundle = read_bundle(&ready, Some(commit), identity, limits)?;
+    let ready = bundle_name(commit, READY_SUFFIX);
+    if entry_exists(&outbox, &ready)? {
+        let bundle = read_bundle(&outbox, &ready, Some(commit), identity, limits)?;
         remove_file_if_exists(
-            &bundle_path(&outbox, commit, PREPARED_SUFFIX),
+            &outbox,
+            &bundle_name(commit, PREPARED_SUFFIX),
             "remove redundant prepared GC evidence",
         )?;
-        sync_store_directory(&outbox)?;
+        sync_store_directory_capability(&outbox)?;
         return Ok(bundle);
     }
 
-    let prepared = bundle_path(&outbox, commit, PREPARED_SUFFIX);
-    let bundle = read_bundle(&prepared, Some(commit), identity, limits)?;
-    std::fs::rename(&prepared, &ready)
+    let prepared = bundle_name(commit, PREPARED_SUFFIX);
+    let bundle = read_bundle(&outbox, &prepared, Some(commit), identity, limits)?;
+    outbox
+        .rename(&prepared, &outbox, &ready)
         .map_err(|source| io_error("mark GC evidence ready", source))?;
-    sync_store_directory(&outbox)?;
+    sync_store_directory_capability(&outbox)?;
     Ok(bundle)
 }
 
 pub(super) fn load_prepared_or_ready<I: PersistentObjectIdentity>(
-    directory: &Path,
+    directory: &Dir,
     commit: GcCommitId,
     identity: &I,
     limits: RecoveryLimits,
 ) -> Result<CompactionEvidenceBundle, DurableError> {
     let outbox = require_outbox_directory(directory)?;
     for suffix in [READY_SUFFIX, PREPARED_SUFFIX] {
-        let path = bundle_path(&outbox, commit, suffix);
-        if path
-            .try_exists()
-            .map_err(|source| io_error("inspect expected GC evidence", source))?
-        {
-            return read_bundle(&path, Some(commit), identity, limits);
+        let name = bundle_name(commit, suffix);
+        if entry_exists(&outbox, &name)? {
+            return read_bundle(&outbox, &name, Some(commit), identity, limits);
         }
     }
     Err(DurableError::InvalidCompactionEvidence(
@@ -107,18 +101,19 @@ pub(super) fn load_prepared_or_ready<I: PersistentObjectIdentity>(
 }
 
 pub(super) fn pending<I: PersistentObjectIdentity>(
-    directory: &Path,
+    directory: &Dir,
     identity: &I,
     limits: RecoveryLimits,
 ) -> Result<Vec<CompactionEvidenceBundle>, DurableError> {
     let Some(outbox) = existing_outbox_directory(directory)? else {
         return Ok(Vec::new());
     };
-    let mut entries = std::fs::read_dir(&outbox)
+    let mut entries = outbox
+        .entries()
         .map_err(|source| io_error("list ready GC evidence", source))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|source| io_error("read GC evidence directory entry", source))?;
-    entries.sort_by_key(std::fs::DirEntry::file_name);
+    entries.sort_by_key(cap_std::fs::DirEntry::file_name);
 
     let mut bundles = Vec::new();
     for entry in entries {
@@ -134,14 +129,13 @@ pub(super) fn pending<I: PersistentObjectIdentity>(
             continue;
         }
         let commit = parse_bundle_name(&name, READY_SUFFIX)?;
-        require_regular_file(&entry.path())?;
-        bundles.push(read_bundle(&entry.path(), Some(commit), identity, limits)?);
+        bundles.push(read_bundle(&outbox, &name, Some(commit), identity, limits)?);
     }
     Ok(bundles)
 }
 
 pub(super) fn acknowledge<I: PersistentObjectIdentity>(
-    directory: &Path,
+    directory: &Dir,
     commit: GcCommitId,
     identity: &I,
     limits: RecoveryLimits,
@@ -149,23 +143,21 @@ pub(super) fn acknowledge<I: PersistentObjectIdentity>(
     let Some(outbox) = existing_outbox_directory(directory)? else {
         return Ok(());
     };
-    let ready = bundle_path(&outbox, commit, READY_SUFFIX);
-    if !ready
-        .try_exists()
-        .map_err(|source| io_error("inspect acknowledged GC evidence", source))?
-    {
+    let ready = bundle_name(commit, READY_SUFFIX);
+    if !entry_exists(&outbox, &ready)? {
         return Ok(());
     }
-    read_bundle(&ready, Some(commit), identity, limits)?;
-    remove_file_if_exists(&ready, "acknowledge ready GC evidence")?;
-    sync_store_directory(&outbox)
+    read_bundle(&outbox, &ready, Some(commit), identity, limits)?;
+    remove_file_if_exists(&outbox, &ready, "acknowledge ready GC evidence")?;
+    sync_store_directory_capability(&outbox)
 }
 
-pub(super) fn cleanup_unpublished(directory: &Path) -> Result<(), DurableError> {
+pub(super) fn cleanup_unpublished(directory: &Dir) -> Result<(), DurableError> {
     let Some(outbox) = existing_outbox_directory(directory)? else {
         return Ok(());
     };
-    for entry in std::fs::read_dir(&outbox)
+    for entry in outbox
+        .entries()
         .map_err(|source| io_error("list unpublished GC evidence", source))?
     {
         let entry = entry.map_err(|source| io_error("read GC evidence directory entry", source))?;
@@ -174,20 +166,21 @@ pub(super) fn cleanup_unpublished(directory: &Path) -> Result<(), DurableError> 
             .into_string()
             .map_err(|_| DurableError::InvalidCompactionEvidence("non-UTF-8 GC outbox name"))?;
         if name.ends_with(PREPARED_SUFFIX) || name.ends_with(TEMP_SUFFIX) {
-            require_regular_file(&entry.path())?;
-            remove_file_if_exists(&entry.path(), "remove unpublished GC evidence")?;
+            open_rw_capability(&outbox, Path::new(&name), false)?;
+            remove_file_if_exists(&outbox, &name, "remove unpublished GC evidence")?;
         }
     }
-    sync_store_directory(&outbox)
+    sync_store_directory_capability(&outbox)
 }
 
 fn write_bundle<I: PersistentObjectIdentity>(
-    path: &Path,
+    directory: &Dir,
+    name: &str,
     bundle: &CompactionEvidenceBundle,
     identity: &I,
     limits: RecoveryLimits,
 ) -> Result<(), DurableError> {
-    let mut file = create_private_file(path)?;
+    let mut file = create_private_file_capability(directory, Path::new(name))?;
     for record in bundle.records() {
         let id = identity.identify(record);
         let payload = encode_object_frame(identity.scheme(), id, record)?;
@@ -199,13 +192,13 @@ fn write_bundle<I: PersistentObjectIdentity>(
 }
 
 fn read_bundle<I: PersistentObjectIdentity>(
-    path: &Path,
+    directory: &Dir,
+    name: &str,
     expected: Option<GcCommitId>,
     identity: &I,
     limits: RecoveryLimits,
 ) -> Result<CompactionEvidenceBundle, DurableError> {
-    require_regular_file(path)?;
-    let mut file = open_existing(path)?;
+    let mut file = open_rw_capability(directory, Path::new(name), false)?;
     let mut records = Vec::new();
     scan_frames(
         &mut file,
@@ -236,12 +229,19 @@ fn read_bundle<I: PersistentObjectIdentity>(
 }
 
 fn require_same_bundle<I: PersistentObjectIdentity>(
-    path: &Path,
+    directory: &Dir,
+    name: &str,
     expected: &CompactionEvidenceBundle,
     identity: &I,
     limits: RecoveryLimits,
 ) -> Result<(), DurableError> {
-    let actual = read_bundle(path, Some(expected.commit_id()), identity, limits)?;
+    let actual = read_bundle(
+        directory,
+        name,
+        Some(expected.commit_id()),
+        identity,
+        limits,
+    )?;
     if &actual != expected {
         return Err(invalid_outbox(
             "GC receipt identity names a different evidence bundle",
@@ -250,86 +250,24 @@ fn require_same_bundle<I: PersistentObjectIdentity>(
     Ok(())
 }
 
-fn ensure_outbox_directory(directory: &Path) -> Result<PathBuf, DurableError> {
-    if let Some(path) = existing_outbox_directory(directory)? {
-        return Ok(path);
-    }
-    let path = directory.join(OUTBOX_DIRECTORY);
-    #[cfg(unix)]
-    let mut builder = DirBuilder::new();
-    #[cfg(not(unix))]
-    let builder = DirBuilder::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    match builder.create(&path) {
-        Ok(()) => sync_store_directory(directory)?,
-        Err(source) if source.kind() == ErrorKind::AlreadyExists => {},
-        Err(source) => return Err(io_error("create GC evidence outbox", source)),
-    }
-    require_outbox_directory(directory)
+fn ensure_outbox_directory(directory: &Dir) -> Result<Dir, DurableError> {
+    open_directory_capability(directory, Path::new(OUTBOX_DIRECTORY), true)?.ok_or(
+        DurableError::InvalidCompactionEvidence("GC evidence outbox is missing after creation"),
+    )
 }
 
-fn require_outbox_directory(directory: &Path) -> Result<PathBuf, DurableError> {
+fn require_outbox_directory(directory: &Dir) -> Result<Dir, DurableError> {
     existing_outbox_directory(directory)?.ok_or(DurableError::InvalidCompactionEvidence(
         "GC evidence outbox is missing",
     ))
 }
 
-fn existing_outbox_directory(directory: &Path) -> Result<Option<PathBuf>, DurableError> {
-    let path = directory.join(OUTBOX_DIRECTORY);
-    let metadata = match std::fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(source) if source.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(source) => return Err(io_error("inspect GC evidence outbox", source)),
-    };
-    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
-        return Err(invalid_outbox(
-            "GC evidence outbox must be a private directory",
-        ));
-    }
-    Ok(Some(path))
+fn existing_outbox_directory(directory: &Dir) -> Result<Option<Dir>, DurableError> {
+    open_directory_capability(directory, Path::new(OUTBOX_DIRECTORY), false)
 }
 
-fn create_private_file(path: &Path) -> Result<File, DurableError> {
-    let mut options = OpenOptions::new();
-    options.create_new(true).read(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    options
-        .open(path)
-        .map_err(|source| io_error("create GC evidence outbox file", source))
-}
-
-fn open_existing(path: &Path) -> Result<File, DurableError> {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .map_err(|source| io_error("open GC evidence outbox file", source))
-}
-
-fn require_regular_file(path: &Path) -> Result<(), DurableError> {
-    let metadata = std::fs::symlink_metadata(path)
-        .map_err(|source| io_error("inspect GC evidence outbox file", source))?;
-    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-        return Err(invalid_outbox(
-            "GC evidence outbox entry must be a regular file",
-        ));
-    }
-    Ok(())
-}
-
-fn bundle_path(directory: &Path, commit: GcCommitId, suffix: &str) -> PathBuf {
-    directory.join(format!(
-        "{}{suffix}",
-        encode_hex(commit.object_id().as_bytes())
-    ))
+fn bundle_name(commit: GcCommitId, suffix: &str) -> String {
+    format!("{}{suffix}", encode_hex(commit.object_id().as_bytes()))
 }
 
 fn parse_bundle_name(name: &str, suffix: &str) -> Result<GcCommitId, DurableError> {
@@ -380,8 +318,20 @@ fn decode_nibble(value: u8) -> Result<u8, DurableError> {
     }
 }
 
-fn remove_file_if_exists(path: &Path, operation: &'static str) -> Result<(), DurableError> {
-    match std::fs::remove_file(path) {
+fn entry_exists(directory: &Dir, name: &str) -> Result<bool, DurableError> {
+    match directory.symlink_metadata(name) {
+        Ok(_) => Ok(true),
+        Err(source) if source.kind() == ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(io_error("inspect GC evidence outbox entry", source)),
+    }
+}
+
+fn remove_file_if_exists(
+    directory: &Dir,
+    name: &str,
+    operation: &'static str,
+) -> Result<(), DurableError> {
+    match directory.remove_file(name) {
         Ok(()) => Ok(()),
         Err(source) if source.kind() == ErrorKind::NotFound => Ok(()),
         Err(source) => Err(io_error(operation, source)),
