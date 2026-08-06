@@ -25,7 +25,7 @@ mod platform;
 mod recovery;
 use namespace::{LooseBlobDirectory, retire_loose_blob_tree};
 pub(in crate::durable::representations) use namespace::{
-    open_component, reject_redirect, sync_directory,
+    configure_no_follow, open_component, sync_directory, validate_opened_regular,
 };
 pub(in crate::durable) use namespace::{open_representation_root, open_store_root};
 pub(in crate::durable) use platform::open_regular_read;

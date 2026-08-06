@@ -38,20 +38,12 @@ impl LooseBlobDirectory {
     }
 
     pub(super) fn open_regular(&self, name: &Path) -> io::Result<File> {
-        reject_redirect(&self.directory, name, false)?;
-        let first = self.directory.open(name)?.into_std();
-        reject_redirect(&self.directory, name, false)?;
-        let second = self.directory.open(name)?.into_std();
-        if !first.metadata()?.is_file()
-            || !second.metadata()?.is_file()
-            || file_identity(&first)? != file_identity(&second)?
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "loose blob entry changed while it was opened",
-            ));
-        }
-        Ok(first)
+        let mut options = OpenOptions::new();
+        options.read(true);
+        configure_no_follow(&mut options);
+        let file = self.directory.open_with(name, &options)?.into_std();
+        validate_opened_regular(&file)?;
+        Ok(file)
     }
 
     pub(super) fn create_new(&self, name: &Path) -> io::Result<File> {
@@ -179,6 +171,44 @@ pub(in crate::durable::representations) fn reject_redirect(
         ));
     }
     Ok(())
+}
+
+pub(in crate::durable::representations) fn configure_no_follow(options: &mut OpenOptions) {
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use cap_std::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+}
+
+pub(in crate::durable::representations) fn validate_opened_regular(file: &File) -> io::Result<()> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || opened_file_is_redirected(&metadata) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "opened representation entry is redirected or not a regular file",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn opened_file_is_redirected(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+const fn opened_file_is_redirected(_metadata: &std::fs::Metadata) -> bool {
+    false
 }
 
 #[cfg(windows)]

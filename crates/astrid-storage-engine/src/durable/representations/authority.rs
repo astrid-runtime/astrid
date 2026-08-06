@@ -5,18 +5,20 @@ use std::path::Path;
 
 use cap_std::fs::{Dir, OpenOptions};
 
-use super::contiguous::{reject_redirect, sync_directory};
+use super::contiguous::{configure_no_follow, sync_directory, validate_opened_regular};
 use crate::durable::{DurableError, io_error};
 
 pub(super) fn open_file(directory: &Dir, name: &Path) -> Result<File, DurableError> {
-    reject_redirect(directory, name, false)
-        .map_err(|source| io_error("validate representation file capability", source))?;
     let mut options = OpenOptions::new();
     options.read(true).write(true);
-    directory
+    configure_no_follow(&mut options);
+    let file = directory
         .open_with(name, &options)
         .map(cap_std::fs::File::into_std)
-        .map_err(|source| io_error("open representation file capability", source))
+        .map_err(|source| io_error("open representation file capability", source))?;
+    validate_opened_regular(&file)
+        .map_err(|source| io_error("validate opened representation file", source))?;
+    Ok(file)
 }
 
 pub(super) fn create_file(directory: &Dir, name: &Path) -> Result<File, DurableError> {

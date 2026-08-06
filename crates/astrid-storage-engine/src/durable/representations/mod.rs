@@ -685,6 +685,7 @@ impl RepresentationStore {
         &mut self,
         update: PendingRepresentationUpdate,
     ) -> Result<(), DurableError> {
+        self.flush_metadata()?;
         let cas = JournalEntry::StateCas {
             journal_generation: self.journal_generation,
             expected: Some(self.active),
@@ -692,6 +693,7 @@ impl RepresentationStore {
         }
         .encode();
         append_frame(&mut self.journal, JOURNAL_MAGIC, &cas)?;
+        self.flush_journal()?;
         self.active = update.state_id;
         self.state = update.state;
         self.catalogue = update.catalogue;
@@ -709,9 +711,17 @@ impl RepresentationStore {
     }
 
     pub(super) fn flush(&mut self) -> Result<(), DurableError> {
+        self.flush_metadata()?;
+        self.flush_journal()
+    }
+
+    fn flush_metadata(&mut self) -> Result<(), DurableError> {
         self.metadata
             .sync_data()
-            .map_err(|source| io_error("flush representation metadata", source))?;
+            .map_err(|source| io_error("flush representation metadata", source))
+    }
+
+    fn flush_journal(&mut self) -> Result<(), DurableError> {
         self.journal
             .sync_data()
             .map_err(|source| io_error("flush representation state journal", source))
