@@ -661,6 +661,50 @@ admitted. The channel is bounded, source and appender failures publish no root,
 worker schedules preserve the canonical batch root, and diagnostics remain
 operator-only so physical dedup does not become a principal-visible oracle.
 
+### Contiguous staged-file adoption
+
+Clean commit `da8e3cd0` integrates the native staging path with contiguous
+physical representations. The sealed staging generation stays unchanged as
+the retry witness; APFS or Linux reflink cloning publishes a source-preserving
+whole-file representation, while unsupported filesystems take the verified
+copy fallback. File and ChunkTree objects remain canonical arena records, and
+snapshot/export materializes every virtual Chunk record so archives never
+depend on the live representation engine.
+
+The run used the same deterministic 512 MiB incompressible corpus, three
+samples, one-MiB ranges, four principals, eight bulk workers, and a governed
+one-GiB object cache on M2 Ultra/APFS.
+
+| Workload | Dense-catalogue checkpoint | Contiguous adoption | Change |
+| --- | ---: | ---: | ---: |
+| Unique publication | 179.5 MiB/s | 271.3 MiB/s | +51.1% |
+| Duplicate publication | 256.5 MiB/s | 388.2 MiB/s | +51.3% |
+| Eight-worker first ingest | 1,251.0 MiB/s | 1,556.4 MiB/s | +24.4% |
+| Four-principal shared publication | 380.9 MiB/s | 928.6 MiB/s | 2.44× |
+| First verified read | 518.2 MiB/s | 648.1 MiB/s | +25.1% |
+| Post-reopen verified read | 404.3 MiB/s | 485.0 MiB/s | +20.0% |
+| Warm verified read | 1,778.5 MiB/s | 1,754.4 MiB/s | same regime; 0.991× same-run native elapsed |
+| Four-principal warm verified read | 6,285.1 MiB/s | 6,485.4 MiB/s | +3.2% |
+
+Unique publication appends 537,392,427 authoritative bytes for 536,870,912
+logical bytes: 1.000971×, so non-payload overhead is 0.0971%. Publishing the
+same 512 MiB again appends 8,387 bytes, or 0.001562% of the logical input. The
+representation-metadata diagnostic excludes `.blob` payloads and records
+61,042 bytes for the unique publication (1,034.6 bytes per inserted object).
+
+The acknowledgement boundary is substrate-speed in the same run: staging
+takes 1.001× native write elapsed time. The result does not claim that APFS
+shared extents consume zero unique blocks; the authoritative-byte ratio counts
+the logical representation length. The source-preserving protocol proves one
+application write plus reflink publication on supported filesystems, while
+exact physical-allocation attribution remains filesystem-specific.
+
+Populated reopen is 1.531 seconds because ordinary recovery currently
+revalidates the full contiguous blob before rebuilding its disposable slice
+index. That is honest recovery work, not a mounted-read cost, but it remains a
+scale target for the already-recorded verified-checkpoint/demand-paged-index
+work. No startup result here is extrapolated to terabyte scale.
+
 The #1388 port was remeasured against its exact current-main parent
 `0ba1181c`. Each cell is the median of three release-mode runs with 64 strict
 128-byte KV updates per principal through the complete async `TreeKvStore`
@@ -724,6 +768,7 @@ catalog.
 | `astrid-storage-pipeline-before-279c9342.json` | clean exact parent for the prepared-admission pipeline comparison |
 | `astrid-storage-pipeline-after-0296819.json` | clean `02968196`; engine-bound bounded pipeline, exact phase timing, and single/eight-worker memory peaks |
 | `astrid-storage-closure-after-a4a492b.json` | clean `a4a492b5`; staging-earned closure evidence with exact phase timing and bounded memory peaks |
+| `astrid-storage-contiguous-da8e3cd.json` | clean `da8e3cd0`; contiguous staged-file adoption, corrected metadata accounting, and source-bound evidence envelope |
 | `astrid-storage-governed-hot-64k.json`, `astrid-storage-governed-hot-1m.json` | `e0bf4217` |
 | `astrid-storage-publication-before.json` | code `3d44cbd6`, harness `ee6990d4` |
 | `astrid-storage-publication-after.json` | code `4193217f`, harness `63d0125e` |
