@@ -190,9 +190,15 @@ where
     pub(crate) fn commit_observed(
         &self,
         transaction: RootTransaction<P>,
-        observer: Arc<dyn ProjectionObserver>,
+        observer: &dyn ProjectionObserver,
     ) -> Result<CommitOutcome, DurableError> {
-        self.commit_inner(transaction, Some(observer))
+        let buffer = Arc::new(crate::projection::ProjectionPhaseBuffer::default());
+        let result = self.commit_inner(
+            transaction,
+            Some(Arc::clone(&buffer) as Arc<dyn ProjectionObserver>),
+        );
+        buffer.flush_into(observer);
+        result
     }
 
     fn commit_inner(

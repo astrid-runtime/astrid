@@ -14,6 +14,7 @@ use super::{
     PersistentObjectIdentity, PreparedFrame, PrincipalCodec, append_frame, append_prepared_frames,
     encode_object_frame, ensure_payload_limit, live_files_mut, read_indexed_object,
 };
+use crate::projection::{object_record_retained_bytes, with_buffered_observer};
 use crate::{
     PreparedProjectionBatch, PrincipalProjectionError, ProjectionObserver, ProjectionPhase,
 };
@@ -144,14 +145,7 @@ impl PreparedStagingBatch {
     fn retained_bytes(&self) -> usize {
         let input_ids = self.input_order.len().saturating_mul(size_of::<ObjectId>());
         self.unique.values().fold(input_ids, |total, prepared| {
-            let record = prepared.record.canonical_bytes().len().saturating_add(
-                prepared
-                    .record
-                    .references()
-                    .iter()
-                    .map(|reference| reference.label().as_bytes().len().saturating_add(40))
-                    .sum::<usize>(),
-            );
+            let record = object_record_retained_bytes(&prepared.record);
             let encoded = prepared
                 .append
                 .as_ref()
@@ -324,9 +318,11 @@ where
         records: Vec<ObjectRecord>,
         observer: Option<&dyn ProjectionObserver>,
     ) -> Result<PreparedProjectionBatch, DurableError> {
-        let prepared = self.prepare_staging_batch(records, observer)?;
-        let retained_bytes = prepared.prepared.retained_bytes();
-        Ok(PreparedProjectionBatch::engine(prepared, retained_bytes))
+        with_buffered_observer(observer, |buffer| {
+            let prepared = self.prepare_staging_batch(records, buffer)?;
+            let retained_bytes = prepared.prepared.retained_bytes();
+            Ok(PreparedProjectionBatch::engine(prepared, retained_bytes))
+        })
     }
 
     pub(crate) fn stage_prepared_for_projection(
@@ -340,8 +336,10 @@ where
         if !Arc::ptr_eq(&self.preparation_authority, &prepared.authority) {
             return Err(foreign_preparation());
         }
-        self.stage_prepared_batch_with_appender(prepared, append_prepared_frames, observer)
-            .map_err(crate::projection::map_durable)
+        with_buffered_observer(observer, |buffer| {
+            self.stage_prepared_batch_with_appender(prepared, append_prepared_frames, buffer)
+                .map_err(crate::projection::map_durable)
+        })
     }
 
     pub(crate) fn stage_objects_observed(
@@ -349,7 +347,9 @@ where
         records: Vec<ObjectRecord>,
         observer: &dyn ProjectionObserver,
     ) -> Result<Vec<(ObjectId, InsertOutcome)>, DurableError> {
-        self.stage_objects_with_appender(records, append_prepared_frames, Some(observer))
+        with_buffered_observer(Some(observer), |buffer| {
+            self.stage_objects_with_appender(records, append_prepared_frames, buffer)
+        })
     }
 
     #[cfg(test)]

@@ -6,8 +6,11 @@
 
 use std::any::Any;
 use std::fmt;
+use std::mem::{size_of, size_of_val};
 use std::sync::Arc;
 use std::time::Duration;
+
+use parking_lot::Mutex;
 
 use astrid_storage_model::{
     InsertOutcome, ModelError, ObjectId, ObjectIdentity, ObjectRecord, RootState,
@@ -80,6 +83,54 @@ pub trait ProjectionObserver: Send + Sync {
     fn record(&self, phase: ProjectionPhase, elapsed: Duration);
 }
 
+/// Process-local phase buffer used to keep observer code outside engine locks.
+#[derive(Default)]
+pub(crate) struct ProjectionPhaseBuffer {
+    events: Mutex<Vec<(ProjectionPhase, Duration)>>,
+}
+
+impl ProjectionObserver for ProjectionPhaseBuffer {
+    fn record(&self, phase: ProjectionPhase, elapsed: Duration) {
+        self.events.lock().push((phase, elapsed));
+    }
+}
+
+impl ProjectionPhaseBuffer {
+    pub(crate) fn flush_into(&self, observer: &dyn ProjectionObserver) {
+        let events = std::mem::take(&mut *self.events.lock());
+        for (phase, elapsed) in events {
+            observer.record(phase, elapsed);
+        }
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub(crate) fn with_buffered_observer<T>(
+    observer: Option<&dyn ProjectionObserver>,
+    operation: impl FnOnce(Option<&dyn ProjectionObserver>) -> T,
+) -> T {
+    let Some(observer) = observer else {
+        return operation(None);
+    };
+    let buffer = ProjectionPhaseBuffer::default();
+    let result = operation(Some(&buffer));
+    buffer.flush_into(observer);
+    result
+}
+
+pub(crate) fn object_record_retained_bytes(record: &ObjectRecord) -> usize {
+    size_of::<ObjectRecord>()
+        .saturating_add(record.canonical_bytes().len())
+        .saturating_add(size_of_val(record.references()))
+        .saturating_add(
+            record
+                .references()
+                .iter()
+                .map(|reference| reference.label().as_bytes().len())
+                .sum::<usize>(),
+        )
+}
+
 /// Opaque, engine-bound preparation for one immutable-object batch.
 ///
 /// Preparation may carry checksums and physical identities across a worker
@@ -98,9 +149,11 @@ struct InMemoryPreparedBatch {
 
 impl PreparedProjectionBatch {
     fn in_memory(authority: Arc<()>, records: Vec<ObjectRecord>) -> Self {
-        let retained_bytes = records.iter().fold(0_usize, |total, record| {
-            total.saturating_add(record.canonical_bytes().len())
-        });
+        let retained_bytes = records
+            .iter()
+            .fold(size_of::<InMemoryPreparedBatch>(), |total, record| {
+                total.saturating_add(object_record_retained_bytes(record))
+            });
         Self {
             payload: Box::new(InMemoryPreparedBatch { authority, records }),
             retained_bytes,
@@ -726,7 +779,7 @@ where
         transaction: RootTransaction<P>,
         observer: Arc<dyn ProjectionObserver>,
     ) -> Result<CommitOutcome, PrincipalProjectionError> {
-        self.commit_observed(transaction, observer)
+        self.commit_observed(transaction, observer.as_ref())
             .map_err(map_durable)
     }
 
@@ -794,6 +847,26 @@ mod tests {
                 .contains("prepared object batch does not belong to this engine")
         );
         assert_eq!(second.object_count(), 0);
+    }
+
+    #[test]
+    fn prepared_projection_batch_accounts_for_record_allocation() {
+        let engine = InMemoryEngine::<String, _>::new(TestIdentity);
+        let record = ObjectRecord::new(
+            ObjectKind::Chunk,
+            ObjectFormatVersion::V1,
+            b"resident charge".to_vec(),
+            Vec::new(),
+            15,
+            ObjectClass::Data,
+        )
+        .unwrap();
+        let canonical_bytes = record.canonical_bytes().len();
+
+        let prepared =
+            PrincipalProjectionEngine::<String>::prepare_objects(&engine, vec![record]).unwrap();
+
+        assert!(prepared.retained_bytes() > canonical_bytes);
     }
 
     #[test]

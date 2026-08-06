@@ -1,7 +1,7 @@
 //! Concurrency, failure-isolation, and recovery tests for group commit.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -16,6 +16,16 @@ struct RecordingProjectionObserver {
 impl crate::ProjectionObserver for RecordingProjectionObserver {
     fn record(&self, phase: crate::ProjectionPhase, _elapsed: Duration) {
         self.phases.lock().insert(phase);
+    }
+}
+
+struct ReentrantProjectionObserver {
+    engine: Arc<DurableEngine<String, TestIdentity, Utf8Codec>>,
+}
+
+impl crate::ProjectionObserver for ReentrantProjectionObserver {
+    fn record(&self, _phase: crate::ProjectionPhase, _elapsed: Duration) {
+        self.engine.object_count().unwrap();
     }
 }
 
@@ -42,7 +52,7 @@ fn observed_staging_and_publication_report_the_durable_phases() {
     engine
         .commit_observed(
             RootTransaction::new("alice".to_owned(), None, commit, Vec::new()),
-            Arc::clone(&observer) as Arc<dyn crate::ProjectionObserver>,
+            observer.as_ref(),
         )
         .unwrap();
 
@@ -58,6 +68,50 @@ fn observed_staging_and_publication_report_the_durable_phases() {
     ] {
         assert!(phases.contains(&expected), "missing phase {expected:?}");
     }
+}
+
+#[test]
+fn projection_observers_run_outside_the_engine_lock() {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let result = (|| -> Result<(), String> {
+            let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+            let engine = Arc::new(
+                DurableEngine::open(directory.path(), TestIdentity, Utf8Codec, limits())
+                    .map_err(|error| error.to_string())?,
+            );
+            let observer = Arc::new(ReentrantProjectionObserver {
+                engine: Arc::clone(&engine),
+            });
+            let (commit, transaction) = transaction("alice", None, b"reentrant observer");
+            let prepared = engine
+                .prepare_objects_for_projection(
+                    transaction
+                        .records()
+                        .iter()
+                        .map(|(_, record)| record.clone())
+                        .collect(),
+                    Some(observer.as_ref()),
+                )
+                .map_err(|error| error.to_string())?;
+            engine
+                .stage_prepared_for_projection(prepared, Some(observer.as_ref()))
+                .map_err(|error| error.to_string())?;
+            engine
+                .commit_observed(
+                    RootTransaction::new("alice".to_owned(), None, commit, Vec::new()),
+                    observer.as_ref(),
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        })();
+        sender.send(result).ok();
+    });
+
+    receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("projection observer deadlocked while re-entering the engine")
+        .unwrap();
 }
 
 #[test]
