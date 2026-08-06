@@ -551,12 +551,14 @@ where
             let files = live_files_mut(files)?;
             return read_indexed_object(&files.arena, id, location, &self.identity, self.limits);
         }
-        if let Some((path, location)) = representations
+        if let Some((file, location)) = representations
             .as_ref()
-            .and_then(|store| store.contiguous_read(id))
+            .map(|store| store.open_contiguous_read(id))
+            .transpose()?
+            .flatten()
         {
             return super::representations::read_contiguous_object(
-                &path,
+                file,
                 location,
                 id,
                 &self.identity,

@@ -26,11 +26,13 @@ impl<I: PersistentObjectIdentity> ClosureObjects<'_, I> {
         if let Some(location) = self.index.get(&id).copied() {
             return read_indexed_object(self.arena, id, location, self.identity, self.limits);
         }
-        if let Some((path, location)) = self
+        if let Some((file, location)) = self
             .representations
-            .and_then(|store| store.contiguous_read(id))
+            .map(|store| store.open_contiguous_read(id))
+            .transpose()?
+            .flatten()
         {
-            return read_contiguous_object(&path, location, id, self.identity);
+            return read_contiguous_object(file, location, id, self.identity);
         }
         Err(ModelError::MissingObject(id).into())
     }
