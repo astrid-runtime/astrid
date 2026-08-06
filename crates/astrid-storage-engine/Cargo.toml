@@ -22,8 +22,12 @@ sha2 = { workspace = true }
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 astrid-storage-content = { workspace = true }
 blake3 = { workspace = true }
+cap-std = "4.0.2"
 fs2 = { workspace = true }
 libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 blake3 = { workspace = true }

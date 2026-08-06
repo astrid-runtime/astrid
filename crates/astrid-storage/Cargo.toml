@@ -64,6 +64,9 @@ blake3 = { workspace = true }
 caseless = { workspace = true }
 unicode-normalization = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
+
 [lints]
 workspace = true
 

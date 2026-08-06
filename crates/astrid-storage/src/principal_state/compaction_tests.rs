@@ -173,7 +173,7 @@ async fn production_retention_preserves_bootstraps_during_compaction() {
 }
 
 #[tokio::test]
-async fn raw_engine_retention_remains_policy_neutral() {
+async fn physical_profiles_and_runtime_retention_both_pin_bootstrap_dependencies() {
     let directory = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(directory.path());
     let store = open_runtime_principal_store(&home, unlimited_quota())
@@ -199,11 +199,11 @@ async fn raw_engine_retention_remains_policy_neutral() {
         .engine
         .capture_compaction_facts(&raw_retention)
         .unwrap();
-    assert!(facts.condemned().contains(&format_spec_id));
-    // The engine deliberately has no knowledge of runtime bootstrap roles.
-    // Runtime composition keeps the engine private and exposes only the
-    // constructor below, which adds and verifies every registered System root
-    // before a destructive plan can be authorized.
+    assert!(!facts.condemned().contains(&format_spec_id));
+    // Physical profiles pin their own logical specification dependencies.
+    // Runtime composition additionally keeps the engine private and exposes
+    // the constructor below, which adds and verifies every registered System
+    // root, including bootstraps not named by physical authority.
 
     let policy = evidence(b"subsequent-runtime-retention");
     let retention = store

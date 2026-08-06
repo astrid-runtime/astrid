@@ -255,7 +255,10 @@ fn ensure_outbox_directory(directory: &Path) -> Result<PathBuf, DurableError> {
         return Ok(path);
     }
     let path = directory.join(OUTBOX_DIRECTORY);
+    #[cfg(unix)]
     let mut builder = DirBuilder::new();
+    #[cfg(not(unix))]
+    let builder = DirBuilder::new();
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;

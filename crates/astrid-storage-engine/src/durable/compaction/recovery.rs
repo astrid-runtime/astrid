@@ -166,6 +166,7 @@ fn rebase_representation_authority<I: PersistentObjectIdentity>(
     };
     let mut arena = open_rw(&directory.join(ARENA_FILE))?;
     let (index, _) = recover_arena(&mut arena, identity, limits, 0)?;
+    representations.rebuild_contiguous_index(&mut arena, &index, identity, limits)?;
     representations.rebase_compacted_arena(&arena, &index, identity, limits)?;
     representations.retire_loose_blobs()
 }

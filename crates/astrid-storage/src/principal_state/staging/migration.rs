@@ -21,8 +21,8 @@ use super::{
 use crate::error::StorageResult;
 use crate::principal_state::StateOwner;
 use crate::principal_state::native_io::{
-    atomic_write, ensure_private_directory, open_private_file, rename_private_entry,
-    sync_directory, validate_private_regular_file,
+    atomic_write, ensure_private_directory, open_private_file, private_file_identity,
+    rename_private_entry, sync_directory, validate_private_regular_file,
 };
 
 pub(super) const LEGACY_INTENT_FILE: &str = "intent.v1";
@@ -365,7 +365,8 @@ fn ensure_footer(target: &Path, entry: &LegacyReady) -> StorageResult<()> {
                     target.display()
                 ))
             })?;
-            append_generation_footer(&mut file, &entry.intent)?;
+            let source_identity = private_file_identity(&file)?;
+            append_generation_footer(&mut file, &entry.intent, source_identity)?;
             file.sync_all().map_err(|error| {
                 connection(format!(
                     "flush migrated staged generation {}: {error}",
