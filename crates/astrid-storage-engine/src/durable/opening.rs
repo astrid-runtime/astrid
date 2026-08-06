@@ -4,7 +4,7 @@ use super::{
     Arc, ArenaReader, BTreeMap, CommitGroup, DurableEngine, DurableEnginePolicy, DurableError,
     DurableInner, EngineOpenOptions, FaultInjector, FileExt, GroupCommitPolicy, LIFECYCLE_USABLE,
     LOCK_FILE, Mutex, NoFaults, ObjectCache, ObjectCacheConfig, Path, PersistentObjectIdentity,
-    PrincipalCodec, RecoveryLimits, RecoveryRetryPolicy, RwLock, io, io_error, open_rw,
+    PrincipalCodec, RecoveryLimits, RecoveryRetryPolicy, RwLock, io, io_error, open_rw_capability,
     recover_store,
 };
 
@@ -198,7 +198,7 @@ where
             .map_err(|source| io_error("create principal-store directory", source))?;
         let directory_capability = Arc::new(super::representations::open_store_root(&path)?);
         let lock_path = path.join(LOCK_FILE);
-        let lock = open_rw(&lock_path)?;
+        let lock = open_rw_capability(&directory_capability, Path::new(LOCK_FILE), true)?;
         if let Err(source) = lock.try_lock_exclusive() {
             if source.kind() == io::ErrorKind::WouldBlock {
                 return Err(DurableError::LockHeld(lock_path));

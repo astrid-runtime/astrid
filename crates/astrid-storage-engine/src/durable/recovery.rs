@@ -4,8 +4,8 @@ use super::{
     ARENA_FILE, ArenaReader, DurableEngine, DurableError, DurableFiles, DurableInner,
     FaultInjector, FaultPoint, INDEX_FILE, IndexState, LIFECYCLE_CLOSED, LIFECYCLE_USABLE,
     MutexGuard, PersistentObjectIdentity, PrincipalCodec, ROOT_FILE, RecoveredStore,
-    RecoveryLimits, Seek, SeekFrom, io, io_error, open_rw, recover_arena, recover_index,
-    recover_interrupted_compaction, recover_roots, replace_index, sync_store_directory,
+    RecoveryLimits, Seek, SeekFrom, io, io_error, open_rw_capability, recover_arena, recover_index,
+    recover_interrupted_compaction, recover_roots, replace_index, sync_store_directory_capability,
 };
 use std::path::Path;
 
@@ -43,10 +43,10 @@ where
         Ok(0),
         super::representations::RepresentationStore::generation_zero_protected_len,
     )?;
-    let mut arena = open_rw(&path.join(ARENA_FILE))?;
-    let mut roots = open_rw(&path.join(ROOT_FILE))?;
-    let mut index_cache = open_rw(&path.join(INDEX_FILE)).ok();
-    sync_store_directory(path)?;
+    let mut arena = open_rw_capability(store_root, Path::new(ARENA_FILE), true)?;
+    let mut roots = open_rw_capability(store_root, Path::new(ROOT_FILE), true)?;
+    let mut index_cache = open_rw_capability(store_root, Path::new(INDEX_FILE), true).ok();
+    sync_store_directory_capability(store_root)?;
     let scheme = identity.scheme();
     let arena_len = arena
         .metadata()
@@ -68,7 +68,7 @@ where
             objects: index,
         };
         drop(index_cache.take());
-        index_cache = replace_index(path, &state, scheme);
+        index_cache = replace_index(store_root, &state, scheme);
         (state.objects, state.arena_tail)
     };
     if let Some(representations) = &mut representations {
