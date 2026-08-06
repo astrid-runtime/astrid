@@ -44,7 +44,7 @@ use journal::{
 pub(super) use migration::migrate_alias_owner_intents;
 use migration::migrate_legacy;
 use recovery::{load_generation, open_generation_in, recover_generations, sealed_generation_name};
-use retirement::{establish as establish_retired_generation, remove as remove_generation};
+use retirement::{establish_in as establish_retired_generation, remove_in as remove_generation};
 
 const GENERATIONS_DIRECTORY: &str = "generations";
 const QUARANTINE_DIRECTORY: &str = "quarantine";
@@ -661,11 +661,11 @@ impl NativeContentStagingArea {
         }
         let cleanup = (|| {
             for key in &completed {
-                let retired = establish_retired_generation(&self.inner.generations, *key)?;
+                establish_retired_generation(&self.inner.generations_directory, *key)?;
                 self.fail_if(StagingFaultPoint::GenerationRetired)?;
-                remove_generation(&retired)?;
+                remove_generation(&self.inner.generations_directory, *key)?;
             }
-            sync_directory(&self.inner.generations)?;
+            self.inner.generations_directory.sync()?;
             self.fail_if(StagingFaultPoint::GenerationCleaned)
         })();
         cleanup?;

@@ -65,6 +65,50 @@ impl PrivateDirectory {
         Ok(file)
     }
 
+    pub(super) fn create_file(&self, name: &Path) -> StorageResult<File> {
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.create_new(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use cap_std::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let file = self
+            .directory
+            .open_with(name, &options)
+            .map(cap_std::fs::File::into_std)
+            .map_err(|error| {
+                connection(format!(
+                    "create private file {}: {error}",
+                    self.path.join(name).display()
+                ))
+            })?;
+        private_file_identity(&file)?;
+        Ok(file)
+    }
+
+    pub(super) fn contains(&self, name: &Path) -> StorageResult<bool> {
+        match self.directory.symlink_metadata(name) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(connection(format!(
+                "inspect private entry {}: {error}",
+                self.path.join(name).display()
+            ))),
+        }
+    }
+
+    pub(super) fn remove_file(&self, name: &Path) -> StorageResult<()> {
+        match self.directory.remove_file(name) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(connection(format!(
+                "remove private file {}: {error}",
+                self.path.join(name).display()
+            ))),
+        }
+    }
+
     pub(super) fn rename_with_identity(
         &self,
         source: &Path,
