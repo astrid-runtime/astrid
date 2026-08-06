@@ -705,6 +705,17 @@ index. That is honest recovery work, not a mounted-read cost, but it remains a
 scale target for the already-recorded verified-checkpoint/demand-paged-index
 work. No startup result here is extrapolated to terabyte scale.
 
+Clean commit `6384aaec` adds adversarial source-reuse and no-follow hardening.
+An occupied canonical blob is reused only after a byte-exact comparison with
+the supplied complete preimage, and authoritative blob access rejects symlink
+and reparse-point substitution through handle-first platform checks. Its clean
+rerun measures the forced non-clone copy fallback separately at 674.7 MiB/s.
+Unique publication remains 270.4 MiB/s; duplicate publication is 295.8 MiB/s
+because it now pays the required full-preimage verification; warm verified
+reads reach 1,774.6 MiB/s; and four-principal shared publication reaches 935.8
+MiB/s. The benchmark reports application-level copy behavior and authoritative
+bytes, not APFS device-block allocation.
+
 The #1388 port was remeasured against its exact current-main parent
 `0ba1181c`. Each cell is the median of three release-mode runs with 64 strict
 128-byte KV updates per principal through the complete async `TreeKvStore`
@@ -769,6 +780,7 @@ catalog.
 | `astrid-storage-pipeline-after-0296819.json` | clean `02968196`; engine-bound bounded pipeline, exact phase timing, and single/eight-worker memory peaks |
 | `astrid-storage-closure-after-a4a492b.json` | clean `a4a492b5`; staging-earned closure evidence with exact phase timing and bounded memory peaks |
 | `astrid-storage-contiguous-da8e3cd.json` | clean `da8e3cd0`; contiguous staged-file adoption, corrected metadata accounting, and source-bound evidence envelope |
+| `astrid-storage-contiguous-6384aae.json` | clean `6384aaec`; adversarial reuse hardening, no-follow authoritative reads, and forced copy-fallback measurement |
 | `astrid-storage-governed-hot-64k.json`, `astrid-storage-governed-hot-1m.json` | `e0bf4217` |
 | `astrid-storage-publication-before.json` | code `3d44cbd6`, harness `ee6990d4` |
 | `astrid-storage-publication-after.json` | code `4193217f`, harness `63d0125e` |
