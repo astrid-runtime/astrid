@@ -13,8 +13,9 @@ use astrid_storage_model::{
 };
 
 use super::{
-    ArenaLocation, DurableError, FRAME_HEADER_LEN, RecoveryLimits, append_frame, append_frames,
-    io_error, open_rw, sync_store_directory,
+    ArenaLocation, DurableError, FRAME_HEADER_LEN, PersistentObjectIdentity, RecoveryLimits,
+    append_frame, append_frames, canonical_record_bytes, io_error, open_rw,
+    read_indexed_object_with_payload, sync_store_directory,
 };
 pub(in crate::durable) use format::Blake3PhysicalIdentity as PhysicalIdentityV1;
 use format::{
@@ -115,6 +116,7 @@ pub(super) struct PendingRepresentationUpdate {
     placements: PlacementSet,
     reverse_additions: Vec<(ObjectId, RepresentationRecordId)>,
     contiguous_additions: Vec<(ObjectId, ContiguousLocation)>,
+    replacement_reverse: Option<BTreeMap<ObjectId, Vec<RepresentationRecordId>>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -235,6 +237,39 @@ impl RepresentationStore {
         frozen_specification: ObjectId,
     ) -> Result<RepresentationProfileId, DurableError> {
         Ok(activation::direct_profile(frozen_specification)?.1)
+    }
+
+    pub(super) fn rebase_compacted_arena<I: PersistentObjectIdentity>(
+        &mut self,
+        arena: &File,
+        index: &BTreeMap<ObjectId, ArenaLocation>,
+        identity: &I,
+        limits: RecoveryLimits,
+    ) -> Result<(), DurableError> {
+        // Objects deliberately excluded when physical authority was activated
+        // (the in-band specification and other bootstrap records) remain
+        // recoverable through store.meta. Compaction must not silently pull
+        // those independent roots into the representation catalogue.
+        let previously_authoritative = self
+            .reverse
+            .keys()
+            .chain(self.contiguous.keys())
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let direct = index
+            .iter()
+            .filter(|(id, _)| previously_authoritative.contains(id))
+            .map(|(id, location)| {
+                let (_, payload) =
+                    read_indexed_object_with_payload(arena, *id, *location, identity, limits)?;
+                self.describe_direct(
+                    *id,
+                    canonical_record_bytes(&payload, identity.scheme())?,
+                    *location,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.rebase_all_direct(&direct)
     }
 
     pub(super) fn describe_direct(
@@ -368,7 +403,112 @@ impl RepresentationStore {
             placements,
             reverse_additions,
             contiguous_additions: Vec::new(),
+            replacement_reverse: None,
         }))
+    }
+
+    /// Replace every active physical representation with the supplied direct
+    /// arena placement. This is the compaction handoff: all represented live
+    /// objects have already been materialized into the replacement arena, so
+    /// no retired loose blob remains authoritative after this state CAS.
+    pub(super) fn rebase_all_direct(
+        &mut self,
+        objects: &[DirectArenaObject],
+    ) -> Result<(), DurableError> {
+        if self.direct_authority_matches(objects)? {
+            return Ok(());
+        }
+        let profile = RepresentationProfile::decode(
+            self.profiles
+                .get(PhysicalMapKey::from(self.direct_profile))
+                .ok_or(DurableError::InvalidRepresentationState(
+                    "direct representation profile disappeared",
+                ))?,
+        )?;
+        let entries = objects
+            .iter()
+            .map(|object| self.prepare_direct_entry(object, &profile))
+            .collect::<Result<Vec<_>, _>>()?;
+        let representation_entries = entries
+            .iter()
+            .map(|entry| entry.representation.clone())
+            .collect();
+        let placement_entries = entries
+            .iter()
+            .map(|entry| entry.placement.clone())
+            .collect();
+        self.representations = CanonicalPhysicalMap::build_dense(
+            &Blake3PhysicalIdentity,
+            PhysicalMapDomain::Representation,
+            representation_entries,
+        )?;
+        self.placement_entries = CanonicalPhysicalMap::build_dense(
+            &Blake3PhysicalIdentity,
+            PhysicalMapDomain::Placement,
+            placement_entries,
+        )?;
+        let replacement_reverse = entries
+            .into_iter()
+            .map(|entry| (entry.object, vec![entry.representation_id]))
+            .collect();
+
+        let mut metadata = Vec::new();
+        let mut appended_map_nodes = BTreeSet::new();
+        for map in [&self.representations, &self.placement_entries] {
+            append_new_reachable_map_nodes(
+                &mut metadata,
+                map,
+                &self.persisted_map_nodes,
+                &mut appended_map_nodes,
+            )?;
+        }
+        let (catalogue, placements, state) = self.next_authority()?;
+        let state_id = state.identify(&Blake3PhysicalIdentity);
+        metadata.extend([
+            MetadataFrame::catalogue(&Blake3PhysicalIdentity, catalogue),
+            MetadataFrame::placement(&Blake3PhysicalIdentity, placements),
+            MetadataFrame::state(&Blake3PhysicalIdentity, state),
+        ]);
+        let payloads = metadata
+            .iter()
+            .map(MetadataFrame::encode)
+            .collect::<Result<Vec<_>, _>>()?;
+        append_frames(&mut self.metadata, METADATA_MAGIC, &payloads)?;
+        self.persisted_map_nodes.extend(appended_map_nodes);
+        let update = PendingRepresentationUpdate {
+            state,
+            state_id,
+            catalogue,
+            placements,
+            reverse_additions: Vec::new(),
+            contiguous_additions: Vec::new(),
+            replacement_reverse: Some(replacement_reverse),
+        };
+        self.publish_direct_update(update)?;
+        self.flush()
+    }
+
+    fn direct_authority_matches(
+        &self,
+        objects: &[DirectArenaObject],
+    ) -> Result<bool, DurableError> {
+        let expected = objects
+            .iter()
+            .map(|object| (object.object, object.location))
+            .collect::<BTreeMap<_, _>>();
+        if expected.len() != objects.len()
+            || self.representations.entry_count()
+                != u64::try_from(objects.len()).map_err(|_| DurableError::EncodingOverflow)?
+            || self.placement_entries.entry_count()
+                != u64::try_from(objects.len()).map_err(|_| DurableError::EncodingOverflow)?
+        {
+            return Ok(false);
+        }
+        Ok(self
+            .direct_arena_locations()?
+            .into_iter()
+            .collect::<BTreeMap<_, _>>()
+            == expected)
     }
 
     fn prepare_direct_entry(
@@ -456,10 +596,15 @@ impl RepresentationStore {
         self.state = update.state;
         self.catalogue = update.catalogue;
         self.placements = update.placements;
-        for (object, representation) in update.reverse_additions {
-            self.reverse.entry(object).or_default().push(representation);
+        if let Some(replacement) = update.replacement_reverse {
+            self.reverse = replacement;
+            self.contiguous.clear();
+        } else {
+            for (object, representation) in update.reverse_additions {
+                self.reverse.entry(object).or_default().push(representation);
+            }
+            self.contiguous.extend(update.contiguous_additions);
         }
-        self.contiguous.extend(update.contiguous_additions);
         Ok(())
     }
 

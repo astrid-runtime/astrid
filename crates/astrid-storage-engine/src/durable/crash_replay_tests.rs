@@ -208,7 +208,9 @@ impl FaultInjector for EngineTraceFaults {
             | FaultPoint::AfterContiguousStructuralFlush
             | FaultPoint::AfterContiguousBlobInstall
             | FaultPoint::AfterContiguousMetadataAppend
-            | FaultPoint::AfterContiguousStatePublish => {},
+            | FaultPoint::AfterContiguousStatePublish
+            | FaultPoint::AfterCompactionRepresentationRebase
+            | FaultPoint::AfterCompactionBlobRetirement => {},
         }
         false
     }

@@ -229,23 +229,45 @@ fn compaction_invalidates_evidence_for_reclaimed_staged_objects() {
 }
 
 #[test]
-fn direct_authority_rejects_retirement_until_final_path_liveness_exists() {
+fn compaction_rebases_direct_authority_before_retiring_old_placements() {
     let directory = tempfile::tempdir().unwrap();
     let engine = super::tests::open(directory.path());
-    two_versions(&engine);
-    let policy = evidence(b"retain-current-roots");
-    let authorization = plan(&engine, retention(&engine, &policy, []), policy);
+    let (first, current) = two_versions(&engine);
     let specification = evidence(b"physical format specification");
     let (specification_id, _) = engine.persist_standalone_object(&specification).unwrap();
     engine
         .ensure_direct_representation_catalogue(specification_id, &[specification_id])
         .unwrap();
+    let policy = evidence(b"retain-current-roots");
+    let authorization = plan(
+        &engine,
+        retention(
+            &engine,
+            &policy,
+            [CompactionRetainedRoot::new(
+                CompactionRootKind::System,
+                specification_id,
+            )],
+        ),
+        policy,
+    );
 
-    assert!(matches!(
-        engine.compact(&authorization),
-        Err(DurableError::RepresentationRetirementUnsupported)
-    ));
-    assert!(engine.object_count().unwrap() > 0);
+    engine.compact(&authorization).unwrap();
+    assert!(engine.object(first.commit).unwrap().is_none());
+    assert!(engine.object(current.commit).unwrap().is_some());
+    {
+        let inner = engine.inner.lock();
+        let representations = inner.representations.as_ref().unwrap();
+        assert!(!representations.contains_direct(first.commit));
+        assert!(representations.contains_direct(current.commit));
+        assert!(!representations.contains_direct(specification_id));
+    }
+    engine.close().unwrap();
+    drop(engine);
+
+    let reopened = super::tests::open(directory.path());
+    assert!(reopened.object(first.commit).unwrap().is_none());
+    assert!(reopened.object(current.commit).unwrap().is_some());
 }
 
 #[test]

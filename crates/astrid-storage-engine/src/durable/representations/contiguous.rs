@@ -29,6 +29,7 @@ use platform::{clone_file_no_replace, clone_is_unsupported, open_regular_read};
 pub(super) const LOOSE_NAMESPACE_GENERATION: u64 = 1;
 const LOOSE_META_MAGIC: [u8; 8] = *b"ASTBLM1\0";
 const LOOSE_META_VERSION: u16 = 1;
+const RETIRED_BLOBS_DIRECTORY: &str = "blobs.retired";
 static COPY_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 impl RepresentationStore {
@@ -121,6 +122,34 @@ impl RepresentationStore {
             .count()
     }
 
+    pub(in crate::durable) fn contiguous_object_ids(&self) -> impl Iterator<Item = ObjectId> + '_ {
+        self.contiguous.keys().copied()
+    }
+
+    /// Retire loose payloads only after active authority contains direct arena
+    /// placements for the complete live object set.
+    pub(in crate::durable) fn retire_loose_blobs(&self) -> Result<(), DurableError> {
+        let active = self.root.join("blobs");
+        let retired = self.root.join(RETIRED_BLOBS_DIRECTORY);
+        remove_blob_tree_if_present(&retired)?;
+        match std::fs::symlink_metadata(&active) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(DurableError::InvalidRepresentationState(
+                    "loose blob root is redirected or not a directory",
+                ));
+            },
+            Ok(_) => {
+                std::fs::rename(&active, &retired)
+                    .map_err(|source| io_error("retire loose blob namespace", source))?;
+                sync_store_directory(&self.root)?;
+            },
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {},
+            Err(source) => return Err(io_error("inspect loose blob namespace", source)),
+        }
+        remove_blob_tree_if_present(&retired)?;
+        sync_store_directory(&self.root)
+    }
+
     pub(in crate::durable) fn rebuild_contiguous_index<I: PersistentObjectIdentity>(
         &mut self,
         arena: &mut File,
@@ -207,7 +236,22 @@ impl RepresentationStore {
             placements,
             reverse_additions,
             contiguous_additions,
+            replacement_reverse: None,
         }))
+    }
+}
+
+fn remove_blob_tree_if_present(path: &Path) -> Result<(), DurableError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            Err(DurableError::InvalidRepresentationState(
+                "retired loose blob root is redirected or not a directory",
+            ))
+        },
+        Ok(_) => std::fs::remove_dir_all(path)
+            .map_err(|source| io_error("remove retired loose blob namespace", source)),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(io_error("inspect retired loose blob namespace", source)),
     }
 }
 
