@@ -20,7 +20,7 @@ use uuid::Uuid;
 use super::native_io::open_private_file;
 use super::native_io::{
     PrivateFileIdentity, create_private_file, ensure_private_directory, private_file_identity,
-    rename_private_entry, sync_directory, validate_private_regular_file,
+    rename_private_entry_with_identity, sync_directory,
 };
 use super::{NativePrincipalContentStore, StateOwner};
 use crate::content::{ChunkingProfile, ContentBatchWriteOutcome, ContentName, ContentWriteOutcome};
@@ -739,8 +739,16 @@ impl StagedContentWriter {
             .path
             .as_ref()
             .ok_or_else(|| connection("staged writer has no generation path".to_owned()))?;
-        let logical_bytes = validate_private_regular_file(path)?;
         let source_identity = private_file_identity(&file)?;
+        let logical_bytes = file
+            .metadata()
+            .map_err(|error| {
+                connection(format!(
+                    "inspect staged content handle {}: {error}",
+                    self.id
+                ))
+            })?
+            .len();
         let active = self.area.register_seal(&self.owner, &self.name)?;
         let sequence = active.sequence;
         let intent = StagingIntent {
@@ -761,7 +769,7 @@ impl StagedContentWriter {
             .inner
             .generations
             .join(sealed_generation_name(sequence, self.id));
-        rename_private_entry(path, &sealed_path)?;
+        rename_private_entry_with_identity(path, &sealed_path, source_identity)?;
         self.area.fail_if(StagingFaultPoint::GenerationRenamed)?;
         self.path = None;
         self.area.submit_seal(intent, sealed_path, source_identity)

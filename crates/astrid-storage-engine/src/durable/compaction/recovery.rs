@@ -1,7 +1,7 @@
 //! Recovery protocol for atomic arena and root-journal generation replacement.
 
 use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use astrid_storage_model::{
     GcCommitId, ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord,
@@ -15,8 +15,8 @@ use super::{
     COMPACTION_INTENT_TEMP, COMPACTION_MAGIC, CompactionIntent, DurableError, INDEX_FILE,
     PersistentObjectIdentity, PrincipalCodec, ROOT_FILE, ROOTS_COMPACTING, ROOTS_PREVIOUS,
     RecoveryLimits, append_frame, decode_object_frame, encode_object_frame, ensure_payload_limit,
-    evidence, io_error, open_rw, outbox, recover_arena, recover_roots, root_journal_digest,
-    sync_store_directory,
+    evidence, io_error, open_rw, open_rw_capability, outbox, recover_arena, recover_roots,
+    root_journal_digest, sync_store_directory, sync_store_directory_capability,
 };
 
 const INTENT_OPERATION_LABEL: &[u8] = b"00-operation-contract";
@@ -45,21 +45,23 @@ pub(super) fn write_compaction_intent<I: PersistentObjectIdentity>(
 }
 
 pub(super) fn backup_active(
-    directory: &Path,
+    directory: &cap_std::fs::Dir,
     active: &'static str,
     previous: &'static str,
 ) -> Result<(), DurableError> {
-    remove_if_exists(&directory.join(previous))?;
-    std::fs::rename(directory.join(active), directory.join(previous))
+    remove_capability_file_if_exists(directory, previous)?;
+    directory
+        .rename(active, directory, previous)
         .map_err(|source| io_error("backup active compaction generation", source))
 }
 
 pub(super) fn promote_compacting(
-    directory: &Path,
+    directory: &cap_std::fs::Dir,
     compacting: &'static str,
     active: &'static str,
 ) -> Result<(), DurableError> {
-    std::fs::rename(directory.join(compacting), directory.join(active))
+    directory
+        .rename(compacting, directory, active)
         .map_err(|source| io_error("promote compacted generation", source))
 }
 
@@ -127,15 +129,24 @@ where
             "compaction intent placement differs from its evidence bundle",
         ));
     }
-    let arenas = candidate_paths(directory, ARENA_FILE, ARENA_COMPACTING, ARENA_PREVIOUS)?;
-    let roots = candidate_paths(directory, ROOT_FILE, ROOTS_COMPACTING, ROOTS_PREVIOUS)?;
-    let (arena, root) = find_valid_pair(&arenas, &roots, intent_model, codec, identity, limits)?;
-    install_candidate(directory, &arena, ARENA_FILE, ARENA_PREVIOUS)?;
-    install_candidate(directory, &root, ROOT_FILE, ROOTS_PREVIOUS)?;
-    sync_store_directory(directory)?;
+    let arenas = candidate_names(store_root, ARENA_FILE, ARENA_COMPACTING, ARENA_PREVIOUS)?;
+    let roots = candidate_names(store_root, ROOT_FILE, ROOTS_COMPACTING, ROOTS_PREVIOUS)?;
+    let (arena, root) = find_valid_pair(
+        store_root,
+        &arenas,
+        &roots,
+        intent_model,
+        codec,
+        identity,
+        limits,
+    )?;
+    install_candidate(store_root, arena, ARENA_FILE, ARENA_PREVIOUS)?;
+    install_candidate(store_root, root, ROOT_FILE, ROOTS_PREVIOUS)?;
+    sync_store_directory_capability(store_root)?;
     let installed = placement_id(
-        &directory.join(ARENA_FILE),
-        &directory.join(ROOT_FILE),
+        store_root,
+        ARENA_FILE,
+        ROOT_FILE,
         intent_model.operation_contract,
         codec,
         identity,
@@ -147,7 +158,7 @@ where
         ));
     }
     rebase_representation_authority(directory, store_root, identity, limits)?;
-    remove_if_exists(&directory.join(INDEX_FILE))?;
+    remove_capability_file_if_exists(store_root, INDEX_FILE)?;
     let ready = outbox::mark_ready(directory, intent_model.commit, identity, limits)?;
     if ready != bundle {
         return Err(DurableError::InvalidCompactionEvidence(
@@ -167,7 +178,7 @@ fn rebase_representation_authority<I: PersistentObjectIdentity>(
     else {
         return Ok(());
     };
-    let mut arena = open_rw(&directory.join(ARENA_FILE))?;
+    let mut arena = open_rw_capability(store_root, Path::new(ARENA_FILE), false)?;
     let (index, _) = recover_arena(&mut arena, identity, limits, 0)?;
     representations.rebuild_contiguous_index(&mut arena, &index, identity, limits)?;
     representations.rebase_compacted_arena(&arena, &index, identity, limits)?;
@@ -276,33 +287,41 @@ fn intent_reference(label: &[u8], target: ObjectId) -> ObjectReference {
     )
 }
 
-fn candidate_paths(
-    directory: &Path,
+fn candidate_names(
+    directory: &cap_std::fs::Dir,
     active: &'static str,
     compacting: &'static str,
     previous: &'static str,
-) -> Result<Vec<PathBuf>, DurableError> {
+) -> Result<Vec<&'static str>, DurableError> {
     let mut paths = Vec::new();
     for name in [compacting, active, previous] {
-        let path = directory.join(name);
-        if path
-            .try_exists()
-            .map_err(|source| io_error("inspect compaction generation candidate", source))?
-        {
-            paths.push(path);
+        match directory.symlink_metadata(name) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                paths.push(name);
+            },
+            Ok(_) => {
+                return Err(DurableError::InvalidCompactionEvidence(
+                    "compaction generation candidate is redirected or not a regular file",
+                ));
+            },
+            Err(source) if source.kind() == ErrorKind::NotFound => {},
+            Err(source) => {
+                return Err(io_error("inspect compaction generation candidate", source));
+            },
         }
     }
     Ok(paths)
 }
 
 fn find_valid_pair<P, I, C>(
-    arenas: &[PathBuf],
-    roots: &[PathBuf],
+    directory: &cap_std::fs::Dir,
+    arenas: &[&'static str],
+    roots: &[&'static str],
     intent: CompactionIntent,
     codec: &C,
     identity: &I,
     limits: RecoveryLimits,
-) -> Result<(PathBuf, PathBuf), DurableError>
+) -> Result<(&'static str, &'static str), DurableError>
 where
     P: Clone + Ord,
     I: PersistentObjectIdentity,
@@ -311,6 +330,7 @@ where
     for arena in arenas {
         for root in roots {
             match placement_id(
+                directory,
                 arena,
                 root,
                 intent.operation_contract,
@@ -319,7 +339,7 @@ where
                 limits,
             ) {
                 Ok(actual) if actual == intent.placement_after => {
-                    return Ok((arena.clone(), root.clone()));
+                    return Ok((*arena, *root));
                 },
                 Ok(_) | Err(_) => {},
             }
@@ -331,8 +351,9 @@ where
 }
 
 fn placement_id<P, I, C>(
-    arena_path: &Path,
-    root_path: &Path,
+    directory: &cap_std::fs::Dir,
+    arena_name: &str,
+    root_name: &str,
     operation_contract: astrid_storage_model::ObjectId,
     codec: &C,
     identity: &I,
@@ -343,8 +364,8 @@ where
     I: PersistentObjectIdentity,
     C: PrincipalCodec<P>,
 {
-    let mut arena = open_rw(arena_path)?;
-    let mut roots = open_rw(root_path)?;
+    let mut arena = open_rw_capability(directory, Path::new(arena_name), false)?;
+    let mut roots = open_rw_capability(directory, Path::new(root_name), false)?;
     let (index, _) = recover_arena(&mut arena, identity, limits, 0)?;
     let (roots_by_principal, _) = recover_roots(
         &mut roots, &mut arena, &index, None, codec, identity, limits,
@@ -373,32 +394,48 @@ where
 }
 
 fn install_candidate(
-    directory: &Path,
-    candidate: &Path,
+    directory: &cap_std::fs::Dir,
+    candidate: &'static str,
     active_name: &'static str,
     previous_name: &'static str,
 ) -> Result<(), DurableError> {
-    let active = directory.join(active_name);
-    if candidate == active {
+    if candidate == active_name {
         return Ok(());
     }
-    let previous = directory.join(previous_name);
-    if active
-        .try_exists()
-        .map_err(|source| io_error("inspect active compaction generation", source))?
-    {
-        if previous
-            .try_exists()
-            .map_err(|source| io_error("inspect previous compaction generation", source))?
-        {
-            remove_if_exists(&active)?;
+    if capability_file_exists(directory, active_name)? {
+        if capability_file_exists(directory, previous_name)? {
+            remove_capability_file_if_exists(directory, active_name)?;
         } else {
-            std::fs::rename(&active, &previous)
+            directory
+                .rename(active_name, directory, previous_name)
                 .map_err(|source| io_error("preserve active compaction generation", source))?;
         }
     }
-    std::fs::rename(candidate, &active)
+    directory
+        .rename(candidate, directory, active_name)
         .map_err(|source| io_error("install recovered compaction generation", source))
+}
+
+fn capability_file_exists(directory: &cap_std::fs::Dir, name: &str) -> Result<bool, DurableError> {
+    match directory.symlink_metadata(name) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => Ok(true),
+        Ok(_) => Err(DurableError::InvalidCompactionEvidence(
+            "compaction authority entry is redirected or not a regular file",
+        )),
+        Err(source) if source.kind() == ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(io_error("inspect compaction authority entry", source)),
+    }
+}
+
+fn remove_capability_file_if_exists(
+    directory: &cap_std::fs::Dir,
+    name: &str,
+) -> Result<(), DurableError> {
+    match directory.remove_file(name) {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(io_error("remove compaction capability file", source)),
+    }
 }
 
 fn cleanup_authority_remnants(
