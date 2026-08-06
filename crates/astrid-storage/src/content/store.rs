@@ -179,21 +179,6 @@ where
 }
 
 impl<P: Ord, E> PrincipalContentStore<P, E> {
-    /// Construct without a principal-specific quota.
-    #[must_use]
-    pub fn from_engine(engine: Arc<E>) -> Self {
-        Self {
-            engine,
-            quota: None,
-            validated_catalogs: Arc::new(Mutex::new(BTreeMap::new())),
-            validated_kv: Arc::new(KvValidationCache::default()),
-        }
-    }
-
-    pub(crate) fn engine(&self) -> Arc<E> {
-        Arc::clone(&self.engine)
-    }
-
     /// Construct with live principal quota resolution.
     #[must_use]
     pub fn from_engine_with_quota(engine: Arc<E>, quota: Arc<dyn KvQuotaResolver<P>>) -> Self {
@@ -250,16 +235,6 @@ where
     P: Clone + Ord + Send + Sync,
     E: PrincipalProjectionEngine<P>,
 {
-    pub(crate) fn publish_verified_content(
-        &self,
-        principal: &P,
-        name: &ContentName,
-        verified: VerifiedContent,
-        staged_objects_inserted: u64,
-    ) -> Result<ContentWriteOutcome, PrincipalContentError> {
-        self.publish(principal, name, verified, None, staged_objects_inserted)
-    }
-
     /// Convert one principal's legacy flat content catalog in place.
     ///
     /// The operation is idempotent and publishes through the ordinary
@@ -465,7 +440,11 @@ where
                     )
                 })?;
                 self.mark_verified(principal, verified);
-                return Ok(ContentWriteOutcome::new(descriptor, root, 0));
+                return Ok(ContentWriteOutcome::new(
+                    descriptor,
+                    root,
+                    staged_objects_inserted,
+                ));
             }
             let mutation = insert(
                 header.catalog,
@@ -1003,6 +982,7 @@ where
 }
 
 mod bulk;
+mod native;
 mod projection;
 
 use projection::{

@@ -24,7 +24,7 @@ use crate::durable::{
 
 mod platform;
 mod recovery;
-use platform::{clone_file_no_replace, clone_is_unsupported};
+use platform::{clone_file_no_replace, clone_is_unsupported, open_regular_read};
 
 pub(super) const LOOSE_NAMESPACE_GENERATION: u64 = 1;
 const LOOSE_META_MAGIC: [u8; 8] = *b"ASTBLM1\0";
@@ -263,14 +263,6 @@ pub(in crate::durable) fn install_loose_blob_copy(
         ))?;
     ensure_loose_blob_directory(store, LOOSE_NAMESPACE_GENERATION)?;
     ensure_loose_metadata(&path, profile, blob, logical_bytes)?;
-    match std::fs::symlink_metadata(&path) {
-        Ok(_) => {
-            verify_published_blob(&path, profile, blob, logical_bytes)?;
-            return Ok(path);
-        },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
-        Err(source) => return Err(io_error("inspect canonical loose blob", source)),
-    }
     let sequence = COPY_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let temporary =
         path.with_extension(format!("blob.copy.{}.{}.tmp", std::process::id(), sequence));
@@ -309,14 +301,16 @@ pub(in crate::durable) fn install_loose_blob_from_path(
     logical_bytes: u64,
     source: &Path,
 ) -> Result<PathBuf, DurableError> {
-    let source_metadata = std::fs::symlink_metadata(source)
-        .map_err(|source| io_error("inspect loose blob adoption source", source))?;
-    if source_metadata.file_type().is_symlink()
-        || !source_metadata.is_file()
-        || source_metadata.len() < logical_bytes
+    let mut source = open_regular_read(source)
+        .map_err(|source| io_error("open loose blob adoption source no-follow", source))?;
+    if source
+        .metadata()
+        .map_err(|source| io_error("inspect loose blob adoption source", source))?
+        .len()
+        < logical_bytes
     {
         return Err(DurableError::InvalidRepresentationState(
-            "loose blob adoption source is redirected, not regular, or truncated",
+            "loose blob adoption source is truncated",
         ));
     }
     let path = loose_blob_path_from_representation_root(
@@ -331,22 +325,13 @@ pub(in crate::durable) fn install_loose_blob_from_path(
         ))?;
     ensure_loose_blob_directory(store, LOOSE_NAMESPACE_GENERATION)?;
     ensure_loose_metadata(&path, profile, blob, logical_bytes)?;
-    match std::fs::symlink_metadata(&path) {
-        Ok(_) => {
-            verify_published_blob(&path, profile, blob, logical_bytes)?;
-            return Ok(path);
-        },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
-        Err(source) => return Err(io_error("inspect canonical loose blob", source)),
-    }
-
     let sequence = COPY_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let temporary = path.with_extension(format!(
         "blob.adopt.{}.{}.tmp",
         std::process::id(),
         sequence
     ));
-    match clone_file_no_replace(source, &temporary) {
+    match clone_file_no_replace(&source, &temporary) {
         Ok(()) => {
             let file = OpenOptions::new()
                 .write(true)
@@ -358,8 +343,9 @@ pub(in crate::durable) fn install_loose_blob_from_path(
         },
         Err(error) if clone_is_unsupported(&error) => {
             let _ = std::fs::remove_file(&temporary);
-            let source = File::open(source)
-                .map_err(|source| io_error("open loose blob adoption source", source))?;
+            source
+                .seek(SeekFrom::Start(0))
+                .map_err(|source| io_error("rewind loose blob adoption source", source))?;
             return install_loose_blob_copy(store, blob, profile, logical_bytes, source);
         },
         Err(source) => return Err(io_error("clone loose blob adoption source", source)),
@@ -518,13 +504,18 @@ fn verify_exact_regular_file(
     expected: &[u8],
     description: &'static str,
 ) -> Result<(), DurableError> {
-    let metadata = std::fs::symlink_metadata(path)
-        .map_err(|source| io_error("inspect loose representation file", source))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+    let mut file = open_authoritative_regular(path, description)?;
+    if file
+        .metadata()
+        .map_err(|source| io_error("inspect loose representation file", source))?
+        .len()
+        != u64::try_from(expected.len()).map_err(|_| DurableError::EncodingOverflow)?
+    {
         return Err(DurableError::InvalidRepresentationState(description));
     }
-    let actual =
-        std::fs::read(path).map_err(|source| io_error("read loose representation file", source))?;
+    let mut actual = Vec::new();
+    file.read_to_end(&mut actual)
+        .map_err(|source| io_error("read loose representation file", source))?;
     if actual != expected {
         return Err(DurableError::InvalidRepresentationState(description));
     }
@@ -532,10 +523,12 @@ fn verify_exact_regular_file(
 }
 
 fn compare_files(left: &Path, right: &Path, logical_bytes: u64) -> Result<(), DurableError> {
-    let mut left =
-        File::open(left).map_err(|source| io_error("open candidate loose blob", source))?;
-    let mut right =
-        File::open(right).map_err(|source| io_error("open occupied loose blob", source))?;
+    let mut left = open_regular_read(left)
+        .map_err(|source| io_error("open candidate loose blob no-follow", source))?;
+    let mut right = open_authoritative_regular(
+        right,
+        "occupied loose blob is redirected or not a regular file",
+    )?;
     let mut left_buffer = vec![0; 1024 * 1024];
     let mut right_buffer = vec![0; 1024 * 1024];
     let mut remaining = logical_bytes;
@@ -576,7 +569,10 @@ pub(in crate::durable) fn read_contiguous_object<I: PersistentObjectIdentity>(
     expected: ObjectId,
     identity: &I,
 ) -> Result<ObjectRecord, DurableError> {
-    let mut file = File::open(path).map_err(|source| io_error("open contiguous chunk", source))?;
+    let mut file = open_authoritative_regular(
+        path,
+        "contiguous blob is missing, redirected, or not a regular file",
+    )?;
     file.seek(SeekFrom::Start(location.offset))
         .map_err(|source| io_error("seek contiguous chunk", source))?;
     let length = usize::try_from(location.length).map_err(|_| DurableError::EncodingOverflow)?;
@@ -628,14 +624,20 @@ fn verify_blob_bytes(
     expected: astrid_storage_model::BlobId,
     logical_bytes: u64,
 ) -> Result<(), DurableError> {
-    let metadata =
-        std::fs::symlink_metadata(path).map_err(|source| io_error("inspect loose blob", source))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() != logical_bytes {
+    let mut file = open_authoritative_regular(
+        path,
+        "loose blob is missing, redirected, or not a regular file",
+    )?;
+    if file
+        .metadata()
+        .map_err(|source| io_error("inspect loose blob", source))?
+        .len()
+        != logical_bytes
+    {
         return Err(DurableError::InvalidRepresentationState(
             "loose blob is redirected, not regular, or has the wrong length",
         ));
     }
-    let mut file = File::open(path).map_err(|source| io_error("open loose blob", source))?;
     let mut hasher = blob_hasher(profile, logical_bytes);
     let mut buffer = vec![0; 1024 * 1024];
     let mut remaining = logical_bytes;
@@ -655,6 +657,24 @@ fn verify_blob_bytes(
         ));
     }
     Ok(())
+}
+
+fn open_authoritative_regular(
+    path: &Path,
+    description: &'static str,
+) -> Result<File, DurableError> {
+    match open_regular_read(path) {
+        Ok(file) => Ok(file),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                || error.kind() == std::io::ErrorKind::InvalidData
+                || std::fs::symlink_metadata(path)
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink()) =>
+        {
+            Err(DurableError::InvalidRepresentationState(description))
+        },
+        Err(source) => Err(io_error("open authoritative loose representation", source)),
+    }
 }
 
 fn blob_hasher(
