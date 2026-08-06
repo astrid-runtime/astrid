@@ -92,6 +92,7 @@ pub(super) fn clone_file_no_replace(
     destination_directory: &cap_std::fs::Dir,
     destination: &Path,
 ) -> std::io::Result<()> {
+    use cap_std::fs::OpenOptionsExt as _;
     use std::os::fd::AsRawFd as _;
 
     #[cfg(target_env = "musl")]
@@ -99,7 +100,7 @@ pub(super) fn clone_file_no_replace(
     #[cfg(not(target_env = "musl"))]
     const FICLONE: libc::c_ulong = 0x4004_9409;
     let mut options = cap_std::fs::OpenOptions::new();
-    options.create_new(true).write(true);
+    options.create_new(true).write(true).mode(0o600);
     let destination_file = destination_directory.open_with(destination, &options)?;
     // SAFETY: both descriptors remain valid for the call; FICLONE copies no
     // user pointers and retains neither descriptor.
