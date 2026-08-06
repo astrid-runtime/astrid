@@ -1100,6 +1100,14 @@ async fn native_stage_acknowledges_before_ingest_and_publishes_on_a_blocking_wor
         store.content().read(&owner, &name).unwrap(),
         Some(b"linux build.artifact".to_vec())
     );
+    let snapshot = store.content().engine().snapshot(&owner).unwrap().unwrap();
+    assert!(
+        snapshot
+            .records()
+            .iter()
+            .any(|(_, record)| record.kind() == ObjectKind::Chunk),
+        "archival snapshots must materialize canonical chunk records"
+    );
     assert!(store.staging().ready().unwrap().is_empty());
     drop(store);
 

@@ -306,8 +306,8 @@ async fn benchmark_runtime(
         drop(reopened);
 
         samples
-            .activation
-            .push(benchmark_representation_activation(&home)?);
+            .authority_validation
+            .push(benchmark_representation_authority_validation(&home)?);
     }
     samples.record(config, report)?;
     Ok(())
@@ -409,7 +409,7 @@ struct RuntimeSamples {
     read_warm: Vec<Duration>,
     reopen: Vec<Duration>,
     read_after_reopen: Vec<Duration>,
-    activation: Vec<Duration>,
+    authority_validation: Vec<Duration>,
 }
 
 impl RuntimeSamples {
@@ -467,7 +467,11 @@ impl RuntimeSamples {
             config.bytes,
             self.read_after_reopen,
         );
-        report.record_operations("astrid_representation_activation", 1, self.activation);
+        report.record_operations(
+            "astrid_representation_authority_validation",
+            1,
+            self.authority_validation,
+        );
         Ok(())
     }
 }
@@ -514,14 +518,13 @@ fn directory_file_bytes(path: &Path) -> BenchResult<u64> {
     Ok(total)
 }
 
-fn benchmark_representation_activation(home: &AstridHome) -> BenchResult<Duration> {
+fn benchmark_representation_authority_validation(home: &AstridHome) -> BenchResult<Duration> {
     let store = home.principal_store_path();
     let representations = store.join("representations");
     let metadata = std::fs::symlink_metadata(&representations)?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err("representation authority is redirected or not a directory".into());
     }
-    std::fs::remove_dir_all(representations)?;
     let metadata = std::fs::read_to_string(store.join("store.meta"))?;
     let format_spec = metadata_object_id(&metadata, "format-spec-object=")?;
     let catalog_spec = metadata_object_id(&metadata, "content-catalog-spec-object=")?;

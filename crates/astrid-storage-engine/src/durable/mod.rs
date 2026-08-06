@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU8;
 use std::time::Duration;
 
+use astrid_storage_content::ContentError;
 use astrid_storage_model::{
     InsertOutcome, ModelError, ObjectClass, ObjectFormatVersion, ObjectId, ObjectIdentity,
     ObjectKind, ObjectRecord, ObjectReference, PhysicalModelError, PrincipalUsage, ReferenceKind,
@@ -242,6 +243,8 @@ pub enum DurableError {
     Model(ModelError),
     /// The canonical physical-representation model rejected an operation.
     PhysicalModel(PhysicalModelError),
+    /// Canonical content construction rejected a staged byte stream.
+    Content(ContentError),
     /// A filesystem operation failed.
     Io {
         /// Operation being attempted.
@@ -321,6 +324,7 @@ impl fmt::Display for DurableError {
         match self {
             Self::Model(error) => write!(formatter, "{error}"),
             Self::PhysicalModel(error) => write!(formatter, "{error}"),
+            Self::Content(error) => write!(formatter, "{error}"),
             Self::Io { operation, source } => write!(formatter, "{operation}: {source}"),
             Self::LockHeld(path) => {
                 write!(formatter, "principal store is locked: {}", path.display())
@@ -393,6 +397,7 @@ impl std::error::Error for DurableError {
         match self {
             Self::Model(error) | Self::RecoveryModel { source: error, .. } => Some(error),
             Self::PhysicalModel(error) => Some(error),
+            Self::Content(error) => Some(error),
             Self::Io { source, .. } => Some(source),
             _ => None,
         }
@@ -408,6 +413,12 @@ impl From<ModelError> for DurableError {
 impl From<PhysicalModelError> for DurableError {
     fn from(error: PhysicalModelError) -> Self {
         Self::PhysicalModel(error)
+    }
+}
+
+impl From<ContentError> for DurableError {
+    fn from(error: ContentError) -> Self {
+        Self::Content(error)
     }
 }
 
@@ -494,7 +505,10 @@ impl<P: Ord, I, C> fmt::Debug for DurableEngine<P, I, C> {
     }
 }
 
+mod contiguous;
 mod engine;
+
+pub use contiguous::{PreparedContiguousFile, PublishedContiguousFile};
 
 impl<P: Ord, I, C> Drop for DurableEngine<P, I, C> {
     fn drop(&mut self) {
@@ -583,8 +597,8 @@ use index::{IndexState, recover_index, replace_index};
 use recovery::{RecoveryScope, recover_store};
 use roots::{encode_root_record, encode_root_snapshot, recover_roots};
 use validation::{
-    materialize_closure, recovery_closure_error, usage_from_closure, validate_commit_closure,
-    validate_incremental_closure,
+    ClosureObjects, materialize_closure, recovery_closure_error, usage_from_closure,
+    validate_commit_closure, validate_incremental_closure,
 };
 
 #[cfg(test)]

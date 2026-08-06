@@ -23,6 +23,7 @@ sha2 = { workspace = true }
 astrid-storage-content = { workspace = true }
 blake3 = { workspace = true }
 fs2 = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 blake3 = { workspace = true }

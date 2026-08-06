@@ -3,18 +3,42 @@
 use astrid_storage_model::{ModelError, ObjectId, ObjectKind, ObjectRecord, PrincipalUsage, World};
 
 use super::format::read_indexed_object;
+use super::representations::{RepresentationStore, read_contiguous_object};
 use super::{
     ArenaLocation, BTreeMap, BTreeSet, DurableError, File, PersistentObjectIdentity, ROOT_FILE,
     RecoveryLimits,
 };
 
+pub(super) struct ClosureObjects<'a, I> {
+    pub(super) arena: &'a mut File,
+    pub(super) index: &'a BTreeMap<ObjectId, ArenaLocation>,
+    pub(super) incoming: &'a BTreeMap<ObjectId, ObjectRecord>,
+    pub(super) representations: Option<&'a RepresentationStore>,
+    pub(super) identity: &'a I,
+    pub(super) limits: RecoveryLimits,
+}
+
+impl<I: PersistentObjectIdentity> ClosureObjects<'_, I> {
+    fn load(&mut self, id: ObjectId) -> Result<ObjectRecord, DurableError> {
+        if let Some(record) = self.incoming.get(&id) {
+            return Ok(record.clone());
+        }
+        if let Some(location) = self.index.get(&id).copied() {
+            return read_indexed_object(self.arena, id, location, self.identity, self.limits);
+        }
+        if let Some((path, location)) = self
+            .representations
+            .and_then(|store| store.contiguous_read(id))
+        {
+            return read_contiguous_object(&path, location, id, self.identity);
+        }
+        Err(ModelError::MissingObject(id).into())
+    }
+}
+
 pub(super) fn materialize_closure<I: PersistentObjectIdentity>(
-    arena: &mut File,
-    index: &BTreeMap<ObjectId, ArenaLocation>,
-    incoming: &BTreeMap<ObjectId, ObjectRecord>,
+    source: &mut ClosureObjects<'_, I>,
     root: ObjectId,
-    identity: &I,
-    limits: RecoveryLimits,
 ) -> Result<Vec<(ObjectId, ObjectRecord)>, DurableError> {
     let mut records = BTreeMap::new();
     let mut marks = BTreeMap::<ObjectId, u8>::new();
@@ -30,15 +54,7 @@ pub(super) fn materialize_closure<I: PersistentObjectIdentity>(
             Some(1) => return Err(ModelError::ObjectCycle(id).into()),
             Some(_) | None => {},
         }
-        let record = if let Some(record) = incoming.get(&id) {
-            record.clone()
-        } else {
-            let location = index
-                .get(&id)
-                .copied()
-                .ok_or(ModelError::MissingObject(id))?;
-            read_indexed_object(arena, id, location, identity, limits)?
-        };
+        let record = source.load(id)?;
         marks.insert(id, 1);
         stack.push((id, true));
         for child in record.owning_references().rev() {
@@ -60,23 +76,11 @@ pub(super) fn validate_commit_closure(
 }
 
 pub(super) fn validate_incremental_closure<I: PersistentObjectIdentity>(
-    arena: &mut File,
-    index: &BTreeMap<ObjectId, ArenaLocation>,
-    incoming: &BTreeMap<ObjectId, ObjectRecord>,
+    source: &mut ClosureObjects<'_, I>,
     validated: &BTreeSet<ObjectId>,
     root: ObjectId,
-    identity: &I,
-    limits: RecoveryLimits,
 ) -> Result<BTreeSet<ObjectId>, DurableError> {
-    let root_record = if let Some(record) = incoming.get(&root) {
-        record.clone()
-    } else {
-        let location = index
-            .get(&root)
-            .copied()
-            .ok_or(ModelError::MissingObject(root))?;
-        read_indexed_object(arena, root, location, identity, limits)?
-    };
+    let root_record = source.load(root)?;
     if root_record.kind() != ObjectKind::Commit {
         return Err(ModelError::RootNotCommit {
             object: root,
@@ -102,15 +106,7 @@ pub(super) fn validate_incremental_closure<I: PersistentObjectIdentity>(
             Some(1) => return Err(ModelError::ObjectCycle(id).into()),
             Some(_) | None => {},
         }
-        let record = if let Some(record) = incoming.get(&id) {
-            record.clone()
-        } else {
-            let location = index
-                .get(&id)
-                .copied()
-                .ok_or(ModelError::MissingObject(id))?;
-            read_indexed_object(arena, id, location, identity, limits)?
-        };
+        let record = source.load(id)?;
         reachable.insert(id);
         marks.insert(id, 1);
         stack.push((id, true));

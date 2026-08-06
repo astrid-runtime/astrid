@@ -227,7 +227,9 @@ impl OpenedContent {
         self.descriptor
     }
 
-    pub(crate) const fn content(self) -> Option<ObjectId> {
+    /// Return the canonical content root, absent only for an empty file.
+    #[must_use]
+    pub const fn content_root(self) -> Option<ObjectId> {
         self.content
     }
 }
