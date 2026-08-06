@@ -448,6 +448,7 @@ impl NativeContentStagingArea {
             .first()
             .ok_or_else(|| connection("staged publication batch is empty".to_owned()))?;
         let owner = first.owner;
+        let mut names = std::collections::BTreeSet::new();
         for entry in &staged {
             if entry.staging_root != self.inner.root {
                 return Err(connection(
@@ -458,6 +459,12 @@ impl NativeContentStagingArea {
                 return Err(connection(
                     "staged publication batch spans multiple owners".to_owned(),
                 ));
+            }
+            if !names.insert(&entry.name) {
+                return Err(connection(format!(
+                    "staged publication batch repeats content name {}",
+                    entry.name
+                )));
             }
             self.ensure_publication_order_excluding(entry, &staged)?;
         }

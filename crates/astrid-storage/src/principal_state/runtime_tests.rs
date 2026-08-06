@@ -22,6 +22,8 @@ use super::*;
 use crate::content::{CONTENT_COMPONENT_LABEL, CatalogValue, LegacyCatalog, encode_legacy_catalog};
 use crate::{ChunkingProfile, ContentName};
 
+mod staging_batch_tests;
+
 fn unlimited_quota() -> Arc<dyn KvQuotaResolver<StateOwner>> {
     Arc::new(|owner: &StateOwner| {
         Ok(match owner {
