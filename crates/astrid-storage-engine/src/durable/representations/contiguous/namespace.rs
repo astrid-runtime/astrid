@@ -122,7 +122,11 @@ fn remove_directory_if_present(parent: &Dir, name: &Path) -> Result<(), DurableE
     }
 }
 
-fn open_component(parent: &Dir, name: &Path, create: bool) -> Result<Dir, DurableError> {
+pub(in crate::durable::representations) fn open_component(
+    parent: &Dir,
+    name: &Path,
+    create: bool,
+) -> Result<Dir, DurableError> {
     let open = || -> io::Result<Dir> {
         reject_redirect(parent, name, true)?;
         let first = parent.open_dir(name)?;
@@ -155,11 +159,15 @@ fn open_component(parent: &Dir, name: &Path, create: bool) -> Result<Dir, Durabl
     }
 }
 
-fn sync_directory(directory: &Dir) -> io::Result<()> {
+pub(in crate::durable::representations) fn sync_directory(directory: &Dir) -> io::Result<()> {
     directory.open(Path::new("."))?.into_std().sync_all()
 }
 
-fn reject_redirect(parent: &Dir, name: &Path, directory: bool) -> io::Result<()> {
+pub(in crate::durable::representations) fn reject_redirect(
+    parent: &Dir,
+    name: &Path,
+    directory: bool,
+) -> io::Result<()> {
     let metadata = parent.symlink_metadata(name)?;
     if is_redirect(&metadata)
         || (directory && !metadata.is_dir())

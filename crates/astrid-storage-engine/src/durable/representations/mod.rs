@@ -1,7 +1,7 @@
 //! Authoritative physical representation catalogue and placement state.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
@@ -13,10 +13,12 @@ use astrid_storage_model::{
     StorageNodeId,
 };
 
+#[cfg(test)]
+use super::open_rw;
 use super::{
     ArenaLocation, DurableError, FRAME_HEADER_LEN, PersistentObjectIdentity, RecoveryLimits,
-    append_frame, append_frames, canonical_record_bytes, io_error, open_rw,
-    read_indexed_object_with_payload, sync_store_directory,
+    append_frame, append_frames, canonical_record_bytes, io_error,
+    read_indexed_object_with_payload,
 };
 pub(in crate::durable) use format::Blake3PhysicalIdentity as PhysicalIdentityV1;
 use format::{
@@ -25,24 +27,24 @@ use format::{
 };
 
 mod activation;
+mod authority;
 mod format;
 mod recovery;
 
-use activation::{
-    append_new_reachable_map_nodes, build_initial_state, create_new, generation_name,
-    publish_current, quarantine_incomplete_root, quarantine_temporary_current,
-};
+use activation::{append_new_reachable_map_nodes, build_initial_state, generation_name};
 use recovery::{
-    MetadataIndex, read_current, recover_journal, recover_metadata, validate_profiles,
+    MetadataIndex, read_current_file, recover_journal, recover_metadata, validate_profiles,
     validate_representations,
 };
 
 mod contiguous;
 mod direct;
+use authority::{create_file as create_cap_file, open_file as open_cap_file, quarantine_entry};
 pub(super) use contiguous::{
     install_loose_blob_copy, install_loose_blob_from_file, open_regular_read, open_store_root,
     read_contiguous_object,
 };
+use contiguous::{open_component, sync_directory};
 
 pub(super) use direct::{DirectArenaObject, PreparedDirectArenaObject};
 
@@ -150,18 +152,35 @@ impl RepresentationStore {
         limits: RecoveryLimits,
     ) -> Result<Option<Self>, DurableError> {
         let root = store.join(DIRECTORY);
-        let current_path = root.join(CURRENT_PATH);
-        if !current_path.exists() {
-            return Ok(None);
-        }
-        let current = read_current(&current_path, limits)?;
-        let root_directory = contiguous::open_representation_root(store_root)?;
-        quarantine_temporary_current(&root)?;
-        let generation_path = root
-            .join(GENERATIONS_DIRECTORY)
-            .join(generation_name(current.journal_generation));
-        let mut metadata = open_rw(&generation_path.join(METADATA_PATH))?;
-        let mut journal = open_rw(&generation_path.join(JOURNAL_PATH))?;
+        let root_directory = match contiguous::open_representation_root(store_root) {
+            Ok(root) => root,
+            Err(DurableError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                return Ok(None);
+            },
+            Err(error) => return Err(error),
+        };
+        let current_file = match open_cap_file(&root_directory, Path::new(CURRENT_PATH)) {
+            Ok(file) => file,
+            Err(DurableError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                return Ok(None);
+            },
+            Err(error) => return Err(error),
+        };
+        let current = read_current_file(current_file, limits)?;
+        quarantine_entry(
+            &root_directory,
+            CURRENT_TEMP_PATH,
+            &format!("{CURRENT_TEMP_PATH}.incomplete"),
+        )?;
+        let generations = open_component(&root_directory, Path::new(GENERATIONS_DIRECTORY), false)?;
+        let generation_name = generation_name(current.journal_generation);
+        let generation = open_component(&generations, Path::new(&generation_name), false)?;
+        let mut metadata = open_cap_file(&generation, Path::new(METADATA_PATH))?;
+        let mut journal = open_cap_file(&generation, Path::new(JOURNAL_PATH))?;
         let index = recover_metadata(&mut metadata, limits)?;
         let (active, state) = recover_journal(&mut journal, current, &index, limits)?;
         let recovered = Self::from_recovered(
@@ -189,18 +208,14 @@ impl RepresentationStore {
         if let Some(existing) = Self::open(store, store_root, limits)? {
             return Ok(existing);
         }
-        let root = store.join(DIRECTORY);
-        quarantine_incomplete_root(store, &root)?;
-        let generations = root.join(GENERATIONS_DIRECTORY);
-        let generation_path = generations.join(generation_name(FIRST_JOURNAL_GENERATION));
-        fs::create_dir_all(&generation_path)
-            .map_err(|source| io_error("create representation generation", source))?;
-        sync_store_directory(store)?;
-        sync_store_directory(&root)?;
-        sync_store_directory(&generations)?;
+        quarantine_entry(store_root, DIRECTORY, &format!("{DIRECTORY}.incomplete"))?;
+        let root_directory = open_component(store_root, Path::new(DIRECTORY), true)?;
+        let generations = open_component(&root_directory, Path::new(GENERATIONS_DIRECTORY), true)?;
+        let generation_name = generation_name(FIRST_JOURNAL_GENERATION);
+        let generation = open_component(&generations, Path::new(&generation_name), true)?;
 
-        let mut metadata = create_new(&generation_path.join(METADATA_PATH))?;
-        let mut journal = create_new(&generation_path.join(JOURNAL_PATH))?;
+        let mut metadata = create_cap_file(&generation, Path::new(METADATA_PATH))?;
+        let mut journal = create_cap_file(&generation, Path::new(JOURNAL_PATH))?;
         let built = build_initial_state(frozen_specification, objects)?;
         let payloads = built
             .metadata
@@ -235,7 +250,8 @@ impl RepresentationStore {
         journal
             .sync_data()
             .map_err(|source| io_error("flush initial representation state", source))?;
-        sync_store_directory(&generation_path)?;
+        sync_directory(&generation)
+            .map_err(|source| io_error("flush representation generation", source))?;
 
         let current = CurrentPointer {
             journal_generation: FIRST_JOURNAL_GENERATION,
@@ -243,7 +259,30 @@ impl RepresentationStore {
             max_tail_frames: u32::MAX,
             max_tail_bytes: u64::MAX,
         };
-        publish_current(&root, current)?;
+        let mut current_file = create_cap_file(&root_directory, Path::new(CURRENT_TEMP_PATH))?;
+        append_frame(&mut current_file, format::CURRENT_MAGIC, &current.encode())?;
+        current_file
+            .sync_data()
+            .map_err(|source| io_error("flush representation current pointer", source))?;
+        drop(current_file);
+        let recovered = read_current_file(
+            open_cap_file(&root_directory, Path::new(CURRENT_TEMP_PATH))?,
+            RecoveryLimits::process_addressable(),
+        )?;
+        if recovered != current {
+            return Err(DurableError::InvalidRepresentationState(
+                "representation current pointer failed verification",
+            ));
+        }
+        root_directory
+            .rename(
+                Path::new(CURRENT_TEMP_PATH),
+                &root_directory,
+                Path::new(CURRENT_PATH),
+            )
+            .map_err(|source| io_error("publish representation current pointer", source))?;
+        sync_directory(&root_directory)
+            .map_err(|source| io_error("flush representation root", source))?;
         drop(metadata);
         drop(journal);
         Self::open(store, store_root, limits)?.ok_or(DurableError::InvalidRepresentationState(

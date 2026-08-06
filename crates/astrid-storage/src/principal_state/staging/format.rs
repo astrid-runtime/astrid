@@ -1,6 +1,5 @@
 //! Versioned, checksummed publication-intent encoding.
 
-use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
@@ -11,8 +10,9 @@ use uuid::Uuid;
 use super::{StagedContentId, connection};
 use crate::content::{ChunkingProfile, ContentName};
 use crate::error::StorageResult;
-use crate::principal_state::native_io::PrivateFileIdentity;
-use crate::principal_state::native_io::validate_private_regular_file;
+use crate::principal_state::native_io::{
+    PrivateFileIdentity, open_private_file, validate_private_regular_file,
+};
 use crate::principal_state::{StateOwner, StateOwnerCodecV1};
 
 const INTENT_MAGIC: &[u8; 16] = b"ASTRID-STAGE-V2\0";
@@ -184,16 +184,30 @@ pub(super) struct GenerationFooter {
 }
 
 pub(super) fn load_generation_footer_with_identity(path: &Path) -> StorageResult<GenerationFooter> {
-    let physical_bytes = validate_private_regular_file(path)?;
-    let trailer_offset = physical_bytes.checked_sub(FOOTER_BYTES).ok_or_else(|| {
+    let mut file = open_private_file(path)?;
+    load_generation_footer_from_file(path, &mut file)
+}
+
+pub(super) fn load_generation_footer_from_file(
+    path: &Path,
+    file: &mut std::fs::File,
+) -> StorageResult<GenerationFooter> {
+    let metadata = file.metadata().map_err(|error| {
         connection(format!(
-            "staged generation {} has no footer",
+            "inspect staged generation handle {}: {error}",
             path.display()
         ))
     })?;
-    let mut file = OpenOptions::new().read(true).open(path).map_err(|error| {
+    if !metadata.is_file() {
+        return Err(connection(format!(
+            "staged generation {} is not a regular file",
+            path.display()
+        )));
+    }
+    let physical_bytes = metadata.len();
+    let trailer_offset = physical_bytes.checked_sub(FOOTER_BYTES).ok_or_else(|| {
         connection(format!(
-            "open staged generation footer {}: {error}",
+            "staged generation {} has no footer",
             path.display()
         ))
     })?;

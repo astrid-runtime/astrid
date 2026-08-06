@@ -8,7 +8,7 @@ use super::codec::{Decoder, Encoder};
 use super::identity::{
     PhysicalIdentity, decode_blob_id, encode_blob_id, encode_object_id, encode_physical_digest,
 };
-use super::{PhysicalModelError, Recipe, RepresentationProfile, RepresentationRecord};
+use super::{Coverage, PhysicalModelError, Recipe, RepresentationProfile, RepresentationRecord};
 
 const MAGIC: &[u8; 8] = b"ASTRAE1\0";
 const VERSION: u16 = 1;
@@ -226,6 +226,21 @@ impl RepresentationAdmissionEvidence {
         if observed_output_bytes != representation.canonical_output_bytes() {
             return Err(PhysicalModelError::InvalidRecipe(
                 "admission output bytes disagree with representation",
+            ));
+        }
+        if let Coverage::Exact {
+            object,
+            canonical_record_bytes,
+        } = representation.coverage()
+            && !matches!(
+                outputs,
+                [output]
+                    if output.object() == *object
+                        && output.canonical_record_bytes() == *canonical_record_bytes
+            )
+        {
+            return Err(PhysicalModelError::InvalidRecipe(
+                "exact admission output does not match exact coverage",
             ));
         }
         Ok(Self {
@@ -504,5 +519,55 @@ mod tests {
             ),
             Err(PhysicalModelError::InvalidRecipe(_))
         ));
+    }
+
+    #[test]
+    fn exact_evidence_binds_the_single_covered_object() {
+        let identity = TestIdentity;
+        let profile = RepresentationProfile::new_builtin(
+            super::super::ProfileKind::DirectCanonical,
+            ReconstructionBounds::new(1, 2, 1024, 1024, 1, 1024, 1).unwrap(),
+            object(1),
+        )
+        .unwrap();
+        let profile_id = profile.identify(&identity).unwrap();
+        let blob = BlobId::identify(&identity, profile_id, b"canonical record").unwrap();
+        let representation = RepresentationRecord::new(
+            profile_id,
+            Coverage::exact(object(2), 16).unwrap(),
+            Recipe::DirectCanonical { blob },
+            16,
+            16,
+            None,
+        )
+        .unwrap();
+
+        let wrong_object = [RepresentationOutputObservation::new(object(3), 16)];
+        let split_objects = [
+            RepresentationOutputObservation::new(object(2), 8),
+            RepresentationOutputObservation::new(object(3), 8),
+        ];
+        assert!(
+            RepresentationAdmissionEvidence::new(
+                &identity,
+                &profile,
+                &representation,
+                blob,
+                16,
+                &wrong_object,
+            )
+            .is_err()
+        );
+        assert!(
+            RepresentationAdmissionEvidence::new(
+                &identity,
+                &profile,
+                &representation,
+                blob,
+                16,
+                &split_objects,
+            )
+            .is_err()
+        );
     }
 }

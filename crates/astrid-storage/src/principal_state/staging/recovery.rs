@@ -2,11 +2,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{DirEntry, ReadDir, read_dir};
+use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use uuid::Uuid;
 
-use super::format::{StagingIntent, load_generation_footer, load_generation_footer_with_identity};
+use super::format::{StagingIntent, load_generation_footer, load_generation_footer_from_file};
 use super::journal::{
     JournalRecord, StageKey, StageKey as JournalStageKey, append_records, flush_journal,
 };
@@ -312,15 +313,21 @@ pub(super) fn open_generation(
             path.display()
         )));
     }
-    let footer = load_generation_footer_with_identity(path)?;
+    let mut file = open_private_file(path)?;
+    let actual = private_file_identity(&file)?;
+    let footer = load_generation_footer_from_file(path, &mut file)?;
+    file.seek(SeekFrom::Start(0)).map_err(|error| {
+        connection(format!(
+            "rewind staged generation handle {}: {error}",
+            path.display()
+        ))
+    })?;
     if &footer.intent != intent {
         return Err(connection(format!(
             "staged generation footer changed after seal in {}",
             path.display()
         )));
     }
-    let file = open_private_file(path)?;
-    let actual = private_file_identity(&file)?;
     if footer
         .source_identity
         .is_some_and(|sealed| sealed != actual)

@@ -1,20 +1,14 @@
 //! Construction and publication of the first physical authority generation.
 
-use std::collections::BTreeSet;
-use std::fs::{self, File, OpenOptions};
-use std::path::Path;
-
 use astrid_storage_model::{
     CanonicalPhysicalMap, Coverage, ObjectId, PhysicalMapDomain, PhysicalMapKey, PhysicalMapNode,
     PlacementEntry, PlacementSet, Recipe, ReconstructionBounds, Replica, ReplicaLocator,
     RepresentationCatalogueRoot, RepresentationProfile, RepresentationRecord, RepresentationState,
 };
+use std::collections::BTreeSet;
 
-use super::format::{Blake3PhysicalIdentity, CURRENT_MAGIC, CurrentPointer, MetadataFrame};
-use super::{
-    CURRENT_PATH, CURRENT_TEMP_PATH, DIRECTORY, DirectArenaObject, DurableError,
-    LOCAL_STORAGE_NODE, RecoveryLimits, append_frame, io_error, read_current, sync_store_directory,
-};
+use super::format::{Blake3PhysicalIdentity, MetadataFrame};
+use super::{DirectArenaObject, DurableError, LOCAL_STORAGE_NODE};
 
 pub(super) struct InitialState {
     pub(super) metadata: Vec<MetadataFrame>,
@@ -199,77 +193,6 @@ impl MapNodeRef for &(astrid_storage_model::PhysicalMapNodeId, PhysicalMapNode) 
     fn node(&self) -> &PhysicalMapNode {
         &self.1
     }
-}
-
-pub(super) fn publish_current(root: &Path, current: CurrentPointer) -> Result<(), DurableError> {
-    let temporary = root.join(CURRENT_TEMP_PATH);
-    let mut file = create_new(&temporary)?;
-    append_frame(&mut file, CURRENT_MAGIC, &current.encode())?;
-    file.sync_data()
-        .map_err(|source| io_error("flush representation current pointer", source))?;
-    drop(file);
-    let recovered = read_current(&temporary, RecoveryLimits::process_addressable())?;
-    if recovered != current {
-        return Err(DurableError::InvalidRepresentationState(
-            "representation current pointer failed verification",
-        ));
-    }
-    fs::rename(&temporary, root.join(CURRENT_PATH))
-        .map_err(|source| io_error("publish representation current pointer", source))?;
-    sync_store_directory(root)
-}
-
-pub(super) fn create_new(path: &Path) -> Result<File, DurableError> {
-    let mut options = OpenOptions::new();
-    options.create_new(true).read(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    options
-        .open(path)
-        .map_err(|source| io_error("create representation file", source))
-}
-
-pub(super) fn quarantine_incomplete_root(store: &Path, root: &Path) -> Result<(), DurableError> {
-    if !root.exists() {
-        return Ok(());
-    }
-    for ordinal in 0_u32..=u32::MAX {
-        let quarantine = store.join(format!("{DIRECTORY}.incomplete.{ordinal:08x}"));
-        if quarantine.exists() {
-            continue;
-        }
-        fs::rename(root, quarantine).map_err(|source| {
-            io_error("quarantine incomplete representation activation", source)
-        })?;
-        sync_store_directory(store)?;
-        return Ok(());
-    }
-    Err(DurableError::InvalidRepresentationState(
-        "representation quarantine namespace is exhausted",
-    ))
-}
-
-pub(super) fn quarantine_temporary_current(root: &Path) -> Result<(), DurableError> {
-    let temporary = root.join(CURRENT_TEMP_PATH);
-    if !temporary.exists() {
-        return Ok(());
-    }
-    for ordinal in 0_u32..=u32::MAX {
-        let quarantine = root.join(format!("{CURRENT_TEMP_PATH}.incomplete.{ordinal:08x}"));
-        if quarantine.exists() {
-            continue;
-        }
-        fs::rename(&temporary, quarantine)
-            .map_err(|source| io_error("quarantine stale representation pointer", source))?;
-        sync_store_directory(root)?;
-        return Ok(());
-    }
-    Err(DurableError::InvalidRepresentationState(
-        "representation pointer quarantine namespace is exhausted",
-    ))
 }
 
 pub(super) fn generation_name(generation: u64) -> String {
