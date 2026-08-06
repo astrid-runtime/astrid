@@ -697,7 +697,11 @@ where
             arena_tail: replacement.arena_tail,
             objects: replacement.index.clone(),
         };
-        let index_cache = replace_index(&self.directory, &index_state, self.identity.scheme());
+        let index_cache = replace_index(
+            &self.directory_capability,
+            &index_state,
+            self.identity.scheme(),
+        );
         let mut arena =
             open_rw_capability(&self.directory_capability, Path::new(ARENA_FILE), false)?;
         let mut roots =
