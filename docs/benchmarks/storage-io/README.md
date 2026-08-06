@@ -82,6 +82,18 @@ a median 58,853,269 bytes with eight workers. The evidence is in
 `astrid-storage-pipeline-before-279c9342.json` and
 `astrid-storage-pipeline-after-0296819.json`.
 
+The closure-evidence checkpoint at clean commit `a4a492b5` reuses the
+identity and complete owning-closure proof earned during authoritative staging.
+On the same 512 MiB corpus, eight-worker publication rises from 388.3 to
+1,251.0 MiB/s (3.22 times), and single-worker publication rises from 184.5 to
+268.4 MiB/s. Root publication falls from 1,067.7 to 90.8 ms because exact
+closure validation falls from 979.1 ms to 0.146 ms. Physical-map work remains
+essentially flat at 78.0 ms versus 74.5 ms, so the removed work was not shifted
+to another publication phase. Median eight-worker pending memory rises from
+58,853,269 to 67,303,811 bytes and remains bounded by the configured worker
+window. The evidence is in
+`astrid-storage-closure-after-a4a492b.json`.
+
 The historical schema did not embed Git revision, executable arguments,
 dirty-tree state, or cache policy. The canonical document records reconstructed
 ancestry and explicitly prevents independent experiment branches from being

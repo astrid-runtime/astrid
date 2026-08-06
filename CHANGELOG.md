@@ -20,6 +20,16 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Added
 
+- **Bulk publication reuses closure evidence earned during authoritative
+  staging.** A bounded, batch-local dependency walk proves admitted owning
+  closures without retaining write-history state; later publication skips only
+  proof it already possesses. Missing children, cycles, failed appends,
+  compaction reclamation, and parent-before-child staging across batches remain
+  on the ordinary fail-closed validation path. On the clean three-sample 512
+  MiB run, eight-worker publication rises from 388.3 to 1,251.0 MiB/s while
+  exact closure validation falls from 979.1 ms to 0.146 ms, with physical-map
+  time essentially unchanged. Closes #1465.
+
 - **Bounded bulk ingest now carries engine-bound prepared objects from worker
   threads to one authoritative appender.** Workers perform source reads,
   canonical construction, frame checksums, and direct physical identities;

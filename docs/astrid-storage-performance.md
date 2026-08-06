@@ -632,6 +632,28 @@ make first ingest read-bound: the next measured target is eliminating redundant
 closure work while preserving canonical identity and fail-closed publication.
 At 388.3 MiB/s, one TiB extrapolates to about 45 minutes.
 
+The next clean checkpoint, `a4a492b5`, retains the closure evidence established
+while each staged object is admitted. Evidence is batch-local and
+order-independent within a batch; children proven by an earlier batch may
+prove later parents, while a parent staged before a missing child simply takes
+the ordinary validation path at publication. This keeps the optimization
+bounded rather than retaining a reverse-edge index over write history.
+
+| Workload | Bounded pipeline | Staged closure evidence | Change |
+|---|---:|---:|---:|
+| Single-worker first ingest | 2,775.6 ms, 184.5 MiB/s | 1,907.5 ms, 268.4 MiB/s | 1.46× throughput |
+| Eight-worker first ingest | 1,318.7 ms, 388.3 MiB/s | 409.3 ms, 1,251.0 MiB/s | 3.22× throughput |
+| Parallel root publication | 1,067.7 ms | 90.8 ms | 11.8× faster |
+| Exact closure validation | 979.1 ms | 0.146 ms | 6,712× faster |
+| Physical-map update | 74.5 ms | 78.0 ms | essentially unchanged |
+| Median eight-worker pending bytes | 58,853,269 | 67,303,811 | +14.4%, still bounded |
+
+The root remains authoritative: missing children, cycles, failed appends,
+reclaimed staged objects, and cross-batch parent-before-child order mint no
+usable shortcut and fall back or fail closed. At 1,251.0 MiB/s, one TiB
+extrapolates to about 14 minutes before filesystem-provider overhead and without
+claiming a larger-than-memory result.
+
 Prepared batches are opaque and bound to the engine instance that produced
 them. The appender re-probes every identity and collision under its mutation
 authority, and a regression rejects cross-engine replay before any object is
@@ -701,6 +723,7 @@ catalog.
 | `astrid-storage-bulk-ingest-eca9c20a.json` | clean `eca9c20a`; bounded batch and closure-checked delta-proportional re-ingest |
 | `astrid-storage-pipeline-before-279c9342.json` | clean exact parent for the prepared-admission pipeline comparison |
 | `astrid-storage-pipeline-after-0296819.json` | clean `02968196`; engine-bound bounded pipeline, exact phase timing, and single/eight-worker memory peaks |
+| `astrid-storage-closure-after-a4a492b.json` | clean `a4a492b5`; staging-earned closure evidence with exact phase timing and bounded memory peaks |
 | `astrid-storage-governed-hot-64k.json`, `astrid-storage-governed-hot-1m.json` | `e0bf4217` |
 | `astrid-storage-publication-before.json` | code `3d44cbd6`, harness `ee6990d4` |
 | `astrid-storage-publication-after.json` | code `4193217f`, harness `63d0125e` |

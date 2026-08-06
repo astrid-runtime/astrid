@@ -117,6 +117,16 @@ source bytes and a changed token reads only its source partition. At 388.3
 MiB/s, one TiB extrapolates to about 45 minutes; closure validation is now the
 dominant measured first-ingest cost.
 
+The following clean checkpoint, `a4a492b5`, carries staging-earned closure
+evidence into publication without weakening the authoritative root check.
+Eight-worker first ingest reaches 1,251.0 MiB/s, 3.22 times the prior
+checkpoint, while exact closure validation falls from 979.1 ms to 0.146 ms.
+Physical-map work remains flat, and the median eight-worker pending-memory bound
+is 67,303,811 bytes. Missing or cyclic closure, failed admission, reclaimed
+staged objects, and parent-before-child staging across batches take the normal
+fail-closed validation path. On this warm 512 MiB corpus, one TiB extrapolates
+to about 14 minutes; this is not a larger-than-memory or mounted-provider claim.
+
 Unique random content appended 1.013715 physical bytes per logical byte,
 including authenticated representation metadata. Republishing the identical
 512 MiB appended 18,032 bytes (0.003359%): exact deduplication plus the new

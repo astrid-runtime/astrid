@@ -1,6 +1,6 @@
 //! Caller-coordinated durability batching for principal-root commits.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::File;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -110,6 +110,27 @@ struct AcceptedCommit<P: Ord> {
     prepared: Prepared<P>,
     receipt: Arc<CommitReceipt>,
     observer: Option<Arc<dyn ProjectionObserver>>,
+}
+
+#[derive(Clone, Copy)]
+struct PendingRepresentations<'a> {
+    locations: &'a [(ObjectId, super::ArenaLocation)],
+    direct: &'a BTreeMap<ObjectId, super::representations::DirectArenaObject>,
+    validated: &'a BTreeSet<ObjectId>,
+}
+
+impl<'a> PendingRepresentations<'a> {
+    const fn new(
+        locations: &'a [(ObjectId, super::ArenaLocation)],
+        direct: &'a BTreeMap<ObjectId, super::representations::DirectArenaObject>,
+        validated: &'a BTreeSet<ObjectId>,
+    ) -> Self {
+        Self {
+            locations,
+            direct,
+            validated,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -387,9 +408,10 @@ where
         let DurableInner {
             files,
             representations,
-            pending_index_locations,
-            pending_direct_objects,
+            pending_index_locations: pending_locations,
+            pending_direct_objects: pending_direct,
             index,
+            validated,
             ..
         } = inner;
         let files = live_files_mut(files)?;
@@ -432,15 +454,14 @@ where
                 )
                 .map(|((id, payload), location)| (id, payload, location));
             debug_assert!(
-                pending_index_locations
+                pending_locations
                     .iter()
                     .all(|(id, location)| index.get(id) == Some(location))
             );
             self.append_group_representations(
                 &files.arena,
                 representations,
-                pending_index_locations,
-                pending_direct_objects,
+                PendingRepresentations::new(pending_locations, pending_direct, validated),
                 accepted.iter().flat_map(|commit| {
                     commit
                         .prepared
@@ -515,18 +536,18 @@ where
         &self,
         arena: &File,
         representations: &mut RepresentationStore,
-        pending: &[(ObjectId, super::ArenaLocation)],
-        pending_direct: &BTreeMap<ObjectId, super::representations::DirectArenaObject>,
+        pending: PendingRepresentations<'_>,
         required: impl Iterator<Item = (ObjectId, super::ArenaLocation)>,
         appended: impl Iterator<Item = (ObjectId, &'a [u8], super::ArenaLocation)>,
     ) -> Result<Option<PendingDirectUpdate>, DurableError> {
         let mut direct = Vec::new();
         direct
-            .try_reserve(pending.len())
+            .try_reserve(pending.locations.len())
             .map_err(|_| DurableError::EncodingOverflow)?;
         let required = required.collect::<BTreeMap<_, _>>();
         let mut seen = std::collections::BTreeSet::new();
         for (id, location) in pending
+            .locations
             .iter()
             .copied()
             .chain(required.iter().map(|(id, location)| (*id, *location)))
@@ -534,8 +555,11 @@ where
             if !seen.insert(id) || representations.contains_direct(id) {
                 continue;
             }
-            if required.contains_key(&id)
-                && let Some(cached) = pending_direct.get(&id)
+            // Admission-created direct descriptions are reusable only after
+            // the logical owning closure earned the same process-local token.
+            // Otherwise reread and identify the arena frame before promotion.
+            if (pending.validated.contains(&id) || required.contains_key(&id))
+                && let Some(cached) = pending.direct.get(&id)
                 && cached.location == location
             {
                 direct.push(cached.clone());

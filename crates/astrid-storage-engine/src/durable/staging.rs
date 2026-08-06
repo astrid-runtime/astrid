@@ -1,6 +1,6 @@
 //! Incremental immutable-object staging for durable root transactions.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -46,6 +46,64 @@ struct StagingBatchAppend {
     ids: Vec<ObjectId>,
     frames: Vec<PreparedFrame>,
     direct: Vec<Option<PreparedDirectArenaObject>>,
+}
+
+fn staged_closure_evidence(
+    validated: &BTreeSet<ObjectId>,
+    records: &BTreeMap<ObjectId, PreparedStagingObject>,
+) -> BTreeSet<ObjectId> {
+    // This is intentionally batch-local. Retaining reverse edges for every
+    // unreachable staged object would turn an accelerator into O(history)
+    // host memory. Parent-before-child batches use the ordinary commit walk.
+    let mut unresolved = BTreeMap::<ObjectId, BTreeSet<ObjectId>>::new();
+    let mut dependents = BTreeMap::<ObjectId, BTreeSet<ObjectId>>::new();
+    for (id, prepared) in records {
+        if validated.contains(id) {
+            continue;
+        }
+        let dependencies = prepared
+            .record
+            .owning_references()
+            .filter(|child| !validated.contains(child))
+            .collect::<BTreeSet<_>>();
+        for child in dependencies
+            .iter()
+            .filter(|child| records.contains_key(child))
+        {
+            dependents.entry(*child).or_default().insert(*id);
+        }
+        unresolved.insert(*id, dependencies);
+    }
+
+    let mut ready = unresolved
+        .iter()
+        .filter_map(|(id, dependencies)| dependencies.is_empty().then_some(*id))
+        .collect::<VecDeque<_>>();
+    let mut proven = BTreeSet::new();
+    while let Some(id) = ready.pop_front() {
+        if !proven.insert(id) {
+            continue;
+        }
+        let Some(parents) = dependents.remove(&id) else {
+            continue;
+        };
+        for parent in parents {
+            let Some(dependencies) = unresolved.get_mut(&parent) else {
+                continue;
+            };
+            dependencies.remove(&id);
+            if dependencies.is_empty() {
+                ready.push_back(parent);
+            }
+        }
+    }
+    proven
+}
+
+fn record_owns_validated_closure(record: &ObjectRecord, validated: &BTreeSet<ObjectId>) -> bool {
+    record
+        .owning_references()
+        .all(|child| validated.contains(&child))
 }
 
 impl PreparedStagingBatch {
@@ -253,6 +311,9 @@ where
             if &existing != record {
                 return Err(ModelError::ObjectCollision(id).into());
             }
+            if record_owns_validated_closure(record, &inner.validated) {
+                inner.validated.insert(id);
+            }
             return Ok((id, InsertOutcome::AlreadyPresent));
         }
         let payload = encode_object_frame(self.identity.scheme(), id, record)?;
@@ -285,6 +346,9 @@ where
                 inner.pending_index_locations.push((id, location));
                 if let Some(direct) = direct {
                     inner.pending_direct_objects.insert(id, direct);
+                }
+                if record_owns_validated_closure(record, &inner.validated) {
+                    inner.validated.insert(id);
                 }
                 Ok((id, InsertOutcome::Inserted))
             },
@@ -428,7 +492,14 @@ where
                 self.verify_existing_batch(&mut inner, &prepared_batch.prepared.unique)?;
             record_phase(observer, ProjectionPhase::AdmissionProbe, probe_started);
             if already_present.len() == prepared_batch.prepared.unique.len() {
-                return Ok(prepared_batch.prepared.finish(&already_present)?.outcomes);
+                let proven =
+                    staged_closure_evidence(&inner.validated, &prepared_batch.prepared.unique);
+                let outcomes = prepared_batch.prepared.finish(&already_present)?.outcomes;
+                // Every record was read back and byte-compared while `inner`
+                // was locked, so these tokens have the same meaning as tokens
+                // earned for newly installed frames below.
+                inner.validated.extend(proven);
+                return Ok(outcomes);
             }
             if active_profile != prepared_batch.direct_profile
                 || !prepared_batch
@@ -445,6 +516,7 @@ where
                 prepared_batch.direct_profile = active_profile;
                 continue;
             }
+            let proven = staged_closure_evidence(&inner.validated, &prepared_batch.prepared.unique);
             let append = prepared_batch.prepared.finish(&already_present)?;
             let append_started = Instant::now();
             let append_result = {
@@ -461,6 +533,10 @@ where
                         append.direct,
                         &locations,
                     )?;
+                    // Install evidence only after every corresponding location
+                    // and direct description is present. Any earlier failure
+                    // leaves the validated frontier unchanged.
+                    inner.validated.extend(proven);
                     record_phase(observer, ProjectionPhase::PhysicalMapUpdate, map_started);
                     return Ok(append.outcomes);
                 },
@@ -534,4 +610,84 @@ fn foreign_preparation() -> PrincipalProjectionError {
     PrincipalProjectionError::Engine(
         "prepared object batch does not belong to this engine".to_owned(),
     )
+}
+
+#[cfg(test)]
+mod closure_evidence_tests {
+    use astrid_storage_model::{
+        ObjectClass, ObjectFormatVersion, ObjectKind, ObjectReference, ReferenceLabel,
+    };
+
+    use super::*;
+
+    fn prepared(record: ObjectRecord) -> PreparedStagingObject {
+        PreparedStagingObject {
+            record,
+            payload: Vec::new(),
+            append: None,
+        }
+    }
+
+    fn record(references: Vec<ObjectReference>) -> ObjectRecord {
+        ObjectRecord::new(
+            ObjectKind::Evidence,
+            ObjectFormatVersion::V1,
+            Vec::new(),
+            references,
+            0,
+            ObjectClass::Metadata,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn closure_evidence_is_order_independent_and_deduplicates_child_edges() {
+        let child = ObjectId::new([1; 32]);
+        let parent = ObjectId::new([2; 32]);
+        let mut records = BTreeMap::new();
+        records.insert(
+            parent,
+            prepared(record(vec![
+                ObjectReference::owns(ReferenceLabel::new(b"first".to_vec()), child),
+                ObjectReference::owns(ReferenceLabel::new(b"second".to_vec()), child),
+            ])),
+        );
+        records.insert(child, prepared(record(Vec::new())));
+
+        assert_eq!(
+            staged_closure_evidence(&BTreeSet::new(), &records),
+            BTreeSet::from([child, parent])
+        );
+    }
+
+    #[test]
+    fn closure_evidence_rejects_missing_children_and_cycles() {
+        let first = ObjectId::new([1; 32]);
+        let second = ObjectId::new([2; 32]);
+        let missing = ObjectId::new([3; 32]);
+        let mut records = BTreeMap::new();
+        records.insert(
+            first,
+            prepared(record(vec![ObjectReference::owns(
+                ReferenceLabel::new(b"second".to_vec()),
+                second,
+            )])),
+        );
+        records.insert(
+            second,
+            prepared(record(vec![ObjectReference::owns(
+                ReferenceLabel::new(b"first".to_vec()),
+                first,
+            )])),
+        );
+        records.insert(
+            ObjectId::new([4; 32]),
+            prepared(record(vec![ObjectReference::owns(
+                ReferenceLabel::new(b"missing".to_vec()),
+                missing,
+            )])),
+        );
+
+        assert!(staged_closure_evidence(&BTreeSet::new(), &records).is_empty());
+    }
 }
