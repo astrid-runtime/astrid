@@ -504,6 +504,7 @@ impl<P: Ord, I, C> fmt::Debug for DurableEngine<P, I, C> {
 mod contiguous;
 mod engine;
 mod object_access;
+mod opening;
 
 pub use contiguous::{PreparedContiguousFile, PublishedContiguousFile};
 
