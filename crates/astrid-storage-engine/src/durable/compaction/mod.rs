@@ -32,10 +32,12 @@ pub(super) const ARENA_PREVIOUS: &str = "objects.arena.previous";
 pub(super) const ROOTS_PREVIOUS: &str = "roots.journal.previous";
 
 mod evidence;
+mod facts;
 mod outbox;
 mod recovery;
 
 pub use evidence::CompactionEvidenceBundle;
+use facts::{encode_current_roots, encode_retained_roots};
 use recovery::{
     backup_active, cleanup_without_intent, prepare_finish_compaction, promote_compacting,
     remove_compaction_intent, write_compaction_intent,
@@ -382,9 +384,6 @@ where
         authorization: &VerifiedCompactionPlan,
     ) -> Result<CompactionReport, DurableError> {
         let mut inner = self.lock_usable()?;
-        if inner.representations.is_some() {
-            return Err(DurableError::RepresentationRetirementUnsupported);
-        }
         let (facts, live) = self.capture_facts_locked(&mut inner, &authorization.retention)?;
         if facts != authorization.facts {
             return Err(DurableError::CompactionSnapshotChanged);
@@ -437,11 +436,9 @@ where
         let live = self.live_objects(inner, retention)?;
         let record = self.fact_snapshot_record(inner, retention)?;
         let snapshot = GcFactSnapshotId::new(self.identify(&record));
-        let condemned = inner
-            .index
-            .keys()
+        let condemned = Self::object_universe(inner)
+            .into_iter()
             .filter(|id| !live.contains(id))
-            .copied()
             .collect();
         Ok((
             CompactionFacts {
@@ -500,14 +497,12 @@ where
         bytes.extend_from_slice(retention.policy.object_id().as_bytes());
         encode_current_roots(&mut bytes, &inner.roots_by_principal, &self.principal_codec)?;
         encode_retained_roots(&mut bytes, &retention.additional_roots)?;
+        let universe = Self::object_universe(inner);
         let object_count =
-            u64::try_from(inner.index.len()).map_err(|_| DurableError::EncodingOverflow)?;
+            u64::try_from(universe.len()).map_err(|_| DurableError::EncodingOverflow)?;
         bytes.extend_from_slice(&object_count.to_le_bytes());
-        let super::DurableInner { files, index, .. } = inner;
-        let files = live_files_mut(files)?;
-        for (id, location) in index.iter() {
-            let record =
-                read_indexed_object(&files.arena, *id, *location, &self.identity, self.limits)?;
+        for id in universe {
+            let record = self.read_compaction_object(inner, id)?;
             bytes.extend_from_slice(id.as_bytes());
             let count = u64::try_from(record.references().len())
                 .map_err(|_| DurableError::EncodingOverflow)?;
@@ -532,46 +527,43 @@ where
         )
         .map_err(DurableError::Model)
     }
-}
 
-fn encode_current_roots<P: Ord, C: PrincipalCodec<P>>(
-    bytes: &mut Vec<u8>,
-    roots: &BTreeMap<P, RootState>,
-    codec: &C,
-) -> Result<(), DurableError> {
-    let mut encoded = roots
-        .iter()
-        .map(|(principal, root)| (codec.encode(principal), *root))
-        .collect::<Vec<_>>();
-    encoded.sort_by(|left, right| left.0.cmp(&right.0));
-    if encoded.windows(2).any(|pair| pair[0].0 == pair[1].0) {
-        return Err(DurableError::InvalidCompactionEvidence(
-            "principal codec collides in fact snapshot",
-        ));
+    fn object_universe(inner: &DurableInner<P>) -> BTreeSet<ObjectId> {
+        let mut universe = inner.index.keys().copied().collect::<BTreeSet<_>>();
+        if let Some(representations) = &inner.representations {
+            universe.extend(representations.contiguous_object_ids());
+        }
+        universe
     }
-    let count = u64::try_from(encoded.len()).map_err(|_| DurableError::EncodingOverflow)?;
-    bytes.extend_from_slice(&count.to_le_bytes());
-    for (principal, root) in encoded {
-        let len = u64::try_from(principal.len()).map_err(|_| DurableError::EncodingOverflow)?;
-        bytes.extend_from_slice(&len.to_le_bytes());
-        bytes.extend_from_slice(&principal);
-        bytes.extend_from_slice(&root.generation.get().to_le_bytes());
-        bytes.extend_from_slice(root.commit.as_bytes());
-    }
-    Ok(())
-}
 
-fn encode_retained_roots(
-    bytes: &mut Vec<u8>,
-    roots: &[CompactionRetainedRoot],
-) -> Result<(), DurableError> {
-    let count = u64::try_from(roots.len()).map_err(|_| DurableError::EncodingOverflow)?;
-    bytes.extend_from_slice(&count.to_le_bytes());
-    for root in roots {
-        bytes.push(root.kind().code());
-        bytes.extend_from_slice(root.object().as_bytes());
+    fn read_compaction_object(
+        &self,
+        inner: &mut DurableInner<P>,
+        id: ObjectId,
+    ) -> Result<ObjectRecord, DurableError> {
+        let super::DurableInner {
+            files,
+            index,
+            representations,
+            ..
+        } = inner;
+        if let Some(location) = index.get(&id).copied() {
+            let files = live_files_mut(files)?;
+            return read_indexed_object(&files.arena, id, location, &self.identity, self.limits);
+        }
+        if let Some((path, location)) = representations
+            .as_ref()
+            .and_then(|store| store.contiguous_read(id))
+        {
+            return super::representations::read_contiguous_object(
+                &path,
+                location,
+                id,
+                &self.identity,
+            );
+        }
+        Err(astrid_storage_model::ModelError::MissingObject(id).into())
     }
-    Ok(())
 }
 
 fn require_evidence_record(
@@ -664,6 +656,18 @@ where
                 "promoted compaction placement differs from its durable receipt",
             ));
         }
+        if let Some(representations) = inner.representations.as_mut() {
+            let arena = open_rw(&self.directory.join(ARENA_FILE))?;
+            representations.rebase_compacted_arena(
+                &arena,
+                &replacement.index,
+                &self.identity,
+                self.limits,
+            )?;
+            self.fail_if(FaultPoint::AfterCompactionRepresentationRebase)?;
+            representations.retire_loose_blobs()?;
+            self.fail_if(FaultPoint::AfterCompactionBlobRetirement)?;
+        }
         let arena_bytes_after = replacement.arena_len;
         self.install_replacement(inner, replacement)?;
         let ready = outbox::mark_ready(
@@ -699,8 +703,8 @@ where
         live: &BTreeSet<ObjectId>,
     ) -> Result<PreparedCompaction, DurableError> {
         cleanup_without_intent(&self.directory)?;
-        let objects_before =
-            u64::try_from(inner.index.len()).map_err(|_| DurableError::EncodingOverflow)?;
+        let objects_before = u64::try_from(Self::object_universe(inner).len())
+            .map_err(|_| DurableError::EncodingOverflow)?;
         let (arena_bytes_before, root_bytes_before, root_digest_before) = {
             let files = live_files_mut(&mut inner.files)?;
             let arena_bytes = files
@@ -829,15 +833,8 @@ where
     ) -> Result<ReplacementState<P>, DurableError> {
         let mut arena = create_private_file(&self.directory.join(ARENA_COMPACTING))?;
         let mut new_index = BTreeMap::new();
-        let super::DurableInner { files, index, .. } = inner;
-        let files = live_files_mut(files)?;
         for id in live {
-            let location = index
-                .get(id)
-                .copied()
-                .ok_or(astrid_storage_model::ModelError::MissingObject(*id))?;
-            let record =
-                read_indexed_object(&files.arena, *id, location, &self.identity, self.limits)?;
+            let record = self.read_compaction_object(inner, *id)?;
             let payload = encode_object_frame(self.identity.scheme(), *id, &record)?;
             ensure_payload_limit(ARENA_FILE, 0, payload.len(), self.limits)?;
             let location = append_frame(&mut arena, ARENA_MAGIC, &payload)?;

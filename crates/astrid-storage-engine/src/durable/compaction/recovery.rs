@@ -8,6 +8,7 @@ use astrid_storage_model::{
     ObjectReference, PlacementSetId, ReferenceKind, ReferenceLabel,
 };
 
+use super::super::representations::RepresentationStore;
 use super::super::scan_frames;
 use super::{
     ARENA_COMPACTING, ARENA_FILE, ARENA_PREVIOUS, COMPACTION_INTENT_FILE, COMPACTION_INTENT_PREFIX,
@@ -144,6 +145,7 @@ where
             "recovered compaction placement differs from its durable intent",
         ));
     }
+    rebase_representation_authority(directory, identity, limits)?;
     remove_if_exists(&directory.join(INDEX_FILE))?;
     let ready = outbox::mark_ready(directory, intent_model.commit, identity, limits)?;
     if ready != bundle {
@@ -152,6 +154,20 @@ where
         ));
     }
     finish_compaction(directory)
+}
+
+fn rebase_representation_authority<I: PersistentObjectIdentity>(
+    directory: &Path,
+    identity: &I,
+    limits: RecoveryLimits,
+) -> Result<(), DurableError> {
+    let Some(mut representations) = RepresentationStore::open(directory, limits)? else {
+        return Ok(());
+    };
+    let mut arena = open_rw(&directory.join(ARENA_FILE))?;
+    let (index, _) = recover_arena(&mut arena, identity, limits, 0)?;
+    representations.rebase_compacted_arena(&arena, &index, identity, limits)?;
+    representations.retire_loose_blobs()
 }
 
 fn validate_intent<I: PersistentObjectIdentity>(

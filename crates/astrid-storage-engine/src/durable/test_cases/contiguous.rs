@@ -11,7 +11,7 @@ impl astrid_storage_content::ContentSource for EngineContentSource<'_> {
     }
 }
 
-fn activate_physical_authority(engine: &TestEngine) {
+fn activate_physical_authority(engine: &TestEngine) -> ObjectId {
     let specification = ObjectRecord::new(
         ObjectKind::Evidence,
         ObjectFormatVersion::V1,
@@ -25,6 +25,7 @@ fn activate_physical_authority(engine: &TestEngine) {
     engine
         .ensure_direct_representation_catalogue(specification_id, &[specification_id])
         .unwrap();
+    specification_id
 }
 
 fn patterned_content(bytes: usize) -> Vec<u8> {
@@ -34,6 +35,63 @@ fn patterned_content(bytes: usize) -> Vec<u8> {
             u8::try_from((index.wrapping_mul(31) ^ block.wrapping_mul(17)) & 0xff).unwrap()
         })
         .collect()
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AcceptContiguousCompaction;
+
+impl CompactionProofVerifier for AcceptContiguousCompaction {
+    fn verify(
+        &self,
+        facts: &CompactionFacts,
+        _policy: &ObjectRecord,
+        _proof: &ObjectRecord,
+    ) -> bool {
+        !facts.condemned().is_empty()
+    }
+}
+
+fn contiguous_compaction_plan(
+    engine: &TestEngine,
+    specification: ObjectId,
+    content: ObjectId,
+) -> VerifiedCompactionPlan {
+    let policy = ObjectRecord::new(
+        ObjectKind::Evidence,
+        ObjectFormatVersion::V1,
+        b"retain published contiguous content".to_vec(),
+        Vec::new(),
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let retention = CompactionRetention::new(
+        ObjectId::new([0xC0; 32]),
+        astrid_storage_model::RetentionPolicyId::new(engine.identify(&policy)),
+        [
+            CompactionRetainedRoot::new(CompactionRootKind::System, specification),
+            CompactionRetainedRoot::new(CompactionRootKind::ExplicitPin, content),
+        ],
+    );
+    let facts = engine.capture_compaction_facts(&retention).unwrap();
+    let proof = ObjectRecord::new(
+        ObjectKind::Evidence,
+        ObjectFormatVersion::V1,
+        b"contiguous compaction proof".to_vec(),
+        Vec::new(),
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    engine
+        .verify_compaction_plan(
+            retention,
+            facts,
+            policy,
+            proof,
+            &AcceptContiguousCompaction,
+        )
+        .unwrap()
 }
 
 #[test]
@@ -90,6 +148,119 @@ fn contiguous_copy_publishes_virtual_chunks_and_reopens() {
             .unwrap(),
         content
     );
+}
+
+#[test]
+fn compaction_materializes_contiguous_objects_before_retiring_the_blob() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open(directory.path());
+    let specification = activate_physical_authority(&engine);
+    let content = patterned_content(2 * 1024 * 1024 + 17);
+    let prepared = engine
+        .prepare_contiguous_file(
+            astrid_storage_content::ChunkingProfile::ASTRID_V1,
+            u64::try_from(content.len()).unwrap(),
+            std::io::Cursor::new(&content),
+        )
+        .unwrap();
+    let descriptor = prepared.descriptor();
+    let chunk_ids = prepared.payload.slices.keys().copied().collect::<Vec<_>>();
+    let blob_path = engine
+        .inner
+        .lock()
+        .representations
+        .as_ref()
+        .unwrap()
+        .loose_blob_path(prepared.payload.blob, 1);
+    engine
+        .publish_contiguous_copy(prepared, std::io::Cursor::new(&content))
+        .unwrap();
+    assert!(blob_path.is_file());
+    assert!(chunk_ids
+        .iter()
+        .all(|id| !engine.inner.lock().index.contains_key(id)));
+
+    let authorization = contiguous_compaction_plan(&engine, specification, descriptor.file());
+    engine.compact(&authorization).unwrap();
+
+    assert!(!blob_path.exists());
+    {
+        let inner = engine.inner.lock();
+        let representations = inner.representations.as_ref().unwrap();
+        assert!(chunk_ids.iter().all(|id| inner.index.contains_key(id)));
+        assert!(chunk_ids
+            .iter()
+            .all(|id| representations.contains_direct(*id)));
+        assert_eq!(representations.contiguous_object_ids().count(), 0);
+    }
+    assert_eq!(
+        astrid_storage_content::read_content(&EngineContentSource(&engine), descriptor.file())
+            .unwrap(),
+        content
+    );
+    engine.close().unwrap();
+    drop(engine);
+
+    let reopened = open(directory.path());
+    assert_eq!(
+        astrid_storage_content::read_content(&EngineContentSource(&reopened), descriptor.file())
+            .unwrap(),
+        content
+    );
+}
+
+#[test]
+fn represented_compaction_recovers_across_authority_and_blob_retirement() {
+    for point in [
+        FaultPoint::AfterCompactionRepresentationRebase,
+        FaultPoint::AfterCompactionBlobRetirement,
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = open(directory.path());
+        let specification = activate_physical_authority(&engine);
+        let content = patterned_content(768 * 1024 + 31);
+        let prepared = engine
+            .prepare_contiguous_file(
+                astrid_storage_content::ChunkingProfile::ASTRID_V1,
+                u64::try_from(content.len()).unwrap(),
+                std::io::Cursor::new(&content),
+            )
+            .unwrap();
+        let descriptor = prepared.descriptor();
+        let blob_path = engine
+            .inner
+            .lock()
+            .representations
+            .as_ref()
+            .unwrap()
+            .loose_blob_path(prepared.payload.blob, 1);
+        engine
+            .publish_contiguous_copy(prepared, std::io::Cursor::new(&content))
+            .unwrap();
+        let authorization =
+            contiguous_compaction_plan(&engine, specification, descriptor.file());
+        drop(engine);
+
+        let interrupted = open_with_fault(directory.path(), point);
+        assert!(matches!(
+            interrupted.compact(&authorization),
+            Err(DurableError::FaultInjected(actual)) if actual == point
+        ));
+        drop(interrupted);
+
+        let recovered = open(directory.path());
+        assert!(!blob_path.exists(), "loose blob survived recovery at {point:?}");
+        assert_eq!(
+            astrid_storage_content::read_content(
+                &EngineContentSource(&recovered),
+                descriptor.file(),
+            )
+            .unwrap(),
+            content,
+            "content changed across recovery at {point:?}"
+        );
+        assert_eq!(recovered.pending_compaction_evidence().unwrap().len(), 1);
+    }
 }
 
 #[test]

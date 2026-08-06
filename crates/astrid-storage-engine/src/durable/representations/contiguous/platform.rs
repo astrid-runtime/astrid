@@ -81,6 +81,9 @@ pub(super) fn clone_file_no_replace(source: &File, destination: &Path) -> std::i
     use std::fs::OpenOptions;
     use std::os::fd::AsRawFd as _;
 
+    #[cfg(target_env = "musl")]
+    const FICLONE: libc::c_int = 0x4004_9409;
+    #[cfg(not(target_env = "musl"))]
     const FICLONE: libc::c_ulong = 0x4004_9409;
     let destination_file = OpenOptions::new()
         .create_new(true)
