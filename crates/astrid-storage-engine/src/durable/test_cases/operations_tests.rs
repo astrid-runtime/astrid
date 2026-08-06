@@ -128,7 +128,7 @@ fn staged_closure_is_validated_and_flushed_by_root_commit() {
     let directory = tempfile::tempdir().unwrap();
     let engine = open(directory.path());
     let (commit, transaction) = transaction("alice", None, b"streamed");
-    for (_, record) in transaction.records().iter().rev() {
+    for (_, record) in transaction.records() {
         assert_eq!(
             engine.stage_object(record).unwrap().1,
             InsertOutcome::Inserted
@@ -136,6 +136,12 @@ fn staged_closure_is_validated_and_flushed_by_root_commit() {
     }
     assert_eq!(engine.object_count().unwrap(), 2);
     assert_eq!(engine.root(&"alice".to_owned()).unwrap(), None);
+    assert!(
+        transaction
+            .records()
+            .iter()
+            .all(|(id, _)| engine.inner.lock().validated.contains(id))
+    );
 
     let outcome = engine
         .commit(RootTransaction::new(
@@ -165,6 +171,29 @@ fn staged_closure_is_validated_and_flushed_by_root_commit() {
 }
 
 #[test]
+fn parent_before_child_staging_falls_back_to_publication_validation() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open(directory.path());
+    let (commit, transaction) = transaction("alice", None, b"out-of-order");
+    for (_, record) in transaction.records().iter().rev() {
+        engine.stage_object(record).unwrap();
+    }
+    assert!(!engine.inner.lock().validated.contains(&commit));
+
+    let outcome = engine
+        .commit(RootTransaction::new(
+            "alice".to_owned(),
+            None,
+            commit,
+            Vec::new(),
+        ))
+        .unwrap();
+
+    assert_eq!(outcome.objects_inserted(), 0);
+    assert_eq!(engine.root(&"alice".to_owned()).unwrap(), Some(outcome.root()));
+}
+
+#[test]
 fn incomplete_staging_cannot_publish_a_dangling_root() {
     let directory = tempfile::tempdir().unwrap();
     let engine = open(directory.path());
@@ -177,6 +206,8 @@ fn incomplete_staging_cannot_publish_a_dangling_root() {
         .1
         .clone();
     engine.stage_object(&commit_record).unwrap();
+
+    assert!(!engine.inner.lock().validated.contains(&commit));
 
     assert!(matches!(
         engine.commit(RootTransaction::new(
@@ -219,6 +250,35 @@ fn staged_batch_is_idempotent_and_publishes_in_one_root_commit() {
         .unwrap();
     assert_eq!(outcome.objects_inserted(), 0);
     assert!(engine.snapshot(&"alice".to_owned()).unwrap().is_some());
+}
+
+#[test]
+fn equal_dedup_hits_reconstruct_batch_closure_evidence() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open(directory.path());
+    let (_, transaction) = transaction("alice", None, b"dedup evidence");
+    let records = transaction
+        .records()
+        .iter()
+        .map(|(_, record)| record.clone())
+        .collect::<Vec<_>>();
+    engine.stage_objects(records.clone()).unwrap();
+    engine.inner.lock().validated.clear();
+
+    let outcomes = engine.stage_objects(records).unwrap();
+
+    assert!(
+        outcomes
+            .iter()
+            .all(|(_, outcome)| *outcome == InsertOutcome::AlreadyPresent)
+    );
+    let inner = engine.inner.lock();
+    assert!(
+        transaction
+            .records()
+            .iter()
+            .all(|(id, _)| inner.validated.contains(id))
+    );
 }
 
 #[test]
@@ -345,6 +405,7 @@ fn staged_batch_appender_failure_installs_no_authority() {
     assert!(inner.poisoned);
     assert!(inner.roots_by_principal.is_empty());
     assert!(ids.iter().all(|id| !inner.index.contains_key(id)));
+    assert!(ids.iter().all(|id| !inner.validated.contains(id)));
     assert_eq!(
         engine.lifecycle.load(Ordering::Acquire),
         LIFECYCLE_REQUIRES_RECOVERY

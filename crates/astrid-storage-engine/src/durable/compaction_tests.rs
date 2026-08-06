@@ -211,6 +211,24 @@ fn compaction_reclaims_only_unreachable_objects_and_preserves_root_generation() 
 }
 
 #[test]
+fn compaction_invalidates_evidence_for_reclaimed_staged_objects() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = super::tests::open(directory.path());
+    let staged = evidence(b"complete but unreachable staged object");
+    let (staged_id, _) = engine.stage_object(&staged).unwrap();
+    assert!(engine.inner.lock().validated.contains(&staged_id));
+    let policy = evidence(b"retain-current-roots");
+    let authorization = plan(&engine, retention(&engine, &policy, []), policy);
+
+    assert!(authorization.facts().condemned().contains(&staged_id));
+    engine.compact(&authorization).unwrap();
+
+    let inner = engine.inner.lock();
+    assert!(!inner.index.contains_key(&staged_id));
+    assert!(!inner.validated.contains(&staged_id));
+}
+
+#[test]
 fn direct_authority_rejects_retirement_until_final_path_liveness_exists() {
     let directory = tempfile::tempdir().unwrap();
     let engine = super::tests::open(directory.path());
