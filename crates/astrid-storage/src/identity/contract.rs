@@ -72,6 +72,24 @@ pub trait IdentityStore: Send + Sync + fmt::Debug {
         ))
     }
 
+    /// Read the immutable principal identity bound to one user record.
+    ///
+    /// Frontend-only users legitimately return `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an identity or storage error if the persisted record is
+    /// malformed.
+    async fn get_principal_identity(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<PrincipalIdentity>, IdentityError> {
+        let _ = id;
+        Err(IdentityError::InvalidInput(
+            "this identity store does not expose durable principal identities".to_owned(),
+        ))
+    }
+
     /// Validate every persisted principal identity and populate the live
     /// alias directory.
     ///

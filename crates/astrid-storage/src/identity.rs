@@ -340,6 +340,13 @@ impl IdentityStore for KvIdentityStore {
         Ok(identity)
     }
 
+    async fn get_principal_identity(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<PrincipalIdentity>, IdentityError> {
+        KvIdentityStore::get_principal_identity(self, id).await
+    }
+
     async fn load_principal_directory(&self) -> Result<(), IdentityError> {
         let keys = self
             .kv

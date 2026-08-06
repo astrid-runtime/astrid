@@ -14,7 +14,7 @@ use astrid_core::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{KvStore, ScopedKvStore, StorageError};
+use crate::{KvStore, PrincipalDirectory, ScopedKvStore, StorageError};
 
 /// Namespace reserved for the authoritative ownership graph.
 pub const OWNERSHIP_NAMESPACE: &str = "system:ownership";
@@ -104,7 +104,7 @@ impl OwnershipSnapshot {
         self.principal_ownership.values()
     }
 
-    fn validate(&self) -> Result<(), OwnershipError> {
+    fn validate(&self, principals: &PrincipalDirectory) -> Result<(), OwnershipError> {
         if self.format_version != GRAPH_FORMAT_VERSION {
             return Err(OwnershipError::UnsupportedFormat(self.format_version));
         }
@@ -165,6 +165,11 @@ impl OwnershipSnapshot {
                     "principal ownership key {principal_uid} disagrees with its record"
                 )));
             }
+            if !principals.contains_uid(*principal_uid) {
+                return Err(OwnershipError::CorruptGraph(format!(
+                    "principal {principal_uid} is absent from the admitted principal directory"
+                )));
+            }
             if !self.fleets.contains_key(&ownership.fleet_uid)
                 || !self.users.contains_key(&ownership.assigned_by)
             {
@@ -181,6 +186,7 @@ impl OwnershipSnapshot {
 #[derive(Clone, Debug)]
 pub struct OwnershipStore {
     storage: ScopedKvStore,
+    principals: PrincipalDirectory,
 }
 
 impl OwnershipStore {
@@ -189,9 +195,13 @@ impl OwnershipStore {
     /// # Errors
     ///
     /// Returns [`OwnershipError::Storage`] if the reserved namespace is invalid.
-    pub fn new(storage: Arc<dyn KvStore>) -> Result<Self, OwnershipError> {
+    pub fn new(
+        storage: Arc<dyn KvStore>,
+        principals: PrincipalDirectory,
+    ) -> Result<Self, OwnershipError> {
         Ok(Self {
             storage: ScopedKvStore::new(storage, OWNERSHIP_NAMESPACE)?,
+            principals,
         })
     }
 
@@ -202,7 +212,7 @@ impl OwnershipStore {
     /// Fails closed on storage errors, malformed bytes, or broken invariants.
     pub async fn load(&self) -> Result<OwnershipSnapshot, OwnershipError> {
         let raw = self.storage.get(GRAPH_KEY).await?;
-        Self::decode(raw.as_deref())
+        self.decode(raw.as_deref())
     }
 
     /// Register one durable human identity, idempotently.
@@ -368,6 +378,9 @@ impl OwnershipStore {
         &self,
         ownership: PrincipalOwnership,
     ) -> Result<(), OwnershipError> {
+        if !self.principals.contains_uid(ownership.principal_uid) {
+            return Err(OwnershipError::PrincipalNotFound(ownership.principal_uid));
+        }
         self.mutate(|graph| {
             let fleet = graph
                 .fleets
@@ -445,9 +458,9 @@ impl OwnershipStore {
     {
         for _ in 0..MAX_CAS_ATTEMPTS {
             let current = self.storage.get(GRAPH_KEY).await?;
-            let mut graph = Self::decode(current.as_deref())?;
+            let mut graph = self.decode(current.as_deref())?;
             let output = apply(&mut graph)?;
-            graph.validate()?;
+            graph.validate(&self.principals)?;
             let encoded = serde_json::to_vec(&graph)
                 .map_err(|error| OwnershipError::Serialization(error.to_string()))?;
             if self
@@ -461,7 +474,7 @@ impl OwnershipStore {
         Err(OwnershipError::ConcurrentModification)
     }
 
-    fn decode(raw: Option<&[u8]>) -> Result<OwnershipSnapshot, OwnershipError> {
+    fn decode(&self, raw: Option<&[u8]>) -> Result<OwnershipSnapshot, OwnershipError> {
         let graph = raw.map_or_else(
             || Ok(OwnershipSnapshot::default()),
             |bytes| {
@@ -469,7 +482,7 @@ impl OwnershipStore {
                     .map_err(|error| OwnershipError::Serialization(error.to_string()))
             },
         )?;
-        graph.validate()?;
+        graph.validate(&self.principals)?;
         Ok(graph)
     }
 
@@ -553,6 +566,9 @@ pub enum OwnershipError {
     /// A principal has no current fleet assignment.
     #[error("principal has no fleet owner: {0}")]
     PrincipalNotOwned(PrincipalUid),
+    /// A principal UID is not present in the admitted durable directory.
+    #[error("principal not found: {0}")]
+    PrincipalNotFound(PrincipalUid),
     /// Sustained concurrent writes prevented an atomic commit.
     #[error("ownership graph changed concurrently too many times")]
     ConcurrentModification,
@@ -599,13 +615,23 @@ mod tests {
         .uid
     }
 
-    fn store() -> OwnershipStore {
-        OwnershipStore::new(Arc::new(MemoryKvStore::new())).unwrap()
+    fn store() -> (OwnershipStore, PrincipalDirectory) {
+        let principals = PrincipalDirectory::default();
+        (
+            OwnershipStore::new(Arc::new(MemoryKvStore::new()), principals.clone()).unwrap(),
+            principals,
+        )
+    }
+
+    fn admit_principal(directory: &PrincipalDirectory, alias: &str, uid: PrincipalUid) {
+        directory
+            .register(astrid_core::PrincipalId::new(alias).unwrap(), uid)
+            .unwrap();
     }
 
     #[tokio::test]
     async fn fleet_creation_atomically_bootstraps_its_owner() {
-        let store = store();
+        let (store, _) = store();
         let owner = user(1, 1);
         let owned_fleet = fleet(10, owner.uid);
         store.create_user(owner.clone()).await.unwrap();
@@ -623,11 +649,12 @@ mod tests {
 
     #[tokio::test]
     async fn principal_cannot_be_silently_reassigned() {
-        let store = store();
+        let (store, principals) = store();
         let owner = user(1, 1);
         let first = fleet(10, owner.uid);
         let second = fleet(11, owner.uid);
         let principal_uid = principal(20, 2);
+        admit_principal(&principals, "test-principal", principal_uid);
         store.create_user(owner.clone()).await.unwrap();
         store.create_fleet(first.clone()).await.unwrap();
         store.create_fleet(second.clone()).await.unwrap();
@@ -666,12 +693,13 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_transfer_requires_management_of_both_fleets() {
-        let store = store();
+        let (store, principals) = store();
         let first_owner = user(1, 1);
         let second_owner = user(2, 2);
         let first = fleet(10, first_owner.uid);
         let second = fleet(11, second_owner.uid);
         let principal_uid = principal(20, 3);
+        admit_principal(&principals, "test-principal", principal_uid);
         store.create_user(first_owner.clone()).await.unwrap();
         store.create_user(second_owner.clone()).await.unwrap();
         store.create_fleet(first.clone()).await.unwrap();
@@ -718,7 +746,7 @@ mod tests {
 
     #[tokio::test]
     async fn last_owner_cannot_be_demoted_or_removed() {
-        let store = store();
+        let (store, _) = store();
         let owner = user(1, 1);
         let owned_fleet = fleet(10, owner.uid);
         store.create_user(owner.clone()).await.unwrap();
@@ -740,7 +768,7 @@ mod tests {
 
     #[tokio::test]
     async fn administrator_cannot_escalate_to_owner_or_remove_one() {
-        let store = store();
+        let (store, _) = store();
         let owner = user(1, 1);
         let administrator = user(2, 2);
         let owned_fleet = fleet(10, owner.uid);
@@ -780,7 +808,7 @@ mod tests {
     async fn malformed_persisted_graph_fails_closed() {
         let backend = Arc::new(MemoryKvStore::new());
         let raw: Arc<dyn KvStore> = backend.clone();
-        let store = OwnershipStore::new(raw).unwrap();
+        let store = OwnershipStore::new(raw, PrincipalDirectory::default()).unwrap();
         backend
             .set(OWNERSHIP_NAMESPACE, GRAPH_KEY, b"not-json".to_vec())
             .await
@@ -795,11 +823,14 @@ mod tests {
     async fn concurrent_principal_assignments_do_not_lose_updates() {
         let backend = Arc::new(MemoryKvStore::new());
         let raw: Arc<dyn KvStore> = backend;
-        let store = OwnershipStore::new(raw).unwrap();
+        let principals = PrincipalDirectory::default();
+        let store = OwnershipStore::new(raw, principals.clone()).unwrap();
         let owner = user(1, 1);
         let owned_fleet = fleet(10, owner.uid);
         let first = principal(20, 2);
         let second = principal(21, 3);
+        admit_principal(&principals, "first-principal", first);
+        admit_principal(&principals, "second-principal", second);
         store.create_user(owner.clone()).await.unwrap();
         store.create_fleet(owned_fleet.clone()).await.unwrap();
 
@@ -829,5 +860,46 @@ mod tests {
             graph.principal_owner(second).unwrap().fleet_uid,
             owned_fleet.uid
         );
+    }
+
+    #[tokio::test]
+    async fn unknown_principals_are_rejected_on_assignment_and_reopen() {
+        let backend = Arc::new(MemoryKvStore::new());
+        let admitted = PrincipalDirectory::default();
+        let raw: Arc<dyn KvStore> = backend.clone();
+        let store = OwnershipStore::new(raw, admitted.clone()).unwrap();
+        let owner = user(1, 1);
+        let owned_fleet = fleet(10, owner.uid);
+        let principal_uid = principal(20, 2);
+        store.create_user(owner.clone()).await.unwrap();
+        store.create_fleet(owned_fleet.clone()).await.unwrap();
+
+        assert!(matches!(
+            store
+                .assign_principal(PrincipalOwnership {
+                    principal_uid,
+                    fleet_uid: owned_fleet.uid,
+                    assigned_by: owner.uid,
+                })
+                .await,
+            Err(OwnershipError::PrincipalNotFound(uid)) if uid == principal_uid
+        ));
+
+        admit_principal(&admitted, "admitted-principal", principal_uid);
+        store
+            .assign_principal(PrincipalOwnership {
+                principal_uid,
+                fleet_uid: owned_fleet.uid,
+                assigned_by: owner.uid,
+            })
+            .await
+            .unwrap();
+
+        let reopened = OwnershipStore::new(backend, PrincipalDirectory::default()).unwrap();
+        assert!(matches!(
+            reopened.load().await,
+            Err(OwnershipError::CorruptGraph(message))
+                if message.contains("absent from the admitted principal directory")
+        ));
     }
 }

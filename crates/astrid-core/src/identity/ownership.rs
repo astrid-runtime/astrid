@@ -323,7 +323,7 @@ impl FleetIdentity {
 pub enum FleetRole {
     /// Controls ownership, membership, and principal assignment.
     Owner,
-    /// Manages members and principal assignment but cannot remove the last owner.
+    /// Manages non-owner members and principals; owner membership is owner-controlled.
     Administrator,
     /// Uses fleet resources without changing ownership.
     Member,

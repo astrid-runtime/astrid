@@ -33,7 +33,9 @@ Every fleet must retain at least one owner.
 
 The ownership graph lives under the reserved `system:ownership` namespace. A
 single compare-and-swap record currently contains users, fleets, memberships,
-and principal assignments. This deliberately favors atomic invariants over
+and principal assignments. Principal edges are additionally checked against
+the kernel's admitted durable principal directory during mutation and load.
+This deliberately favors atomic invariants over
 premature sharding: a new fleet and its first owner commit together, and no
 crash or concurrent writer can expose a principal in two fleets. Reads validate
 canonical user and fleet genesis records and every graph edge before admitting
