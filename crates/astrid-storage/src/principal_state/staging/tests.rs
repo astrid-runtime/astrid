@@ -171,15 +171,33 @@ fn seal_stays_bound_to_the_opened_generation_directory() {
 
     let sealed = staged.seal().unwrap();
     let sealed_name = sealed_generation_name(sealed.sequence, id);
-    assert!(
-        displaced_root
-            .join(GENERATIONS_DIRECTORY)
-            .join(&sealed_name)
-            .is_file()
-    );
+    let original_sealed = displaced_root
+        .join(GENERATIONS_DIRECTORY)
+        .join(&sealed_name);
+    assert!(original_sealed.is_file());
     assert!(!original_open.exists());
     assert!(replacement_open.is_file());
-    assert!(!replacement_generations.join(sealed_name).exists());
+    assert!(!replacement_generations.join(&sealed_name).exists());
+
+    let replacement_sealed = replacement_generations.join(&sealed_name);
+    std::fs::hard_link(&original_sealed, &replacement_sealed).unwrap();
+    let key = StageKey {
+        sequence: sealed.sequence,
+        id,
+    };
+    retirement::establish_in(&area.inner.generations_directory, key).unwrap();
+    let retired_name = retired_generation_name(key.sequence, key.id);
+    let original_retired = displaced_root
+        .join(GENERATIONS_DIRECTORY)
+        .join(&retired_name);
+    assert!(original_retired.is_file());
+    assert!(!original_sealed.exists());
+    assert!(replacement_sealed.is_file());
+    assert!(!replacement_generations.join(&retired_name).exists());
+
+    retirement::remove_in(&area.inner.generations_directory, key).unwrap();
+    assert!(!original_retired.exists());
+    assert!(replacement_sealed.is_file());
 }
 
 #[test]
