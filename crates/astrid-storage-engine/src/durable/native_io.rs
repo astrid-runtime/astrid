@@ -15,6 +15,11 @@ pub(super) fn open_rw(directory: &Dir, name: &Path, create: bool) -> Result<File
         .truncate(false)
         .read(true)
         .write(true);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
     configure_no_follow(&mut options);
     let file = directory
         .open_with(name, &options)
