@@ -171,6 +171,53 @@ fn staged_closure_is_validated_and_flushed_by_root_commit() {
 }
 
 #[test]
+fn reopen_discards_unrooted_staging_evidence_and_revalidates_on_publish() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open(directory.path());
+    let (commit, transaction) = transaction("alice", None, b"process-local evidence");
+    let records = transaction
+        .records()
+        .iter()
+        .map(|(_, record)| record.clone())
+        .collect::<Vec<_>>();
+    engine.stage_objects(records).unwrap();
+    assert!(
+        transaction
+            .records()
+            .iter()
+            .all(|(id, _)| engine.inner.lock().validated.contains(id))
+    );
+    engine.flush().unwrap();
+    engine.close().unwrap();
+    drop(engine);
+
+    let reopened = open(directory.path());
+    assert!(
+        transaction
+            .records()
+            .iter()
+            .all(|(id, _)| !reopened.inner.lock().validated.contains(id))
+    );
+    let outcome = reopened
+        .commit(RootTransaction::new(
+            "alice".to_owned(),
+            None,
+            commit,
+            Vec::new(),
+        ))
+        .unwrap();
+
+    assert_eq!(outcome.objects_inserted(), 0);
+    assert_eq!(reopened.root(&"alice".to_owned()).unwrap(), Some(outcome.root()));
+    assert!(
+        transaction
+            .records()
+            .iter()
+            .all(|(id, _)| reopened.inner.lock().validated.contains(id))
+    );
+}
+
+#[test]
 fn parent_before_child_staging_falls_back_to_publication_validation() {
     let directory = tempfile::tempdir().unwrap();
     let engine = open(directory.path());
