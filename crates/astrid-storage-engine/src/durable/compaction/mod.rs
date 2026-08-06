@@ -465,16 +465,24 @@ where
             .chain(retention.additional_roots.iter().map(|root| root.object()))
             .collect::<Vec<_>>();
         let mut live = BTreeSet::new();
-        let super::DurableInner { files, index, .. } = inner;
+        let super::DurableInner {
+            files,
+            index,
+            representations,
+            ..
+        } = inner;
         let files = live_files_mut(files)?;
         for root in roots {
             let closure = materialize_closure(
-                &mut files.arena,
-                index,
-                &BTreeMap::new(),
+                &mut super::ClosureObjects {
+                    arena: &mut files.arena,
+                    index,
+                    incoming: &BTreeMap::new(),
+                    representations: representations.as_ref(),
+                    identity: &self.identity,
+                    limits: self.limits,
+                },
                 root,
-                &self.identity,
-                self.limits,
             )?;
             live.extend(closure.into_iter().map(|(id, _)| id));
         }
@@ -877,6 +885,7 @@ where
             &mut roots,
             &mut arena,
             &index,
+            None,
             &self.principal_codec,
             &self.identity,
             self.limits,
@@ -966,7 +975,7 @@ where
         ));
     }
     let (roots_by_principal, validated) =
-        recover_roots(roots, arena, &recovered, codec, identity, limits)?;
+        recover_roots(roots, arena, &recovered, None, codec, identity, limits)?;
     let arena_len = arena
         .metadata()
         .map_err(|source| io_error("read replacement arena metadata", source))?

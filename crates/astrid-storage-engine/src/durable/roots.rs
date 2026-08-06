@@ -5,6 +5,7 @@ use std::fs::File;
 
 use astrid_storage_model::{ModelError, ObjectId, RootGeneration, RootState};
 
+use super::representations::RepresentationStore;
 use super::{
     ArenaLocation, DurableError, IdentityScheme, PersistentObjectIdentity, PrincipalCodec,
     ROOT_FILE, ROOT_MAGIC, RecoveryLimits, corrupt, materialize_closure, recovery_closure_error,
@@ -19,6 +20,7 @@ pub(super) fn recover_roots<P, I, C>(
     roots: &mut File,
     arena: &mut File,
     index: &BTreeMap<ObjectId, ArenaLocation>,
+    representations: Option<&RepresentationStore>,
     codec: &C,
     identity: &I,
     limits: RecoveryLimits,
@@ -36,13 +38,14 @@ where
         apply_root_journal_record(&mut recovered, codec, scheme, offset, payload, record)
     })?;
 
-    validate_recovered_roots(recovered, arena, index, identity, limits)
+    validate_recovered_roots(recovered, arena, index, representations, identity, limits)
 }
 
 fn validate_recovered_roots<P, I>(
     recovered: BTreeMap<P, (RootState, u64)>,
     arena: &mut File,
     index: &BTreeMap<ObjectId, ArenaLocation>,
+    representations: Option<&RepresentationStore>,
     identity: &I,
     limits: RecoveryLimits,
 ) -> Result<(BTreeMap<P, RootState>, BTreeSet<ObjectId>), DurableError>
@@ -53,12 +56,15 @@ where
     let mut validated = BTreeSet::new();
     for (root, offset) in recovered.values().copied() {
         let records = materialize_closure(
-            arena,
-            index,
-            &BTreeMap::new(),
+            &mut super::ClosureObjects {
+                arena,
+                index,
+                incoming: &BTreeMap::new(),
+                representations,
+                identity,
+                limits,
+            },
             root.commit,
-            identity,
-            limits,
         )
         .map_err(|error| recovery_closure_error(error, offset))?;
         validate_commit_closure(&records, root.commit).map_err(|source| {

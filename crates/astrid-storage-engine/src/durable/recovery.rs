@@ -36,7 +36,7 @@ where
     C: PrincipalCodec<P>,
 {
     recover_interrupted_compaction(path, principal_codec, identity, limits)?;
-    let representations = super::representations::RepresentationStore::open(path, limits)?;
+    let mut representations = super::representations::RepresentationStore::open(path, limits)?;
     let protected_arena_len = representations.as_ref().map_or(
         Ok(0),
         super::representations::RepresentationStore::generation_zero_protected_len,
@@ -69,10 +69,15 @@ where
         index_cache = replace_index(path, &state, scheme);
         (state.objects, state.arena_tail)
     };
+    if let Some(representations) = &mut representations {
+        representations.validate_generation_zero_index(&index)?;
+        representations.rebuild_contiguous_index(&mut arena, &index, identity, limits)?;
+    }
     let (roots_by_principal, validated) = recover_roots(
         &mut roots,
         &mut arena,
         &index,
+        representations.as_ref(),
         principal_codec,
         identity,
         limits,
@@ -90,10 +95,6 @@ where
     let arena_reader = arena
         .try_clone()
         .map_err(|source| io_error("clone object arena for positional reads", source))?;
-    if let Some(representations) = &representations {
-        representations.validate_generation_zero_index(&index)?;
-    }
-
     Ok(RecoveredStore {
         roots_by_principal,
         index,

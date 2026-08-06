@@ -298,7 +298,7 @@ impl JournalEntry {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(super) struct Blake3PhysicalIdentity;
+pub(in crate::durable) struct Blake3PhysicalIdentity;
 
 impl PhysicalIdentity for Blake3PhysicalIdentity {
     fn identify(&self, context: &'static str, material: &[u8]) -> [u8; 32] {

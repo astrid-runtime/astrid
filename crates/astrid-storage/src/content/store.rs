@@ -190,6 +190,10 @@ impl<P: Ord, E> PrincipalContentStore<P, E> {
         }
     }
 
+    pub(crate) fn engine(&self) -> Arc<E> {
+        Arc::clone(&self.engine)
+    }
+
     /// Construct with live principal quota resolution.
     #[must_use]
     pub fn from_engine_with_quota(engine: Arc<E>, quota: Arc<dyn KvQuotaResolver<P>>) -> Self {
@@ -246,6 +250,16 @@ where
     P: Clone + Ord + Send + Sync,
     E: PrincipalProjectionEngine<P>,
 {
+    pub(crate) fn publish_verified_content(
+        &self,
+        principal: &P,
+        name: &ContentName,
+        verified: VerifiedContent,
+        staged_objects_inserted: u64,
+    ) -> Result<ContentWriteOutcome, PrincipalContentError> {
+        self.publish(principal, name, verified, None, staged_objects_inserted)
+    }
+
     /// Convert one principal's legacy flat content catalog in place.
     ///
     /// The operation is idempotent and publishes through the ordinary

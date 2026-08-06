@@ -1,15 +1,15 @@
 use super::{
-    ARENA_FILE, ARENA_MAGIC, Arc, ArenaReader, BTreeMap, BTreeSet, CommitGroup, DurableEngine,
-    DurableEnginePolicy, DurableError, DurableInner, EngineOpenOptions, FaultInjector, FaultPoint,
-    FileExt, GroupCommitPolicy, InsertOutcome, LIFECYCLE_CLOSED, LIFECYCLE_REQUIRES_RECOVERY,
-    LIFECYCLE_USABLE, LOCK_FILE, ModelError, Mutex, NoFaults, ObjectCache, ObjectCacheConfig,
-    ObjectCacheStats, ObjectId, ObjectRecord, Path, PersistentObjectIdentity, Prepared,
-    PrincipalCodec, PrincipalUsage, ProjectionCacheEntry, ProjectionCacheKey, ROOT_FILE,
-    RecoveryLimits, RecoveryRetryPolicy, RecoveryScope, RootGeneration, RootSnapshot, RootState,
-    RootTransaction, RwLock, append_frame, canonical_record_bytes, encode_object_frame,
-    encode_root_record, ensure_payload_limit, io, io_error, live_files_mut, materialize_closure,
-    open_rw, read_indexed_object, read_indexed_objects, recover_store, usage_from_closure,
-    validate_incremental_closure,
+    ARENA_FILE, ARENA_MAGIC, Arc, ArenaReader, BTreeMap, BTreeSet, ClosureObjects, CommitGroup,
+    DurableEngine, DurableEnginePolicy, DurableError, DurableInner, EngineOpenOptions,
+    FaultInjector, FaultPoint, FileExt, GroupCommitPolicy, InsertOutcome, LIFECYCLE_CLOSED,
+    LIFECYCLE_REQUIRES_RECOVERY, LIFECYCLE_USABLE, LOCK_FILE, ModelError, Mutex, NoFaults,
+    ObjectCache, ObjectCacheConfig, ObjectCacheStats, ObjectId, ObjectRecord, Path,
+    PersistentObjectIdentity, Prepared, PrincipalCodec, PrincipalUsage, ProjectionCacheEntry,
+    ProjectionCacheKey, ROOT_FILE, RecoveryLimits, RecoveryRetryPolicy, RecoveryScope,
+    RootGeneration, RootSnapshot, RootState, RootTransaction, RwLock, append_frame,
+    canonical_record_bytes, encode_object_frame, encode_root_record, ensure_payload_limit, io,
+    io_error, live_files_mut, materialize_closure, open_rw, read_indexed_object,
+    read_indexed_objects, recover_store, usage_from_closure, validate_incremental_closure,
 };
 use crate::{ProjectionObserver, ProjectionPhase};
 
@@ -256,7 +256,16 @@ where
     /// Returns a recovery error when authoritative reopen cannot complete.
     pub fn object_count(&self) -> Result<usize, DurableError> {
         let inner = self.lock_usable()?;
-        Ok(inner.index.len())
+        inner
+            .index
+            .len()
+            .checked_add(
+                inner
+                    .representations
+                    .as_ref()
+                    .map_or(0, |store| store.contiguous_count_excluding(&inner.index)),
+            )
+            .ok_or(DurableError::EncodingOverflow)
     }
 
     /// Return one recovered immutable object.
@@ -267,12 +276,30 @@ where
     pub fn object(&self, id: ObjectId) -> Result<Option<ObjectRecord>, DurableError> {
         let mut recovery = RecoveryScope::default();
         loop {
-            let (location, generation) = {
+            let (location, contiguous, generation) = {
                 let inner = self.lock_usable_with(&mut recovery)?;
-                let Some(location) = inner.index.get(&id).copied() else {
-                    return Ok(None);
-                };
-                (location, inner.arena_generation)
+                (
+                    inner.index.get(&id).copied(),
+                    inner
+                        .representations
+                        .as_ref()
+                        .and_then(|store| store.contiguous_read(id)),
+                    inner.arena_generation,
+                )
+            };
+            if location.is_none()
+                && let Some((path, location)) = contiguous
+            {
+                return super::representations::read_contiguous_object(
+                    &path,
+                    location,
+                    id,
+                    &self.identity,
+                )
+                .map(Some);
+            }
+            let Some(location) = location else {
+                return Ok(None);
             };
             let reader_guard = self.arena_reader.read();
             let Some(reader) = reader_guard.as_ref() else {
@@ -328,12 +355,39 @@ where
             if let Some(record) = self.object_cache.get(principal, id) {
                 return Ok(Some(record));
             }
-            let (location, generation) = {
+            let (location, contiguous, generation) = {
                 let inner = self.lock_usable_with(&mut recovery)?;
-                let Some(location) = inner.index.get(&id).copied() else {
-                    return Ok(None);
-                };
-                (location, inner.arena_generation)
+                (
+                    inner.index.get(&id).copied(),
+                    inner
+                        .representations
+                        .as_ref()
+                        .and_then(|store| store.contiguous_read(id)),
+                    inner.arena_generation,
+                )
+            };
+            if location.is_none()
+                && let Some((path, location)) = contiguous
+            {
+                let record = super::representations::read_contiguous_object(
+                    &path,
+                    location,
+                    id,
+                    &self.identity,
+                )?;
+                if let Some(record) = self.retain_loaded_object_if_current_with(
+                    principal,
+                    id,
+                    generation,
+                    record,
+                    &mut recovery,
+                )? {
+                    return Ok(Some(record));
+                }
+                continue;
+            }
+            let Some(location) = location else {
+                return Ok(None);
             };
             let reader_guard = self.arena_reader.read();
             let Some(reader) = reader_guard.as_ref() else {
@@ -413,13 +467,29 @@ where
         }
 
         loop {
-            let (locations, generation) = {
+            let (locations, contiguous, generation) = {
                 let inner = self.lock_usable_with(&mut recovery)?;
                 let locations = missing
                     .keys()
                     .filter_map(|id| inner.index.get(id).copied().map(|location| (*id, location)))
                     .collect::<Vec<_>>();
-                (locations, inner.arena_generation)
+                let contiguous = inner
+                    .representations
+                    .as_ref()
+                    .map(|store| {
+                        missing
+                            .keys()
+                            .filter_map(|id| {
+                                (!inner.index.contains_key(id)).then(|| {
+                                    store
+                                        .contiguous_read(*id)
+                                        .map(|(path, location)| (*id, path, location))
+                                })?
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                (locations, contiguous, inner.arena_generation)
             };
             let reader_guard = self.arena_reader.read();
             let Some(reader) = reader_guard.as_ref() else {
@@ -428,13 +498,30 @@ where
             if reader.generation != generation {
                 continue;
             }
-            let loaded =
+            let mut loaded =
                 read_indexed_objects(&reader.file, &locations, &self.identity, self.limits)?;
             drop(reader_guard);
+            for (id, path, location) in &contiguous {
+                loaded.insert(
+                    *id,
+                    super::representations::read_contiguous_object(
+                        path,
+                        *location,
+                        *id,
+                        &self.identity,
+                    )?,
+                );
+            }
 
             let inner = self.lock_usable_with(&mut recovery)?;
             if inner.arena_generation != generation
-                || loaded.keys().any(|id| !inner.index.contains_key(id))
+                || loaded.keys().any(|id| {
+                    !inner.index.contains_key(id)
+                        && !inner
+                            .representations
+                            .as_ref()
+                            .is_some_and(|store| store.contains_contiguous(*id))
+                })
             {
                 continue;
             }
@@ -476,7 +563,13 @@ where
         recovery: &mut RecoveryScope,
     ) -> Result<Option<Arc<ObjectRecord>>, DurableError> {
         let inner = self.lock_usable_with(recovery)?;
-        if inner.arena_generation != generation || !inner.index.contains_key(&id) {
+        if inner.arena_generation != generation
+            || (!inner.index.contains_key(&id)
+                && !inner
+                    .representations
+                    .as_ref()
+                    .is_some_and(|store| store.contains_contiguous(id)))
+        {
             return Ok(None);
         }
         Ok(Some(self.object_cache.insert(principal, id, record)))
@@ -714,7 +807,7 @@ where
 
     pub(super) fn flush_standalone(
         inner: &mut DurableInner<P>,
-        representation_update: Option<super::representations::PendingDirectUpdate>,
+        representation_update: Option<super::representations::PendingRepresentationUpdate>,
     ) -> Result<u64, DurableError> {
         let DurableInner {
             files,
@@ -774,15 +867,23 @@ where
         let Some(root) = inner.roots_by_principal.get(principal).copied() else {
             return Ok(None);
         };
-        let DurableInner { files, index, .. } = &mut *inner;
+        let DurableInner {
+            files,
+            index,
+            representations,
+            ..
+        } = &mut *inner;
         let files = live_files_mut(files)?;
         let records = materialize_closure(
-            &mut files.arena,
-            index,
-            &BTreeMap::new(),
+            &mut ClosureObjects {
+                arena: &mut files.arena,
+                index,
+                incoming: &BTreeMap::new(),
+                representations: representations.as_ref(),
+                identity: &self.identity,
+                limits: self.limits,
+            },
             root.commit,
-            &self.identity,
-            self.limits,
         )?;
         Ok(Some(RootSnapshot { root, records }))
     }
@@ -800,15 +901,23 @@ where
             .get(principal)
             .copied()
             .ok_or(ModelError::PrincipalMissing)?;
-        let DurableInner { files, index, .. } = &mut *inner;
+        let DurableInner {
+            files,
+            index,
+            representations,
+            ..
+        } = &mut *inner;
         let files = live_files_mut(files)?;
         let records = materialize_closure(
-            &mut files.arena,
-            index,
-            &BTreeMap::new(),
+            &mut ClosureObjects {
+                arena: &mut files.arena,
+                index,
+                incoming: &BTreeMap::new(),
+                representations: representations.as_ref(),
+                identity: &self.identity,
+                limits: self.limits,
+            },
             root.commit,
-            &self.identity,
-            self.limits,
         )?;
         usage_from_closure(&records, root.commit).map_err(Into::into)
     }
@@ -927,17 +1036,21 @@ where
             files,
             index,
             validated,
+            representations,
             ..
         } = inner;
         let files = live_files_mut(files)?;
         validate_incremental_closure(
-            &mut files.arena,
-            index,
-            incoming,
+            &mut ClosureObjects {
+                arena: &mut files.arena,
+                index,
+                incoming,
+                representations: representations.as_ref(),
+                identity: &self.identity,
+                limits: self.limits,
+            },
             validated,
             commit,
-            &self.identity,
-            self.limits,
         )
     }
 

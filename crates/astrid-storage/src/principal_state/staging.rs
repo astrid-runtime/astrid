@@ -21,9 +21,7 @@ use super::native_io::{
     sync_directory, validate_private_regular_file,
 };
 use super::{NativePrincipalContentStore, StateOwner};
-use crate::content::{
-    ChunkingProfile, ContentBatchWriteOutcome, ContentIngest, ContentName, ContentWriteOutcome,
-};
+use crate::content::{ChunkingProfile, ContentBatchWriteOutcome, ContentName, ContentWriteOutcome};
 use crate::error::{StorageError, StorageResult};
 
 mod format;
@@ -375,9 +373,35 @@ impl NativeContentStagingArea {
         let area = self.clone();
         tokio::task::spawn_blocking(move || {
             validate_generation(&staged.content_path(), &staged.intent())?;
-            let source = open_private_file(&staged.content_path())?.take(staged.logical_bytes);
+            let engine = content.engine();
+            let prepared = engine
+                .prepare_contiguous_file(
+                    staged.profile,
+                    staged.logical_bytes,
+                    open_private_file(&staged.content_path())?.take(staged.logical_bytes),
+                )
+                .map_err(|error| {
+                    StorageError::Internal(format!(
+                        "prepare staged contiguous content {}: {error}",
+                        staged.id
+                    ))
+                })?;
+            validate_generation(&staged.content_path(), &staged.intent())?;
+            let published = engine
+                .publish_contiguous_from_path(prepared, &staged.content_path())
+                .map_err(|error| {
+                    StorageError::Internal(format!(
+                        "publish staged contiguous content {}: {error}",
+                        staged.id
+                    ))
+                })?;
             let outcome = content
-                .put_streaming_with_profile(&staged.owner, &staged.name, source, staged.profile)
+                .publish_verified_content(
+                    &staged.owner,
+                    &staged.name,
+                    published.verified_content(),
+                    published.objects_inserted(),
+                )
                 .map_err(|error| {
                     StorageError::Internal(format!("publish staged content {}: {error}", staged.id))
                 })?;
@@ -426,18 +450,41 @@ impl NativeContentStagingArea {
         }
         let area = self.clone();
         tokio::task::spawn_blocking(move || {
-            let mut ingests = Vec::with_capacity(staged.len());
+            let engine = content.engine();
+            let mut completed = Vec::with_capacity(staged.len());
+            let mut objects_inserted = 0_u64;
             for entry in &staged {
                 validate_generation(&entry.content_path(), &entry.intent())?;
-                let source = open_private_file(&entry.content_path())?.take(entry.logical_bytes);
-                ingests.push(ContentIngest::with_profile(
-                    entry.name.clone(),
-                    source,
-                    entry.profile,
-                ));
+                let prepared = engine
+                    .prepare_contiguous_file(
+                        entry.profile,
+                        entry.logical_bytes,
+                        open_private_file(&entry.content_path())?.take(entry.logical_bytes),
+                    )
+                    .map_err(|error| {
+                        StorageError::Internal(format!(
+                            "prepare staged contiguous content {}: {error}",
+                            entry.id
+                        ))
+                    })?;
+                validate_generation(&entry.content_path(), &entry.intent())?;
+                let published = engine
+                    .publish_contiguous_from_path(prepared, &entry.content_path())
+                    .map_err(|error| {
+                        StorageError::Internal(format!(
+                            "publish staged contiguous content {}: {error}",
+                            entry.id
+                        ))
+                    })?;
+                objects_inserted = objects_inserted
+                    .checked_add(published.objects_inserted())
+                    .ok_or_else(|| {
+                        StorageError::Internal("staged batch object accounting overflow".to_owned())
+                    })?;
+                completed.push((entry.name.clone(), published.verified_content()));
             }
             let outcome = content
-                .put_streaming_batch(&owner, ingests)
+                .publish_verified_batch(&owner, completed, objects_inserted)
                 .map_err(|error| {
                     StorageError::Internal(format!("publish staged content batch: {error}"))
                 })?;

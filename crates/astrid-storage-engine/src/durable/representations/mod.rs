@@ -16,6 +16,7 @@ use super::{
     ArenaLocation, DurableError, FRAME_HEADER_LEN, RecoveryLimits, append_frame, append_frames,
     io_error, open_rw, sync_store_directory,
 };
+pub(in crate::durable) use format::Blake3PhysicalIdentity as PhysicalIdentityV1;
 use format::{
     Blake3PhysicalIdentity, CurrentPointer, JOURNAL_MAGIC, JournalEntry, METADATA_MAGIC,
     MetadataFrame, MetadataKind, journal_digest,
@@ -34,7 +35,11 @@ use recovery::{
     validate_representations,
 };
 
+mod contiguous;
 mod direct;
+pub(super) use contiguous::{
+    install_loose_blob_copy, install_loose_blob_from_path, read_contiguous_object,
+};
 
 pub(super) use direct::{DirectArenaObject, PreparedDirectArenaObject};
 
@@ -86,6 +91,7 @@ pub(super) fn append_legacy_profile_frame(
 
 #[derive(Debug)]
 pub(super) struct RepresentationStore {
+    root: std::path::PathBuf,
     metadata: File,
     journal: File,
     journal_generation: u64,
@@ -99,14 +105,24 @@ pub(super) struct RepresentationStore {
     persisted_map_nodes: BTreeSet<astrid_storage_model::PhysicalMapNodeId>,
     direct_profile: RepresentationProfileId,
     reverse: BTreeMap<ObjectId, Vec<RepresentationRecordId>>,
+    contiguous: BTreeMap<ObjectId, ContiguousLocation>,
 }
 
-pub(super) struct PendingDirectUpdate {
+pub(super) struct PendingRepresentationUpdate {
     state: RepresentationState,
     state_id: RepresentationStateId,
     catalogue: RepresentationCatalogueRoot,
     placements: PlacementSet,
     reverse_additions: Vec<(ObjectId, RepresentationRecordId)>,
+    contiguous_additions: Vec<(ObjectId, ContiguousLocation)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ContiguousLocation {
+    pub(super) blob: astrid_storage_model::BlobId,
+    pub(super) namespace_generation: u64,
+    pub(super) offset: u64,
+    pub(super) length: u64,
 }
 
 struct DirectMapEntry {
@@ -133,6 +149,7 @@ impl RepresentationStore {
         let index = recover_metadata(&mut metadata, limits)?;
         let (active, state) = recover_journal(&mut journal, current, &index, limits)?;
         let recovered = Self::from_recovered(
+            root,
             metadata,
             journal,
             current.journal_generation,
@@ -265,7 +282,7 @@ impl RepresentationStore {
     pub(super) fn append_direct_update(
         &mut self,
         objects: &[DirectArenaObject],
-    ) -> Result<Option<PendingDirectUpdate>, DurableError> {
+    ) -> Result<Option<PendingRepresentationUpdate>, DurableError> {
         let mut metadata = Vec::new();
         let profile = RepresentationProfile::decode(
             self.profiles
@@ -344,12 +361,13 @@ impl RepresentationStore {
             .collect::<Result<Vec<_>, _>>()?;
         append_frames(&mut self.metadata, METADATA_MAGIC, &payloads)?;
         self.persisted_map_nodes.extend(appended_map_nodes);
-        Ok(Some(PendingDirectUpdate {
+        Ok(Some(PendingRepresentationUpdate {
             state,
             state_id,
             catalogue,
             placements,
             reverse_additions,
+            contiguous_additions: Vec::new(),
         }))
     }
 
@@ -425,7 +443,7 @@ impl RepresentationStore {
 
     pub(super) fn publish_direct_update(
         &mut self,
-        update: PendingDirectUpdate,
+        update: PendingRepresentationUpdate,
     ) -> Result<(), DurableError> {
         let cas = JournalEntry::StateCas {
             journal_generation: self.journal_generation,
@@ -441,6 +459,7 @@ impl RepresentationStore {
         for (object, representation) in update.reverse_additions {
             self.reverse.entry(object).or_default().push(representation);
         }
+        self.contiguous.extend(update.contiguous_additions);
         Ok(())
     }
 
@@ -558,6 +577,7 @@ impl RepresentationStore {
     }
 
     fn from_recovered(
+        root: std::path::PathBuf,
         metadata: File,
         journal: File,
         journal_generation: u64,
@@ -606,6 +626,7 @@ impl RepresentationStore {
             ));
         }
         Ok(Self {
+            root,
             metadata,
             journal,
             journal_generation,
@@ -619,6 +640,7 @@ impl RepresentationStore {
             persisted_map_nodes: index.nodes.keys().copied().collect(),
             direct_profile,
             reverse,
+            contiguous: BTreeMap::new(),
         })
     }
 }

@@ -857,6 +857,7 @@ dependencies = [
  "blake3",
  "ed25519-dalek",
  "fs2",
+ "libc",
  "parking_lot",
  "sha2 0.11.0",
  "tempfile",

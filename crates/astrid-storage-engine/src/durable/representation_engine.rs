@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 
 use astrid_storage_model::{ObjectId, RepresentationStateId};
 
-use super::representations::{DirectArenaObject, PendingDirectUpdate, RepresentationStore};
+use super::representations::{DirectArenaObject, PendingRepresentationUpdate, RepresentationStore};
 use super::{
     DurableEngine, DurableError, DurableInner, PersistentObjectIdentity, PrincipalCodec,
     canonical_record_bytes, live_files_mut, read_indexed_object_with_payload,
@@ -225,7 +225,7 @@ where
         &self,
         inner: &mut DurableInner<P>,
         appended: &[DirectArenaObject],
-    ) -> Result<Option<PendingDirectUpdate>, DurableError> {
+    ) -> Result<Option<PendingRepresentationUpdate>, DurableError> {
         let DurableInner {
             files,
             representations,
