@@ -18,14 +18,13 @@ use super::{
     RepresentationStore, append_frames,
 };
 use crate::durable::contiguous::ContiguousSlice;
-use crate::durable::{
-    ArenaLocation, PersistentObjectIdentity, RecoveryLimits, io_error, sync_store_directory,
-};
+use crate::durable::{ArenaLocation, PersistentObjectIdentity, RecoveryLimits, io_error};
 
 mod namespace;
 mod platform;
 mod recovery;
-use namespace::LooseBlobDirectory;
+use namespace::{LooseBlobDirectory, retire_loose_blob_tree};
+pub(in crate::durable) use namespace::{open_representation_root, open_store_root};
 pub(in crate::durable) use platform::open_regular_read;
 use platform::{clone_file_no_replace, clone_is_unsupported};
 
@@ -107,7 +106,12 @@ impl RepresentationStore {
         let Some(location) = self.contiguous.get(&object).copied() else {
             return Ok(None);
         };
-        let directory = LooseBlobDirectory::open(&self.root, location.namespace_generation, false)?;
+        let directory = LooseBlobDirectory::open(
+            &self.root_directory,
+            &self.root,
+            location.namespace_generation,
+            false,
+        )?;
         let file = open_authoritative_regular(
             &directory,
             &loose_blob_name(location.blob),
@@ -137,25 +141,7 @@ impl RepresentationStore {
     /// Retire loose payloads only after active authority contains direct arena
     /// placements for the complete live object set.
     pub(in crate::durable) fn retire_loose_blobs(&self) -> Result<(), DurableError> {
-        let active = self.root.join("blobs");
-        let retired = self.root.join(RETIRED_BLOBS_DIRECTORY);
-        remove_blob_tree_if_present(&retired)?;
-        match std::fs::symlink_metadata(&active) {
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-                return Err(DurableError::InvalidRepresentationState(
-                    "loose blob root is redirected or not a directory",
-                ));
-            },
-            Ok(_) => {
-                std::fs::rename(&active, &retired)
-                    .map_err(|source| io_error("retire loose blob namespace", source))?;
-                sync_store_directory(&self.root)?;
-            },
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {},
-            Err(source) => return Err(io_error("inspect loose blob namespace", source)),
-        }
-        remove_blob_tree_if_present(&retired)?;
-        sync_store_directory(&self.root)
+        retire_loose_blob_tree(&self.root_directory)
     }
 
     pub(in crate::durable) fn rebuild_contiguous_index<I: PersistentObjectIdentity>(
@@ -171,6 +157,7 @@ impl RepresentationStore {
         for (record_id, record, namespace_generation) in active {
             let profile = self.profile(record.profile())?;
             let (reverse, locations) = recovery.recover_contiguous_record(
+                &self.root_directory,
                 &self.root,
                 record_id,
                 &record,
@@ -252,20 +239,6 @@ impl RepresentationStore {
     }
 }
 
-fn remove_blob_tree_if_present(path: &Path) -> Result<(), DurableError> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-            Err(DurableError::InvalidRepresentationState(
-                "retired loose blob root is redirected or not a directory",
-            ))
-        },
-        Ok(_) => std::fs::remove_dir_all(path)
-            .map_err(|source| io_error("remove retired loose blob namespace", source)),
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(io_error("inspect retired loose blob namespace", source)),
-    }
-}
-
 type ContiguousIndexes = (
     Vec<(ObjectId, astrid_storage_model::RepresentationRecordId)>,
     Vec<(ObjectId, ContiguousLocation)>,
@@ -300,15 +273,21 @@ fn contiguous_index_additions(
 }
 
 pub(in crate::durable) fn install_loose_blob_copy(
-    store: &Path,
+    store_root: &cap_std::fs::Dir,
+    store_path: &Path,
     blob: astrid_storage_model::BlobId,
     profile: astrid_storage_model::RepresentationProfileId,
     logical_bytes: u64,
     source: impl Read,
 ) -> Result<PathBuf, DurableError> {
-    let representation_root = store.join(super::DIRECTORY);
-    let directory =
-        LooseBlobDirectory::open(&representation_root, LOOSE_NAMESPACE_GENERATION, true)?;
+    let representation_root_path = store_path.join(super::DIRECTORY);
+    let representation_root = open_representation_root(store_root)?;
+    let directory = LooseBlobDirectory::open(
+        &representation_root,
+        &representation_root_path,
+        LOOSE_NAMESPACE_GENERATION,
+        true,
+    )?;
     let name = loose_blob_name(blob);
     ensure_loose_metadata(&directory, &name, profile, blob, logical_bytes)?;
     let sequence = COPY_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -347,7 +326,8 @@ pub(in crate::durable) fn install_loose_blob_copy(
 }
 
 pub(in crate::durable) fn install_loose_blob_from_file(
-    store: &Path,
+    store_root: &cap_std::fs::Dir,
+    store_path: &Path,
     blob: astrid_storage_model::BlobId,
     profile: astrid_storage_model::RepresentationProfileId,
     logical_bytes: u64,
@@ -366,9 +346,14 @@ pub(in crate::durable) fn install_loose_blob_from_file(
             "loose blob adoption source is truncated",
         ));
     }
-    let representation_root = store.join(super::DIRECTORY);
-    let directory =
-        LooseBlobDirectory::open(&representation_root, LOOSE_NAMESPACE_GENERATION, true)?;
+    let representation_root_path = store_path.join(super::DIRECTORY);
+    let representation_root = open_representation_root(store_root)?;
+    let directory = LooseBlobDirectory::open(
+        &representation_root,
+        &representation_root_path,
+        LOOSE_NAMESPACE_GENERATION,
+        true,
+    )?;
     let name = loose_blob_name(blob);
     ensure_loose_metadata(&directory, &name, profile, blob, logical_bytes)?;
     let sequence = COPY_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -402,7 +387,14 @@ pub(in crate::durable) fn install_loose_blob_from_file(
             source
                 .seek(SeekFrom::Start(0))
                 .map_err(|source| io_error("rewind loose blob adoption source", source))?;
-            return install_loose_blob_copy(store, blob, profile, logical_bytes, source);
+            return install_loose_blob_copy(
+                store_root,
+                store_path,
+                blob,
+                profile,
+                logical_bytes,
+                source,
+            );
         },
         Err(source) => {
             let _ = directory.remove_file(&temporary);
@@ -663,13 +655,19 @@ fn chunk_record(bytes: Vec<u8>) -> Result<ObjectRecord, DurableError> {
 }
 
 fn verify_published_blob(
+    representation_directory: &cap_std::fs::Dir,
     representation_root: &Path,
     namespace_generation: u64,
     blob: astrid_storage_model::BlobId,
     profile: astrid_storage_model::RepresentationProfileId,
     logical_bytes: u64,
 ) -> Result<File, DurableError> {
-    let directory = LooseBlobDirectory::open(representation_root, namespace_generation, false)?;
+    let directory = LooseBlobDirectory::open(
+        representation_directory,
+        representation_root,
+        namespace_generation,
+        false,
+    )?;
     let name = loose_blob_name(blob);
     let metadata = encode_loose_metadata(profile, blob, logical_bytes)?;
     verify_exact_regular_file(

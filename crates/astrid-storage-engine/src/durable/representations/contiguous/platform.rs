@@ -110,7 +110,7 @@ pub(super) fn clone_file_no_replace(
     } else {
         let error = std::io::Error::last_os_error();
         drop(destination_file);
-        let _ = std::fs::remove_file(destination);
+        let _ = destination_directory.remove_file(destination);
         Err(error)
     }
 }
@@ -131,6 +131,6 @@ pub(super) fn clone_is_unsupported(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::Unsupported
         || matches!(
             error.raw_os_error(),
-            Some(libc::ENOTSUP | libc::EXDEV | libc::EINVAL)
+            Some(libc::ENOTSUP | libc::EXDEV | libc::EINVAL | libc::ENOTTY)
         )
 }

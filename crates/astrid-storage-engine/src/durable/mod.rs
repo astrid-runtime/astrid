@@ -475,6 +475,7 @@ struct EngineOpenOptions<P> {
 /// Neither principal authority nor quota policy is inferred by this engine.
 pub struct DurableEngine<P: Ord, I, C> {
     directory: PathBuf,
+    directory_capability: Arc<cap_std::fs::Dir>,
     identity: I,
     principal_codec: C,
     limits: RecoveryLimits,

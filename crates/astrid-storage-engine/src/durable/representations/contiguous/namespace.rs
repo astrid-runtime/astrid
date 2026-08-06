@@ -15,18 +15,18 @@ pub(super) struct LooseBlobDirectory {
 
 impl LooseBlobDirectory {
     pub(super) fn open(
-        representation_root: &Path,
+        representation_root: &Dir,
+        ambient_root: &Path,
         namespace_generation: u64,
         create: bool,
     ) -> Result<Self, DurableError> {
-        let root = open_root(representation_root)?;
-        let blobs = open_component(&root, Path::new("blobs"), create)?;
+        let blobs = open_component(representation_root, Path::new("blobs"), create)?;
         let loose = open_component(&blobs, Path::new("loose"), create)?;
         let generation_name = format!("{namespace_generation:016x}");
         let directory = open_component(&loose, Path::new(&generation_name), create)?;
         Ok(Self {
             directory,
-            ambient_path: representation_root
+            ambient_path: ambient_root
                 .join("blobs")
                 .join("loose")
                 .join(generation_name),
@@ -85,20 +85,41 @@ impl LooseBlobDirectory {
     }
 }
 
-fn open_root(path: &Path) -> Result<Dir, DurableError> {
-    let parent_path = path
-        .parent()
-        .ok_or(DurableError::InvalidRepresentationState(
-            "representation root has no parent",
-        ))?;
-    let name = path
-        .file_name()
-        .ok_or(DurableError::InvalidRepresentationState(
-            "representation root has no final component",
-        ))?;
-    let parent = Dir::open_ambient_dir(parent_path, cap_std::ambient_authority())
-        .map_err(|source| io_error("open representation parent capability", source))?;
-    open_component(&parent, Path::new(name), false)
+pub(in crate::durable) fn open_store_root(path: &Path) -> Result<Dir, DurableError> {
+    Dir::open_ambient_dir(path, cap_std::ambient_authority())
+        .map_err(|source| io_error("open store root capability", source))
+}
+
+pub(in crate::durable) fn open_representation_root(store_root: &Dir) -> Result<Dir, DurableError> {
+    open_component(store_root, Path::new(super::super::DIRECTORY), false)
+}
+
+pub(super) fn retire_loose_blob_tree(root: &Dir) -> Result<(), DurableError> {
+    let active = Path::new("blobs");
+    let retired = Path::new(super::RETIRED_BLOBS_DIRECTORY);
+    remove_directory_if_present(root, retired)?;
+    match reject_redirect(root, active, true) {
+        Ok(()) => {
+            root.rename(active, root, retired)
+                .map_err(|source| io_error("retire loose blob namespace", source))?;
+            sync_directory(root)
+                .map_err(|source| io_error("flush representation root capability", source))?;
+        },
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {},
+        Err(source) => return Err(io_error("inspect loose blob namespace", source)),
+    }
+    remove_directory_if_present(root, retired)?;
+    sync_directory(root).map_err(|source| io_error("flush representation root capability", source))
+}
+
+fn remove_directory_if_present(parent: &Dir, name: &Path) -> Result<(), DurableError> {
+    match reject_redirect(parent, name, true) {
+        Ok(()) => parent
+            .remove_dir_all(name)
+            .map_err(|source| io_error("remove retired loose blob namespace", source)),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(io_error("inspect retired loose blob namespace", source)),
+    }
 }
 
 fn open_component(parent: &Dir, name: &Path, create: bool) -> Result<Dir, DurableError> {
@@ -140,7 +161,7 @@ fn sync_directory(directory: &Dir) -> io::Result<()> {
 
 fn reject_redirect(parent: &Dir, name: &Path, directory: bool) -> io::Result<()> {
     let metadata = parent.symlink_metadata(name)?;
-    if metadata.file_type().is_symlink()
+    if is_redirect(&metadata)
         || (directory && !metadata.is_dir())
         || (!directory && !metadata.is_file())
     {
@@ -150,6 +171,20 @@ fn reject_redirect(parent: &Dir, name: &Path, directory: bool) -> io::Result<()>
         ));
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn is_redirect(metadata: &cap_std::fs::Metadata) -> bool {
+    use cap_std::fs::MetadataExt as _;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    metadata.file_type().is_symlink()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn is_redirect(metadata: &cap_std::fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
 }
 
 fn directory_identity(directory: &Dir) -> io::Result<(u64, u64)> {

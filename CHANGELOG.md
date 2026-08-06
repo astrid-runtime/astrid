@@ -31,8 +31,8 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   blobs. Crash-prefix, tamper, symlink, occupied-path, source-preservation,
   compaction, and compaction-recovery tests cover the new publication
   protocol. On the clean 512 MiB APFS benchmark, staging remains at native
-  speed, eight-worker publication reaches 1,556.4 MiB/s, warm verified reads
-  reach 1,754.4 MiB/s, and duplicate publication appends 8,387 authoritative
+  speed, eight-worker publication reaches 1,212.1 MiB/s, warm verified reads
+  reach 1,774.6 MiB/s, and duplicate publication appends 8,387 authoritative
   bytes. Closes #1467.
 
 - **Bulk publication reuses closure evidence earned during authoritative

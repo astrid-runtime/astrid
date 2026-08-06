@@ -161,7 +161,9 @@ fn rebase_representation_authority<I: PersistentObjectIdentity>(
     identity: &I,
     limits: RecoveryLimits,
 ) -> Result<(), DurableError> {
-    let Some(mut representations) = RepresentationStore::open(directory, limits)? else {
+    let store_root = super::super::representations::open_store_root(directory)?;
+    let Some(mut representations) = RepresentationStore::open(directory, &store_root, limits)?
+    else {
         return Ok(());
     };
     let mut arena = open_rw(&directory.join(ARENA_FILE))?;

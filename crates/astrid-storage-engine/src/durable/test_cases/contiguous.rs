@@ -245,6 +245,47 @@ fn compaction_materializes_contiguous_objects_before_retiring_the_blob() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn compaction_retires_blobs_below_the_pinned_representation_root() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open(directory.path());
+    let specification = activate_physical_authority(&engine);
+    let content = patterned_content(512 * 1024 + 19);
+    let prepared = engine
+        .prepare_contiguous_file(
+            astrid_storage_content::ChunkingProfile::ASTRID_V1,
+            u64::try_from(content.len()).unwrap(),
+            std::io::Cursor::new(&content),
+        )
+        .unwrap();
+    let descriptor = prepared.descriptor();
+    engine
+        .publish_contiguous_copy(prepared, std::io::Cursor::new(&content))
+        .unwrap();
+    add_contiguous_compaction_orphan(&engine);
+    let authorization = contiguous_compaction_plan(&engine, specification, descriptor.file());
+
+    let representation_root = directory.path().join("representations");
+    let displaced = directory.path().join("representations.displaced");
+    let outside = directory.path().join("outside-representations");
+    std::fs::rename(&representation_root, &displaced).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("sentinel"), b"untouched").unwrap();
+    std::os::unix::fs::symlink(&outside, &representation_root).unwrap();
+
+    engine.compact(&authorization).unwrap();
+
+    assert_eq!(std::fs::read(outside.join("sentinel")).unwrap(), b"untouched");
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 1);
+    assert!(!displaced.join("blobs").exists());
+    assert_eq!(
+        astrid_storage_content::read_content(&EngineContentSource(&engine), descriptor.file())
+            .unwrap(),
+        content
+    );
+}
+
 #[test]
 fn represented_compaction_recovers_across_authority_and_blob_retirement() {
     for point in [
@@ -433,6 +474,38 @@ fn contiguous_publication_rejects_a_redirected_namespace_component() {
         .publish_contiguous_copy(prepared, std::io::Cursor::new(&content))
         .is_err());
     assert_eq!(std::fs::read_dir(outside).unwrap().count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn contiguous_publication_stays_below_the_store_handle_after_root_replacement() {
+    let container = tempfile::tempdir().unwrap();
+    let store = container.path().join("store");
+    let displaced = container.path().join("store.displaced");
+    let outside = container.path().join("outside-store");
+    let engine = open(&store);
+    activate_physical_authority(&engine);
+    let content = patterned_content(256 * 1024 + 13);
+    let prepared = engine
+        .prepare_contiguous_file(
+            astrid_storage_content::ChunkingProfile::ASTRID_V1,
+            u64::try_from(content.len()).unwrap(),
+            std::io::Cursor::new(&content),
+        )
+        .unwrap();
+
+    std::fs::rename(&store, &displaced).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, &store).unwrap();
+
+    engine
+        .publish_contiguous_copy(prepared, std::io::Cursor::new(&content))
+        .unwrap();
+    assert!(
+        !outside.join("representations").exists(),
+        "contiguous publication escaped the retained store capability"
+    );
+    assert!(displaced.join("representations/blobs/loose").is_dir());
 }
 
 #[cfg(unix)]

@@ -113,6 +113,7 @@ where
             )?;
             RepresentationStore::activate(
                 &self.directory,
+                &self.directory_capability,
                 self.limits,
                 frozen_specification,
                 objects.into_iter().map(Ok),

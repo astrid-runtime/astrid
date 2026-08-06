@@ -218,6 +218,7 @@ where
         self.fail_if(FaultPoint::AfterContiguousStructuralFlush)?;
         let logical_bytes = prepared.verified.descriptor().logical_bytes();
         super::representations::install_loose_blob_copy(
+            &self.directory_capability,
             &self.directory,
             prepared.payload.blob,
             prepared.payload.profile_id,
@@ -267,6 +268,7 @@ where
         self.fail_if(FaultPoint::AfterContiguousStructuralFlush)?;
         let logical_bytes = prepared.verified.descriptor().logical_bytes();
         super::representations::install_loose_blob_from_file(
+            &self.directory_capability,
             &self.directory,
             prepared.payload.blob,
             prepared.payload.profile_id,

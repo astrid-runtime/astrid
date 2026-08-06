@@ -201,6 +201,7 @@ where
         let path = path.as_ref().to_path_buf();
         std::fs::create_dir_all(&path)
             .map_err(|source| io_error("create principal-store directory", source))?;
+        let directory_capability = Arc::new(super::representations::open_store_root(&path)?);
         let lock_path = path.join(LOCK_FILE);
         let lock = open_rw(&lock_path)?;
         if let Err(source) = lock.try_lock_exclusive() {
@@ -210,10 +211,17 @@ where
             return Err(io_error("lock principal store", source));
         }
 
-        let recovered = recover_store(&path, &principal_codec, &identity, limits)?;
+        let recovered = recover_store(
+            &path,
+            &directory_capability,
+            &principal_codec,
+            &identity,
+            limits,
+        )?;
 
         Ok(Self {
             directory: path,
+            directory_capability,
             identity,
             principal_codec,
             limits,
