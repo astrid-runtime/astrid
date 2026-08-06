@@ -397,6 +397,14 @@ pub(in crate::durable) fn install_loose_blob_from_file(
                     .map_err(|source| io_error("open cloned loose blob temporary", source))?;
                 validate_opened_regular(&file)
                     .map_err(|source| io_error("validate cloned loose blob temporary", source))?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                        .map_err(|source| {
+                            io_error("set cloned loose blob private permissions", source)
+                        })?;
+                }
                 file.set_len(logical_bytes)
                     .and_then(|()| file.sync_all())
                     .map_err(|source| io_error("truncate and flush cloned loose blob", source))

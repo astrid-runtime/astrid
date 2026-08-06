@@ -470,6 +470,9 @@ fn contiguous_recovery_rejects_tampered_blob() {
 
 #[test]
 fn contiguous_path_adoption_preserves_the_sealed_source() {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
+
     let directory = tempfile::tempdir().unwrap();
     let engine = open(directory.path());
     activate_physical_authority(&engine);
@@ -478,6 +481,8 @@ fn contiguous_path_adoption_preserves_the_sealed_source() {
     sealed.extend_from_slice(b"staging intent and footer remain recoverable");
     let source_path = directory.path().join("sealed-generation");
     std::fs::write(&source_path, &sealed).unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(&source_path, std::fs::Permissions::from_mode(0o644)).unwrap();
     let prepared = engine
         .prepare_contiguous_file(
             astrid_storage_content::ChunkingProfile::ASTRID_V1,
@@ -488,12 +493,28 @@ fn contiguous_path_adoption_preserves_the_sealed_source() {
         )
         .unwrap();
     let descriptor = prepared.descriptor();
+    #[cfg(unix)]
+    let blob = prepared.payload.blob;
 
     engine
         .publish_contiguous_from_path(prepared, &source_path)
         .unwrap();
 
     assert_eq!(std::fs::read(&source_path).unwrap(), sealed);
+    #[cfg(unix)]
+    {
+        let blob_path = engine
+            .inner
+            .lock()
+            .representations
+            .as_ref()
+            .unwrap()
+            .loose_blob_path(blob, 1);
+        assert_eq!(
+            std::fs::metadata(blob_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
     assert_eq!(
         astrid_storage_content::read_content(&EngineContentSource(&engine), descriptor.file())
             .unwrap(),
