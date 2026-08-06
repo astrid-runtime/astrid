@@ -323,13 +323,13 @@ async fn benchmark_publication(
     let (unique_name, unique_staged, stage_write, stage_seal) =
         stage_source(store, source, owner, "large/unique.bin", config.block_bytes)?;
     let authoritative_before = authoritative_store_bytes(home)?;
-    let representation_before = representation_authority_bytes(home)?;
+    let representation_before = representation_metadata_bytes(home)?;
     let started = Instant::now();
     let unique_outcome = store.publish_staged(unique_staged).await?;
     black_box(unique_outcome);
     let unique_publish = started.elapsed();
     let authoritative_after_unique = authoritative_store_bytes(home)?;
-    let representation_after_unique = representation_authority_bytes(home)?;
+    let representation_after_unique = representation_metadata_bytes(home)?;
     let unique_authoritative_bytes = authoritative_after_unique
         .checked_sub(authoritative_before)
         .ok_or("authoritative store shrank during unique publication")?;
@@ -346,13 +346,13 @@ async fn benchmark_publication(
         config.block_bytes,
     )?;
     let authoritative_before_duplicate = authoritative_store_bytes(home)?;
-    let representation_before_duplicate = representation_authority_bytes(home)?;
+    let representation_before_duplicate = representation_metadata_bytes(home)?;
     let started = Instant::now();
     let duplicate_outcome = store.publish_staged(duplicate_staged).await?;
     black_box(duplicate_outcome);
     let duplicate_publish = started.elapsed();
     let authoritative_after_duplicate = authoritative_store_bytes(home)?;
-    let representation_after_duplicate = representation_authority_bytes(home)?;
+    let representation_after_duplicate = representation_metadata_bytes(home)?;
     let duplicate_authoritative_bytes = authoritative_after_duplicate
         .checked_sub(authoritative_before_duplicate)
         .ok_or("authoritative store shrank during duplicate publication")?;
@@ -495,6 +495,10 @@ fn representation_authority_bytes(home: &AstridHome) -> BenchResult<u64> {
     directory_file_bytes(&home.principal_store_path().join("representations"))
 }
 
+fn representation_metadata_bytes(home: &AstridHome) -> BenchResult<u64> {
+    directory_file_bytes_except_blobs(&home.principal_store_path().join("representations"))
+}
+
 fn directory_file_bytes(path: &Path) -> BenchResult<u64> {
     let mut total = 0_u64;
     for entry in std::fs::read_dir(path)? {
@@ -514,6 +518,37 @@ fn directory_file_bytes(path: &Path) -> BenchResult<u64> {
         total = total
             .checked_add(bytes)
             .ok_or("representation authority byte count overflow")?;
+    }
+    Ok(total)
+}
+
+fn directory_file_bytes_except_blobs(path: &Path) -> BenchResult<u64> {
+    let mut total = 0_u64;
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        let bytes = if metadata.is_dir() {
+            directory_file_bytes_except_blobs(&entry.path())?
+        } else if metadata.is_file() {
+            if entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "blob")
+            {
+                0
+            } else {
+                metadata.len()
+            }
+        } else {
+            return Err(format!(
+                "authoritative representation path is not a regular file: {}",
+                entry.path().display()
+            )
+            .into());
+        };
+        total = total
+            .checked_add(bytes)
+            .ok_or("representation metadata byte count overflow")?;
     }
     Ok(total)
 }
