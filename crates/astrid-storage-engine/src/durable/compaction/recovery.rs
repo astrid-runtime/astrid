@@ -14,9 +14,9 @@ use super::{
     ARENA_COMPACTING, ARENA_FILE, ARENA_PREVIOUS, COMPACTION_INTENT_FILE, COMPACTION_INTENT_PREFIX,
     COMPACTION_INTENT_TEMP, COMPACTION_MAGIC, CompactionIntent, DurableError, INDEX_FILE,
     PersistentObjectIdentity, PrincipalCodec, ROOT_FILE, ROOTS_COMPACTING, ROOTS_PREVIOUS,
-    RecoveryLimits, append_frame, decode_object_frame, encode_object_frame, ensure_payload_limit,
-    evidence, io_error, open_rw, open_rw_capability, outbox, recover_arena, recover_roots,
-    root_journal_digest, sync_store_directory, sync_store_directory_capability,
+    RecoveryLimits, append_frame, create_private_file_capability, decode_object_frame,
+    encode_object_frame, ensure_payload_limit, evidence, io_error, open_rw_capability, outbox,
+    recover_arena, recover_roots, root_journal_digest, sync_store_directory_capability,
 };
 
 const INTENT_OPERATION_LABEL: &[u8] = b"00-operation-contract";
@@ -24,14 +24,13 @@ const INTENT_COMMIT_LABEL: &[u8] = b"01-gc-commit";
 const INTENT_PLACEMENT_LABEL: &[u8] = b"02-placement-after";
 
 pub(super) fn write_compaction_intent<I: PersistentObjectIdentity>(
-    directory: &Path,
+    directory: &cap_std::fs::Dir,
     intent_model: CompactionIntent,
     identity: &I,
     limits: RecoveryLimits,
 ) -> Result<(), DurableError> {
-    let temporary = directory.join(COMPACTION_INTENT_TEMP);
-    let intent = directory.join(COMPACTION_INTENT_FILE);
-    let mut file = super::create_private_file(&temporary)?;
+    remove_capability_file_if_exists(directory, COMPACTION_INTENT_TEMP)?;
+    let mut file = create_private_file_capability(directory, Path::new(COMPACTION_INTENT_TEMP))?;
     let record = intent_record(intent_model)?;
     let id = identity.identify(&record);
     let payload = encode_object_frame(identity.scheme(), id, &record)?;
@@ -39,9 +38,10 @@ pub(super) fn write_compaction_intent<I: PersistentObjectIdentity>(
     append_frame(&mut file, COMPACTION_MAGIC, &payload)?;
     file.sync_data()
         .map_err(|source| io_error("flush compaction intent", source))?;
-    std::fs::rename(&temporary, &intent)
+    directory
+        .rename(COMPACTION_INTENT_TEMP, directory, COMPACTION_INTENT_FILE)
         .map_err(|source| io_error("publish compaction intent", source))?;
-    sync_store_directory(directory)
+    sync_store_directory_capability(directory)
 }
 
 pub(super) fn backup_active(
@@ -65,7 +65,7 @@ pub(super) fn promote_compacting(
         .map_err(|source| io_error("promote compacted generation", source))
 }
 
-pub(super) fn prepare_finish_compaction(directory: &Path) -> Result<(), DurableError> {
+pub(super) fn prepare_finish_compaction(directory: &cap_std::fs::Dir) -> Result<(), DurableError> {
     for file in [
         ARENA_PREVIOUS,
         ROOTS_PREVIOUS,
@@ -73,34 +73,30 @@ pub(super) fn prepare_finish_compaction(directory: &Path) -> Result<(), DurableE
         ROOTS_COMPACTING,
         COMPACTION_INTENT_TEMP,
     ] {
-        remove_if_exists(&directory.join(file))?;
+        remove_capability_file_if_exists(directory, file)?;
     }
-    sync_store_directory(directory)
+    sync_store_directory_capability(directory)
 }
 
-pub(super) fn remove_compaction_intent(directory: &Path) -> Result<(), DurableError> {
-    remove_if_exists(&directory.join(COMPACTION_INTENT_FILE))?;
-    sync_store_directory(directory)
+pub(super) fn remove_compaction_intent(directory: &cap_std::fs::Dir) -> Result<(), DurableError> {
+    remove_capability_file_if_exists(directory, COMPACTION_INTENT_FILE)?;
+    sync_store_directory_capability(directory)
 }
 
-fn finish_compaction(directory: &Path) -> Result<(), DurableError> {
+fn finish_compaction(directory: &cap_std::fs::Dir) -> Result<(), DurableError> {
     prepare_finish_compaction(directory)?;
     remove_compaction_intent(directory)
 }
 
-pub(super) fn cleanup_without_intent(directory: &Path) -> Result<(), DurableError> {
-    if directory
-        .join(COMPACTION_INTENT_FILE)
-        .try_exists()
-        .map_err(|source| io_error("inspect compaction intent while cleaning remnants", source))?
-    {
+pub(super) fn cleanup_without_intent(directory: &cap_std::fs::Dir) -> Result<(), DurableError> {
+    if capability_file_exists(directory, COMPACTION_INTENT_FILE)? {
         return Ok(());
     }
     cleanup_authority_remnants(directory, ARENA_FILE, ARENA_COMPACTING, ARENA_PREVIOUS)?;
     cleanup_authority_remnants(directory, ROOT_FILE, ROOTS_COMPACTING, ROOTS_PREVIOUS)?;
-    remove_if_exists(&directory.join(COMPACTION_INTENT_TEMP))?;
+    remove_capability_file_if_exists(directory, COMPACTION_INTENT_TEMP)?;
     outbox::cleanup_unpublished(directory)?;
-    sync_store_directory(directory)
+    sync_store_directory_capability(directory)
 }
 
 pub(super) fn recover_interrupted_compaction<P, I, C>(
@@ -115,15 +111,11 @@ where
     I: PersistentObjectIdentity,
     C: PrincipalCodec<P>,
 {
-    let intent = directory.join(COMPACTION_INTENT_FILE);
-    if !intent
-        .try_exists()
-        .map_err(|source| io_error("inspect compaction intent", source))?
-    {
-        return cleanup_without_intent(directory);
+    if !capability_file_exists(store_root, COMPACTION_INTENT_FILE)? {
+        return cleanup_without_intent(store_root);
     }
-    let intent_model = validate_intent(&intent, identity, limits)?;
-    let bundle = outbox::load_prepared_or_ready(directory, intent_model.commit, identity, limits)?;
+    let intent_model = validate_intent(store_root, identity, limits)?;
+    let bundle = outbox::load_prepared_or_ready(store_root, intent_model.commit, identity, limits)?;
     if bundle.placement_after_id(identity) != intent_model.placement_after {
         return Err(DurableError::InvalidCompactionEvidence(
             "compaction intent placement differs from its evidence bundle",
@@ -159,13 +151,13 @@ where
     }
     rebase_representation_authority(directory, store_root, identity, limits)?;
     remove_capability_file_if_exists(store_root, INDEX_FILE)?;
-    let ready = outbox::mark_ready(directory, intent_model.commit, identity, limits)?;
+    let ready = outbox::mark_ready(store_root, intent_model.commit, identity, limits)?;
     if ready != bundle {
         return Err(DurableError::InvalidCompactionEvidence(
             "recovered GC evidence differs from its prepared bundle",
         ));
     }
-    finish_compaction(directory)
+    finish_compaction(store_root)
 }
 
 fn rebase_representation_authority<I: PersistentObjectIdentity>(
@@ -186,11 +178,11 @@ fn rebase_representation_authority<I: PersistentObjectIdentity>(
 }
 
 fn validate_intent<I: PersistentObjectIdentity>(
-    path: &Path,
+    directory: &cap_std::fs::Dir,
     identity: &I,
     limits: RecoveryLimits,
 ) -> Result<CompactionIntent, DurableError> {
-    let mut file = open_rw(path)?;
+    let mut file = open_rw_capability(directory, Path::new(COMPACTION_INTENT_FILE), false)?;
     let mut recovered = None;
     scan_frames(
         &mut file,
@@ -439,32 +431,19 @@ fn remove_capability_file_if_exists(
 }
 
 fn cleanup_authority_remnants(
-    directory: &Path,
+    directory: &cap_std::fs::Dir,
     active_name: &'static str,
     compacting_name: &'static str,
     previous_name: &'static str,
 ) -> Result<(), DurableError> {
-    let active = directory.join(active_name);
-    let previous = directory.join(previous_name);
-    if !active
-        .try_exists()
-        .map_err(|source| io_error("inspect active compaction file", source))?
-        && previous
-            .try_exists()
-            .map_err(|source| io_error("inspect previous compaction file", source))?
+    if !capability_file_exists(directory, active_name)?
+        && capability_file_exists(directory, previous_name)?
     {
-        std::fs::rename(&previous, &active)
+        directory
+            .rename(previous_name, directory, active_name)
             .map_err(|source| io_error("restore previous compaction generation", source))?;
     } else {
-        remove_if_exists(&previous)?;
+        remove_capability_file_if_exists(directory, previous_name)?;
     }
-    remove_if_exists(&directory.join(compacting_name))
-}
-
-fn remove_if_exists(path: &Path) -> Result<(), DurableError> {
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(source) if source.kind() == ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(io_error("remove compaction remnant", source)),
-    }
+    remove_capability_file_if_exists(directory, compacting_name)
 }

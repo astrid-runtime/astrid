@@ -211,6 +211,32 @@ fn compaction_reclaims_only_unreachable_objects_and_preserves_root_generation() 
 }
 
 #[test]
+fn compaction_remains_bound_to_the_pinned_store_after_path_replacement() {
+    let parent = tempfile::tempdir().unwrap();
+    let configured = parent.path().join("configured");
+    let retained = parent.path().join("retained");
+    let engine = super::tests::open(&configured);
+    let (first, current) = two_versions(&engine);
+    let policy = evidence(b"retain-current-roots");
+    let authorization = plan(&engine, retention(&engine, &policy, []), policy);
+
+    std::fs::rename(&configured, &retained).unwrap();
+    std::fs::create_dir(&configured).unwrap();
+
+    engine.compact(&authorization).unwrap();
+    assert!(engine.object(first.commit).unwrap().is_none());
+    assert_eq!(engine.root(&"alice".to_owned()).unwrap(), Some(current));
+    assert_eq!(engine.pending_compaction_evidence().unwrap().len(), 1);
+    assert_eq!(std::fs::read_dir(&configured).unwrap().count(), 0);
+    drop(engine);
+
+    let reopened = super::tests::open(&retained);
+    assert_eq!(reopened.root(&"alice".to_owned()).unwrap(), Some(current));
+    assert!(reopened.object(first.commit).unwrap().is_none());
+    assert_eq!(reopened.pending_compaction_evidence().unwrap().len(), 1);
+}
+
+#[test]
 fn compaction_invalidates_evidence_for_reclaimed_staged_objects() {
     let directory = tempfile::tempdir().unwrap();
     let engine = super::tests::open(directory.path());

@@ -7,7 +7,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+#[cfg(test)]
+use std::fs::OpenOptions;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
@@ -585,17 +587,16 @@ pub use compaction::{
 pub use faults::{FaultInjector, FaultPoint, NoFaults};
 use format::{
     PreparedFrame, append_frame, append_frames, append_prepared_frames, canonical_record_bytes,
-    corrupt, decode_object_frame, encode_object_frame, ensure_payload_limit, io_error, open_rw,
+    corrupt, decode_object_frame, encode_object_frame, ensure_payload_limit, io_error,
     read_indexed_object, read_indexed_object_with_payload, read_indexed_objects, recover_arena,
-    scan_frames, sync_store_directory, verify_indexed_location, verify_indexed_tail,
-    visit_indexed_objects,
+    scan_frames, verify_indexed_location, verify_indexed_tail, visit_indexed_objects,
 };
 #[cfg(test)]
-use format::{frame_checksum, last_batch_spans};
+use format::{frame_checksum, last_batch_spans, open_rw};
 use index::{IndexState, recover_index, replace_index};
 use native_io::{
-    create_private as create_private_file_capability, open_rw as open_rw_capability,
-    sync_directory as sync_store_directory_capability,
+    create_private as create_private_file_capability, open_directory as open_directory_capability,
+    open_rw as open_rw_capability, sync_directory as sync_store_directory_capability,
 };
 use recovery::{RecoveryScope, recover_store};
 use roots::{encode_root_record, encode_root_snapshot, recover_roots};

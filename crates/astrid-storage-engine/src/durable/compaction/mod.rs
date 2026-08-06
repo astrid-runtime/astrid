@@ -1,7 +1,7 @@
 //! Proof-bound liveness capture and crash-recoverable arena compaction.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{Seek, SeekFrom};
 use std::path::Path;
 
@@ -15,10 +15,11 @@ use crate::refinery::{EngineCompactionPass, NativeArenaCompactionPass};
 use super::{
     ARENA_FILE, ARENA_MAGIC, ArenaLocation, DurableEngine, DurableError, DurableFiles,
     DurableInner, FaultPoint, INDEX_FILE, IndexState, PersistentObjectIdentity, PrincipalCodec,
-    ROOT_FILE, ROOT_MAGIC, RecoveryLimits, append_frame, decode_object_frame, encode_object_frame,
-    encode_root_snapshot, ensure_payload_limit, io_error, live_files_mut, materialize_closure,
-    open_rw, open_rw_capability, read_indexed_object, recover_arena, recover_roots, replace_index,
-    scan_frames, sync_store_directory, sync_store_directory_capability,
+    ROOT_FILE, ROOT_MAGIC, RecoveryLimits, append_frame, create_private_file_capability,
+    decode_object_frame, encode_object_frame, encode_root_snapshot, ensure_payload_limit, io_error,
+    live_files_mut, materialize_closure, open_directory_capability, open_rw_capability,
+    read_indexed_object, recover_arena, recover_roots, replace_index, scan_frames,
+    sync_store_directory_capability,
 };
 
 const FACT_SNAPSHOT_PREFIX: &[u8] = b"astrid-gc-fact-snapshot-v1\0";
@@ -307,7 +308,7 @@ where
         &self,
     ) -> Result<Vec<CompactionEvidenceBundle>, DurableError> {
         let _inner = self.lock_usable()?;
-        outbox::pending(&self.directory, &self.identity, self.limits)
+        outbox::pending(&self.directory_capability, &self.identity, self.limits)
     }
 
     /// Acknowledge one receipt after the independent audit sink is durable.
@@ -320,7 +321,12 @@ where
     /// Returns a recovery-required, I/O, framing, identity, or evidence error.
     pub fn acknowledge_compaction_evidence(&self, commit: GcCommitId) -> Result<(), DurableError> {
         let _inner = self.lock_usable()?;
-        outbox::acknowledge(&self.directory, commit, &self.identity, self.limits)
+        outbox::acknowledge(
+            &self.directory_capability,
+            commit,
+            &self.identity,
+            self.limits,
+        )
     }
 
     fn capture_facts_locked(
@@ -526,14 +532,14 @@ where
         let prepared = self.prepare_compaction(inner, authorization, live)?;
         self.fail_if(FaultPoint::AfterCompactionFilesFlush)?;
         outbox::prepare(
-            &self.directory,
+            &self.directory_capability,
             &prepared.bundle,
             &self.identity,
             self.limits,
         )?;
         self.fail_if(FaultPoint::AfterCompactionEvidencePrepare)?;
         write_compaction_intent(
-            &self.directory,
+            &self.directory_capability,
             prepared.intent,
             &self.identity,
             self.limits,
@@ -577,7 +583,7 @@ where
         let arena_bytes_after = replacement.arena_len;
         self.install_replacement(inner, replacement)?;
         let ready = outbox::mark_ready(
-            &self.directory,
+            &self.directory_capability,
             prepared.intent.commit,
             &self.identity,
             self.limits,
@@ -588,9 +594,9 @@ where
             ));
         }
         self.fail_if(FaultPoint::AfterCompactionEvidenceReady)?;
-        prepare_finish_compaction(&self.directory)?;
+        prepare_finish_compaction(&self.directory_capability)?;
         self.fail_if(FaultPoint::BeforeCompactionIntentRemoval)?;
-        remove_compaction_intent(&self.directory)?;
+        remove_compaction_intent(&self.directory_capability)?;
         Ok(CompactionReport {
             objects_before: prepared.objects_before,
             objects_after: prepared.objects_after,
@@ -608,7 +614,7 @@ where
         authorization: &VerifiedCompactionPlan,
         live: &BTreeSet<ObjectId>,
     ) -> Result<PreparedCompaction, DurableError> {
-        cleanup_without_intent(&self.directory)?;
+        cleanup_without_intent(&self.directory_capability)?;
         let objects_before = u64::try_from(Self::object_universe(inner).len())
             .map_err(|_| DurableError::EncodingOverflow)?;
         let (arena_bytes_before, root_bytes_before, root_digest_before) = {
@@ -843,19 +849,6 @@ fn encoded_roots<P: Ord, C: PrincipalCodec<P>>(
         ));
     }
     Ok(encoded)
-}
-
-fn create_private_file(path: &Path) -> Result<File, DurableError> {
-    let mut options = OpenOptions::new();
-    options.create(true).truncate(true).read(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    options
-        .open(path)
-        .map_err(|source| io_error("create compaction file", source))
 }
 
 pub(super) fn root_journal_digest(file: &mut File) -> Result<[u8; 32], DurableError> {
