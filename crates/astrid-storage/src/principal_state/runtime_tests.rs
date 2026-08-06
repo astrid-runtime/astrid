@@ -1268,7 +1268,11 @@ async fn staged_publication_retries_after_root_commit_before_cleanup() {
     let retried = store.publish_staged(staged).await.unwrap();
     assert_eq!(retried.descriptor(), first.descriptor());
     assert_eq!(retried.principal_root(), first.principal_root());
-    assert_eq!(retried.objects_inserted(), 0);
+    assert_eq!(
+        retried.objects_inserted(),
+        1,
+        "unchanged logical publication still reports newly admitted physical evidence"
+    );
     assert!(store.staging().ready().unwrap().is_empty());
 }
 

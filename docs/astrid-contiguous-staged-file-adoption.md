@@ -29,13 +29,16 @@ means the clone shares the content extents while the staging footer occupies at
 most its own changed tail extent. The source remains a byte-exact durable retry
 witness until the ordinary root publication marker authorizes staging cleanup.
 
-This removes the destructive transition that required a separate adoption
-intent. Every crash prefix has one of three simple states: the unchanged sealed
-source alone; the source plus unauthoritative temporary/blob files; or the
-source plus an authoritative representation state. Retrying from the source is
-always possible. A filesystem without clone support copies exactly the logical
-prefix into the same private temporary and follows the identical verification
-and publication path.
+This removes the destructive transition that required a *second* adoption
+intent. The existing checksummed staging intent remains durable throughout the
+operation and binds owner, content name, generation, length, profile, and
+source identity before any representation mutation. Every crash prefix has one
+of three simple states: the unchanged sealed source alone; the source plus
+unauthoritative temporary/blob files; or the source plus an authoritative
+representation state. Retrying from the intent-bound source is always possible.
+A filesystem without clone support copies exactly the logical prefix into the
+same private temporary and follows the identical verification and publication
+path.
 
 Temporary blob names are private and non-authoritative. The final target is the
 canonical loose-blob path from the representation contract. Publication uses

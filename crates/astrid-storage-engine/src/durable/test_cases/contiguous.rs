@@ -201,6 +201,42 @@ fn contiguous_publication_rejects_a_symlink_at_the_canonical_blob_path() {
     assert_eq!(std::fs::read(target).unwrap(), content);
 }
 
+#[cfg(unix)]
+#[test]
+fn contiguous_reads_reject_a_blob_replaced_by_a_symlink() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open(directory.path());
+    activate_physical_authority(&engine);
+    let content = patterned_content(256 * 1024 + 11);
+    let prepared = engine
+        .prepare_contiguous_file(
+            astrid_storage_content::ChunkingProfile::ASTRID_V1,
+            u64::try_from(content.len()).unwrap(),
+            std::io::Cursor::new(&content),
+        )
+        .unwrap();
+    let chunk = *prepared.payload.slices.keys().next().unwrap();
+    let blob_path = engine
+        .inner
+        .lock()
+        .representations
+        .as_ref()
+        .unwrap()
+        .loose_blob_path(prepared.payload.blob, 1);
+    engine
+        .publish_contiguous_copy(prepared, std::io::Cursor::new(&content))
+        .unwrap();
+    let replacement = directory.path().join("redirected-blob");
+    std::fs::write(&replacement, &content).unwrap();
+    std::fs::remove_file(&blob_path).unwrap();
+    std::os::unix::fs::symlink(&replacement, &blob_path).unwrap();
+
+    assert!(matches!(
+        engine.object(chunk),
+        Err(DurableError::InvalidRepresentationState(_))
+    ));
+}
+
 #[test]
 fn contiguous_publication_rejects_wrong_bytes_at_the_canonical_blob_path() {
     let directory = tempfile::tempdir().unwrap();
@@ -229,6 +265,37 @@ fn contiguous_publication_rejects_wrong_bytes_at_the_canonical_blob_path() {
         Err(DurableError::InvalidRepresentationState(_))
     ));
     assert_eq!(std::fs::read(blob_path).unwrap(), vec![0xff; content.len()]);
+}
+
+#[test]
+fn occupied_blob_reuse_still_verifies_the_supplied_complete_preimage() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open(directory.path());
+    activate_physical_authority(&engine);
+    let content = patterned_content(256 * 1024 + 29);
+    let prepared = engine
+        .prepare_contiguous_file(
+            astrid_storage_content::ChunkingProfile::ASTRID_V1,
+            u64::try_from(content.len()).unwrap(),
+            std::io::Cursor::new(&content),
+        )
+        .unwrap();
+    engine
+        .publish_contiguous_copy(prepared, std::io::Cursor::new(&content))
+        .unwrap();
+    let retry = engine
+        .prepare_contiguous_file(
+            astrid_storage_content::ChunkingProfile::ASTRID_V1,
+            u64::try_from(content.len()).unwrap(),
+            std::io::Cursor::new(&content),
+        )
+        .unwrap();
+    let different = vec![0x5a; content.len()];
+
+    assert!(matches!(
+        engine.publish_contiguous_copy(retry, std::io::Cursor::new(different)),
+        Err(DurableError::InvalidRepresentationState(_))
+    ));
 }
 
 #[test]

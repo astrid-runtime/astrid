@@ -44,6 +44,16 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   native installations deterministically acquire a default user, fleet, and
   ownership edge without changing CLI, HTTP, profile, group, or
   `StateOwnerCodecV1` behavior. Closes #1469.
+- **Sealed staging files can become verified contiguous physical
+  representations without a second full-data write.** Canonical File and
+  ChunkTree objects remain in the arena while authenticated chunk slices are
+  recovered transparently from a copy-on-write cloned blob. Export and
+  snapshots still materialize canonical Chunk records. Crash-prefix,
+  tamper, symlink, occupied-path, and source-preservation tests cover the new
+  publication protocol. On the clean 512 MiB APFS benchmark, staging remains
+  at native speed, eight-worker publication reaches 1,556.4 MiB/s, warm
+  verified reads reach 1,754.4 MiB/s, and duplicate publication appends 8,387
+  authoritative bytes. Closes #1467.
 
 - **Bulk publication reuses closure evidence earned during authoritative
   staging.** A bounded, batch-local dependency walk proves admitted owning
