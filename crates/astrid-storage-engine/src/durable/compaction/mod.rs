@@ -17,8 +17,8 @@ use super::{
     DurableInner, FaultPoint, INDEX_FILE, IndexState, PersistentObjectIdentity, PrincipalCodec,
     ROOT_FILE, ROOT_MAGIC, RecoveryLimits, append_frame, decode_object_frame, encode_object_frame,
     encode_root_snapshot, ensure_payload_limit, io_error, live_files_mut, materialize_closure,
-    open_rw, read_indexed_object, recover_arena, recover_roots, replace_index, scan_frames,
-    sync_store_directory,
+    open_rw, open_rw_capability, read_indexed_object, recover_arena, recover_roots, replace_index,
+    scan_frames, sync_store_directory, sync_store_directory_capability,
 };
 
 const FACT_SNAPSHOT_PREFIX: &[u8] = b"astrid-gc-fact-snapshot-v1\0";
@@ -542,7 +542,7 @@ where
 
         drop(inner.files.take());
         self.promote_replacement_files()?;
-        sync_store_directory(&self.directory)?;
+        sync_store_directory_capability(&self.directory_capability)?;
         self.fail_if(FaultPoint::AfterCompactionDirectoryFlush)?;
         let replacement = self.open_replacement_files()?;
         let promoted = evidence::placement_record(
@@ -562,7 +562,8 @@ where
             ));
         }
         if let Some(representations) = inner.representations.as_mut() {
-            let arena = open_rw(&self.directory.join(ARENA_FILE))?;
+            let arena =
+                open_rw_capability(&self.directory_capability, Path::new(ARENA_FILE), false)?;
             representations.rebase_compacted_arena(
                 &arena,
                 &replacement.index,
@@ -697,8 +698,10 @@ where
             objects: replacement.index.clone(),
         };
         let index_cache = replace_index(&self.directory, &index_state, self.identity.scheme());
-        let mut arena = open_rw(&self.directory.join(ARENA_FILE))?;
-        let mut roots = open_rw(&self.directory.join(ROOT_FILE))?;
+        let mut arena =
+            open_rw_capability(&self.directory_capability, Path::new(ARENA_FILE), false)?;
+        let mut roots =
+            open_rw_capability(&self.directory_capability, Path::new(ROOT_FILE), false)?;
         arena
             .seek(SeekFrom::End(0))
             .map_err(|source| io_error("seek compacted object arena", source))?;
@@ -736,7 +739,10 @@ where
         inner: &mut DurableInner<P>,
         live: &BTreeSet<ObjectId>,
     ) -> Result<ReplacementState<P>, DurableError> {
-        let mut arena = create_private_file(&self.directory.join(ARENA_COMPACTING))?;
+        let mut arena = super::create_private_file_capability(
+            &self.directory_capability,
+            Path::new(ARENA_COMPACTING),
+        )?;
         let mut new_index = BTreeMap::new();
         for id in live {
             let record = self.read_compaction_object(inner, *id)?;
@@ -752,12 +758,15 @@ where
         let roots = encoded_roots(&inner.roots_by_principal, &self.principal_codec)?;
         let payload = encode_root_snapshot(self.identity.scheme(), &roots)?;
         ensure_payload_limit(ROOT_FILE, 0, payload.len(), self.limits)?;
-        let mut journal = create_private_file(&self.directory.join(ROOTS_COMPACTING))?;
+        let mut journal = super::create_private_file_capability(
+            &self.directory_capability,
+            Path::new(ROOTS_COMPACTING),
+        )?;
         append_frame(&mut journal, ROOT_MAGIC, &payload)?;
         journal
             .sync_data()
             .map_err(|source| io_error("flush compacted root snapshot", source))?;
-        sync_store_directory(&self.directory)?;
+        sync_store_directory_capability(&self.directory_capability)?;
         validate_replacement(
             &mut arena,
             &mut journal,
@@ -769,19 +778,21 @@ where
     }
 
     fn promote_replacement_files(&self) -> Result<(), DurableError> {
-        backup_active(&self.directory, ARENA_FILE, ARENA_PREVIOUS)?;
+        backup_active(&self.directory_capability, ARENA_FILE, ARENA_PREVIOUS)?;
         self.fail_if(FaultPoint::AfterCompactionArenaBackup)?;
-        promote_compacting(&self.directory, ARENA_COMPACTING, ARENA_FILE)?;
+        promote_compacting(&self.directory_capability, ARENA_COMPACTING, ARENA_FILE)?;
         self.fail_if(FaultPoint::AfterCompactionArenaPromote)?;
-        backup_active(&self.directory, ROOT_FILE, ROOTS_PREVIOUS)?;
+        backup_active(&self.directory_capability, ROOT_FILE, ROOTS_PREVIOUS)?;
         self.fail_if(FaultPoint::AfterCompactionRootsBackup)?;
-        promote_compacting(&self.directory, ROOTS_COMPACTING, ROOT_FILE)?;
+        promote_compacting(&self.directory_capability, ROOTS_COMPACTING, ROOT_FILE)?;
         self.fail_if(FaultPoint::AfterCompactionRootsPromote)
     }
 
     fn open_replacement_files(&self) -> Result<ReplacementState<P>, DurableError> {
-        let mut arena = open_rw(&self.directory.join(ARENA_FILE))?;
-        let mut roots = open_rw(&self.directory.join(ROOT_FILE))?;
+        let mut arena =
+            open_rw_capability(&self.directory_capability, Path::new(ARENA_FILE), false)?;
+        let mut roots =
+            open_rw_capability(&self.directory_capability, Path::new(ROOT_FILE), false)?;
         let (index, arena_tail) = recover_arena(&mut arena, &self.identity, self.limits, 0)?;
         let (roots_by_principal, validated) = recover_roots(
             &mut roots,

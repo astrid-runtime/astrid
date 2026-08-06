@@ -10,7 +10,7 @@ use super::format::StagingIntent;
 use super::journal::{JournalRecord, StageKey, append_records, flush_journal};
 use super::{
     NativeContentStagingArea, PrivateFileIdentity, ReadyStagedContent, StagingFaultPoint,
-    sync_directory,
+    open_generation, sync_directory,
 };
 use crate::error::{StorageError, StorageResult};
 
@@ -135,6 +135,13 @@ impl NativeContentStagingArea {
             return;
         }
         let result = (|| {
+            for request in &batch {
+                open_generation(
+                    &request.path,
+                    &request.intent,
+                    Some(request.source_identity),
+                )?;
+            }
             sync_directory(&self.inner.generations)?;
             self.fail_if(StagingFaultPoint::GenerationDirectoryFlushed)?;
             let records: Vec<_> = batch

@@ -563,6 +563,7 @@ mod format;
 mod group;
 mod index;
 mod lifecycle;
+mod native_io;
 mod recovery;
 mod representation_engine;
 mod representations;
@@ -592,6 +593,10 @@ use format::{
 #[cfg(test)]
 use format::{frame_checksum, last_batch_spans};
 use index::{IndexState, recover_index, replace_index};
+use native_io::{
+    create_private as create_private_file_capability, open_rw as open_rw_capability,
+    sync_directory as sync_store_directory_capability,
+};
 use recovery::{RecoveryScope, recover_store};
 use roots::{encode_root_record, encode_root_snapshot, recover_roots};
 use validation::{

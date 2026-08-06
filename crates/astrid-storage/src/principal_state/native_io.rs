@@ -282,6 +282,44 @@ pub(super) fn rename_private_entry(source: &Path, destination: &Path) -> Storage
     })
 }
 
+pub(super) fn rename_private_entry_with_identity(
+    source: &Path,
+    destination: &Path,
+    expected: PrivateFileIdentity,
+) -> StorageResult<()> {
+    let source_file = open_private_file(source)?;
+    if private_file_identity(&source_file)? != expected {
+        return Err(connection(format!(
+            "private source {} changed before rename",
+            source.display()
+        )));
+    }
+    match std::fs::symlink_metadata(destination) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+        Err(error) => {
+            return Err(connection(format!(
+                "inspect private rename destination {}: {error}",
+                destination.display()
+            )));
+        },
+        Ok(_) => {
+            return Err(connection(format!(
+                "private rename destination {} already exists",
+                destination.display()
+            )));
+        },
+    }
+    rename_private_entry(source, destination)?;
+    let destination_file = open_private_file(destination)?;
+    if private_file_identity(&destination_file)? != expected {
+        return Err(connection(format!(
+            "private destination {} does not name the verified source",
+            destination.display()
+        )));
+    }
+    Ok(())
+}
+
 pub(super) fn sync_directory(path: &Path) -> StorageResult<()> {
     #[cfg(unix)]
     {
