@@ -17,7 +17,8 @@ use astrid_storage_model::{
 
 use super::representations::PhysicalIdentityV1;
 use super::{
-    DurableEngine, DurableError, FaultPoint, PersistentObjectIdentity, PrincipalCodec, io_error,
+    DurableEngine, DurableError, DurableInner, FaultPoint, ModelError, PersistentObjectIdentity,
+    PrincipalCodec, io_error, read_indexed_object,
 };
 
 const PREPARATION_BATCH_BYTES: usize = 4 * 1024 * 1024;
@@ -90,6 +91,7 @@ pub(super) struct PreparedContiguousPayload {
     pub(super) representation: RepresentationRecord,
     pub(super) evidence: ObjectRecord,
     pub(super) slices: BTreeMap<ObjectId, ContiguousSlice>,
+    pub(super) collision_slices: Vec<(ObjectId, ContiguousSlice)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -192,6 +194,7 @@ where
                 representation,
                 evidence,
                 slices: sink.slices,
+                collision_slices: sink.collision_slices,
             },
         })
     }
@@ -313,6 +316,7 @@ where
             payload,
         } = prepared;
         let mut inner = self.lock_usable()?;
+        self.validate_installed_contiguous_collisions(&inner, &payload)?;
         let evidence_id = self.identify(&payload.evidence);
         if !inner.index.contains_key(&evidence_id) {
             return Err(DurableError::InvalidRepresentationState(
@@ -355,6 +359,76 @@ where
         })
     }
 
+    fn validate_installed_contiguous_collisions(
+        &self,
+        inner: &DurableInner<P>,
+        payload: &PreparedContiguousPayload,
+    ) -> Result<(), DurableError> {
+        let representations =
+            inner
+                .representations
+                .as_ref()
+                .ok_or(DurableError::InvalidRepresentationState(
+                    "contiguous publication requires active physical authority",
+                ))?;
+        let candidate_blob = representations.open_loose_blob(payload.blob, 1)?;
+        let read_candidate = |id, slice: ContiguousSlice| {
+            super::representations::read_contiguous_object(
+                candidate_blob
+                    .try_clone()
+                    .map_err(|source| io_error("clone collision candidate blob", source))?,
+                super::representations::ContiguousLocation {
+                    blob: payload.blob,
+                    namespace_generation: 1,
+                    offset: slice.offset,
+                    length: slice.length,
+                },
+                id,
+                &self.identity,
+            )
+        };
+
+        for (id, duplicate) in &payload.collision_slices {
+            let first = *payload
+                .slices
+                .get(id)
+                .ok_or(DurableError::InvalidRepresentationState(
+                    "duplicate contiguous slice has no primary slice",
+                ))?;
+            if read_candidate(*id, first)? != read_candidate(*id, *duplicate)? {
+                return Err(ModelError::ObjectCollision(*id).into());
+            }
+        }
+
+        let files = inner.files.as_ref().ok_or(DurableError::Closed)?;
+        for (id, slice) in &payload.slices {
+            let existing = if let Some(location) = inner.index.get(id).copied() {
+                Some(read_indexed_object(
+                    &files.arena,
+                    *id,
+                    location,
+                    &self.identity,
+                    self.limits,
+                )?)
+            } else if let Some((file, location)) = representations.open_contiguous_read(*id)? {
+                Some(super::representations::read_contiguous_object(
+                    file,
+                    location,
+                    *id,
+                    &self.identity,
+                )?)
+            } else {
+                None
+            };
+            if let Some(existing) = existing
+                && read_candidate(*id, *slice)? != existing
+            {
+                return Err(ModelError::ObjectCollision(*id).into());
+            }
+        }
+        Ok(())
+    }
+
     fn contiguous_profile(
         &self,
     ) -> Result<(RepresentationProfile, RepresentationProfileId), DurableError> {
@@ -388,6 +462,7 @@ struct ContiguousSink<'a, P: Ord, I, C> {
     canonical_output_bytes: u64,
     observations: Vec<RepresentationOutputObservation>,
     slices: BTreeMap<ObjectId, ContiguousSlice>,
+    collision_slices: Vec<(ObjectId, ContiguousSlice)>,
 }
 
 impl<'a, P: Ord, I, C> ContiguousSink<'a, P, I, C> {
@@ -401,6 +476,7 @@ impl<'a, P: Ord, I, C> ContiguousSink<'a, P, I, C> {
             canonical_output_bytes: 0,
             observations: Vec::new(),
             slices: BTreeMap::new(),
+            collision_slices: Vec::new(),
         }
     }
 }
@@ -440,7 +516,13 @@ where
         if record.kind() == ObjectKind::Chunk {
             let length = u64::try_from(record.canonical_bytes().len())
                 .map_err(|_| DurableError::EncodingOverflow)?;
-            if !self.slices.contains_key(&id) {
+            let slice = ContiguousSlice {
+                offset: self.offset,
+                length,
+            };
+            if self.slices.contains_key(&id) {
+                self.collision_slices.push((id, slice));
+            } else {
                 let canonical_record_bytes = record.retained_bytes()?;
                 self.canonical_output_bytes = self
                     .canonical_output_bytes
@@ -450,13 +532,7 @@ where
                     id,
                     canonical_record_bytes,
                 ));
-                self.slices.insert(
-                    id,
-                    ContiguousSlice {
-                        offset: self.offset,
-                        length,
-                    },
-                );
+                self.slices.insert(id, slice);
             }
             self.offset = self
                 .offset

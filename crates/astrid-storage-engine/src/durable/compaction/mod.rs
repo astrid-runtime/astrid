@@ -54,6 +54,7 @@ struct CompactionIntent {
 
 pub(super) fn recover_interrupted_compaction<P, I, C>(
     directory: &Path,
+    store_root: &cap_std::fs::Dir,
     codec: &C,
     identity: &I,
     limits: RecoveryLimits,
@@ -63,7 +64,7 @@ where
     I: PersistentObjectIdentity,
     C: PrincipalCodec<P>,
 {
-    recovery::recover_interrupted_compaction(directory, codec, identity, limits)
+    recovery::recover_interrupted_compaction(directory, store_root, codec, identity, limits)
 }
 
 /// Native relation snapshot and proposed condemned set for one GC proof.

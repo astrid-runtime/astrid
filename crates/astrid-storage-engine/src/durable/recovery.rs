@@ -36,7 +36,7 @@ where
     I: PersistentObjectIdentity,
     C: PrincipalCodec<P>,
 {
-    recover_interrupted_compaction(path, principal_codec, identity, limits)?;
+    recover_interrupted_compaction(path, store_root, principal_codec, identity, limits)?;
     let mut representations =
         super::representations::RepresentationStore::open(path, store_root, limits)?;
     let protected_arena_len = representations.as_ref().map_or(
