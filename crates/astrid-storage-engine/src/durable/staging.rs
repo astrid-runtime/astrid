@@ -1,6 +1,8 @@
 //! Incremental immutable-object staging for durable root transactions.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+use std::time::Instant;
 
 use astrid_storage_model::{
     InsertOutcome, ModelError, ObjectId, ObjectRecord, RepresentationProfileId,
@@ -11,6 +13,10 @@ use super::{
     ARENA_FILE, ARENA_MAGIC, ArenaLocation, DurableEngine, DurableError, DurableInner, File,
     PersistentObjectIdentity, PreparedFrame, PrincipalCodec, append_frame, append_prepared_frames,
     encode_object_frame, ensure_payload_limit, live_files_mut, read_indexed_object,
+};
+use crate::projection::{object_record_retained_bytes, with_buffered_observer};
+use crate::{
+    PreparedProjectionBatch, PrincipalProjectionError, ProjectionObserver, ProjectionPhase,
 };
 
 struct PreparedStagingObject {
@@ -27,6 +33,12 @@ struct PreparedStagingAppend {
 struct PreparedStagingBatch {
     unique: BTreeMap<ObjectId, PreparedStagingObject>,
     input_order: Vec<ObjectId>,
+}
+
+struct DurablePreparedBatch {
+    authority: Arc<()>,
+    direct_profile: Option<RepresentationProfileId>,
+    prepared: PreparedStagingBatch,
 }
 
 struct StagingBatchAppend {
@@ -78,29 +90,48 @@ impl PreparedStagingBatch {
         identity: &I,
         already_present: &BTreeSet<ObjectId>,
         direct_profile: Option<RepresentationProfileId>,
+        observer: Option<&dyn ProjectionObserver>,
     ) -> Result<(), DurableError> {
+        let mut preparation_elapsed = std::time::Duration::ZERO;
+        let mut direct_identity_elapsed = std::time::Duration::ZERO;
         for (id, prepared) in &mut self.unique {
             if already_present.contains(id) {
                 continue;
             }
+            let preparation_started = observer.map(|_| Instant::now());
             let canonical_record = match &prepared.append {
                 Some(append) => {
                     super::canonical_record_bytes(append.frame.payload(), identity.scheme())?
                 },
                 None => super::canonical_record_bytes(&prepared.payload, identity.scheme())?,
             };
+            preparation_elapsed = preparation_elapsed.saturating_add(
+                preparation_started.map_or(std::time::Duration::ZERO, |started| started.elapsed()),
+            );
+            let direct_started = observer.map(|_| Instant::now());
             let direct = direct_profile
                 .map(|profile| PreparedDirectArenaObject::identify(profile, *id, canonical_record))
                 .transpose()?;
+            direct_identity_elapsed = direct_identity_elapsed.saturating_add(
+                direct_started.map_or(std::time::Duration::ZERO, |started| started.elapsed()),
+            );
             if let Some(append) = &mut prepared.append {
                 append.direct = direct;
             } else {
                 let payload = std::mem::take(&mut prepared.payload);
+                let frame_started = observer.map(|_| Instant::now());
                 prepared.append = Some(PreparedStagingAppend {
                     frame: PreparedFrame::new(ARENA_MAGIC, payload)?,
                     direct,
                 });
+                preparation_elapsed = preparation_elapsed.saturating_add(
+                    frame_started.map_or(std::time::Duration::ZERO, |started| started.elapsed()),
+                );
             }
+        }
+        if let Some(observer) = observer {
+            observer.record(ProjectionPhase::ObjectPreparation, preparation_elapsed);
+            observer.record(ProjectionPhase::DirectIdentity, direct_identity_elapsed);
         }
         Ok(())
     }
@@ -109,6 +140,25 @@ impl PreparedStagingBatch {
         self.unique
             .iter()
             .all(|(id, prepared)| already_present.contains(id) || prepared.append.is_some())
+    }
+
+    fn retained_bytes(&self) -> usize {
+        let input_ids = self.input_order.len().saturating_mul(size_of::<ObjectId>());
+        self.unique.values().fold(input_ids, |total, prepared| {
+            let record = object_record_retained_bytes(&prepared.record);
+            let encoded = prepared
+                .append
+                .as_ref()
+                .map_or(prepared.payload.len(), |append| {
+                    append.frame.retained_bytes().saturating_add(
+                        append
+                            .direct
+                            .as_ref()
+                            .map_or(0, |_| size_of::<PreparedDirectArenaObject>()),
+                    )
+                });
+            total.saturating_add(record).saturating_add(encoded)
+        })
     }
 
     fn finish(
@@ -260,7 +310,46 @@ where
         &self,
         records: Vec<ObjectRecord>,
     ) -> Result<Vec<(ObjectId, InsertOutcome)>, DurableError> {
-        self.stage_objects_with_appender(records, append_prepared_frames)
+        self.stage_objects_with_appender(records, append_prepared_frames, None)
+    }
+
+    pub(crate) fn prepare_objects_for_projection(
+        &self,
+        records: Vec<ObjectRecord>,
+        observer: Option<&dyn ProjectionObserver>,
+    ) -> Result<PreparedProjectionBatch, DurableError> {
+        with_buffered_observer(observer, |buffer| {
+            let prepared = self.prepare_staging_batch(records, buffer)?;
+            let retained_bytes = prepared.prepared.retained_bytes();
+            Ok(PreparedProjectionBatch::engine(prepared, retained_bytes))
+        })
+    }
+
+    pub(crate) fn stage_prepared_for_projection(
+        &self,
+        prepared: PreparedProjectionBatch,
+        observer: Option<&dyn ProjectionObserver>,
+    ) -> Result<Vec<(ObjectId, InsertOutcome)>, PrincipalProjectionError> {
+        let prepared = prepared
+            .into_engine_payload::<DurablePreparedBatch>()
+            .ok_or_else(foreign_preparation)?;
+        if !Arc::ptr_eq(&self.preparation_authority, &prepared.authority) {
+            return Err(foreign_preparation());
+        }
+        with_buffered_observer(observer, |buffer| {
+            self.stage_prepared_batch_with_appender(prepared, append_prepared_frames, buffer)
+                .map_err(crate::projection::map_durable)
+        })
+    }
+
+    pub(crate) fn stage_objects_observed(
+        &self,
+        records: Vec<ObjectRecord>,
+        observer: &dyn ProjectionObserver,
+    ) -> Result<Vec<(ObjectId, InsertOutcome)>, DurableError> {
+        with_buffered_observer(Some(observer), |buffer| {
+            self.stage_objects_with_appender(records, append_prepared_frames, buffer)
+        })
     }
 
     #[cfg(test)]
@@ -272,56 +361,107 @@ where
     where
         A: FnMut(&mut File, &[PreparedFrame]) -> Result<Vec<ArenaLocation>, DurableError>,
     {
-        self.stage_objects_with_appender(records, appender)
+        self.stage_objects_with_appender(records, appender, None)
     }
 
     fn stage_objects_with_appender<A>(
         &self,
         records: Vec<ObjectRecord>,
-        mut write_batch: A,
+        write_batch: A,
+        observer: Option<&dyn ProjectionObserver>,
     ) -> Result<Vec<(ObjectId, InsertOutcome)>, DurableError>
     where
         A: FnMut(&mut File, &[PreparedFrame]) -> Result<Vec<ArenaLocation>, DurableError>,
     {
-        let mut prepared = PreparedStagingBatch::new(&self.identity, records, self.limits)?;
-        loop {
-            let mut inner = self.lock_usable()?;
-            let direct_profile = inner
-                .representations
-                .as_ref()
-                .map(RepresentationStore::direct_profile);
-            let already_present = self.verify_existing_batch(&mut inner, &prepared.unique)?;
-            if already_present.len() == prepared.unique.len() {
-                return Ok(prepared.finish(&already_present)?.outcomes);
-            }
-            drop(inner);
-            prepared.prepare_missing(&self.identity, &already_present, direct_profile)?;
+        let prepared = self.prepare_staging_batch(records, observer)?;
+        self.stage_prepared_batch_with_appender(prepared, write_batch, observer)
+    }
 
+    fn prepare_staging_batch(
+        &self,
+        records: Vec<ObjectRecord>,
+        observer: Option<&dyn ProjectionObserver>,
+    ) -> Result<DurablePreparedBatch, DurableError> {
+        let preparation_started = Instant::now();
+        let mut prepared = PreparedStagingBatch::new(&self.identity, records, self.limits)?;
+        record_phase(
+            observer,
+            ProjectionPhase::ObjectPreparation,
+            preparation_started,
+        );
+        let mut inner = self.lock_usable()?;
+        let direct_profile = inner
+            .representations
+            .as_ref()
+            .map(RepresentationStore::direct_profile);
+        let probe_started = Instant::now();
+        let already_present = self.verify_existing_batch(&mut inner, &prepared.unique)?;
+        record_phase(observer, ProjectionPhase::AdmissionProbe, probe_started);
+        drop(inner);
+        if already_present.len() != prepared.unique.len() {
+            prepared.prepare_missing(&self.identity, &already_present, direct_profile, observer)?;
+        }
+        Ok(DurablePreparedBatch {
+            authority: Arc::clone(&self.preparation_authority),
+            direct_profile,
+            prepared,
+        })
+    }
+
+    fn stage_prepared_batch_with_appender<A>(
+        &self,
+        mut prepared_batch: DurablePreparedBatch,
+        mut write_batch: A,
+        observer: Option<&dyn ProjectionObserver>,
+    ) -> Result<Vec<(ObjectId, InsertOutcome)>, DurableError>
+    where
+        A: FnMut(&mut File, &[PreparedFrame]) -> Result<Vec<ArenaLocation>, DurableError>,
+    {
+        loop {
             let mut inner = self.lock_usable()?;
             let active_profile = inner
                 .representations
                 .as_ref()
                 .map(RepresentationStore::direct_profile);
-            let already_present = self.verify_existing_batch(&mut inner, &prepared.unique)?;
-            if active_profile != direct_profile
-                || !prepared.every_missing_object_is_prepared(&already_present)
+            let probe_started = Instant::now();
+            let already_present =
+                self.verify_existing_batch(&mut inner, &prepared_batch.prepared.unique)?;
+            record_phase(observer, ProjectionPhase::AdmissionProbe, probe_started);
+            if already_present.len() == prepared_batch.prepared.unique.len() {
+                return Ok(prepared_batch.prepared.finish(&already_present)?.outcomes);
+            }
+            if active_profile != prepared_batch.direct_profile
+                || !prepared_batch
+                    .prepared
+                    .every_missing_object_is_prepared(&already_present)
             {
                 drop(inner);
+                prepared_batch.prepared.prepare_missing(
+                    &self.identity,
+                    &already_present,
+                    active_profile,
+                    observer,
+                )?;
+                prepared_batch.direct_profile = active_profile;
                 continue;
             }
-            let append = prepared.finish(&already_present)?;
+            let append = prepared_batch.prepared.finish(&already_present)?;
+            let append_started = Instant::now();
             let append_result = {
                 let files = live_files_mut(&mut inner.files)?;
                 write_batch(&mut files.arena, &append.frames)
             };
+            record_phase(observer, ProjectionPhase::ArenaAppend, append_started);
             match append_result {
                 Ok(locations) => {
+                    let map_started = Instant::now();
                     self.install_appended_batch(
                         &mut inner,
                         &append.ids,
                         append.direct,
                         &locations,
                     )?;
+                    record_phase(observer, ProjectionPhase::PhysicalMapUpdate, map_started);
                     return Ok(append.outcomes);
                 },
                 Err(error) => {
@@ -378,4 +518,20 @@ where
         }
         Ok(())
     }
+}
+
+fn record_phase(
+    observer: Option<&dyn ProjectionObserver>,
+    phase: ProjectionPhase,
+    started: Instant,
+) {
+    if let Some(observer) = observer {
+        observer.record(phase, started.elapsed());
+    }
+}
+
+fn foreign_preparation() -> PrincipalProjectionError {
+    PrincipalProjectionError::Engine(
+        "prepared object batch does not belong to this engine".to_owned(),
+    )
 }

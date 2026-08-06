@@ -6,7 +6,11 @@
 
 use std::any::Any;
 use std::fmt;
+use std::mem::{size_of, size_of_val};
 use std::sync::Arc;
+use std::time::Duration;
+
+use parking_lot::Mutex;
 
 use astrid_storage_model::{
     InsertOutcome, ModelError, ObjectId, ObjectIdentity, ObjectRecord, RootState,
@@ -47,6 +51,155 @@ pub trait ProjectionCachePayload: Any + Send + Sync {
 pub struct ProjectionCacheEntry {
     value: Arc<dyn Any + Send + Sync>,
     retained_bytes: u64,
+}
+
+/// Privileged phase name emitted by measured projection operations.
+///
+/// These phases expose shared-engine work and must remain below every
+/// principal-visible API boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ProjectionPhase {
+    /// Canonical object validation, identity, and frame preparation.
+    ObjectPreparation,
+    /// Authoritative existing-object collision probe.
+    AdmissionProbe,
+    /// Direct physical-identity construction.
+    DirectIdentity,
+    /// Append of prepared immutable-object frames.
+    ArenaAppend,
+    /// Physical representation-map staging or publication.
+    PhysicalMapUpdate,
+    /// Owning-closure validation before a root transition.
+    ClosureValidation,
+    /// Append of the authoritative root transition.
+    RootPublication,
+    /// Durable media flushes guarding publication acknowledgement.
+    Flush,
+}
+
+/// Operator-owned sink for projection phase measurements.
+pub trait ProjectionObserver: Send + Sync {
+    /// Record elapsed time for one privileged phase occurrence.
+    fn record(&self, phase: ProjectionPhase, elapsed: Duration);
+}
+
+/// Process-local phase buffer used to keep observer code outside engine locks.
+#[derive(Default)]
+pub(crate) struct ProjectionPhaseBuffer {
+    events: Mutex<Vec<(ProjectionPhase, Duration)>>,
+}
+
+impl ProjectionObserver for ProjectionPhaseBuffer {
+    fn record(&self, phase: ProjectionPhase, elapsed: Duration) {
+        self.events.lock().push((phase, elapsed));
+    }
+}
+
+impl ProjectionPhaseBuffer {
+    pub(crate) fn flush_into(&self, observer: &dyn ProjectionObserver) {
+        let events = std::mem::take(&mut *self.events.lock());
+        for (phase, elapsed) in events {
+            observer.record(phase, elapsed);
+        }
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub(crate) fn with_buffered_observer<T>(
+    observer: Option<&dyn ProjectionObserver>,
+    operation: impl FnOnce(Option<&dyn ProjectionObserver>) -> T,
+) -> T {
+    let Some(observer) = observer else {
+        return operation(None);
+    };
+    let buffer = ProjectionPhaseBuffer::default();
+    let result = operation(Some(&buffer));
+    buffer.flush_into(observer);
+    result
+}
+
+pub(crate) fn object_record_retained_bytes(record: &ObjectRecord) -> usize {
+    size_of::<ObjectRecord>()
+        .saturating_add(record.canonical_bytes().len())
+        .saturating_add(size_of_val(record.references()))
+        .saturating_add(
+            record
+                .references()
+                .iter()
+                .map(|reference| reference.label().as_bytes().len())
+                .sum::<usize>(),
+        )
+}
+
+/// Opaque, engine-bound preparation for one immutable-object batch.
+///
+/// Preparation may carry checksums and physical identities across a worker
+/// boundary, but admission remains authoritative: the receiving engine
+/// validates ownership of this value and rechecks every identity and collision
+/// before appending bytes.
+pub struct PreparedProjectionBatch {
+    payload: Box<dyn Any + Send>,
+    retained_bytes: usize,
+}
+
+struct InMemoryPreparedBatch {
+    authority: Arc<()>,
+    records: Vec<ObjectRecord>,
+}
+
+impl PreparedProjectionBatch {
+    fn in_memory(authority: Arc<()>, records: Vec<ObjectRecord>) -> Self {
+        let retained_bytes = records
+            .iter()
+            .fold(size_of::<InMemoryPreparedBatch>(), |total, record| {
+                total.saturating_add(object_record_retained_bytes(record))
+            });
+        Self {
+            payload: Box::new(InMemoryPreparedBatch { authority, records }),
+            retained_bytes,
+        }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn engine<T: Any + Send>(payload: T, retained_bytes: usize) -> Self {
+        Self {
+            payload: Box::new(payload),
+            retained_bytes,
+        }
+    }
+
+    pub(crate) fn into_payload<T: Any + Send>(self) -> Result<T, PrincipalProjectionError> {
+        self.payload
+            .downcast::<T>()
+            .map(|payload| *payload)
+            .map_err(|_| {
+                PrincipalProjectionError::Engine(
+                    "prepared object batch does not belong to this engine".to_owned(),
+                )
+            })
+    }
+
+    fn into_in_memory(
+        self,
+        authority: &Arc<()>,
+    ) -> Result<Vec<ObjectRecord>, PrincipalProjectionError> {
+        let prepared = self.into_payload::<InMemoryPreparedBatch>()?;
+        if !Arc::ptr_eq(authority, &prepared.authority) {
+            return Err(foreign_preparation());
+        }
+        Ok(prepared.records)
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn into_engine_payload<T: Any + Send>(self) -> Option<T> {
+        self.payload.downcast::<T>().ok().map(|payload| *payload)
+    }
+
+    /// Return the bytes retained by the prepared batch while awaiting admission.
+    #[must_use]
+    pub const fn retained_bytes(&self) -> usize {
+        self.retained_bytes
+    }
 }
 
 impl ProjectionCacheEntry {
@@ -167,6 +320,83 @@ pub trait PrincipalProjectionEngine<P>: Send + Sync {
             .into_iter()
             .map(|record| self.stage_object(record))
             .collect()
+    }
+
+    /// Stage objects while reporting privileged operator phase measurements.
+    ///
+    /// Engines without finer instrumentation report the complete call as
+    /// [`ProjectionPhase::ObjectPreparation`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same model or engine failure as [`Self::stage_objects`].
+    fn stage_objects_observed(
+        &self,
+        records: Vec<ObjectRecord>,
+        observer: &dyn ProjectionObserver,
+    ) -> Result<Vec<(ObjectId, InsertOutcome)>, PrincipalProjectionError> {
+        let started = std::time::Instant::now();
+        let outcome = self.stage_objects(records);
+        observer.record(ProjectionPhase::ObjectPreparation, started.elapsed());
+        outcome
+    }
+
+    /// Prepare immutable objects for later authoritative admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns a projection error when this engine does not implement an
+    /// engine-bound preparation path or cannot validate an object.
+    fn prepare_objects(
+        &self,
+        _records: Vec<ObjectRecord>,
+    ) -> Result<PreparedProjectionBatch, PrincipalProjectionError> {
+        Err(unsupported_preparation())
+    }
+
+    /// Prepare immutable objects while reporting privileged phase measurements.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failure as [`Self::prepare_objects`].
+    fn prepare_objects_observed(
+        &self,
+        records: Vec<ObjectRecord>,
+        observer: &dyn ProjectionObserver,
+    ) -> Result<PreparedProjectionBatch, PrincipalProjectionError> {
+        let started = std::time::Instant::now();
+        let prepared = self.prepare_objects(records);
+        observer.record(ProjectionPhase::ObjectPreparation, started.elapsed());
+        prepared
+    }
+
+    /// Authoritatively admit a batch prepared by this engine.
+    ///
+    /// # Errors
+    ///
+    /// Returns a projection error for a foreign preparation, invalid identity,
+    /// collision, encoding failure, or append failure.
+    fn stage_prepared_objects(
+        &self,
+        _prepared: PreparedProjectionBatch,
+    ) -> Result<Vec<(ObjectId, InsertOutcome)>, PrincipalProjectionError> {
+        Err(unsupported_preparation())
+    }
+
+    /// Admit a prepared batch while reporting privileged phase measurements.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failure as [`Self::stage_prepared_objects`].
+    fn stage_prepared_objects_observed(
+        &self,
+        prepared: PreparedProjectionBatch,
+        observer: &dyn ProjectionObserver,
+    ) -> Result<Vec<(ObjectId, InsertOutcome)>, PrincipalProjectionError> {
+        let started = std::time::Instant::now();
+        let outcome = self.stage_prepared_objects(prepared);
+        observer.record(ProjectionPhase::ArenaAppend, started.elapsed());
+        outcome
     }
 
     /// Return a principal's current root.
@@ -314,6 +544,25 @@ pub trait PrincipalProjectionEngine<P>: Send + Sync {
         transaction: RootTransaction<P>,
     ) -> Result<CommitOutcome, PrincipalProjectionError>;
 
+    /// Publish a root while reporting privileged operator phase measurements.
+    ///
+    /// Engines without finer instrumentation report the complete call as
+    /// [`ProjectionPhase::RootPublication`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same model or engine failure as [`Self::commit_root`].
+    fn commit_root_observed(
+        &self,
+        transaction: RootTransaction<P>,
+        observer: Arc<dyn ProjectionObserver>,
+    ) -> Result<CommitOutcome, PrincipalProjectionError> {
+        let started = std::time::Instant::now();
+        let outcome = self.commit_root(transaction);
+        observer.record(ProjectionPhase::RootPublication, started.elapsed());
+        outcome
+    }
+
     /// Flush authoritative engine state.
     ///
     /// # Errors
@@ -346,6 +595,23 @@ where
             .into_iter()
             .map(|record| self.put_object(record).map_err(Into::into))
             .collect()
+    }
+
+    fn prepare_objects(
+        &self,
+        records: Vec<ObjectRecord>,
+    ) -> Result<PreparedProjectionBatch, PrincipalProjectionError> {
+        Ok(PreparedProjectionBatch::in_memory(
+            Arc::clone(&self.preparation_authority),
+            records,
+        ))
+    }
+
+    fn stage_prepared_objects(
+        &self,
+        prepared: PreparedProjectionBatch,
+    ) -> Result<Vec<(ObjectId, InsertOutcome)>, PrincipalProjectionError> {
+        self.stage_objects(prepared.into_in_memory(&self.preparation_authority)?)
     }
 
     fn current_root(&self, principal: &P) -> Result<Option<RootState>, PrincipalProjectionError> {
@@ -391,6 +657,46 @@ where
         records: Vec<ObjectRecord>,
     ) -> Result<Vec<(ObjectId, InsertOutcome)>, PrincipalProjectionError> {
         DurableEngine::stage_objects(self, records).map_err(map_durable)
+    }
+
+    fn stage_objects_observed(
+        &self,
+        records: Vec<ObjectRecord>,
+        observer: &dyn ProjectionObserver,
+    ) -> Result<Vec<(ObjectId, InsertOutcome)>, PrincipalProjectionError> {
+        DurableEngine::stage_objects_observed(self, records, observer).map_err(map_durable)
+    }
+
+    fn prepare_objects(
+        &self,
+        records: Vec<ObjectRecord>,
+    ) -> Result<PreparedProjectionBatch, PrincipalProjectionError> {
+        self.prepare_objects_for_projection(records, None)
+            .map_err(map_durable)
+    }
+
+    fn prepare_objects_observed(
+        &self,
+        records: Vec<ObjectRecord>,
+        observer: &dyn ProjectionObserver,
+    ) -> Result<PreparedProjectionBatch, PrincipalProjectionError> {
+        self.prepare_objects_for_projection(records, Some(observer))
+            .map_err(map_durable)
+    }
+
+    fn stage_prepared_objects(
+        &self,
+        prepared: PreparedProjectionBatch,
+    ) -> Result<Vec<(ObjectId, InsertOutcome)>, PrincipalProjectionError> {
+        self.stage_prepared_for_projection(prepared, None)
+    }
+
+    fn stage_prepared_objects_observed(
+        &self,
+        prepared: PreparedProjectionBatch,
+        observer: &dyn ProjectionObserver,
+    ) -> Result<Vec<(ObjectId, InsertOutcome)>, PrincipalProjectionError> {
+        self.stage_prepared_for_projection(prepared, Some(observer))
     }
 
     fn current_root(&self, principal: &P) -> Result<Option<RootState>, PrincipalProjectionError> {
@@ -468,15 +774,109 @@ where
         self.commit(transaction).map_err(map_durable)
     }
 
+    fn commit_root_observed(
+        &self,
+        transaction: RootTransaction<P>,
+        observer: Arc<dyn ProjectionObserver>,
+    ) -> Result<CommitOutcome, PrincipalProjectionError> {
+        self.commit_observed(transaction, observer.as_ref())
+            .map_err(map_durable)
+    }
+
     fn flush_projection(&self) -> Result<(), PrincipalProjectionError> {
         self.flush().map_err(map_durable)
     }
 }
 
 #[cfg(not(target_family = "wasm"))]
-fn map_durable(error: DurableError) -> PrincipalProjectionError {
+pub(crate) fn map_durable(error: DurableError) -> PrincipalProjectionError {
     match error {
         DurableError::Model(model) => PrincipalProjectionError::Model(model),
         other => PrincipalProjectionError::Engine(other.to_string()),
+    }
+}
+
+fn foreign_preparation() -> PrincipalProjectionError {
+    PrincipalProjectionError::Engine(
+        "prepared object batch does not belong to this engine".to_owned(),
+    )
+}
+
+fn unsupported_preparation() -> PrincipalProjectionError {
+    PrincipalProjectionError::Engine(
+        "projection engine does not support prepared object admission".to_owned(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use astrid_storage_model::{ObjectClass, ObjectFormatVersion, ObjectIdentity, ObjectKind};
+
+    #[derive(Clone, Copy)]
+    struct TestIdentity;
+
+    impl ObjectIdentity for TestIdentity {
+        fn identify(&self, _record: &ObjectRecord) -> ObjectId {
+            ObjectId::new([42; 32])
+        }
+    }
+
+    #[test]
+    fn prepared_projection_batches_are_bound_to_the_in_memory_engine() {
+        let first = InMemoryEngine::<String, _>::new(TestIdentity);
+        let second = InMemoryEngine::<String, _>::new(TestIdentity);
+        let record = ObjectRecord::new(
+            ObjectKind::Chunk,
+            ObjectFormatVersion::V1,
+            b"engine-bound".to_vec(),
+            Vec::new(),
+            12,
+            ObjectClass::Data,
+        )
+        .unwrap();
+        let prepared =
+            PrincipalProjectionEngine::<String>::prepare_objects(&first, vec![record]).unwrap();
+
+        let error = PrincipalProjectionEngine::<String>::stage_prepared_objects(&second, prepared)
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("prepared object batch does not belong to this engine")
+        );
+        assert_eq!(second.object_count(), 0);
+    }
+
+    #[test]
+    fn prepared_projection_batch_accounts_for_record_allocation() {
+        let engine = InMemoryEngine::<String, _>::new(TestIdentity);
+        let record = ObjectRecord::new(
+            ObjectKind::Chunk,
+            ObjectFormatVersion::V1,
+            b"resident charge".to_vec(),
+            Vec::new(),
+            15,
+            ObjectClass::Data,
+        )
+        .unwrap();
+        let canonical_bytes = record.canonical_bytes().len();
+
+        let prepared =
+            PrincipalProjectionEngine::<String>::prepare_objects(&engine, vec![record]).unwrap();
+
+        assert!(prepared.retained_bytes() > canonical_bytes);
+    }
+
+    #[test]
+    fn projection_model_error_preserves_typed_source() {
+        let error = PrincipalProjectionError::from(ModelError::ArithmeticOverflow);
+        let source = std::error::Error::source(&error).unwrap();
+
+        assert_eq!(
+            source.downcast_ref::<ModelError>(),
+            Some(&ModelError::ArithmeticOverflow)
+        );
     }
 }

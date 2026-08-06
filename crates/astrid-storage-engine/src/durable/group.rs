@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use astrid_storage_model::{ModelError, ObjectId};
 use parking_lot::{Condvar, Mutex};
@@ -11,10 +11,12 @@ use parking_lot::{Condvar, Mutex};
 use super::representations::{PendingDirectUpdate, RepresentationStore};
 
 use super::{
-    ARENA_MAGIC, CommitOutcome, DurableEngine, DurableError, DurableInner, FaultPoint, Persisted,
-    PersistentObjectIdentity, Prepared, PrincipalCodec, ROOT_MAGIC, RootTransaction, append_frames,
-    canonical_record_bytes, io_error, live_files_mut, read_indexed_object_with_payload,
+    ARENA_MAGIC, CommitOutcome, DurableEngine, DurableError, DurableFiles, DurableInner,
+    FaultPoint, Persisted, PersistentObjectIdentity, Prepared, PrincipalCodec, ROOT_MAGIC,
+    RootTransaction, append_frames, canonical_record_bytes, io_error, live_files_mut,
+    read_indexed_object_with_payload,
 };
+use crate::{ProjectionObserver, ProjectionPhase};
 
 const DEFAULT_INITIAL_DELAY: Duration = Duration::from_micros(250);
 const DEFAULT_BUSY_EXTENSION: Duration = Duration::from_micros(250);
@@ -101,11 +103,13 @@ impl<P> Default for CommitGroup<P> {
 struct QueuedCommit<P> {
     transaction: RootTransaction<P>,
     receipt: Arc<CommitReceipt>,
+    observer: Option<Arc<dyn ProjectionObserver>>,
 }
 
 struct AcceptedCommit<P: Ord> {
     prepared: Prepared<P>,
     receipt: Arc<CommitReceipt>,
+    observer: Option<Arc<dyn ProjectionObserver>>,
 }
 
 #[derive(Default)]
@@ -180,12 +184,35 @@ where
     /// recovery-required; the next operation attempts bounded recovery before
     /// it proceeds.
     pub fn commit(&self, transaction: RootTransaction<P>) -> Result<CommitOutcome, DurableError> {
+        self.commit_inner(transaction, None)
+    }
+
+    pub(crate) fn commit_observed(
+        &self,
+        transaction: RootTransaction<P>,
+        observer: &dyn ProjectionObserver,
+    ) -> Result<CommitOutcome, DurableError> {
+        let buffer = Arc::new(crate::projection::ProjectionPhaseBuffer::default());
+        let result = self.commit_inner(
+            transaction,
+            Some(Arc::clone(&buffer) as Arc<dyn ProjectionObserver>),
+        );
+        buffer.flush_into(observer);
+        result
+    }
+
+    fn commit_inner(
+        &self,
+        transaction: RootTransaction<P>,
+        observer: Option<Arc<dyn ProjectionObserver>>,
+    ) -> Result<CommitOutcome, DurableError> {
         let receipt = Arc::new(CommitReceipt::default());
         let mut lead = {
             let mut group = self.commit_group.lock();
             group.queue.push_back(QueuedCommit {
                 transaction,
                 receipt: Arc::clone(&receipt),
+                observer,
             });
             if group.leader_active {
                 false
@@ -272,7 +299,12 @@ where
         let mut pending_roots = BTreeMap::new();
         let mut pending_frames = BTreeMap::<ObjectId, Arc<[u8]>>::new();
         for request in batch {
-            match self.prepare(&mut inner, request.transaction, &pending_roots) {
+            match self.prepare(
+                &mut inner,
+                request.transaction,
+                &pending_roots,
+                request.observer.as_deref(),
+            ) {
                 Ok(mut prepared) => {
                     if let Err(error) = reserve_group_frames(&mut prepared, &mut pending_frames) {
                         completions.push((request.receipt, Err(error)));
@@ -282,6 +314,7 @@ where
                     accepted.push(AcceptedCommit {
                         prepared,
                         receipt: request.receipt,
+                        observer: request.observer,
                     });
                 },
                 Err(error) => completions.push((request.receipt, Err(error))),
@@ -360,6 +393,7 @@ where
             ..
         } = inner;
         let files = live_files_mut(files)?;
+        let append_started = Instant::now();
         let mut ids = Vec::new();
         let mut payloads = Vec::new();
         for accepted in accepted {
@@ -380,7 +414,9 @@ where
             }
         }
         let commit_locations = append_frames(&mut files.arena, ARENA_MAGIC, &commit_payloads)?;
+        record_group(accepted, ProjectionPhase::ArenaAppend, append_started);
         self.fail_if(FaultPoint::AfterCommitAppend)?;
+        let map_started = Instant::now();
         let representation_update = if let Some(representations) = representations {
             let appended = ids
                 .iter()
@@ -417,27 +453,23 @@ where
         } else {
             None
         };
+        record_group(accepted, ProjectionPhase::PhysicalMapUpdate, map_started);
+        let flush_started = Instant::now();
         files
             .arena
             .sync_data()
             .map_err(|source| io_error("flush grouped transaction object frames", source))?;
+        record_group(accepted, ProjectionPhase::Flush, flush_started);
         self.fail_if(FaultPoint::AfterObjectFlush)?;
         self.fail_if(FaultPoint::AfterCommitFlush)?;
         if let (Some(representations), Some(update)) = (representations, representation_update) {
+            let map_started = Instant::now();
             representations.publish_direct_update(update)?;
+            record_group(accepted, ProjectionPhase::PhysicalMapUpdate, map_started);
         }
         self.fail_if(FaultPoint::BeforeRootCas)?;
 
-        let journals: Vec<_> = accepted
-            .iter()
-            .map(|accepted| accepted.prepared.journal.as_slice())
-            .collect();
-        append_frames(&mut files.roots, ROOT_MAGIC, &journals)?;
-        files
-            .roots
-            .sync_data()
-            .map_err(|source| io_error("flush grouped root-journal frames", source))?;
-        self.fail_if(FaultPoint::AfterRootCas)?;
+        self.publish_group_roots(files, accepted)?;
         let arena_len = files
             .arena
             .metadata()
@@ -452,6 +484,31 @@ where
                 .collect(),
             arena_len,
         })
+    }
+
+    fn publish_group_roots(
+        &self,
+        files: &mut DurableFiles,
+        accepted: &[AcceptedCommit<P>],
+    ) -> Result<(), DurableError> {
+        let journals: Vec<_> = accepted
+            .iter()
+            .map(|accepted| accepted.prepared.journal.as_slice())
+            .collect();
+        let publication_started = Instant::now();
+        append_frames(&mut files.roots, ROOT_MAGIC, &journals)?;
+        record_group(
+            accepted,
+            ProjectionPhase::RootPublication,
+            publication_started,
+        );
+        let flush_started = Instant::now();
+        files
+            .roots
+            .sync_data()
+            .map_err(|source| io_error("flush grouped root-journal frames", source))?;
+        record_group(accepted, ProjectionPhase::Flush, flush_started);
+        self.fail_if(FaultPoint::AfterRootCas)
     }
 
     fn append_group_representations<'a>(
@@ -503,6 +560,15 @@ where
             )?);
         }
         representations.append_direct_update(&direct)
+    }
+}
+
+fn record_group<P: Ord>(accepted: &[AcceptedCommit<P>], phase: ProjectionPhase, started: Instant) {
+    let elapsed = started.elapsed();
+    for accepted in accepted {
+        if let Some(observer) = accepted.observer.as_deref() {
+            observer.record(phase, elapsed);
+        }
     }
 }
 

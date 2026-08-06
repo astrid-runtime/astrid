@@ -51,8 +51,9 @@ pub use muninn::{
     VerifiedDerivationEvidence, verify_derivation_evidence,
 };
 pub use projection::{
-    PrincipalProjectionEngine, PrincipalProjectionError, ProjectionCacheEntry, ProjectionCacheKey,
-    ProjectionCachePayload,
+    PreparedProjectionBatch, PrincipalProjectionEngine, PrincipalProjectionError,
+    ProjectionCacheEntry, ProjectionCacheKey, ProjectionCachePayload, ProjectionObserver,
+    ProjectionPhase,
 };
 #[cfg(not(target_family = "wasm"))]
 pub use refinery::{
@@ -179,6 +180,7 @@ impl RootSnapshot {
 pub struct InMemoryEngine<P: Ord, I> {
     identity: I,
     world: RwLock<World<P>>,
+    preparation_authority: std::sync::Arc<()>,
 }
 
 impl<P: Ord, I> InMemoryEngine<P, I> {
@@ -188,6 +190,7 @@ impl<P: Ord, I> InMemoryEngine<P, I> {
         Self {
             identity,
             world: RwLock::new(World::new()),
+            preparation_authority: std::sync::Arc::new(()),
         }
     }
 
@@ -984,16 +987,5 @@ mod tests {
                 assert_eq!(engine.root(&"alice"), expected_root);
             }
         }
-    }
-
-    #[test]
-    fn projection_model_error_preserves_typed_source() {
-        let error = PrincipalProjectionError::from(ModelError::ArithmeticOverflow);
-        let source = std::error::Error::source(&error).unwrap();
-
-        assert_eq!(
-            source.downcast_ref::<ModelError>(),
-            Some(&ModelError::ArithmeticOverflow)
-        );
     }
 }

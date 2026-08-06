@@ -53,9 +53,9 @@ pub use content::{
     plan_projection_names,
 };
 pub use content::{
-    BulkIngestPolicy, ChunkingProfile, ContentBatchEntry, ContentBatchWriteOutcome,
-    ContentChangeCache, ContentDescriptor, ContentEntry, ContentIngest, ContentName,
-    ContentNameError, ContentObservation, ContentWriteOutcome, PrincipalContentError,
+    BulkIngestDiagnostics, BulkIngestPolicy, ChunkingProfile, ContentBatchEntry,
+    ContentBatchWriteOutcome, ContentChangeCache, ContentDescriptor, ContentEntry, ContentIngest,
+    ContentName, ContentNameError, ContentObservation, ContentWriteOutcome, PrincipalContentError,
     PrincipalContentReadHandle, PrincipalContentStore, SourceEpoch, SourceFingerprint,
     SourceObservation, SourceScopeId, SourceTrust, StableSourceId,
 };

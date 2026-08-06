@@ -71,6 +71,17 @@ read zero bytes and a one-file mutation reads only its partition. The new exact
 comparison is recorded in `astrid-storage-admission-before-3d61052b.json` and
 `astrid-storage-admission-after-0d6a8366.json`.
 
+The next clean checkpoint, `02968196`, was compared with exact parent
+`279c9342` using the same corpus and worker grant. Moving the prepared values
+through a bounded, engine-bound handoff preserves parallel ingest at 388.3
+MiB/s and raises scaling from 2.080 to 2.105 times. Its operator-only phase
+matrix records a 250.7 ms pipeline, 163.6 ms of authoritative object admission,
+and 1,067.7 ms of root publication, of which 979.1 ms is exact closure
+validation. Pending prepared values peak at 4,207,436 bytes with one worker and
+a median 58,853,269 bytes with eight workers. The evidence is in
+`astrid-storage-pipeline-before-279c9342.json` and
+`astrid-storage-pipeline-after-0296819.json`.
+
 The historical schema did not embed Git revision, executable arguments,
 dirty-tree state, or cache policy. The canonical document records reconstructed
 ancestry and explicitly prevents independent experiment branches from being

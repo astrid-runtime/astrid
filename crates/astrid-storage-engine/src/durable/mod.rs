@@ -479,6 +479,7 @@ pub struct DurableEngine<P: Ord, I, C> {
     arena_reader: RwLock<Option<ArenaReader>>,
     object_cache: ObjectCache<P>,
     recovery_policy: RecoveryRetryPolicy,
+    preparation_authority: Arc<()>,
     inner: Mutex<DurableInner<P>>,
 }
 

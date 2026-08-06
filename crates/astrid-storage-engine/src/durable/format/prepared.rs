@@ -42,6 +42,10 @@ impl PreparedFrame {
         &self.payload
     }
 
+    pub(in crate::durable) fn retained_bytes(&self) -> usize {
+        self.header.len().saturating_add(self.payload.len())
+    }
+
     fn encoded_len(&self) -> Result<u64, DurableError> {
         FRAME_HEADER_LEN
             .checked_add(self.payload_len)

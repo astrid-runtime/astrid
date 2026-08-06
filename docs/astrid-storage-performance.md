@@ -610,6 +610,35 @@ native durable batch markers, stable-handle mutation checks, explicit barrier
 policy, governed scheduler leases, and larger-than-RAM/cold-corpus evidence
 remain separate work.
 
+The subsequent bounded-pipeline checkpoint compares clean candidate
+`02968196` with exact parent `279c9342`, which already contains the prepared
+admission work above. The workload and grants are otherwise identical.
+
+| Workload | Exact parent | Bounded pipeline | Change |
+|---|---:|---:|---:|
+| Single-worker first ingest | 2,751.4 ms, 186.1 MiB/s | 2,775.6 ms, 184.5 MiB/s | -0.9% throughput |
+| Eight-worker first ingest | 1,322.5 ms, 387.1 MiB/s | 1,318.7 ms, 388.3 MiB/s | +0.3% throughput |
+| Worker scaling | 2.080× | 2.105× | +1.2% |
+| Median pending prepared bytes | not measured | 4,207,436 bytes (one worker); 58,853,269 bytes (eight workers) | explicitly bounded |
+
+The new measurement surface divides the candidate into source
+read/chunk/build, object preparation, authoritative admission, physical-map
+update, closure validation, root-journal append, and durable flush. Worker
+phase durations are cumulative work and may overlap; `pipeline` and root
+publication are wall-clock boundaries. The parallel pipeline takes 250.7 ms,
+including 163.6 ms in authoritative object admission. Root publication takes
+1,067.7 ms, including 979.1 ms of closure validation. Thus wider admission alone cannot
+make first ingest read-bound: the next measured target is eliminating redundant
+closure work while preserving canonical identity and fail-closed publication.
+At 388.3 MiB/s, one TiB extrapolates to about 45 minutes.
+
+Prepared batches are opaque and bound to the engine instance that produced
+them. The appender re-probes every identity and collision under its mutation
+authority, and a regression rejects cross-engine replay before any object is
+admitted. The channel is bounded, source and appender failures publish no root,
+worker schedules preserve the canonical batch root, and diagnostics remain
+operator-only so physical dedup does not become a principal-visible oracle.
+
 The #1388 port was remeasured against its exact current-main parent
 `0ba1181c`. Each cell is the median of three release-mode runs with 64 strict
 128-byte KV updates per principal through the complete async `TreeKvStore`
@@ -670,6 +699,8 @@ catalog.
 | `astrid-storage-verified-64k.json` | `1d2679ef` |
 | `astrid-storage-cache-final-64k.json` | `d69309ef` |
 | `astrid-storage-bulk-ingest-eca9c20a.json` | clean `eca9c20a`; bounded batch and closure-checked delta-proportional re-ingest |
+| `astrid-storage-pipeline-before-279c9342.json` | clean exact parent for the prepared-admission pipeline comparison |
+| `astrid-storage-pipeline-after-0296819.json` | clean `02968196`; engine-bound bounded pipeline, exact phase timing, and single/eight-worker memory peaks |
 | `astrid-storage-governed-hot-64k.json`, `astrid-storage-governed-hot-1m.json` | `e0bf4217` |
 | `astrid-storage-publication-before.json` | code `3d44cbd6`, harness `ee6990d4` |
 | `astrid-storage-publication-after.json` | code `4193217f`, harness `63d0125e` |

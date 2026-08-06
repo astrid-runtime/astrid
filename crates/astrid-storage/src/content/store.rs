@@ -35,7 +35,7 @@ const KV_COMPONENT_LABEL: &[u8] = b"kv";
 const PARENT_LABEL: &[u8] = b"parent";
 const STATE_LABEL: &[u8] = b"state";
 // Soft write-coalescing target, not a record, file, or deployment limit.
-const STAGING_BATCH_TARGET_BYTES: usize = 4 * 1024 * 1024;
+pub(super) const STAGING_BATCH_TARGET_BYTES: usize = 4 * 1024 * 1024;
 const VERIFIED_CONTENT_CACHE_KEY: ProjectionCacheKey = ProjectionCacheKey::new(1);
 const PARTIAL_VERIFICATION_CACHE_KEY: ProjectionCacheKey = ProjectionCacheKey::new(2);
 const DECODED_HEADER_CACHE_KEY: ProjectionCacheKey = ProjectionCacheKey::new(3);

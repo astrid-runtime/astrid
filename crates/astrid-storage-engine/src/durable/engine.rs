@@ -11,6 +11,7 @@ use super::{
     open_rw, read_indexed_object, read_indexed_objects, recover_store, usage_from_closure,
     validate_incremental_closure,
 };
+use crate::{ProjectionObserver, ProjectionPhase};
 
 impl<P, I, C> DurableEngine<P, I, C>
 where
@@ -224,6 +225,7 @@ where
             })),
             object_cache: ObjectCache::new(options.policy.object_cache),
             recovery_policy: options.policy.recovery,
+            preparation_authority: Arc::new(()),
             group_policy: options.policy.group_commit,
             commit_group: Mutex::new(CommitGroup::default()),
             inner: Mutex::new(DurableInner {
@@ -816,6 +818,7 @@ where
         inner: &mut DurableInner<P>,
         transaction: RootTransaction<P>,
         pending_roots: &BTreeMap<P, RootState>,
+        observer: Option<&dyn ProjectionObserver>,
     ) -> Result<Prepared<P>, DurableError> {
         let RootTransaction {
             principal,
@@ -862,7 +865,15 @@ where
                 },
             }
         }
-        let reachable = self.validate_pending_closure(inner, &unique, commit_id)?;
+        let closure_started = std::time::Instant::now();
+        let reachable = self.validate_pending_closure(inner, &unique, commit_id);
+        if let Some(observer) = observer {
+            observer.record(
+                ProjectionPhase::ClosureValidation,
+                closure_started.elapsed(),
+            );
+        }
+        let reachable = reachable?;
 
         let mut objects = Vec::new();
         let mut commit_frame = None;

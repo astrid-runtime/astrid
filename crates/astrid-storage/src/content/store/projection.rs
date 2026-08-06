@@ -5,6 +5,9 @@ use super::{
     PrincipalProjectionError, ProjectionCachePayload, ReferenceKind, ReferenceLabel, RootState,
     STAGING_BATCH_TARGET_BYTES, VerifiedContent,
 };
+#[cfg(not(target_family = "wasm"))]
+use astrid_storage_engine::PreparedProjectionBatch;
+use astrid_storage_engine::ProjectionObserver;
 
 #[derive(Clone)]
 pub(super) struct ContentHeader {
@@ -130,68 +133,108 @@ where
     }
 }
 
-pub(super) struct EngineSink<'a, P, E> {
+pub(super) struct StagedObjectBatch {
+    records: BTreeMap<ObjectId, ObjectRecord>,
+}
+
+impl StagedObjectBatch {
+    pub(super) fn into_records(self) -> Vec<ObjectRecord> {
+        self.records.into_values().collect()
+    }
+
+    pub(super) fn expected(&self) -> Vec<ObjectId> {
+        self.records.keys().copied().collect()
+    }
+}
+
+pub(super) trait BatchAdmission<P, E> {
+    fn admit(
+        &mut self,
+        engine: &E,
+        batch: StagedObjectBatch,
+    ) -> Result<u64, PrincipalProjectionError>;
+}
+
+pub(super) struct DirectAdmission;
+
+impl<P, E> BatchAdmission<P, E> for DirectAdmission
+where
+    E: PrincipalProjectionEngine<P>,
+{
+    fn admit(
+        &mut self,
+        engine: &E,
+        batch: StagedObjectBatch,
+    ) -> Result<u64, PrincipalProjectionError> {
+        admit_object_batch(engine, batch)
+    }
+}
+
+pub(super) struct EngineSink<'a, P, E, A = DirectAdmission> {
     engine: &'a E,
+    admission: A,
     pub(super) objects_inserted: u64,
     pending_bytes: usize,
+    peak_pending_bytes: usize,
     pending: BTreeMap<ObjectId, ObjectRecord>,
     marker: PhantomData<fn() -> P>,
 }
 
-impl<'a, P, E> EngineSink<'a, P, E> {
+impl<'a, P, E> EngineSink<'a, P, E, DirectAdmission> {
     pub(super) const fn new(engine: &'a E) -> Self {
+        Self::with_admission(engine, DirectAdmission)
+    }
+}
+
+impl<'a, P, E, A> EngineSink<'a, P, E, A> {
+    pub(super) const fn with_admission(engine: &'a E, admission: A) -> Self {
         Self {
             engine,
+            admission,
             objects_inserted: 0,
             pending_bytes: 0,
+            peak_pending_bytes: 0,
             pending: BTreeMap::new(),
             marker: PhantomData,
         }
     }
+
+    pub(super) const fn admission(&self) -> &A {
+        &self.admission
+    }
+
+    pub(super) const fn peak_pending_bytes(&self) -> usize {
+        self.peak_pending_bytes
+    }
 }
 
-impl<P, E> EngineSink<'_, P, E>
+impl<P, E, A> EngineSink<'_, P, E, A>
 where
     E: PrincipalProjectionEngine<P>,
+    A: BatchAdmission<P, E>,
 {
     pub(super) fn finish(&mut self) -> Result<(), PrincipalProjectionError> {
         if self.pending.is_empty() {
             return Ok(());
         }
-        let pending = std::mem::take(&mut self.pending);
+        let batch = StagedObjectBatch {
+            records: std::mem::take(&mut self.pending),
+        };
         self.pending_bytes = 0;
-        let expected: Vec<_> = pending.keys().copied().collect();
-        let outcomes = self.engine.stage_objects(pending.into_values().collect())?;
-        if outcomes.len() != expected.len() {
-            return Err(PrincipalProjectionError::Engine(
-                "staging engine returned the wrong outcome count".to_owned(),
-            ));
-        }
-        for (expected, (computed, outcome)) in expected.into_iter().zip(outcomes) {
-            if computed != expected {
-                return Err(PrincipalProjectionError::Model(
-                    ModelError::ObjectIdentityMismatch {
-                        declared: expected,
-                        computed,
-                    },
-                ));
-            }
-            if outcome == InsertOutcome::Inserted {
-                self.objects_inserted =
-                    self.objects_inserted
-                        .checked_add(1)
-                        .ok_or(PrincipalProjectionError::Model(
-                            ModelError::ArithmeticOverflow,
-                        ))?;
-            }
-        }
+        self.objects_inserted = self
+            .objects_inserted
+            .checked_add(self.admission.admit(self.engine, batch)?)
+            .ok_or(PrincipalProjectionError::Model(
+                ModelError::ArithmeticOverflow,
+            ))?;
         Ok(())
     }
 }
 
-impl<P, E> ContentObjectSink for EngineSink<'_, P, E>
+impl<P, E, A> ContentObjectSink for EngineSink<'_, P, E, A>
 where
     E: PrincipalProjectionEngine<P>,
+    A: BatchAdmission<P, E>,
 {
     type Error = PrincipalProjectionError;
 
@@ -209,12 +252,85 @@ where
         self.pending_bytes = self
             .pending_bytes
             .saturating_add(staged_record_size(&record));
+        self.peak_pending_bytes = self.peak_pending_bytes.max(self.pending_bytes);
         self.pending.insert(id, record);
         if self.pending_bytes >= STAGING_BATCH_TARGET_BYTES {
             self.finish()?;
         }
         Ok(id)
     }
+}
+
+pub(super) fn admit_object_batch<P, E>(
+    engine: &E,
+    batch: StagedObjectBatch,
+) -> Result<u64, PrincipalProjectionError>
+where
+    E: PrincipalProjectionEngine<P>,
+{
+    let expected = batch.expected();
+    let outcomes = engine.stage_objects(batch.into_records())?;
+    validate_admission_outcomes(expected, outcomes)
+}
+
+pub(super) fn admit_object_batch_observed<P, E>(
+    engine: &E,
+    batch: StagedObjectBatch,
+    observer: &dyn ProjectionObserver,
+) -> Result<u64, PrincipalProjectionError>
+where
+    E: PrincipalProjectionEngine<P>,
+{
+    let expected = batch.expected();
+    let outcomes = engine.stage_objects_observed(batch.into_records(), observer)?;
+    validate_admission_outcomes(expected, outcomes)
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub(super) fn admit_prepared_object_batch<P, E>(
+    engine: &E,
+    expected: Vec<ObjectId>,
+    prepared: PreparedProjectionBatch,
+    observer: Option<&dyn ProjectionObserver>,
+) -> Result<u64, PrincipalProjectionError>
+where
+    E: PrincipalProjectionEngine<P>,
+{
+    let outcomes = match observer {
+        Some(observer) => engine.stage_prepared_objects_observed(prepared, observer)?,
+        None => engine.stage_prepared_objects(prepared)?,
+    };
+    validate_admission_outcomes(expected, outcomes)
+}
+
+fn validate_admission_outcomes(
+    expected: Vec<ObjectId>,
+    outcomes: Vec<(ObjectId, InsertOutcome)>,
+) -> Result<u64, PrincipalProjectionError> {
+    if outcomes.len() != expected.len() {
+        return Err(PrincipalProjectionError::Engine(
+            "staging engine returned the wrong outcome count".to_owned(),
+        ));
+    }
+    let mut inserted = 0_u64;
+    for (expected, (computed, outcome)) in expected.into_iter().zip(outcomes) {
+        if computed != expected {
+            return Err(PrincipalProjectionError::Model(
+                ModelError::ObjectIdentityMismatch {
+                    declared: expected,
+                    computed,
+                },
+            ));
+        }
+        if outcome == InsertOutcome::Inserted {
+            inserted = inserted
+                .checked_add(1)
+                .ok_or(PrincipalProjectionError::Model(
+                    ModelError::ArithmeticOverflow,
+                ))?;
+        }
+    }
+    Ok(inserted)
 }
 
 fn staged_record_size(record: &ObjectRecord) -> usize {
