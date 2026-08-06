@@ -82,7 +82,7 @@ let loaded: serde_json::Value = scoped.get_json("prefs").await?.unwrap();
 ## Performance
 
 The current contiguous-adoption implementation was measured from clean commit
-`da8e3cd0` on an M2 Ultra/APFS host. Each reported median covers three
+`6384aaec` on an M2 Ultra/APFS host. Each reported median covers three
 runs over a deterministic 512 MiB incompressible corpus, with one-MiB reads, four
 principals, and a governed one-GiB object-cache budget. Native comparisons are
 same-run substrate measurements; the verified-read comparator reads and
@@ -90,17 +90,18 @@ BLAKE3-verifies the same bytes.
 
 | Operation | Median result | Interpretation |
 |---|---:|---|
-| Astrid staging write | 5,120.3 MiB/s | 1.001× native elapsed; acknowledgement path |
-| Native warm verified read | 1,738.0 MiB/s | read plus BLAKE3 |
-| Astrid warm verified read | 1,754.4 MiB/s | 0.991× native elapsed time |
-| Astrid first verified read | 648.1 MiB/s | process-local evidence cold |
-| Astrid post-reopen verified read | 485.0 MiB/s | evidence rebuilt after reopen |
-| Unique publication | 271.3 MiB/s | asynchronous contiguous admission |
-| Duplicate publication | 388.2 MiB/s | exact same-content admission |
-| Eight-worker first ingest | 1,556.4 MiB/s | 5.724× single-worker throughput |
-| Four-principal shared publication | 928.6 MiB/s aggregate | 3.423× single-principal throughput |
-| Four-principal warm verified read | 6,485.4 MiB/s aggregate | 3.697× single-principal throughput |
-| Populated reopen | 1.531 s | revalidates the contiguous representation |
+| Astrid staging write | 5,080.8 MiB/s | acknowledgement path |
+| Verified copy fallback | 674.7 MiB/s | forced full-data fallback, no clone |
+| Native warm verified read | 1,660.7 MiB/s | read plus BLAKE3 |
+| Astrid warm verified read | 1,774.6 MiB/s | 0.936× native elapsed time |
+| Astrid first verified read | 625.6 MiB/s | process-local evidence cold |
+| Astrid post-reopen verified read | 488.5 MiB/s | evidence rebuilt after reopen |
+| Unique publication | 270.4 MiB/s | asynchronous contiguous admission |
+| Duplicate publication | 295.8 MiB/s | supplied preimage is reverified before reuse |
+| Eight-worker first ingest | 1,212.1 MiB/s | 4.449× single-worker throughput |
+| Four-principal shared publication | 935.8 MiB/s aggregate | 3.461× single-principal throughput |
+| Four-principal warm verified read | 6,325.5 MiB/s aggregate | 3.565× single-principal throughput |
+| Populated reopen | 1.561 s | revalidates the contiguous representation |
 
 The current bounded bulk-ingest checkpoint at clean commit `02968196` split
 the same 512 MiB corpus into 128 independently fingerprinted 4 MiB sources.
