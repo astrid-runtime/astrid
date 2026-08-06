@@ -81,8 +81,8 @@ let loaded: serde_json::Value = scoped.get_json("prefs").await?.unwrap();
 
 ## Performance
 
-The current dense physical-catalogue implementation was measured from clean
-commit `ce756e1e` on an M2 Ultra/APFS host. Each reported median covers three
+The current contiguous-adoption implementation was measured from clean commit
+`da8e3cd0` on an M2 Ultra/APFS host. Each reported median covers three
 runs over a deterministic 512 MiB incompressible corpus, with one-MiB reads, four
 principals, and a governed one-GiB object-cache budget. Native comparisons are
 same-run substrate measurements; the verified-read comparator reads and
@@ -90,17 +90,17 @@ BLAKE3-verifies the same bytes.
 
 | Operation | Median result | Interpretation |
 |---|---:|---|
-| Astrid staging write | 4,443.2 MiB/s | native-speed acknowledgement path |
-| Native warm verified read | 1,596.8 MiB/s | read plus BLAKE3 |
-| Astrid warm verified read | 1,778.5 MiB/s | 0.898× native elapsed time |
-| Astrid first verified read | 518.2 MiB/s | process-local evidence cold |
-| Astrid post-reopen verified read | 404.3 MiB/s | evidence rebuilt after reopen |
-| Unique publication | 179.5 MiB/s | asynchronous authoritative admission |
-| Duplicate publication | 256.5 MiB/s | exact same-content admission |
-| Four-principal shared publication | 380.9 MiB/s aggregate | 2.122× single-principal throughput |
-| Four-principal warm verified read | 6,285.1 MiB/s aggregate | 3.534× single-principal throughput |
-| Populated reopen | 1.276 s | dense physical-catalogue recovery |
-| Direct-catalogue activation | 2.243 s | one-time migration of the populated store |
+| Astrid staging write | 5,120.3 MiB/s | 1.001× native elapsed; acknowledgement path |
+| Native warm verified read | 1,738.0 MiB/s | read plus BLAKE3 |
+| Astrid warm verified read | 1,754.4 MiB/s | 0.991× native elapsed time |
+| Astrid first verified read | 648.1 MiB/s | process-local evidence cold |
+| Astrid post-reopen verified read | 485.0 MiB/s | evidence rebuilt after reopen |
+| Unique publication | 271.3 MiB/s | asynchronous contiguous admission |
+| Duplicate publication | 388.2 MiB/s | exact same-content admission |
+| Eight-worker first ingest | 1,556.4 MiB/s | 5.724× single-worker throughput |
+| Four-principal shared publication | 928.6 MiB/s aggregate | 3.423× single-principal throughput |
+| Four-principal warm verified read | 6,485.4 MiB/s aggregate | 3.697× single-principal throughput |
+| Populated reopen | 1.531 s | revalidates the contiguous representation |
 
 The current bounded bulk-ingest checkpoint at clean commit `02968196` split
 the same 512 MiB corpus into 128 independently fingerprinted 4 MiB sources.
@@ -127,15 +127,16 @@ staged objects, and parent-before-child staging across batches take the normal
 fail-closed validation path. On this warm 512 MiB corpus, one TiB extrapolates
 to about 14 minutes; this is not a larger-than-memory or mounted-provider claim.
 
-Unique random content appended 1.013715 physical bytes per logical byte,
-including authenticated representation metadata. Republishing the identical
-512 MiB appended 18,032 bytes (0.003359%): exact deduplication plus the new
-principal root and catalogue metadata. Strict small-file seals measured 71.6
-files/s versus 230.2 native write-and-sync operations/s, so ordinary hosted
+Unique random content appended 1.000971 authoritative bytes per logical byte,
+including the contiguous blob and authenticated representation metadata.
+Republishing the identical 512 MiB appended 8,387 bytes (0.001562%): exact
+deduplication plus the new principal root and catalogue metadata. The unique
+publication added 61,042 bytes of representation metadata, or 1,034.6 bytes
+per newly inserted object; the raw 512 MiB payload is not misreported as
+metadata. Strict small-file seals measured 70.5 files/s versus 197.3 native
+write-and-sync operations/s, so ordinary hosted
 close remains the native-speed staging boundary while publication proceeds in
-the background. The dense map uses 903.0 representation-metadata bytes per new
-object, 19.7% below the preceding canonical binary map, while preserving
-legacy-root recovery and logical identities.
+the background.
 
 These are engine and APFS-substrate measurements, not mounted-provider results
 or corpus-wide compression claims. The full methodology, historical baselines,
