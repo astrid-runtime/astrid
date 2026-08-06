@@ -11,7 +11,9 @@ impl astrid_storage_content::ContentSource for EngineContentSource<'_> {
     }
 }
 
-fn activate_physical_authority(engine: &TestEngine) -> ObjectId {
+fn activate_physical_authority<I: PersistentObjectIdentity>(
+    engine: &DurableEngine<String, I, Utf8Codec>,
+) -> ObjectId {
     let specification = ObjectRecord::new(
         ObjectKind::Evidence,
         ObjectFormatVersion::V1,
@@ -28,6 +30,25 @@ fn activate_physical_authority(engine: &TestEngine) -> ObjectId {
     specification_id
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ChunkCollisionIdentity;
+
+impl ObjectIdentity for ChunkCollisionIdentity {
+    fn identify(&self, record: &ObjectRecord) -> ObjectId {
+        if record.kind() == ObjectKind::Chunk {
+            ObjectId::new([0x5a; 32])
+        } else {
+            TestIdentity.identify(record)
+        }
+    }
+}
+
+impl PersistentObjectIdentity for ChunkCollisionIdentity {
+    fn scheme(&self) -> IdentityScheme {
+        TEST_IDENTITY_SCHEME
+    }
+}
+
 fn patterned_content(bytes: usize) -> Vec<u8> {
     (0..bytes)
         .map(|index| {
@@ -35,6 +56,68 @@ fn patterned_content(bytes: usize) -> Vec<u8> {
             u8::try_from((index.wrapping_mul(31) ^ block.wrapping_mul(17)) & 0xff).unwrap()
         })
         .collect()
+}
+
+#[test]
+fn contiguous_publication_rejects_unequal_repeated_chunk_preimages() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = DurableEngine::<String, ChunkCollisionIdentity, Utf8Codec>::open(
+        directory.path(),
+        ChunkCollisionIdentity,
+        Utf8Codec,
+        limits(),
+    )
+    .unwrap();
+    activate_physical_authority(&engine);
+    let content = patterned_content(768 * 1024 + 29);
+    let prepared = engine
+        .prepare_contiguous_file(
+            astrid_storage_content::ChunkingProfile::ASTRID_V1,
+            u64::try_from(content.len()).unwrap(),
+            std::io::Cursor::new(&content),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        engine.publish_contiguous_copy(prepared, std::io::Cursor::new(&content)),
+        Err(DurableError::Model(ModelError::ObjectCollision(_)))
+    ));
+}
+
+#[test]
+fn contiguous_publication_rejects_an_unequal_preexisting_chunk_preimage() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = DurableEngine::<String, ChunkCollisionIdentity, Utf8Codec>::open(
+        directory.path(),
+        ChunkCollisionIdentity,
+        Utf8Codec,
+        limits(),
+    )
+    .unwrap();
+    activate_physical_authority(&engine);
+    let existing = ObjectRecord::new(
+        ObjectKind::Chunk,
+        ObjectFormatVersion::V1,
+        b"pre-existing collision witness".to_vec(),
+        Vec::new(),
+        0,
+        ObjectClass::Data,
+    )
+    .unwrap();
+    engine.stage_object(&existing).unwrap();
+    let content = patterned_content(8 * 1024 + 7);
+    let prepared = engine
+        .prepare_contiguous_file(
+            astrid_storage_content::ChunkingProfile::ASTRID_V1,
+            u64::try_from(content.len()).unwrap(),
+            std::io::Cursor::new(&content),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        engine.publish_contiguous_copy(prepared, std::io::Cursor::new(&content)),
+        Err(DurableError::Model(ModelError::ObjectCollision(_)))
+    ));
 }
 
 #[derive(Clone, Copy, Debug)]

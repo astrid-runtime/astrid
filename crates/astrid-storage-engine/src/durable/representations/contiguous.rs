@@ -120,6 +120,24 @@ impl RepresentationStore {
         Ok(Some((file, location)))
     }
 
+    pub(in crate::durable) fn open_loose_blob(
+        &self,
+        blob: astrid_storage_model::BlobId,
+        namespace_generation: u64,
+    ) -> Result<File, DurableError> {
+        let directory = LooseBlobDirectory::open(
+            &self.root_directory,
+            &self.root,
+            namespace_generation,
+            false,
+        )?;
+        open_authoritative_regular(
+            &directory,
+            &loose_blob_name(blob),
+            "contiguous blob is missing, redirected, or not a regular file",
+        )
+    }
+
     pub(in crate::durable) fn contains_contiguous(&self, object: ObjectId) -> bool {
         self.contiguous.contains_key(&object)
     }

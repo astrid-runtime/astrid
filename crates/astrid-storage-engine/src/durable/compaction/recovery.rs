@@ -103,6 +103,7 @@ pub(super) fn cleanup_without_intent(directory: &Path) -> Result<(), DurableErro
 
 pub(super) fn recover_interrupted_compaction<P, I, C>(
     directory: &Path,
+    store_root: &cap_std::fs::Dir,
     codec: &C,
     identity: &I,
     limits: RecoveryLimits,
@@ -145,7 +146,7 @@ where
             "recovered compaction placement differs from its durable intent",
         ));
     }
-    rebase_representation_authority(directory, identity, limits)?;
+    rebase_representation_authority(directory, store_root, identity, limits)?;
     remove_if_exists(&directory.join(INDEX_FILE))?;
     let ready = outbox::mark_ready(directory, intent_model.commit, identity, limits)?;
     if ready != bundle {
@@ -158,11 +159,11 @@ where
 
 fn rebase_representation_authority<I: PersistentObjectIdentity>(
     directory: &Path,
+    store_root: &cap_std::fs::Dir,
     identity: &I,
     limits: RecoveryLimits,
 ) -> Result<(), DurableError> {
-    let store_root = super::super::representations::open_store_root(directory)?;
-    let Some(mut representations) = RepresentationStore::open(directory, &store_root, limits)?
+    let Some(mut representations) = RepresentationStore::open(directory, store_root, limits)?
     else {
         return Ok(());
     };
