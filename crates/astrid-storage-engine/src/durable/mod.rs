@@ -301,8 +301,6 @@ pub enum DurableError {
     InvalidRestore(&'static str),
     /// Physical representation metadata or its authority journal was invalid.
     InvalidRepresentationState(&'static str),
-    /// Arena retirement was requested before representation liveness is implemented.
-    RepresentationRetirementUnsupported,
     /// Compaction evidence, retention, or its native fact snapshot was invalid.
     InvalidCompactionEvidence(&'static str),
     /// The native liveness snapshot changed between proof and physical rewrite.
@@ -368,9 +366,6 @@ impl fmt::Display for DurableError {
             Self::InvalidRepresentationState(detail) => {
                 write!(formatter, "invalid representation state: {detail}")
             },
-            Self::RepresentationRetirementUnsupported => formatter.write_str(
-                "arena retirement requires representation leases and final-path liveness",
-            ),
             Self::InvalidCompactionEvidence(detail) => {
                 write!(formatter, "invalid compaction evidence: {detail}")
             },

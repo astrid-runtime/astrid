@@ -74,7 +74,7 @@ fn evidence(bytes: &[u8]) -> ObjectRecord {
 }
 
 #[tokio::test]
-async fn production_retention_preserves_bootstraps_while_retirement_is_deferred() {
+async fn production_retention_preserves_bootstraps_during_compaction() {
     let directory = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(directory.path());
     let store = open_runtime_principal_store(&home, unlimited_quota())
@@ -136,14 +136,8 @@ async fn production_retention_preserves_bootstraps_while_retirement_is_deferred(
             &AcceptCompactionProof,
         )
         .unwrap();
-    assert!(matches!(
-        store.engine.compact(&plan),
-        Err(astrid_storage_engine::DurableError::RepresentationRetirementUnsupported)
-    ));
-    assert_eq!(
-        store.engine.object(orphan).unwrap(),
-        Some(evidence(b"collect-me"))
-    );
+    store.engine.compact(&plan).unwrap();
+    assert_eq!(store.engine.object(orphan).unwrap(), None);
     store.engine.close().unwrap();
     drop(store);
 
@@ -179,7 +173,7 @@ async fn production_retention_preserves_bootstraps_while_retirement_is_deferred(
 }
 
 #[tokio::test]
-async fn raw_retention_cannot_bypass_the_representation_retirement_gate() {
+async fn raw_engine_retention_remains_policy_neutral() {
     let directory = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(directory.path());
     let store = open_runtime_principal_store(&home, unlimited_quota())
@@ -206,20 +200,10 @@ async fn raw_retention_cannot_bypass_the_representation_retirement_gate() {
         .capture_compaction_facts(&raw_retention)
         .unwrap();
     assert!(facts.condemned().contains(&format_spec_id));
-    let plan = store
-        .engine
-        .verify_compaction_plan(
-            raw_retention,
-            facts,
-            policy,
-            evidence(b"test-tensor-logic-proof"),
-            &AcceptCompactionProof,
-        )
-        .unwrap();
-    assert!(matches!(
-        store.engine.compact(&plan),
-        Err(astrid_storage_engine::DurableError::RepresentationRetirementUnsupported)
-    ));
+    // The engine deliberately has no knowledge of runtime bootstrap roles.
+    // Runtime composition keeps the engine private and exposes only the
+    // constructor below, which adds and verifies every registered System root
+    // before a destructive plan can be authorized.
 
     let policy = evidence(b"subsequent-runtime-retention");
     let retention = store
