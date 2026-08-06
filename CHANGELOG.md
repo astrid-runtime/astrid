@@ -20,6 +20,15 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Added
 
+- **Astrid now has durable human and fleet ownership identities independent of
+  executable principals and capability groups.** Canonical `UserUid` and
+  `FleetUid` genesis records feed an atomically persisted ownership graph with
+  owner-safe membership changes, exclusive principal assignment, explicit
+  cross-fleet transfers, concurrent-writer protection, and fail-closed boot
+  validation. Existing native installations deterministically acquire a
+  default user, fleet, and ownership edge without changing CLI, HTTP, profile,
+  group, or `StateOwnerCodecV1` behavior. Closes #1469.
+
 - **Bulk publication reuses closure evidence earned during authoritative
   staging.** A bounded, batch-local dependency walk proves admitted owning
   closures without retaining write-history state; later publication skips only

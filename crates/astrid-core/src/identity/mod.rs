@@ -4,11 +4,17 @@
 //! platforms, and [`FrontendLink`], a mapping from platform-specific identities
 //! to Astrid users.
 
+/// Durable human and fleet ownership identities.
+pub mod ownership;
 /// Stable principal identity.
 pub mod principal;
 /// Core identity types.
 pub mod types;
 
+pub use ownership::{
+    FleetGenesis, FleetIdentity, FleetMembership, FleetRole, FleetUid, OwnershipIdentityError,
+    PrincipalOwnership, UserGenesis, UserIdentity, UserUid,
+};
 pub use principal::{PrincipalGenesis, PrincipalIdentity, PrincipalIdentityError, PrincipalUid};
 pub use types::{AstridUserId, FrontendLink, normalize_platform};
 

@@ -36,6 +36,7 @@ pub mod content;
 pub mod error;
 pub mod identity;
 pub mod kv;
+pub mod ownership;
 mod principal_directory;
 mod principal_graph;
 #[cfg(not(target_family = "wasm"))]
@@ -65,6 +66,7 @@ pub use kv::{
     KvEntry, KvPrincipalResolver, KvQuotaResolver, KvStore, MemoryKvStore, PrincipalKvStore,
     ScopedKvStore, TreeKvStore,
 };
+pub use ownership::{FleetRecord, OwnershipError, OwnershipSnapshot, OwnershipStore};
 pub use principal_directory::PrincipalDirectory;
 pub use secret::{
     DenySecretStore, FileSecretStore, KvSecretStore, ReadThroughSecretStore, SecretStore,

@@ -242,6 +242,8 @@ pub struct Kernel {
     pub allowance_store: Arc<astrid_approval::AllowanceStore>,
     /// System-wide identity store for platform user resolution.
     identity_store: Arc<dyn astrid_storage::IdentityStore>,
+    /// Durable human, fleet, and exclusive principal ownership graph.
+    ownership_store: Arc<astrid_storage::OwnershipStore>,
     /// System-wide per-principal profile cache (Layer 3 quota enforcement).
     ///
     /// One instance per kernel boot. Every capsule load plumbs this into
@@ -348,6 +350,12 @@ impl KernelResources {
 }
 
 impl Kernel {
+    /// Astrid's authoritative human-to-fleet ownership store.
+    #[must_use]
+    pub fn ownership_store(&self) -> &Arc<astrid_storage::OwnershipStore> {
+        &self.ownership_store
+    }
+
     /// Per-project runtime layout selected at boot.
     #[must_use]
     pub fn workspace_layout(&self) -> &WorkspaceLayout {
@@ -773,6 +781,14 @@ impl Kernel {
                     "Failed to load durable principal identities: {error}"
                 ))
             })?;
+        let ownership_store = Arc::new(
+            astrid_storage::OwnershipStore::new(Arc::clone(&kv)).map_err(|error| {
+                std::io::Error::other(format!("Failed to create ownership store: {error}"))
+            })?,
+        );
+        ownership_store.load().await.map_err(|error| {
+            std::io::Error::other(format!("Failed to load ownership graph: {error}"))
+        })?;
 
         // Load group config (issue #670). Boot-loaded once, then swapped
         // atomically by Layer 6 admin topics (issue #672). Missing file
@@ -799,11 +815,21 @@ impl Kernel {
             // Bootstrap the CLI root user (idempotent). Also seeds the
             // default principal's profile with `groups = ["admin"]` so
             // single-tenant deployments get full management-API access.
-            bootstrap_cli_root_user(&identity_store, &home)
+            let (root_user, root_public_key) = bootstrap_cli_root_user(&identity_store, &home)
                 .await
                 .map_err(|e| {
                     std::io::Error::other(format!("Failed to bootstrap CLI root user: {e}"))
                 })?;
+            bootstrap_cli_root_ownership(
+                &ownership_store,
+                &principal_directory,
+                root_user,
+                root_public_key,
+            )
+            .await
+            .map_err(|error| {
+                std::io::Error::other(format!("Failed to bootstrap CLI root ownership: {error}"))
+            })?;
 
             // Apply pre-configured identity links from config.
             apply_identity_config(&identity_store, &workspace_root, &workspace_layout).await;
@@ -848,6 +874,7 @@ impl Kernel {
             token_path,
             allowance_store,
             identity_store,
+            ownership_store,
             profile_cache: profile_cache
                 .unwrap_or_else(|| Arc::new(PrincipalProfileCache::with_home(home.clone()))),
             groups,
@@ -2572,6 +2599,9 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         .expect("test kernel: identity kv scope");
     let identity_store: Arc<dyn astrid_storage::IdentityStore> =
         Arc::new(astrid_storage::KvIdentityStore::new(identity_kv));
+    let ownership_store = Arc::new(
+        astrid_storage::OwnershipStore::new(Arc::clone(&kv)).expect("test kernel: ownership store"),
+    );
 
     let groups = Arc::new(ArcSwap::from_pointee(
         GroupConfig::load(&home).expect("test kernel: load groups"),
@@ -2615,6 +2645,7 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         token_path: home.token_path(),
         allowance_store,
         identity_store,
+        ownership_store,
         profile_cache: Arc::new(PrincipalProfileCache::with_home(home.clone())),
         groups,
         astrid_home: home,
@@ -3494,7 +3525,7 @@ fn warn_agent_loop_readiness(manifests: &[&astrid_capsule_types::manifest::Capsu
 async fn bootstrap_cli_root_user(
     store: &Arc<dyn astrid_storage::IdentityStore>,
     home: &astrid_core::dirs::AstridHome,
-) -> Result<(), astrid_storage::IdentityError> {
+) -> Result<(astrid_core::AstridUserId, [u8; 32]), astrid_storage::IdentityError> {
     // Seed the default principal profile with the admin group. Runs
     // before the identity-link short-circuit below so a deleted profile
     // between boots is restored even when the identity record persists.
@@ -3513,7 +3544,7 @@ async fn bootstrap_cli_root_user(
             .bind_principal_identity(user.id, principal, initial_public_key)
             .await?;
         tracing::debug!("CLI root user already linked");
-        return Ok(());
+        return Ok((user, initial_public_key));
     }
 
     // No CLI link exists. Create or find the root user.
@@ -3526,7 +3557,42 @@ async fn bootstrap_cli_root_user(
     store.link("cli", "local", user.id, "system").await?;
     tracing::info!(user_id = %user.id, "Linked CLI root user (cli/local)");
 
-    Ok(())
+    Ok((user, initial_public_key))
+}
+
+async fn bootstrap_cli_root_ownership(
+    store: &astrid_storage::OwnershipStore,
+    principal_directory: &astrid_storage::PrincipalDirectory,
+    root_user: astrid_core::AstridUserId,
+    initial_public_key: [u8; 32],
+) -> Result<(), astrid_storage::OwnershipError> {
+    let user = astrid_core::UserIdentity::from_genesis(astrid_core::UserGenesis::from_parts(
+        root_user.id,
+        root_user.created_at,
+        initial_public_key,
+    ))?;
+    store.create_user(user.clone()).await?;
+
+    // Reuse the legacy root UUID and timestamp as deterministic fleet genesis
+    // inputs. User/fleet UID derivation is domain-separated, so their durable
+    // identifiers remain distinct while every boot derives the same records.
+    let fleet = astrid_core::FleetIdentity::from_genesis(astrid_core::FleetGenesis::from_parts(
+        root_user.id,
+        root_user.created_at,
+        user.uid,
+    ))?;
+    store.create_fleet(fleet.clone()).await?;
+
+    let principal_uid = principal_directory
+        .uid_for(&astrid_core::PrincipalId::default())
+        .map_err(astrid_storage::OwnershipError::Storage)?;
+    store
+        .assign_principal(astrid_core::PrincipalOwnership {
+            principal_uid,
+            fleet_uid: fleet.uid,
+            assigned_by: user.uid,
+        })
+        .await
 }
 
 fn principal_initial_public_key(
@@ -3846,6 +3912,46 @@ mod tests {
     use astrid_capsule_types::CapsuleId;
     use astrid_capsule_types::error::CapsuleResult;
     use astrid_capsule_types::manifest::CapsuleManifest;
+
+    #[tokio::test]
+    async fn legacy_root_ownership_bootstrap_is_deterministic_and_idempotent() {
+        let backend: Arc<dyn astrid_storage::KvStore> =
+            Arc::new(astrid_storage::MemoryKvStore::new());
+        let ownership_store = astrid_storage::OwnershipStore::new(backend).unwrap();
+        let directory = astrid_storage::PrincipalDirectory::default();
+        let principal_identity = astrid_core::PrincipalIdentity::from_genesis(
+            astrid_core::PrincipalGenesis::from_parts(
+                uuid::Uuid::from_u128(2),
+                chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+                [2; 32],
+            ),
+        )
+        .unwrap();
+        directory
+            .register(astrid_core::PrincipalId::default(), principal_identity.uid)
+            .unwrap();
+        let root_user = astrid_core::AstridUserId {
+            id: uuid::Uuid::from_u128(1),
+            principal: astrid_core::PrincipalId::default(),
+            public_key: None,
+            display_name: None,
+            created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+        };
+
+        bootstrap_cli_root_ownership(&ownership_store, &directory, root_user.clone(), [1; 32])
+            .await
+            .unwrap();
+        let first = ownership_store.load().await.unwrap();
+        bootstrap_cli_root_ownership(&ownership_store, &directory, root_user, [1; 32])
+            .await
+            .unwrap();
+        let second = ownership_store.load().await.unwrap();
+
+        assert_eq!(first, second);
+        let principal_owner = second.principal_owner(principal_identity.uid).unwrap();
+        assert_eq!(second.fleets().count(), 1);
+        assert!(second.fleet(principal_owner.fleet_uid).is_some());
+    }
 
     #[test]
     fn persistent_idle_monitor_stops_after_ephemeral_mode_is_enabled() {
