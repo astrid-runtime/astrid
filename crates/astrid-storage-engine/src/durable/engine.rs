@@ -293,20 +293,21 @@ where
             }
             let (location, contiguous, generation) = {
                 let inner = self.lock_usable_with(&mut recovery)?;
+                let contiguous = match inner.representations.as_ref() {
+                    Some(store) => store.open_contiguous_read(id)?,
+                    None => None,
+                };
                 (
                     inner.index.get(&id).copied(),
-                    inner
-                        .representations
-                        .as_ref()
-                        .and_then(|store| store.contiguous_read(id)),
+                    contiguous,
                     inner.arena_generation,
                 )
             };
             if location.is_none()
-                && let Some((path, location)) = contiguous
+                && let Some((file, location)) = contiguous
             {
                 let record = super::representations::read_contiguous_object(
-                    &path,
+                    file,
                     location,
                     id,
                     &self.identity,
@@ -409,22 +410,16 @@ where
                     .keys()
                     .filter_map(|id| inner.index.get(id).copied().map(|location| (*id, location)))
                     .collect::<Vec<_>>();
-                let contiguous = inner
-                    .representations
-                    .as_ref()
-                    .map(|store| {
-                        missing
-                            .keys()
-                            .filter_map(|id| {
-                                (!inner.index.contains_key(id)).then(|| {
-                                    store
-                                        .contiguous_read(*id)
-                                        .map(|(path, location)| (*id, path, location))
-                                })?
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
+                let mut contiguous = Vec::new();
+                if let Some(store) = inner.representations.as_ref() {
+                    for id in missing.keys() {
+                        if !inner.index.contains_key(id)
+                            && let Some((file, location)) = store.open_contiguous_read(*id)?
+                        {
+                            contiguous.push((*id, file, location));
+                        }
+                    }
+                }
                 (locations, contiguous, inner.arena_generation)
             };
             let reader_guard = self.arena_reader.read();
@@ -437,13 +432,13 @@ where
             let mut loaded =
                 read_indexed_objects(&reader.file, &locations, &self.identity, self.limits)?;
             drop(reader_guard);
-            for (id, path, location) in &contiguous {
+            for (id, file, location) in contiguous {
                 loaded.insert(
-                    *id,
+                    id,
                     super::representations::read_contiguous_object(
-                        path,
-                        *location,
-                        *id,
+                        file,
+                        location,
+                        id,
                         &self.identity,
                     )?,
                 );

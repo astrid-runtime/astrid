@@ -97,15 +97,19 @@ impl RepresentationStore {
         self.append_contiguous_authority(reverse_additions, contiguous_additions)
     }
 
-    pub(in crate::durable) fn contiguous_read(
+    pub(in crate::durable) fn open_contiguous_read(
         &self,
         object: ObjectId,
-    ) -> Option<(PathBuf, ContiguousLocation)> {
-        let location = self.contiguous.get(&object).copied()?;
-        Some((
-            self.loose_blob_path(location.blob, location.namespace_generation),
-            location,
-        ))
+    ) -> Result<Option<(File, ContiguousLocation)>, DurableError> {
+        let Some(location) = self.contiguous.get(&object).copied() else {
+            return Ok(None);
+        };
+        let path = self.loose_blob_path(location.blob, location.namespace_generation);
+        let file = open_authoritative_regular(
+            &path,
+            "contiguous blob is missing, redirected, or not a regular file",
+        )?;
+        Ok(Some((file, location)))
     }
 
     pub(in crate::durable) fn contains_contiguous(&self, object: ObjectId) -> bool {
@@ -608,15 +612,11 @@ fn loose_blob_path_from_representation_root(
 }
 
 pub(in crate::durable) fn read_contiguous_object<I: PersistentObjectIdentity>(
-    path: &Path,
+    mut file: File,
     location: ContiguousLocation,
     expected: ObjectId,
     identity: &I,
 ) -> Result<ObjectRecord, DurableError> {
-    let mut file = open_authoritative_regular(
-        path,
-        "contiguous blob is missing, redirected, or not a regular file",
-    )?;
     file.seek(SeekFrom::Start(location.offset))
         .map_err(|source| io_error("seek contiguous chunk", source))?;
     let length = usize::try_from(location.length).map_err(|_| DurableError::EncodingOverflow)?;

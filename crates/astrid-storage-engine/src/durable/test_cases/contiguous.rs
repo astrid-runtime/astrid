@@ -179,11 +179,33 @@ fn compaction_materializes_contiguous_objects_before_retiring_the_blob() {
     assert!(chunk_ids
         .iter()
         .all(|id| !engine.inner.lock().index.contains_key(id)));
+    let pinned_chunk = chunk_ids[0];
+    let (pinned_file, pinned_location) = engine
+        .inner
+        .lock()
+        .representations
+        .as_ref()
+        .unwrap()
+        .open_contiguous_read(pinned_chunk)
+        .unwrap()
+        .unwrap();
 
     let authorization = contiguous_compaction_plan(&engine, specification, descriptor.file());
     engine.compact(&authorization).unwrap();
 
     assert!(!blob_path.exists());
+    assert_eq!(
+        super::representations::read_contiguous_object(
+            pinned_file,
+            pinned_location,
+            pinned_chunk,
+            &TestIdentity,
+        )
+        .unwrap()
+        .kind(),
+        ObjectKind::Chunk,
+        "a read handle issued before compaction lost its recoverable bytes"
+    );
     {
         let inner = engine.inner.lock();
         let representations = inner.representations.as_ref().unwrap();

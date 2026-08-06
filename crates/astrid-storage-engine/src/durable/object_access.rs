@@ -42,20 +42,21 @@ where
         loop {
             let (location, contiguous, generation) = {
                 let inner = self.lock_usable_with(&mut recovery)?;
+                let contiguous = match inner.representations.as_ref() {
+                    Some(store) => store.open_contiguous_read(id)?,
+                    None => None,
+                };
                 (
                     inner.index.get(&id).copied(),
-                    inner
-                        .representations
-                        .as_ref()
-                        .and_then(|store| store.contiguous_read(id)),
+                    contiguous,
                     inner.arena_generation,
                 )
             };
             if location.is_none()
-                && let Some((path, location)) = contiguous
+                && let Some((file, location)) = contiguous
             {
                 return super::representations::read_contiguous_object(
-                    &path,
+                    file,
                     location,
                     id,
                     &self.identity,
