@@ -77,7 +77,7 @@ impl LooseBlobDirectory {
     }
 
     pub(super) fn sync(&self) -> io::Result<()> {
-        self.directory.try_clone()?.into_std_file().sync_all()
+        sync_directory(&self.directory)
     }
 
     pub(super) const fn capability(&self) -> &Dir {
@@ -126,14 +126,16 @@ fn open_component(parent: &Dir, name: &Path, create: bool) -> Result<Dir, Durabl
                         .ok_or(source)
                 })
                 .map_err(|source| io_error("create loose blob directory capability", source))?;
-            parent
-                .try_clone()
-                .and_then(|directory| directory.into_std_file().sync_all())
+            sync_directory(parent)
                 .map_err(|source| io_error("flush loose blob parent capability", source))?;
             open().map_err(|source| io_error("pin loose blob directory capability", source))
         },
         Err(source) => Err(io_error("pin loose blob directory capability", source)),
     }
+}
+
+fn sync_directory(directory: &Dir) -> io::Result<()> {
+    directory.open(Path::new("."))?.into_std().sync_all()
 }
 
 fn reject_redirect(parent: &Dir, name: &Path, directory: bool) -> io::Result<()> {
