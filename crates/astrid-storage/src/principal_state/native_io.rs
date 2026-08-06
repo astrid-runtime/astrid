@@ -145,10 +145,18 @@ pub(super) fn create_private_file(path: &Path) -> StorageResult<File> {
 
 pub(super) fn open_private_file(path: &Path) -> StorageResult<File> {
     validate_private_regular_file(path)?;
-    OpenOptions::new()
-        .read(true)
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options
         .open(path)
-        .map_err(|error| connection(format!("open private file {}: {error}", path.display())))
+        .map_err(|error| connection(format!("open private file {}: {error}", path.display())))?;
+    private_file_identity(&file)?;
+    Ok(file)
 }
 
 pub(super) fn atomic_write(path: &Path, bytes: &[u8]) -> StorageResult<()> {

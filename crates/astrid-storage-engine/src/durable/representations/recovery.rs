@@ -1,9 +1,8 @@
 //! Recovery and closed-world validation for physical representation authority.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
 
 use astrid_storage_model::{
     CanonicalPhysicalMap, Coverage, ObjectId, PhysicalMapKey, PhysicalMapNode, PlacementEntry,
@@ -474,15 +473,10 @@ pub(super) fn active_entries(
     Ok(entries)
 }
 
-pub(super) fn read_current(
-    path: &Path,
+pub(super) fn read_current_file(
+    mut file: File,
     limits: RecoveryLimits,
 ) -> Result<CurrentPointer, DurableError> {
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .map_err(|source| io_error("open representation current pointer", source))?;
     let mut current = None;
     scan_frames(
         &mut file,

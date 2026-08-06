@@ -806,6 +806,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hex",
  "keyring",
+ "libc",
  "parking_lot",
  "serde",
  "serde_json",

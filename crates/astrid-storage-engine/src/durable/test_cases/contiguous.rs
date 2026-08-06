@@ -593,6 +593,27 @@ fn contiguous_publication_stays_below_the_store_handle_after_root_replacement() 
 
 #[cfg(unix)]
 #[test]
+fn representation_activation_stays_below_the_store_handle_after_root_replacement() {
+    let container = tempfile::tempdir().unwrap();
+    let store = container.path().join("store");
+    let displaced = container.path().join("store.displaced");
+    let outside = container.path().join("outside-store");
+    let engine = open(&store);
+
+    std::fs::rename(&store, &displaced).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, &store).unwrap();
+
+    activate_physical_authority(&engine);
+    assert!(
+        !outside.join("representations").exists(),
+        "representation activation escaped the retained store capability"
+    );
+    assert!(displaced.join("representations/CURRENT").is_file());
+}
+
+#[cfg(unix)]
+#[test]
 fn contiguous_reads_reject_a_blob_replaced_by_a_symlink() {
     let directory = tempfile::tempdir().unwrap();
     let engine = open(directory.path());
