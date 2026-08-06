@@ -389,11 +389,14 @@ pub(in crate::durable) fn install_loose_blob_from_file(
             let prepared = (|| {
                 let mut options = cap_std::fs::OpenOptions::new();
                 options.write(true);
+                configure_no_follow(&mut options);
                 let file = directory
                     .capability()
                     .open_with(&temporary, &options)
                     .map(cap_std::fs::File::into_std)
                     .map_err(|source| io_error("open cloned loose blob temporary", source))?;
+                validate_opened_regular(&file)
+                    .map_err(|source| io_error("validate cloned loose blob temporary", source))?;
                 file.set_len(logical_bytes)
                     .and_then(|()| file.sync_all())
                     .map_err(|source| io_error("truncate and flush cloned loose blob", source))

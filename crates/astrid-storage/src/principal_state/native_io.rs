@@ -22,6 +22,16 @@ pub(super) fn private_file_identity(file: &File) -> StorageResult<PrivateFileIde
             "private file handle is not a regular file".to_owned(),
         ));
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(connection(
+                "private file handle is a reparse point".to_owned(),
+            ));
+        }
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
@@ -144,13 +154,27 @@ pub(super) fn create_private_file(path: &Path) -> StorageResult<File> {
 }
 
 pub(super) fn open_private_file(path: &Path) -> StorageResult<File> {
+    open_private_file_with_access(path, false)
+}
+
+pub(super) fn open_private_file_rw(path: &Path) -> StorageResult<File> {
+    open_private_file_with_access(path, true)
+}
+
+fn open_private_file_with_access(path: &Path, write: bool) -> StorageResult<File> {
     validate_private_regular_file(path)?;
     let mut options = OpenOptions::new();
-    options.read(true);
+    options.read(true).write(write);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
     let file = options
         .open(path)
