@@ -432,7 +432,7 @@ pub(super) fn validate_representations(
     Ok((reverse, extent_count))
 }
 
-fn active_entries(
+pub(super) fn active_entries(
     map: &CanonicalPhysicalMap,
 ) -> Result<Vec<(PhysicalMapKey, &[u8])>, DurableError> {
     let Some(root) = map.root() else {

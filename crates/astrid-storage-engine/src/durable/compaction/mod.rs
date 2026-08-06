@@ -7,7 +7,7 @@ use std::path::Path;
 
 use astrid_storage_model::{
     GcCommitId, GcFactSnapshotId, GcPlanEvidence, ObjectClass, ObjectFormatVersion, ObjectId,
-    ObjectKind, ObjectRecord, PlacementSetId, RetentionPolicyId, RootState, TensorLogicProofId,
+    ObjectKind, ObjectRecord, PlacementSetId, RootState, TensorLogicProofId,
 };
 
 use crate::refinery::{EngineCompactionPass, NativeArenaCompactionPass};
@@ -34,10 +34,12 @@ pub(super) const ROOTS_PREVIOUS: &str = "roots.journal.previous";
 mod evidence;
 mod facts;
 mod outbox;
+mod policy;
 mod recovery;
 
 pub use evidence::CompactionEvidenceBundle;
 use facts::{encode_current_roots, encode_retained_roots};
+pub use policy::{CompactionRetainedRoot, CompactionRetention, CompactionRootKind};
 use recovery::{
     backup_active, cleanup_without_intent, prepare_finish_compaction, promote_compacting,
     remove_compaction_intent, write_compaction_intent,
@@ -62,114 +64,6 @@ where
     C: PrincipalCodec<P>,
 {
     recovery::recover_interrupted_compaction(directory, codec, identity, limits)
-}
-
-/// Explicit liveness policy supplied by native composition.
-///
-/// Current principal roots are always retained. Additional roots cover
-/// operator pins, independent audit anchors, open-handle closures, and
-/// externally rooted bootstrap objects. There is intentionally no default
-/// history policy: the caller must identify the exact retained policy object.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CompactionRetention {
-    operation_contract: ObjectId,
-    policy: RetentionPolicyId,
-    additional_roots: Vec<CompactionRetainedRoot>,
-}
-
-/// Native reason an object closure remains live during compaction.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[non_exhaustive]
-pub enum CompactionRootKind {
-    /// Store or runtime bootstrap data retained independently of a principal.
-    System,
-    /// Named checkpoint, legal hold, or operator-selected history pin.
-    ExplicitPin,
-    /// Export, import, ingest, placement, or other bounded operation lease.
-    OperationLease,
-    /// Immutable content selected by a currently open read handle.
-    ReadHandle,
-    /// Condemned content awaiting the selected resurrection-fence epoch.
-    Quarantine,
-    /// Evidence retained by an audit or re-attestation custody policy.
-    AuditCustody,
-}
-
-impl CompactionRootKind {
-    const fn code(self) -> u8 {
-        match self {
-            Self::System => 0,
-            Self::ExplicitPin => 1,
-            Self::OperationLease => 2,
-            Self::ReadHandle => 3,
-            Self::Quarantine => 4,
-            Self::AuditCustody => 5,
-        }
-    }
-}
-
-/// One typed non-principal root interpreted by a retention policy.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct CompactionRetainedRoot {
-    kind: CompactionRootKind,
-    object: ObjectId,
-}
-
-impl CompactionRetainedRoot {
-    /// Construct one explicit retained-root fact.
-    #[must_use]
-    pub const fn new(kind: CompactionRootKind, object: ObjectId) -> Self {
-        Self { kind, object }
-    }
-
-    /// Return why this root remains live.
-    #[must_use]
-    pub const fn kind(self) -> CompactionRootKind {
-        self.kind
-    }
-
-    /// Return the root object whose complete owning closure remains live.
-    #[must_use]
-    pub const fn object(self) -> ObjectId {
-        self.object
-    }
-}
-
-impl CompactionRetention {
-    /// Construct a canonical retained-root set under one identified policy.
-    #[must_use]
-    pub fn new(
-        operation_contract: ObjectId,
-        policy: RetentionPolicyId,
-        additional_roots: impl IntoIterator<Item = CompactionRetainedRoot>,
-    ) -> Self {
-        let mut additional_roots = additional_roots.into_iter().collect::<Vec<_>>();
-        additional_roots.sort_unstable();
-        additional_roots.dedup();
-        Self {
-            operation_contract,
-            policy,
-            additional_roots,
-        }
-    }
-
-    /// Return the pinned native compaction operation contract.
-    #[must_use]
-    pub const fn operation_contract(&self) -> ObjectId {
-        self.operation_contract
-    }
-
-    /// Return the exact retention-policy identity.
-    #[must_use]
-    pub const fn policy(&self) -> RetentionPolicyId {
-        self.policy
-    }
-
-    /// Borrow the strictly ordered additional retained roots.
-    #[must_use]
-    pub fn additional_roots(&self) -> &[CompactionRetainedRoot] {
-        &self.additional_roots
-    }
 }
 
 /// Native relation snapshot and proposed condemned set for one GC proof.
@@ -347,7 +241,7 @@ where
             "Tensor Logic proof must be canonical generic Evidence",
         )?;
         let policy_id = self.identify(&policy_record);
-        if policy_id != retention.policy.object_id() {
+        if policy_id != retention.policy().object_id() {
             return Err(DurableError::InvalidCompactionEvidence(
                 "retention policy identity mismatch",
             ));
@@ -358,7 +252,7 @@ where
         let proof = TensorLogicProofId::new(self.identify(&proof_record));
         let plan = GcPlanEvidence::new(
             facts.snapshot,
-            retention.policy,
+            retention.policy(),
             proof,
             facts.condemned.clone(),
         )
@@ -455,12 +349,20 @@ where
         inner: &mut DurableInner<P>,
         retention: &CompactionRetention,
     ) -> Result<BTreeSet<ObjectId>, DurableError> {
-        let roots = inner
+        let mut roots = inner
             .roots_by_principal
             .values()
             .map(|root| root.commit)
-            .chain(retention.additional_roots.iter().map(|root| root.object()))
+            .chain(
+                retention
+                    .additional_roots()
+                    .iter()
+                    .map(|root| root.object()),
+            )
             .collect::<Vec<_>>();
+        if let Some(representations) = &inner.representations {
+            roots.extend(representations.logical_liveness_roots()?);
+        }
         let mut live = BTreeSet::new();
         let super::DurableInner {
             files,
@@ -493,10 +395,10 @@ where
     ) -> Result<ObjectRecord, DurableError> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(FACT_SNAPSHOT_PREFIX);
-        bytes.extend_from_slice(retention.operation_contract.as_bytes());
-        bytes.extend_from_slice(retention.policy.object_id().as_bytes());
+        bytes.extend_from_slice(retention.operation_contract().as_bytes());
+        bytes.extend_from_slice(retention.policy().object_id().as_bytes());
         encode_current_roots(&mut bytes, &inner.roots_by_principal, &self.principal_codec)?;
-        encode_retained_roots(&mut bytes, &retention.additional_roots)?;
+        encode_retained_roots(&mut bytes, retention.additional_roots())?;
         let universe = Self::object_universe(inner);
         let object_count =
             u64::try_from(universe.len()).map_err(|_| DurableError::EncodingOverflow)?;
@@ -614,8 +516,8 @@ where
         authorization: &VerifiedCompactionPlan,
         live: &BTreeSet<ObjectId>,
     ) -> Result<CompactionReport, DurableError> {
-        let pass = NativeArenaCompactionPass::new(authorization.retention.operation_contract);
-        if pass.operation_contract() != authorization.retention.operation_contract {
+        let pass = NativeArenaCompactionPass::new(authorization.retention.operation_contract());
+        if pass.operation_contract() != authorization.retention.operation_contract() {
             return Err(DurableError::InvalidCompactionEvidence(
                 "native compaction operation contract mismatch",
             ));
@@ -741,7 +643,7 @@ where
         let bundle = evidence::build_bundle(
             authorization,
             &evidence::PlacementView {
-                operation_contract: authorization.retention.operation_contract,
+                operation_contract: authorization.retention.operation_contract(),
                 arena_bytes: arena_bytes_before,
                 root_journal_bytes: root_bytes_before,
                 root_journal_digest: root_digest_before,
@@ -749,7 +651,7 @@ where
                 roots: &inner.roots_by_principal,
             },
             &evidence::PlacementView {
-                operation_contract: authorization.retention.operation_contract,
+                operation_contract: authorization.retention.operation_contract(),
                 arena_bytes: replacement.arena_len,
                 root_journal_bytes: replacement.root_len,
                 root_journal_digest: replacement.root_digest,
@@ -769,7 +671,7 @@ where
             &self.identity,
         )?;
         let intent = CompactionIntent {
-            operation_contract: authorization.retention.operation_contract,
+            operation_contract: authorization.retention.operation_contract(),
             commit: bundle.commit_id(),
             placement_after: bundle.placement_after_id(&self.identity),
         };

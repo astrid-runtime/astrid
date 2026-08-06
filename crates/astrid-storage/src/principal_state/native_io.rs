@@ -7,6 +7,58 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{StorageError, StorageResult};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PrivateFileIdentity {
+    pub(super) volume: u64,
+    pub(super) file: u64,
+}
+
+pub(super) fn private_file_identity(file: &File) -> StorageResult<PrivateFileIdentity> {
+    let metadata = file
+        .metadata()
+        .map_err(|error| connection(format!("inspect private file handle: {error}")))?;
+    if !metadata.is_file() {
+        return Err(connection(
+            "private file handle is not a regular file".to_owned(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        Ok(PrivateFileIdentity {
+            volume: metadata.dev(),
+            file: metadata.ino(),
+        })
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: `file` owns a live Windows handle and `info` is writable.
+        #[allow(unsafe_code)]
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &raw mut info) } == 0 {
+            return Err(connection(format!(
+                "inspect private Windows file identity: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(PrivateFileIdentity {
+            volume: u64::from(info.dwVolumeSerialNumber),
+            file: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = metadata;
+        Err(connection(
+            "private file identity is unsupported on this platform".to_owned(),
+        ))
+    }
+}
+
 pub(super) fn ensure_private_directory(path: &Path) -> StorageResult<()> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {

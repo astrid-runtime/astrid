@@ -8,7 +8,7 @@ use super::codec::{Decoder, Encoder};
 use super::identity::{
     PhysicalIdentity, decode_blob_id, encode_blob_id, encode_object_id, encode_physical_digest,
 };
-use super::{PhysicalModelError, Recipe, RepresentationRecord};
+use super::{PhysicalModelError, Recipe, RepresentationProfile, RepresentationRecord};
 
 const MAGIC: &[u8; 8] = b"ASTRAE1\0";
 const VERSION: u16 = 1;
@@ -188,11 +188,18 @@ impl RepresentationAdmissionEvidence {
     /// observations that contradict its declared reconstruction bounds.
     pub fn new<I: PhysicalIdentity>(
         identity: &I,
+        profile: &RepresentationProfile,
         representation: &RepresentationRecord,
         primary_blob: BlobId,
         observed_encoded_bytes: u64,
         outputs: &[RepresentationOutputObservation],
     ) -> Result<Self, PhysicalModelError> {
+        representation.validate_against_profile(identity, profile)?;
+        if observed_encoded_bytes > profile.reconstruction_bounds().maximum_encoded_bytes() {
+            return Err(PhysicalModelError::InvalidRecipe(
+                "admission input bytes exceed profile bounds",
+            ));
+        }
         let method = RepresentationAdmissionMethod::for_recipe(representation.recipe())?;
         let recipe_blob = match representation.recipe() {
             Recipe::DirectCanonical { blob }
@@ -362,7 +369,7 @@ mod tests {
     #[test]
     fn evidence_round_trips_and_binds_the_normalized_subject() {
         let identity = TestIdentity;
-        let bounds = ReconstructionBounds::new(1, 2, 1024, 1024, 1, 1024, 1).unwrap();
+        let bounds = ReconstructionBounds::new(1, 3, 1024, 1024, 1, 1024, 1).unwrap();
         let profile = RepresentationProfile::new_builtin(
             super::super::ProfileKind::ContiguousFile,
             bounds,
@@ -404,7 +411,8 @@ mod tests {
 
         let outputs = [RepresentationOutputObservation::new(object(6), 32)];
         let evidence =
-            RepresentationAdmissionEvidence::new(&identity, &first, blob, 13, &outputs).unwrap();
+            RepresentationAdmissionEvidence::new(&identity, &profile, &first, blob, 13, &outputs)
+                .unwrap();
         let encoded = evidence.encode();
         assert_eq!(
             RepresentationAdmissionEvidence::decode(&encoded).unwrap(),
@@ -418,7 +426,7 @@ mod tests {
     #[test]
     fn evidence_rejects_a_different_primary_blob() {
         let identity = TestIdentity;
-        let bounds = ReconstructionBounds::new(1, 2, 1024, 1024, 1, 1024, 1).unwrap();
+        let bounds = ReconstructionBounds::new(1, 3, 1024, 1024, 1, 1024, 1).unwrap();
         let profile = RepresentationProfile::new_builtin(
             super::super::ProfileKind::ContiguousFile,
             bounds,
@@ -446,6 +454,7 @@ mod tests {
         let output = [RepresentationOutputObservation::new(object(6), 32)];
         let error = RepresentationAdmissionEvidence::new(
             &identity,
+            &profile,
             &representation,
             BlobId::new([9; 32]),
             13,
@@ -453,5 +462,47 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, PhysicalModelError::InvalidRecipe(_)));
+    }
+
+    #[test]
+    fn evidence_rejects_encoded_bytes_above_the_pinned_profile_bound() {
+        let identity = TestIdentity;
+        let profile = RepresentationProfile::new_builtin(
+            super::super::ProfileKind::ContiguousFile,
+            ReconstructionBounds::new(1, 3, 64, 1024, 1, 1024, 1).unwrap(),
+            object(1),
+        )
+        .unwrap();
+        let profile_id = profile.identify(&identity).unwrap();
+        let blob = BlobId::identify(&identity, profile_id, b"content bytes").unwrap();
+        let representation = RepresentationRecord::new(
+            profile_id,
+            Coverage::canonical_file_chunks(
+                object(2),
+                Some(object(3)),
+                13,
+                1,
+                CanonicalChunkingProfile::ASTRID_V1,
+            )
+            .unwrap(),
+            Recipe::ContiguousFile { blob },
+            32,
+            32,
+            Some(object(4)),
+        )
+        .unwrap();
+        let output = [RepresentationOutputObservation::new(object(6), 32)];
+
+        assert!(matches!(
+            RepresentationAdmissionEvidence::new(
+                &identity,
+                &profile,
+                &representation,
+                blob,
+                65,
+                &output,
+            ),
+            Err(PhysicalModelError::InvalidRecipe(_))
+        ));
     }
 }

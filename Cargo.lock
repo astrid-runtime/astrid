@@ -817,6 +817,7 @@ dependencies = [
  "tracing",
  "unicode-normalization",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -854,12 +855,14 @@ dependencies = [
  "astrid-storage-content",
  "astrid-storage-model",
  "blake3",
+ "cap-std 4.0.2",
  "ed25519-dalek",
  "fs2",
  "libc",
  "parking_lot",
  "sha2 0.11.0",
  "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

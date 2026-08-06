@@ -159,6 +159,7 @@ where
         )?;
         let evidence = RepresentationAdmissionEvidence::new(
             &PhysicalIdentityV1,
+            &physical_profile,
             &provisional,
             blob,
             logical_bytes,
@@ -244,11 +245,28 @@ where
         prepared: PreparedContiguousFile,
         source: &std::path::Path,
     ) -> Result<PublishedContiguousFile, DurableError> {
+        let source = super::representations::open_regular_read(source)
+            .map_err(|source| io_error("open loose blob adoption source no-follow", source))?;
+        self.publish_contiguous_from_file(prepared, &source)
+    }
+
+    /// Adopt an already-validated sealed file handle as a contiguous physical
+    /// representation. The same handle can be cloned for preparation and
+    /// publication, so namespace replacement cannot substitute a new source.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::publish_contiguous_from_path`].
+    pub fn publish_contiguous_from_file(
+        &self,
+        prepared: PreparedContiguousFile,
+        source: &std::fs::File,
+    ) -> Result<PublishedContiguousFile, DurableError> {
         self.validate_contiguous_preparation(&prepared)?;
         self.flush()?;
         self.fail_if(FaultPoint::AfterContiguousStructuralFlush)?;
         let logical_bytes = prepared.verified.descriptor().logical_bytes();
-        super::representations::install_loose_blob_from_path(
+        super::representations::install_loose_blob_from_file(
             &self.directory,
             prepared.payload.blob,
             prepared.payload.profile_id,
@@ -299,21 +317,20 @@ where
                 "contiguous evidence is not durable in the object arena",
             ));
         }
-        let update =
-            {
-                let representations = inner.representations.as_mut().ok_or(
-                    DurableError::InvalidRepresentationState(
-                        "contiguous publication requires active physical authority",
-                    ),
-                )?;
-                representations.append_contiguous_update(
-                    &payload.profile,
-                    &payload.representation,
-                    &payload.slices,
-                )?
-            };
         let publication =
             (|| {
+                let update = {
+                    let representations = inner.representations.as_mut().ok_or(
+                        DurableError::InvalidRepresentationState(
+                            "contiguous publication requires active physical authority",
+                        ),
+                    )?;
+                    representations.append_contiguous_update(
+                        &payload.profile,
+                        &payload.representation,
+                        &payload.slices,
+                    )?
+                };
                 self.fail_if(FaultPoint::AfterContiguousMetadataAppend)?;
                 let representations = inner.representations.as_mut().ok_or(
                     DurableError::InvalidRepresentationState(

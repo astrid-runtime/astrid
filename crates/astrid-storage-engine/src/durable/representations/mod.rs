@@ -6,10 +6,11 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use astrid_storage_model::{
-    CanonicalPhysicalMap, Coverage, ObjectId, PhysicalMapDomain, PhysicalMapKey, PlacementEntry,
-    PlacementSet, Recipe, Replica, ReplicaLocator, RepresentationCatalogueRoot,
-    RepresentationProfile, RepresentationProfileId, RepresentationRecord, RepresentationRecordId,
-    RepresentationState, RepresentationStateId, StorageNodeId,
+    CanonicalPhysicalMap, Coverage, Dependency, ObjectId, PhysicalMapDomain, PhysicalMapKey,
+    PlacementEntry, PlacementSet, ProfileDependency, Recipe, Replica, ReplicaLocator,
+    RepresentationCatalogueRoot, RepresentationProfile, RepresentationProfileId,
+    RepresentationRecord, RepresentationRecordId, RepresentationState, RepresentationStateId,
+    StorageNodeId,
 };
 
 use super::{
@@ -39,7 +40,8 @@ use recovery::{
 mod contiguous;
 mod direct;
 pub(super) use contiguous::{
-    install_loose_blob_copy, install_loose_blob_from_path, read_contiguous_object,
+    install_loose_blob_copy, install_loose_blob_from_file, open_regular_read,
+    read_contiguous_object,
 };
 
 pub(super) use direct::{DirectArenaObject, PreparedDirectArenaObject};
@@ -272,6 +274,40 @@ impl RepresentationStore {
         self.rebase_all_direct(&direct)
     }
 
+    pub(super) fn logical_liveness_roots(&self) -> Result<BTreeSet<ObjectId>, DurableError> {
+        let mut roots = BTreeSet::new();
+        for (_, bytes) in recovery::active_entries(&self.profiles)? {
+            let profile = RepresentationProfile::decode(bytes)?;
+            roots.extend(
+                profile
+                    .immutable_dependencies()
+                    .iter()
+                    .filter_map(|dependency| match dependency {
+                        ProfileDependency::LogicalObject(object) => Some(*object),
+                        ProfileDependency::PhysicalBlob(_) => None,
+                    }),
+            );
+        }
+        for (_, bytes) in recovery::active_entries(&self.representations)? {
+            let record = RepresentationRecord::decode(bytes)?;
+            roots.extend(
+                record
+                    .dependencies()
+                    .iter()
+                    .filter_map(|dependency| match dependency {
+                        Dependency::LogicalObject(object) | Dependency::Evidence(object) => {
+                            Some(*object)
+                        },
+                        Dependency::Invocation(invocation) => Some(invocation.object_id()),
+                        Dependency::PhysicalBlob(_)
+                        | Dependency::Representation(_)
+                        | Dependency::Profile(_) => None,
+                    }),
+            );
+        }
+        Ok(roots)
+    }
+
     pub(super) fn describe_direct(
         &self,
         object: ObjectId,
@@ -283,6 +319,15 @@ impl RepresentationStore {
 
     pub(super) const fn direct_profile(&self) -> RepresentationProfileId {
         self.direct_profile
+    }
+
+    fn profile(&self, id: RepresentationProfileId) -> Result<RepresentationProfile, DurableError> {
+        self.profiles
+            .get(PhysicalMapKey::from(id))
+            .ok_or(DurableError::InvalidRepresentationState(
+                "representation profile disappeared",
+            ))
+            .and_then(|bytes| RepresentationProfile::decode(bytes).map_err(Into::into))
     }
 
     pub(super) const fn active(&self) -> RepresentationStateId {

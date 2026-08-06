@@ -4,7 +4,7 @@ use std::fs::File;
 use std::path::Path;
 
 #[cfg(unix)]
-pub(super) fn open_regular_read(path: &Path) -> std::io::Result<File> {
+pub(in crate::durable) fn open_regular_read(path: &Path) -> std::io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
     let file = std::fs::OpenOptions::new()
@@ -21,7 +21,7 @@ pub(super) fn open_regular_read(path: &Path) -> std::io::Result<File> {
 }
 
 #[cfg(windows)]
-pub(super) fn open_regular_read(path: &Path) -> std::io::Result<File> {
+pub(in crate::durable) fn open_regular_read(path: &Path) -> std::io::Result<File> {
     use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
 
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
@@ -41,7 +41,7 @@ pub(super) fn open_regular_read(path: &Path) -> std::io::Result<File> {
 }
 
 #[cfg(not(any(unix, windows)))]
-pub(super) fn open_regular_read(path: &Path) -> std::io::Result<File> {
+pub(in crate::durable) fn open_regular_read(path: &Path) -> std::io::Result<File> {
     let file = File::open(path)?;
     if !file.metadata()?.is_file() {
         return Err(std::io::Error::new(
@@ -53,7 +53,11 @@ pub(super) fn open_regular_read(path: &Path) -> std::io::Result<File> {
 }
 
 #[cfg(target_os = "macos")]
-pub(super) fn clone_file_no_replace(source: &File, destination: &Path) -> std::io::Result<()> {
+pub(super) fn clone_file_no_replace(
+    source: &File,
+    destination_directory: &cap_std::fs::Dir,
+    destination: &Path,
+) -> std::io::Result<()> {
     use std::ffi::CString;
     use std::os::fd::AsRawFd as _;
     use std::os::unix::ffi::OsStrExt as _;
@@ -67,8 +71,14 @@ pub(super) fn clone_file_no_replace(source: &File, destination: &Path) -> std::i
     // SAFETY: the source descriptor and destination C string remain valid for
     // the call. The destination does not exist and the call retains neither.
     #[allow(unsafe_code)]
-    let result =
-        unsafe { libc::fclonefileat(source.as_raw_fd(), libc::AT_FDCWD, destination.as_ptr(), 0) };
+    let result = unsafe {
+        libc::fclonefileat(
+            source.as_raw_fd(),
+            destination_directory.as_raw_fd(),
+            destination.as_ptr(),
+            0,
+        )
+    };
     if result == 0 {
         Ok(())
     } else {
@@ -77,18 +87,20 @@ pub(super) fn clone_file_no_replace(source: &File, destination: &Path) -> std::i
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn clone_file_no_replace(source: &File, destination: &Path) -> std::io::Result<()> {
-    use std::fs::OpenOptions;
+pub(super) fn clone_file_no_replace(
+    source: &File,
+    destination_directory: &cap_std::fs::Dir,
+    destination: &Path,
+) -> std::io::Result<()> {
     use std::os::fd::AsRawFd as _;
 
     #[cfg(target_env = "musl")]
     const FICLONE: libc::c_int = 0x4004_9409;
     #[cfg(not(target_env = "musl"))]
     const FICLONE: libc::c_ulong = 0x4004_9409;
-    let destination_file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(destination)?;
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    let destination_file = destination_directory.open_with(destination, &options)?;
     // SAFETY: both descriptors remain valid for the call; FICLONE copies no
     // user pointers and retains neither descriptor.
     #[allow(unsafe_code)]
@@ -104,7 +116,11 @@ pub(super) fn clone_file_no_replace(source: &File, destination: &Path) -> std::i
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-pub(super) fn clone_file_no_replace(_source: &File, _destination: &Path) -> std::io::Result<()> {
+pub(super) fn clone_file_no_replace(
+    _source: &File,
+    _destination_directory: &cap_std::fs::Dir,
+    _destination: &Path,
+) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "copy-on-write file cloning is unavailable",

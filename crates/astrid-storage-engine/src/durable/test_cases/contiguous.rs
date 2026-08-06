@@ -94,6 +94,19 @@ fn contiguous_compaction_plan(
         .unwrap()
 }
 
+fn add_contiguous_compaction_orphan(engine: &TestEngine) {
+    let orphan = ObjectRecord::new(
+        ObjectKind::Evidence,
+        ObjectFormatVersion::V1,
+        b"unreachable represented-compaction fixture".to_vec(),
+        Vec::new(),
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    engine.persist_standalone_object(&orphan).unwrap();
+}
+
 #[test]
 fn contiguous_copy_publishes_virtual_chunks_and_reopens() {
     let directory = tempfile::tempdir().unwrap();
@@ -175,6 +188,7 @@ fn compaction_materializes_contiguous_objects_before_retiring_the_blob() {
     engine
         .publish_contiguous_copy(prepared, std::io::Cursor::new(&content))
         .unwrap();
+    add_contiguous_compaction_orphan(&engine);
     assert!(blob_path.is_file());
     assert!(chunk_ids
         .iter()
@@ -234,6 +248,7 @@ fn compaction_materializes_contiguous_objects_before_retiring_the_blob() {
 #[test]
 fn represented_compaction_recovers_across_authority_and_blob_retirement() {
     for point in [
+        FaultPoint::AfterCompactionDirectoryFlush,
         FaultPoint::AfterCompactionRepresentationRebase,
         FaultPoint::AfterCompactionBlobRetirement,
     ] {
@@ -259,6 +274,7 @@ fn represented_compaction_recovers_across_authority_and_blob_retirement() {
         engine
             .publish_contiguous_copy(prepared, std::io::Cursor::new(&content))
             .unwrap();
+        add_contiguous_compaction_orphan(&engine);
         let authorization =
             contiguous_compaction_plan(&engine, specification, descriptor.file());
         drop(engine);
@@ -396,6 +412,31 @@ fn contiguous_publication_rejects_a_symlink_at_the_canonical_blob_path() {
 
 #[cfg(unix)]
 #[test]
+fn contiguous_publication_rejects_a_redirected_namespace_component() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open(directory.path());
+    activate_physical_authority(&engine);
+    let content = patterned_content(256 * 1024 + 10);
+    let prepared = engine
+        .prepare_contiguous_file(
+            astrid_storage_content::ChunkingProfile::ASTRID_V1,
+            u64::try_from(content.len()).unwrap(),
+            std::io::Cursor::new(&content),
+        )
+        .unwrap();
+    let outside = directory.path().join("outside-namespace");
+    std::fs::create_dir(&outside).unwrap();
+    let blobs = directory.path().join("representations").join("blobs");
+    std::os::unix::fs::symlink(&outside, &blobs).unwrap();
+
+    assert!(engine
+        .publish_contiguous_copy(prepared, std::io::Cursor::new(&content))
+        .is_err());
+    assert_eq!(std::fs::read_dir(outside).unwrap().count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
 fn contiguous_reads_reject_a_blob_replaced_by_a_symlink() {
     let directory = tempfile::tempdir().unwrap();
     let engine = open(directory.path());
@@ -430,6 +471,39 @@ fn contiguous_reads_reject_a_blob_replaced_by_a_symlink() {
     ));
 }
 
+#[cfg(unix)]
+#[test]
+fn contiguous_reads_reject_a_redirected_namespace_component() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open(directory.path());
+    activate_physical_authority(&engine);
+    let content = patterned_content(256 * 1024 + 12);
+    let prepared = engine
+        .prepare_contiguous_file(
+            astrid_storage_content::ChunkingProfile::ASTRID_V1,
+            u64::try_from(content.len()).unwrap(),
+            std::io::Cursor::new(&content),
+        )
+        .unwrap();
+    let chunk = *prepared.payload.slices.keys().next().unwrap();
+    let blob_path = engine
+        .inner
+        .lock()
+        .representations
+        .as_ref()
+        .unwrap()
+        .loose_blob_path(prepared.payload.blob, 1);
+    engine
+        .publish_contiguous_copy(prepared, std::io::Cursor::new(&content))
+        .unwrap();
+    let loose = blob_path.parent().unwrap().parent().unwrap();
+    let displaced = loose.with_extension("displaced");
+    std::fs::rename(loose, &displaced).unwrap();
+    std::os::unix::fs::symlink(&displaced, loose).unwrap();
+
+    assert!(engine.object(chunk).is_err());
+}
+
 #[test]
 fn contiguous_publication_rejects_wrong_bytes_at_the_canonical_blob_path() {
     let directory = tempfile::tempdir().unwrap();
@@ -457,7 +531,15 @@ fn contiguous_publication_rejects_wrong_bytes_at_the_canonical_blob_path() {
         engine.publish_contiguous_copy(prepared, std::io::Cursor::new(&content)),
         Err(DurableError::InvalidRepresentationState(_))
     ));
-    assert_eq!(std::fs::read(blob_path).unwrap(), vec![0xff; content.len()]);
+    assert_eq!(
+        std::fs::read(&blob_path).unwrap(),
+        vec![0xff; content.len()]
+    );
+    assert!(
+        std::fs::read_dir(blob_path.parent().unwrap())
+            .unwrap()
+            .all(|entry| !entry.unwrap().file_name().to_string_lossy().ends_with(".tmp"))
+    );
 }
 
 #[test]

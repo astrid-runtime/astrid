@@ -14,7 +14,7 @@ use astrid_storage_model::{
 
 use super::{
     Blake3PhysicalIdentity, ContiguousIndexes, DurableError, RepresentationStore, chunk_record,
-    contiguous_index_additions, loose_blob_path_from_representation_root, verify_published_blob,
+    contiguous_index_additions, verify_published_blob,
 };
 use crate::durable::contiguous::ContiguousSlice;
 use crate::durable::{
@@ -126,12 +126,14 @@ impl<'a, I: PersistentObjectIdentity> RecoveryStore<'a, I> {
         representation_root: &Path,
         record_id: astrid_storage_model::RepresentationRecordId,
         record: &RepresentationRecord,
+        profile: &RepresentationProfile,
         namespace_generation: u64,
     ) -> Result<ContiguousIndexes, DurableError> {
         recover_contiguous_record_with_store(
             representation_root,
             record_id,
             record,
+            profile,
             namespace_generation,
             self,
         )
@@ -142,6 +144,7 @@ fn recover_contiguous_record_with_store<I: PersistentObjectIdentity>(
     representation_root: &Path,
     record_id: astrid_storage_model::RepresentationRecordId,
     record: &RepresentationRecord,
+    profile: &RepresentationProfile,
     namespace_generation: u64,
     store: &mut RecoveryStore<'_, I>,
 ) -> Result<ContiguousIndexes, DurableError> {
@@ -162,11 +165,13 @@ fn recover_contiguous_record_with_store<I: PersistentObjectIdentity>(
             "contiguous representation has a different recipe",
         ));
     };
-    let path =
-        loose_blob_path_from_representation_root(representation_root, *blob, namespace_generation);
-    verify_published_blob(&path, record.profile(), *blob, *logical_bytes)?;
-    let blob_file =
-        File::open(&path).map_err(|source| io_error("open contiguous loose blob", source))?;
+    let blob_file = verify_published_blob(
+        representation_root,
+        namespace_generation,
+        *blob,
+        record.profile(),
+        *logical_bytes,
+    )?;
     let sink_file = blob_file
         .try_clone()
         .map_err(|source| io_error("clone contiguous loose blob", source))?;
@@ -205,7 +210,7 @@ fn recover_contiguous_record_with_store<I: PersistentObjectIdentity>(
     let observations = std::mem::take(&mut sink.observations);
     let slices = std::mem::take(&mut sink.slices);
     drop(sink);
-    verify_admission_evidence(store, record, *blob, *logical_bytes, &observations)?;
+    verify_admission_evidence(store, profile, record, *blob, *logical_bytes, &observations)?;
     Ok(contiguous_index_additions(
         record_id,
         *blob,
@@ -216,6 +221,7 @@ fn recover_contiguous_record_with_store<I: PersistentObjectIdentity>(
 
 fn verify_admission_evidence<I: PersistentObjectIdentity>(
     store: &mut RecoveryStore<'_, I>,
+    profile: &RepresentationProfile,
     record: &RepresentationRecord,
     blob: astrid_storage_model::BlobId,
     logical_bytes: u64,
@@ -223,6 +229,7 @@ fn verify_admission_evidence<I: PersistentObjectIdentity>(
 ) -> Result<(), DurableError> {
     let expected = RepresentationAdmissionEvidence::new(
         &Blake3PhysicalIdentity,
+        profile,
         record,
         blob,
         logical_bytes,

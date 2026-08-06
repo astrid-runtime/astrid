@@ -1,7 +1,7 @@
 //! Contiguous-file catalogue entries and disposable chunk-slice locations.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,9 +22,12 @@ use crate::durable::{
     ArenaLocation, PersistentObjectIdentity, RecoveryLimits, io_error, sync_store_directory,
 };
 
+mod namespace;
 mod platform;
 mod recovery;
-use platform::{clone_file_no_replace, clone_is_unsupported, open_regular_read};
+use namespace::LooseBlobDirectory;
+pub(in crate::durable) use platform::open_regular_read;
+use platform::{clone_file_no_replace, clone_is_unsupported};
 
 pub(super) const LOOSE_NAMESPACE_GENERATION: u64 = 1;
 const LOOSE_META_MAGIC: [u8; 8] = *b"ASTBLM1\0";
@@ -104,9 +107,10 @@ impl RepresentationStore {
         let Some(location) = self.contiguous.get(&object).copied() else {
             return Ok(None);
         };
-        let path = self.loose_blob_path(location.blob, location.namespace_generation);
+        let directory = LooseBlobDirectory::open(&self.root, location.namespace_generation, false)?;
         let file = open_authoritative_regular(
-            &path,
+            &directory,
+            &loose_blob_name(location.blob),
             "contiguous blob is missing, redirected, or not a regular file",
         )?;
         Ok(Some((file, location)))
@@ -165,10 +169,12 @@ impl RepresentationStore {
         let active = recovery::active_contiguous_records(self)?;
         let mut recovery = recovery::RecoveryStore::new(arena, index, identity, limits);
         for (record_id, record, namespace_generation) in active {
+            let profile = self.profile(record.profile())?;
             let (reverse, locations) = recovery.recover_contiguous_record(
                 &self.root,
                 record_id,
                 &record,
+                &profile,
                 namespace_generation,
             )?;
             self.install_contiguous_indexes(&reverse, &locations);
@@ -176,6 +182,7 @@ impl RepresentationStore {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(in crate::durable) fn loose_blob_path(
         &self,
         blob: astrid_storage_model::BlobId,
@@ -299,58 +306,56 @@ pub(in crate::durable) fn install_loose_blob_copy(
     logical_bytes: u64,
     source: impl Read,
 ) -> Result<PathBuf, DurableError> {
-    let path = loose_blob_path_from_representation_root(
-        &store.join(super::DIRECTORY),
-        blob,
-        LOOSE_NAMESPACE_GENERATION,
-    );
-    let directory = path
-        .parent()
-        .ok_or(DurableError::InvalidRepresentationState(
-            "loose blob path has no parent",
-        ))?;
-    ensure_loose_blob_directory(store, LOOSE_NAMESPACE_GENERATION)?;
-    ensure_loose_metadata(&path, profile, blob, logical_bytes)?;
+    let representation_root = store.join(super::DIRECTORY);
+    let directory =
+        LooseBlobDirectory::open(&representation_root, LOOSE_NAMESPACE_GENERATION, true)?;
+    let name = loose_blob_name(blob);
+    ensure_loose_metadata(&directory, &name, profile, blob, logical_bytes)?;
     let sequence = COPY_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let temporary =
-        path.with_extension(format!("blob.copy.{}.{}.tmp", std::process::id(), sequence));
-    let mut options = OpenOptions::new();
-    options.create_new(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
+    let temporary = PathBuf::from(format!(
+        "{}.copy.{}.{}.tmp",
+        name.to_string_lossy(),
+        std::process::id(),
+        sequence
+    ));
+    let result = (|| {
+        let mut output = directory
+            .create_new(&temporary)
+            .map_err(|source| io_error("create loose blob temporary", source))?;
+        let copied = std::io::copy(&mut source.take(logical_bytes), &mut output)
+            .map_err(|source| io_error("copy loose blob bytes", source))?;
+        if copied != logical_bytes {
+            return Err(DurableError::InvalidRepresentationState(
+                "loose blob source ended before its declared length",
+            ));
+        }
+        output
+            .flush()
+            .and_then(|()| output.sync_all())
+            .map_err(|source| io_error("flush loose blob temporary", source))?;
+        drop(output);
+        publish_loose_blob_temporary(&directory, &temporary, &name, profile, blob, logical_bytes)?;
+        directory
+            .sync()
+            .map_err(|source| io_error("flush loose blob directory capability", source))?;
+        Ok(directory.ambient_path().join(&name))
+    })();
+    if result.is_err() {
+        let _ = directory.remove_file(&temporary);
     }
-    let mut output = options
-        .open(&temporary)
-        .map_err(|source| io_error("create loose blob temporary", source))?;
-    let copied = std::io::copy(&mut source.take(logical_bytes), &mut output)
-        .map_err(|source| io_error("copy loose blob bytes", source))?;
-    if copied != logical_bytes {
-        let _ = std::fs::remove_file(&temporary);
-        return Err(DurableError::InvalidRepresentationState(
-            "loose blob source ended before its declared length",
-        ));
-    }
-    output
-        .flush()
-        .and_then(|()| output.sync_all())
-        .map_err(|source| io_error("flush loose blob temporary", source))?;
-    drop(output);
-    publish_loose_blob_temporary(&temporary, &path, profile, blob, logical_bytes)?;
-    sync_store_directory(directory)?;
-    Ok(path)
+    result
 }
 
-pub(in crate::durable) fn install_loose_blob_from_path(
+pub(in crate::durable) fn install_loose_blob_from_file(
     store: &Path,
     blob: astrid_storage_model::BlobId,
     profile: astrid_storage_model::RepresentationProfileId,
     logical_bytes: u64,
-    source: &Path,
+    source: &File,
 ) -> Result<PathBuf, DurableError> {
-    let mut source = open_regular_read(source)
-        .map_err(|source| io_error("open loose blob adoption source no-follow", source))?;
+    let mut source = source
+        .try_clone()
+        .map_err(|source| io_error("clone loose blob adoption source handle", source))?;
     if source
         .metadata()
         .map_err(|source| io_error("inspect loose blob adoption source", source))?
@@ -361,153 +366,150 @@ pub(in crate::durable) fn install_loose_blob_from_path(
             "loose blob adoption source is truncated",
         ));
     }
-    let path = loose_blob_path_from_representation_root(
-        &store.join(super::DIRECTORY),
-        blob,
-        LOOSE_NAMESPACE_GENERATION,
-    );
-    let directory = path
-        .parent()
-        .ok_or(DurableError::InvalidRepresentationState(
-            "loose blob path has no parent",
-        ))?;
-    ensure_loose_blob_directory(store, LOOSE_NAMESPACE_GENERATION)?;
-    ensure_loose_metadata(&path, profile, blob, logical_bytes)?;
+    let representation_root = store.join(super::DIRECTORY);
+    let directory =
+        LooseBlobDirectory::open(&representation_root, LOOSE_NAMESPACE_GENERATION, true)?;
+    let name = loose_blob_name(blob);
+    ensure_loose_metadata(&directory, &name, profile, blob, logical_bytes)?;
     let sequence = COPY_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let temporary = path.with_extension(format!(
-        "blob.adopt.{}.{}.tmp",
+    let temporary = PathBuf::from(format!(
+        "{}.adopt.{}.{}.tmp",
+        name.to_string_lossy(),
         std::process::id(),
         sequence
     ));
-    match clone_file_no_replace(&source, &temporary) {
+    match clone_file_no_replace(&source, directory.capability(), &temporary) {
         Ok(()) => {
-            let file = OpenOptions::new()
-                .write(true)
-                .open(&temporary)
-                .map_err(|source| io_error("open cloned loose blob temporary", source))?;
-            file.set_len(logical_bytes)
-                .and_then(|()| file.sync_all())
-                .map_err(|source| io_error("truncate and flush cloned loose blob", source))?;
+            let prepared = (|| {
+                let mut options = cap_std::fs::OpenOptions::new();
+                options.write(true);
+                let file = directory
+                    .capability()
+                    .open_with(&temporary, &options)
+                    .map(cap_std::fs::File::into_std)
+                    .map_err(|source| io_error("open cloned loose blob temporary", source))?;
+                file.set_len(logical_bytes)
+                    .and_then(|()| file.sync_all())
+                    .map_err(|source| io_error("truncate and flush cloned loose blob", source))
+            })();
+            if let Err(error) = prepared {
+                let _ = directory.remove_file(&temporary);
+                return Err(error);
+            }
         },
         Err(error) if clone_is_unsupported(&error) => {
-            let _ = std::fs::remove_file(&temporary);
+            let _ = directory.remove_file(&temporary);
             source
                 .seek(SeekFrom::Start(0))
                 .map_err(|source| io_error("rewind loose blob adoption source", source))?;
             return install_loose_blob_copy(store, blob, profile, logical_bytes, source);
         },
-        Err(source) => return Err(io_error("clone loose blob adoption source", source)),
+        Err(source) => {
+            let _ = directory.remove_file(&temporary);
+            return Err(io_error("clone loose blob adoption source", source));
+        },
     }
-    publish_loose_blob_temporary(&temporary, &path, profile, blob, logical_bytes)?;
-    sync_store_directory(directory)?;
-    Ok(path)
+    let result = (|| {
+        publish_loose_blob_temporary(&directory, &temporary, &name, profile, blob, logical_bytes)?;
+        directory
+            .sync()
+            .map_err(|source| io_error("flush loose blob directory capability", source))?;
+        Ok(directory.ambient_path().join(&name))
+    })();
+    if result.is_err() {
+        let _ = directory.remove_file(&temporary);
+    }
+    result
 }
 
 fn publish_loose_blob_temporary(
+    directory: &LooseBlobDirectory,
     temporary: &Path,
-    path: &Path,
+    name: &Path,
     profile: astrid_storage_model::RepresentationProfileId,
     blob: astrid_storage_model::BlobId,
     logical_bytes: u64,
 ) -> Result<(), DurableError> {
-    verify_blob_bytes(temporary, profile, blob, logical_bytes)?;
-    match std::fs::hard_link(temporary, path) {
-        Ok(()) => {
-            std::fs::remove_file(temporary)
-                .map_err(|source| io_error("remove published loose blob temporary", source))?;
-        },
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            verify_blob_bytes(path, profile, blob, logical_bytes)?;
-            compare_files(temporary, path, logical_bytes)?;
-            std::fs::remove_file(temporary)
-                .map_err(|source| io_error("remove duplicate loose blob temporary", source))?;
-        },
-        Err(source) => return Err(io_error("publish loose blob", source)),
-    }
-    Ok(())
-}
-
-fn ensure_loose_blob_directory(
-    store: &Path,
-    namespace_generation: u64,
-) -> Result<(), DurableError> {
-    let representation_root = store.join(super::DIRECTORY);
-    let blobs = representation_root.join("blobs");
-    let loose = blobs.join("loose");
-    let generation = loose.join(format!("{namespace_generation:016x}"));
-    for (parent, directory) in [
-        (representation_root.as_path(), blobs.as_path()),
-        (blobs.as_path(), loose.as_path()),
-        (loose.as_path(), generation.as_path()),
-    ] {
-        match std::fs::create_dir(directory) {
-            Ok(()) => sync_store_directory(parent)?,
+    let result = (|| {
+        verify_blob_bytes(directory, temporary, profile, blob, logical_bytes)?;
+        match directory.hard_link(temporary, name) {
+            Ok(()) => {},
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let metadata = std::fs::symlink_metadata(directory)
-                    .map_err(|source| io_error("inspect loose blob directory", source))?;
-                if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                    return Err(DurableError::InvalidRepresentationState(
-                        "loose blob namespace component is redirected or not a directory",
-                    ));
-                }
+                verify_blob_bytes(directory, name, profile, blob, logical_bytes)?;
+                compare_files(directory, temporary, name, logical_bytes)?;
             },
-            Err(source) => return Err(io_error("create loose blob directory", source)),
+            Err(source) => return Err(io_error("publish loose blob", source)),
         }
+        directory
+            .remove_file(temporary)
+            .map_err(|source| io_error("remove loose blob temporary", source))
+    })();
+    if result.is_err() {
+        let _ = directory.remove_file(temporary);
     }
-    Ok(())
+    result
 }
 
 fn ensure_loose_metadata(
-    blob_path: &Path,
+    directory: &LooseBlobDirectory,
+    blob_name: &Path,
     profile: astrid_storage_model::RepresentationProfileId,
     blob: astrid_storage_model::BlobId,
     logical_bytes: u64,
 ) -> Result<(), DurableError> {
-    let metadata_path = blob_path.with_extension("meta");
+    let metadata_path = blob_name.with_extension("meta");
     let sequence = COPY_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let temporary =
-        blob_path.with_extension(format!("meta.{}.{}.tmp", std::process::id(), sequence));
+        blob_name.with_extension(format!("meta.{}.{}.tmp", std::process::id(), sequence));
     let expected = encode_loose_metadata(profile, blob, logical_bytes)?;
-    match std::fs::symlink_metadata(&metadata_path) {
+    match directory.capability().symlink_metadata(&metadata_path) {
         Ok(_) => {
-            verify_exact_regular_file(&metadata_path, &expected, "loose blob metadata")?;
+            verify_exact_regular_file(directory, &metadata_path, &expected, "loose blob metadata")?;
             return Ok(());
         },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
         Err(source) => return Err(io_error("inspect loose blob metadata", source)),
     }
-    create_exact_file(&temporary, &expected, "loose blob metadata temporary")?;
-    match std::fs::hard_link(&temporary, &metadata_path) {
-        Ok(()) => {},
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            verify_exact_regular_file(&metadata_path, &expected, "loose blob metadata")?;
-        },
-        Err(source) => return Err(io_error("publish loose blob metadata", source)),
+    let result = (|| {
+        create_exact_file(
+            directory,
+            &temporary,
+            &expected,
+            "loose blob metadata temporary",
+        )?;
+        match directory.hard_link(&temporary, &metadata_path) {
+            Ok(()) => {},
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                verify_exact_regular_file(
+                    directory,
+                    &metadata_path,
+                    &expected,
+                    "loose blob metadata",
+                )?;
+            },
+            Err(source) => return Err(io_error("publish loose blob metadata", source)),
+        }
+        directory
+            .remove_file(&temporary)
+            .map_err(|source| io_error("remove loose blob metadata temporary", source))?;
+        directory
+            .sync()
+            .map_err(|source| io_error("flush loose blob metadata directory", source))
+    })();
+    if result.is_err() {
+        let _ = directory.remove_file(&temporary);
     }
-    std::fs::remove_file(&temporary)
-        .map_err(|source| io_error("remove loose blob metadata temporary", source))?;
-    let directory = metadata_path
-        .parent()
-        .ok_or(DurableError::InvalidRepresentationState(
-            "loose metadata path has no parent",
-        ))?;
-    sync_store_directory(directory)
+    result
 }
 
 fn create_exact_file(
+    directory: &LooseBlobDirectory,
     path: &Path,
     bytes: &[u8],
     operation: &'static str,
 ) -> Result<(), DurableError> {
-    let mut options = OpenOptions::new();
-    options.create_new(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(path)
+    let mut file = directory
+        .create_new(path)
         .map_err(|source| io_error(operation, source))?;
     file.write_all(bytes)
         .and_then(|()| file.flush())
@@ -548,11 +550,12 @@ fn append_tagged_identity(output: &mut Vec<u8>, digest: &[u8; 32]) {
 }
 
 fn verify_exact_regular_file(
+    directory: &LooseBlobDirectory,
     path: &Path,
     expected: &[u8],
     description: &'static str,
 ) -> Result<(), DurableError> {
-    let mut file = open_authoritative_regular(path, description)?;
+    let mut file = open_authoritative_regular(directory, path, description)?;
     if file
         .metadata()
         .map_err(|source| io_error("inspect loose representation file", source))?
@@ -570,10 +573,17 @@ fn verify_exact_regular_file(
     Ok(())
 }
 
-fn compare_files(left: &Path, right: &Path, logical_bytes: u64) -> Result<(), DurableError> {
-    let mut left = open_regular_read(left)
+fn compare_files(
+    directory: &LooseBlobDirectory,
+    left: &Path,
+    right: &Path,
+    logical_bytes: u64,
+) -> Result<(), DurableError> {
+    let mut left = directory
+        .open_regular(left)
         .map_err(|source| io_error("open candidate loose blob no-follow", source))?;
     let mut right = open_authoritative_regular(
+        directory,
         right,
         "occupied loose blob is redirected or not a regular file",
     )?;
@@ -600,6 +610,7 @@ fn compare_files(left: &Path, right: &Path, logical_bytes: u64) -> Result<(), Du
     Ok(())
 }
 
+#[cfg(test)]
 fn loose_blob_path_from_representation_root(
     root: &Path,
     blob: astrid_storage_model::BlobId,
@@ -608,7 +619,11 @@ fn loose_blob_path_from_representation_root(
     root.join("blobs")
         .join("loose")
         .join(format!("{namespace_generation:016x}"))
-        .join(format!("{}.blob", tagged_blob_hex(blob)))
+        .join(loose_blob_name(blob))
+}
+
+fn loose_blob_name(blob: astrid_storage_model::BlobId) -> PathBuf {
+    PathBuf::from(format!("{}.blob", tagged_blob_hex(blob)))
 }
 
 pub(in crate::durable) fn read_contiguous_object<I: PersistentObjectIdentity>(
@@ -648,27 +663,43 @@ fn chunk_record(bytes: Vec<u8>) -> Result<ObjectRecord, DurableError> {
 }
 
 fn verify_published_blob(
-    path: &Path,
+    representation_root: &Path,
+    namespace_generation: u64,
+    blob: astrid_storage_model::BlobId,
     profile: astrid_storage_model::RepresentationProfileId,
-    expected: astrid_storage_model::BlobId,
     logical_bytes: u64,
-) -> Result<(), DurableError> {
-    let metadata = encode_loose_metadata(profile, expected, logical_bytes)?;
+) -> Result<File, DurableError> {
+    let directory = LooseBlobDirectory::open(representation_root, namespace_generation, false)?;
+    let name = loose_blob_name(blob);
+    let metadata = encode_loose_metadata(profile, blob, logical_bytes)?;
     verify_exact_regular_file(
-        &path.with_extension("meta"),
+        &directory,
+        &name.with_extension("meta"),
         &metadata,
         "loose blob metadata mismatch",
     )?;
-    verify_blob_bytes(path, profile, expected, logical_bytes)
+    verify_blob_file(&directory, &name, profile, blob, logical_bytes)
 }
 
 fn verify_blob_bytes(
+    directory: &LooseBlobDirectory,
     path: &Path,
     profile: astrid_storage_model::RepresentationProfileId,
     expected: astrid_storage_model::BlobId,
     logical_bytes: u64,
 ) -> Result<(), DurableError> {
+    verify_blob_file(directory, path, profile, expected, logical_bytes).map(drop)
+}
+
+fn verify_blob_file(
+    directory: &LooseBlobDirectory,
+    path: &Path,
+    profile: astrid_storage_model::RepresentationProfileId,
+    expected: astrid_storage_model::BlobId,
+    logical_bytes: u64,
+) -> Result<File, DurableError> {
     let mut file = open_authoritative_regular(
+        directory,
         path,
         "loose blob is missing, redirected, or not a regular file",
     )?;
@@ -700,19 +731,24 @@ fn verify_blob_bytes(
             "loose blob identity mismatch",
         ));
     }
-    Ok(())
+    file.seek(SeekFrom::Start(0))
+        .map_err(|source| io_error("rewind verified loose blob", source))?;
+    Ok(file)
 }
 
 fn open_authoritative_regular(
+    directory: &LooseBlobDirectory,
     path: &Path,
     description: &'static str,
 ) -> Result<File, DurableError> {
-    match open_regular_read(path) {
+    match directory.open_regular(path) {
         Ok(file) => Ok(file),
         Err(error)
             if error.kind() == std::io::ErrorKind::NotFound
                 || error.kind() == std::io::ErrorKind::InvalidData
-                || std::fs::symlink_metadata(path)
+                || directory
+                    .capability()
+                    .symlink_metadata(path)
                     .is_ok_and(|metadata| metadata.file_type().is_symlink()) =>
         {
             Err(DurableError::InvalidRepresentationState(description))
