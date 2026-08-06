@@ -17,7 +17,9 @@ use astrid_storage::{
 };
 use astrid_storage_content::{ContentObjectSink, build_content_streaming};
 use astrid_storage_engine::{DurableEngine, RecoveryLimits};
-use astrid_storage_model::{ObjectId, ObjectIdentity, ObjectRecord};
+use astrid_storage_model::{
+    ObjectClass, ObjectFormatVersion, ObjectId, ObjectIdentity, ObjectKind, ObjectRecord,
+};
 
 use super::config::Config;
 use super::report::Report;
@@ -38,6 +40,7 @@ pub(super) async fn run(
     benchmark_native_large_writes(config, root, source, report)?;
     benchmark_staging_large_writes(config, root, source, report)?;
     benchmark_content_compute(config, source, report)?;
+    benchmark_contiguous_copy_fallback(config, root, source, report)?;
     benchmark_bulk_ingest(config, root, source, source_digest, report).await?;
     benchmark_small_files(config, root, report)?;
     benchmark_runtime(config, root, source, source_digest, report).await?;
@@ -62,6 +65,47 @@ pub(super) async fn run(
         "astrid_concurrent_shared_read_warm",
         "astrid_read_warm",
     )?;
+    Ok(())
+}
+
+fn benchmark_contiguous_copy_fallback(
+    config: &Config,
+    root: &Path,
+    source: &Path,
+    report: &mut Report,
+) -> BenchResult<()> {
+    let mut samples = Vec::with_capacity(config.samples);
+    for _ in 0..config.samples {
+        let directory = tempfile::tempdir_in(root)?;
+        let engine = DurableEngine::<StateOwner, Blake3ObjectIdentityV1, StateOwnerCodecV1>::open(
+            directory.path(),
+            Blake3ObjectIdentityV1,
+            StateOwnerCodecV1,
+            RecoveryLimits::process_addressable(),
+        )?;
+        let specification = ObjectRecord::new(
+            ObjectKind::Evidence,
+            ObjectFormatVersion::V1,
+            b"storage_io contiguous fallback specification".to_vec(),
+            Vec::new(),
+            0,
+            ObjectClass::Metadata,
+        )?;
+        let (specification, _) = engine.persist_standalone_object(&specification)?;
+        engine.ensure_direct_representation_catalogue(specification, &[specification])?;
+        let prepared = engine.prepare_contiguous_file(
+            ChunkingProfile::ASTRID_V1,
+            config.bytes,
+            File::open(source)?.take(config.bytes),
+        )?;
+        let started = Instant::now();
+        black_box(
+            engine.publish_contiguous_copy(prepared, File::open(source)?.take(config.bytes))?,
+        );
+        samples.push(started.elapsed());
+        engine.close()?;
+    }
+    report.record_bytes("astrid_contiguous_copy_fallback", config.bytes, samples);
     Ok(())
 }
 
@@ -306,8 +350,8 @@ async fn benchmark_runtime(
         drop(reopened);
 
         samples
-            .activation
-            .push(benchmark_representation_activation(&home)?);
+            .authority_validation
+            .push(benchmark_representation_authority_validation(&home)?);
     }
     samples.record(config, report)?;
     Ok(())
@@ -323,13 +367,13 @@ async fn benchmark_publication(
     let (unique_name, unique_staged, stage_write, stage_seal) =
         stage_source(store, source, owner, "large/unique.bin", config.block_bytes)?;
     let authoritative_before = authoritative_store_bytes(home)?;
-    let representation_before = representation_authority_bytes(home)?;
+    let representation_before = representation_metadata_bytes(home)?;
     let started = Instant::now();
     let unique_outcome = store.publish_staged(unique_staged).await?;
     black_box(unique_outcome);
     let unique_publish = started.elapsed();
     let authoritative_after_unique = authoritative_store_bytes(home)?;
-    let representation_after_unique = representation_authority_bytes(home)?;
+    let representation_after_unique = representation_metadata_bytes(home)?;
     let unique_authoritative_bytes = authoritative_after_unique
         .checked_sub(authoritative_before)
         .ok_or("authoritative store shrank during unique publication")?;
@@ -346,13 +390,13 @@ async fn benchmark_publication(
         config.block_bytes,
     )?;
     let authoritative_before_duplicate = authoritative_store_bytes(home)?;
-    let representation_before_duplicate = representation_authority_bytes(home)?;
+    let representation_before_duplicate = representation_metadata_bytes(home)?;
     let started = Instant::now();
     let duplicate_outcome = store.publish_staged(duplicate_staged).await?;
     black_box(duplicate_outcome);
     let duplicate_publish = started.elapsed();
     let authoritative_after_duplicate = authoritative_store_bytes(home)?;
-    let representation_after_duplicate = representation_authority_bytes(home)?;
+    let representation_after_duplicate = representation_metadata_bytes(home)?;
     let duplicate_authoritative_bytes = authoritative_after_duplicate
         .checked_sub(authoritative_before_duplicate)
         .ok_or("authoritative store shrank during duplicate publication")?;
@@ -409,7 +453,7 @@ struct RuntimeSamples {
     read_warm: Vec<Duration>,
     reopen: Vec<Duration>,
     read_after_reopen: Vec<Duration>,
-    activation: Vec<Duration>,
+    authority_validation: Vec<Duration>,
 }
 
 impl RuntimeSamples {
@@ -467,7 +511,11 @@ impl RuntimeSamples {
             config.bytes,
             self.read_after_reopen,
         );
-        report.record_operations("astrid_representation_activation", 1, self.activation);
+        report.record_operations(
+            "astrid_representation_authority_validation",
+            1,
+            self.authority_validation,
+        );
         Ok(())
     }
 }
@@ -489,6 +537,10 @@ fn authoritative_store_bytes(home: &AstridHome) -> BenchResult<u64> {
 
 fn representation_authority_bytes(home: &AstridHome) -> BenchResult<u64> {
     directory_file_bytes(&home.principal_store_path().join("representations"))
+}
+
+fn representation_metadata_bytes(home: &AstridHome) -> BenchResult<u64> {
+    directory_file_bytes_except_blobs(&home.principal_store_path().join("representations"))
 }
 
 fn directory_file_bytes(path: &Path) -> BenchResult<u64> {
@@ -514,14 +566,44 @@ fn directory_file_bytes(path: &Path) -> BenchResult<u64> {
     Ok(total)
 }
 
-fn benchmark_representation_activation(home: &AstridHome) -> BenchResult<Duration> {
+fn directory_file_bytes_except_blobs(path: &Path) -> BenchResult<u64> {
+    let mut total = 0_u64;
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        let bytes = if metadata.is_dir() {
+            directory_file_bytes_except_blobs(&entry.path())?
+        } else if metadata.is_file() {
+            if entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "blob")
+            {
+                0
+            } else {
+                metadata.len()
+            }
+        } else {
+            return Err(format!(
+                "authoritative representation path is not a regular file: {}",
+                entry.path().display()
+            )
+            .into());
+        };
+        total = total
+            .checked_add(bytes)
+            .ok_or("representation metadata byte count overflow")?;
+    }
+    Ok(total)
+}
+
+fn benchmark_representation_authority_validation(home: &AstridHome) -> BenchResult<Duration> {
     let store = home.principal_store_path();
     let representations = store.join("representations");
     let metadata = std::fs::symlink_metadata(&representations)?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err("representation authority is redirected or not a directory".into());
     }
-    std::fs::remove_dir_all(representations)?;
     let metadata = std::fs::read_to_string(store.join("store.meta"))?;
     let format_spec = metadata_object_id(&metadata, "format-spec-object=")?;
     let catalog_spec = metadata_object_id(&metadata, "content-catalog-spec-object=")?;

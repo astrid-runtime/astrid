@@ -106,6 +106,101 @@ fn begin_rejects_identifier_reserved_by_a_sealed_generation() {
 }
 
 #[test]
+fn sealed_generation_rejects_a_replaced_directory_entry() {
+    let directory = tempfile::tempdir().unwrap();
+    let area = open_area(directory.path());
+    let mut staged = writer(&area, "identity-bound.bin");
+    staged.write_all(b"identity-bound bytes").unwrap();
+    let sealed = staged.seal().unwrap();
+    let path = sealed.content_path();
+    let displaced = path.with_extension("displaced");
+    std::fs::rename(&path, &displaced).unwrap();
+    std::fs::copy(&displaced, &path).unwrap();
+
+    let error = area.ready().unwrap_err();
+    assert!(
+        error.to_string().contains("source identity changed"),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read(displaced).unwrap(),
+        std::fs::read(path).unwrap()
+    );
+}
+
+#[test]
+fn sealed_generation_rejects_a_rewritten_source_identity() {
+    let directory = tempfile::tempdir().unwrap();
+    let area = open_area(directory.path());
+    let mut staged = writer(&area, "identity-checksum.bin");
+    staged.write_all(b"identity-checksum bytes").unwrap();
+    let sealed = staged.seal().unwrap();
+    let path = sealed.content_path();
+    let mut bytes = std::fs::read(&path).unwrap();
+    let identity_offset = bytes.len() - 32 - 32 - 16;
+    bytes[identity_offset] ^= 0x80;
+    std::fs::write(&path, bytes).unwrap();
+
+    let error = area.ready().unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("source binding checksum mismatch"),
+        "{error}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn seal_stays_bound_to_the_opened_generation_directory() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("staging");
+    let displaced_root = directory.path().join("original-staging");
+    let area = open_area(&root);
+    let mut staged = writer(&area, "directory-bound.bin");
+    staged.write_all(b"directory-bound bytes").unwrap();
+    let id = staged.id();
+    let open_name = open_generation_name(id);
+
+    std::fs::rename(&root, &displaced_root).unwrap();
+    let replacement_generations = root.join(GENERATIONS_DIRECTORY);
+    std::fs::create_dir_all(&replacement_generations).unwrap();
+    let original_open = displaced_root.join(GENERATIONS_DIRECTORY).join(&open_name);
+    let replacement_open = replacement_generations.join(&open_name);
+    std::fs::hard_link(&original_open, &replacement_open).unwrap();
+
+    let sealed = staged.seal().unwrap();
+    let sealed_name = sealed_generation_name(sealed.sequence, id);
+    let original_sealed = displaced_root
+        .join(GENERATIONS_DIRECTORY)
+        .join(&sealed_name);
+    assert!(original_sealed.is_file());
+    assert!(!original_open.exists());
+    assert!(replacement_open.is_file());
+    assert!(!replacement_generations.join(&sealed_name).exists());
+
+    let replacement_sealed = replacement_generations.join(&sealed_name);
+    std::fs::hard_link(&original_sealed, &replacement_sealed).unwrap();
+    let key = StageKey {
+        sequence: sealed.sequence,
+        id,
+    };
+    retirement::establish_in(&area.inner.generations_directory, key).unwrap();
+    let retired_name = retired_generation_name(key.sequence, key.id);
+    let original_retired = displaced_root
+        .join(GENERATIONS_DIRECTORY)
+        .join(&retired_name);
+    assert!(original_retired.is_file());
+    assert!(!original_sealed.exists());
+    assert!(replacement_sealed.is_file());
+    assert!(!replacement_generations.join(&retired_name).exists());
+
+    retirement::remove_in(&area.inner.generations_directory, key).unwrap();
+    assert!(!original_retired.exists());
+    assert!(replacement_sealed.is_file());
+}
+
+#[test]
 fn dropping_an_unsealed_writer_releases_its_identifier() {
     let directory = tempfile::tempdir().unwrap();
     let area = open_area(directory.path());
@@ -623,11 +718,7 @@ fn ready_scan_rejects_a_symlinked_content_source() {
     symlink("/etc/passwd", staged.content_path()).unwrap();
 
     let error = area.ready().unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("redirected or not a regular file")
-    );
+    assert!(error.to_string().contains("open private file"), "{error}");
 }
 
 #[test]
@@ -1390,7 +1481,8 @@ fn legacy_migration_resumes_before_or_after_the_generation_footer() {
                 .write(true)
                 .open(&target)
                 .unwrap();
-            append_generation_footer(&mut generation, &intent).unwrap();
+            let source_identity = private_file_identity(&generation).unwrap();
+            append_generation_footer(&mut generation, &intent, source_identity).unwrap();
             generation.sync_all().unwrap();
         } else if footer_state == "torn" {
             let mut generation = std::fs::OpenOptions::new()

@@ -1,6 +1,5 @@
 //! Versioned, checksummed publication-intent encoding.
 
-use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
@@ -11,7 +10,9 @@ use uuid::Uuid;
 use super::{StagedContentId, connection};
 use crate::content::{ChunkingProfile, ContentName};
 use crate::error::StorageResult;
-use crate::principal_state::native_io::validate_private_regular_file;
+use crate::principal_state::native_io::{
+    PrivateFileIdentity, open_private_file, validate_private_regular_file,
+};
 use crate::principal_state::{StateOwner, StateOwnerCodecV1};
 
 const INTENT_MAGIC: &[u8; 16] = b"ASTRID-STAGE-V2\0";
@@ -20,9 +21,12 @@ const LEGACY_INTENT_MAGIC: &[u8; 16] = b"ASTRID-STAGE-V1\0";
 const LEGACY_INTENT_VERSION: u16 = 1;
 const CHECKSUM_BYTES: usize = 32;
 const FOOTER_MAGIC: &[u8; 16] = b"ASTRID-STAGE-F1\0";
-const FOOTER_VERSION: u16 = 1;
+const FOOTER_VERSION: u16 = 2;
+const LEGACY_FOOTER_VERSION: u16 = 1;
 const FOOTER_BYTES: u64 = 32;
 const FOOTER_BYTES_USIZE: usize = 32;
+const SOURCE_IDENTITY_BYTES: u64 = 16;
+const SOURCE_BINDING_CHECKSUM_BYTES: u64 = 32;
 const FASTCDC_2020_ALGORITHM: u8 = 1;
 const FASTCDC_IMPLEMENTATION_REVISION: u16 = 1;
 const FASTCDC_NORMALIZATION: u8 = 1;
@@ -147,31 +151,63 @@ pub(super) fn load_intent(path: &Path) -> StorageResult<StagingIntent> {
 pub(super) fn append_generation_footer(
     file: &mut std::fs::File,
     intent: &StagingIntent,
+    source_identity: PrivateFileIdentity,
 ) -> StorageResult<()> {
     let encoded = encode_intent(intent)?;
-    let encoded_len = u64::try_from(encoded.len())
+    let payload_len = u64::try_from(encoded.len())
         .map_err(|_| connection("staged generation footer length overflow".to_owned()))?;
+    let payload_len = payload_len
+        .checked_add(SOURCE_IDENTITY_BYTES)
+        .and_then(|length| length.checked_add(SOURCE_BINDING_CHECKSUM_BYTES))
+        .ok_or_else(|| connection("staged generation footer length overflow".to_owned()))?;
+    let source_identity = source_identity_bytes(source_identity);
+    let source_binding = source_binding_checksum(&encoded, &source_identity);
     let mut trailer = [0_u8; FOOTER_BYTES_USIZE];
     trailer[..FOOTER_MAGIC.len()].copy_from_slice(FOOTER_MAGIC);
     trailer[16..18].copy_from_slice(&FOOTER_VERSION.to_le_bytes());
-    trailer[24..32].copy_from_slice(&encoded_len.to_le_bytes());
+    trailer[24..32].copy_from_slice(&payload_len.to_le_bytes());
     file.seek(SeekFrom::End(0))
         .and_then(|_| file.write_all(&encoded))
+        .and_then(|()| file.write_all(&source_identity))
+        .and_then(|()| file.write_all(&source_binding))
         .and_then(|()| file.write_all(&trailer))
         .map_err(|error| connection(format!("append staged generation footer: {error}")))
 }
 
 pub(super) fn load_generation_footer(path: &Path) -> StorageResult<StagingIntent> {
-    let physical_bytes = validate_private_regular_file(path)?;
-    let trailer_offset = physical_bytes.checked_sub(FOOTER_BYTES).ok_or_else(|| {
+    load_generation_footer_with_identity(path).map(|footer| footer.intent)
+}
+
+pub(super) struct GenerationFooter {
+    pub(super) intent: StagingIntent,
+    pub(super) source_identity: Option<PrivateFileIdentity>,
+}
+
+pub(super) fn load_generation_footer_with_identity(path: &Path) -> StorageResult<GenerationFooter> {
+    let mut file = open_private_file(path)?;
+    load_generation_footer_from_file(path, &mut file)
+}
+
+pub(super) fn load_generation_footer_from_file(
+    path: &Path,
+    file: &mut std::fs::File,
+) -> StorageResult<GenerationFooter> {
+    let metadata = file.metadata().map_err(|error| {
         connection(format!(
-            "staged generation {} has no footer",
+            "inspect staged generation handle {}: {error}",
             path.display()
         ))
     })?;
-    let mut file = OpenOptions::new().read(true).open(path).map_err(|error| {
+    if !metadata.is_file() {
+        return Err(connection(format!(
+            "staged generation {} is not a regular file",
+            path.display()
+        )));
+    }
+    let physical_bytes = metadata.len();
+    let trailer_offset = physical_bytes.checked_sub(FOOTER_BYTES).ok_or_else(|| {
         connection(format!(
-            "open staged generation footer {}: {error}",
+            "staged generation {} has no footer",
             path.display()
         ))
     })?;
@@ -186,7 +222,8 @@ pub(super) fn load_generation_footer(path: &Path) -> StorageResult<StagingIntent
             path.display()
         )));
     }
-    if u16::from_le_bytes([trailer[16], trailer[17]]) != FOOTER_VERSION {
+    let footer_version = u16::from_le_bytes([trailer[16], trailer[17]]);
+    if !matches!(footer_version, LEGACY_FOOTER_VERSION | FOOTER_VERSION) {
         return Err(connection(format!(
             "staged generation {} footer version is unsupported",
             path.display()
@@ -198,40 +235,98 @@ pub(super) fn load_generation_footer(path: &Path) -> StorageResult<StagingIntent
             path.display()
         )));
     }
-    let intent_bytes = u64::from_le_bytes(
+    let payload_bytes = u64::from_le_bytes(
         trailer[24..32]
             .try_into()
             .map_err(|_| connection("staged footer length width mismatch".to_owned()))?,
     );
-    let intent_offset = trailer_offset.checked_sub(intent_bytes).ok_or_else(|| {
+    let payload_offset = trailer_offset.checked_sub(payload_bytes).ok_or_else(|| {
         connection(format!(
             "staged generation {} footer length exceeds the file",
             path.display()
         ))
     })?;
-    let intent_len = usize::try_from(intent_bytes)
+    let payload_len = usize::try_from(payload_bytes)
         .map_err(|_| connection("staged footer is not addressable".to_owned()))?;
-    let mut encoded = Vec::new();
-    encoded
-        .try_reserve_exact(intent_len)
+    let mut payload = Vec::new();
+    payload
+        .try_reserve_exact(payload_len)
         .map_err(|_| connection("staged footer allocation failed".to_owned()))?;
-    encoded.resize(intent_len, 0);
-    file.seek(SeekFrom::Start(intent_offset))
-        .and_then(|_| file.read_exact(&mut encoded))
+    payload.resize(payload_len, 0);
+    file.seek(SeekFrom::Start(payload_offset))
+        .and_then(|_| file.read_exact(&mut payload))
         .map_err(|error| connection(format!("read staged generation intent footer: {error}")))?;
-    let intent = decode_intent(&encoded).map_err(|error| {
-        connection(format!(
-            "decode staged generation footer {}: {error}",
-            path.display()
-        ))
-    })?;
-    if intent.logical_bytes != intent_offset {
+    let footer = decode_generation_footer_payload(path, footer_version, &payload)?;
+    if footer.intent.logical_bytes != payload_offset {
         return Err(connection(format!(
             "staged generation {} footer does not follow its logical bytes",
             path.display()
         )));
     }
-    Ok(intent)
+    Ok(footer)
+}
+
+fn decode_generation_footer_payload(
+    path: &Path,
+    footer_version: u16,
+    payload: &[u8],
+) -> StorageResult<GenerationFooter> {
+    let (encoded, source_identity) = if footer_version == FOOTER_VERSION {
+        let binding_bytes = SOURCE_IDENTITY_BYTES
+            .checked_add(SOURCE_BINDING_CHECKSUM_BYTES)
+            .ok_or_else(|| connection("staged footer binding length overflow".to_owned()))?;
+        let identity_offset = payload
+            .len()
+            .checked_sub(usize::try_from(binding_bytes).unwrap_or(usize::MAX))
+            .ok_or_else(|| connection("staged footer source identity is truncated".to_owned()))?;
+        let (encoded, binding) = payload.split_at(identity_offset);
+        let (identity, checksum) = binding.split_at(
+            usize::try_from(SOURCE_IDENTITY_BYTES)
+                .map_err(|_| connection("staged footer identity is not addressable".to_owned()))?,
+        );
+        if checksum != source_binding_checksum(encoded, identity) {
+            return Err(connection(format!(
+                "staged generation {} source binding checksum mismatch",
+                path.display()
+            )));
+        }
+        let volume =
+            u64::from_le_bytes(identity[..8].try_into().map_err(|_| {
+                connection("staged footer source volume width mismatch".to_owned())
+            })?);
+        let file = u64::from_le_bytes(
+            identity[8..]
+                .try_into()
+                .map_err(|_| connection("staged footer source file width mismatch".to_owned()))?,
+        );
+        (encoded, Some(PrivateFileIdentity { volume, file }))
+    } else {
+        (payload, None)
+    };
+    let intent = decode_intent(encoded).map_err(|error| {
+        connection(format!(
+            "decode staged generation footer {}: {error}",
+            path.display()
+        ))
+    })?;
+    Ok(GenerationFooter {
+        intent,
+        source_identity,
+    })
+}
+
+fn source_identity_bytes(identity: PrivateFileIdentity) -> [u8; 16] {
+    let mut bytes = [0_u8; 16];
+    bytes[..8].copy_from_slice(&identity.volume.to_le_bytes());
+    bytes[8..].copy_from_slice(&identity.file.to_le_bytes());
+    bytes
+}
+
+fn source_binding_checksum(encoded_intent: &[u8], identity: &[u8]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key("astrid staged source binding v1");
+    hasher.update(encoded_intent);
+    hasher.update(identity);
+    *hasher.finalize().as_bytes()
 }
 
 pub(super) fn decode_intent(bytes: &[u8]) -> Result<StagingIntent, &'static str> {

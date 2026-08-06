@@ -8,7 +8,10 @@ use parking_lot::{Condvar, Mutex};
 
 use super::format::StagingIntent;
 use super::journal::{JournalRecord, StageKey, append_records, flush_journal};
-use super::{NativeContentStagingArea, ReadyStagedContent, StagingFaultPoint, sync_directory};
+use super::{
+    NativeContentStagingArea, PrivateFileIdentity, ReadyStagedContent, StagingFaultPoint,
+    open_generation_in,
+};
 use crate::error::{StorageError, StorageResult};
 
 #[derive(Debug, Default)]
@@ -23,6 +26,7 @@ pub(super) struct SealGroup {
 struct QueuedSeal {
     intent: StagingIntent,
     path: PathBuf,
+    source_identity: PrivateFileIdentity,
     receipt: Arc<SealReceipt>,
 }
 
@@ -62,6 +66,7 @@ impl NativeContentStagingArea {
         &self,
         intent: StagingIntent,
         path: PathBuf,
+        source_identity: PrivateFileIdentity,
     ) -> StorageResult<ReadyStagedContent> {
         let receipt = Arc::new(SealReceipt::default());
         let mut lead = {
@@ -69,6 +74,7 @@ impl NativeContentStagingArea {
             group.queue.push_back(QueuedSeal {
                 intent,
                 path,
+                source_identity,
                 receipt: Arc::clone(&receipt),
             });
             if group.leader_active {
@@ -129,7 +135,15 @@ impl NativeContentStagingArea {
             return;
         }
         let result = (|| {
-            sync_directory(&self.inner.generations)?;
+            for request in &batch {
+                open_generation_in(
+                    &self.inner.generations_directory,
+                    &request.path,
+                    &request.intent,
+                    Some(request.source_identity),
+                )?;
+            }
+            self.inner.generations_directory.sync()?;
             self.fail_if(StagingFaultPoint::GenerationDirectoryFlushed)?;
             let records: Vec<_> = batch
                 .iter()
@@ -153,6 +167,7 @@ impl NativeContentStagingArea {
                         self.inner.root.clone(),
                         request.path,
                         request.intent,
+                        request.source_identity,
                     );
                     request.receipt.complete(Ok(ready));
                 }

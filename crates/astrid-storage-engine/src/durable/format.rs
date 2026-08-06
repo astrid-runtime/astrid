@@ -4,9 +4,13 @@ use super::{
     ARENA_FILE, ARENA_MAGIC, ArenaLocation, BTreeMap, CHECKSUM_START, DurableError,
     FRAME_HEADER_LEN, FRAME_HEADER_LEN_USIZE, FRAME_VERSION, File, IdentityScheme, ModelError,
     ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord, ObjectReference,
-    OpenOptions, Path, PersistentObjectIdentity, Read, RecoveryLimits, ReferenceKind,
-    ReferenceLabel, Seek, SeekFrom, Write, io,
+    PersistentObjectIdentity, Read, RecoveryLimits, ReferenceKind, ReferenceLabel, Seek, SeekFrom,
+    Write, io,
 };
+#[cfg(test)]
+use std::fs::OpenOptions;
+#[cfg(test)]
+use std::path::Path;
 
 const IDENTITY_PREFIX_BYTES: usize = 8;
 const CURRENT_DIGEST_BYTES: u32 = 32;
@@ -226,6 +230,7 @@ fn positioned_read(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<us
     reader.read(buffer)
 }
 
+#[cfg(test)]
 pub(super) fn open_rw(path: &Path) -> Result<File, DurableError> {
     let mut options = OpenOptions::new();
     options.create(true).truncate(false).read(true).write(true);
@@ -237,18 +242,6 @@ pub(super) fn open_rw(path: &Path) -> Result<File, DurableError> {
     options
         .open(path)
         .map_err(|source| io_error("open principal-store file", source))
-}
-
-#[cfg(unix)]
-pub(super) fn sync_store_directory(path: &Path) -> Result<(), DurableError> {
-    File::open(path)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|source| io_error("flush principal-store directory", source))
-}
-
-#[cfg(not(unix))]
-pub(super) fn sync_store_directory(_path: &Path) -> Result<(), DurableError> {
-    Ok(())
 }
 
 pub(super) fn io_error(operation: &'static str, source: io::Error) -> DurableError {

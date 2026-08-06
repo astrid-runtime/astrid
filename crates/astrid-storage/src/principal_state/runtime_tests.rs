@@ -22,6 +22,8 @@ use super::*;
 use crate::content::{CONTENT_COMPONENT_LABEL, CatalogValue, LegacyCatalog, encode_legacy_catalog};
 use crate::{ChunkingProfile, ContentName};
 
+mod staging_batch_tests;
+
 fn unlimited_quota() -> Arc<dyn KvQuotaResolver<StateOwner>> {
     Arc::new(|owner: &StateOwner| {
         Ok(match owner {
@@ -1100,6 +1102,14 @@ async fn native_stage_acknowledges_before_ingest_and_publishes_on_a_blocking_wor
         store.content().read(&owner, &name).unwrap(),
         Some(b"linux build.artifact".to_vec())
     );
+    let snapshot = store.content().engine().snapshot(&owner).unwrap().unwrap();
+    assert!(
+        snapshot
+            .records()
+            .iter()
+            .any(|(_, record)| record.kind() == ObjectKind::Chunk),
+        "archival snapshots must materialize canonical chunk records"
+    );
     assert!(store.staging().ready().unwrap().is_empty());
     drop(store);
 
@@ -1260,7 +1270,11 @@ async fn staged_publication_retries_after_root_commit_before_cleanup() {
     let retried = store.publish_staged(staged).await.unwrap();
     assert_eq!(retried.descriptor(), first.descriptor());
     assert_eq!(retried.principal_root(), first.principal_root());
-    assert_eq!(retried.objects_inserted(), 0);
+    assert_eq!(
+        retried.objects_inserted(),
+        1,
+        "unchanged logical publication still reports newly admitted physical evidence"
+    );
     assert!(store.staging().ready().unwrap().is_empty());
 }
 

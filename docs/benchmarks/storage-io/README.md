@@ -94,6 +94,26 @@ to another publication phase. Median eight-worker pending memory rises from
 window. The evidence is in
 `astrid-storage-closure-after-a4a492b.json`.
 
+The contiguous-adoption checkpoint at clean commit `da8e3cd0` keeps the sealed
+staging generation as the retry witness and publishes a verified whole-file
+representation. Unique publication reaches 271.3 MiB/s and appends 1.000971
+authoritative bytes per logical byte. Republishing the same 512 MiB reaches
+388.2 MiB/s and appends 8,387 bytes (0.001562%). Eight-worker first ingest
+reaches 1,556.4 MiB/s; four-principal shared publication reaches 928.6 MiB/s;
+and four-principal warm verified reads reach 6,485.4 MiB/s. Representation
+metadata excludes `.blob` payloads and measures 61,042 bytes for the unique
+publication. The evidence is in `astrid-storage-contiguous-da8e3cd.json`.
+
+Clean commit `6384aaec` hardens canonical-blob reuse against substituted source
+bytes and symlink replacement, then measures the mandatory copy fallback as a
+separate workload. The forced fallback copies and verifies the 512 MiB corpus
+at 674.7 MiB/s. Unique publication remains 270.4 MiB/s, warm verified reads
+reach 1,774.6 MiB/s, and four-principal shared publication reaches 935.8 MiB/s.
+Duplicate publication is 295.8 MiB/s because reuse now reads and verifies the
+supplied complete preimage instead of trusting an occupied canonical path. The
+same run appends 8,387 authoritative bytes for that duplicate. The evidence is
+in `astrid-storage-contiguous-6384aae.json`.
+
 The historical schema did not embed Git revision, executable arguments,
 dirty-tree state, or cache policy. The canonical document records reconstructed
 ancestry and explicitly prevents independent experiment branches from being

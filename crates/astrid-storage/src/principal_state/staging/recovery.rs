@@ -2,11 +2,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{DirEntry, ReadDir, read_dir};
+use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use uuid::Uuid;
 
-use super::format::{StagingIntent, load_generation_footer};
+use super::format::{StagingIntent, load_generation_footer, load_generation_footer_from_file};
 use super::journal::{
     JournalRecord, StageKey, StageKey as JournalStageKey, append_records, flush_journal,
 };
@@ -17,6 +18,7 @@ use super::{
 };
 use crate::error::StorageResult;
 use crate::principal_state::native_io::{
+    PrivateDirectory, PrivateFileIdentity, open_private_file, private_file_identity,
     rename_private_entry, sync_directory, validate_private_regular_file,
 };
 
@@ -283,18 +285,28 @@ pub(super) enum GenerationName {
 
 pub(super) fn load_generation(
     staging_root: &Path,
+    directory: &PrivateDirectory,
     path: PathBuf,
     intent: StagingIntent,
 ) -> StorageResult<ReadyStagedContent> {
-    validate_generation(&path, &intent)?;
+    let (_, source_identity) = open_generation_in(directory, &path, &intent, None)?;
     Ok(ReadyStagedContent::from_intent(
         staging_root.to_path_buf(),
         path,
         intent,
+        source_identity,
     ))
 }
 
 pub(super) fn validate_generation(path: &Path, intent: &StagingIntent) -> StorageResult<()> {
+    open_generation(path, intent, None).map(|_| ())
+}
+
+pub(super) fn open_generation(
+    path: &Path,
+    intent: &StagingIntent,
+    expected_identity: Option<PrivateFileIdentity>,
+) -> StorageResult<(std::fs::File, PrivateFileIdentity)> {
     let expected = sealed_generation_name(intent.sequence, intent.id);
     if path.file_name().and_then(|name| name.to_str()) != Some(expected.as_str()) {
         return Err(connection(format!(
@@ -302,14 +314,58 @@ pub(super) fn validate_generation(path: &Path, intent: &StagingIntent) -> Storag
             path.display()
         )));
     }
-    let footer = load_generation_footer(path)?;
-    if &footer != intent {
+    let file = open_private_file(path)?;
+    validate_generation_file(path, intent, expected_identity, file)
+}
+
+pub(super) fn open_generation_in(
+    directory: &PrivateDirectory,
+    path: &Path,
+    intent: &StagingIntent,
+    expected_identity: Option<PrivateFileIdentity>,
+) -> StorageResult<(std::fs::File, PrivateFileIdentity)> {
+    let expected = sealed_generation_name(intent.sequence, intent.id);
+    if path.file_name().and_then(|name| name.to_str()) != Some(expected.as_str()) {
+        return Err(connection(format!(
+            "staged generation path is not canonical: {}",
+            path.display()
+        )));
+    }
+    let file = directory.open_file(Path::new(&expected))?;
+    validate_generation_file(path, intent, expected_identity, file)
+}
+
+fn validate_generation_file(
+    path: &Path,
+    intent: &StagingIntent,
+    expected_identity: Option<PrivateFileIdentity>,
+    mut file: std::fs::File,
+) -> StorageResult<(std::fs::File, PrivateFileIdentity)> {
+    let actual = private_file_identity(&file)?;
+    let footer = load_generation_footer_from_file(path, &mut file)?;
+    file.seek(SeekFrom::Start(0)).map_err(|error| {
+        connection(format!(
+            "rewind staged generation handle {}: {error}",
+            path.display()
+        ))
+    })?;
+    if &footer.intent != intent {
         return Err(connection(format!(
             "staged generation footer changed after seal in {}",
             path.display()
         )));
     }
-    Ok(())
+    if footer
+        .source_identity
+        .is_some_and(|sealed| sealed != actual)
+        || expected_identity.is_some_and(|expected| expected != actual)
+    {
+        return Err(connection(format!(
+            "staged generation source identity changed after seal in {}",
+            path.display()
+        )));
+    }
+    Ok((file, actual))
 }
 
 pub(super) fn sealed_generation_name(sequence: u64, id: StagedContentId) -> String {

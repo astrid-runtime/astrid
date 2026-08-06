@@ -7,7 +7,7 @@
 //! from the root journal and identity-checked arena objects.
 
 use std::collections::BTreeMap;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{Seek, SeekFrom};
 use std::path::Path;
 
@@ -16,8 +16,9 @@ use astrid_storage_model::ObjectId;
 use super::{
     ARENA_FILE, ArenaLocation, DurableEngine, DurableError, DurableInner, FRAME_HEADER_LEN,
     INDEX_FILE, INDEX_MAGIC, IdentityScheme, PersistentObjectIdentity, PrincipalCodec,
-    RecoveryLimits, append_frame, live_files_mut, open_rw, scan_frames, sync_store_directory,
-    verify_indexed_location, verify_indexed_tail,
+    RecoveryLimits, append_frame, create_private_file_capability, live_files_mut,
+    open_rw_capability, scan_frames, sync_store_directory_capability, verify_indexed_location,
+    verify_indexed_tail,
 };
 
 const SNAPSHOT_RECORD: u8 = 1;
@@ -164,55 +165,62 @@ pub(super) fn recover_index(
 
 /// Replace the disposable index with one complete, flushed checkpoint.
 pub(super) fn replace_index(
-    directory: &Path,
+    directory: &cap_std::fs::Dir,
     state: &IndexState,
     scheme: IdentityScheme,
 ) -> Option<File> {
     let payload = encode_snapshot(state, scheme).ok()?;
-    let temporary = directory.join(format!("{INDEX_FILE}.tmp"));
-    let destination = directory.join(INDEX_FILE);
-    let mut options = OpenOptions::new();
-    options.create(true).truncate(true).read(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&temporary).ok()?;
+    let temporary = format!("{INDEX_FILE}.tmp");
+    remove_checkpoint_if_present(directory, &temporary).ok()?;
+    let mut file = create_private_file_capability(directory, Path::new(&temporary)).ok()?;
     append_frame(&mut file, INDEX_MAGIC, &payload).ok()?;
     file.sync_data().ok()?;
     drop(file);
-    replace_checkpoint(&temporary, &destination).ok()?;
-    sync_store_directory(directory).ok()?;
-    let mut reopened = open_rw(&destination).ok()?;
+    replace_checkpoint(directory, &temporary, INDEX_FILE).ok()?;
+    sync_store_directory_capability(directory).ok()?;
+    let mut reopened = open_rw_capability(directory, Path::new(INDEX_FILE), false).ok()?;
     reopened.seek(SeekFrom::End(0)).ok()?;
     Some(reopened)
 }
 
 #[cfg(not(windows))]
-fn replace_checkpoint(temporary: &Path, destination: &Path) -> std::io::Result<()> {
-    std::fs::rename(temporary, destination)
+fn replace_checkpoint(
+    directory: &cap_std::fs::Dir,
+    temporary: &str,
+    destination: &str,
+) -> std::io::Result<()> {
+    directory.rename(temporary, directory, destination)
 }
 
 #[cfg(windows)]
-fn replace_checkpoint(temporary: &Path, destination: &Path) -> std::io::Result<()> {
-    if !destination.exists() {
-        return std::fs::rename(temporary, destination);
+fn replace_checkpoint(
+    directory: &cap_std::fs::Dir,
+    temporary: &str,
+    destination: &str,
+) -> std::io::Result<()> {
+    if directory.symlink_metadata(destination).is_err() {
+        return directory.rename(temporary, directory, destination);
     }
-    let backup = destination.with_extension("index.previous");
-    if backup.exists() {
-        std::fs::remove_file(&backup)?;
-    }
-    std::fs::rename(destination, &backup)?;
-    match std::fs::rename(temporary, destination) {
+    let backup = "objects.index.previous";
+    remove_checkpoint_if_present(directory, backup)?;
+    directory.rename(destination, directory, backup)?;
+    match directory.rename(temporary, directory, destination) {
         Ok(()) => {
-            let _ = std::fs::remove_file(backup);
+            let _ = directory.remove_file(backup);
             Ok(())
         },
         Err(error) => {
-            let _ = std::fs::rename(backup, destination);
+            let _ = directory.rename(backup, directory, destination);
             Err(error)
         },
+    }
+}
+
+fn remove_checkpoint_if_present(directory: &cap_std::fs::Dir, name: &str) -> std::io::Result<()> {
+    match directory.remove_file(name) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }
 

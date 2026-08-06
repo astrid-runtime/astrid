@@ -1,40 +1,50 @@
 //! Authoritative physical representation catalogue and placement state.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use astrid_storage_model::{
-    CanonicalPhysicalMap, Coverage, ObjectId, PhysicalMapDomain, PhysicalMapKey, PlacementEntry,
-    PlacementSet, Recipe, Replica, ReplicaLocator, RepresentationCatalogueRoot,
-    RepresentationProfile, RepresentationProfileId, RepresentationRecord, RepresentationRecordId,
-    RepresentationState, RepresentationStateId, StorageNodeId,
+    CanonicalPhysicalMap, Coverage, Dependency, ObjectId, PhysicalMapDomain, PhysicalMapKey,
+    PlacementEntry, PlacementSet, ProfileDependency, Recipe, Replica, ReplicaLocator,
+    RepresentationCatalogueRoot, RepresentationProfile, RepresentationProfileId,
+    RepresentationRecord, RepresentationRecordId, RepresentationState, RepresentationStateId,
+    StorageNodeId,
 };
 
+#[cfg(test)]
+use super::open_rw;
 use super::{
-    ArenaLocation, DurableError, FRAME_HEADER_LEN, RecoveryLimits, append_frame, append_frames,
-    io_error, open_rw, sync_store_directory,
+    ArenaLocation, DurableError, FRAME_HEADER_LEN, PersistentObjectIdentity, RecoveryLimits,
+    append_frame, append_frames, canonical_record_bytes, io_error,
+    read_indexed_object_with_payload,
 };
+pub(in crate::durable) use format::Blake3PhysicalIdentity as PhysicalIdentityV1;
 use format::{
     Blake3PhysicalIdentity, CurrentPointer, JOURNAL_MAGIC, JournalEntry, METADATA_MAGIC,
     MetadataFrame, MetadataKind, journal_digest,
 };
 
 mod activation;
+mod authority;
 mod format;
 mod recovery;
 
-use activation::{
-    append_new_reachable_map_nodes, build_initial_state, create_new, generation_name,
-    publish_current, quarantine_incomplete_root, quarantine_temporary_current,
-};
+use activation::{append_new_reachable_map_nodes, build_initial_state, generation_name};
 use recovery::{
-    MetadataIndex, read_current, recover_journal, recover_metadata, validate_profiles,
+    MetadataIndex, read_current_file, recover_journal, recover_metadata, validate_profiles,
     validate_representations,
 };
 
+mod contiguous;
 mod direct;
+use authority::{create_file as create_cap_file, open_file as open_cap_file, quarantine_entry};
+pub(super) use contiguous::{
+    install_loose_blob_copy, install_loose_blob_from_file, open_regular_read, open_store_root,
+    read_contiguous_object,
+};
+use contiguous::{open_component, sync_directory};
 
 pub(super) use direct::{DirectArenaObject, PreparedDirectArenaObject};
 
@@ -86,6 +96,8 @@ pub(super) fn append_legacy_profile_frame(
 
 #[derive(Debug)]
 pub(super) struct RepresentationStore {
+    root: std::path::PathBuf,
+    root_directory: cap_std::fs::Dir,
     metadata: File,
     journal: File,
     journal_generation: u64,
@@ -99,14 +111,31 @@ pub(super) struct RepresentationStore {
     persisted_map_nodes: BTreeSet<astrid_storage_model::PhysicalMapNodeId>,
     direct_profile: RepresentationProfileId,
     reverse: BTreeMap<ObjectId, Vec<RepresentationRecordId>>,
+    contiguous: BTreeMap<ObjectId, ContiguousLocation>,
 }
 
-pub(super) struct PendingDirectUpdate {
+#[derive(Debug)]
+struct PinnedRepresentationRoot {
+    path: std::path::PathBuf,
+    directory: cap_std::fs::Dir,
+}
+
+pub(super) struct PendingRepresentationUpdate {
     state: RepresentationState,
     state_id: RepresentationStateId,
     catalogue: RepresentationCatalogueRoot,
     placements: PlacementSet,
     reverse_additions: Vec<(ObjectId, RepresentationRecordId)>,
+    contiguous_additions: Vec<(ObjectId, ContiguousLocation)>,
+    replacement_reverse: Option<BTreeMap<ObjectId, Vec<RepresentationRecordId>>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ContiguousLocation {
+    pub(super) blob: astrid_storage_model::BlobId,
+    pub(super) namespace_generation: u64,
+    pub(super) offset: u64,
+    pub(super) length: u64,
 }
 
 struct DirectMapEntry {
@@ -117,22 +146,48 @@ struct DirectMapEntry {
 }
 
 impl RepresentationStore {
-    pub(super) fn open(store: &Path, limits: RecoveryLimits) -> Result<Option<Self>, DurableError> {
+    pub(super) fn open(
+        store: &Path,
+        store_root: &cap_std::fs::Dir,
+        limits: RecoveryLimits,
+    ) -> Result<Option<Self>, DurableError> {
         let root = store.join(DIRECTORY);
-        let current_path = root.join(CURRENT_PATH);
-        if !current_path.exists() {
-            return Ok(None);
-        }
-        let current = read_current(&current_path, limits)?;
-        quarantine_temporary_current(&root)?;
-        let generation_path = root
-            .join(GENERATIONS_DIRECTORY)
-            .join(generation_name(current.journal_generation));
-        let mut metadata = open_rw(&generation_path.join(METADATA_PATH))?;
-        let mut journal = open_rw(&generation_path.join(JOURNAL_PATH))?;
+        let root_directory = match contiguous::open_representation_root(store_root) {
+            Ok(root) => root,
+            Err(DurableError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                return Ok(None);
+            },
+            Err(error) => return Err(error),
+        };
+        let current_file = match open_cap_file(&root_directory, Path::new(CURRENT_PATH)) {
+            Ok(file) => file,
+            Err(DurableError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                return Ok(None);
+            },
+            Err(error) => return Err(error),
+        };
+        let current = read_current_file(current_file, limits)?;
+        quarantine_entry(
+            &root_directory,
+            CURRENT_TEMP_PATH,
+            &format!("{CURRENT_TEMP_PATH}.incomplete"),
+        )?;
+        let generations = open_component(&root_directory, Path::new(GENERATIONS_DIRECTORY), false)?;
+        let generation_name = generation_name(current.journal_generation);
+        let generation = open_component(&generations, Path::new(&generation_name), false)?;
+        let mut metadata = open_cap_file(&generation, Path::new(METADATA_PATH))?;
+        let mut journal = open_cap_file(&generation, Path::new(JOURNAL_PATH))?;
         let index = recover_metadata(&mut metadata, limits)?;
         let (active, state) = recover_journal(&mut journal, current, &index, limits)?;
         let recovered = Self::from_recovered(
+            PinnedRepresentationRoot {
+                path: root,
+                directory: root_directory,
+            },
             metadata,
             journal,
             current.journal_generation,
@@ -145,25 +200,22 @@ impl RepresentationStore {
 
     pub(super) fn activate(
         store: &Path,
+        store_root: &cap_std::fs::Dir,
         limits: RecoveryLimits,
         frozen_specification: ObjectId,
         objects: impl IntoIterator<Item = Result<DirectArenaObject, DurableError>>,
     ) -> Result<Self, DurableError> {
-        if let Some(existing) = Self::open(store, limits)? {
+        if let Some(existing) = Self::open(store, store_root, limits)? {
             return Ok(existing);
         }
-        let root = store.join(DIRECTORY);
-        quarantine_incomplete_root(store, &root)?;
-        let generations = root.join(GENERATIONS_DIRECTORY);
-        let generation_path = generations.join(generation_name(FIRST_JOURNAL_GENERATION));
-        fs::create_dir_all(&generation_path)
-            .map_err(|source| io_error("create representation generation", source))?;
-        sync_store_directory(store)?;
-        sync_store_directory(&root)?;
-        sync_store_directory(&generations)?;
+        quarantine_entry(store_root, DIRECTORY, &format!("{DIRECTORY}.incomplete"))?;
+        let root_directory = open_component(store_root, Path::new(DIRECTORY), true)?;
+        let generations = open_component(&root_directory, Path::new(GENERATIONS_DIRECTORY), true)?;
+        let generation_name = generation_name(FIRST_JOURNAL_GENERATION);
+        let generation = open_component(&generations, Path::new(&generation_name), true)?;
 
-        let mut metadata = create_new(&generation_path.join(METADATA_PATH))?;
-        let mut journal = create_new(&generation_path.join(JOURNAL_PATH))?;
+        let mut metadata = create_cap_file(&generation, Path::new(METADATA_PATH))?;
+        let mut journal = create_cap_file(&generation, Path::new(JOURNAL_PATH))?;
         let built = build_initial_state(frozen_specification, objects)?;
         let payloads = built
             .metadata
@@ -198,7 +250,8 @@ impl RepresentationStore {
         journal
             .sync_data()
             .map_err(|source| io_error("flush initial representation state", source))?;
-        sync_store_directory(&generation_path)?;
+        sync_directory(&generation)
+            .map_err(|source| io_error("flush representation generation", source))?;
 
         let current = CurrentPointer {
             journal_generation: FIRST_JOURNAL_GENERATION,
@@ -206,10 +259,33 @@ impl RepresentationStore {
             max_tail_frames: u32::MAX,
             max_tail_bytes: u64::MAX,
         };
-        publish_current(&root, current)?;
+        let mut current_file = create_cap_file(&root_directory, Path::new(CURRENT_TEMP_PATH))?;
+        append_frame(&mut current_file, format::CURRENT_MAGIC, &current.encode())?;
+        current_file
+            .sync_data()
+            .map_err(|source| io_error("flush representation current pointer", source))?;
+        drop(current_file);
+        let recovered = read_current_file(
+            open_cap_file(&root_directory, Path::new(CURRENT_TEMP_PATH))?,
+            RecoveryLimits::process_addressable(),
+        )?;
+        if recovered != current {
+            return Err(DurableError::InvalidRepresentationState(
+                "representation current pointer failed verification",
+            ));
+        }
+        root_directory
+            .rename(
+                Path::new(CURRENT_TEMP_PATH),
+                &root_directory,
+                Path::new(CURRENT_PATH),
+            )
+            .map_err(|source| io_error("publish representation current pointer", source))?;
+        sync_directory(&root_directory)
+            .map_err(|source| io_error("flush representation root", source))?;
         drop(metadata);
         drop(journal);
-        Self::open(store, limits)?.ok_or(DurableError::InvalidRepresentationState(
+        Self::open(store, store_root, limits)?.ok_or(DurableError::InvalidRepresentationState(
             "published representation state did not reopen",
         ))
     }
@@ -218,6 +294,73 @@ impl RepresentationStore {
         frozen_specification: ObjectId,
     ) -> Result<RepresentationProfileId, DurableError> {
         Ok(activation::direct_profile(frozen_specification)?.1)
+    }
+
+    pub(super) fn rebase_compacted_arena<I: PersistentObjectIdentity>(
+        &mut self,
+        arena: &File,
+        index: &BTreeMap<ObjectId, ArenaLocation>,
+        identity: &I,
+        limits: RecoveryLimits,
+    ) -> Result<(), DurableError> {
+        // Objects deliberately excluded when physical authority was activated
+        // (the in-band specification and other bootstrap records) remain
+        // recoverable through store.meta. Compaction must not silently pull
+        // those independent roots into the representation catalogue.
+        let previously_authoritative = self
+            .reverse
+            .keys()
+            .chain(self.contiguous.keys())
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let direct = index
+            .iter()
+            .filter(|(id, _)| previously_authoritative.contains(id))
+            .map(|(id, location)| {
+                let (_, payload) =
+                    read_indexed_object_with_payload(arena, *id, *location, identity, limits)?;
+                self.describe_direct(
+                    *id,
+                    canonical_record_bytes(&payload, identity.scheme())?,
+                    *location,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.rebase_all_direct(&direct)
+    }
+
+    pub(super) fn logical_liveness_roots(&self) -> Result<BTreeSet<ObjectId>, DurableError> {
+        let mut roots = BTreeSet::new();
+        for (_, bytes) in recovery::active_entries(&self.profiles)? {
+            let profile = RepresentationProfile::decode(bytes)?;
+            roots.extend(
+                profile
+                    .immutable_dependencies()
+                    .iter()
+                    .filter_map(|dependency| match dependency {
+                        ProfileDependency::LogicalObject(object) => Some(*object),
+                        ProfileDependency::PhysicalBlob(_) => None,
+                    }),
+            );
+        }
+        for (_, bytes) in recovery::active_entries(&self.representations)? {
+            let record = RepresentationRecord::decode(bytes)?;
+            roots.extend(
+                record
+                    .dependencies()
+                    .iter()
+                    .filter_map(|dependency| match dependency {
+                        Dependency::LogicalObject(object) | Dependency::Evidence(object) => {
+                            Some(*object)
+                        },
+                        Dependency::Invocation(invocation) => Some(invocation.object_id()),
+                        Dependency::PhysicalBlob(_)
+                        | Dependency::Representation(_)
+                        | Dependency::Profile(_) => None,
+                    }),
+            );
+        }
+        Ok(roots)
     }
 
     pub(super) fn describe_direct(
@@ -231,6 +374,15 @@ impl RepresentationStore {
 
     pub(super) const fn direct_profile(&self) -> RepresentationProfileId {
         self.direct_profile
+    }
+
+    fn profile(&self, id: RepresentationProfileId) -> Result<RepresentationProfile, DurableError> {
+        self.profiles
+            .get(PhysicalMapKey::from(id))
+            .ok_or(DurableError::InvalidRepresentationState(
+                "representation profile disappeared",
+            ))
+            .and_then(|bytes| RepresentationProfile::decode(bytes).map_err(Into::into))
     }
 
     pub(super) const fn active(&self) -> RepresentationStateId {
@@ -265,7 +417,7 @@ impl RepresentationStore {
     pub(super) fn append_direct_update(
         &mut self,
         objects: &[DirectArenaObject],
-    ) -> Result<Option<PendingDirectUpdate>, DurableError> {
+    ) -> Result<Option<PendingRepresentationUpdate>, DurableError> {
         let mut metadata = Vec::new();
         let profile = RepresentationProfile::decode(
             self.profiles
@@ -344,13 +496,119 @@ impl RepresentationStore {
             .collect::<Result<Vec<_>, _>>()?;
         append_frames(&mut self.metadata, METADATA_MAGIC, &payloads)?;
         self.persisted_map_nodes.extend(appended_map_nodes);
-        Ok(Some(PendingDirectUpdate {
+        Ok(Some(PendingRepresentationUpdate {
             state,
             state_id,
             catalogue,
             placements,
             reverse_additions,
+            contiguous_additions: Vec::new(),
+            replacement_reverse: None,
         }))
+    }
+
+    /// Replace every active physical representation with the supplied direct
+    /// arena placement. This is the compaction handoff: all represented live
+    /// objects have already been materialized into the replacement arena, so
+    /// no retired loose blob remains authoritative after this state CAS.
+    pub(super) fn rebase_all_direct(
+        &mut self,
+        objects: &[DirectArenaObject],
+    ) -> Result<(), DurableError> {
+        if self.direct_authority_matches(objects)? {
+            return Ok(());
+        }
+        let profile = RepresentationProfile::decode(
+            self.profiles
+                .get(PhysicalMapKey::from(self.direct_profile))
+                .ok_or(DurableError::InvalidRepresentationState(
+                    "direct representation profile disappeared",
+                ))?,
+        )?;
+        let entries = objects
+            .iter()
+            .map(|object| self.prepare_direct_entry(object, &profile))
+            .collect::<Result<Vec<_>, _>>()?;
+        let representation_entries = entries
+            .iter()
+            .map(|entry| entry.representation.clone())
+            .collect();
+        let placement_entries = entries
+            .iter()
+            .map(|entry| entry.placement.clone())
+            .collect();
+        self.representations = CanonicalPhysicalMap::build_dense(
+            &Blake3PhysicalIdentity,
+            PhysicalMapDomain::Representation,
+            representation_entries,
+        )?;
+        self.placement_entries = CanonicalPhysicalMap::build_dense(
+            &Blake3PhysicalIdentity,
+            PhysicalMapDomain::Placement,
+            placement_entries,
+        )?;
+        let replacement_reverse = entries
+            .into_iter()
+            .map(|entry| (entry.object, vec![entry.representation_id]))
+            .collect();
+
+        let mut metadata = Vec::new();
+        let mut appended_map_nodes = BTreeSet::new();
+        for map in [&self.representations, &self.placement_entries] {
+            append_new_reachable_map_nodes(
+                &mut metadata,
+                map,
+                &self.persisted_map_nodes,
+                &mut appended_map_nodes,
+            )?;
+        }
+        let (catalogue, placements, state) = self.next_authority()?;
+        let state_id = state.identify(&Blake3PhysicalIdentity);
+        metadata.extend([
+            MetadataFrame::catalogue(&Blake3PhysicalIdentity, catalogue),
+            MetadataFrame::placement(&Blake3PhysicalIdentity, placements),
+            MetadataFrame::state(&Blake3PhysicalIdentity, state),
+        ]);
+        let payloads = metadata
+            .iter()
+            .map(MetadataFrame::encode)
+            .collect::<Result<Vec<_>, _>>()?;
+        append_frames(&mut self.metadata, METADATA_MAGIC, &payloads)?;
+        self.persisted_map_nodes.extend(appended_map_nodes);
+        let update = PendingRepresentationUpdate {
+            state,
+            state_id,
+            catalogue,
+            placements,
+            reverse_additions: Vec::new(),
+            contiguous_additions: Vec::new(),
+            replacement_reverse: Some(replacement_reverse),
+        };
+        self.publish_direct_update(update)?;
+        self.flush()
+    }
+
+    fn direct_authority_matches(
+        &self,
+        objects: &[DirectArenaObject],
+    ) -> Result<bool, DurableError> {
+        let expected = objects
+            .iter()
+            .map(|object| (object.object, object.location))
+            .collect::<BTreeMap<_, _>>();
+        if expected.len() != objects.len()
+            || self.representations.entry_count()
+                != u64::try_from(objects.len()).map_err(|_| DurableError::EncodingOverflow)?
+            || self.placement_entries.entry_count()
+                != u64::try_from(objects.len()).map_err(|_| DurableError::EncodingOverflow)?
+        {
+            return Ok(false);
+        }
+        Ok(self
+            .direct_arena_locations()?
+            .into_iter()
+            .collect::<BTreeMap<_, _>>()
+            == expected)
     }
 
     fn prepare_direct_entry(
@@ -425,8 +683,9 @@ impl RepresentationStore {
 
     pub(super) fn publish_direct_update(
         &mut self,
-        update: PendingDirectUpdate,
+        update: PendingRepresentationUpdate,
     ) -> Result<(), DurableError> {
+        self.flush_metadata()?;
         let cas = JournalEntry::StateCas {
             journal_generation: self.journal_generation,
             expected: Some(self.active),
@@ -434,20 +693,35 @@ impl RepresentationStore {
         }
         .encode();
         append_frame(&mut self.journal, JOURNAL_MAGIC, &cas)?;
+        self.flush_journal()?;
         self.active = update.state_id;
         self.state = update.state;
         self.catalogue = update.catalogue;
         self.placements = update.placements;
-        for (object, representation) in update.reverse_additions {
-            self.reverse.entry(object).or_default().push(representation);
+        if let Some(replacement) = update.replacement_reverse {
+            self.reverse = replacement;
+            self.contiguous.clear();
+        } else {
+            for (object, representation) in update.reverse_additions {
+                self.reverse.entry(object).or_default().push(representation);
+            }
+            self.contiguous.extend(update.contiguous_additions);
         }
         Ok(())
     }
 
     pub(super) fn flush(&mut self) -> Result<(), DurableError> {
+        self.flush_metadata()?;
+        self.flush_journal()
+    }
+
+    fn flush_metadata(&mut self) -> Result<(), DurableError> {
         self.metadata
             .sync_data()
-            .map_err(|source| io_error("flush representation metadata", source))?;
+            .map_err(|source| io_error("flush representation metadata", source))
+    }
+
+    fn flush_journal(&mut self) -> Result<(), DurableError> {
         self.journal
             .sync_data()
             .map_err(|source| io_error("flush representation state journal", source))
@@ -558,6 +832,7 @@ impl RepresentationStore {
     }
 
     fn from_recovered(
+        root: PinnedRepresentationRoot,
         metadata: File,
         journal: File,
         journal_generation: u64,
@@ -606,6 +881,8 @@ impl RepresentationStore {
             ));
         }
         Ok(Self {
+            root: root.path,
+            root_directory: root.directory,
             metadata,
             journal,
             journal_generation,
@@ -619,6 +896,7 @@ impl RepresentationStore {
             persisted_map_nodes: index.nodes.keys().copied().collect(),
             direct_profile,
             reverse,
+            contiguous: BTreeMap::new(),
         })
     }
 }

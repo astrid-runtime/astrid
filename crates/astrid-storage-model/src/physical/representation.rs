@@ -572,18 +572,36 @@ impl RepresentationRecord {
     /// Returns [`PhysicalModelError::LengthOverflow`] when the dependency
     /// count does not fit its format-one `u64` length field.
     pub fn encode(&self) -> Result<Vec<u8>, PhysicalModelError> {
+        self.encode_fields(&self.dependencies, self.verification_evidence)
+    }
+
+    pub(super) fn admission_subject_bytes(&self) -> Result<Vec<u8>, PhysicalModelError> {
+        if matches!(self.recipe, Recipe::Generated { .. }) {
+            return Err(PhysicalModelError::InvalidRecipe(
+                "generated representation uses derivation evidence",
+            ));
+        }
+        let dependencies = derived_dependencies(self.profile, &self.recipe, None);
+        self.encode_fields(&dependencies, None)
+    }
+
+    fn encode_fields(
+        &self,
+        dependencies: &[Dependency],
+        verification_evidence: Option<ObjectId>,
+    ) -> Result<Vec<u8>, PhysicalModelError> {
         let mut encoder = Encoder::new();
         encoder.u16(REPRESENTATION_VERSION);
         encode_profile_id(&mut encoder, self.profile);
         self.coverage.encode_into(&mut encoder);
         self.recipe.encode_into(&mut encoder);
-        encoder.count(self.dependencies.len())?;
-        for dependency in &self.dependencies {
+        encoder.count(dependencies.len())?;
+        for dependency in dependencies {
             dependency.encode_into(&mut encoder);
         }
         encoder.u64(self.canonical_output_bytes);
         encoder.u64(self.maximum_reconstruction_bytes);
-        encode_optional_object(&mut encoder, self.verification_evidence);
+        encode_optional_object(&mut encoder, verification_evidence);
         Ok(encoder.finish())
     }
 

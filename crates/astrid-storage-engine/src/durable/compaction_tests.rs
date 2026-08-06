@@ -211,6 +211,32 @@ fn compaction_reclaims_only_unreachable_objects_and_preserves_root_generation() 
 }
 
 #[test]
+fn compaction_remains_bound_to_the_pinned_store_after_path_replacement() {
+    let parent = tempfile::tempdir().unwrap();
+    let configured = parent.path().join("configured");
+    let retained = parent.path().join("retained");
+    let engine = super::tests::open(&configured);
+    let (first, current) = two_versions(&engine);
+    let policy = evidence(b"retain-current-roots");
+    let authorization = plan(&engine, retention(&engine, &policy, []), policy);
+
+    std::fs::rename(&configured, &retained).unwrap();
+    std::fs::create_dir(&configured).unwrap();
+
+    engine.compact(&authorization).unwrap();
+    assert!(engine.object(first.commit).unwrap().is_none());
+    assert_eq!(engine.root(&"alice".to_owned()).unwrap(), Some(current));
+    assert_eq!(engine.pending_compaction_evidence().unwrap().len(), 1);
+    assert_eq!(std::fs::read_dir(&configured).unwrap().count(), 0);
+    drop(engine);
+
+    let reopened = super::tests::open(&retained);
+    assert_eq!(reopened.root(&"alice".to_owned()).unwrap(), Some(current));
+    assert!(reopened.object(first.commit).unwrap().is_none());
+    assert_eq!(reopened.pending_compaction_evidence().unwrap().len(), 1);
+}
+
+#[test]
 fn compaction_invalidates_evidence_for_reclaimed_staged_objects() {
     let directory = tempfile::tempdir().unwrap();
     let engine = super::tests::open(directory.path());
@@ -229,23 +255,45 @@ fn compaction_invalidates_evidence_for_reclaimed_staged_objects() {
 }
 
 #[test]
-fn direct_authority_rejects_retirement_until_final_path_liveness_exists() {
+fn compaction_rebases_direct_authority_before_retiring_old_placements() {
     let directory = tempfile::tempdir().unwrap();
     let engine = super::tests::open(directory.path());
-    two_versions(&engine);
-    let policy = evidence(b"retain-current-roots");
-    let authorization = plan(&engine, retention(&engine, &policy, []), policy);
+    let (first, current) = two_versions(&engine);
     let specification = evidence(b"physical format specification");
     let (specification_id, _) = engine.persist_standalone_object(&specification).unwrap();
     engine
         .ensure_direct_representation_catalogue(specification_id, &[specification_id])
         .unwrap();
+    let policy = evidence(b"retain-current-roots");
+    let authorization = plan(
+        &engine,
+        retention(
+            &engine,
+            &policy,
+            [CompactionRetainedRoot::new(
+                CompactionRootKind::System,
+                specification_id,
+            )],
+        ),
+        policy,
+    );
 
-    assert!(matches!(
-        engine.compact(&authorization),
-        Err(DurableError::RepresentationRetirementUnsupported)
-    ));
-    assert!(engine.object_count().unwrap() > 0);
+    engine.compact(&authorization).unwrap();
+    assert!(engine.object(first.commit).unwrap().is_none());
+    assert!(engine.object(current.commit).unwrap().is_some());
+    {
+        let inner = engine.inner.lock();
+        let representations = inner.representations.as_ref().unwrap();
+        assert!(!representations.contains_direct(first.commit));
+        assert!(representations.contains_direct(current.commit));
+        assert!(!representations.contains_direct(specification_id));
+    }
+    engine.close().unwrap();
+    drop(engine);
+
+    let reopened = super::tests::open(directory.path());
+    assert!(reopened.object(first.commit).unwrap().is_none());
+    assert!(reopened.object(current.commit).unwrap().is_some());
 }
 
 #[test]

@@ -638,8 +638,10 @@ pub use physical::{
     CanonicalChunkingProfile, CanonicalPhysicalMap, Coverage, Dependency, PhysicalIdentity,
     PhysicalMapDomain, PhysicalMapKey, PhysicalMapNode, PhysicalMapNodeId, PhysicalModelError,
     PlacementEntry, PlacementSet, PlacementSetId, ProfileDependency, ProfileKind, Recipe,
-    ReconstructionBounds, Replica, ReplicaLocator, RepresentationCatalogueRoot,
-    RepresentationCatalogueRootId, RepresentationProfile, RepresentationProfileId,
+    ReconstructionBounds, Replica, ReplicaLocator, RepresentationAdmissionEvidence,
+    RepresentationAdmissionMethod, RepresentationAdmissionSubjectId,
+    RepresentationAdmissionTranscript, RepresentationCatalogueRoot, RepresentationCatalogueRootId,
+    RepresentationOutputObservation, RepresentationProfile, RepresentationProfileId,
     RepresentationRecord, RepresentationRecordId, RepresentationState, RepresentationStateId,
 };
 pub use proof::{

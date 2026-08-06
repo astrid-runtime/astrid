@@ -5,7 +5,303 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use cap_std::fs::Dir;
+
 use crate::error::{StorageError, StorageResult};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PrivateFileIdentity {
+    pub(super) volume: u64,
+    pub(super) file: u64,
+}
+
+/// An opened directory capability retained across runtime staging mutations.
+#[derive(Debug)]
+pub(super) struct PrivateDirectory {
+    directory: Dir,
+    path: PathBuf,
+}
+
+impl PrivateDirectory {
+    pub(super) fn open(path: &Path) -> StorageResult<Self> {
+        let directory =
+            Dir::open_ambient_dir(path, cap_std::ambient_authority()).map_err(|error| {
+                connection(format!(
+                    "open private directory capability {}: {error}",
+                    path.display()
+                ))
+            })?;
+        Ok(Self {
+            directory,
+            path: path.to_path_buf(),
+        })
+    }
+
+    pub(super) fn open_file(&self, name: &Path) -> StorageResult<File> {
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use cap_std::fs::OpenOptionsExt as _;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        #[cfg(windows)]
+        {
+            use cap_std::fs::OpenOptionsExt as _;
+            use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+        let file = self
+            .directory
+            .open_with(name, &options)
+            .map(cap_std::fs::File::into_std)
+            .map_err(|error| {
+                connection(format!(
+                    "open private file {}: {error}",
+                    self.path.join(name).display()
+                ))
+            })?;
+        private_file_identity(&file)?;
+        Ok(file)
+    }
+
+    pub(super) fn create_file(&self, name: &Path) -> StorageResult<File> {
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.create_new(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use cap_std::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let file = self
+            .directory
+            .open_with(name, &options)
+            .map(cap_std::fs::File::into_std)
+            .map_err(|error| {
+                connection(format!(
+                    "create private file {}: {error}",
+                    self.path.join(name).display()
+                ))
+            })?;
+        private_file_identity(&file)?;
+        Ok(file)
+    }
+
+    pub(super) fn contains(&self, name: &Path) -> StorageResult<bool> {
+        match self.directory.symlink_metadata(name) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(connection(format!(
+                "inspect private entry {}: {error}",
+                self.path.join(name).display()
+            ))),
+        }
+    }
+
+    pub(super) fn remove_file(&self, name: &Path) -> StorageResult<()> {
+        match self.directory.remove_file(name) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(connection(format!(
+                "remove private file {}: {error}",
+                self.path.join(name).display()
+            ))),
+        }
+    }
+
+    pub(super) fn rename_with_identity(
+        &self,
+        source: &Path,
+        destination: &Path,
+        expected: PrivateFileIdentity,
+    ) -> StorageResult<()> {
+        let source_file = self.open_file(source)?;
+        if private_file_identity(&source_file)? != expected {
+            return Err(connection(format!(
+                "private source {} changed before rename",
+                self.path.join(source).display()
+            )));
+        }
+        match self.directory.symlink_metadata(destination) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+            Err(error) => {
+                return Err(connection(format!(
+                    "inspect private rename destination {}: {error}",
+                    self.path.join(destination).display()
+                )));
+            },
+            Ok(_) => {
+                return Err(connection(format!(
+                    "private rename destination {} already exists",
+                    self.path.join(destination).display()
+                )));
+            },
+        }
+        rename_no_replace(&self.directory, source, destination).map_err(|error| {
+            connection(format!(
+                "rename private entry {} as {}: {error}",
+                self.path.join(source).display(),
+                self.path.join(destination).display()
+            ))
+        })?;
+        let destination_file = self.open_file(destination)?;
+        if private_file_identity(&destination_file)? != expected {
+            return Err(connection(format!(
+                "private destination {} does not name the verified source",
+                self.path.join(destination).display()
+            )));
+        }
+        Ok(())
+    }
+
+    pub(super) fn sync(&self) -> StorageResult<()> {
+        #[cfg(unix)]
+        {
+            let directory = self
+                .directory
+                .try_clone()
+                .map_err(|error| {
+                    connection(format!("flush directory {}: {error}", self.path.display()))
+                })?
+                .into_std_file();
+            directory.sync_all().map_err(|error| {
+                connection(format!("flush directory {}: {error}", self.path.display()))
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn rename_no_replace(directory: &Dir, source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let source = CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let destination = CString::new(destination.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    // SAFETY: both names and the retained directory descriptor remain valid
+    // for the call. RENAME_NOREPLACE makes destination selection atomic.
+    #[allow(unsafe_code)]
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            directory.as_raw_fd(),
+            source.as_ptr(),
+            directory.as_raw_fd(),
+            destination.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn rename_no_replace(directory: &Dir, source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let source = CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let destination = CString::new(destination.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    // SAFETY: both names and the retained directory descriptor remain valid
+    // for the call. RENAME_EXCL makes destination selection atomic.
+    #[allow(unsafe_code)]
+    let result = unsafe {
+        libc::renameatx_np(
+            directory.as_raw_fd(),
+            source.as_ptr(),
+            directory.as_raw_fd(),
+            destination.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn rename_no_replace(directory: &Dir, source: &Path, destination: &Path) -> std::io::Result<()> {
+    directory.rename(source, directory, destination)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn rename_no_replace(_directory: &Dir, _source: &Path, _destination: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "capability-relative exclusive rename is unsupported",
+    ))
+}
+
+pub(super) fn private_file_identity(file: &File) -> StorageResult<PrivateFileIdentity> {
+    let metadata = file
+        .metadata()
+        .map_err(|error| connection(format!("inspect private file handle: {error}")))?;
+    if !metadata.is_file() {
+        return Err(connection(
+            "private file handle is not a regular file".to_owned(),
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(connection(
+                "private file handle is a reparse point".to_owned(),
+            ));
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        Ok(PrivateFileIdentity {
+            volume: metadata.dev(),
+            file: metadata.ino(),
+        })
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: `file` owns a live Windows handle and `info` is writable.
+        #[allow(unsafe_code)]
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &raw mut info) } == 0 {
+            return Err(connection(format!(
+                "inspect private Windows file identity: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(PrivateFileIdentity {
+            volume: u64::from(info.dwVolumeSerialNumber),
+            file: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = metadata;
+        Err(connection(
+            "private file identity is unsupported on this platform".to_owned(),
+        ))
+    }
+}
 
 pub(super) fn ensure_private_directory(path: &Path) -> StorageResult<()> {
     match std::fs::symlink_metadata(path) {
@@ -92,11 +388,33 @@ pub(super) fn create_private_file(path: &Path) -> StorageResult<File> {
 }
 
 pub(super) fn open_private_file(path: &Path) -> StorageResult<File> {
+    open_private_file_with_access(path, false)
+}
+
+pub(super) fn open_private_file_rw(path: &Path) -> StorageResult<File> {
+    open_private_file_with_access(path, true)
+}
+
+fn open_private_file_with_access(path: &Path, write: bool) -> StorageResult<File> {
     validate_private_regular_file(path)?;
-    OpenOptions::new()
-        .read(true)
+    let mut options = OpenOptions::new();
+    options.read(true).write(write);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options
         .open(path)
-        .map_err(|error| connection(format!("open private file {}: {error}", path.display())))
+        .map_err(|error| connection(format!("open private file {}: {error}", path.display())))?;
+    private_file_identity(&file)?;
+    Ok(file)
 }
 
 pub(super) fn atomic_write(path: &Path, bytes: &[u8]) -> StorageResult<()> {

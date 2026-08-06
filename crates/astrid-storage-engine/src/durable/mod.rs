@@ -7,7 +7,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+#[cfg(test)]
+use std::fs::OpenOptions;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
@@ -15,6 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU8;
 use std::time::Duration;
 
+use astrid_storage_content::ContentError;
 use astrid_storage_model::{
     InsertOutcome, ModelError, ObjectClass, ObjectFormatVersion, ObjectId, ObjectIdentity,
     ObjectKind, ObjectRecord, ObjectReference, PhysicalModelError, PrincipalUsage, ReferenceKind,
@@ -242,6 +245,8 @@ pub enum DurableError {
     Model(ModelError),
     /// The canonical physical-representation model rejected an operation.
     PhysicalModel(PhysicalModelError),
+    /// Canonical content construction rejected a staged byte stream.
+    Content(ContentError),
     /// A filesystem operation failed.
     Io {
         /// Operation being attempted.
@@ -298,8 +303,6 @@ pub enum DurableError {
     InvalidRestore(&'static str),
     /// Physical representation metadata or its authority journal was invalid.
     InvalidRepresentationState(&'static str),
-    /// Arena retirement was requested before representation liveness is implemented.
-    RepresentationRetirementUnsupported,
     /// Compaction evidence, retention, or its native fact snapshot was invalid.
     InvalidCompactionEvidence(&'static str),
     /// The native liveness snapshot changed between proof and physical rewrite.
@@ -321,6 +324,7 @@ impl fmt::Display for DurableError {
         match self {
             Self::Model(error) => write!(formatter, "{error}"),
             Self::PhysicalModel(error) => write!(formatter, "{error}"),
+            Self::Content(error) => write!(formatter, "{error}"),
             Self::Io { operation, source } => write!(formatter, "{operation}: {source}"),
             Self::LockHeld(path) => {
                 write!(formatter, "principal store is locked: {}", path.display())
@@ -364,9 +368,6 @@ impl fmt::Display for DurableError {
             Self::InvalidRepresentationState(detail) => {
                 write!(formatter, "invalid representation state: {detail}")
             },
-            Self::RepresentationRetirementUnsupported => formatter.write_str(
-                "arena retirement requires representation leases and final-path liveness",
-            ),
             Self::InvalidCompactionEvidence(detail) => {
                 write!(formatter, "invalid compaction evidence: {detail}")
             },
@@ -393,6 +394,7 @@ impl std::error::Error for DurableError {
         match self {
             Self::Model(error) | Self::RecoveryModel { source: error, .. } => Some(error),
             Self::PhysicalModel(error) => Some(error),
+            Self::Content(error) => Some(error),
             Self::Io { source, .. } => Some(source),
             _ => None,
         }
@@ -408,6 +410,12 @@ impl From<ModelError> for DurableError {
 impl From<PhysicalModelError> for DurableError {
     fn from(error: PhysicalModelError) -> Self {
         Self::PhysicalModel(error)
+    }
+}
+
+impl From<ContentError> for DurableError {
+    fn from(error: ContentError) -> Self {
+        Self::Content(error)
     }
 }
 
@@ -469,6 +477,7 @@ struct EngineOpenOptions<P> {
 /// Neither principal authority nor quota policy is inferred by this engine.
 pub struct DurableEngine<P: Ord, I, C> {
     directory: PathBuf,
+    directory_capability: Arc<cap_std::fs::Dir>,
     identity: I,
     principal_codec: C,
     limits: RecoveryLimits,
@@ -494,7 +503,12 @@ impl<P: Ord, I, C> fmt::Debug for DurableEngine<P, I, C> {
     }
 }
 
+mod contiguous;
 mod engine;
+mod object_access;
+mod opening;
+
+pub use contiguous::{PreparedContiguousFile, PublishedContiguousFile};
 
 impl<P: Ord, I, C> Drop for DurableEngine<P, I, C> {
     fn drop(&mut self) {
@@ -551,6 +565,7 @@ mod format;
 mod group;
 mod index;
 mod lifecycle;
+mod native_io;
 mod recovery;
 mod representation_engine;
 mod representations;
@@ -572,19 +587,22 @@ pub use compaction::{
 pub use faults::{FaultInjector, FaultPoint, NoFaults};
 use format::{
     PreparedFrame, append_frame, append_frames, append_prepared_frames, canonical_record_bytes,
-    corrupt, decode_object_frame, encode_object_frame, ensure_payload_limit, io_error, open_rw,
+    corrupt, decode_object_frame, encode_object_frame, ensure_payload_limit, io_error,
     read_indexed_object, read_indexed_object_with_payload, read_indexed_objects, recover_arena,
-    scan_frames, sync_store_directory, verify_indexed_location, verify_indexed_tail,
-    visit_indexed_objects,
+    scan_frames, verify_indexed_location, verify_indexed_tail, visit_indexed_objects,
 };
 #[cfg(test)]
-use format::{frame_checksum, last_batch_spans};
+use format::{frame_checksum, last_batch_spans, open_rw};
 use index::{IndexState, recover_index, replace_index};
+use native_io::{
+    create_private as create_private_file_capability, open_directory as open_directory_capability,
+    open_rw as open_rw_capability, sync_directory as sync_store_directory_capability,
+};
 use recovery::{RecoveryScope, recover_store};
 use roots::{encode_root_record, encode_root_snapshot, recover_roots};
 use validation::{
-    materialize_closure, recovery_closure_error, usage_from_closure, validate_commit_closure,
-    validate_incremental_closure,
+    ClosureObjects, materialize_closure, recovery_closure_error, usage_from_closure,
+    validate_commit_closure, validate_incremental_closure,
 };
 
 #[cfg(test)]

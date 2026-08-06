@@ -20,6 +20,21 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Added
 
+- **Sealed staging files can become verified contiguous physical
+  representations without a second full-data write.** Canonical File and
+  ChunkTree objects remain in the arena while authenticated chunk slices are
+  recovered transparently from a copy-on-write cloned blob. Export and
+  snapshots still materialize canonical Chunk records. Proof-audited
+  compaction also treats represented-only chunks as members of the object
+  universe: it materializes every live object into the replacement arena,
+  publishes replacement placement authority, and only then retires loose
+  blobs. Crash-prefix, tamper, symlink, occupied-path, source-preservation,
+  compaction, and compaction-recovery tests cover the new publication
+  protocol. On the clean 512 MiB APFS benchmark, staging remains at native
+  speed, eight-worker publication reaches 1,212.1 MiB/s, warm verified reads
+  reach 1,774.6 MiB/s, and duplicate publication appends 8,387 authoritative
+  bytes. Closes #1467.
+
 - **Bulk publication reuses closure evidence earned during authoritative
   staging.** A bounded, batch-local dependency walk proves admitted owning
   closures without retaining write-history state; later publication skips only

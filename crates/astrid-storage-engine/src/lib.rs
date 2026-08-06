@@ -39,8 +39,9 @@ pub use durable::{
     CompactionRetainedRoot, CompactionRetention, CompactionRootKind, DurableEngine,
     DurableEnginePolicy, DurableError, FaultInjector, FaultPoint, GroupCommitPolicy,
     IdentityScheme, NoFaults, ObjectCacheCapacity, ObjectCacheConfig, ObjectCacheController,
-    ObjectCacheMemoryBudget, ObjectCacheStats, PersistentObjectIdentity, PrincipalCodec,
-    PrincipalObjectCacheBudget, RecoveryLimits, RecoveryRetryPolicy, VerifiedCompactionPlan,
+    ObjectCacheMemoryBudget, ObjectCacheStats, PersistentObjectIdentity, PreparedContiguousFile,
+    PrincipalCodec, PrincipalObjectCacheBudget, PublishedContiguousFile, RecoveryLimits,
+    RecoveryRetryPolicy, VerifiedCompactionPlan,
 };
 pub use kv::{
     KvProjectionEngine, KvProjectionError, KvState, KvStateSnapshot, commit_kv_with_engine,

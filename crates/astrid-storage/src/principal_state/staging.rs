@@ -16,14 +16,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use astrid_storage_engine::GroupCommitPolicy;
 use uuid::Uuid;
 
+#[cfg(test)]
+use super::native_io::open_private_file;
 use super::native_io::{
-    create_private_file, ensure_private_directory, open_private_file, rename_private_entry,
-    sync_directory, validate_private_regular_file,
+    PrivateDirectory, PrivateFileIdentity, create_private_file, ensure_private_directory,
+    private_file_identity, sync_directory,
 };
 use super::{NativePrincipalContentStore, StateOwner};
-use crate::content::{
-    ChunkingProfile, ContentBatchWriteOutcome, ContentIngest, ContentName, ContentWriteOutcome,
-};
+use crate::content::{ChunkingProfile, ContentBatchWriteOutcome, ContentName, ContentWriteOutcome};
 use crate::error::{StorageError, StorageResult};
 
 mod format;
@@ -43,8 +43,8 @@ use journal::{
 };
 pub(super) use migration::migrate_alias_owner_intents;
 use migration::migrate_legacy;
-use recovery::{load_generation, recover_generations, sealed_generation_name, validate_generation};
-use retirement::{establish as establish_retired_generation, remove as remove_generation};
+use recovery::{load_generation, open_generation_in, recover_generations, sealed_generation_name};
+use retirement::{establish_in as establish_retired_generation, remove_in as remove_generation};
 
 const GENERATIONS_DIRECTORY: &str = "generations";
 const QUARANTINE_DIRECTORY: &str = "quarantine";
@@ -70,6 +70,7 @@ pub struct NativeContentStagingArea {
 struct StagingInner {
     root: PathBuf,
     generations: PathBuf,
+    generations_directory: PrivateDirectory,
     seal_order: PoisoningMutex<SealOrder>,
     group_policy: GroupCommitPolicy,
     seal_group: PoisoningMutex<SealGroup>,
@@ -245,10 +246,12 @@ impl NativeContentStagingArea {
             .chain(journal.completed.iter())
             .map(|key| key.id)
             .collect();
+        let generations_directory = PrivateDirectory::open(&generations)?;
         Ok(Self {
             inner: Arc::new(StagingInner {
                 root,
                 generations,
+                generations_directory,
                 seal_order: PoisoningMutex::new(SealOrder {
                     next_sequence,
                     active: std::collections::BTreeMap::new(),
@@ -344,7 +347,12 @@ impl NativeContentStagingArea {
                     .inner
                     .generations
                     .join(sealed_generation_name(intent.sequence, intent.id));
-                load_generation(&self.inner.root, path, intent)
+                load_generation(
+                    &self.inner.root,
+                    &self.inner.generations_directory,
+                    path,
+                    intent,
+                )
             })
             .collect()
     }
@@ -374,10 +382,48 @@ impl NativeContentStagingArea {
         self.ensure_publication_order(&staged)?;
         let area = self.clone();
         tokio::task::spawn_blocking(move || {
-            validate_generation(&staged.content_path(), &staged.intent())?;
-            let source = open_private_file(&staged.content_path())?.take(staged.logical_bytes);
+            let (source, _) = open_generation_in(
+                &area.inner.generations_directory,
+                &staged.content_path(),
+                &staged.intent(),
+                Some(staged.source_identity),
+            )?;
+            let engine = content.engine();
+            let prepared = engine
+                .prepare_contiguous_file(
+                    staged.profile,
+                    staged.logical_bytes,
+                    source
+                        .try_clone()
+                        .map_err(|error| {
+                            connection(format!(
+                                "clone staged content handle {}: {error}",
+                                staged.id
+                            ))
+                        })?
+                        .take(staged.logical_bytes),
+                )
+                .map_err(|error| {
+                    StorageError::Internal(format!(
+                        "prepare staged contiguous content {}: {error}",
+                        staged.id
+                    ))
+                })?;
+            let published = engine
+                .publish_contiguous_from_file(prepared, &source)
+                .map_err(|error| {
+                    StorageError::Internal(format!(
+                        "publish staged contiguous content {}: {error}",
+                        staged.id
+                    ))
+                })?;
             let outcome = content
-                .put_streaming_with_profile(&staged.owner, &staged.name, source, staged.profile)
+                .publish_verified_content(
+                    &staged.owner,
+                    &staged.name,
+                    published.verified_content(),
+                    published.objects_inserted(),
+                )
                 .map_err(|error| {
                     StorageError::Internal(format!("publish staged content {}: {error}", staged.id))
                 })?;
@@ -411,6 +457,7 @@ impl NativeContentStagingArea {
             .first()
             .ok_or_else(|| connection("staged publication batch is empty".to_owned()))?;
         let owner = first.owner;
+        let mut names = std::collections::BTreeSet::new();
         for entry in &staged {
             if entry.staging_root != self.inner.root {
                 return Err(connection(
@@ -422,22 +469,63 @@ impl NativeContentStagingArea {
                     "staged publication batch spans multiple owners".to_owned(),
                 ));
             }
+            if !names.insert(&entry.name) {
+                return Err(connection(format!(
+                    "staged publication batch repeats content name {}",
+                    entry.name
+                )));
+            }
             self.ensure_publication_order_excluding(entry, &staged)?;
         }
         let area = self.clone();
         tokio::task::spawn_blocking(move || {
-            let mut ingests = Vec::with_capacity(staged.len());
+            let engine = content.engine();
+            let mut completed = Vec::with_capacity(staged.len());
+            let mut objects_inserted = 0_u64;
             for entry in &staged {
-                validate_generation(&entry.content_path(), &entry.intent())?;
-                let source = open_private_file(&entry.content_path())?.take(entry.logical_bytes);
-                ingests.push(ContentIngest::with_profile(
-                    entry.name.clone(),
-                    source,
-                    entry.profile,
-                ));
+                let (source, _) = open_generation_in(
+                    &area.inner.generations_directory,
+                    &entry.content_path(),
+                    &entry.intent(),
+                    Some(entry.source_identity),
+                )?;
+                let prepared = engine
+                    .prepare_contiguous_file(
+                        entry.profile,
+                        entry.logical_bytes,
+                        source
+                            .try_clone()
+                            .map_err(|error| {
+                                connection(format!(
+                                    "clone staged content handle {}: {error}",
+                                    entry.id
+                                ))
+                            })?
+                            .take(entry.logical_bytes),
+                    )
+                    .map_err(|error| {
+                        StorageError::Internal(format!(
+                            "prepare staged contiguous content {}: {error}",
+                            entry.id
+                        ))
+                    })?;
+                let published = engine
+                    .publish_contiguous_from_file(prepared, &source)
+                    .map_err(|error| {
+                        StorageError::Internal(format!(
+                            "publish staged contiguous content {}: {error}",
+                            entry.id
+                        ))
+                    })?;
+                objects_inserted = objects_inserted
+                    .checked_add(published.objects_inserted())
+                    .ok_or_else(|| {
+                        StorageError::Internal("staged batch object accounting overflow".to_owned())
+                    })?;
+                completed.push((entry.name.clone(), published.verified_content()));
             }
             let outcome = content
-                .put_streaming_batch(&owner, ingests)
+                .publish_verified_batch(&owner, completed, objects_inserted)
                 .map_err(|error| {
                     StorageError::Internal(format!("publish staged content batch: {error}"))
                 })?;
@@ -573,11 +661,11 @@ impl NativeContentStagingArea {
         }
         let cleanup = (|| {
             for key in &completed {
-                let retired = establish_retired_generation(&self.inner.generations, *key)?;
+                establish_retired_generation(&self.inner.generations_directory, *key)?;
                 self.fail_if(StagingFaultPoint::GenerationRetired)?;
-                remove_generation(&retired)?;
+                remove_generation(&self.inner.generations_directory, *key)?;
             }
-            sync_directory(&self.inner.generations)?;
+            self.inner.generations_directory.sync()?;
             self.fail_if(StagingFaultPoint::GenerationCleaned)
         })();
         cleanup?;
@@ -661,7 +749,16 @@ impl StagedContentWriter {
             .path
             .as_ref()
             .ok_or_else(|| connection("staged writer has no generation path".to_owned()))?;
-        let logical_bytes = validate_private_regular_file(path)?;
+        let source_identity = private_file_identity(&file)?;
+        let logical_bytes = file
+            .metadata()
+            .map_err(|error| {
+                connection(format!(
+                    "inspect staged content handle {}: {error}",
+                    self.id
+                ))
+            })?
+            .len();
         let active = self.area.register_seal(&self.owner, &self.name)?;
         let sequence = active.sequence;
         let intent = StagingIntent {
@@ -672,7 +769,7 @@ impl StagedContentWriter {
             profile: self.profile,
             logical_bytes,
         };
-        append_generation_footer(&mut file, &intent)?;
+        append_generation_footer(&mut file, &intent, source_identity)?;
         file.sync_all()
             .map_err(|error| connection(format!("flush staged content {}: {error}", self.id)))?;
         self.area.fail_if(StagingFaultPoint::ContentFlushed)?;
@@ -682,10 +779,26 @@ impl StagedContentWriter {
             .inner
             .generations
             .join(sealed_generation_name(sequence, self.id));
-        rename_private_entry(path, &sealed_path)?;
+        let source_name = path.file_name().ok_or_else(|| {
+            connection(format!(
+                "staged generation {} has no file name",
+                path.display()
+            ))
+        })?;
+        let destination_name = sealed_path.file_name().ok_or_else(|| {
+            connection(format!(
+                "sealed generation {} has no file name",
+                sealed_path.display()
+            ))
+        })?;
+        self.area.inner.generations_directory.rename_with_identity(
+            Path::new(source_name),
+            Path::new(destination_name),
+            source_identity,
+        )?;
         self.area.fail_if(StagingFaultPoint::GenerationRenamed)?;
         self.path = None;
-        self.area.submit_seal(intent, sealed_path)
+        self.area.submit_seal(intent, sealed_path, source_identity)
     }
 }
 
@@ -740,10 +853,16 @@ pub struct ReadyStagedContent {
     name: ContentName,
     profile: ChunkingProfile,
     logical_bytes: u64,
+    source_identity: PrivateFileIdentity,
 }
 
 impl ReadyStagedContent {
-    fn from_intent(staging_root: PathBuf, path: PathBuf, intent: StagingIntent) -> Self {
+    fn from_intent(
+        staging_root: PathBuf,
+        path: PathBuf,
+        intent: StagingIntent,
+        source_identity: PrivateFileIdentity,
+    ) -> Self {
         Self {
             staging_root,
             path,
@@ -753,6 +872,7 @@ impl ReadyStagedContent {
             name: intent.name,
             profile: intent.profile,
             logical_bytes: intent.logical_bytes,
+            source_identity,
         }
     }
 

@@ -61,8 +61,15 @@ getrandom = { version = "0.4", features = ["wasm_js"] }
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 astrid-resources = { workspace = true }
 blake3 = { workspace = true }
+cap-std = "4.0.2"
 caseless = { workspace = true }
 unicode-normalization = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
 
 [lints]
 workspace = true

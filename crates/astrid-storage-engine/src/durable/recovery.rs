@@ -4,8 +4,8 @@ use super::{
     ARENA_FILE, ArenaReader, DurableEngine, DurableError, DurableFiles, DurableInner,
     FaultInjector, FaultPoint, INDEX_FILE, IndexState, LIFECYCLE_CLOSED, LIFECYCLE_USABLE,
     MutexGuard, PersistentObjectIdentity, PrincipalCodec, ROOT_FILE, RecoveredStore,
-    RecoveryLimits, Seek, SeekFrom, io, io_error, open_rw, recover_arena, recover_index,
-    recover_interrupted_compaction, recover_roots, replace_index, sync_store_directory,
+    RecoveryLimits, Seek, SeekFrom, io, io_error, open_rw_capability, recover_arena, recover_index,
+    recover_interrupted_compaction, recover_roots, replace_index, sync_store_directory_capability,
 };
 use std::path::Path;
 
@@ -26,6 +26,7 @@ impl RecoveryScope {
 
 pub(super) fn recover_store<P, I, C>(
     path: &Path,
+    store_root: &cap_std::fs::Dir,
     principal_codec: &C,
     identity: &I,
     limits: RecoveryLimits,
@@ -35,16 +36,17 @@ where
     I: PersistentObjectIdentity,
     C: PrincipalCodec<P>,
 {
-    recover_interrupted_compaction(path, principal_codec, identity, limits)?;
-    let representations = super::representations::RepresentationStore::open(path, limits)?;
+    recover_interrupted_compaction(path, store_root, principal_codec, identity, limits)?;
+    let mut representations =
+        super::representations::RepresentationStore::open(path, store_root, limits)?;
     let protected_arena_len = representations.as_ref().map_or(
         Ok(0),
         super::representations::RepresentationStore::generation_zero_protected_len,
     )?;
-    let mut arena = open_rw(&path.join(ARENA_FILE))?;
-    let mut roots = open_rw(&path.join(ROOT_FILE))?;
-    let mut index_cache = open_rw(&path.join(INDEX_FILE)).ok();
-    sync_store_directory(path)?;
+    let mut arena = open_rw_capability(store_root, Path::new(ARENA_FILE), true)?;
+    let mut roots = open_rw_capability(store_root, Path::new(ROOT_FILE), true)?;
+    let mut index_cache = open_rw_capability(store_root, Path::new(INDEX_FILE), true).ok();
+    sync_store_directory_capability(store_root)?;
     let scheme = identity.scheme();
     let arena_len = arena
         .metadata()
@@ -66,13 +68,18 @@ where
             objects: index,
         };
         drop(index_cache.take());
-        index_cache = replace_index(path, &state, scheme);
+        index_cache = replace_index(store_root, &state, scheme);
         (state.objects, state.arena_tail)
     };
+    if let Some(representations) = &mut representations {
+        representations.validate_generation_zero_index(&index)?;
+        representations.rebuild_contiguous_index(&mut arena, &index, identity, limits)?;
+    }
     let (roots_by_principal, validated) = recover_roots(
         &mut roots,
         &mut arena,
         &index,
+        representations.as_ref(),
         principal_codec,
         identity,
         limits,
@@ -90,10 +97,6 @@ where
     let arena_reader = arena
         .try_clone()
         .map_err(|source| io_error("clone object arena for positional reads", source))?;
-    if let Some(representations) = &representations {
-        representations.validate_generation_zero_index(&index)?;
-    }
-
     Ok(RecoveredStore {
         roots_by_principal,
         index,
@@ -204,6 +207,7 @@ where
             } else {
                 recover_store(
                     &self.directory,
+                    &self.directory_capability,
                     &self.principal_codec,
                     &self.identity,
                     self.limits,
