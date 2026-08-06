@@ -19,8 +19,8 @@ use uuid::Uuid;
 #[cfg(test)]
 use super::native_io::open_private_file;
 use super::native_io::{
-    PrivateFileIdentity, create_private_file, ensure_private_directory, private_file_identity,
-    rename_private_entry_with_identity, sync_directory,
+    PrivateDirectory, PrivateFileIdentity, create_private_file, ensure_private_directory,
+    private_file_identity, sync_directory,
 };
 use super::{NativePrincipalContentStore, StateOwner};
 use crate::content::{ChunkingProfile, ContentBatchWriteOutcome, ContentName, ContentWriteOutcome};
@@ -43,7 +43,7 @@ use journal::{
 };
 pub(super) use migration::migrate_alias_owner_intents;
 use migration::migrate_legacy;
-use recovery::{load_generation, open_generation, recover_generations, sealed_generation_name};
+use recovery::{load_generation, open_generation_in, recover_generations, sealed_generation_name};
 use retirement::{establish as establish_retired_generation, remove as remove_generation};
 
 const GENERATIONS_DIRECTORY: &str = "generations";
@@ -70,6 +70,7 @@ pub struct NativeContentStagingArea {
 struct StagingInner {
     root: PathBuf,
     generations: PathBuf,
+    generations_directory: PrivateDirectory,
     seal_order: PoisoningMutex<SealOrder>,
     group_policy: GroupCommitPolicy,
     seal_group: PoisoningMutex<SealGroup>,
@@ -245,10 +246,12 @@ impl NativeContentStagingArea {
             .chain(journal.completed.iter())
             .map(|key| key.id)
             .collect();
+        let generations_directory = PrivateDirectory::open(&generations)?;
         Ok(Self {
             inner: Arc::new(StagingInner {
                 root,
                 generations,
+                generations_directory,
                 seal_order: PoisoningMutex::new(SealOrder {
                     next_sequence,
                     active: std::collections::BTreeMap::new(),
@@ -344,7 +347,12 @@ impl NativeContentStagingArea {
                     .inner
                     .generations
                     .join(sealed_generation_name(intent.sequence, intent.id));
-                load_generation(&self.inner.root, path, intent)
+                load_generation(
+                    &self.inner.root,
+                    &self.inner.generations_directory,
+                    path,
+                    intent,
+                )
             })
             .collect()
     }
@@ -374,7 +382,8 @@ impl NativeContentStagingArea {
         self.ensure_publication_order(&staged)?;
         let area = self.clone();
         tokio::task::spawn_blocking(move || {
-            let (source, _) = open_generation(
+            let (source, _) = open_generation_in(
+                &area.inner.generations_directory,
                 &staged.content_path(),
                 &staged.intent(),
                 Some(staged.source_identity),
@@ -474,7 +483,8 @@ impl NativeContentStagingArea {
             let mut completed = Vec::with_capacity(staged.len());
             let mut objects_inserted = 0_u64;
             for entry in &staged {
-                let (source, _) = open_generation(
+                let (source, _) = open_generation_in(
+                    &area.inner.generations_directory,
                     &entry.content_path(),
                     &entry.intent(),
                     Some(entry.source_identity),
@@ -769,7 +779,23 @@ impl StagedContentWriter {
             .inner
             .generations
             .join(sealed_generation_name(sequence, self.id));
-        rename_private_entry_with_identity(path, &sealed_path, source_identity)?;
+        let source_name = path.file_name().ok_or_else(|| {
+            connection(format!(
+                "staged generation {} has no file name",
+                path.display()
+            ))
+        })?;
+        let destination_name = sealed_path.file_name().ok_or_else(|| {
+            connection(format!(
+                "sealed generation {} has no file name",
+                sealed_path.display()
+            ))
+        })?;
+        self.area.inner.generations_directory.rename_with_identity(
+            Path::new(source_name),
+            Path::new(destination_name),
+            source_identity,
+        )?;
         self.area.fail_if(StagingFaultPoint::GenerationRenamed)?;
         self.path = None;
         self.area.submit_seal(intent, sealed_path, source_identity)

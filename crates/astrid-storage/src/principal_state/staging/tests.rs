@@ -150,6 +150,38 @@ fn sealed_generation_rejects_a_rewritten_source_identity() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn seal_stays_bound_to_the_opened_generation_directory() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("staging");
+    let displaced_root = directory.path().join("original-staging");
+    let area = open_area(&root);
+    let mut staged = writer(&area, "directory-bound.bin");
+    staged.write_all(b"directory-bound bytes").unwrap();
+    let id = staged.id();
+    let open_name = open_generation_name(id);
+
+    std::fs::rename(&root, &displaced_root).unwrap();
+    let replacement_generations = root.join(GENERATIONS_DIRECTORY);
+    std::fs::create_dir_all(&replacement_generations).unwrap();
+    let original_open = displaced_root.join(GENERATIONS_DIRECTORY).join(&open_name);
+    let replacement_open = replacement_generations.join(&open_name);
+    std::fs::hard_link(&original_open, &replacement_open).unwrap();
+
+    let sealed = staged.seal().unwrap();
+    let sealed_name = sealed_generation_name(sealed.sequence, id);
+    assert!(
+        displaced_root
+            .join(GENERATIONS_DIRECTORY)
+            .join(&sealed_name)
+            .is_file()
+    );
+    assert!(!original_open.exists());
+    assert!(replacement_open.is_file());
+    assert!(!replacement_generations.join(sealed_name).exists());
+}
+
 #[test]
 fn dropping_an_unsealed_writer_releases_its_identifier() {
     let directory = tempfile::tempdir().unwrap();
@@ -668,11 +700,7 @@ fn ready_scan_rejects_a_symlinked_content_source() {
     symlink("/etc/passwd", staged.content_path()).unwrap();
 
     let error = area.ready().unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("redirected or not a regular file")
-    );
+    assert!(error.to_string().contains("open private file"), "{error}");
 }
 
 #[test]

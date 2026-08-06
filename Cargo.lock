@@ -799,6 +799,7 @@ dependencies = [
  "astrid-storage-model",
  "async-trait",
  "blake3",
+ "cap-std 4.0.2",
  "caseless",
  "chrono",
  "ed25519-dalek",
