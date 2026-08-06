@@ -18,8 +18,8 @@ use super::{
 };
 use crate::error::StorageResult;
 use crate::principal_state::native_io::{
-    PrivateFileIdentity, open_private_file, private_file_identity, rename_private_entry,
-    sync_directory, validate_private_regular_file,
+    PrivateDirectory, PrivateFileIdentity, open_private_file, private_file_identity,
+    rename_private_entry, sync_directory, validate_private_regular_file,
 };
 
 struct RecoveryScan {
@@ -285,10 +285,11 @@ pub(super) enum GenerationName {
 
 pub(super) fn load_generation(
     staging_root: &Path,
+    directory: &PrivateDirectory,
     path: PathBuf,
     intent: StagingIntent,
 ) -> StorageResult<ReadyStagedContent> {
-    let (_, source_identity) = open_generation(&path, &intent, None)?;
+    let (_, source_identity) = open_generation_in(directory, &path, &intent, None)?;
     Ok(ReadyStagedContent::from_intent(
         staging_root.to_path_buf(),
         path,
@@ -313,7 +314,33 @@ pub(super) fn open_generation(
             path.display()
         )));
     }
-    let mut file = open_private_file(path)?;
+    let file = open_private_file(path)?;
+    validate_generation_file(path, intent, expected_identity, file)
+}
+
+pub(super) fn open_generation_in(
+    directory: &PrivateDirectory,
+    path: &Path,
+    intent: &StagingIntent,
+    expected_identity: Option<PrivateFileIdentity>,
+) -> StorageResult<(std::fs::File, PrivateFileIdentity)> {
+    let expected = sealed_generation_name(intent.sequence, intent.id);
+    if path.file_name().and_then(|name| name.to_str()) != Some(expected.as_str()) {
+        return Err(connection(format!(
+            "staged generation path is not canonical: {}",
+            path.display()
+        )));
+    }
+    let file = directory.open_file(Path::new(&expected))?;
+    validate_generation_file(path, intent, expected_identity, file)
+}
+
+fn validate_generation_file(
+    path: &Path,
+    intent: &StagingIntent,
+    expected_identity: Option<PrivateFileIdentity>,
+    mut file: std::fs::File,
+) -> StorageResult<(std::fs::File, PrivateFileIdentity)> {
     let actual = private_file_identity(&file)?;
     let footer = load_generation_footer_from_file(path, &mut file)?;
     file.seek(SeekFrom::Start(0)).map_err(|error| {
