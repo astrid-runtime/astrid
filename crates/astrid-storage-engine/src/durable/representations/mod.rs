@@ -40,7 +40,7 @@ use recovery::{
 mod contiguous;
 mod direct;
 pub(super) use contiguous::{
-    install_loose_blob_copy, install_loose_blob_from_file, open_regular_read,
+    install_loose_blob_copy, install_loose_blob_from_file, open_regular_read, open_store_root,
     read_contiguous_object,
 };
 
@@ -95,6 +95,7 @@ pub(super) fn append_legacy_profile_frame(
 #[derive(Debug)]
 pub(super) struct RepresentationStore {
     root: std::path::PathBuf,
+    root_directory: cap_std::fs::Dir,
     metadata: File,
     journal: File,
     journal_generation: u64,
@@ -109,6 +110,12 @@ pub(super) struct RepresentationStore {
     direct_profile: RepresentationProfileId,
     reverse: BTreeMap<ObjectId, Vec<RepresentationRecordId>>,
     contiguous: BTreeMap<ObjectId, ContiguousLocation>,
+}
+
+#[derive(Debug)]
+struct PinnedRepresentationRoot {
+    path: std::path::PathBuf,
+    directory: cap_std::fs::Dir,
 }
 
 pub(super) struct PendingRepresentationUpdate {
@@ -137,13 +144,18 @@ struct DirectMapEntry {
 }
 
 impl RepresentationStore {
-    pub(super) fn open(store: &Path, limits: RecoveryLimits) -> Result<Option<Self>, DurableError> {
+    pub(super) fn open(
+        store: &Path,
+        store_root: &cap_std::fs::Dir,
+        limits: RecoveryLimits,
+    ) -> Result<Option<Self>, DurableError> {
         let root = store.join(DIRECTORY);
         let current_path = root.join(CURRENT_PATH);
         if !current_path.exists() {
             return Ok(None);
         }
         let current = read_current(&current_path, limits)?;
+        let root_directory = contiguous::open_representation_root(store_root)?;
         quarantine_temporary_current(&root)?;
         let generation_path = root
             .join(GENERATIONS_DIRECTORY)
@@ -153,7 +165,10 @@ impl RepresentationStore {
         let index = recover_metadata(&mut metadata, limits)?;
         let (active, state) = recover_journal(&mut journal, current, &index, limits)?;
         let recovered = Self::from_recovered(
-            root,
+            PinnedRepresentationRoot {
+                path: root,
+                directory: root_directory,
+            },
             metadata,
             journal,
             current.journal_generation,
@@ -166,11 +181,12 @@ impl RepresentationStore {
 
     pub(super) fn activate(
         store: &Path,
+        store_root: &cap_std::fs::Dir,
         limits: RecoveryLimits,
         frozen_specification: ObjectId,
         objects: impl IntoIterator<Item = Result<DirectArenaObject, DurableError>>,
     ) -> Result<Self, DurableError> {
-        if let Some(existing) = Self::open(store, limits)? {
+        if let Some(existing) = Self::open(store, store_root, limits)? {
             return Ok(existing);
         }
         let root = store.join(DIRECTORY);
@@ -230,7 +246,7 @@ impl RepresentationStore {
         publish_current(&root, current)?;
         drop(metadata);
         drop(journal);
-        Self::open(store, limits)?.ok_or(DurableError::InvalidRepresentationState(
+        Self::open(store, store_root, limits)?.ok_or(DurableError::InvalidRepresentationState(
             "published representation state did not reopen",
         ))
     }
@@ -767,7 +783,7 @@ impl RepresentationStore {
     }
 
     fn from_recovered(
-        root: std::path::PathBuf,
+        root: PinnedRepresentationRoot,
         metadata: File,
         journal: File,
         journal_generation: u64,
@@ -816,7 +832,8 @@ impl RepresentationStore {
             ));
         }
         Ok(Self {
-            root,
+            root: root.path,
+            root_directory: root.directory,
             metadata,
             journal,
             journal_generation,

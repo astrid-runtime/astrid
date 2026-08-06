@@ -26,6 +26,7 @@ impl RecoveryScope {
 
 pub(super) fn recover_store<P, I, C>(
     path: &Path,
+    store_root: &cap_std::fs::Dir,
     principal_codec: &C,
     identity: &I,
     limits: RecoveryLimits,
@@ -36,7 +37,8 @@ where
     C: PrincipalCodec<P>,
 {
     recover_interrupted_compaction(path, principal_codec, identity, limits)?;
-    let mut representations = super::representations::RepresentationStore::open(path, limits)?;
+    let mut representations =
+        super::representations::RepresentationStore::open(path, store_root, limits)?;
     let protected_arena_len = representations.as_ref().map_or(
         Ok(0),
         super::representations::RepresentationStore::generation_zero_protected_len,
@@ -205,6 +207,7 @@ where
             } else {
                 recover_store(
                     &self.directory,
+                    &self.directory_capability,
                     &self.principal_codec,
                     &self.identity,
                     self.limits,

@@ -123,6 +123,7 @@ impl<'a, I: PersistentObjectIdentity> RecoveryStore<'a, I> {
 
     pub(super) fn recover_contiguous_record(
         &mut self,
+        representation_directory: &cap_std::fs::Dir,
         representation_root: &Path,
         record_id: astrid_storage_model::RepresentationRecordId,
         record: &RepresentationRecord,
@@ -130,6 +131,7 @@ impl<'a, I: PersistentObjectIdentity> RecoveryStore<'a, I> {
         namespace_generation: u64,
     ) -> Result<ContiguousIndexes, DurableError> {
         recover_contiguous_record_with_store(
+            representation_directory,
             representation_root,
             record_id,
             record,
@@ -141,6 +143,7 @@ impl<'a, I: PersistentObjectIdentity> RecoveryStore<'a, I> {
 }
 
 fn recover_contiguous_record_with_store<I: PersistentObjectIdentity>(
+    representation_directory: &cap_std::fs::Dir,
     representation_root: &Path,
     record_id: astrid_storage_model::RepresentationRecordId,
     record: &RepresentationRecord,
@@ -166,6 +169,7 @@ fn recover_contiguous_record_with_store<I: PersistentObjectIdentity>(
         ));
     };
     let blob_file = verify_published_blob(
+        representation_directory,
         representation_root,
         namespace_generation,
         *blob,
