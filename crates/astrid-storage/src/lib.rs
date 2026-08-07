@@ -66,7 +66,9 @@ pub use kv::{
     KvEntry, KvPrincipalResolver, KvQuotaResolver, KvStore, MemoryKvStore, PrincipalKvStore,
     ScopedKvStore, TreeKvStore,
 };
-pub use ownership::{FleetRecord, OwnershipError, OwnershipSnapshot, OwnershipStore};
+pub use ownership::{
+    FleetRecord, OwnershipError, OwnershipSnapshot, OwnershipStore, PrincipalDeletionGuard,
+};
 pub use principal_directory::PrincipalDirectory;
 pub use secret::{
     DenySecretStore, FileSecretStore, KvSecretStore, ReadThroughSecretStore, SecretStore,

@@ -13,6 +13,7 @@ use astrid_core::{
     PrincipalOwnership, PrincipalUid, UserIdentity, UserUid,
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::{KvStore, PrincipalDirectory, ScopedKvStore, StorageError};
 
@@ -187,6 +188,18 @@ impl OwnershipSnapshot {
 pub struct OwnershipStore {
     storage: ScopedKvStore,
     principals: PrincipalDirectory,
+    mutation_lock: Arc<Mutex<()>>,
+}
+
+/// Exclusive barrier held while an unowned principal is removed from the
+/// durable identity directory.
+///
+/// Dropping this guard allows ownership mutations to resume. Callers must keep
+/// it alive until identity removal has either completed or been abandoned.
+#[derive(Debug)]
+#[must_use = "dropping the guard permits concurrent ownership assignment"]
+pub struct PrincipalDeletionGuard {
+    _guard: OwnedMutexGuard<()>,
 }
 
 impl OwnershipStore {
@@ -202,6 +215,7 @@ impl OwnershipStore {
         Ok(Self {
             storage: ScopedKvStore::new(storage, OWNERSHIP_NAMESPACE)?,
             principals,
+            mutation_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -213,6 +227,30 @@ impl OwnershipStore {
     pub async fn load(&self) -> Result<OwnershipSnapshot, OwnershipError> {
         let raw = self.storage.get(GRAPH_KEY).await?;
         self.decode(raw.as_deref())
+    }
+
+    /// Exclude ownership mutations while an unowned principal is deleted.
+    ///
+    /// The returned guard must remain alive through removal from the durable
+    /// identity store. This closes the check-to-delete race with concurrent
+    /// assignment through another clone of this store.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a principal that already belongs to a fleet and fails closed on
+    /// invalid or unavailable ownership state.
+    pub async fn guard_principal_deletion(
+        &self,
+        principal_uid: PrincipalUid,
+    ) -> Result<PrincipalDeletionGuard, OwnershipError> {
+        let guard = Arc::clone(&self.mutation_lock).lock_owned().await;
+        if let Some(ownership) = self.load().await?.principal_owner(principal_uid) {
+            return Err(OwnershipError::PrincipalAlreadyOwned {
+                principal: principal_uid,
+                fleet: ownership.fleet_uid,
+            });
+        }
+        Ok(PrincipalDeletionGuard { _guard: guard })
     }
 
     /// Register one durable human identity, idempotently.
@@ -378,10 +416,10 @@ impl OwnershipStore {
         &self,
         ownership: PrincipalOwnership,
     ) -> Result<(), OwnershipError> {
-        if !self.principals.contains_uid(ownership.principal_uid) {
-            return Err(OwnershipError::PrincipalNotFound(ownership.principal_uid));
-        }
         self.mutate(|graph| {
+            if !self.principals.contains_uid(ownership.principal_uid) {
+                return Err(OwnershipError::PrincipalNotFound(ownership.principal_uid));
+            }
             let fleet = graph
                 .fleets
                 .get(&ownership.fleet_uid)
@@ -456,6 +494,7 @@ impl OwnershipStore {
         T: Clone,
         F: Fn(&mut OwnershipSnapshot) -> Result<T, OwnershipError>,
     {
+        let _guard = self.mutation_lock.lock().await;
         for _ in 0..MAX_CAS_ATTEMPTS {
             let current = self.storage.get(GRAPH_KEY).await?;
             let mut graph = self.decode(current.as_deref())?;
@@ -901,5 +940,51 @@ mod tests {
             Err(OwnershipError::CorruptGraph(message))
                 if message.contains("absent from the admitted principal directory")
         ));
+    }
+
+    #[tokio::test]
+    async fn deletion_guard_serializes_assignment_with_directory_removal() {
+        let (store, principals) = store();
+        let owner = user(1, 1);
+        let owned_fleet = fleet(10, owner.uid);
+        let principal_uid = principal(20, 2);
+        let alias = astrid_core::PrincipalId::new("deleting-principal").unwrap();
+        principals.register(alias.clone(), principal_uid).unwrap();
+        store.create_user(owner.clone()).await.unwrap();
+        store.create_fleet(owned_fleet.clone()).await.unwrap();
+
+        let deletion_guard = store.guard_principal_deletion(principal_uid).await.unwrap();
+        let assigning_store = store.clone();
+        let mut assignment = tokio::spawn(async move {
+            assigning_store
+                .assign_principal(PrincipalOwnership {
+                    principal_uid,
+                    fleet_uid: owned_fleet.uid,
+                    assigned_by: owner.uid,
+                })
+                .await
+        });
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut assignment)
+                .await
+                .is_err(),
+            "assignment must wait while principal deletion owns the mutation barrier"
+        );
+        principals.unregister(&alias, principal_uid);
+        drop(deletion_guard);
+
+        assert!(matches!(
+            assignment.await.unwrap(),
+            Err(OwnershipError::PrincipalNotFound(uid)) if uid == principal_uid
+        ));
+        assert!(
+            store
+                .load()
+                .await
+                .unwrap()
+                .principal_owner(principal_uid)
+                .is_none()
+        );
     }
 }

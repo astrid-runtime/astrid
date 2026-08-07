@@ -372,7 +372,7 @@ async fn agent_delete(kernel: &Arc<crate::Kernel>, principal: PrincipalId) -> Ad
         Ok(user) => user,
         Err(e) => return err_internal(format!("identity store resolve failed: {e}")),
     };
-    if let Some(user) = resolved.as_ref() {
+    let _ownership_guard = if let Some(user) = resolved.as_ref() {
         let identity = match kernel.identity_store.get_principal_identity(user.id).await {
             Ok(identity) => identity,
             Err(e) => {
@@ -382,18 +382,27 @@ async fn agent_delete(kernel: &Arc<crate::Kernel>, principal: PrincipalId) -> Ad
             },
         };
         if let Some(identity) = identity {
-            let ownership = match kernel.ownership_store.load().await {
-                Ok(ownership) => ownership,
-                Err(e) => return err_internal(format!("ownership store load failed: {e}")),
-            };
-            if let Some(owner) = ownership.principal_owner(identity.uid) {
-                return err_bad_input(format!(
-                    "cannot delete principal `{principal}` while it is assigned to fleet {}",
-                    owner.fleet_uid
-                ));
+            match kernel
+                .ownership_store
+                .guard_principal_deletion(identity.uid)
+                .await
+            {
+                Ok(guard) => Some(guard),
+                Err(astrid_storage::OwnershipError::PrincipalAlreadyOwned { fleet, .. }) => {
+                    return err_bad_input(format!(
+                        "cannot delete principal `{principal}` while it is assigned to fleet {fleet}"
+                    ));
+                },
+                Err(e) => {
+                    return err_internal(format!("ownership store deletion guard failed: {e}"));
+                },
             }
+        } else {
+            None
         }
-    }
+    } else {
+        None
+    };
     // Unlink before delete_user so a concurrent `resolve` can't return
     // a dangling user id in the narrow window between the two calls.
     if let Err(e) = kernel
