@@ -615,12 +615,92 @@ pub enum OwnershipError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
     use chrono::{TimeZone, Utc};
+    use tokio::sync::Barrier;
     use uuid::Uuid;
 
     use super::*;
     use crate::MemoryKvStore;
     use astrid_core::{FleetGenesis, PrincipalGenesis, PrincipalIdentity, UserGenesis};
+
+    #[derive(Debug)]
+    struct ReadBarrierKv {
+        inner: MemoryKvStore,
+        barrier: Barrier,
+        armed: AtomicBool,
+        ownership_reads: AtomicUsize,
+    }
+
+    impl ReadBarrierKv {
+        fn new() -> Self {
+            Self {
+                inner: MemoryKvStore::new(),
+                barrier: Barrier::new(2),
+                armed: AtomicBool::new(false),
+                ownership_reads: AtomicUsize::new(0),
+            }
+        }
+
+        fn arm(&self) {
+            self.ownership_reads.store(0, Ordering::SeqCst);
+            self.armed.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl KvStore for ReadBarrierKv {
+        async fn get(&self, namespace: &str, key: &str) -> crate::StorageResult<Option<Vec<u8>>> {
+            let value = self.inner.get(namespace, key).await?;
+            if self.armed.load(Ordering::SeqCst)
+                && namespace == OWNERSHIP_NAMESPACE
+                && key == GRAPH_KEY
+                && self.ownership_reads.fetch_add(1, Ordering::SeqCst) < 2
+            {
+                self.barrier.wait().await;
+            }
+            Ok(value)
+        }
+
+        async fn set(
+            &self,
+            namespace: &str,
+            key: &str,
+            value: Vec<u8>,
+        ) -> crate::StorageResult<()> {
+            self.inner.set(namespace, key, value).await
+        }
+
+        async fn delete(&self, namespace: &str, key: &str) -> crate::StorageResult<bool> {
+            self.inner.delete(namespace, key).await
+        }
+
+        async fn exists(&self, namespace: &str, key: &str) -> crate::StorageResult<bool> {
+            self.inner.exists(namespace, key).await
+        }
+
+        async fn list_keys(&self, namespace: &str) -> crate::StorageResult<Vec<String>> {
+            self.inner.list_keys(namespace).await
+        }
+
+        async fn compare_and_swap(
+            &self,
+            namespace: &str,
+            key: &str,
+            expected: Option<&[u8]>,
+            new: Vec<u8>,
+        ) -> crate::StorageResult<bool> {
+            self.inner
+                .compare_and_swap(namespace, key, expected, new)
+                .await
+        }
+
+        async fn clear_namespace(&self, namespace: &str) -> crate::StorageResult<u64> {
+            self.inner.clear_namespace(namespace).await
+        }
+    }
 
     fn at(seconds: i64) -> chrono::DateTime<Utc> {
         Utc.timestamp_opt(seconds, 0).single().unwrap()
@@ -860,8 +940,8 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_principal_assignments_do_not_lose_updates() {
-        let backend = Arc::new(MemoryKvStore::new());
-        let raw: Arc<dyn KvStore> = backend;
+        let backend = Arc::new(ReadBarrierKv::new());
+        let raw: Arc<dyn KvStore> = backend.clone();
         let principals = PrincipalDirectory::default();
         let store = OwnershipStore::new(raw, principals.clone()).unwrap();
         let owner = user(1, 1);
@@ -873,8 +953,9 @@ mod tests {
         store.create_user(owner.clone()).await.unwrap();
         store.create_fleet(owned_fleet.clone()).await.unwrap();
 
-        let first_store = store.clone();
-        let second_store = store.clone();
+        let first_store = OwnershipStore::new(backend.clone(), principals.clone()).unwrap();
+        let second_store = OwnershipStore::new(backend.clone(), principals.clone()).unwrap();
+        backend.arm();
         let (first_result, second_result) = tokio::join!(
             first_store.assign_principal(PrincipalOwnership {
                 principal_uid: first,

@@ -470,7 +470,10 @@ mod tests {
     #[test]
     fn user_uid_is_stable_and_canonical() {
         let identity = user();
-        assert_eq!(identity.uid.to_string().len(), 64);
+        assert_eq!(
+            identity.uid.to_string(),
+            "4678a23b161f8867c20b32adbca86e58754aaf5fc225d64286563e790077b535"
+        );
         assert_eq!(identity.uid.to_string().parse(), Ok(identity.uid));
         assert_eq!(identity.validate(), Ok(()));
         assert!(
@@ -492,7 +495,10 @@ mod tests {
             creator,
         ))
         .unwrap();
-        assert_eq!(identity.uid.to_string().len(), 64);
+        assert_eq!(
+            identity.uid.to_string(),
+            "c46c84da942d4c7fe48e04e6f298e4cf39285a1c5b096cb4985c01bdcfec3709"
+        );
         assert_eq!(identity.validate(), Ok(()));
 
         let other_creator = UserUid::from_bytes([0x11; 32]);
