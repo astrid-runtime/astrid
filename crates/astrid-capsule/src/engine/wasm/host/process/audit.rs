@@ -8,6 +8,7 @@
 //! onto the kernel's signed audit chain (the sensitive exec seam).
 
 use crate::audit_sink::{HostAuditEvent, HostAuditOutcome};
+use crate::engine::wasm::bindings::astrid::process1_1_0::host::{ErrorCode, ProcessSignal};
 use crate::engine::wasm::host_state::HostState;
 
 /// True for the sensitive exec seams — `spawn`, `spawn-background`,
@@ -226,4 +227,47 @@ pub(crate) fn audit_process_id<T, E: std::fmt::Debug>(
             "audit",
         ),
     }
+}
+
+pub(crate) fn process_signal_name(signal: ProcessSignal) -> &'static str {
+    match signal {
+        ProcessSignal::Term => "term",
+        ProcessSignal::Hup => "hup",
+        ProcessSignal::Usr1 => "usr1",
+        ProcessSignal::Usr2 => "usr2",
+        ProcessSignal::Int => "int",
+        ProcessSignal::Stop => "stop",
+        ProcessSignal::Cont => "cont",
+    }
+}
+
+/// Record exactly one signed signal outcome plus the existing trace envelope.
+pub(crate) fn audit_process_signal(
+    state: &HostState,
+    process: &str,
+    signal: ProcessSignal,
+    result: &Result<(), ErrorCode>,
+) {
+    audit_process(state, "astrid:process/host.signal", process, result);
+    let Some(sink) = state.audit_sink.as_ref() else {
+        return;
+    };
+    let reason;
+    let outcome = match result {
+        Ok(()) => HostAuditOutcome::Allowed,
+        Err(ErrorCode::CapabilityDenied | ErrorCode::NoSuchProcess) => {
+            reason = format!("{:?}", result.as_ref().expect_err("matched error"));
+            HostAuditOutcome::Denied(&reason)
+        },
+        Err(error) => {
+            reason = format!("{error:?}");
+            HostAuditOutcome::Failed(&reason)
+        },
+    };
+    sink.record_process_signal(
+        &state.effective_principal(),
+        process,
+        process_signal_name(signal),
+        outcome,
+    );
 }

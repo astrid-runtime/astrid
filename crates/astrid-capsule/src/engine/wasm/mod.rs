@@ -1841,6 +1841,7 @@ impl ExecutionEngine for WasmEngine {
                 // see ONE filesystem (see the VFS-branch selection above).
                 workspace_root: effective_workspace_root.clone(),
                 spawn_mask_paths: spawn_mask_paths.clone(),
+                process_sandbox_policy: None,
                 vfs: Arc::clone(&workspace_vfs),
                 vfs_root_handle: root_handle.clone(),
                 home: None,
@@ -2964,6 +2965,7 @@ async fn build_lifecycle_host_state(
         workspace_root: cfg.workspace_root.clone(),
         // Lifecycle hooks run on a plain HostVfs with no CoW, so nothing to mask.
         spawn_mask_paths: Vec::new(),
+        process_sandbox_policy: None,
         vfs: Arc::new(vfs),
         vfs_root_handle: root_handle,
         home: home_mount,

@@ -73,6 +73,7 @@ pub(super) struct PersistentEntry {
     pub(super) label: String,
     pub(super) command: String,
     pub(super) os_pid: u32,
+    pub(super) tree: Arc<super::super::platform::ProcessTree>,
     pub(super) spawned_at: Instant,
     pub(super) max_lifetime: Duration,
     pub(super) idle_timeout: Duration,
@@ -81,8 +82,8 @@ pub(super) struct PersistentEntry {
     /// Latches the exit so `wait` / `stop` await it without racing the
     /// monitor task or holding the core lock across an `await`.
     pub(super) exit_rx: watch::Receiver<Option<ExitRecord>>,
-    /// The monitor task owning the `Child`. Aborting it drops the `Child`,
-    /// whose `kill_on_drop(true)` SIGKILLs the process — the reap backstop.
+    /// The monitor task owning the `Child`. Tree termination happens before
+    /// abort; dropping the child then remains the root-process reap backstop.
     pub(super) monitor: tokio::task::JoinHandle<()>,
     /// Cleanup guard for any read-only file injections wired into this child's
     /// sandbox. Held for the process's lifetime; its `Drop` (Linux scratch dir
@@ -130,7 +131,7 @@ pub(super) struct Resolved {
     pub(super) key: [u8; 32],
     pub(super) core: Arc<Mutex<ProcessCore>>,
     pub(super) exit_rx: watch::Receiver<Option<ExitRecord>>,
-    pub(super) os_pid: u32,
+    pub(super) tree: Arc<super::super::platform::ProcessTree>,
 }
 
 /// Read the current exit (if any) without holding a lock across `await`.
@@ -157,15 +158,26 @@ pub(super) async fn wait_for_exit(
 
 /// Spawn the monitor task that owns the `Child`, records its exit into
 /// `core`, and notifies `exit_tx`. Returns the join handle (aborting it
-/// drops the `Child`, whose `kill_on_drop` is the reap backstop).
+/// drops the `Child`, whose `kill_on_drop` is the root-process reap backstop).
 pub(super) fn spawn_monitor(
     runtime: &tokio::runtime::Handle,
     mut child: tokio::process::Child,
+    tree: Arc<super::super::platform::ProcessTree>,
     core: Arc<Mutex<ProcessCore>>,
     exit_tx: watch::Sender<Option<ExitRecord>>,
 ) -> tokio::task::JoinHandle<()> {
     runtime.spawn(async move {
         let status = child.wait().await;
+        #[cfg(windows)]
+        if let Err(error) = tree.terminate(super::super::platform::Termination::Force) {
+            tracing::warn!(
+                pid = tree.pid(),
+                ?error,
+                "failed to terminate persistent process descendants after root exit"
+            );
+        }
+        #[cfg(not(windows))]
+        let _ = tree;
         let record = match status {
             Ok(st) => ExitRecord {
                 exit_code: st.code(),
@@ -185,7 +197,8 @@ pub(super) fn spawn_monitor(
         }
         let _ = exit_tx.send(Some(record));
         // `child` drops here: already exited, so `kill_on_drop` is a no-op.
-        // If the task is ABORTED before exit, that drop SIGKILLs instead.
+        // If the task is aborted before exit, dropping the child forces its
+        // root process to terminate instead.
     })
 }
 
@@ -244,78 +257,20 @@ pub(super) fn spawn_ring_reader<R>(
     });
 }
 
-/// Reap an entry removed from the map: SIGKILL the group (best effort) and
-/// abort the monitor (dropping its `Child`, the `kill_on_drop` backstop).
-pub(super) fn reap_entry(entry: PersistentEntry) {
-    if entry.is_live() {
-        let _ = send_signal(entry.os_pid, HostSignal::Kill);
-    }
+/// Reap an entry removed from the map: force the tree (best effort) and abort
+/// the monitor (dropping its `Child`, the `kill_on_drop` backstop).
+pub(super) fn reap_entry(entry: PersistentEntry) -> Result<(), ErrorCode> {
+    let result = entry
+        .tree
+        .terminate(super::super::platform::Termination::Force);
     entry.monitor.abort();
+    result
 }
 
-/// Platform-neutral signal understood by the persistent-process registry.
-#[derive(Clone, Copy, Debug)]
-pub(super) enum HostSignal {
-    Term,
-    Hup,
-    Usr1,
-    Usr2,
-    Int,
-    Stop,
-    Cont,
-    Kill,
-}
-
-/// Map the WIT `process-signal` to an internal signal.
-pub(super) fn map_signal(sig: ProcessSignal) -> HostSignal {
-    match sig {
-        ProcessSignal::Term => HostSignal::Term,
-        ProcessSignal::Hup => HostSignal::Hup,
-        ProcessSignal::Usr1 => HostSignal::Usr1,
-        ProcessSignal::Usr2 => HostSignal::Usr2,
-        ProcessSignal::Int => HostSignal::Int,
-        ProcessSignal::Stop => HostSignal::Stop,
-        ProcessSignal::Cont => HostSignal::Cont,
-    }
-}
-
-/// Send a signal to the child's PROCESS GROUP (it is spawned with
-/// `process_group(0)`, so descendants are signalled too), falling back to
-/// the bare pid if the group send fails.
-pub(super) fn send_signal(pid: u32, sig: HostSignal) -> Result<(), ErrorCode> {
-    // Refuse pid 0: `killpg(0)` / `kill(0)` target the CALLER's (daemon's) own
-    // process group — never the child. A reaped child surfaces pid `None`
-    // (stored as 0); guard here as defense-in-depth (spawn also rejects it).
-    if pid == 0 {
-        return Err(ErrorCode::Closed);
-    }
-    #[cfg(unix)]
-    {
-        use nix::sys::signal::Signal;
-
-        let raw = i32::try_from(pid).map_err(|_| ErrorCode::InvalidInput)?;
-        let target = nix::unistd::Pid::from_raw(raw);
-        let native = match sig {
-            HostSignal::Term => Signal::SIGTERM,
-            HostSignal::Hup => Signal::SIGHUP,
-            HostSignal::Usr1 => Signal::SIGUSR1,
-            HostSignal::Usr2 => Signal::SIGUSR2,
-            HostSignal::Int => Signal::SIGINT,
-            HostSignal::Stop => Signal::SIGSTOP,
-            HostSignal::Cont => Signal::SIGCONT,
-            HostSignal::Kill => Signal::SIGKILL,
-        };
-        if nix::sys::signal::killpg(target, native).is_err() {
-            nix::sys::signal::kill(target, native)
-                .map_err(|e| ErrorCode::Unknown(format!("signal {sig:?}: {e}")))?;
-        }
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (pid, sig);
-        Err(ErrorCode::Unknown(
-            "process signals unsupported on this platform".to_string(),
-        ))
-    }
+/// Deliver a WIT signal through the platform backend.
+pub(super) fn send_signal(
+    tree: &super::super::platform::ProcessTree,
+    signal: ProcessSignal,
+) -> Result<(), ErrorCode> {
+    super::super::platform::signal_process_tree(tree, signal)
 }

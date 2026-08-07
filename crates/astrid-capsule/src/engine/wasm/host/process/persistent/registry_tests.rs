@@ -27,11 +27,7 @@ fn spawn_raw(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::null());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        std_cmd.process_group(0);
-    }
+    super::super::platform::configure_process_group(&mut std_cmd);
     let mut cmd = tokio::process::Command::from(std_cmd);
     cmd.kill_on_drop(true);
     let mut child = cmd.spawn().expect("spawn test child");
@@ -51,11 +47,13 @@ fn params(
     os_pid: u32,
     concurrent_cap: usize,
 ) -> SpawnParams {
+    let tree = super::super::platform::ProcessTree::attach(&child).expect("attach process tree");
     SpawnParams {
         creator: creator.clone(),
         capsule_id: Arc::from(capsule),
         command: "sh -c <test>".to_string(),
         os_pid,
+        tree,
         child,
         stdout,
         stderr,
@@ -89,11 +87,7 @@ fn spawn_raw_stdin(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::piped());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        std_cmd.process_group(0);
-    }
+    super::super::platform::configure_process_group(&mut std_cmd);
     let mut cmd = tokio::process::Command::from(std_cmd);
     cmd.kill_on_drop(true);
     let mut child = cmd.spawn().expect("spawn test child");
@@ -279,11 +273,13 @@ async fn write_stdin_delivers_survives_reset_and_close_eofs() {
     // writes unbuffered, so each line surfaces on stdout immediately.
     let (child, so, se, stdin, pid) =
         spawn_raw_stdin("while IFS= read -r line; do echo \"got:$line\"; done");
+    let tree = super::super::platform::ProcessTree::attach(&child).expect("attach process tree");
     let spawn_params = SpawnParams {
         creator: alice.clone(),
         capsule_id: Arc::from("cap"),
         command: "sh -c <stdin-echo>".to_string(),
         os_pid: pid,
+        tree,
         child,
         stdout: so,
         stderr: se,

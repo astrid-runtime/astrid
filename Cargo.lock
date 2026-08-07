@@ -428,6 +428,7 @@ dependencies = [
  "wasmparser 0.253.0",
  "wasmtime",
  "wasmtime-wasi",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

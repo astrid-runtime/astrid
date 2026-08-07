@@ -20,6 +20,17 @@ pub(super) fn prepare_spawn_context(
     state: &HostState,
     request: &SpawnRequest,
 ) -> Result<PreparedSpawnContext, ErrorCode> {
+    #[cfg(windows)]
+    const PASSTHROUGH: &[&str] = &[
+        "PATH",
+        "PATHEXT",
+        "SystemRoot",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TZ",
+    ];
+    #[cfg(not(windows))]
     const PASSTHROUGH: &[&str] = &["PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ"];
     const MAX_ENV_VARS: usize = 256;
     const MAX_ENV_VALUE_BYTES: usize = 64 * 1024;
@@ -31,7 +42,7 @@ pub(super) fn prepare_spawn_context(
     let mut env = BTreeMap::new();
     for key in PASSTHROUGH {
         if let Ok(value) = std::env::var(key) {
-            env.insert((*key).to_string(), value);
+            env.insert(canonical_env_key(key), value);
         }
     }
 
@@ -40,10 +51,11 @@ pub(super) fn prepare_spawn_context(
     let mut write_paths = Vec::new();
     for item in &request.env {
         let key = item.key.as_str();
+        let canonical_key = canonical_env_key(key);
         if !valid_env_key(key)
             || item.value.contains('\0')
             || item.value.len() > MAX_ENV_VALUE_BYTES
-            || !supplied.insert(key.to_string())
+            || !supplied.insert(canonical_key.clone())
             || reserved_process_env(key)
         {
             return Err(ErrorCode::InvalidInput);
@@ -57,7 +69,7 @@ pub(super) fn prepare_spawn_context(
         } else {
             item.value.clone()
         };
-        env.insert(key.to_string(), value);
+        env.insert(canonical_key, value);
     }
 
     let cwd = match request.cwd.as_deref() {
@@ -129,9 +141,31 @@ pub(super) fn valid_env_key(key: &str) -> bool {
         && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
+pub(super) fn canonical_env_key(key: &str) -> String {
+    #[cfg(windows)]
+    {
+        key.to_ascii_uppercase()
+    }
+    #[cfg(not(windows))]
+    {
+        key.to_string()
+    }
+}
+
 /// Environment variables that can redirect command resolution, inject code
 /// before the approved executable starts, or impersonate a host-issued session.
+#[cfg(windows)]
 pub(super) fn reserved_process_env(key: &str) -> bool {
+    let key = key.to_ascii_uppercase();
+    matches!(key.as_str(), "PATHEXT" | "COMSPEC" | "SYSTEMROOT") || reserved_process_env_exact(&key)
+}
+
+#[cfg(not(windows))]
+pub(super) fn reserved_process_env(key: &str) -> bool {
+    reserved_process_env_exact(key)
+}
+
+fn reserved_process_env_exact(key: &str) -> bool {
     key == "PATH"
         || key == "ASTRID_SESSION_TOKEN"
         || key == "BASH_ENV"
@@ -190,6 +224,29 @@ mod tests {
         assert!(reserved_process_env("DYLD_INSERT_LIBRARIES"));
         assert!(reserved_process_env("ASTRID_SESSION_TOKEN"));
         assert!(!reserved_process_env("ANTHROPIC_API_KEY"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_reserved_environment_keys_remain_case_sensitive() {
+        assert!(!reserved_process_env("Path"));
+        assert!(!reserved_process_env("ld_preload"));
+        assert!(!reserved_process_env("PATHEXT"));
+        assert!(!reserved_process_env("COMSPEC"));
+        assert!(!reserved_process_env("SYSTEMROOT"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_environment_keys_are_case_insensitive() {
+        assert_eq!(canonical_env_key("Path"), "PATH");
+        assert_eq!(canonical_env_key("systemRoot"), "SYSTEMROOT");
+        assert_eq!(canonical_env_key("Mixed_Case"), "MIXED_CASE");
+        assert!(reserved_process_env("Path"));
+        assert!(reserved_process_env("PATHEXT"));
+        assert!(reserved_process_env("ComSpec"));
+        assert!(reserved_process_env("SystemRoot"));
+        assert!(reserved_process_env("ld_preload"));
     }
 
     #[test]

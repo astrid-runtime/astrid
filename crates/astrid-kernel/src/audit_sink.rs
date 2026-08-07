@@ -144,6 +144,30 @@ impl KernelAuditSink {
             ),
         }
     }
+
+    fn append_action(
+        &self,
+        principal: &PrincipalId,
+        action: AuditAction,
+        outcome: HostAuditOutcome<'_>,
+    ) {
+        let (proof, audit_outcome) = Self::to_proof_outcome(outcome);
+        let result = block_on_audit(self.audit_log.append_with_principal(
+            self.session_id.clone(),
+            principal.clone(),
+            action,
+            proof,
+            audit_outcome,
+        ));
+        if let Err(e) = result {
+            warn!(
+                security_event = true,
+                %principal,
+                error = %e,
+                "Failed to persist per-action audit entry — continuing"
+            );
+        }
+    }
 }
 
 /// Drive an audit-log future to completion synchronously from the host-fn
@@ -199,26 +223,24 @@ impl HostAuditSink for KernelAuditSink {
         event: HostAuditEvent<'_>,
         outcome: HostAuditOutcome<'_>,
     ) {
-        let action = Self::to_action(event);
-        let (proof, audit_outcome) = Self::to_proof_outcome(outcome);
-        // Native-only sync bridge onto the async audit log; see
-        // [`block_on_audit`]. Persistence failure degrades to "continue +
-        // alert", never a panic or a blocked host call.
-        let result = block_on_audit(self.audit_log.append_with_principal(
-            self.session_id.clone(),
-            principal.clone(),
-            action,
-            proof,
-            audit_outcome,
-        ));
-        if let Err(e) = result {
-            warn!(
-                security_event = true,
-                %principal,
-                error = %e,
-                "Failed to persist per-action audit entry — continuing"
-            );
-        }
+        self.append_action(principal, Self::to_action(event), outcome);
+    }
+
+    fn record_process_signal(
+        &self,
+        principal: &PrincipalId,
+        process: &str,
+        signal: &str,
+        outcome: HostAuditOutcome<'_>,
+    ) {
+        self.append_action(
+            principal,
+            AuditAction::ProcessSignal {
+                process: truncate_guest_str(process),
+                signal: truncate_guest_str(signal),
+            },
+            outcome,
+        );
     }
 }
 
@@ -230,6 +252,62 @@ mod tests {
 
     fn principal() -> PrincipalId {
         PrincipalId::new("alice").expect("valid principal")
+    }
+
+    fn assert_event_mappings(entries: &[astrid_audit::AuditEntry]) {
+        assert_eq!(entries.len(), 7, "all seven events must persist");
+        for entry in entries {
+            assert_eq!(
+                entry.principal.as_ref(),
+                Some(&principal()),
+                "principal must be stamped"
+            );
+        }
+        assert!(matches!(
+            (&entries[0].action, &entries[0].outcome),
+            (AuditAction::FileRead { path }, AuditOutcome::Success { .. }) if path == "/w/r"
+        ));
+        assert!(matches!(
+            (
+                &entries[6].action,
+                &entries[6].authorization,
+                &entries[6].outcome
+            ),
+            (
+                AuditAction::ProcessSignal { process, signal },
+                AuthorizationProof::Denied { .. },
+                AuditOutcome::Failure { .. }
+            ) if process == "persistent:0123456789abcdef" && signal == "hup"
+        ));
+        assert!(matches!(
+            (&entries[1].action, &entries[1].outcome),
+            (AuditAction::FileWrite { path, content_hash }, AuditOutcome::Failure { .. })
+                if path == "/w/w" && *content_hash == ContentHash::zero()
+        ));
+        assert!(matches!(
+            &entries[2].action,
+            AuditAction::FileDelete { path } if path == "/w/d"
+        ));
+        assert!(matches!(
+            &entries[3].action,
+            AuditAction::NetConnect { host, port } if host == "example.com" && *port == 443
+        ));
+        assert!(matches!(
+            &entries[4].action,
+            AuditAction::NetBind { addr } if addr == "127.0.0.1:0"
+        ));
+        assert!(matches!(
+            (
+                &entries[5].action,
+                &entries[5].authorization,
+                &entries[5].outcome
+            ),
+            (
+                AuditAction::ProcessSpawn { command },
+                AuthorizationProof::Denied { .. },
+                AuditOutcome::Failure { .. }
+            ) if command == "ls"
+        ));
     }
 
     /// Every event kind, including a denial, lands a principal-stamped,
@@ -278,57 +356,18 @@ mod tests {
             HostAuditEvent::ProcessSpawn { command: "ls" },
             HostAuditOutcome::Denied("not in host_process allowlist"),
         );
+        sink.record_process_signal(
+            &p,
+            "persistent:0123456789abcdef",
+            "hup",
+            HostAuditOutcome::Denied("unsupported signal"),
+        );
 
         let entries = log
             .get_principal_entries(&session, Some(&p))
             .await
             .expect("read principal entries");
-        assert_eq!(entries.len(), 6, "all six events must persist");
-
-        // Every entry is stamped with the acting principal.
-        for e in &entries {
-            assert_eq!(e.principal.as_ref(), Some(&p), "principal must be stamped");
-        }
-
-        // FileRead → success.
-        assert!(matches!(
-            (&entries[0].action, &entries[0].outcome),
-            (AuditAction::FileRead { path }, AuditOutcome::Success { .. }) if path == "/w/r"
-        ));
-        // FileWrite Failed → Failure + zero content hash placeholder.
-        assert!(matches!(
-            (&entries[1].action, &entries[1].outcome),
-            (AuditAction::FileWrite { path, content_hash }, AuditOutcome::Failure { .. })
-                if path == "/w/w" && *content_hash == ContentHash::zero()
-        ));
-        // FileDelete → success.
-        assert!(matches!(
-            &entries[2].action,
-            AuditAction::FileDelete { path } if path == "/w/d"
-        ));
-        // NetConnect → success with host + port.
-        assert!(matches!(
-            &entries[3].action,
-            AuditAction::NetConnect { host, port } if host == "example.com" && *port == 443
-        ));
-        // NetBind → success with addr.
-        assert!(matches!(
-            &entries[4].action,
-            AuditAction::NetBind { addr } if addr == "127.0.0.1:0"
-        ));
-        // ProcessSpawn Denied → Failure + Denied proof.
-        assert!(matches!(
-            (
-                &entries[5].action,
-                &entries[5].authorization,
-                &entries[5].outcome
-            ),
-            (
-                AuditAction::ProcessSpawn { command },
-                AuthorizationProof::Denied { .. },
-                AuditOutcome::Failure { .. }
-            ) if command == "ls"
-        ));
+        assert_event_mappings(&entries);
 
         // The signed hash chain remains valid after the high-frequency
         // appends.

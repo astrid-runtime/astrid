@@ -3,22 +3,70 @@
 //! the matching child processes.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 #[cfg(unix)]
 use std::time::Duration;
 
-#[cfg(unix)]
+#[cfg(not(unix))]
 use tracing::warn;
 
 /// Grace period between SIGINT and SIGKILL when cancelling processes.
 #[cfg(unix)]
 const SIGKILL_GRACE_PERIOD: Duration = Duration::from_secs(2);
 
+#[derive(Debug)]
+struct TrackedProcess {
+    call_id: Option<String>,
+    owner: TrackedOwner,
+}
+
+#[derive(Debug)]
+enum TrackedOwner {
+    /// Compatibility entry created through the original public PID API.
+    Legacy,
+    /// Internal process-tree owner used by the hardened host implementation.
+    Tree {
+        identity: u64,
+        tree: Weak<super::platform::ProcessTree>,
+    },
+}
+
+#[derive(Debug)]
+struct CancellationTarget {
+    pid: u32,
+    #[cfg(unix)]
+    identity: Option<u64>,
+    tree: Option<Arc<super::platform::ProcessTree>>,
+}
+
+impl TrackedProcess {
+    fn target(&self, pid: u32) -> Option<CancellationTarget> {
+        match &self.owner {
+            TrackedOwner::Legacy => Some(CancellationTarget {
+                pid,
+                #[cfg(unix)]
+                identity: None,
+                tree: None,
+            }),
+            TrackedOwner::Tree { identity, tree } => {
+                #[cfg(not(unix))]
+                let _ = identity;
+                tree.upgrade().map(|tree| CancellationTarget {
+                    pid,
+                    #[cfg(unix)]
+                    identity: Some(*identity),
+                    tree: Some(tree),
+                })
+            },
+        }
+    }
+}
+
 /// Tracks active child process PIDs for cancellation, with optional
 /// call_id association for multi-session scoping.
 #[derive(Debug, Default)]
 pub struct ProcessTracker {
-    active_pids: Arc<Mutex<HashMap<u32, Option<String>>>>,
+    active_pids: Arc<Mutex<HashMap<u32, TrackedProcess>>>,
 }
 
 impl ProcessTracker {
@@ -29,14 +77,45 @@ impl ProcessTracker {
     }
 
     /// Register a child process PID with an optional call_id.
+    ///
+    /// This preserves the original public API for external callers. The
+    /// process host itself uses [`Self::register_tree`] so Windows cancellation
+    /// owns the whole descendant tree and PID reuse is identity-checked.
     pub fn register(&self, pid: u32, call_id: Option<String>) {
         if pid == 0 {
-            return; // Guard: PID 0 means "no process" on some platforms.
+            return;
         }
         self.active_pids
             .lock()
             .expect("process tracker lock poisoned")
-            .insert(pid, call_id);
+            .insert(
+                pid,
+                TrackedProcess {
+                    call_id,
+                    owner: TrackedOwner::Legacy,
+                },
+            );
+    }
+
+    /// Register a stable process-tree owner with an optional call_id.
+    pub(super) fn register_tree(
+        &self,
+        tree: &Arc<super::platform::ProcessTree>,
+        call_id: Option<String>,
+    ) {
+        self.active_pids
+            .lock()
+            .expect("process tracker lock poisoned")
+            .insert(
+                tree.pid(),
+                TrackedProcess {
+                    call_id,
+                    owner: TrackedOwner::Tree {
+                        identity: tree.identity(),
+                        tree: Arc::downgrade(tree),
+                    },
+                },
+            );
     }
 
     /// Whether any child process is currently registered as running.
@@ -47,11 +126,15 @@ impl ProcessTracker {
     /// the tree under it would corrupt or destroy its work.
     #[must_use]
     pub fn has_active(&self) -> bool {
-        !self
+        let mut active = self
             .active_pids
             .lock()
-            .expect("process tracker lock poisoned")
-            .is_empty()
+            .expect("process tracker lock poisoned");
+        active.retain(|_, tracked| match &tracked.owner {
+            TrackedOwner::Legacy => true,
+            TrackedOwner::Tree { tree, .. } => tree.strong_count() > 0,
+        });
+        !active.is_empty()
     }
 
     /// Unregister a child process PID (process has exited).
@@ -60,6 +143,29 @@ impl ProcessTracker {
             .lock()
             .expect("process tracker lock poisoned")
             .remove(&pid);
+    }
+
+    /// Unregister only if the stable identity still matches this tree owner.
+    pub(super) fn unregister_tree(&self, tree: &super::platform::ProcessTree) {
+        self.unregister_identity(tree.pid(), tree.identity());
+    }
+
+    fn unregister_identity(&self, pid: u32, identity: u64) {
+        let mut active = self
+            .active_pids
+            .lock()
+            .expect("process tracker lock poisoned");
+        if active.get(&pid).is_some_and(|tracked| {
+            matches!(
+                &tracked.owner,
+                TrackedOwner::Tree {
+                    identity: current,
+                    ..
+                } if *current == identity
+            )
+        }) {
+            active.remove(&pid);
+        }
     }
 
     /// Cancel processes matching the given call_ids.
@@ -71,74 +177,117 @@ impl ProcessTracker {
             return;
         }
         let call_id_set: HashSet<&String> = call_ids.iter().collect();
-        let pids: Vec<u32> = self
+        let targets: Vec<CancellationTarget> = self
             .active_pids
             .lock()
             .expect("process tracker lock poisoned")
             .iter()
-            .filter_map(|(&pid, stored_call_id)| match stored_call_id {
-                None => Some(pid),
-                Some(id) => call_id_set.contains(id).then_some(pid),
+            .filter_map(|(&pid, tracked)| match &tracked.call_id {
+                None => tracked.target(pid),
+                Some(id) if call_id_set.contains(id) => tracked.target(pid),
+                Some(_) => None,
             })
             .collect();
 
-        self.signal_pids(&pids, handle);
+        self.signal_targets(&targets, handle);
     }
 
-    /// Send SIGINT to all tracked processes, then SIGKILL after a grace
-    /// period. Used for capsule-level shutdown.
+    /// Cancel all tracked processes. Unix receives SIGINT then SIGKILL after
+    /// a grace period; Windows terminates each descendant tree immediately.
     pub fn cancel_all(&self, handle: &tokio::runtime::Handle) {
-        let pids: Vec<u32> = self
+        let targets: Vec<CancellationTarget> = self
             .active_pids
             .lock()
             .expect("process tracker lock poisoned")
-            .keys()
-            .copied()
+            .iter()
+            .filter_map(|(&pid, tracked)| tracked.target(pid))
             .collect();
-        self.signal_pids(&pids, handle);
+        self.signal_targets(&targets, handle);
     }
 
-    fn signal_pids(&self, pids: &[u32], handle: &tokio::runtime::Handle) {
-        if pids.is_empty() {
+    fn signal_targets(&self, targets: &[CancellationTarget], handle: &tokio::runtime::Handle) {
+        if targets.is_empty() {
             return;
         }
 
         #[cfg(unix)]
         {
-            for &pid in pids {
-                let Some(raw) = i32::try_from(pid).ok() else {
-                    warn!(pid, "PID overflows i32, skipping signal");
-                    continue;
-                };
-                let _ = nix::sys::signal::kill(
-                    nix::unistd::Pid::from_raw(raw),
-                    nix::sys::signal::Signal::SIGINT,
-                );
+            for target in targets {
+                if let Some(tree) = &target.tree {
+                    let _ = super::platform::signal_root_process(
+                        tree,
+                        crate::engine::wasm::bindings::astrid::process1_1_0::host::ProcessSignal::Int,
+                    );
+                } else if let Ok(raw) = i32::try_from(target.pid) {
+                    let _ = nix::sys::signal::kill(
+                        nix::unistd::Pid::from_raw(raw),
+                        nix::sys::signal::Signal::SIGINT,
+                    );
+                }
             }
 
             let tracker = self.active_pids.clone();
-            let target_pids: Vec<u32> = pids.to_vec();
+            let targets: Vec<(u32, Option<u64>)> = targets
+                .iter()
+                .map(|target| (target.pid, target.identity))
+                .collect();
             handle.spawn(async move {
                 tokio::time::sleep(SIGKILL_GRACE_PERIOD).await;
-                let still_active = tracker.lock().expect("process tracker lock poisoned");
-                for pid in target_pids {
-                    if !still_active.contains_key(&pid) {
-                        continue;
+                for (pid, identity) in targets {
+                    let still_current = tracker
+                        .lock()
+                        .expect("process tracker lock poisoned")
+                        .get(&pid)
+                        .is_some_and(|tracked| match (&tracked.owner, identity) {
+                            (TrackedOwner::Legacy, None) => true,
+                            (
+                                TrackedOwner::Tree {
+                                    identity: current, ..
+                                },
+                                Some(expected),
+                            ) => *current == expected,
+                            _ => false,
+                        });
+                    if still_current && let Ok(raw) = i32::try_from(pid) {
+                        let _ = nix::sys::signal::kill(
+                            nix::unistd::Pid::from_raw(raw),
+                            nix::sys::signal::Signal::SIGKILL,
+                        );
                     }
-                    let Some(raw) = i32::try_from(pid).ok() else {
-                        continue;
-                    };
-                    let _ = nix::sys::signal::kill(
-                        nix::unistd::Pid::from_raw(raw),
-                        nix::sys::signal::Signal::SIGKILL,
-                    );
                 }
             });
         }
 
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
-            let _ = (pids, handle);
+            let _ = handle;
+            for target in targets {
+                let Some(tree) = &target.tree else {
+                    warn!(
+                        pid = target.pid,
+                        "legacy PID-only process tracking cannot own a Windows descendant tree"
+                    );
+                    continue;
+                };
+                if let Err(error) = tree.terminate(super::platform::Termination::Force) {
+                    warn!(
+                        pid = tree.pid(),
+                        ?error,
+                        "failed to terminate Windows process tree"
+                    );
+                }
+            }
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = handle;
+            for target in targets {
+                warn!(
+                    pid = target.pid,
+                    "process cancellation unsupported on this platform; leaving tracker entry active"
+                );
+            }
         }
     }
 
@@ -168,11 +317,37 @@ mod tests {
     //! `spawn_background` relies on.
     use super::*;
 
+    fn register_tree_sentinel(
+        tracker: &ProcessTracker,
+        pid: u32,
+        identity: u64,
+        call_id: Option<String>,
+    ) {
+        if pid == 0 {
+            return;
+        }
+        tracker
+            .active_pids
+            .lock()
+            .expect("process tracker lock poisoned")
+            .insert(
+                pid,
+                TrackedProcess {
+                    call_id,
+                    owner: TrackedOwner::Tree {
+                        identity,
+                        tree: Weak::new(),
+                    },
+                },
+            );
+    }
+
     #[test]
     fn register_adds_pid() {
         let t = ProcessTracker::new();
         t.register(42, None);
         assert_eq!(t.active_pids_snapshot(), vec![42]);
+        assert!(t.has_active());
     }
 
     #[test]
@@ -211,5 +386,26 @@ mod tests {
         t.register(42, Some("call-a".into()));
         t.unregister(42);
         assert!(t.active_pids_snapshot().is_empty());
+    }
+
+    #[test]
+    fn stale_unregister_does_not_remove_reused_pid_owner() {
+        let t = ProcessTracker::new();
+        register_tree_sentinel(&t, 42, 100, Some("old".into()));
+        register_tree_sentinel(&t, 42, 200, Some("new".into()));
+
+        t.unregister_identity(42, 100);
+        assert_eq!(t.active_pids_snapshot(), vec![42]);
+        assert_eq!(
+            t.active_pids
+                .lock()
+                .expect("process tracker lock poisoned")
+                .get(&42)
+                .and_then(|tracked| match &tracked.owner {
+                    TrackedOwner::Tree { identity, .. } => Some(*identity),
+                    TrackedOwner::Legacy => None,
+                }),
+            Some(200)
+        );
     }
 }
