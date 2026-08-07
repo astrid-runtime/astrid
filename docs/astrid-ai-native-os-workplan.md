@@ -156,8 +156,12 @@ not become a ring-0 ABI.
 - [x] Record ADRs for protection domains, capability object representation, handle
   transfer, revocation, fault endpoints, scheduling, and audit ordering:
   [Astrid Kernel Architecture Decision Records](astrid-kernel-adrs.md).
-- [ ] Define the support-policy vocabulary: experimental machine, supported host,
-  supported capsule contract, verified claim, and known residual risk.
+- [x] Define the support-policy vocabulary: experimental machine, supported host,
+  supported capsule contract, verified claim, and known residual risk:
+  [Astrid Kernel Support-Policy Vocabulary](astrid-kernel-support-policy.md).
+- [x] Sketch the version-zero native ABI with no path, no stringly syscall, and no
+  ambient-authority handle (the charter's Milestone 0 exit gate):
+  [Astrid Kernel v0 ABI Sketch](astrid-kernel-abi-sketch.md).
 
 Exit condition: every security or compatibility claim names its enforcing component
 and planned evidence. No guarantee depends on “the architecture should prevent it.”
