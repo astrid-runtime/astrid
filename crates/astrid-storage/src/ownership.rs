@@ -5,15 +5,16 @@
 //! together, and a principal can never be observed in two fleets. The format
 //! can be sharded behind the same API if graph size later warrants it.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, OnceLock, Weak};
 
 use astrid_core::{
     FleetIdentity, FleetMembership, FleetRole, FleetUid, OwnershipIdentityError,
     PrincipalOwnership, PrincipalUid, UserIdentity, UserUid,
 };
+use parking_lot::Mutex as SyncMutex;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, OwnedMutexGuard};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use crate::{KvStore, PrincipalDirectory, ScopedKvStore, StorageError};
 
@@ -22,6 +23,22 @@ pub const OWNERSHIP_NAMESPACE: &str = "system:ownership";
 const GRAPH_KEY: &str = "graph-v1";
 const GRAPH_FORMAT_VERSION: u16 = 1;
 const MAX_CAS_ATTEMPTS: usize = 64;
+
+fn mutation_lock_for(storage: &Arc<dyn KvStore>) -> Arc<AsyncMutex<()>> {
+    static LOCKS: OnceLock<SyncMutex<HashMap<usize, Weak<AsyncMutex<()>>>>> = OnceLock::new();
+
+    let storage_identity = Arc::as_ptr(storage).cast::<()>() as usize;
+    let registry = LOCKS.get_or_init(|| SyncMutex::new(HashMap::new()));
+    let mut locks = registry.lock();
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(&storage_identity).and_then(Weak::upgrade) {
+        return lock;
+    }
+
+    let lock = Arc::new(AsyncMutex::new(()));
+    locks.insert(storage_identity, Arc::downgrade(&lock));
+    lock
+}
 
 /// One fleet identity and all current human memberships.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -188,7 +205,7 @@ impl OwnershipSnapshot {
 pub struct OwnershipStore {
     storage: ScopedKvStore,
     principals: PrincipalDirectory,
-    mutation_lock: Arc<Mutex<()>>,
+    mutation_lock: Arc<AsyncMutex<()>>,
 }
 
 /// Exclusive barrier held while an unowned principal is removed from the
@@ -212,10 +229,11 @@ impl OwnershipStore {
         storage: Arc<dyn KvStore>,
         principals: PrincipalDirectory,
     ) -> Result<Self, OwnershipError> {
+        let mutation_lock = mutation_lock_for(&storage);
         Ok(Self {
             storage: ScopedKvStore::new(storage, OWNERSHIP_NAMESPACE)?,
             principals,
-            mutation_lock: Arc::new(Mutex::new(())),
+            mutation_lock,
         })
     }
 
@@ -742,6 +760,17 @@ mod tests {
         )
     }
 
+    fn externally_coordinated_store(
+        storage: Arc<dyn KvStore>,
+        principals: PrincipalDirectory,
+    ) -> OwnershipStore {
+        OwnershipStore {
+            storage: ScopedKvStore::new(storage, OWNERSHIP_NAMESPACE).unwrap(),
+            principals,
+            mutation_lock: Arc::new(AsyncMutex::new(())),
+        }
+    }
+
     fn admit_principal(directory: &PrincipalDirectory, alias: &str, uid: PrincipalUid) {
         directory
             .register(astrid_core::PrincipalId::new(alias).unwrap(), uid)
@@ -953,8 +982,11 @@ mod tests {
         store.create_user(owner.clone()).await.unwrap();
         store.create_fleet(owned_fleet.clone()).await.unwrap();
 
-        let first_store = OwnershipStore::new(backend.clone(), principals.clone()).unwrap();
-        let second_store = OwnershipStore::new(backend.clone(), principals.clone()).unwrap();
+        // Distinct locks model writers outside this process. Production stores
+        // over the same backend share `mutation_lock_for`; CAS remains the
+        // durability boundary for independently coordinated writers.
+        let first_store = externally_coordinated_store(backend.clone(), principals.clone());
+        let second_store = externally_coordinated_store(backend.clone(), principals.clone());
         backend.arm();
         let (first_result, second_result) = tokio::join!(
             first_store.assign_principal(PrincipalOwnership {
@@ -1025,7 +1057,11 @@ mod tests {
 
     #[tokio::test]
     async fn deletion_guard_serializes_assignment_with_directory_removal() {
-        let (store, principals) = store();
+        let backend = Arc::new(MemoryKvStore::new());
+        let principals = PrincipalDirectory::default();
+        let store = OwnershipStore::new(backend.clone(), principals.clone()).unwrap();
+        let independently_opened =
+            OwnershipStore::new(backend.clone(), principals.clone()).unwrap();
         let owner = user(1, 1);
         let owned_fleet = fleet(10, owner.uid);
         let principal_uid = principal(20, 2);
@@ -1035,9 +1071,8 @@ mod tests {
         store.create_fleet(owned_fleet.clone()).await.unwrap();
 
         let deletion_guard = store.guard_principal_deletion(principal_uid).await.unwrap();
-        let assigning_store = store.clone();
         let mut assignment = tokio::spawn(async move {
-            assigning_store
+            independently_opened
                 .assign_principal(PrincipalOwnership {
                     principal_uid,
                     fleet_uid: owned_fleet.uid,
