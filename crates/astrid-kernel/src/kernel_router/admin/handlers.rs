@@ -394,7 +394,7 @@ async fn agent_delete(kernel: &Arc<crate::Kernel>, principal: PrincipalId) -> Ad
         if let Some(identity) = identity {
             match kernel
                 .ownership_store
-                .guard_principal_deletion(identity.uid)
+                .guard_principal_deletion_for_alias(identity.uid, principal.clone())
                 .await
             {
                 Ok(guard) => Some(guard),
@@ -411,6 +411,13 @@ async fn agent_delete(kernel: &Arc<crate::Kernel>, principal: PrincipalId) -> Ad
             None
         }
     } else {
+        if let Err(e) = kernel
+            .ownership_store
+            .finish_principal_deletion_by_alias(&principal)
+            .await
+        {
+            return err_internal(format!("ownership store deletion recovery failed: {e}"));
+        }
         None
     };
     // Unlink before delete_user so a concurrent `resolve` can't return

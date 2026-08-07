@@ -480,6 +480,66 @@ async fn deletion_guard_serializes_assignment_with_directory_removal() {
 }
 
 #[tokio::test]
+async fn deletion_reservation_can_be_finished_by_alias_after_identity_disappears() {
+    let backend = Arc::new(MemoryKvStore::new());
+    let principals = PrincipalDirectory::default();
+    let store = OwnershipStore::new(backend, principals.clone()).unwrap();
+    let principal_uid = principal(20, 2);
+    let alias = astrid_core::PrincipalId::new("recoverable-deletion").unwrap();
+    principals.register(alias.clone(), principal_uid).unwrap();
+
+    let guard = store
+        .guard_principal_deletion_for_alias(principal_uid, alias.clone())
+        .await
+        .unwrap();
+    principals.unregister(&alias, principal_uid);
+    drop(guard);
+
+    assert!(
+        store
+            .finish_principal_deletion_by_alias(&alias)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .finish_principal_deletion_by_alias(&alias)
+            .await
+            .unwrap()
+    );
+    assert!(matches!(
+        store.guard_principal_deletion(principal_uid).await,
+        Err(OwnershipError::PrincipalNotFound(uid)) if uid == principal_uid
+    ));
+}
+
+#[tokio::test]
+async fn deletion_reservation_rejects_reusing_an_interrupted_alias() {
+    let backend = Arc::new(MemoryKvStore::new());
+    let principals = PrincipalDirectory::default();
+    let store = OwnershipStore::new(backend, principals.clone()).unwrap();
+    let first = principal(20, 2);
+    let second = principal(21, 3);
+    let alias = astrid_core::PrincipalId::new("reserved-alias").unwrap();
+    principals.register(alias.clone(), first).unwrap();
+
+    let guard = store
+        .guard_principal_deletion_for_alias(first, alias.clone())
+        .await
+        .unwrap();
+    principals.unregister(&alias, first);
+    drop(guard);
+    principals.register(alias.clone(), second).unwrap();
+
+    assert!(matches!(
+        store
+            .guard_principal_deletion_for_alias(second, alias.clone())
+            .await,
+        Err(OwnershipError::DeletionAliasReserved { principal, .. }) if principal == first
+    ));
+}
+
+#[tokio::test]
 async fn stale_assignment_retries_and_observes_deletion_reservation() {
     let backend = Arc::new(ReadBarrierKv::new());
     let principals = PrincipalDirectory::default();

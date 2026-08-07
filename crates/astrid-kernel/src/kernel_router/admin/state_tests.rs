@@ -560,6 +560,64 @@ async fn agent_delete_removes_identity_profile_and_invalidates_cache() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn agent_delete_retry_clears_reservation_after_identity_was_removed() {
+    let (_dir, kernel) = fixture().await;
+    let principal = pid("recoverable-delete");
+    let created = handlers::dispatch(
+        &kernel,
+        &astrid_core::PrincipalId::default(),
+        AdminRequestKind::AgentCreate {
+            name: principal.to_string(),
+            groups: Vec::new(),
+            grants: Vec::new(),
+            inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
+        },
+    )
+    .await;
+    assert_success(&created);
+
+    let user = kernel
+        .identity_store
+        .resolve("cli", principal.as_str())
+        .await
+        .unwrap()
+        .unwrap();
+    let identity = kernel
+        .identity_store
+        .get_principal_identity(user.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let guard = kernel
+        .ownership_store
+        .guard_principal_deletion_for_alias(identity.uid, principal.clone())
+        .await
+        .unwrap();
+    assert!(kernel.identity_store.delete_user(user.id).await.unwrap());
+    drop(guard);
+
+    let retried = handlers::dispatch(
+        &kernel,
+        &astrid_core::PrincipalId::default(),
+        AdminRequestKind::AgentDelete {
+            principal: principal.clone(),
+        },
+    )
+    .await;
+    assert_success(&retried);
+    assert!(matches!(
+        kernel
+            .ownership_store
+            .guard_principal_deletion(identity.uid)
+            .await,
+        Err(astrid_storage::OwnershipError::PrincipalNotFound(uid)) if uid == identity.uid
+    ));
+    assert!(!PrincipalProfile::path_for(&kernel.astrid_home, &principal).exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn agent_delete_rejects_a_fleet_owned_principal_without_partial_deletion() {
     let (_dir, kernel) = fixture().await;
     let principal = pid("owned-bob");

@@ -5,11 +5,11 @@
 //! together, and a principal can never be observed in two fleets. The format
 //! can be sharded behind the same API if graph size later warrants it.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use astrid_core::{
-    FleetIdentity, FleetMembership, FleetRole, FleetUid, OwnershipIdentityError,
+    FleetIdentity, FleetMembership, FleetRole, FleetUid, OwnershipIdentityError, PrincipalId,
     PrincipalOwnership, PrincipalUid, UserIdentity, UserUid,
 };
 use serde::{Deserialize, Serialize};
@@ -59,7 +59,13 @@ pub struct OwnershipSnapshot {
     fleets: BTreeMap<FleetUid, FleetRecord>,
     principal_ownership: BTreeMap<PrincipalUid, PrincipalOwnership>,
     #[serde(default)]
-    principal_deletions: BTreeSet<PrincipalUid>,
+    principal_deletions: BTreeMap<PrincipalUid, PrincipalDeletionReservation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrincipalDeletionReservation {
+    alias: Option<PrincipalId>,
 }
 
 impl Default for OwnershipSnapshot {
@@ -69,7 +75,7 @@ impl Default for OwnershipSnapshot {
             users: BTreeMap::new(),
             fleets: BTreeMap::new(),
             principal_ownership: BTreeMap::new(),
-            principal_deletions: BTreeSet::new(),
+            principal_deletions: BTreeMap::new(),
         }
     }
 }
@@ -182,10 +188,19 @@ impl OwnershipSnapshot {
                 )));
             }
         }
-        for principal_uid in &self.principal_deletions {
+        let mut deletion_aliases = BTreeMap::new();
+        for (principal_uid, reservation) in &self.principal_deletions {
             if self.principal_ownership.contains_key(principal_uid) {
                 return Err(OwnershipError::CorruptGraph(format!(
                     "principal {principal_uid} is both owned and reserved for deletion"
+                )));
+            }
+            if let Some(alias) = &reservation.alias
+                && let Some(existing_uid) =
+                    deletion_aliases.insert(alias.as_str().to_owned(), *principal_uid)
+            {
+                return Err(OwnershipError::CorruptGraph(format!(
+                    "principal deletion alias {alias} is reserved by both {existing_uid} and {principal_uid}"
                 )));
             }
         }
@@ -275,6 +290,62 @@ impl OwnershipStore {
         &self,
         principal_uid: PrincipalUid,
     ) -> Result<PrincipalDeletionGuard, OwnershipError> {
+        self.guard_principal_deletion_inner(principal_uid, None)
+            .await
+    }
+
+    /// Reserve an unowned principal and retain its alias for crash recovery.
+    ///
+    /// The alias allows a later deletion retry to remove the reservation even
+    /// when the durable identity record and live directory entry were already
+    /// deleted.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an owned or unknown principal, a conflicting retry alias, and
+    /// invalid or unavailable ownership state.
+    pub async fn guard_principal_deletion_for_alias(
+        &self,
+        principal_uid: PrincipalUid,
+        alias: PrincipalId,
+    ) -> Result<PrincipalDeletionGuard, OwnershipError> {
+        self.guard_principal_deletion_inner(principal_uid, Some(alias))
+            .await
+    }
+
+    /// Finish a previously interrupted deletion using its durable alias.
+    ///
+    /// Returns `true` when a matching reservation was removed and `false`
+    /// when no interrupted deletion exists for this alias.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed when the graph cannot be read, validated, or atomically
+    /// updated.
+    pub async fn finish_principal_deletion_by_alias(
+        &self,
+        alias: &PrincipalId,
+    ) -> Result<bool, OwnershipError> {
+        let alias = alias.clone();
+        self.mutate(|graph| {
+            let principal_uid = graph
+                .principal_deletions
+                .iter()
+                .find_map(|(uid, reservation)| {
+                    (reservation.alias.as_ref() == Some(&alias)).then_some(*uid)
+                });
+            Ok(principal_uid
+                .and_then(|uid| graph.principal_deletions.remove(&uid))
+                .is_some())
+        })
+        .await
+    }
+
+    async fn guard_principal_deletion_inner(
+        &self,
+        principal_uid: PrincipalUid,
+        alias: Option<PrincipalId>,
+    ) -> Result<PrincipalDeletionGuard, OwnershipError> {
         let guard = Arc::clone(&self.mutation_lock).lock_owned().await;
         self.mutate_unlocked(|graph| {
             if let Some(ownership) = graph.principal_owner(principal_uid) {
@@ -283,12 +354,48 @@ impl OwnershipStore {
                     fleet: ownership.fleet_uid,
                 });
             }
-            if !graph.principal_deletions.contains(&principal_uid)
-                && !self.principals.contains_uid(principal_uid)
+            if let Some(requested) = &alias
+                && let Ok(live_alias) = self.principals.alias_for(principal_uid)
+                && &live_alias != requested
             {
-                return Err(OwnershipError::PrincipalNotFound(principal_uid));
+                return Err(OwnershipError::DeletionReservationConflict {
+                    principal: principal_uid,
+                    alias: live_alias,
+                });
             }
-            graph.principal_deletions.insert(principal_uid);
+            if let Some(reservation) = graph.principal_deletions.get_mut(&principal_uid) {
+                match (&reservation.alias, &alias) {
+                    (Some(existing), Some(requested)) if existing != requested => {
+                        return Err(OwnershipError::DeletionReservationConflict {
+                            principal: principal_uid,
+                            alias: existing.clone(),
+                        });
+                    },
+                    (None, Some(requested)) => reservation.alias = Some(requested.clone()),
+                    _ => {},
+                }
+            } else {
+                if !self.principals.contains_uid(principal_uid) {
+                    return Err(OwnershipError::PrincipalNotFound(principal_uid));
+                }
+                if let Some(requested) = &alias
+                    && let Some((reserved_uid, _)) = graph
+                        .principal_deletions
+                        .iter()
+                        .find(|(_, reservation)| reservation.alias.as_ref() == Some(requested))
+                {
+                    return Err(OwnershipError::DeletionAliasReserved {
+                        alias: requested.clone(),
+                        principal: *reserved_uid,
+                    });
+                }
+                graph.principal_deletions.insert(
+                    principal_uid,
+                    PrincipalDeletionReservation {
+                        alias: alias.clone(),
+                    },
+                );
+            }
             Ok(())
         })
         .await?;
@@ -463,7 +570,10 @@ impl OwnershipStore {
         ownership: PrincipalOwnership,
     ) -> Result<(), OwnershipError> {
         self.mutate(|graph| {
-            if graph.principal_deletions.contains(&ownership.principal_uid) {
+            if graph
+                .principal_deletions
+                .contains_key(&ownership.principal_uid)
+            {
                 return Err(OwnershipError::PrincipalDeletionInProgress(
                     ownership.principal_uid,
                 ));
@@ -670,6 +780,22 @@ pub enum OwnershipError {
     /// A principal cannot be assigned while durable identity deletion is active.
     #[error("principal deletion is in progress: {0}")]
     PrincipalDeletionInProgress(PrincipalUid),
+    /// A retry attempted to bind one deletion reservation to another alias.
+    #[error("principal deletion reservation for {principal} belongs to alias {alias}")]
+    DeletionReservationConflict {
+        /// Reserved durable principal UID.
+        principal: PrincipalUid,
+        /// Alias retained by the original deletion attempt.
+        alias: PrincipalId,
+    },
+    /// An alias already identifies another interrupted deletion.
+    #[error("principal deletion alias {alias} is already reserved for {principal}")]
+    DeletionAliasReserved {
+        /// Alias retained by the interrupted deletion.
+        alias: PrincipalId,
+        /// Durable UID owned by the existing reservation.
+        principal: PrincipalUid,
+    },
     /// Sustained concurrent writes prevented an atomic commit.
     #[error("ownership graph changed concurrently too many times")]
     ConcurrentModification,
