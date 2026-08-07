@@ -25,9 +25,11 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   `FleetUid` genesis records feed an atomically persisted ownership graph with
   owner-safe membership changes, exclusive principal assignment, explicit
   cross-fleet transfers, concurrent-writer protection, and fail-closed boot
-  validation. Existing native installations deterministically acquire a
-  default user, fleet, and ownership edge without changing CLI, HTTP, profile,
-  group, or `StateOwnerCodecV1` behavior. Closes #1469.
+  validation. Principal deletion is rejected while a fleet assignment exists,
+  preventing identity removal from leaving a dangling ownership edge. Existing
+  native installations deterministically acquire a default user, fleet, and
+  ownership edge without changing CLI, HTTP, profile, group, or
+  `StateOwnerCodecV1` behavior. Closes #1469.
 
 - **Bulk publication reuses closure evidence earned during authoritative
   staging.** A bounded, batch-local dependency walk proves admitted owning

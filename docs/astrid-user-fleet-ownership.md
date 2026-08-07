@@ -18,7 +18,9 @@ A principal has at most one fleet owner. It cannot be silently assigned to a
 second fleet. Moving it is an explicit transfer authorized in both the source
 and destination fleets. Groups remain independent of fleets: changing fleet
 membership does not rewrite a principal's capability groups, and assigning a
-group does not convey ownership.
+group does not convey ownership. The existing `agent.delete` path rejects a
+principal while it has a fleet assignment, so identity removal cannot leave a
+dangling ownership edge.
 
 Fleet membership has three roles:
 
