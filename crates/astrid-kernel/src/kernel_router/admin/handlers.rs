@@ -363,14 +363,62 @@ async fn agent_delete(kernel: &Arc<crate::Kernel>, principal: PrincipalId) -> Ad
 
     let _guard = kernel.admin_write_lock.lock().await;
 
-    // Resolve the link first so we know which user-record to delete.
-    let resolved = match kernel
+    // Prefer the frontend link, then fall back to the durable user record. A
+    // prior partial deletion may already have removed the link while leaving
+    // the principal identity and directory admission intact.
+    let linked = match kernel
         .identity_store
         .resolve(AGENT_IDENTITY_PLATFORM, principal.as_str())
         .await
     {
         Ok(user) => user,
         Err(e) => return err_internal(format!("identity store resolve failed: {e}")),
+    };
+    let resolved = if linked.is_some() {
+        linked
+    } else {
+        match kernel.identity_store.list_users().await {
+            Ok(users) => users.into_iter().find(|user| user.principal == principal),
+            Err(e) => return err_internal(format!("identity store list_users failed: {e}")),
+        }
+    };
+    let ownership_guard = if let Some(user) = resolved.as_ref() {
+        let identity = match kernel.identity_store.get_principal_identity(user.id).await {
+            Ok(identity) => identity,
+            Err(e) => {
+                return err_internal(format!(
+                    "identity store principal identity lookup failed: {e}"
+                ));
+            },
+        };
+        if let Some(identity) = identity {
+            match kernel
+                .ownership_store
+                .guard_principal_deletion_for_alias(identity.uid, principal.clone())
+                .await
+            {
+                Ok(guard) => Some(guard),
+                Err(astrid_storage::OwnershipError::PrincipalAlreadyOwned { fleet, .. }) => {
+                    return err_bad_input(format!(
+                        "cannot delete principal `{principal}` while it is assigned to fleet {fleet}"
+                    ));
+                },
+                Err(e) => {
+                    return err_internal(format!("ownership store deletion guard failed: {e}"));
+                },
+            }
+        } else {
+            None
+        }
+    } else {
+        if let Err(e) = kernel
+            .ownership_store
+            .finish_principal_deletion_by_alias(&principal)
+            .await
+        {
+            return err_internal(format!("ownership store deletion recovery failed: {e}"));
+        }
+        None
     };
     // Unlink before delete_user so a concurrent `resolve` can't return
     // a dangling user id in the narrow window between the two calls.
@@ -381,10 +429,23 @@ async fn agent_delete(kernel: &Arc<crate::Kernel>, principal: PrincipalId) -> Ad
     {
         return err_internal(format!("identity store unlink failed: {e}"));
     }
-    if let Some(user) = resolved
-        && let Err(e) = kernel.identity_store.delete_user(user.id).await
+    if let Some(user) = resolved {
+        match kernel.identity_store.delete_user(user.id).await {
+            Ok(true) => {},
+            Ok(false) => {
+                return err_internal(
+                    "identity store user disappeared during principal deletion".to_string(),
+                );
+            },
+            Err(e) => return err_internal(format!("identity store delete_user failed: {e}")),
+        }
+    }
+    if let Some(guard) = ownership_guard
+        && let Err(e) = guard.finish().await
     {
-        return err_internal(format!("identity store delete_user failed: {e}"));
+        return err_internal(format!(
+            "ownership store deletion reservation cleanup failed: {e}"
+        ));
     }
 
     // Remove the policy file. Without this, traffic claiming this

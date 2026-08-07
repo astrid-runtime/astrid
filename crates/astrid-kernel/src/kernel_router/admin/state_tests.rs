@@ -16,6 +16,7 @@ use astrid_core::dirs::AstridHome;
 use astrid_core::groups::{BUILTIN_ADMIN, BUILTIN_AGENT, BUILTIN_RESTRICTED, GroupConfig};
 use astrid_core::principal::PrincipalId;
 use astrid_core::profile::{AuthMethod, DeviceKey, DeviceScope, PrincipalProfile, Quotas};
+use astrid_core::{FleetGenesis, FleetIdentity, PrincipalOwnership, UserGenesis, UserIdentity};
 use astrid_events::kernel_api::{AdminRequestKind, AdminResponseBody, AgentSummary, GroupSummary};
 use tempfile::TempDir;
 
@@ -78,6 +79,41 @@ fn assert_error_contains(res: &AdminResponseBody, needle: &str) {
         },
         other => panic!("expected Error, got: {other:?}"),
     }
+}
+
+async fn assert_owned_delete_rejected_after_unlink(
+    kernel: &Arc<Kernel>,
+    principal: &PrincipalId,
+    user_id: uuid::Uuid,
+    profile_path: &std::path::Path,
+) {
+    kernel
+        .identity_store
+        .unlink("cli", principal.as_str())
+        .await
+        .unwrap();
+    let retried = handlers::dispatch(
+        kernel,
+        &PrincipalId::default(),
+        AdminRequestKind::AgentDelete {
+            principal: principal.clone(),
+        },
+    )
+    .await;
+    assert_error_contains(&retried, "assigned to fleet");
+    assert!(
+        profile_path.exists(),
+        "retried rejection must retain profile"
+    );
+    assert!(
+        kernel
+            .identity_store
+            .get_user(user_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "retried rejection must retain the durable user"
+    );
 }
 
 fn agent_list_for(response: AdminResponseBody) -> Vec<AgentSummary> {
@@ -521,6 +557,169 @@ async fn agent_delete_removes_identity_profile_and_invalidates_cache() {
     assert!(after.groups.is_empty());
     assert!(after.grants.is_empty());
     assert!(after.revokes.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_delete_retry_clears_reservation_after_identity_was_removed() {
+    let (_dir, kernel) = fixture().await;
+    let principal = pid("recoverable-delete");
+    let created = handlers::dispatch(
+        &kernel,
+        &astrid_core::PrincipalId::default(),
+        AdminRequestKind::AgentCreate {
+            name: principal.to_string(),
+            groups: Vec::new(),
+            grants: Vec::new(),
+            inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
+        },
+    )
+    .await;
+    assert_success(&created);
+
+    let user = kernel
+        .identity_store
+        .resolve("cli", principal.as_str())
+        .await
+        .unwrap()
+        .unwrap();
+    let identity = kernel
+        .identity_store
+        .get_principal_identity(user.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let guard = kernel
+        .ownership_store
+        .guard_principal_deletion_for_alias(identity.uid, principal.clone())
+        .await
+        .unwrap();
+    assert!(kernel.identity_store.delete_user(user.id).await.unwrap());
+    drop(guard);
+
+    let retried = handlers::dispatch(
+        &kernel,
+        &astrid_core::PrincipalId::default(),
+        AdminRequestKind::AgentDelete {
+            principal: principal.clone(),
+        },
+    )
+    .await;
+    assert_success(&retried);
+    assert!(matches!(
+        kernel
+            .ownership_store
+            .guard_principal_deletion(identity.uid)
+            .await,
+        Err(astrid_storage::OwnershipError::PrincipalNotFound(uid)) if uid == identity.uid
+    ));
+    assert!(!PrincipalProfile::path_for(&kernel.astrid_home, &principal).exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_delete_rejects_a_fleet_owned_principal_without_partial_deletion() {
+    let (_dir, kernel) = fixture().await;
+    let principal = pid("owned-bob");
+    let created = handlers::dispatch(
+        &kernel,
+        &astrid_core::PrincipalId::default(),
+        AdminRequestKind::AgentCreate {
+            name: principal.to_string(),
+            groups: Vec::new(),
+            grants: Vec::new(),
+            inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
+        },
+    )
+    .await;
+    assert_success(&created);
+
+    let user = kernel
+        .identity_store
+        .resolve("cli", principal.as_str())
+        .await
+        .unwrap()
+        .unwrap();
+    let principal_identity = kernel
+        .identity_store
+        .get_principal_identity(user.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let owner = UserIdentity::from_genesis(UserGenesis::from_parts(
+        user.id,
+        user.created_at,
+        principal_identity.genesis.initial_public_key,
+    ))
+    .unwrap();
+    let fleet = FleetIdentity::from_genesis(FleetGenesis::from_parts(
+        user.id,
+        user.created_at,
+        owner.uid,
+    ))
+    .unwrap();
+    kernel
+        .ownership_store
+        .create_user(owner.clone())
+        .await
+        .unwrap();
+    kernel
+        .ownership_store
+        .create_fleet(fleet.clone())
+        .await
+        .unwrap();
+    kernel
+        .ownership_store
+        .assign_principal(PrincipalOwnership {
+            principal_uid: principal_identity.uid,
+            fleet_uid: fleet.uid,
+            assigned_by: owner.uid,
+        })
+        .await
+        .unwrap();
+
+    let profile_path = PrincipalProfile::path_for(&kernel.astrid_home, &principal);
+    let deleted = handlers::dispatch(
+        &kernel,
+        &astrid_core::PrincipalId::default(),
+        AdminRequestKind::AgentDelete {
+            principal: principal.clone(),
+        },
+    )
+    .await;
+    assert_error_contains(&deleted, "assigned to fleet");
+
+    assert!(
+        profile_path.exists(),
+        "rejected deletion must retain profile"
+    );
+    assert!(
+        kernel
+            .identity_store
+            .resolve("cli", principal.as_str())
+            .await
+            .unwrap()
+            .is_some(),
+        "rejected deletion must retain the identity link"
+    );
+
+    // Model a prior partial attempt that removed the frontend link but failed
+    // before deleting the durable user. A retry must recover the user by its
+    // stored principal alias and still enforce ownership.
+    assert_owned_delete_rejected_after_unlink(&kernel, &principal, user.id, &profile_path).await;
+    assert_eq!(
+        kernel
+            .ownership_store
+            .load()
+            .await
+            .unwrap()
+            .principal_owner(principal_identity.uid)
+            .unwrap()
+            .fleet_uid,
+        fleet.uid
+    );
 }
 
 // ── Phantom-principal rejection (Gemini follow-up + R-thirteen) ──

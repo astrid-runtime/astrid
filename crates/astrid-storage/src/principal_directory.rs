@@ -117,6 +117,12 @@ impl PrincipalDirectory {
             })
     }
 
+    /// Whether a durable UID currently names an admitted live principal.
+    #[must_use]
+    pub fn contains_uid(&self, uid: PrincipalUid) -> bool {
+        self.inner.read().principals.contains_key(&uid)
+    }
+
     /// Rebind one existing UID to a new validated alias.
     ///
     /// The old alias must currently name `uid`, and the replacement alias must
