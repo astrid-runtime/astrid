@@ -5,14 +5,13 @@
 //! together, and a principal can never be observed in two fleets. The format
 //! can be sharded behind the same API if graph size later warrants it.
 
-use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, OnceLock, Weak};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use astrid_core::{
     FleetIdentity, FleetMembership, FleetRole, FleetUid, OwnershipIdentityError,
     PrincipalOwnership, PrincipalUid, UserIdentity, UserUid,
 };
-use parking_lot::Mutex as SyncMutex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
@@ -23,22 +22,6 @@ pub const OWNERSHIP_NAMESPACE: &str = "system:ownership";
 const GRAPH_KEY: &str = "graph-v1";
 const GRAPH_FORMAT_VERSION: u16 = 1;
 const MAX_CAS_ATTEMPTS: usize = 64;
-
-fn mutation_lock_for(storage: &Arc<dyn KvStore>) -> Arc<AsyncMutex<()>> {
-    static LOCKS: OnceLock<SyncMutex<HashMap<usize, Weak<AsyncMutex<()>>>>> = OnceLock::new();
-
-    let storage_identity = Arc::as_ptr(storage).cast::<()>() as usize;
-    let registry = LOCKS.get_or_init(|| SyncMutex::new(HashMap::new()));
-    let mut locks = registry.lock();
-    locks.retain(|_, lock| lock.strong_count() > 0);
-    if let Some(lock) = locks.get(&storage_identity).and_then(Weak::upgrade) {
-        return lock;
-    }
-
-    let lock = Arc::new(AsyncMutex::new(()));
-    locks.insert(storage_identity, Arc::downgrade(&lock));
-    lock
-}
 
 /// One fleet identity and all current human memberships.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,6 +58,8 @@ pub struct OwnershipSnapshot {
     users: BTreeMap<UserUid, UserIdentity>,
     fleets: BTreeMap<FleetUid, FleetRecord>,
     principal_ownership: BTreeMap<PrincipalUid, PrincipalOwnership>,
+    #[serde(default)]
+    principal_deletions: BTreeSet<PrincipalUid>,
 }
 
 impl Default for OwnershipSnapshot {
@@ -84,6 +69,7 @@ impl Default for OwnershipSnapshot {
             users: BTreeMap::new(),
             fleets: BTreeMap::new(),
             principal_ownership: BTreeMap::new(),
+            principal_deletions: BTreeSet::new(),
         }
     }
 }
@@ -196,6 +182,13 @@ impl OwnershipSnapshot {
                 )));
             }
         }
+        for principal_uid in &self.principal_deletions {
+            if self.principal_ownership.contains_key(principal_uid) {
+                return Err(OwnershipError::CorruptGraph(format!(
+                    "principal {principal_uid} is both owned and reserved for deletion"
+                )));
+            }
+        }
         Ok(())
     }
 }
@@ -216,7 +209,27 @@ pub struct OwnershipStore {
 #[derive(Debug)]
 #[must_use = "dropping the guard permits concurrent ownership assignment"]
 pub struct PrincipalDeletionGuard {
+    store: OwnershipStore,
+    principal_uid: PrincipalUid,
     _guard: OwnedMutexGuard<()>,
+}
+
+impl PrincipalDeletionGuard {
+    /// Remove the durable reservation after identity removal completes.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed when the latest graph cannot be read, validated, or
+    /// atomically updated. On failure the reservation remains durable.
+    pub async fn finish(self) -> Result<(), OwnershipError> {
+        let principal_uid = self.principal_uid;
+        self.store
+            .mutate_unlocked(|graph| {
+                graph.principal_deletions.remove(&principal_uid);
+                Ok(())
+            })
+            .await
+    }
 }
 
 impl OwnershipStore {
@@ -229,11 +242,10 @@ impl OwnershipStore {
         storage: Arc<dyn KvStore>,
         principals: PrincipalDirectory,
     ) -> Result<Self, OwnershipError> {
-        let mutation_lock = mutation_lock_for(&storage);
         Ok(Self {
             storage: ScopedKvStore::new(storage, OWNERSHIP_NAMESPACE)?,
             principals,
-            mutation_lock,
+            mutation_lock: Arc::new(AsyncMutex::new(())),
         })
     }
 
@@ -247,11 +259,13 @@ impl OwnershipStore {
         self.decode(raw.as_deref())
     }
 
-    /// Exclude ownership mutations while an unowned principal is deleted.
+    /// Reserve an unowned principal for durable identity deletion.
     ///
-    /// The returned guard must remain alive through removal from the durable
-    /// identity store. This closes the check-to-delete race with concurrent
-    /// assignment through another clone of this store.
+    /// The reservation changes the graph's CAS version, so a writer that read
+    /// the unowned graph before this call must retry and observe the deletion.
+    /// Call [`PrincipalDeletionGuard::finish`] only after durable identity
+    /// removal succeeds. Dropping the guard leaves the reservation in place so
+    /// a partial deletion fails closed and can be retried safely.
     ///
     /// # Errors
     ///
@@ -262,13 +276,27 @@ impl OwnershipStore {
         principal_uid: PrincipalUid,
     ) -> Result<PrincipalDeletionGuard, OwnershipError> {
         let guard = Arc::clone(&self.mutation_lock).lock_owned().await;
-        if let Some(ownership) = self.load().await?.principal_owner(principal_uid) {
-            return Err(OwnershipError::PrincipalAlreadyOwned {
-                principal: principal_uid,
-                fleet: ownership.fleet_uid,
-            });
-        }
-        Ok(PrincipalDeletionGuard { _guard: guard })
+        self.mutate_unlocked(|graph| {
+            if let Some(ownership) = graph.principal_owner(principal_uid) {
+                return Err(OwnershipError::PrincipalAlreadyOwned {
+                    principal: principal_uid,
+                    fleet: ownership.fleet_uid,
+                });
+            }
+            if !graph.principal_deletions.contains(&principal_uid)
+                && !self.principals.contains_uid(principal_uid)
+            {
+                return Err(OwnershipError::PrincipalNotFound(principal_uid));
+            }
+            graph.principal_deletions.insert(principal_uid);
+            Ok(())
+        })
+        .await?;
+        Ok(PrincipalDeletionGuard {
+            store: self.clone(),
+            principal_uid,
+            _guard: guard,
+        })
     }
 
     /// Register one durable human identity, idempotently.
@@ -435,6 +463,11 @@ impl OwnershipStore {
         ownership: PrincipalOwnership,
     ) -> Result<(), OwnershipError> {
         self.mutate(|graph| {
+            if graph.principal_deletions.contains(&ownership.principal_uid) {
+                return Err(OwnershipError::PrincipalDeletionInProgress(
+                    ownership.principal_uid,
+                ));
+            }
             if !self.principals.contains_uid(ownership.principal_uid) {
                 return Err(OwnershipError::PrincipalNotFound(ownership.principal_uid));
             }
@@ -513,6 +546,14 @@ impl OwnershipStore {
         F: Fn(&mut OwnershipSnapshot) -> Result<T, OwnershipError>,
     {
         let _guard = self.mutation_lock.lock().await;
+        self.mutate_unlocked(apply).await
+    }
+
+    async fn mutate_unlocked<T, F>(&self, apply: F) -> Result<T, OwnershipError>
+    where
+        T: Clone,
+        F: Fn(&mut OwnershipSnapshot) -> Result<T, OwnershipError>,
+    {
         for _ in 0..MAX_CAS_ATTEMPTS {
             let current = self.storage.get(GRAPH_KEY).await?;
             let mut graph = self.decode(current.as_deref())?;
@@ -626,481 +667,14 @@ pub enum OwnershipError {
     /// A principal UID is not present in the admitted durable directory.
     #[error("principal not found: {0}")]
     PrincipalNotFound(PrincipalUid),
+    /// A principal cannot be assigned while durable identity deletion is active.
+    #[error("principal deletion is in progress: {0}")]
+    PrincipalDeletionInProgress(PrincipalUid),
     /// Sustained concurrent writes prevented an atomic commit.
     #[error("ownership graph changed concurrently too many times")]
     ConcurrentModification,
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-
-    use async_trait::async_trait;
-    use chrono::{TimeZone, Utc};
-    use tokio::sync::Barrier;
-    use uuid::Uuid;
-
-    use super::*;
-    use crate::MemoryKvStore;
-    use astrid_core::{FleetGenesis, PrincipalGenesis, PrincipalIdentity, UserGenesis};
-
-    #[derive(Debug)]
-    struct ReadBarrierKv {
-        inner: MemoryKvStore,
-        barrier: Barrier,
-        armed: AtomicBool,
-        ownership_reads: AtomicUsize,
-    }
-
-    impl ReadBarrierKv {
-        fn new() -> Self {
-            Self {
-                inner: MemoryKvStore::new(),
-                barrier: Barrier::new(2),
-                armed: AtomicBool::new(false),
-                ownership_reads: AtomicUsize::new(0),
-            }
-        }
-
-        fn arm(&self) {
-            self.ownership_reads.store(0, Ordering::SeqCst);
-            self.armed.store(true, Ordering::SeqCst);
-        }
-    }
-
-    #[async_trait]
-    impl KvStore for ReadBarrierKv {
-        async fn get(&self, namespace: &str, key: &str) -> crate::StorageResult<Option<Vec<u8>>> {
-            let value = self.inner.get(namespace, key).await?;
-            if self.armed.load(Ordering::SeqCst)
-                && namespace == OWNERSHIP_NAMESPACE
-                && key == GRAPH_KEY
-                && self.ownership_reads.fetch_add(1, Ordering::SeqCst) < 2
-            {
-                self.barrier.wait().await;
-            }
-            Ok(value)
-        }
-
-        async fn set(
-            &self,
-            namespace: &str,
-            key: &str,
-            value: Vec<u8>,
-        ) -> crate::StorageResult<()> {
-            self.inner.set(namespace, key, value).await
-        }
-
-        async fn delete(&self, namespace: &str, key: &str) -> crate::StorageResult<bool> {
-            self.inner.delete(namespace, key).await
-        }
-
-        async fn exists(&self, namespace: &str, key: &str) -> crate::StorageResult<bool> {
-            self.inner.exists(namespace, key).await
-        }
-
-        async fn list_keys(&self, namespace: &str) -> crate::StorageResult<Vec<String>> {
-            self.inner.list_keys(namespace).await
-        }
-
-        async fn compare_and_swap(
-            &self,
-            namespace: &str,
-            key: &str,
-            expected: Option<&[u8]>,
-            new: Vec<u8>,
-        ) -> crate::StorageResult<bool> {
-            self.inner
-                .compare_and_swap(namespace, key, expected, new)
-                .await
-        }
-
-        async fn clear_namespace(&self, namespace: &str) -> crate::StorageResult<u64> {
-            self.inner.clear_namespace(namespace).await
-        }
-    }
-
-    fn at(seconds: i64) -> chrono::DateTime<Utc> {
-        Utc.timestamp_opt(seconds, 0).single().unwrap()
-    }
-
-    fn user(id: u128, key: u8) -> UserIdentity {
-        UserIdentity::from_genesis(UserGenesis::from_parts(
-            Uuid::from_u128(id),
-            at(1_700_000_000),
-            [key; 32],
-        ))
-        .unwrap()
-    }
-
-    fn fleet(id: u128, creator: UserUid) -> FleetIdentity {
-        FleetIdentity::from_genesis(FleetGenesis::from_parts(
-            Uuid::from_u128(id),
-            at(1_700_000_001),
-            creator,
-        ))
-        .unwrap()
-    }
-
-    fn principal(id: u128, key: u8) -> PrincipalUid {
-        PrincipalIdentity::from_genesis(PrincipalGenesis::from_parts(
-            Uuid::from_u128(id),
-            at(1_700_000_002),
-            [key; 32],
-        ))
-        .unwrap()
-        .uid
-    }
-
-    fn store() -> (OwnershipStore, PrincipalDirectory) {
-        let principals = PrincipalDirectory::default();
-        (
-            OwnershipStore::new(Arc::new(MemoryKvStore::new()), principals.clone()).unwrap(),
-            principals,
-        )
-    }
-
-    fn externally_coordinated_store(
-        storage: Arc<dyn KvStore>,
-        principals: PrincipalDirectory,
-    ) -> OwnershipStore {
-        OwnershipStore {
-            storage: ScopedKvStore::new(storage, OWNERSHIP_NAMESPACE).unwrap(),
-            principals,
-            mutation_lock: Arc::new(AsyncMutex::new(())),
-        }
-    }
-
-    fn admit_principal(directory: &PrincipalDirectory, alias: &str, uid: PrincipalUid) {
-        directory
-            .register(astrid_core::PrincipalId::new(alias).unwrap(), uid)
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn fleet_creation_atomically_bootstraps_its_owner() {
-        let (store, _) = store();
-        let owner = user(1, 1);
-        let owned_fleet = fleet(10, owner.uid);
-        store.create_user(owner.clone()).await.unwrap();
-        store.create_fleet(owned_fleet.clone()).await.unwrap();
-
-        let graph = store.load().await.unwrap();
-        let membership = graph
-            .fleet(owned_fleet.uid)
-            .unwrap()
-            .membership(owner.uid)
-            .unwrap();
-        assert_eq!(membership.role, FleetRole::Owner);
-        assert_eq!(membership.granted_by, owner.uid);
-    }
-
-    #[tokio::test]
-    async fn principal_cannot_be_silently_reassigned() {
-        let (store, principals) = store();
-        let owner = user(1, 1);
-        let first = fleet(10, owner.uid);
-        let second = fleet(11, owner.uid);
-        let principal_uid = principal(20, 2);
-        admit_principal(&principals, "test-principal", principal_uid);
-        store.create_user(owner.clone()).await.unwrap();
-        store.create_fleet(first.clone()).await.unwrap();
-        store.create_fleet(second.clone()).await.unwrap();
-        store
-            .assign_principal(PrincipalOwnership {
-                principal_uid,
-                fleet_uid: first.uid,
-                assigned_by: owner.uid,
-            })
-            .await
-            .unwrap();
-
-        let error = store
-            .assign_principal(PrincipalOwnership {
-                principal_uid,
-                fleet_uid: second.uid,
-                assigned_by: owner.uid,
-            })
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            OwnershipError::PrincipalAlreadyOwned { .. }
-        ));
-        assert_eq!(
-            store
-                .load()
-                .await
-                .unwrap()
-                .principal_owner(principal_uid)
-                .unwrap()
-                .fleet_uid,
-            first.uid
-        );
-    }
-
-    #[tokio::test]
-    async fn explicit_transfer_requires_management_of_both_fleets() {
-        let (store, principals) = store();
-        let first_owner = user(1, 1);
-        let second_owner = user(2, 2);
-        let first = fleet(10, first_owner.uid);
-        let second = fleet(11, second_owner.uid);
-        let principal_uid = principal(20, 3);
-        admit_principal(&principals, "test-principal", principal_uid);
-        store.create_user(first_owner.clone()).await.unwrap();
-        store.create_user(second_owner.clone()).await.unwrap();
-        store.create_fleet(first.clone()).await.unwrap();
-        store.create_fleet(second.clone()).await.unwrap();
-        store
-            .assign_principal(PrincipalOwnership {
-                principal_uid,
-                fleet_uid: first.uid,
-                assigned_by: first_owner.uid,
-            })
-            .await
-            .unwrap();
-
-        let denied = store
-            .transfer_principal(principal_uid, first.uid, second.uid, first_owner.uid)
-            .await
-            .unwrap_err();
-        assert!(matches!(denied, OwnershipError::NotFleetManager { .. }));
-
-        store
-            .set_membership(
-                second.uid,
-                first_owner.uid,
-                FleetRole::Administrator,
-                second_owner.uid,
-            )
-            .await
-            .unwrap();
-        store
-            .transfer_principal(principal_uid, first.uid, second.uid, first_owner.uid)
-            .await
-            .unwrap();
-        assert_eq!(
-            store
-                .load()
-                .await
-                .unwrap()
-                .principal_owner(principal_uid)
-                .unwrap()
-                .fleet_uid,
-            second.uid
-        );
-    }
-
-    #[tokio::test]
-    async fn last_owner_cannot_be_demoted_or_removed() {
-        let (store, _) = store();
-        let owner = user(1, 1);
-        let owned_fleet = fleet(10, owner.uid);
-        store.create_user(owner.clone()).await.unwrap();
-        store.create_fleet(owned_fleet.clone()).await.unwrap();
-
-        assert!(matches!(
-            store
-                .set_membership(owned_fleet.uid, owner.uid, FleetRole::Member, owner.uid)
-                .await,
-            Err(OwnershipError::LastOwner(_))
-        ));
-        assert!(matches!(
-            store
-                .remove_member(owned_fleet.uid, owner.uid, owner.uid)
-                .await,
-            Err(OwnershipError::LastOwner(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn administrator_cannot_escalate_to_owner_or_remove_one() {
-        let (store, _) = store();
-        let owner = user(1, 1);
-        let administrator = user(2, 2);
-        let owned_fleet = fleet(10, owner.uid);
-        store.create_user(owner.clone()).await.unwrap();
-        store.create_user(administrator.clone()).await.unwrap();
-        store.create_fleet(owned_fleet.clone()).await.unwrap();
-        store
-            .set_membership(
-                owned_fleet.uid,
-                administrator.uid,
-                FleetRole::Administrator,
-                owner.uid,
-            )
-            .await
-            .unwrap();
-
-        assert!(matches!(
-            store
-                .set_membership(
-                    owned_fleet.uid,
-                    administrator.uid,
-                    FleetRole::Owner,
-                    administrator.uid,
-                )
-                .await,
-            Err(OwnershipError::OwnerAuthorityRequired(_))
-        ));
-        assert!(matches!(
-            store
-                .remove_member(owned_fleet.uid, owner.uid, administrator.uid)
-                .await,
-            Err(OwnershipError::OwnerAuthorityRequired(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn malformed_persisted_graph_fails_closed() {
-        let backend = Arc::new(MemoryKvStore::new());
-        let raw: Arc<dyn KvStore> = backend.clone();
-        let store = OwnershipStore::new(raw, PrincipalDirectory::default()).unwrap();
-        backend
-            .set(OWNERSHIP_NAMESPACE, GRAPH_KEY, b"not-json".to_vec())
-            .await
-            .unwrap();
-        assert!(matches!(
-            store.load().await,
-            Err(OwnershipError::Serialization(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn concurrent_principal_assignments_do_not_lose_updates() {
-        let backend = Arc::new(ReadBarrierKv::new());
-        let raw: Arc<dyn KvStore> = backend.clone();
-        let principals = PrincipalDirectory::default();
-        let store = OwnershipStore::new(raw, principals.clone()).unwrap();
-        let owner = user(1, 1);
-        let owned_fleet = fleet(10, owner.uid);
-        let first = principal(20, 2);
-        let second = principal(21, 3);
-        admit_principal(&principals, "first-principal", first);
-        admit_principal(&principals, "second-principal", second);
-        store.create_user(owner.clone()).await.unwrap();
-        store.create_fleet(owned_fleet.clone()).await.unwrap();
-
-        // Distinct locks model writers outside this process. Production stores
-        // over the same backend share `mutation_lock_for`; CAS remains the
-        // durability boundary for independently coordinated writers.
-        let first_store = externally_coordinated_store(backend.clone(), principals.clone());
-        let second_store = externally_coordinated_store(backend.clone(), principals.clone());
-        backend.arm();
-        let (first_result, second_result) = tokio::join!(
-            first_store.assign_principal(PrincipalOwnership {
-                principal_uid: first,
-                fleet_uid: owned_fleet.uid,
-                assigned_by: owner.uid,
-            }),
-            second_store.assign_principal(PrincipalOwnership {
-                principal_uid: second,
-                fleet_uid: owned_fleet.uid,
-                assigned_by: owner.uid,
-            })
-        );
-        first_result.unwrap();
-        second_result.unwrap();
-
-        let graph = store.load().await.unwrap();
-        assert_eq!(
-            graph.principal_owner(first).unwrap().fleet_uid,
-            owned_fleet.uid
-        );
-        assert_eq!(
-            graph.principal_owner(second).unwrap().fleet_uid,
-            owned_fleet.uid
-        );
-    }
-
-    #[tokio::test]
-    async fn unknown_principals_are_rejected_on_assignment_and_reopen() {
-        let backend = Arc::new(MemoryKvStore::new());
-        let admitted = PrincipalDirectory::default();
-        let raw: Arc<dyn KvStore> = backend.clone();
-        let store = OwnershipStore::new(raw, admitted.clone()).unwrap();
-        let owner = user(1, 1);
-        let owned_fleet = fleet(10, owner.uid);
-        let principal_uid = principal(20, 2);
-        store.create_user(owner.clone()).await.unwrap();
-        store.create_fleet(owned_fleet.clone()).await.unwrap();
-
-        assert!(matches!(
-            store
-                .assign_principal(PrincipalOwnership {
-                    principal_uid,
-                    fleet_uid: owned_fleet.uid,
-                    assigned_by: owner.uid,
-                })
-                .await,
-            Err(OwnershipError::PrincipalNotFound(uid)) if uid == principal_uid
-        ));
-
-        admit_principal(&admitted, "admitted-principal", principal_uid);
-        store
-            .assign_principal(PrincipalOwnership {
-                principal_uid,
-                fleet_uid: owned_fleet.uid,
-                assigned_by: owner.uid,
-            })
-            .await
-            .unwrap();
-
-        let reopened = OwnershipStore::new(backend, PrincipalDirectory::default()).unwrap();
-        assert!(matches!(
-            reopened.load().await,
-            Err(OwnershipError::CorruptGraph(message))
-                if message.contains("absent from the admitted principal directory")
-        ));
-    }
-
-    #[tokio::test]
-    async fn deletion_guard_serializes_assignment_with_directory_removal() {
-        let backend = Arc::new(MemoryKvStore::new());
-        let principals = PrincipalDirectory::default();
-        let store = OwnershipStore::new(backend.clone(), principals.clone()).unwrap();
-        let independently_opened =
-            OwnershipStore::new(backend.clone(), principals.clone()).unwrap();
-        let owner = user(1, 1);
-        let owned_fleet = fleet(10, owner.uid);
-        let principal_uid = principal(20, 2);
-        let alias = astrid_core::PrincipalId::new("deleting-principal").unwrap();
-        principals.register(alias.clone(), principal_uid).unwrap();
-        store.create_user(owner.clone()).await.unwrap();
-        store.create_fleet(owned_fleet.clone()).await.unwrap();
-
-        let deletion_guard = store.guard_principal_deletion(principal_uid).await.unwrap();
-        let mut assignment = tokio::spawn(async move {
-            independently_opened
-                .assign_principal(PrincipalOwnership {
-                    principal_uid,
-                    fleet_uid: owned_fleet.uid,
-                    assigned_by: owner.uid,
-                })
-                .await
-        });
-
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(50), &mut assignment)
-                .await
-                .is_err(),
-            "assignment must wait while principal deletion owns the mutation barrier"
-        );
-        principals.unregister(&alias, principal_uid);
-        drop(deletion_guard);
-
-        assert!(matches!(
-            assignment.await.unwrap(),
-            Err(OwnershipError::PrincipalNotFound(uid)) if uid == principal_uid
-        ));
-        assert!(
-            store
-                .load()
-                .await
-                .unwrap()
-                .principal_owner(principal_uid)
-                .is_none()
-        );
-    }
-}
+#[path = "ownership_tests.rs"]
+mod tests;

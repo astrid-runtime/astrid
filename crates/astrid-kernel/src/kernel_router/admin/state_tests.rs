@@ -81,6 +81,41 @@ fn assert_error_contains(res: &AdminResponseBody, needle: &str) {
     }
 }
 
+async fn assert_owned_delete_rejected_after_unlink(
+    kernel: &Arc<Kernel>,
+    principal: &PrincipalId,
+    user_id: uuid::Uuid,
+    profile_path: &std::path::Path,
+) {
+    kernel
+        .identity_store
+        .unlink("cli", principal.as_str())
+        .await
+        .unwrap();
+    let retried = handlers::dispatch(
+        kernel,
+        &PrincipalId::default(),
+        AdminRequestKind::AgentDelete {
+            principal: principal.clone(),
+        },
+    )
+    .await;
+    assert_error_contains(&retried, "assigned to fleet");
+    assert!(
+        profile_path.exists(),
+        "retried rejection must retain profile"
+    );
+    assert!(
+        kernel
+            .identity_store
+            .get_user(user_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "retried rejection must retain the durable user"
+    );
+}
+
 fn agent_list_for(response: AdminResponseBody) -> Vec<AgentSummary> {
     match response {
         AdminResponseBody::AgentList(list) => list,
@@ -611,6 +646,11 @@ async fn agent_delete_rejects_a_fleet_owned_principal_without_partial_deletion()
             .is_some(),
         "rejected deletion must retain the identity link"
     );
+
+    // Model a prior partial attempt that removed the frontend link but failed
+    // before deleting the durable user. A retry must recover the user by its
+    // stored principal alias and still enforce ownership.
+    assert_owned_delete_rejected_after_unlink(&kernel, &principal, user.id, &profile_path).await;
     assert_eq!(
         kernel
             .ownership_store
