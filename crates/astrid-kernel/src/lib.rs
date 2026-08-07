@@ -3567,19 +3567,42 @@ async fn bootstrap_cli_root_user(
         return Ok((user, identity));
     }
 
-    // No CLI link exists. Create or find the root user.
-    let user = store
-        .create_principal(principal, initial_public_key)
-        .await?;
-    let identity = store
-        .get_principal_identity(user.id)
-        .await?
-        .ok_or_else(|| {
-            astrid_storage::IdentityError::InvalidInput(
-                "new CLI root principal is missing immutable identity".to_owned(),
-            )
-        })?;
-    tracing::info!(user_id = %user.id, "Created CLI root user");
+    // No CLI link exists. Recover a durable principal left by an interrupted
+    // first boot, or create it when no such record exists yet.
+    let mut recovered = None;
+    for user in store.list_users().await? {
+        if user.principal != principal {
+            continue;
+        }
+        let Some(identity) = store.get_principal_identity(user.id).await? else {
+            continue;
+        };
+        if recovered.is_some() {
+            return Err(astrid_storage::IdentityError::InvalidInput(
+                "multiple durable CLI root principals exist".to_owned(),
+            ));
+        }
+        recovered = Some((user, identity));
+    }
+
+    let (user, identity) = if let Some(existing) = recovered {
+        tracing::info!(user_id = %existing.0.id, "Recovered unlinked CLI root user");
+        existing
+    } else {
+        let user = store
+            .create_principal(principal, initial_public_key)
+            .await?;
+        let identity = store
+            .get_principal_identity(user.id)
+            .await?
+            .ok_or_else(|| {
+                astrid_storage::IdentityError::InvalidInput(
+                    "new CLI root principal is missing immutable identity".to_owned(),
+                )
+            })?;
+        tracing::info!(user_id = %user.id, "Created CLI root user");
+        (user, identity)
+    };
 
     // Link the CLI platform identity.
     store.link("cli", "local", user.id, "system").await?;
@@ -3943,6 +3966,57 @@ mod tests {
     use astrid_capsule_types::CapsuleId;
     use astrid_capsule_types::error::CapsuleResult;
     use astrid_capsule_types::manifest::CapsuleManifest;
+
+    #[tokio::test]
+    async fn cli_root_bootstrap_recovers_a_durable_principal_without_its_link() {
+        let (_dir, home) = scratch_home();
+        seed_default_principal_admin_profile(&home).unwrap();
+        let principal = astrid_core::PrincipalId::default();
+        let initial_public_key = principal_initial_public_key(&home, &principal).unwrap();
+        let backend: Arc<dyn astrid_storage::KvStore> =
+            Arc::new(astrid_storage::MemoryKvStore::new());
+        let directory = astrid_storage::PrincipalDirectory::default();
+        let identity_store: Arc<dyn astrid_storage::IdentityStore> =
+            Arc::new(astrid_storage::KvIdentityStore::with_principal_directory(
+                astrid_storage::ScopedKvStore::new(backend, "system:identity").unwrap(),
+                directory,
+            ));
+        let stranded = identity_store
+            .create_principal(principal, initial_public_key)
+            .await
+            .unwrap();
+        assert!(
+            identity_store
+                .resolve("cli", "local")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let (recovered, recovered_identity) = bootstrap_cli_root_user(&identity_store, &home)
+            .await
+            .unwrap();
+
+        assert_eq!(recovered.id, stranded.id);
+        assert_eq!(
+            identity_store
+                .resolve("cli", "local")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            stranded.id
+        );
+        assert_eq!(identity_store.list_users().await.unwrap().len(), 1);
+        assert_eq!(
+            identity_store
+                .get_principal_identity(stranded.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            recovered_identity
+        );
+    }
 
     #[tokio::test]
     async fn legacy_root_ownership_bootstrap_is_deterministic_and_idempotent() {
