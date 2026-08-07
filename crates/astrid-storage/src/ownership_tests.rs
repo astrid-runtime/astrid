@@ -483,7 +483,8 @@ async fn deletion_guard_serializes_assignment_with_directory_removal() {
 async fn deletion_reservation_can_be_finished_by_alias_after_identity_disappears() {
     let backend = Arc::new(MemoryKvStore::new());
     let principals = PrincipalDirectory::default();
-    let store = OwnershipStore::new(backend, principals.clone()).unwrap();
+    let store = OwnershipStore::new(backend.clone(), principals.clone()).unwrap();
+    let independently_opened = OwnershipStore::new(backend, principals.clone()).unwrap();
     let principal_uid = principal(20, 2);
     let alias = astrid_core::PrincipalId::new("recoverable-deletion").unwrap();
     principals.register(alias.clone(), principal_uid).unwrap();
@@ -492,6 +493,12 @@ async fn deletion_reservation_can_be_finished_by_alias_after_identity_disappears
         .guard_principal_deletion_for_alias(principal_uid, alias.clone())
         .await
         .unwrap();
+    assert!(matches!(
+        independently_opened
+            .finish_principal_deletion_by_alias(&alias)
+            .await,
+        Err(OwnershipError::PrincipalDeletionStillLive(uid)) if uid == principal_uid
+    ));
     principals.unregister(&alias, principal_uid);
     drop(guard);
 
@@ -514,7 +521,7 @@ async fn deletion_reservation_can_be_finished_by_alias_after_identity_disappears
 }
 
 #[tokio::test]
-async fn deletion_reservation_rejects_reusing_an_interrupted_alias() {
+async fn deletion_reservation_rejects_a_second_deletion_for_the_same_alias() {
     let backend = Arc::new(MemoryKvStore::new());
     let principals = PrincipalDirectory::default();
     let store = OwnershipStore::new(backend, principals.clone()).unwrap();

@@ -334,6 +334,11 @@ impl OwnershipStore {
                 .find_map(|(uid, reservation)| {
                     (reservation.alias.as_ref() == Some(&alias)).then_some(*uid)
                 });
+            if let Some(uid) = principal_uid
+                && self.principals.contains_uid(uid)
+            {
+                return Err(OwnershipError::PrincipalDeletionStillLive(uid));
+            }
             Ok(principal_uid
                 .and_then(|uid| graph.principal_deletions.remove(&uid))
                 .is_some())
@@ -780,6 +785,9 @@ pub enum OwnershipError {
     /// A principal cannot be assigned while durable identity deletion is active.
     #[error("principal deletion is in progress: {0}")]
     PrincipalDeletionInProgress(PrincipalUid),
+    /// Recovery cannot clear a reservation while its identity remains live.
+    #[error("principal deletion identity is still live: {0}")]
+    PrincipalDeletionStillLive(PrincipalUid),
     /// A retry attempted to bind one deletion reservation to another alias.
     #[error("principal deletion reservation for {principal} belongs to alias {alias}")]
     DeletionReservationConflict {
