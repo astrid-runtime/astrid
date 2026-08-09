@@ -20,6 +20,14 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Added
 
+- **Capsule archives are now byte-reproducible for identical package inputs and
+  signing identity.** `astrid-build` uses a stable phase and recursive path order
+  with normalized tar ownership, permissions, timestamps, and gzip headers while
+  retaining the existing archive layout and install-time reader compatibility.
+  Regression coverage compares independently built archive bytes, verifies
+  canonical metadata, and makes the signing key an explicit controlled input.
+  Closes #1475; related to #555.
+
 - **Astrid now has durable human and fleet ownership identities independent of
   executable principals and capability groups.** Canonical `UserUid` and
   `FleetUid` genesis records feed an atomically persisted ownership graph with

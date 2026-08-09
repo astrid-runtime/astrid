@@ -263,25 +263,88 @@ fn inject_commands(
         return;
     };
 
+    let command_paths = sorted_command_paths(entries.flatten().map(|entry| entry.path()));
     let mut commands_array = toml_edit::ArrayOfTables::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("toml") {
-            let file_name = path.file_name().unwrap_or_default().to_string_lossy();
-            let cmd_name = format!(
-                "/{}",
-                path.file_stem().unwrap_or_default().to_string_lossy()
-            );
+    for path in command_paths {
+        let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+        let cmd_name = format!(
+            "/{}",
+            path.file_stem().unwrap_or_default().to_string_lossy()
+        );
 
-            let mut cmd_table = toml_edit::Table::new();
-            cmd_table.insert("name", toml_edit::value(cmd_name));
-            cmd_table.insert("file", toml_edit::value(format!("commands/{file_name}")));
-            commands_array.push(cmd_table);
-        }
+        let mut cmd_table = toml_edit::Table::new();
+        cmd_table.insert("name", toml_edit::value(cmd_name));
+        cmd_table.insert("file", toml_edit::value(format!("commands/{file_name}")));
+        commands_array.push(cmd_table);
     }
 
     if !commands_array.is_empty() {
         additional_files.push(commands_dir);
         toml_doc.insert("command", toml_edit::Item::ArrayOfTables(commands_array));
+    }
+}
+
+fn sorted_command_paths(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
+    let mut paths = paths
+        .into_iter()
+        .filter(|path| {
+            path.is_file()
+                && path.extension().and_then(|extension| extension.to_str()) == Some("toml")
+        })
+        .collect::<Vec<_>>();
+    paths.sort_unstable_by(|left, right| left.file_name().cmp(&right.file_name()));
+    paths
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_paths_are_sorted_before_manifest_generation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let commands = temp.path().join("commands");
+        fs::create_dir(&commands).expect("create commands directory");
+        let alpha = commands.join("alpha.toml");
+        let omega = commands.join("omega.toml");
+        fs::write(&alpha, "description = 'alpha'").expect("write alpha command");
+        fs::write(&omega, "description = 'omega'").expect("write omega command");
+
+        let sorted = sorted_command_paths([omega, alpha]);
+        let names = sorted
+            .iter()
+            .map(|path| path.file_name().expect("command filename"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                std::ffi::OsStr::new("alpha.toml"),
+                std::ffi::OsStr::new("omega.toml")
+            ]
+        );
+    }
+
+    #[test]
+    fn command_manifest_entries_follow_canonical_path_order() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let commands = temp.path().join("commands");
+        fs::create_dir(&commands).expect("create commands directory");
+        fs::write(commands.join("omega.toml"), "description = 'omega'")
+            .expect("write omega command");
+        fs::write(commands.join("alpha.toml"), "description = 'alpha'")
+            .expect("write alpha command");
+
+        let mut manifest = toml_edit::DocumentMut::new();
+        let mut additional_files = Vec::new();
+        inject_commands(temp.path(), &mut manifest, &mut additional_files);
+
+        let names = manifest["command"]
+            .as_array_of_tables()
+            .expect("command array")
+            .iter()
+            .map(|command| command["name"].as_str().expect("command name"))
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["/alpha", "/omega"]);
+        assert_eq!(additional_files, [commands]);
     }
 }
