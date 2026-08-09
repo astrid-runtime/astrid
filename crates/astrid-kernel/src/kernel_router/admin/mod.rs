@@ -188,6 +188,7 @@ async fn reject_admin_request_without_caller(
     publish_response(
         kernel,
         response_topic,
+        caller.as_str(),
         AdminKernelResponse::for_request(
             req.request_id,
             AdminResponseBody::Error(MANAGEMENT_CALLER_REQUIRED.to_string()),
@@ -575,6 +576,7 @@ async fn handle_redeem_admin_request(
     publish_response(
         kernel,
         response_topic,
+        caller.as_str(),
         AdminKernelResponse::for_request(request_id, body),
     );
 }
@@ -751,6 +753,7 @@ async fn handle_admin_request(
             publish_response(
                 kernel,
                 response_topic,
+                caller.as_str(),
                 AdminKernelResponse::for_request(request_id, AdminResponseBody::Error(error)),
             );
             return;
@@ -761,6 +764,7 @@ async fn handle_admin_request(
     publish_response(
         kernel,
         response_topic,
+        caller.as_str(),
         AdminKernelResponse::for_request(request_id, body),
     );
 }

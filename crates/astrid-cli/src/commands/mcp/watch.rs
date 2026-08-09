@@ -71,11 +71,8 @@ const ENUMERATE_DEADLINE: Duration = Duration::from_secs(55);
 pub(super) async fn run(peer: Peer<RoleServer>, principal: String) {
     // The watch uplink's session id is ephemeral — it only keys this
     // transport's frames. Bind the connection to the SAME principal the
-    // request handlers use: the proxy pins the first principal it sees per
-    // connection and DROPS any message stamped with a different one, so a
-    // `default`-bound uplink would have this watcher's explicitly-stamped
-    // enumerate requests silently dropped whenever the principal is not
-    // `default`.
+    // request handlers use: the native uplink binds that principal during the
+    // signed connection handshake, before any enumerate request is sent.
     let caller = match astrid_core::PrincipalId::new(&principal) {
         Ok(c) => c,
         Err(e) => {
@@ -185,15 +182,10 @@ pub(super) async fn run(peer: Peer<RoleServer>, principal: String) {
 /// Send a `tools.list` request on the GIVEN uplink and collect the set of tool
 /// names from the broker reply.
 ///
-/// Sending the request is load-bearing beyond enumeration: it also BINDS this
-/// uplink's principal in the cli-proxy (which binds a connection on the first
-/// ingress message it sends). Only a bound uplink is delivered the kernel's
-/// per-principal `capsules_loaded` broadcast, so the watch loop must run at
-/// least one enumeration on its OWN uplink — the baseline seed — or it would
-/// never receive a single reload signal. The request is stamped with
-/// `principal`; the proxy pins the first principal per connection and drops
-/// mismatched stamps, so binding to the request's principal (not `default`)
-/// keeps a non-`default` watcher's later broadcasts flowing.
+/// The request establishes the baseline inventory. The connection was already
+/// bound to `principal` by the signed native-uplink handshake, so subsequent
+/// per-principal `capsules_loaded` broadcasts route to this watcher without a
+/// first-message identity convention.
 async fn enumerate_on(
     client: &mut SocketClient,
     principal: &str,

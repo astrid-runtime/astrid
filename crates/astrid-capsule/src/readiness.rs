@@ -1,7 +1,7 @@
 //! Agent-loop readiness — name-agnostic introspection over the loaded
 //! capsule manifest set.
 //!
-//! The kernel hard-requires only the socket uplink, so a fresh daemon boots
+//! The daemon provides its own socket uplink, so a capsule-free install boots
 //! clean yet may produce no agent replies: `user.v1.prompt` is published, but
 //! if no capsule subscribes it (or the LLM chain is incomplete) the publish
 //! silently no-ops and the client waits out a timeout with no signal.

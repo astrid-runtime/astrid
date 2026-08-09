@@ -56,8 +56,8 @@ async fn main() -> ExitCode {
 
     // Resolve and validate the process-wide principal ONCE, before any
     // socket connection. Every IPC message the process sends stamps
-    // this identity (the uplink proxy pins one principal per connection
-    // and drops mismatches). Invalid input exits with a clear error
+    // this identity (the native uplink binds one verified principal per
+    // connection). Invalid input exits with a clear error
     // naming the constraint.
     match principal::resolve_process(parsed.principal.as_deref()) {
         Ok(p) => principal::set(p),

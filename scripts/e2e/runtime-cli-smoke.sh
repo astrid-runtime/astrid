@@ -344,6 +344,42 @@ run_cli_daemon_lifecycle_smoke() {
     || fail "daemon status missed running daemon"
 }
 
+run_standalone_admin_smoke() {
+  local standalone_root standalone_home standalone_workspace standalone_poison status
+  standalone_root="$(mktemp -d "${TMPDIR:-/tmp}/astrid-standalone-e2e.XXXXXX")"
+  standalone_home="$standalone_root/home"
+  standalone_workspace="$standalone_root/workspace"
+  standalone_poison="$standalone_root/poison-home"
+  mkdir -p "$standalone_home" "$standalone_workspace" "$standalone_poison"
+
+  note "checking capsule-free Astrid start/status/stop/restart"
+  set +e
+  (
+    set -euo pipefail
+    cd "$standalone_workspace"
+    export ASTRID_HOME="$standalone_home" HOME="$standalone_poison"
+    "$CORE_DIR/target/debug/astrid" start
+    "$CORE_DIR/target/debug/astrid" status > "$ARTIFACTS/standalone-status-first.txt"
+    grep -q '0 loaded' "$ARTIFACTS/standalone-status-first.txt"
+    "$CORE_DIR/target/debug/astrid" stop
+    "$CORE_DIR/target/debug/astrid" start
+    "$CORE_DIR/target/debug/astrid" status > "$ARTIFACTS/standalone-status-restart.txt"
+    grep -q '0 loaded' "$ARTIFACTS/standalone-status-restart.txt"
+    "$CORE_DIR/target/debug/astrid" stop
+    if find "$standalone_home/home" -path '*/.local/capsules/*' -print -quit 2>/dev/null \
+      | grep -q .; then
+      printf 'capsule unexpectedly present in standalone home\n' >&2
+      exit 1
+    fi
+  )
+  status=$?
+  set -e
+  env ASTRID_HOME="$standalone_home" HOME="$standalone_poison" \
+    "$CORE_DIR/target/debug/astrid" stop >/dev/null 2>&1 || true
+  rm -rf "$standalone_root"
+  [[ "$status" -eq 0 ]] || fail "capsule-free standalone admin lifecycle failed"
+}
+
 run_isolated_cli() {
   local home=$1 cwd=$2
   shift 2

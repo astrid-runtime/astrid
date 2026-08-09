@@ -1,13 +1,9 @@
 //! Gateway × kernel end-to-end smoke test.
 //!
 //! Boots a real `Kernel` and a real `GatewayState` against a tempdir
-//! `ASTRID_HOME`, then exercises the pieces of the loop that don't
-//! require the `astrid-capsule-cli` proxy capsule. The proxy
-//! capsule is what bridges the kernel's bound Unix socket to its
-//! event bus; without it, `AdminClient::connect` times out on
-//! handshake even though the socket file exists. Loading the proxy
-//! would require a pre-built WASM artefact in this crate's test
-//! fixtures, which is out of scope.
+//! `ASTRID_HOME`, then exercises the gateway and kernel in-process. Astrid's
+//! native daemon-owned uplink is tested separately; no distribution capsule is
+//! required to bridge the canonical socket.
 //!
 //! ## What this proves
 //!
@@ -30,12 +26,11 @@
 //!
 //! ## What this does NOT cover (and why)
 //!
-//! * **`/api/auth/redeem` over the real socket.** The redeem
-//!   handler calls `AdminClient::connect` which times out without
-//!   `astrid-capsule-cli` loaded. Covered manually with `astrid
-//!   start && curl ...` against a built daemon, and by the
-//!   in-process router tests in `astrid-gateway/tests/router.rs`
-//!   that exercise the auth middleware with mocked state.
+//! * **`/api/auth/redeem` over the real socket.** This in-process fixture does
+//!   not spawn the daemon-owned accept loop. The standalone admin smoke test
+//!   covers native-socket lifecycle commands, while the in-process router
+//!   tests in `astrid-gateway/tests/router.rs` cover the redeem endpoint with
+//!   mocked state; neither currently exercises redeem over the real socket.
 //! ## Sandbox note
 //!
 //! Unix-socket bind permissions are blocked in some sandboxed

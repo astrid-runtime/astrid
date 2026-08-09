@@ -27,6 +27,7 @@ pub type UplinkListener =
 /// No uplink socket exists on the browser target; this uninhabited type
 /// makes `Option<UplinkListener>` necessarily `None` there.
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[derive(Clone)]
 pub enum UplinkListener {}
 
 /// Handle to the per-principal overlay VFS registry (Layer 4, issue #668).

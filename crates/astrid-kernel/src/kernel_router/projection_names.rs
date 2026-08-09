@@ -55,6 +55,7 @@ pub(super) async fn try_handle(
             publish_response(
                 kernel,
                 response_topic_for(&message.topic),
+                message.principal.as_deref().unwrap_or("anonymous"),
                 KernelResponse::Error("invalid projection-name diagnostic request".to_owned()),
             );
             return true;
@@ -72,6 +73,7 @@ pub(super) async fn try_handle(
             publish_response(
                 kernel,
                 response_topic_for(&message.topic),
+                message.principal.as_deref().unwrap_or("anonymous"),
                 KernelResponse::Error(MANAGEMENT_CALLER_REQUIRED.to_string()),
             );
             return true;
@@ -121,7 +123,12 @@ async fn handle(
             },
         )
         .await;
-        publish_response(kernel, response_topic, KernelResponse::Error(reason));
+        publish_response(
+            kernel,
+            response_topic,
+            caller.as_str(),
+            KernelResponse::Error(reason),
+        );
         return;
     }
 
@@ -169,5 +176,5 @@ async fn handle(
         let _ = policy;
         KernelResponse::Error("projection-name diagnosis is unavailable on this host".to_owned())
     };
-    publish_response(kernel, response_topic, response);
+    publish_response(kernel, response_topic, caller.as_str(), response);
 }

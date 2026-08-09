@@ -24,6 +24,7 @@ astrid-core = { workspace = true }
 astrid-gateway = { workspace = true }
 astrid-kernel = { workspace = true }
 astrid-telemetry = { workspace = true, features = ["config"] }
+astrid-uplink = { workspace = true }
 clap = { workspace = true }
 colored = { workspace = true }
 # `signal` (SIGTERM/SIGHUP/ctrl-c shutdown), `rt-multi-thread` (the

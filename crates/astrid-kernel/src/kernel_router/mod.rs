@@ -101,6 +101,7 @@ pub(crate) fn spawn_kernel_router(kernel: Arc<crate::Kernel>) -> astrid_runtime:
                             publish_response(
                                 &kernel,
                                 response_topic_for(&message.topic),
+                                message.principal.as_deref().unwrap_or("anonymous"),
                                 KernelResponse::Error(MANAGEMENT_CALLER_REQUIRED.to_string()),
                             );
                             continue;
@@ -284,7 +285,12 @@ async fn handle_request(
                     },
                 )
                 .await;
-                publish_response(kernel, response_topic, KernelResponse::Error(e.to_string()));
+                publish_response(
+                    kernel,
+                    response_topic,
+                    caller.as_str(),
+                    KernelResponse::Error(e.to_string()),
+                );
                 return;
             },
         };
@@ -317,7 +323,12 @@ async fn handle_request(
             },
         )
         .await;
-        publish_response(kernel, response_topic, KernelResponse::Error(reason));
+        publish_response(
+            kernel,
+            response_topic,
+            caller.as_str(),
+            KernelResponse::Error(reason),
+        );
         return;
     }
     record_admin_audit(
@@ -344,7 +355,7 @@ async fn handle_request(
     // across every request — no per-endpoint config. Dropped before each
     // terminal publish below so the terminal frame is never preceded by a late
     // redundant ping.
-    let pinger = KeepalivePinger::spawn(kernel, response_topic.clone());
+    let pinger = KeepalivePinger::spawn(kernel, response_topic.clone(), &caller);
 
     let res = match req {
         KernelRequest::InstallCapsule { source, workspace } => {
@@ -459,6 +470,7 @@ async fn handle_request(
             publish_response(
                 kernel,
                 response_topic.clone(),
+                caller.as_str(),
                 KernelResponse::Success(serde_json::json!({"status": "shutting_down"})),
             );
             // Signal the daemon's main loop to exit gracefully.
@@ -519,7 +531,7 @@ async fn handle_request(
     // Stop the keepalive before the terminal frame so it isn't preceded by a
     // late redundant `Working`.
     drop(pinger);
-    publish_response(kernel, response_topic, res);
+    publish_response(kernel, response_topic, caller.as_str(), res);
 }
 
 async fn inventory_manifest_map(

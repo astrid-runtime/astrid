@@ -161,19 +161,6 @@ fn resolve_http_limits(cfg: Option<&astrid_config::Config>) -> astrid_capsule::H
     )
 }
 
-/// Whether a loaded capsule can serve the kernel-owned CLI Unix socket.
-///
-/// Package names are distribution policy. The runtime identifies the bridge
-/// by the behavior it requests: a long-lived uplink with a Unix bind.
-fn provides_cli_socket_uplink(manifest: &astrid_capsule::manifest::CapsuleManifest) -> bool {
-    manifest.capabilities.uplink
-        && manifest.capabilities.net_bind.iter().any(|binding| {
-            binding
-                .strip_prefix("unix:")
-                .is_some_and(|address| !address.trim().is_empty())
-        })
-}
-
 fn write_readiness_then_arm_ephemeral<T, E>(
     ephemeral: bool,
     write_readiness: impl FnOnce() -> Result<T, E>,
@@ -193,8 +180,8 @@ fn write_readiness_then_arm_ephemeral<T, E>(
 ///
 /// # Errors
 ///
-/// Returns an error if the kernel fails to boot, the CLI proxy capsule is
-/// missing, or the readiness file cannot be written.
+/// Returns an error if the kernel fails to boot, the native local uplink cannot
+/// claim its listener, or the readiness file cannot be written.
 #[expect(
     clippy::too_many_lines,
     reason = "boot sequence: sequential config resolution + kernel/capsule setup that does not benefit from splitting"
@@ -266,6 +253,21 @@ pub async fn run() -> Result<()> {
     .await
     .map_err(|e| anyhow::anyhow!("Failed to boot Kernel: {e}"))?;
 
+    // Astrid owns its baseline control plane. Start it before loading optional
+    // distribution capsules so no capsule can race the canonical listener or
+    // make a clean runtime unbootable by being absent or broken.
+    let native_listener = kernel
+        .claim_native_uplink_listener()
+        .ok_or_else(|| anyhow::anyhow!("native local uplink listener is unavailable"))?;
+    let native_uplink_task = astrid_uplink::native::NativeUplink {
+        listener: native_listener,
+        session_token: std::sync::Arc::clone(&kernel.session_token),
+        home: astrid_home.clone(),
+        event_bus: std::sync::Arc::clone(&kernel.event_bus),
+        shutdown: kernel.shutdown_tx.subscribe(),
+    }
+    .spawn();
+
     // In ephemeral mode, shut down immediately when the last client disconnects.
     if args.ephemeral {
         kernel.set_ephemeral(true);
@@ -288,26 +290,6 @@ pub async fn run() -> Result<()> {
             "failed to refresh canonical astrid-contracts.wit at boot; \
              contracts skew checks may lack a current baseline"
         );
-    }
-
-    // Verify a compatible CLI socket uplink loaded. Without one, the daemon
-    // has no accept loop and CLI connections will always time out. Identify
-    // the provider by manifest behavior, never a distribution package name.
-    {
-        let reg = kernel.capsules.read().await;
-        let has_cli_proxy = reg
-            .values()
-            .any(|capsule| provides_cli_socket_uplink(capsule.manifest()));
-        if !has_cli_proxy {
-            tracing::error!(
-                "compatible CLI socket uplink not found - \
-                 daemon cannot accept CLI connections"
-            );
-            anyhow::bail!(
-                "Compatible CLI socket uplink not found. \
-                 Install a capsule that provides a Unix socket uplink, then restart the daemon."
-            );
-        }
     }
 
     // Signal readiness AFTER the default CLI/system view is loaded and
@@ -400,6 +382,9 @@ pub async fn run() -> Result<()> {
     }
 
     kernel.shutdown(Some("signal".to_string())).await;
+    if let Err(error) = native_uplink_task.await {
+        tracing::warn!(%error, "native local uplink task did not exit cleanly");
+    }
 
     Ok(())
 }
@@ -484,44 +469,8 @@ fn spawn_gateway(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        DAEMON_LOG_TARGET_ENV, daemon_log_config, provides_cli_socket_uplink,
-        write_readiness_then_arm_ephemeral,
-    };
-    use astrid_capsule::manifest::CapsuleManifest;
+    use super::{DAEMON_LOG_TARGET_ENV, daemon_log_config, write_readiness_then_arm_ephemeral};
     use std::sync::Mutex;
-
-    fn manifest(name: &str, uplink: bool, net_bind: &[&str]) -> CapsuleManifest {
-        let mut manifest = CapsuleManifest::default();
-        manifest.package.name = name.to_owned();
-        manifest.capabilities.uplink = uplink;
-        manifest.capabilities.net_bind = net_bind.iter().map(ToString::to_string).collect();
-        manifest
-    }
-
-    #[test]
-    fn accepts_renamed_cli_socket_uplink() {
-        let renamed = manifest("distribution-cli", true, &["unix:*"]);
-        assert!(provides_cli_socket_uplink(&renamed));
-    }
-
-    #[test]
-    fn rejects_incomplete_or_non_unix_uplinks() {
-        let cases = [
-            manifest("no-uplink", false, &["unix:*"]),
-            manifest("no-bind", true, &[]),
-            manifest("tcp-only", true, &["127.0.0.1:8080"]),
-            manifest("empty-unix-bind", true, &["unix:"]),
-        ];
-
-        for manifest in cases {
-            assert!(
-                !provides_cli_socket_uplink(&manifest),
-                "{} must not satisfy CLI socket readiness",
-                manifest.package.name
-            );
-        }
-    }
 
     #[test]
     fn daemon_log_target_unset_defaults_to_file() {

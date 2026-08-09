@@ -130,6 +130,10 @@ pub struct Kernel {
     pub home_root: Option<PathBuf>,
     /// The natively bound Unix Socket for the CLI proxy.
     pub cli_socket_listener: Option<astrid_capsule::context::UplinkListener>,
+    /// Set once the Astrid-owned native uplink claims the canonical listener.
+    /// Capsules then receive no handle to that endpoint, preventing competing
+    /// accept loops from randomly splitting client connections.
+    native_uplink_owns_listener: AtomicBool,
     /// Exclusive advisory lock enforcing a single kernel instance, held for
     /// the daemon's lifetime (see [`socket::acquire_boot_singleton_lock`],
     /// acquired before the KV/audit stores open). `None` for test kernels that
@@ -350,6 +354,24 @@ impl KernelResources {
 }
 
 impl Kernel {
+    /// Claim the canonical local listener for Astrid's built-in uplink.
+    ///
+    /// The first caller receives the shared listener. Once claimed, capsule
+    /// contexts no longer receive it; optional distribution frontends may
+    /// expose other transports but cannot replace or race the base control
+    /// plane.
+    #[must_use]
+    pub fn claim_native_uplink_listener(&self) -> Option<astrid_capsule::context::UplinkListener> {
+        if self
+            .native_uplink_owns_listener
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return None;
+        }
+        self.cli_socket_listener.clone()
+    }
+
     /// Astrid's authoritative human-to-fleet ownership store.
     #[must_use]
     pub fn ownership_store(&self) -> &Arc<astrid_storage::OwnershipStore> {
@@ -854,6 +876,7 @@ impl Kernel {
             workspace_selection,
             home_root,
             cli_socket_listener,
+            native_uplink_owns_listener: AtomicBool::new(false),
             singleton_lock,
             kv,
             #[cfg(not(target_family = "wasm"))]
@@ -1162,13 +1185,16 @@ impl Kernel {
         }
         self.verify_workspace_capsule_tree(dir)?;
 
+        let capsule_listener = (!self.native_uplink_owns_listener.load(Ordering::Acquire))
+            .then(|| self.cli_socket_listener.clone())
+            .flatten();
         let ctx = astrid_capsule::context::CapsuleContext::new(
             load_principal,
             self.workspace_root.clone(),
             self.home_root.clone(),
             kv,
             Arc::clone(&self.event_bus),
-            self.cli_socket_listener.clone(),
+            capsule_listener,
         )
         .with_registry(Arc::clone(&self.capsules))
         .with_session_token(Arc::clone(&self.session_token))
@@ -1451,7 +1477,7 @@ impl Kernel {
         // turn. Computed from the live registry *after* load completes (not the
         // pre-load discovered set) so a manifest that failed to load is not
         // mistaken for a working capability. Without this a fresh daemon
-        // (socket uplink only) boots clean yet silently drops every prompt —
+        // (native control plane only) boots clean yet silently drops every prompt —
         // name-agnostic introspection turns that into one actionable warning.
         {
             let reg = self.capsules.read().await;
@@ -2640,6 +2666,7 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
             .expect("test workspace selection"),
         home_root: Some(principal_home.root().to_path_buf()),
         cli_socket_listener: None,
+        native_uplink_owns_listener: AtomicBool::new(false),
         singleton_lock: None,
         kv,
         #[cfg(not(target_family = "wasm"))]

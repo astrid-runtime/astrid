@@ -17,10 +17,11 @@ use serde::Serialize;
 pub(crate) fn publish_response<R: Serialize>(
     kernel: &Arc<crate::Kernel>,
     response_topic: Topic,
+    principal: &str,
     res: R,
 ) {
     if let Ok(val) = serde_json::to_value(res) {
-        publish_response_value(kernel, response_topic, val);
+        publish_response_value(kernel, response_topic, principal, val);
     }
 }
 
@@ -35,13 +36,15 @@ pub(crate) fn publish_response<R: Serialize>(
 pub(crate) fn publish_response_value(
     kernel: &Arc<crate::Kernel>,
     response_topic: Topic,
+    principal: &str,
     val: serde_json::Value,
 ) {
     let msg = IpcMessage::new(
         response_topic,
         IpcPayload::RawJson(val),
         kernel.session_id.0,
-    );
+    )
+    .with_principal(principal);
     let _ = kernel.event_bus.publish(astrid_events::AstridEvent::Ipc {
         metadata: astrid_events::EventMetadata::new("kernel_router"),
         message: msg,
@@ -78,8 +81,12 @@ impl KeepalivePinger {
     /// Spawn the keepalive task for `response_topic`. The first `Working` frame
     /// is emitted only after the first [`KEEPALIVE_INTERVAL`] sleep, so a
     /// handler that completes sooner produces none.
-    pub(crate) fn spawn(kernel: &Arc<crate::Kernel>, response_topic: Topic) -> Self {
-        Self::spawn_with_interval(kernel, response_topic, KEEPALIVE_INTERVAL)
+    pub(crate) fn spawn(
+        kernel: &Arc<crate::Kernel>,
+        response_topic: Topic,
+        principal: &PrincipalId,
+    ) -> Self {
+        Self::spawn_with_interval(kernel, response_topic, principal, KEEPALIVE_INTERVAL)
     }
 
     /// [`spawn`](Self::spawn) with an explicit interval. Production passes
@@ -88,16 +95,18 @@ impl KeepalivePinger {
     fn spawn_with_interval(
         kernel: &Arc<crate::Kernel>,
         response_topic: Topic,
+        principal: &PrincipalId,
         interval: Duration,
     ) -> Self {
         let kernel = Arc::clone(kernel);
+        let principal = principal.to_string();
         let handle = astrid_runtime::spawn(async move {
             loop {
                 astrid_runtime::time::sleep(interval).await;
                 let Ok(val) = serde_json::to_value(KernelResponse::Working) else {
                     return;
                 };
-                publish_response_value(&kernel, response_topic.clone(), val);
+                publish_response_value(&kernel, response_topic.clone(), &principal, val);
             }
         });
         Self { handle }
@@ -163,8 +172,13 @@ mod tests {
         let mut rx = kernel.event_bus.subscribe_topic(response_topic.as_str());
 
         let interval = std::time::Duration::from_millis(40);
-        let pinger =
-            KeepalivePinger::spawn_with_interval(&kernel, response_topic.clone(), interval);
+        let principal = PrincipalId::new("alice").expect("valid principal");
+        let pinger = KeepalivePinger::spawn_with_interval(
+            &kernel,
+            response_topic.clone(),
+            &principal,
+            interval,
+        );
 
         // Count Working frames over ~5 intervals while the guard is alive.
         let deadline = astrid_runtime::time::Instant::now() + std::time::Duration::from_millis(220);
@@ -182,6 +196,7 @@ mod tests {
                         && let Ok(KernelResponse::Working) =
                             serde_json::from_value::<KernelResponse>(val.clone())
                     {
+                        assert_eq!(message.principal.as_deref(), Some("alice"));
                         working_seen += 1;
                     }
                 },
