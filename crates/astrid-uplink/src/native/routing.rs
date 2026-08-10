@@ -87,13 +87,23 @@ pub(super) fn payload_request_id(payload: &IpcPayload) -> Option<&str> {
     }
 }
 
-fn outbound_session(message: &IpcMessage) -> Option<&str> {
+pub(super) fn outbound_session(message: &IpcMessage) -> Option<&str> {
     matches!(
         message.topic.as_str(),
         CHAT_RESPONSE_TOPIC | CHAT_DELTA_TOPIC
     )
     .then(|| payload_session_id(&message.payload))
     .flatten()
+}
+
+pub(super) fn is_cancel_turn(payload: &IpcPayload) -> bool {
+    matches!(
+        payload,
+        IpcPayload::UserInput {
+            context: Some(context),
+            ..
+        } if context.get("action").and_then(serde_json::Value::as_str) == Some("cancel_turn")
+    )
 }
 
 pub(super) fn should_deliver(
@@ -247,6 +257,22 @@ mod tests {
         assert!(!ingress_allowed("astrid.v1.admin.response.status.fake"));
         assert!(ingress_allowed("astrid.v1.admin.status.fake"));
         assert!(ingress_allowed("sage.v1.hook.before_tool_call"));
+    }
+
+    #[test]
+    fn recognizes_only_explicit_cancel_turn_control_payload() {
+        let cancel = IpcPayload::UserInput {
+            text: String::new(),
+            session_id: "session-1".to_owned(),
+            context: Some(serde_json::json!({"action": "cancel_turn"})),
+        };
+        let ordinary = IpcPayload::UserInput {
+            text: "hello".to_owned(),
+            session_id: "session-1".to_owned(),
+            context: None,
+        };
+        assert!(is_cancel_turn(&cancel));
+        assert!(!is_cancel_turn(&ordinary));
     }
 
     #[test]

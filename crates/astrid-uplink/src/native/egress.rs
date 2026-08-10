@@ -1,6 +1,6 @@
 //! Per-connection egress queues for the native local transport.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use astrid_events::{AstridEvent, EventBus};
@@ -51,7 +51,7 @@ struct ClientQueue {
 /// or cause an unrelated connection to report lag.
 pub(super) struct Registry {
     clients: Mutex<HashMap<uuid::Uuid, ClientQueue>>,
-    active_turns: Mutex<HashSet<(String, String)>>,
+    active_turns: Mutex<HashMap<(String, String), uuid::Uuid>>,
 }
 
 pub(super) struct Subscription {
@@ -66,7 +66,7 @@ impl Registry {
     pub(super) fn install(event_bus: &Arc<EventBus>) -> Arc<Self> {
         let registry = Arc::new(Self {
             clients: Mutex::new(HashMap::new()),
-            active_turns: Mutex::new(HashSet::new()),
+            active_turns: Mutex::new(HashMap::new()),
         });
         let weak_registry = Arc::downgrade(&registry);
         event_bus.observe_permanently(EVENT_SOURCE, move |event| {
@@ -76,19 +76,23 @@ impl Registry {
             let Some(message) = event_message(event) else {
                 return;
             };
-            if let (Some(principal), Some(session)) = (
-                message.principal.as_deref(),
-                routing::completed_chat_session(message),
-            ) {
+            if !routing::egress_allowed(event_topic(event).unwrap_or_default()) {
+                return;
+            }
+
+            let turn_key = message.principal.as_deref().and_then(|principal| {
+                routing::outbound_session(message)
+                    .map(|session| (principal.to_owned(), session.to_owned()))
+            });
+            let turn_owner = turn_key.as_ref().and_then(|key| {
                 registry
                     .active_turns
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&(principal.to_owned(), session.to_owned()));
-            }
-            if !routing::egress_allowed(event_topic(event).unwrap_or_default()) {
-                return;
-            }
+                    .get(key)
+                    .copied()
+            });
+            let completed = routing::completed_chat_session(message).is_some();
 
             // Match the bare frame written by `write_message` rather than the
             // richer internal envelope (whose tagged RawJson representation
@@ -110,7 +114,10 @@ impl Registry {
                 .clients
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for client in clients.values() {
+            for (id, client) in clients.iter() {
+                if turn_key.is_some() && turn_owner != Some(*id) {
+                    continue;
+                }
                 let session = client
                     .session
                     .read()
@@ -122,6 +129,25 @@ impl Registry {
                     session.as_deref(),
                 ) {
                     client.queue.enqueue(Arc::clone(&event), event_bytes);
+                }
+            }
+            if completed
+                && let Some(owner) = turn_owner
+                && let Some(client) = clients.get(&owner)
+            {
+                *client
+                    .session
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            }
+            drop(clients);
+            if completed && let (Some(key), Some(owner)) = (turn_key, turn_owner) {
+                let mut active = registry
+                    .active_turns
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if active.get(&key) == Some(&owner) {
+                    active.remove(&key);
                 }
             }
         });
@@ -163,18 +189,29 @@ impl Subscription {
         let Some(registry) = self.registry.upgrade() else {
             return false;
         };
-        registry
+        let mut current = self
+            .session
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if current.is_some() {
+            return false;
+        }
+        let inserted = match registry
             .active_turns
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert((self.principal.clone(), session.to_owned()))
-    }
-
-    pub(super) fn set_session(&self, session: Option<String>) {
-        *self
-            .session
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = session;
+            .entry((self.principal.clone(), session.to_owned()))
+        {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(self.id);
+                true
+            },
+            std::collections::hash_map::Entry::Occupied(_) => false,
+        };
+        if inserted {
+            *current = Some(session.to_owned());
+        }
+        inserted
     }
 
     pub(super) fn session(&self) -> Option<String> {
@@ -276,6 +313,16 @@ impl Drop for Subscription {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&self.id);
+        if let Some(session) = self.session() {
+            let key = (self.principal.clone(), session);
+            let mut active = registry
+                .active_turns
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if active.get(&key) == Some(&self.id) {
+                active.remove(&key);
+            }
+        }
     }
 }
 
@@ -325,8 +372,8 @@ mod tests {
     fn one_turn_per_principal_session_until_terminal_publication() {
         let bus = Arc::new(EventBus::new());
         let registry = Registry::install(&bus);
-        let first = registry.subscribe("alice".to_owned(), None);
-        let second = registry.subscribe("alice".to_owned(), None);
+        let mut first = registry.subscribe("alice".to_owned(), None);
+        let mut second = registry.subscribe("alice".to_owned(), None);
 
         assert!(first.begin_turn("session-1"));
         assert!(!second.begin_turn("session-1"));
@@ -346,6 +393,58 @@ mod tests {
             .with_principal("alice"),
         });
 
+        assert_eq!(first.session(), None);
+        assert!(!second.begin_turn("session-1"));
+        assert!(first.try_recv().is_ok(), "owner receives its terminal");
+
+        bus.publish(AstridEvent::Ipc {
+            metadata: EventMetadata::new("test"),
+            message: IpcMessage::new(
+                Topic::from_raw("agent.v1.response"),
+                IpcPayload::AgentResponse {
+                    text: "done".to_owned(),
+                    is_final: true,
+                    session_id: "session-2".to_owned(),
+                },
+                uuid::Uuid::nil(),
+            )
+            .with_principal("alice"),
+        });
+        assert_eq!(second.session(), None);
+        assert!(
+            second.try_recv().is_ok(),
+            "second owner receives its terminal"
+        );
+        assert!(second.begin_turn("session-1"));
+
+        bus.publish(AstridEvent::Ipc {
+            metadata: EventMetadata::new("test"),
+            message: IpcMessage::new(
+                Topic::from_raw("agent.v1.stream.delta"),
+                IpcPayload::RawJson(serde_json::json!({
+                    "session_id": "session-1",
+                    "delta": "new"
+                })),
+                uuid::Uuid::nil(),
+            )
+            .with_principal("alice"),
+        });
+        assert!(matches!(first.try_recv(), Err(TryRecvError::Empty)));
+        assert!(
+            second.try_recv().is_ok(),
+            "only the new owner receives deltas"
+        );
+    }
+
+    #[test]
+    fn dropping_turn_owner_releases_only_its_admission() {
+        let bus = Arc::new(EventBus::new());
+        let registry = Registry::install(&bus);
+        let first = registry.subscribe("alice".to_owned(), None);
+        let second = registry.subscribe("alice".to_owned(), None);
+
+        assert!(first.begin_turn("session-1"));
+        drop(first);
         assert!(second.begin_turn("session-1"));
     }
 }
