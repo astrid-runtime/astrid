@@ -372,13 +372,10 @@ async fn serve_connection(
                     // outbound frames before closing the transport. Without
                     // this, `select!` can observe shutdown first and discard
                     // the acknowledgement the CLI is waiting for.
-                    let session = receiver.session();
                     drain_outbound_on_shutdown(
                         &mut writer,
                         &mut receiver,
                         &principal,
-                        identity.device_key_id.as_deref(),
-                        session.as_deref(),
                         &mut stream_accumulators,
                     ).await;
                     break;
@@ -421,9 +418,6 @@ async fn serve_connection(
                 if let Err(error) = forward_outbound(
                     &mut writer,
                     &event,
-                    &principal,
-                    identity.device_key_id.as_deref(),
-                    receiver.session().as_deref(),
                     &mut stream_accumulators,
                 ).await {
                     tracing::warn!(%principal, %error, "local uplink write failed");
@@ -453,8 +447,6 @@ async fn drain_outbound_on_shutdown(
     writer: &mut LocalWriteHalf,
     receiver: &mut egress::Subscription,
     principal: &str,
-    device_key_id: Option<&str>,
-    session: Option<&str>,
     stream_accumulators: &mut HashMap<String, Option<String>>,
 ) {
     loop {
@@ -470,16 +462,7 @@ async fn drain_outbound_on_shutdown(
                 break;
             },
         };
-        if let Err(error) = forward_outbound(
-            writer,
-            &event,
-            principal,
-            device_key_id,
-            session,
-            stream_accumulators,
-        )
-        .await
-        {
+        if let Err(error) = forward_outbound(writer, &event, stream_accumulators).await {
             tracing::warn!(
                 %principal,
                 %error,
@@ -493,17 +476,16 @@ async fn drain_outbound_on_shutdown(
 async fn forward_outbound(
     writer: &mut LocalWriteHalf,
     event: &AstridEvent,
-    principal: &str,
-    device_key_id: Option<&str>,
-    session: Option<&str>,
     stream_accumulators: &mut HashMap<String, Option<String>>,
 ) -> std::io::Result<()> {
     let AstridEvent::Ipc { message, .. } = event else {
         return Ok(());
     };
-    if !routing::should_deliver(message, principal, device_key_id, session) {
-        return Ok(());
-    }
+    // The per-subscription queue admitted this event synchronously at
+    // publication time using immutable principal/device identity and the
+    // then-current turn owner. Do not re-check mutable session state here:
+    // terminal publication clears ownership after enqueueing, and a second
+    // filter would discard that accepted terminal plus earlier queued deltas.
     let mut message = message.clone();
     routing::reconcile_stream(&mut message, stream_accumulators);
     write_message(writer, &message).await
