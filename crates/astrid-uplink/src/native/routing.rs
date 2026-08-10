@@ -111,10 +111,13 @@ pub(super) fn should_deliver(
     {
         return false;
     }
-    match outbound_session(message) {
-        Some(target) => session == Some(target),
-        None => true,
+    if matches!(
+        message.topic.as_str(),
+        CHAT_RESPONSE_TOPIC | CHAT_DELTA_TOPIC
+    ) {
+        return outbound_session(message).is_some_and(|target| session == Some(target));
     }
+    true
 }
 
 pub(super) fn completed_chat_session(message: &IpcMessage) -> Option<&str> {
@@ -286,6 +289,19 @@ mod tests {
         assert!(should_deliver(&message, "alice", None, Some("one")));
         assert!(!should_deliver(&message, "bob", None, Some("one")));
         assert!(!should_deliver(&message, "alice", None, Some("two")));
+    }
+
+    #[test]
+    fn malformed_chat_frame_without_session_fails_closed() {
+        for topic in [CHAT_RESPONSE_TOPIC, CHAT_DELTA_TOPIC] {
+            let message = IpcMessage::new(
+                Topic::from_raw(topic),
+                IpcPayload::RawJson(serde_json::json!({"text": "unscoped"})),
+                Uuid::nil(),
+            )
+            .with_principal("alice");
+            assert!(!should_deliver(&message, "alice", None, Some("session-1")));
+        }
     }
 
     #[test]
