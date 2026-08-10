@@ -1,17 +1,47 @@
 //! Per-connection egress queues for the native local transport.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use astrid_events::{AstridEvent, EventBus};
 
-use super::{CLIENT_EGRESS_CAPACITY, EVENT_SOURCE, event_topic, routing};
+use super::{CLIENT_EGRESS_CAPACITY, EVENT_SOURCE, MAX_PAYLOAD_BYTES, event_topic, routing};
+
+const CLIENT_EGRESS_BYTE_BUDGET: usize = 16 * MAX_PAYLOAD_BYTES;
+
+struct QueuedEvent {
+    event: Arc<AstridEvent>,
+    bytes: usize,
+}
+
+#[derive(Default)]
+struct QueueState {
+    events: VecDeque<QueuedEvent>,
+    bytes: usize,
+    overflowed: bool,
+}
+
+struct EgressQueue {
+    state: Mutex<QueueState>,
+    ready: tokio::sync::Notify,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(super) enum RecvError {
+    Lagged,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(super) enum TryRecvError {
+    Empty,
+    Lagged,
+}
 
 struct ClientQueue {
     principal: String,
     device_key_id: Option<String>,
     session: Arc<RwLock<Option<String>>>,
-    sender: tokio::sync::broadcast::Sender<Arc<AstridEvent>>,
+    queue: Arc<EgressQueue>,
 }
 
 /// Registry consulted synchronously while events are published.
@@ -27,7 +57,7 @@ pub(super) struct Subscription {
     id: uuid::Uuid,
     registry: Weak<Registry>,
     session: Arc<RwLock<Option<String>>>,
-    receiver: tokio::sync::broadcast::Receiver<Arc<AstridEvent>>,
+    queue: Arc<EgressQueue>,
 }
 
 impl Registry {
@@ -47,6 +77,21 @@ impl Registry {
                 return;
             }
 
+            // Match the bare frame written by `write_message` rather than the
+            // richer internal envelope (whose tagged RawJson representation
+            // is intentionally not the local wire shape). The fixed overhead
+            // conservatively covers topic, principal, source UUID, and JSON
+            // field syntax.
+            let event_bytes = message
+                .payload
+                .to_guest_bytes()
+                .map_or(usize::MAX, |bytes| {
+                    bytes
+                        .len()
+                        .saturating_add(message.topic.as_str().len())
+                        .saturating_add(message.principal.as_deref().map_or(0, str::len))
+                        .saturating_add(1024)
+                });
             let event = Arc::new(event.clone());
             let clients = registry
                 .clients
@@ -63,7 +108,7 @@ impl Registry {
                     client.device_key_id.as_deref(),
                     session.as_deref(),
                 ) {
-                    let _ = client.sender.send(Arc::clone(&event));
+                    client.queue.enqueue(Arc::clone(&event), event_bytes);
                 }
             }
         });
@@ -77,7 +122,7 @@ impl Registry {
     ) -> Subscription {
         let id = uuid::Uuid::new_v4();
         let session = Arc::new(RwLock::new(None));
-        let (sender, receiver) = tokio::sync::broadcast::channel(CLIENT_EGRESS_CAPACITY);
+        let queue = Arc::new(EgressQueue::new());
         self.clients
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -87,14 +132,14 @@ impl Registry {
                     principal,
                     device_key_id,
                     session: Arc::clone(&session),
-                    sender,
+                    queue: Arc::clone(&queue),
                 },
             );
         Subscription {
             id,
             registry: Arc::downgrade(self),
             session,
-            receiver,
+            queue,
         }
     }
 }
@@ -114,16 +159,85 @@ impl Subscription {
             .clone()
     }
 
-    pub(super) async fn recv(
-        &mut self,
-    ) -> Result<Arc<AstridEvent>, tokio::sync::broadcast::error::RecvError> {
-        self.receiver.recv().await
+    pub(super) async fn recv(&mut self) -> Result<Arc<AstridEvent>, RecvError> {
+        self.queue.recv().await
     }
 
-    pub(super) fn try_recv(
-        &mut self,
-    ) -> Result<Arc<AstridEvent>, tokio::sync::broadcast::error::TryRecvError> {
-        self.receiver.try_recv()
+    pub(super) fn try_recv(&mut self) -> Result<Arc<AstridEvent>, TryRecvError> {
+        self.queue.try_recv()
+    }
+}
+
+impl EgressQueue {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(QueueState::default()),
+            ready: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn enqueue(&self, event: Arc<AstridEvent>, bytes: usize) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.overflowed {
+            return;
+        }
+        if state.events.len() >= CLIENT_EGRESS_CAPACITY
+            || bytes > CLIENT_EGRESS_BYTE_BUDGET.saturating_sub(state.bytes)
+        {
+            // Release retained frames immediately. The affected connection
+            // observes Lagged and fail-closes; other clients have independent
+            // queues and remain available.
+            state.events.clear();
+            state.bytes = 0;
+            state.overflowed = true;
+            drop(state);
+            self.ready.notify_one();
+            return;
+        }
+        state.bytes = state.bytes.saturating_add(bytes);
+        state.events.push_back(QueuedEvent { event, bytes });
+        drop(state);
+        self.ready.notify_one();
+    }
+
+    async fn recv(&self) -> Result<Arc<AstridEvent>, RecvError> {
+        loop {
+            // Register before inspecting state so a publisher cannot notify
+            // between the empty check and this task beginning to wait.
+            let ready = self.ready.notified();
+            {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if state.overflowed {
+                    return Err(RecvError::Lagged);
+                }
+                if let Some(queued) = state.events.pop_front() {
+                    state.bytes = state.bytes.saturating_sub(queued.bytes);
+                    return Ok(queued.event);
+                }
+            }
+            ready.await;
+        }
+    }
+
+    fn try_recv(&self) -> Result<Arc<AstridEvent>, TryRecvError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.overflowed {
+            return Err(TryRecvError::Lagged);
+        }
+        let Some(queued) = state.events.pop_front() else {
+            return Err(TryRecvError::Empty);
+        };
+        state.bytes = state.bytes.saturating_sub(queued.bytes);
+        Ok(queued.event)
     }
 }
 
@@ -145,4 +259,40 @@ fn event_message(event: &AstridEvent) -> Option<&astrid_types::ipc::IpcMessage> 
         return None;
     };
     Some(message)
+}
+
+#[cfg(test)]
+mod tests {
+    use astrid_events::EventMetadata;
+    use astrid_types::Topic;
+    use astrid_types::ipc::{IpcMessage, IpcPayload};
+
+    use super::*;
+
+    fn event() -> Arc<AstridEvent> {
+        Arc::new(AstridEvent::Ipc {
+            metadata: EventMetadata::new("test"),
+            message: IpcMessage::new(
+                Topic::from_raw("astrid.v1.response.test"),
+                IpcPayload::RawJson(serde_json::json!({"ok": true})),
+                uuid::Uuid::nil(),
+            )
+            .with_principal("alice"),
+        })
+    }
+
+    #[tokio::test]
+    async fn byte_budget_fail_closes_and_releases_retained_events() {
+        let queue = EgressQueue::new();
+        queue.enqueue(event(), CLIENT_EGRESS_BYTE_BUDGET);
+        queue.enqueue(event(), 1);
+
+        assert!(matches!(queue.recv().await, Err(RecvError::Lagged)));
+        let state = queue
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(state.events.is_empty());
+        assert_eq!(state.bytes, 0);
+    }
 }

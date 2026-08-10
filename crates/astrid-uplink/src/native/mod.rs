@@ -11,9 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use astrid_core::dirs::AstridHome;
-use astrid_core::local_transport::{
-    self, LocalListener, LocalReadHalf, LocalStream, LocalWriteHalf,
-};
+use astrid_core::local_transport::{self, LocalListener, LocalStream, LocalWriteHalf};
 use astrid_core::session_token::SessionToken;
 use astrid_events::{AstridEvent, EventBus, EventMetadata};
 use astrid_types::Topic;
@@ -162,7 +160,8 @@ async fn serve_connection(
     publish_lifecycle(&event_bus, Topic::client_connect(), &principal, None);
     tracing::info!(%principal, authenticated = identity.is_principal_verified(), "local client connected");
 
-    let (mut reader, mut writer) = local_transport::split(stream);
+    let (reader, mut writer) = local_transport::split(stream);
+    let mut reader = FramedReader::new(reader);
     let mut stream_accumulators = HashMap::new();
 
     loop {
@@ -187,7 +186,7 @@ async fn serve_connection(
                     break;
                 }
             },
-            inbound = read_message(&mut reader) => match inbound {
+            inbound = reader.read_message() => match inbound {
                 Ok(Some(message)) => {
                     if let Err(reason) = validate_ingress(&message) {
                         tracing::warn!(security_event = true, %principal, %reason, "dropped local uplink message");
@@ -228,12 +227,10 @@ async fn serve_connection(
             outbound = receiver.recv() => {
                 let event = match outbound {
                     Ok(event) => event,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(dropped)) => {
+                    Err(egress::RecvError::Lagged) => {
                         tracing::error!(
                             security_event = true,
                             %principal,
-                            dropped,
                             "closing lagged local uplink connection"
                         );
                         break;
@@ -274,15 +271,11 @@ async fn drain_outbound_on_shutdown(
     loop {
         let event = match receiver.try_recv() {
             Ok(event) => event,
-            Err(
-                tokio::sync::broadcast::error::TryRecvError::Empty
-                | tokio::sync::broadcast::error::TryRecvError::Closed,
-            ) => break,
-            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(dropped)) => {
+            Err(egress::TryRecvError::Empty) => break,
+            Err(egress::TryRecvError::Lagged) => {
                 tracing::error!(
                     security_event = true,
                     %principal,
-                    dropped,
                     "closing lagged local uplink connection"
                 );
                 break;
@@ -348,28 +341,69 @@ fn validate_ingress(message: &IpcMessage) -> Result<(), &'static str> {
     Ok(())
 }
 
-async fn read_message(reader: &mut LocalReadHalf) -> std::io::Result<Option<IpcMessage>> {
-    let mut len_buf = [0_u8; 4];
-    match reader.read_exact(&mut len_buf).await {
-        Ok(_) => {},
-        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(error) => return Err(error),
+struct FramedReader<R> {
+    reader: R,
+    buffered: Vec<u8>,
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> FramedReader<R> {
+    fn new(reader: R) -> Self {
+        Self {
+            reader,
+            buffered: Vec::new(),
+        }
     }
-    let len = u32::from_be_bytes(len_buf) as usize;
-    if len > MAX_FRAME_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("IPC frame too large: {len} bytes"),
-        ));
+
+    /// Read one length-prefixed message while retaining partial frame state.
+    ///
+    /// `AsyncReadExt::read` is cancellation-safe, and all bytes returned by a
+    /// completed read are appended before the next await. Recreating this
+    /// future after another `select!` branch wins therefore cannot discard a
+    /// partially received prefix or body.
+    async fn read_message(&mut self) -> std::io::Result<Option<IpcMessage>> {
+        loop {
+            if self.buffered.len() >= 4 {
+                let len = u32::from_be_bytes(
+                    self.buffered[..4]
+                        .try_into()
+                        .expect("four-byte frame prefix"),
+                ) as usize;
+                if len > MAX_FRAME_BYTES {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("IPC frame too large: {len} bytes"),
+                    ));
+                }
+                let frame_len = 4_usize.checked_add(len).ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "IPC frame overflow")
+                })?;
+                if self.buffered.len() >= frame_len {
+                    let message =
+                        serde_json::from_slice(&self.buffered[4..frame_len]).map_err(|error| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("invalid IPC message: {error}"),
+                            )
+                        })?;
+                    self.buffered.drain(..frame_len);
+                    return Ok(Some(message));
+                }
+            }
+
+            let mut chunk = [0_u8; 8192];
+            let read = self.reader.read(&mut chunk).await?;
+            if read == 0 {
+                if self.buffered.is_empty() {
+                    return Ok(None);
+                }
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "local IPC stream ended within a frame",
+                ));
+            }
+            self.buffered.extend_from_slice(&chunk[..read]);
+        }
     }
-    let mut bytes = vec![0_u8; len];
-    reader.read_exact(&mut bytes).await?;
-    serde_json::from_slice(&bytes).map(Some).map_err(|error| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("invalid IPC message: {error}"),
-        )
-    })
 }
 
 async fn write_message(writer: &mut LocalWriteHalf, message: &IpcMessage) -> std::io::Result<()> {
@@ -443,6 +477,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn framed_reader_retains_partial_body_when_read_is_cancelled() {
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let expected = IpcMessage::new(
+            Topic::from_raw("astrid.v1.admin.status.test"),
+            IpcPayload::RawJson(serde_json::json!({"request": "status"})),
+            Uuid::new_v4(),
+        );
+        let body = serde_json::to_vec(&expected).expect("serialize frame");
+        let split = body.len() / 2;
+        writer
+            .write_all(&(body.len() as u32).to_be_bytes())
+            .await
+            .expect("write prefix");
+        writer
+            .write_all(&body[..split])
+            .await
+            .expect("write partial body");
+
+        let mut reader = FramedReader::new(reader);
+        tokio::time::timeout(Duration::from_millis(20), reader.read_message())
+            .await
+            .expect_err("partial frame should remain pending");
+
+        writer
+            .write_all(&body[split..])
+            .await
+            .expect("write body remainder");
+        let actual = tokio::time::timeout(Duration::from_secs(2), reader.read_message())
+            .await
+            .expect("completed frame timeout")
+            .expect("read completed frame")
+            .expect("frame present");
+        assert_eq!(actual.topic, expected.topic);
+        assert_eq!(actual.payload, expected.payload);
+        assert_eq!(actual.source_id, expected.source_id);
+    }
+
+    #[tokio::test]
     async fn egress_registry_preserves_full_payloads_and_isolates_principals() {
         let bus = Arc::new(EventBus::new());
         let registry = egress::Registry::install(&bus);
@@ -478,7 +550,7 @@ mod tests {
         assert!(matches!(&*item, AstridEvent::Ipc { .. }));
         assert!(matches!(
             bob_rx.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            Err(egress::TryRecvError::Empty)
         ));
     }
 
