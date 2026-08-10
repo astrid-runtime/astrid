@@ -118,4 +118,19 @@ mod tests {
         assert_eq!(actual.payload, expected.payload);
         assert_eq!(actual.source_id, expected.source_id);
     }
+
+    #[tokio::test]
+    async fn rejects_oversized_frame_from_prefix_alone() {
+        let (mut writer, reader) = tokio::io::duplex(16);
+        writer
+            .write_all(&((MAX_FRAME_BYTES + 1) as u32).to_be_bytes())
+            .await
+            .expect("write prefix");
+
+        let error = FramedReader::new(reader)
+            .read_message()
+            .await
+            .expect_err("oversized frame must be rejected before its body is read");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
 }

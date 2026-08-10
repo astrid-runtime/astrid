@@ -436,16 +436,13 @@ async fn publish_as_unbound_stamps_no_device_key_id() {
     );
 }
 
-/// A capsule's OWN `publish` is never device-scoped: the owner acts at full
-/// principal authority, so no device_key_id is stamped even if an unrelated
-/// `ingress_device_key_id` happens to be set on the host state.
+/// A self-triggered capsule publish has no caller device to inherit. An
+/// unrelated `ingress_device_key_id` belongs only to `publish_as` forwarding.
 #[tokio::test]
-async fn publish_never_stamps_device_key_id() {
+async fn self_triggered_publish_stamps_no_device_key_id() {
     let rt = tokio::runtime::Handle::current();
     let mut state = minimal_host_state(rt);
     state.ipc_publish_patterns = vec!["capsule.v1.*".to_string()];
-    // Even with an ingress device id present, the own-principal publish path
-    // must not stamp it — only the publish_as forward path carries one.
     state.ingress_device_key_id = Some("dev-abc123".to_string());
 
     let mut receiver = state.event_bus.subscribe_topic("capsule.v1.ping");
@@ -456,8 +453,28 @@ async fn publish_never_stamps_device_key_id() {
     let (_principal, device_key_id) = first_device_key_id(&mut receiver);
     assert_eq!(
         device_key_id, None,
-        "a capsule's own publish must never carry a device key_id"
+        "a publish without caller context must not borrow forwarding state"
     );
+}
+
+/// Device attenuation is authority provenance, so it must survive a capsule
+/// fan-out hop just like principal and transport origin.
+#[tokio::test]
+async fn publish_inherits_device_key_id_from_caller_context() {
+    let rt = tokio::runtime::Handle::current();
+    let mut state = minimal_host_state(rt);
+    state.ipc_publish_patterns = vec!["capsule.v1.*".to_string()];
+    state.caller_context = Some(
+        caller_with_origin(astrid_events::ipc::MessageOrigin::LocalSocket)
+            .with_device_key_id("dev-abc123"),
+    );
+
+    let mut receiver = state.event_bus.subscribe_topic("capsule.v1.ping");
+    IpcHost::publish(&mut state, "capsule.v1.ping".to_string(), "{}".to_string())
+        .expect("publish should succeed");
+
+    let (_principal, device_key_id) = first_device_key_id(&mut receiver);
+    assert_eq!(device_key_id.as_deref(), Some("dev-abc123"));
 }
 
 /// Pull the `origin` off the first published message.

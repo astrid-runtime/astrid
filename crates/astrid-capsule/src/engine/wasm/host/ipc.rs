@@ -211,9 +211,10 @@ fn check_subscribe_acl(state: &HostState, topic_pattern: &str) -> Result<(), Err
 ///
 /// `device_key_id` is the host-derived authenticating-device fingerprint to
 /// stamp onto the outbound message so the kernel cap-gate can apply the
-/// device's scope. `None` for a capsule's own-principal `publish` (its own
-/// host calls are never device-scoped) and for an unauthenticated forward;
-/// `publish_as` passes the connection's in-flight `ingress_device_key_id`.
+/// device's scope. A guest `publish` inherits it from the host-stamped caller
+/// context, preserving device attenuation through capsule fan-out;
+/// `publish_as` uses the connection's in-flight `ingress_device_key_id`.
+/// Self-triggered publishes and unauthenticated forwards carry `None`.
 ///
 /// `origin` is the host-stamped transport [`MessageOrigin`] of the ORIGINATING
 /// request. It is ALWAYS taken from host-populated state (the in-flight
@@ -289,9 +290,7 @@ fn publish_inner(
             // `publish`, ingress_origin for `publish-as`), never guest-supplied.
             .with_origin(origin);
     // Stamp the host-derived authenticating-device fingerprint so the kernel
-    // cap-gate can apply the device's scope as an attenuation floor. Only the
-    // `publish_as` forward path carries one; a capsule's own `publish` passes
-    // `None` (its host calls run at the owner's full authority).
+    // cap-gate can apply the device's scope as an attenuation floor.
     if let Some(id) = device_key_id {
         message = message.with_device_key_id(id);
     }
@@ -323,9 +322,21 @@ impl ipc::Host for HostState {
             .as_ref()
             .map(|m| m.origin)
             .unwrap_or(astrid_events::ipc::MessageOrigin::System);
-        // A capsule's own host calls are never device-scoped: the owner acts at
-        // full principal authority, so no device_key_id is stamped here.
-        let result = publish_inner(self, topic, payload, principal_str, None, origin);
+        // Preserve the authenticating device's attenuation through capsule
+        // fan-out. The value is host-stamped on ingress and cannot be supplied
+        // by the guest. Self-triggered publishes have no caller context.
+        let device_key_id = self
+            .caller_context
+            .as_ref()
+            .and_then(|message| message.device_key_id.clone());
+        let result = publish_inner(
+            self,
+            topic,
+            payload,
+            principal_str,
+            device_key_id.as_deref(),
+            origin,
+        );
         audit_ipc(
             self,
             "astrid:ipc/host.publish",

@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use astrid_core::dirs::AstridHome;
+use astrid_core::kernel_api::KernelRequest;
 use astrid_core::local_transport::{self, LocalListener, LocalStream, LocalWriteHalf};
 use astrid_core::session_token::SessionToken;
 use astrid_events::{AstridEvent, EventBus, EventMetadata};
@@ -27,7 +28,10 @@ const MAX_ESTABLISHED_CONNECTIONS: usize = 128;
 const RESERVED_ADMIN_CONNECTIONS: usize = 8;
 const RESERVED_ADMIN_ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const RESERVED_ADMIN_LIFETIME: std::time::Duration = std::time::Duration::from_mins(1);
-const MAX_FRAME_BYTES: usize = 50 * 1024 * 1024;
+// A valid payload is at most 1 MiB. Allow another MiB for the JSON envelope,
+// topic, and provenance fields without permitting a small set of peers to
+// force 50 MiB allocations with ignored metadata.
+const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
 const CLIENT_EGRESS_CAPACITY: usize = 1024;
 const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -35,7 +39,7 @@ const EVENT_SOURCE: &str = "native_local_uplink";
 
 struct ReservedResponse {
     topic: String,
-    request_id: String,
+    request_id: Option<String>,
 }
 
 struct ConnectionAdmission {
@@ -268,9 +272,34 @@ fn publish_trusted_ingress(
 }
 
 fn reserved_response_for(message: &IpcMessage) -> Option<ReservedResponse> {
-    Some(ReservedResponse {
-        topic: routing::reserved_admin_response_topic(message.topic.as_str())?,
-        request_id: routing::payload_request_id(&message.payload)?.to_owned(),
+    if let Some(topic) = routing::reserved_admin_response_topic(message.topic.as_str()) {
+        return Some(ReservedResponse {
+            topic,
+            request_id: Some(routing::payload_request_id(&message.payload)?.to_owned()),
+        });
+    }
+
+    let (operation, correlation) = message
+        .topic
+        .as_str()
+        .strip_prefix("astrid.v1.request.")?
+        .split_once('.')?;
+    if correlation.is_empty() || correlation.contains('.') {
+        return None;
+    }
+    let IpcPayload::RawJson(value) = &message.payload else {
+        return None;
+    };
+    let request: KernelRequest = serde_json::from_value(value.clone()).ok()?;
+    let matches_operation = matches!(
+        (operation, request),
+        ("status", KernelRequest::GetStatus) | ("shutdown", KernelRequest::Shutdown { .. })
+    );
+    matches_operation.then(|| ReservedResponse {
+        topic: format!("astrid.v1.response.{operation}.{correlation}"),
+        // KernelClient's private correlation UUID is encoded in the exact
+        // topic; KernelResponse has no request_id field.
+        request_id: None,
     })
 }
 
@@ -279,7 +308,9 @@ fn reserved_response_matches(event: &AstridEvent, expected: &ReservedResponse) -
         return false;
     };
     message.topic.as_str() == expected.topic
-        && routing::payload_request_id(&message.payload) == Some(expected.request_id.as_str())
+        && expected.request_id.as_deref().is_none_or(|request_id| {
+            routing::payload_request_id(&message.payload) == Some(request_id)
+        })
 }
 
 fn process_inbound(
@@ -600,6 +631,79 @@ mod tests {
         };
         assert!(!reserved_response_matches(&response("other"), &expected));
         assert!(reserved_response_matches(&response("request-1"), &expected));
+    }
+
+    #[test]
+    fn reserved_lane_accepts_real_status_and_shutdown_requests() {
+        let request = |topic: &str, request: KernelRequest| {
+            IpcMessage::new(
+                Topic::from_raw(topic),
+                IpcPayload::RawJson(serde_json::to_value(request).expect("serialize request")),
+                Uuid::nil(),
+            )
+        };
+
+        let status = reserved_response_for(&request(
+            "astrid.v1.request.status.correlation1",
+            KernelRequest::GetStatus,
+        ))
+        .expect("status uses reserved lane");
+        assert_eq!(status.topic, "astrid.v1.response.status.correlation1");
+        assert_eq!(status.request_id, None);
+
+        let shutdown = reserved_response_for(&request(
+            "astrid.v1.request.shutdown.correlation2",
+            KernelRequest::Shutdown { reason: None },
+        ))
+        .expect("shutdown uses reserved lane");
+        assert_eq!(shutdown.topic, "astrid.v1.response.shutdown.correlation2");
+        assert_eq!(shutdown.request_id, None);
+
+        assert!(
+            reserved_response_for(&request(
+                "astrid.v1.request.status.correlation3",
+                KernelRequest::Shutdown { reason: None },
+            ))
+            .is_none(),
+            "topic and payload operation must agree"
+        );
+        assert!(
+            reserved_response_for(&request(
+                "astrid.v1.request.list_capsules.correlation4",
+                KernelRequest::ListCapsules,
+            ))
+            .is_none(),
+            "the reserve is limited to liveness and shutdown operations"
+        );
+    }
+
+    #[test]
+    fn kernel_reserved_completion_uses_private_response_topic() {
+        let request = IpcMessage::new(
+            Topic::from_raw("astrid.v1.request.status.correlation1"),
+            IpcPayload::RawJson(
+                serde_json::to_value(KernelRequest::GetStatus).expect("serialize request"),
+            ),
+            Uuid::nil(),
+        );
+        let expected = reserved_response_for(&request).expect("reserved response target");
+        let response = |topic: &str| AstridEvent::Ipc {
+            metadata: EventMetadata::new("test"),
+            message: IpcMessage::new(
+                Topic::from_raw(topic),
+                IpcPayload::RawJson(serde_json::json!({"status": "Success", "data": {}})),
+                Uuid::nil(),
+            ),
+        };
+
+        assert!(!reserved_response_matches(
+            &response("astrid.v1.response.status.other"),
+            &expected
+        ));
+        assert!(reserved_response_matches(
+            &response("astrid.v1.response.status.correlation1"),
+            &expected
+        ));
     }
 
     #[tokio::test]
