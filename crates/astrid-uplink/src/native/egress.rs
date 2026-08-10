@@ -1,6 +1,6 @@
 //! Per-connection egress queues for the native local transport.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use astrid_events::{AstridEvent, EventBus};
@@ -51,11 +51,13 @@ struct ClientQueue {
 /// or cause an unrelated connection to report lag.
 pub(super) struct Registry {
     clients: Mutex<HashMap<uuid::Uuid, ClientQueue>>,
+    active_turns: Mutex<HashSet<(String, String)>>,
 }
 
 pub(super) struct Subscription {
     id: uuid::Uuid,
     registry: Weak<Registry>,
+    principal: String,
     session: Arc<RwLock<Option<String>>>,
     queue: Arc<EgressQueue>,
 }
@@ -64,6 +66,7 @@ impl Registry {
     pub(super) fn install(event_bus: &Arc<EventBus>) -> Arc<Self> {
         let registry = Arc::new(Self {
             clients: Mutex::new(HashMap::new()),
+            active_turns: Mutex::new(HashSet::new()),
         });
         let weak_registry = Arc::downgrade(&registry);
         event_bus.observe_permanently(EVENT_SOURCE, move |event| {
@@ -73,6 +76,16 @@ impl Registry {
             let Some(message) = event_message(event) else {
                 return;
             };
+            if let (Some(principal), Some(session)) = (
+                message.principal.as_deref(),
+                routing::completed_chat_session(message),
+            ) {
+                registry
+                    .active_turns
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&(principal.to_owned(), session.to_owned()));
+            }
             if !routing::egress_allowed(event_topic(event).unwrap_or_default()) {
                 return;
             }
@@ -129,7 +142,7 @@ impl Registry {
             .insert(
                 id,
                 ClientQueue {
-                    principal,
+                    principal: principal.clone(),
                     device_key_id,
                     session: Arc::clone(&session),
                     queue: Arc::clone(&queue),
@@ -138,6 +151,7 @@ impl Registry {
         Subscription {
             id,
             registry: Arc::downgrade(self),
+            principal,
             session,
             queue,
         }
@@ -145,6 +159,17 @@ impl Registry {
 }
 
 impl Subscription {
+    pub(super) fn begin_turn(&self, session: &str) -> bool {
+        let Some(registry) = self.registry.upgrade() else {
+            return false;
+        };
+        registry
+            .active_turns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert((self.principal.clone(), session.to_owned()))
+    }
+
     pub(super) fn set_session(&self, session: Option<String>) {
         *self
             .session
@@ -294,5 +319,33 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(state.events.is_empty());
         assert_eq!(state.bytes, 0);
+    }
+
+    #[test]
+    fn one_turn_per_principal_session_until_terminal_publication() {
+        let bus = Arc::new(EventBus::new());
+        let registry = Registry::install(&bus);
+        let first = registry.subscribe("alice".to_owned(), None);
+        let second = registry.subscribe("alice".to_owned(), None);
+
+        assert!(first.begin_turn("session-1"));
+        assert!(!second.begin_turn("session-1"));
+        assert!(second.begin_turn("session-2"));
+
+        bus.publish(AstridEvent::Ipc {
+            metadata: EventMetadata::new("test"),
+            message: IpcMessage::new(
+                Topic::from_raw("agent.v1.response"),
+                IpcPayload::AgentResponse {
+                    text: "done".to_owned(),
+                    is_final: true,
+                    session_id: "session-1".to_owned(),
+                },
+                uuid::Uuid::nil(),
+            )
+            .with_principal("alice"),
+        });
+
+        assert!(second.begin_turn("session-1"));
     }
 }

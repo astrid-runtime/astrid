@@ -4,6 +4,7 @@
 //! frontends, but daemon boot and the `astrid` CLI do not depend on one.
 
 mod egress;
+mod framing;
 mod handshake;
 mod routing;
 
@@ -16,13 +17,15 @@ use astrid_core::session_token::SessionToken;
 use astrid_events::{AstridEvent, EventBus, EventMetadata};
 use astrid_types::Topic;
 use astrid_types::ipc::{IpcMessage, IpcPayload, MessageOrigin};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 
+use framing::FramedReader;
 use handshake::AuthenticatedIdentity;
 
 const MAX_PENDING_HANDSHAKES: usize = 8;
 const MAX_ESTABLISHED_CONNECTIONS: usize = 128;
 const RESERVED_ADMIN_CONNECTIONS: usize = 8;
+const RESERVED_ADMIN_ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const RESERVED_ADMIN_LIFETIME: std::time::Duration = std::time::Duration::from_mins(1);
 const MAX_FRAME_BYTES: usize = 50 * 1024 * 1024;
 const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
@@ -30,9 +33,15 @@ const CLIENT_EGRESS_CAPACITY: usize = 1024;
 const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const EVENT_SOURCE: &str = "native_local_uplink";
 
-struct ConnectionLane {
+struct ReservedResponse {
+    topic: String,
+    request_id: String,
+}
+
+struct ConnectionAdmission {
     _permit: tokio::sync::OwnedSemaphorePermit,
-    reserved_admin: bool,
+    initial_message: Option<IpcMessage>,
+    reserved_response: Option<ReservedResponse>,
 }
 
 struct ConnectionRuntime {
@@ -73,16 +82,20 @@ impl ConnectionRuntime {
                 }
             },
         };
+        let admission =
+            if let Ok(permit) = Arc::clone(&self.established_permits).try_acquire_owned() {
+                ConnectionAdmission {
+                    _permit: permit,
+                    initial_message: None,
+                    reserved_response: None,
+                }
+            } else {
+                let Some(admission) = self.admit_reserved_admin(&mut stream).await else {
+                    return;
+                };
+                admission
+            };
         drop(handshake_permit);
-        let Some(lane) =
-            try_acquire_connection_lane(&self.established_permits, &self.reserved_admin_permits)
-        else {
-            tracing::warn!(
-                security_event = true,
-                "native local uplink connection limits exhausted"
-            );
-            return;
-        };
         let egress = self.egress_registry.subscribe(
             identity.principal.to_string(),
             identity.device_key_id.clone(),
@@ -93,29 +106,46 @@ impl ConnectionRuntime {
             Arc::clone(&self.event_bus),
             egress,
             shutdown,
-            lane,
+            admission,
         )
         .await;
     }
-}
 
-fn try_acquire_connection_lane(
-    established: &Arc<tokio::sync::Semaphore>,
-    reserved_admin: &Arc<tokio::sync::Semaphore>,
-) -> Option<ConnectionLane> {
-    if let Ok(permit) = Arc::clone(established).try_acquire_owned() {
-        return Some(ConnectionLane {
+    async fn admit_reserved_admin(&self, stream: &mut LocalStream) -> Option<ConnectionAdmission> {
+        let mut reader = FramedReader::new(stream);
+        let message =
+            match tokio::time::timeout(RESERVED_ADMIN_ADMISSION_TIMEOUT, reader.read_message())
+                .await
+            {
+                Ok(Ok(Some(message))) => message,
+                Ok(Ok(None)) => return None,
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "reserved admin admission read failed");
+                    return None;
+                },
+                Err(_) => {
+                    tracing::warn!("reserved admin admission timed out");
+                    return None;
+                },
+            };
+        if let Err(reason) = validate_ingress(&message) {
+            tracing::warn!(security_event = true, %reason, "reserved admin admission rejected");
+            return None;
+        }
+        let Some(reserved_response) = reserved_response_for(&message) else {
+            tracing::warn!("non-admin request rejected from reserved connection lane");
+            return None;
+        };
+        let Ok(permit) = Arc::clone(&self.reserved_admin_permits).try_acquire_owned() else {
+            tracing::warn!("reserved admin connection limit exhausted");
+            return None;
+        };
+        Some(ConnectionAdmission {
             _permit: permit,
-            reserved_admin: false,
-        });
-    }
-    Arc::clone(reserved_admin)
-        .try_acquire_owned()
-        .ok()
-        .map(|permit| ConnectionLane {
-            _permit: permit,
-            reserved_admin: true,
+            initial_message: Some(message),
+            reserved_response: Some(reserved_response),
         })
+    }
 }
 
 /// Handles required by the Astrid-owned local uplink server.
@@ -237,17 +267,38 @@ fn publish_trusted_ingress(
     });
 }
 
-fn admit_reserved_admin(
-    topic: &str,
-    response_topic: &mut Option<String>,
+fn reserved_response_for(message: &IpcMessage) -> Option<ReservedResponse> {
+    Some(ReservedResponse {
+        topic: routing::reserved_admin_response_topic(message.topic.as_str())?,
+        request_id: routing::payload_request_id(&message.payload)?.to_owned(),
+    })
+}
+
+fn reserved_response_matches(event: &AstridEvent, expected: &ReservedResponse) -> bool {
+    let AstridEvent::Ipc { message, .. } = event else {
+        return false;
+    };
+    message.topic.as_str() == expected.topic
+        && routing::payload_request_id(&message.payload) == Some(expected.request_id.as_str())
+}
+
+fn process_inbound(
+    event_bus: &EventBus,
+    identity: &AuthenticatedIdentity,
+    principal: &str,
+    receiver: &egress::Subscription,
+    message: IpcMessage,
 ) -> Result<(), &'static str> {
-    if response_topic.is_some() {
-        return Err("reserved admin connection attempted multiple requests");
+    validate_ingress(&message)?;
+    if message.topic.as_str() == routing::CHAT_REQUEST_TOPIC {
+        let session = routing::payload_session_id(&message.payload)
+            .ok_or("chat request is missing a session ID")?;
+        if !receiver.begin_turn(session) {
+            return Err("a turn is already active for this principal and session");
+        }
+        receiver.set_session(Some(session.to_owned()));
     }
-    *response_topic = Some(
-        routing::reserved_admin_response_topic(topic)
-            .ok_or("non-admin request rejected from reserved connection lane")?,
-    );
+    publish_trusted_ingress(event_bus, identity, principal, message);
     Ok(())
 }
 
@@ -257,21 +308,24 @@ async fn serve_connection(
     event_bus: Arc<EventBus>,
     mut receiver: egress::Subscription,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
-    connection_lane: ConnectionLane,
+    mut admission: ConnectionAdmission,
 ) {
     let principal = identity.principal.to_string();
-    publish_lifecycle(&event_bus, Topic::client_connect(), &principal, None);
-    tracing::info!(%principal, authenticated = identity.is_principal_verified(), "local client connected");
-
     let (reader, mut writer) = local_transport::split(stream);
     let mut reader = FramedReader::new(reader);
     let mut stream_accumulators = HashMap::new();
-    let reserved_admin = connection_lane.reserved_admin;
-    let _connection_lane = connection_lane;
+    let reserved_admin = admission.reserved_response.is_some();
     let reserved_deadline = tokio::time::Instant::now()
         .checked_add(RESERVED_ADMIN_LIFETIME)
         .unwrap_or_else(tokio::time::Instant::now);
-    let mut reserved_response_topic: Option<String> = None;
+    if let Some(message) = admission.initial_message.take()
+        && let Err(reason) = process_inbound(&event_bus, &identity, &principal, &receiver, message)
+    {
+        tracing::warn!(security_event = true, %principal, %reason);
+        return;
+    }
+    publish_lifecycle(&event_bus, Topic::client_connect(), &principal, None);
+    tracing::info!(%principal, authenticated = identity.is_principal_verified(), "local client connected");
 
     loop {
         tokio::select! {
@@ -301,25 +355,19 @@ async fn serve_connection(
             },
             inbound = reader.read_message() => match inbound {
                 Ok(Some(message)) => {
-                    if let Err(reason) = validate_ingress(&message) {
-                        tracing::warn!(security_event = true, %principal, %reason, "dropped local uplink message");
-                        continue;
-                    }
-                    if reserved_admin
-                        && let Err(reason) = admit_reserved_admin(
-                            message.topic.as_str(),
-                            &mut reserved_response_topic,
-                        )
-                    {
-                        tracing::warn!(%principal, %reason);
+                    if reserved_admin {
+                        tracing::warn!(%principal, "reserved admin connection attempted multiple requests");
                         break;
                     }
-                    if message.topic.as_str() == routing::CHAT_REQUEST_TOPIC {
-                        let session = routing::payload_session_id(&message.payload).map(str::to_owned);
-                        routing::begin_turn(&message.payload, &mut stream_accumulators);
-                        receiver.set_session(session);
+                    if let Err(reason) = process_inbound(
+                        &event_bus,
+                        &identity,
+                        &principal,
+                        &receiver,
+                        message,
+                    ) {
+                        tracing::warn!(security_event = true, %principal, %reason, "dropped local uplink message");
                     }
-                    publish_trusted_ingress(&event_bus, &identity, &principal, message);
                 },
                 Ok(None) => break,
                 Err(error) => {
@@ -350,7 +398,11 @@ async fn serve_connection(
                     tracing::warn!(%principal, %error, "local uplink write failed");
                     break;
                 }
-                if reserved_response_topic.as_deref() == event_topic(&event) {
+                if admission
+                    .reserved_response
+                    .as_ref()
+                    .is_some_and(|expected| reserved_response_matches(&event, expected))
+                {
                     break;
                 }
             },
@@ -447,71 +499,6 @@ fn validate_ingress(message: &IpcMessage) -> Result<(), &'static str> {
     Ok(())
 }
 
-struct FramedReader<R> {
-    reader: R,
-    buffered: Vec<u8>,
-}
-
-impl<R: tokio::io::AsyncRead + Unpin> FramedReader<R> {
-    fn new(reader: R) -> Self {
-        Self {
-            reader,
-            buffered: Vec::new(),
-        }
-    }
-
-    /// Read one length-prefixed message while retaining partial frame state.
-    ///
-    /// `AsyncReadExt::read` is cancellation-safe, and all bytes returned by a
-    /// completed read are appended before the next await. Recreating this
-    /// future after another `select!` branch wins therefore cannot discard a
-    /// partially received prefix or body.
-    async fn read_message(&mut self) -> std::io::Result<Option<IpcMessage>> {
-        loop {
-            if self.buffered.len() >= 4 {
-                let len = u32::from_be_bytes(
-                    self.buffered[..4]
-                        .try_into()
-                        .expect("four-byte frame prefix"),
-                ) as usize;
-                if len > MAX_FRAME_BYTES {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("IPC frame too large: {len} bytes"),
-                    ));
-                }
-                let frame_len = 4_usize.checked_add(len).ok_or_else(|| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, "IPC frame overflow")
-                })?;
-                if self.buffered.len() >= frame_len {
-                    let message =
-                        serde_json::from_slice(&self.buffered[4..frame_len]).map_err(|error| {
-                            std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                format!("invalid IPC message: {error}"),
-                            )
-                        })?;
-                    self.buffered.drain(..frame_len);
-                    return Ok(Some(message));
-                }
-            }
-
-            let mut chunk = [0_u8; 8192];
-            let read = self.reader.read(&mut chunk).await?;
-            if read == 0 {
-                if self.buffered.is_empty() {
-                    return Ok(None);
-                }
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "local IPC stream ended within a frame",
-                ));
-            }
-            self.buffered.extend_from_slice(&chunk[..read]);
-        }
-    }
-}
-
 async fn write_message(writer: &mut LocalWriteHalf, message: &IpcMessage) -> std::io::Result<()> {
     let payload_bytes = message
         .payload
@@ -582,61 +569,37 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn framed_reader_retains_partial_body_when_read_is_cancelled() {
-        let (mut writer, reader) = tokio::io::duplex(4096);
-        let expected = IpcMessage::new(
-            Topic::from_raw("astrid.v1.admin.status.test"),
-            IpcPayload::RawJson(serde_json::json!({"request": "status"})),
-            Uuid::new_v4(),
-        );
-        let body = serde_json::to_vec(&expected).expect("serialize frame");
-        let split = body.len() / 2;
-        writer
-            .write_all(&(body.len() as u32).to_be_bytes())
-            .await
-            .expect("write prefix");
-        writer
-            .write_all(&body[..split])
-            .await
-            .expect("write partial body");
-
-        let mut reader = FramedReader::new(reader);
-        tokio::time::timeout(Duration::from_millis(20), reader.read_message())
-            .await
-            .expect_err("partial frame should remain pending");
-
-        writer
-            .write_all(&body[split..])
-            .await
-            .expect("write body remainder");
-        let actual = tokio::time::timeout(Duration::from_secs(2), reader.read_message())
-            .await
-            .expect("completed frame timeout")
-            .expect("read completed frame")
-            .expect("frame present");
-        assert_eq!(actual.topic, expected.topic);
-        assert_eq!(actual.payload, expected.payload);
-        assert_eq!(actual.source_id, expected.source_id);
-    }
-
     #[test]
-    fn established_limit_falls_back_to_a_separate_reserved_admin_lane() {
+    fn general_connection_limit_does_not_consume_the_admin_reserve() {
         let established = Arc::new(tokio::sync::Semaphore::new(1));
         let reserved = Arc::new(tokio::sync::Semaphore::new(1));
 
-        let general = try_acquire_connection_lane(&established, &reserved)
+        let _general = Arc::clone(&established)
+            .try_acquire_owned()
             .expect("general connection permit");
-        assert!(!general.reserved_admin);
-        let admin =
-            try_acquire_connection_lane(&established, &reserved).expect("reserved admin permit");
-        assert!(admin.reserved_admin);
-        assert!(try_acquire_connection_lane(&established, &reserved).is_none());
+        assert!(Arc::clone(&established).try_acquire_owned().is_err());
+        assert_eq!(reserved.available_permits(), 1);
+    }
 
-        drop(general);
-        let replacement =
-            try_acquire_connection_lane(&established, &reserved).expect("released general permit");
-        assert!(!replacement.reserved_admin);
+    #[test]
+    fn reserved_completion_matches_topic_and_request_id() {
+        let request = IpcMessage::new(
+            Topic::from_raw("astrid.v1.admin.agent.list"),
+            IpcPayload::RawJson(serde_json::json!({"request_id": "request-1"})),
+            Uuid::nil(),
+        );
+        let expected = reserved_response_for(&request).expect("reserved response target");
+
+        let response = |request_id: &str| AstridEvent::Ipc {
+            metadata: EventMetadata::new("test"),
+            message: IpcMessage::new(
+                Topic::from_raw("astrid.v1.admin.response.agent.list"),
+                IpcPayload::RawJson(serde_json::json!({"request_id": request_id})),
+                Uuid::nil(),
+            ),
+        };
+        assert!(!reserved_response_matches(&response("other"), &expected));
+        assert!(reserved_response_matches(&response("request-1"), &expected));
     }
 
     #[tokio::test]
