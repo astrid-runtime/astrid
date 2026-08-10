@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use astrid_core::dirs::AstridHome;
-use astrid_core::kernel_api::KernelRequest;
+use astrid_core::kernel_api::{KernelRequest, KernelResponse};
 use astrid_core::local_transport::{self, LocalListener, LocalStream, LocalWriteHalf};
 use astrid_core::session_token::SessionToken;
 use astrid_events::{AstridEvent, EventBus, EventMetadata};
@@ -41,7 +41,6 @@ const EVENT_SOURCE: &str = "native_local_uplink";
 
 struct ReservedResponse {
     topic: String,
-    request_id: Option<String>,
 }
 
 struct ConnectionAdmission {
@@ -274,13 +273,6 @@ fn publish_trusted_ingress(
 }
 
 fn reserved_response_for(message: &IpcMessage) -> Option<ReservedResponse> {
-    if let Some(topic) = routing::reserved_admin_response_topic(message.topic.as_str()) {
-        return Some(ReservedResponse {
-            topic,
-            request_id: Some(routing::payload_request_id(&message.payload)?.to_owned()),
-        });
-    }
-
     let (operation, correlation) = message
         .topic
         .as_str()
@@ -299,9 +291,6 @@ fn reserved_response_for(message: &IpcMessage) -> Option<ReservedResponse> {
     );
     matches_operation.then(|| ReservedResponse {
         topic: format!("astrid.v1.response.{operation}.{correlation}"),
-        // KernelClient's private correlation UUID is encoded in the exact
-        // topic; KernelResponse has no request_id field.
-        request_id: None,
     })
 }
 
@@ -309,10 +298,16 @@ fn reserved_response_matches(event: &AstridEvent, expected: &ReservedResponse) -
     let AstridEvent::Ipc { message, .. } = event else {
         return false;
     };
-    message.topic.as_str() == expected.topic
-        && expected.request_id.as_deref().is_none_or(|request_id| {
-            routing::payload_request_id(&message.payload) == Some(request_id)
-        })
+    if message.topic.as_str() != expected.topic {
+        return false;
+    }
+    let IpcPayload::RawJson(value) = &message.payload else {
+        return true;
+    };
+    !matches!(
+        serde_json::from_value::<KernelResponse>(value.clone()),
+        Ok(KernelResponse::Working)
+    )
 }
 
 fn process_inbound(

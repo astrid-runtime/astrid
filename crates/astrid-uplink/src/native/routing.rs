@@ -56,13 +56,6 @@ pub(super) fn ingress_allowed(topic: &str) -> bool {
             .any(|prefix| topic.starts_with(prefix))
 }
 
-pub(super) fn reserved_admin_response_topic(request_topic: &str) -> Option<String> {
-    request_topic
-        .strip_prefix("astrid.v1.admin.")
-        .filter(|suffix| !suffix.is_empty() && !suffix.starts_with("response."))
-        .map(|suffix| format!("astrid.v1.admin.response.{suffix}"))
-}
-
 pub(super) fn egress_allowed(topic: &str) -> bool {
     ALLOWED_EGRESS_EXACT.contains(&topic)
         || ALLOWED_EGRESS_PREFIXES
@@ -76,13 +69,6 @@ pub(super) fn payload_session_id(payload: &IpcPayload) -> Option<&str> {
             Some(session_id)
         },
         IpcPayload::RawJson(value) => value.get("session_id").and_then(|value| value.as_str()),
-        _ => None,
-    }
-}
-
-pub(super) fn payload_request_id(payload: &IpcPayload) -> Option<&str> {
-    match payload {
-        IpcPayload::RawJson(value) => value.get("request_id").and_then(|value| value.as_str()),
         _ => None,
     }
 }
@@ -279,18 +265,6 @@ mod tests {
     fn routes_elicit_requests_but_not_client_responses_on_egress() {
         assert!(egress_allowed("astrid.v1.elicit"));
         assert!(!egress_allowed("astrid.v1.elicit.response.fake"));
-    }
-
-    #[test]
-    fn reserved_admin_lane_accepts_only_request_topics() {
-        assert_eq!(
-            reserved_admin_response_topic("astrid.v1.admin.status.request-1").as_deref(),
-            Some("astrid.v1.admin.response.status.request-1")
-        );
-        assert!(reserved_admin_response_topic("user.v1.prompt").is_none());
-        assert!(
-            reserved_admin_response_topic("astrid.v1.admin.response.status.request-1").is_none()
-        );
     }
 
     #[test]

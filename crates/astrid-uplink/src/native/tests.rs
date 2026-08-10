@@ -31,27 +31,6 @@ fn general_connection_limit_does_not_consume_the_admin_reserve() {
 }
 
 #[test]
-fn reserved_completion_matches_topic_and_request_id() {
-    let request = IpcMessage::new(
-        Topic::from_raw("astrid.v1.admin.agent.list"),
-        IpcPayload::RawJson(serde_json::json!({"request_id": "request-1"})),
-        Uuid::nil(),
-    );
-    let expected = reserved_response_for(&request).expect("reserved response target");
-
-    let response = |request_id: &str| AstridEvent::Ipc {
-        metadata: EventMetadata::new("test"),
-        message: IpcMessage::new(
-            Topic::from_raw("astrid.v1.admin.response.agent.list"),
-            IpcPayload::RawJson(serde_json::json!({"request_id": request_id})),
-            Uuid::nil(),
-        ),
-    };
-    assert!(!reserved_response_matches(&response("other"), &expected));
-    assert!(reserved_response_matches(&response("request-1"), &expected));
-}
-
-#[test]
 fn reserved_lane_accepts_real_status_and_shutdown_requests() {
     let request = |topic: &str, request: KernelRequest| {
         IpcMessage::new(
@@ -67,7 +46,6 @@ fn reserved_lane_accepts_real_status_and_shutdown_requests() {
     ))
     .expect("status uses reserved lane");
     assert_eq!(status.topic, "astrid.v1.response.status.correlation1");
-    assert_eq!(status.request_id, None);
 
     let shutdown = reserved_response_for(&request(
         "astrid.v1.request.shutdown.correlation2",
@@ -75,7 +53,6 @@ fn reserved_lane_accepts_real_status_and_shutdown_requests() {
     ))
     .expect("shutdown uses reserved lane");
     assert_eq!(shutdown.topic, "astrid.v1.response.shutdown.correlation2");
-    assert_eq!(shutdown.request_id, None);
 
     assert!(
         reserved_response_for(&request(
@@ -92,6 +69,15 @@ fn reserved_lane_accepts_real_status_and_shutdown_requests() {
         ))
         .is_none(),
         "the reserve is limited to liveness and shutdown operations"
+    );
+    assert!(
+        reserved_response_for(&IpcMessage::new(
+            Topic::from_raw("astrid.v1.admin.status.correlation5"),
+            IpcPayload::RawJson(serde_json::json!({"request_id": "correlation5"})),
+            Uuid::nil(),
+        ))
+        .is_none(),
+        "legacy admin operations cannot consume the liveness reserve"
     );
 }
 
@@ -122,6 +108,21 @@ fn kernel_reserved_completion_uses_private_response_topic() {
         &response("astrid.v1.response.status.correlation1"),
         &expected
     ));
+
+    let working = AstridEvent::Ipc {
+        metadata: EventMetadata::new("test"),
+        message: IpcMessage::new(
+            Topic::from_raw("astrid.v1.response.status.correlation1"),
+            IpcPayload::RawJson(
+                serde_json::to_value(KernelResponse::Working).expect("serialize keepalive"),
+            ),
+            Uuid::nil(),
+        ),
+    };
+    assert!(
+        !reserved_response_matches(&working, &expected),
+        "Working keepalive is not terminal"
+    );
 }
 
 #[test]
