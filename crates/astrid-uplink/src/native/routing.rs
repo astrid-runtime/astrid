@@ -107,6 +107,14 @@ pub(super) fn should_deliver(
     }
 }
 
+/// Start a new turn without inheriting stream state from an earlier turn that
+/// never produced a terminal frame.
+pub(super) fn begin_turn(payload: &IpcPayload, accumulators: &mut HashMap<String, Option<String>>) {
+    if let Some(session) = payload_session_id(payload) {
+        accumulators.remove(session);
+    }
+}
+
 /// Prevent the terminal chat frame from replaying text already emitted as
 /// stream deltas. This preserves the CLI's append-then-flush wire behavior.
 pub(super) fn reconcile_stream(
@@ -145,11 +153,24 @@ pub(super) fn reconcile_stream(
     if topic != CHAT_RESPONSE_TOPIC || !response_is_final(&message.payload) {
         return;
     }
-    let Some(Some(streamed)) = accumulators.remove(&session) else {
+    let Some(state) = accumulators.get(&session) else {
+        return;
+    };
+    let Some(streamed) = state else {
+        // A tombstone belongs to the active turn and is complete once its
+        // terminal frame arrives.
+        accumulators.remove(&session);
         return;
     };
     let full = response_text(&message.payload).unwrap_or_default();
-    let remainder = full.strip_prefix(&streamed).unwrap_or(full).to_owned();
+    let Some(remainder) = full.strip_prefix(streamed) else {
+        // A terminal frame that does not extend the active stream can be a
+        // late response from an abandoned turn in the same session. Forward
+        // it intact, but do not consume the new turn's accumulator.
+        return;
+    };
+    let remainder = remainder.to_owned();
+    accumulators.remove(&session);
     set_response_text(&mut message.payload, remainder);
 }
 
@@ -322,7 +343,7 @@ mod tests {
         let mut message = message(CHAT_RESPONSE_TOPIC, Some("alice"), "one");
         reconcile_stream(&mut message, &mut accum);
         assert_eq!(response_text(&message.payload), Some("hello"));
-        assert!(accum.is_empty());
+        assert_eq!(accum.get("one"), Some(&Some("draft".to_owned())));
     }
 
     #[test]
@@ -340,6 +361,54 @@ mod tests {
         let mut terminal = message(CHAT_RESPONSE_TOPIC, Some("alice"), "one");
         reconcile_stream(&mut terminal, &mut accum);
         assert_eq!(response_text(&terminal.payload), Some("hello"));
+        assert!(accum.is_empty());
+    }
+
+    #[test]
+    fn new_prompt_resets_abandoned_stream_state_for_the_same_session() {
+        let mut accum = HashMap::from([("one".to_owned(), None)]);
+        let prompt = IpcPayload::UserInput {
+            text: "next".to_owned(),
+            session_id: "one".to_owned(),
+            context: None,
+        };
+        begin_turn(&prompt, &mut accum);
+        assert!(accum.is_empty());
+
+        let mut delta = message(CHAT_DELTA_TOPIC, Some("alice"), "one");
+        set_response_text(&mut delta.payload, "hel".to_owned());
+        reconcile_stream(&mut delta, &mut accum);
+
+        let mut terminal = message(CHAT_RESPONSE_TOPIC, Some("alice"), "one");
+        reconcile_stream(&mut terminal, &mut accum);
+        assert_eq!(response_text(&terminal.payload), Some("lo"));
+        assert!(accum.is_empty());
+    }
+
+    #[test]
+    fn late_terminal_does_not_consume_the_new_turn_accumulator() {
+        let mut accum = HashMap::from([("one".to_owned(), Some("old".to_owned()))]);
+        let prompt = IpcPayload::UserInput {
+            text: "next".to_owned(),
+            session_id: "one".to_owned(),
+            context: None,
+        };
+        begin_turn(&prompt, &mut accum);
+
+        let mut delta = message(CHAT_DELTA_TOPIC, Some("alice"), "one");
+        set_response_text(&mut delta.payload, "new".to_owned());
+        reconcile_stream(&mut delta, &mut accum);
+
+        let mut late_terminal = message(CHAT_RESPONSE_TOPIC, Some("alice"), "one");
+        set_response_text(&mut late_terminal.payload, "old answer".to_owned());
+        reconcile_stream(&mut late_terminal, &mut accum);
+        assert_eq!(response_text(&late_terminal.payload), Some("old answer"));
+        assert_eq!(accum.get("one"), Some(&Some("new".to_owned())));
+
+        let mut current_terminal = message(CHAT_RESPONSE_TOPIC, Some("alice"), "one");
+        set_response_text(&mut current_terminal.payload, "new answer".to_owned());
+        reconcile_stream(&mut current_terminal, &mut accum);
+        assert_eq!(response_text(&current_terminal.payload), Some(" answer"));
         assert!(accum.is_empty());
     }
 }

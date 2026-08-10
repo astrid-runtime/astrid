@@ -3,6 +3,7 @@
 //! This is the baseline control-plane transport. Distributions may add
 //! frontends, but daemon boot and the `astrid` CLI do not depend on one.
 
+mod egress;
 mod handshake;
 mod routing;
 
@@ -53,9 +54,7 @@ impl NativeUplink {
     async fn run(mut self) {
         let handshake_permits = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_HANDSHAKES));
         let mut connections = tokio::task::JoinSet::new();
-        let (egress_tx, _) = tokio::sync::broadcast::channel(CLIENT_EGRESS_CAPACITY);
-        let egress_tx = Arc::new(egress_tx);
-        install_egress_observer(&self.event_bus, &egress_tx);
+        let egress_registry = egress::Registry::install(&self.event_bus);
         let (connection_shutdown_tx, connection_shutdown_rx) = tokio::sync::watch::channel(false);
         loop {
             let permit = tokio::select! {
@@ -95,7 +94,7 @@ impl NativeUplink {
             let mut shutdown = connection_shutdown_rx.clone();
             let session_token = Arc::clone(&self.session_token);
             let home = self.home.clone();
-            let egress = egress_tx.subscribe();
+            let egress_registry = Arc::clone(&egress_registry);
             connections.spawn(async move {
                 let handshake_permit = permit;
                 let mut stream = stream;
@@ -124,6 +123,10 @@ impl NativeUplink {
                 // authenticated long-lived MCP connection must not consume
                 // capacity needed by later status/stop clients.
                 drop(handshake_permit);
+                let egress = egress_registry.subscribe(
+                    identity.principal.to_string(),
+                    identity.device_key_id.clone(),
+                );
                 serve_connection(stream, identity, event_bus, egress, shutdown).await;
             });
             while let Some(result) = connections.try_join_next() {
@@ -133,33 +136,12 @@ impl NativeUplink {
             }
         }
         let _ = connection_shutdown_tx.send(true);
-        drop(egress_tx);
         while let Some(result) = connections.join_next().await {
             if let Err(error) = result {
                 tracing::warn!(%error, "native local uplink connection task failed");
             }
         }
     }
-}
-
-fn install_egress_observer(
-    event_bus: &Arc<EventBus>,
-    sender: &Arc<tokio::sync::broadcast::Sender<Arc<AstridEvent>>>,
-) {
-    // Filter synchronously at publication, before entering the bounded client
-    // queue. A broad async bus subscription can lag on audit/lifecycle traffic
-    // that no local client is eligible to receive, falsely closing every
-    // connection. The permanent observer retains only a Weak sender so it does
-    // not extend the server lifetime after shutdown.
-    let sender = Arc::downgrade(sender);
-    event_bus.observe_permanently(EVENT_SOURCE, move |event| {
-        if !routing::egress_allowed(event_topic(event).unwrap_or_default()) {
-            return;
-        }
-        if let Some(sender) = sender.upgrade() {
-            let _ = sender.send(Arc::new(event.clone()));
-        }
-    });
 }
 
 fn event_topic(event: &AstridEvent) -> Option<&str> {
@@ -173,7 +155,7 @@ async fn serve_connection(
     stream: LocalStream,
     identity: AuthenticatedIdentity,
     event_bus: Arc<EventBus>,
-    mut receiver: tokio::sync::broadcast::Receiver<Arc<AstridEvent>>,
+    mut receiver: egress::Subscription,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let principal = identity.principal.to_string();
@@ -181,7 +163,6 @@ async fn serve_connection(
     tracing::info!(%principal, authenticated = identity.is_principal_verified(), "local client connected");
 
     let (mut reader, mut writer) = local_transport::split(stream);
-    let mut session: Option<String> = None;
     let mut stream_accumulators = HashMap::new();
 
     loop {
@@ -194,6 +175,7 @@ async fn serve_connection(
                     // outbound frames before closing the transport. Without
                     // this, `select!` can observe shutdown first and discard
                     // the acknowledgement the CLI is waiting for.
+                    let session = receiver.session();
                     drain_outbound_on_shutdown(
                         &mut writer,
                         &mut receiver,
@@ -212,7 +194,9 @@ async fn serve_connection(
                         continue;
                     }
                     if message.topic.as_str() == routing::CHAT_REQUEST_TOPIC {
-                        session = routing::payload_session_id(&message.payload).map(str::to_owned);
+                        let session = routing::payload_session_id(&message.payload).map(str::to_owned);
+                        routing::begin_turn(&message.payload, &mut stream_accumulators);
+                        receiver.set_session(session);
                     }
                     // Rebuild the envelope so every provenance field is
                     // host-derived. The client controls only the allowlisted
@@ -260,7 +244,7 @@ async fn serve_connection(
                     &event,
                     &principal,
                     identity.device_key_id.as_deref(),
-                    session.as_deref(),
+                    receiver.session().as_deref(),
                     &mut stream_accumulators,
                 ).await {
                     tracing::warn!(%principal, %error, "local uplink write failed");
@@ -281,7 +265,7 @@ async fn serve_connection(
 
 async fn drain_outbound_on_shutdown(
     writer: &mut LocalWriteHalf,
-    receiver: &mut tokio::sync::broadcast::Receiver<Arc<AstridEvent>>,
+    receiver: &mut egress::Subscription,
     principal: &str,
     device_key_id: Option<&str>,
     session: Option<&str>,
@@ -459,21 +443,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn egress_observer_preserves_full_payloads_and_cross_principal_order() {
+    async fn egress_registry_preserves_full_payloads_and_isolates_principals() {
         let bus = Arc::new(EventBus::new());
-        let (egress_tx, mut egress_rx) = tokio::sync::broadcast::channel(8);
-        let egress_tx = Arc::new(egress_tx);
-        install_egress_observer(&bus, &egress_tx);
+        let registry = egress::Registry::install(&bus);
+        let mut alice_rx = registry.subscribe("alice".to_owned(), None);
+        let mut bob_rx = registry.subscribe("bob".to_owned(), None);
 
         // Publishing both events without yielding makes this a deterministic
         // regression for the former shared 1 MiB routed budget: Bob's event
-        // evicted Alice's before the hub could drain it. The broadcast-backed
-        // hub retains both full frames and preserves their bus sequence.
+        // evicted Alice's before the hub could drain it. Per-connection queues
+        // retain both full frames without exposing one principal's event to
+        // the other principal's receiver.
         bus.publish(egress_event("alice", 600 * 1024));
         bus.publish(egress_event("bob", 600 * 1024));
 
-        for expected in ["alice", "bob"] {
-            let item = tokio::time::timeout(Duration::from_secs(2), egress_rx.recv())
+        for (expected, receiver) in [("alice", &mut alice_rx), ("bob", &mut bob_rx)] {
+            let item = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
                 .await
                 .expect("egress timeout")
                 .expect("egress channel closed");
@@ -486,19 +471,22 @@ mod tests {
         // The old routed queue also rejected a valid maximum-size payload
         // because its topic bytes pushed accounting beyond the 1 MiB budget.
         bus.publish(egress_event("alice", MAX_PAYLOAD_BYTES - 2));
-        let item = tokio::time::timeout(Duration::from_secs(2), egress_rx.recv())
+        let item = tokio::time::timeout(Duration::from_secs(2), alice_rx.recv())
             .await
             .expect("maximum-size egress timeout")
             .expect("egress channel closed");
         assert!(matches!(&*item, AstridEvent::Ipc { .. }));
+        assert!(matches!(
+            bob_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]
     async fn unrelated_bus_burst_cannot_lag_client_egress() {
         let bus = Arc::new(EventBus::with_capacity(1));
-        let (egress_tx, mut egress_rx) = tokio::sync::broadcast::channel(1);
-        let egress_tx = Arc::new(egress_tx);
-        install_egress_observer(&bus, &egress_tx);
+        let registry = egress::Registry::install(&bus);
+        let mut egress_rx = registry.subscribe("alice".to_owned(), None);
 
         for _ in 0..2048 {
             let mut event = egress_event("alice", 1);
@@ -515,6 +503,27 @@ mod tests {
             .expect("egress timeout")
             .expect("egress channel closed");
         assert!(matches!(&*item, AstridEvent::Ipc { .. }));
+    }
+
+    #[tokio::test]
+    async fn one_principal_burst_cannot_lag_another_principal() {
+        let bus = Arc::new(EventBus::new());
+        let registry = egress::Registry::install(&bus);
+        let mut bob_rx = registry.subscribe("bob".to_owned(), None);
+
+        for _ in 0..=CLIENT_EGRESS_CAPACITY {
+            bus.publish(egress_event("alice", 1));
+        }
+        bus.publish(egress_event("bob", 1));
+
+        let item = tokio::time::timeout(Duration::from_secs(2), bob_rx.recv())
+            .await
+            .expect("Bob egress timeout")
+            .expect("Bob egress queue lagged on Alice traffic");
+        let AstridEvent::Ipc { message, .. } = &*item else {
+            panic!("expected IPC event");
+        };
+        assert_eq!(message.principal.as_deref(), Some("bob"));
     }
 
     #[tokio::test]
