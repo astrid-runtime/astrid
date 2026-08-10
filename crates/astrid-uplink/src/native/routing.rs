@@ -82,7 +82,12 @@ fn outbound_session(message: &IpcMessage) -> Option<&str> {
     .flatten()
 }
 
-pub(super) fn should_deliver(message: &IpcMessage, principal: &str, session: Option<&str>) -> bool {
+pub(super) fn should_deliver(
+    message: &IpcMessage,
+    principal: &str,
+    device_key_id: Option<&str>,
+    session: Option<&str>,
+) -> bool {
     if !egress_allowed(message.topic.as_str()) {
         return false;
     }
@@ -90,6 +95,11 @@ pub(super) fn should_deliver(message: &IpcMessage, principal: &str, session: Opt
         Some(target) if target != principal => return false,
         None if !SYSTEM_BROADCAST_EXACT.contains(&message.topic.as_str()) => return false,
         Some(_) | None => {},
+    }
+    if let Some(target) = message.device_key_id.as_deref()
+        && device_key_id != Some(target)
+    {
+        return false;
     }
     match outbound_session(message) {
         Some(target) => session == Some(target),
@@ -108,7 +118,7 @@ pub(super) fn reconcile_stream(
         return;
     };
     if topic == CHAT_DELTA_TOPIC {
-        let Some(text) = response_text(&message.payload) else {
+        let Some(text) = delta_text(&message.payload) else {
             return;
         };
         if accumulators.len() >= MAX_STREAM_SESSIONS
@@ -141,6 +151,17 @@ pub(super) fn reconcile_stream(
     let full = response_text(&message.payload).unwrap_or_default();
     let remainder = full.strip_prefix(&streamed).unwrap_or(full).to_owned();
     set_response_text(&mut message.payload, remainder);
+}
+
+fn delta_text(payload: &IpcPayload) -> Option<&str> {
+    match payload {
+        IpcPayload::AgentResponse { text, .. } => Some(text),
+        IpcPayload::RawJson(value) => value
+            .get("delta")
+            .or_else(|| value.get("text"))
+            .and_then(|value| value.as_str()),
+        _ => None,
+    }
 }
 
 fn response_text(payload: &IpcPayload) -> Option<&str> {
@@ -214,22 +235,46 @@ mod tests {
     #[test]
     fn principal_less_management_responses_never_broadcast() {
         let response = message("astrid.v1.admin.response.status", None, "one");
-        assert!(!should_deliver(&response, "alice", None));
+        assert!(!should_deliver(&response, "alice", None, None));
 
         let onboarding = message("astrid.v1.onboarding.required", None, "one");
-        assert!(!should_deliver(&onboarding, "alice", None));
+        assert!(!should_deliver(&onboarding, "alice", None, None));
 
         let onboarding = message("astrid.v1.onboarding.required", Some("alice"), "one");
-        assert!(should_deliver(&onboarding, "alice", None));
-        assert!(!should_deliver(&onboarding, "bob", None));
+        assert!(should_deliver(&onboarding, "alice", None, None));
+        assert!(!should_deliver(&onboarding, "bob", None, None));
     }
 
     #[test]
     fn demuxes_by_principal_and_chat_session() {
         let message = message(CHAT_RESPONSE_TOPIC, Some("alice"), "one");
-        assert!(should_deliver(&message, "alice", Some("one")));
-        assert!(!should_deliver(&message, "bob", Some("one")));
-        assert!(!should_deliver(&message, "alice", Some("two")));
+        assert!(should_deliver(&message, "alice", None, Some("one")));
+        assert!(!should_deliver(&message, "bob", None, Some("one")));
+        assert!(!should_deliver(&message, "alice", None, Some("two")));
+    }
+
+    #[test]
+    fn device_scoped_response_reaches_only_the_authenticated_device() {
+        let mut response = message(
+            "astrid.v1.admin.response.auth.pair.issue",
+            Some("alice"),
+            "one",
+        );
+        response.device_key_id = Some("full-device".to_owned());
+
+        assert!(should_deliver(
+            &response,
+            "alice",
+            Some("full-device"),
+            None
+        ));
+        assert!(!should_deliver(
+            &response,
+            "alice",
+            Some("use-only-device"),
+            None
+        ));
+        assert!(!should_deliver(&response, "alice", None, None));
     }
 
     #[test]
@@ -238,6 +283,36 @@ mod tests {
         let mut message = message(CHAT_RESPONSE_TOPIC, Some("alice"), "one");
         reconcile_stream(&mut message, &mut accum);
         assert_eq!(response_text(&message.payload), Some("lo"));
+        assert!(accum.is_empty());
+    }
+
+    #[test]
+    fn reconciles_raw_json_delta_before_terminal_response() {
+        let mut accum = HashMap::new();
+        let mut delta = IpcMessage::new(
+            Topic::from_raw(CHAT_DELTA_TOPIC),
+            IpcPayload::RawJson(serde_json::json!({
+                "session_id": "one",
+                "delta": "hel"
+            })),
+            Uuid::nil(),
+        )
+        .with_principal("alice");
+        reconcile_stream(&mut delta, &mut accum);
+
+        let mut terminal = IpcMessage::new(
+            Topic::from_raw(CHAT_RESPONSE_TOPIC),
+            IpcPayload::RawJson(serde_json::json!({
+                "session_id": "one",
+                "text": "hello",
+                "is_final": true
+            })),
+            Uuid::nil(),
+        )
+        .with_principal("alice");
+        reconcile_stream(&mut terminal, &mut accum);
+
+        assert_eq!(response_text(&terminal.payload), Some("lo"));
         assert!(accum.is_empty());
     }
 

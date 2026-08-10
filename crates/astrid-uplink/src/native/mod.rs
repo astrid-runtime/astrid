@@ -28,12 +28,6 @@ const CLIENT_EGRESS_CAPACITY: usize = 1024;
 const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const EVENT_SOURCE: &str = "native_local_uplink";
 
-#[derive(Clone)]
-enum EgressItem {
-    Event(Arc<AstridEvent>),
-    Lagged(u64),
-}
-
 /// Handles required by the Astrid-owned local uplink server.
 pub struct NativeUplink {
     /// Kernel-bound listener. Only this server should accept from it.
@@ -60,7 +54,8 @@ impl NativeUplink {
         let handshake_permits = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_HANDSHAKES));
         let mut connections = tokio::task::JoinSet::new();
         let (egress_tx, _) = tokio::sync::broadcast::channel(CLIENT_EGRESS_CAPACITY);
-        let mut egress_tasks = spawn_egress_hub(&self.event_bus, &egress_tx, &self.shutdown);
+        let egress_tx = Arc::new(egress_tx);
+        install_egress_observer(&self.event_bus, &egress_tx);
         let (connection_shutdown_tx, connection_shutdown_rx) = tokio::sync::watch::channel(false);
         loop {
             let permit = tokio::select! {
@@ -137,11 +132,6 @@ impl NativeUplink {
                 }
             }
         }
-        while let Some(result) = egress_tasks.join_next().await {
-            if let Err(error) = result {
-                tracing::warn!(%error, "native local uplink egress task failed");
-            }
-        }
         let _ = connection_shutdown_tx.send(true);
         drop(egress_tx);
         while let Some(result) = connections.join_next().await {
@@ -152,48 +142,24 @@ impl NativeUplink {
     }
 }
 
-fn spawn_egress_hub(
+fn install_egress_observer(
     event_bus: &Arc<EventBus>,
-    sender: &tokio::sync::broadcast::Sender<EgressItem>,
-    shutdown: &tokio::sync::watch::Receiver<bool>,
-) -> tokio::task::JoinSet<()> {
-    let mut tasks = tokio::task::JoinSet::new();
-    let mut receiver = event_bus.subscribe_as(EVENT_SOURCE);
-    let sender = sender.clone();
-    let mut shutdown = shutdown.clone();
-    tasks.spawn(async move {
-        loop {
-            tokio::select! {
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        while let Some(event) = receiver.try_recv() {
-                            publish_to_egress(&sender, event);
-                        }
-                        publish_egress_lag(&sender, receiver.drain_lagged());
-                        break;
-                    }
-                },
-                event = receiver.recv() => {
-                    publish_egress_lag(&sender, receiver.drain_lagged());
-                    let Some(event) = event else { break; };
-                    publish_to_egress(&sender, event);
-                },
-            }
+    sender: &Arc<tokio::sync::broadcast::Sender<Arc<AstridEvent>>>,
+) {
+    // Filter synchronously at publication, before entering the bounded client
+    // queue. A broad async bus subscription can lag on audit/lifecycle traffic
+    // that no local client is eligible to receive, falsely closing every
+    // connection. The permanent observer retains only a Weak sender so it does
+    // not extend the server lifetime after shutdown.
+    let sender = Arc::downgrade(sender);
+    event_bus.observe_permanently(EVENT_SOURCE, move |event| {
+        if !routing::egress_allowed(event_topic(event).unwrap_or_default()) {
+            return;
+        }
+        if let Some(sender) = sender.upgrade() {
+            let _ = sender.send(Arc::new(event.clone()));
         }
     });
-    tasks
-}
-
-fn publish_to_egress(sender: &tokio::sync::broadcast::Sender<EgressItem>, event: Arc<AstridEvent>) {
-    if routing::egress_allowed(event_topic(&event).unwrap_or_default()) {
-        let _ = sender.send(EgressItem::Event(event));
-    }
-}
-
-fn publish_egress_lag(sender: &tokio::sync::broadcast::Sender<EgressItem>, dropped: u64) {
-    if dropped != 0 {
-        let _ = sender.send(EgressItem::Lagged(dropped));
-    }
 }
 
 fn event_topic(event: &AstridEvent) -> Option<&str> {
@@ -207,7 +173,7 @@ async fn serve_connection(
     stream: LocalStream,
     identity: AuthenticatedIdentity,
     event_bus: Arc<EventBus>,
-    mut receiver: tokio::sync::broadcast::Receiver<EgressItem>,
+    mut receiver: tokio::sync::broadcast::Receiver<Arc<AstridEvent>>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let principal = identity.principal.to_string();
@@ -232,6 +198,7 @@ async fn serve_connection(
                         &mut writer,
                         &mut receiver,
                         &principal,
+                        identity.device_key_id.as_deref(),
                         session.as_deref(),
                         &mut stream_accumulators,
                     ).await;
@@ -276,16 +243,7 @@ async fn serve_connection(
             },
             outbound = receiver.recv() => {
                 let event = match outbound {
-                    Ok(EgressItem::Event(event)) => event,
-                    Ok(EgressItem::Lagged(dropped)) => {
-                        tracing::error!(
-                            security_event = true,
-                            %principal,
-                            dropped,
-                            "closing local uplink after event-bus lag"
-                        );
-                        break;
-                    },
+                    Ok(event) => event,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(dropped)) => {
                         tracing::error!(
@@ -301,6 +259,7 @@ async fn serve_connection(
                     &mut writer,
                     &event,
                     &principal,
+                    identity.device_key_id.as_deref(),
                     session.as_deref(),
                     &mut stream_accumulators,
                 ).await {
@@ -322,23 +281,15 @@ async fn serve_connection(
 
 async fn drain_outbound_on_shutdown(
     writer: &mut LocalWriteHalf,
-    receiver: &mut tokio::sync::broadcast::Receiver<EgressItem>,
+    receiver: &mut tokio::sync::broadcast::Receiver<Arc<AstridEvent>>,
     principal: &str,
+    device_key_id: Option<&str>,
     session: Option<&str>,
     stream_accumulators: &mut HashMap<String, Option<String>>,
 ) {
     loop {
         let event = match receiver.try_recv() {
-            Ok(EgressItem::Event(event)) => event,
-            Ok(EgressItem::Lagged(dropped)) => {
-                tracing::error!(
-                    security_event = true,
-                    %principal,
-                    dropped,
-                    "closing local uplink after event-bus lag"
-                );
-                break;
-            },
+            Ok(event) => event,
             Err(
                 tokio::sync::broadcast::error::TryRecvError::Empty
                 | tokio::sync::broadcast::error::TryRecvError::Closed,
@@ -353,8 +304,15 @@ async fn drain_outbound_on_shutdown(
                 break;
             },
         };
-        if let Err(error) =
-            forward_outbound(writer, &event, principal, session, stream_accumulators).await
+        if let Err(error) = forward_outbound(
+            writer,
+            &event,
+            principal,
+            device_key_id,
+            session,
+            stream_accumulators,
+        )
+        .await
         {
             tracing::warn!(
                 %principal,
@@ -370,13 +328,14 @@ async fn forward_outbound(
     writer: &mut LocalWriteHalf,
     event: &AstridEvent,
     principal: &str,
+    device_key_id: Option<&str>,
     session: Option<&str>,
     stream_accumulators: &mut HashMap<String, Option<String>>,
 ) -> std::io::Result<()> {
     let AstridEvent::Ipc { message, .. } = event else {
         return Ok(());
     };
-    if !routing::should_deliver(message, principal, session) {
+    if !routing::should_deliver(message, principal, device_key_id, session) {
         return Ok(());
     }
     let mut message = message.clone();
@@ -500,11 +459,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn egress_hub_preserves_full_payloads_and_cross_principal_order() {
+    async fn egress_observer_preserves_full_payloads_and_cross_principal_order() {
         let bus = Arc::new(EventBus::new());
         let (egress_tx, mut egress_rx) = tokio::sync::broadcast::channel(8);
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let mut tasks = spawn_egress_hub(&bus, &egress_tx, &shutdown_rx);
+        let egress_tx = Arc::new(egress_tx);
+        install_egress_observer(&bus, &egress_tx);
 
         // Publishing both events without yielding makes this a deterministic
         // regression for the former shared 1 MiB routed budget: Bob's event
@@ -518,10 +477,7 @@ mod tests {
                 .await
                 .expect("egress timeout")
                 .expect("egress channel closed");
-            let EgressItem::Event(event) = item else {
-                panic!("unexpected egress lag");
-            };
-            let AstridEvent::Ipc { message, .. } = &*event else {
+            let AstridEvent::Ipc { message, .. } = &*item else {
                 panic!("expected IPC event");
             };
             assert_eq!(message.principal.as_deref(), Some(expected));
@@ -534,34 +490,31 @@ mod tests {
             .await
             .expect("maximum-size egress timeout")
             .expect("egress channel closed");
-        assert!(matches!(item, EgressItem::Event(_)));
-
-        shutdown_tx.send(true).expect("request shutdown");
-        while let Some(result) = tasks.join_next().await {
-            result.expect("egress task");
-        }
+        assert!(matches!(&*item, AstridEvent::Ipc { .. }));
     }
 
     #[tokio::test]
-    async fn egress_hub_propagates_bus_lag_before_any_surviving_event() {
+    async fn unrelated_bus_burst_cannot_lag_client_egress() {
         let bus = Arc::new(EventBus::with_capacity(1));
-        let (egress_tx, mut egress_rx) = tokio::sync::broadcast::channel(8);
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let mut tasks = spawn_egress_hub(&bus, &egress_tx, &shutdown_rx);
+        let (egress_tx, mut egress_rx) = tokio::sync::broadcast::channel(1);
+        let egress_tx = Arc::new(egress_tx);
+        install_egress_observer(&bus, &egress_tx);
 
-        bus.publish(egress_event("alice", 1));
+        for _ in 0..2048 {
+            let mut event = egress_event("alice", 1);
+            let AstridEvent::Ipc { message, .. } = &mut event else {
+                unreachable!("helper always creates IPC events");
+            };
+            message.topic = Topic::from_raw("internal.v1.audit.noise");
+            bus.publish(event);
+        }
         bus.publish(egress_event("alice", 1));
 
         let item = tokio::time::timeout(Duration::from_secs(2), egress_rx.recv())
             .await
             .expect("egress timeout")
             .expect("egress channel closed");
-        assert!(matches!(item, EgressItem::Lagged(1)));
-
-        shutdown_tx.send(true).expect("request shutdown");
-        while let Some(result) = tasks.join_next().await {
-            result.expect("egress task");
-        }
+        assert!(matches!(&*item, AstridEvent::Ipc { .. }));
     }
 
     #[tokio::test]

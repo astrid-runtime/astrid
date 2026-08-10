@@ -18,10 +18,11 @@ pub(crate) fn publish_response<R: Serialize>(
     kernel: &Arc<crate::Kernel>,
     response_topic: Topic,
     principal: &str,
+    device_key_id: Option<&str>,
     res: R,
 ) {
     if let Ok(val) = serde_json::to_value(res) {
-        publish_response_value(kernel, response_topic, principal, val);
+        publish_response_value(kernel, response_topic, principal, device_key_id, val);
     }
 }
 
@@ -37,14 +38,16 @@ pub(crate) fn publish_response_value(
     kernel: &Arc<crate::Kernel>,
     response_topic: Topic,
     principal: &str,
+    device_key_id: Option<&str>,
     val: serde_json::Value,
 ) {
-    let msg = IpcMessage::new(
+    let mut msg = IpcMessage::new(
         response_topic,
         IpcPayload::RawJson(val),
         kernel.session_id.0,
     )
     .with_principal(principal);
+    msg.device_key_id = device_key_id.map(str::to_owned);
     let _ = kernel.event_bus.publish(astrid_events::AstridEvent::Ipc {
         metadata: astrid_events::EventMetadata::new("kernel_router"),
         message: msg,
@@ -85,8 +88,15 @@ impl KeepalivePinger {
         kernel: &Arc<crate::Kernel>,
         response_topic: Topic,
         principal: &PrincipalId,
+        device_key_id: Option<&str>,
     ) -> Self {
-        Self::spawn_with_interval(kernel, response_topic, principal, KEEPALIVE_INTERVAL)
+        Self::spawn_with_interval(
+            kernel,
+            response_topic,
+            principal,
+            device_key_id,
+            KEEPALIVE_INTERVAL,
+        )
     }
 
     /// [`spawn`](Self::spawn) with an explicit interval. Production passes
@@ -96,17 +106,25 @@ impl KeepalivePinger {
         kernel: &Arc<crate::Kernel>,
         response_topic: Topic,
         principal: &PrincipalId,
+        device_key_id: Option<&str>,
         interval: Duration,
     ) -> Self {
         let kernel = Arc::clone(kernel);
         let principal = principal.to_string();
+        let device_key_id = device_key_id.map(str::to_owned);
         let handle = astrid_runtime::spawn(async move {
             loop {
                 astrid_runtime::time::sleep(interval).await;
                 let Ok(val) = serde_json::to_value(KernelResponse::Working) else {
                     return;
                 };
-                publish_response_value(&kernel, response_topic.clone(), &principal, val);
+                publish_response_value(
+                    &kernel,
+                    response_topic.clone(),
+                    &principal,
+                    device_key_id.as_deref(),
+                    val,
+                );
             }
         });
         Self { handle }
@@ -154,6 +172,30 @@ pub(crate) async fn workspace_commit_response(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn terminal_response_is_scoped_to_principal_and_device() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = astrid_core::dirs::AstridHome::from_path(dir.path());
+        let kernel = crate::test_kernel_with_home(home).await;
+        let response_topic = Topic::kernel_response("device-scoped");
+        let mut receiver = kernel.event_bus.subscribe_topic(response_topic.as_str());
+
+        publish_response(
+            &kernel,
+            response_topic,
+            "alice",
+            Some("device-a"),
+            KernelResponse::Success(serde_json::json!({"ok": true})),
+        );
+
+        let event = receiver.recv().await.expect("response event");
+        let astrid_events::AstridEvent::Ipc { message, .. } = &*event else {
+            panic!("expected IPC response");
+        };
+        assert_eq!(message.principal.as_deref(), Some("alice"));
+        assert_eq!(message.device_key_id.as_deref(), Some("device-a"));
+    }
+
     /// The keepalive pinger publishes `KernelResponse::Working` frames on the
     /// response topic while a slow handler is in flight, and STOPS the moment its
     /// RAII guard drops. Drives `KeepalivePinger` directly with a short interval so
@@ -177,6 +219,7 @@ mod tests {
             &kernel,
             response_topic.clone(),
             &principal,
+            Some("device-a"),
             interval,
         );
 
@@ -197,6 +240,7 @@ mod tests {
                             serde_json::from_value::<KernelResponse>(val.clone())
                     {
                         assert_eq!(message.principal.as_deref(), Some("alice"));
+                        assert_eq!(message.device_key_id.as_deref(), Some("device-a"));
                         working_seen += 1;
                     }
                 },

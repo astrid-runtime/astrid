@@ -21,7 +21,7 @@ The native server owns only transport concerns:
 - bounded length-prefixed JSON framing;
 - host stamping of principal, device key, and local transport origin;
 - a narrow CLI ingress/egress topic policy;
-- principal, correlation-topic, and chat-session response demultiplexing;
+- principal, device-key, and chat-session response demultiplexing;
 - connection lifecycle accounting and fail-closed handling of bus loss.
 
 Requests still flow through the ordinary event bus and existing kernel routers.
@@ -54,6 +54,13 @@ The native server speaks the existing protocol version and reuses the current
 correlation suffixes, inactivity/ceiling timeouts, and principal key material.
 Changing those surfaces follows their normal compatibility policy; merely
 moving endpoint ownership into Astrid does not authorize a wire break.
+
+Kernel and administrative responses are stamped with the authenticated device
+key that originated the request. The server enforces that stamp before writing
+the frame, so a second device for the same principal cannot observe a response
+authorized for the first device. Within one authenticated device, existing
+clients continue to select their own response by correlation topic and request
+identifier.
 
 The runtime E2E harness begins with a capsule-free home and proves
 start/handshake/status/stop/restart before installing any distribution. Unit

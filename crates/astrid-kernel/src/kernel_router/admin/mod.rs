@@ -189,6 +189,7 @@ async fn reject_admin_request_without_caller(
         kernel,
         response_topic,
         caller.as_str(),
+        device_key_id.as_deref(),
         AdminKernelResponse::for_request(
             req.request_id,
             AdminResponseBody::Error(MANAGEMENT_CALLER_REQUIRED.to_string()),
@@ -551,6 +552,7 @@ async fn handle_redeem_admin_request(
     response_topic: Topic,
     request_id: Option<String>,
     caller: PrincipalId,
+    device_key_id: Option<String>,
     kind: AdminRequestKind,
 ) {
     let method = admin_request_method(&kind);
@@ -565,7 +567,7 @@ async fn handle_redeem_admin_request(
             caller: &caller,
             method,
             required_cap,
-            device_key_id: None,
+            device_key_id: device_key_id.as_deref(),
             target_principal: None,
             params: audit_params,
             authorization,
@@ -577,6 +579,7 @@ async fn handle_redeem_admin_request(
         kernel,
         response_topic,
         caller.as_str(),
+        device_key_id.as_deref(),
         AdminKernelResponse::for_request(request_id, body),
     );
 }
@@ -722,7 +725,15 @@ async fn handle_admin_request(
         req.kind,
         AdminRequestKind::InviteRedeem { .. } | AdminRequestKind::PairDeviceRedeem { .. }
     ) {
-        handle_redeem_admin_request(kernel, response_topic, request_id, caller, req.kind).await;
+        handle_redeem_admin_request(
+            kernel,
+            response_topic,
+            request_id,
+            caller,
+            device_key_id,
+            req.kind,
+        )
+        .await;
         return;
     }
 
@@ -754,6 +765,7 @@ async fn handle_admin_request(
                 kernel,
                 response_topic,
                 caller.as_str(),
+                device_key_id.as_deref(),
                 AdminKernelResponse::for_request(request_id, AdminResponseBody::Error(error)),
             );
             return;
@@ -765,6 +777,7 @@ async fn handle_admin_request(
         kernel,
         response_topic,
         caller.as_str(),
+        device_key_id.as_deref(),
         AdminKernelResponse::for_request(request_id, body),
     );
 }
