@@ -377,6 +377,13 @@ pub async fn run() -> Result<()> {
         }
     }
 
+    // Converge every termination source onto the runtime-wide shutdown signal.
+    // API requests and Unix signals have already set it; the non-Unix Ctrl-C
+    // branch has not. `send_replace` is intentionally idempotent so the native
+    // uplink and any future runtime-owned services always observe shutdown
+    // before their tasks are awaited.
+    kernel.shutdown_tx.send_replace(true);
+
     if let Some(notify) = gateway_shutdown {
         notify.notify_waiters();
     }
