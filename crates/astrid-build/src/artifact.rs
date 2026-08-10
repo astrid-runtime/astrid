@@ -15,9 +15,10 @@ use std::path::{Component, Path};
 use anyhow::{Context, bail};
 use astrid_core::dirs::AstridHome;
 use astrid_crypto::{KeyPair, PublicKey, Signature};
-use flate2::Compression;
 use flate2::read::GzDecoder;
+#[cfg(test)]
 use flate2::write::GzEncoder;
+use flate2::{Compression, GzBuilder};
 use serde::{Deserialize, Serialize};
 
 /// Root archive entry containing the self-describing capsule signature.
@@ -364,8 +365,11 @@ fn rewrite_with_provenance(archive_path: &Path, envelope: &[u8]) -> anyhow::Resu
     {
         let input = File::open(archive_path)?;
         let mut source = tar::Archive::new(GzDecoder::new(input));
-        let encoder = GzEncoder::new(staged.as_file_mut(), Compression::default());
+        let encoder = GzBuilder::new()
+            .mtime(0)
+            .write(staged.as_file_mut(), Compression::default());
         let mut target = tar::Builder::new(encoder);
+        target.mode(tar::HeaderMode::Deterministic);
         for entry in source
             .entries()
             .context("failed to read unsigned capsule")?
@@ -375,15 +379,20 @@ fn rewrite_with_provenance(archive_path: &Path, envelope: &[u8]) -> anyhow::Resu
             if path == PROVENANCE_FILE {
                 bail!("capsule archive already contains {PROVENANCE_FILE}");
             }
-            let header = entry.header().clone();
+            let entry_type = entry.header().entry_type();
+            let source_mode = entry.header().mode().unwrap_or(0);
+            let mode = if entry_type.is_dir() || source_mode & 0o111 != 0 {
+                0o755
+            } else {
+                0o644
+            };
+            let mut header = deterministic_header(entry.size(), mode, entry_type);
             target
-                .append(&header, &mut entry)
+                .append_data(&mut header, &path, &mut entry)
                 .with_context(|| format!("failed to copy capsule entry '{path}'"))?;
         }
-        let mut header = tar::Header::new_gnu();
-        header.set_size(envelope.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
+        let mut header =
+            deterministic_header(envelope.len() as u64, 0o644, tar::EntryType::Regular);
         target.append_data(&mut header, PROVENANCE_FILE, envelope)?;
         let encoder = target.into_inner()?;
         encoder.finish()?;
@@ -393,6 +402,21 @@ fn rewrite_with_provenance(archive_path: &Path, envelope: &[u8]) -> anyhow::Resu
         .persist(archive_path)
         .map_err(|error| anyhow::anyhow!("failed to replace signed capsule archive: {error}"))?;
     Ok(())
+}
+
+/// Construct a metadata-stable GNU tar header for synthesized or rewritten
+/// entries. Content and executable intent remain significant; host ownership
+/// and wall-clock timestamps do not.
+fn deterministic_header(size: u64, mode: u32, entry_type: tar::EntryType) -> tar::Header {
+    let mut header = tar::Header::new_gnu();
+    header.set_size(size);
+    header.set_mode(mode);
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_mtime(tar::DETERMINISTIC_TIMESTAMP);
+    header.set_entry_type(entry_type);
+    header.set_cksum();
+    header
 }
 
 fn collect_directory_records(
@@ -508,13 +532,25 @@ mod tests {
     }
 
     fn unsigned_archive(path: &Path, manifest: &[u8], payload: &[u8]) {
+        unsigned_archive_with_payload_mode(path, manifest, payload, 0o644);
+    }
+
+    fn unsigned_archive_with_payload_mode(
+        path: &Path,
+        manifest: &[u8],
+        payload: &[u8],
+        payload_mode: u32,
+    ) {
         let file = File::create(path).unwrap();
         let encoder = GzEncoder::new(file, Compression::default());
         let mut tar = tar::Builder::new(encoder);
-        for (name, bytes) in [("Capsule.toml", manifest), ("capsule.wasm", payload)] {
+        for (name, bytes, mode) in [
+            ("Capsule.toml", manifest, 0o644),
+            ("capsule.wasm", payload, payload_mode),
+        ] {
             let mut header = tar::Header::new_gnu();
             header.set_size(bytes.len() as u64);
-            header.set_mode(0o644);
+            header.set_mode(mode);
             header.set_cksum();
             tar.append_data(&mut header, name, bytes).unwrap();
         }
@@ -589,6 +625,33 @@ mod tests {
             verify_archive(&archive).unwrap(),
             ArtifactVerification::Signed(signed)
         );
+    }
+
+    #[test]
+    fn signing_preserves_any_executable_intent_as_canonical_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("test.capsule");
+        unsigned_archive_with_payload_mode(
+            &archive,
+            b"[package]\nname='test'\nversion='1.0.0'\n",
+            b"wasm",
+            0o010,
+        );
+
+        sign_archive(&archive, &KeyPair::generate()).unwrap();
+
+        let input = File::open(&archive).unwrap();
+        let mut source = tar::Archive::new(GzDecoder::new(input));
+        let mode = source
+            .entries()
+            .unwrap()
+            .map(Result::unwrap)
+            .find(|entry| entry.path().unwrap() == Path::new("capsule.wasm"))
+            .expect("capsule payload")
+            .header()
+            .mode()
+            .unwrap();
+        assert_eq!(mode, 0o755);
     }
 
     #[test]

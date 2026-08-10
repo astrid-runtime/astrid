@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
-use flate2::Compression;
 use flate2::write::GzEncoder;
+use flate2::{Compression, GzBuilder};
 use std::collections::HashSet;
 use std::fs::{self, File};
+use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
@@ -77,8 +78,15 @@ pub(crate) fn pack_capsule_archive(
     let tar_gz = File::create(output_path)
         .with_context(|| format!("Failed to create archive file: {}", output_path.display()))?;
 
-    let enc = GzEncoder::new(tar_gz, Compression::default());
+    // Gzip's default header records the current wall-clock time. Pinning it is
+    // required for byte-for-byte reproducible archives from identical inputs.
+    let enc = GzBuilder::new()
+        .mtime(0)
+        .write(tar_gz, Compression::default());
     let mut tar = tar::Builder::new(enc);
+    // Every entry is written through an explicit canonical header below.
+    // HeaderMode alone does not normalize source permission bits.
+    tar.mode(tar::HeaderMode::Deterministic);
 
     // Explicitly enforce symlink dereferencing (this is already the default in the tar
     // crate, but we state it explicitly because the install path rejects symlinks as a
@@ -86,27 +94,19 @@ pub(crate) fn pack_capsule_archive(
     tar.follow_symlinks(true);
 
     // 1. Write the synthesized Capsule.toml directly from memory
-    let mut header = tar::Header::new_gnu();
-    header.set_size(manifest_content.len() as u64);
-    header.set_mode(0o644);
-    header.set_cksum();
+    let mut header = deterministic_header(
+        manifest_content.len() as u64,
+        0o644,
+        tar::EntryType::Regular,
+    );
     tar.append_data(&mut header, "Capsule.toml", manifest_content.as_bytes())
         .context("Failed to write Capsule.toml to archive")?;
 
     // 2. Append the WASM binary (if present)
     if let Some(wasm) = wasm_path {
         if wasm.exists() {
-            let mut wasm_file = File::open(wasm).with_context(|| {
-                format!("Failed to open WASM binary for packing: {}", wasm.display())
-            })?;
             let file_name = wasm.file_name().unwrap_or_default();
-            tar.append_file(file_name, &mut wasm_file)
-                .with_context(|| {
-                    format!(
-                        "Failed to append WASM binary to archive: {}",
-                        wasm.display()
-                    )
-                })?;
+            append_file(&mut tar, Path::new(file_name), wasm)?;
         } else {
             anyhow::bail!("WASM binary not found at {}", wasm.display());
         }
@@ -116,22 +116,26 @@ pub(crate) fn pack_capsule_archive(
     // Use a cycle-safe recursive walk instead of tar's append_dir_all, because
     // follow_symlinks(true) + append_dir_all has no cycle detection — a symlink
     // pointing to an ancestor directory would cause infinite recursion and OOM.
-    let mut visited = HashSet::new();
-    for file_path in additional_files {
-        if file_path.exists() {
-            let rel_path = file_path
+    let mut ordered_files: Vec<(&Path, PathBuf)> = additional_files
+        .iter()
+        .filter(|path| path.exists())
+        .map(|path| {
+            let relative = path
                 .strip_prefix(base_dir)
-                .unwrap_or(Path::new(file_path.file_name().unwrap_or_default()));
+                .unwrap_or(Path::new(path.file_name().unwrap_or_default()))
+                .to_path_buf();
+            (*path, relative)
+        })
+        .collect();
+    ordered_files.sort_unstable_by(|left, right| left.1.cmp(&right.1));
 
+    let mut visited = HashSet::new();
+    for (file_path, rel_path) in ordered_files {
+        if file_path.exists() {
             if file_path.is_dir() {
-                append_dir_recursive(&mut tar, rel_path, file_path, &mut visited)?;
+                append_dir_recursive(&mut tar, &rel_path, file_path, &mut visited)?;
             } else {
-                let mut f = File::open(file_path).with_context(|| {
-                    format!("Failed to open file for packing: {}", file_path.display())
-                })?;
-                tar.append_file(rel_path, &mut f).with_context(|| {
-                    format!("Failed to append file to archive: {}", file_path.display())
-                })?;
+                append_file(&mut tar, &rel_path, file_path)?;
             }
         }
     }
@@ -147,7 +151,11 @@ pub(crate) fn pack_capsule_archive(
         append_dir_recursive(&mut tar, Path::new("wit"), wit, &mut wit_visited)?;
     }
 
-    tar.finish().context("Failed to finalize capsule archive")?;
+    let enc = tar
+        .into_inner()
+        .context("Failed to finalize capsule tar stream")?;
+    enc.finish()
+        .context("Failed to finalize capsule gzip stream")?;
 
     // Warn if archive is large (node_modules can bloat Tier 2 capsules)
     if let Ok(meta) = fs::metadata(output_path) {
@@ -192,19 +200,27 @@ fn append_dir_recursive(
         return Ok(());
     }
 
-    // Append the directory entry itself
-    tar.append_dir(archive_path, fs_path).with_context(|| {
-        format!(
-            "Failed to append directory to archive: {}",
-            fs_path.display()
-        )
-    })?;
+    // Directory contents and execute intent are the only permission semantics
+    // carried into the package. Checkout ownership and incidental mode bits do
+    // not perturb the archive.
+    let mut header = deterministic_header(0, 0o755, tar::EntryType::Directory);
+    tar.append_data(&mut header, archive_path, std::io::empty())
+        .with_context(|| {
+            format!(
+                "Failed to append directory to archive: {}",
+                fs_path.display()
+            )
+        })?;
+
+    // Filesystem iteration order is unspecified. Sort before recursion so the
+    // tar stream is stable across filesystems and repeated builds.
+    let mut entries = fs::read_dir(fs_path)
+        .with_context(|| format!("Failed to read directory: {}", fs_path.display()))?
+        .collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_unstable_by_key(fs::DirEntry::file_name);
 
     // Recurse into children
-    for entry in fs::read_dir(fs_path)
-        .with_context(|| format!("Failed to read directory: {}", fs_path.display()))?
-    {
-        let entry = entry?;
+    for entry in entries {
         let child_fs = entry.path();
         let child_archive = archive_path.join(entry.file_name());
 
@@ -215,21 +231,83 @@ fn append_dir_recursive(
         if metadata.is_dir() {
             append_dir_recursive(tar, &child_archive, &child_fs, visited)?;
         } else {
-            let mut f = File::open(&child_fs).with_context(|| {
-                format!("Failed to open file for packing: {}", child_fs.display())
-            })?;
-            tar.append_file(&child_archive, &mut f).with_context(|| {
-                format!("Failed to append file to archive: {}", child_fs.display())
-            })?;
+            append_file(tar, &child_archive, &child_fs)?;
         }
     }
 
     Ok(())
 }
 
+fn append_file(
+    tar: &mut tar::Builder<GzEncoder<File>>,
+    archive_path: &Path,
+    fs_path: &Path,
+) -> Result<()> {
+    let mut file = File::open(fs_path)
+        .with_context(|| format!("Failed to open file for packing: {}", fs_path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("Failed to inspect file for packing: {}", fs_path.display()))?;
+    let mode = normalized_file_mode(&metadata, &mut file)?;
+    let mut header = deterministic_header(metadata.len(), mode, tar::EntryType::Regular);
+    tar.append_data(&mut header, archive_path, &mut file)
+        .with_context(|| format!("Failed to append file to archive: {}", fs_path.display()))
+}
+
+fn normalized_file_mode(metadata: &fs::Metadata, file: &mut File) -> Result<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 != 0 {
+            return Ok(0o755);
+        }
+    }
+
+    // Windows has no Unix execute bits. Preserve executable intent from
+    // self-describing file formats so a checked-out script or native binary
+    // does not become data merely because the build host lacks that metadata.
+    let mut prefix = [0_u8; 4];
+    let read = file
+        .read(&mut prefix)
+        .context("Failed to inspect executable intent")?;
+    file.rewind()
+        .context("Failed to rewind file after executable-intent inspection")?;
+    Ok(if executable_magic(&prefix[..read]) {
+        0o755
+    } else {
+        0o644
+    })
+}
+
+fn executable_magic(prefix: &[u8]) -> bool {
+    prefix.starts_with(b"#!")
+        || prefix.starts_with(b"\x7fELF")
+        || prefix.starts_with(b"MZ")
+        || matches!(
+            prefix,
+            [0xfe, 0xed, 0xfa, 0xce | 0xcf]
+                | [0xce | 0xcf, 0xfa, 0xed, 0xfe]
+                | [0xca, 0xfe, 0xba, 0xbe | 0xbf]
+                | [0xbe | 0xbf, 0xba, 0xfe, 0xca]
+        )
+}
+
+fn deterministic_header(size: u64, mode: u32, entry_type: tar::EntryType) -> tar::Header {
+    let mut header = tar::Header::new_gnu();
+    header.set_size(size);
+    header.set_mode(mode);
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_mtime(tar::DETERMINISTIC_TIMESTAMP);
+    header.set_entry_type(entry_type);
+    header.set_cksum();
+    header
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astrid_crypto::KeyPair;
 
     #[test]
     fn opaque_assets_are_packaged_without_manifest_metadata() {
@@ -276,5 +354,148 @@ mod tests {
 
         let error = discover_opaque_assets(source.path()).unwrap_err();
         assert!(error.to_string().contains("cannot be symlinks"));
+    }
+
+    #[test]
+    fn signed_archives_are_reproducible_across_input_order_and_mtime() {
+        let source = tempfile::tempdir().unwrap();
+        let first = source.path().join("z-last.txt");
+        let assets_dir = source.path().join("assets");
+        let nested = assets_dir.join("nested/first.txt");
+        fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        fs::write(&first, "same first bytes").unwrap();
+        fs::write(&nested, "same nested bytes").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&first, fs::Permissions::from_mode(0o600)).unwrap();
+            fs::set_permissions(&nested, fs::Permissions::from_mode(0o640)).unwrap();
+        }
+
+        let manifest = "[package]\nname = \"reproducible\"\nversion = \"1.0.0\"\n";
+        let archive_a = source.path().join("a.capsule");
+        let archive_b = source.path().join("b.capsule");
+        let key = KeyPair::generate();
+
+        // Deliberately provide reverse lexical order for the first build.
+        pack_capsule_archive(
+            &archive_a,
+            manifest,
+            None,
+            source.path(),
+            &[first.as_path(), assets_dir.as_path()],
+            None,
+        )
+        .unwrap();
+        crate::artifact::sign_archive(&archive_a, &key).unwrap();
+
+        // Move source mtimes while retaining the exact bytes, then reverse the
+        // caller-provided input order. This would perturb the old archive
+        // headers without adding a timing-dependent sleep to the test.
+        let changed_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_234_567);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&first)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(changed_time))
+            .unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&nested)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(changed_time))
+            .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&first, fs::Permissions::from_mode(0o644)).unwrap();
+            fs::set_permissions(&nested, fs::Permissions::from_mode(0o664)).unwrap();
+        }
+        pack_capsule_archive(
+            &archive_b,
+            manifest,
+            None,
+            source.path(),
+            &[assets_dir.as_path(), first.as_path()],
+            None,
+        )
+        .unwrap();
+        crate::artifact::sign_archive(&archive_b, &key).unwrap();
+
+        assert_eq!(fs::read(archive_a).unwrap(), fs::read(archive_b).unwrap());
+    }
+
+    #[test]
+    fn signed_archive_bytes_include_the_signing_identity() {
+        let source = tempfile::tempdir().unwrap();
+        let payload = source.path().join("payload.txt");
+        fs::write(&payload, "same payload").unwrap();
+        let archive_a = source.path().join("key-a.capsule");
+        let archive_b = source.path().join("key-b.capsule");
+        let manifest = "[package]\nname = \"signer-input\"\nversion = \"1.0.0\"\n";
+
+        for archive in [&archive_a, &archive_b] {
+            pack_capsule_archive(
+                archive,
+                manifest,
+                None,
+                source.path(),
+                &[payload.as_path()],
+                None,
+            )
+            .unwrap();
+        }
+        crate::artifact::sign_archive(&archive_a, &KeyPair::generate()).unwrap();
+        crate::artifact::sign_archive(&archive_b, &KeyPair::generate()).unwrap();
+
+        assert_ne!(fs::read(archive_a).unwrap(), fs::read(archive_b).unwrap());
+    }
+
+    #[test]
+    fn synthesized_and_filesystem_headers_are_normalized() {
+        let source = tempfile::tempdir().unwrap();
+        let payload = source.path().join("payload.txt");
+        let executable = source.path().join("run.sh");
+        let assets = source.path().join("assets");
+        fs::write(&payload, "payload").unwrap();
+        fs::write(&executable, "#!/bin/sh\n").unwrap();
+        fs::create_dir(&assets).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&payload, fs::Permissions::from_mode(0o600)).unwrap();
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::set_permissions(&assets, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let archive_path = source.path().join("headers.capsule");
+
+        pack_capsule_archive(
+            &archive_path,
+            "[package]\nname = \"headers\"\nversion = \"1.0.0\"\n",
+            None,
+            source.path(),
+            &[payload.as_path(), executable.as_path(), assets.as_path()],
+            None,
+        )
+        .unwrap();
+
+        let file = File::open(archive_path).unwrap();
+        let decoder = flate2::read::GzDecoder::new(file);
+        assert_eq!(decoder.header().unwrap().mtime(), 0);
+        let mut archive = tar::Archive::new(decoder);
+        for entry in archive.entries().unwrap() {
+            let entry = entry.unwrap();
+            let header = entry.header();
+            assert_eq!(header.uid().unwrap(), 0);
+            assert_eq!(header.gid().unwrap(), 0);
+            assert_eq!(header.mtime().unwrap(), tar::DETERMINISTIC_TIMESTAMP);
+            let path = entry.path().unwrap();
+            let expected_mode = if path == Path::new("assets") || path == Path::new("run.sh") {
+                0o755
+            } else {
+                0o644
+            };
+            assert_eq!(header.mode().unwrap(), expected_mode);
+        }
     }
 }
