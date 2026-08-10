@@ -21,11 +21,102 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use handshake::AuthenticatedIdentity;
 
 const MAX_PENDING_HANDSHAKES: usize = 8;
+const MAX_ESTABLISHED_CONNECTIONS: usize = 128;
+const RESERVED_ADMIN_CONNECTIONS: usize = 8;
+const RESERVED_ADMIN_LIFETIME: std::time::Duration = std::time::Duration::from_mins(1);
 const MAX_FRAME_BYTES: usize = 50 * 1024 * 1024;
 const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
 const CLIENT_EGRESS_CAPACITY: usize = 1024;
 const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const EVENT_SOURCE: &str = "native_local_uplink";
+
+struct ConnectionLane {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    reserved_admin: bool,
+}
+
+struct ConnectionRuntime {
+    session_token: Arc<SessionToken>,
+    home: AstridHome,
+    event_bus: Arc<EventBus>,
+    egress_registry: Arc<egress::Registry>,
+    established_permits: Arc<tokio::sync::Semaphore>,
+    reserved_admin_permits: Arc<tokio::sync::Semaphore>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+}
+
+impl ConnectionRuntime {
+    async fn handle(
+        self: Arc<Self>,
+        mut stream: LocalStream,
+        handshake_permit: tokio::sync::OwnedSemaphorePermit,
+    ) {
+        let mut shutdown = self.shutdown.clone();
+        let identity = tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return;
+                }
+                return;
+            },
+            result = handshake::authenticate(&mut stream, &self.session_token, &self.home) => {
+                match result {
+                    Ok(identity) => identity,
+                    Err(reason) => {
+                        tracing::warn!(
+                            security_event = true,
+                            %reason,
+                            "rejected local uplink connection"
+                        );
+                        return;
+                    },
+                }
+            },
+        };
+        drop(handshake_permit);
+        let Some(lane) =
+            try_acquire_connection_lane(&self.established_permits, &self.reserved_admin_permits)
+        else {
+            tracing::warn!(
+                security_event = true,
+                "native local uplink connection limits exhausted"
+            );
+            return;
+        };
+        let egress = self.egress_registry.subscribe(
+            identity.principal.to_string(),
+            identity.device_key_id.clone(),
+        );
+        serve_connection(
+            stream,
+            identity,
+            Arc::clone(&self.event_bus),
+            egress,
+            shutdown,
+            lane,
+        )
+        .await;
+    }
+}
+
+fn try_acquire_connection_lane(
+    established: &Arc<tokio::sync::Semaphore>,
+    reserved_admin: &Arc<tokio::sync::Semaphore>,
+) -> Option<ConnectionLane> {
+    if let Ok(permit) = Arc::clone(established).try_acquire_owned() {
+        return Some(ConnectionLane {
+            _permit: permit,
+            reserved_admin: false,
+        });
+    }
+    Arc::clone(reserved_admin)
+        .try_acquire_owned()
+        .ok()
+        .map(|permit| ConnectionLane {
+            _permit: permit,
+            reserved_admin: true,
+        })
+}
 
 /// Handles required by the Astrid-owned local uplink server.
 pub struct NativeUplink {
@@ -51,9 +142,22 @@ impl NativeUplink {
 
     async fn run(mut self) {
         let handshake_permits = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_HANDSHAKES));
-        let mut connections = tokio::task::JoinSet::new();
+        let established_permits =
+            Arc::new(tokio::sync::Semaphore::new(MAX_ESTABLISHED_CONNECTIONS));
+        let reserved_admin_permits =
+            Arc::new(tokio::sync::Semaphore::new(RESERVED_ADMIN_CONNECTIONS));
         let egress_registry = egress::Registry::install(&self.event_bus);
         let (connection_shutdown_tx, connection_shutdown_rx) = tokio::sync::watch::channel(false);
+        let runtime = Arc::new(ConnectionRuntime {
+            session_token: Arc::clone(&self.session_token),
+            home: self.home.clone(),
+            event_bus: Arc::clone(&self.event_bus),
+            egress_registry,
+            established_permits,
+            reserved_admin_permits,
+            shutdown: connection_shutdown_rx,
+        });
+        let mut connections = tokio::task::JoinSet::new();
         loop {
             let permit = tokio::select! {
                 changed = self.shutdown.changed() => {
@@ -88,45 +192,7 @@ impl NativeUplink {
                     continue;
                 },
             };
-            let event_bus = Arc::clone(&self.event_bus);
-            let mut shutdown = connection_shutdown_rx.clone();
-            let session_token = Arc::clone(&self.session_token);
-            let home = self.home.clone();
-            let egress_registry = Arc::clone(&egress_registry);
-            connections.spawn(async move {
-                let handshake_permit = permit;
-                let mut stream = stream;
-                let identity = tokio::select! {
-                    changed = shutdown.changed() => {
-                        if changed.is_err() || *shutdown.borrow() {
-                            return;
-                        }
-                        return;
-                    },
-                    result = handshake::authenticate(&mut stream, &session_token, &home) => {
-                        match result {
-                            Ok(identity) => identity,
-                            Err(reason) => {
-                                tracing::warn!(
-                                    security_event = true,
-                                    %reason,
-                                    "rejected local uplink connection"
-                                );
-                                return;
-                            },
-                        }
-                    },
-                };
-                // Stalled, unauthenticated peers are bounded, but an
-                // authenticated long-lived MCP connection must not consume
-                // capacity needed by later status/stop clients.
-                drop(handshake_permit);
-                let egress = egress_registry.subscribe(
-                    identity.principal.to_string(),
-                    identity.device_key_id.clone(),
-                );
-                serve_connection(stream, identity, event_bus, egress, shutdown).await;
-            });
+            connections.spawn(Arc::clone(&runtime).handle(stream, permit));
             while let Some(result) = connections.try_join_next() {
                 if let Err(error) = result {
                     tracing::warn!(%error, "native local uplink connection task failed");
@@ -149,12 +215,49 @@ fn event_topic(event: &AstridEvent) -> Option<&str> {
     Some(message.topic.as_str())
 }
 
+fn publish_trusted_ingress(
+    event_bus: &EventBus,
+    identity: &AuthenticatedIdentity,
+    principal: &str,
+    message: IpcMessage,
+) {
+    // Rebuild the envelope so every provenance field is host-derived. The
+    // client controls only the allowlisted topic and payload.
+    let mut trusted = IpcMessage::new(message.topic, message.payload, uuid::Uuid::nil())
+        .with_principal(principal);
+    trusted.device_key_id.clone_from(&identity.device_key_id);
+    trusted.origin = if identity.is_principal_verified() {
+        MessageOrigin::LocalSocket
+    } else {
+        MessageOrigin::System
+    };
+    event_bus.publish(AstridEvent::Ipc {
+        metadata: EventMetadata::new(EVENT_SOURCE),
+        message: trusted,
+    });
+}
+
+fn admit_reserved_admin(
+    topic: &str,
+    response_topic: &mut Option<String>,
+) -> Result<(), &'static str> {
+    if response_topic.is_some() {
+        return Err("reserved admin connection attempted multiple requests");
+    }
+    *response_topic = Some(
+        routing::reserved_admin_response_topic(topic)
+            .ok_or("non-admin request rejected from reserved connection lane")?,
+    );
+    Ok(())
+}
+
 async fn serve_connection(
     stream: LocalStream,
     identity: AuthenticatedIdentity,
     event_bus: Arc<EventBus>,
     mut receiver: egress::Subscription,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
+    connection_lane: ConnectionLane,
 ) {
     let principal = identity.principal.to_string();
     publish_lifecycle(&event_bus, Topic::client_connect(), &principal, None);
@@ -163,9 +266,19 @@ async fn serve_connection(
     let (reader, mut writer) = local_transport::split(stream);
     let mut reader = FramedReader::new(reader);
     let mut stream_accumulators = HashMap::new();
+    let reserved_admin = connection_lane.reserved_admin;
+    let _connection_lane = connection_lane;
+    let reserved_deadline = tokio::time::Instant::now()
+        .checked_add(RESERVED_ADMIN_LIFETIME)
+        .unwrap_or_else(tokio::time::Instant::now);
+    let mut reserved_response_topic: Option<String> = None;
 
     loop {
         tokio::select! {
+            () = tokio::time::sleep_until(reserved_deadline), if reserved_admin => {
+                tracing::warn!(%principal, "reserved admin connection exceeded its lifetime");
+                break;
+            },
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     // A management shutdown response is published before the
@@ -192,31 +305,21 @@ async fn serve_connection(
                         tracing::warn!(security_event = true, %principal, %reason, "dropped local uplink message");
                         continue;
                     }
+                    if reserved_admin
+                        && let Err(reason) = admit_reserved_admin(
+                            message.topic.as_str(),
+                            &mut reserved_response_topic,
+                        )
+                    {
+                        tracing::warn!(%principal, %reason);
+                        break;
+                    }
                     if message.topic.as_str() == routing::CHAT_REQUEST_TOPIC {
                         let session = routing::payload_session_id(&message.payload).map(str::to_owned);
                         routing::begin_turn(&message.payload, &mut stream_accumulators);
                         receiver.set_session(session);
                     }
-                    // Rebuild the envelope so every provenance field is
-                    // host-derived. The client controls only the allowlisted
-                    // topic and payload — never principal, device, origin,
-                    // source, signature, timestamp, or sequence.
-                    let mut trusted = IpcMessage::new(
-                        message.topic,
-                        message.payload,
-                        uuid::Uuid::nil(),
-                    )
-                    .with_principal(&principal);
-                    trusted.device_key_id.clone_from(&identity.device_key_id);
-                    trusted.origin = if identity.is_principal_verified() {
-                        MessageOrigin::LocalSocket
-                    } else {
-                        MessageOrigin::System
-                    };
-                    event_bus.publish(AstridEvent::Ipc {
-                        metadata: EventMetadata::new(EVENT_SOURCE),
-                        message: trusted,
-                    });
+                    publish_trusted_ingress(&event_bus, &identity, &principal, message);
                 },
                 Ok(None) => break,
                 Err(error) => {
@@ -245,6 +348,9 @@ async fn serve_connection(
                     &mut stream_accumulators,
                 ).await {
                     tracing::warn!(%principal, %error, "local uplink write failed");
+                    break;
+                }
+                if reserved_response_topic.as_deref() == event_topic(&event) {
                     break;
                 }
             },
@@ -512,6 +618,25 @@ mod tests {
         assert_eq!(actual.topic, expected.topic);
         assert_eq!(actual.payload, expected.payload);
         assert_eq!(actual.source_id, expected.source_id);
+    }
+
+    #[test]
+    fn established_limit_falls_back_to_a_separate_reserved_admin_lane() {
+        let established = Arc::new(tokio::sync::Semaphore::new(1));
+        let reserved = Arc::new(tokio::sync::Semaphore::new(1));
+
+        let general = try_acquire_connection_lane(&established, &reserved)
+            .expect("general connection permit");
+        assert!(!general.reserved_admin);
+        let admin =
+            try_acquire_connection_lane(&established, &reserved).expect("reserved admin permit");
+        assert!(admin.reserved_admin);
+        assert!(try_acquire_connection_lane(&established, &reserved).is_none());
+
+        drop(general);
+        let replacement =
+            try_acquire_connection_lane(&established, &reserved).expect("released general permit");
+        assert!(!replacement.reserved_admin);
     }
 
     #[tokio::test]

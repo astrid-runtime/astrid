@@ -7,7 +7,7 @@ use astrid_events::{AstridEvent, EventBus};
 
 use super::{CLIENT_EGRESS_CAPACITY, EVENT_SOURCE, MAX_PAYLOAD_BYTES, event_topic, routing};
 
-const CLIENT_EGRESS_BYTE_BUDGET: usize = 16 * MAX_PAYLOAD_BYTES;
+const CLIENT_EGRESS_BYTE_BUDGET: usize = 4 * MAX_PAYLOAD_BYTES;
 
 struct QueuedEvent {
     event: Arc<AstridEvent>,
