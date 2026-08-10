@@ -16,14 +16,20 @@ test-support = []
 anyhow = { workspace = true }
 astrid-core = { workspace = true }
 astrid-crypto = { workspace = true }
+astrid-events = { workspace = true }
 astrid-types = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 # `net`: host-local/TCP client transport; native-only, not in the tokio base.
-tokio = { workspace = true, features = ["net"] }
+tokio = { workspace = true, features = ["net", "sync", "time", "io-util", "rt"] }
 tracing = { workspace = true }
 uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

@@ -25,8 +25,7 @@
 //! workers are all pinned by an exempt run-loop tight-compute capsule, then
 //! `SIGTERM`, asserting exit within the watchdog grace — is NOT yet automated.
 //! It requires a compute-pinning exempt run-loop capsule fixture and the full
-//! capsule fleet the runtime bash harness assembles (a bare daemon refuses to
-//! boot without the CLI proxy capsule), so it belongs in that harness rather
+//! capsule fleet the runtime bash harness assembles, so it belongs in that harness rather
 //! than the sandboxed workspace test matrix. The engine-level `exempt_*` tests
 //! above prove the un-pinning mechanism the daemon relies on; the end-to-end
 //! harness scenario is a tracked follow-up.

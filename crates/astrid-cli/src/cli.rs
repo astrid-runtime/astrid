@@ -37,9 +37,9 @@ pub(crate) struct Cli {
     /// the process sends, so the kernel scopes session, KV, home,
     /// secrets, and quotas to this identity. Falls back to the
     /// `ASTRID_PRINCIPAL` env var, then to `default`. Must be 1-64
-    /// chars of `[a-zA-Z0-9_-]`. The uplink proxy pins the first
-    /// principal it sees on a connection and drops any message stamped
-    /// with a different one, so this is fixed for the whole process.
+    /// chars of `[a-zA-Z0-9_-]`. The native uplink cryptographically
+    /// binds this principal during the connection handshake, so it is
+    /// fixed for the whole process.
     #[arg(
         id = "process-principal",
         long = "principal",

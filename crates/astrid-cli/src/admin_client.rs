@@ -29,9 +29,8 @@ impl AdminClient {
 /// invite` verb to construct a request-bound admin client without each
 /// verb resolving the principal itself. The bound principal is the
 /// one resolved at startup (`crate::principal::current`), so every
-/// admin request this process sends attributes to one identity — the
-/// uplink proxy pins the first principal per connection and drops
-/// mismatches.
+/// admin request this process sends attributes to the identity the native
+/// uplink verified and bound during the connection handshake.
 ///
 /// # Errors
 /// Returns an error if the socket file is missing (no daemon),

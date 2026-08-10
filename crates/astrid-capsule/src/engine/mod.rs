@@ -269,7 +269,8 @@ pub(crate) async fn resolve_env(
                 fields: onboarding_fields,
             },
             uuid::Uuid::nil(),
-        );
+        )
+        .with_principal(ctx.principal.to_string());
         let _ = ctx.event_bus.publish(astrid_events::AstridEvent::Ipc {
             metadata: astrid_events::EventMetadata::new(source),
             message: msg,

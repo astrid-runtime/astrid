@@ -27,6 +27,12 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   Regression coverage compares independently built archive bytes, verifies
   canonical metadata, and makes the signing key an explicit controlled input.
   Closes #1475; related to #555.
+- **Astrid now owns its baseline local administrative transport.** A clean
+  runtime can start, authenticate the native `astrid` CLI, execute management
+  requests, stop, and restart without installing a distribution-provided
+  uplink capsule. Distribution frontends remain optional and cannot compete
+  for the canonical listener or make base daemon boot depend on AOS. Closes
+  #1471.
 
 - **Astrid now has durable human and fleet ownership identities independent of
   executable principals and capability groups.** Canonical `UserUid` and

@@ -309,14 +309,14 @@ impl HostState {
     ///    grant.
     ///
     ///    TRUST ASSUMPTION: treating `LocalSocket` as "the local operator" is
-    ///    only sound because that origin is stamped (in
-    ///    `net::tcp_stream::read`) exclusively on the uplink path — the stamp is
-    ///    gated on `has_uplink_capability`, and the uplink capability is granted
-    ///    only to the designated uplink capsule (capsule-cli). If that
-    ///    capability were ever granted to a non-uplink capsule, that capsule
-    ///    could forge a `LocalSocket` origin and self-approve local egress. The
-    ///    enforcement boundary is therefore the uplink-capability grant, not
-    ///    this check; keep it uplink-capsule-only.
+    ///    sound only at two host-controlled boundaries. The native uplink stamps
+    ///    it after its signed handshake verifies the principal and device. The
+    ///    compatibility capsule path stamps it in `net::tcp_stream::read` only
+    ///    when `has_uplink_capability` holds; that capability must remain limited
+    ///    to designated uplink capsules. A weaker handshake or a grant to an
+    ///    arbitrary capsule would let it forge local origin and self-approve
+    ///    egress. Those authentication and capability boundaries—not this
+    ///    origin comparison—are the enforcement floor.
     /// 2. Else, if `principal` already holds a runtime grant for THIS capsule
     ///    reaching `host:port`, return `true` immediately (no prompt). The grant
     ///    is keyed on `capsule_id` too, so capsule B never short-circuits on

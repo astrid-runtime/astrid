@@ -497,7 +497,7 @@ async fn perform_handshake(stream: &mut LocalStream, principal: &PrincipalId) ->
     perform_handshake_in_home(stream, principal, &home).await
 }
 
-async fn perform_handshake_in_home(
+pub(crate) async fn perform_handshake_in_home(
     stream: &mut LocalStream,
     principal: &PrincipalId,
     home: &astrid_core::dirs::AstridHome,

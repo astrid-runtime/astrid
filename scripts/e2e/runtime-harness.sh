@@ -330,6 +330,8 @@ main() {
     cargo build -p astrid --bins
   fi
 
+  run_standalone_admin_smoke
+
   require_capsules
 
   note "building .capsule artifact for lifecycle coverage"

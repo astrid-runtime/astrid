@@ -1,11 +1,10 @@
 //! Process-wide CLI principal.
 //!
 //! The `astrid` CLI acts as exactly one principal for its whole
-//! lifetime. The uplink proxy pins the first principal it sees on a
-//! connection: it auto-attributes unstamped messages to that principal
-//! and DROPS any message stamped with a different one. A mixed stream
-//! therefore loses messages silently, so the CLI must present one
-//! consistent principal on every IPC message it sends.
+//! lifetime. The native uplink cryptographically binds the connection during
+//! its handshake and host-stamps that verified identity onto every request;
+//! client-supplied authority fields are never trusted. The CLI must therefore
+//! present one consistent principal for connection setup and all requests.
 //!
 //! The principal is resolved ONCE at startup ([`resolve_process`]) with
 //! precedence explicit `--principal` flag > `ASTRID_PRINCIPAL` env >
