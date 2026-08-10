@@ -92,7 +92,11 @@ mod tests {
         let body = serde_json::to_vec(&expected).expect("serialize frame");
         let split = body.len() / 2;
         writer
-            .write_all(&(body.len() as u32).to_be_bytes())
+            .write_all(
+                &u32::try_from(body.len())
+                    .expect("test frame fits u32")
+                    .to_be_bytes(),
+            )
             .await
             .expect("write prefix");
         writer
@@ -123,7 +127,11 @@ mod tests {
     async fn rejects_oversized_frame_from_prefix_alone() {
         let (mut writer, reader) = tokio::io::duplex(16);
         writer
-            .write_all(&((MAX_FRAME_BYTES + 1) as u32).to_be_bytes())
+            .write_all(
+                &u32::try_from(MAX_FRAME_BYTES + 1)
+                    .expect("frame limit fits u32")
+                    .to_be_bytes(),
+            )
             .await
             .expect("write prefix");
 
