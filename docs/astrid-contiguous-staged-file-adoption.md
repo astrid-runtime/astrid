@@ -99,6 +99,10 @@ those retained capabilities; replacing an ambient staging path can therefore
 deny a later pathname lookup but cannot redirect recovery writes. Repeated
 chunk validation during contiguous recovery uses positional reads, so checking
 an earlier slice cannot move the streaming reconstruction cursor.
+On Unix, every retained staging-directory capability also owns a read-opened
+directory descriptor bound to the same filesystem identity for `fsync`;
+capability descriptors that use Linux `O_PATH` remain routing authority but are
+never mistaken for durability handles.
 
 The reflink path writes source bytes once plus bounded metadata and at most a
 copy-on-write tail extent. The fallback performs one additional full-data

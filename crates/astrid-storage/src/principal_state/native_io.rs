@@ -42,6 +42,8 @@ impl PrivateFileIdentity {
 #[derive(Debug)]
 pub(super) struct PrivateDirectory {
     directory: Dir,
+    #[cfg(unix)]
+    sync_handle: File,
     path: PathBuf,
     identity: PrivateDirectoryIdentity,
 }
@@ -77,8 +79,12 @@ impl PrivateDirectory {
                 path.display()
             )));
         }
+        #[cfg(unix)]
+        let sync_handle = private_directory_sync_handle(&directory, path, identity)?;
         Ok(Self {
             directory,
+            #[cfg(unix)]
+            sync_handle,
             path: path.to_path_buf(),
             identity,
         })
@@ -106,8 +112,12 @@ impl PrivateDirectory {
                 self.path.join(name).display()
             )));
         }
+        #[cfg(unix)]
+        let sync_handle = private_directory_sync_handle(&first, &self.path.join(name), identity)?;
         Ok(Self {
             directory: first,
+            #[cfg(unix)]
+            sync_handle,
             path: self.path.join(name),
             identity,
         })
@@ -402,14 +412,7 @@ impl PrivateDirectory {
     pub(super) fn sync(&self) -> StorageResult<()> {
         #[cfg(unix)]
         {
-            let directory = self
-                .directory
-                .try_clone()
-                .map_err(|error| {
-                    connection(format!("flush directory {}: {error}", self.path.display()))
-                })?
-                .into_std_file();
-            directory.sync_all().map_err(|error| {
+            self.sync_handle.sync_all().map_err(|error| {
                 connection(format!("flush directory {}: {error}", self.path.display()))
             })
         }
@@ -420,11 +423,49 @@ impl PrivateDirectory {
     }
 }
 
+#[cfg(unix)]
+fn private_directory_sync_handle(
+    directory: &Dir,
+    path: &Path,
+    expected: PrivateDirectoryIdentity,
+) -> StorageResult<File> {
+    use cap_std::fs::OpenOptionsExt as _;
+
+    // cap-std may retain an O_PATH descriptor for a directory on Linux. That
+    // descriptor is suitable as openat authority but fsync returns EBADF.
+    // Open `.` through the retained capability to obtain a read descriptor
+    // suitable for durability, then bind it to the capability's identity.
+    let mut options = cap_std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW);
+    let handle = directory
+        .open_with(Path::new("."), &options)
+        .map(cap_std::fs::File::into_std)
+        .map_err(|error| {
+            connection(format!(
+                "open flush handle for private directory {}: {error}",
+                path.display()
+            ))
+        })?;
+    if private_directory_file_identity(&handle)? != expected {
+        return Err(connection(format!(
+            "flush handle for private directory {} names a different directory",
+            path.display()
+        )));
+    }
+    Ok(handle)
+}
+
 fn private_directory_identity(directory: &Dir) -> StorageResult<PrivateDirectoryIdentity> {
     let file = directory
         .try_clone()
         .map_err(|error| connection(format!("clone private directory handle: {error}")))?
         .into_std_file();
+    private_directory_file_identity(&file)
+}
+
+fn private_directory_file_identity(file: &File) -> StorageResult<PrivateDirectoryIdentity> {
     let metadata = file
         .metadata()
         .map_err(|error| connection(format!("inspect private directory handle: {error}")))?;
@@ -469,6 +510,21 @@ fn private_directory_identity(directory: &Dir) -> StorageResult<PrivateDirectory
         Err(connection(
             "private directory identity is unsupported on this platform".to_owned(),
         ))
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::PrivateDirectory;
+
+    #[test]
+    fn retained_directory_capability_has_a_durable_sync_handle() {
+        let temporary = tempfile::tempdir().expect("create temporary directory");
+        let directory = PrivateDirectory::open(temporary.path()).expect("open private directory");
+
+        directory
+            .sync()
+            .expect("flush through the retained directory capability");
     }
 }
 
