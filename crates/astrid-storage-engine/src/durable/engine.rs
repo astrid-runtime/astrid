@@ -1,15 +1,12 @@
 use super::{
-    ARENA_FILE, ARENA_MAGIC, Arc, ArenaReader, BTreeMap, BTreeSet, CommitGroup, DurableEngine,
-    DurableEnginePolicy, DurableError, DurableInner, EngineOpenOptions, FaultInjector, FaultPoint,
-    FileExt, GroupCommitPolicy, InsertOutcome, LIFECYCLE_CLOSED, LIFECYCLE_REQUIRES_RECOVERY,
-    LIFECYCLE_USABLE, LOCK_FILE, ModelError, Mutex, NoFaults, ObjectCache, ObjectCacheConfig,
-    ObjectCacheStats, ObjectId, ObjectRecord, Path, PersistentObjectIdentity, Prepared,
-    PrincipalCodec, PrincipalUsage, ProjectionCacheEntry, ProjectionCacheKey, ROOT_FILE,
-    RecoveryLimits, RecoveryRetryPolicy, RecoveryScope, RootGeneration, RootSnapshot, RootState,
-    RootTransaction, RwLock, append_frame, canonical_record_bytes, encode_object_frame,
-    encode_root_record, ensure_payload_limit, io, io_error, live_files_mut, materialize_closure,
-    open_rw, read_indexed_object, read_indexed_objects, recover_store, usage_from_closure,
-    validate_incremental_closure,
+    ARENA_FILE, ARENA_MAGIC, Arc, BTreeMap, BTreeSet, ClosureObjects, DurableEngine, DurableError,
+    DurableInner, FaultPoint, InsertOutcome, LIFECYCLE_CLOSED, LIFECYCLE_REQUIRES_RECOVERY,
+    LIFECYCLE_USABLE, ModelError, ObjectCacheStats, ObjectId, ObjectRecord,
+    PersistentObjectIdentity, Prepared, PrincipalCodec, PrincipalUsage, ProjectionCacheEntry,
+    ProjectionCacheKey, ROOT_FILE, RecoveryScope, RootGeneration, RootSnapshot, RootState,
+    RootTransaction, append_frame, canonical_record_bytes, encode_object_frame, encode_root_record,
+    ensure_payload_limit, io_error, live_files_mut, materialize_closure, read_indexed_object,
+    read_indexed_objects, usage_from_closure, validate_incremental_closure,
 };
 use crate::{ProjectionObserver, ProjectionPhase};
 
@@ -19,271 +16,10 @@ where
     I: PersistentObjectIdentity,
     C: PrincipalCodec<P>,
 {
-    /// Open or create a durable store with no injected faults.
-    ///
-    /// # Errors
-    ///
-    /// Returns an I/O, lock, frame, identity, principal-codec, or model
-    /// recovery error. An incomplete or physically invalid final frame is
-    /// treated as an uncommitted tail only when no valid frame follows it;
-    /// semantic invalidity and interior corruption remain fatal.
-    pub fn open(
-        path: impl AsRef<Path>,
-        identity: I,
-        principal_codec: C,
-        limits: RecoveryLimits,
-    ) -> Result<Self, DurableError> {
-        Self::open_with_options(
-            path,
-            identity,
-            principal_codec,
-            limits,
-            EngineOpenOptions {
-                policy: DurableEnginePolicy::default(),
-                faults: Arc::new(NoFaults),
-            },
-        )
-    }
-
-    /// Open or create a durable store with an explicit group-commit policy.
-    ///
-    /// Setting both delays to zero disables intentional waiting while still
-    /// allowing callers queued behind an active flush to share that caller's
-    /// next durability group.
-    ///
-    /// # Errors
-    ///
-    /// Returns the same errors as [`Self::open`].
-    pub fn open_with_group_commit_policy(
-        path: impl AsRef<Path>,
-        identity: I,
-        principal_codec: C,
-        limits: RecoveryLimits,
-        group_policy: GroupCommitPolicy,
-    ) -> Result<Self, DurableError> {
-        Self::open_with_options(
-            path,
-            identity,
-            principal_codec,
-            limits,
-            EngineOpenOptions {
-                policy: DurableEnginePolicy::new(
-                    group_policy,
-                    RecoveryRetryPolicy::default(),
-                    ObjectCacheConfig::disabled(),
-                ),
-                faults: Arc::new(NoFaults),
-            },
-        )
-    }
-
-    /// Open or create a durable store with an explicitly governed decoded
-    /// object cache.
-    ///
-    /// The engine never selects a hidden default cache ceiling. The embedding
-    /// runtime owns both the live total controller and per-principal budget.
-    ///
-    /// # Errors
-    ///
-    /// Returns the same errors as [`Self::open`].
-    pub fn open_with_object_cache(
-        path: impl AsRef<Path>,
-        identity: I,
-        principal_codec: C,
-        limits: RecoveryLimits,
-        object_cache: ObjectCacheConfig<P>,
-    ) -> Result<Self, DurableError> {
-        Self::open_with_options(
-            path,
-            identity,
-            principal_codec,
-            limits,
-            EngineOpenOptions {
-                policy: DurableEnginePolicy::new(
-                    GroupCommitPolicy::default(),
-                    RecoveryRetryPolicy::default(),
-                    object_cache,
-                ),
-                faults: Arc::new(NoFaults),
-            },
-        )
-    }
-
-    /// Open or create a durable store with an explicit in-process recovery
-    /// policy.
-    ///
-    /// The recovery policy bounds work performed by one foreground operation.
-    /// It does not cap future recovery attempts: a later operation starts a
-    /// fresh bounded attempt after an operator resolves a persistent I/O
-    /// incident.
-    ///
-    /// # Errors
-    ///
-    /// Returns the same errors as [`Self::open`].
-    pub fn open_with_recovery_policy(
-        path: impl AsRef<Path>,
-        identity: I,
-        principal_codec: C,
-        limits: RecoveryLimits,
-        recovery_policy: RecoveryRetryPolicy,
-    ) -> Result<Self, DurableError> {
-        Self::open_with_options(
-            path,
-            identity,
-            principal_codec,
-            limits,
-            EngineOpenOptions {
-                policy: DurableEnginePolicy::new(
-                    GroupCommitPolicy::default(),
-                    recovery_policy,
-                    ObjectCacheConfig::disabled(),
-                ),
-                faults: Arc::new(NoFaults),
-            },
-        )
-    }
-
-    /// Open or create a durable store with one complete operating policy.
-    ///
-    /// # Errors
-    ///
-    /// Returns the same errors as [`Self::open`].
-    pub fn open_with_policy(
-        path: impl AsRef<Path>,
-        identity: I,
-        principal_codec: C,
-        limits: RecoveryLimits,
-        policy: DurableEnginePolicy<P>,
-    ) -> Result<Self, DurableError> {
-        Self::open_with_options(
-            path,
-            identity,
-            principal_codec,
-            limits,
-            EngineOpenOptions {
-                policy,
-                faults: Arc::new(NoFaults),
-            },
-        )
-    }
-
-    /// Open or create a durable store with an explicit fault injector.
-    ///
-    /// # Errors
-    ///
-    /// Returns the same errors as [`Self::open`].
-    pub fn open_with_faults(
-        path: impl AsRef<Path>,
-        identity: I,
-        principal_codec: C,
-        limits: RecoveryLimits,
-        faults: Arc<dyn FaultInjector>,
-    ) -> Result<Self, DurableError> {
-        Self::open_with_options(
-            path,
-            identity,
-            principal_codec,
-            limits,
-            EngineOpenOptions {
-                policy: DurableEnginePolicy::default(),
-                faults,
-            },
-        )
-    }
-
-    pub(super) fn open_with_options(
-        path: impl AsRef<Path>,
-        identity: I,
-        principal_codec: C,
-        limits: RecoveryLimits,
-        options: EngineOpenOptions<P>,
-    ) -> Result<Self, DurableError> {
-        let path = path.as_ref().to_path_buf();
-        std::fs::create_dir_all(&path)
-            .map_err(|source| io_error("create principal-store directory", source))?;
-        let lock_path = path.join(LOCK_FILE);
-        let lock = open_rw(&lock_path)?;
-        if let Err(source) = lock.try_lock_exclusive() {
-            if source.kind() == io::ErrorKind::WouldBlock {
-                return Err(DurableError::LockHeld(lock_path));
-            }
-            return Err(io_error("lock principal store", source));
-        }
-
-        let recovered = recover_store(&path, &principal_codec, &identity, limits)?;
-
-        Ok(Self {
-            directory: path,
-            identity,
-            principal_codec,
-            limits,
-            faults: options.faults,
-            lifecycle: std::sync::atomic::AtomicU8::new(LIFECYCLE_USABLE),
-            arena_reader: RwLock::new(Some(ArenaReader {
-                file: recovered.arena_reader,
-                generation: 0,
-            })),
-            object_cache: ObjectCache::new(options.policy.object_cache),
-            recovery_policy: options.policy.recovery,
-            preparation_authority: Arc::new(()),
-            group_policy: options.policy.group_commit,
-            commit_group: Mutex::new(CommitGroup::default()),
-            inner: Mutex::new(DurableInner {
-                roots_by_principal: recovered.roots_by_principal,
-                index: recovered.index,
-                pending_index_locations: Vec::new(),
-                pending_direct_objects: BTreeMap::new(),
-                validated: recovered.validated,
-                files: Some(recovered.files),
-                representations: recovered.representations,
-                lock: Some(lock),
-                poisoned: false,
-                arena_generation: 0,
-            }),
-        })
-    }
-
     /// Compute the logical identity of a canonical object.
     #[must_use]
     pub fn identify(&self, record: &ObjectRecord) -> ObjectId {
         self.identity.identify(record)
-    }
-
-    /// Return the number of recovered immutable objects.
-    ///
-    /// # Errors
-    ///
-    /// Returns a recovery error when authoritative reopen cannot complete.
-    pub fn object_count(&self) -> Result<usize, DurableError> {
-        let inner = self.lock_usable()?;
-        Ok(inner.index.len())
-    }
-
-    /// Return one recovered immutable object.
-    ///
-    /// # Errors
-    ///
-    /// Returns a recovery error when authoritative reopen cannot complete.
-    pub fn object(&self, id: ObjectId) -> Result<Option<ObjectRecord>, DurableError> {
-        let mut recovery = RecoveryScope::default();
-        loop {
-            let (location, generation) = {
-                let inner = self.lock_usable_with(&mut recovery)?;
-                let Some(location) = inner.index.get(&id).copied() else {
-                    return Ok(None);
-                };
-                (location, inner.arena_generation)
-            };
-            let reader_guard = self.arena_reader.read();
-            let Some(reader) = reader_guard.as_ref() else {
-                return Err(DurableError::Closed);
-            };
-            if reader.generation != generation {
-                continue;
-            }
-            return read_indexed_object(&reader.file, id, location, &self.identity, self.limits)
-                .map(Some);
-        }
     }
 
     /// Return one immutable object through the principal-accounted decoded
@@ -328,12 +64,40 @@ where
             if let Some(record) = self.object_cache.get(principal, id) {
                 return Ok(Some(record));
             }
-            let (location, generation) = {
+            let (location, contiguous, generation) = {
                 let inner = self.lock_usable_with(&mut recovery)?;
-                let Some(location) = inner.index.get(&id).copied() else {
-                    return Ok(None);
+                let contiguous = match inner.representations.as_ref() {
+                    Some(store) => store.open_contiguous_read(id)?,
+                    None => None,
                 };
-                (location, inner.arena_generation)
+                (
+                    inner.index.get(&id).copied(),
+                    contiguous,
+                    inner.arena_generation,
+                )
+            };
+            if location.is_none()
+                && let Some((file, location)) = contiguous
+            {
+                let record = super::representations::read_contiguous_object(
+                    file,
+                    location,
+                    id,
+                    &self.identity,
+                )?;
+                if let Some(record) = self.retain_loaded_object_if_current_with(
+                    principal,
+                    id,
+                    generation,
+                    record,
+                    &mut recovery,
+                )? {
+                    return Ok(Some(record));
+                }
+                continue;
+            }
+            let Some(location) = location else {
+                return Ok(None);
             };
             let reader_guard = self.arena_reader.read();
             let Some(reader) = reader_guard.as_ref() else {
@@ -413,13 +177,23 @@ where
         }
 
         loop {
-            let (locations, generation) = {
+            let (locations, contiguous, generation) = {
                 let inner = self.lock_usable_with(&mut recovery)?;
                 let locations = missing
                     .keys()
                     .filter_map(|id| inner.index.get(id).copied().map(|location| (*id, location)))
                     .collect::<Vec<_>>();
-                (locations, inner.arena_generation)
+                let mut contiguous = Vec::new();
+                if let Some(store) = inner.representations.as_ref() {
+                    for id in missing.keys() {
+                        if !inner.index.contains_key(id)
+                            && let Some((file, location)) = store.open_contiguous_read(*id)?
+                        {
+                            contiguous.push((*id, file, location));
+                        }
+                    }
+                }
+                (locations, contiguous, inner.arena_generation)
             };
             let reader_guard = self.arena_reader.read();
             let Some(reader) = reader_guard.as_ref() else {
@@ -428,13 +202,30 @@ where
             if reader.generation != generation {
                 continue;
             }
-            let loaded =
+            let mut loaded =
                 read_indexed_objects(&reader.file, &locations, &self.identity, self.limits)?;
             drop(reader_guard);
+            for (id, file, location) in contiguous {
+                loaded.insert(
+                    id,
+                    super::representations::read_contiguous_object(
+                        file,
+                        location,
+                        id,
+                        &self.identity,
+                    )?,
+                );
+            }
 
             let inner = self.lock_usable_with(&mut recovery)?;
             if inner.arena_generation != generation
-                || loaded.keys().any(|id| !inner.index.contains_key(id))
+                || loaded.keys().any(|id| {
+                    !inner.index.contains_key(id)
+                        && !inner
+                            .representations
+                            .as_ref()
+                            .is_some_and(|store| store.contains_contiguous(*id))
+                })
             {
                 continue;
             }
@@ -476,7 +267,13 @@ where
         recovery: &mut RecoveryScope,
     ) -> Result<Option<Arc<ObjectRecord>>, DurableError> {
         let inner = self.lock_usable_with(recovery)?;
-        if inner.arena_generation != generation || !inner.index.contains_key(&id) {
+        if inner.arena_generation != generation
+            || (!inner.index.contains_key(&id)
+                && !inner
+                    .representations
+                    .as_ref()
+                    .is_some_and(|store| store.contains_contiguous(id)))
+        {
             return Ok(None);
         }
         Ok(Some(self.object_cache.insert(principal, id, record)))
@@ -714,7 +511,7 @@ where
 
     pub(super) fn flush_standalone(
         inner: &mut DurableInner<P>,
-        representation_update: Option<super::representations::PendingDirectUpdate>,
+        representation_update: Option<super::representations::PendingRepresentationUpdate>,
     ) -> Result<u64, DurableError> {
         let DurableInner {
             files,
@@ -774,15 +571,23 @@ where
         let Some(root) = inner.roots_by_principal.get(principal).copied() else {
             return Ok(None);
         };
-        let DurableInner { files, index, .. } = &mut *inner;
+        let DurableInner {
+            files,
+            index,
+            representations,
+            ..
+        } = &mut *inner;
         let files = live_files_mut(files)?;
         let records = materialize_closure(
-            &mut files.arena,
-            index,
-            &BTreeMap::new(),
+            &mut ClosureObjects {
+                arena: &mut files.arena,
+                index,
+                incoming: &BTreeMap::new(),
+                representations: representations.as_ref(),
+                identity: &self.identity,
+                limits: self.limits,
+            },
             root.commit,
-            &self.identity,
-            self.limits,
         )?;
         Ok(Some(RootSnapshot { root, records }))
     }
@@ -800,15 +605,23 @@ where
             .get(principal)
             .copied()
             .ok_or(ModelError::PrincipalMissing)?;
-        let DurableInner { files, index, .. } = &mut *inner;
+        let DurableInner {
+            files,
+            index,
+            representations,
+            ..
+        } = &mut *inner;
         let files = live_files_mut(files)?;
         let records = materialize_closure(
-            &mut files.arena,
-            index,
-            &BTreeMap::new(),
+            &mut ClosureObjects {
+                arena: &mut files.arena,
+                index,
+                incoming: &BTreeMap::new(),
+                representations: representations.as_ref(),
+                identity: &self.identity,
+                limits: self.limits,
+            },
             root.commit,
-            &self.identity,
-            self.limits,
         )?;
         usage_from_closure(&records, root.commit).map_err(Into::into)
     }
@@ -927,17 +740,21 @@ where
             files,
             index,
             validated,
+            representations,
             ..
         } = inner;
         let files = live_files_mut(files)?;
         validate_incremental_closure(
-            &mut files.arena,
-            index,
-            incoming,
+            &mut ClosureObjects {
+                arena: &mut files.arena,
+                index,
+                incoming,
+                representations: representations.as_ref(),
+                identity: &self.identity,
+                limits: self.limits,
+            },
             validated,
             commit,
-            &self.identity,
-            self.limits,
         )
     }
 

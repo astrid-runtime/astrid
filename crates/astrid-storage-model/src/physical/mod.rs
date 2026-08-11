@@ -6,6 +6,7 @@
 
 use core::fmt;
 
+mod admission;
 mod catalogue;
 mod codec;
 mod identity;
@@ -15,6 +16,11 @@ mod profile;
 mod representation;
 mod state;
 
+pub use admission::{
+    RepresentationAdmissionEvidence, RepresentationAdmissionMethod,
+    RepresentationAdmissionSubjectId, RepresentationAdmissionTranscript,
+    RepresentationOutputObservation,
+};
 pub use catalogue::RepresentationCatalogueRoot;
 pub use identity::{
     PhysicalIdentity, PhysicalMapNodeId, PlacementSetId, RepresentationCatalogueRootId,

@@ -76,6 +76,33 @@ where
     P: Clone + Ord + Send + Sync,
     E: PrincipalProjectionEngine<P>,
 {
+    pub(crate) fn publish_verified_batch(
+        &self,
+        principal: &P,
+        entries: impl IntoIterator<Item = (ContentName, VerifiedContent)>,
+        staged_objects_inserted: u64,
+    ) -> Result<ContentBatchWriteOutcome, PrincipalContentError> {
+        let mut completed = BTreeMap::new();
+        for (name, verified) in entries {
+            if completed
+                .insert(
+                    name.clone(),
+                    PreparedContent {
+                        verified,
+                        observation: ContentObservation::BytesObserved,
+                    },
+                )
+                .is_some()
+            {
+                return Err(PrincipalContentError::DuplicateBatchName(name));
+            }
+        }
+        if completed.is_empty() {
+            return Err(PrincipalContentError::EmptyBatch);
+        }
+        self.publish_batch(principal, &completed, staged_objects_inserted, None)
+    }
+
     /// Stream and atomically publish several names under one principal root.
     ///
     /// Sources are consumed in canonical name order. Content records are

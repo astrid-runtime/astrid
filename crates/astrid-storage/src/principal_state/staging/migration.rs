@@ -1,6 +1,5 @@
 //! Crash-safe migration from per-generation staging directories.
 
-use std::fs::OpenOptions;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -9,23 +8,30 @@ use astrid_core::principal::PrincipalId;
 
 use super::format::{
     LegacyStagingIntent, LegacyStagingOwner, StagingIntent, append_generation_footer,
-    encode_intent, load_generation_footer, load_intent, load_legacy_intent,
+    encode_intent, load_intent, load_legacy_intent,
 };
 use super::journal::{JournalRecord, StageKey, append_records, flush_journal};
 use super::legacy::{self, LegacyReady};
-use super::recovery::{read_directory, sealed_generation_name, validate_generation};
-use super::retirement::remove as remove_generation;
+use super::recovery::{open_generation_in, read_directory, sealed_generation_name};
 use super::{
     JournalState, StagingFaultInjector, StagingFaultPoint, claim_generation_key, connection,
 };
 use crate::error::StorageResult;
 use crate::principal_state::StateOwner;
 use crate::principal_state::native_io::{
-    atomic_write, ensure_private_directory, open_private_file, rename_private_entry,
-    sync_directory, validate_private_regular_file,
+    PrivateDirectory, atomic_write, ensure_private_directory, private_file_identity, sync_directory,
 };
 
 pub(super) const LEGACY_INTENT_FILE: &str = "intent.v1";
+
+pub(super) struct MigrationDirectories<'a> {
+    pub(super) root_path: &'a Path,
+    pub(super) root: &'a PrivateDirectory,
+    pub(super) generations_path: &'a Path,
+    pub(super) generations: &'a PrivateDirectory,
+    pub(super) quarantine_path: &'a Path,
+    pub(super) quarantine: &'a PrivateDirectory,
+}
 
 struct AliasIntentMigration {
     directory: PathBuf,
@@ -206,30 +212,46 @@ fn apply_alias_intent_migration(migration: &AliasIntentMigration) -> StorageResu
 }
 
 pub(super) fn migrate_legacy(
-    root: &Path,
-    generations: &Path,
-    quarantine: &Path,
+    directories: &MigrationDirectories<'_>,
     journal: &mut JournalState,
     faults: &dyn StagingFaultInjector,
 ) -> StorageResult<()> {
-    let Some(intents) = legacy::inspect_migration_intents(root)? else {
+    let Some(intents) = legacy::inspect_migration_intents(directories.root_path)? else {
         return Ok(());
     };
     validate_intent_keys(Some(journal), &intents)?;
-    let Some((legacy_ready, entries)) = legacy::recover(root, quarantine)? else {
+    let Some((_legacy_ready, entries)) = legacy::recover(
+        directories.root_path,
+        directories.root,
+        directories.quarantine_path,
+        directories.quarantine,
+    )?
+    else {
         return Ok(());
     };
     let mut new_entries = Vec::new();
     for entry in entries {
         let key = StageKey::from_intent(&entry.intent);
-        let target = generations.join(sealed_generation_name(key.sequence, key.id));
+        let target_name = PathBuf::from(sealed_generation_name(key.sequence, key.id));
+        let target = directories.generations_path.join(&target_name);
         if journal.completed.contains(&key) {
-            remove_completed(&entry, &target)?;
+            remove_completed(
+                directories.root,
+                directories.generations,
+                &entry,
+                &target_name,
+            )?;
             continue;
         }
-        prepare_generation(&entry, &target, faults)?;
-        sync_directory(generations)?;
-        validate_generation(&target, &entry.intent)?;
+        prepare_generation(
+            directories.generations,
+            &entry,
+            &target,
+            &target_name,
+            faults,
+        )?;
+        directories.generations.sync()?;
+        open_generation_in(directories.generations, &target, &entry.intent, None)?;
         match journal.pending.get(&key) {
             Some(existing) if existing == &entry.intent => {},
             Some(_) => return Err(intent_disagreement(key)),
@@ -239,55 +261,79 @@ pub(super) fn migrate_legacy(
 
     persist_new_entries(journal, &new_entries)?;
     for entry in new_entries {
-        legacy::cleanup(&entry.directory)?;
+        let ready_directory = directories
+            .root
+            .open_child(Path::new(legacy::READY_DIRECTORY))?;
+        legacy::cleanup_in(&ready_directory, &entry.directory_name, &entry.capability)?;
     }
-    cleanup_already_journalled(root, quarantine, journal)?;
-    sync_directory(&legacy_ready)
+    cleanup_already_journalled(
+        directories.root_path,
+        directories.root,
+        directories.quarantine_path,
+        directories.quarantine,
+        journal,
+    )?;
+    directories
+        .root
+        .open_child(Path::new(legacy::READY_DIRECTORY))?
+        .sync()
 }
 
-fn remove_completed(entry: &LegacyReady, target: &Path) -> StorageResult<()> {
-    if target.exists() {
-        remove_generation(target)?;
-        if let Some(parent) = target.parent() {
-            sync_directory(parent)?;
-        }
+fn remove_completed(
+    root: &PrivateDirectory,
+    generations: &PrivateDirectory,
+    entry: &LegacyReady,
+    target: &Path,
+) -> StorageResult<()> {
+    if generations.contains(target)? {
+        generations.remove_file(target)?;
+        generations.sync()?;
     }
-    legacy::cleanup(&entry.directory)
+    let ready = root.open_child(Path::new(legacy::READY_DIRECTORY))?;
+    legacy::cleanup_in(&ready, &entry.directory_name, &entry.capability)
 }
 
 fn prepare_generation(
+    generations: &PrivateDirectory,
     entry: &LegacyReady,
     target: &Path,
+    target_name: &Path,
     faults: &dyn StagingFaultInjector,
 ) -> StorageResult<()> {
-    match (&entry.content, target.exists()) {
-        (Some(source), false) => {
-            rename_private_entry(source, target)?;
+    match (&entry.content, generations.contains(target_name)?) {
+        (Some(_source), false) => {
+            let content_name = Path::new(legacy::CONTENT_FILE);
+            let identity = private_file_identity(&entry.capability.open_file(content_name)?)?;
+            entry.capability.rename_to_with_identity(
+                content_name,
+                generations,
+                target_name,
+                identity,
+            )?;
             // The footer mutates the renamed inode. Make both sides of the
             // rename durable first, otherwise a crash can resurrect the inode
             // at its legacy name with a new-format footer that the legacy
             // reader correctly rejects.
-            if let Some(source_parent) = source.parent() {
-                sync_directory(source_parent)?;
-            }
-            if let Some(target_parent) = target.parent() {
-                sync_directory(target_parent)?;
-            }
+            entry.capability.sync()?;
+            generations.sync()?;
             faults.fail(StagingFaultPoint::MigrationNamespaceFlushed)?;
         },
-        (Some(source), true) => {
-            if !file_prefix_equal(source, target, entry.intent.logical_bytes)? {
+        (Some(_source), true) => {
+            if !file_prefix_equal_in(
+                &entry.capability,
+                Path::new(legacy::CONTENT_FILE),
+                generations,
+                target_name,
+                entry.intent.logical_bytes,
+            )? {
                 return Err(connection(format!(
                     "legacy and journalled staged generations disagree for {}-{}",
                     entry.intent.sequence, entry.intent.id
                 )));
             }
-            std::fs::remove_file(source).map_err(|error| {
-                connection(format!(
-                    "remove duplicate legacy staged content {}: {error}",
-                    source.display()
-                ))
-            })?;
+            entry
+                .capability
+                .remove_file(Path::new(legacy::CONTENT_FILE))?;
         },
         (None, true) => {},
         (None, false) => {
@@ -297,7 +343,7 @@ fn prepare_generation(
             )));
         },
     }
-    ensure_footer(target, entry)
+    ensure_footer(generations, target, target_name, entry)
 }
 
 fn validate_intent_keys(
@@ -330,31 +376,39 @@ fn validate_intent_keys(
     Ok(())
 }
 
-fn ensure_footer(target: &Path, entry: &LegacyReady) -> StorageResult<()> {
-    match load_generation_footer(target) {
-        Ok(existing) if existing == entry.intent => Ok(()),
+fn ensure_footer(
+    generations: &PrivateDirectory,
+    target: &Path,
+    target_name: &Path,
+    entry: &LegacyReady,
+) -> StorageResult<()> {
+    let current_footer = generations
+        .open_file(target_name)
+        .and_then(|mut file| super::format::load_generation_footer_from_file(target, &mut file));
+    match current_footer {
+        Ok(existing) if existing.intent == entry.intent => Ok(()),
         Ok(_) => Err(connection(format!(
             "legacy staged footer disagrees for {}-{}",
             entry.intent.sequence, entry.intent.id
         ))),
         Err(_) => {
-            let physical_bytes = validate_private_regular_file(target)?;
+            let physical_bytes = generations
+                .open_file(target_name)?
+                .metadata()
+                .map_err(|error| {
+                    connection(format!(
+                        "inspect migrated staged generation {}: {error}",
+                        target.display()
+                    ))
+                })?
+                .len();
             if physical_bytes < entry.intent.logical_bytes {
                 return Err(connection(format!(
                     "migrated staged generation is shorter than its legacy intent for {}-{}",
                     entry.intent.sequence, entry.intent.id
                 )));
             }
-            let mut file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(target)
-                .map_err(|error| {
-                    connection(format!(
-                        "open legacy staged generation {}: {error}",
-                        target.display()
-                    ))
-                })?;
+            let mut file = generations.open_file_rw(target_name)?;
             // A crash while migration appends the new footer can retain any
             // prefix of that footer. The legacy intent remains authoritative
             // until cleanup, so discard only bytes beyond its recorded
@@ -365,7 +419,8 @@ fn ensure_footer(target: &Path, entry: &LegacyReady) -> StorageResult<()> {
                     target.display()
                 ))
             })?;
-            append_generation_footer(&mut file, &entry.intent)?;
+            let source_identity = private_file_identity(&file)?;
+            append_generation_footer(&mut file, &entry.intent, source_identity)?;
             file.sync_all().map_err(|error| {
                 connection(format!(
                     "flush migrated staged generation {}: {error}",
@@ -396,29 +451,48 @@ fn persist_new_entries(journal: &mut JournalState, entries: &[LegacyReady]) -> S
 
 fn cleanup_already_journalled(
     root: &Path,
+    root_directory: &PrivateDirectory,
     quarantine: &Path,
+    quarantine_directory: &PrivateDirectory,
     journal: &JournalState,
 ) -> StorageResult<()> {
-    let Some((_, entries)) = legacy::recover(root, quarantine)? else {
+    let Some((_, entries)) =
+        legacy::recover(root, root_directory, quarantine, quarantine_directory)?
+    else {
         return Ok(());
     };
+    let ready_directory = root_directory.open_child(Path::new(legacy::READY_DIRECTORY))?;
     for entry in entries {
         let key = StageKey::from_intent(&entry.intent);
         if journal.pending.get(&key) == Some(&entry.intent) {
-            legacy::cleanup(&entry.directory)?;
+            legacy::cleanup_in(&ready_directory, &entry.directory_name, &entry.capability)?;
         }
     }
     Ok(())
 }
 
-fn file_prefix_equal(left: &Path, right: &Path, logical_bytes: u64) -> StorageResult<bool> {
-    if validate_private_regular_file(left)? != logical_bytes
-        || validate_private_regular_file(right)? < logical_bytes
+fn file_prefix_equal_in(
+    left_directory: &PrivateDirectory,
+    left_name: &Path,
+    right_directory: &PrivateDirectory,
+    right_name: &Path,
+    logical_bytes: u64,
+) -> StorageResult<bool> {
+    let mut left = left_directory.open_file(left_name)?;
+    let mut right = right_directory.open_file(right_name)?;
+    if left
+        .metadata()
+        .map_err(|error| connection(format!("inspect legacy comparison source: {error}")))?
+        .len()
+        != logical_bytes
+        || right
+            .metadata()
+            .map_err(|error| connection(format!("inspect migrated generation: {error}")))?
+            .len()
+            < logical_bytes
     {
         return Ok(false);
     }
-    let mut left = open_private_file(left)?;
-    let mut right = open_private_file(right)?;
     let mut left_buffer = vec![0_u8; 65_536].into_boxed_slice();
     let mut right_buffer = vec![0_u8; 65_536].into_boxed_slice();
     let buffer_len = u64::try_from(left_buffer.len())
@@ -441,7 +515,7 @@ fn file_prefix_equal(left: &Path, right: &Path, logical_bytes: u64) -> StorageRe
                 u64::try_from(left_read)
                     .map_err(|_| connection("legacy comparison length overflow".to_owned()))?,
             )
-            .ok_or_else(|| connection("legacy comparison underflow".to_owned()))?;
+            .ok_or_else(|| connection("legacy comparison length underflow".to_owned()))?;
     }
     Ok(true)
 }

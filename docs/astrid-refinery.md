@@ -179,6 +179,15 @@ At least one recoverable representation of every live ObjectId remains
 reachable throughout publication. Compaction never exposes a window where the
 new placement is authoritative before its complete closure is durable.
 
+The current native compactor takes the conservative form of that rule. It
+materializes every live object, including chunks served only from a contiguous
+blob, into the replacement arena. It then publishes a direct-placement
+catalogue for that complete represented set before retiring the loose-blob
+namespace. The durable compaction intent makes both steps replayable after a
+crash. A future selection policy may preserve or create alternate
+representations during the same traversal, but it cannot weaken this authority
+handoff or make a loose blob disappear first.
+
 ## Evidence shape
 
 Every completed work batch emits an auditable record:

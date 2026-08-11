@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use astrid_storage_model::{ModelError, ObjectId};
 use parking_lot::{Condvar, Mutex};
 
-use super::representations::{PendingDirectUpdate, RepresentationStore};
+use super::representations::{PendingRepresentationUpdate, RepresentationStore};
 
 use super::{
     ARENA_MAGIC, CommitOutcome, DurableEngine, DurableError, DurableFiles, DurableInner,
@@ -539,7 +539,7 @@ where
         pending: PendingRepresentations<'_>,
         required: impl Iterator<Item = (ObjectId, super::ArenaLocation)>,
         appended: impl Iterator<Item = (ObjectId, &'a [u8], super::ArenaLocation)>,
-    ) -> Result<Option<PendingDirectUpdate>, DurableError> {
+    ) -> Result<Option<PendingRepresentationUpdate>, DurableError> {
         let mut direct = Vec::new();
         direct
             .try_reserve(pending.locations.len())

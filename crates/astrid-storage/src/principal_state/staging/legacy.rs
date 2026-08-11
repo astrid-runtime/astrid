@@ -5,11 +5,11 @@ use std::path::{Path, PathBuf};
 
 use uuid::Uuid;
 
-use super::format::{StagingIntent, load_intent};
+use super::format::{StagingIntent, load_intent, load_intent_from_file};
 use super::{StagedContentId, connection};
 use crate::error::StorageResult;
 use crate::principal_state::native_io::{
-    ensure_private_directory, rename_private_entry, sync_directory, validate_private_regular_file,
+    PrivateDirectory, private_file_identity, validate_private_regular_file,
 };
 
 pub(super) const WRITING_DIRECTORY: &str = "writing";
@@ -20,7 +20,8 @@ pub(super) const PUBLISHED_FILE: &str = "published.v1";
 pub(super) const PUBLISHED_MARKER: &[u8] = b"astrid-content-stage-published-v1\n";
 
 pub(super) struct LegacyReady {
-    pub(super) directory: PathBuf,
+    pub(super) directory_name: PathBuf,
+    pub(super) capability: PrivateDirectory,
     pub(super) intent: StagingIntent,
     pub(super) content: Option<PathBuf>,
 }
@@ -115,7 +116,9 @@ pub(super) fn inspect_migration_intents(root: &Path) -> StorageResult<Option<Vec
 
 pub(super) fn recover(
     root: &Path,
+    root_directory: &PrivateDirectory,
     quarantine: &Path,
+    quarantine_directory: &PrivateDirectory,
 ) -> StorageResult<Option<(PathBuf, Vec<LegacyReady>)>> {
     let writing = root.join(WRITING_DIRECTORY);
     let ready = root.join(READY_DIRECTORY);
@@ -124,27 +127,29 @@ pub(super) fn recover(
     if !writing_exists && !ready_exists {
         return Ok(None);
     }
-    ensure_private_directory(&writing)?;
-    ensure_private_directory(&ready)?;
-    ensure_private_directory(quarantine)?;
-    recover_writing(&writing, &ready, quarantine)?;
+    let writing_directory = root_directory.ensure_child(Path::new(WRITING_DIRECTORY))?;
+    let ready_directory = root_directory.ensure_child(Path::new(READY_DIRECTORY))?;
+    recover_writing(
+        &writing,
+        &writing_directory,
+        &ready_directory,
+        quarantine,
+        quarantine_directory,
+    )?;
 
     let mut pending = Vec::new();
-    for entry in read_directory(&ready)? {
-        let entry = entry.map_err(|error| {
-            connection(format!(
-                "enumerate legacy staging queue {}: {error}",
-                ready.display()
-            ))
-        })?;
-        let directory = entry.path();
-        let (sequence, id) = parse_ready_name(&entry.file_name().to_string_lossy())?;
-        validate_stage_directory(&directory)?;
-        if published(&directory)? || directory_is_empty(&directory)? {
-            cleanup(&directory)?;
+    for entry_name in ready_directory.entries()? {
+        let entry_name = PathBuf::from(entry_name);
+        let directory = ready.join(&entry_name);
+        let (sequence, id) = parse_ready_name(&entry_name.to_string_lossy())?;
+        let capability = ready_directory.open_child(&entry_name)?;
+        if published_in(&directory, &capability)? || capability.entries()?.is_empty() {
+            cleanup_in(&ready_directory, &entry_name, &capability)?;
             continue;
         }
-        let intent = load_intent(&directory.join(INTENT_FILE))?;
+        let intent_path = directory.join(INTENT_FILE);
+        let mut intent_file = capability.open_file(Path::new(INTENT_FILE))?;
+        let intent = load_intent_from_file(&intent_path, &mut intent_file)?;
         if intent.sequence != sequence || intent.id != id {
             return Err(connection(format!(
                 "legacy staged intent does not match ready directory {}",
@@ -152,18 +157,20 @@ pub(super) fn recover(
             )));
         }
         let content_path = directory.join(CONTENT_FILE);
-        let content = match std::fs::symlink_metadata(&content_path) {
-            Ok(_) => Some(content_path),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => {
-                return Err(connection(format!(
-                    "inspect legacy staged content {}: {error}",
-                    content_path.display()
-                )));
-            },
-        };
+        let content = capability
+            .contains(Path::new(CONTENT_FILE))?
+            .then_some(content_path);
         if let Some(content) = &content {
-            let logical_bytes = validate_private_regular_file(content)?;
+            let logical_bytes = capability
+                .open_file(Path::new(CONTENT_FILE))?
+                .metadata()
+                .map_err(|error| {
+                    connection(format!(
+                        "inspect legacy staged content {}: {error}",
+                        content.display()
+                    ))
+                })?
+                .len();
             if logical_bytes != intent.logical_bytes {
                 return Err(connection(format!(
                     "legacy staged content length changed after seal in {}",
@@ -171,9 +178,10 @@ pub(super) fn recover(
                 )));
             }
         }
-        validate_stage_entries(&directory, content.is_some())?;
+        validate_stage_entries_in(&directory, &capability, content.is_some())?;
         pending.push(LegacyReady {
-            directory,
+            directory_name: entry_name,
+            capability,
             intent,
             content,
         });
@@ -195,72 +203,93 @@ fn legacy_queue_exists(path: &Path) -> StorageResult<bool> {
     }
 }
 
-pub(super) fn cleanup(directory: &Path) -> StorageResult<()> {
+pub(super) fn cleanup_in(
+    parent: &PrivateDirectory,
+    directory_name: &Path,
+    directory: &PrivateDirectory,
+) -> StorageResult<()> {
     for name in [CONTENT_FILE, INTENT_FILE, PUBLISHED_FILE] {
-        let path = directory.join(name);
-        match std::fs::remove_file(&path) {
-            Ok(()) => {},
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
-            Err(error) => {
-                return Err(connection(format!(
-                    "remove legacy staging file {}: {error}",
-                    path.display()
-                )));
-            },
+        if directory.contains(Path::new(name))? {
+            directory.remove_file(Path::new(name))?;
         }
     }
-    std::fs::remove_dir(directory).map_err(|error| {
-        connection(format!(
-            "remove legacy staging directory {}: {error}",
-            directory.display()
-        ))
-    })
+    directory.sync()?;
+    parent.remove_directory(directory_name)?;
+    parent.sync()
 }
 
-fn recover_writing(writing: &Path, ready: &Path, quarantine: &Path) -> StorageResult<()> {
-    for entry in read_directory(writing)? {
-        let entry = entry.map_err(|error| {
-            connection(format!(
-                "enumerate incomplete legacy staging writes {}: {error}",
-                writing.display()
-            ))
-        })?;
-        let path = entry.path();
-        if !stage_entry_is_directory(&path)? {
-            move_to_quarantine(&path, quarantine, "legacy-unsealed")?;
+fn recover_writing(
+    writing: &Path,
+    writing_directory: &PrivateDirectory,
+    ready_directory: &PrivateDirectory,
+    quarantine: &Path,
+    quarantine_directory: &PrivateDirectory,
+) -> StorageResult<()> {
+    for entry_name in writing_directory.entries()? {
+        let entry_name = PathBuf::from(entry_name);
+        let path = writing.join(&entry_name);
+        if !writing_directory.entry_is_directory(&entry_name)? {
+            move_file_to_quarantine(
+                writing_directory,
+                &entry_name,
+                quarantine,
+                quarantine_directory,
+                "legacy-unsealed",
+            )?;
             continue;
         }
-        validate_stage_directory(&path)?;
-        let id = entry
+        let capability = writing_directory.open_child(&entry_name)?;
+        let id = entry_name
             .file_name()
-            .to_str()
+            .and_then(|name| name.to_str())
             .and_then(|name| Uuid::parse_str(name).ok())
             .map(StagedContentId);
         let recovered = id
             .and_then(|id| {
-                load_intent(&path.join(INTENT_FILE))
+                let intent_path = path.join(INTENT_FILE);
+                capability
+                    .open_file(Path::new(INTENT_FILE))
+                    .and_then(|mut file| load_intent_from_file(&intent_path, &mut file))
                     .ok()
                     .map(|intent| (id, intent))
             })
             .filter(|(id, intent)| *id == intent.id)
             .and_then(|(id, intent)| {
-                validate_private_regular_file(&path.join(CONTENT_FILE))
+                capability
+                    .open_file(Path::new(CONTENT_FILE))
+                    .and_then(|file| {
+                        file.metadata()
+                            .map(|metadata| metadata.len())
+                            .map_err(|error| connection(format!("inspect staged content: {error}")))
+                    })
                     .ok()
                     .filter(|length| *length == intent.logical_bytes)
                     .map(|_| (id, intent))
             });
         let Some((id, intent)) = recovered else {
-            move_to_quarantine(&path, quarantine, "legacy-unsealed")?;
+            move_directory_to_quarantine(
+                writing_directory,
+                &entry_name,
+                quarantine,
+                quarantine_directory,
+                "legacy-unsealed",
+            )?;
             continue;
         };
-        let destination = ready.join(ready_name(intent.sequence, id));
-        if destination.exists() {
-            move_to_quarantine(&path, quarantine, "legacy-duplicate")?;
+        let destination_name = PathBuf::from(ready_name(intent.sequence, id));
+        if ready_directory.contains(&destination_name)? {
+            move_directory_to_quarantine(
+                writing_directory,
+                &entry_name,
+                quarantine,
+                quarantine_directory,
+                "legacy-duplicate",
+            )?;
             continue;
         }
-        rename_private_entry(&path, &destination)?;
-        sync_directory(writing)?;
-        sync_directory(ready)?;
+        writing_directory.rename_child_to(&entry_name, ready_directory, &destination_name)?;
+        writing_directory.sync()?;
+        ready_directory.sync()?;
     }
     Ok(())
 }
@@ -286,6 +315,22 @@ fn published(directory: &Path) -> StorageResult<bool> {
     }
 }
 
+fn published_in(directory: &Path, capability: &PrivateDirectory) -> StorageResult<bool> {
+    if !capability.contains(Path::new(PUBLISHED_FILE))? {
+        return Ok(false);
+    }
+    let marker = directory.join(PUBLISHED_FILE);
+    let mut file = capability.open_file(Path::new(PUBLISHED_FILE))?;
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut bytes).map_err(|error| {
+        connection(format!(
+            "read legacy publication marker {}: {error}",
+            marker.display()
+        ))
+    })?;
+    Ok(bytes == PUBLISHED_MARKER)
+}
+
 fn directory_is_empty(directory: &Path) -> StorageResult<bool> {
     match read_directory(directory)?.next() {
         None => Ok(true),
@@ -297,20 +342,17 @@ fn directory_is_empty(directory: &Path) -> StorageResult<bool> {
     }
 }
 
-fn validate_stage_entries(directory: &Path, content_exists: bool) -> StorageResult<()> {
+fn validate_stage_entries_in(
+    directory: &Path,
+    capability: &PrivateDirectory,
+    content_exists: bool,
+) -> StorageResult<()> {
     let mut expected = if content_exists {
         vec![CONTENT_FILE, INTENT_FILE]
     } else {
         vec![INTENT_FILE]
     };
-    for entry in read_directory(directory)? {
-        let entry = entry.map_err(|error| {
-            connection(format!(
-                "enumerate legacy staging directory {}: {error}",
-                directory.display()
-            ))
-        })?;
-        let name = entry.file_name();
+    for name in capability.entries()? {
         let Some(name) = name.to_str() else {
             return Err(connection(format!(
                 "legacy staging directory {} contains a non-UTF-8 entry",
@@ -371,26 +413,51 @@ fn read_directory(path: &Path) -> StorageResult<ReadDir> {
     })
 }
 
-fn move_to_quarantine(source: &Path, quarantine: &Path, classification: &str) -> StorageResult<()> {
-    let source_name = source
-        .file_name()
-        .and_then(|name| name.to_str())
+fn quarantine_name(
+    source_name: &Path,
+    quarantine: &PrivateDirectory,
+    classification: &str,
+) -> StorageResult<PathBuf> {
+    let source_name = source_name
+        .to_str()
         .ok_or_else(|| connection("legacy staging entry name is not valid UTF-8".to_owned()))?;
     let mut suffix = 0_u64;
-    let destination = loop {
-        let candidate = quarantine.join(format!("{source_name}.{classification}.{suffix}"));
-        if !candidate.exists() {
-            break candidate;
+    loop {
+        let candidate = PathBuf::from(format!("{source_name}.{classification}.{suffix}"));
+        if !quarantine.contains(&candidate)? {
+            return Ok(candidate);
         }
         suffix = suffix
             .checked_add(1)
             .ok_or_else(|| connection("legacy quarantine sequence exhausted".to_owned()))?;
-    };
-    rename_private_entry(source, &destination)?;
-    if let Some(parent) = source.parent() {
-        sync_directory(parent)?;
     }
-    sync_directory(quarantine)
+}
+
+fn move_directory_to_quarantine(
+    source: &PrivateDirectory,
+    source_name: &Path,
+    _quarantine_path: &Path,
+    quarantine: &PrivateDirectory,
+    classification: &str,
+) -> StorageResult<()> {
+    let destination = quarantine_name(source_name, quarantine, classification)?;
+    source.rename_child_to(source_name, quarantine, &destination)?;
+    source.sync()?;
+    quarantine.sync()
+}
+
+fn move_file_to_quarantine(
+    source: &PrivateDirectory,
+    source_name: &Path,
+    _quarantine_path: &Path,
+    quarantine: &PrivateDirectory,
+    classification: &str,
+) -> StorageResult<()> {
+    let destination = quarantine_name(source_name, quarantine, classification)?;
+    let identity = private_file_identity(&source.open_file(source_name)?)?;
+    source.rename_to_with_identity(source_name, quarantine, &destination, identity)?;
+    source.sync()?;
+    quarantine.sync()
 }
 
 pub(super) fn validate_stage_directory(path: &Path) -> StorageResult<()> {

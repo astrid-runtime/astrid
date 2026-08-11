@@ -47,6 +47,18 @@ pub enum FaultPoint {
     BeforeInProcessRecoveryArenaFlush,
     /// In-process recovery is about to flush the selected root-journal prefix.
     BeforeInProcessRecoveryRootFlush,
+    /// Structural content and evidence objects are durable but no blob is installed.
+    AfterContiguousStructuralFlush,
+    /// Loose metadata and blob bytes are durable but no representation state names them.
+    AfterContiguousBlobInstall,
+    /// Contiguous catalogue metadata is appended but its state is not published.
+    AfterContiguousMetadataAppend,
+    /// Representation state names the contiguous blob but its durability flush is incomplete.
+    AfterContiguousStatePublish,
+    /// Compacted arena placements are active and loose representations are no longer authoritative.
+    AfterCompactionRepresentationRebase,
+    /// Retired loose blobs are gone while the durable compaction intent remains.
+    AfterCompactionBlobRetirement,
 }
 
 /// Injectable crash decision used by recovery tests and harnesses.
@@ -95,6 +107,12 @@ mod tests {
             FaultPoint::BeforeInProcessRecoveryOpen,
             FaultPoint::BeforeInProcessRecoveryArenaFlush,
             FaultPoint::BeforeInProcessRecoveryRootFlush,
+            FaultPoint::AfterContiguousStructuralFlush,
+            FaultPoint::AfterContiguousBlobInstall,
+            FaultPoint::AfterContiguousMetadataAppend,
+            FaultPoint::AfterContiguousStatePublish,
+            FaultPoint::AfterCompactionRepresentationRebase,
+            FaultPoint::AfterCompactionBlobRetirement,
         ];
 
         for (expected, point) in points.into_iter().enumerate() {
