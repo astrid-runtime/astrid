@@ -303,6 +303,15 @@ struct FailOnce {
     fired: AtomicBool,
 }
 
+#[cfg(unix)]
+#[derive(Debug)]
+struct ReplaceRootAt {
+    point: StagingFaultPoint,
+    root: PathBuf,
+    displaced: PathBuf,
+    fired: AtomicBool,
+}
+
 #[derive(Debug)]
 struct BarrierAt {
     point: StagingFaultPoint,
@@ -360,6 +369,19 @@ impl StagingFaultInjector for FailOnce {
         } else {
             Ok(())
         }
+    }
+}
+
+#[cfg(unix)]
+impl StagingFaultInjector for ReplaceRootAt {
+    fn fail(&self, point: StagingFaultPoint) -> StorageResult<()> {
+        if point == self.point && !self.fired.swap(true, AtomicOrdering::SeqCst) {
+            std::fs::rename(&self.root, &self.displaced).unwrap();
+            std::fs::create_dir(&self.root).unwrap();
+            std::fs::create_dir(self.root.join(GENERATIONS_DIRECTORY)).unwrap();
+            std::fs::create_dir(self.root.join(QUARANTINE_DIRECTORY)).unwrap();
+        }
+        Ok(())
     }
 }
 
@@ -718,7 +740,12 @@ fn ready_scan_rejects_a_symlinked_content_source() {
     symlink("/etc/passwd", staged.content_path()).unwrap();
 
     let error = area.ready().unwrap_err();
-    assert!(error.to_string().contains("open private file"), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("redirected or not a regular file"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -1535,6 +1562,43 @@ fn legacy_migration_flushes_both_rename_namespaces_before_adding_a_footer() {
     let entries = reopened.ready().unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(read_logical(&entries[0]), b"legacy bytes");
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_migration_stays_below_capabilities_when_root_is_replaced() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("staging");
+    let displaced = directory.path().join("original-staging");
+    let ready = root.join(legacy::READY_DIRECTORY);
+    std::fs::create_dir_all(&ready).unwrap();
+    let intent = legacy_entry(&ready, 22, "capability-bound", b"legacy bytes", false);
+
+    let area = NativeContentStagingArea::open_configured(
+        root.clone(),
+        GroupCommitPolicy::immediate(),
+        Arc::new(ReplaceRootAt {
+            point: StagingFaultPoint::MigrationNamespaceFlushed,
+            root: root.clone(),
+            displaced: displaced.clone(),
+            fired: AtomicBool::new(false),
+        }),
+    )
+    .unwrap();
+
+    let entries = area.ready().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].id(), intent.id);
+    let generation = displaced
+        .join(GENERATIONS_DIRECTORY)
+        .join(sealed_generation_name(intent.sequence, intent.id));
+    assert!(generation.exists());
+    assert!(
+        std::fs::read_dir(root.join(GENERATIONS_DIRECTORY))
+            .unwrap()
+            .next()
+            .is_none()
+    );
 }
 
 #[test]

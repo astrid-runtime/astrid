@@ -455,9 +455,20 @@ fn publish_loose_blob_temporary(
     logical_bytes: u64,
 ) -> Result<(), DurableError> {
     let result = (|| {
-        verify_blob_bytes(directory, temporary, profile, blob, logical_bytes)?;
+        let temporary_file = verify_blob_file(directory, temporary, profile, blob, logical_bytes)?;
         match directory.hard_link(temporary, name) {
-            Ok(()) => {},
+            Ok(()) => {
+                if let Err(error) = verify_linked_identity(
+                    directory,
+                    name,
+                    &temporary_file,
+                    logical_bytes,
+                    "published loose blob does not name the verified temporary",
+                ) {
+                    let _ = directory.remove_file(name);
+                    return Err(error);
+                }
+            },
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 verify_blob_bytes(directory, name, profile, blob, logical_bytes)?;
                 compare_files(directory, temporary, name, logical_bytes)?;
@@ -495,14 +506,25 @@ fn ensure_loose_metadata(
         Err(source) => return Err(io_error("inspect loose blob metadata", source)),
     }
     let result = (|| {
-        create_exact_file(
+        let temporary_file = create_exact_file(
             directory,
             &temporary,
             &expected,
             "loose blob metadata temporary",
         )?;
         match directory.hard_link(&temporary, &metadata_path) {
-            Ok(()) => {},
+            Ok(()) => {
+                if let Err(error) = verify_linked_identity(
+                    directory,
+                    &metadata_path,
+                    &temporary_file,
+                    u64::try_from(expected.len()).map_err(|_| DurableError::EncodingOverflow)?,
+                    "published loose metadata does not name the verified temporary",
+                ) {
+                    let _ = directory.remove_file(&metadata_path);
+                    return Err(error);
+                }
+            },
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 verify_exact_regular_file(
                     directory,
@@ -531,14 +553,39 @@ fn create_exact_file(
     path: &Path,
     bytes: &[u8],
     operation: &'static str,
-) -> Result<(), DurableError> {
+) -> Result<File, DurableError> {
     let mut file = directory
         .create_new(path)
         .map_err(|source| io_error(operation, source))?;
     file.write_all(bytes)
         .and_then(|()| file.flush())
         .and_then(|()| file.sync_all())
-        .map_err(|source| io_error(operation, source))
+        .map_err(|source| io_error(operation, source))?;
+    Ok(file)
+}
+
+fn verify_linked_identity(
+    directory: &LooseBlobDirectory,
+    installed: &Path,
+    verified: &File,
+    expected_bytes: u64,
+    description: &'static str,
+) -> Result<(), DurableError> {
+    let installed = directory
+        .open_regular(installed)
+        .map_err(|source| io_error("open newly linked loose representation file", source))?;
+    let installed_metadata = installed
+        .metadata()
+        .map_err(|source| io_error("inspect newly linked loose representation file", source))?;
+    if installed_metadata.len() != expected_bytes
+        || namespace::opened_file_identity(&installed)
+            .map_err(|source| io_error("identify newly linked loose representation file", source))?
+            != namespace::opened_file_identity(verified)
+                .map_err(|source| io_error("identify verified loose temporary", source))?
+    {
+        return Err(DurableError::InvalidRepresentationState(description));
+    }
+    Ok(())
 }
 
 fn encode_loose_metadata(
@@ -812,4 +859,40 @@ fn tagged_blob_hex(blob: astrid_storage_model::BlobId) -> String {
         let _ = write!(encoded, "{byte:02x}");
     }
     encoded
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write as _;
+    use std::path::Path;
+
+    use cap_std::ambient_authority;
+
+    #[test]
+    fn publication_rejects_a_link_to_an_unverified_inode() {
+        let root = tempfile::tempdir().unwrap();
+        let root_directory =
+            cap_std::fs::Dir::open_ambient_dir(root.path(), ambient_authority()).unwrap();
+        let directory =
+            super::LooseBlobDirectory::open(&root_directory, root.path(), 1, true).unwrap();
+        let mut verified = directory.create_new(Path::new("verified.tmp")).unwrap();
+        verified.write_all(b"same-length").unwrap();
+        verified.sync_all().unwrap();
+        let mut substituted = directory.create_new(Path::new("installed.blob")).unwrap();
+        substituted.write_all(b"other-byte!").unwrap();
+        substituted.sync_all().unwrap();
+
+        assert!(matches!(
+            super::verify_linked_identity(
+                &directory,
+                Path::new("installed.blob"),
+                &verified,
+                11,
+                "substituted publication",
+            ),
+            Err(super::DurableError::InvalidRepresentationState(
+                "substituted publication"
+            ))
+        ));
+    }
 }

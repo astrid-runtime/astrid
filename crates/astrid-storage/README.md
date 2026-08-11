@@ -81,67 +81,16 @@ let loaded: serde_json::Value = scoped.get_json("prefs").await?.unwrap();
 
 ## Performance
 
-The current contiguous-adoption implementation was measured from clean commit
-`6384aaec` on an M2 Ultra/APFS host. Each reported median covers three
-runs over a deterministic 512 MiB incompressible corpus, with one-MiB reads, four
-principals, and a governed one-GiB object-cache budget. Native comparisons are
-same-run substrate measurements; the verified-read comparator reads and
-BLAKE3-verifies the same bytes.
+Performance values are evidence artifacts, not crate API documentation. Run
+the manual **Storage benchmark evidence** workflow to produce content-bound
+reports for Linux, macOS, and Windows from the same exact revision and workload
+configuration. The report records the code revision, tree state, executable,
+arguments, host environment, cache policy, and raw samples.
 
-| Operation | Median result | Interpretation |
-|---|---:|---|
-| Astrid staging write | 5,080.8 MiB/s | acknowledgement path |
-| Verified copy fallback | 674.7 MiB/s | forced full-data fallback, no clone |
-| Native warm verified read | 1,660.7 MiB/s | read plus BLAKE3 |
-| Astrid warm verified read | 1,774.6 MiB/s | 0.936× native elapsed time |
-| Astrid first verified read | 625.6 MiB/s | process-local evidence cold |
-| Astrid post-reopen verified read | 488.5 MiB/s | evidence rebuilt after reopen |
-| Unique publication | 270.4 MiB/s | asynchronous contiguous admission |
-| Duplicate publication | 295.8 MiB/s | supplied preimage is reverified before reuse |
-| Eight-worker first ingest | 1,212.1 MiB/s | 4.449× single-worker throughput |
-| Four-principal shared publication | 935.8 MiB/s aggregate | 3.461× single-principal throughput |
-| Four-principal warm verified read | 6,325.5 MiB/s aggregate | 3.565× single-principal throughput |
-| Populated reopen | 1.561 s | revalidates the contiguous representation |
-
-The current bounded bulk-ingest checkpoint at clean commit `02968196` split
-the same 512 MiB corpus into 128 independently fingerprinted 4 MiB sources.
-Workers now carry engine-bound prepared batches through a bounded channel to
-one authoritative appender. Against exact parent `279c9342`, eight-worker first
-ingest holds at 388.3 MiB/s and scaling at 2.105 times the serial path while
-making both memory bounds observable: 4,207,436 bytes single-worker and a
-58,853,269-byte median with eight workers. The operator-only phase matrix
-measures 250.7 ms in the parallel pipeline versus 1,067.7 ms in root
-publication, including 979.1 ms of exact closure validation.
-These phase totals are diagnostics, not guest-visible dedup signals. The
-earlier source-change invariant still applies: unchanged re-ingest reads no
-source bytes and a changed token reads only its source partition. At 388.3
-MiB/s, one TiB extrapolates to about 45 minutes; closure validation is now the
-dominant measured first-ingest cost.
-
-The following clean checkpoint, `a4a492b5`, carries staging-earned closure
-evidence into publication without weakening the authoritative root check.
-Eight-worker first ingest reaches 1,251.0 MiB/s, 3.22 times the prior
-checkpoint, while exact closure validation falls from 979.1 ms to 0.146 ms.
-Physical-map work remains flat, and the median eight-worker pending-memory bound
-is 67,303,811 bytes. Missing or cyclic closure, failed admission, reclaimed
-staged objects, and parent-before-child staging across batches take the normal
-fail-closed validation path. On this warm 512 MiB corpus, one TiB extrapolates
-to about 14 minutes; this is not a larger-than-memory or mounted-provider claim.
-
-Unique random content appended 1.000971 authoritative bytes per logical byte,
-including the contiguous blob and authenticated representation metadata.
-Republishing the identical 512 MiB appended 8,387 bytes (0.001562%): exact
-deduplication plus the new principal root and catalogue metadata. The unique
-publication added 61,042 bytes of representation metadata, or 1,034.6 bytes
-per newly inserted object; the raw 512 MiB payload is not misreported as
-metadata. Strict small-file seals measured 70.5 files/s versus 197.3 native
-write-and-sync operations/s, so ordinary hosted
-close remains the native-speed staging boundary while publication proceeds in
-the background.
-
-These are engine and APFS-substrate measurements, not mounted-provider results
-or corpus-wide compression claims. The full methodology, historical baselines,
-raw samples, and content-bound evidence envelope live in
+Historical device-local results remain useful for diagnosing regressions, but
+they are not portable release numbers. The full methodology, cross-platform CI
+contract, historical baselines, raw samples, and content-bound evidence
+envelopes live in
 [`../../docs/astrid-storage-performance.md`](../../docs/astrid-storage-performance.md)
 and [`../../docs/benchmarks/storage-io/`](../../docs/benchmarks/storage-io/).
 

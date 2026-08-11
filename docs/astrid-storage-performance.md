@@ -8,6 +8,14 @@ of copying results.
 Selected raw outputs are preserved in
 [`benchmarks/storage-io/`](benchmarks/storage-io/README.md).
 
+The manually dispatched `Storage benchmark evidence` workflow runs the same
+content-bound harness on GitHub-hosted Linux x86-64, macOS arm64, and Windows
+x86-64 runners and uploads one content-bound JSON artifact per platform.
+Comparisons are valid only within a run or between reports whose recorded
+revision, arguments, runner image, and environment are intentionally matched.
+Device-local results below remain historical diagnostics; they are not copied
+into crate-facing documentation as portable performance claims.
+
 Status: convergence and native-path baselines recorded; mounted-provider
 measurements pending
 

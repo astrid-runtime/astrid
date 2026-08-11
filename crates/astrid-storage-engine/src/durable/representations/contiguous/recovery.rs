@@ -2,7 +2,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
+#[cfg(not(any(unix, windows)))]
+use std::io::{Seek, SeekFrom};
 use std::path::Path;
 
 use astrid_storage_content::{ChunkingProfile, ContentObjectSink, build_content_streaming};
@@ -373,14 +375,9 @@ fn read_contiguous_object_from_file<I: PersistentObjectIdentity>(
     expected: ObjectId,
     identity: &I,
 ) -> Result<ObjectRecord, DurableError> {
-    let mut file = file
-        .try_clone()
-        .map_err(|source| io_error("clone contiguous chunk reader", source))?;
-    file.seek(SeekFrom::Start(location.offset))
-        .map_err(|source| io_error("seek repeated contiguous chunk", source))?;
     let length = usize::try_from(location.length).map_err(|_| DurableError::EncodingOverflow)?;
     let mut bytes = vec![0; length];
-    file.read_exact(&mut bytes)
+    read_exact_at(file, &mut bytes, location.offset)
         .map_err(|source| io_error("read repeated contiguous chunk", source))?;
     let record = chunk_record(bytes)?;
     if identity.identify(&record) != expected {
@@ -389,6 +386,41 @@ fn read_contiguous_object_from_file<I: PersistentObjectIdentity>(
         ));
     }
     Ok(record)
+}
+
+#[cfg(unix)]
+fn read_exact_at(file: &File, bytes: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt as _;
+
+    file.read_exact_at(bytes, offset)
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: &File, mut bytes: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt as _;
+
+    while !bytes.is_empty() {
+        let read = file.seek_read(bytes, offset)?;
+        if read == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+        }
+        offset = offset
+            .checked_add(u64::try_from(read).map_err(std::io::Error::other)?)
+            .ok_or_else(|| std::io::Error::other("positional read offset overflow"))?;
+        bytes = &mut bytes[read..];
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn read_exact_at(file: &File, bytes: &mut [u8], offset: u64) -> std::io::Result<()> {
+    let mut cursor = file.try_clone()?;
+    let original = cursor.stream_position()?;
+    let result = cursor
+        .seek(SeekFrom::Start(offset))
+        .and_then(|_| cursor.read_exact(bytes));
+    let restore = cursor.seek(SeekFrom::Start(original)).map(drop);
+    result.and(restore)
 }
 
 fn map_recovery_stream_error(
@@ -400,5 +432,31 @@ fn map_recovery_stream_error(
             io_error("read contiguous blob during recovery", source)
         },
         astrid_storage_content::ContentStreamError::Sink(error) => error,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+
+    #[test]
+    fn repeated_chunk_read_does_not_move_streaming_cursor() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("contiguous-reader");
+        let mut writer = std::fs::File::create(&path).unwrap();
+        writer.write_all(b"first-second-third").unwrap();
+        writer.sync_all().unwrap();
+        drop(writer);
+
+        let mut stream = std::fs::File::open(path).unwrap();
+        stream.seek(SeekFrom::Start(12)).unwrap();
+        let duplicate_reader = stream.try_clone().unwrap();
+        let mut duplicate = [0_u8; 5];
+        super::read_exact_at(&duplicate_reader, &mut duplicate, 0).unwrap();
+        assert_eq!(&duplicate, b"first");
+
+        let mut remaining = Vec::new();
+        stream.read_to_end(&mut remaining).unwrap();
+        assert_eq!(remaining, b"-third");
     }
 }

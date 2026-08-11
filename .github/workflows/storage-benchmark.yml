@@ -1,0 +1,66 @@
+name: Storage benchmark evidence
+
+on:
+  workflow_dispatch:
+    inputs:
+      bytes:
+        description: Deterministic corpus size in bytes
+        required: true
+        default: '67108864'
+      samples:
+        description: Samples per repeatable workload
+        required: true
+        default: '3'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  benchmark:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+          - name: macos-arm64
+            os: macos-latest
+          - name: windows-x86_64
+            os: windows-latest
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Check out exact revision
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Capture storage evidence
+        shell: bash
+        run: |
+          cargo bench -p astrid-storage --bench storage_io -- \
+            --bytes '${{ inputs.bytes }}' \
+            --samples '${{ inputs.samples }}' \
+            --small-files 32 \
+            --concurrent-principals 4 \
+            --bulk-workers 4 \
+            --bulk-files 32 \
+            --object-cache-bytes 268435456 \
+            --output 'storage-benchmark-${{ matrix.name }}.json'
+
+      - name: Upload content-bound report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: storage-benchmark-${{ github.sha }}-${{ matrix.name }}
+          path: storage-benchmark-${{ matrix.name }}.json
+          if-no-files-found: error
+          retention-days: 30

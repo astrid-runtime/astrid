@@ -65,14 +65,19 @@ principal root can name them.
    no representation state or principal root names them yet.
 4. Publish and flush the exact `ASTBLM1\0` loose-blob metadata using exclusive
    temporary creation and no-replace hard-link installation. Equal occupied
-   metadata is reusable only after byte-exact comparison.
+   metadata is reusable only after byte-exact comparison. A successful new
+   link is reopened no-follow and must have the same filesystem identity and
+   length as the still-open verified temporary before publication continues.
 5. Clone the sealed source no-replace to a private temporary, truncate the
    clone to `logical_bytes`, flush it, and recompute length and `BlobId`. If
    whole-file cloning is unsupported, copy only the logical prefix into a
    flushed temporary. The sealed source remains unchanged in both modes.
 6. Install the temporary at the final BlobId path atomically with no-replace.
-   If it exists, open it no-follow below the pinned directory and never mutate
-   it; reuse only after complete-preimage equality, otherwise fail fatally.
+   Reopen a newly installed path no-follow and require the same filesystem
+   identity and length as the still-open verified temporary. If the final path
+   already exists, open it no-follow below the pinned directory and never
+   mutate it; reuse only after complete-preimage equality, otherwise fail
+   fatally.
 7. Re-derive the exact physical records, then stage and flush their catalogue
    nodes plus direct arena and final-blob placements.
    Recovery rebuilds any lost disposable locations from the verified arena.
@@ -86,6 +91,14 @@ principal root can name them.
 10. Write the ordinary durable publication marker and reap the staging
    generation. A root conflict retries the catalogue/root mutation without
    rereading the blob.
+
+The staging root, generations directory, and quarantine directory are pinned
+before the journal is opened or any migration/recovery mutation begins. Legacy
+promotion, quarantine, retirement, cleanup, and validation are all relative to
+those retained capabilities; replacing an ambient staging path can therefore
+deny a later pathname lookup but cannot redirect recovery writes. Repeated
+chunk validation during contiguous recovery uses positional reads, so checking
+an earlier slice cannot move the streaming reconstruction cursor.
 
 The reflink path writes source bytes once plus bounded metadata and at most a
 copy-on-write tail extent. The fallback performs one additional full-data

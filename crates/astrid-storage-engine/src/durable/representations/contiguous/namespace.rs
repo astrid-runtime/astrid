@@ -13,6 +13,18 @@ pub(super) struct LooseBlobDirectory {
     ambient_path: PathBuf,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct FileIdentity {
+    volume: VolumeId,
+    file: FileId,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VolumeId(u64);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileId(u64);
+
 impl LooseBlobDirectory {
     pub(super) fn open(
         representation_root: &Dir,
@@ -227,18 +239,22 @@ fn is_redirect(metadata: &cap_std::fs::Metadata) -> bool {
 
 fn directory_identity(directory: &Dir) -> io::Result<(u64, u64)> {
     let file = directory.try_clone()?.into_std_file();
-    file_identity(&file)
+    let identity = opened_file_identity(&file)?;
+    Ok((identity.volume.0, identity.file.0))
 }
 
 #[cfg(unix)]
-fn file_identity(file: &File) -> io::Result<(u64, u64)> {
+pub(super) fn opened_file_identity(file: &File) -> io::Result<FileIdentity> {
     use std::os::unix::fs::MetadataExt as _;
     let metadata = file.metadata()?;
-    Ok((metadata.dev(), metadata.ino()))
+    Ok(FileIdentity {
+        volume: VolumeId(metadata.dev()),
+        file: FileId(metadata.ino()),
+    })
 }
 
 #[cfg(windows)]
-fn file_identity(file: &File) -> io::Result<(u64, u64)> {
+pub(super) fn opened_file_identity(file: &File) -> io::Result<FileIdentity> {
     use std::os::windows::io::AsRawHandle as _;
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
@@ -250,14 +266,14 @@ fn file_identity(file: &File) -> io::Result<(u64, u64)> {
     if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &raw mut info) } == 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok((
-        u64::from(info.dwVolumeSerialNumber),
-        (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
-    ))
+    Ok(FileIdentity {
+        volume: VolumeId(u64::from(info.dwVolumeSerialNumber)),
+        file: FileId((u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow)),
+    })
 }
 
 #[cfg(not(any(unix, windows)))]
-fn file_identity(_file: &File) -> io::Result<(u64, u64)> {
+pub(super) fn opened_file_identity(_file: &File) -> io::Result<FileIdentity> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "stable private file identity is unavailable",

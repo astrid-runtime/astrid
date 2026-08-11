@@ -21,8 +21,7 @@ const LEGACY_INTENT_MAGIC: &[u8; 16] = b"ASTRID-STAGE-V1\0";
 const LEGACY_INTENT_VERSION: u16 = 1;
 const CHECKSUM_BYTES: usize = 32;
 const FOOTER_MAGIC: &[u8; 16] = b"ASTRID-STAGE-F1\0";
-const FOOTER_VERSION: u16 = 2;
-const LEGACY_FOOTER_VERSION: u16 = 1;
+const FOOTER_VERSION: u16 = 1;
 const FOOTER_BYTES: u64 = 32;
 const FOOTER_BYTES_USIZE: usize = 32;
 const SOURCE_IDENTITY_BYTES: u64 = 16;
@@ -142,7 +141,16 @@ fn encode_fields(
 
 pub(super) fn load_intent(path: &Path) -> StorageResult<StagingIntent> {
     validate_private_regular_file(path)?;
-    let bytes = std::fs::read(path)
+    let mut file = open_private_file(path)?;
+    load_intent_from_file(path, &mut file)
+}
+
+pub(super) fn load_intent_from_file(
+    path: &Path,
+    file: &mut std::fs::File,
+) -> StorageResult<StagingIntent> {
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
         .map_err(|error| connection(format!("read staged intent {}: {error}", path.display())))?;
     decode_intent(&bytes)
         .map_err(|error| connection(format!("decode staged intent {}: {error}", path.display())))
@@ -174,18 +182,9 @@ pub(super) fn append_generation_footer(
         .map_err(|error| connection(format!("append staged generation footer: {error}")))
 }
 
-pub(super) fn load_generation_footer(path: &Path) -> StorageResult<StagingIntent> {
-    load_generation_footer_with_identity(path).map(|footer| footer.intent)
-}
-
 pub(super) struct GenerationFooter {
     pub(super) intent: StagingIntent,
-    pub(super) source_identity: Option<PrivateFileIdentity>,
-}
-
-pub(super) fn load_generation_footer_with_identity(path: &Path) -> StorageResult<GenerationFooter> {
-    let mut file = open_private_file(path)?;
-    load_generation_footer_from_file(path, &mut file)
+    pub(super) source_identity: PrivateFileIdentity,
 }
 
 pub(super) fn load_generation_footer_from_file(
@@ -223,7 +222,7 @@ pub(super) fn load_generation_footer_from_file(
         )));
     }
     let footer_version = u16::from_le_bytes([trailer[16], trailer[17]]);
-    if !matches!(footer_version, LEGACY_FOOTER_VERSION | FOOTER_VERSION) {
+    if footer_version != FOOTER_VERSION {
         return Err(connection(format!(
             "staged generation {} footer version is unsupported",
             path.display()
@@ -256,7 +255,7 @@ pub(super) fn load_generation_footer_from_file(
     file.seek(SeekFrom::Start(payload_offset))
         .and_then(|_| file.read_exact(&mut payload))
         .map_err(|error| connection(format!("read staged generation intent footer: {error}")))?;
-    let footer = decode_generation_footer_payload(path, footer_version, &payload)?;
+    let footer = decode_generation_footer_payload(path, &payload)?;
     if footer.intent.logical_bytes != payload_offset {
         return Err(connection(format!(
             "staged generation {} footer does not follow its logical bytes",
@@ -268,41 +267,37 @@ pub(super) fn load_generation_footer_from_file(
 
 fn decode_generation_footer_payload(
     path: &Path,
-    footer_version: u16,
     payload: &[u8],
 ) -> StorageResult<GenerationFooter> {
-    let (encoded, source_identity) = if footer_version == FOOTER_VERSION {
-        let binding_bytes = SOURCE_IDENTITY_BYTES
-            .checked_add(SOURCE_BINDING_CHECKSUM_BYTES)
-            .ok_or_else(|| connection("staged footer binding length overflow".to_owned()))?;
-        let identity_offset = payload
-            .len()
-            .checked_sub(usize::try_from(binding_bytes).unwrap_or(usize::MAX))
-            .ok_or_else(|| connection("staged footer source identity is truncated".to_owned()))?;
-        let (encoded, binding) = payload.split_at(identity_offset);
-        let (identity, checksum) = binding.split_at(
-            usize::try_from(SOURCE_IDENTITY_BYTES)
-                .map_err(|_| connection("staged footer identity is not addressable".to_owned()))?,
-        );
-        if checksum != source_binding_checksum(encoded, identity) {
-            return Err(connection(format!(
-                "staged generation {} source binding checksum mismatch",
-                path.display()
-            )));
-        }
-        let volume =
-            u64::from_le_bytes(identity[..8].try_into().map_err(|_| {
-                connection("staged footer source volume width mismatch".to_owned())
-            })?);
-        let file = u64::from_le_bytes(
-            identity[8..]
-                .try_into()
-                .map_err(|_| connection("staged footer source file width mismatch".to_owned()))?,
-        );
-        (encoded, Some(PrivateFileIdentity { volume, file }))
-    } else {
-        (payload, None)
-    };
+    let binding_bytes = SOURCE_IDENTITY_BYTES
+        .checked_add(SOURCE_BINDING_CHECKSUM_BYTES)
+        .ok_or_else(|| connection("staged footer binding length overflow".to_owned()))?;
+    let identity_offset = payload
+        .len()
+        .checked_sub(usize::try_from(binding_bytes).unwrap_or(usize::MAX))
+        .ok_or_else(|| connection("staged footer source identity is truncated".to_owned()))?;
+    let (encoded, binding) = payload.split_at(identity_offset);
+    let (identity, checksum) = binding.split_at(
+        usize::try_from(SOURCE_IDENTITY_BYTES)
+            .map_err(|_| connection("staged footer identity is not addressable".to_owned()))?,
+    );
+    if checksum != source_binding_checksum(encoded, identity) {
+        return Err(connection(format!(
+            "staged generation {} source binding checksum mismatch",
+            path.display()
+        )));
+    }
+    let volume = u64::from_le_bytes(
+        identity[..8]
+            .try_into()
+            .map_err(|_| connection("staged footer source volume width mismatch".to_owned()))?,
+    );
+    let file = u64::from_le_bytes(
+        identity[8..]
+            .try_into()
+            .map_err(|_| connection("staged footer source file width mismatch".to_owned()))?,
+    );
+    let source_identity = PrivateFileIdentity::from_raw_parts(volume, file);
     let intent = decode_intent(encoded).map_err(|error| {
         connection(format!(
             "decode staged generation footer {}: {error}",
@@ -316,9 +311,10 @@ fn decode_generation_footer_payload(
 }
 
 fn source_identity_bytes(identity: PrivateFileIdentity) -> [u8; 16] {
+    let (volume, file) = identity.raw_parts();
     let mut bytes = [0_u8; 16];
-    bytes[..8].copy_from_slice(&identity.volume.to_le_bytes());
-    bytes[8..].copy_from_slice(&identity.file.to_le_bytes());
+    bytes[..8].copy_from_slice(&volume.to_le_bytes());
+    bytes[8..].copy_from_slice(&file.to_le_bytes());
     bytes
 }
 

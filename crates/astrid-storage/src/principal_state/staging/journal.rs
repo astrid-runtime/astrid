@@ -1,7 +1,7 @@
 //! Checksummed append-only lifecycle journal for staged generations.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
@@ -10,7 +10,7 @@ use uuid::Uuid;
 use super::format::{StagingIntent, decode_intent, encode_intent};
 use super::{StagedContentId, connection};
 use crate::error::StorageResult;
-use crate::principal_state::native_io::validate_private_regular_file;
+use crate::principal_state::native_io::PrivateDirectory;
 
 const JOURNAL_MAGIC: [u8; 8] = *b"ASTRSTG1";
 const JOURNAL_VERSION: u16 = 1;
@@ -46,37 +46,19 @@ pub(super) struct JournalRecovery {
     pub(super) completed: BTreeSet<StageKey>,
 }
 
-pub(super) fn open_journal(path: &Path) -> StorageResult<(File, JournalRecovery)> {
-    let exists = match std::fs::symlink_metadata(path) {
-        Ok(_) => {
-            validate_private_regular_file(path)?;
-            true
-        },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(error) => {
-            return Err(connection(format!(
-                "inspect staging journal {}: {error}",
-                path.display()
-            )));
-        },
+pub(super) fn open_journal(
+    root: &PrivateDirectory,
+    path: &Path,
+) -> StorageResult<(File, JournalRecovery)> {
+    let name = path
+        .file_name()
+        .map(Path::new)
+        .ok_or_else(|| connection(format!("staging journal {} has no name", path.display())))?;
+    let mut file = if root.contains(name)? {
+        root.open_file_rw(name)?
+    } else {
+        root.create_file(name)?
     };
-    let mut options = OpenOptions::new();
-    options.create_new(!exists).read(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(path)
-        .map_err(|error| connection(format!("open staging journal {}: {error}", path.display())))?;
-    astrid_core::platform_fs::restrict_private_file(path).map_err(|error| {
-        connection(format!(
-            "restrict staging journal {}: {error}",
-            path.display()
-        ))
-    })?;
-    validate_private_regular_file(path)?;
     let recovery = recover(&mut file, path)?;
     Ok((file, recovery))
 }

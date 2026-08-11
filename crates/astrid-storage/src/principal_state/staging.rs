@@ -20,7 +20,7 @@ use uuid::Uuid;
 use super::native_io::open_private_file;
 use super::native_io::{
     PrivateDirectory, PrivateFileIdentity, create_private_file, ensure_private_directory,
-    private_file_identity, sync_directory,
+    private_file_identity,
 };
 use super::{NativePrincipalContentStore, StateOwner};
 use crate::content::{ChunkingProfile, ContentBatchWriteOutcome, ContentName, ContentWriteOutcome};
@@ -42,7 +42,7 @@ use journal::{
     JournalRecord, StageKey, append_records, flush_journal, open_journal, truncate_empty,
 };
 pub(super) use migration::migrate_alias_owner_intents;
-use migration::migrate_legacy;
+use migration::{MigrationDirectories, migrate_legacy};
 use recovery::{load_generation, open_generation_in, recover_generations, sealed_generation_name};
 use retirement::{establish_in as establish_retired_generation, remove_in as remove_generation};
 
@@ -207,10 +207,13 @@ impl NativeContentStagingArea {
         for path in [&generations, &quarantine] {
             ensure_private_directory(path)?;
         }
-        let (journal_file, recovered) = open_journal(&root.join(JOURNAL_FILE))?;
+        let root_directory = PrivateDirectory::open(&root)?;
+        let generations_directory = PrivateDirectory::open(&generations)?;
+        let quarantine_directory = PrivateDirectory::open(&quarantine)?;
+        let (journal_file, recovered) = open_journal(&root_directory, &root.join(JOURNAL_FILE))?;
         // Persist the journal and directory links before any seal can be
         // acknowledged through them.
-        sync_directory(&root)?;
+        root_directory.sync()?;
         let mut journal = JournalState {
             file: journal_file,
             pending: recovered.pending,
@@ -218,13 +221,25 @@ impl NativeContentStagingArea {
             poisoned: false,
         };
         migrate_legacy(
-            &root,
-            &generations,
-            &quarantine,
+            &MigrationDirectories {
+                root_path: &root,
+                root: &root_directory,
+                generations_path: &generations,
+                generations: &generations_directory,
+                quarantine_path: &quarantine,
+                quarantine: &quarantine_directory,
+            },
             &mut journal,
             faults.as_ref(),
         )?;
-        recover_generations(&generations, &quarantine, &mut journal, faults.as_ref())?;
+        recover_generations(
+            &generations,
+            &generations_directory,
+            &quarantine,
+            &quarantine_directory,
+            &mut journal,
+            faults.as_ref(),
+        )?;
         let next_sequence = journal
             .pending
             .keys()
@@ -246,7 +261,6 @@ impl NativeContentStagingArea {
             .chain(journal.completed.iter())
             .map(|key| key.id)
             .collect();
-        let generations_directory = PrivateDirectory::open(&generations)?;
         Ok(Self {
             inner: Arc::new(StagingInner {
                 root,
