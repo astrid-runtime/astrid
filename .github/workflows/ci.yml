@@ -553,6 +553,8 @@ jobs:
             new_packages="${new_packages:+$new_packages,}$package"
           done < <(git diff --name-only --diff-filter=A "$BASE_SHA"...HEAD -- 'crates/*/Cargo.toml')
           echo "new-packages=$new_packages" >> "$GITHUB_OUTPUT"
+          internal_excludes="astrid-types${new_packages:+,$new_packages}"
+          echo "internal-excludes=$internal_excludes" >> "$GITHUB_OUTPUT"
           if [ -n "$new_packages" ]; then
             echo "New packages have no baseline API and will be excluded: $new_packages"
           fi
@@ -580,22 +582,54 @@ jobs:
           if git log --format=%B "$BASE_SHA..$HEAD_SHA" \
             | grep -Eq '(^[A-Za-z0-9_-]+(\([^)]*\))?!:|^BREAKING[ -]CHANGE:)'; then
             echo "found=true" >> "$GITHUB_OUTPUT"
-            echo "Breaking-change marker found; cargo-semver-checks is skipped."
+            echo "Breaking-change marker found; the blocking astrid-types semver check is skipped."
           else
             echo "found=false" >> "$GITHUB_OUTPUT"
-            echo "No breaking-change marker found; running cargo-semver-checks."
+            echo "No breaking-change marker found; enforcing astrid-types compatibility."
           fi
 
-      - name: Check public API compatibility
+      - name: Check astrid-types API compatibility
         if: steps.api-inputs.outputs.run == 'true' && steps.breaking-change.outputs.found != 'true'
         uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2
         with:
           manifest-path: Cargo.toml
           baseline-rev: ${{ github.event.pull_request.base.sha }}
-          exclude: ${{ steps.api-inputs.outputs.new-packages }}
+          package: astrid-types
           feature-group: all-features
           rust-toolchain: manual
           github-token: ${{ github.token }}
+
+      - name: Report internal crate API compatibility
+        id: internal-semver
+        if: steps.api-inputs.outputs.run == 'true'
+        continue-on-error: true
+        uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2
+        with:
+          manifest-path: Cargo.toml
+          baseline-rev: ${{ github.event.pull_request.base.sha }}
+          exclude: ${{ steps.api-inputs.outputs.internal-excludes }}
+          feature-group: all-features
+          rust-toolchain: manual
+          github-token: ${{ github.token }}
+
+      - name: Summarize Rust API compatibility policy
+        if: always() && steps.api-inputs.outputs.run == 'true'
+        env:
+          INTERNAL_OUTCOME: ${{ steps.internal-semver.outcome }}
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ### Rust API compatibility
+
+          \`astrid-types\` is Astrid's supported Rust contract, so incompatible changes fail this job unless the commits explicitly declare a breaking change.
+
+          Other workspace crates are implementation details. Their semver findings remain visible for maintainer review, but are advisory so automation cannot force architecture changes merely to preserve an internal Rust surface.
+
+          Internal crate check outcome: **$INTERNAL_OUTCOME**. See #1480 for the publication policy.
+          EOF
+
+          if [ "$INTERNAL_OUTCOME" = "failure" ]; then
+            echo "::warning title=Internal Rust API change::Review the advisory cargo-semver-checks findings. Internal compatibility requires maintainer judgment and is not a merge blocker."
+          fi
 
   public-rust-api-diff:
     name: Public Rust API diff
@@ -654,12 +688,18 @@ jobs:
         run: |
           if git log --format=%B "$BASE_SHA..$HEAD_SHA" \
             | grep -Eq '(^[A-Za-z0-9_-]+(\([^)]*\))?!:|^BREAKING[ -]CHANGE:)'; then
-            DENY=""
-            echo "Breaking-change marker found; reporting public API diff without denying changes."
+            TYPES_DENY=""
+            echo "Breaking-change marker found; reporting astrid-types API diff without denying changes."
           else
-            DENY="--deny changed --deny removed"
-            echo "No breaking-change marker found; denying changed or removed public API items."
+            TYPES_DENY="--deny changed --deny removed"
+            echo "No breaking-change marker found; denying changed or removed astrid-types API items."
           fi
+
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          ### Public Rust API item diff
+
+          `astrid-types` changes are enforced. Internal crate diffs are report-only because those crates are implementation details whose compatibility requires maintainer judgment.
+          EOF
 
           packages=$(cargo metadata --locked --format-version 1 --no-deps \
             | jq -r '.packages[]
@@ -677,12 +717,18 @@ jobs:
               continue
             fi
             echo "::group::cargo public-api $package"
+            deny_args=()
+            if [ "$package" = "astrid-types" ]; then
+              if [ -n "$TYPES_DENY" ]; then
+                deny_args=(--deny changed --deny removed)
+              fi
+            fi
             cargo +nightly-2026-06-29 public-api \
               --package "$package" \
               --all-features \
               -ss \
               diff \
-              $DENY \
+              "${deny_args[@]}" \
               --force \
               "$BASE_SHA..HEAD"
             echo "::endgroup::"
