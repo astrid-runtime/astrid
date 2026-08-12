@@ -4479,7 +4479,7 @@ mod tests {
         assert_eq!(retired, vec![private_id.clone(), shared_id.clone()]);
         assert_eq!(
             shared_cancelled_for.lock().unwrap().as_slice(),
-            &[alice.clone()]
+            std::slice::from_ref(&alice)
         );
         assert!(!shared_cancelled.load(Ordering::Relaxed));
         assert!(!shared_unloaded.load(Ordering::Relaxed));
