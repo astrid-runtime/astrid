@@ -22,6 +22,7 @@
 //! `profile.toml` snapshots.
 
 mod agent_create_helpers;
+mod agent_delete;
 mod caps_tokens;
 #[cfg(test)]
 mod enforcement_tests;
@@ -39,6 +40,8 @@ mod state_tests;
 mod state_tests_agent_backfill;
 #[cfg(test)]
 mod state_tests_agent_clone;
+#[cfg(test)]
+mod state_tests_agent_delete;
 #[cfg(test)]
 mod state_tests_agent_modify;
 #[cfg(test)]

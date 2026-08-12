@@ -1493,6 +1493,16 @@ impl Kernel {
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     pub async fn ensure_principal_loaded(&self, principal: &PrincipalId) {
         let _load_guard = self.capsule_load_lock.lock().await;
+        // A deleted principal has no policy profile. Re-check under the same
+        // lock used by deletion/unload so a loader queued before the authz
+        // fence cannot re-attach capsule views after deletion has retired them.
+        if *principal != PrincipalId::default()
+            && !astrid_core::profile::PrincipalProfile::path_for(&self.astrid_home, principal)
+                .exists()
+        {
+            tracing::debug!(%principal, "Skipping capsule load for principal without a profile");
+            return;
+        }
         let sorted = self.sorted_principal_capsules(principal);
         validate_principal_capsules(principal, &sorted);
 
@@ -1533,6 +1543,13 @@ impl Kernel {
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     async fn ensure_principal_uplinks_loaded(&self, principal: &PrincipalId) {
         let _load_guard = self.capsule_load_lock.lock().await;
+        if *principal != PrincipalId::default()
+            && !astrid_core::profile::PrincipalProfile::path_for(&self.astrid_home, principal)
+                .exists()
+        {
+            tracing::debug!(%principal, "Skipping uplink load for principal without a profile");
+            return;
+        }
         let sorted = self.sorted_principal_capsules(principal);
         validate_principal_capsules(principal, &sorted);
 
@@ -2148,6 +2165,35 @@ impl Kernel {
         Ok(true)
     }
 
+    /// Remove every capsule view owned by `principal` before that principal's
+    /// persistent state is reclaimed.
+    ///
+    /// The load lock closes the race with background warm/install discovery:
+    /// once the profile/identity fence has closed new authorization, no loader
+    /// can re-attach a view between the snapshot and the last unload. Each
+    /// release uses [`Self::unload_one_capsule`], preserving shared-runtime
+    /// semantics: the last view cancels and unloads the whole runtime, while a
+    /// non-last view cancels only this principal's in-flight blocking work.
+    pub(crate) async fn unload_principal_capsules(
+        &self,
+        principal: &PrincipalId,
+    ) -> Result<Vec<astrid_capsule_types::CapsuleId>, anyhow::Error> {
+        let _load_guard = self.capsule_load_lock.lock().await;
+        let mut ids: Vec<_> = {
+            let registry = self.capsules.read().await;
+            registry.list_for(principal).into_iter().cloned().collect()
+        };
+        ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+
+        let mut unloaded = Vec::with_capacity(ids.len());
+        for id in ids {
+            if self.unload_one_capsule(&id, principal).await? {
+                unloaded.push(id);
+            }
+        }
+        Ok(unloaded)
+    }
+
     /// Promote (`commit == true`) or roll back (`commit == false`) a capsule's
     /// OS-level copy-on-write workspace changes — the gate's approve/reject for
     /// a non-git workspace (Fix #2).
@@ -2557,24 +2603,29 @@ async fn unload_loaded_capsule_after_source_disappeared(
 #[cfg(test)]
 async fn open_test_runtime_kv(
     home: &astrid_core::dirs::AstridHome,
-) -> Arc<dyn astrid_storage::KvStore> {
+) -> (
+    Arc<dyn astrid_storage::KvStore>,
+    astrid_storage::PrincipalDirectory,
+) {
     let quota: Arc<dyn astrid_storage::KvQuotaResolver<astrid_storage::StateOwner>> =
         Arc::new(|_: &astrid_storage::StateOwner| Ok(None));
-    astrid_storage::open_runtime_kv(home, quota)
+    let directory = astrid_storage::PrincipalDirectory::default();
+    let kv = astrid_storage::open_runtime_kv_with_directory(home, quota, directory.clone())
         .await
-        .expect("test kernel: open authoritative principal store")
+        .expect("test kernel: open authoritative principal store");
+    (kv, directory)
 }
 
 #[cfg(test)]
 fn open_test_identity_stores(
     kv: &Arc<dyn astrid_storage::KvStore>,
+    principal_directory: astrid_storage::PrincipalDirectory,
 ) -> (
     Arc<dyn astrid_storage::IdentityStore>,
     Arc<astrid_storage::OwnershipStore>,
 ) {
     let identity_kv = astrid_storage::ScopedKvStore::new(Arc::clone(kv), "system:identity")
         .expect("test kernel: identity kv scope");
-    let principal_directory = astrid_storage::PrincipalDirectory::default();
     let identity_store = Arc::new(astrid_storage::KvIdentityStore::with_principal_directory(
         identity_kv,
         principal_directory.clone(),
@@ -2600,7 +2651,7 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
     // Use the same authoritative principal-store composition as native boot.
     // A test helper opening the legacy import source directly would let kernel
     // tests pass against a runtime topology that production cannot select.
-    let kv = open_test_runtime_kv(&home).await;
+    let (kv, principal_directory) = open_test_runtime_kv(&home).await;
     let capabilities = Arc::new(
         CapabilityStore::with_kv_store(Arc::clone(&kv))
             .await
@@ -2644,7 +2695,7 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
     ));
 
     let allowance_store = Arc::new(astrid_approval::AllowanceStore::new());
-    let (identity_store, ownership_store) = open_test_identity_stores(&kv);
+    let (identity_store, ownership_store) = open_test_identity_stores(&kv, principal_directory);
 
     let groups = Arc::new(ArcSwap::from_pointee(
         GroupConfig::load(&home).expect("test kernel: load groups"),
@@ -4372,6 +4423,72 @@ mod tests {
             "the last release goes through the instance-scoped path, not \
              request_cancel_for"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unload_principal_capsules_retires_every_view_without_harming_shared_peers() {
+        let (_d, home) = scratch_home();
+        let kernel = test_kernel_with_home(home).await;
+        let alice = PrincipalId::new("alice").unwrap();
+        let bob = PrincipalId::new("bob").unwrap();
+        let shared_id = CapsuleId::new("shared").unwrap();
+        let private_id = CapsuleId::new("private").unwrap();
+        let shared_hash = astrid_capsule::registry::WasmHash::from_raw("shared-hash");
+        let private_hash = astrid_capsule::registry::WasmHash::from_raw("private-hash");
+
+        let shared_cancelled = Arc::new(AtomicBool::new(false));
+        let shared_unloaded = Arc::new(AtomicBool::new(false));
+        let shared_cancelled_for: Arc<std::sync::Mutex<Vec<PrincipalId>>> = Arc::default();
+        let private_cancelled = Arc::new(AtomicBool::new(false));
+        let private_unloaded = Arc::new(AtomicBool::new(false));
+
+        {
+            let mut registry = kernel.capsules.write().await;
+            registry
+                .register_owned_by_default(
+                    Box::new(CancellableTestCapsule {
+                        id: shared_id.clone(),
+                        manifest: CapsuleManifest::default(),
+                        cancelled: Arc::clone(&shared_cancelled),
+                        unloaded: Arc::clone(&shared_unloaded),
+                        cancelled_for: Arc::clone(&shared_cancelled_for),
+                    }),
+                    shared_hash.clone(),
+                    &alice,
+                )
+                .unwrap();
+            registry
+                .register_existing(&shared_id, &shared_hash, &bob)
+                .unwrap();
+            registry
+                .register_owned_by_default(
+                    Box::new(CancellableTestCapsule {
+                        id: private_id.clone(),
+                        manifest: CapsuleManifest::default(),
+                        cancelled: Arc::clone(&private_cancelled),
+                        unloaded: Arc::clone(&private_unloaded),
+                        cancelled_for: Arc::default(),
+                    }),
+                    private_hash,
+                    &alice,
+                )
+                .unwrap();
+        }
+
+        let retired = kernel.unload_principal_capsules(&alice).await.unwrap();
+        assert_eq!(retired, vec![private_id.clone(), shared_id.clone()]);
+        assert_eq!(
+            shared_cancelled_for.lock().unwrap().as_slice(),
+            &[alice.clone()]
+        );
+        assert!(!shared_cancelled.load(Ordering::Relaxed));
+        assert!(!shared_unloaded.load(Ordering::Relaxed));
+        assert!(private_cancelled.load(Ordering::Relaxed));
+        assert!(private_unloaded.load(Ordering::Relaxed));
+
+        let registry = kernel.capsules.read().await;
+        assert!(registry.list_for(&alice).is_empty());
+        assert!(registry.get_for(&bob, &shared_id).is_some());
     }
 
     /// A test capsule that reports `Failed` from `check_health`, for the health

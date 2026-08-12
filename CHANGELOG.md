@@ -17,6 +17,9 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   dependencies in `Cargo.lock`. Removing the unused surface eliminates both
   RustSec exceptions and keeps the audit gate strict. The native principal
   store and live legacy-SurrealKV migration reader are unchanged. Closes #1448.
+### Changed
+
+- **`agent delete` now reclaims the deleted principal's full runtime footprint.** Delete closes authz first (unlink + profile removal + cache invalidate), then retires its live capsule views and reclaims capsule KV namespaces, the home tree, signing key (`keys/{principal}.key`), and secrets (`secrets/{principal}/`). Shared runtimes remain available to other principals while principal-scoped work is cancelled before state removal. Reclamation is best-effort; failures are reported in the response's `cleanup_errors`. Replaces the previous "reclamation is an ops concern" leave-behind, and drops the interim `--purge-home` flag. Part of #1217.
 
 ### Added
 
