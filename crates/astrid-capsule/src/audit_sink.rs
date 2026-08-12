@@ -61,6 +61,13 @@ pub enum HostAuditEvent<'a> {
         /// The command being executed.
         command: &'a str,
     },
+    /// An inbound TCP connection accepted by a capsule listener.
+    NetAccept {
+        /// Host-observed local listener endpoint.
+        local_addr: &'a str,
+        /// Host-observed remote peer endpoint.
+        peer_addr: &'a str,
+    },
 }
 
 /// The outcome of a sensitive host call, as seen at the host-fn seam.

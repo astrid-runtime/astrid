@@ -29,6 +29,7 @@
 //!   hop-limit, linger, reuseaddr socket options.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use wasmtime::component::Resource;
 
@@ -52,21 +53,108 @@ use stream::CONNECT_TIMEOUT;
 
 /// Maximum concurrent socket connections per capsule. Defense-in-depth
 /// cap on top of the per-principal profile quota. Tracked via
-/// [`HostState::net_stream_count`], bumped on every successful
+/// the capsule-wide stream counter, bumped on every successful
 /// `accept` / `connect-tcp` push and decremented in the resource
 /// drop path.
 pub(super) const MAX_ACTIVE_STREAMS: usize = 8;
+
+/// Maximum simultaneously bound inbound TCP listeners per capsule instance,
+/// matching the published `astrid:net` WIT contract.
+pub(super) const MAX_ACTIVE_TCP_LISTENERS: usize = 4;
+
+impl HostState {
+    pub(in crate::engine::wasm) fn reserve_net_stream(&mut self) -> bool {
+        let reserved = self
+            .capsule_net_stream_count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < MAX_ACTIVE_STREAMS).then_some(count + 1)
+            })
+            .is_ok();
+        if reserved {
+            self.local_net_stream_count.fetch_add(1, Ordering::AcqRel);
+            self.net_stream_count += 1;
+        }
+        reserved
+    }
+
+    pub(in crate::engine::wasm) fn release_net_stream(&mut self) {
+        let decremented = self.capsule_net_stream_count.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |count| count.checked_sub(1),
+        );
+        debug_assert!(decremented.is_ok(), "network stream quota underflow");
+        let local = self.local_net_stream_count.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |count| count.checked_sub(1),
+        );
+        debug_assert!(local.is_ok(), "local network stream quota underflow");
+        self.net_stream_count = self.net_stream_count.saturating_sub(1);
+    }
+
+    pub(in crate::engine::wasm) fn claim_reserved_net_stream(&mut self) {
+        self.net_stream_count += 1;
+    }
+}
 
 /// Stamp marking a resource slot in the table as a `UnixListener` handle.
 /// The kernel pre-binds the listener; the resource handle is just a
 /// capability token that the capsule must hold to call `accept`.
 pub(super) struct UnixListenerSlot;
 
-/// Stamp marking a resource slot as a `TcpListener` for future inbound
-/// TCP server support. Pre-allocated so the type is in scope even though
-/// `bind-tcp` is still a stub.
-#[allow(dead_code)]
-pub(super) struct TcpListenerSlot;
+/// Resource slot holding a bound inbound TCP listener. The
+/// `Resource<TcpListener>` handed to the guest is a token over this slot;
+/// `accept` / `poll-accept` / `local-addr` reach the `tokio` listener
+/// through it, and `Drop` closes the socket.
+pub(super) struct TcpListenerSlot {
+    pub(super) listener: Arc<tokio::net::TcpListener>,
+    pub(super) pending: Arc<PendingTcpConnection>,
+    pub(super) cancel_token: tokio_util::sync::CancellationToken,
+    pub(super) listener_count: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+pub(super) struct PendingTcpConnection {
+    pub(super) connection: tokio::sync::Mutex<Option<PendingTcpAccepted>>,
+    pub(super) stream_count: Arc<std::sync::atomic::AtomicUsize>,
+    pub(super) local_stream_count: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+pub(super) struct PendingTcpAccepted {
+    pub(super) stream: tokio::net::TcpStream,
+    pub(super) local_addr: String,
+    pub(super) peer_addr: String,
+}
+
+impl Drop for PendingTcpConnection {
+    fn drop(&mut self) {
+        if self.connection.get_mut().is_some() {
+            let decremented =
+                self.stream_count
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                        count.checked_sub(1)
+                    });
+            debug_assert!(decremented.is_ok(), "pending TCP quota underflow");
+            let local = self.local_stream_count.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |count| count.checked_sub(1),
+            );
+            debug_assert!(local.is_ok(), "pending local TCP quota underflow");
+        }
+    }
+}
+
+impl Drop for TcpListenerSlot {
+    fn drop(&mut self) {
+        let decremented =
+            self.listener_count
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                    count.checked_sub(1)
+                });
+        debug_assert!(decremented.is_ok(), "TCP listener quota underflow");
+    }
+}
 
 /// Stamp marking a resource slot as a `UdpSocket`. Same reason as above.
 #[allow(dead_code)]
@@ -84,6 +172,20 @@ pub(super) fn validate_host(host: &str) -> Result<(), ErrorCode> {
         return Err(ErrorCode::AddressNotAvailable);
     }
     Ok(())
+}
+
+/// Whether a TCP-bind host names a loopback interface. Capsule-hosted
+/// servers are confined to loopback (see `bind_tcp`): `127.0.0.0/8`, `::1`,
+/// or the literal `localhost`. A hostname other than `localhost` is refused
+/// rather than resolved — binding must name a concrete local interface, and
+/// resolving arbitrary names for a bind target is an SSRF-shaped footgun.
+pub(super) fn is_loopback_bind_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
 }
 
 /// Classify a tokio io::Error into the typed `net::ErrorCode`.
@@ -159,6 +261,36 @@ pub(crate) fn audit_net_connect<T, E: std::fmt::Debug>(
     sink.record(
         &state.effective_principal(),
         HostAuditEvent::NetConnect { host, port },
+        outcome,
+    );
+}
+
+/// Record an inbound TCP accept with the host-observed local and peer
+/// endpoints, so traffic entering a capsule retains durable provenance.
+pub(crate) fn audit_net_accept<T, E: std::fmt::Debug>(
+    state: &HostState,
+    local_addr: &str,
+    peer_addr: &str,
+    result: &Result<T, E>,
+) {
+    audit_net(state, "astrid:net/host.tcp-listener.accept", 0, result);
+    let Some(sink) = state.audit_sink.as_ref() else {
+        return;
+    };
+    let error;
+    let outcome = match result {
+        Ok(_) => HostAuditOutcome::Allowed,
+        Err(err) => {
+            error = format!("{err:?}");
+            HostAuditOutcome::Failed(&error)
+        },
+    };
+    sink.record(
+        &state.effective_principal(),
+        HostAuditEvent::NetAccept {
+            local_addr,
+            peer_addr,
+        },
         outcome,
     );
 }
@@ -291,12 +423,115 @@ impl net::Host for HostState {
         Ok(Resource::new_own(res.rep()))
     }
 
-    fn bind_tcp(&mut self, _host: String, _port: u16) -> Result<Resource<TcpListener>, ErrorCode> {
-        // Inbound TCP server hosting — needs a fresh tokio listener +
-        // capability gate (net_tcp_bind allowlist) + per-capsule accept
-        // loop. Lands in a follow-up commit; capsules importing
-        // `bind-tcp` today see CapabilityDenied so they fail closed.
-        Err(ErrorCode::CapabilityDenied)
+    fn bind_tcp(&mut self, host: String, port: u16) -> Result<Resource<TcpListener>, ErrorCode> {
+        validate_host(&host)?;
+        let bind_addr = format!("tcp:{host}:{port}");
+
+        // Capability gate: host:port must match the capsule's `net_bind`
+        // allowlist (TCP entries share that field with unix binds).
+        if let Some(ref gate) = self.security {
+            let capsule_id = self.capsule_id.as_str().to_owned();
+            let host_for_check = host.clone();
+            let gate = gate.clone();
+            let rt = self.runtime_handle.clone();
+            let semaphore = self.blocking_semaphore.clone();
+            let check = util::bounded_block_on(&rt, &semaphore, async move {
+                gate.check_net_tcp_bind(&capsule_id, &host_for_check, port)
+                    .await
+            });
+            if let Err(reason) = check {
+                // Deny path records before the early return (exactly-once).
+                record_net_denied(self, HostAuditEvent::NetBind { addr: &bind_addr }, &reason);
+                return Err(ErrorCode::CapabilityDenied);
+            }
+        }
+
+        // Security rail: capsule-hosted servers are loopback-only. Exposing a
+        // capsule listener beyond loopback is a deliberate future opt-in; this
+        // mirrors `connect-tcp`, which runs its `is_safe_ip` airlock AFTER the
+        // capability gate. A non-loopback bind is refused here, not silently
+        // downgraded.
+        if !is_loopback_bind_host(&host) {
+            let reason = "non-loopback TCP bind refused (capsule servers are loopback-only)";
+            audit_net_bind(self, &bind_addr, HostAuditOutcome::Failed(reason));
+            return Err(ErrorCode::AirlockRejected);
+        }
+
+        // Bind a fresh tokio listener on the daemon runtime. Quick op — the
+        // non-cancellable bounded_block_on is fine (accept, which blocks
+        // indefinitely, uses the cancellable variant instead).
+        let rt = self.runtime_handle.clone();
+        let sem = self.blocking_semaphore.clone();
+        // `localhost` is accepted for ergonomics, but never handed back to the
+        // resolver: local name service is mutable host configuration and may
+        // map it to a non-loopback address. Bind a concrete loopback literal.
+        let host_owned = if host.eq_ignore_ascii_case("localhost") {
+            "127.0.0.1".to_string()
+        } else {
+            host.clone()
+        };
+        let bind_result: Result<tokio::net::TcpListener, std::io::Error> =
+            util::bounded_block_on(&rt, &sem, async move {
+                tokio::net::TcpListener::bind((host_owned.as_str(), port)).await
+            });
+        let listener = match bind_result {
+            Ok(l) => l,
+            Err(e) => {
+                let mapped = map_io_err(e);
+                let reason = format!("{mapped:?}");
+                audit_net_bind(self, &bind_addr, HostAuditOutcome::Failed(&reason));
+                return Err(mapped);
+            },
+        };
+        let actual_addr = match listener.local_addr() {
+            Ok(addr) if addr.ip().is_loopback() => format!("tcp:{addr}"),
+            Ok(addr) => {
+                let reason = format!("resolved bind escaped loopback: {addr}");
+                audit_net_bind(self, &bind_addr, HostAuditOutcome::Failed(&reason));
+                return Err(ErrorCode::AirlockRejected);
+            },
+            Err(e) => {
+                let mapped = map_io_err(e);
+                let reason = format!("{mapped:?}");
+                audit_net_bind(self, &bind_addr, HostAuditOutcome::Failed(&reason));
+                return Err(mapped);
+            },
+        };
+
+        if self
+            .tcp_listener_count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < MAX_ACTIVE_TCP_LISTENERS).then_some(count + 1)
+            })
+            .is_err()
+        {
+            let reason = "inbound TCP listener quota exceeded";
+            audit_net_bind(self, &actual_addr, HostAuditOutcome::Failed(reason));
+            return Err(ErrorCode::Quota);
+        }
+
+        let slot = TcpListenerSlot {
+            listener: Arc::new(listener),
+            pending: Arc::new(PendingTcpConnection {
+                connection: tokio::sync::Mutex::new(None),
+                stream_count: Arc::clone(&self.capsule_net_stream_count),
+                local_stream_count: Arc::clone(&self.local_net_stream_count),
+            }),
+            cancel_token: self.effective_cancel_token(),
+            listener_count: Arc::clone(&self.tcp_listener_count),
+        };
+        let res = match self.resource_table.push(slot) {
+            Ok(res) => res,
+            Err(e) => {
+                // The socket is already bound; the push consumes and drops the
+                // listener here, releasing it. Record the failure.
+                let reason = format!("resource table: {e}");
+                audit_net_bind(self, &bind_addr, HostAuditOutcome::Failed(&reason));
+                return Err(ErrorCode::Unknown(reason));
+            },
+        };
+        audit_net_bind(self, &actual_addr, HostAuditOutcome::Allowed);
+        Ok(Resource::new_own(res.rep()))
     }
 
     fn connect_tcp(&mut self, host: String, port: u16) -> Result<Resource<TcpStream>, ErrorCode> {
@@ -324,7 +559,7 @@ impl net::Host for HostState {
             }
         }
 
-        if self.net_stream_count >= MAX_ACTIVE_STREAMS {
+        if self.capsule_net_stream_count.load(Ordering::Acquire) >= MAX_ACTIVE_STREAMS {
             let result: Result<Resource<TcpStream>, ErrorCode> = Err(ErrorCode::Quota);
             audit_net_connect(self, &host, port, &result);
             return result;
@@ -377,7 +612,7 @@ impl net::Host for HostState {
             },
         };
 
-        if self.net_stream_count >= MAX_ACTIVE_STREAMS {
+        if !self.reserve_net_stream() {
             drop(stream);
             let result: Result<Resource<TcpStream>, ErrorCode> = Err(ErrorCode::Quota);
             audit_net_connect(self, &host, port, &result);
@@ -392,6 +627,7 @@ impl net::Host for HostState {
         let res = match self.resource_table.push(net_stream) {
             Ok(res) => res,
             Err(e) => {
+                self.release_net_stream();
                 // The TCP connect ALREADY SUCCEEDED (the socket is open); the
                 // push consumes and drops the stream here, aborting the
                 // connection. Record the connect as having happened with a
@@ -402,7 +638,6 @@ impl net::Host for HostState {
                 return result;
             },
         };
-        self.net_stream_count += 1;
         let result: Result<Resource<TcpStream>, ErrorCode> = Ok(Resource::new_own(res.rep()));
         audit_net_connect(self, &host, port, &result);
         result
@@ -466,10 +701,86 @@ impl net::Host for HostState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::wasm::bindings::astrid::net::host::{Host as _, HostTcpListener};
+    use crate::engine::wasm::test_fixtures::minimal_host_state;
 
     #[test]
     fn max_active_streams_pinned() {
         assert_eq!(MAX_ACTIVE_STREAMS, 8);
+        assert_eq!(MAX_ACTIVE_TCP_LISTENERS, 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tcp_listener_quota_is_independent_and_released_on_drop() {
+        let mut state = minimal_host_state(tokio::runtime::Handle::current());
+        let mut listeners = Vec::new();
+        for _ in 0..MAX_ACTIVE_TCP_LISTENERS {
+            listeners.push(state.bind_tcp("127.0.0.1".into(), 0).unwrap());
+        }
+        assert!(matches!(
+            state.bind_tcp("127.0.0.1".into(), 0),
+            Err(ErrorCode::Quota)
+        ));
+
+        let released = listeners.pop().unwrap();
+        HostTcpListener::drop(&mut state, released).unwrap();
+        let replacement = state.bind_tcp("127.0.0.1".into(), 0).unwrap();
+        HostTcpListener::drop(&mut state, replacement).unwrap();
+        for listener in listeners {
+            HostTcpListener::drop(&mut state, listener).unwrap();
+        }
+        assert_eq!(state.tcp_listener_count.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn public_store_count_excludes_other_pending_reservations() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut state = minimal_host_state(runtime.handle().clone());
+
+        assert!(state.reserve_net_stream());
+        state
+            .capsule_net_stream_count
+            .fetch_add(1, Ordering::AcqRel);
+        state.local_net_stream_count.fetch_add(1, Ordering::AcqRel);
+        assert_eq!(state.net_stream_count, 1);
+
+        state.release_net_stream();
+        assert_eq!(state.net_stream_count, 0);
+        state.claim_reserved_net_stream();
+        assert_eq!(state.net_stream_count, 1);
+        assert_eq!(state.capsule_net_stream_count.load(Ordering::Acquire), 1);
+        assert_eq!(state.local_net_stream_count.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn public_store_count_excludes_existing_pending_on_direct_reserve() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut state = minimal_host_state(runtime.handle().clone());
+
+        state
+            .capsule_net_stream_count
+            .fetch_add(1, Ordering::AcqRel);
+        state.local_net_stream_count.fetch_add(1, Ordering::AcqRel);
+        assert_eq!(state.net_stream_count, 0);
+
+        assert!(state.reserve_net_stream());
+        assert_eq!(state.net_stream_count, 1);
+        state.claim_reserved_net_stream();
+        assert_eq!(state.net_stream_count, 2);
+        assert_eq!(state.capsule_net_stream_count.load(Ordering::Acquire), 2);
+        assert_eq!(state.local_net_stream_count.load(Ordering::Acquire), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn localhost_binds_a_concrete_loopback_address() {
+        let mut state = minimal_host_state(tokio::runtime::Handle::current());
+        let listener = state.bind_tcp("localhost".into(), 0).unwrap();
+        let local = state
+            .local_addr(Resource::new_borrow(listener.rep()))
+            .unwrap();
+        let addr: std::net::SocketAddr = local.parse().unwrap();
+        assert!(addr.ip().is_loopback());
+        HostTcpListener::drop(&mut state, listener).unwrap();
     }
 
     #[test]
@@ -500,5 +811,25 @@ mod tests {
     fn validate_host_accepts_max_length() {
         let max = "a".repeat(255);
         assert!(validate_host(&max).is_ok());
+    }
+
+    #[test]
+    fn loopback_bind_host_accepts_loopback() {
+        assert!(is_loopback_bind_host("127.0.0.1"));
+        assert!(is_loopback_bind_host("127.0.0.5"));
+        assert!(is_loopback_bind_host("::1"));
+        assert!(is_loopback_bind_host("localhost"));
+        assert!(is_loopback_bind_host("LOCALHOST"));
+    }
+
+    #[test]
+    fn loopback_bind_host_rejects_non_loopback() {
+        assert!(!is_loopback_bind_host("0.0.0.0"));
+        assert!(!is_loopback_bind_host("192.168.1.10"));
+        assert!(!is_loopback_bind_host("8.8.8.8"));
+        assert!(!is_loopback_bind_host("::"));
+        // A hostname other than localhost is refused (not resolved).
+        assert!(!is_loopback_bind_host("example.com"));
+        assert!(!is_loopback_bind_host(""));
     }
 }

@@ -467,6 +467,17 @@ pub enum AuditAction {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         device_key_id: Option<String>,
     },
+
+    /// Inbound TCP connection accepted by a capsule listener.
+    ///
+    /// Kept at the end of this fieldless enum so adding the action does not
+    /// change the implicit discriminants of any existing public variant.
+    NetAccept {
+        /// Host-observed local listener endpoint.
+        local_addr: String,
+        /// Host-observed remote peer endpoint.
+        peer_addr: String,
+    },
 }
 
 impl AuditAction {
@@ -539,6 +550,12 @@ impl AuditAction {
             },
             Self::NetBind { addr } => {
                 format!("Bound socket {addr}")
+            },
+            Self::NetAccept {
+                local_addr,
+                peer_addr,
+            } => {
+                format!("Accepted connection from {peer_addr} on {local_addr}")
             },
             Self::ProcessSpawn { command } => {
                 format!("Spawned process {command}")

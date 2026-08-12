@@ -1645,14 +1645,20 @@ impl ExecutionEngine for WasmEngine {
             // the legacy [capabilities] arrays (helper falls back if empty).
             let ipc_publish_v = manifest.effective_ipc_publish_patterns();
             let ipc_subscribe_v = manifest.effective_ipc_subscribe_patterns();
-            // Only capsules declaring net_bind (the CLI proxy) get the socket
-            // listener / session token.
-            let cli_listener = if manifest.capabilities.net_bind.is_empty() {
+            // Only an explicit Unix bind declaration grants the pre-bound CLI
+            // listener and its session token. TCP host:port declarations use
+            // the same manifest field but must not cross-authorize Unix IPC.
+            let has_unix_bind = manifest
+                .capabilities
+                .net_bind
+                .iter()
+                .any(|entry| entry.starts_with("unix:"));
+            let cli_listener = if !has_unix_bind {
                 None
             } else {
                 ctx.cli_socket_listener.clone()
             };
-            let session_tok = if manifest.capabilities.net_bind.is_empty() {
+            let session_tok = if !has_unix_bind {
                 None
             } else {
                 ctx.session_token.clone()
@@ -1807,6 +1813,8 @@ impl ExecutionEngine for WasmEngine {
             let client_connections: Arc<
                 dashmap::DashMap<u32, astrid_core::principal::PrincipalId>,
             > = Arc::new(dashmap::DashMap::new());
+            let tcp_listener_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let capsule_net_stream_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let make_state: Arc<dyn Fn() -> HostState + Send + Sync> = Arc::new(move || HostState {
                 wasi_ctx: build_wasi_ctx(),
                 resource_table: wasmtime::component::ResourceTable::new(),
@@ -1898,6 +1906,9 @@ impl ExecutionEngine for WasmEngine {
                 process_tracker: process_tracker.clone(),
                 persistent_processes: persistent_registry.clone(),
                 net_stream_count: 0,
+                capsule_net_stream_count: Arc::clone(&capsule_net_stream_count),
+                local_net_stream_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                tcp_listener_count: Arc::clone(&tcp_listener_count),
                 subscription_count: 0,
                 process_count_total: 0,
                 process_count_by_principal: std::collections::HashMap::new(),
@@ -3039,6 +3050,9 @@ async fn build_lifecycle_host_state(
             tokio::runtime::Handle::current(),
         )),
         net_stream_count: 0,
+        capsule_net_stream_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        local_net_stream_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        tcp_listener_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         subscription_count: 0,
         process_count_total: 0,
         process_count_by_principal: std::collections::HashMap::new(),

@@ -462,6 +462,7 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   refusal or eviction always falls back to verified reads. Cold reopen tests
   corrupt a neighbour frame after recovery and prove that no process-local
   evidence can suppress its checksum failure. Closes #1399.
+- **Capsule inbound TCP bind (`bind_tcp`).** A capsule can bind an inbound TCP port and accept connections from its run loop via the WIT `bind-tcp(host, port) -> tcp-listener` fn (`accept` / `poll-accept` / `local-addr`), gated by the per-capsule `net_bind = ["host:port", "host:*"]` manifest capability (new fail-closed `check_net_tcp_bind` gate reusing the `net_connect` host:port matcher). A post-gate loopback airlock refuses non-loopback binds; accepted connections reuse the existing `NetStream::Tcp` read/write/close plumbing. The runtime primitive the srouter capsule needs (loopback ingress on 127.0.0.1:8788). Closes #1230.
 - **Windows local transport uses authenticated per-user named pipes.** A pipe
   name derived only from the caller's operating-system SID replaces
   filesystem endpoint naming on Windows. Local-only byte-mode instances use a

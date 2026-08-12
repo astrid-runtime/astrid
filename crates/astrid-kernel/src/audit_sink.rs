@@ -118,6 +118,40 @@ impl KernelAuditSink {
             HostAuditEvent::ProcessSpawn { command } => AuditAction::ProcessSpawn {
                 command: truncate_guest_str(command),
             },
+            HostAuditEvent::NetAccept {
+                local_addr,
+                peer_addr,
+            } => AuditAction::NetAccept {
+                local_addr: truncate_guest_str(local_addr),
+                peer_addr: truncate_guest_str(peer_addr),
+            },
+        }
+    }
+
+    fn record_action(
+        &self,
+        principal: &PrincipalId,
+        action: AuditAction,
+        outcome: HostAuditOutcome<'_>,
+    ) {
+        let (proof, audit_outcome) = Self::to_proof_outcome(outcome);
+        // Native-only sync bridge onto the async audit log; see
+        // [`block_on_audit`]. Persistence failure degrades to "continue +
+        // alert", never a panic or a blocked host call.
+        let result = block_on_audit(self.audit_log.append_with_principal(
+            self.session_id.clone(),
+            principal.clone(),
+            action,
+            proof,
+            audit_outcome,
+        ));
+        if let Err(e) = result {
+            warn!(
+                security_event = true,
+                %principal,
+                error = %e,
+                "Failed to persist per-action audit entry — continuing"
+            );
         }
     }
 
@@ -200,25 +234,7 @@ impl HostAuditSink for KernelAuditSink {
         outcome: HostAuditOutcome<'_>,
     ) {
         let action = Self::to_action(event);
-        let (proof, audit_outcome) = Self::to_proof_outcome(outcome);
-        // Native-only sync bridge onto the async audit log; see
-        // [`block_on_audit`]. Persistence failure degrades to "continue +
-        // alert", never a panic or a blocked host call.
-        let result = block_on_audit(self.audit_log.append_with_principal(
-            self.session_id.clone(),
-            principal.clone(),
-            action,
-            proof,
-            audit_outcome,
-        ));
-        if let Err(e) = result {
-            warn!(
-                security_event = true,
-                %principal,
-                error = %e,
-                "Failed to persist per-action audit entry — continuing"
-            );
-        }
+        self.record_action(principal, action, outcome);
     }
 }
 
@@ -275,6 +291,14 @@ mod tests {
         );
         sink.record(
             &p,
+            HostAuditEvent::NetAccept {
+                local_addr: "127.0.0.1:8788",
+                peer_addr: "127.0.0.1:49152",
+            },
+            HostAuditOutcome::Allowed,
+        );
+        sink.record(
+            &p,
             HostAuditEvent::ProcessSpawn { command: "ls" },
             HostAuditOutcome::Denied("not in host_process allowlist"),
         );
@@ -283,7 +307,7 @@ mod tests {
             .get_principal_entries(&session, Some(&p))
             .await
             .expect("read principal entries");
-        assert_eq!(entries.len(), 6, "all six events must persist");
+        assert_eq!(entries.len(), 7, "all seven events must persist");
 
         // Every entry is stamped with the acting principal.
         for e in &entries {
@@ -316,12 +340,20 @@ mod tests {
             &entries[4].action,
             AuditAction::NetBind { addr } if addr == "127.0.0.1:0"
         ));
+        // NetAccept → success with host-observed endpoints.
+        assert!(matches!(
+            &entries[5].action,
+            AuditAction::NetAccept {
+                local_addr,
+                peer_addr,
+            } if local_addr == "127.0.0.1:8788" && peer_addr == "127.0.0.1:49152"
+        ));
         // ProcessSpawn Denied → Failure + Denied proof.
         assert!(matches!(
             (
-                &entries[5].action,
-                &entries[5].authorization,
-                &entries[5].outcome
+                &entries[6].action,
+                &entries[6].authorization,
+                &entries[6].outcome
             ),
             (
                 AuditAction::ProcessSpawn { command },

@@ -394,11 +394,17 @@ async fn net_bind_gate_enforced() {
     let gate2 = ManifestSecurityGate::new(manifest2, workspace_root(), None);
     assert!(gate2.check_net_bind("test").await.is_ok());
 
-    // Empty string in net_bind is treated as malformed -> denied
+    // Empty string in net_bind is treated as malformed -> denied.
     let mut manifest3 = make_manifest(vec![], vec![], vec![]);
     manifest3.capabilities.net_bind = vec!["".into()];
     let gate3 = ManifestSecurityGate::new(manifest3, workspace_root(), None);
     assert!(gate3.check_net_bind("test").await.is_err());
+
+    // A TCP-only declaration must not authorize the shared Unix CLI listener.
+    let mut manifest4 = make_manifest(vec![], vec![], vec![]);
+    manifest4.capabilities.net_bind = vec!["127.0.0.1:8799".into()];
+    let gate4 = ManifestSecurityGate::new(manifest4, workspace_root(), None);
+    assert!(gate4.check_net_bind("test").await.is_err());
 }
 
 #[tokio::test]
@@ -598,4 +604,68 @@ async fn check_net_connect_matches_allowlist_entry() {
             .is_err()
     );
     assert!(gate.check_net_connect("c", "evil.com", 443).await.is_err());
+}
+
+#[tokio::test]
+async fn check_net_tcp_bind_matches_net_bind_host_port() {
+    let mut manifest = make_manifest(vec![], vec![], vec![]);
+    manifest.capabilities.net_bind = vec!["127.0.0.1:8799".to_string()];
+    let gate = ManifestSecurityGate::new(manifest, workspace_root(), None);
+    // Exact host:port allowed.
+    assert!(
+        gate.check_net_tcp_bind("c", "127.0.0.1", 8799)
+            .await
+            .is_ok()
+    );
+    // Wrong port denied.
+    assert!(
+        gate.check_net_tcp_bind("c", "127.0.0.1", 9000)
+            .await
+            .is_err()
+    );
+    // Wrong host denied.
+    assert!(gate.check_net_tcp_bind("c", "0.0.0.0", 8799).await.is_err());
+}
+
+#[tokio::test]
+async fn check_net_tcp_bind_wildcard_port() {
+    let mut manifest = make_manifest(vec![], vec![], vec![]);
+    manifest.capabilities.net_bind = vec!["127.0.0.1:*".to_string()];
+    let gate = ManifestSecurityGate::new(manifest, workspace_root(), None);
+    assert!(
+        gate.check_net_tcp_bind("c", "127.0.0.1", 8799)
+            .await
+            .is_ok()
+    );
+    assert!(
+        gate.check_net_tcp_bind("c", "127.0.0.1", 1234)
+            .await
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn check_net_tcp_bind_unix_entry_does_not_authorize_tcp() {
+    // The CLI proxy declares `net_bind = ["unix:*"]`. That entry must NEVER
+    // authorize an inbound TCP bind — the two socket families share the field
+    // without cross-authorizing.
+    let mut manifest = make_manifest(vec![], vec![], vec![]);
+    manifest.capabilities.net_bind = vec!["unix:*".to_string()];
+    let gate = ManifestSecurityGate::new(manifest, workspace_root(), None);
+    assert!(
+        gate.check_net_tcp_bind("c", "127.0.0.1", 8799)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn check_net_tcp_bind_empty_net_bind_denies() {
+    let manifest = make_manifest(vec![], vec![], vec![]);
+    let gate = ManifestSecurityGate::new(manifest, workspace_root(), None);
+    assert!(
+        gate.check_net_tcp_bind("c", "127.0.0.1", 8799)
+            .await
+            .is_err()
+    );
 }

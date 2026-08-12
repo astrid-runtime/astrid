@@ -337,12 +337,11 @@ interface host {
 
     /// Bind a TCP listener for inbound connections.
     ///
-    /// `"0.0.0.0"` / `"::"` exposes the listener to every network
-    /// interface (server posture) — restrict in `Capsule.toml
-    /// [capabilities] net_tcp_bind` to loopback-only patterns unless
-    /// the capsule genuinely needs to serve. Port `0` selects an
-    /// ephemeral port. Gated by a `net_tcp_bind` capability allowlist
-    /// distinct from `net_connect`.
+    /// Astrid confines TCP listeners to loopback hosts: `localhost`,
+    /// `127.0.0.0/8`, or `::1`. Wildcard and non-loopback interfaces are
+    /// rejected. Port `0` selects an ephemeral port. The requested
+    /// `host:port` must match the capsule's `[capabilities].net_bind`
+    /// allowlist; this authority is distinct from `net_connect`.
     bind-tcp: func(host: string, port: u16) -> result<tcp-listener, error-code>;
 
     /// Open an outbound TCP connection to `host:port`. Goes through

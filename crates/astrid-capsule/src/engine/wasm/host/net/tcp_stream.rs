@@ -518,7 +518,7 @@ impl HostTcpStream for HostState {
             .delete::<NetStream>(Resource::new_own(table_rep))
             .is_ok()
         {
-            self.net_stream_count = self.net_stream_count.saturating_sub(1);
+            self.release_net_stream();
         }
         // Drop any verified per-connection principal binding (issue #45/#852)
         // so the registry does not leak entries for closed connections. A

@@ -22,6 +22,7 @@ enum CapturedEvent {
     FileDelete(String),
     NetConnect(String, u16),
     NetBind(String),
+    NetAccept(String, String),
     ProcessSpawn(String),
 }
 
@@ -34,6 +35,10 @@ impl CapturedEvent {
             HostAuditEvent::NetConnect { host, port } => Self::NetConnect(host.to_owned(), port),
             HostAuditEvent::NetBind { addr } => Self::NetBind(addr.to_owned()),
             HostAuditEvent::ProcessSpawn { command } => Self::ProcessSpawn(command.to_owned()),
+            HostAuditEvent::NetAccept {
+                local_addr,
+                peer_addr,
+            } => Self::NetAccept(local_addr.to_owned(), peer_addr.to_owned()),
         }
     }
 }
@@ -164,6 +169,28 @@ async fn audit_net_reports_connect() {
             CapturedEvent::NetConnect("example.com".into(), 443),
             CapturedOutcome::Allowed
         )
+    );
+}
+
+#[tokio::test]
+async fn audit_net_accept_carries_host_observed_endpoints() {
+    let (state, sink) = state_with_sink(tokio::runtime::Handle::current());
+    let alice = PrincipalId::new("alice").unwrap();
+
+    super::net::audit_net_accept(
+        &state,
+        "127.0.0.1:8788",
+        "127.0.0.1:49152",
+        &Ok::<(), ()>(()),
+    );
+
+    assert_eq!(
+        sink.snapshot(),
+        vec![(
+            alice,
+            CapturedEvent::NetAccept("127.0.0.1:8788".into(), "127.0.0.1:49152".into()),
+            CapturedOutcome::Allowed,
+        )]
     );
 }
 
