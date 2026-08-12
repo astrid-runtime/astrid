@@ -271,14 +271,14 @@ impl CapsuleSecurityGate for ManifestSecurityGate {
     }
 
     async fn check_net_bind(&self, capsule_id: &str) -> Result<(), String> {
-        // Require at least one non-empty net_bind entry. Empty strings in the
-        // manifest are treated as malformed and do not grant capability.
+        // The kernel's pre-bound CLI socket is Unix-only authority. A TCP
+        // host:port declaration must never make that listener available.
         let has_valid_entry = self
             .manifest
             .capabilities
             .net_bind
             .iter()
-            .any(|entry| !entry.is_empty());
+            .any(|entry| entry.starts_with("unix:"));
         if has_valid_entry {
             Ok(())
         } else {

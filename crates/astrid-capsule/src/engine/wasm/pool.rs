@@ -31,6 +31,7 @@
 //! via auto-subscribed IPC inside `run()`, not via `invoke_interceptor`.
 
 use std::collections::VecDeque;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -460,7 +461,15 @@ fn clear_on_return(state: &mut HostState, reset_resources: bool) {
         // them to the empty-table baseline so the per-(principal) gates start
         // from zero for the next lease.
         state.active_http_streams.clear();
-        state.net_stream_count = 0;
+        let local_streams = state.local_net_stream_count.swap(0, Ordering::AcqRel);
+        if local_streams != 0 {
+            let decremented = state.net_stream_count.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |count| count.checked_sub(local_streams),
+            );
+            debug_assert!(decremented.is_ok(), "shared network stream quota underflow");
+        }
         state.subscription_count = 0;
         state.process_count_total = 0;
         state.process_count_by_principal.clear();
@@ -513,7 +522,8 @@ mod tests {
             .resource_table
             .push(DropFlag(Arc::clone(&dropped)))
             .expect("push test resource");
-        state.net_stream_count = 1;
+        state.net_stream_count.store(1, Ordering::Release);
+        state.local_net_stream_count.store(1, Ordering::Release);
         state.subscription_count = 2;
         state.process_count_total = 1;
         state
@@ -538,7 +548,7 @@ mod tests {
             "returned instance must observe an empty resource table"
         );
         // Mirror counters back to the empty-table baseline.
-        assert_eq!(state.net_stream_count, 0);
+        assert_eq!(state.net_stream_count.load(Ordering::Acquire), 0);
         assert_eq!(state.subscription_count, 0);
         assert_eq!(state.process_count_total, 0);
         assert!(state.process_count_by_principal.is_empty());
@@ -548,6 +558,28 @@ mod tests {
             state.invocation_cancel_token.is_none(),
             "a leftover per-principal cancel token must not survive into the next lease"
         );
+    }
+
+    #[test]
+    fn returning_one_store_preserves_another_stores_stream_quota() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let shared = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut first = minimal_host_state(runtime.handle().clone());
+        let mut second = minimal_host_state(runtime.handle().clone());
+        first.net_stream_count = Arc::clone(&shared);
+        second.net_stream_count = Arc::clone(&shared);
+
+        assert!(first.reserve_net_stream());
+        assert!(second.reserve_net_stream());
+        first.release_net_stream();
+        clear_on_return(&mut first, true);
+
+        assert_eq!(shared.load(Ordering::Acquire), 1);
+        assert_eq!(second.local_net_stream_count.load(Ordering::Acquire), 1);
+        clear_on_return(&mut second, true);
+        assert_eq!(shared.load(Ordering::Acquire), 0);
     }
 
     /// The `host_process` carve-out (`reset_resources = false`) deliberately

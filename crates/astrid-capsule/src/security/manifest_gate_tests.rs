@@ -394,11 +394,17 @@ async fn net_bind_gate_enforced() {
     let gate2 = ManifestSecurityGate::new(manifest2, workspace_root(), None);
     assert!(gate2.check_net_bind("test").await.is_ok());
 
-    // Empty string in net_bind is treated as malformed -> denied
+    // Empty string in net_bind is treated as malformed -> denied.
     let mut manifest3 = make_manifest(vec![], vec![], vec![]);
     manifest3.capabilities.net_bind = vec!["".into()];
     let gate3 = ManifestSecurityGate::new(manifest3, workspace_root(), None);
     assert!(gate3.check_net_bind("test").await.is_err());
+
+    // A TCP-only declaration must not authorize the shared Unix CLI listener.
+    let mut manifest4 = make_manifest(vec![], vec![], vec![]);
+    manifest4.capabilities.net_bind = vec!["127.0.0.1:8799".into()];
+    let gate4 = ManifestSecurityGate::new(manifest4, workspace_root(), None);
+    assert!(gate4.check_net_bind("test").await.is_err());
 }
 
 #[tokio::test]

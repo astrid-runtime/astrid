@@ -62,6 +62,35 @@ pub(super) const MAX_ACTIVE_STREAMS: usize = 8;
 /// matching the published `astrid:net` WIT contract.
 pub(super) const MAX_ACTIVE_TCP_LISTENERS: usize = 4;
 
+impl HostState {
+    pub(in crate::engine::wasm) fn reserve_net_stream(&self) -> bool {
+        let reserved = self.net_stream_count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < MAX_ACTIVE_STREAMS).then_some(count + 1)
+            })
+            .is_ok();
+        if reserved {
+            self.local_net_stream_count.fetch_add(1, Ordering::AcqRel);
+        }
+        reserved
+    }
+
+    pub(in crate::engine::wasm) fn release_net_stream(&self) {
+        let decremented =
+            self.net_stream_count
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                    count.checked_sub(1)
+                });
+        debug_assert!(decremented.is_ok(), "network stream quota underflow");
+        let local = self.local_net_stream_count.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |count| count.checked_sub(1),
+        );
+        debug_assert!(local.is_ok(), "local network stream quota underflow");
+    }
+}
+
 /// Stamp marking a resource slot in the table as a `UnixListener` handle.
 /// The kernel pre-binds the listener; the resource handle is just a
 /// capability token that the capsule must hold to call `accept`.
@@ -73,13 +102,40 @@ pub(super) struct UnixListenerSlot;
 /// through it, and `Drop` closes the socket.
 pub(super) struct TcpListenerSlot {
     pub(super) listener: Arc<tokio::net::TcpListener>,
-    /// One connection accepted by a readiness poll but not yet consumed by
-    /// `accept`. Sharing this slot prevents readiness from losing data and
-    /// coalesces multiple pollables onto one pending connection.
-    pub(super) pending:
-        Arc<tokio::sync::Mutex<Option<(tokio::net::TcpStream, std::net::SocketAddr)>>>,
+    pub(super) pending: Arc<PendingTcpConnection>,
     pub(super) cancel_token: tokio_util::sync::CancellationToken,
     pub(super) listener_count: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+pub(super) struct PendingTcpConnection {
+    pub(super) connection: tokio::sync::Mutex<Option<PendingTcpAccepted>>,
+    pub(super) stream_count: Arc<std::sync::atomic::AtomicUsize>,
+    pub(super) local_stream_count: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+pub(super) struct PendingTcpAccepted {
+    pub(super) stream: tokio::net::TcpStream,
+    pub(super) local_addr: String,
+    pub(super) peer_addr: String,
+}
+
+impl Drop for PendingTcpConnection {
+    fn drop(&mut self) {
+        if self.connection.get_mut().is_some() {
+            let decremented =
+                self.stream_count
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                        count.checked_sub(1)
+                    });
+            debug_assert!(decremented.is_ok(), "pending TCP quota underflow");
+            let local = self.local_stream_count.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |count| count.checked_sub(1),
+            );
+            debug_assert!(local.is_ok(), "pending local TCP quota underflow");
+        }
+    }
 }
 
 impl Drop for TcpListenerSlot {
@@ -449,7 +505,11 @@ impl net::Host for HostState {
 
         let slot = TcpListenerSlot {
             listener: Arc::new(listener),
-            pending: Arc::new(tokio::sync::Mutex::new(None)),
+            pending: Arc::new(PendingTcpConnection {
+                connection: tokio::sync::Mutex::new(None),
+                stream_count: Arc::clone(&self.net_stream_count),
+                local_stream_count: Arc::clone(&self.local_net_stream_count),
+            }),
             cancel_token: self.effective_cancel_token(),
             listener_count: Arc::clone(&self.tcp_listener_count),
         };
@@ -492,7 +552,7 @@ impl net::Host for HostState {
             }
         }
 
-        if self.net_stream_count >= MAX_ACTIVE_STREAMS {
+        if self.net_stream_count.load(Ordering::Acquire) >= MAX_ACTIVE_STREAMS {
             let result: Result<Resource<TcpStream>, ErrorCode> = Err(ErrorCode::Quota);
             audit_net_connect(self, &host, port, &result);
             return result;
@@ -545,7 +605,7 @@ impl net::Host for HostState {
             },
         };
 
-        if self.net_stream_count >= MAX_ACTIVE_STREAMS {
+        if !self.reserve_net_stream() {
             drop(stream);
             let result: Result<Resource<TcpStream>, ErrorCode> = Err(ErrorCode::Quota);
             audit_net_connect(self, &host, port, &result);
@@ -560,6 +620,7 @@ impl net::Host for HostState {
         let res = match self.resource_table.push(net_stream) {
             Ok(res) => res,
             Err(e) => {
+                self.release_net_stream();
                 // The TCP connect ALREADY SUCCEEDED (the socket is open); the
                 // push consumes and drops the stream here, aborting the
                 // connection. Record the connect as having happened with a
@@ -570,7 +631,6 @@ impl net::Host for HostState {
                 return result;
             },
         };
-        self.net_stream_count += 1;
         let result: Result<Resource<TcpStream>, ErrorCode> = Ok(Resource::new_own(res.rep()));
         audit_net_connect(self, &host, port, &result);
         result

@@ -288,14 +288,6 @@ pub enum AuditAction {
         addr: String,
     },
 
-    /// Inbound TCP connection accepted by a capsule listener.
-    NetAccept {
-        /// Host-observed local listener endpoint.
-        local_addr: String,
-        /// Host-observed remote peer endpoint.
-        peer_addr: String,
-    },
-
     /// Child-process spawn by a capsule host call (`astrid:process` spawn).
     ///
     /// Recorded for every spawn attempt — allowed, failed, or denied — so a
@@ -474,6 +466,17 @@ pub enum AuditAction {
         /// from the public key); `None` for a full-authority request.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         device_key_id: Option<String>,
+    },
+
+    /// Inbound TCP connection accepted by a capsule listener.
+    ///
+    /// Kept at the end of this fieldless enum so adding the action does not
+    /// change the implicit discriminants of any existing public variant.
+    NetAccept {
+        /// Host-observed local listener endpoint.
+        local_addr: String,
+        /// Host-observed remote peer endpoint.
+        peer_addr: String,
     },
 }
 

@@ -5,6 +5,7 @@
 //! `NetStream::Unix` resource handle.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use astrid_core::local_transport;
@@ -21,7 +22,7 @@ use crate::engine::wasm::host::util;
 
 impl HostUnixListener for HostState {
     fn accept(&mut self, _self_: Resource<UnixListener>) -> Result<Resource<TcpStream>, ErrorCode> {
-        if self.net_stream_count >= MAX_ACTIVE_STREAMS {
+        if self.net_stream_count.load(Ordering::Acquire) >= MAX_ACTIVE_STREAMS {
             return Err(ErrorCode::Quota);
         }
 
@@ -115,17 +116,19 @@ impl HostUnixListener for HostState {
             }
         };
 
-        if self.net_stream_count >= MAX_ACTIVE_STREAMS {
+        if !self.reserve_net_stream() {
             drop(stream);
             return Err(ErrorCode::Quota);
         }
 
         let net_stream = NetStream::Unix(Arc::new(tokio::sync::Mutex::new(stream)));
-        let res = self
-            .resource_table
-            .push(net_stream)
-            .map_err(|e| ErrorCode::Unknown(format!("resource table: {e}")))?;
-        self.net_stream_count += 1;
+        let res = match self.resource_table.push(net_stream) {
+            Ok(resource) => resource,
+            Err(error) => {
+                self.release_net_stream();
+                return Err(ErrorCode::Unknown(format!("resource table: {error}")));
+            },
+        };
         let rep = res.rep();
         // Record the verified principal AND its authenticating device key_id
         // (issue #45/#852) keyed by the stream resource rep, now that the rep
@@ -164,7 +167,7 @@ impl HostUnixListener for HostState {
         let session_token = self.session_token.clone();
         let blocking_semaphore = self.blocking_semaphore.clone();
 
-        if self.net_stream_count >= MAX_ACTIVE_STREAMS {
+        if self.net_stream_count.load(Ordering::Acquire) >= MAX_ACTIVE_STREAMS {
             return Ok(None);
         }
 
@@ -237,17 +240,19 @@ impl HostUnixListener for HostState {
             }
         }
 
-        if self.net_stream_count >= MAX_ACTIVE_STREAMS {
+        if !self.reserve_net_stream() {
             drop(stream);
             return Ok(None);
         }
 
         let net_stream = NetStream::Unix(Arc::new(tokio::sync::Mutex::new(stream)));
-        let res = self
-            .resource_table
-            .push(net_stream)
-            .map_err(|e| ErrorCode::Unknown(format!("resource table: {e}")))?;
-        self.net_stream_count += 1;
+        let res = match self.resource_table.push(net_stream) {
+            Ok(resource) => resource,
+            Err(error) => {
+                self.release_net_stream();
+                return Err(ErrorCode::Unknown(format!("resource table: {error}")));
+            },
+        };
         let rep = res.rep();
         // Same per-connection principal + device-key binding as `accept`
         // (issue #45/#852).

@@ -615,13 +615,17 @@ pub struct HostState {
     /// here — off the wasmtime resource table — which is what lets them
     /// survive instance churn.
     pub persistent_processes: Arc<crate::engine::wasm::host::process::PersistentProcessRegistry>,
-    /// Live count of `NetStream` entries currently in the resource table.
+    /// Live count of accepted/connected streams, including a connection
+    /// accepted by a readiness poll but not yet claimed by the guest.
     /// Maintained alongside `ResourceTable` insertions / drops so the
     /// `MAX_ACTIVE_STREAMS` gate is O(1) instead of iterating every
     /// resource (the table may hold hundreds of pollables / errors /
-    /// http handles unrelated to net). Single-threaded: wasmtime
-    /// stores are owned by exactly one OS thread.
-    pub net_stream_count: usize,
+    /// http handles unrelated to net). Atomic because readiness pollables can
+    /// reserve a connection before the guest re-enters a host function.
+    pub net_stream_count: Arc<std::sync::atomic::AtomicUsize>,
+    /// Streams reserved by this pooled Store. Reset subtracts this exact
+    /// contribution from the shared capsule-wide counter.
+    pub local_net_stream_count: Arc<std::sync::atomic::AtomicUsize>,
     /// Live count of bound inbound TCP listeners, shared by every pooled
     /// store for this capsule. The WIT contract limits the capsule as a whole
     /// to four listeners; a store-local counter would multiply that limit by
