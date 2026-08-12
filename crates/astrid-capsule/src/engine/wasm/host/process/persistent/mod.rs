@@ -69,8 +69,8 @@ use config::{
     MAX_STDIN_WRITE, MAX_STOP_GRACE, clamp_label, clamp_log_ring, overflow_from_wit, resolve_ttls,
 };
 use entry::{
-    HostSignal, PersistentEntry, Phase, ProcessCore, current_exit, map_signal, reap_entry,
-    send_signal, spawn_monitor, spawn_ring_reader, wait_for_exit,
+    PersistentEntry, Phase, ProcessCore, current_exit, reap_entry, send_signal, spawn_monitor,
+    spawn_ring_reader, wait_for_exit,
 };
 use ids::mint_id;
 use ring::{LogRing, Stream, decode_cursor, encode_cursor};
@@ -88,6 +88,7 @@ pub(in crate::engine::wasm::host::process) struct SpawnParams {
     /// cmd + args, as the capsule requested it (for display / label default).
     pub(in crate::engine::wasm::host::process) command: String,
     pub(in crate::engine::wasm::host::process) os_pid: u32,
+    pub(in crate::engine::wasm::host::process) tree: Arc<super::platform::ProcessTree>,
     pub(in crate::engine::wasm::host::process) child: tokio::process::Child,
     pub(in crate::engine::wasm::host::process) stdout: tokio::process::ChildStdout,
     pub(in crate::engine::wasm::host::process) stderr: tokio::process::ChildStderr,
@@ -174,7 +175,7 @@ impl PersistentProcessRegistry {
             key,
             core: Arc::clone(&entry.core),
             exit_rx: entry.exit_rx.clone(),
-            os_pid: entry.os_pid,
+            tree: Arc::clone(&entry.tree),
         })
     }
 
@@ -230,7 +231,13 @@ impl PersistentProcessRegistry {
         spawn_ring_reader(&self.runtime, p.stdout, Arc::clone(&core), Stream::Out);
         spawn_ring_reader(&self.runtime, p.stderr, Arc::clone(&core), Stream::Err);
         let (exit_tx, exit_rx) = watch::channel::<Option<entry::ExitRecord>>(None);
-        let monitor = spawn_monitor(&self.runtime, p.child, Arc::clone(&core), exit_tx);
+        let monitor = spawn_monitor(
+            &self.runtime,
+            p.child,
+            Arc::clone(&p.tree),
+            Arc::clone(&core),
+            exit_tx,
+        );
         let injection_guard = p.injection_guard;
 
         let mut id = mint_id();
@@ -242,7 +249,9 @@ impl PersistentProcessRegistry {
             tries += 1;
             if tries > 8 {
                 // 256-bit space: unreachable in practice. Fail closed.
+                let cleanup = p.tree.terminate(super::platform::Termination::Force);
                 monitor.abort();
+                cleanup?;
                 return Err(ErrorCode::Unknown(
                     "process-id collision space exhausted".to_string(),
                 ));
@@ -257,6 +266,7 @@ impl PersistentProcessRegistry {
                 label,
                 command: p.command,
                 os_pid: p.os_pid,
+                tree: p.tree,
                 spawned_at: Instant::now(),
                 max_lifetime,
                 idle_timeout,
@@ -409,7 +419,7 @@ impl PersistentProcessRegistry {
         {
             return Ok(());
         }
-        send_signal(r.os_pid, map_signal(sig))
+        send_signal(&r.tree, sig)
     }
 
     /// Write to stdin (requires `keep-stdin-open`).
@@ -481,8 +491,8 @@ impl PersistentProcessRegistry {
         }
     }
 
-    /// Graceful terminal stop: SIGTERM → grace → SIGKILL, then REMOVE the id
-    /// (frees the concurrent + retained slot).
+    /// Graceful terminal stop: platform grace → forced tree termination, then
+    /// REMOVE the id (frees the concurrent + retained slot).
     pub(in crate::engine::wasm::host::process) async fn stop(
         &self,
         id: &str,
@@ -496,12 +506,12 @@ impl PersistentProcessRegistry {
         let exit = if let Some(e) = current_exit(&r.core) {
             e
         } else {
-            let _ = send_signal(r.os_pid, HostSignal::Term);
+            r.tree.terminate(super::platform::Termination::Graceful)?;
             let mut rx = r.exit_rx.clone();
             match tokio::time::timeout(grace, wait_for_exit(&mut rx)).await {
                 Ok(Some(e)) => e,
                 _ => {
-                    let _ = send_signal(r.os_pid, HostSignal::Kill);
+                    r.tree.terminate(super::platform::Termination::Force)?;
                     let mut rx2 = r.exit_rx.clone();
                     match tokio::time::timeout(MAX_STOP_GRACE, wait_for_exit(&mut rx2)).await {
                         Ok(Some(e)) => e,
@@ -517,7 +527,7 @@ impl PersistentProcessRegistry {
         // syscall never stalls other registry ops.
         let removed = self.lock().remove(&r.key);
         if let Some(entry) = removed {
-            reap_entry(entry);
+            reap_entry(entry)?;
         }
         Ok(exit.into())
     }
@@ -544,7 +554,7 @@ impl PersistentProcessRegistry {
         let removed = map.remove(&key);
         drop(map);
         if let Some(entry) = removed {
-            reap_entry(entry);
+            reap_entry(entry)?;
         }
         Ok(())
     }
@@ -591,7 +601,9 @@ impl PersistentProcessRegistry {
         // Reap (killpg + abort) outside the map lock.
         let n = reaped.len();
         for entry in reaped {
-            reap_entry(entry);
+            if let Err(error) = reap_entry(entry) {
+                tracing::warn!(?error, "persistent process sweep cleanup failed");
+            }
         }
         n
     }
@@ -600,14 +612,17 @@ impl PersistentProcessRegistry {
     pub fn shutdown(&self) {
         let drained: Vec<PersistentEntry> = self.lock().drain().map(|(_, e)| e).collect();
         for entry in drained {
-            reap_entry(entry);
+            if let Err(error) = reap_entry(entry) {
+                tracing::warn!(?error, "persistent process shutdown cleanup failed");
+            }
         }
     }
 }
 
 fn reject_spawn(mut p: SpawnParams, err: ErrorCode) -> Result<String, ErrorCode> {
-    let _ = entry::send_signal(p.os_pid, HostSignal::Kill);
+    let cleanup = p.tree.terminate(super::platform::Termination::Force);
     let _ = p.child.start_kill();
     let _ = p.child.try_wait();
+    cleanup?;
     Err(err)
 }

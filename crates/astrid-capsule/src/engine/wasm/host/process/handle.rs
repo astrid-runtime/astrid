@@ -1,15 +1,13 @@
 //! `HostProcessHandle` impl — methods on the `Resource<ProcessHandle>`.
 //!
-//! Live: `read-logs`, `wait`, `kill`, `os-pid`.
+//! Live: `read-logs`, `wait`, `kill`, `signal`, `os-pid`.
 //! Stubbed (return Unknown / CapabilityDenied): `write-stdin`,
-//! `close-stdin`, `signal`, `wait-with-output`, `subscribe-exit`,
-//! `subscribe-logs`. These need:
+//! `close-stdin`, `wait-with-output`, `subscribe-exit`, `subscribe-logs`.
+//! These need:
 //! - stdin pipe storage in ManagedProcess (write-stdin / close-stdin)
-//! - real signal mapping (signal — currently only the SIGKILL fast path
-//!   is exposed via kill())
 //! - pollable wiring (subscribe-*)
 //! - wait_with_output requires re-architecting around the streaming
-//!   reader threads (the captured output is already drained piecemeal
+//!   reader tasks (the captured output is already drained piecemeal
 //!   into the ring buffer; reassembling a one-shot final output across
 //!   the wait/drain race is non-trivial)
 //!
@@ -35,14 +33,21 @@ impl HostProcessHandle for HostState {
         // `tokio::process::Child::try_wait` is non-blocking and
         // returns the exit status if the child has exited. Same
         // semantics as std::process::Child::try_wait.
+        let mut exited = false;
         let (running, exit_code) = if let Some(child) = proc.child.as_mut() {
             match child.try_wait() {
                 Ok(Some(status)) => {
+                    #[cfg(windows)]
+                    proc.tree.terminate(super::platform::Termination::Force)?;
+                    exited = true;
                     proc.child.take();
                     (false, status.code())
                 },
                 Ok(None) => (true, None),
                 Err(_) => {
+                    #[cfg(windows)]
+                    proc.tree.terminate(super::platform::Termination::Force)?;
+                    exited = true;
                     proc.child.take();
                     (false, Some(-1))
                 },
@@ -50,6 +55,9 @@ impl HostProcessHandle for HostState {
         } else {
             (false, None)
         };
+        if exited {
+            self.process_tracker.unregister_tree(&proc.tree);
+        }
 
         let stdout = drain_buffer(&proc.stdout_buf);
         let stderr = drain_buffer(&proc.stderr_buf);
@@ -90,42 +98,30 @@ impl HostProcessHandle for HostState {
         self_: Resource<ProcessHandle>,
         sig: ProcessSignal,
     ) -> Result<(), ErrorCode> {
-        #[cfg(unix)]
-        {
-            let proc = self
-                .resource_table
-                .get::<ManagedProcess>(&Resource::new_borrow(self_.rep()))
-                .map_err(|_| ErrorCode::Closed)?;
-            // `tokio::process::Child::id()` returns `Option<u32>` —
-            // `None` once the child has been polled and reaped, which
-            // we treat as Closed here. The std variant returned `u32`
-            // unconditionally.
-            let pid = proc
-                .child
-                .as_ref()
-                .and_then(tokio::process::Child::id)
-                .ok_or(ErrorCode::Closed)?;
-            let nix_sig = match sig {
-                ProcessSignal::Term => nix::sys::signal::Signal::SIGTERM,
-                ProcessSignal::Hup => nix::sys::signal::Signal::SIGHUP,
-                ProcessSignal::Usr1 => nix::sys::signal::Signal::SIGUSR1,
-                ProcessSignal::Usr2 => nix::sys::signal::Signal::SIGUSR2,
-                ProcessSignal::Int => nix::sys::signal::Signal::SIGINT,
-                ProcessSignal::Stop => nix::sys::signal::Signal::SIGSTOP,
-                ProcessSignal::Cont => nix::sys::signal::Signal::SIGCONT,
-            };
-            let raw = i32::try_from(pid).map_err(|_| ErrorCode::InvalidInput)?;
-            nix::sys::signal::kill(nix::unistd::Pid::from_raw(raw), nix_sig)
-                .map_err(|e| ErrorCode::Unknown(format!("kill({sig:?}): {e}")))?;
-            Ok(())
+        if !super::platform::signal_supported(sig) {
+            let result = Err(ErrorCode::CapabilityDenied);
+            super::audit::audit_process_signal(self, "process-handle", sig, &result);
+            return result;
         }
-        #[cfg(not(unix))]
+        let (command, result) = match self
+            .resource_table
+            .get::<ManagedProcess>(&Resource::new_borrow(self_.rep()))
         {
-            let _ = (self_, sig);
-            Err(ErrorCode::Unknown(
-                "ProcessHandle.signal: not supported on this platform".to_string(),
-            ))
-        }
+            Ok(proc) => {
+                // `tokio::process::Child::id()` returns `None` once the
+                // child has exited and been reaped.
+                let result = proc
+                    .child
+                    .as_ref()
+                    .and_then(tokio::process::Child::id)
+                    .ok_or(ErrorCode::Closed)
+                    .and_then(|_| super::platform::signal_root_process(&proc.tree, sig));
+                (proc.audit_descriptor.clone(), result)
+            },
+            Err(_) => ("closed-process-handle".to_string(), Err(ErrorCode::Closed)),
+        };
+        super::audit::audit_process_signal(self, &command, sig, &result);
+        result
     }
 
     fn kill(&mut self, self_: Resource<ProcessHandle>) -> Result<KillResult, ErrorCode> {
@@ -134,12 +130,13 @@ impl HostProcessHandle for HostState {
             .get_mut::<ManagedProcess>(&Resource::new_borrow(self_.rep()))
             .map_err(|_| ErrorCode::Closed)?;
         let (killed, exit_code) = match proc.child.take() {
-            Some(mut child) => {
-                let code = kill_and_reap(&mut child);
-                (true, code)
+            Some(mut child) => kill_and_reap(&mut child, &proc.tree)?,
+            None => {
+                proc.tree.terminate(super::platform::Termination::Force)?;
+                (false, None)
             },
-            None => (false, None),
         };
+        self.process_tracker.unregister_tree(&proc.tree);
         let stdout = drain_buffer(&proc.stdout_buf);
         let stderr = drain_buffer(&proc.stderr_buf);
         Ok(KillResult {
@@ -176,7 +173,6 @@ impl HostProcessHandle for HostState {
             Some(c) => c,
             None => return Err(ErrorCode::Closed),
         };
-
         let result = crate::engine::wasm::host::util::bounded_block_on_cancellable(
             &rt,
             &sem,
@@ -206,7 +202,10 @@ impl HostProcessHandle for HostState {
         // that the OS no longer knows about.
         let succeeded = matches!(result, Some(Ok(_)));
         if succeeded {
+            #[cfg(windows)]
+            proc.tree.terminate(super::platform::Termination::Force)?;
             proc.child.take();
+            self.process_tracker.unregister_tree(&proc.tree);
         }
 
         match result {
@@ -249,7 +248,7 @@ impl HostProcessHandle for HostState {
 
     fn subscribe_logs(&mut self, _self_: Resource<ProcessHandle>) -> Resource<DynPollable> {
         // Same pattern — guests poll, then `read-logs` drains whatever
-        // the reader thread has buffered (or returns empty if nothing
+        // the reader task has buffered (or returns empty if nothing
         // is available yet, which is honest non-blocking semantics).
         super::super::stubs::always_ready_pollable(&mut self.resource_table)
     }
@@ -263,9 +262,7 @@ impl HostProcessHandle for HostState {
             .resource_table
             .delete::<ManagedProcess>(Resource::new_own(rep.rep()))
         {
-            if let Some(pid) = managed.child.as_ref().and_then(tokio::process::Child::id) {
-                self.process_tracker.unregister(pid);
-            }
+            self.process_tracker.unregister_tree(&managed.tree);
             self.process_count_total = self.process_count_total.saturating_sub(1);
             if let Some(count) = self.process_count_by_principal.get_mut(&managed.creator) {
                 *count = count.saturating_sub(1);

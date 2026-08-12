@@ -1,28 +1,6 @@
-//! `astrid:process@1.1.0` host implementation (the `@1.0.0` shims live in
-//! `compat.rs`).
-//!
-//! Both frozen contract versions are served off one implementation. This
-//! module implements the `@1.1.0` `Host` / `HostProcessHandle` traits — the
-//! SUPERSET, carrying the per-spawn read-only `file-injection` surface. The
-//! `@1.0.0` traits are thin delegating shims in `compat.rs` that spawn with an
-//! empty injection list; see that module for the version-bridging rationale.
-//!
-//! Desktop-only package (the WIT header explicitly notes hermit-rs
-//! unikernel targets do not provide it). The kernel here:
-//!
-//! - `spawn` — synchronous sandboxed exec with stdout/stderr capture.
-//!   Full impl; ported from the legacy path.
-//! - `spawn-background` — sandboxed exec returning
-//!   `Resource<ProcessHandle>`. Stdout/stderr drain into 1 MiB-per-stream
-//!   ring buffers via reader threads. Tracked by the per-capsule cap
-//!   plus the per-principal profile sub-budget.
-//! - `ProcessHandle.{read-logs, wait, kill, os-pid}` — full impls.
-//! - `ProcessHandle.{write-stdin, close-stdin, signal, wait-with-output,
-//!   subscribe-exit, subscribe-logs}` — stubbed pending dedicated
-//!   follow-ups (stdin pipe storage + pollable wiring).
-//!
-//! `HostState.background_processes` is gone — the wasmtime resource
-//! table is the canonical storage for `ManagedProcess`.
+//! Shared `astrid:process@1.1.0` host implementation. The frozen `@1.0.0`
+//! surface delegates through `compat.rs`; the resource table remains the
+//! canonical storage for ephemeral process handles.
 
 mod audit;
 mod compat;
@@ -31,28 +9,32 @@ mod handle;
 mod inject;
 mod managed;
 mod persistent;
+mod platform;
+mod support;
 mod tracker;
 
 use std::collections::VecDeque;
-use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
-use tokio::process::Command as TokioCommand;
 use tracing::warn;
 use wasmtime::component::Resource;
 
 use crate::engine::wasm::bindings::astrid::process1_1_0::host::{
-    self as process, EnvVar, ErrorCode, ExitInfo, LogChunk, LogCursor, LogStream, ProcessHandle,
+    self as process, ErrorCode, ExitInfo, LogChunk, LogCursor, LogStream, ProcessHandle,
     ProcessInfo, ProcessResult, ProcessSignal, ReadLogsResult, SpawnRequest,
 };
 use crate::engine::wasm::host::util;
 use crate::engine::wasm::host_state::HostState;
-use context::{PreparedSpawnContext, prepare_spawn_context};
-use managed::{ManagedProcess, attach_pipes, configure_piped, prepare_sandboxed_command};
+use context::prepare_spawn_context;
+use managed::{
+    ForegroundProcess, ManagedProcess, PrepareCommandError, SandboxInputs, attach_pipes,
+    build_persistent_child, configure_piped, prepare_sandboxed_command, write_background_stdin,
+};
+use support::{authenticated_principal, env_summary, extract_call_id, process_sandbox_policy};
 
 pub(crate) use audit::{
-    audit_process, audit_process_id, audit_process_injections, audit_spawn_result,
-    record_process_denied,
+    audit_process, audit_process_id, audit_process_injections, audit_process_signal,
+    audit_spawn_result, record_process_denied,
 };
 pub use persistent::PersistentProcessRegistry;
 pub use tracker::ProcessTracker;
@@ -66,75 +48,6 @@ pub(crate) const MAX_BACKGROUND_PROCESSES: usize = 8;
 /// Per-spawn stdin prelude cap (the WIT: `spawn-request.stdin` "Capped at
 /// 4 MiB per spawn"). Oversized preludes are rejected with `too-large`.
 const MAX_SPAWN_STDIN_BYTES: usize = 4 * 1024 * 1024;
-
-/// Extract the call_id from the caller's IPC context if it carried a
-/// `ToolExecuteRequest` payload.
-fn extract_call_id(state: &HostState) -> Option<String> {
-    state.caller_context.as_ref().and_then(|msg| {
-        if let astrid_events::ipc::IpcPayload::ToolExecuteRequest { call_id, .. } = &msg.payload {
-            Some(call_id.clone())
-        } else {
-            None
-        }
-    })
-}
-
-/// Summarize environment keys for audit without recording their values.
-fn env_summary(env: &[EnvVar]) -> String {
-    env.iter()
-        .map(|e| e.key.as_str())
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-/// The AUTHENTICATED calling principal, or `None` when the call resolves to
-/// the capsule-owner fallback (no caller in scope). `spawn-persistent`
-/// refuses the fallback: a persistent id MUST be scoped to a real principal,
-/// or unauthenticated paths would share one `default` namespace that
-/// `list-processes` would enumerate across tenants.
-fn authenticated_principal(state: &HostState) -> Option<astrid_core::principal::PrincipalId> {
-    state
-        .caller_context
-        .as_ref()
-        .and_then(|m| m.principal.as_deref())
-        .and_then(|p| astrid_core::principal::PrincipalId::new(p).ok())
-}
-
-/// Build the sandboxed `Child` for a persistent spawn: stdout/stderr piped,
-/// stdin piped only when a prelude or `keep-stdin-open` needs it, own process
-/// group (so signals reach descendants), `kill_on_drop` as the reap backstop.
-fn build_persistent_child(
-    request: &SpawnRequest,
-    workspace_root: &std::path::Path,
-    context: &PreparedSpawnContext,
-    want_stdin: bool,
-    injections: &[astrid_workspace::RoInjection],
-    inject_env: &[(String, String)],
-    extra_masks: &[std::path::PathBuf],
-) -> Result<tokio::process::Child, ErrorCode> {
-    let mut sandboxed = prepare_sandboxed_command(
-        &request.cmd,
-        &request.args,
-        workspace_root,
-        context,
-        injections,
-        inject_env,
-        extra_masks,
-    )
-    .map_err(|_| ErrorCode::InvalidInput)?;
-    // `configure_piped` sets the process group + stdout/stderr pipes.
-    configure_piped(&mut sandboxed);
-    if want_stdin {
-        sandboxed.stdin(Stdio::piped());
-    } else {
-        sandboxed.stdin(Stdio::null());
-    }
-    let mut tokio_cmd = TokioCommand::from(sandboxed);
-    tokio_cmd.kill_on_drop(true);
-    tokio_cmd
-        .spawn()
-        .map_err(|e| ErrorCode::Unknown(format!("spawn-persistent failed: {e}")))
-}
 
 impl process::Host for HostState {
     fn spawn(&mut self, request: SpawnRequest) -> Result<ProcessResult, ErrorCode> {
@@ -172,6 +85,16 @@ impl process::Host for HostState {
             return Err(ErrorCode::CapabilityDenied);
         }
 
+        if request
+            .stdin
+            .as_ref()
+            .is_some_and(|stdin| stdin.len() > MAX_SPAWN_STDIN_BYTES)
+        {
+            let result: Result<ProcessResult, ErrorCode> = Err(ErrorCode::TooLarge);
+            audit_process(self, "astrid:process/host.spawn", &cmd_for_audit, &result);
+            return result;
+        }
+
         let spawn_context = match prepare_spawn_context(self, &request) {
             Ok(context) => context,
             Err(error) => {
@@ -200,14 +123,21 @@ impl process::Host for HostState {
         let mut sandboxed_cmd = match prepare_sandboxed_command(
             &request.cmd,
             &request.args,
-            &workspace_root,
             &spawn_context,
-            &prepared.sandbox,
-            &injection_env,
-            &self.spawn_mask_paths,
+            SandboxInputs {
+                workspace_root: &workspace_root,
+                injections: &prepared.sandbox,
+                inject_env: &injection_env,
+                extra_masks: &self.spawn_mask_paths,
+                policy: process_sandbox_policy(self),
+            },
         ) {
             Ok(cmd) => cmd,
-            Err(_) => {
+            Err(PrepareCommandError::SandboxDenied(reason)) => {
+                record_process_denied(self, "astrid:process/host.spawn", &cmd_for_audit, &reason);
+                return Err(ErrorCode::CapabilityDenied);
+            },
+            Err(PrepareCommandError::Invalid) => {
                 // Sandbox construction failed before exec — audit the attempt as
                 // Failed instead of returning silently via `?`.
                 let result: Result<ProcessResult, ErrorCode> = Err(ErrorCode::InvalidInput);
@@ -221,10 +151,16 @@ impl process::Host for HostState {
                 return result;
             },
         };
-        sandboxed_cmd.stdout(Stdio::piped());
-        sandboxed_cmd.stderr(Stdio::piped());
+        configure_piped(&mut sandboxed_cmd);
+        sandboxed_cmd.stdin(if request.stdin.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        });
 
-        let child = match sandboxed_cmd.spawn() {
+        let mut tokio_cmd = tokio::process::Command::from(sandboxed_cmd);
+        tokio_cmd.kill_on_drop(true);
+        let child = match tokio_cmd.spawn() {
             Ok(child) => child,
             Err(e) => {
                 // Fork/exec failed — audit the attempt as Failed before
@@ -241,20 +177,36 @@ impl process::Host for HostState {
                 return result;
             },
         };
-        let pid = child.id();
-        process_tracker.register(pid, call_id);
+        let foreground = match ForegroundProcess::new(child) {
+            Ok(process) => process,
+            Err(error) => {
+                let result: Result<ProcessResult, ErrorCode> =
+                    Err(ErrorCode::Unknown(format!("spawn failed: {error}")));
+                audit_spawn_result(
+                    self,
+                    "astrid:process/host.spawn",
+                    &cmd_for_audit,
+                    &injection_audit,
+                    &result,
+                );
+                return result;
+            },
+        };
+        let pid = foreground.pid();
+        let tree = foreground.tree();
+        process_tracker.register_tree(&tree, call_id);
 
+        let stdin_prelude = request.stdin.unwrap_or_default();
         let output_result =
             util::bounded_block_on_cancellable(&handle, &semaphore, &cancel_token, async move {
-                tokio::task::spawn_blocking(move || child.wait_with_output())
-                    .await
-                    .map_err(std::io::Error::other)
-                    .and_then(|r| r)
+                let mut foreground = foreground;
+                foreground.write_stdin_prelude(&stdin_prelude).await?;
+                foreground.wait_with_output().await
             });
 
         let result: Result<ProcessResult, ErrorCode> = match output_result {
             Some(Ok(output)) => {
-                process_tracker.unregister(pid);
+                process_tracker.unregister_tree(&tree);
                 Ok(ProcessResult {
                     stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
                     stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
@@ -265,19 +217,12 @@ impl process::Host for HostState {
                 })
             },
             Some(Err(e)) => {
-                process_tracker.unregister(pid);
+                process_tracker.unregister_tree(&tree);
                 Err(ErrorCode::Unknown(format!("exec failed: {e}")))
             },
             None => {
                 warn!(capsule_id = %self.capsule_id, pid, "process cancelled");
-                #[cfg(unix)]
-                if let Ok(raw) = i32::try_from(pid) {
-                    let _ = nix::sys::signal::kill(
-                        nix::unistd::Pid::from_raw(raw),
-                        nix::sys::signal::Signal::SIGKILL,
-                    );
-                }
-                process_tracker.unregister(pid);
+                process_tracker.unregister_tree(&tree);
                 Err(ErrorCode::Cancelled)
             },
         };
@@ -319,6 +264,7 @@ impl process::Host for HostState {
         let capsule_id = self.capsule_id.as_str().to_owned();
         let handle = self.runtime_handle.clone();
         let semaphore = self.blocking_semaphore.clone();
+        let cancel_token = self.effective_cancel_token();
         let cmd_for_audit = request.cmd.clone();
 
         if let Some(sec) = security {
@@ -343,6 +289,21 @@ impl process::Host for HostState {
                 "no security gate configured",
             );
             return Err(ErrorCode::CapabilityDenied);
+        }
+
+        if request
+            .stdin
+            .as_ref()
+            .is_some_and(|stdin| stdin.len() > MAX_SPAWN_STDIN_BYTES)
+        {
+            let result: Result<Resource<ProcessHandle>, ErrorCode> = Err(ErrorCode::TooLarge);
+            audit_process(
+                self,
+                "astrid:process/host.spawn-background",
+                &cmd_for_audit,
+                &result,
+            );
+            return result;
         }
 
         // Re-check the cancellation token AFTER the (potentially
@@ -391,14 +352,26 @@ impl process::Host for HostState {
         let mut sandboxed_cmd = match prepare_sandboxed_command(
             &request.cmd,
             &request.args,
-            &workspace_root,
             &spawn_context,
-            &prepared.sandbox,
-            &injection_env,
-            &self.spawn_mask_paths,
+            SandboxInputs {
+                workspace_root: &workspace_root,
+                injections: &prepared.sandbox,
+                inject_env: &injection_env,
+                extra_masks: &self.spawn_mask_paths,
+                policy: process_sandbox_policy(self),
+            },
         ) {
             Ok(cmd) => cmd,
-            Err(_) => {
+            Err(PrepareCommandError::SandboxDenied(reason)) => {
+                record_process_denied(
+                    self,
+                    "astrid:process/host.spawn-background",
+                    &cmd_for_audit,
+                    &reason,
+                );
+                return Err(ErrorCode::CapabilityDenied);
+            },
+            Err(PrepareCommandError::Invalid) => {
                 // Sandbox construction failed before exec — audit the attempt as
                 // Failed instead of returning silently via `?`.
                 let result: Result<Resource<ProcessHandle>, ErrorCode> =
@@ -414,6 +387,11 @@ impl process::Host for HostState {
             },
         };
         configure_piped(&mut sandboxed_cmd);
+        sandboxed_cmd.stdin(if request.stdin.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        });
 
         // Convert the prepared std::Command into a tokio::Command so the
         // spawned Child supports async wait(&mut self) without ownership
@@ -421,11 +399,10 @@ impl process::Host for HostState {
         // stranded the handle inside spawn_blocking on timeout).
         // `kill_on_drop(true)` ensures the tokio runtime reaps the
         // zombie if `ManagedProcess` is dropped before the child exits.
-        let mut tokio_cmd = TokioCommand::from(sandboxed_cmd);
+        let mut tokio_cmd = tokio::process::Command::from(sandboxed_cmd);
         tokio_cmd.kill_on_drop(true);
 
-        let command_str = format!("{} {}", request.cmd, request.args.join(" "));
-        let child = match tokio_cmd.spawn() {
+        let mut child = match tokio_cmd.spawn() {
             Ok(child) => child,
             Err(e) => {
                 // Fork/exec failed — audit the attempt as Failed before
@@ -442,43 +419,13 @@ impl process::Host for HostState {
                 return result;
             },
         };
-
-        let stdout_buf: Arc<Mutex<VecDeque<u8>>> = Arc::new(Mutex::new(VecDeque::new()));
-        let stderr_buf: Arc<Mutex<VecDeque<u8>>> = Arc::new(Mutex::new(VecDeque::new()));
-        let mut managed = ManagedProcess {
-            child: Some(child),
-            stdout_buf: Arc::clone(&stdout_buf),
-            stderr_buf: Arc::clone(&stderr_buf),
-            command: command_str,
-            creator: principal.clone(),
-            injection_guard: Some(prepared.guard),
-        };
-
-        let pid = managed
-            .child
-            .as_ref()
-            .and_then(tokio::process::Child::id)
-            .unwrap_or(0);
-        attach_pipes(&mut managed, &handle);
-
-        // Register with the cancellation tracker so a
-        // `tool.v1.request.cancel` event reaches the background
-        // child. spawn-background does not currently propagate a
-        // call_id (no caller_context payload to extract from in the
-        // common case), so the entry is registered with None — which
-        // makes it eligible for the "conservative fallback" branch of
-        // `cancel_by_call_ids` (cancelled by any matching event).
-        self.process_tracker.register(pid, None);
-
-        let res = match self.resource_table.push(managed) {
-            Ok(res) => res,
-            Err(e) => {
-                // The child has ALREADY forked (and is registered/kill-on-drop
-                // via `managed`, which drops here). The spawn genuinely happened,
-                // so audit it as a Failed spawn rather than returning with no
-                // trace of the exec.
-                let result: Result<Resource<ProcessHandle>, ErrorCode> =
-                    Err(ErrorCode::Unknown(format!("resource table: {e}")));
+        let tree = match platform::ProcessTree::attach(&child) {
+            Ok(tree) => tree,
+            Err(error) => {
+                let _ = child.start_kill();
+                let result: Result<Resource<ProcessHandle>, ErrorCode> = Err(ErrorCode::Unknown(
+                    format!("spawn-background ownership failed: {error}"),
+                ));
                 audit_spawn_result(
                     self,
                     "astrid:process/host.spawn-background",
@@ -489,6 +436,79 @@ impl process::Host for HostState {
                 return result;
             },
         };
+
+        if let Err(error) = write_background_stdin(
+            &handle,
+            &semaphore,
+            &cancel_token,
+            &mut child,
+            request.stdin,
+        ) {
+            let result: Result<Resource<ProcessHandle>, ErrorCode> =
+                match tree.terminate(platform::Termination::Force) {
+                    Ok(()) => Err(error),
+                    Err(termination_error) => Err(ErrorCode::Unknown(format!(
+                        "spawn-background input failed ({error:?}); tree cleanup failed: \
+                         {termination_error:?}"
+                    ))),
+                };
+            audit_spawn_result(
+                self,
+                "astrid:process/host.spawn-background",
+                &cmd_for_audit,
+                &injection_audit,
+                &result,
+            );
+            return result;
+        }
+
+        let stdout_buf: Arc<Mutex<VecDeque<u8>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let stderr_buf: Arc<Mutex<VecDeque<u8>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let mut managed = ManagedProcess {
+            child: Some(child),
+            tree: Arc::clone(&tree),
+            stdout_buf: Arc::clone(&stdout_buf),
+            stderr_buf: Arc::clone(&stderr_buf),
+            audit_descriptor: cmd_for_audit.clone(),
+            creator: principal.clone(),
+            injection_guard: Some(prepared.guard),
+        };
+
+        attach_pipes(&mut managed, &handle);
+
+        // Register with the cancellation tracker so a
+        // `tool.v1.request.cancel` event reaches the background
+        // child. spawn-background does not currently propagate a
+        // call_id (no caller_context payload to extract from in the
+        // common case), so the entry is registered with None — which
+        // makes it eligible for the "conservative fallback" branch of
+        // `cancel_by_call_ids` (cancelled by any matching event).
+        let res = match self.resource_table.push(managed) {
+            Ok(res) => res,
+            Err(e) => {
+                // The child has already forked. Tracker registration deliberately
+                // happens only after this insertion, so there is no stale tracker
+                // entry to unregister; `managed` drops here and the explicit tree
+                // termination covers descendants. Audit the real failed spawn.
+                let cleanup = tree.terminate(platform::Termination::Force);
+                let result: Result<Resource<ProcessHandle>, ErrorCode> =
+                    Err(ErrorCode::Unknown(match cleanup {
+                        Ok(()) => format!("resource table: {e}"),
+                        Err(error) => {
+                            format!("resource table: {e}; tree cleanup failed: {error:?}")
+                        },
+                    }));
+                audit_spawn_result(
+                    self,
+                    "astrid:process/host.spawn-background",
+                    &cmd_for_audit,
+                    &injection_audit,
+                    &result,
+                );
+                return result;
+            },
+        };
+        self.process_tracker.register_tree(&tree, None);
         self.process_count_total += 1;
         *self
             .process_count_by_principal
@@ -505,22 +525,9 @@ impl process::Host for HostState {
         result
     }
 
-    // ================================================================
-    // PERSISTENT TIER — `astrid:process@1.0.0`.
-    //
-    // Backed by the host-owned `PersistentProcessRegistry`
-    // (`self.persistent_processes`), shared across the capsule's pooled
-    // instances so an id survives instance reset. Every id-keyed op
-    // re-resolves the live `(principal, capsule)` and checks it against the
-    // recorded creator inside the registry; unknown / wrong-owner /
-    // wrong-capsule / reaped collapse to `no-such-process` with no oracle.
-    //
-    // Still deferred (and honest about it): `attach` (resource-handle
-    // materialisation), `watch` / `unwatch` (host-published lifecycle events
-    // — an OPEN publish-authority question in RFC host_abi; `status` + bounded
-    // `wait` is the working alternative), and the `(NOT YET ...)` items the
-    // WIT itself flags (resource-limit enforcement, cpu/mem stats, pollables).
-    // ================================================================
+    // Persistent entries live in the host-owned registry shared by pooled
+    // instances. Every id operation rechecks the principal and capsule owner;
+    // unknown, wrong-owner, and reaped entries share one no-such-process result.
 
     fn spawn_persistent(&mut self, request: SpawnRequest) -> Result<String, ErrorCode> {
         let cmd_for_audit = request.cmd.clone();
@@ -658,16 +665,28 @@ impl process::Host for HostState {
         }
 
         let want_stdin = request.keep_stdin_open.unwrap_or(false) || request.stdin.is_some();
-        let mut child = match build_persistent_child(
+        let (mut child, tree) = match build_persistent_child(
             &request,
-            &workspace_root,
             &spawn_context,
             want_stdin,
-            &prepared.sandbox,
-            &prepared.env,
-            &self.spawn_mask_paths,
+            SandboxInputs {
+                workspace_root: &workspace_root,
+                injections: &prepared.sandbox,
+                inject_env: &prepared.env,
+                extra_masks: &self.spawn_mask_paths,
+                policy: process_sandbox_policy(self),
+            },
         ) {
             Ok(c) => c,
+            Err(ErrorCode::CapabilityDenied) => {
+                record_process_denied(
+                    self,
+                    "astrid:process/host.spawn-persistent",
+                    &cmd_for_audit,
+                    "native process sandbox is unavailable under required policy",
+                );
+                return Err(ErrorCode::CapabilityDenied);
+            },
             Err(e) => {
                 let result: Result<String, ErrorCode> = Err(e);
                 audit_process(
@@ -682,19 +701,9 @@ impl process::Host for HostState {
         // Reject a missing/zero pid: `killpg(0)` / `kill(0)` would target the
         // daemon's OWN process group. A reaped child surfaces `None`; drop it
         // (kill_on_drop reaps) and fail rather than store an unsignalable entry.
-        let Some(os_pid) = child.id().filter(|&p| p != 0) else {
-            let result: Result<String, ErrorCode> = Err(ErrorCode::Unknown(
-                "spawn-persistent: child has no usable pid".to_string(),
-            ));
-            audit_process(
-                self,
-                "astrid:process/host.spawn-persistent",
-                &cmd_for_audit,
-                &result,
-            );
-            return result;
-        };
+        let os_pid = tree.pid();
         let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+            tree.terminate(platform::Termination::Force)?;
             return Err(ErrorCode::Unknown(
                 "spawn-persistent: missing stdio pipes".to_string(),
             ));
@@ -712,9 +721,16 @@ impl process::Host for HostState {
                 (pipe, r)
             });
             if write_res.is_err() {
-                let result: Result<String, ErrorCode> = Err(ErrorCode::Unknown(
-                    "spawn-persistent: stdin prelude write failed".to_string(),
-                ));
+                let result: Result<String, ErrorCode> =
+                    match tree.terminate(platform::Termination::Force) {
+                        Ok(()) => Err(ErrorCode::Unknown(
+                            "spawn-persistent: stdin prelude write failed".to_string(),
+                        )),
+                        Err(error) => Err(ErrorCode::Unknown(format!(
+                            "spawn-persistent: stdin prelude write failed; tree cleanup failed: \
+                             {error:?}"
+                        ))),
+                    };
                 audit_process(
                     self,
                     "astrid:process/host.spawn-persistent",
@@ -738,6 +754,7 @@ impl process::Host for HostState {
             capsule_id: capsule_id_arc,
             command,
             os_pid,
+            tree,
             child,
             stdout,
             stderr,
@@ -890,12 +907,19 @@ impl process::Host for HostState {
     }
 
     fn signal(&mut self, id: String, sig: ProcessSignal) -> Result<(), ErrorCode> {
+        let id_hash = blake3::hash(id.as_bytes()).to_hex();
+        let descriptor = format!("persistent:{}", &id_hash[..16]);
+        if !platform::signal_supported(sig) {
+            let result = Err(ErrorCode::CapabilityDenied);
+            audit_process_signal(self, &descriptor, sig, &result);
+            return result;
+        }
         let principal = self.effective_principal();
         let capsule_id = self.capsule_id.as_str().to_owned();
         let result = self
             .persistent_processes
             .signal(&id, &principal, &capsule_id, sig);
-        audit_process_id(self, "astrid:process/host.signal", &id, &result);
+        audit_process_signal(self, &descriptor, sig, &result);
         result
     }
 

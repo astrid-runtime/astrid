@@ -262,6 +262,10 @@ pub struct HostState {
     /// promote/rollback gate. Threaded into `SandboxCommand::wrap_with_injections`
     /// as `extra_masks` on every spawn. Empty for git-managed / No-CoW workspaces.
     pub spawn_mask_paths: Vec<PathBuf>,
+    /// Optional per-state override for unavailable native process sandboxes.
+    /// Production states leave this `None` and read `ASTRID_SANDBOX_POLICY`;
+    /// tests and embedders can make the operator choice explicit.
+    pub process_sandbox_policy: Option<astrid_workspace::SandboxPolicy>,
     /// The Virtual File System (VFS) instance for this plugin.
     pub vfs: Arc<dyn astrid_vfs::Vfs>,
     /// The root capability handle for the VFS.

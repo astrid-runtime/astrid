@@ -251,10 +251,15 @@ where
 
 impl net::Host for HostState {
     fn bind_unix(&mut self) -> Result<Resource<UnixListener>, ErrorCode> {
-        // Stable descriptor for the pre-provisioned CLI control socket — a
-        // Unix-domain listener has no host:port, so this names the bind on
-        // the audit chain.
-        let bind_addr = "unix:cli-socket";
+        // Stable transport-neutral descriptor for the pre-provisioned local
+        // control listener. The frozen WIT method remains `bind-unix`, while
+        // the backend may be a Unix socket or Windows named pipe.
+        let bind_addr = "local:cli-control";
+        if !astrid_core::local_transport::backend_available() {
+            let reason = "host-local listener backend is unavailable on this platform";
+            record_net_denied(self, HostAuditEvent::NetBind { addr: bind_addr }, reason);
+            return Err(ErrorCode::CapabilityDenied);
+        }
         if let Some(ref gate) = self.security {
             let capsule_id = self.capsule_id.as_str().to_owned();
             let gate = gate.clone();

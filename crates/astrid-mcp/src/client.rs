@@ -11,7 +11,7 @@ use tracing::{debug, info, warn};
 use crate::capabilities::{CapabilitiesHandler, ServerNotice};
 use crate::config::{ServerConfig, ServersConfig};
 use crate::error::{McpError, McpResult};
-use crate::server::ServerManager;
+use crate::server::{ServerConnectionError, ServerManager};
 use crate::types::{ToolDefinition, ToolResult};
 
 use tokio::sync::mpsc;
@@ -118,6 +118,15 @@ impl McpClient {
     ///
     /// Returns an error if the server cannot be started or connected.
     pub async fn connect(&self, server_name: &str) -> McpResult<()> {
+        self.connect_classified(server_name)
+            .await
+            .map_err(ServerConnectionError::into_mcp_error)
+    }
+
+    pub(crate) async fn connect_classified(
+        &self,
+        server_name: &str,
+    ) -> Result<(), ServerConnectionError> {
         // Register the server if not already running
         if !self.servers.is_running(server_name).await {
             self.servers.start(server_name).await?;
@@ -125,7 +134,7 @@ impl McpClient {
 
         // Establish the actual MCP connection
         self.servers
-            .connect_server(
+            .connect_server_classified(
                 server_name,
                 self.capabilities.clone(),
                 Some(self.notice_tx.clone()),
@@ -145,10 +154,20 @@ impl McpClient {
     /// # Errors
     /// Returns an error if the server is already running or cannot be started.
     pub async fn connect_dynamic(&self, name: &str, config: ServerConfig) -> McpResult<()> {
+        self.connect_dynamic_classified(name, config)
+            .await
+            .map_err(ServerConnectionError::into_mcp_error)
+    }
+
+    pub(crate) async fn connect_dynamic_classified(
+        &self,
+        name: &str,
+        config: ServerConfig,
+    ) -> Result<(), ServerConnectionError> {
         self.servers.add_server(name, config).await?;
 
         self.servers
-            .connect_server(
+            .connect_server_classified(
                 name,
                 self.capabilities.clone(),
                 Some(self.notice_tx.clone()),
@@ -295,7 +314,7 @@ impl McpClient {
     }
 
     /// Refresh the tools cache from all running servers.
-    async fn refresh_tools_cache(&self) -> McpResult<()> {
+    pub(crate) async fn refresh_tools_cache(&self) -> McpResult<()> {
         let tools = self.servers.all_tools().await;
         let mut cache = self.tools_cache.write().await;
         *cache = tools;

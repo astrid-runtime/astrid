@@ -103,4 +103,20 @@ pub trait HostAuditSink: Send + Sync {
         event: HostAuditEvent<'_>,
         outcome: HostAuditOutcome<'_>,
     );
+
+    /// Record a process-signal request without extending the public,
+    /// exhaustively matched [`HostAuditEvent`] enum.
+    ///
+    /// The provided no-op keeps existing external sink implementations source
+    /// compatible. The kernel sink overrides this method and persists a typed,
+    /// signed process-signal action.
+    fn record_process_signal(
+        &self,
+        principal: &astrid_core::PrincipalId,
+        process: &str,
+        signal: &str,
+        outcome: HostAuditOutcome<'_>,
+    ) {
+        let _ = (principal, process, signal, outcome);
+    }
 }
