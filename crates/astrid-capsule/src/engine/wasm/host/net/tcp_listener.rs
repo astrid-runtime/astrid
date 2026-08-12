@@ -11,7 +11,7 @@ use super::{
     HostState, MAX_ACTIVE_STREAMS, PendingTcpAccepted, PendingTcpConnection, TcpListenerSlot,
     audit_net_accept, map_io_err,
 };
-use crate::audit_sink::{HostAuditEvent, HostAuditOutcome, HostAuditSink};
+use crate::audit_sink::{HostAuditOutcome, HostAuditSink};
 use crate::engine::wasm::bindings::astrid::net::host::{
     ErrorCode, HostTcpListener, TcpListener, TcpStream,
 };
@@ -68,12 +68,10 @@ impl Pollable for TcpListenerReadiness {
             .is_err()
         {
             if let Some(sink) = &self.audit_sink {
-                sink.record(
+                sink.record_net_accept(
                     &self.principal,
-                    HostAuditEvent::NetAccept {
-                        local_addr: &local_addr,
-                        peer_addr: &peer_addr,
-                    },
+                    &local_addr,
+                    &peer_addr,
                     HostAuditOutcome::Failed("network stream quota exceeded"),
                 );
             }
@@ -81,12 +79,10 @@ impl Pollable for TcpListenerReadiness {
         }
         pending.local_stream_count.fetch_add(1, Ordering::AcqRel);
         if let Some(sink) = &self.audit_sink {
-            sink.record(
+            sink.record_net_accept(
                 &self.principal,
-                HostAuditEvent::NetAccept {
-                    local_addr: &local_addr,
-                    peer_addr: &peer_addr,
-                },
+                &local_addr,
+                &peer_addr,
                 HostAuditOutcome::Allowed,
             );
         }

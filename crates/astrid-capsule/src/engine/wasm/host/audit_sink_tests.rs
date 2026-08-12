@@ -34,10 +34,6 @@ impl CapturedEvent {
             HostAuditEvent::FileDelete { path } => Self::FileDelete(path.to_owned()),
             HostAuditEvent::NetConnect { host, port } => Self::NetConnect(host.to_owned(), port),
             HostAuditEvent::NetBind { addr } => Self::NetBind(addr.to_owned()),
-            HostAuditEvent::NetAccept {
-                local_addr,
-                peer_addr,
-            } => Self::NetAccept(local_addr.to_owned(), peer_addr.to_owned()),
             HostAuditEvent::ProcessSpawn { command } => Self::ProcessSpawn(command.to_owned()),
         }
     }
@@ -77,6 +73,20 @@ impl HostAuditSink for RecordingSink {
         self.records.lock().expect("sink mutex").push((
             principal.clone(),
             CapturedEvent::from(event),
+            CapturedOutcome::from(outcome),
+        ));
+    }
+
+    fn record_net_accept(
+        &self,
+        principal: &PrincipalId,
+        local_addr: &str,
+        peer_addr: &str,
+        outcome: HostAuditOutcome<'_>,
+    ) {
+        self.records.lock().expect("sink mutex").push((
+            principal.clone(),
+            CapturedEvent::NetAccept(local_addr.to_owned(), peer_addr.to_owned()),
             CapturedOutcome::from(outcome),
         ));
     }
