@@ -207,4 +207,55 @@ impl HostState {
             None => astrid_core::profile::PrincipalProfile::default_ref(),
         }
     }
+
+    /// Enforce the derived-principal network boundary while preserving legacy
+    /// profiles that predate principal-level host enforcement. Membership in
+    /// the built-in `restricted` group opts into fail-closed egress: only the
+    /// profile's explicit `network.egress` patterns may resolve/connect.
+    pub(crate) fn principal_egress_allows(&self, host: &str, port: Option<u16>) -> bool {
+        let profile = self.effective_profile();
+        if !profile
+            .groups
+            .iter()
+            .any(|group| group == astrid_core::groups::BUILTIN_RESTRICTED)
+        {
+            return true;
+        }
+        profile.network.egress.iter().any(|pattern| {
+            let Some((pattern_host, pattern_port)) = pattern.rsplit_once(':') else {
+                return false;
+            };
+            if !pattern_host.eq_ignore_ascii_case(host) {
+                return false;
+            }
+            match port {
+                Some(port) => {
+                    pattern_port == "*"
+                        || pattern_port.parse::<u16>().is_ok_and(|value| value == port)
+                },
+                None => pattern_port == "*" || pattern_port.parse::<u16>().is_ok(),
+            }
+        })
+    }
+
+    /// Restricted principals may spawn only executables explicitly named in
+    /// their profile. Derived principals currently provision an empty list, so
+    /// a child process cannot bypass the host's network boundary.
+    pub(crate) fn principal_process_allows(&self, command: &str) -> bool {
+        let profile = self.effective_profile();
+        if !profile
+            .groups
+            .iter()
+            .any(|group| group == astrid_core::groups::BUILTIN_RESTRICTED)
+        {
+            return true;
+        }
+        profile.process.allow.iter().any(|allowed| {
+            allowed == command
+                || (!allowed.contains('/')
+                    && std::path::Path::new(command)
+                        .file_name()
+                        .is_some_and(|name| name == std::ffi::OsStr::new(allowed)))
+        })
+    }
 }

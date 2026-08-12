@@ -17,6 +17,7 @@
 //! necessary, not this), so a partial copy leaves a "needs manual setup"
 //! agent, never a confidentiality break.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use astrid_core::principal::PrincipalId;
@@ -33,17 +34,87 @@ pub(super) async fn inherit_from_principal(
     source: &PrincipalId,
     principal: &PrincipalId,
 ) {
-    copy_env_dir(kernel, source, principal);
+    let _ = copy_env_dir(kernel, source, principal, None);
+    let (capsule_ids, secret_keys_by_capsule) = snapshot_loaded_capsule_state(kernel).await;
+    let _ = copy_capsule_state(
+        kernel,
+        source,
+        principal,
+        &capsule_ids,
+        &secret_keys_by_capsule,
+    )
+    .await;
+}
 
+/// Copy only the named capsule state namespaces for a derived principal.
+pub(super) async fn inherit_selected_capsule_state(
+    kernel: &Arc<crate::Kernel>,
+    source: &PrincipalId,
+    principal: &PrincipalId,
+    capsules: &[String],
+) -> Result<(), String> {
+    let selected: HashSet<&str> = capsules.iter().map(String::as_str).collect();
+    let mut errors = copy_env_dir(kernel, source, principal, Some(&selected));
+
+    let mut capsule_ids = Vec::with_capacity(capsules.len());
+    let mut secret_keys_by_capsule = Vec::new();
+    let source_capsules = kernel.astrid_home.principal_home(source).capsules_dir();
+    for name in capsules {
+        let capsule_id = match astrid_capsule::capsule::CapsuleId::new(name.clone()) {
+            Ok(capsule_id) => capsule_id,
+            Err(error) => {
+                errors.push(format!("invalid selected capsule '{name}': {error}"));
+                continue;
+            },
+        };
+        let manifest_path = source_capsules.join(name).join("Capsule.toml");
+        match astrid_capsule::discovery::load_manifest(&manifest_path) {
+            Ok(manifest) => {
+                let keys = manifest
+                    .env
+                    .iter()
+                    .filter(|(_, def)| def.env_type == "secret")
+                    .map(|(key, _)| key.clone())
+                    .collect::<Vec<_>>();
+                if !keys.is_empty() {
+                    secret_keys_by_capsule.push((capsule_id.clone(), keys));
+                }
+                capsule_ids.push(capsule_id);
+            },
+            Err(error) => errors.push(format!(
+                "selected capsule '{name}' manifest could not be read: {error}"
+            )),
+        }
+    }
+    errors.extend(
+        copy_capsule_state(
+            kernel,
+            source,
+            principal,
+            &capsule_ids,
+            &secret_keys_by_capsule,
+        )
+        .await,
+    );
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+async fn snapshot_loaded_capsule_state(
+    kernel: &Arc<crate::Kernel>,
+) -> (
+    Vec<astrid_capsule::capsule::CapsuleId>,
+    Vec<(astrid_capsule::capsule::CapsuleId, Vec<String>)>,
+) {
     // Snapshot manifest data under the registry lock, then drop it
     // before any async / blocking I/O. Holding the read lock across
     // `copy_kv_namespaces` (async KV) and `copy_secret_files`
     // (blocking fs) would serialise every concurrent install / update
     // / remove against the inherit path for as long as the copy ran.
-    let (capsule_ids, secret_keys_by_capsule): (
-        Vec<astrid_capsule::capsule::CapsuleId>,
-        Vec<(astrid_capsule::capsule::CapsuleId, Vec<String>)>,
-    ) = {
+    {
         let registry = kernel.capsules.read().await;
         let ids: Vec<_> = registry.list().into_iter().cloned().collect();
         let mut secrets: Vec<(astrid_capsule::capsule::CapsuleId, Vec<String>)> = Vec::new();
@@ -62,11 +133,20 @@ pub(super) async fn inherit_from_principal(
             }
         }
         (ids, secrets)
-    };
+    }
+}
 
-    let total_keys = copy_kv_namespaces(kernel, source, principal, &capsule_ids).await;
-    let (probed_secrets, copied_secrets) =
-        copy_secret_files(kernel, source, principal, &secret_keys_by_capsule);
+async fn copy_capsule_state(
+    kernel: &Arc<crate::Kernel>,
+    source: &PrincipalId,
+    principal: &PrincipalId,
+    capsule_ids: &[astrid_capsule::capsule::CapsuleId],
+    secret_keys_by_capsule: &[(astrid_capsule::capsule::CapsuleId, Vec<String>)],
+) -> Vec<String> {
+    let (total_keys, mut errors) = copy_kv_namespaces(kernel, source, principal, capsule_ids).await;
+    let (probed_secrets, copied_secrets, secret_errors) =
+        copy_secret_files(kernel, source, principal, secret_keys_by_capsule);
+    errors.extend(secret_errors);
 
     info!(
         %principal,
@@ -76,23 +156,41 @@ pub(super) async fn inherit_from_principal(
         probed_secrets,
         "agent.create: inherited source's env JSON + KV namespaces + secrets"
     );
+    errors
 }
 
-fn copy_env_dir(kernel: &Arc<crate::Kernel>, source: &PrincipalId, principal: &PrincipalId) {
+fn copy_env_dir(
+    kernel: &Arc<crate::Kernel>,
+    source: &PrincipalId,
+    principal: &PrincipalId,
+    selected: Option<&HashSet<&str>>,
+) -> Vec<String> {
+    let mut errors = Vec::new();
     let source_env = kernel.astrid_home.principal_home(source).env_dir();
     let agent_env = kernel.astrid_home.principal_home(principal).env_dir();
     if !source_env.is_dir() {
-        return;
+        return errors;
     }
     if let Err(e) = std::fs::create_dir_all(&agent_env) {
         tracing::warn!(%principal, error = %e, "agent.create: env_dir mkdir failed");
-        return;
+        errors.push(format!("env destination create failed: {e}"));
+        return errors;
     }
-    let Ok(entries) = std::fs::read_dir(&source_env) else {
-        return;
+    let entries = match std::fs::read_dir(&source_env) {
+        Ok(entries) => entries,
+        Err(error) => {
+            errors.push(format!("env source read failed: {error}"));
+            return errors;
+        },
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
+        let selected_name = name
+            .to_str()
+            .and_then(|name| name.strip_suffix(".env.json"));
+        if selected.is_some_and(|set| selected_name.is_none_or(|name| !set.contains(name))) {
+            continue;
+        }
         let src = entry.path();
         let dst = agent_env.join(&name);
         if let Err(e) = std::fs::copy(&src, &dst) {
@@ -102,8 +200,13 @@ fn copy_env_dir(kernel: &Arc<crate::Kernel>, source: &PrincipalId, principal: &P
                 error = %e,
                 "agent.create: env JSON copy failed"
             );
+            errors.push(format!(
+                "env file {} copy failed: {e}",
+                name.to_string_lossy()
+            ));
         }
     }
+    errors
 }
 
 async fn copy_kv_namespaces(
@@ -111,8 +214,9 @@ async fn copy_kv_namespaces(
     source: &PrincipalId,
     principal: &PrincipalId,
     capsule_ids: &[astrid_capsule::capsule::CapsuleId],
-) -> usize {
+) -> (usize, Vec<String>) {
     let mut total_keys = 0usize;
+    let mut errors = Vec::new();
     for capsule_id in capsule_ids {
         let src_ns = format!("{source}:capsule:{capsule_id}");
         let dst_ns = format!("{principal}:capsule:{capsule_id}");
@@ -125,6 +229,7 @@ async fn copy_kv_namespaces(
                     error = %e,
                     "agent.create: KV list_keys failed for capsule namespace"
                 );
+                errors.push(format!("KV namespace {src_ns} list failed: {e}"));
                 continue;
             },
         };
@@ -149,6 +254,7 @@ async fn copy_kv_namespaces(
                             error = %e,
                             "agent.create: KV copy write failed"
                         );
+                        errors.push(format!("KV namespace {dst_ns} key {key} write failed: {e}"));
                     }
                 },
                 Ok(None) => { /* benign race: key disappeared between list and get */ },
@@ -160,11 +266,12 @@ async fn copy_kv_namespaces(
                         error = %e,
                         "agent.create: KV copy read failed"
                     );
+                    errors.push(format!("KV namespace {src_ns} key {key} read failed: {e}"));
                 },
             }
         }
     }
-    total_keys
+    (total_keys, errors)
 }
 
 fn copy_secret_files(
@@ -172,10 +279,11 @@ fn copy_secret_files(
     source: &PrincipalId,
     principal: &PrincipalId,
     secret_keys_by_capsule: &[(astrid_capsule::capsule::CapsuleId, Vec<String>)],
-) -> (usize, usize) {
+) -> (usize, usize, Vec<String>) {
     use astrid_storage::{FileSecretStore, SecretStore};
     let mut probed = 0usize;
     let mut copied = 0usize;
+    let mut errors = Vec::new();
     let secrets_root = kernel.astrid_home.secrets_dir();
     for (capsule_id, secret_keys) in secret_keys_by_capsule {
         let src =
@@ -199,6 +307,7 @@ fn copy_secret_files(
                         security_event = true,
                         "agent.create: secret read failed for source's slot"
                     );
+                    errors.push(format!("secret {capsule_id}/{key} read failed: {e}"));
                     continue;
                 },
             };
@@ -211,10 +320,11 @@ fn copy_secret_files(
                     security_event = true,
                     "agent.create: secret write failed for new principal"
                 );
+                errors.push(format!("secret {capsule_id}/{key} write failed: {e}"));
             } else {
                 copied = copied.saturating_add(1);
             }
         }
     }
-    (probed, copied)
+    (probed, copied, errors)
 }

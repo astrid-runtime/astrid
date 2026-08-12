@@ -221,6 +221,15 @@ impl HostState {
     ) -> Result<WireResponse, ErrorCode> {
         check_scheme(url, opts.https_only)?;
 
+        let parsed = reqwest::Url::parse(url).map_err(|_| ErrorCode::InvalidRequest)?;
+        let host = parsed.host_str().ok_or(ErrorCode::InvalidRequest)?;
+        let port = parsed
+            .port_or_known_default()
+            .ok_or(ErrorCode::InvalidRequest)?;
+        if !self.principal_egress_allows(host, Some(port)) {
+            return Err(ErrorCode::CapabilityDenied);
+        }
+
         let capsule_id = self.capsule_id.as_str().to_owned();
         let security = self.security.clone();
         let io_semaphore = self.io_semaphore.clone();

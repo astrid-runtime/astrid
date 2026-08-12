@@ -8,7 +8,7 @@
 pub(crate) use astrid_uplink::admin_client::into_result;
 
 use anyhow::Result;
-use astrid_core::kernel_api::{AdminRequestKind, AdminResponseBody};
+use astrid_core::kernel_api::{AdminRequestKind, AdminResponseBody, AgentDeriveRequest};
 use astrid_uplink::admin_client::AdminClient as UplinkAdminClient;
 
 /// Admin request surface available to CLI commands.
@@ -20,6 +20,13 @@ pub(crate) struct AdminClient(UplinkAdminClient);
 impl AdminClient {
     pub(crate) async fn request(&mut self, kind: AdminRequestKind) -> Result<AdminResponseBody> {
         self.0.request(kind).await
+    }
+
+    pub(crate) async fn request_agent_derive(
+        &mut self,
+        request: AgentDeriveRequest,
+    ) -> Result<AdminResponseBody> {
+        self.0.request_agent_derive(request).await
     }
 }
 

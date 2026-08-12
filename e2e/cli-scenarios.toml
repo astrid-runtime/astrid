@@ -26,6 +26,12 @@ status = "covered"
 mode = "mutating"
 principal = "admin"
 
+[commands."agent spawn"]
+scenario = "ephemeral_spawn"
+status = "mapped"
+mode = "mutating"
+principal = "admin"
+
 [commands."agent list"]
 scenario = "principal_visibility"
 status = "covered"

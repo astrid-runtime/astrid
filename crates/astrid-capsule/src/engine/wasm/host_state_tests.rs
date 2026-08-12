@@ -862,3 +862,41 @@ fn effective_kv_falls_back_to_neutral_for_principalless_message() {
     );
     assert!(std::ptr::eq(state.effective_kv(), &state.kv));
 }
+
+#[test]
+fn restricted_profile_egress_is_fail_closed_and_endpoint_scoped() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let mut state = minimal_host_state(rt.handle().clone());
+    let mut profile = astrid_core::profile::PrincipalProfile {
+        groups: vec![astrid_core::groups::BUILTIN_RESTRICTED.to_string()],
+        ..Default::default()
+    };
+    state.invocation_profile = Some(Arc::new(profile.clone()));
+    assert!(!state.principal_egress_allows("api.example.com", Some(443)));
+    assert!(!state.principal_egress_allows("api.example.com", None));
+    assert!(!state.principal_process_allows("curl"));
+
+    profile.network.egress = vec!["api.example.com:443".to_string()];
+    profile.process.allow = vec!["/usr/bin/curl".to_string(), "git".to_string()];
+    state.invocation_profile = Some(Arc::new(profile));
+    assert!(state.principal_egress_allows("API.EXAMPLE.COM", Some(443)));
+    assert!(state.principal_egress_allows("api.example.com", None));
+    assert!(!state.principal_egress_allows("api.example.com", Some(80)));
+    assert!(!state.principal_egress_allows("other.example.com", Some(443)));
+    assert!(state.principal_process_allows("/usr/bin/curl"));
+    assert!(state.principal_process_allows("/opt/homebrew/bin/git"));
+    assert!(!state.principal_process_allows("/usr/bin/wget"));
+}
+
+#[test]
+fn legacy_nonrestricted_profile_preserves_existing_egress_behavior() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let mut state = minimal_host_state(rt.handle().clone());
+    state.invocation_profile = Some(Arc::new(astrid_core::profile::PrincipalProfile::default()));
+    assert!(state.principal_egress_allows("api.example.com", Some(443)));
+    assert!(state.principal_process_allows("anything"));
+}

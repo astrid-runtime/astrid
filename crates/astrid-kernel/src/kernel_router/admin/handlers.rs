@@ -351,6 +351,7 @@ async fn agent_create(
         inherit_from,
         clone_from,
         allow_admin_clone,
+        true,
     )
     .await
 }

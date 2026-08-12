@@ -23,6 +23,7 @@
 
 mod agent_create_helpers;
 mod agent_delete;
+mod agent_derive;
 mod caps_tokens;
 #[cfg(test)]
 mod enforcement_tests;
@@ -42,6 +43,8 @@ mod state_tests_agent_backfill;
 mod state_tests_agent_clone;
 #[cfg(test)]
 mod state_tests_agent_delete;
+#[cfg(test)]
+mod state_tests_agent_derive;
 #[cfg(test)]
 mod state_tests_agent_modify;
 #[cfg(test)]
@@ -99,6 +102,10 @@ pub(crate) fn spawn_admin_router(kernel: Arc<crate::Kernel>) -> astrid_runtime::
             let IpcPayload::RawJson(val) = &message.payload else {
                 continue;
             };
+
+            if agent_derive::try_dispatch(&kernel, message, val) {
+                continue;
+            }
 
             match serde_json::from_value::<AdminKernelRequest>(val.clone()) {
                 Ok(req) => {

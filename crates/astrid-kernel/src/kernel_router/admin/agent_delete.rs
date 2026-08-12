@@ -84,13 +84,13 @@ pub(super) async fn agent_delete(
     }))
 }
 
-struct PendingIdentityRemoval {
+pub(super) struct PendingIdentityRemoval {
     user: Option<astrid_core::AstridUserId>,
     principal_uid: Option<astrid_core::PrincipalUid>,
     ownership_guard: Option<astrid_storage::PrincipalDeletionGuard>,
 }
 
-async fn prepare_identity_removal(
+pub(super) async fn prepare_identity_removal(
     kernel: &Arc<crate::Kernel>,
     principal: &PrincipalId,
 ) -> Result<PendingIdentityRemoval, AdminResponseBody> {
@@ -174,7 +174,7 @@ async fn recover_or_reserve_legacy_alias(
         .map_err(|e| err_internal(format!("ownership store legacy deletion guard failed: {e}")))
 }
 
-async fn finish_identity_removal(
+pub(super) async fn finish_identity_removal(
     kernel: &Arc<crate::Kernel>,
     principal: &PrincipalId,
     pending: PendingIdentityRemoval,

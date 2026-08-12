@@ -150,6 +150,16 @@ impl process::Host for HostState {
         let cmd_for_audit = request.cmd.clone();
         let _env_for_audit = env_summary(&request.env);
 
+        if !self.principal_process_allows(&request.cmd) {
+            record_process_denied(
+                self,
+                "astrid:process/host.spawn",
+                &cmd_for_audit,
+                "restricted principal process policy denied executable",
+            );
+            return Err(ErrorCode::CapabilityDenied);
+        }
+
         if let Some(sec) = security {
             let cmd = request.cmd.to_string();
             let check = util::bounded_block_on(&handle, &semaphore, async move {
@@ -320,6 +330,16 @@ impl process::Host for HostState {
         let handle = self.runtime_handle.clone();
         let semaphore = self.blocking_semaphore.clone();
         let cmd_for_audit = request.cmd.clone();
+
+        if !self.principal_process_allows(&request.cmd) {
+            record_process_denied(
+                self,
+                "astrid:process/host.spawn-background",
+                &cmd_for_audit,
+                "restricted principal process policy denied executable",
+            );
+            return Err(ErrorCode::CapabilityDenied);
+        }
 
         if let Some(sec) = security {
             let cmd = request.cmd.to_string();
@@ -526,6 +546,16 @@ impl process::Host for HostState {
         let cmd_for_audit = request.cmd.clone();
         let handle = self.runtime_handle.clone();
         let semaphore = self.blocking_semaphore.clone();
+
+        if !self.principal_process_allows(&request.cmd) {
+            record_process_denied(
+                self,
+                "astrid:process/host.spawn-persistent",
+                &cmd_for_audit,
+                "restricted principal process policy denied executable",
+            );
+            return Err(ErrorCode::CapabilityDenied);
+        }
 
         // Capability gate FIRST — a capsule lacking `host_process` gets
         // `capability-denied` (consistent with `spawn` / `spawn-background`

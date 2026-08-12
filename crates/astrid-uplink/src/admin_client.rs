@@ -24,6 +24,7 @@ use anyhow::{Context, Result, anyhow};
 use astrid_core::PrincipalId;
 use astrid_core::kernel_api::{
     AdminKernelRequest, AdminKernelResponse, AdminRequestKind, AdminResponseBody,
+    AgentDeriveKernelRequest, AgentDeriveRequest,
 };
 use astrid_types::Topic;
 use astrid_types::ipc::{IpcMessage, IpcPayload};
@@ -146,6 +147,17 @@ impl AdminClient {
         let req = AdminKernelRequest::with_request_id(request_id.clone(), kind);
         let payload =
             serde_json::to_value(&req).context("Failed to serialize AdminKernelRequest")?;
+        self.send_and_wait(topic, want_response, request_id, payload)
+            .await
+    }
+
+    async fn send_and_wait(
+        &mut self,
+        topic: Topic,
+        want_response: Topic,
+        request_id: String,
+        payload: Value,
+    ) -> Result<AdminResponseBody> {
         let msg = IpcMessage::new(topic, IpcPayload::RawJson(payload), Uuid::nil())
             .with_principal(self.caller.to_string());
         self.inner.send_message(msg).await?;
@@ -229,6 +241,28 @@ impl AdminClient {
                 },
             }
         }
+    }
+
+    /// Atomically create a restricted derived principal through the additive
+    /// derive endpoint without widening the exhaustive admin request enum.
+    ///
+    /// # Errors
+    /// Returns an error when serialization, transport, response decoding, or
+    /// the response deadline fails.
+    pub async fn request_agent_derive(
+        &mut self,
+        request: AgentDeriveRequest,
+    ) -> Result<AdminResponseBody> {
+        let request_id = Uuid::new_v4().to_string();
+        let topic = Topic::admin_request("agent.derive");
+        let want_response = Topic::admin_response("agent.derive");
+        let payload = serde_json::to_value(AgentDeriveKernelRequest {
+            request_id: Some(request_id.clone()),
+            request,
+        })
+        .context("Failed to serialize AgentDeriveKernelRequest")?;
+        self.send_and_wait(topic, want_response, request_id, payload)
+            .await
     }
 }
 
