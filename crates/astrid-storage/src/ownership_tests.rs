@@ -521,6 +521,64 @@ async fn deletion_reservation_can_be_finished_by_alias_after_identity_disappears
 }
 
 #[tokio::test]
+async fn interrupted_deletion_reserves_alias_until_resumed_guard_finishes() {
+    let backend = Arc::new(MemoryKvStore::new());
+    let principals = PrincipalDirectory::default();
+    let store = OwnershipStore::new(backend, principals.clone()).unwrap();
+    let principal_uid = principal(20, 2);
+    let alias = astrid_core::PrincipalId::new("recoverable-deletion").unwrap();
+    principals.register(alias.clone(), principal_uid).unwrap();
+    let guard = store
+        .guard_principal_deletion_for_alias(principal_uid, alias.clone())
+        .await
+        .unwrap();
+    principals.unregister(&alias, principal_uid);
+    drop(guard);
+
+    assert!(matches!(
+        store.ensure_alias_available(&alias).await,
+        Err(OwnershipError::DeletionAliasReserved { principal, .. })
+            if principal == principal_uid
+    ));
+    let resumed = store
+        .resume_principal_deletion_by_alias(&alias)
+        .await
+        .unwrap()
+        .expect("reservation exists");
+    assert_eq!(resumed.principal_uid(), principal_uid);
+    resumed.finish().await.unwrap();
+    store.ensure_alias_available(&alias).await.unwrap();
+}
+
+#[tokio::test]
+async fn legacy_alias_reservation_blocks_recreation_without_a_live_identity() {
+    let backend = Arc::new(MemoryKvStore::new());
+    let principals = PrincipalDirectory::default();
+    let store = OwnershipStore::new(backend, principals).unwrap();
+    let alias = astrid_core::PrincipalId::new("legacy-partial-delete").unwrap();
+
+    let guard = store
+        .guard_legacy_alias_deletion(alias.clone())
+        .await
+        .unwrap();
+    let reservation_uid = guard.principal_uid();
+    drop(guard);
+
+    assert!(matches!(
+        store.ensure_alias_available(&alias).await,
+        Err(OwnershipError::DeletionAliasReserved { principal, .. })
+            if principal == reservation_uid
+    ));
+    let resumed = store
+        .resume_principal_deletion_by_alias(&alias)
+        .await
+        .unwrap()
+        .expect("legacy reservation exists");
+    resumed.finish().await.unwrap();
+    store.ensure_alias_available(&alias).await.unwrap();
+}
+
+#[tokio::test]
 async fn deletion_reservation_rejects_a_second_deletion_for_the_same_alias() {
     let backend = Arc::new(MemoryKvStore::new());
     let principals = PrincipalDirectory::default();

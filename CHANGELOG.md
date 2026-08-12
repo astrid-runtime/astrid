@@ -19,7 +19,7 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   store and live legacy-SurrealKV migration reader are unchanged. Closes #1448.
 ### Changed
 
-- **`agent delete` now reclaims the deleted principal's full runtime footprint.** Delete closes authz first (unlink + profile removal + cache invalidate), then retires its live capsule views and reclaims capsule KV namespaces, the home tree, signing key (`keys/{principal}.key`), and secrets (`secrets/{principal}/`). Shared runtimes remain available to other principals while principal-scoped work is cancelled before state removal. Reclamation is best-effort; failures are reported in the response's `cleanup_errors`. Replaces the previous "reclamation is an ops concern" leave-behind, and drops the interim `--purge-home` flag. Part of #1217.
+- **`agent delete` now reclaims the deleted principal's full runtime footprint.** Delete fences new token and allowance authority, unlinks authentication, removes the profile, retires live capsule views, purges every immutable-UID KV namespace (including orphaned capsules), and reclaims the home tree, signing key (`keys/{principal}.key`), and secrets (`secrets/{principal}/`). Reclamation fails closed: incomplete cleanup returns an error, retains a durable alias reservation, and is safe to retry without letting a replacement identity inherit residual authority or state. Successful responses retain an empty `cleanup_errors` array for wire compatibility. Shared runtimes remain available to other principals. Replaces the previous "reclamation is an ops concern" leave-behind, and drops the interim `--purge-home` flag. Part of #1217.
 
 ### Added
 

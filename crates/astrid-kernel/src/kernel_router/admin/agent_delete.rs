@@ -28,6 +28,16 @@ pub(super) async fn agent_delete(
         Ok(pending) => pending,
         Err(response) => return response,
     };
+    kernel
+        .capabilities
+        .begin_principal_retirement(principal.clone())
+        .await;
+    if let Err(error) = kernel
+        .allowance_store
+        .begin_principal_retirement(&principal)
+    {
+        return err_internal(format!("allowance retirement fence failed: {error}"));
+    }
 
     if let Err(e) = kernel
         .identity_store
@@ -49,12 +59,19 @@ pub(super) async fn agent_delete(
     kernel.profile_cache.invalidate(&principal);
 
     let (unloaded_capsules, reclaimed, cleanup_errors) =
-        match retire_and_reclaim(kernel, &principal).await {
+        match retire_and_reclaim(kernel, &principal, pending.principal_uid).await {
             Ok(result) => result,
             Err(e) => return err_internal(e),
         };
 
-    if let Err(response) = finish_identity_removal(kernel, pending).await {
+    if !cleanup_errors.is_empty() {
+        return err_internal(format!(
+            "principal reclamation incomplete; alias remains reserved: {}",
+            cleanup_errors.join("; ")
+        ));
+    }
+
+    if let Err(response) = finish_identity_removal(kernel, &principal, pending).await {
         return response;
     }
 
@@ -69,6 +86,7 @@ pub(super) async fn agent_delete(
 
 struct PendingIdentityRemoval {
     user: Option<astrid_core::AstridUserId>,
+    principal_uid: Option<astrid_core::PrincipalUid>,
     ownership_guard: Option<astrid_storage::PrincipalDeletionGuard>,
 }
 
@@ -93,7 +111,7 @@ async fn prepare_identity_removal(
             .find(|user| user.principal == *principal)
     };
 
-    let ownership_guard = if let Some(user) = resolved.as_ref() {
+    let (principal_uid, ownership_guard) = if let Some(user) = resolved.as_ref() {
         let identity = kernel
             .identity_store
             .get_principal_identity(user.id)
@@ -109,7 +127,7 @@ async fn prepare_identity_removal(
                 .guard_principal_deletion_for_alias(identity.uid, principal.clone())
                 .await
             {
-                Ok(guard) => Some(guard),
+                Ok(guard) => (Some(identity.uid), Some(guard)),
                 Err(astrid_storage::OwnershipError::PrincipalAlreadyOwned { fleet, .. }) => {
                     return Err(err_bad_input(format!(
                         "cannot delete principal `{principal}` while it is assigned to fleet {fleet}"
@@ -122,28 +140,51 @@ async fn prepare_identity_removal(
                 },
             }
         } else {
-            None
+            let guard = recover_or_reserve_legacy_alias(kernel, principal).await?;
+            (None, Some(guard))
         }
     } else {
-        kernel
-            .ownership_store
-            .finish_principal_deletion_by_alias(principal)
-            .await
-            .map_err(|e| err_internal(format!("ownership store deletion recovery failed: {e}")))?;
-        None
+        let guard = recover_or_reserve_legacy_alias(kernel, principal).await?;
+        (Some(guard.principal_uid()), Some(guard))
     };
 
     Ok(PendingIdentityRemoval {
         user: resolved,
+        principal_uid,
         ownership_guard,
     })
 }
 
+async fn recover_or_reserve_legacy_alias(
+    kernel: &Arc<crate::Kernel>,
+    principal: &PrincipalId,
+) -> Result<astrid_storage::PrincipalDeletionGuard, AdminResponseBody> {
+    if let Some(guard) = kernel
+        .ownership_store
+        .resume_principal_deletion_by_alias(principal)
+        .await
+        .map_err(|e| err_internal(format!("ownership store deletion recovery failed: {e}")))?
+    {
+        return Ok(guard);
+    }
+    kernel
+        .ownership_store
+        .guard_legacy_alias_deletion(principal.clone())
+        .await
+        .map_err(|e| err_internal(format!("ownership store legacy deletion guard failed: {e}")))
+}
+
 async fn finish_identity_removal(
     kernel: &Arc<crate::Kernel>,
+    principal: &PrincipalId,
     pending: PendingIdentityRemoval,
 ) -> Result<(), AdminResponseBody> {
-    if let Some(user) = pending.user {
+    let PendingIdentityRemoval {
+        user,
+        principal_uid,
+        ownership_guard,
+    } = pending;
+    if let Some(user) = user {
         match kernel.identity_store.delete_user(user.id).await {
             Ok(true) => {},
             Ok(false) => {
@@ -158,13 +199,35 @@ async fn finish_identity_removal(
             },
         }
     }
-    if let Some(guard) = pending.ownership_guard {
+    // Deleting the durable identity removes the alias→UID directory entry,
+    // fencing every principal-scoped KV resolver. Purge once more after that
+    // fence so a late write from an invocation dispatched before unload cannot
+    // recreate state behind the reclaimed root.
+    kernel.allowance_store.clear_for_principal(principal);
+    kernel
+        .capabilities
+        .purge_principal(principal)
+        .await
+        .map_err(|e| err_internal(format!("post-identity capability purge failed: {e}")))?;
+    if let (Some(store), Some(uid)) = (&kernel.principal_store, principal_uid) {
+        store.purge_principal_kv(uid).map_err(|e| {
+            err_internal(format!("post-identity principal state purge failed: {e}"))
+        })?;
+    }
+    if let Some(guard) = ownership_guard {
         guard.finish().await.map_err(|e| {
             err_internal(format!(
                 "ownership store deletion reservation cleanup failed: {e}"
             ))
         })?;
     }
+    kernel
+        .capabilities
+        .finish_principal_retirement(principal)
+        .await;
+    kernel
+        .allowance_store
+        .finish_principal_retirement(principal);
     Ok(())
 }
 
@@ -177,32 +240,44 @@ type ReclaimOutcome = (
 async fn retire_and_reclaim(
     kernel: &Arc<crate::Kernel>,
     principal: &PrincipalId,
+    principal_uid: Option<astrid_core::PrincipalUid>,
 ) -> Result<ReclaimOutcome, String> {
     let unloaded = kernel
         .unload_principal_capsules(principal)
         .await
         .map_err(|e| format!("failed to retire capsule views for `{principal}`: {e}"))?;
 
-    // KV lives in the kernel store rather than below the principal home, so
-    // reclaim each capsule namespace explicitly before deleting the install
-    // tree. The live view covers active capsules; the on-disk set also covers
-    // installed capsules that failed to load.
-    let capsule_dir = kernel.astrid_home.principal_home(principal).capsules_dir();
-    let mut capsule_ids: BTreeSet<String> = unloaded.iter().map(ToString::to_string).collect();
-    if let Ok(entries) = std::fs::read_dir(&capsule_dir) {
-        capsule_ids.extend(entries.flatten().filter_map(|entry| {
-            entry
-                .file_type()
-                .ok()
-                .filter(std::fs::FileType::is_dir)
-                .and_then(|_| entry.file_name().into_string().ok())
-        }));
+    kernel.allowance_store.clear_for_principal(principal);
+    let mut authority_errors = Vec::new();
+    if let Err(error) = kernel.capabilities.purge_principal(principal).await {
+        authority_errors.push(format!("capabilities: {error}"));
     }
-    let mut kv_errors = Vec::new();
-    for capsule in capsule_ids {
-        let namespace = format!("{principal}:capsule:{capsule}");
-        if let Err(error) = kernel.kv.clear_namespace(&namespace).await {
-            kv_errors.push(format!("kv namespace {namespace}: {error}"));
+
+    // Native storage has an authoritative immutable-UID root. Removing it
+    // reclaims every capsule namespace, including already-uninstalled or
+    // corrupt/missing installations. Legacy/test compositions without the
+    // native store retain the prior best-effort namespace fallback.
+    if let (Some(store), Some(uid)) = (&kernel.principal_store, principal_uid) {
+        if let Err(error) = store.purge_principal_kv(uid) {
+            authority_errors.push(format!("principal state: {error}"));
+        }
+    } else {
+        let capsule_dir = kernel.astrid_home.principal_home(principal).capsules_dir();
+        let mut capsule_ids: BTreeSet<String> = unloaded.iter().map(ToString::to_string).collect();
+        if let Ok(entries) = std::fs::read_dir(&capsule_dir) {
+            capsule_ids.extend(entries.flatten().filter_map(|entry| {
+                entry
+                    .file_type()
+                    .ok()
+                    .filter(std::fs::FileType::is_dir)
+                    .and_then(|_| entry.file_name().into_string().ok())
+            }));
+        }
+        for capsule in capsule_ids {
+            let namespace = format!("{principal}:capsule:{capsule}");
+            if let Err(error) = kernel.kv.clear_namespace(&namespace).await {
+                authority_errors.push(format!("kv namespace {namespace}: {error}"));
+            }
         }
     }
 
@@ -227,7 +302,7 @@ async fn retire_and_reclaim(
     .map_err(|e| format!("agent footprint reclamation task failed: {e}"))?;
 
     let mut reclaimed = Vec::new();
-    let mut cleanup_errors = kv_errors;
+    let mut cleanup_errors = authority_errors;
     if cleanup_errors.is_empty() {
         reclaimed.push("kv");
     }

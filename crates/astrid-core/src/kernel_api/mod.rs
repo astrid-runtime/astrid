@@ -452,8 +452,10 @@ pub enum AdminRequestKind {
     /// profile removal + cache invalidate), then reclaims the principal's
     /// on-disk footprint — home tree (`home/{principal}/`), signing key
     /// (`keys/{principal}.key`), and secrets (`secrets/{principal}/`).
-    /// Reclamation is best-effort; any failures are reported in the
-    /// response's `cleanup_errors` (#1217).
+    /// Reclamation fails closed: any incomplete authority or filesystem
+    /// cleanup returns an error, retains a durable alias reservation, and is
+    /// safe to retry. Successful responses retain an empty `cleanup_errors`
+    /// array for wire compatibility (#1217).
     AgentDelete {
         /// Principal to delete.
         principal: PrincipalId,

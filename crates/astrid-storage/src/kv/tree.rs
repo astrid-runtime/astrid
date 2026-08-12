@@ -413,6 +413,35 @@ where
     E: KvProjectionEngine<P> + 'static,
     R: KvPrincipalResolver<P>,
 {
+    /// Atomically remove every visible KV entry owned by `owner`.
+    ///
+    /// This privileged lifecycle operation works from the authoritative tree
+    /// and overlay rather than caller-supplied namespace names, so orphaned
+    /// namespaces remain reclaimable after their capsule is uninstalled.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error if the owner's authoritative KV state cannot be
+    /// read or the clearing mutation cannot be committed.
+    pub fn clear_owner(&self, owner: &P) -> StorageResult<u64> {
+        self.blocking_store().mutate(owner, |context, header| {
+            let mut entries = BTreeMap::<Vec<u8>, Option<Vec<u8>>>::new();
+            context.visit_entries(header.tree, |composite, value| {
+                entries.insert(composite.to_vec(), Some(value.to_vec()));
+                Ok(())
+            })?;
+            for (key, value) in header.overlay.all() {
+                entries.insert(key, value);
+            }
+            let mutations = entries
+                .into_iter()
+                .filter_map(|(key, value)| value.map(|_| (key, None)))
+                .collect::<Vec<_>>();
+            let count = u64::try_from(mutations.len()).unwrap_or(u64::MAX);
+            Ok((count, mutations, count != 0))
+        })
+    }
+
     #[cfg(all(feature = "legacy-surrealkv", not(target_family = "wasm")))]
     pub(crate) fn import_entries_for_migration(
         &self,

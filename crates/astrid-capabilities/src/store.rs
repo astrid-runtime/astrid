@@ -56,6 +56,10 @@ const PRESENCE_MARKER: &[u8] = &[1];
 /// are about the token's identity, not the caller): revoking a token
 /// revokes it for every principal that happened to hold it.
 pub struct CapabilityStore {
+    /// Principals undergoing durable deletion. The async lock is held for the
+    /// full token add/read transaction so retirement is a real authority
+    /// fence rather than a check-then-act race.
+    retiring_principals: tokio::sync::RwLock<std::collections::HashSet<PrincipalId>>,
     /// Session tokens (in-memory, cleared on session end), keyed per-principal.
     session_tokens: RwLock<HashMap<PrincipalId, HashMap<TokenId, CapabilityToken>>>,
     /// Persistent tokens (`KvStore` backed).
@@ -76,6 +80,7 @@ impl CapabilityStore {
     #[must_use]
     pub fn in_memory() -> Self {
         Self {
+            retiring_principals: tokio::sync::RwLock::new(std::collections::HashSet::new()),
             session_tokens: RwLock::new(HashMap::new()),
             persistent_store: None,
             revoked: RwLock::new(std::collections::HashSet::new()),
@@ -98,6 +103,7 @@ impl CapabilityStore {
         let kv: Arc<dyn KvStore> = Arc::new(store);
 
         let mut cap_store = Self {
+            retiring_principals: tokio::sync::RwLock::new(std::collections::HashSet::new()),
             session_tokens: RwLock::new(HashMap::new()),
             persistent_store: Some(kv),
             revoked: RwLock::new(std::collections::HashSet::new()),
@@ -118,6 +124,7 @@ impl CapabilityStore {
     /// Returns an error if loading existing revoked/used tokens fails.
     pub async fn with_kv_store(store: Arc<dyn KvStore>) -> CapabilityResult<Self> {
         let mut cap_store = Self {
+            retiring_principals: tokio::sync::RwLock::new(std::collections::HashSet::new()),
             session_tokens: RwLock::new(HashMap::new()),
             persistent_store: Some(store),
             revoked: RwLock::new(std::collections::HashSet::new()),
@@ -188,6 +195,13 @@ impl CapabilityStore {
     ///
     /// Returns an error if the token is invalid or storage fails.
     pub async fn add(&self, token: CapabilityToken) -> CapabilityResult<()> {
+        let retirement = self.retiring_principals.read().await;
+        if retirement.contains(&token.principal) {
+            return Err(CapabilityError::StorageError(format!(
+                "principal {} is retiring",
+                token.principal
+            )));
+        }
         // Validate the token first
         token.validate()?;
 
@@ -255,6 +269,7 @@ impl CapabilityStore {
     /// fails verification (including v1 tokens still on disk after upgrade
     /// to v2 signing), or a storage error if reading fails.
     pub async fn get(&self, token_id: &TokenId) -> CapabilityResult<Option<CapabilityToken>> {
+        let retirement = self.retiring_principals.read().await;
         // Check if revoked
         {
             let revoked = self
@@ -276,6 +291,9 @@ impl CapabilityStore {
                 .map_err(|e| CapabilityError::StorageError(e.to_string()))?;
             for principal_map in tokens.values() {
                 if let Some(token) = principal_map.get(token_id) {
+                    if retirement.contains(&token.principal) {
+                        return Ok(None);
+                    }
                     return Ok(Some(token.clone()));
                 }
             }
@@ -288,6 +306,9 @@ impl CapabilityStore {
         if let Some(store) = &self.persistent_store
             && let Some(token) = Self::read_persistent_token_any_principal(store, token_id).await?
         {
+            if retirement.contains(&token.principal) {
+                return Ok(None);
+            }
             return Ok(Some(token));
         }
 
@@ -401,6 +422,10 @@ impl CapabilityStore {
         resource: &str,
         permission: Permission,
     ) -> Option<CapabilityToken> {
+        let retirement = self.retiring_principals.read().await;
+        if retirement.contains(principal) {
+            return None;
+        }
         // Check session tokens (this principal's inner map only). Matching
         // candidates are cloned out first — the `std` read guard must not be
         // held across the consumed-check await below.
@@ -476,6 +501,21 @@ impl CapabilityStore {
         }
 
         None
+    }
+
+    /// Fence all token creation and authorization for a retiring principal.
+    ///
+    /// An add already in progress holds the read side of this lock until its
+    /// storage transaction completes. Therefore, once this method returns,
+    /// the subsequent purge observes every earlier add and every later add is
+    /// rejected.
+    pub async fn begin_principal_retirement(&self, principal: PrincipalId) {
+        self.retiring_principals.write().await.insert(principal);
+    }
+
+    /// Release an in-process retirement fence after durable reclamation.
+    pub async fn finish_principal_retirement(&self, principal: &PrincipalId) {
+        self.retiring_principals.write().await.remove(principal);
     }
 
     /// Revoke a token (global — all principals).
@@ -568,6 +608,76 @@ impl CapabilityStore {
             .map_err(|e| CapabilityError::StorageError(e.to_string()))?;
         tokens.remove(principal);
         Ok(())
+    }
+
+    /// Permanently remove every capability token owned by `principal`.
+    ///
+    /// This is stronger than session cleanup and is intended for identity
+    /// deletion. Primary rows and secondary indexes are removed so a later
+    /// identity that reuses the same human-readable alias cannot inherit the
+    /// old generation's authority. Revocation and replay tombstones are kept:
+    /// they are cheap, globally unique, and must remain fail-closed if deleting
+    /// a primary row fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error after attempting every cleanup operation. The
+    /// in-memory session state is cleared even when durable cleanup fails.
+    pub async fn purge_principal(&self, principal: &PrincipalId) -> CapabilityResult<()> {
+        self.clear_session_for(principal)?;
+        let Some(store) = &self.persistent_store else {
+            return Ok(());
+        };
+
+        let prefix = token_key_prefix(principal);
+        let primary_keys = store
+            .list_keys_with_prefix(NS_TOKENS, &prefix)
+            .await
+            .map_err(|e| CapabilityError::StorageError(e.to_string()))?;
+        let mut token_ids = std::collections::HashSet::new();
+        for key in &primary_keys {
+            if let Some(raw_id) = key.strip_prefix(&prefix)
+                && let Ok(id) = uuid::Uuid::parse_str(raw_id)
+            {
+                token_ids.insert(TokenId::from_uuid(id));
+            }
+        }
+
+        // Include index-only remnants from an interrupted earlier purge.
+        let index_keys = store
+            .list_keys(NS_TOKEN_INDEX)
+            .await
+            .map_err(|e| CapabilityError::StorageError(e.to_string()))?;
+        for raw_id in index_keys {
+            let owner = store
+                .get(NS_TOKEN_INDEX, &raw_id)
+                .await
+                .map_err(|e| CapabilityError::StorageError(e.to_string()))?;
+            if owner.as_deref() == Some(principal.as_str().as_bytes())
+                && let Ok(id) = uuid::Uuid::parse_str(&raw_id)
+            {
+                token_ids.insert(TokenId::from_uuid(id));
+            }
+        }
+
+        let mut failures = Vec::new();
+        for key in primary_keys {
+            if let Err(error) = store.delete(NS_TOKENS, &key).await {
+                failures.push(format!("delete token {key}: {error}"));
+            }
+        }
+        for token_id in &token_ids {
+            let raw_id = token_id.0.to_string();
+            if let Err(error) = store.delete(NS_TOKEN_INDEX, &raw_id).await {
+                failures.push(format!("delete {NS_TOKEN_INDEX}/{raw_id}: {error}"));
+            }
+        }
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(CapabilityError::StorageError(failures.join("; ")))
+        }
     }
 
     /// Mark a single-use token as used.
@@ -739,6 +849,10 @@ impl std::fmt::Debug for CapabilityStore {
         });
         let revoked_count = self.revoked.read().map_or(0, |r| r.len());
         let used_count = self.used_tokens.try_read().map_or(0, |u| u.len());
+        let retiring_count = self
+            .retiring_principals
+            .try_read()
+            .map_or(0, |principals| principals.len());
         let has_persistence = self.persistent_store.is_some();
 
         f.debug_struct("CapabilityStore")
@@ -746,6 +860,7 @@ impl std::fmt::Debug for CapabilityStore {
             .field("session_tokens", &session_count)
             .field("revoked_count", &revoked_count)
             .field("used_count", &used_count)
+            .field("retiring_principals", &retiring_count)
             .field("has_persistence", &has_persistence)
             .finish()
     }

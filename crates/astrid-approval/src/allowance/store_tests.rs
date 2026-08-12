@@ -463,6 +463,61 @@ fn test_store_export_is_principal_scoped() {
 }
 
 #[test]
+fn clear_for_principal_removes_every_scope_without_touching_peers() {
+    let store = AllowanceStore::new();
+    for session_only in [true, false] {
+        store
+            .add_allowance(make_allowance_for(
+                alice(),
+                AllowancePattern::ServerTools {
+                    server: format!("alice-{session_only}"),
+                },
+                session_only,
+            ))
+            .unwrap();
+    }
+    store
+        .add_allowance(make_allowance_for(
+            bob(),
+            AllowancePattern::ServerTools {
+                server: "bob".to_string(),
+            },
+            false,
+        ))
+        .unwrap();
+
+    store.clear_for_principal(&alice());
+
+    assert_eq!(store.count_for(&alice()), 0);
+    assert_eq!(store.count_for(&bob()), 1);
+}
+
+#[test]
+fn retirement_fences_allowance_creation_and_authorization_until_finished() {
+    let store = AllowanceStore::new();
+    let action = SensitiveAction::McpToolCall {
+        server: "retired".to_string(),
+        tool: "run".to_string(),
+    };
+    let allowance = make_allowance_for(
+        alice(),
+        AllowancePattern::ServerTools {
+            server: "retired".to_string(),
+        },
+        false,
+    );
+    store.add_allowance(allowance.clone()).unwrap();
+
+    store.begin_principal_retirement(&alice()).unwrap();
+    assert!(store.find_matching(&alice(), &action, None).is_none());
+    assert!(store.add_allowance(allowance.clone()).is_err());
+
+    store.finish_principal_retirement(&alice());
+    store.add_allowance(allowance).unwrap();
+    assert!(store.find_matching(&alice(), &action, None).is_some());
+}
+
+#[test]
 fn test_store_add_trusts_allowance_principal() {
     // Adversarial case: the Allowance's principal is the only source of
     // truth. An allowance for bob is inserted under bob — not under any

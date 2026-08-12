@@ -676,17 +676,7 @@ async fn run_delete(args: DeleteArgs) -> Result<ExitCode> {
     let body = client
         .request(AdminRequestKind::AgentDelete { principal })
         .await?;
-    let outcome = into_result(body)?;
-    // Surface any footprint-reclamation failures the kernel reported
-    // (delete closes authz regardless; leftovers are an ops follow-up).
-    if let AdminResponseBody::Success(v) = &outcome
-        && let Some(errs) = v.get("cleanup_errors").and_then(|e| e.as_array())
-        && !errs.is_empty()
-    {
-        for e in errs.iter().filter_map(|e| e.as_str()) {
-            eprintln!("warning: footprint cleanup: {e}");
-        }
-    }
+    into_result(body)?;
     println!(
         "{}",
         Theme::success(&format!("Deleted agent '{}'", args.name))
