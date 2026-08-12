@@ -118,6 +118,13 @@ impl KernelAuditSink {
             HostAuditEvent::ProcessSpawn { command } => AuditAction::ProcessSpawn {
                 command: truncate_guest_str(command),
             },
+            HostAuditEvent::NetAccept {
+                local_addr,
+                peer_addr,
+            } => AuditAction::NetAccept {
+                local_addr: truncate_guest_str(local_addr),
+                peer_addr: truncate_guest_str(peer_addr),
+            },
         }
     }
 
@@ -229,23 +236,6 @@ impl HostAuditSink for KernelAuditSink {
         let action = Self::to_action(event);
         self.record_action(principal, action, outcome);
     }
-
-    fn record_net_accept(
-        &self,
-        principal: &PrincipalId,
-        local_addr: &str,
-        peer_addr: &str,
-        outcome: HostAuditOutcome<'_>,
-    ) {
-        self.record_action(
-            principal,
-            AuditAction::NetAccept {
-                local_addr: truncate_guest_str(local_addr),
-                peer_addr: truncate_guest_str(peer_addr),
-            },
-            outcome,
-        );
-    }
 }
 
 #[cfg(test)]
@@ -299,10 +289,12 @@ mod tests {
             },
             HostAuditOutcome::Allowed,
         );
-        sink.record_net_accept(
+        sink.record(
             &p,
-            "127.0.0.1:8788",
-            "127.0.0.1:49152",
+            HostAuditEvent::NetAccept {
+                local_addr: "127.0.0.1:8788",
+                peer_addr: "127.0.0.1:49152",
+            },
             HostAuditOutcome::Allowed,
         );
         sink.record(

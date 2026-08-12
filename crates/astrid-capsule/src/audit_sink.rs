@@ -61,6 +61,13 @@ pub enum HostAuditEvent<'a> {
         /// The command being executed.
         command: &'a str,
     },
+    /// An inbound TCP connection accepted by a capsule listener.
+    NetAccept {
+        /// Host-observed local listener endpoint.
+        local_addr: &'a str,
+        /// Host-observed remote peer endpoint.
+        peer_addr: &'a str,
+    },
 }
 
 /// The outcome of a sensitive host call, as seen at the host-fn seam.
@@ -103,19 +110,4 @@ pub trait HostAuditSink: Send + Sync {
         event: HostAuditEvent<'_>,
         outcome: HostAuditOutcome<'_>,
     );
-
-    /// Record an inbound TCP connection accepted by a capsule listener.
-    ///
-    /// This is a provided method rather than a [`HostAuditEvent`] variant so
-    /// adding accept provenance does not break downstream exhaustive matches
-    /// over that public enum. Existing sinks remain source-compatible; sinks
-    /// that persist accept events should override this method.
-    fn record_net_accept(
-        &self,
-        _principal: &astrid_core::PrincipalId,
-        _local_addr: &str,
-        _peer_addr: &str,
-        _outcome: HostAuditOutcome<'_>,
-    ) {
-    }
 }

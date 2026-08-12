@@ -285,7 +285,14 @@ pub(crate) fn audit_net_accept<T, E: std::fmt::Debug>(
             HostAuditOutcome::Failed(&error)
         },
     };
-    sink.record_net_accept(&state.effective_principal(), local_addr, peer_addr, outcome);
+    sink.record(
+        &state.effective_principal(),
+        HostAuditEvent::NetAccept {
+            local_addr,
+            peer_addr,
+        },
+        outcome,
+    );
 }
 
 /// Report a denied net operation to the per-action audit sink. The connect
