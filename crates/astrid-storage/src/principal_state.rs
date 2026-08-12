@@ -605,6 +605,6 @@ pub async fn open_runtime_kv_with_directory(
 }
 
 #[cfg(test)]
-mod runtime_tests;
-#[cfg(test)]
 mod purge_tests;
+#[cfg(test)]
+mod runtime_tests;
