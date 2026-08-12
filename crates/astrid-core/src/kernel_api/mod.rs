@@ -448,8 +448,14 @@ pub enum AdminRequestKind {
         allow_admin_clone: bool,
     },
     /// Delete an existing agent identity. The `default` principal is
-    /// rejected unconditionally. The principal's home directory is NOT
-    /// scrubbed — reclamation is an ops concern.
+    /// rejected unconditionally. Delete closes authz first (unlink +
+    /// profile removal + cache invalidate), then reclaims the principal's
+    /// on-disk footprint — home tree (`home/{principal}/`), signing key
+    /// (`keys/{principal}.key`), and secrets (`secrets/{principal}/`).
+    /// Reclamation fails closed: any incomplete authority or filesystem
+    /// cleanup returns an error, retains a durable alias reservation, and is
+    /// safe to retry. Successful responses retain an empty `cleanup_errors`
+    /// array for wire compatibility (#1217).
     AgentDelete {
         /// Principal to delete.
         principal: PrincipalId,

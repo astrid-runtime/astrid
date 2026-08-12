@@ -23,6 +23,7 @@ astrid-storage-content = { workspace = true }
 astrid-storage-engine = { workspace = true }
 astrid-storage-model = { workspace = true }
 async-trait = { workspace = true }
+blake3 = { workspace = true }
 chrono = { workspace = true, features = ["clock"] }
 hex = { workspace = true }
 keyring = { workspace = true, optional = true }
@@ -60,7 +61,6 @@ getrandom = { version = "0.4", features = ["wasm_js"] }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 astrid-resources = { workspace = true }
-blake3 = { workspace = true }
 cap-std = "4.0.2"
 caseless = { workspace = true }
 unicode-normalization = { workspace = true }

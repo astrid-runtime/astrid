@@ -1,0 +1,335 @@
+//! Principal deletion: close authority, retire live capsule views, reclaim state.
+
+use std::collections::BTreeSet;
+use std::path::Path;
+use std::sync::Arc;
+
+use astrid_core::principal::PrincipalId;
+use astrid_events::kernel_api::AdminResponseBody;
+use tracing::{info, warn};
+
+use super::handlers::{
+    AGENT_IDENTITY_PLATFORM, err_bad_input, err_internal, principal_profile_path, success_json,
+};
+
+pub(super) async fn agent_delete(
+    kernel: &Arc<crate::Kernel>,
+    principal: PrincipalId,
+) -> AdminResponseBody {
+    if principal == PrincipalId::default() {
+        return err_bad_input(
+            "cannot delete the `default` principal — it is the single-tenant bootstrap anchor"
+                .to_string(),
+        );
+    }
+
+    let _guard = kernel.admin_write_lock.lock().await;
+    let pending = match prepare_identity_removal(kernel, &principal).await {
+        Ok(pending) => pending,
+        Err(response) => return response,
+    };
+    kernel
+        .capabilities
+        .begin_principal_retirement(principal.clone())
+        .await;
+    if let Err(error) = kernel
+        .allowance_store
+        .begin_principal_retirement(&principal)
+    {
+        return err_internal(format!("allowance retirement fence failed: {error}"));
+    }
+
+    if let Err(e) = kernel
+        .identity_store
+        .unlink(AGENT_IDENTITY_PLATFORM, principal.as_str())
+        .await
+    {
+        return err_internal(format!("identity store unlink failed: {e}"));
+    }
+
+    let path = principal_profile_path(kernel, &principal);
+    if let Err(e) = std::fs::remove_file(&path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return err_internal(format!(
+            "failed to remove profile.toml at {}: {e}",
+            path.display()
+        ));
+    }
+    kernel.profile_cache.invalidate(&principal);
+
+    let (unloaded_capsules, reclaimed, cleanup_errors) =
+        match retire_and_reclaim(kernel, &principal, pending.principal_uid).await {
+            Ok(result) => result,
+            Err(e) => return err_internal(e),
+        };
+
+    if !cleanup_errors.is_empty() {
+        return err_internal(format!(
+            "principal reclamation incomplete; alias remains reserved: {}",
+            cleanup_errors.join("; ")
+        ));
+    }
+
+    if let Err(response) = finish_identity_removal(kernel, &principal, pending).await {
+        return response;
+    }
+
+    info!(%principal, ?unloaded_capsules, ?reclaimed, ?cleanup_errors, "Layer 6 agent.delete");
+    success_json(serde_json::json!({
+        "principal": principal.as_str(),
+        "unloaded_capsules": unloaded_capsules,
+        "reclaimed": reclaimed,
+        "cleanup_errors": cleanup_errors,
+    }))
+}
+
+struct PendingIdentityRemoval {
+    user: Option<astrid_core::AstridUserId>,
+    principal_uid: Option<astrid_core::PrincipalUid>,
+    ownership_guard: Option<astrid_storage::PrincipalDeletionGuard>,
+}
+
+async fn prepare_identity_removal(
+    kernel: &Arc<crate::Kernel>,
+    principal: &PrincipalId,
+) -> Result<PendingIdentityRemoval, AdminResponseBody> {
+    let linked = kernel
+        .identity_store
+        .resolve(AGENT_IDENTITY_PLATFORM, principal.as_str())
+        .await
+        .map_err(|e| err_internal(format!("identity store resolve failed: {e}")))?;
+    let resolved = if linked.is_some() {
+        linked
+    } else {
+        kernel
+            .identity_store
+            .list_users()
+            .await
+            .map_err(|e| err_internal(format!("identity store list_users failed: {e}")))?
+            .into_iter()
+            .find(|user| user.principal == *principal)
+    };
+
+    let (principal_uid, ownership_guard) = if let Some(user) = resolved.as_ref() {
+        let identity = kernel
+            .identity_store
+            .get_principal_identity(user.id)
+            .await
+            .map_err(|e| {
+                err_internal(format!(
+                    "identity store principal identity lookup failed: {e}"
+                ))
+            })?;
+        if let Some(identity) = identity {
+            match kernel
+                .ownership_store
+                .guard_principal_deletion_for_alias(identity.uid, principal.clone())
+                .await
+            {
+                Ok(guard) => (Some(identity.uid), Some(guard)),
+                Err(astrid_storage::OwnershipError::PrincipalAlreadyOwned { fleet, .. }) => {
+                    return Err(err_bad_input(format!(
+                        "cannot delete principal `{principal}` while it is assigned to fleet {fleet}"
+                    )));
+                },
+                Err(e) => {
+                    return Err(err_internal(format!(
+                        "ownership store deletion guard failed: {e}"
+                    )));
+                },
+            }
+        } else {
+            let guard = recover_or_reserve_legacy_alias(kernel, principal).await?;
+            (None, Some(guard))
+        }
+    } else {
+        let guard = recover_or_reserve_legacy_alias(kernel, principal).await?;
+        (Some(guard.principal_uid()), Some(guard))
+    };
+
+    Ok(PendingIdentityRemoval {
+        user: resolved,
+        principal_uid,
+        ownership_guard,
+    })
+}
+
+async fn recover_or_reserve_legacy_alias(
+    kernel: &Arc<crate::Kernel>,
+    principal: &PrincipalId,
+) -> Result<astrid_storage::PrincipalDeletionGuard, AdminResponseBody> {
+    if let Some(guard) = kernel
+        .ownership_store
+        .resume_principal_deletion_by_alias(principal)
+        .await
+        .map_err(|e| err_internal(format!("ownership store deletion recovery failed: {e}")))?
+    {
+        return Ok(guard);
+    }
+    kernel
+        .ownership_store
+        .guard_legacy_alias_deletion(principal.clone())
+        .await
+        .map_err(|e| err_internal(format!("ownership store legacy deletion guard failed: {e}")))
+}
+
+async fn finish_identity_removal(
+    kernel: &Arc<crate::Kernel>,
+    principal: &PrincipalId,
+    pending: PendingIdentityRemoval,
+) -> Result<(), AdminResponseBody> {
+    let PendingIdentityRemoval {
+        user,
+        principal_uid,
+        ownership_guard,
+    } = pending;
+    if let Some(user) = user {
+        match kernel.identity_store.delete_user(user.id).await {
+            Ok(true) => {},
+            Ok(false) => {
+                return Err(err_internal(
+                    "identity store user disappeared during principal deletion".to_string(),
+                ));
+            },
+            Err(e) => {
+                return Err(err_internal(format!(
+                    "identity store delete_user failed: {e}"
+                )));
+            },
+        }
+    }
+    // Deleting the durable identity removes the alias→UID directory entry,
+    // fencing every principal-scoped KV resolver. Purge once more after that
+    // fence so a late write from an invocation dispatched before unload cannot
+    // recreate state behind the reclaimed root.
+    kernel.allowance_store.clear_for_principal(principal);
+    kernel
+        .capabilities
+        .purge_principal(principal)
+        .await
+        .map_err(|e| err_internal(format!("post-identity capability purge failed: {e}")))?;
+    if let (Some(store), Some(uid)) = (&kernel.principal_store, principal_uid) {
+        store.purge_principal_kv(uid).map_err(|e| {
+            err_internal(format!("post-identity principal state purge failed: {e}"))
+        })?;
+    }
+    if let Some(guard) = ownership_guard {
+        guard.finish().await.map_err(|e| {
+            err_internal(format!(
+                "ownership store deletion reservation cleanup failed: {e}"
+            ))
+        })?;
+    }
+    kernel
+        .capabilities
+        .finish_principal_retirement(principal)
+        .await;
+    kernel
+        .allowance_store
+        .finish_principal_retirement(principal);
+    Ok(())
+}
+
+type ReclaimOutcome = (
+    Vec<astrid_capsule_types::CapsuleId>,
+    Vec<&'static str>,
+    Vec<String>,
+);
+
+async fn retire_and_reclaim(
+    kernel: &Arc<crate::Kernel>,
+    principal: &PrincipalId,
+    principal_uid: Option<astrid_core::PrincipalUid>,
+) -> Result<ReclaimOutcome, String> {
+    let unloaded = kernel
+        .unload_principal_capsules(principal)
+        .await
+        .map_err(|e| format!("failed to retire capsule views for `{principal}`: {e}"))?;
+
+    kernel.allowance_store.clear_for_principal(principal);
+    let mut authority_errors = Vec::new();
+    if let Err(error) = kernel.capabilities.purge_principal(principal).await {
+        authority_errors.push(format!("capabilities: {error}"));
+    }
+
+    // Native storage has an authoritative immutable-UID root. Removing it
+    // reclaims every capsule namespace, including already-uninstalled or
+    // corrupt/missing installations. Legacy/test compositions without the
+    // native store retain the prior best-effort namespace fallback.
+    if let (Some(store), Some(uid)) = (&kernel.principal_store, principal_uid) {
+        if let Err(error) = store.purge_principal_kv(uid) {
+            authority_errors.push(format!("principal state: {error}"));
+        }
+    } else {
+        let capsule_dir = kernel.astrid_home.principal_home(principal).capsules_dir();
+        let mut capsule_ids: BTreeSet<String> = unloaded.iter().map(ToString::to_string).collect();
+        if let Ok(entries) = std::fs::read_dir(&capsule_dir) {
+            capsule_ids.extend(entries.flatten().filter_map(|entry| {
+                entry
+                    .file_type()
+                    .ok()
+                    .filter(std::fs::FileType::is_dir)
+                    .and_then(|_| entry.file_name().into_string().ok())
+            }));
+        }
+        for capsule in capsule_ids {
+            let namespace = format!("{principal}:capsule:{capsule}");
+            if let Err(error) = kernel.kv.clear_namespace(&namespace).await {
+                authority_errors.push(format!("kv namespace {namespace}: {error}"));
+            }
+        }
+    }
+
+    let home = kernel
+        .astrid_home
+        .principal_home(principal)
+        .root()
+        .to_path_buf();
+    let key = kernel
+        .astrid_home
+        .keys_dir()
+        .join(format!("{principal}.key"));
+    let secrets = kernel.astrid_home.secrets_dir().join(principal.as_str());
+    let outcomes = tokio::task::spawn_blocking(move || {
+        [
+            ("home", reclaim_dir_all(&home)),
+            ("keys", reclaim_file(&key)),
+            ("secrets", reclaim_dir_all(&secrets)),
+        ]
+    })
+    .await
+    .map_err(|e| format!("agent footprint reclamation task failed: {e}"))?;
+
+    let mut reclaimed = Vec::new();
+    let mut cleanup_errors = authority_errors;
+    if cleanup_errors.is_empty() {
+        reclaimed.push("kv");
+    }
+    for (what, outcome) in outcomes {
+        match outcome {
+            Ok(()) => reclaimed.push(what),
+            Err(msg) => {
+                warn!(%principal, %what, error = %msg, "agent.delete: footprint reclamation failed");
+                cleanup_errors.push(format!("{what}: {msg}"));
+            },
+        }
+    }
+    Ok((unloaded, reclaimed, cleanup_errors))
+}
+
+fn reclaim_dir_all(path: &Path) -> Result<(), String> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
+fn reclaim_file(path: &Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}

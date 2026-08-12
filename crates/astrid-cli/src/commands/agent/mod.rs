@@ -660,7 +660,10 @@ fn print_agent_detail(agent: &AgentSummary) {
 async fn run_delete(args: DeleteArgs) -> Result<ExitCode> {
     let principal = PrincipalId::new(&args.name).context("invalid agent name")?;
     if !args.yes {
-        eprint!("Delete agent '{principal}' (home directory is NOT removed) [y/N]? ");
+        eprint!(
+            "Delete agent '{principal}' \
+             (home directory, signing key, and secrets are reclaimed) [y/N]? "
+        );
         std::io::Write::flush(&mut std::io::stderr()).ok();
         let mut buf = String::new();
         std::io::stdin().read_line(&mut buf).ok();
@@ -673,7 +676,7 @@ async fn run_delete(args: DeleteArgs) -> Result<ExitCode> {
     let body = client
         .request(AdminRequestKind::AgentDelete { principal })
         .await?;
-    let _ = into_result(body)?;
+    into_result(body)?;
     println!(
         "{}",
         Theme::success(&format!("Deleted agent '{}'", args.name))

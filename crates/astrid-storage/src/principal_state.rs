@@ -219,6 +219,7 @@ pub type NativePrincipalContentStore = PrincipalContentStore<
 #[derive(Clone)]
 pub struct RuntimePrincipalStore {
     engine: Arc<RuntimeEngine>,
+    runtime_kv: Arc<RuntimeStore>,
     kv: Arc<dyn KvStore>,
     content: Arc<NativePrincipalContentStore>,
     staging: Arc<NativeContentStagingArea>,
@@ -271,6 +272,25 @@ impl RuntimePrincipalStore {
     #[must_use]
     pub fn principal_directory(&self) -> PrincipalDirectory {
         self.principals.clone()
+    }
+
+    /// Remove every KV namespace owned by one immutable principal UID.
+    ///
+    /// This is the authoritative identity-deletion primitive: it reclaims
+    /// every capsule KV namespace without guessing capsule IDs from the live
+    /// registry or installation directory. Other typed state components remain
+    /// bound to the retired immutable UID and cannot be inherited by a later
+    /// identity that reuses the alias.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error if the principal's authoritative KV state cannot
+    /// be read or the clearing mutation cannot be committed.
+    pub fn purge_principal_kv(&self, principal: PrincipalUid) -> StorageResult<bool> {
+        let owner = StateOwner::Principal(principal);
+        self.runtime_kv
+            .clear_owner(&owner)
+            .map(|removed| removed != 0)
     }
 
     /// Inspect one owner's exact catalog names under a target-volume policy.
@@ -509,14 +529,14 @@ async fn open_runtime_principal_store_with_options(
             })??;
     }
 
-    let kv: Arc<dyn KvStore> =
-        Arc::new(RuntimeStore::from_engine_with_quota_and_content_validation(
-            Arc::clone(&engine),
-            StateOwnerResolver::new(principals.clone()),
-            Arc::clone(&quota),
-            Arc::clone(&validated_kv),
-            Arc::clone(&validated_catalogs),
-        ));
+    let runtime_kv = Arc::new(RuntimeStore::from_engine_with_quota_and_content_validation(
+        Arc::clone(&engine),
+        StateOwnerResolver::new(principals.clone()),
+        Arc::clone(&quota),
+        Arc::clone(&validated_kv),
+        Arc::clone(&validated_catalogs),
+    ));
+    let kv: Arc<dyn KvStore> = runtime_kv.clone();
     KvIdentityStore::with_principal_directory(
         ScopedKvStore::new(Arc::clone(&kv), "system:identity")?,
         principals.clone(),
@@ -539,6 +559,7 @@ async fn open_runtime_principal_store_with_options(
     let staging = Arc::new(NativeContentStagingArea::open(home.content_staging_path())?);
     Ok(RuntimePrincipalStore {
         engine,
+        runtime_kv,
         kv,
         content,
         staging,
@@ -583,5 +604,7 @@ pub async fn open_runtime_kv_with_directory(
         .map(|store| store.kv())
 }
 
+#[cfg(test)]
+mod purge_tests;
 #[cfg(test)]
 mod runtime_tests;

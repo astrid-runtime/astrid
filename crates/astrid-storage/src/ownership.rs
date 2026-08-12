@@ -230,6 +230,12 @@ pub struct PrincipalDeletionGuard {
 }
 
 impl PrincipalDeletionGuard {
+    /// Immutable principal generation protected by this reservation.
+    #[must_use]
+    pub const fn principal_uid(&self) -> PrincipalUid {
+        self.principal_uid
+    }
+
     /// Remove the durable reservation after identity removal completes.
     ///
     /// # Errors
@@ -313,6 +319,61 @@ impl OwnershipStore {
             .await
     }
 
+    /// Reserve an alias whose legacy identity generation is already missing.
+    ///
+    /// Recovery code uses this before touching alias-keyed files so a failed
+    /// cleanup cannot make an old key, home, or secret tree available to a new
+    /// identity. The synthetic UID exists only as the durable map key for this
+    /// reservation and is derived in a separate domain from real identities.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed if the alias is already reserved, the synthetic key
+    /// collides with a live principal, or the ownership graph cannot be saved.
+    pub async fn guard_legacy_alias_deletion(
+        &self,
+        alias: PrincipalId,
+    ) -> Result<PrincipalDeletionGuard, OwnershipError> {
+        let mut hasher =
+            blake3::Hasher::new_derive_key("astrid legacy alias deletion reservation v1");
+        hasher.update(alias.as_str().as_bytes());
+        let reservation_uid = PrincipalUid::from_bytes(*hasher.finalize().as_bytes());
+        let guard = Arc::clone(&self.mutation_lock).lock_owned().await;
+        self.mutate_unlocked(|graph| {
+            if self.principals.contains_uid(reservation_uid) {
+                return Err(OwnershipError::CorruptGraph(format!(
+                    "legacy deletion reservation for alias {alias} collides with live principal {reservation_uid}"
+                )));
+            }
+            if let Some((principal, _)) = graph
+                .principal_deletions
+                .iter()
+                .find(|(_, reservation)| reservation.alias.as_ref() == Some(&alias))
+            {
+                if *principal != reservation_uid {
+                    return Err(OwnershipError::DeletionAliasReserved {
+                        alias: alias.clone(),
+                        principal: *principal,
+                    });
+                }
+            } else {
+                graph.principal_deletions.insert(
+                    reservation_uid,
+                    PrincipalDeletionReservation {
+                        alias: Some(alias.clone()),
+                    },
+                );
+            }
+            Ok(())
+        })
+        .await?;
+        Ok(PrincipalDeletionGuard {
+            store: self.clone(),
+            principal_uid: reservation_uid,
+            _guard: guard,
+        })
+    }
+
     /// Finish a previously interrupted deletion using its durable alias.
     ///
     /// Returns `true` when a matching reservation was removed and `false`
@@ -344,6 +405,62 @@ impl OwnershipStore {
                 .is_some())
         })
         .await
+    }
+
+    /// Reacquire an interrupted deletion reservation by its retained alias.
+    ///
+    /// Unlike [`finish_principal_deletion_by_alias`](Self::finish_principal_deletion_by_alias),
+    /// this does not remove the reservation. The caller must first finish all
+    /// generation-scoped reclamation and then call [`PrincipalDeletionGuard::finish`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an ownership error if the graph cannot be loaded or the retired
+    /// principal is unexpectedly live again.
+    pub async fn resume_principal_deletion_by_alias(
+        &self,
+        alias: &PrincipalId,
+    ) -> Result<Option<PrincipalDeletionGuard>, OwnershipError> {
+        let guard = Arc::clone(&self.mutation_lock).lock_owned().await;
+        let graph = self.load().await?;
+        let principal_uid = graph
+            .principal_deletions
+            .iter()
+            .find_map(|(uid, reservation)| {
+                (reservation.alias.as_ref() == Some(alias)).then_some(*uid)
+            });
+        let Some(principal_uid) = principal_uid else {
+            return Ok(None);
+        };
+        if self.principals.contains_uid(principal_uid) {
+            return Err(OwnershipError::PrincipalDeletionStillLive(principal_uid));
+        }
+        Ok(Some(PrincipalDeletionGuard {
+            store: self.clone(),
+            principal_uid,
+            _guard: guard,
+        }))
+    }
+
+    /// Reject creation while an interrupted deletion still owns `alias`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an ownership error if the graph cannot be loaded or `alias` is
+    /// still reserved by an incomplete deletion.
+    pub async fn ensure_alias_available(&self, alias: &PrincipalId) -> Result<(), OwnershipError> {
+        let graph = self.load().await?;
+        if let Some((principal, _)) = graph
+            .principal_deletions
+            .iter()
+            .find(|(_, reservation)| reservation.alias.as_ref() == Some(alias))
+        {
+            return Err(OwnershipError::DeletionAliasReserved {
+                alias: alias.clone(),
+                principal: *principal,
+            });
+        }
+        Ok(())
     }
 
     async fn guard_principal_deletion_inner(

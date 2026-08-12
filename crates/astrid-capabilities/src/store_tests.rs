@@ -116,6 +116,92 @@ async fn test_clear_session() {
 }
 
 #[tokio::test]
+async fn purge_principal_removes_session_and_persistent_authority_only_for_target() {
+    let kv: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+    let store = CapabilityStore::with_kv_store(Arc::clone(&kv))
+        .await
+        .unwrap();
+    let keypair = test_keypair();
+    let make = |principal: PrincipalId, scope: TokenScope, resource: &str| {
+        CapabilityToken::create(
+            ResourcePattern::exact(resource).unwrap(),
+            vec![Permission::Invoke],
+            scope,
+            keypair.key_id(),
+            AuditEntryId::new(),
+            &keypair,
+            None,
+            principal,
+        )
+    };
+    let alice_session = make(alice(), TokenScope::Session, "mcp://alice:session");
+    let alice_persistent = make(alice(), TokenScope::Persistent, "mcp://alice:persistent");
+    let alice_persistent_id = alice_persistent.id.clone();
+    let bob_persistent = make(bob(), TokenScope::Persistent, "mcp://bob:persistent");
+    let bob_persistent_id = bob_persistent.id.clone();
+    store.add(alice_session).await.unwrap();
+    store.add(alice_persistent).await.unwrap();
+    store.add(bob_persistent).await.unwrap();
+    store.revoke(&alice_persistent_id).await.unwrap();
+
+    store.purge_principal(&alice()).await.unwrap();
+
+    assert!(matches!(
+        store.get(&alice_persistent_id).await,
+        Err(CapabilityError::TokenRevoked { .. })
+    ));
+    assert!(store.get(&bob_persistent_id).await.unwrap().is_some());
+    assert!(
+        !store
+            .has_capability(&alice(), "mcp://alice:session", Permission::Invoke)
+            .await
+    );
+    assert!(
+        store
+            .has_capability(&bob(), "mcp://bob:persistent", Permission::Invoke)
+            .await
+    );
+    assert!(
+        kv.get(NS_TOKEN_INDEX, &alice_persistent_id.0.to_string())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        kv.get(NS_REVOKED, &alice_persistent_id.0.to_string())
+            .await
+            .unwrap()
+            .is_some(),
+        "revocation tombstones must outlive identity cleanup"
+    );
+}
+
+#[tokio::test]
+async fn retirement_fences_token_creation_and_lookup_until_finished() {
+    let store = CapabilityStore::in_memory();
+    let keypair = test_keypair();
+    let token = CapabilityToken::create(
+        ResourcePattern::exact("mcp://alice:retired").unwrap(),
+        vec![Permission::Invoke],
+        TokenScope::Session,
+        keypair.key_id(),
+        AuditEntryId::new(),
+        &keypair,
+        None,
+        alice(),
+    );
+    let token_id = token.id.clone();
+    store.add(token.clone()).await.unwrap();
+
+    store.begin_principal_retirement(alice()).await;
+    assert!(store.get(&token_id).await.unwrap().is_none());
+    assert!(store.add(token.clone()).await.is_err());
+
+    store.finish_principal_retirement(&alice()).await;
+    assert!(store.get(&token_id).await.unwrap().is_some());
+}
+
+#[tokio::test]
 async fn test_find_capability() {
     let store = CapabilityStore::in_memory();
     let keypair = test_keypair();

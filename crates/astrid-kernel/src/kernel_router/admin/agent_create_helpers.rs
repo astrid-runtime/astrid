@@ -42,6 +42,16 @@ pub(super) async fn provision_new_principal(
     clone_from: Option<PrincipalId>,
     allow_admin_clone: bool,
 ) -> AdminResponseBody {
+    if let Err(error) = kernel
+        .ownership_store
+        .ensure_alias_available(&principal)
+        .await
+    {
+        return err_bad_input(format!(
+            "principal alias `{principal}` is unavailable: {error}"
+        ));
+    }
+
     // Build the profile: a `clone_from` replica (validated + admin-guarded) or
     // a fresh profile from the supplied groups/grants. Runs under the lock so
     // the clone source is pinned across the read.

@@ -9,6 +9,7 @@
 use crate::error::{ApprovalError, ApprovalResult};
 use astrid_core::principal::PrincipalId;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fmt;
 use std::path::Path;
 use std::sync::RwLock;
@@ -31,6 +32,7 @@ use crate::action::SensitiveAction;
 /// assert_eq!(store.count(), 0);
 /// ```
 pub struct AllowanceStore {
+    retiring_principals: RwLock<HashSet<PrincipalId>>,
     /// Two-level map: `principal → allowance id → allowance`.
     ///
     /// Outer key isolates principals; inner map keeps lookups cheap within
@@ -44,6 +46,7 @@ impl AllowanceStore {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            retiring_principals: RwLock::new(HashSet::new()),
             allowances: RwLock::new(HashMap::new()),
         }
     }
@@ -58,6 +61,16 @@ impl AllowanceStore {
     ///
     /// Returns a storage error if the internal lock is poisoned.
     pub fn add_allowance(&self, allowance: Allowance) -> ApprovalResult<()> {
+        let retirement = self
+            .retiring_principals
+            .read()
+            .map_err(|e| ApprovalError::Storage(e.to_string()))?;
+        if retirement.contains(&allowance.principal) {
+            return Err(ApprovalError::Storage(format!(
+                "principal {} is retiring",
+                allowance.principal
+            )));
+        }
         let mut store = self
             .allowances
             .write()
@@ -89,6 +102,13 @@ impl AllowanceStore {
         action: &SensitiveAction,
         workspace_root: Option<&Path>,
     ) -> Option<Allowance> {
+        if self
+            .retiring_principals
+            .read()
+            .map_or(true, |retiring| retiring.contains(principal))
+        {
+            return None;
+        }
         let store = self.allowances.read().unwrap_or_else(|e| {
             tracing::warn!("AllowanceStore read lock poisoned, recovering");
             e.into_inner()
@@ -117,6 +137,13 @@ impl AllowanceStore {
         action: &SensitiveAction,
         workspace_root: Option<&Path>,
     ) -> Option<Allowance> {
+        if self
+            .retiring_principals
+            .read()
+            .map_or(true, |retiring| retiring.contains(principal))
+        {
+            return None;
+        }
         let mut store = self.allowances.write().unwrap_or_else(|e| {
             tracing::warn!("AllowanceStore lock poisoned, recovering");
             e.into_inner()
@@ -217,6 +244,46 @@ impl AllowanceStore {
                 store.remove(principal);
             }
         }
+    }
+
+    /// Remove every allowance owned by `principal`, regardless of scope.
+    ///
+    /// Identity deletion uses this stronger operation: an alias may later be
+    /// recreated as a new identity, and neither session nor persistent
+    /// approvals may cross that generation boundary.
+    pub fn clear_for_principal(&self, principal: &PrincipalId) {
+        let mut store = self.allowances.write().unwrap_or_else(|e| {
+            tracing::warn!("AllowanceStore write lock poisoned in clear_for_principal, recovering");
+            e.into_inner()
+        });
+        store.remove(principal);
+    }
+
+    /// Atomically fence future allowance creation and clear existing grants.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error if either internal lock is poisoned.
+    pub fn begin_principal_retirement(&self, principal: &PrincipalId) -> ApprovalResult<()> {
+        let mut retirement = self
+            .retiring_principals
+            .write()
+            .map_err(|e| ApprovalError::Storage(e.to_string()))?;
+        retirement.insert(principal.clone());
+        let mut allowances = self
+            .allowances
+            .write()
+            .map_err(|e| ApprovalError::Storage(e.to_string()))?;
+        allowances.remove(principal);
+        Ok(())
+    }
+
+    /// Release an in-process retirement fence after durable reclamation.
+    pub fn finish_principal_retirement(&self, principal: &PrincipalId) {
+        self.retiring_principals
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(principal);
     }
 
     /// Remove every principal's session-only allowances.
@@ -353,9 +420,14 @@ impl fmt::Debug for AllowanceStore {
             });
             (store.len(), store.values().map(HashMap::len).sum::<usize>())
         };
+        let retiring = self
+            .retiring_principals
+            .read()
+            .map_or(0, |principals| principals.len());
         f.debug_struct("AllowanceStore")
             .field("principals", &principals)
             .field("count", &total)
+            .field("retiring_principals", &retiring)
             .finish()
     }
 }
