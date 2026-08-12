@@ -115,6 +115,13 @@ impl KernelAuditSink {
             HostAuditEvent::NetBind { addr } => AuditAction::NetBind {
                 addr: truncate_guest_str(addr),
             },
+            HostAuditEvent::NetAccept {
+                local_addr,
+                peer_addr,
+            } => AuditAction::NetAccept {
+                local_addr: truncate_guest_str(local_addr),
+                peer_addr: truncate_guest_str(peer_addr),
+            },
             HostAuditEvent::ProcessSpawn { command } => AuditAction::ProcessSpawn {
                 command: truncate_guest_str(command),
             },

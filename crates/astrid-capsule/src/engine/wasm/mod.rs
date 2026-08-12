@@ -1807,6 +1807,7 @@ impl ExecutionEngine for WasmEngine {
             let client_connections: Arc<
                 dashmap::DashMap<u32, astrid_core::principal::PrincipalId>,
             > = Arc::new(dashmap::DashMap::new());
+            let tcp_listener_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let make_state: Arc<dyn Fn() -> HostState + Send + Sync> = Arc::new(move || HostState {
                 wasi_ctx: build_wasi_ctx(),
                 resource_table: wasmtime::component::ResourceTable::new(),
@@ -1898,6 +1899,7 @@ impl ExecutionEngine for WasmEngine {
                 process_tracker: process_tracker.clone(),
                 persistent_processes: persistent_registry.clone(),
                 net_stream_count: 0,
+                tcp_listener_count: Arc::clone(&tcp_listener_count),
                 subscription_count: 0,
                 process_count_total: 0,
                 process_count_by_principal: std::collections::HashMap::new(),
@@ -3039,6 +3041,7 @@ async fn build_lifecycle_host_state(
             tokio::runtime::Handle::current(),
         )),
         net_stream_count: 0,
+        tcp_listener_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         subscription_count: 0,
         process_count_total: 0,
         process_count_by_principal: std::collections::HashMap::new(),

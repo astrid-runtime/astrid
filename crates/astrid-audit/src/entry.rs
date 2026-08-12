@@ -288,6 +288,14 @@ pub enum AuditAction {
         addr: String,
     },
 
+    /// Inbound TCP connection accepted by a capsule listener.
+    NetAccept {
+        /// Host-observed local listener endpoint.
+        local_addr: String,
+        /// Host-observed remote peer endpoint.
+        peer_addr: String,
+    },
+
     /// Child-process spawn by a capsule host call (`astrid:process` spawn).
     ///
     /// Recorded for every spawn attempt — allowed, failed, or denied — so a
@@ -539,6 +547,12 @@ impl AuditAction {
             },
             Self::NetBind { addr } => {
                 format!("Bound socket {addr}")
+            },
+            Self::NetAccept {
+                local_addr,
+                peer_addr,
+            } => {
+                format!("Accepted connection from {peer_addr} on {local_addr}")
             },
             Self::ProcessSpawn { command } => {
                 format!("Spawned process {command}")

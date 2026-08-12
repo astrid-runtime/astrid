@@ -146,6 +146,7 @@ pub(crate) fn minimal_host_state(rt: tokio::runtime::Handle) -> HostState {
             crate::engine::wasm::host::process::PersistentProcessRegistry::new(rt),
         ),
         net_stream_count: 0,
+        tcp_listener_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         subscription_count: 0,
         process_count_total: 0,
         process_count_by_principal: HashMap::new(),

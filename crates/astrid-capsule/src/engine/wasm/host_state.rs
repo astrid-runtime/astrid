@@ -622,6 +622,11 @@ pub struct HostState {
     /// http handles unrelated to net). Single-threaded: wasmtime
     /// stores are owned by exactly one OS thread.
     pub net_stream_count: usize,
+    /// Live count of bound inbound TCP listeners, shared by every pooled
+    /// store for this capsule. The WIT contract limits the capsule as a whole
+    /// to four listeners; a store-local counter would multiply that limit by
+    /// the dynamic pool size.
+    pub tcp_listener_count: Arc<std::sync::atomic::AtomicUsize>,
     /// Live count of `SubscriptionEntry` entries. Same rationale as
     /// `net_stream_count`.
     pub subscription_count: usize,

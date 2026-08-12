@@ -56,6 +56,13 @@ pub enum HostAuditEvent<'a> {
         /// The bind address.
         addr: &'a str,
     },
+    /// An inbound TCP connection accepted by a capsule listener.
+    NetAccept {
+        /// Host-observed local listener endpoint.
+        local_addr: &'a str,
+        /// Host-observed remote peer endpoint.
+        peer_addr: &'a str,
+    },
     /// A child-process spawn.
     ProcessSpawn {
         /// The command being executed.
