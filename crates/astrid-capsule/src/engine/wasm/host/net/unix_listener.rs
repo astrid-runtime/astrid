@@ -22,7 +22,7 @@ use crate::engine::wasm::host::util;
 
 impl HostUnixListener for HostState {
     fn accept(&mut self, _self_: Resource<UnixListener>) -> Result<Resource<TcpStream>, ErrorCode> {
-        if self.net_stream_count.load(Ordering::Acquire) >= MAX_ACTIVE_STREAMS {
+        if self.capsule_net_stream_count.load(Ordering::Acquire) >= MAX_ACTIVE_STREAMS {
             return Err(ErrorCode::Quota);
         }
 
@@ -167,7 +167,7 @@ impl HostUnixListener for HostState {
         let session_token = self.session_token.clone();
         let blocking_semaphore = self.blocking_semaphore.clone();
 
-        if self.net_stream_count.load(Ordering::Acquire) >= MAX_ACTIVE_STREAMS {
+        if self.capsule_net_stream_count.load(Ordering::Acquire) >= MAX_ACTIVE_STREAMS {
             return Ok(None);
         }
 

@@ -120,6 +120,9 @@ impl HostState {
             drop(stream);
             return Err(ErrorCode::Quota);
         }
+        if reserved {
+            self.claim_reserved_net_stream();
+        }
         let net_stream = NetStream::Tcp(TcpStreamSlot {
             stream: Arc::new(tokio::sync::Mutex::new(stream)),
             read_timeout: None,
@@ -149,7 +152,7 @@ impl HostState {
 impl HostTcpListener for HostState {
     fn accept(&mut self, self_: Resource<TcpListener>) -> Result<Resource<TcpStream>, ErrorCode> {
         let (listener, pending, _) = self.tcp_listener_slot(self_.rep())?;
-        if self.net_stream_count.load(Ordering::Acquire) >= MAX_ACTIVE_STREAMS {
+        if self.capsule_net_stream_count.load(Ordering::Acquire) >= MAX_ACTIVE_STREAMS {
             return Err(ErrorCode::Quota);
         }
         self.recv_yielded = true;
@@ -194,7 +197,7 @@ impl HostTcpListener for HostState {
         timeout_ms: u64,
     ) -> Result<Option<Resource<TcpStream>>, ErrorCode> {
         let (listener, pending, _) = self.tcp_listener_slot(self_.rep())?;
-        if self.net_stream_count.load(Ordering::Acquire) >= MAX_ACTIVE_STREAMS {
+        if self.capsule_net_stream_count.load(Ordering::Acquire) >= MAX_ACTIVE_STREAMS {
             return Err(ErrorCode::Quota);
         }
         self.recv_yielded = true;

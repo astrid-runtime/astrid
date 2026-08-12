@@ -462,13 +462,13 @@ fn clear_on_return(state: &mut HostState, reset_resources: bool) {
         // from zero for the next lease.
         state.active_http_streams.clear();
         let local_streams = state.local_net_stream_count.swap(0, Ordering::AcqRel);
+        state.net_stream_count = 0;
         if local_streams != 0 {
-            let decremented =
-                state
-                    .net_stream_count
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                        count.checked_sub(local_streams)
-                    });
+            let decremented = state.capsule_net_stream_count.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |count| count.checked_sub(local_streams),
+            );
             debug_assert!(decremented.is_ok(), "shared network stream quota underflow");
         }
         state.subscription_count = 0;
@@ -523,7 +523,8 @@ mod tests {
             .resource_table
             .push(DropFlag(Arc::clone(&dropped)))
             .expect("push test resource");
-        state.net_stream_count.store(1, Ordering::Release);
+        state.net_stream_count = 1;
+        state.capsule_net_stream_count.store(1, Ordering::Release);
         state.local_net_stream_count.store(1, Ordering::Release);
         state.subscription_count = 2;
         state.process_count_total = 1;
@@ -549,7 +550,8 @@ mod tests {
             "returned instance must observe an empty resource table"
         );
         // Mirror counters back to the empty-table baseline.
-        assert_eq!(state.net_stream_count.load(Ordering::Acquire), 0);
+        assert_eq!(state.net_stream_count, 0);
+        assert_eq!(state.capsule_net_stream_count.load(Ordering::Acquire), 0);
         assert_eq!(state.subscription_count, 0);
         assert_eq!(state.process_count_total, 0);
         assert!(state.process_count_by_principal.is_empty());
@@ -569,8 +571,8 @@ mod tests {
         let shared = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut first = minimal_host_state(runtime.handle().clone());
         let mut second = minimal_host_state(runtime.handle().clone());
-        first.net_stream_count = Arc::clone(&shared);
-        second.net_stream_count = Arc::clone(&shared);
+        first.capsule_net_stream_count = Arc::clone(&shared);
+        second.capsule_net_stream_count = Arc::clone(&shared);
 
         assert!(first.reserve_net_stream());
         assert!(second.reserve_net_stream());

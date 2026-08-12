@@ -53,7 +53,7 @@ use stream::CONNECT_TIMEOUT;
 
 /// Maximum concurrent socket connections per capsule. Defense-in-depth
 /// cap on top of the per-principal profile quota. Tracked via
-/// [`HostState::net_stream_count`], bumped on every successful
+/// the capsule-wide stream counter, bumped on every successful
 /// `accept` / `connect-tcp` push and decremented in the resource
 /// drop path.
 pub(super) const MAX_ACTIVE_STREAMS: usize = 8;
@@ -63,25 +63,26 @@ pub(super) const MAX_ACTIVE_STREAMS: usize = 8;
 pub(super) const MAX_ACTIVE_TCP_LISTENERS: usize = 4;
 
 impl HostState {
-    pub(in crate::engine::wasm) fn reserve_net_stream(&self) -> bool {
+    pub(in crate::engine::wasm) fn reserve_net_stream(&mut self) -> bool {
         let reserved = self
-            .net_stream_count
+            .capsule_net_stream_count
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 (count < MAX_ACTIVE_STREAMS).then_some(count + 1)
             })
             .is_ok();
         if reserved {
             self.local_net_stream_count.fetch_add(1, Ordering::AcqRel);
+            self.net_stream_count += 1;
         }
         reserved
     }
 
-    pub(in crate::engine::wasm) fn release_net_stream(&self) {
-        let decremented =
-            self.net_stream_count
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                    count.checked_sub(1)
-                });
+    pub(in crate::engine::wasm) fn release_net_stream(&mut self) {
+        let decremented = self.capsule_net_stream_count.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |count| count.checked_sub(1),
+        );
         debug_assert!(decremented.is_ok(), "network stream quota underflow");
         let local = self.local_net_stream_count.fetch_update(
             Ordering::AcqRel,
@@ -89,6 +90,11 @@ impl HostState {
             |count| count.checked_sub(1),
         );
         debug_assert!(local.is_ok(), "local network stream quota underflow");
+        self.net_stream_count = self.net_stream_count.saturating_sub(1);
+    }
+
+    pub(in crate::engine::wasm) fn claim_reserved_net_stream(&mut self) {
+        self.net_stream_count += 1;
     }
 }
 
@@ -508,7 +514,7 @@ impl net::Host for HostState {
             listener: Arc::new(listener),
             pending: Arc::new(PendingTcpConnection {
                 connection: tokio::sync::Mutex::new(None),
-                stream_count: Arc::clone(&self.net_stream_count),
+                stream_count: Arc::clone(&self.capsule_net_stream_count),
                 local_stream_count: Arc::clone(&self.local_net_stream_count),
             }),
             cancel_token: self.effective_cancel_token(),
@@ -553,7 +559,7 @@ impl net::Host for HostState {
             }
         }
 
-        if self.net_stream_count.load(Ordering::Acquire) >= MAX_ACTIVE_STREAMS {
+        if self.capsule_net_stream_count.load(Ordering::Acquire) >= MAX_ACTIVE_STREAMS {
             let result: Result<Resource<TcpStream>, ErrorCode> = Err(ErrorCode::Quota);
             audit_net_connect(self, &host, port, &result);
             return result;
@@ -724,6 +730,45 @@ mod tests {
             HostTcpListener::drop(&mut state, listener).unwrap();
         }
         assert_eq!(state.tcp_listener_count.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn public_store_count_excludes_other_pending_reservations() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut state = minimal_host_state(runtime.handle().clone());
+
+        assert!(state.reserve_net_stream());
+        state
+            .capsule_net_stream_count
+            .fetch_add(1, Ordering::AcqRel);
+        state.local_net_stream_count.fetch_add(1, Ordering::AcqRel);
+        assert_eq!(state.net_stream_count, 1);
+
+        state.release_net_stream();
+        assert_eq!(state.net_stream_count, 0);
+        state.claim_reserved_net_stream();
+        assert_eq!(state.net_stream_count, 1);
+        assert_eq!(state.capsule_net_stream_count.load(Ordering::Acquire), 1);
+        assert_eq!(state.local_net_stream_count.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn public_store_count_excludes_existing_pending_on_direct_reserve() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut state = minimal_host_state(runtime.handle().clone());
+
+        state
+            .capsule_net_stream_count
+            .fetch_add(1, Ordering::AcqRel);
+        state.local_net_stream_count.fetch_add(1, Ordering::AcqRel);
+        assert_eq!(state.net_stream_count, 0);
+
+        assert!(state.reserve_net_stream());
+        assert_eq!(state.net_stream_count, 1);
+        state.claim_reserved_net_stream();
+        assert_eq!(state.net_stream_count, 2);
+        assert_eq!(state.capsule_net_stream_count.load(Ordering::Acquire), 2);
+        assert_eq!(state.local_net_stream_count.load(Ordering::Acquire), 2);
     }
 
     #[tokio::test(flavor = "multi_thread")]

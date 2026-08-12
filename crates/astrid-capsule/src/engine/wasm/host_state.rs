@@ -615,22 +615,24 @@ pub struct HostState {
     /// here — off the wasmtime resource table — which is what lets them
     /// survive instance churn.
     pub persistent_processes: Arc<crate::engine::wasm::host::process::PersistentProcessRegistry>,
-    /// Live count of accepted/connected streams, including a connection
-    /// accepted by a readiness poll but not yet claimed by the guest.
-    /// Maintained alongside `ResourceTable` insertions / drops so the
-    /// `MAX_ACTIVE_STREAMS` gate is O(1) instead of iterating every
-    /// resource (the table may hold hundreds of pollables / errors /
-    /// http handles unrelated to net). Atomic because readiness pollables can
-    /// reserve a connection before the guest re-enters a host function.
-    pub net_stream_count: Arc<std::sync::atomic::AtomicUsize>,
+    /// Live count of accepted/connected streams owned by this Store.
+    ///
+    /// Retained as a public compatibility mirror for callers that inspect the
+    /// per-Store resource count. Capsule-wide quota enforcement uses the
+    /// internal atomic below because readiness pollables can reserve a stream
+    /// while the guest is outside a host call.
+    pub net_stream_count: usize,
+    /// Live accepted/connected streams across every pooled Store for this
+    /// capsule, including readiness reservations not yet claimed by the guest.
+    pub(crate) capsule_net_stream_count: Arc<std::sync::atomic::AtomicUsize>,
     /// Streams reserved by this pooled Store. Reset subtracts this exact
     /// contribution from the shared capsule-wide counter.
-    pub local_net_stream_count: Arc<std::sync::atomic::AtomicUsize>,
+    pub(crate) local_net_stream_count: Arc<std::sync::atomic::AtomicUsize>,
     /// Live count of bound inbound TCP listeners, shared by every pooled
     /// store for this capsule. The WIT contract limits the capsule as a whole
     /// to four listeners; a store-local counter would multiply that limit by
     /// the dynamic pool size.
-    pub tcp_listener_count: Arc<std::sync::atomic::AtomicUsize>,
+    pub(crate) tcp_listener_count: Arc<std::sync::atomic::AtomicUsize>,
     /// Live count of `SubscriptionEntry` entries. Same rationale as
     /// `net_stream_count`.
     pub subscription_count: usize,

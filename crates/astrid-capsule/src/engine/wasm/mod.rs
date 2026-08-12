@@ -1814,7 +1814,7 @@ impl ExecutionEngine for WasmEngine {
                 dashmap::DashMap<u32, astrid_core::principal::PrincipalId>,
             > = Arc::new(dashmap::DashMap::new());
             let tcp_listener_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let net_stream_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let capsule_net_stream_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let make_state: Arc<dyn Fn() -> HostState + Send + Sync> = Arc::new(move || HostState {
                 wasi_ctx: build_wasi_ctx(),
                 resource_table: wasmtime::component::ResourceTable::new(),
@@ -1905,7 +1905,8 @@ impl ExecutionEngine for WasmEngine {
                 identity_store: st_identity_store.clone(),
                 process_tracker: process_tracker.clone(),
                 persistent_processes: persistent_registry.clone(),
-                net_stream_count: Arc::clone(&net_stream_count),
+                net_stream_count: 0,
+                capsule_net_stream_count: Arc::clone(&capsule_net_stream_count),
                 local_net_stream_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 tcp_listener_count: Arc::clone(&tcp_listener_count),
                 subscription_count: 0,
@@ -3048,7 +3049,8 @@ async fn build_lifecycle_host_state(
         persistent_processes: Arc::new(host::process::PersistentProcessRegistry::new(
             tokio::runtime::Handle::current(),
         )),
-        net_stream_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        net_stream_count: 0,
+        capsule_net_stream_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         local_net_stream_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         tcp_listener_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         subscription_count: 0,
