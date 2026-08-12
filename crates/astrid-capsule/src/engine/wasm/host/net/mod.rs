@@ -64,7 +64,8 @@ pub(super) const MAX_ACTIVE_TCP_LISTENERS: usize = 4;
 
 impl HostState {
     pub(in crate::engine::wasm) fn reserve_net_stream(&self) -> bool {
-        let reserved = self.net_stream_count
+        let reserved = self
+            .net_stream_count
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 (count < MAX_ACTIVE_STREAMS).then_some(count + 1)
             })

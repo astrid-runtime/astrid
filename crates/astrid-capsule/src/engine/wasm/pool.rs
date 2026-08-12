@@ -463,11 +463,12 @@ fn clear_on_return(state: &mut HostState, reset_resources: bool) {
         state.active_http_streams.clear();
         let local_streams = state.local_net_stream_count.swap(0, Ordering::AcqRel);
         if local_streams != 0 {
-            let decremented = state.net_stream_count.fetch_update(
-                Ordering::AcqRel,
-                Ordering::Acquire,
-                |count| count.checked_sub(local_streams),
-            );
+            let decremented =
+                state
+                    .net_stream_count
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                        count.checked_sub(local_streams)
+                    });
             debug_assert!(decremented.is_ok(), "shared network stream quota underflow");
         }
         state.subscription_count = 0;

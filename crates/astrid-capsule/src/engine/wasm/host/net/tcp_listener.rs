@@ -55,9 +55,10 @@ impl Pollable for TcpListenerReadiness {
         let Some(Ok((stream, peer_addr))) = accepted else {
             return;
         };
-        let local_addr = stream
-            .local_addr()
-            .map_or_else(|error| format!("unknown ({error})"), |addr| addr.to_string());
+        let local_addr = stream.local_addr().map_or_else(
+            |error| format!("unknown ({error})"),
+            |addr| addr.to_string(),
+        );
         let peer_addr = peer_addr.to_string();
         if pending
             .stream_count
@@ -134,10 +135,7 @@ impl HostState {
         Ok(Resource::new_own(resource.rep()))
     }
 
-    fn take_pending(
-        &self,
-        pending: Arc<PendingTcpConnection>,
-    ) -> Option<PendingTcpAccepted> {
+    fn take_pending(&self, pending: Arc<PendingTcpConnection>) -> Option<PendingTcpAccepted> {
         let runtime = self.runtime_handle.clone();
         let semaphore = self.blocking_semaphore.clone();
         let cancel = self.effective_cancel_token();
@@ -168,20 +166,19 @@ impl HostTcpListener for HostState {
             let runtime = self.runtime_handle.clone();
             let semaphore = self.blocking_semaphore.clone();
             let cancel = self.effective_cancel_token();
-            let accepted = util::bounded_block_on_cancellable(
-                &runtime,
-                &semaphore,
-                &cancel,
-                async move { listener.accept().await },
-            );
+            let accepted =
+                util::bounded_block_on_cancellable(&runtime, &semaphore, &cancel, async move {
+                    listener.accept().await
+                });
             let (stream, peer_addr) = match accepted {
                 Some(Ok(connection)) => connection,
                 Some(Err(error)) => return Err(map_io_err(error)),
                 None => return Err(ErrorCode::Closed),
             };
-            let local_addr = stream
-                .local_addr()
-                .map_or_else(|error| format!("unknown ({error})"), |addr| addr.to_string());
+            let local_addr = stream.local_addr().map_or_else(
+                |error| format!("unknown ({error})"),
+                |addr| addr.to_string(),
+            );
             (stream, local_addr, peer_addr.to_string(), false)
         };
         let result = self.register_accepted(stream, reserved);
@@ -210,17 +207,16 @@ impl HostTcpListener for HostState {
         let semaphore = self.blocking_semaphore.clone();
         let cancel = self.effective_cancel_token();
         let timeout = std::time::Duration::from_millis(timeout_ms);
-        let accepted = util::bounded_block_on_cancellable(
-            &runtime,
-            &semaphore,
-            &cancel,
-            async move { tokio::time::timeout(timeout, listener.accept()).await },
-        );
+        let accepted =
+            util::bounded_block_on_cancellable(&runtime, &semaphore, &cancel, async move {
+                tokio::time::timeout(timeout, listener.accept()).await
+            });
         match accepted {
             Some(Ok(Ok((stream, peer_addr)))) => {
-                let local_addr = stream
-                    .local_addr()
-                    .map_or_else(|error| format!("unknown ({error})"), |addr| addr.to_string());
+                let local_addr = stream.local_addr().map_or_else(
+                    |error| format!("unknown ({error})"),
+                    |addr| addr.to_string(),
+                );
                 let peer_addr = peer_addr.to_string();
                 let result = self.register_accepted(stream, false);
                 audit_net_accept(self, &local_addr, &peer_addr, &result);
