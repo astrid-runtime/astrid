@@ -164,6 +164,14 @@ pub trait Capsule: Send + Sync {
     /// rather than risking cancellation of another principal's work.
     fn request_cancel_for(&self, _principal: &astrid_core::principal::PrincipalId) {}
 
+    /// Re-open per-principal work after a new dispatch view is registered.
+    fn resume_for(&self, _principal: &astrid_core::principal::PrincipalId) {}
+
+    /// Retire one principal's view and wait for its admitted interceptor work.
+    async fn quiesce_for(&self, principal: &astrid_core::principal::PrincipalId) {
+        self.request_cancel_for(principal);
+    }
+
     /// Extract the inbound receiver for uplink messages.
     /// This is typically called exactly once by the OS router after loading.
     fn take_inbound_rx(
@@ -323,6 +331,18 @@ impl Capsule for CompositeCapsule {
     fn request_cancel_for(&self, principal: &astrid_core::principal::PrincipalId) {
         for engine in &self.engines {
             engine.request_cancel_for(principal);
+        }
+    }
+
+    fn resume_for(&self, principal: &astrid_core::principal::PrincipalId) {
+        for engine in &self.engines {
+            engine.resume_for(principal);
+        }
+    }
+
+    async fn quiesce_for(&self, principal: &astrid_core::principal::PrincipalId) {
+        for engine in &self.engines {
+            engine.quiesce_for(principal).await;
         }
     }
 

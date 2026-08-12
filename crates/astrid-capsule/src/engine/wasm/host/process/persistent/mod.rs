@@ -603,6 +603,26 @@ impl PersistentProcessRegistry {
             reap_entry(entry);
         }
     }
+
+    /// Kill and remove entries owned by one retiring principal only.
+    pub fn shutdown_for(&self, principal: &PrincipalId) {
+        let mut removed = Vec::new();
+        {
+            let mut map = self.lock();
+            let keys: Vec<_> = map
+                .iter()
+                .filter_map(|(key, entry)| (entry.creator == *principal).then_some(*key))
+                .collect();
+            for key in keys {
+                if let Some(entry) = map.remove(&key) {
+                    removed.push(entry);
+                }
+            }
+        }
+        for entry in removed {
+            reap_entry(entry);
+        }
+    }
 }
 
 fn reject_spawn(mut p: SpawnParams, err: ErrorCode) -> Result<String, ErrorCode> {

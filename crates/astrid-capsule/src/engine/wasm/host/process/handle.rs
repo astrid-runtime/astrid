@@ -27,6 +27,7 @@ use crate::engine::wasm::host_state::HostState;
 
 impl HostProcessHandle for HostState {
     fn read_logs(&mut self, self_: Resource<ProcessHandle>) -> Result<ReadLogsResult, ErrorCode> {
+        self.ensure_process_handle_authority()?;
         let proc = self
             .resource_table
             .get_mut::<ManagedProcess>(&Resource::new_borrow(self_.rep()))
@@ -90,6 +91,7 @@ impl HostProcessHandle for HostState {
         self_: Resource<ProcessHandle>,
         sig: ProcessSignal,
     ) -> Result<(), ErrorCode> {
+        self.ensure_process_handle_authority()?;
         #[cfg(unix)]
         {
             let proc = self
@@ -129,6 +131,7 @@ impl HostProcessHandle for HostState {
     }
 
     fn kill(&mut self, self_: Resource<ProcessHandle>) -> Result<KillResult, ErrorCode> {
+        self.ensure_process_handle_authority()?;
         let proc = self
             .resource_table
             .get_mut::<ManagedProcess>(&Resource::new_borrow(self_.rep()))
@@ -158,6 +161,7 @@ impl HostProcessHandle for HostState {
         self_: Resource<ProcessHandle>,
         timeout_ms: Option<u64>,
     ) -> Result<ExitInfo, ErrorCode> {
+        self.ensure_process_handle_authority()?;
         let rt = self.runtime_handle.clone();
         let sem = self.blocking_semaphore.clone();
         let tok = self.effective_cancel_token();
@@ -230,6 +234,7 @@ impl HostProcessHandle for HostState {
     }
 
     fn os_pid(&mut self, self_: Resource<ProcessHandle>) -> Result<u32, ErrorCode> {
+        self.ensure_process_handle_authority()?;
         let proc = self
             .resource_table
             .get::<ManagedProcess>(&Resource::new_borrow(self_.rep()))
@@ -278,5 +283,13 @@ impl HostProcessHandle for HostState {
             drop(managed);
         }
         Ok(())
+    }
+}
+
+impl HostState {
+    fn ensure_process_handle_authority(&self) -> Result<(), ErrorCode> {
+        self.invocation_authority_active()
+            .then_some(())
+            .ok_or(ErrorCode::CapabilityDenied)
     }
 }

@@ -249,3 +249,62 @@ async fn derive_rejects_invalid_shape_without_leaving_identity_artifacts() {
         );
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn derive_rolls_back_when_required_capsule_cannot_load() {
+    let (_dir, kernel) = fixture().await;
+    let source = PrincipalId::default();
+    let install = kernel
+        .astrid_home
+        .principal_home(&source)
+        .capsules_dir()
+        .join("broken-harness");
+    std::fs::create_dir_all(&install).unwrap();
+    std::fs::write(
+        install.join("Capsule.toml"),
+        r#"[package]
+name = "broken-harness"
+version = "1.0.0"
+
+[[component]]
+id = "main"
+file = "missing.wasm"
+"#,
+    )
+    .unwrap();
+
+    let response = super::agent_derive::agent_derive_from_req(
+        &kernel,
+        AgentDeriveRequest {
+            name: "broken-worker".into(),
+            source,
+            load_capsules: vec!["broken-harness".into()],
+            allow_capsules: Vec::new(),
+            inherit_capsule_state: Vec::new(),
+            network_egress: Vec::new(),
+        },
+    )
+    .await;
+    let AdminResponseBody::Error(error) = response else {
+        panic!("broken required capsule must fail derivation")
+    };
+    assert!(error.contains("failed to load"), "got: {error}");
+
+    let principal = PrincipalId::new("broken-worker").unwrap();
+    assert!(!PrincipalProfile::path_for(&kernel.astrid_home, &principal).exists());
+    assert!(
+        kernel
+            .identity_store
+            .resolve("cli", principal.as_str())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !kernel
+            .astrid_home
+            .principal_home(&principal)
+            .root()
+            .exists()
+    );
+}

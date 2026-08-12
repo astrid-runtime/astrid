@@ -181,6 +181,10 @@ pub struct WasmEngine {
     /// shared runtime interrupts its in-flight blocking host calls without
     /// touching the other principals' work.
     principal_cancel_tokens: Option<PrincipalCancelTokens>,
+    /// Admission fence and active-call counter for each principal sharing this
+    /// runtime. View retirement closes admission first, then waits for calls
+    /// admitted under the old view to return before reclamation proceeds.
+    principal_invocations: Option<Arc<PrincipalInvocationTracker>>,
     /// RAII guard that stops the epoch ticker thread on drop.
     epoch_ticker: Option<EpochTickerGuard>,
     /// Shared per-principal profile cache (Layer 3, issue #666).
@@ -293,6 +297,95 @@ pub struct WasmEngine {
         Option<Arc<crate::engine::wasm::host::process::PersistentProcessRegistry>>,
 }
 
+#[derive(Default)]
+pub(super) struct PrincipalInvocationTracker {
+    state: std::sync::Mutex<PrincipalInvocationState>,
+    changed: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct PrincipalInvocationState {
+    retired: std::collections::HashSet<astrid_core::PrincipalId>,
+    active: std::collections::HashMap<astrid_core::PrincipalId, usize>,
+}
+
+pub(crate) struct PrincipalInvocationGuard {
+    tracker: Arc<PrincipalInvocationTracker>,
+    principal: astrid_core::PrincipalId,
+}
+
+impl PrincipalInvocationTracker {
+    pub(super) fn begin(
+        self: &Arc<Self>,
+        principal: &astrid_core::PrincipalId,
+    ) -> Option<PrincipalInvocationGuard> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.retired.contains(principal) {
+            return None;
+        }
+        *state.active.entry(principal.clone()).or_default() += 1;
+        Some(PrincipalInvocationGuard {
+            tracker: Arc::clone(self),
+            principal: principal.clone(),
+        })
+    }
+
+    fn retire(&self, principal: &astrid_core::PrincipalId) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retired
+            .insert(principal.clone());
+    }
+
+    fn resume(&self, principal: &astrid_core::PrincipalId) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retired
+            .remove(principal);
+    }
+
+    async fn wait_for_quiescence(&self, principal: &astrid_core::PrincipalId) {
+        loop {
+            let notified = self.changed.notified();
+            let active = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .active
+                .get(principal)
+                .copied()
+                .unwrap_or(0);
+            if active == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl Drop for PrincipalInvocationGuard {
+    fn drop(&mut self) {
+        let mut state = self
+            .tracker
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(active) = state.active.get_mut(&self.principal) {
+            *active = active.saturating_sub(1);
+            if *active == 0 {
+                state.active.remove(&self.principal);
+            }
+        }
+        drop(state);
+        self.tracker.changed.notify_waiters();
+    }
+}
+
 impl WasmEngine {
     /// Construct a WASM engine for one capsule.
     ///
@@ -334,6 +427,7 @@ impl WasmEngine {
             ready_rx: None,
             cancel_token: None,
             principal_cancel_tokens: None,
+            principal_invocations: None,
             epoch_ticker: None,
             profile_cache: None,
             owner_principal: None,
@@ -1077,30 +1171,39 @@ fn install_principal_overlays_sync(
     true
 }
 
-/// Cancel and REMOVE `principal`'s per-principal cancellation token.
+/// Cancel and retain `principal`'s per-principal cancellation token as a
+/// retirement tombstone.
 ///
 /// The core of [`ExecutionEngine::request_cancel_for`] for the WASM engine,
 /// split out so the mechanism is unit-testable without loading a component.
-/// Removal (not just cancellation) matters: a principal that releases its view
-/// of a shared runtime and later re-registers one (remove → reinstall) must
-/// lazily receive a FRESH, uncancelled child token from the overlay installer,
-/// not the insta-cancelled leftover. A principal with no entry (never invoked,
-/// or already removed) is a no-op. The map mutex is held only for the removal;
-/// a poisoned lock is recovered rather than propagated — cancellation is a
-/// liveness mechanism and must not itself wedge.
+/// Retention closes the unregister/install race: a late invocation sees the
+/// cancelled entry and cannot mint fresh authority. A principal with no prior
+/// invocation still receives a cancelled tombstone. Explicit view registration
+/// removes the tombstone through [`resume_principal_token`].
 fn cancel_principal_token(
     tokens: &PrincipalCancelTokens,
+    parent: &tokio_util::sync::CancellationToken,
     principal: &astrid_core::principal::PrincipalId,
 ) {
     let token = {
         let mut map = tokens
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        map.remove(principal)
+        map.entry(principal.clone())
+            .or_insert_with(|| parent.child_token())
+            .clone()
     };
-    if let Some(token) = token {
-        token.cancel();
-    }
+    token.cancel();
+}
+
+fn resume_principal_token(
+    tokens: &PrincipalCancelTokens,
+    principal: &astrid_core::principal::PrincipalId,
+) {
+    tokens
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(principal);
 }
 
 /// Open (creating the log dir if needed) the daily-rotated log file for
@@ -1411,6 +1514,7 @@ impl ExecutionEngine for WasmEngine {
         // principal's entry reaches its waits on any pooled instance.
         let principal_cancel_tokens = HostState::new_principal_cancel_tokens();
         let principal_cancel_tokens_for_state = principal_cancel_tokens.clone();
+        let principal_invocations = Arc::new(PrincipalInvocationTracker::default());
         let process_tracker = Arc::new(crate::engine::wasm::host::process::ProcessTracker::new());
         let process_tracker_for_listener = process_tracker.clone();
         // Host-owned persistent-process registry — one per engine, cloned
@@ -1784,6 +1888,7 @@ impl ExecutionEngine for WasmEngine {
             let io_semaphore = io_semaphore.clone();
             let cancel_token_for_state = cancel_token_for_state.clone();
             let principal_cancel_tokens_for_state = principal_cancel_tokens_for_state.clone();
+            let principal_invocations_for_state = Arc::clone(&principal_invocations);
             let process_tracker = process_tracker.clone();
             let persistent_registry = persistent_registry.clone();
             let memory_ledger = memory_ledger.clone();
@@ -1850,6 +1955,8 @@ impl ExecutionEngine for WasmEngine {
                 invocation_secret_store: None,
                 invocation_capsule_log: None,
                 invocation_profile: None,
+                invocation_profile_authorized: true,
+                principal_invocations: Some(Arc::clone(&principal_invocations_for_state)),
                 profile_cache: st_profile_cache.clone(),
                 invocation_env_overlay: None,
                 // Neutral, physically-isolated KV fallback (see the `kv` field
@@ -2239,6 +2346,7 @@ impl ExecutionEngine for WasmEngine {
 
         self.cancel_token = Some(cancel_token.clone());
         self.principal_cancel_tokens = Some(principal_cancel_tokens);
+        self.principal_invocations = Some(principal_invocations);
         self.wasmtime_engine = Some(wt_engine.clone());
 
         // Start the epoch ticker for timeout enforcement.
@@ -2440,8 +2548,35 @@ impl ExecutionEngine for WasmEngine {
     }
 
     fn request_cancel_for(&self, principal: &astrid_core::principal::PrincipalId) {
+        if let Some(tracker) = &self.principal_invocations {
+            tracker.retire(principal);
+        }
+        if let (Some(tokens), Some(parent)) = (&self.principal_cancel_tokens, &self.cancel_token) {
+            cancel_principal_token(tokens, parent, principal);
+        }
+        if let Some(processes) = &self.persistent_processes {
+            processes.shutdown_for(principal);
+        }
+        if let Some(processes) = &self.process_tracker
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            processes.cancel_for_principal(principal, &runtime);
+        }
+    }
+
+    fn resume_for(&self, principal: &astrid_core::principal::PrincipalId) {
+        if let Some(tracker) = &self.principal_invocations {
+            tracker.resume(principal);
+        }
         if let Some(tokens) = &self.principal_cancel_tokens {
-            cancel_principal_token(tokens, principal);
+            resume_principal_token(tokens, principal);
+        }
+    }
+
+    async fn quiesce_for(&self, principal: &astrid_core::principal::PrincipalId) {
+        self.request_cancel_for(principal);
+        if let Some(tracker) = &self.principal_invocations {
+            tracker.wait_for_quiescence(principal).await;
         }
     }
 
@@ -2485,6 +2620,17 @@ impl ExecutionEngine for WasmEngine {
             .and_then(|p| astrid_core::PrincipalId::new(p).ok())
             .or_else(|| self.owner_principal.clone())
             .unwrap_or_default();
+        let _invocation_guard = match self.principal_invocations.as_ref() {
+            Some(tracker) => match tracker.begin(&invoking_principal) {
+                Some(guard) => Some(guard),
+                None => {
+                    return Ok(crate::capsule::InterceptResult::Deny {
+                        reason: format!("principal '{invoking_principal}' capsule view is retired"),
+                    });
+                },
+            },
+            None => None,
+        };
 
         // Per-invocation timing for the live "sample" view (#816
         // observability). Started before profile resolution + pool checkout so
@@ -2712,6 +2858,7 @@ impl ExecutionEngine for WasmEngine {
                     invoking_principal.clone(),
                 );
                 state.invocation_profile = invocation_profile.clone();
+                state.invocation_profile_authorized = true;
                 state.invocation_env_overlay =
                     load_invocation_env_overlay(&invoking_principal, state.capsule_id.as_str());
 
@@ -2750,13 +2897,21 @@ impl ExecutionEngine for WasmEngine {
                     "astrid-hook-trigger",
                 );
             match typed_lookup {
-                Ok(func) => func
-                    .call_async(&mut *s, (action.to_string(), payload.to_vec()))
-                    .await
-                    .map(|(cr,)| cr)
-                    .map_err(|e| {
-                        CapsuleError::WasmError(format!("astrid_hook_trigger failed: {e:?}"))
-                    }),
+                Ok(func) => {
+                    let invocation_cancel = s.data().effective_cancel_token();
+                    tokio::select! {
+                        biased;
+                        () = invocation_cancel.cancelled() => Err(CapsuleError::WasmError(
+                            "principal capsule view retired during invocation".to_string()
+                        )),
+                        called = func.call_async(
+                            &mut *s,
+                            (action.to_string(), payload.to_vec())
+                        ) => called.map(|(cr,)| cr).map_err(|e| {
+                            CapsuleError::WasmError(format!("astrid_hook_trigger failed: {e:?}"))
+                        }),
+                    }
+                },
                 Err(e) => Err(CapsuleError::UnsupportedEntryPoint(format!(
                     "capsule does not export `astrid-hook-trigger`: {e}"
                 ))),
@@ -2973,6 +3128,8 @@ async fn build_lifecycle_host_state(
         invocation_secret_store: None,
         invocation_capsule_log: None,
         invocation_profile: None,
+        invocation_profile_authorized: true,
+        principal_invocations: None,
         // Lifecycle hooks don't run the per-principal recv loop; no cache needed.
         profile_cache: None,
         invocation_env_overlay: None,

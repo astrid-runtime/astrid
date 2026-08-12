@@ -15,8 +15,9 @@
 //!
 //! # Fail-closed
 //!
-//! [`PrincipalProfile::load`] treats a missing file as [`PrincipalProfile::default`]
-//! (single-tenant parity), but malformed TOML, unknown fields, invalid values,
+//! The bootstrap `default` principal retains missing-file single-tenant parity.
+//! A missing profile for every non-default identity is a hard error, as are
+//! malformed TOML, unknown fields, invalid values,
 //! or a future `profile_version` are hard errors. Those errors propagate out
 //! of [`PrincipalProfileCache::resolve`] so callers can deny the invocation
 //! with a clear audit trail, rather than silently falling back to permissive
@@ -113,6 +114,11 @@ impl PrincipalProfileCache {
     /// The caller is expected to deny the invocation on any of these errors
     /// (see Layer 3 design doc, issue #666).
     pub fn resolve(&self, principal: &PrincipalId) -> ProfileResult<Arc<PrincipalProfile>> {
+        // `default` is the explicit single-tenant compatibility identity and
+        // may use the built-in profile when no file exists. Every other
+        // principal is an isolation boundary: silently manufacturing the
+        // permissive default profile for a deleted or half-provisioned alias
+        // would restore authority after its profile fence was removed.
         loop {
             let state = self
                 .state
@@ -123,7 +129,11 @@ impl PrincipalProfileCache {
             }
             let generation = state.generations.get(principal).copied().unwrap_or(0);
             drop(state);
-            let profile = Arc::new(PrincipalProfile::load(&self.astrid_home, principal)?);
+            let profile = Arc::new(if *principal == PrincipalId::default() {
+                PrincipalProfile::load(&self.astrid_home, principal)?
+            } else {
+                PrincipalProfile::load_required(&self.astrid_home, principal)?
+            });
             if let Some(profile) = self.publish_loaded(principal, profile, generation) {
                 return Ok(profile);
             }
@@ -296,9 +306,9 @@ mod tests {
     }
 
     #[test]
-    fn missing_file_returns_default_and_caches_it() {
+    fn only_default_principal_may_use_missing_file_compatibility_profile() {
         let (_dir, cache) = fixture();
-        let p = principal("alice");
+        let p = PrincipalId::default();
 
         let profile = cache.resolve(&p).expect("resolve missing");
         assert_eq!(*profile, PrincipalProfile::default());
@@ -307,6 +317,13 @@ mod tests {
         // Second call: same Arc, no second disk read.
         let profile2 = cache.resolve(&p).expect("resolve cached");
         assert!(Arc::ptr_eq(&profile, &profile2));
+
+        let alice = principal("alice");
+        assert!(matches!(
+            cache.resolve(&alice),
+            Err(ProfileError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound
+        ));
+        assert_eq!(cache.len(), 1, "failed identities must not be cached");
     }
 
     #[test]
@@ -380,7 +397,11 @@ mod tests {
                  max_memory_bytes = 16777216\n"
             ),
         );
-        // Bob has no file on disk → Default.
+        write_profile(
+            &dir,
+            &b,
+            &format!("profile_version = {CURRENT_PROFILE_VERSION}\n"),
+        );
 
         let pa = cache.resolve(&a).expect("alice");
         let pb = cache.resolve(&b).expect("bob");
@@ -402,7 +423,11 @@ mod tests {
         let (dir, cache) = fixture();
         let p = principal("reloader");
 
-        // First load: no file → Default.
+        write_profile(
+            &dir,
+            &p,
+            &format!("profile_version = {CURRENT_PROFILE_VERSION}\n"),
+        );
         let first = cache.resolve(&p).expect("first resolve");
         assert_eq!(first.quotas.max_memory_bytes, DEFAULT_MAX_MEMORY_BYTES);
 
@@ -476,9 +501,14 @@ mod tests {
         // Lightweight contention check — not a loom model, just a sanity
         // check that multiple threads can `resolve()` the same principal
         // without deadlocks or panics.
-        let (_dir, cache) = fixture();
+        let (dir, cache) = fixture();
         let cache = Arc::new(cache);
         let p = principal("racer");
+        write_profile(
+            &dir,
+            &p,
+            &format!("profile_version = {CURRENT_PROFILE_VERSION}\n"),
+        );
 
         let mut handles = Vec::new();
         for _ in 0..8 {

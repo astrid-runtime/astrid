@@ -430,7 +430,11 @@ fn profile_cache_invalidation_reflects_on_disk_mutation() {
     let cache = PrincipalProfileCache::with_home(home.clone());
     let principal = pid("alice");
 
-    // First resolve: missing file → Default (enabled=true, no grants).
+    let path = PrincipalProfile::path_for(&home, &principal);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    PrincipalProfile::default().save_to_path(&path).unwrap();
+
+    // First resolve caches the explicit non-default profile.
     let first = cache.resolve(&principal).unwrap();
     assert!(first.enabled);
     assert!(first.grants.is_empty());
@@ -440,8 +444,6 @@ fn profile_cache_invalidation_reflects_on_disk_mutation() {
         grants: vec!["self:capsule:install".into()],
         ..Default::default()
     };
-    let path = PrincipalProfile::path_for(&home, &principal);
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     updated.save_to_path(&path).unwrap();
 
     // Without invalidate, cache returns stale Default.

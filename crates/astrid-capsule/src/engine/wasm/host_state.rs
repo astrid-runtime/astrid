@@ -341,14 +341,23 @@ pub struct HostState {
     /// Resolved on BOTH per-invocation paths: the dispatcher-driven
     /// interceptor path (`invoke_interceptor`) and the guest-pulled
     /// `ipc::recv` path ([`install_recv_invocation_context`](Self::install_recv_invocation_context),
-    /// via [`profile_cache`](Self::profile_cache)). Either way the *default*
-    /// quotas apply when the principal is unconfigured, by one of two
-    /// mechanisms: with no cache (tests / single-tenant) this stays `None`
-    /// and [`effective_profile`](Self::effective_profile) substitutes the
-    /// process-global default; with a cache, a principal that has no profile
-    /// file resolves to `Some(PrincipalProfile::default())` (a missing file is
-    /// not an error — see [`PrincipalProfile::load`](astrid_core::profile::PrincipalProfile::load)).
+    /// via [`profile_cache`](Self::profile_cache)). With no cache (tests /
+    /// single-tenant), this stays `None` and
+    /// [`effective_profile`](Self::effective_profile) substitutes the
+    /// process-global default. With a cache, only the bootstrap `default`
+    /// principal retains the missing-file compatibility fallback; a missing
+    /// profile for any non-default principal is an authorization failure.
     pub invocation_profile: Option<Arc<astrid_core::profile::PrincipalProfile>>,
+    /// Whether the current invocation's profile resolved successfully.
+    ///
+    /// A restricted synthetic profile supplies fail-closed quota/network/process
+    /// values after a recv-path resolution error, while this bit prevents the
+    /// guest from publishing IPC effects until real policy is available again.
+    pub invocation_profile_authorized: bool,
+    /// Shared per-principal lifecycle admission fence. Run-loop host calls
+    /// acquire a guard from this tracker and retain it through the actual
+    /// effect, so deletion waits for effects admitted before retirement.
+    pub(super) principal_invocations: Option<Arc<super::PrincipalInvocationTracker>>,
     /// Shared profile-cache handle, used by the `ipc::recv` path to resolve
     /// the invoking principal's [`PrincipalProfile`](astrid_core::profile::PrincipalProfile)
     /// into [`invocation_profile`](Self::invocation_profile).

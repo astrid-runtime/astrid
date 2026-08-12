@@ -138,8 +138,7 @@ async fn agent_delete_closes_authz_before_reclaiming() {
     .await;
     assert!(matches!(response, AdminResponseBody::Success(_)));
 
-    let after = kernel.profile_cache.resolve(&principal).unwrap();
-    assert!(after.groups.is_empty() && after.grants.is_empty());
+    assert!(kernel.profile_cache.resolve(&principal).is_err());
     assert!(!home.exists() && !key.exists() && !secrets.exists());
 }
 

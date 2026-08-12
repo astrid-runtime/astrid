@@ -44,6 +44,27 @@ impl PrincipalProfile {
         Self::load_from_path(&Self::path_for(home, principal))
     }
 
+    /// Load a profile without the missing-file compatibility fallback.
+    ///
+    /// Non-default principals use this at authority boundaries so removal of
+    /// their profile is itself a durable revocation fence. The file is opened
+    /// exactly once; there is no `exists`/read race that can fall through to a
+    /// permissive default after concurrent deletion.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProfileError::Io`] including `NotFound` for any read failure,
+    /// [`ProfileError::Parse`] for malformed TOML, or [`ProfileError::Invalid`]
+    /// when validation rejects the loaded profile.
+    pub fn load_required(home: &AstridHome, principal: &PrincipalId) -> ProfileResult<Self> {
+        let path = Self::path_for(home, principal);
+        let content =
+            crate::platform_fs::read_private_file_to_string(&path).map_err(ProfileError::Io)?;
+        let profile: Self = toml::from_str(&content)?;
+        profile.validate()?;
+        Ok(profile)
+    }
+
     /// Load a profile from an explicit path. Exposed for tests and tools
     /// that don't own an [`AstridHome`].
     ///

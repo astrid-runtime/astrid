@@ -1048,6 +1048,9 @@ impl Kernel {
                 registry
                     .register_existing(&id, &wasm_hash, principal)
                     .map_err(|e| anyhow::anyhow!("Failed to add capsule view: {e}"))?;
+                if let Some(capsule) = registry.get_for(principal, &id) {
+                    capsule.resume_for(principal);
+                }
                 return Ok(());
             }
         }
@@ -1082,6 +1085,8 @@ impl Kernel {
                             error = %e,
                             "Failed to add view after concurrent shared load"
                         );
+                    } else if let Some(capsule) = registry.get_for(principal, &id) {
+                        capsule.resume_for(principal);
                     }
                 }
                 drop(registry);
@@ -1102,6 +1107,9 @@ impl Kernel {
             registry
                 .register_owned_by_default(capsule, wasm_hash, principal)
                 .map_err(|e| anyhow::anyhow!("Failed to register capsule: {e}"))?;
+            if let Some(capsule) = registry.get_for(principal, &id) {
+                capsule.resume_for(principal);
+            }
         }
 
         Ok(())
@@ -1538,6 +1546,60 @@ impl Kernel {
         let other_names: Vec<String> = others.iter().map(|(m, _)| m.package.name.clone()).collect();
         self.await_capsule_readiness_for(principal, &other_names)
             .await;
+    }
+
+    /// Load a principal's capsule view and prove that every explicitly required
+    /// capsule reached readiness before returning.
+    ///
+    /// The ordinary background warm path remains best-effort for compatibility;
+    /// derived sessions use this checked edge because returning a principal that
+    /// cannot run its selected harness would violate the atomic derive contract.
+    pub(crate) async fn ensure_principal_capsules_ready(
+        &self,
+        principal: &PrincipalId,
+        required: &[String],
+    ) -> Result<(), String> {
+        use astrid_capsule::capsule::ReadyStatus;
+
+        self.ensure_principal_loaded(principal).await;
+        let capsules = {
+            let registry = self.capsules.read().await;
+            let mut capsules = Vec::with_capacity(required.len());
+            for name in required {
+                let id = astrid_capsule_types::CapsuleId::new(name.clone())
+                    .map_err(|error| format!("invalid required capsule '{name}': {error}"))?;
+                let capsule = registry.get_for(principal, &id).ok_or_else(|| {
+                    format!("required capsule '{name}' failed to load for principal '{principal}'")
+                })?;
+                capsules.push((name.clone(), capsule));
+            }
+            capsules
+        };
+
+        let timeout = std::time::Duration::from_millis(500);
+        let mut waits = tokio::task::JoinSet::new();
+        for (name, capsule) in capsules {
+            waits.spawn(async move { (name, capsule.wait_ready(timeout).await) });
+        }
+        while let Some(result) = waits.join_next().await {
+            let (name, status) = result
+                .map_err(|error| format!("required capsule readiness task failed: {error}"))?;
+            match status {
+                ReadyStatus::Ready => {},
+                ReadyStatus::Timeout => {
+                    return Err(format!(
+                        "required capsule '{name}' did not signal ready within {}ms",
+                        timeout.as_millis()
+                    ));
+                },
+                ReadyStatus::Crashed => {
+                    return Err(format!(
+                        "required capsule '{name}' exited before signaling ready"
+                    ));
+                },
+            }
+        }
+        Ok(())
     }
 
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -2096,13 +2158,19 @@ impl Kernel {
         // other principals still reference the shared instance would break them.
         let removed = {
             let mut registry = self.capsules.write().await;
-            match registry.unregister_for(principal, id) {
+            let removed = match registry.unregister_for(principal, id) {
                 Ok(removed) => removed,
                 Err(astrid_capsule_types::error::CapsuleError::NotFound(_)) => return Ok(false),
                 Err(e) => {
                     return Err(anyhow::anyhow!("failed to unregister capsule '{id}': {e}"));
                 },
-            }
+            };
+            // Keep the registry write edge across quiescence. Registration is
+            // the only path that calls `resume_for`; without this ordering, a
+            // concurrent reinstall could resume the principal and then have
+            // this old unload cancel its newly registered view.
+            removed.capsule.quiesce_for(principal).await;
+            removed
         };
 
         // Explicitly unload the old capsule only when this was the last view.
@@ -2144,14 +2212,10 @@ impl Kernel {
             // principal. Cancel exactly that principal's waits; everyone
             // else's work is untouched (per-principal child tokens, not the
             // instance-wide `request_cancel`).
-            //
-            // Accepted race: an invocation dispatched before the unregister
-            // above but installing its per-principal context after this cancel
-            // mints a fresh token and survives until its own timeout. New
-            // invocations cannot dispatch (the view is gone), so the window is
-            // bounded; closing it would take cross-component locking between
-            // the registry and every engine, which is not worth it.
-            removed.capsule.request_cancel_for(principal);
+            // The lifecycle fence rejects late admissions, cancels blocking
+            // host work, and waits for interceptor calls admitted before
+            // unregister to return. The cancelled token remains as a tombstone
+            // until an explicit future view registration reopens the identity.
             tracing::debug!(
                 capsule_id = %id,
                 principal = %principal,
@@ -4220,6 +4284,41 @@ mod tests {
         cancelled_for: Arc<std::sync::Mutex<Vec<PrincipalId>>>,
     }
 
+    struct BlockingQuiesceCapsule {
+        id: CapsuleId,
+        manifest: CapsuleManifest,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl Capsule for BlockingQuiesceCapsule {
+        fn id(&self) -> &CapsuleId {
+            &self.id
+        }
+
+        fn manifest(&self) -> &CapsuleManifest {
+            &self.manifest
+        }
+
+        fn state(&self) -> CapsuleState {
+            CapsuleState::Ready
+        }
+
+        async fn load(&mut self, _ctx: &CapsuleContext) -> CapsuleResult<()> {
+            Ok(())
+        }
+
+        async fn unload(&mut self) -> CapsuleResult<()> {
+            Ok(())
+        }
+
+        async fn quiesce_for(&self, _principal: &PrincipalId) {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+    }
+
     #[async_trait::async_trait]
     impl Capsule for CancellableTestCapsule {
         fn id(&self) -> &CapsuleId {
@@ -4404,9 +4503,9 @@ mod tests {
             );
         }
 
-        // Bob's release is the LAST view: the full instance-scoped
-        // `request_cancel` + `unload` path runs, and no additional
-        // per-principal cancel substitutes for it.
+        // Bob's release is the LAST view: its principal-scoped fence closes
+        // first so late work cannot survive into teardown, followed by the
+        // full instance-scoped `request_cancel` + `unload` path.
         let removed = kernel.unload_one_capsule(&id, &bob).await.unwrap();
         assert!(removed);
         assert!(
@@ -4419,10 +4518,69 @@ mod tests {
         );
         assert_eq!(
             cancelled_for.lock().expect("cancelled_for mutex").clone(),
-            vec![alice],
-            "the last release goes through the instance-scoped path, not \
-             request_cancel_for"
+            vec![alice, bob],
+            "every releasing principal must cross its lifecycle fence, including \
+             the last view before instance teardown"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn registration_cannot_resume_principal_until_old_view_finishes_quiescing() {
+        let (_d, home) = scratch_home();
+        let kernel = test_kernel_with_home(home).await;
+        let id = CapsuleId::new("serialized-lifecycle").unwrap();
+        let alice = PrincipalId::new("alice").unwrap();
+        let bob = PrincipalId::new("bob").unwrap();
+        let hash = astrid_capsule::registry::WasmHash::from_raw("serialized-lifecycle-hash");
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+
+        {
+            let mut registry = kernel.capsules.write().await;
+            registry
+                .register_owned_by_default(
+                    Box::new(BlockingQuiesceCapsule {
+                        id: id.clone(),
+                        manifest: CapsuleManifest::default(),
+                        entered: Arc::clone(&entered),
+                        release: Arc::clone(&release),
+                    }),
+                    hash.clone(),
+                    &alice,
+                )
+                .unwrap();
+            registry.register_existing(&id, &hash, &bob).unwrap();
+        }
+
+        let unloading = {
+            let kernel = Arc::clone(&kernel);
+            let id = id.clone();
+            let alice = alice.clone();
+            tokio::spawn(async move { kernel.unload_one_capsule(&id, &alice).await })
+        };
+        entered.notified().await;
+
+        let registering = {
+            let kernel = Arc::clone(&kernel);
+            let id = id.clone();
+            let hash = hash.clone();
+            let alice = alice.clone();
+            tokio::spawn(async move {
+                let mut registry = kernel.capsules.write().await;
+                registry.register_existing(&id, &hash, &alice)
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !registering.is_finished(),
+            "registration/resume must wait behind the old view's quiescence"
+        );
+
+        release.notify_one();
+        assert!(unloading.await.unwrap().unwrap());
+        registering.await.unwrap().unwrap();
+        assert!(kernel.capsules.read().await.get_for(&alice, &id).is_some());
+        assert!(kernel.capsules.read().await.get_for(&bob, &id).is_some());
     }
 
     #[tokio::test(flavor = "multi_thread")]

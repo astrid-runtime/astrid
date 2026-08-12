@@ -900,3 +900,38 @@ fn legacy_nonrestricted_profile_preserves_existing_egress_behavior() {
     assert!(state.principal_egress_allows("api.example.com", Some(443)));
     assert!(state.principal_process_allows("anything"));
 }
+
+#[test]
+fn recv_profile_load_failure_installs_restricted_authority_floor() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let mut state = minimal_host_state(rt.handle().clone());
+    let dir = tempfile::tempdir().unwrap();
+    let home = astrid_core::dirs::AstridHome::from_path(dir.path());
+    let principal = astrid_core::PrincipalId::new("broken-profile").unwrap();
+    let path = astrid_core::profile::PrincipalProfile::path_for(&home, &principal);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "this is not valid = [toml").unwrap();
+    state.profile_cache = Some(Arc::new(
+        crate::profile_cache::PrincipalProfileCache::with_home(home),
+    ));
+    let message = astrid_events::ipc::IpcMessage::new(
+        Topic::from_raw("user.v1.prompt"),
+        astrid_events::ipc::IpcPayload::RawJson(serde_json::json!({})),
+        uuid::Uuid::new_v4(),
+    )
+    .with_principal(principal.to_string());
+
+    state.install_recv_invocation_context(&message);
+    assert!(!state.invocation_profile_authorized);
+    assert!(
+        state
+            .effective_profile()
+            .groups
+            .iter()
+            .any(|group| group == astrid_core::groups::BUILTIN_RESTRICTED)
+    );
+    assert!(!state.principal_egress_allows("api.example.com", Some(443)));
+    assert!(!state.principal_process_allows("curl"));
+}

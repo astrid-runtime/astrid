@@ -233,6 +233,12 @@ fn publish_inner(
     device_key_id: Option<&str>,
     origin: astrid_events::ipc::MessageOrigin,
 ) -> Result<(), ErrorCode> {
+    // View retirement is an authority fence, not merely a liveness hint. A
+    // guest invocation that raced unregister retains a cancelled per-principal
+    // token and may no longer publish effects onto the bus.
+    if !state.invocation_authority_active() {
+        return Err(ErrorCode::CapabilityDenied);
+    }
     if topic.len() > 256 {
         return Err(ErrorCode::InvalidInput);
     }

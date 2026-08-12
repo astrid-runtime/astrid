@@ -334,9 +334,8 @@ impl OwnershipStore {
         &self,
         alias: PrincipalId,
     ) -> Result<PrincipalDeletionGuard, OwnershipError> {
-        let mut hasher = blake3::Hasher::new_derive_key(
-            "astrid legacy alias deletion reservation v1",
-        );
+        let mut hasher =
+            blake3::Hasher::new_derive_key("astrid legacy alias deletion reservation v1");
         hasher.update(alias.as_str().as_bytes());
         let reservation_uid = PrincipalUid::from_bytes(*hasher.finalize().as_bytes());
         let guard = Arc::clone(&self.mutation_lock).lock_owned().await;

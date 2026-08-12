@@ -198,7 +198,13 @@ mod error_mapping_tests {
 /// reaches the success-path [`audit_fs`], so this is the single record for a
 /// denied read (exactly-once). The audited path is the resolved physical
 /// path the gate evaluated.
-fn gate_read(state: &HostState, physical: &std::path::Path) -> Result<(), ErrorCode> {
+fn gate_read(
+    state: &HostState,
+    physical: &std::path::Path,
+) -> Result<Option<crate::engine::wasm::PrincipalInvocationGuard>, ErrorCode> {
+    let operation = state
+        .begin_host_operation()
+        .map_err(|()| ErrorCode::CapabilityDenied)?;
     if let Some(gate) = state.security.clone() {
         let capsule_id = state.capsule_id.as_str().to_owned();
         let p = physical.to_string_lossy().to_string();
@@ -220,7 +226,7 @@ fn gate_read(state: &HostState, physical: &std::path::Path) -> Result<(), ErrorC
             return Err(ErrorCode::CapabilityDenied);
         }
     }
-    Ok(())
+    Ok(operation)
 }
 
 /// The mutation a write-gated fs op represents. Every mutation and removal
@@ -245,7 +251,10 @@ fn gate_write(
     state: &HostState,
     physical: &std::path::Path,
     kind: WriteKind,
-) -> Result<(), ErrorCode> {
+) -> Result<Option<crate::engine::wasm::PrincipalInvocationGuard>, ErrorCode> {
+    let operation = state
+        .begin_host_operation()
+        .map_err(|()| ErrorCode::CapabilityDenied)?;
     if let Some(gate) = state.security.clone() {
         let capsule_id = state.capsule_id.as_str().to_owned();
         let p = physical.to_string_lossy().to_string();
@@ -272,7 +281,7 @@ fn gate_write(
             return Err(ErrorCode::CapabilityDenied);
         }
     }
-    Ok(())
+    Ok(operation)
 }
 
 /// Resolve and read-authorize a VFS path exposed to a sandboxed native child.
@@ -281,7 +290,7 @@ pub(super) fn authorize_process_read_path(
     raw_path: &str,
 ) -> Result<std::path::PathBuf, ErrorCode> {
     let resolved = resolve_path(state, raw_path).map_err(map_resolve_err)?;
-    gate_read(state, &resolved.physical)?;
+    let _operation = gate_read(state, &resolved.physical)?;
     Ok(resolved.physical)
 }
 
@@ -291,7 +300,8 @@ pub(super) fn authorize_process_write_path(
     state: &HostState,
     physical: &std::path::Path,
 ) -> Result<(), ErrorCode> {
-    gate_write(state, physical, WriteKind::Write)
+    let _operation = gate_write(state, physical, WriteKind::Write)?;
+    Ok(())
 }
 
 /// Convert a VFS metadata record into the WIT `FileStat`. The VFS only
@@ -336,7 +346,7 @@ impl fs::Host for HostState {
 
     fn fs_exists(&mut self, path: String) -> Result<bool, ErrorCode> {
         let resolved = resolve_path(self, &path).map_err(map_resolve_err)?;
-        gate_read(self, &resolved.physical)?;
+        let _operation = gate_read(self, &resolved.physical)?;
         let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
         let exists =
             util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {
@@ -361,7 +371,7 @@ impl fs::Host for HostState {
 
     fn fs_mkdir(&mut self, path: String) -> Result<(), ErrorCode> {
         let resolved = resolve_path(self, &path).map_err(map_resolve_err)?;
-        gate_write(self, &resolved.physical, WriteKind::Write)?;
+        let _operation = gate_write(self, &resolved.physical, WriteKind::Write)?;
         let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
 
         // Strict-create semantics per `astrid:fs@1.0.0` (fs-mkdir
@@ -421,7 +431,7 @@ impl fs::Host for HostState {
         // unstubs the idempotent variant the capsule contract
         // promises.
         let resolved = resolve_path(self, &path).map_err(map_resolve_err)?;
-        gate_write(self, &resolved.physical, WriteKind::Write)?;
+        let _operation = gate_write(self, &resolved.physical, WriteKind::Write)?;
         let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
         let result =
             util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {
@@ -445,7 +455,7 @@ impl fs::Host for HostState {
 
     fn fs_readdir(&mut self, path: String) -> Result<Vec<String>, ErrorCode> {
         let resolved = resolve_path(self, &path).map_err(map_resolve_err)?;
-        gate_read(self, &resolved.physical)?;
+        let _operation = gate_read(self, &resolved.physical)?;
         let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
         let result =
             util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {
@@ -470,7 +480,7 @@ impl fs::Host for HostState {
 
     fn fs_stat(&mut self, path: String) -> Result<FileStat, ErrorCode> {
         let resolved = resolve_path(self, &path).map_err(map_resolve_err)?;
-        gate_read(self, &resolved.physical)?;
+        let _operation = gate_read(self, &resolved.physical)?;
         let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
         let result =
             util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {
@@ -501,7 +511,7 @@ impl fs::Host for HostState {
 
     fn fs_unlink(&mut self, path: String) -> Result<(), ErrorCode> {
         let resolved = resolve_path(self, &path).map_err(map_resolve_err)?;
-        gate_write(self, &resolved.physical, WriteKind::Delete)?;
+        let _operation = gate_write(self, &resolved.physical, WriteKind::Delete)?;
         let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
         let result =
             util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {
@@ -525,7 +535,7 @@ impl fs::Host for HostState {
 
     fn read_file(&mut self, path: String) -> Result<Vec<u8>, ErrorCode> {
         let resolved = resolve_path(self, &path).map_err(map_resolve_err)?;
-        gate_read(self, &resolved.physical)?;
+        let _operation = gate_read(self, &resolved.physical)?;
         let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
         // Sentinel string used to encode the "too large at stat time"
         // case as a `PermissionDenied` payload so we can re-raise it
@@ -596,7 +606,7 @@ impl fs::Host for HostState {
             return Err(ErrorCode::TooLarge);
         }
         let resolved = resolve_path(self, &path).map_err(map_resolve_err)?;
-        gate_write(self, &resolved.physical, WriteKind::Write)?;
+        let _operation = gate_write(self, &resolved.physical, WriteKind::Write)?;
         let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
         let result =
             util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {

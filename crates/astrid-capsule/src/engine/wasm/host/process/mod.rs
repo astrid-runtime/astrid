@@ -252,7 +252,7 @@ impl process::Host for HostState {
             },
         };
         let pid = child.id();
-        process_tracker.register(pid, call_id);
+        process_tracker.register(pid, self.effective_principal(), call_id);
 
         let output_result =
             util::bounded_block_on_cancellable(&handle, &semaphore, &cancel_token, async move {
@@ -488,7 +488,7 @@ impl process::Host for HostState {
         // common case), so the entry is registered with None — which
         // makes it eligible for the "conservative fallback" branch of
         // `cancel_by_call_ids` (cancelled by any matching event).
-        self.process_tracker.register(pid, None);
+        self.process_tracker.register(pid, principal.clone(), None);
 
         let res = match self.resource_table.push(managed) {
             Ok(res) => res,
@@ -801,6 +801,9 @@ impl process::Host for HostState {
     }
 
     fn attach(&mut self, id: String) -> Result<Resource<ProcessHandle>, ErrorCode> {
+        if !self.invocation_authority_active() {
+            return Err(ErrorCode::CapabilityDenied);
+        }
         // Deferred: materialising a `process-handle` resource over a registry
         // entry needs dual-typed dispatch in the resource table. The id-keyed
         // free functions below ARE the documented `attach(id)?.method()`

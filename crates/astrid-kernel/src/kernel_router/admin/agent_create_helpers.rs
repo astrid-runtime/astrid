@@ -124,8 +124,28 @@ pub(super) async fn provision_derived_principal(
         )
         .await;
     }
-    warm_created_principal(kernel, principal.clone());
+    finish_derived_principal(kernel, principal, source, load_capsules, profile).await
+}
 
+async fn finish_derived_principal(
+    kernel: &Arc<crate::Kernel>,
+    principal: PrincipalId,
+    source: PrincipalId,
+    load_capsules: Vec<String>,
+    profile: PrincipalProfile,
+) -> AdminResponseBody {
+    if let Err(error) = kernel
+        .ensure_principal_capsules_ready(&principal, &load_capsules)
+        .await
+    {
+        return rollback_after_failure(
+            kernel,
+            &principal,
+            err_internal(format!("derived capsule readiness failed: {error}")),
+        )
+        .await;
+    }
+    kernel.publish_capsules_loaded().await;
     info!(%principal, %source, ?load_capsules, "Layer 6 agent.derive");
     success_json(serde_json::json!({
         "principal": principal.as_str(),
@@ -297,10 +317,22 @@ async fn rollback_derived_principal(
         .await
         .map_err(|response| format!("identity removal preparation returned {response:?}"))?;
     kernel
+        .capabilities
+        .begin_principal_retirement(principal.clone())
+        .await;
+    kernel
+        .allowance_store
+        .begin_principal_retirement(principal)
+        .map_err(|error| format!("allowance retirement fence failed: {error}"))?;
+    kernel
         .identity_store
         .unlink(AGENT_IDENTITY_PLATFORM, principal.as_str())
         .await
         .map_err(|error| format!("identity unlink failed: {error}"))?;
+    let mut cleanup_errors = Vec::new();
+    if let Err(error) = kernel.unload_principal_capsules(principal).await {
+        cleanup_errors.push(format!("capsule retirement failed: {error}"));
+    }
     let capsule_dir = kernel.astrid_home.principal_home(principal).capsules_dir();
     if let Ok(entries) = std::fs::read_dir(capsule_dir) {
         for capsule in entries.flatten().filter_map(|entry| {
@@ -310,21 +342,87 @@ async fn rollback_derived_principal(
                 .filter(std::fs::FileType::is_dir)
                 .and_then(|_| entry.file_name().into_string().ok())
         }) {
-            let _ = kernel
+            if let Err(error) = kernel
                 .kv
                 .clear_namespace(&format!("{principal}:capsule:{capsule}"))
-                .await;
+                .await
+            {
+                cleanup_errors.push(format!("KV namespace for capsule '{capsule}': {error}"));
+            }
         }
     }
-    let _ = std::fs::remove_file(principal_profile_path(kernel, principal));
-    let _ = std::fs::remove_dir_all(kernel.astrid_home.principal_home(principal).root());
-    remove_principal_key(kernel, principal);
-    let _ = std::fs::remove_dir_all(kernel.astrid_home.secrets_dir().join(principal.as_str()));
+    collect_remove_file(
+        &principal_profile_path(kernel, principal),
+        "profile",
+        &mut cleanup_errors,
+    );
+    collect_remove_dir(
+        kernel.astrid_home.principal_home(principal).root(),
+        "principal home",
+        &mut cleanup_errors,
+    );
+    collect_remove_file(
+        &kernel
+            .astrid_home
+            .keys_dir()
+            .join(format!("{principal}.key")),
+        "principal key",
+        &mut cleanup_errors,
+    );
+    collect_remove_dir(
+        &kernel.astrid_home.secrets_dir().join(principal.as_str()),
+        "principal secrets",
+        &mut cleanup_errors,
+    );
     kernel.profile_cache.invalidate(principal);
-    super::agent_delete::finish_identity_removal(kernel, pending)
+    if !cleanup_errors.is_empty() {
+        // Dropping `pending` intentionally retains its durable ownership
+        // reservation. The capability and allowance retirement fences also
+        // remain closed. A retry must finish reclamation before this alias can
+        // acquire fresh authority.
+        return Err(cleanup_errors.join("; "));
+    }
+    super::agent_delete::finish_identity_removal(kernel, principal, pending)
         .await
-        .map_err(|response| format!("identity removal completion returned {response:?}"))?;
-    Ok(())
+        .map_err(|response| format!("identity removal completion returned {response:?}"))
+}
+
+fn collect_remove_file(path: &Path, label: &str, errors: &mut Vec<String>) {
+    if let Err(error) = std::fs::remove_file(path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        errors.push(format!("{label} {}: {error}", path.display()));
+    }
+}
+
+fn collect_remove_dir(path: &Path, label: &str, errors: &mut Vec<String>) {
+    if let Err(error) = std::fs::remove_dir_all(path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        errors.push(format!("{label} {}: {error}", path.display()));
+    }
+}
+
+#[cfg(test)]
+mod rollback_cleanup_tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_collectors_preserve_every_reclamation_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("directory");
+        let file = temp.path().join("file");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(&file, b"state").unwrap();
+        let mut errors = Vec::new();
+
+        collect_remove_file(&directory, "profile", &mut errors);
+        collect_remove_dir(&file, "home", &mut errors);
+
+        assert_eq!(errors.len(), 2, "both independent failures must survive");
+        assert!(errors[0].contains("profile"));
+        assert!(errors[1].contains("home"));
+    }
 }
 
 /// Build, register, and provision a genuinely-new principal.
@@ -407,19 +505,12 @@ pub(super) async fn provision_new_principal(
         )
         .await
     {
-        // Best-effort rollback so partial state doesn't persist.
-        let _ = kernel.identity_store.delete_user(user.id).await;
-        remove_principal_key(kernel, &principal);
+        rollback_created_identity(kernel, &principal, user.id, &profile_path, false).await;
         return err_internal(format!("identity store link failed: {e}"));
     }
 
     if let Err(e) = profile.save_to_path(&profile_path) {
-        let _ = kernel
-            .identity_store
-            .unlink(AGENT_IDENTITY_PLATFORM, principal.as_str())
-            .await;
-        let _ = kernel.identity_store.delete_user(user.id).await;
-        remove_principal_key(kernel, &principal);
+        rollback_created_identity(kernel, &principal, user.id, &profile_path, false).await;
         return err_internal(format!("profile save failed: {e}"));
     }
 
@@ -432,13 +523,7 @@ pub(super) async fn provision_new_principal(
     // Roll back identity + profile so the agent isn't left in a state
     // where future invocations would leak into someone else's data.
     if let Err(e) = kernel.astrid_home.principal_home(&principal).ensure() {
-        let _ = kernel
-            .identity_store
-            .unlink(AGENT_IDENTITY_PLATFORM, principal.as_str())
-            .await;
-        let _ = kernel.identity_store.delete_user(user.id).await;
-        let _ = std::fs::remove_file(&profile_path);
-        remove_principal_key(kernel, &principal);
+        rollback_created_identity(kernel, &principal, user.id, &profile_path, true).await;
         return err_internal(format!(
             "principal home tree provisioning failed (rolled back): {e}"
         ));
@@ -448,14 +533,7 @@ pub(super) async fn provision_new_principal(
         && let Err(e) =
             materialize_cloned_capsule_installs(kernel, source, &principal, &profile.capsules)
     {
-        let _ = kernel
-            .identity_store
-            .unlink(AGENT_IDENTITY_PLATFORM, principal.as_str())
-            .await;
-        let _ = kernel.identity_store.delete_user(user.id).await;
-        let _ = std::fs::remove_file(&profile_path);
-        let _ = std::fs::remove_dir_all(kernel.astrid_home.principal_home(&principal).root());
-        remove_principal_key(kernel, &principal);
+        rollback_created_identity(kernel, &principal, user.id, &profile_path, true).await;
         return err_internal(format!("capsule install clone failed (rolled back): {e}"));
     }
 
@@ -484,6 +562,25 @@ pub(super) async fn provision_new_principal(
         "principal": principal.as_str(),
         "astrid_user_id": user.id,
     }))
+}
+
+async fn rollback_created_identity(
+    kernel: &crate::Kernel,
+    principal: &PrincipalId,
+    user_id: uuid::Uuid,
+    profile_path: &Path,
+    remove_home: bool,
+) {
+    let _ = kernel
+        .identity_store
+        .unlink(AGENT_IDENTITY_PLATFORM, principal.as_str())
+        .await;
+    let _ = kernel.identity_store.delete_user(user_id).await;
+    let _ = std::fs::remove_file(profile_path);
+    if remove_home {
+        let _ = std::fs::remove_dir_all(kernel.astrid_home.principal_home(principal).root());
+    }
+    remove_principal_key(kernel, principal);
 }
 
 fn remove_principal_key(kernel: &crate::Kernel, principal: &PrincipalId) {
