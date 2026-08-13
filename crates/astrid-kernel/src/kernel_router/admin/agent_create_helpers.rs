@@ -403,28 +403,6 @@ fn collect_remove_dir(path: &Path, label: &str, errors: &mut Vec<String>) {
     }
 }
 
-#[cfg(test)]
-mod rollback_cleanup_tests {
-    use super::*;
-
-    #[test]
-    fn cleanup_collectors_preserve_every_reclamation_error() {
-        let temp = tempfile::tempdir().unwrap();
-        let directory = temp.path().join("directory");
-        let file = temp.path().join("file");
-        std::fs::create_dir(&directory).unwrap();
-        std::fs::write(&file, b"state").unwrap();
-        let mut errors = Vec::new();
-
-        collect_remove_file(&directory, "profile", &mut errors);
-        collect_remove_dir(&file, "home", &mut errors);
-
-        assert_eq!(errors.len(), 2, "both independent failures must survive");
-        assert!(errors[0].contains("profile"));
-        assert!(errors[1].contains("home"));
-    }
-}
-
 /// Build, register, and provision a genuinely-new principal.
 ///
 /// The collision + backfill decision is made by the caller (`agent_create`);
@@ -918,4 +896,26 @@ pub(super) async fn backfill_keypair(
         "backfilled_keypair": true,
         "message": format!("backfilled missing keypair for existing principal {principal}"),
     }))
+}
+
+#[cfg(test)]
+mod rollback_cleanup_tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_collectors_preserve_every_reclamation_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("directory");
+        let file = temp.path().join("file");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(&file, b"state").unwrap();
+        let mut errors = Vec::new();
+
+        collect_remove_file(&directory, "profile", &mut errors);
+        collect_remove_dir(&file, "home", &mut errors);
+
+        assert_eq!(errors.len(), 2, "both independent failures must survive");
+        assert!(errors[0].contains("profile"));
+        assert!(errors[1].contains("home"));
+    }
 }

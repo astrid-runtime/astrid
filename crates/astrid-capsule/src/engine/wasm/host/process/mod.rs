@@ -252,7 +252,7 @@ impl process::Host for HostState {
             },
         };
         let pid = child.id();
-        process_tracker.register(pid, self.effective_principal(), call_id);
+        process_tracker.register_for_principal(pid, self.effective_principal(), call_id);
 
         let output_result =
             util::bounded_block_on_cancellable(&handle, &semaphore, &cancel_token, async move {
@@ -488,7 +488,8 @@ impl process::Host for HostState {
         // common case), so the entry is registered with None — which
         // makes it eligible for the "conservative fallback" branch of
         // `cancel_by_call_ids` (cancelled by any matching event).
-        self.process_tracker.register(pid, principal.clone(), None);
+        self.process_tracker
+            .register_for_principal(pid, principal.clone(), None);
 
         let res = match self.resource_table.push(managed) {
             Ok(res) => res,

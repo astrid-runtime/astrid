@@ -1559,47 +1559,58 @@ impl Kernel {
         principal: &PrincipalId,
         required: &[String],
     ) -> Result<(), String> {
-        use astrid_capsule::capsule::ReadyStatus;
-
-        self.ensure_principal_loaded(principal).await;
-        let capsules = {
-            let registry = self.capsules.read().await;
-            let mut capsules = Vec::with_capacity(required.len());
-            for name in required {
-                let id = astrid_capsule_types::CapsuleId::new(name.clone())
-                    .map_err(|error| format!("invalid required capsule '{name}': {error}"))?;
-                let capsule = registry.get_for(principal, &id).ok_or_else(|| {
-                    format!("required capsule '{name}' failed to load for principal '{principal}'")
-                })?;
-                capsules.push((name.clone(), capsule));
-            }
-            capsules
-        };
-
-        let timeout = std::time::Duration::from_millis(500);
-        let mut waits = tokio::task::JoinSet::new();
-        for (name, capsule) in capsules {
-            waits.spawn(async move { (name, capsule.wait_ready(timeout).await) });
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        {
+            let _ = (principal, required);
+            return Err("capsule loading is unavailable in the portable kernel build".to_string());
         }
-        while let Some(result) = waits.join_next().await {
-            let (name, status) = result
-                .map_err(|error| format!("required capsule readiness task failed: {error}"))?;
-            match status {
-                ReadyStatus::Ready => {},
-                ReadyStatus::Timeout => {
-                    return Err(format!(
-                        "required capsule '{name}' did not signal ready within {}ms",
-                        timeout.as_millis()
-                    ));
-                },
-                ReadyStatus::Crashed => {
-                    return Err(format!(
-                        "required capsule '{name}' exited before signaling ready"
-                    ));
-                },
+
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        {
+            use astrid_capsule::capsule::ReadyStatus;
+
+            self.ensure_principal_loaded(principal).await;
+            let capsules = {
+                let registry = self.capsules.read().await;
+                let mut capsules = Vec::with_capacity(required.len());
+                for name in required {
+                    let id = astrid_capsule_types::CapsuleId::new(name.clone())
+                        .map_err(|error| format!("invalid required capsule '{name}': {error}"))?;
+                    let capsule = registry.get_for(principal, &id).ok_or_else(|| {
+                        format!(
+                            "required capsule '{name}' failed to load for principal '{principal}'"
+                        )
+                    })?;
+                    capsules.push((name.clone(), capsule));
+                }
+                capsules
+            };
+
+            let timeout = std::time::Duration::from_millis(500);
+            let mut waits = tokio::task::JoinSet::new();
+            for (name, capsule) in capsules {
+                waits.spawn(async move { (name, capsule.wait_ready(timeout).await) });
             }
+            while let Some(result) = waits.join_next().await {
+                let (name, status) = result
+                    .map_err(|error| format!("required capsule readiness task failed: {error}"))?;
+                match status {
+                    ReadyStatus::Ready => {},
+                    ReadyStatus::Timeout => {
+                        return Err(format!(
+                            "required capsule '{name}' did not signal ready within {}ms",
+                            timeout.as_millis()
+                        ));
+                    },
+                    ReadyStatus::Crashed => {
+                        return Err(format!(
+                            "required capsule '{name}' exited before signaling ready"
+                        ));
+                    },
+                }
+            }
+            Ok(())
         }
-        Ok(())
     }
 
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]

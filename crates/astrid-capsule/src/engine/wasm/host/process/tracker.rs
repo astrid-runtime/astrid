@@ -30,8 +30,23 @@ impl ProcessTracker {
         Self::default()
     }
 
-    /// Register a child process PID with an optional call_id.
-    pub fn register(&self, pid: u32, principal: astrid_core::PrincipalId, call_id: Option<String>) {
+    /// Register a child process PID with an optional call ID.
+    ///
+    /// This compatibility entry point associates legacy callers with the
+    /// default principal. Principal-aware host paths use
+    /// [`register_for_principal`](Self::register_for_principal) so retirement
+    /// can cancel exactly one tenant's process group.
+    pub fn register(&self, pid: u32, call_id: Option<String>) {
+        self.register_for_principal(pid, astrid_core::PrincipalId::default(), call_id);
+    }
+
+    /// Register a child process PID under the principal that created it.
+    pub fn register_for_principal(
+        &self,
+        pid: u32,
+        principal: astrid_core::PrincipalId,
+        call_id: Option<String>,
+    ) {
         if pid == 0 {
             return; // Guard: PID 0 means "no process" on some platforms.
         }
@@ -202,15 +217,22 @@ mod tests {
     #[test]
     fn register_adds_pid() {
         let t = ProcessTracker::new();
-        t.register(42, principal(), None);
+        t.register_for_principal(42, principal(), None);
+        assert_eq!(t.active_pids_snapshot(), vec![42]);
+    }
+
+    #[test]
+    fn legacy_register_signature_remains_available() {
+        let t = ProcessTracker::new();
+        t.register(42, Some("legacy-call".into()));
         assert_eq!(t.active_pids_snapshot(), vec![42]);
     }
 
     #[test]
     fn unregister_removes_pid() {
         let t = ProcessTracker::new();
-        t.register(42, principal(), None);
-        t.register(99, principal(), Some("call-a".into()));
+        t.register_for_principal(42, principal(), None);
+        t.register_for_principal(99, principal(), Some("call-a".into()));
         t.unregister(42);
         assert_eq!(t.active_pids_snapshot(), vec![99]);
     }
@@ -218,7 +240,7 @@ mod tests {
     #[test]
     fn pid_zero_is_rejected() {
         let t = ProcessTracker::new();
-        t.register(0, principal(), None);
+        t.register_for_principal(0, principal(), None);
         assert!(t.active_pids_snapshot().is_empty());
     }
 
@@ -227,8 +249,8 @@ mod tests {
         // Re-registering a PID with a different call_id must replace
         // the prior entry, otherwise stale call_id associations leak.
         let t = ProcessTracker::new();
-        t.register(42, principal(), Some("call-a".into()));
-        t.register(42, principal(), Some("call-b".into()));
+        t.register_for_principal(42, principal(), Some("call-a".into()));
+        t.register_for_principal(42, principal(), Some("call-b".into()));
         assert_eq!(t.active_pids_snapshot(), vec![42]);
     }
 
@@ -268,9 +290,9 @@ mod tests {
         assert!(alice_ready.exists() && bob_ready.exists());
 
         let tracker = ProcessTracker::new();
-        tracker.register(alice_child.id(), principal(), None);
+        tracker.register_for_principal(alice_child.id(), principal(), None);
         let bob = astrid_core::PrincipalId::new("tracker-peer").unwrap();
-        tracker.register(bob_child.id(), bob, None);
+        tracker.register_for_principal(bob_child.id(), bob, None);
         tracker.cancel_for_principal(&principal(), &tokio::runtime::Handle::current());
 
         tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
@@ -293,7 +315,7 @@ mod tests {
         // unregister, `cancel_by_call_ids` must find no PIDs to
         // signal — verified here by observing the snapshot is empty.
         let t = ProcessTracker::new();
-        t.register(42, principal(), Some("call-a".into()));
+        t.register_for_principal(42, principal(), Some("call-a".into()));
         t.unregister(42);
         assert!(t.active_pids_snapshot().is_empty());
     }
