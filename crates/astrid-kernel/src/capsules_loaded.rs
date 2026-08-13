@@ -1,18 +1,19 @@
 //! Helpers for the `astrid.v1.capsules_loaded` broadcast payload.
 //!
 //! The kernel surfaces, per loaded capsule, its installed `meta.json` plus its
-//! tool surface. A surface baked into `meta.json` at build time is forwarded
-//! verbatim; one that was not baked is filled in by the kernel probing the live
-//! capsule's `tool_describe` and injecting the result ([`inject_tools`]), so an
-//! un-rebuilt (or third-party) capsule still contributes a complete surface.
-//! Either way the kernel invokes-and-forwards — it does not interpret the
-//! descriptors, the way a Linux uevent carries a device's attributes and leaves
-//! all interpretation to userspace. A sandboxed consumer (e.g. the sage-mcp
-//! broker) derives a deterministic tool surface from this signal, instead of a
-//! racy describe fan-out, without itself gaining filesystem access.
+//! live tool surface. The reserved `tools` field is removed from installed
+//! metadata before the kernel probes the capsule's `tool_describe`; a successful
+//! probe injects the current result ([`inject_tools`]), while an unavailable or
+//! failed probe leaves the field absent so consumers can fall back to describe
+//! fan-out. This also prevents tool surfaces baked by older Astrid releases from
+//! suppressing that fallback. The kernel invokes-and-forwards — it does not
+//! interpret the descriptors, the way a Linux uevent carries a device's
+//! attributes and leaves all interpretation to userspace. A sandboxed consumer
+//! (e.g. the sage-mcp broker) derives a deterministic tool surface from this
+//! signal without itself gaining filesystem access.
 //!
 //! These helpers are the pure payload-assembly pieces ([`read_capsule_meta_opaque`],
-//! [`meta_has_tools`], [`inject_tools`], [`build_capsules_loaded_payload`]), kept
+//! [`without_tools`], [`inject_tools`], [`build_capsules_loaded_payload`]), kept
 //! off [`crate::Kernel`] so they are unit-testable without a running kernel; the
 //! live `tool_describe` probe itself lives in `Kernel::publish_capsules_loaded`.
 
@@ -29,6 +30,23 @@ use serde_json::{Value, json};
 pub(crate) fn read_capsule_meta_opaque(source_dir: &Path) -> Option<Value> {
     let bytes = std::fs::read(source_dir.join("meta.json")).ok()?;
     serde_json::from_slice(&bytes).ok()
+}
+
+/// Remove the reserved live `tools` field from opaque installed metadata.
+///
+/// Older Astrid releases persisted build-time tool descriptors in `meta.json`.
+/// They must not be treated as current: a run-loop capsule needs an absent field
+/// to trigger consumer describe fan-out, and a failed live probe must not expose
+/// stale descriptors. Other metadata, including non-object values, remains
+/// untouched.
+pub(crate) fn without_tools(meta: Option<Value>) -> Option<Value> {
+    meta.map(|value| match value {
+        Value::Object(mut map) => {
+            map.remove("tools");
+            Value::Object(map)
+        },
+        other => other,
+    })
 }
 
 /// Inject a freshly-described `tools` array into a capsule's opaque `meta`.
@@ -92,6 +110,27 @@ mod tests {
         // Non-object meta -> fresh object (don't lose the tools).
         let out2 = inject_tools(Some(json!("oops")), tools.clone());
         assert_eq!(out2["tools"], tools);
+    }
+
+    #[test]
+    fn without_tools_removes_legacy_surface_and_preserves_other_meta() {
+        let meta = json!({
+            "version": "1.0.0",
+            "tools": [{ "name": "stale_tool" }],
+            "wasm_hash": "abc"
+        });
+
+        let out = without_tools(Some(meta)).expect("object metadata");
+
+        assert!(out.get("tools").is_none());
+        assert_eq!(out["version"], "1.0.0");
+        assert_eq!(out["wasm_hash"], "abc");
+    }
+
+    #[test]
+    fn without_tools_preserves_absent_and_nonobject_meta() {
+        assert_eq!(without_tools(None), None);
+        assert_eq!(without_tools(Some(json!("opaque"))), Some(json!("opaque")));
     }
 
     #[test]

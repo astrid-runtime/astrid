@@ -1963,12 +1963,16 @@ impl Kernel {
                 self.verify_workspace_capsule_tree(source_dir).ok()?;
                 meta
             });
+            // `tools` is live-owned data. Strip surfaces persisted by older
+            // Astrid releases before probing so an unavailable/failed probe
+            // leaves the field genuinely absent and consumer fan-out can run.
+            meta = capsules_loaded::without_tools(meta);
 
             // Probe the live instance for its tool surface and inject it. Best-
             // effort: a describe (or serialize) failure leaves `tools` absent
             // and the consumer falls back to its fan-out for this cycle.
-            match astrid_capsule::describe_loaded_capsule(capsule.as_ref()).await {
-                Ok(tools) => {
+            match astrid_capsule::describe_loaded_capsule_status(capsule.as_ref()).await {
+                Ok(Some(tools)) => {
                     // A tool advertises straight from its `#[astrid::tool]`
                     // annotation, but only EXECUTES if the manifest `[subscribe]`s
                     // its `tool.v1.execute.<name>` topic (the dispatcher routes
@@ -2003,6 +2007,18 @@ impl Kernel {
                             "failed to serialize live-described tools; capsule left uncaptured this cycle"
                         ),
                     }
+                },
+                Ok(None) => {
+                    // Pool-less / run-loop capsule: the interceptor describe
+                    // can't run, so leave `tools` ABSENT (not `[]`). The
+                    // consumer's describe fan-out then fires and the capsule's
+                    // own `tool.v1.request.describe` responder supplies its
+                    // surface. Injecting `[]` reads as "0 tools" and suppresses
+                    // the fan-out (#1198).
+                    tracing::debug!(
+                        capsule_id = %name,
+                        "pool-less/run-loop capsule: leaving tools absent so the describe fan-out fires (#1198)"
+                    );
                 },
                 Err(e) => tracing::debug!(
                     capsule_id = %name, error = %e,
