@@ -46,18 +46,63 @@ pub struct ToolDescriptor {
 /// Returns an error if the interceptor errors for any reason other than "not
 /// implemented", genuinely denies (a reason other than the unknown-action one),
 /// or returns a payload that is present but not the expected JSON shape.
+///
+/// Preserves the original signature: a pool-less run-loop capsule's *unknown*
+/// surface collapses to an empty vec here. Callers that must distinguish
+/// "unknown" from "empty" — to drive the describe fan-out (#1198) — use
+/// [`describe_loaded_capsule_status`] instead.
 pub async fn describe_loaded_capsule(capsule: &dyn Capsule) -> anyhow::Result<Vec<ToolDescriptor>> {
-    let result = match capsule.invoke_interceptor("tool_describe", &[], None).await {
+    Ok(describe_loaded_capsule_status(capsule)
+        .await?
+        .unwrap_or_default())
+}
+
+/// Like [`describe_loaded_capsule`], but preserves the "surface unknown" signal
+/// the load-time capture needs.
+///
+/// Returns:
+/// - `Ok(Some(tools))` — the describe ran and returned a (possibly empty) tool
+///   surface; the caller injects it into the `capsules_loaded` meta.
+/// - `Ok(None)` — the describe COULD NOT run because this is a pool-less
+///   run-loop capsule (`invoke_interceptor` reports `NotSupported`). The caller
+///   must then leave `tools` ABSENT (not `[]`), so the consumer's describe
+///   fan-out fires and the capsule's own `tool.v1.request.describe` responder
+///   supplies the surface. Injecting `[]` here reads as "0 tools" and suppresses
+///   the fan-out — the bug in #1198.
+///
+/// # Errors
+///
+/// Same as [`describe_loaded_capsule`].
+pub async fn describe_loaded_capsule_status(
+    capsule: &dyn Capsule,
+) -> anyhow::Result<Option<Vec<ToolDescriptor>>> {
+    interpret_describe_result(capsule.invoke_interceptor("tool_describe", &[], None).await)
+}
+
+/// Pure mapping of a `tool_describe` interceptor outcome to a captured tool
+/// surface. Split out from [`describe_loaded_capsule`] so the capture semantics
+/// — especially the pool-less `NotSupported => None` case that fixes #1198 — are
+/// unit-testable without a live capsule.
+fn interpret_describe_result(
+    outcome: Result<InterceptResult, crate::error::CapsuleError>,
+) -> anyhow::Result<Option<Vec<ToolDescriptor>>> {
+    let result = match outcome {
         Ok(r) => r,
-        Err(e) if is_unsupported(&e) => return Ok(Vec::new()),
+        // Pool-less run-loop capsule: the interceptor path isn't available, so
+        // the tool surface is UNKNOWN — not empty. Signal absent (`None`) so the
+        // caller lets the describe fan-out supply it (#1198), rather than
+        // injecting `[]` and suppressing the fan-out.
+        Err(e) if is_unsupported(&e) => return Ok(None),
         Err(e) => return Err(anyhow::anyhow!("tool_describe interceptor failed: {e}")),
     };
 
     let payload = match result {
         InterceptResult::Continue(bytes) | InterceptResult::Final(bytes) => bytes,
-        // No `tool_describe` arm => "no tools", treated like NotSupported above.
+        // A capsule that CAN run interceptors but has no `#[astrid::tool]` arm
+        // (e.g. the broker) genuinely has zero static tools: captured-empty
+        // (`Some([])`), NOT absent — there is nothing for a fan-out to supply.
         InterceptResult::Deny { reason } if is_unknown_action(&reason) => {
-            return Ok(Vec::new());
+            return Ok(Some(Vec::new()));
         },
         // Any other deny is a genuine refusal — surface it.
         InterceptResult::Deny { reason } => {
@@ -66,10 +111,10 @@ pub async fn describe_loaded_capsule(capsule: &dyn Capsule) -> anyhow::Result<Ve
     };
 
     if payload.is_empty() {
-        return Ok(Vec::new());
+        return Ok(Some(Vec::new()));
     }
 
-    parse_tool_descriptors(&payload)
+    parse_tool_descriptors(&payload).map(Some)
 }
 
 /// Parse the `tools` array out of a `tool_describe` descriptor payload
@@ -149,6 +194,54 @@ fn is_unknown_action(reason: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1198: a pool-less run-loop capsule's `NotSupported` describe maps to
+    /// `None` (surface UNKNOWN → leave absent so the describe fan-out fires), NOT
+    /// to a captured-empty `Some([])` which reads as "0 tools" and suppresses it.
+    #[test]
+    fn pool_less_notsupported_maps_to_none_for_fan_out() {
+        let out = interpret_describe_result(Err(crate::error::CapsuleError::NotSupported(
+            "no interceptors".into(),
+        )));
+        assert!(matches!(out, Ok(None)));
+    }
+
+    /// A capsule that CAN run interceptors but has no `#[astrid::tool]` (the
+    /// broker) is captured-empty (`Some([])`), not absent — nothing to fan out.
+    #[test]
+    fn unknown_action_deny_is_captured_empty_not_absent() {
+        let out = interpret_describe_result(Ok(InterceptResult::Deny {
+            reason: "unknown hook action: tool_describe".into(),
+        }));
+        assert!(matches!(out, Ok(Some(ref v)) if v.is_empty()));
+    }
+
+    #[test]
+    fn described_tools_are_captured_as_some() {
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "tools": [{ "name": "t", "description": "d", "input_schema": { "type": "object" } }]
+        }))
+        .unwrap();
+        let tools = interpret_describe_result(Ok(InterceptResult::Continue(payload)))
+            .expect("ok")
+            .expect("some");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "t");
+    }
+
+    #[test]
+    fn empty_describe_payload_is_captured_empty() {
+        let out = interpret_describe_result(Ok(InterceptResult::Continue(Vec::new())));
+        assert!(matches!(out, Ok(Some(ref v)) if v.is_empty()));
+    }
+
+    #[test]
+    fn genuine_deny_surfaces_as_error() {
+        let out = interpret_describe_result(Ok(InterceptResult::Deny {
+            reason: "capability denied: caps:token:mint".into(),
+        }));
+        assert!(out.is_err());
+    }
 
     #[test]
     fn unknown_action_deny_matches_only_tool_describe() {

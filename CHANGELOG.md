@@ -9,6 +9,9 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Run-loop capsule tools now appear in `tools/list`.** A pool-less run-loop capsule's tool-describe path returned `NotSupported`, which was captured as a present-but-empty tool set, so the describe fan-out — which fires only on *absent* tools — never consulted the capsule's own `tool.v1.request.describe` responder. The load-time capture now distinguishes "couldn't capture" from "captured, empty" and leaves tools absent for pool-less capsules so the fan-out fires. Closes #1198.
 ### Removed
 
 - **The unused SurrealDB query wrapper and its dormant dependency graph have
