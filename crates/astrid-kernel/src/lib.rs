@@ -1785,6 +1785,10 @@ impl Kernel {
                 self.verify_workspace_capsule_tree(source_dir).ok()?;
                 meta
             });
+            // `tools` is live-owned data. Strip surfaces persisted by older
+            // Astrid releases before probing so an unavailable/failed probe
+            // leaves the field genuinely absent and consumer fan-out can run.
+            meta = capsules_loaded::without_tools(meta);
 
             // Probe the live instance for its tool surface and inject it. Best-
             // effort: a describe (or serialize) failure leaves `tools` absent
