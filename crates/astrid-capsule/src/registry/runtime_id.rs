@@ -97,11 +97,24 @@ impl RuntimeId {
 
     #[cfg(test)]
     pub(crate) fn for_test(capsule_id: CapsuleId, generation: u64) -> Self {
+        Self::for_test_scope(
+            capsule_id,
+            generation,
+            RuntimeScope::Principal(PrincipalUid::from_bytes([generation as u8; 32])),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_scope(
+        capsule_id: CapsuleId,
+        generation: u64,
+        scope: RuntimeScope,
+    ) -> Self {
         Self {
             key: RuntimeKey::new(
                 capsule_id,
                 WasmHash::from_raw(format!("test-artifact-{generation}")),
-                RuntimeScope::Principal(PrincipalUid::from_bytes([generation as u8; 32])),
+                scope,
             ),
             generation,
         }

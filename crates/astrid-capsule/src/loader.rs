@@ -132,6 +132,7 @@ impl CapsuleLoader {
                     self.http_limits,
                 )
                 .with_compiled_cache(self.compiled_wasm.clone())
+                .with_runtime_id(self.runtime_id.clone())
                 .with_deferred_activation(self.defer_background_activation),
             ));
         }

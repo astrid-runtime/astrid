@@ -156,6 +156,12 @@ async fn await_runtime_activation(
     true
 }
 
+fn runtime_id_is_system(runtime_id: Option<&crate::registry::RuntimeId>) -> bool {
+    runtime_id.is_some_and(|runtime_id| {
+        runtime_id.key().scope() == crate::registry::RuntimeScope::SystemResident
+    })
+}
+
 /// Executes WASM Components via the wasmtime Component Model.
 ///
 /// This engine sandboxes execution in wasmtime and wires the
@@ -228,6 +234,11 @@ pub struct WasmEngine {
     /// Explicit kernel-classified SystemResident scope. Never inferred from a
     /// caller at invocation time.
     system_runtime: bool,
+    /// Preallocated authority identity for this mutable runtime generation.
+    /// Production loaders always stamp it before load; compatibility callers
+    /// without one remain principal-scoped rather than inferring authority
+    /// from context shape.
+    runtime_id: Option<crate::registry::RuntimeId>,
     /// Shared per-principal overlay VFS registry (Layer 4, issue #668).
     ///
     /// Populated at load time from the kernel-wide registry.
@@ -462,6 +473,7 @@ impl WasmEngine {
             profile_cache: None,
             owner_principal: None,
             system_runtime: false,
+            runtime_id: None,
             overlay_registry: None,
             fuel_ledger,
             memory_ledger,
@@ -479,6 +491,15 @@ impl WasmEngine {
     #[must_use]
     pub fn with_compiled_cache(mut self, cache: CompiledWasmCache) -> Self {
         self.compiled_cache = cache;
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_runtime_id(
+        mut self,
+        runtime_id: Option<crate::registry::RuntimeId>,
+    ) -> Self {
+        self.runtime_id = runtime_id;
         self
     }
 
@@ -1717,11 +1738,10 @@ impl ExecutionEngine for WasmEngine {
 
         let capsule_dir_for_verify = self._capsule_dir.clone();
         let compiled_cache = self.compiled_cache.clone();
-        // Production system contexts use the reserved default alias only as a
-        // transport placeholder and deliberately carry no principal home.
-        // The real default-principal runtime always receives its concrete home.
-        let system_runtime =
-            ctx.principal == astrid_core::PrincipalId::default() && ctx.home_root.is_none();
+        // Authority scope comes only from the kernel-reserved RuntimeId. A
+        // missing identity is a compatibility/test path and fails closed to a
+        // principal runtime; context shape must never grant system authority.
+        let system_runtime = runtime_id_is_system(self.runtime_id.as_ref());
         // Inlined async block — was previously wrapped in
         // `block_in_place` to permit nested `block_on` for the VFS
         // `register_dir` calls. Component-model async lets us `.await`
@@ -3836,6 +3856,21 @@ fn wasm_exports_contain(name: &str, wasm_bytes: &[u8]) -> bool {
 mod tests {
     use super::*;
     use astrid_events::ipc::Topic;
+
+    #[test]
+    fn runtime_scope_is_the_only_system_authority_source() {
+        let id = crate::capsule::CapsuleId::from_static("scope-test");
+        let principal = crate::registry::RuntimeId::for_test(id.clone(), 1);
+        let system = crate::registry::RuntimeId::for_test_scope(
+            id,
+            2,
+            crate::registry::RuntimeScope::SystemResident,
+        );
+
+        assert!(!runtime_id_is_system(None));
+        assert!(!runtime_id_is_system(Some(&principal)));
+        assert!(runtime_id_is_system(Some(&system)));
+    }
 
     // ── git-managed workspace detection (gitoxide work-tree discovery) ──
     //

@@ -68,12 +68,45 @@ use astrid_mcp::{McpClient, SecureMcpClient, ServerManager, ServersConfig};
 use astrid_vfs::{HostVfs, OverlayVfsRegistry, Vfs};
 use dashmap::DashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 use tokio::sync::{Mutex, RwLock};
 
 const SCOPED_TOPIC_PROBE_SENTINEL: &str = "\0astrid.scoped-topic\0";
 const SCOPED_SERVICE_PROBE_SENTINEL: &str = "\0astrid.scoped-service\0";
+pub(crate) const REACT_WATCHDOG_TOPIC: &str = "astrid.v1.watchdog.tick";
+const WATCHDOG_PUBLISH_BATCH: usize = 32;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CapsuleViewKey {
+    principal: PrincipalId,
+    capsule: CapsuleId,
+}
+
+struct CapsuleViewLease {
+    key: CapsuleViewKey,
+    lock: Weak<Mutex<()>>,
+    locks: Arc<DashMap<CapsuleViewKey, Weak<Mutex<()>>>>,
+}
+
+impl Drop for CapsuleViewLease {
+    fn drop(&mut self) {
+        self.locks.remove_if(&self.key, |_, stored| {
+            stored.ptr_eq(&self.lock) && stored.strong_count() == 0
+        });
+    }
+}
+
+struct CapsuleViewGuard {
+    held: Option<tokio::sync::OwnedMutexGuard<()>>,
+    _lease: CapsuleViewLease,
+}
+
+impl Drop for CapsuleViewGuard {
+    fn drop(&mut self) {
+        drop(self.held.take());
+    }
+}
 
 /// The core Operating System Kernel.
 pub struct Kernel {
@@ -234,6 +267,13 @@ pub struct Kernel {
     /// path, so queue them instead of letting admin-driven warms stampede the
     /// daemon and starve unrelated HTTP/auth routes.
     capsule_load_lock: Mutex<()>,
+    /// Serializes lifecycle transitions for one `(principal, capsule)` view.
+    ///
+    /// The global load lock protects short publication and retirement edges;
+    /// this narrower lock remains held while an old view quiesces so an
+    /// identical view cannot resume it mid-drain. Weak values make idle keys
+    /// self-evicting without an unbounded fleet-history map.
+    capsule_view_locks: Arc<DashMap<CapsuleViewKey, Weak<Mutex<()>>>>,
     /// Ephemeral mode: shut down immediately when the last client disconnects.
     pub ephemeral: AtomicBool,
     /// Instant when the kernel was booted (for uptime calculation). Crate-
@@ -372,7 +412,74 @@ struct PreparedRuntimeReplacement {
     system_runtime: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeResidency {
+    Principal,
+    SystemResident,
+}
+
+impl RuntimeResidency {
+    const fn is_system(self) -> bool {
+        matches!(self, Self::SystemResident)
+    }
+}
+
+fn classify_runtime_residency(
+    manifest: &astrid_capsule_types::manifest::CapsuleManifest,
+    id: &astrid_capsule_types::CapsuleId,
+    system_allowed: bool,
+) -> Result<RuntimeResidency, anyhow::Error> {
+    let provides_uplink = !manifest.uplinks.is_empty();
+    if provides_uplink && !system_allowed {
+        anyhow::bail!(
+            "capsule '{id}' provides an uplink but is absent from the \
+             operator-owned [[uplinks]] allowlist"
+        );
+    }
+    if system_allowed && (manifest.capabilities.uplink || provides_uplink) {
+        Ok(RuntimeResidency::SystemResident)
+    } else {
+        Ok(RuntimeResidency::Principal)
+    }
+}
+
 impl Kernel {
+    async fn lock_capsule_view(
+        &self,
+        principal: &PrincipalId,
+        capsule: &CapsuleId,
+    ) -> CapsuleViewGuard {
+        let key = CapsuleViewKey {
+            principal: principal.clone(),
+            capsule: capsule.clone(),
+        };
+        let lock = match self.capsule_view_locks.entry(key.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                if let Some(lock) = entry.get().upgrade() {
+                    lock
+                } else {
+                    let lock = Arc::new(Mutex::new(()));
+                    entry.insert(Arc::downgrade(&lock));
+                    lock
+                }
+            },
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                let lock = Arc::new(Mutex::new(()));
+                entry.insert(Arc::downgrade(&lock));
+                lock
+            },
+        };
+        let lease = CapsuleViewLease {
+            key,
+            lock: Arc::downgrade(&lock),
+            locks: Arc::clone(&self.capsule_view_locks),
+        };
+        CapsuleViewGuard {
+            held: Some(lock.lock_owned().await),
+            _lease: lease,
+        }
+    }
+
     /// Install the operator-owned allowlist for explicit system-resident
     /// capsules. Capsule manifests cannot mutate or widen this policy.
     pub async fn set_system_capsules(&self, capsules: impl IntoIterator<Item = String>) {
@@ -920,6 +1027,7 @@ impl Kernel {
             http_limits,
             full_reload_in_flight: AtomicBool::new(false),
             capsule_load_lock: Mutex::new(()),
+            capsule_view_locks: Arc::new(DashMap::new()),
             ephemeral: AtomicBool::new(false),
             boot_time: astrid_runtime::time::Instant::now(),
             shutdown_tx: tokio::sync::watch::channel(false).0,
@@ -942,7 +1050,7 @@ impl Kernel {
         {
             drop(kernel_router::spawn_kernel_router(Arc::clone(&kernel)));
             drop(spawn_idle_monitor(Arc::clone(&kernel)));
-            drop(spawn_react_watchdog(Arc::clone(&kernel.event_bus)));
+            drop(spawn_react_watchdog(Arc::clone(&kernel)));
             drop(spawn_capsule_health_monitor(Arc::clone(&kernel)));
         }
         // Passive storm diagnostics — subscribes synchronously inside the
@@ -1055,19 +1163,20 @@ impl Kernel {
             })?;
         self.verify_workspace_component_paths(&dir, &manifest)?;
         let id = astrid_capsule_types::CapsuleId::from_static(&manifest.package.name);
+        let _view_guard = self.lock_capsule_view(principal, &id).await;
+        let _load_guard = self.capsule_load_lock.lock().await;
+        if *principal != PrincipalId::default()
+            && self.capabilities.is_principal_retiring(principal).await
+        {
+            anyhow::bail!("cannot load capsule '{id}' for retiring principal '{principal}'");
+        }
         let wasm_hash = capsule_instance_hash(&manifest, &dir);
         // `capabilities.uplink` alone remains a principal-scoped daemon/host
         // grant unless the operator explicitly promotes it. A manifest that
         // actually provides an uplink must be operator-approved.
-        let provides_uplink = !manifest.uplinks.is_empty();
         let system_allowed = self.system_capsules.read().await.contains(id.as_str());
-        let system_runtime = system_allowed && (manifest.capabilities.uplink || provides_uplink);
-        if provides_uplink && !system_runtime {
-            anyhow::bail!(
-                "capsule '{id}' provides an uplink but is absent from the \
-                 operator-owned [[uplinks]] allowlist"
-            );
-        }
+        let system_runtime =
+            classify_runtime_residency(&manifest, &id, system_allowed)?.is_system();
         if system_runtime && !manifest.mcp_servers.is_empty() {
             anyhow::bail!(
                 "system-resident capsule '{id}' cannot host principal-bearing stdio MCP servers"
@@ -1356,15 +1465,8 @@ impl Kernel {
             );
         }
         let artifact = capsule_instance_hash(&manifest, source_dir);
-        let provides_uplink = !manifest.uplinks.is_empty();
         let system_allowed = self.system_capsules.read().await.contains(id.as_str());
-        let system_runtime = system_allowed && (manifest.capabilities.uplink || provides_uplink);
-        if provides_uplink && !system_runtime {
-            anyhow::bail!(
-                "capsule '{id}' provides an uplink but is absent from the \
-                 operator-owned [[uplinks]] allowlist"
-            );
-        }
+        let system_runtime = classify_runtime_residency(&manifest, id, system_allowed)?.is_system();
         if system_runtime && !manifest.mcp_servers.is_empty() {
             anyhow::bail!(
                 "system-resident capsule '{id}' cannot host principal-bearing stdio MCP servers"
@@ -1476,10 +1578,21 @@ impl Kernel {
             .prepare_runtime_replacement(id, &source_dir, principal, current_runtime.key().scope())
             .await?;
 
+        let load_guard = self.capsule_load_lock.lock().await;
+        if self.capabilities.is_principal_retiring(principal).await {
+            drop(load_guard);
+            prepared.capsule.retire();
+            prepared.capsule.request_cancel();
+            if let Err(cleanup) = prepared.capsule.unload().await {
+                tracing::warn!(capsule_id = %id, %cleanup, "Failed to unload replacement rejected by principal retirement");
+            }
+            anyhow::bail!("cannot replace capsule '{id}' for retiring principal '{principal}'");
+        }
         let (mut previous, replacement) = {
             let mut registry = self.capsules.write().await;
             if registry.runtime_id_for(principal, id).as_ref() != Some(&current_runtime) {
                 drop(registry);
+                drop(load_guard);
                 prepared.capsule.request_cancel();
                 prepared.capsule.unload().await?;
                 return Ok(RestartOutcome::Superseded);
@@ -1492,6 +1605,7 @@ impl Kernel {
                 )
             {
                 drop(registry);
+                drop(load_guard);
                 prepared.capsule.retire();
                 prepared.capsule.request_cancel();
                 if let Err(cleanup) = prepared.capsule.unload().await {
@@ -1531,6 +1645,7 @@ impl Kernel {
             replacement.publish();
             (replaced.previous, replacement)
         };
+        drop(load_guard);
 
         let outcome = unload_replaced_runtime(id, &mut previous).await;
         if let Err(error) = replacement
@@ -1633,7 +1748,6 @@ impl Kernel {
     /// Build or refresh one principal's capsule view from its own install set.
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     pub async fn ensure_principal_loaded(&self, principal: &PrincipalId) {
-        let _load_guard = self.capsule_load_lock.lock().await;
         if *principal != PrincipalId::default() {
             // The retirement fence is authoritative while deletion retains the
             // profile long enough for quota-aware state reclamation. Check it
@@ -1754,7 +1868,6 @@ impl Kernel {
 
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     async fn ensure_principal_uplinks_loaded(&self, principal: &PrincipalId) {
-        let _load_guard = self.capsule_load_lock.lock().await;
         if *principal != PrincipalId::default()
             && self.capabilities.is_principal_retiring(principal).await
         {
@@ -2173,7 +2286,6 @@ impl Kernel {
             Vec<(String, String, Option<serde_json::Value>)>,
         >::new();
         for (principal, capsule) in &capsules {
-            let principal = principal.to_string();
             let name = capsule.id().to_string();
             let mut meta = capsule.source_dir().and_then(|source_dir| {
                 self.verify_workspace_capsule_tree(source_dir).ok()?;
@@ -2189,7 +2301,9 @@ impl Kernel {
             // Probe the live instance for its tool surface and inject it. Best-
             // effort: a describe (or serialize) failure leaves `tools` absent
             // and the consumer falls back to its fan-out for this cycle.
-            match astrid_capsule::describe_loaded_capsule_status(capsule.as_ref()).await {
+            match astrid_capsule::describe_loaded_capsule_status_for(capsule.as_ref(), principal)
+                .await
+            {
                 Ok(Some(tools)) => {
                     // A tool advertises straight from its `#[astrid::tool]`
                     // annotation, but only EXECUTES if the manifest `[subscribe]`s
@@ -2244,9 +2358,9 @@ impl Kernel {
                 ),
             }
             by_principal
-                .entry(principal.clone())
+                .entry(principal.to_string())
                 .or_default()
-                .push((principal, name, meta));
+                .push((principal.to_string(), name, meta));
         }
         if by_principal.is_empty() {
             by_principal.insert(PrincipalId::default().to_string(), Vec::new());
@@ -2283,15 +2397,16 @@ impl Kernel {
         id: &astrid_capsule_types::CapsuleId,
         principal: &PrincipalId,
     ) -> Result<(), anyhow::Error> {
+        let view_guard = self.lock_capsule_view(principal, id).await;
         let registered = { self.capsules.read().await.get_for(principal, id).is_some() };
         if registered {
-            let _load_guard = self.capsule_load_lock.lock().await;
             if self.capabilities.is_principal_retiring(principal).await {
                 anyhow::bail!("cannot reload capsule '{id}' for retiring principal '{principal}'");
             }
             self.restart_capsule(id, principal, None).await?;
             self.publish_capsules_loaded().await;
         } else {
+            drop(view_guard);
             // Build or refresh this principal's view from its installed set.
             self.ensure_principal_loaded(principal).await;
             if self.capsules.read().await.get_for(principal, id).is_none() {
@@ -2327,7 +2442,8 @@ impl Kernel {
         id: &astrid_capsule_types::CapsuleId,
         principal: &PrincipalId,
     ) -> Result<bool, anyhow::Error> {
-        let _load_guard = self.capsule_load_lock.lock().await;
+        let _view_guard = self.lock_capsule_view(principal, id).await;
+        let load_guard = self.capsule_load_lock.lock().await;
         // A principal runtime is always torn down. An operator-owned
         // `SystemResident` runtime survives until its final view is released.
         let removed = {
@@ -2345,9 +2461,23 @@ impl Kernel {
         // drain. This avoids a lock cycle with admitted host calls that perform
         // generation-scoped registry reads.
         if removed.torn_down {
+            // The generation is no longer reachable from the registry. Close
+            // every admission path before releasing the global publication
+            // lock, then let generation-owned teardown drain independently.
+            // This preserves hard MCP process-tree cleanup without allowing a
+            // wedged child to block unrelated principals' lifecycle work.
             removed.capsule.retire();
+            removed.capsule.request_cancel();
+            drop(load_guard);
+            removed.capsule.quiesce_for(principal).await;
+        } else {
+            // The keyed view guard prevents this exact view from reattaching
+            // while its retirement tombstone drains. The old generation is
+            // still reachable by peer views, so only principal-scoped work is
+            // quiesced; unrelated lifecycle work need not wait behind it.
+            drop(load_guard);
+            removed.capsule.quiesce_for(principal).await;
         }
-        removed.capsule.quiesce_for(principal).await;
 
         // Explicitly unload the old capsule only when this was the last view.
         // There is no Drop impl that calls unload() (it's async), so we must do
@@ -2355,7 +2485,6 @@ impl Kernel {
         // Arc::get_mut requires exclusive ownership (strong_count == 1).
         if removed.torn_down {
             let mut old = removed.capsule;
-            old.request_cancel();
             let mut unloaded = false;
             for retry in 0..20_u32 {
                 if let Some(capsule) = std::sync::Arc::get_mut(&mut old) {
@@ -2907,6 +3036,10 @@ fn test_workspace_selection(home: &astrid_core::dirs::AstridHome) -> WorkspaceSe
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the complete kernel test fixture keeps every security-relevant dependency explicit"
+)]
 pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -> Arc<Kernel> {
     use astrid_capsule::profile_cache::PrincipalProfileCache;
 
@@ -3005,6 +3138,7 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         http_limits: astrid_capsule_types::HttpLimits::default(),
         full_reload_in_flight: AtomicBool::new(false),
         capsule_load_lock: Mutex::new(()),
+        capsule_view_locks: Arc::new(DashMap::new()),
         ephemeral: AtomicBool::new(false),
         boot_time: astrid_runtime::time::Instant::now(),
         shutdown_tx: tokio::sync::watch::channel(false).0,
@@ -3427,7 +3561,7 @@ async fn attempt_capsule_restart(
     );
 
     let capsule_id = astrid_capsule_types::CapsuleId::from_static(id_str);
-    let _lifecycle = kernel.capsule_load_lock.lock().await;
+    let _view_guard = kernel.lock_capsule_view(principal, &capsule_id).await;
     if kernel.capabilities.is_principal_retiring(principal).await {
         tracing::debug!(capsule_id = %id_str, %principal, "Skipping health restart for retiring principal");
         return;
@@ -3537,7 +3671,7 @@ fn spawn_capsule_health_monitor(kernel: Arc<Kernel>) -> astrid_runtime::JoinHand
             // RuntimeId already carries authority scope and generation, so each
             // mutable runtime is probed exactly once. A SystemResident runtime
             // likewise appears once regardless of its number of views.
-            let failures = collect_failed_runtimes_deduped(&ready_capsules);
+            let failures = collect_failed_runtimes(&ready_capsules);
             for (principal, id_str, _runtime_id, reason) in &failures {
                 tracing::error!(
                     capsule_id = %id_str,
@@ -3625,7 +3759,7 @@ fn tracker_should_be_retained(tracker: &RestartTracker, failed_this_tick: bool) 
 
 /// Collect failed runtime generations from the health-monitor snapshot.
 /// Returns `(requesting principal, capsule id, RuntimeId, failure reason)`.
-fn collect_failed_runtimes_deduped(
+fn collect_failed_runtimes(
     ready_capsules: &[(
         PrincipalId,
         astrid_capsule::registry::RuntimeId,
@@ -3639,11 +3773,9 @@ fn collect_failed_runtimes_deduped(
 )> {
     let mut failures = Vec::new();
     for (principal, runtime_id, capsule) in ready_capsules {
-        // Probe health FIRST — it borrows and does not allocate, and the common
-        // case (a healthy runtime) short-circuits before any `String` / key
-        // allocation. Only an actually-failed runtime pays for the `(id, hash)`
-        // dedup key; `HashSet::insert` returning `false` means this exact
-        // `(id, hash)` was already recorded this tick, so we skip the duplicate.
+        // The registry snapshot is already unique by RuntimeId generation.
+        // Probe health before allocating the diagnostic capsule-id String so
+        // healthy runtimes remain allocation-free on the common path.
         let astrid_capsule::capsule::CapsuleState::Failed(reason) = capsule.check_health() else {
             continue;
         };
@@ -3653,12 +3785,46 @@ fn collect_failed_runtimes_deduped(
     failures
 }
 
+fn watchdog_principals(registry: &astrid_capsule::registry::CapsuleRegistry) -> Vec<PrincipalId> {
+    let unique: std::collections::HashSet<_> = registry
+        .cloned_values_with_principal()
+        .into_iter()
+        .map(|(principal, _)| principal)
+        .collect();
+    let mut principals: Vec<_> = unique.into_iter().collect();
+    principals.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+    principals
+}
+
+async fn publish_watchdog_ticks(
+    event_bus: &EventBus,
+    principals: impl IntoIterator<Item = PrincipalId>,
+) {
+    for (index, principal) in principals.into_iter().enumerate() {
+        let msg = astrid_events::ipc::IpcMessage::new(
+            astrid_events::ipc::Topic::from_raw(REACT_WATCHDOG_TOPIC),
+            astrid_events::ipc::IpcPayload::Custom {
+                data: serde_json::json!({}),
+            },
+            uuid::Uuid::new_v4(),
+        )
+        .with_principal(principal.to_string());
+        let _ = event_bus.publish(astrid_events::AstridEvent::Ipc {
+            metadata: astrid_events::EventMetadata::new("kernel"),
+            message: msg,
+        });
+        if index != 0 && index.is_multiple_of(WATCHDOG_PUBLISH_BATCH) {
+            tokio::task::yield_now().await;
+        }
+    }
+}
+
 /// Spawns a periodic watchdog that publishes `astrid.v1.watchdog.tick` events every 5 seconds.
 ///
 /// The `ReAct` capsule (WASM guest) cannot use async timers, so this kernel-side task
 /// drives timeout enforcement by waking the capsule on a fixed interval. Each tick
 /// causes the capsule's `handle_watchdog_tick` interceptor to run `check_phase_timeout`.
-fn spawn_react_watchdog(event_bus: Arc<EventBus>) -> astrid_runtime::JoinHandle<()> {
+fn spawn_react_watchdog(kernel: Arc<Kernel>) -> astrid_runtime::JoinHandle<()> {
     astrid_runtime::spawn(async move {
         let mut interval = astrid_runtime::time::interval(std::time::Duration::from_secs(5));
         // The first tick fires immediately - skip it to give capsules time to load.
@@ -3669,17 +3835,17 @@ fn spawn_react_watchdog(event_bus: Arc<EventBus>) -> astrid_runtime::JoinHandle<
             metrics::counter!(METRIC_BACKGROUND_TICKS_TOTAL, "loop" => "react_watchdog")
                 .increment(1);
 
-            let msg = astrid_events::ipc::IpcMessage::new(
-                astrid_events::ipc::Topic::from_raw("astrid.v1.watchdog.tick"),
-                astrid_events::ipc::IpcPayload::Custom {
-                    data: serde_json::json!({}),
-                },
-                uuid::Uuid::new_v4(),
-            );
-            let _ = event_bus.publish(astrid_events::AstridEvent::Ipc {
-                metadata: astrid_events::EventMetadata::new("kernel"),
-                message: msg,
-            });
+            // A watchdog tick is per admitted principal, not an anonymous
+            // user event. Stamp one event for every live principal view so the
+            // dispatcher selects that principal's isolated runtimes plus any
+            // explicitly shared SystemResident services. An unstamped global
+            // fan-out would either drop principal runtimes or expose the same
+            // event indiscriminately across authority scopes.
+            let principals = {
+                let registry = kernel.capsules.read().await;
+                watchdog_principals(&registry)
+            };
+            publish_watchdog_ticks(&kernel.event_bus, principals).await;
         }
     })
 }
@@ -4672,6 +4838,36 @@ mod tests {
     }
 
     #[test]
+    fn runtime_residency_policy_distinguishes_grants_from_providers() {
+        let id = CapsuleId::new("uplink-policy").unwrap();
+        let mut capability_only = CapsuleManifest::default();
+        capability_only.capabilities.uplink = true;
+
+        assert_eq!(
+            classify_runtime_residency(&capability_only, &id, false).unwrap(),
+            RuntimeResidency::Principal
+        );
+        assert_eq!(
+            classify_runtime_residency(&capability_only, &id, true).unwrap(),
+            RuntimeResidency::SystemResident
+        );
+
+        let mut provider = CapsuleManifest::default();
+        provider
+            .uplinks
+            .push(astrid_capsule_types::manifest::UplinkDef {
+                name: "test".to_string(),
+                platform: "test".to_string(),
+                profile: astrid_core::UplinkProfile::Chat,
+            });
+        assert!(classify_runtime_residency(&provider, &id, false).is_err());
+        assert_eq!(
+            classify_runtime_residency(&provider, &id, true).unwrap(),
+            RuntimeResidency::SystemResident
+        );
+    }
+
+    #[test]
     fn capsule_discovery_extra_paths_include_principal_capsules_only() {
         let (_d, home) = scratch_home();
         let workspace = tempfile::tempdir().unwrap();
@@ -4767,6 +4963,117 @@ mod tests {
         .await
         .expect("unload deadlocked registry write against admitted registry read")
         .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retired_generation_drain_does_not_hold_global_lifecycle_lock() {
+        let (_d, home) = scratch_home();
+        let kernel = test_kernel_with_home(home).await;
+        let id = CapsuleId::new("blocking-retired-drain").unwrap();
+        let alice = PrincipalId::new("alice").unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+
+        kernel
+            .capsules
+            .write()
+            .await
+            .register_principal_runtime(
+                Box::new(BlockingQuiesceCapsule {
+                    id: id.clone(),
+                    manifest: CapsuleManifest::default(),
+                    entered: Arc::clone(&entered),
+                    release: Arc::clone(&release),
+                }),
+                astrid_capsule::registry::WasmHash::from_raw("blocking-retired-drain"),
+                &alice,
+                astrid_core::PrincipalUid::from_bytes([7; 32]),
+            )
+            .unwrap();
+
+        let unloading = {
+            let kernel = Arc::clone(&kernel);
+            let id = id.clone();
+            let alice = alice.clone();
+            tokio::spawn(async move { kernel.unload_one_capsule(&id, &alice).await })
+        };
+        entered.notified().await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            drop(kernel.capsule_load_lock.lock().await);
+        })
+        .await
+        .expect("an unrelated lifecycle must proceed while a retired generation drains");
+
+        release.notify_one();
+        assert!(unloading.await.unwrap().unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn capsule_view_lock_serializes_waiters_and_evicts_idle_key() {
+        let (_d, home) = scratch_home();
+        let kernel = test_kernel_with_home(home).await;
+        let principal = PrincipalId::new("lock-churn").unwrap();
+        let id = CapsuleId::new("lock-churn").unwrap();
+        let first = kernel.lock_capsule_view(&principal, &id).await;
+        assert_eq!(kernel.capsule_view_locks.len(), 1);
+
+        let waiting = {
+            let kernel = Arc::clone(&kernel);
+            let principal = principal.clone();
+            let id = id.clone();
+            tokio::spawn(async move { kernel.lock_capsule_view(&principal, &id).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished(), "the same typed view must serialize");
+
+        drop(first);
+        let second = waiting.await.expect("view-lock waiter");
+        assert_eq!(kernel.capsule_view_locks.len(), 1);
+        drop(second);
+        assert!(
+            kernel.capsule_view_locks.is_empty(),
+            "the final guard must evict its exact dead weak entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_capsule_view_waiter_evicts_dead_key() {
+        let (_d, home) = scratch_home();
+        let kernel = test_kernel_with_home(home).await;
+        let principal = PrincipalId::new("cancelled-lock").unwrap();
+        let id = CapsuleId::new("cancelled-lock").unwrap();
+        let first = kernel.lock_capsule_view(&principal, &id).await;
+        let waiting = {
+            let kernel = Arc::clone(&kernel);
+            let principal = principal.clone();
+            let id = id.clone();
+            tokio::spawn(async move { kernel.lock_capsule_view(&principal, &id).await })
+        };
+        let key = CapsuleViewKey {
+            principal: principal.clone(),
+            capsule: id.clone(),
+        };
+        loop {
+            let strong = kernel
+                .capsule_view_locks
+                .get(&key)
+                .map_or(0, |weak| weak.strong_count());
+            if strong >= 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(kernel.capsule_view_locks.len(), 1);
+
+        drop(first);
+        waiting.abort();
+        let result = waiting.await;
+        assert!(matches!(result, Err(error) if error.is_cancelled()));
+        assert!(
+            kernel.capsule_view_locks.is_empty(),
+            "a cancelled pre-acquisition lease must evict its dead weak key"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4930,12 +5237,19 @@ mod tests {
         };
         entered.notified().await;
 
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            drop(kernel.capsule_load_lock.lock().await);
+        })
+        .await
+        .expect("an unrelated lifecycle must proceed while one system view drains");
+
         let registering = {
             let kernel = Arc::clone(&kernel);
             let id = id.clone();
             let hash = hash.clone();
             let alice = alice.clone();
             tokio::spawn(async move {
+                let _view = kernel.lock_capsule_view(&alice, &id).await;
                 let _lifecycle = kernel.capsule_load_lock.lock().await;
                 let mut registry = kernel.capsules.write().await;
                 registry.register_existing(&id, &hash, &alice)
@@ -5054,6 +5368,83 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn watchdog_targets_every_live_principal_view_once() {
+        let (_d, home) = scratch_home();
+        let kernel = test_kernel_with_home(home).await;
+        let alice = PrincipalId::new("alice").unwrap();
+        let bob = PrincipalId::new("bob").unwrap();
+
+        {
+            let mut registry = kernel.capsules.write().await;
+            registry
+                .register_principal_runtime(
+                    Box::new(FailingTestCapsule {
+                        id: CapsuleId::new("alice-react").unwrap(),
+                        manifest: CapsuleManifest::default(),
+                    }),
+                    astrid_capsule::registry::WasmHash::from_raw("alice-react"),
+                    &alice,
+                    astrid_core::PrincipalUid::from_bytes([1; 32]),
+                )
+                .unwrap();
+            let system_id = CapsuleId::new("system-watchdog").unwrap();
+            let system_hash = astrid_capsule::registry::WasmHash::from_raw("system-watchdog");
+            registry
+                .register_system_runtime(
+                    Box::new(FailingTestCapsule {
+                        id: system_id.clone(),
+                        manifest: CapsuleManifest::default(),
+                    }),
+                    system_hash.clone(),
+                    &PrincipalId::default(),
+                )
+                .unwrap();
+            registry
+                .register_existing(&system_id, &system_hash, &bob)
+                .unwrap();
+        }
+
+        let principals = {
+            let registry = kernel.capsules.read().await;
+            watchdog_principals(&registry)
+        };
+        assert_eq!(principals.len(), 3);
+        assert!(principals.contains(&PrincipalId::default()));
+        assert!(principals.contains(&alice));
+        assert!(principals.contains(&bob));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watchdog_batching_yields_to_bounded_bus_receivers() {
+        const PRINCIPALS: usize = 500;
+        let bus = Arc::new(EventBus::with_capacity(64));
+        let mut subscriber = bus.subscribe_as("test");
+        let collecting = tokio::spawn(async move {
+            let mut event_count = 0;
+            while event_count < PRINCIPALS {
+                if subscriber.recv().await.is_some() {
+                    event_count += 1;
+                }
+            }
+            (event_count, subscriber.drain_lagged())
+        });
+        tokio::task::yield_now().await;
+
+        let principals = (0..PRINCIPALS).map(|index| {
+            PrincipalId::new(format!("watchdog-{index}")).expect("generated principal is valid")
+        });
+        publish_watchdog_ticks(&bus, principals).await;
+
+        let (event_count, lagged) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), collecting)
+                .await
+                .expect("receiver should drain the yielded watchdog batches")
+                .expect("collector task");
+        assert_eq!(event_count, PRINCIPALS);
+        assert_eq!(lagged, 0, "watchdog fan-out must not overrun the bus");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn health_monitor_tracks_one_explicit_system_runtime_generation() {
         let (_d, home) = scratch_home();
         let kernel = test_kernel_with_home(home).await;
@@ -5091,7 +5482,7 @@ mod tests {
             "system runtime health is represented once regardless of view count"
         );
 
-        let failures = collect_failed_runtimes_deduped(&ready);
+        let failures = collect_failed_runtimes(&ready);
         assert_eq!(
             failures.len(),
             1,
@@ -5105,9 +5496,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn health_monitor_keeps_two_distinct_hashes_of_one_id_separate() {
         // Two principals on DIFFERENT versions of the same capsule id resolve to
-        // two DISTINCT content hashes (per-principal installs). Dedup is by
-        // `(id, hash)`, so two failed runtimes for one id must surface as TWO
-        // failures (two independent restarts), never collapsed into one.
+        // two DISTINCT content hashes and immutable authority scopes. Two failed
+        // runtime generations for one id must surface as TWO independent
+        // restart identities, never collapse by capsule name.
         let (_d, home) = scratch_home();
         let kernel = test_kernel_with_home(home).await;
         let id = CapsuleId::new("two-versions").unwrap();
@@ -5120,23 +5511,25 @@ mod tests {
             let mut registry = kernel.capsules.write().await;
             // `default` on v1, `alice` on v2 — two distinct runtimes, one id.
             registry
-                .register_system_runtime(
+                .register_principal_runtime(
                     Box::new(FailingTestCapsule {
                         id: id.clone(),
                         manifest: CapsuleManifest::default(),
                     }),
                     hash_v1.clone(),
                     &default_p,
+                    astrid_core::PrincipalUid::from_bytes([1; 32]),
                 )
                 .unwrap();
             registry
-                .register_system_runtime(
+                .register_principal_runtime(
                     Box::new(FailingTestCapsule {
                         id: id.clone(),
                         manifest: CapsuleManifest::default(),
                     }),
                     hash_v2.clone(),
                     &alice,
+                    astrid_core::PrincipalUid::from_bytes([2; 32]),
                 )
                 .unwrap();
         }
@@ -5147,7 +5540,7 @@ mod tests {
         };
         assert_eq!(ready.len(), 2, "two distinct hashes → two view triples");
 
-        let failures = collect_failed_runtimes_deduped(&ready);
+        let failures = collect_failed_runtimes(&ready);
         assert_eq!(
             failures.len(),
             2,
