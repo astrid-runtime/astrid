@@ -553,6 +553,8 @@ jobs:
             new_packages="${new_packages:+$new_packages,}$package"
           done < <(git diff --name-only --diff-filter=A "$BASE_SHA"...HEAD -- 'crates/*/Cargo.toml')
           echo "new-packages=$new_packages" >> "$GITHUB_OUTPUT"
+          internal_excludes="astrid-types${new_packages:+,$new_packages}"
+          echo "internal-excludes=$internal_excludes" >> "$GITHUB_OUTPUT"
           if [ -n "$new_packages" ]; then
             echo "New packages have no baseline API and will be excluded: $new_packages"
           fi
@@ -580,22 +582,86 @@ jobs:
           if git log --format=%B "$BASE_SHA..$HEAD_SHA" \
             | grep -Eq '(^[A-Za-z0-9_-]+(\([^)]*\))?!:|^BREAKING[ -]CHANGE:)'; then
             echo "found=true" >> "$GITHUB_OUTPUT"
-            echo "Breaking-change marker found; cargo-semver-checks is skipped."
+            echo "Breaking-change marker found; the blocking astrid-types semver check is skipped."
           else
             echo "found=false" >> "$GITHUB_OUTPUT"
-            echo "No breaking-change marker found; running cargo-semver-checks."
+            echo "No breaking-change marker found; enforcing astrid-types compatibility."
           fi
 
-      - name: Check public API compatibility
+      - name: Check astrid-types API compatibility
         if: steps.api-inputs.outputs.run == 'true' && steps.breaking-change.outputs.found != 'true'
         uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2
         with:
           manifest-path: Cargo.toml
           baseline-rev: ${{ github.event.pull_request.base.sha }}
-          exclude: ${{ steps.api-inputs.outputs.new-packages }}
+          package: astrid-types
           feature-group: all-features
           rust-toolchain: manual
           github-token: ${{ github.token }}
+
+      - name: Install cargo-semver-checks for internal report
+        id: install-internal-semver
+        if: always() && steps.api-inputs.outputs.run == 'true'
+        uses: taiki-e/install-action@16b05812d776ae1dfaabc8277e421fb6d2506419 # v2
+        with:
+          tool: cargo-semver-checks
+
+      - name: Report internal crate API compatibility
+        id: internal-semver
+        if: always() && steps.api-inputs.outputs.run == 'true' && steps.install-internal-semver.outcome == 'success'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          INTERNAL_EXCLUDES: ${{ steps.api-inputs.outputs.internal-excludes }}
+          CARGO_TARGET_DIR: semver-checks/target
+        run: |
+          set -o pipefail
+
+          IFS=',' read -ra excludes <<< "$INTERNAL_EXCLUDES"
+          exclude_args=()
+          for package in "${excludes[@]}"; do
+            exclude_args+=(--exclude "$package")
+          done
+
+          set +e
+          cargo semver-checks check-release \
+            --manifest-path Cargo.toml \
+            --baseline-rev "$BASE_SHA" \
+            --all-features \
+            "${exclude_args[@]}" 2>&1 | tee internal-semver-checks.log
+          status=${PIPESTATUS[0]}
+          set -e
+
+          case "$status" in
+            0)
+              echo "result=success" >> "$GITHUB_OUTPUT"
+              ;;
+            100)
+              echo "result=findings" >> "$GITHUB_OUTPUT"
+              echo "::warning title=Internal Rust API change::Review the advisory cargo-semver-checks findings. Internal compatibility requires maintainer judgment and is not a merge blocker."
+              ;;
+            *)
+              echo "result=error" >> "$GITHUB_OUTPUT"
+              echo "::error title=Internal Rust API check failed::cargo-semver-checks could not complete (exit $status); this is a tool, build, or infrastructure failure, not an advisory API finding."
+              exit "$status"
+              ;;
+          esac
+
+      - name: Summarize Rust API compatibility policy
+        if: always() && steps.api-inputs.outputs.run == 'true'
+        env:
+          INTERNAL_OUTCOME: ${{ steps.internal-semver.outcome }}
+          INTERNAL_RESULT: ${{ steps.internal-semver.outputs.result }}
+        run: |
+          result="${INTERNAL_RESULT:-not-run}"
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ### Rust API compatibility
+
+          \`astrid-types\` is Astrid's supported Rust contract, so incompatible changes fail this job unless the commits explicitly declare a breaking change.
+
+          Other workspace crates are implementation details. Their semver findings remain visible for maintainer review, but are advisory so automation cannot force architecture changes merely to preserve an internal Rust surface.
+
+          Internal crate check result: **$result** (step outcome: **$INTERNAL_OUTCOME**). See #1480 for the publication policy.
+          EOF
 
   public-rust-api-diff:
     name: Public Rust API diff
@@ -654,12 +720,18 @@ jobs:
         run: |
           if git log --format=%B "$BASE_SHA..$HEAD_SHA" \
             | grep -Eq '(^[A-Za-z0-9_-]+(\([^)]*\))?!:|^BREAKING[ -]CHANGE:)'; then
-            DENY=""
-            echo "Breaking-change marker found; reporting public API diff without denying changes."
+            TYPES_DENY=""
+            echo "Breaking-change marker found; reporting astrid-types API diff without denying changes."
           else
-            DENY="--deny changed --deny removed"
-            echo "No breaking-change marker found; denying changed or removed public API items."
+            TYPES_DENY="--deny changed --deny removed"
+            echo "No breaking-change marker found; denying changed or removed astrid-types API items."
           fi
+
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          ### Public Rust API item diff
+
+          `astrid-types` changes are enforced. Internal crate diffs are report-only because those crates are implementation details whose compatibility requires maintainer judgment.
+          EOF
 
           packages=$(cargo metadata --locked --format-version 1 --no-deps \
             | jq -r '.packages[]
@@ -668,6 +740,12 @@ jobs:
               | [.name, .manifest_path] | @tsv')
 
           while IFS=$'\t' read -r package manifest_path; do
+            # Report every internal crate before the enforced astrid-types
+            # check, so a contract failure cannot hide advisory evidence for
+            # packages that happen to follow it in cargo metadata order.
+            if [ "$package" = "astrid-types" ]; then
+              continue
+            fi
             # A crate introduced by this PR has no manifest at the base SHA;
             # cargo-public-api cannot diff against a baseline where the
             # package does not exist, and the entire API is additive anyway.
@@ -682,11 +760,25 @@ jobs:
               --all-features \
               -ss \
               diff \
-              $DENY \
               --force \
               "$BASE_SHA..HEAD"
             echo "::endgroup::"
           done <<< "$packages"
+
+          types_deny_args=()
+          if [ -n "$TYPES_DENY" ]; then
+            types_deny_args=(--deny changed --deny removed)
+          fi
+          echo "::group::cargo public-api astrid-types (enforced contract)"
+          cargo +nightly-2026-06-29 public-api \
+            --package astrid-types \
+            --all-features \
+            -ss \
+            diff \
+            "${types_deny_args[@]}" \
+            --force \
+            "$BASE_SHA..HEAD"
+          echo "::endgroup::"
 
   gateway-openapi-contract:
     name: Gateway OpenAPI contract
