@@ -30,8 +30,7 @@ impl CapsuleRegistry {
                 "runtime generation changed before replacing '{id}' for '{principal}'"
             )));
         }
-        if !replacement.manifest().uplinks.is_empty() || replacement.manifest().capabilities.uplink
-        {
+        if !replacement.manifest().uplinks.is_empty() {
             return Err(CapsuleError::UnsupportedEntryPoint(format!(
                 "uplink capsule '{id}' requires explicit system runtime scope"
             )));
@@ -58,8 +57,7 @@ impl CapsuleRegistry {
                 "reserved runtime identity does not match principal replacement '{id}'"
             )));
         }
-        if !replacement.manifest().uplinks.is_empty() || replacement.manifest().capabilities.uplink
-        {
+        if !replacement.manifest().uplinks.is_empty() {
             return Err(CapsuleError::UnsupportedEntryPoint(format!(
                 "uplink capsule '{id}' requires explicit system runtime scope"
             )));

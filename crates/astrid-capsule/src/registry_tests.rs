@@ -358,6 +358,43 @@ impl MockCapsule {
             },
         }
     }
+
+    fn with_uplink_capability(mut self) -> Self {
+        self.manifest.capabilities.uplink = true;
+        self
+    }
+}
+
+#[test]
+fn uplink_host_capability_does_not_require_system_runtime_scope() {
+    let mut registry = CapsuleRegistry::new();
+    let alice = pid("alice");
+    let bob = pid("bob");
+    let id = CapsuleId::from_static("uplink-client");
+    let artifact = test_hash("uplink-client-artifact");
+
+    let alice_runtime = registry
+        .register_principal_runtime(
+            Box::new(MockCapsule::new("uplink-client").with_uplink_capability()),
+            artifact.clone(),
+            &alice,
+            uid(1),
+        )
+        .expect("uplink host access is an ordinary capability grant");
+    let bob_runtime = registry
+        .register_principal_runtime(
+            Box::new(MockCapsule::new("uplink-client").with_uplink_capability()),
+            artifact,
+            &bob,
+            uid(2),
+        )
+        .expect("each principal gets an isolated uplink-capable daemon");
+
+    assert_eq!(alice_runtime.key().scope(), RuntimeScope::Principal(uid(1)));
+    assert_eq!(bob_runtime.key().scope(), RuntimeScope::Principal(uid(2)));
+    assert_ne!(alice_runtime, bob_runtime);
+    assert!(registry.get_for(&alice, &id).is_some());
+    assert!(registry.get_for(&bob, &id).is_some());
 }
 
 #[async_trait]

@@ -198,6 +198,7 @@ pub struct Kernel {
     memory_ledger: astrid_capsule_types::MemoryLedger,
     /// Immutable verified WASM compilation cache shared by all
     /// authority-scoped capsule runtimes in this kernel.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     compiled_wasm: astrid_capsule::engine::wasm::CompiledWasmCache,
     /// Host-derived (operator-overridable) concurrency ceilings for capsule
     /// host calls, resolved once by the daemon and forwarded to every
@@ -911,6 +912,7 @@ impl Kernel {
             fuel_ledger: astrid_capsule_types::FuelLedger::default(),
             fuel_rate: astrid_capsule_types::FuelRateLimiter::default(),
             memory_ledger: astrid_capsule_types::MemoryLedger::default(),
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             compiled_wasm: astrid_capsule::engine::wasm::CompiledWasmCache::default(),
             runtime_limits,
             local_egress,
@@ -1054,12 +1056,15 @@ impl Kernel {
         self.verify_workspace_component_paths(&dir, &manifest)?;
         let id = astrid_capsule_types::CapsuleId::from_static(&manifest.package.name);
         let wasm_hash = capsule_instance_hash(&manifest, &dir);
-        let requests_system = manifest.capabilities.uplink || !manifest.uplinks.is_empty();
-        let system_runtime =
-            requests_system && self.system_capsules.read().await.contains(id.as_str());
-        if requests_system && !system_runtime {
+        // `capabilities.uplink` alone remains a principal-scoped daemon/host
+        // grant unless the operator explicitly promotes it. A manifest that
+        // actually provides an uplink must be operator-approved.
+        let provides_uplink = !manifest.uplinks.is_empty();
+        let system_allowed = self.system_capsules.read().await.contains(id.as_str());
+        let system_runtime = system_allowed && (manifest.capabilities.uplink || provides_uplink);
+        if provides_uplink && !system_runtime {
             anyhow::bail!(
-                "capsule '{id}' requests uplink/system residency but is absent from the \
+                "capsule '{id}' provides an uplink but is absent from the \
                  operator-owned [[uplinks]] allowlist"
             );
         }
@@ -1351,12 +1356,12 @@ impl Kernel {
             );
         }
         let artifact = capsule_instance_hash(&manifest, source_dir);
-        let requests_system = manifest.capabilities.uplink || !manifest.uplinks.is_empty();
-        let system_runtime =
-            requests_system && self.system_capsules.read().await.contains(id.as_str());
-        if requests_system && !system_runtime {
+        let provides_uplink = !manifest.uplinks.is_empty();
+        let system_allowed = self.system_capsules.read().await.contains(id.as_str());
+        let system_runtime = system_allowed && (manifest.capabilities.uplink || provides_uplink);
+        if provides_uplink && !system_runtime {
             anyhow::bail!(
-                "capsule '{id}' requests uplink/system residency but is absent from the \
+                "capsule '{id}' provides an uplink but is absent from the \
                  operator-owned [[uplinks]] allowlist"
             );
         }
@@ -2992,6 +2997,7 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         fuel_ledger: astrid_capsule_types::FuelLedger::default(),
         fuel_rate: astrid_capsule_types::FuelRateLimiter::default(),
         memory_ledger: astrid_capsule_types::MemoryLedger::default(),
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         compiled_wasm: astrid_capsule::engine::wasm::CompiledWasmCache::default(),
         runtime_limits: astrid_capsule_types::CapsuleRuntimeLimits::default(),
         local_egress: std::collections::HashMap::new(),

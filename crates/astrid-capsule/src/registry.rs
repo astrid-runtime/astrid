@@ -197,7 +197,7 @@ impl CapsuleRegistry {
         principal: &PrincipalId,
         uid: PrincipalUid,
     ) -> CapsuleResult<RuntimeId> {
-        if !capsule.manifest().uplinks.is_empty() || capsule.manifest().capabilities.uplink {
+        if !capsule.manifest().uplinks.is_empty() {
             return Err(CapsuleError::UnsupportedEntryPoint(format!(
                 "uplink capsule '{}' requires explicit system runtime scope",
                 capsule.id()
@@ -257,9 +257,7 @@ impl CapsuleRegistry {
         }
         let artifact = runtime_id.key.artifact().clone();
         let scope = runtime_id.key.scope();
-        if matches!(scope, RuntimeScope::Principal(_))
-            && (!capsule.manifest().uplinks.is_empty() || capsule.manifest().capabilities.uplink)
-        {
+        if matches!(scope, RuntimeScope::Principal(_)) && !capsule.manifest().uplinks.is_empty() {
             return Err(CapsuleError::UnsupportedEntryPoint(format!(
                 "uplink capsule '{id}' requires explicit system runtime scope"
             )));
@@ -347,7 +345,7 @@ impl CapsuleRegistry {
             )));
         }
         if matches!(runtime_id.key.scope(), RuntimeScope::Principal(_))
-            && (!capsule.manifest().uplinks.is_empty() || capsule.manifest().capabilities.uplink)
+            && !capsule.manifest().uplinks.is_empty()
         {
             return Err(CapsuleError::UnsupportedEntryPoint(format!(
                 "uplink capsule '{id}' requires explicit system runtime scope"
