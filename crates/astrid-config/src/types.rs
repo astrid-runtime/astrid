@@ -63,7 +63,8 @@ pub struct Config {
     pub retry: RetrySection,
     /// Agent identity seed (static fallback for spark.toml).
     pub spark: SparkSection,
-    /// Pre-declared uplink plugins to validate at startup.
+    /// Operator-approved uplink plugins. Workspace config cannot set or alter
+    /// this list because the daemon uses it as the `SystemResident` allowlist.
     pub uplinks: Vec<UplinkConfig>,
     /// Pre-configured platform identity links applied at every startup.
     pub identity: IdentitySection,
@@ -901,10 +902,12 @@ impl SparkSection {
 
 /// Pre-declared uplink plugin entry.
 ///
-/// Entries in `[[uplinks]]` declare which uplink plugins should be
-/// available and which behavioural profile they should expose. At startup, the
-/// daemon validates that each declared plugin is loaded and exposes a uplink
-/// with the expected profile.
+/// Entries in `[[uplinks]]` declare which uplink plugins should be available
+/// and which behavioural profile they should expose. This is operator-only
+/// configuration: a workspace layer cannot introduce or modify entries because
+/// the daemon also uses the plugin names as its `SystemResident` allowlist. At
+/// startup, the daemon validates that each declared plugin is loaded and
+/// exposes an uplink with the expected profile.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UplinkConfig {

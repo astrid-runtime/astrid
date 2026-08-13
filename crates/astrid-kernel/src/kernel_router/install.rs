@@ -15,9 +15,8 @@
 //!    runtime's build identity are accepted automatically.
 //! 3. On success, content-addressing has populated `bin/<hash>.wasm` /
 //!    `wit/<hash>.wit` and the per-capsule directory now holds the
-//!    manifest + meta. Trigger
-//!    [`load_all_capsules`](crate::Kernel::load_all_capsules) so the
-//!    new capsule is live without a daemon restart.
+//!    manifest + meta. Reconcile that exact capsule into a fresh live runtime
+//!    generation so installs and upgrades take effect without daemon restart.
 //! 4. Serialize the [`InstallOutput`] as a flat JSON payload the
 //!    dashboard can render.
 //!
@@ -137,12 +136,30 @@ pub(super) async fn handle_install_capsule(
         Err(e) => return KernelResponse::Error(format!("install task panicked: {e}")),
     };
 
-    // Pick up the new capsule without a daemon restart. The loader
-    // is idempotent on already-registered IDs.
-    kernel.ensure_principal_loaded(caller).await;
-    kernel.publish_capsules_loaded().await;
+    // Reconcile the exact installed capsule into the live runtime. An upgrade
+    // must create a new runtime generation even when its bytes/hash are
+    // unchanged (configuration and lifecycle state may have changed); merely
+    // calling `ensure_principal_loaded` would return early on the old view.
+    if let Err(error) = activate_installed_capsule(kernel, caller, &output).await {
+        return KernelResponse::Error(error);
+    }
 
     KernelResponse::Success(install_output_json(&output))
+}
+
+async fn activate_installed_capsule(
+    kernel: &Arc<crate::Kernel>,
+    caller: &astrid_core::principal::PrincipalId,
+    output: &InstallOutput,
+) -> Result<(), String> {
+    let manifest =
+        astrid_capsule::discovery::load_manifest(&output.target_dir.join("Capsule.toml"))
+            .map_err(|error| format!("installed capsule could not be activated: {error}"))?;
+    let id = astrid_capsule_types::CapsuleId::from_static(&manifest.package.name);
+    kernel
+        .reload_one_capsule(&id, caller)
+        .await
+        .map_err(|error| format!("capsule installed on disk but live activation failed: {error:#}"))
 }
 
 fn install_output_json(o: &InstallOutput) -> serde_json::Value {

@@ -21,6 +21,7 @@ use astrid_events::ipc::IpcPayload;
 use astrid_events::ipc::Topic;
 
 /// A minimal mock capsule for dispatch tests.
+#[derive(Clone)]
 struct MockCapsule {
     id: CapsuleId,
     manifest: CapsuleManifest,
@@ -163,7 +164,8 @@ fn publish_ipc(bus: &EventBus, topic: &str) {
             data: serde_json::json!({}),
         },
         uuid::Uuid::nil(),
-    );
+    )
+    .with_principal(astrid_core::PrincipalId::default().to_string());
     bus.publish(AstridEvent::Ipc {
         metadata: astrid_events::EventMetadata::new("test"),
         message: msg,
@@ -186,12 +188,34 @@ fn publish_ipc_as(bus: &EventBus, topic: &str, principal: &str) {
     });
 }
 
+fn publish_ipc_unstamped(bus: &EventBus, topic: &str) {
+    let message = astrid_events::ipc::IpcMessage::new(
+        Topic::from_raw(topic),
+        IpcPayload::Custom {
+            data: serde_json::json!({}),
+        },
+        uuid::Uuid::nil(),
+    );
+    bus.publish(AstridEvent::Ipc {
+        metadata: astrid_events::EventMetadata::new("test"),
+        message,
+    });
+}
+
+fn register_system_test_capsule(registry: &mut CapsuleRegistry, capsule: Box<dyn Capsule>) {
+    let id = capsule.id().clone();
+    let hash = crate::registry::WasmHash::synthetic(id.as_str(), "test");
+    registry
+        .register_system_runtime(capsule, hash, &astrid_core::PrincipalId::default())
+        .expect("register explicit test system runtime");
+}
+
 #[tokio::test]
 async fn dispatch_routes_to_matching_interceptor() {
     let (capsule, invoked) = MockCapsule::new("test-capsule", "test.topic");
 
     let mut registry = CapsuleRegistry::new();
-    registry.register(Box::new(capsule)).unwrap();
+    register_system_test_capsule(&mut registry, Box::new(capsule));
     let registry = Arc::new(RwLock::new(registry));
 
     let bus = Arc::new(EventBus::with_capacity(64));
@@ -249,8 +273,8 @@ async fn dispatch_concurrent_does_not_block() {
     let (cap_b, invoked_b) = MockCapsule::new("capsule-b", "topic.b");
 
     let mut registry = CapsuleRegistry::new();
-    registry.register(Box::new(cap_a)).unwrap();
-    registry.register(Box::new(cap_b)).unwrap();
+    register_system_test_capsule(&mut registry, Box::new(cap_a));
+    register_system_test_capsule(&mut registry, Box::new(cap_b));
     let registry = Arc::new(RwLock::new(registry));
 
     let bus = Arc::new(EventBus::with_capacity(64));
@@ -283,7 +307,7 @@ async fn dispatch_routes_lifecycle_events() {
         MockCapsule::new("lifecycle-capsule", "astrid.v1.lifecycle.tool_call_started");
 
     let mut registry = CapsuleRegistry::new();
-    registry.register(Box::new(capsule)).unwrap();
+    register_system_test_capsule(&mut registry, Box::new(capsule));
     let registry = Arc::new(RwLock::new(registry));
 
     let bus = Arc::new(EventBus::with_capacity(64));
@@ -406,8 +430,13 @@ async fn find_matching_interceptors_sorts_by_priority() {
     let registry = Arc::new(RwLock::new(registry));
     let bus = EventBus::with_capacity(64);
 
-    let matches = find_matching_interceptors(&registry, "test.event", None, None, None, &bus).await;
-    let names: Vec<&str> = matches.iter().map(|(c, _, _)| c.id().as_str()).collect();
+    let matches =
+        find_matching_interceptors(&registry, "test.event", Some("default"), None, None, &bus)
+            .await;
+    let names: Vec<&str> = matches
+        .iter()
+        .map(|(_, capsule, _, _)| capsule.id().as_str())
+        .collect();
     assert_eq!(
         names,
         vec!["low-pri", "mid-pri", "high-pri"],
@@ -435,8 +464,13 @@ async fn find_matching_interceptors_tiebreaks_equal_priority_by_id() {
     let registry = Arc::new(RwLock::new(registry));
     let bus = EventBus::with_capacity(64);
 
-    let matches = find_matching_interceptors(&registry, "test.event", None, None, None, &bus).await;
-    let names: Vec<&str> = matches.iter().map(|(c, _, _)| c.id().as_str()).collect();
+    let matches =
+        find_matching_interceptors(&registry, "test.event", Some("default"), None, None, &bus)
+            .await;
+    let names: Vec<&str> = matches
+        .iter()
+        .map(|(_, capsule, _, _)| capsule.id().as_str())
+        .collect();
     assert_eq!(
         names,
         vec!["guard", "a-tie", "z-tie"],
@@ -614,7 +648,7 @@ async fn single_match_does_not_block_across_principal_keys() {
     capsule.principal_log = Some(Arc::clone(&principal_log));
 
     let mut registry = CapsuleRegistry::new();
-    registry.register(Box::new(capsule)).unwrap();
+    register_system_test_capsule(&mut registry, Box::new(capsule));
     let registry = Arc::new(RwLock::new(registry));
 
     let bus = Arc::new(EventBus::with_capacity(64));
@@ -657,8 +691,8 @@ async fn chain_serializes_per_principal_key_on_same_capsule() {
         MockCapsule::with_priority("ser-b", "chain.topic", 100, Some(Arc::clone(&order)));
 
     let mut registry = CapsuleRegistry::new();
-    registry.register(Box::new(cap_a)).unwrap();
-    registry.register(Box::new(cap_b)).unwrap();
+    register_system_test_capsule(&mut registry, Box::new(cap_a));
+    register_system_test_capsule(&mut registry, Box::new(cap_b));
     let registry = Arc::new(RwLock::new(registry));
 
     let bus = Arc::new(EventBus::with_capacity(64));
@@ -699,7 +733,7 @@ async fn dispatch_isolates_per_principal_under_n1000_fanin() {
     capsule.principal_log = Some(Arc::clone(&principals));
 
     let mut registry = CapsuleRegistry::new();
-    registry.register(Box::new(capsule)).unwrap();
+    register_system_test_capsule(&mut registry, Box::new(capsule));
     let registry = Arc::new(RwLock::new(registry));
 
     // Bus with generous capacity so the broadcast subscriber doesn't
@@ -753,7 +787,7 @@ async fn dispatch_does_not_drop_under_burst_to_single_principal() {
     capsule.invoke_counter = Some(Arc::clone(&counter));
 
     let mut registry = CapsuleRegistry::new();
-    registry.register(Box::new(capsule)).unwrap();
+    register_system_test_capsule(&mut registry, Box::new(capsule));
     let registry = Arc::new(RwLock::new(registry));
 
     let bus = Arc::new(EventBus::with_capacity(256));
@@ -804,7 +838,7 @@ async fn dispatcher_idle_evicts_per_principal_consumers_after_grace() {
     capsule.invoke_counter = Some(Arc::clone(&counter));
 
     let mut registry = CapsuleRegistry::new();
-    registry.register(Box::new(capsule)).unwrap();
+    register_system_test_capsule(&mut registry, Box::new(capsule));
     let registry = Arc::new(RwLock::new(registry));
 
     let bus = Arc::new(EventBus::with_capacity(64));
@@ -860,7 +894,8 @@ async fn dispatch_respawns_when_mapped_consumer_is_closed() {
 
     // Pre-seed the queue map with a CLOSED sender for the key (receiver dropped).
     let queues: CapsuleQueues = Arc::new(parking_lot::Mutex::new(HashMap::new()));
-    let key = (capsule.id().clone(), Some("alice".to_string()));
+    let runtime_id = RuntimeId::for_test(capsule.id().clone(), 1);
+    let key = (runtime_id.clone(), Some("alice".to_string()));
     let (dead_tx, dead_rx) = mpsc::channel::<InterceptorWork>(CAPSULE_EVENT_QUEUE_CAPACITY);
     drop(dead_rx);
     assert!(
@@ -873,12 +908,12 @@ async fn dispatch_respawns_when_mapped_consumer_is_closed() {
     // deliver rather than hand back the dead sender and drop.
     dispatch_single(
         &queues,
+        (runtime_id, Some("alice".to_string())),
         Arc::clone(&capsule),
         "test_action".to_string(),
         Arc::new("respawn.topic".to_string()),
         Arc::new(Vec::new()),
         None,
-        Some("alice".to_string()),
     );
 
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -902,9 +937,10 @@ async fn chain_lock_prunes_entry_when_last_referrer_drops() {
     // for many distinct principals and assert the map sheds every entry.
     let chain_locks: ChainLocks = Arc::new(parking_lot::RwLock::new(HashMap::new()));
     let cap = CapsuleId::from_static("chainmap-cap");
+    let runtime_id = RuntimeId::for_test(cap, 1);
 
     for i in 0..256 {
-        let key = (cap.clone(), Some(format!("user-{i}")));
+        let key = (runtime_id.clone(), Some(format!("user-{i}")));
         let guard = acquire_chain_lock(&chain_locks, key).await;
         // While the guard is alive the entry exists.
         assert_eq!(chain_locks.read().len(), 1, "entry present while held");
@@ -930,7 +966,7 @@ async fn chain_lock_retained_while_another_holder_exists() {
     // without its serialization mutex.
     let chain_locks: ChainLocks = Arc::new(parking_lot::RwLock::new(HashMap::new()));
     let cap = CapsuleId::from_static("shared-cap");
-    let key = (cap.clone(), Some("alice".to_string()));
+    let key = (RuntimeId::for_test(cap, 1), Some("alice".to_string()));
 
     let g1 = acquire_chain_lock(&chain_locks, key.clone()).await;
     assert_eq!(chain_locks.read().len(), 1);
@@ -1041,11 +1077,8 @@ mod access_enforcement {
         let first_pid = PrincipalId::new(first).expect("valid principal");
         let capsule_id = capsule.id().clone();
         registry
-            .register_for(Box::new(capsule), hash.clone(), &first_pid)
+            .register_system_runtime(Box::new(capsule), hash.clone(), &first_pid)
             .unwrap();
-        // Additional principals SHARE the one runtime via `register_existing`
-        // (the production view-add path) — not a second `register_for` under a
-        // different owner, which the registry now rejects.
         for principal in &principals[1..] {
             let pid = PrincipalId::new(*principal).expect("valid principal");
             registry
@@ -1396,11 +1429,23 @@ mod access_enforcement {
     #[tokio::test]
     async fn llm_describe_without_principal_fails_closed() {
         let (_dir, _home, resolver) = resolver_fixture();
-        let (invoked, bus, handle) =
-            spawn_with_capsule(resolver, "llm-provider", "llm.v1.request.describe");
+        let (capsule, invoked) = MockCapsule::new("llm-provider", "llm.v1.request.describe");
+        let mut registry = CapsuleRegistry::new();
+        registry
+            .register_for(
+                Box::new(capsule),
+                crate::registry::WasmHash::synthetic("llm-provider", "0.0.1"),
+                &PrincipalId::default(),
+            )
+            .unwrap();
+        let registry = Arc::new(RwLock::new(registry));
+        let bus = Arc::new(EventBus::with_capacity(64));
+        let dispatcher =
+            EventDispatcher::new(registry, Arc::clone(&bus)).with_access_resolver(resolver);
+        let handle = tokio::spawn(dispatcher.run());
 
         tokio::task::yield_now().await;
-        publish_ipc(&bus, "llm.v1.request.describe");
+        publish_ipc_unstamped(&bus, "llm.v1.request.describe");
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         assert!(
@@ -1640,7 +1685,7 @@ mod access_enforcement {
     async fn no_resolver_means_ungated() {
         let (tool_cap, invoked) = MockCapsule::new("secret-tool", "tool.v1.execute.do_thing");
         let mut registry = CapsuleRegistry::new();
-        registry.register(Box::new(tool_cap)).unwrap();
+        register_system_test_capsule(&mut registry, Box::new(tool_cap));
         let registry = Arc::new(RwLock::new(registry));
         let bus = Arc::new(EventBus::with_capacity(64));
         // No `.with_access_resolver(..)`.
@@ -1743,7 +1788,7 @@ async fn dispatch_with_injected_home_provisions_principal_under_it() {
     let (capsule, invoked) = MockCapsule::new("prov-capsule", "prov.topic");
 
     let mut registry = CapsuleRegistry::new();
-    registry.register(Box::new(capsule)).unwrap();
+    register_system_test_capsule(&mut registry, Box::new(capsule));
     let registry = Arc::new(RwLock::new(registry));
 
     let dir = tempfile::tempdir().unwrap();
@@ -1784,7 +1829,7 @@ async fn dispatch_without_home_creates_nothing_and_still_dispatches() {
     let (capsule, invoked) = MockCapsule::new("nohome-capsule", "nohome.topic");
 
     let mut registry = CapsuleRegistry::new();
-    registry.register(Box::new(capsule)).unwrap();
+    register_system_test_capsule(&mut registry, Box::new(capsule));
     let registry = Arc::new(RwLock::new(registry));
 
     // A tempdir that is deliberately never injected — it stands where an

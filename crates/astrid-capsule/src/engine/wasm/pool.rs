@@ -1,20 +1,20 @@
 //! Per-capsule pool of WASM instances for concurrent interceptor invocation.
 //!
 //! Before the pool, each non-run-loop capsule had a single `Store<HostState>`
-//! behind one mutex, so `invoke_interceptor` serialised every principal's
-//! invocation through that one instance — the throughput floor behind the
+//! behind one mutex, so `invoke_interceptor` serialised every invocation
+//! through that one instance — the throughput floor behind the
 //! `astrid#813` orchestration cliff (one LLM turn every ~3s, invariant to
 //! concurrency, measured directly as a 2000+ deep invocation backlog on one
 //! Store; see `astrid#816`).
 //!
 //! A [`CapsuleInstancePool`] holds N independent `(Store, Instance)` pairs
 //! built from the same compiled component. Invocations lease a free instance
-//! and run genuinely concurrently — N principals' interceptors execute in
-//! parallel instead of single-file.
+//! and run genuinely concurrently within one authority-scoped runtime.
 //!
 //! ## Free checkout
 //!
-//! Any available instance serves any invocation. This is sound only because
+//! Any available instance serves any invocation for the runtime's one durable
+//! principal. This is sound because guest state never crosses PrincipalUid and
 //! interceptor capsules use wasmtime resources (subscriptions, HTTP streams)
 //! *within* a single invocation (subscribe → publish → recv → drop in one
 //! call), so no handle created on one Store is reused on another. The
@@ -157,7 +157,7 @@ pub(super) struct CapsuleInstancePool {
     /// within one completed call", so a cancelled or panicked invocation that
     /// orphans a live resource (HTTP stream, IPC subscription, net stream,
     /// process handle, WASI fd) in the returned Store must NOT leak it into
-    /// the next lease — possibly a different principal. The CLEAR phase drops
+    /// the next lease. The CLEAR phase drops
     /// the whole resource table to close those handles before the instance is
     /// reusable. See [`PoolCheckout::drop`].
     ///
@@ -165,7 +165,7 @@ pub(super) struct CapsuleInstancePool {
     /// deliberately holds live `ManagedProcess` handles across invocations
     /// (background processes), so tearing the resource table down on return
     /// would kill them. It is sound to skip the reset there precisely because
-    /// it never leases a *second* Store, so no cross-principal reuse occurs.
+    /// it never leases a *second* Store, so persistent handles stay coherent.
     reset_resources_on_return: bool,
     /// On-demand instance factory for lazy growth.
     builder: Arc<InstanceBuilder>,

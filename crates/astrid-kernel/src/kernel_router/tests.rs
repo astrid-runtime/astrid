@@ -1231,21 +1231,15 @@ async fn seed_capsule_inventory_profile(
         let id = CapsuleId::new(*capsule).expect("valid capsule id");
         let hash = astrid_capsule::registry::WasmHash::synthetic(capsule, "0.0.1");
         if reg.get_for(principal, &id).is_none() {
-            // Mirror the production load path: if a runtime for this hash already
-            // exists (e.g. registered under `default`), add THIS principal's view
-            // via `register_existing` rather than a cross-owner `register_for`,
-            // which the registry now rejects (#1069 host-state isolation).
-            if reg.contains_hash(&hash) {
-                reg.register_existing(&id, &hash, principal)
-                    .expect("seed capsule view (shared)");
-            } else {
-                reg.register_for(
-                    Box::new(InventoryCapsule::new(capsule, &format!("{capsule}-cmd"))),
-                    hash,
-                    principal,
-                )
-                .expect("seed capsule view");
-            }
+            // Mirror production authority isolation: immutable bytes may have
+            // the same hash, but each principal owns a distinct executable
+            // runtime and mutable guest state.
+            reg.register_for(
+                Box::new(InventoryCapsule::new(capsule, &format!("{capsule}-cmd"))),
+                hash,
+                principal,
+            )
+            .expect("seed principal capsule runtime");
         }
     }
 }
@@ -1475,8 +1469,7 @@ async fn capsule_topic_probe_can_target_exact_capsule_in_principal_view() {
     let principal = PrincipalId::new("regular-user").expect("valid principal");
     let topic = "session.v1.request.list";
 
-    let source_id = uuid::Uuid::new_v4();
-    {
+    let source_id = {
         let mut registry = kernel.capsules.write().await;
         let provider =
             InventoryCapsule::new("test-topic-provider", "provider").with_subscribe(topic);
@@ -1484,8 +1477,10 @@ async fn capsule_topic_probe_can_target_exact_capsule_in_principal_view() {
         registry
             .register_for(Box::new(provider), hash.clone(), &principal)
             .expect("register provider fixture");
-        registry.register_instance_uuid(source_id, hash);
-    }
+        registry
+            .source_id_for(&principal, &CapsuleId::from_static("test-topic-provider"))
+            .expect("provider source id")
+    };
 
     let probe = kernel.capsule_topic_probe();
     let provider_key = format!(
@@ -1531,9 +1526,7 @@ async fn capsule_service_probe_accepts_only_one_compatible_interface_provider() 
     let kernel = crate::test_kernel_with_home(home).await;
     let principal = PrincipalId::new("regular-user").expect("valid principal");
     let topic = "session.v1.request.list";
-    let provider_source = uuid::Uuid::new_v4();
-
-    {
+    let provider_source = {
         let mut registry = kernel.capsules.write().await;
         let provider = InventoryCapsule::new("renamed-session-provider", "session")
             .with_subscribe(topic)
@@ -1542,7 +1535,12 @@ async fn capsule_service_probe_accepts_only_one_compatible_interface_provider() 
         registry
             .register_for(Box::new(provider), provider_hash.clone(), &principal)
             .expect("register provider fixture");
-        registry.register_instance_uuid(provider_source, provider_hash);
+        let provider_source = registry
+            .source_id_for(
+                &principal,
+                &CapsuleId::from_static("renamed-session-provider"),
+            )
+            .expect("provider source id");
 
         let unrelated =
             InventoryCapsule::new("topic-only-adversary", "adversary").with_subscribe(topic);
@@ -1550,8 +1548,8 @@ async fn capsule_service_probe_accepts_only_one_compatible_interface_provider() 
         registry
             .register_for(Box::new(unrelated), unrelated_hash.clone(), &principal)
             .expect("register unrelated fixture");
-        registry.register_instance_uuid(uuid::Uuid::new_v4(), unrelated_hash);
-    }
+        provider_source
+    };
 
     let probe = kernel.capsule_topic_probe();
     let service_key = format!(
@@ -1576,7 +1574,6 @@ async fn capsule_service_probe_accepts_only_one_compatible_interface_provider() 
         registry
             .register_for(Box::new(duplicate), duplicate_hash.clone(), &principal)
             .expect("register duplicate fixture");
-        registry.register_instance_uuid(uuid::Uuid::new_v4(), duplicate_hash);
     }
 
     assert!(

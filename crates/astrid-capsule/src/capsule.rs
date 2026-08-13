@@ -125,6 +125,18 @@ pub trait Capsule: Send + Sync {
     /// Unload the capsule, terminating all of its execution engines.
     async fn unload(&mut self) -> CapsuleResult<()>;
 
+    /// Start prepared autonomous work behind closed external-route admission.
+    /// Request-driven engines may keep the default no-op.
+    async fn activate(&mut self) -> CapsuleResult<()> {
+        Ok(())
+    }
+
+    /// Open externally visible routes after this prepared generation is ready.
+    fn publish(&self) {}
+
+    /// Close externally visible route admission for this generation.
+    fn retire(&self) {}
+
     /// Promote this capsule's OS-level copy-on-write workspace changes into the
     /// pristine workspace (the gate's "approve"). Returns `Ok(true)` if a
     /// copy-on-write workspace was committed, `Ok(false)` if the capsule has
@@ -151,12 +163,9 @@ pub trait Capsule: Send + Sync {
     /// Request cooperative cancellation of ONE principal's in-flight blocking
     /// work, leaving every other principal's work running.
     ///
-    /// A shared-by-hash runtime survives a single principal's view release
-    /// (issue #1069) — but that principal's blocked host calls (approval/
-    /// elicit waits, net/io/ipc waits) would otherwise keep running inside the
-    /// shared instance with nothing left to answer them, wedging it for every
-    /// remaining principal. The kernel calls this on the non-last view release
-    /// so exactly the departing principal's waits are interrupted.
+    /// An explicit system runtime may serve more than one principal view. A
+    /// departing principal's blocked approval/elicit/net/io/ipc waits must be
+    /// interrupted without cancelling the singleton for remaining views.
     ///
     /// Default no-op — fail-safe: a capsule implementation without
     /// per-principal wait tracking keeps today's instance-scoped semantics
@@ -285,10 +294,24 @@ impl Capsule for CompositeCapsule {
 
     async fn load(&mut self, ctx: &CapsuleContext) -> CapsuleResult<()> {
         self.state = CapsuleState::Loading;
-        for engine in &mut self.engines {
-            if let Err(e) = engine.load(ctx).await {
-                self.state = CapsuleState::Failed(e.to_string());
-                return Err(e);
+        for index in 0..self.engines.len() {
+            if let Err(load_error) = self.engines[index].load(ctx).await {
+                let mut cleanup_errors = Vec::new();
+                for loaded in self.engines[..index].iter_mut().rev() {
+                    if let Err(error) = loaded.unload().await {
+                        cleanup_errors.push(error.to_string());
+                    }
+                }
+                if cleanup_errors.is_empty() {
+                    self.state = CapsuleState::Failed(load_error.to_string());
+                    return Err(load_error);
+                }
+                let message = format!(
+                    "capsule engine load failed: {load_error}; rollback also failed: {}",
+                    cleanup_errors.join("; ")
+                );
+                self.state = CapsuleState::Failed(message.clone());
+                return Err(crate::error::CapsuleError::ExecutionFailed(message));
             }
         }
         self.state = CapsuleState::Ready;
@@ -297,13 +320,56 @@ impl Capsule for CompositeCapsule {
 
     async fn unload(&mut self) -> CapsuleResult<()> {
         self.state = CapsuleState::Unloading;
-        for engine in &mut self.engines {
+        let mut errors = Vec::new();
+        for engine in self.engines.iter_mut().rev() {
             // Unload on a best-effort basis so a failing engine doesn't
             // prevent others from shutting down gracefully.
-            let _ = engine.unload().await;
+            if let Err(error) = engine.unload().await {
+                errors.push(error.to_string());
+            }
         }
-        self.state = CapsuleState::Unloaded;
+        if errors.is_empty() {
+            self.state = CapsuleState::Unloaded;
+            Ok(())
+        } else {
+            let message = format!("capsule engine unload failed: {}", errors.join("; "));
+            self.state = CapsuleState::Failed(message.clone());
+            Err(crate::error::CapsuleError::ExecutionFailed(message))
+        }
+    }
+
+    async fn activate(&mut self) -> CapsuleResult<()> {
+        for index in 0..self.engines.len() {
+            if let Err(activation_error) = self.engines[index].activate().await {
+                let mut cleanup_errors = Vec::new();
+                for active in self.engines[..index].iter_mut().rev() {
+                    active.request_cancel();
+                    if let Err(error) = active.unload().await {
+                        cleanup_errors.push(error.to_string());
+                    }
+                }
+                if cleanup_errors.is_empty() {
+                    return Err(activation_error);
+                }
+                return Err(crate::error::CapsuleError::ExecutionFailed(format!(
+                    "capsule engine activation failed: {activation_error}; rollback also failed: {}",
+                    cleanup_errors.join("; ")
+                )));
+            }
+        }
         Ok(())
+    }
+
+    fn publish(&self) {
+        for engine in &self.engines {
+            engine.publish();
+        }
+    }
+
+    fn retire(&self) {
+        for engine in &self.engines {
+            engine.retire();
+        }
     }
 
     async fn promote_workspace(&self) -> CapsuleResult<bool> {

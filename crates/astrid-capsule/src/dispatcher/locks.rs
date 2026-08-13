@@ -3,14 +3,14 @@ use std::sync::Arc;
 
 use astrid_events::PrincipalKey;
 
-use crate::capsule::CapsuleId;
+use crate::registry::RuntimeId;
 
 /// Shared map of per-(capsule, principal) chain mutexes. One
-/// `Arc<tokio::sync::Mutex<()>>` per `(CapsuleId, PrincipalKey)` so
+/// `Arc<tokio::sync::Mutex<()>>` per `(RuntimeId, PrincipalKey)` so
 /// chain dispatches for the same key serialize FIFO while distinct
 /// keys run concurrently.
 pub(super) type ChainLocks =
-    Arc<parking_lot::RwLock<HashMap<(CapsuleId, PrincipalKey), Arc<tokio::sync::Mutex<()>>>>>;
+    Arc<parking_lot::RwLock<HashMap<(RuntimeId, PrincipalKey), Arc<tokio::sync::Mutex<()>>>>>;
 
 /// RAII chain-lock lease that prunes its `ChainLocks` map entry on drop
 /// when it was the last referrer.
@@ -18,7 +18,7 @@ pub(super) struct ChainLockGuard {
     guard: Option<tokio::sync::OwnedMutexGuard<()>>,
     mutex: Arc<tokio::sync::Mutex<()>>,
     chain_locks: ChainLocks,
-    key: (CapsuleId, PrincipalKey),
+    key: (RuntimeId, PrincipalKey),
 }
 
 impl Drop for ChainLockGuard {
@@ -39,7 +39,7 @@ impl Drop for ChainLockGuard {
 /// is a hit on an existing lock.
 pub(super) async fn acquire_chain_lock(
     chain_locks: &ChainLocks,
-    key: (CapsuleId, PrincipalKey),
+    key: (RuntimeId, PrincipalKey),
 ) -> ChainLockGuard {
     let mutex = {
         let read = chain_locks.read();

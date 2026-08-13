@@ -37,7 +37,7 @@ use tracing::{debug, warn};
 use crate::access::CapsuleAccessResolver;
 use crate::capsule::{Capsule, CapsuleId};
 use crate::dispatcher::locks::{ChainLocks, acquire_chain_lock};
-use crate::registry::CapsuleRegistry;
+use crate::registry::{CapsuleRegistry, RuntimeId};
 use astrid_events::PrincipalKey;
 use astrid_events::{AstridEvent, EventBus, EventReceiver};
 
@@ -98,7 +98,7 @@ pub(crate) fn set_idle_consumer_grace_for_test(ms: u64) {
 /// dispatcher's `entry().or_insert_with(...)` and the subsequent
 /// `try_send`.
 type CapsuleQueues =
-    Arc<parking_lot::Mutex<HashMap<(CapsuleId, PrincipalKey), mpsc::Sender<InterceptorWork>>>>;
+    Arc<parking_lot::Mutex<HashMap<(RuntimeId, PrincipalKey), mpsc::Sender<InterceptorWork>>>>;
 
 /// Work item sent to a per-capsule ordered queue.
 struct InterceptorWork {
@@ -128,7 +128,7 @@ pub struct EventDispatcher {
     /// (pre-production behavior).
     identity_store: Option<Arc<dyn astrid_storage::IdentityStore>>,
     /// Per-(capsule, principal) chain serialization mutexes.
-    /// Chains for the same `(CapsuleId, PrincipalKey)` are mutually
+    /// Chains for the same `(RuntimeId, PrincipalKey)` are mutually
     /// exclusive (FIFO via `tokio::sync::Mutex`) but distinct
     /// principals — even within the same class — run concurrently.
     /// Closes the cross-principal SET/CALL race at the dispatcher
@@ -341,7 +341,7 @@ impl EventDispatcher {
 fn dispatch_to_capsule_queues(
     queues: &CapsuleQueues,
     chain_locks: &ChainLocks,
-    matches: Vec<(Arc<dyn Capsule>, String, u32)>,
+    matches: Vec<(RuntimeId, Arc<dyn Capsule>, String, u32)>,
     topic: Arc<String>,
     payload_bytes: Arc<Vec<u8>>,
     ipc_message: Option<Arc<astrid_events::ipc::IpcMessage>>,
@@ -354,15 +354,15 @@ fn dispatch_to_capsule_queues(
 
     // For single-interceptor events (common case), skip chain overhead.
     if matches.len() == 1 {
-        let (capsule, action, _priority) = matches.into_iter().next().unwrap();
+        let (runtime_id, capsule, action, _priority) = matches.into_iter().next().unwrap();
         dispatch_single(
             queues,
+            (runtime_id, principal_key),
             capsule,
             action,
             topic,
             payload_bytes,
             ipc_message,
-            principal_key,
         );
         return;
     }
@@ -380,20 +380,20 @@ fn dispatch_to_capsule_queues(
     // instead of parallelize. Only a genuinely ORDERED set (members at DISTINCT
     // priorities — an explicit "fire me before you" signal) keeps the
     // sequential, short-circuiting chain below.
-    let lead_priority = matches[0].2;
+    let lead_priority = matches[0].3;
     if matches
         .iter()
-        .all(|(_, _, priority)| *priority == lead_priority)
+        .all(|(_, _, _, priority)| *priority == lead_priority)
     {
-        for (capsule, action, _priority) in matches {
+        for (runtime_id, capsule, action, _priority) in matches {
             dispatch_single(
                 queues,
+                (runtime_id, principal_key.clone()),
                 capsule,
                 action,
                 Arc::clone(&topic),
                 Arc::clone(&payload_bytes),
                 ipc_message.clone(),
-                principal_key.clone(),
             );
         }
         return;
@@ -401,15 +401,17 @@ fn dispatch_to_capsule_queues(
 
     // Distinct priorities → ordered middleware chain: run sequentially in
     // priority order. Spawned as a task so the dispatcher loop doesn't block.
-    let matches_owned: Vec<(Arc<dyn Capsule>, String)> =
-        matches.into_iter().map(|(c, a, _)| (c, a)).collect();
+    let matches_owned: Vec<(RuntimeId, Arc<dyn Capsule>, String)> = matches
+        .into_iter()
+        .map(|(runtime_id, capsule, action, _)| (runtime_id, capsule, action))
+        .collect();
     let topic_clone = Arc::clone(&topic);
     let ipc_clone = ipc_message.clone();
     let chain_locks_clone = Arc::clone(chain_locks);
     astrid_runtime::spawn(async move {
         let mut current_payload = (*payload_bytes).clone();
 
-        for (capsule, action) in &matches_owned {
+        for (runtime_id, capsule, action) in &matches_owned {
             debug!(
                 capsule_id = %capsule.id(),
                 action = %action,
@@ -426,7 +428,7 @@ fn dispatch_to_capsule_queues(
             // per-principal, not per-class (#813 Layer 3). The guard
             // prunes its map entry on drop so the lock map stays bounded
             // under high principal churn (#828).
-            let chain_key = (capsule.id().clone(), principal_key.clone());
+            let chain_key = (runtime_id.clone(), principal_key.clone());
             let _chain_guard = acquire_chain_lock(&chain_locks_clone, chain_key).await;
 
             let caller = ipc_clone.as_deref();
@@ -495,10 +497,13 @@ fn dispatch_to_capsule_queues(
 /// used to enforce `MAX_DISPATCHER_QUEUES_PER_CAPSULE`. Linear in the
 /// number of dispatcher queues, called only on the cold-miss path.
 fn queues_per_capsule(
-    queues: &HashMap<(CapsuleId, PrincipalKey), mpsc::Sender<InterceptorWork>>,
+    queues: &HashMap<(RuntimeId, PrincipalKey), mpsc::Sender<InterceptorWork>>,
     capsule_id: &CapsuleId,
 ) -> usize {
-    queues.keys().filter(|(cid, _)| cid == capsule_id).count()
+    queues
+        .keys()
+        .filter(|(runtime_id, _)| runtime_id.key().capsule_id() == capsule_id)
+        .count()
 }
 
 /// Get or spawn the per-(capsule, principal) consumer task and return
@@ -510,7 +515,7 @@ fn queues_per_capsule(
 fn get_or_spawn_consumer(
     queues: &CapsuleQueues,
     capsule: &Arc<dyn Capsule>,
-    key: (CapsuleId, PrincipalKey),
+    key: (RuntimeId, PrincipalKey),
 ) -> mpsc::Sender<InterceptorWork> {
     let mut guard = queues.lock();
     // Never hand back a CLOSED sender. The mapped entry can be stale: an
@@ -538,12 +543,13 @@ fn get_or_spawn_consumer(
     // exist once per capsule.
     let mut effective_key = key.clone();
     if effective_key.1.is_some()
-        && queues_per_capsule(&guard, &effective_key.0) >= MAX_DISPATCHER_QUEUES_PER_CAPSULE
+        && queues_per_capsule(&guard, effective_key.0.key().capsule_id())
+            >= MAX_DISPATCHER_QUEUES_PER_CAPSULE
     {
         tracing::error!(
             target: "astrid.audit.ipc",
             security_event = true,
-            capsule = %effective_key.0,
+            capsule = %effective_key.0.key().capsule_id(),
             principal_key_count = MAX_DISPATCHER_QUEUES_PER_CAPSULE,
             "dispatcher: per-principal queue cap exceeded; degrading to shared queue"
         );
@@ -582,7 +588,7 @@ async fn run_consumer(
     mut rx: mpsc::Receiver<InterceptorWork>,
     capsule: Arc<dyn Capsule>,
     queues: CapsuleQueues,
-    key: (CapsuleId, PrincipalKey),
+    key: (RuntimeId, PrincipalKey),
 ) {
     loop {
         match astrid_runtime::time::timeout(idle_consumer_grace(), rx.recv()).await {
@@ -715,14 +721,13 @@ async fn run_consumer(
 /// when both fall in the same `PrincipalClass` (#813 Layer 3).
 fn dispatch_single(
     queues: &CapsuleQueues,
+    key: (RuntimeId, PrincipalKey),
     capsule: Arc<dyn Capsule>,
     action: String,
     topic: Arc<String>,
     payload_bytes: Arc<Vec<u8>>,
     ipc_message: Option<Arc<astrid_events::ipc::IpcMessage>>,
-    principal_key: PrincipalKey,
 ) {
-    let key = (capsule.id().clone(), principal_key);
     let sender = get_or_spawn_consumer(queues, &capsule, key.clone());
 
     let work = InterceptorWork {
@@ -805,7 +810,7 @@ async fn find_matching_interceptors(
     caller_device_key_id: Option<&str>,
     access_resolver: Option<&CapsuleAccessResolver>,
     event_bus: &EventBus,
-) -> Vec<(Arc<dyn crate::capsule::Capsule>, String, u32)> {
+) -> Vec<(RuntimeId, Arc<dyn crate::capsule::Capsule>, String, u32)> {
     // Compute the gate once per event, not per capsule. Principal-stamped
     // dispatch is view-scoped when a resolver is present; grant-on-use only
     // engages for the narrower user-invocable surface.
@@ -824,7 +829,7 @@ async fn find_matching_interceptors(
         return Vec::new();
     }
     let registry = registry.read().await;
-    let mut matches: Vec<(Arc<dyn crate::capsule::Capsule>, String, u32)> = Vec::new();
+    let mut matches: Vec<(RuntimeId, Arc<dyn crate::capsule::Capsule>, String, u32)> = Vec::new();
     // Dedup grant-on-use signals within a single dispatch pass. This stays
     // tiny in practice, so a Vec keeps the gate path simple.
     let mut grant_signalled: Vec<String> = Vec::new();
@@ -844,7 +849,7 @@ async fn find_matching_interceptors(
         expand_global_view,
     );
 
-    for capsule in candidate_capsules {
+    for (runtime_id, capsule) in candidate_capsules {
         if !matches!(capsule.state(), crate::capsule::CapsuleState::Ready) {
             continue;
         }
@@ -897,7 +902,7 @@ async fn find_matching_interceptors(
             continue;
         }
         for (action, priority) in capsule_matches {
-            matches.push((Arc::clone(&capsule), action, priority));
+            matches.push((runtime_id.clone(), Arc::clone(&capsule), action, priority));
         }
     }
     // Sort by priority (lower fires first), then by capsule id and action as a
@@ -910,7 +915,7 @@ async fn find_matching_interceptors(
     // keeps dispatch reproducible everywhere.) Priority rides along in the
     // returned tuple so dispatch can distinguish an ordered chain (distinct
     // priorities) from an independent fan-out (all equal).
-    matches.sort_by(|(a_cap, a_act, a_pri), (b_cap, b_act, b_pri)| {
+    matches.sort_by(|(_, a_cap, a_act, a_pri), (_, b_cap, b_act, b_pri)| {
         a_pri
             .cmp(b_pri)
             .then_with(|| a_cap.id().as_str().cmp(b_cap.id().as_str()))
@@ -923,25 +928,24 @@ fn candidate_capsules_for_dispatch(
     registry: &CapsuleRegistry,
     caller_pid: Option<&astrid_core::PrincipalId>,
     has_access_resolver: bool,
-    view_scoped_surface: bool,
+    _view_scoped_surface: bool,
     expand_global_view: bool,
-) -> Vec<Arc<dyn crate::capsule::Capsule>> {
-    if view_scoped_surface && !expand_global_view {
-        return caller_pid.map_or_else(Vec::new, |principal| registry.cloned_values_for(principal));
+) -> Vec<(RuntimeId, Arc<dyn crate::capsule::Capsule>)> {
+    let Some(principal) = caller_pid else {
+        return registry.cloned_system_runtimes();
+    };
+    let mut candidates = registry.cloned_runtimes_for(principal);
+    if expand_global_view || !has_access_resolver {
+        for (runtime_id, capsule) in registry.cloned_system_runtimes() {
+            if !candidates
+                .iter()
+                .any(|(candidate, _)| candidate == &runtime_id)
+            {
+                candidates.push((runtime_id, capsule));
+            }
+        }
     }
-
-    if has_access_resolver
-        && !expand_global_view
-        && let Some(principal) = caller_pid
-    {
-        return registry.cloned_values_for(principal);
-    }
-
-    registry
-        .list_any()
-        .into_iter()
-        .filter_map(|id| registry.get_any(id))
-        .collect()
+    candidates
 }
 
 #[cfg(test)]

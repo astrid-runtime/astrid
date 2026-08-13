@@ -12,6 +12,7 @@ use tokio::sync::Notify;
 use uuid::Uuid;
 
 use crate::event::AstridEvent;
+use crate::route::RouteAdmissionGate;
 use crate::route::matcher::{TopicMatcher, ipc_size_of, principal_class_label};
 
 /// Maximum bytes a single subscription will hold across all its
@@ -82,6 +83,13 @@ pub struct RouteKey {
 /// principal; `Some(s)` = user/agent principal string.
 pub type PrincipalKey = Option<String>;
 
+#[derive(Debug)]
+enum RouteAdmission {
+    All,
+    Exact(PrincipalKey),
+    PrincipalOrSystem(String),
+}
+
 /// Per-principal FIFO sub-queue inside a route.
 #[derive(Debug)]
 pub(crate) struct PrincipalQueue {
@@ -148,7 +156,9 @@ pub(crate) struct RouteEntry {
     /// treat the persisted audit log (`append_with_principal`) as the source of
     /// truth, not the live bus feed. In-band drop-signalling / log
     /// reconciliation is a future (Phase 2) concern.
-    pub(crate) scope: Option<PrincipalKey>,
+    scope: RouteAdmission,
+    /// Runtime-generation publication fence shared by all of its routes.
+    gate: RouteAdmissionGate,
     /// Wakeup for `RoutedEventReceiver::recv`.
     pub(crate) notify: Arc<Notify>,
 }
@@ -173,9 +183,33 @@ impl RouteEntry {
             principal_order: VecDeque::new(),
             total_bytes: 0,
             capsule_id_label,
-            scope,
+            scope: scope.map_or(RouteAdmission::All, RouteAdmission::Exact),
+            gate: RouteAdmissionGate::default(),
             notify: Arc::new(Notify::new()),
         }
+    }
+
+    /// Construct a route that admits one principal plus kernel/system events.
+    pub(crate) fn new_principal_or_system(
+        matcher: TopicMatcher,
+        capsule_id_label: String,
+        principal: String,
+    ) -> Self {
+        Self {
+            matcher,
+            fanout: HashMap::new(),
+            principal_order: VecDeque::new(),
+            total_bytes: 0,
+            capsule_id_label,
+            scope: RouteAdmission::PrincipalOrSystem(principal),
+            gate: RouteAdmissionGate::default(),
+            notify: Arc::new(Notify::new()),
+        }
+    }
+
+    pub(crate) fn with_gate(mut self, gate: RouteAdmissionGate) -> Self {
+        self.gate = gate;
+        self
     }
 
     /// Whether an event published by `publisher` is admitted into this
@@ -187,7 +221,16 @@ impl RouteEntry {
     ///
     /// [`dispatch_to_routes`]: crate::bus::EventBus
     pub(crate) fn accepts(&self, publisher: &PrincipalKey) -> bool {
-        self.scope.as_ref().is_none_or(|s| s == publisher)
+        if !self.gate.is_published() {
+            return false;
+        }
+        match &self.scope {
+            RouteAdmission::All => true,
+            RouteAdmission::Exact(expected) => expected == publisher,
+            RouteAdmission::PrincipalOrSystem(expected) => {
+                publisher.as_ref().is_none_or(|actual| actual == expected)
+            },
+        }
     }
 
     /// Push an event into the route, applying oldest-head eviction under

@@ -150,6 +150,9 @@ pub struct Kernel {
     /// own backend; the shutdown flush goes through the trait's
     /// [`close`](astrid_storage::KvStore::close).
     pub kv: Arc<dyn astrid_storage::KvStore>,
+    /// Live alias-to-immutable-UID directory used to scope executable capsule
+    /// runtimes. Runtime authority is never keyed by a reusable alias.
+    pub(crate) principal_directory: astrid_storage::PrincipalDirectory,
     /// Native principal projections sharing the same engine as [`Self::kv`].
     ///
     /// Portable hosts may inject only a [`KvStore`](astrid_storage::KvStore),
@@ -193,6 +196,9 @@ pub struct Kernel {
     /// capsules. Telemetry today; fills `ResourceUsage::memory_bytes_peak_total`.
     /// See [`MemoryLedger`](astrid_capsule_types::MemoryLedger).
     memory_ledger: astrid_capsule_types::MemoryLedger,
+    /// Immutable verified WASM compilation cache shared by all
+    /// authority-scoped capsule runtimes in this kernel.
+    compiled_wasm: astrid_capsule::engine::wasm::CompiledWasmCache,
     /// Host-derived (operator-overridable) concurrency ceilings for capsule
     /// host calls, resolved once by the daemon and forwarded to every
     /// `WasmEngine` via the loader. The kernel only stores and forwards this
@@ -206,6 +212,10 @@ pub struct Kernel {
     /// exempt operator-sanctioned loopback/private endpoints. Empty = no
     /// exemptions (fail-closed).
     local_egress: std::collections::HashMap<String, Vec<String>>,
+    /// Operator-declared capsule IDs permitted to run as explicit system
+    /// singletons. Manifest fields can request uplink behavior but cannot grant
+    /// this cross-principal authority themselves.
+    system_capsules: RwLock<std::collections::HashSet<String>>,
     /// Resolved `astrid:http` host ceilings (timeouts, redirect/stream caps,
     /// buffered-body limit) from the `[http]` config section. A GLOBAL value —
     /// the same for every capsule (unlike `local_egress`). Resolved once from
@@ -353,7 +363,20 @@ impl KernelResources {
     }
 }
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+struct PreparedRuntimeReplacement {
+    capsule: Box<dyn astrid_capsule::capsule::Capsule>,
+    runtime_id: astrid_capsule::registry::RuntimeId,
+    principal_uid: Option<astrid_core::identity::PrincipalUid>,
+    system_runtime: bool,
+}
+
 impl Kernel {
+    /// Install the operator-owned allowlist for explicit system-resident
+    /// capsules. Capsule manifests cannot mutate or widen this policy.
+    pub async fn set_system_capsules(&self, capsules: impl IntoIterator<Item = String>) {
+        *self.system_capsules.write().await = capsules.into_iter().collect();
+    }
     /// Claim the canonical local listener for Astrid's built-in uplink.
     ///
     /// The first caller receives the shared listener. Once claimed, capsule
@@ -879,6 +902,7 @@ impl Kernel {
             native_uplink_owns_listener: AtomicBool::new(false),
             singleton_lock,
             kv,
+            principal_directory,
             #[cfg(not(target_family = "wasm"))]
             principal_store,
             audit_log,
@@ -887,8 +911,10 @@ impl Kernel {
             fuel_ledger: astrid_capsule_types::FuelLedger::default(),
             fuel_rate: astrid_capsule_types::FuelRateLimiter::default(),
             memory_ledger: astrid_capsule_types::MemoryLedger::default(),
+            compiled_wasm: astrid_capsule::engine::wasm::CompiledWasmCache::default(),
             runtime_limits,
             local_egress,
+            system_capsules: RwLock::new(std::collections::HashSet::new()),
             http_limits,
             full_reload_in_flight: AtomicBool::new(false),
             capsule_load_lock: Mutex::new(()),
@@ -1028,23 +1054,31 @@ impl Kernel {
         self.verify_workspace_component_paths(&dir, &manifest)?;
         let id = astrid_capsule_types::CapsuleId::from_static(&manifest.package.name);
         let wasm_hash = capsule_instance_hash(&manifest, &dir);
+        let requests_system = manifest.capabilities.uplink || !manifest.uplinks.is_empty();
+        let system_runtime =
+            requests_system && self.system_capsules.read().await.contains(id.as_str());
+        if requests_system && !system_runtime {
+            anyhow::bail!(
+                "capsule '{id}' requests uplink/system residency but is absent from the \
+                 operator-owned [[uplinks]] allowlist"
+            );
+        }
+        if system_runtime && !manifest.mcp_servers.is_empty() {
+            anyhow::bail!(
+                "system-resident capsule '{id}' cannot host principal-bearing stdio MCP servers"
+            );
+        }
         self.verify_workspace_capsule_tree(&dir)?;
 
-        // Dedup by content hash (issue #1069). Runtime instances are shared by
-        // hash across principals: a hash referenced by N principals loads ONCE.
-        //
-        // - Already in THIS principal's view → nothing to do.
-        // - A runtime for this hash already exists (loaded by another
-        //   principal) → add this principal's VIEW over the shared instance;
-        //   no runtime is built.
-        //
-        // Only when the hash is not yet loaded do we build a runtime (below).
+        // Mutable runtimes are authority-scoped. A principal always receives a
+        // fresh runtime for its immutable UID; only an explicitly classified
+        // SystemResident service may attach another view to one runtime.
         {
             let mut registry = self.capsules.write().await;
             if registry.get_for(principal, &id).is_some() {
                 return Ok(());
             }
-            if registry.contains_hash(&wasm_hash) {
+            if system_runtime && registry.contains_system_runtime(&id, &wasm_hash) {
                 registry
                     .register_existing(&id, &wasm_hash, principal)
                     .map_err(|e| anyhow::anyhow!("Failed to add capsule view: {e}"))?;
@@ -1054,11 +1088,51 @@ impl Kernel {
                 return Ok(());
             }
         }
+        if system_runtime && principal != &PrincipalId::default() {
+            anyhow::bail!(
+                "system-resident capsule '{id}' must be created by the operator/default view before dependents attach"
+            );
+        }
+        if system_runtime {
+            let operator_root = self
+                .astrid_home
+                .principal_home(&PrincipalId::default())
+                .capsules_dir();
+            if !dir.starts_with(&operator_root) {
+                anyhow::bail!(
+                    "system-resident capsule '{id}' must originate from the operator/default install root '{}', not '{}'",
+                    operator_root.display(),
+                    dir.display()
+                );
+            }
+        }
 
-        // First load of this content hash: build ONE shared runtime under the
-        // DEFAULT (system) principal (see `build_shared_capsule`). The installing
-        // `principal` receives the dispatch view via `register_owned_by_default`.
-        let mut capsule = self.build_shared_capsule(manifest, &dir).await?;
+        let principal_uid = self.runtime_principal_uid(system_runtime, principal, &id)?;
+        let scope = principal_uid.map_or(
+            astrid_capsule::registry::RuntimeScope::SystemResident,
+            astrid_capsule::registry::RuntimeScope::Principal,
+        );
+        let runtime_id =
+            self.capsules
+                .write()
+                .await
+                .reserve_runtime_id(id.clone(), wasm_hash.clone(), scope)?;
+        let mut capsule = self
+            .build_capsule_runtime(
+                manifest,
+                &dir,
+                (!system_runtime).then_some(principal),
+                runtime_id.clone(),
+            )
+            .await?;
+
+        if let Err(error) = activate_and_wait_ready(&id, capsule.as_mut()).await {
+            capsule.request_cancel();
+            if let Err(cleanup) = capsule.unload().await {
+                tracing::warn!(capsule_id = %id, error = %cleanup, "Failed to unload rejected runtime candidate");
+            }
+            return Err(error);
+        }
 
         if !manifest_path.exists() {
             unload_loaded_capsule_after_source_disappeared(capsule, &id, principal, &manifest_path)
@@ -1066,90 +1140,95 @@ impl Kernel {
             return Ok(());
         }
 
-        {
-            let mut registry = self.capsules.write().await;
-            // A concurrent load may have won the race: either this principal
-            // already has a view, or another principal built the shared runtime
-            // for this hash while we were loading. In both cases discard the
-            // runtime we just built. If the hash now exists but this principal
-            // lacks a view, add the view over the winner and drop ours.
-            let already_in_view = registry.get_for(principal, &id).is_some();
-            let hash_now_loaded = registry.contains_hash(&wasm_hash);
-            if already_in_view || hash_now_loaded {
-                if hash_now_loaded && !already_in_view {
-                    // Attach this principal's view to the runtime that won.
-                    if let Err(e) = registry.register_existing(&id, &wasm_hash, principal) {
-                        tracing::warn!(
-                            capsule_id = %id,
-                            principal = %principal,
-                            error = %e,
-                            "Failed to add view after concurrent shared load"
-                        );
-                    } else if let Some(capsule) = registry.get_for(principal, &id) {
-                        capsule.resume_for(principal);
-                    }
+        self.publish_initial_runtime(capsule, runtime_id, &wasm_hash, system_runtime, principal)
+            .await
+    }
+
+    async fn publish_initial_runtime(
+        &self,
+        mut candidate: Box<dyn astrid_capsule::capsule::Capsule>,
+        runtime_id: astrid_capsule::registry::RuntimeId,
+        artifact: &astrid_capsule::registry::WasmHash,
+        system_runtime: bool,
+        principal: &PrincipalId,
+    ) -> Result<(), anyhow::Error> {
+        let id = candidate.id().clone();
+        let mut registry = self.capsules.write().await;
+        let already_in_view = registry.get_for(principal, &id).is_some();
+        let system_winner = system_runtime && registry.contains_system_runtime(&id, artifact);
+        if already_in_view || system_winner {
+            if system_winner && !already_in_view {
+                registry.register_existing(&id, artifact, principal)?;
+                if let Some(capsule) = registry.get_for(principal, &id) {
+                    capsule.resume_for(principal);
                 }
-                drop(registry);
-                capsule.request_cancel();
-                if let Err(e) = capsule.unload().await {
-                    tracing::warn!(
-                        capsule_id = %id,
-                        principal = %principal,
-                        error = %e,
-                        "Redundant capsule unload failed after concurrent load"
-                    );
-                }
-                return Ok(());
             }
-            // First loader of this hash: register the shared runtime (owned by
-            // the default/system principal) and give the installing principal
-            // its dispatch view.
-            registry
-                .register_owned_by_default(capsule, wasm_hash, principal)
-                .map_err(|e| anyhow::anyhow!("Failed to register capsule: {e}"))?;
-            if let Some(capsule) = registry.get_for(principal, &id) {
-                capsule.resume_for(principal);
+            drop(registry);
+            candidate.request_cancel();
+            if let Err(error) = candidate.unload().await {
+                tracing::warn!(capsule_id = %id, %principal, %error, "Redundant capsule candidate failed to unload");
             }
+            return Ok(());
         }
 
+        let owner = Some(principal.clone());
+        if let Err(publication) =
+            registry.try_register_reserved_runtime(candidate, runtime_id, principal, owner)
+        {
+            drop(registry);
+            let mut candidate = publication.capsule;
+            candidate.retire();
+            candidate.request_cancel();
+            if let Err(cleanup) = candidate.unload().await {
+                tracing::warn!(capsule_id = %id, %cleanup, "Failed to unload rejected publication candidate");
+            }
+            return Err(anyhow::anyhow!(publication.error));
+        }
+        if let Some(capsule) = registry.get_for(principal, &id) {
+            capsule.resume_for(principal);
+            capsule.publish();
+        }
         Ok(())
     }
 
-    /// Build and load ONE shared capsule runtime under the DEFAULT (system)
-    /// principal.
-    ///
-    /// A content-addressed runtime is SHARED across every principal that views
-    /// the same WASM hash, so it is loaded under no real principal's identity.
-    /// The runtime's load-time host state is therefore a NEUTRAL, fail-closed
-    /// placeholder: its `kv` is a physically-isolated in-memory store and its
-    /// `secret_store` is deny-all — NEVER `default`'s (or anyone's) real KV,
-    /// secrets, or home. That placeholder is reached only by principal-less
-    /// load-time contexts (e.g. a watchdog tick or `capsules_loaded`), where it
-    /// denies rather than exposing any principal's private state.
-    ///
-    /// EVERY invocation that carries a principal — the owner/`default`
-    /// included — installs per-invocation `invocation_*` overlays scoped to the
-    /// *invoking* principal (KV / secret store / home / tmp / log), so
-    /// per-principal isolation is preserved without a per-principal runtime.
-    /// Per-principal config is likewise NOT baked here: it is resolved per
-    /// invocation via the `invocation_env_overlay` (read from the invoking
-    /// principal's `.config/env/{capsule}.env.json`). The `default` env config
-    /// this method pre-loads and `self.config` seed only the real shared KV
-    /// backend (`kv_backend`) used to CONSTRUCT overlays and the hash-identical
-    /// manifest defaults — never the neutral load-time `kv` fallback.
+    fn runtime_principal_uid(
+        &self,
+        system_runtime: bool,
+        principal: &PrincipalId,
+        id: &astrid_capsule_types::CapsuleId,
+    ) -> Result<Option<astrid_core::identity::PrincipalUid>, anyhow::Error> {
+        if system_runtime {
+            return Ok(None);
+        }
+        self.principal_directory
+            .uid_for(principal)
+            .map(Some)
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "cannot load capsule '{id}' for unadmitted principal '{principal}': {error}"
+                )
+            })
+    }
+
+    /// Build and load one mutable runtime. `Some(principal)` installs that
+    /// principal's concrete KV/home/env authority from construction onward.
+    /// `None` is reserved for an explicitly classified `SystemResident` service
+    /// and receives a neutral system namespace rather than `default` authority.
     ///
     /// # Errors
     ///
     /// Returns an error if the capsule cannot be created, the KV scope cannot be
     /// built, or `capsule.load` fails.
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    async fn build_shared_capsule(
+    async fn build_capsule_runtime(
         &self,
         manifest: astrid_capsule_types::manifest::CapsuleManifest,
         dir: &std::path::Path,
+        principal: Option<&PrincipalId>,
+        runtime_id: astrid_capsule::registry::RuntimeId,
     ) -> Result<Box<dyn astrid_capsule::capsule::Capsule>, anyhow::Error> {
         self.verify_workspace_capsule_tree(dir)?;
-        let load_principal = PrincipalId::default();
+        let load_principal = principal.cloned().unwrap_or_default();
 
         let loader = astrid_capsule::loader::CapsuleLoader::new(
             self.mcp.clone(),
@@ -1158,12 +1237,18 @@ impl Kernel {
             self.memory_ledger.clone(),
             self.runtime_limits,
             self.http_limits,
-        );
+        )
+        .with_compiled_wasm_cache(self.compiled_wasm.clone())
+        .with_runtime_id(runtime_id)
+        .with_deferred_background_activation();
         let mut capsule = loader.create_capsule(manifest, dir.to_path_buf())?;
 
         let kv = astrid_storage::ScopedKvStore::new(
             Arc::clone(&self.kv),
-            format!("{load_principal}:capsule:{}", capsule.id()),
+            principal.map_or_else(
+                || format!("system:capsule:{}", capsule.id()),
+                |principal| format!("{principal}:capsule:{}", capsule.id()),
+            ),
         )?;
 
         // Pre-load default/system env config into the KV store. Check the
@@ -1171,8 +1256,9 @@ impl Kernel {
         // .env.json. (Per-principal overrides come from the per-invocation
         // overlay, not this load-time pre-load.)
         let capsule_name = capsule.id().to_string();
-        let env_path = if let Ok(home) = astrid_core::dirs::AstridHome::resolve() {
-            let ph = home.principal_home(&load_principal);
+        let env_path = if let Some(principal) = principal {
+            let home = &self.astrid_home;
+            let ph = home.principal_home(principal);
             let principal_env = ph.env_dir().join(format!("{capsule_name}.env.json"));
             if principal_env.exists() {
                 principal_env
@@ -1199,7 +1285,12 @@ impl Kernel {
         let ctx = astrid_capsule::context::CapsuleContext::new(
             load_principal,
             self.workspace_root.clone(),
-            self.home_root.clone(),
+            principal.map(|principal| {
+                self.astrid_home
+                    .principal_home(principal)
+                    .root()
+                    .to_path_buf()
+            }),
             kv,
             Arc::clone(&self.event_bus),
             capsule_listener,
@@ -1226,37 +1317,123 @@ impl Kernel {
             Arc::clone(&self.audit_log),
             self.session_id.clone(),
         ));
-
         capsule.load(&ctx).await?;
         Ok(capsule)
     }
 
-    /// Restart a capsule by fully tearing down ONE distinct shared runtime and
-    /// re-loading it from source for every principal that was viewing THAT hash.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    async fn prepare_runtime_replacement(
+        &self,
+        id: &astrid_capsule_types::CapsuleId,
+        source_dir: &Path,
+        principal: &PrincipalId,
+        expected_scope: astrid_capsule::registry::RuntimeScope,
+    ) -> Result<PreparedRuntimeReplacement, anyhow::Error> {
+        self.verify_workspace_capsule_tree(source_dir)?;
+        let manifest_path = source_dir.join("Capsule.toml");
+        let manifest = astrid_capsule::discovery::load_manifest(&manifest_path)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        if manifest.package.name != id.as_str() {
+            anyhow::bail!(
+                "replacement manifest id '{}' does not match running capsule '{id}'",
+                manifest.package.name
+            );
+        }
+        astrid_capsule_install::verify_installed_authority(
+            &self.astrid_home,
+            source_dir,
+            &manifest,
+        )?;
+        self.verify_workspace_component_paths(source_dir, &manifest)?;
+        if !manifest.mcp_servers.is_empty() {
+            anyhow::bail!(
+                "live replacement of stdio MCP capsule '{id}' is not yet atomic; restart the daemon to activate these process changes"
+            );
+        }
+        let artifact = capsule_instance_hash(&manifest, source_dir);
+        let requests_system = manifest.capabilities.uplink || !manifest.uplinks.is_empty();
+        let system_runtime =
+            requests_system && self.system_capsules.read().await.contains(id.as_str());
+        if requests_system && !system_runtime {
+            anyhow::bail!(
+                "capsule '{id}' requests uplink/system residency but is absent from the \
+                 operator-owned [[uplinks]] allowlist"
+            );
+        }
+        if system_runtime && !manifest.mcp_servers.is_empty() {
+            anyhow::bail!(
+                "system-resident capsule '{id}' cannot host principal-bearing stdio MCP servers"
+            );
+        }
+        if system_runtime {
+            let operator_root = self
+                .astrid_home
+                .principal_home(&PrincipalId::default())
+                .capsules_dir();
+            if principal != &PrincipalId::default() || !source_dir.starts_with(&operator_root) {
+                anyhow::bail!(
+                    "system-resident capsule '{id}' may only be replaced from the operator/default install root '{}'",
+                    operator_root.display()
+                );
+            }
+        }
+        let actual_scope = if system_runtime {
+            astrid_capsule::registry::RuntimeScope::SystemResident
+        } else {
+            astrid_capsule::registry::RuntimeScope::Principal(
+                self.principal_directory.uid_for(principal)?,
+            )
+        };
+        if actual_scope != expected_scope {
+            anyhow::bail!(
+                "capsule '{id}' cannot change runtime scope during live replacement: \
+                 running={expected_scope:?}, installed={actual_scope:?}"
+            );
+        }
+        let principal_uid = self.runtime_principal_uid(system_runtime, principal, id)?;
+        let runtime_id =
+            self.capsules
+                .write()
+                .await
+                .reserve_runtime_id(id.clone(), artifact, actual_scope)?;
+        let mut capsule = self
+            .build_capsule_runtime(
+                manifest,
+                source_dir,
+                (!system_runtime).then_some(principal),
+                runtime_id.clone(),
+            )
+            .await?;
+        if !manifest_path.exists() {
+            anyhow::bail!(
+                "capsule source disappeared while preparing replacement: {}",
+                manifest_path.display()
+            );
+        }
+        if let Err(error) = activate_and_wait_ready(id, capsule.as_mut()).await {
+            capsule.request_cancel();
+            if let Err(cleanup) = capsule.unload().await {
+                tracing::warn!(capsule_id = %id, error = %cleanup, "Failed to unload rejected replacement candidate");
+            }
+            return Err(error);
+        }
+        Ok(PreparedRuntimeReplacement {
+            capsule,
+            runtime_id,
+            principal_uid,
+            system_runtime,
+        })
+    }
+
+    /// Restart the exact runtime generation visible to `principal`. Principal
+    /// failures affect only that immutable UID. A `SystemResident` failure
+    /// rebuilds its explicit singleton and restores its dependent views.
     ///
-    /// A content-addressed runtime is SHARED across principals (issue #1069): a
-    /// failed runtime is one instance behind N principal views of the SAME hash.
-    /// A restart must rebuild that ONE instance so that no view is left pointing
-    /// at a dead runtime — releasing only the requesting principal's view would
-    /// decrement the refcount, leave the still-failed runtime alive, and (because
-    /// the hash is still loaded) merely re-attach the requester's view to the
-    /// failed instance via `register_existing`.
-    ///
-    /// The restart is scoped to the SPECIFIC hash the requesting `principal`
-    /// views. A capsule id can have TWO distinct hashes loaded at once
-    /// (per-principal installs of different versions); rebuilding *every* view of
-    /// the id — including a viewer pointing at a different, healthy hash — would
-    /// wrongly re-home that viewer onto the restarted version. So we resolve the
-    /// requester's hash, capture only the views pointing at it, tear that runtime
-    /// down, then reload it from its own source and re-attach exactly those views.
-    ///
-    /// Returns [`RestartOutcome::Clean`] when the old runtime was fully unloaded
-    /// before the fresh instance loaded, or [`RestartOutcome::OldInstanceLingering`]
-    /// when a still-held `Arc` clone (e.g. a live dispatcher consumer) blocked
-    /// the exclusive `unload` — the old run-loop/subprocess are cooperatively
-    /// cancelled regardless (no CPU/process leak), but the health monitor must
-    /// keep the restart tracker so its retry cap engages instead of thrashing a
-    /// persistently-failing capsule every ~10s.
+    /// The replacement is activated behind a closed route-admission gate and
+    /// must become ready before it is atomically published. Returns
+    /// [`RestartOutcome::Clean`] when the old runtime was then fully unloaded,
+    /// or [`RestartOutcome::OldInstanceLingering`] when another `Arc` still
+    /// holds its already-cancelled resources.
     ///
     /// # Errors
     ///
@@ -1267,146 +1444,97 @@ impl Kernel {
         &self,
         id: &astrid_capsule_types::CapsuleId,
         principal: &PrincipalId,
+        expected_runtime: Option<&astrid_capsule::registry::RuntimeId>,
     ) -> Result<RestartOutcome, anyhow::Error> {
-        // Capture the failed runtime's own source directory AND every principal
-        // viewing THAT hash before we tear it down. The requesting `principal` is
-        // restored first so its `handle_lifecycle_restart` fires below.
-        let (source_dir, view_principals) = {
+        let (source_dir, current_runtime) = {
             let registry = self.capsules.read().await;
             let capsule = registry
                 .get_for(principal, id)
                 .ok_or_else(|| anyhow::anyhow!("capsule '{id}' not found in registry"))?;
-            let hash = registry
-                .hash_for(principal, id)
+            let runtime_id = registry
+                .runtime_id_for(principal, id)
                 .ok_or_else(|| anyhow::anyhow!("capsule '{id}' not found in registry"))?;
+            if expected_runtime.is_some_and(|expected| expected != &runtime_id) {
+                return Ok(RestartOutcome::Superseded);
+            }
             let source_dir = capsule
                 .source_dir()
                 .map(std::path::Path::to_path_buf)
                 .ok_or_else(|| anyhow::anyhow!("capsule '{id}' has no source directory"))?;
-            // Requesting principal first, then the rest (dedup), so reload order
-            // is deterministic and the requester's lifecycle-restart hook fires.
-            // Scoped to the requester's HASH so a viewer of a different hash of
-            // the same id is left untouched.
-            let mut principals = vec![principal.clone()];
-            for p in registry.principals_viewing_hash(id, &hash) {
-                if p != *principal {
-                    principals.push(p);
-                }
-            }
-            (source_dir, principals)
+            (source_dir, runtime_id)
         };
 
-        // Tear the shared runtime down COMPLETELY: unregister every view so the
-        // last release removes the instance and lets us unload it. Doing this for
-        // all views (not just the requester's) is what makes this an actual
-        // restart of the shared runtime rather than a no-op view re-attach.
-        let mut torn_down_runtime: Option<std::sync::Arc<dyn astrid_capsule::capsule::Capsule>> =
-            None;
-        {
+        // Prepare and prove a route-gated replacement while the current
+        // generation remains visible and healthy. A preparation or readiness
+        // failure leaves the running view untouched.
+        let mut prepared = self
+            .prepare_runtime_replacement(id, &source_dir, principal, current_runtime.key().scope())
+            .await?;
+
+        let (mut previous, replacement) = {
             let mut registry = self.capsules.write().await;
-            for p in &view_principals {
-                match registry.unregister_for(p, id) {
-                    Ok(removed) => {
-                        if removed.torn_down {
-                            torn_down_runtime = Some(removed.capsule);
-                        }
-                    },
-                    Err(astrid_capsule_types::error::CapsuleError::NotFound(_)) => {
-                        // A concurrent unload already released this view; fine.
-                    },
-                    Err(e) => {
-                        return Err(anyhow::anyhow!(
-                            "failed to unregister capsule '{id}' view for '{p}': {e}"
-                        ));
-                    },
-                }
+            if registry.runtime_id_for(principal, id).as_ref() != Some(&current_runtime) {
+                drop(registry);
+                prepared.capsule.request_cancel();
+                prepared.capsule.unload().await?;
+                return Ok(RestartOutcome::Superseded);
             }
-        }
-
-        // Explicitly unload the torn-down runtime (there is no async Drop, so we
-        // must do it here to avoid leaking MCP subprocesses and engine
-        // resources). `Arc::get_mut` requires exclusive ownership.
-        //
-        // A restart with NO torn-down runtime (a concurrent unload already
-        // released it) is Clean by definition — there is no old instance left
-        // to leak.
-        let mut outcome = RestartOutcome::Clean;
-        if let Some(mut old) = torn_down_runtime {
-            // Cooperatively stop the old instance FIRST, without needing
-            // exclusive ownership. `request_cancel` cancels the instance
-            // cancel-token, which (a) unblocks in-flight blocking host calls so
-            // their dispatcher-task `Arc` clones drop, (b) stops the run-loop
-            // task — its `select!` on the same token preempts even a compute-
-            // bound guest now that exempt run-loops cooperatively yield every
-            // epoch window (Fix 5) — and (c) wakes the host-process reaper,
-            // which reaps subprocesses. So the old run-loop/subprocess are gone
-            // even when the exclusive `unload` below cannot run.
-            old.request_cancel();
-            let mut unloaded = false;
-            for retry in 0..20_u32 {
-                if let Some(capsule) = std::sync::Arc::get_mut(&mut old) {
-                    if let Err(e) = capsule.unload().await {
-                        tracing::warn!(
-                            capsule_id = %id,
-                            error = %e,
-                            "Capsule unload failed during restart"
-                        );
-                    }
-                    unloaded = true;
-                    break;
+            if prepared.system_runtime
+                && let Err(error) = registry.validate_system_runtime_replacement(
+                    &current_runtime,
+                    prepared.capsule.as_ref(),
+                    &prepared.runtime_id,
+                )
+            {
+                drop(registry);
+                prepared.capsule.retire();
+                prepared.capsule.request_cancel();
+                if let Err(cleanup) = prepared.capsule.unload().await {
+                    tracing::warn!(capsule_id = %id, %cleanup, "Failed to unload rejected replacement publication");
                 }
-                if retry < 19 {
-                    astrid_runtime::time::sleep(std::time::Duration::from_millis(50)).await;
-                }
+                return Err(anyhow::anyhow!(error));
             }
-            if !unloaded {
-                // Exclusive unload was blocked by a still-held `Arc` clone. The
-                // run-loop/subprocess were already cooperatively cancelled
-                // above, so this is not a CPU/process leak — the engine's
-                // epoch-ticker/pool memory is reclaimed when the last clone
-                // (e.g. an idle-evicting dispatcher consumer) drops. But the
-                // restart is NOT clean: report it so the health monitor keeps
-                // the retry tracker and its cap engages, instead of a
-                // persistently-failing capsule thrashing a fresh reload every
-                // ~10s forever.
-                outcome = RestartOutcome::OldInstanceLingering;
-                tracing::warn!(
-                    capsule_id = %id,
-                    strong_count = std::sync::Arc::strong_count(&old),
-                    "Old capsule instance not exclusively unloaded during restart \
-                     (Arc still held); run-loop/subprocess were cancelled, memory \
-                     reclaims when the last clone drops. Restart tracker retained."
-                );
+            let replaced = if prepared.system_runtime {
+                registry.replace_system_runtime_reserved(
+                    &current_runtime,
+                    prepared.capsule,
+                    prepared.runtime_id,
+                )?
+            } else {
+                registry.replace_principal_runtime_reserved(
+                    &current_runtime,
+                    prepared.capsule,
+                    prepared.runtime_id,
+                    principal,
+                    prepared
+                        .principal_uid
+                        .expect("principal replacement resolved durable uid"),
+                )?
+            };
+            let replacement = registry
+                .get_for(principal, id)
+                .expect("replacement generation was atomically published");
+
+            // Close the old generation before publishing the candidate's
+            // already-ready routes. Dispatcher lookups already resolve the new
+            // view, so no interval admits fresh work to both generations.
+            replaced.previous.retire();
+            replaced.previous.request_cancel();
+            for viewer in registry.principals_viewing_runtime(&replaced.runtime_id) {
+                replacement.resume_for(&viewer);
             }
-        }
-
-        // Rebuild the shared runtime and re-attach every captured view. The first
-        // `load_capsule` builds the fresh runtime (owned by `default`); the rest
-        // attach their views over it (same content hash → shared instance).
-        for p in &view_principals {
-            self.load_capsule(source_dir.clone(), p).await?;
-        }
-
-        // Signal the newly loaded capsule to clean up ephemeral state
-        // from the previous incarnation. Capsules that don't implement
-        // `handle_lifecycle_restart` will return an error, which is fine.
-        //
-        // Clone the capsule Arc under a brief read lock, then drop the
-        // guard before invoke_interceptor which calls block_in_place.
-        // Holding the RwLock across block_in_place parks the worker thread
-        // and starves registry writers (health monitor, capsule loading).
-        let capsule = {
-            let registry = self.capsules.read().await;
-            registry.get_for(principal, id)
+            replacement.publish();
+            (replaced.previous, replacement)
         };
-        if let Some(capsule) = capsule
-            && let Err(e) = capsule
-                .invoke_interceptor("handle_lifecycle_restart", &[], None)
-                .await
+
+        let outcome = unload_replaced_runtime(id, &mut previous).await;
+        if let Err(error) = replacement
+            .invoke_interceptor("handle_lifecycle_restart", &[], None)
+            .await
         {
             tracing::debug!(
                 capsule_id = %id,
-                error = %e,
+                error = %error,
                 "Capsule does not handle lifecycle restart (optional)"
             );
         }
@@ -1622,6 +1750,12 @@ impl Kernel {
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     async fn ensure_principal_uplinks_loaded(&self, principal: &PrincipalId) {
         let _load_guard = self.capsule_load_lock.lock().await;
+        if *principal != PrincipalId::default()
+            && self.capabilities.is_principal_retiring(principal).await
+        {
+            tracing::debug!(%principal, "Skipping uplink load for retiring principal");
+            return;
+        }
         if *principal != PrincipalId::default()
             && !astrid_core::profile::PrincipalProfile::path_for(&self.astrid_home, principal)
                 .exists()
@@ -2146,7 +2280,11 @@ impl Kernel {
     ) -> Result<(), anyhow::Error> {
         let registered = { self.capsules.read().await.get_for(principal, id).is_some() };
         if registered {
-            self.restart_capsule(id, principal).await?;
+            let _load_guard = self.capsule_load_lock.lock().await;
+            if self.capabilities.is_principal_retiring(principal).await {
+                anyhow::bail!("cannot reload capsule '{id}' for retiring principal '{principal}'");
+            }
+            self.restart_capsule(id, principal, None).await?;
             self.publish_capsules_loaded().await;
         } else {
             // Build or refresh this principal's view from its installed set.
@@ -2184,27 +2322,27 @@ impl Kernel {
         id: &astrid_capsule_types::CapsuleId,
         principal: &PrincipalId,
     ) -> Result<bool, anyhow::Error> {
-        // Unregister only this principal's view. The runtime is shared by
-        // content hash across principals; `unregister_for` decrements the
-        // refcount and reports whether this was the last view. The runtime is
-        // cancelled/unloaded ONLY on the last release — tearing it down while
-        // other principals still reference the shared instance would break them.
+        let _load_guard = self.capsule_load_lock.lock().await;
+        // A principal runtime is always torn down. An operator-owned
+        // `SystemResident` runtime survives until its final view is released.
         let removed = {
             let mut registry = self.capsules.write().await;
-            let removed = match registry.unregister_for(principal, id) {
+            match registry.unregister_for(principal, id) {
                 Ok(removed) => removed,
                 Err(astrid_capsule_types::error::CapsuleError::NotFound(_)) => return Ok(false),
                 Err(e) => {
                     return Err(anyhow::anyhow!("failed to unregister capsule '{id}': {e}"));
                 },
-            };
-            // Keep the registry write edge across quiescence. Registration is
-            // the only path that calls `resume_for`; without this ordering, a
-            // concurrent reinstall could resume the principal and then have
-            // this old unload cancel its newly registered view.
-            removed.capsule.quiesce_for(principal).await;
-            removed
+            }
         };
+        // Registration/reload is serialized by `capsule_load_lock`, so the
+        // registry map lock can be released before awaiting the old runtime's
+        // drain. This avoids a lock cycle with admitted host calls that perform
+        // generation-scoped registry reads.
+        if removed.torn_down {
+            removed.capsule.retire();
+        }
+        removed.capsule.quiesce_for(principal).await;
 
         // Explicitly unload the old capsule only when this was the last view.
         // There is no Drop impl that calls unload() (it's async), so we must do
@@ -2238,10 +2376,10 @@ impl Kernel {
                 );
             }
         } else {
-            // The shared runtime survives — but the DEPARTING principal's
+            // The SystemResident runtime survives — but the departing view's
             // in-flight blocking host calls (approval/elicit waits, net/io/ipc
             // waits) would otherwise keep running inside it with nothing left
-            // to answer them, wedging the shared instance for every remaining
+            // to answer them, wedging the system runtime for every remaining
             // principal. Cancel exactly that principal's waits; everyone
             // else's work is untouched (per-principal child tokens, not the
             // instance-wide `request_cancel`).
@@ -2252,7 +2390,7 @@ impl Kernel {
             tracing::debug!(
                 capsule_id = %id,
                 principal = %principal,
-                "Unloaded one view of a shared runtime; other principals still \
+                "Unloaded one view of a SystemResident runtime; other principals still \
                  reference it, so the runtime is left running and only the \
                  departing principal's in-flight host calls were cancelled"
             );
@@ -2268,14 +2406,13 @@ impl Kernel {
     /// The load lock closes the race with background warm/install discovery:
     /// once the profile/identity fence has closed new authorization, no loader
     /// can re-attach a view between the snapshot and the last unload. Each
-    /// release uses [`Self::unload_one_capsule`], preserving shared-runtime
-    /// semantics: the last view cancels and unloads the whole runtime, while a
-    /// non-last view cancels only this principal's in-flight blocking work.
+    /// release uses [`Self::unload_one_capsule`]. Principal runtimes are always
+    /// removed; dependent `SystemResident` views survive only while their
+    /// explicit owner remains installed.
     pub(crate) async fn unload_principal_capsules(
         &self,
         principal: &PrincipalId,
     ) -> Result<Vec<astrid_capsule_types::CapsuleId>, anyhow::Error> {
-        let _load_guard = self.capsule_load_lock.lock().await;
         let mut ids: Vec<_> = {
             let registry = self.capsules.read().await;
             registry.list_for(principal).into_iter().cloned().collect()
@@ -2758,6 +2895,13 @@ fn open_test_identity_stores(
 }
 
 #[cfg(test)]
+fn test_workspace_selection(home: &astrid_core::dirs::AstridHome) -> WorkspaceSelection {
+    WorkspaceLayout::default()
+        .resolve(home.root())
+        .expect("test workspace selection")
+}
+
+#[cfg(test)]
 pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -> Arc<Kernel> {
     use astrid_capsule::profile_cache::PrincipalProfileCache;
 
@@ -2815,7 +2959,8 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
     ));
 
     let allowance_store = Arc::new(astrid_approval::AllowanceStore::new());
-    let (identity_store, ownership_store) = open_test_identity_stores(&kv, principal_directory);
+    let (identity_store, ownership_store) =
+        open_test_identity_stores(&kv, principal_directory.clone());
 
     let groups = Arc::new(ArcSwap::from_pointee(
         GroupConfig::load(&home).expect("test kernel: load groups"),
@@ -2832,14 +2977,13 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         vfs_root_handle: root_handle,
         workspace_root: home.root().to_path_buf(),
         workspace_layout: WorkspaceLayout::default(),
-        workspace_selection: WorkspaceLayout::default()
-            .resolve(home.root())
-            .expect("test workspace selection"),
+        workspace_selection: test_workspace_selection(&home),
         home_root: Some(principal_home.root().to_path_buf()),
         cli_socket_listener: None,
         native_uplink_owns_listener: AtomicBool::new(false),
         singleton_lock: None,
         kv,
+        principal_directory,
         #[cfg(not(target_family = "wasm"))]
         principal_store: Some(principal_store),
         audit_log,
@@ -2848,8 +2992,10 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         fuel_ledger: astrid_capsule_types::FuelLedger::default(),
         fuel_rate: astrid_capsule_types::FuelRateLimiter::default(),
         memory_ledger: astrid_capsule_types::MemoryLedger::default(),
+        compiled_wasm: astrid_capsule::engine::wasm::CompiledWasmCache::default(),
         runtime_limits: astrid_capsule_types::CapsuleRuntimeLimits::default(),
         local_egress: std::collections::HashMap::new(),
+        system_capsules: RwLock::new(std::collections::HashSet::new()),
         http_limits: astrid_capsule_types::HttpLimits::default(),
         full_reload_in_flight: AtomicBool::new(false),
         capsule_load_lock: Mutex::new(()),
@@ -3150,7 +3296,7 @@ impl RestartTracker {
 
 /// Whether [`Kernel::restart_capsule`] fully tore the old instance down.
 ///
-/// A restart reloads a fresh instance either way; this is a DIAGNOSTIC of what
+/// A restart publishes a fresh generation either way; this is a diagnostic of what
 /// happened to the OLD one. It deliberately does NOT drive the retry cap: the
 /// cap counts consecutive HEALTH failures (a lingering old instance is a normal,
 /// harmless state for a busy capsule whose dispatcher consumer still holds a
@@ -3159,8 +3305,8 @@ impl RestartTracker {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 enum RestartOutcome {
-    /// The old runtime was exclusively unloaded before the fresh instance
-    /// loaded — a genuinely clean restart.
+    /// The old runtime was exclusively unloaded after the fresh generation was
+    /// atomically published.
     Clean,
     /// The old runtime's exclusive `unload` was skipped because an `Arc` clone
     /// (e.g. a live dispatcher consumer holding a clone for up to its idle
@@ -3169,6 +3315,65 @@ enum RestartOutcome {
     /// clone drops. This is common for a capsule under load and is NOT counted
     /// as a restart failure.
     OldInstanceLingering,
+    /// The observed failed generation was already replaced before restart.
+    Superseded,
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+async fn unload_replaced_runtime(
+    id: &astrid_capsule_types::CapsuleId,
+    previous: &mut Arc<dyn astrid_capsule::capsule::Capsule>,
+) -> RestartOutcome {
+    for retry in 0..20_u32 {
+        if let Some(capsule) = Arc::get_mut(previous) {
+            if let Err(error) = capsule.unload().await {
+                tracing::warn!(
+                    capsule_id = %id,
+                    error = %error,
+                    "Capsule unload failed after generation replacement"
+                );
+            }
+            return RestartOutcome::Clean;
+        }
+        if retry < 19 {
+            astrid_runtime::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+    tracing::warn!(
+        capsule_id = %id,
+        strong_count = Arc::strong_count(previous),
+        "Old capsule generation remains referenced after replacement; autonomous \
+         work was cancelled and memory reclaims when the last reference drops"
+    );
+    RestartOutcome::OldInstanceLingering
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+async fn activate_and_wait_ready(
+    id: &astrid_capsule_types::CapsuleId,
+    candidate: &mut dyn astrid_capsule::capsule::Capsule,
+) -> Result<(), anyhow::Error> {
+    use astrid_capsule::capsule::ReadyStatus;
+
+    let activation_timeout = std::time::Duration::from_secs(30);
+    let readiness_timeout = std::time::Duration::from_millis(500);
+    match astrid_runtime::time::timeout(activation_timeout, candidate.activate()).await {
+        Ok(result) => result?,
+        Err(_) => anyhow::bail!(
+            "candidate generation for '{id}' did not activate within {}ms",
+            activation_timeout.as_millis()
+        ),
+    }
+    match candidate.wait_ready(readiness_timeout).await {
+        ReadyStatus::Ready => Ok(()),
+        ReadyStatus::Timeout => anyhow::bail!(
+            "candidate generation for '{id}' did not signal ready within {}ms",
+            readiness_timeout.as_millis()
+        ),
+        ReadyStatus::Crashed => {
+            anyhow::bail!("candidate generation for '{id}' exited before signaling ready")
+        },
+    }
 }
 
 /// Attempts to restart a failed capsule, respecting backoff and max retries.
@@ -3188,6 +3393,7 @@ async fn attempt_capsule_restart(
     kernel: &Kernel,
     id_str: &str,
     principal: &PrincipalId,
+    expected_runtime: &astrid_capsule::registry::RuntimeId,
     tracker: &mut RestartTracker,
 ) {
     if tracker.exhausted() {
@@ -3215,7 +3421,15 @@ async fn attempt_capsule_restart(
     );
 
     let capsule_id = astrid_capsule_types::CapsuleId::from_static(id_str);
-    match kernel.restart_capsule(&capsule_id, principal).await {
+    let _lifecycle = kernel.capsule_load_lock.lock().await;
+    if kernel.capabilities.is_principal_retiring(principal).await {
+        tracing::debug!(capsule_id = %id_str, %principal, "Skipping health restart for retiring principal");
+        return;
+    }
+    match kernel
+        .restart_capsule(&capsule_id, principal, Some(expected_runtime))
+        .await
+    {
         Ok(RestartOutcome::Clean) => {
             tracing::info!(
                 capsule_id = %id_str,
@@ -3236,6 +3450,13 @@ async fn attempt_capsule_restart(
                 attempt,
                 "Capsule restarted (old instance lingering behind a held Arc; cancelled, \
                  memory reclaims when the last clone drops)"
+            );
+        },
+        Ok(RestartOutcome::Superseded) => {
+            tracing::debug!(
+                capsule_id = %id_str,
+                principal = %principal,
+                "Skipping restart because the failed runtime generation was already replaced"
             );
         },
         Err(e) => {
@@ -3272,8 +3493,10 @@ fn spawn_capsule_health_monitor(kernel: Arc<Kernel>) -> astrid_runtime::JoinHand
         let mut interval = astrid_runtime::time::interval(std::time::Duration::from_secs(10));
         interval.tick().await; // Skip the first immediate tick.
 
-        let mut restart_trackers: std::collections::HashMap<String, RestartTracker> =
-            std::collections::HashMap::new();
+        let mut restart_trackers: std::collections::HashMap<
+            astrid_capsule::registry::RuntimeId,
+            RestartTracker,
+        > = std::collections::HashMap::new();
 
         loop {
             interval.tick().await;
@@ -3284,16 +3507,16 @@ fn spawn_capsule_health_monitor(kernel: Arc<Kernel>) -> astrid_runtime::JoinHand
             // the lock before calling check_health() or publishing events.
             let ready_capsules: Vec<(
                 PrincipalId,
-                astrid_capsule::registry::WasmHash,
+                astrid_capsule::registry::RuntimeId,
                 std::sync::Arc<dyn astrid_capsule::capsule::Capsule>,
             )> = {
                 let registry = kernel.capsules.read().await;
                 registry
-                    .cloned_values_with_principal_and_hash()
+                    .cloned_runtimes_with_principal()
                     .into_iter()
-                    .filter_map(|(principal, hash, capsule)| {
+                    .filter_map(|(principal, runtime_id, capsule)| {
                         if capsule.state() == astrid_capsule::capsule::CapsuleState::Ready {
-                            Some((principal, hash, capsule))
+                            Some((principal, runtime_id, capsule))
                         } else {
                             None
                         }
@@ -3305,17 +3528,11 @@ fn spawn_capsule_health_monitor(kernel: Arc<Kernel>) -> astrid_runtime::JoinHand
             // the Arc Vec before restarting. This ensures restart_capsule's
             // Arc::get_mut can succeed (no other strong references held).
             //
-            // A content-addressed runtime is SHARED across principals (issue
-            // #1069): `cloned_values_with_principal_and_hash()` yields one
-            // `(principal, hash, Arc)` triple PER VIEW, so a runtime referenced by
-            // N views of the same hash appears N times, all sharing one `Arc` and
-            // reporting the same `check_health`. `collect_failed_runtimes_deduped`
-            // DEDUPS by `(id, hash)` so that runtime is restarted exactly ONCE —
-            // yet a capsule id with two DISTINCT loaded hashes (per-principal
-            // installs of different versions) yields two entries, each restarted
-            // independently. `restart_capsule` rebuilds every view of that hash.
+            // RuntimeId already carries authority scope and generation, so each
+            // mutable runtime is probed exactly once. A SystemResident runtime
+            // likewise appears once regardless of its number of views.
             let failures = collect_failed_runtimes_deduped(&ready_capsules);
-            for (principal, id_str, _hash, reason) in &failures {
+            for (principal, id_str, _runtime_id, reason) in &failures {
                 tracing::error!(
                     capsule_id = %id_str,
                     principal = %principal,
@@ -3343,18 +3560,18 @@ fn spawn_capsule_health_monitor(kernel: Arc<Kernel>) -> astrid_runtime::JoinHand
             // obtain exclusive access for calling unload().
             drop(ready_capsules);
 
-            let failed_this_tick: std::collections::HashSet<String> = failures
-                .iter()
-                .map(|(_principal, id, hash, _)| restart_tracker_key(id, hash))
-                .collect();
+            let failed_this_tick: std::collections::HashSet<astrid_capsule::registry::RuntimeId> =
+                failures
+                    .iter()
+                    .map(|(_principal, _id, runtime_id, _)| runtime_id.clone())
+                    .collect();
 
-            for (principal, id_str, hash, _reason) in &failures {
-                let tracker_key = restart_tracker_key(id_str, hash);
+            for (principal, id_str, runtime_id, _reason) in &failures {
                 let tracker = restart_trackers
-                    .entry(tracker_key.clone())
+                    .entry(runtime_id.clone())
                     .or_insert_with(RestartTracker::new);
 
-                attempt_capsule_restart(&kernel, id_str, principal, tracker).await;
+                attempt_capsule_restart(&kernel, id_str, principal, runtime_id, tracker).await;
             }
 
             // Prune trackers on RECOVERY — the sole tracker-removal path. A
@@ -3400,53 +3617,22 @@ fn tracker_should_be_retained(tracker: &RestartTracker, failed_this_tick: bool) 
     failed_this_tick
 }
 
-/// Restart-tracker key for a DISTINCT shared runtime: `(capsule id, content
-/// hash)`.
-///
-/// A content-addressed runtime is shared across principals (issue #1069) — one
-/// instance behind N views of the SAME hash. Including the hash (not the capsule
-/// id alone, and not `principal/capsule_id`) makes the health monitor track ONE
-/// restart budget per DISTINCT runtime: a failed shared instance is not restarted
-/// N times (once per viewing principal), yet two distinct hashes of one capsule
-/// id (per-principal installs of different versions) get INDEPENDENT budgets so a
-/// crash-looping v1 cannot exhaust v2's restart allowance or vice versa.
-fn restart_tracker_key(capsule_id: &str, hash: &astrid_capsule::registry::WasmHash) -> String {
-    format!("{capsule_id}\0{hash}")
-}
-
-/// Collect the FAILED runtimes from the health-monitor's view snapshot,
-/// deduplicated by `(capsule id, content hash)`.
-///
-/// `cloned_values_with_principal_and_hash()` yields one `(principal, hash, Arc)`
-/// triple PER VIEW, so a SHARED failed runtime (issue #1069) referenced by N
-/// views of the SAME hash appears N times — all sharing one `Arc` and reporting
-/// the same `check_health`. This dedups by `(id, hash)` so that shared runtime
-/// yields exactly ONE failure entry (and therefore exactly one restart), while
-/// still surfacing TWO entries when one capsule id has two DISTINCT hashes loaded
-/// at once (e.g. `default` on `foo@1.0` and `alice` on `foo@2.0` — installs are
-/// per-principal, so each derives its own content hash). Each distinct runtime is
-/// then restarted independently rather than one being collapsed into the other.
-///
-/// The retained entry keeps the first-seen viewing principal as the restart
-/// requester; `restart_capsule` rebuilds every view pointing at that exact hash.
-///
-/// Returns `(requesting principal, capsule id, content hash, failure reason)`.
+/// Collect failed runtime generations from the health-monitor snapshot.
+/// Returns `(requesting principal, capsule id, RuntimeId, failure reason)`.
 fn collect_failed_runtimes_deduped(
     ready_capsules: &[(
         PrincipalId,
-        astrid_capsule::registry::WasmHash,
+        astrid_capsule::registry::RuntimeId,
         std::sync::Arc<dyn astrid_capsule::capsule::Capsule>,
     )],
 ) -> Vec<(
     PrincipalId,
     String,
-    astrid_capsule::registry::WasmHash,
+    astrid_capsule::registry::RuntimeId,
     String,
 )> {
     let mut failures = Vec::new();
-    let mut seen: std::collections::HashSet<(String, astrid_capsule::registry::WasmHash)> =
-        std::collections::HashSet::new();
-    for (principal, hash, capsule) in ready_capsules {
+    for (principal, runtime_id, capsule) in ready_capsules {
         // Probe health FIRST — it borrows and does not allocate, and the common
         // case (a healthy runtime) short-circuits before any `String` / key
         // allocation. Only an actually-failed runtime pays for the `(id, hash)`
@@ -3456,9 +3642,7 @@ fn collect_failed_runtimes_deduped(
             continue;
         };
         let id_str = capsule.id().to_string();
-        if seen.insert((id_str.clone(), hash.clone())) {
-            failures.push((principal.clone(), id_str, hash.clone(), reason));
-        }
+        failures.push((principal.clone(), id_str, runtime_id.clone(), reason));
     }
     failures
 }
@@ -4159,7 +4343,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
 
-    use astrid_capsule::capsule::{Capsule, CapsuleState};
+    use astrid_capsule::capsule::{Capsule, CapsuleState, ReadyStatus};
     use astrid_capsule::context::CapsuleContext;
     use astrid_capsule_types::CapsuleId;
     use astrid_capsule_types::error::CapsuleResult;
@@ -4347,6 +4531,77 @@ mod tests {
         release: Arc<tokio::sync::Notify>,
     }
 
+    struct RegistryReadingQuiesceCapsule {
+        id: CapsuleId,
+        manifest: CapsuleManifest,
+        registry: Arc<RwLock<astrid_capsule::registry::CapsuleRegistry>>,
+    }
+
+    struct NeverReadyCapsule {
+        id: CapsuleId,
+        manifest: CapsuleManifest,
+        activated: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Capsule for NeverReadyCapsule {
+        fn id(&self) -> &CapsuleId {
+            &self.id
+        }
+
+        fn manifest(&self) -> &CapsuleManifest {
+            &self.manifest
+        }
+
+        fn state(&self) -> CapsuleState {
+            CapsuleState::Ready
+        }
+
+        async fn load(&mut self, _ctx: &CapsuleContext) -> CapsuleResult<()> {
+            Ok(())
+        }
+
+        async fn unload(&mut self) -> CapsuleResult<()> {
+            Ok(())
+        }
+
+        async fn activate(&mut self) -> CapsuleResult<()> {
+            self.activated.store(true, Ordering::Release);
+            Ok(())
+        }
+
+        async fn wait_ready(&self, _timeout: std::time::Duration) -> ReadyStatus {
+            ReadyStatus::Timeout
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Capsule for RegistryReadingQuiesceCapsule {
+        fn id(&self) -> &CapsuleId {
+            &self.id
+        }
+
+        fn manifest(&self) -> &CapsuleManifest {
+            &self.manifest
+        }
+
+        fn state(&self) -> CapsuleState {
+            CapsuleState::Ready
+        }
+
+        async fn load(&mut self, _ctx: &CapsuleContext) -> CapsuleResult<()> {
+            Ok(())
+        }
+
+        async fn unload(&mut self) -> CapsuleResult<()> {
+            Ok(())
+        }
+
+        async fn quiesce_for(&self, _principal: &PrincipalId) {
+            let _registry = self.registry.read().await;
+        }
+    }
+
     #[async_trait::async_trait]
     impl Capsule for BlockingQuiesceCapsule {
         fn id(&self) -> &CapsuleId {
@@ -4483,18 +4738,69 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unload_releases_registry_write_lock_before_quiescence() {
+        let (_d, home) = scratch_home();
+        let kernel = test_kernel_with_home(home).await;
+        let id = CapsuleId::new("registry-reading-quiesce").unwrap();
+        kernel
+            .capsules
+            .write()
+            .await
+            .register(Box::new(RegistryReadingQuiesceCapsule {
+                id: id.clone(),
+                manifest: CapsuleManifest::default(),
+                registry: Arc::clone(&kernel.capsules),
+            }))
+            .unwrap();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            kernel.unload_one_capsule(&id, &PrincipalId::default()),
+        )
+        .await
+        .expect("unload deadlocked registry write against admitted registry read")
+        .unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread")]
-    async fn unload_one_principal_retains_shared_runtime_for_others() {
-        // Shared-by-hash (#1069): alice and bob view ONE runtime for the same
-        // content hash. Unloading alice's view must NOT cancel or unload the
-        // shared runtime while bob still references it — the runtime survives
-        // and bob's view is intact. (The pre-#1069 model built one runtime per
-        // principal; this asserts the shared model.)
+    async fn unready_candidate_cannot_replace_current_generation() {
+        let id = CapsuleId::new("never-ready").unwrap();
+        let principal = PrincipalId::default();
+        let mut registry = astrid_capsule::registry::CapsuleRegistry::new();
+        registry
+            .register(Box::new(CancellableTestCapsule {
+                id: id.clone(),
+                manifest: CapsuleManifest::default(),
+                cancelled: Arc::new(AtomicBool::new(false)),
+                unloaded: Arc::new(AtomicBool::new(false)),
+                cancelled_for: Arc::default(),
+            }))
+            .unwrap();
+        let current = registry.runtime_id_for(&principal, &id).unwrap();
+        let activated = Arc::new(AtomicBool::new(false));
+        let mut candidate = NeverReadyCapsule {
+            id: id.clone(),
+            manifest: CapsuleManifest::default(),
+            activated: Arc::clone(&activated),
+        };
+
+        assert!(activate_and_wait_ready(&id, &mut candidate).await.is_err());
+        assert!(activated.load(Ordering::Acquire));
+        assert_eq!(registry.runtime_id_for(&principal, &id), Some(current));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unload_one_principal_retains_system_runtime_for_others() {
+        // Alice and Bob deliberately view one explicit system singleton.
+        // Releasing Alice's view must cancel only her in-flight work while the
+        // service and Bob's view remain intact.
         let (_d, home) = scratch_home();
         let kernel = test_kernel_with_home(home).await;
         let id = CapsuleId::new("shared-test").unwrap();
         let alice = PrincipalId::new("alice").unwrap();
         let bob = PrincipalId::new("bob").unwrap();
+        let operator = PrincipalId::default();
         let hash = astrid_capsule::registry::WasmHash::from_raw("shared-test-hash");
         let cancelled = Arc::new(AtomicBool::new(false));
         let unloaded = Arc::new(AtomicBool::new(false));
@@ -4502,14 +4808,10 @@ mod tests {
 
         {
             let mut registry = kernel.capsules.write().await;
-            // First loader builds the shared runtime via the PRODUCTION path:
-            // owned by `default`, with alice's dispatch view. Using
-            // `register_owned_by_default` (not `register_for(.., &alice)`) means
-            // the shared instance's load-time owner is `default`, never a real
-            // non-default principal whose host-state fields would be a
-            // cross-principal fallback.
+            // Register the explicit system singleton under operator policy;
+            // Alice and Bob are dependent views, never implicit owners.
             registry
-                .register_owned_by_default(
+                .register_system_runtime(
                     Box::new(CancellableTestCapsule {
                         id: id.clone(),
                         manifest: CapsuleManifest::default(),
@@ -4518,22 +4820,22 @@ mod tests {
                         cancelled_for: Arc::clone(&cancelled_for),
                     }),
                     hash.clone(),
-                    &alice,
+                    &operator,
                 )
                 .unwrap();
-            // Bob shares the SAME runtime (no second build).
             registry.register_existing(&id, &hash, &bob).unwrap();
+            registry.register_existing(&id, &hash, &alice).unwrap();
         }
 
         let removed = kernel.unload_one_capsule(&id, &alice).await.unwrap();
         assert!(removed);
         assert!(
             !cancelled.load(Ordering::Relaxed),
-            "releasing one view of a shared runtime must NOT cancel it while bob references it"
+            "releasing one system view must NOT cancel the singleton while bob references it"
         );
         assert!(
             !unloaded.load(Ordering::Relaxed),
-            "releasing one view of a shared runtime must NOT unload it while bob references it"
+            "releasing one system view must NOT unload it while bob references it"
         );
         assert_eq!(
             cancelled_for.lock().expect("cancelled_for mutex").clone(),
@@ -4550,19 +4852,23 @@ mod tests {
             );
             assert!(
                 registry.get_for(&bob, &id).is_some(),
-                "bob's view should retain the shared runtime"
+                "bob's view should retain the system runtime"
             );
             assert_eq!(
                 registry.refcount_for_hash(&hash),
-                Some(1),
-                "shared runtime refcount drops to bob's single remaining view"
+                Some(2),
+                "system runtime retains the operator and bob views"
             );
         }
 
-        // Bob's release is the LAST view: its principal-scoped fence closes
-        // first so late work cannot survive into teardown, followed by the
-        // full instance-scoped `request_cancel` + `unload` path.
+        // Bob can also detach without tearing down the operator-owned service.
         let removed = kernel.unload_one_capsule(&id, &bob).await.unwrap();
+        assert!(removed);
+        assert!(!cancelled.load(Ordering::Relaxed));
+        assert!(!unloaded.load(Ordering::Relaxed));
+
+        // Removing the operator-owned view revokes the singleton itself.
+        let removed = kernel.unload_one_capsule(&id, &operator).await.unwrap();
         assert!(removed);
         assert!(
             cancelled.load(Ordering::Relaxed),
@@ -4574,7 +4880,7 @@ mod tests {
         );
         assert_eq!(
             cancelled_for.lock().expect("cancelled_for mutex").clone(),
-            vec![alice, bob],
+            vec![alice, bob, operator],
             "every releasing principal must cross its lifecycle fence, including \
              the last view before instance teardown"
         );
@@ -4587,6 +4893,7 @@ mod tests {
         let id = CapsuleId::new("serialized-lifecycle").unwrap();
         let alice = PrincipalId::new("alice").unwrap();
         let bob = PrincipalId::new("bob").unwrap();
+        let operator = PrincipalId::default();
         let hash = astrid_capsule::registry::WasmHash::from_raw("serialized-lifecycle-hash");
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
@@ -4594,7 +4901,7 @@ mod tests {
         {
             let mut registry = kernel.capsules.write().await;
             registry
-                .register_owned_by_default(
+                .register_system_runtime(
                     Box::new(BlockingQuiesceCapsule {
                         id: id.clone(),
                         manifest: CapsuleManifest::default(),
@@ -4602,9 +4909,10 @@ mod tests {
                         release: Arc::clone(&release),
                     }),
                     hash.clone(),
-                    &alice,
+                    &operator,
                 )
                 .unwrap();
+            registry.register_existing(&id, &hash, &alice).unwrap();
             registry.register_existing(&id, &hash, &bob).unwrap();
         }
 
@@ -4622,6 +4930,7 @@ mod tests {
             let hash = hash.clone();
             let alice = alice.clone();
             tokio::spawn(async move {
+                let _lifecycle = kernel.capsule_load_lock.lock().await;
                 let mut registry = kernel.capsules.write().await;
                 registry.register_existing(&id, &hash, &alice)
             })
@@ -4645,6 +4954,7 @@ mod tests {
         let kernel = test_kernel_with_home(home).await;
         let alice = PrincipalId::new("alice").unwrap();
         let bob = PrincipalId::new("bob").unwrap();
+        let operator = PrincipalId::default();
         let shared_id = CapsuleId::new("shared").unwrap();
         let private_id = CapsuleId::new("private").unwrap();
         let shared_hash = astrid_capsule::registry::WasmHash::from_raw("shared-hash");
@@ -4659,7 +4969,7 @@ mod tests {
         {
             let mut registry = kernel.capsules.write().await;
             registry
-                .register_owned_by_default(
+                .register_system_runtime(
                     Box::new(CancellableTestCapsule {
                         id: shared_id.clone(),
                         manifest: CapsuleManifest::default(),
@@ -4668,14 +4978,17 @@ mod tests {
                         cancelled_for: Arc::clone(&shared_cancelled_for),
                     }),
                     shared_hash.clone(),
-                    &alice,
+                    &operator,
                 )
+                .unwrap();
+            registry
+                .register_existing(&shared_id, &shared_hash, &alice)
                 .unwrap();
             registry
                 .register_existing(&shared_id, &shared_hash, &bob)
                 .unwrap();
             registry
-                .register_owned_by_default(
+                .register_for(
                     Box::new(CancellableTestCapsule {
                         id: private_id.clone(),
                         manifest: CapsuleManifest::default(),
@@ -4735,11 +5048,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn health_monitor_dedups_shared_failed_runtime_to_one_restart() {
-        // Bleed #3: a shared failed runtime with N views must be collected as
-        // exactly ONE failure (hence restarted once), not once per viewing
-        // principal. `cloned_values_with_principal()` yields one pair per view
-        // (N), all sharing one `Arc`; the dedup must collapse them to one.
+    async fn health_monitor_tracks_one_explicit_system_runtime_generation() {
         let (_d, home) = scratch_home();
         let kernel = test_kernel_with_home(home).await;
         let id = CapsuleId::new("failing-shared").unwrap();
@@ -4750,10 +5059,10 @@ mod tests {
 
         {
             let mut registry = kernel.capsules.write().await;
-            // Production path: owned by default, three principal views over ONE
-            // shared runtime.
+            // Three principal views over one explicit operator-owned system
+            // runtime generation.
             registry
-                .register_owned_by_default(
+                .register_system_runtime(
                     Box::new(FailingTestCapsule {
                         id: id.clone(),
                         manifest: CapsuleManifest::default(),
@@ -4768,13 +5077,12 @@ mod tests {
 
         let ready = {
             let registry = kernel.capsules.read().await;
-            registry.cloned_values_with_principal_and_hash()
+            registry.cloned_runtimes_with_principal()
         };
-        // Three views of one shared runtime → three triples.
         assert_eq!(
             ready.len(),
-            3,
-            "three views must produce three (principal, hash, Arc) triples (shared runtime)"
+            1,
+            "system runtime health is represented once regardless of view count"
         );
 
         let failures = collect_failed_runtimes_deduped(&ready);
@@ -4785,13 +5093,7 @@ mod tests {
             failures.len()
         );
         assert_eq!(failures[0].1, id.as_str());
-        assert_eq!(failures[0].2, hash);
-        // The tracker key is `(id, hash)` — one budget for the DISTINCT shared
-        // runtime, not one per principal.
-        assert_eq!(
-            restart_tracker_key(&failures[0].1, &failures[0].2),
-            restart_tracker_key(id.as_str(), &hash)
-        );
+        assert_eq!(failures[0].2.key().artifact(), &hash);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4812,7 +5114,7 @@ mod tests {
             let mut registry = kernel.capsules.write().await;
             // `default` on v1, `alice` on v2 — two distinct runtimes, one id.
             registry
-                .register_owned_by_default(
+                .register_system_runtime(
                     Box::new(FailingTestCapsule {
                         id: id.clone(),
                         manifest: CapsuleManifest::default(),
@@ -4822,7 +5124,7 @@ mod tests {
                 )
                 .unwrap();
             registry
-                .register_owned_by_default(
+                .register_system_runtime(
                     Box::new(FailingTestCapsule {
                         id: id.clone(),
                         manifest: CapsuleManifest::default(),
@@ -4835,7 +5137,7 @@ mod tests {
 
         let ready = {
             let registry = kernel.capsules.read().await;
-            registry.cloned_values_with_principal_and_hash()
+            registry.cloned_runtimes_with_principal()
         };
         assert_eq!(ready.len(), 2, "two distinct hashes → two view triples");
 
@@ -4846,32 +5148,27 @@ mod tests {
             "two distinct failed hashes for one id must NOT be collapsed; got {}",
             failures.len()
         );
-        let mut seen_hashes: Vec<_> = failures.iter().map(|(_, _, h, _)| h.clone()).collect();
+        let mut seen_hashes: Vec<_> = failures
+            .iter()
+            .map(|(_, _, runtime_id, _)| runtime_id.key().artifact().clone())
+            .collect();
         seen_hashes.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-        assert_eq!(seen_hashes, vec![hash_v1.clone(), hash_v2.clone()]);
-        // Distinct tracker keys → independent restart budgets per version.
-        assert_ne!(
-            restart_tracker_key(id.as_str(), &hash_v1),
-            restart_tracker_key(id.as_str(), &hash_v2),
-            "each distinct runtime must get its own restart budget"
-        );
+        assert_eq!(seen_hashes, vec![hash_v1, hash_v2]);
+        assert_ne!(failures[0].2, failures[1].2);
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn register_owned_by_default_then_register_for_alice_is_rejected() {
-        // Bleed #5 guard, kernel level: once a hash is loaded under `default`
-        // (the production owner), a `register_for` under a real principal must be
-        // REJECTED — no code path may create a shared instance owned by a real
-        // non-default principal whose load-time fields would be a fallback.
+    async fn system_and_principal_runtimes_with_same_artifact_remain_distinct() {
         let (_d, home) = scratch_home();
         let kernel = test_kernel_with_home(home).await;
         let id = CapsuleId::new("guarded").unwrap();
         let alice = PrincipalId::new("alice").unwrap();
+        let bob = PrincipalId::new("bob").unwrap();
         let hash = astrid_capsule::registry::WasmHash::from_raw("guarded-hash");
 
         let mut registry = kernel.capsules.write().await;
         registry
-            .register_owned_by_default(
+            .register_system_runtime(
                 Box::new(CancellableTestCapsule {
                     id: id.clone(),
                     manifest: CapsuleManifest::default(),
@@ -4883,26 +5180,31 @@ mod tests {
                 &PrincipalId::default(),
             )
             .unwrap();
-        // A `register_for` under alice targets owner=alice ≠ existing owner
-        // (default) → rejected.
-        let rejected = registry.register_for(
-            Box::new(CancellableTestCapsule {
-                id: id.clone(),
-                manifest: CapsuleManifest::default(),
-                cancelled: Arc::new(AtomicBool::new(false)),
-                unloaded: Arc::new(AtomicBool::new(false)),
-                cancelled_for: Arc::default(),
-            }),
-            hash.clone(),
-            &alice,
-        );
-        assert!(
-            rejected.is_err(),
-            "register_for under a real principal must be rejected when the hash is default-owned"
-        );
-        // The sanctioned share path (register_existing) still works.
-        registry.register_existing(&id, &hash, &alice).unwrap();
+        registry
+            .register_for(
+                Box::new(CancellableTestCapsule {
+                    id: id.clone(),
+                    manifest: CapsuleManifest::default(),
+                    cancelled: Arc::new(AtomicBool::new(false)),
+                    unloaded: Arc::new(AtomicBool::new(false)),
+                    cancelled_for: Arc::default(),
+                }),
+                hash.clone(),
+                &alice,
+            )
+            .expect("alice receives a separate authority-scoped runtime");
+
+        let system = registry
+            .get_for(&PrincipalId::default(), &id)
+            .expect("system runtime");
+        let alice_runtime = registry.get_for(&alice, &id).expect("alice runtime");
+        assert!(!Arc::ptr_eq(&system, &alice_runtime));
         assert_eq!(registry.refcount_for_hash(&hash), Some(2));
+
+        registry.register_existing(&id, &hash, &bob).unwrap();
+        let bob_runtime = registry.get_for(&bob, &id).expect("bob system view");
+        assert!(Arc::ptr_eq(&system, &bob_runtime));
+        assert_eq!(registry.refcount_for_hash(&hash), Some(3));
     }
 
     #[test]

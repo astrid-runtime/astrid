@@ -101,6 +101,13 @@ pub fn enforce_restrictions(
     // global config can set `[http]`.
     block_workspace_override(merged, baseline, workspace_layer, &["http"], "http");
 
+    // uplinks: operator-only system-runtime allowlist. The daemon uses these
+    // entries to authorize capsules for SystemResident scope, so accepting a
+    // workspace-provided entry would turn untrusted project configuration into
+    // cross-principal execution authority. Revert the whole array to the
+    // pre-workspace operator baseline whenever the workspace touches it.
+    block_workspace_override(merged, baseline, workspace_layer, &["uplinks"], "uplinks");
+
     // workspace.auto_allow_read: cannot expand beyond baseline.
     block_workspace_expansion(
         merged,

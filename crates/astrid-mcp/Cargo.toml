@@ -15,6 +15,7 @@ astrid-core = { workspace = true }
 astrid-crypto = { workspace = true }
 astrid-workspace = { workspace = true }
 async-trait = { workspace = true }
+process-wrap = { workspace = true }
 rmcp = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -28,6 +29,9 @@ which = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+nix = { workspace = true }
 
 [features]
 test-support = []

@@ -8,6 +8,8 @@
 // The MCP host engine spawns OS processes via `astrid-mcp`; native-only.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub mod mcp;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+mod mcp_teardown;
 #[cfg(all(test, not(all(target_arch = "wasm32", target_os = "unknown"))))]
 mod mcp_tests;
 mod static_engine;
@@ -41,6 +43,21 @@ pub(crate) trait ExecutionEngine: Send + Sync {
     /// Unload the engine (e.g., drop WASM memory or SIGTERM the child process).
     async fn unload(&mut self) -> CapsuleResult<()>;
 
+    /// Start a prepared engine behind closed external-route admission.
+    ///
+    /// Engines without autonomous work are already usable after `load` and
+    /// therefore keep the default no-op. The kernel proves readiness before
+    /// publishing the generation and opening its routes.
+    async fn activate(&mut self) -> CapsuleResult<()> {
+        Ok(())
+    }
+
+    /// Open externally visible routes after this prepared engine is ready.
+    fn publish(&self) {}
+
+    /// Close externally visible route admission for a retiring generation.
+    fn retire(&self) {}
+
     /// Request cooperative cancellation of blocking work before exclusive unload.
     ///
     /// This is intentionally synchronous and `&self`: callers may still have
@@ -51,10 +68,9 @@ pub(crate) trait ExecutionEngine: Send + Sync {
     /// Request cooperative cancellation of ONE principal's in-flight blocking
     /// work, leaving every other principal's work running.
     ///
-    /// Called when a principal releases its view of a runtime that other
-    /// principals still share: the runtime must survive, but the departing
-    /// principal's blocked host calls (approval/elicit waits, net/io/ipc
-    /// waits) must not wedge the shared instance for everyone else.
+    /// Called when a principal releases a view of an explicit system runtime:
+    /// the singleton survives, but the departing principal's blocked host
+    /// calls must not wedge it for remaining views.
     ///
     /// Default no-op — fail-safe: an engine without per-principal wait
     /// tracking keeps today's instance-scoped semantics (its waits end only

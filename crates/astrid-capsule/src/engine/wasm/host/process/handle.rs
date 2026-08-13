@@ -28,10 +28,14 @@ use crate::engine::wasm::host_state::HostState;
 impl HostProcessHandle for HostState {
     fn read_logs(&mut self, self_: Resource<ProcessHandle>) -> Result<ReadLogsResult, ErrorCode> {
         self.ensure_process_handle_authority()?;
+        let principal = self.effective_principal();
         let proc = self
             .resource_table
             .get_mut::<ManagedProcess>(&Resource::new_borrow(self_.rep()))
             .map_err(|_| ErrorCode::Closed)?;
+        if proc.creator != principal {
+            return Err(ErrorCode::CapabilityDenied);
+        }
 
         // `tokio::process::Child::try_wait` is non-blocking and
         // returns the exit status if the child has exited. Same
@@ -92,12 +96,16 @@ impl HostProcessHandle for HostState {
         sig: ProcessSignal,
     ) -> Result<(), ErrorCode> {
         self.ensure_process_handle_authority()?;
+        let principal = self.effective_principal();
         #[cfg(unix)]
         {
             let proc = self
                 .resource_table
                 .get::<ManagedProcess>(&Resource::new_borrow(self_.rep()))
                 .map_err(|_| ErrorCode::Closed)?;
+            if proc.creator != principal {
+                return Err(ErrorCode::CapabilityDenied);
+            }
             // `tokio::process::Child::id()` returns `Option<u32>` —
             // `None` once the child has been polled and reaped, which
             // we treat as Closed here. The std variant returned `u32`
@@ -123,7 +131,7 @@ impl HostProcessHandle for HostState {
         }
         #[cfg(not(unix))]
         {
-            let _ = (self_, sig);
+            let _ = (self_, sig, principal);
             Err(ErrorCode::Unknown(
                 "ProcessHandle.signal: not supported on this platform".to_string(),
             ))
@@ -132,10 +140,14 @@ impl HostProcessHandle for HostState {
 
     fn kill(&mut self, self_: Resource<ProcessHandle>) -> Result<KillResult, ErrorCode> {
         self.ensure_process_handle_authority()?;
+        let principal = self.effective_principal();
         let proc = self
             .resource_table
             .get_mut::<ManagedProcess>(&Resource::new_borrow(self_.rep()))
             .map_err(|_| ErrorCode::Closed)?;
+        if proc.creator != principal {
+            return Err(ErrorCode::CapabilityDenied);
+        }
         let (killed, exit_code) = match proc.child.take() {
             Some(mut child) => {
                 let code = kill_and_reap(&mut child);
@@ -162,6 +174,7 @@ impl HostProcessHandle for HostState {
         timeout_ms: Option<u64>,
     ) -> Result<ExitInfo, ErrorCode> {
         self.ensure_process_handle_authority()?;
+        let principal = self.effective_principal();
         let rt = self.runtime_handle.clone();
         let sem = self.blocking_semaphore.clone();
         let tok = self.effective_cancel_token();
@@ -176,6 +189,9 @@ impl HostProcessHandle for HostState {
             .resource_table
             .get_mut::<ManagedProcess>(&Resource::new_borrow(self_.rep()))
             .map_err(|_| ErrorCode::Closed)?;
+        if proc.creator != principal {
+            return Err(ErrorCode::CapabilityDenied);
+        }
         let child = match proc.child.as_mut() {
             Some(c) => c,
             None => return Err(ErrorCode::Closed),
@@ -235,10 +251,14 @@ impl HostProcessHandle for HostState {
 
     fn os_pid(&mut self, self_: Resource<ProcessHandle>) -> Result<u32, ErrorCode> {
         self.ensure_process_handle_authority()?;
+        let principal = self.effective_principal();
         let proc = self
             .resource_table
             .get::<ManagedProcess>(&Resource::new_borrow(self_.rep()))
             .map_err(|_| ErrorCode::Closed)?;
+        if proc.creator != principal {
+            return Err(ErrorCode::CapabilityDenied);
+        }
         proc.child
             .as_ref()
             .and_then(tokio::process::Child::id)
@@ -260,6 +280,19 @@ impl HostProcessHandle for HostState {
     }
 
     fn drop(&mut self, rep: Resource<ProcessHandle>) -> wasmtime::Result<()> {
+        self.ensure_process_handle_authority()
+            .map_err(|_| wasmtime::Error::msg("process handle authority retired"))?;
+        let principal = self.effective_principal();
+        let resource = Resource::new_borrow(rep.rep());
+        let managed = self
+            .resource_table
+            .get::<ManagedProcess>(&resource)
+            .map_err(|_| wasmtime::Error::msg("process handle closed"))?;
+        if managed.creator != principal {
+            return Err(wasmtime::Error::msg(
+                "process handle belongs to a different principal",
+            ));
+        }
         // Pull the entry out of the table first so the cancellation
         // tracker can be updated *before* `ManagedProcess::Drop` kills
         // the child — otherwise a `tool.v1.request.cancel` event
@@ -291,5 +324,47 @@ impl HostState {
         self.invocation_authority_active()
             .then_some(())
             .ok_or(ErrorCode::CapabilityDenied)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn process_handle_rejects_a_different_principal() {
+        let mut state = crate::engine::wasm::test_fixtures::minimal_host_state(
+            tokio::runtime::Handle::current(),
+        );
+        let alice = astrid_core::PrincipalId::new("alice").unwrap();
+        state.principal = astrid_core::PrincipalId::new("bob").unwrap();
+        let resource = state
+            .resource_table
+            .push(ManagedProcess {
+                child: None,
+                stdout_buf: Arc::new(Mutex::new(VecDeque::new())),
+                stderr_buf: Arc::new(Mutex::new(VecDeque::new())),
+                command: "fixture".into(),
+                creator: alice,
+                injection_guard: None,
+            })
+            .expect("process resource");
+        let handle = Resource::<ProcessHandle>::new_borrow(resource.rep());
+
+        assert!(matches!(
+            HostProcessHandle::os_pid(&mut state, handle),
+            Err(ErrorCode::CapabilityDenied)
+        ));
+        assert!(
+            HostProcessHandle::drop(
+                &mut state,
+                Resource::<ProcessHandle>::new_own(resource.rep()),
+            )
+            .is_err(),
+            "a peer must not be able to drop and kill the creator's process",
+        );
     }
 }

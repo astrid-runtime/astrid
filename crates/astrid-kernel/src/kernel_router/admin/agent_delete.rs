@@ -28,15 +28,21 @@ pub(super) async fn agent_delete(
         Ok(pending) => pending,
         Err(response) => return response,
     };
-    kernel
-        .capabilities
-        .begin_principal_retirement(principal.clone())
-        .await;
-    if let Err(error) = kernel
-        .allowance_store
-        .begin_principal_retirement(&principal)
     {
-        return err_internal(format!("allowance retirement fence failed: {error}"));
+        // Serialize the retirement edge against capsule construction and live
+        // replacement. A loader that won the lock finishes before retirement;
+        // one that follows observes the tombstone and fails closed.
+        let _load_guard = kernel.capsule_load_lock.lock().await;
+        kernel
+            .capabilities
+            .begin_principal_retirement(principal.clone())
+            .await;
+        if let Err(error) = kernel
+            .allowance_store
+            .begin_principal_retirement(&principal)
+        {
+            return err_internal(format!("allowance retirement fence failed: {error}"));
+        }
     }
 
     if let Err(e) = kernel

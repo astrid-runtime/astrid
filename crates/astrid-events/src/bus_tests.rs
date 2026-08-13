@@ -838,6 +838,106 @@ async fn routed_path_does_not_disturb_broadcast_subscribers() {
 }
 
 #[tokio::test]
+async fn staged_route_rejects_prepublication_events_and_opens_in_place() {
+    let bus = EventBus::new();
+    let gate = super::RouteAdmissionGate::staged();
+    let mut routed = bus.subscribe_topic_routed_scoped_gated(
+        uuid::Uuid::new_v4(),
+        "t.*",
+        "capsule-staged",
+        "test_sub",
+        None,
+        gate.clone(),
+    );
+
+    bus.publish(ipc_evt("t.before", Some("alice")));
+    assert_eq!(routed.active_principals(), 0);
+    assert!(
+        routed
+            .try_drain(super::MAX_SUBSCRIPTION_BUDGET_BYTES)
+            .is_empty(),
+        "closed routes must reject rather than buffer pre-publication traffic"
+    );
+
+    gate.publish();
+    bus.publish(ipc_evt("t.after", Some("alice")));
+    let drained = routed.try_drain(super::MAX_SUBSCRIPTION_BUDGET_BYTES);
+    assert_eq!(drained.len(), 1);
+    let AstridEvent::Ipc { message, .. } = &*drained[0] else {
+        panic!("expected IPC event");
+    };
+    assert_eq!(message.topic, "t.after");
+}
+
+#[tokio::test]
+async fn one_gate_opens_all_runtime_routes_atomically() {
+    let bus = EventBus::new();
+    let gate = super::RouteAdmissionGate::staged();
+    let mut first = bus.subscribe_topic_routed_scoped_gated(
+        uuid::Uuid::new_v4(),
+        "one.*",
+        "capsule-staged",
+        "test_sub",
+        None,
+        gate.clone(),
+    );
+    let mut second = bus.subscribe_topic_routed_principal_or_system_gated(
+        uuid::Uuid::new_v4(),
+        "two.*",
+        "capsule-staged",
+        "test_sub",
+        "alice",
+        gate.clone(),
+    );
+
+    gate.publish();
+    bus.publish(ipc_evt("one.event", Some("alice")));
+    bus.publish(ipc_evt("two.event", Some("alice")));
+
+    assert_eq!(
+        first.try_drain(super::MAX_SUBSCRIPTION_BUDGET_BYTES).len(),
+        1
+    );
+    assert_eq!(
+        second.try_drain(super::MAX_SUBSCRIPTION_BUDGET_BYTES).len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn retiring_old_gate_before_publishing_replacement_prevents_double_delivery() {
+    let bus = EventBus::new();
+    let old_gate = super::RouteAdmissionGate::published();
+    let new_gate = super::RouteAdmissionGate::staged();
+    let mut old = bus.subscribe_topic_routed_scoped_gated(
+        uuid::Uuid::new_v4(),
+        "swap.*",
+        "old",
+        "test",
+        None,
+        old_gate.clone(),
+    );
+    let mut new = bus.subscribe_topic_routed_scoped_gated(
+        uuid::Uuid::new_v4(),
+        "swap.*",
+        "new",
+        "test",
+        None,
+        new_gate.clone(),
+    );
+
+    old_gate.retire();
+    new_gate.publish();
+    bus.publish(ipc_evt("swap.after", Some("alice")));
+
+    assert!(
+        old.try_drain(super::MAX_SUBSCRIPTION_BUDGET_BYTES)
+            .is_empty()
+    );
+    assert_eq!(new.try_drain(super::MAX_SUBSCRIPTION_BUDGET_BYTES).len(), 1);
+}
+
+#[tokio::test]
 async fn routed_5000_principals_demand_allocate() {
     // A burst of 5000 distinct principals on the same routed sub
     // creates 5000 buckets and a single drr_drain should empty them

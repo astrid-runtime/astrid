@@ -107,6 +107,7 @@ astrid-uplink = { workspace = true, features = ["test-support"] }
 # for hermetic stream-quota tests, with no network.
 http = "1"
 wasm-encoder = { workspace = true }
+wat = { workspace = true }
 
 [lints.rust]
 unsafe_code = "deny"

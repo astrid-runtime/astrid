@@ -11,6 +11,11 @@ use tracing::{error, info, warn};
 
 use astrid_core::retry::RetryConfig;
 
+#[cfg(windows)]
+use process_wrap::tokio::JobObject;
+#[cfg(unix)]
+use process_wrap::tokio::ProcessGroup;
+use process_wrap::tokio::{CommandWrap, KillOnDrop};
 use rmcp::ServiceExt;
 use rmcp::service::{Peer, RoleClient, RunningService};
 use rmcp::transport::TokioChildProcess;
@@ -25,6 +30,23 @@ use tokio::sync::mpsc;
 
 /// Type alias for a running MCP client service.
 type McpService = RunningService<RoleClient, AstridClientHandler>;
+
+/// Wrap an MCP subprocess in the platform's process-tree ownership primitive.
+///
+/// rmcp kills its transport child when the transport is dropped. These wrappers
+/// extend that kill to the entire Unix process group or Windows Job Object, so
+/// helper processes cannot outlive a retired MCP server. `KillOnDrop` also makes
+/// the ownership explicit at process-wrap's layer if startup fails before rmcp
+/// finishes constructing the service.
+fn wrap_process_tree(command: tokio::process::Command) -> CommandWrap {
+    let mut command = CommandWrap::from(command);
+    command.wrap(KillOnDrop);
+    #[cfg(unix)]
+    command.wrap(ProcessGroup::leader());
+    #[cfg(windows)]
+    command.wrap(JobObject);
+    command
+}
 
 /// A running MCP server instance.
 pub(crate) struct RunningServer {
@@ -137,7 +159,7 @@ pub struct ServerManager {
     configs: ServersConfig,
     /// Running servers.
     running: Arc<RwLock<HashMap<String, RunningServer>>>,
-    /// Timeout for graceful `close_with_timeout` during shutdown.
+    /// Warning threshold for a graceful shutdown that remains owned until done.
     shutdown_timeout: std::time::Duration,
     /// Workspace root for sandbox writable directory.
     ///
@@ -398,9 +420,11 @@ impl ServerManager {
         }
 
         // Create transport (spawns the child process)
-        let transport = TokioChildProcess::new(cmd).map_err(|e| McpError::ServerStartFailed {
-            name: name.to_string(),
-            reason: e.to_string(),
+        let transport = TokioChildProcess::new(wrap_process_tree(cmd)).map_err(|e| {
+            McpError::ServerStartFailed {
+                name: name.to_string(),
+                reason: e.to_string(),
+            }
         })?;
 
         // Create the client handler and perform the MCP handshake
@@ -695,39 +719,53 @@ impl ServerManager {
 
     /// Stop a server.
     ///
-    /// Performs a graceful shutdown via `close_with_timeout` on the MCP
-    /// session before dropping the `RunningServer`.  This avoids the rmcp
-    /// `Drop` warning about asynchronous cleanup.
+    /// Performs a graceful shutdown on the MCP session before dropping the
+    /// `RunningServer`. The configured timeout is only a warning threshold:
+    /// after it elapses this method keeps owning and awaiting the same close
+    /// future, because that future owns rmcp's process-tree termination.
     ///
     /// # Errors
     ///
     /// Returns an error if the server is not running.
     pub async fn stop(&self, name: &str) -> McpResult<()> {
-        let mut running = self.running.write().await;
-
-        let mut server = running
-            .remove(name)
-            .ok_or_else(|| McpError::ServerNotRunning {
-                name: name.to_string(),
-            })?;
+        let mut server = {
+            let mut running = self.running.write().await;
+            running
+                .remove(name)
+                .ok_or_else(|| McpError::ServerNotRunning {
+                    name: name.to_string(),
+                })?
+        };
 
         info!(server = name, "Stopping MCP server");
 
-        // Gracefully close the MCP session before dropping.
+        // Gracefully close the MCP session before dropping. Never abandon this
+        // future on a timeout: rmcp closes the transport here, and its child
+        // transport is what kills and waits for the platform process tree.
         if let Some(ref mut service) = server.service {
-            match service.close_with_timeout(self.shutdown_timeout).await {
-                Ok(Some(reason)) => {
-                    info!(server = name, ?reason, "MCP session closed gracefully");
-                },
-                Ok(None) => {
-                    warn!(
-                        server = name,
-                        timeout_secs = self.shutdown_timeout.as_secs(),
-                        "MCP session close timed out; dropping"
-                    );
-                },
-                Err(e) => {
-                    warn!(server = name, error = %e, "MCP session close join error");
+            let close = service.close();
+            tokio::pin!(close);
+            let result = if self.shutdown_timeout.is_zero() {
+                close.await
+            } else {
+                tokio::select! {
+                    result = &mut close => result,
+                    () = tokio::time::sleep(self.shutdown_timeout) => {
+                        warn!(
+                            server = name,
+                            threshold_secs = self.shutdown_timeout.as_secs(),
+                            "MCP session close exceeded warning threshold; continuing to await owned cleanup"
+                        );
+                        close.await
+                    }
+                }
+            };
+            match result {
+                Ok(reason) => info!(server = name, ?reason, "MCP session closed gracefully"),
+                Err(error) => {
+                    return Err(McpError::ConnectionFailed(format!(
+                        "MCP session close task failed for {name}: {error}"
+                    )));
                 },
             }
         }
@@ -1032,6 +1070,184 @@ impl std::fmt::Debug for ServerManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    const RELUCTANT_FIXTURE_ENV: &str = "ASTRID_MCP_RELUCTANT_FIXTURE";
+    #[cfg(unix)]
+    const RELUCTANT_DESCENDANT_PID_ENV: &str = "ASTRID_MCP_DESCENDANT_PID_FILE";
+
+    #[cfg(unix)]
+    struct ReluctantMcpServer;
+
+    #[cfg(unix)]
+    impl rmcp::ServerHandler for ReluctantMcpServer {}
+
+    /// Subprocess-only fixture driven by `stop_awaits_rmcp_process_tree_absence`.
+    /// It completes the real MCP handshake, spawns a descendant, then refuses
+    /// to exit after its stdio service closes so rmcp must take its forced
+    /// process-tree termination path.
+    #[cfg(unix)]
+    #[ignore = "subprocess-only MCP fixture"]
+    #[tokio::test]
+    async fn reluctant_mcp_server_fixture() {
+        if std::env::var_os(RELUCTANT_FIXTURE_ENV).is_none() {
+            return;
+        }
+        let pid_file =
+            std::env::var_os(RELUCTANT_DESCENDANT_PID_ENV).expect("fixture descendant pid file");
+        let mut descendant = tokio::process::Command::new("/bin/sh");
+        descendant
+            .arg("-c")
+            .arg("echo $$ > \"$1\"; trap '' TERM; while :; do sleep 1; done")
+            .arg("astrid-mcp-descendant")
+            .arg(pid_file);
+        let _descendant = descendant.spawn().expect("spawn fixture descendant");
+
+        let service = ReluctantMcpServer
+            .serve(rmcp::transport::stdio())
+            .await
+            .expect("serve fixture MCP");
+        let _ = service.waiting().await;
+        std::future::pending::<()>().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_awaits_rmcp_process_tree_absence() {
+        use nix::errno::Errno;
+        use nix::sys::signal::kill;
+        use nix::unistd::Pid;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pid_file = temp.path().join("descendant.pid");
+        let executable = std::env::current_exe().expect("current test executable");
+        let mut config = ServerConfig::stdio("reluctant", executable.to_string_lossy()).trusted();
+        config.args = vec![
+            "--ignored".to_string(),
+            "--exact".to_string(),
+            "server::tests::reluctant_mcp_server_fixture".to_string(),
+            "--quiet".to_string(),
+            "--nocapture".to_string(),
+            "--test-threads=1".to_string(),
+        ];
+        config
+            .env
+            .insert(RELUCTANT_FIXTURE_ENV.to_string(), "1".to_string());
+        config.env.insert(
+            RELUCTANT_DESCENDANT_PID_ENV.to_string(),
+            pid_file.to_string_lossy().into_owned(),
+        );
+
+        // Exercise the old failure condition: crossing this threshold must
+        // warn, not detach the only future that owns tree termination.
+        let configs = ServersConfig {
+            shutdown_timeout: std::time::Duration::from_millis(1),
+            ..ServersConfig::default()
+        };
+        let manager = Arc::new(ServerManager::new(configs));
+        manager
+            .add_server("reluctant", config)
+            .await
+            .expect("register fixture server");
+        manager
+            .connect_server("reluctant", Arc::new(CapabilitiesHandler::new()), None)
+            .await
+            .expect("connect real fixture MCP server");
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !pid_file.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fixture descendant should report its pid");
+        let descendant_pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("read descendant pid")
+            .trim()
+            .parse()
+            .expect("parse descendant pid");
+        assert!(kill(Pid::from_raw(descendant_pid), None).is_ok());
+
+        // A reluctant tree must not hold the global running-map lock and stall
+        // unrelated MCP peers while rmcp performs its forced shutdown.
+        manager.running.write().await.insert(
+            "peer".to_string(),
+            RunningServer::new(ServerConfig::stdio("peer", "/usr/bin/false")),
+        );
+        let stopping_manager = Arc::clone(&manager);
+        let stopping = tokio::spawn(async move { stopping_manager.stop("reluctant").await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                manager.is_running("peer")
+            )
+            .await
+            .expect("peer lookup must not wait for another server's teardown")
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(8), stopping)
+            .await
+            .expect("owned rmcp teardown should remain bounded")
+            .expect("stop task should join")
+            .expect("stop fixture server");
+
+        assert_eq!(
+            kill(Pid::from_raw(descendant_pid), None),
+            Err(Errno::ESRCH),
+            "stop must not return before the descendant is absent"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_tree_wrapper_kills_descendants_without_touching_peer_group() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let descendant_effect = temp.path().join("descendant-effect");
+        let peer_effect = temp.path().join("peer-effect");
+        let ready = temp.path().join("ready");
+
+        let mut owned_command = tokio::process::Command::new("/bin/sh");
+        owned_command
+            .arg("-c")
+            .arg("(sleep 0.4; : > \"$1\") & : > \"$2\"; wait")
+            .arg("astrid-mcp-test")
+            .arg(&descendant_effect)
+            .arg(&ready);
+        let mut owned = wrap_process_tree(owned_command)
+            .spawn()
+            .expect("spawn owned tree");
+
+        let mut peer = tokio::process::Command::new("/bin/sh");
+        peer.arg("-c")
+            .arg("sleep 0.4; : > \"$1\"")
+            .arg("astrid-mcp-peer")
+            .arg(&peer_effect);
+        let mut peer = peer.spawn().expect("spawn peer process group");
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !ready.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("owned descendant should start");
+
+        Box::into_pin(owned.kill())
+            .await
+            .expect("kill owned process group");
+        peer.wait().await.expect("wait for peer");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        assert!(
+            !descendant_effect.exists(),
+            "a descendant of the retired MCP server must not survive"
+        );
+        assert!(
+            peer_effect.exists(),
+            "an unrelated process group must survive"
+        );
+    }
 
     #[tokio::test]
     async fn test_server_manager_creation() {

@@ -1,9 +1,8 @@
 //! Tests for per-principal cancellation-token scoping on `HostState`.
 //!
-//! A shared-by-hash runtime (issue #1069) serves N principals from one
-//! instance; releasing ONE principal's view must interrupt exactly that
-//! principal's in-flight blocking host calls (approval/elicit/net/io/ipc
-//! waits) without cancelling the instance the others still use. Split from
+//! An explicit system runtime can serve N principal views. Releasing ONE view
+//! must interrupt exactly that principal's in-flight blocking host calls
+//! without cancelling the singleton the others still use. Split from
 //! `host_state_tests.rs` to keep both under the 1000-line CI cap; included
 //! via `#[path]` from `host_state.rs`.
 

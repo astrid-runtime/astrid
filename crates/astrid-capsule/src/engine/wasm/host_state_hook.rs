@@ -9,7 +9,7 @@ impl HostState {
     ///
     /// Hooks run OUTSIDE the full capsule manifest / security-gate lifecycle: a
     /// one-shot, single-principal execution scoped to a per-module identity, not
-    /// a pooled shared runtime. This constructor centralises the hook-side shape
+    /// a pooled runtime. This constructor centralises the hook-side shape
     /// so `astrid-hooks` does not have to name every [`HostState`] field — which
     /// also keeps `HostState` free to gain fields (`#[non_exhaustive]`) without
     /// breaking the hooks crate.
@@ -22,7 +22,7 @@ impl HostState {
     /// no inbound/uplink/socket state, and no audit-firehose. The single publish
     /// pattern is `hook.v1.result.*`.
     ///
-    /// Unlike a shared runtime, a hook's `kv` legitimately IS its own store (a
+    /// A hook's `kv` legitimately IS its own store (a
     /// single-principal one-shot), so no `invocation_*` overlays are installed;
     /// `kv_backend` mirrors `kv` for API completeness.
     #[must_use]
@@ -48,6 +48,7 @@ impl HostState {
             resource_table: wasmtime::component::ResourceTable::new(),
             store_meter,
             principal: astrid_core::PrincipalId::default(),
+            system_runtime: false,
             capsule_uuid: uuid::Uuid::new_v4(),
             caller_context: None,
             interceptor_active: false,
@@ -83,6 +84,7 @@ impl HostState {
             kv_backend,
             kv,
             event_bus,
+            route_admission_gate: astrid_events::RouteAdmissionGate::default(),
             ipc_limiter: Arc::new(astrid_events::ipc::IpcRateLimiter::new()),
             config: HashMap::new(),
             secret_env: std::collections::HashSet::new(),
