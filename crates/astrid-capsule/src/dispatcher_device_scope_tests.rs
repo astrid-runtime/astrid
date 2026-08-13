@@ -18,6 +18,7 @@ use crate::error::CapsuleResult;
 use crate::manifest::{CapabilitiesDef, CapsuleManifest, PackageDef, SubscribeDef};
 use crate::profile_cache::PrincipalProfileCache;
 
+#[derive(Clone)]
 struct TestCapsule {
     id: CapsuleId,
     manifest: CapsuleManifest,
@@ -161,7 +162,7 @@ fn registry_for(capsule: TestCapsule, principals: &[&str]) -> Arc<RwLock<Capsule
     let capsule_id = capsule.id().clone();
     let first = astrid_core::PrincipalId::new(principals[0]).unwrap();
     registry
-        .register_for(Box::new(capsule), hash.clone(), &first)
+        .register_system_runtime(Box::new(capsule), hash.clone(), &first)
         .unwrap();
     for principal in &principals[1..] {
         registry

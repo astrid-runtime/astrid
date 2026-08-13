@@ -162,6 +162,32 @@ impl HostState {
             .principal
             .as_deref()
             .and_then(|p| astrid_core::PrincipalId::new(p).ok());
+        if !self.system_runtime
+            && publisher
+                .as_ref()
+                .is_some_and(|publisher| publisher != &self.principal)
+        {
+            self.caller_context = Some(msg.clone());
+            self.invocation_profile_authorized = false;
+            self.invocation_profile = Some(Arc::new(astrid_core::profile::PrincipalProfile {
+                groups: vec![astrid_core::groups::BUILTIN_RESTRICTED.to_string()],
+                ..Default::default()
+            }));
+            self.invocation_env_overlay = None;
+            self.invocation_kv = None;
+            self.invocation_secret_store = None;
+            self.invocation_capsule_log = None;
+            self.invocation_home = None;
+            self.invocation_tmp = None;
+            self.install_invocation_cancel_token(publisher.as_ref());
+            tracing::warn!(
+                owner = %self.principal,
+                publisher = ?publisher,
+                capsule = %self.capsule_id,
+                "principal runtime received a peer event; installing restricted authority floor"
+            );
+            return;
+        }
         let new_principal = msg.principal.clone();
         let existing_principal = self
             .caller_context
@@ -210,9 +236,8 @@ impl HostState {
         //
         //   • KV / secret-store / log overlays — installed for EVERY publisher
         //     that carries a present, parseable principal, the load-owner
-        //     (`default`) INCLUDED, via the shared
-        //     [`install_principal_overlays_sync`]. A shared content-addressed
-        //     runtime (issue #1069) is loaded under no real principal, so the
+        //     (`default`) INCLUDED, via [`install_principal_overlays_sync`]. An
+        //     explicit system runtime is loaded under no real principal, so the
         //     load-time `kv` / `secret_store` / `capsule_log` are NEUTRAL
         //     fail-closed placeholders; every real publisher must get its OWN
         //     scope explicitly. A principal-less system/lifecycle event (no

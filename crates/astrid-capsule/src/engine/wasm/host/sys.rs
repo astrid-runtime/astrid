@@ -225,7 +225,9 @@ impl sys::Host for HostState {
 
         let allowed = util::bounded_block_on(&rt_handle, &blocking_semaphore, async {
             let reg = registry.read().await;
-            let Some(capsule) = reg.find_instance_by_uuid(&source_uuid) else {
+            let Some(capsule) =
+                reg.find_instance_by_uuid_for(&self.effective_principal(), &source_uuid)
+            else {
                 return false;
             };
             // The full capability namespace, not just `allow_prompt_injection`:

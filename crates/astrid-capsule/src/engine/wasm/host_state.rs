@@ -100,13 +100,11 @@ pub struct InterceptorHandle {
 use crate::engine::wasm::host::process::ProcessTracker;
 use crate::security::CapsuleSecurityGate;
 
-/// Shared map of per-principal cancellation tokens for one capsule runtime.
+/// Cancellation tokens admitted within one authority-scoped runtime.
 ///
-/// A content-addressed runtime is SHARED across every principal that views the
-/// same WASM hash (issue #1069), but the instance-wide
-/// [`cancel_token`](HostState::cancel_token) can only cancel EVERYONE's
-/// blocking host calls at once. This map gives cancellation the same
-/// granularity as the other per-principal overlays: each entry is a
+/// Principal runtimes normally contain one durable identity. Explicit
+/// SystemResident services may multiplex authenticated callers, so this map
+/// gives cancellation the same granularity as attribution overlays: each is a
 /// [`child_token`](CancellationToken::child_token) of the instance token (so a
 /// full-instance cancel still cascades to every principal), minted lazily by
 /// the per-invocation overlay installer and cancelled + removed when that
@@ -226,6 +224,9 @@ pub struct HostState {
     pub store_meter: crate::memory_ledger::StoreMemoryMeter,
     /// The principal this capsule is running on behalf of.
     pub principal: astrid_core::principal::PrincipalId,
+    /// Explicit kernel-service scope. When false, every long-lived IPC route
+    /// is restricted to `principal`; default-principal is still a principal.
+    pub system_runtime: bool,
     /// The plugin this state belongs to.
     pub capsule_id: CapsuleId,
     /// Per-capsule log file at `home/{principal}/.local/log/{capsule}.log`.
@@ -272,39 +273,21 @@ pub struct HostState {
     /// Load-time principal tmp mount (`/tmp/` paths, backed by
     /// `~/.astrid/home/{principal}/.local/tmp/`). `None` if unavailable.
     pub tmp: Option<PrincipalMount>,
-    /// Load-time KV fallback: a NEUTRAL, physically-isolated store that holds
-    /// **no real principal's data**.
-    ///
-    /// A content-addressed runtime is SHARED across every principal that views
-    /// the same WASM hash (issue #1069) and is loaded under no real principal's
-    /// identity. Every invocation that carries a principal installs an
-    /// [`invocation_kv`](Self::invocation_kv) overlay scoped to the *invoking*
-    /// principal (the owner/`default` included). This field is therefore only
-    /// ever reached by principal-less / load-time contexts — and it must resolve
-    /// to a namespace that maps to no real principal's namespace, NEVER to
-    /// `default`'s (or anyone's) real capsule KV.
-    ///
-    /// Backed by a fresh in-memory store (see
-    /// [`HostState::neutral_kv`](Self::neutral_kv)), so a stray read is empty and
-    /// a stray write cannot reach any persistent principal namespace. Real
-    /// per-invocation overlays are built from
-    /// [`kv_backend`](Self::kv_backend), never from this field.
+    /// Load-time authority-scoped KV. Principal runtimes receive their owner's
+    /// namespace; SystemResident runtimes receive an explicit system namespace.
+    /// Neutral test/lifecycle contexts may use [`HostState::neutral_kv`].
     pub kv: ScopedKvStore,
     /// The real, shared KV backend used to CONSTRUCT per-invocation overlays.
     ///
-    /// Separated from [`kv`](Self::kv) (the neutral fallback) so that overlay
-    /// construction (`{principal}:capsule:{capsule_id}`) targets the persistent
-    /// backend while the fallback stays neutral/fail-closed. Never used as a
-    /// fallback itself.
+    /// Used to construct authenticated per-message overlays without deriving
+    /// them from another scoped view.
     pub kv_backend: Arc<dyn astrid_storage::KvStore>,
     /// Per-invocation KV store scoped to the calling principal.
     ///
     /// Set by `WasmEngine::invoke_interceptor` (and the `ipc::recv` path) for
     /// EVERY invocation that carries a principal — the owner/`default` included.
     /// Host functions use [`effective_kv`](Self::effective_kv) which returns this
-    /// overlay when set and the neutral [`kv`](Self::kv) fallback otherwise, so a
-    /// caller's reads/writes always land in its own principal namespace and never
-    /// bleed into another principal's.
+    /// overlay when set and the runtime-owned [`kv`](Self::kv) otherwise.
     pub invocation_kv: Option<ScopedKvStore>,
     /// Per-invocation home mount for the calling principal.
     ///
@@ -391,6 +374,9 @@ pub struct HostState {
     pub invocation_env_overlay: Option<HashMap<String, String>>,
     /// System Event Bus for IPC publish/subscribe.
     pub event_bus: astrid_events::EventBus,
+    /// Shared generation-publication fence for every routed subscription this
+    /// Store creates. Prepared runtimes keep it staged until registry publish.
+    pub route_admission_gate: astrid_events::RouteAdmissionGate,
     /// Rate limiter for IPC message publishing.
     ///
     /// `Arc` so a capsule's pool of `Store`s shares one limiter — otherwise
@@ -512,16 +498,9 @@ pub struct HostState {
     /// Set to `Some(Install)` or `Some(Upgrade)` during lifecycle dispatch.
     /// Gates the `astrid_elicit` host function.
     pub lifecycle_phase: Option<LifecyclePhase>,
-    /// Load-time secret-store fallback: a NEUTRAL, deny-all placeholder
-    /// ([`astrid_storage::DenySecretStore`]) that holds and grants nothing.
-    ///
-    /// Same rationale as [`kv`](Self::kv): a shared content-addressed runtime
-    /// (issue #1069) is loaded under no real principal, so every principal-
-    /// carrying invocation installs an
-    /// [`invocation_secret_store`](Self::invocation_secret_store) scoped to the
-    /// invoking principal. This fallback is reached only by principal-less /
-    /// load-time contexts and MUST fail closed — never expose `default`'s (or
-    /// anyone's) real secrets.
+    /// Runtime-owned secret store. Principal runtimes use the owner namespace;
+    /// SystemResident runtimes use an explicit system namespace. Neutral test
+    /// contexts use a deny-all store.
     pub secret_store: Arc<dyn SecretStore>,
     /// Readiness signal sender for run-loop capsules.
     ///
@@ -572,9 +551,8 @@ pub struct HostState {
     /// contexts. Blocking host calls wait on
     /// [`effective_cancel_token`](Self::effective_cancel_token) — this overlay
     /// when set, else the instance [`cancel_token`](Self::cancel_token) — so
-    /// releasing ONE principal's view of a shared runtime can interrupt that
-    /// principal's in-flight approval/elicit/net/io/ipc waits without killing
-    /// the other principals' work.
+    /// retiring one admitted identity can interrupt its in-flight waits without
+    /// affecting other identities admitted by a SystemResident service.
     pub invocation_cancel_token: Option<CancellationToken>,
     /// Session token for authenticating CLI socket connections. Only set for
     /// the CLI proxy capsule (which has `net_bind` capability).
@@ -795,9 +773,7 @@ impl HostState {
     /// Backed by a fresh [`MemoryKvStore`](astrid_storage::MemoryKvStore) — NOT
     /// the shared persistent backend — so a stray read is empty and a stray write
     /// cannot reach any principal's persistent namespace. This is the store a
-    /// shared runtime falls back to for principal-less / load-time contexts; a
-    /// real invocation always installs a per-principal `invocation_kv` overlay
-    /// built from [`kv_backend`](Self::kv_backend).
+    /// neutral test/lifecycle context can use without touching persistent state.
     #[must_use]
     pub fn neutral_kv() -> ScopedKvStore {
         ScopedKvStore::new(
@@ -809,9 +785,8 @@ impl HostState {
 
     /// Build the NEUTRAL, deny-all secret-store fallback.
     ///
-    /// See [`astrid_storage::DenySecretStore`]. Reached only by principal-less /
-    /// load-time contexts on a shared runtime; every principal-carrying
-    /// invocation installs an `invocation_secret_store` scoped to the caller.
+    /// See [`astrid_storage::DenySecretStore`]. Used by neutral test/lifecycle
+    /// contexts that have no persistent authority namespace.
     #[must_use]
     pub fn neutral_secret_store() -> Arc<dyn SecretStore> {
         Arc::new(astrid_storage::DenySecretStore::new())
@@ -875,25 +850,9 @@ impl HostState {
         self.inbound_tx = Some(tx);
     }
 
-    /// Debug-only consistency check: when a caller with a present, parseable
-    /// principal is in scope, the corresponding `invocation_*` field **must** be
-    /// populated. Otherwise the accessor silently returns the NEUTRAL
-    /// fail-closed placeholder and the caller's reads/writes are denied/empty
-    /// when they should have hit the caller's own scope.
-    ///
-    /// This matters for SHARED runtimes (issue #1069): a single runtime is
-    /// shared across every principal that views the same content hash, loaded
-    /// under [`PrincipalId::default()`](astrid_core::PrincipalId). `default` is
-    /// an ORDINARY principal, so the load-time `kv`/`secret_store` fields are
-    /// NEUTRAL placeholders (not `default`'s namespace); EVERY caller — the
-    /// owner/`default` included — must get an `invocation_*` overlay scoped to
-    /// itself. The setup in [`WasmEngine::invoke_interceptor`] and the recv path
-    /// (both via `install_principal_overlays*`) guarantee `invocation_kv` and
-    /// `invocation_secret_store` are populated whenever a caller principal is
-    /// present (the only failure path is `ScopedKvStore::new` rejecting an
-    /// empty/null-byte namespace, which our format string never produces, and
-    /// which itself fails closed). This assertion catches any regression that
-    /// breaks that invariant in debug builds.
+    /// Debug-only consistency check for authenticated per-message overlays.
+    /// A present caller must have an explicit KV/secret scope rather than
+    /// accidentally falling through to a different runtime authority.
     ///
     /// Deliberately scoped to a *present, parseable* caller principal (owner
     /// included — no longer excused when the caller equals the owner, since the

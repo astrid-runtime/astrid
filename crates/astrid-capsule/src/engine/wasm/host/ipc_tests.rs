@@ -104,6 +104,27 @@ fn host_state_for(
 }
 
 #[tokio::test]
+async fn host_subscription_uses_shared_runtime_publication_gate() {
+    let rt = tokio::runtime::Handle::current();
+    let mut state = host_state_for(rt, "alice", false, &[AUDIT_TOPIC]);
+    state.route_admission_gate = astrid_events::RouteAdmissionGate::staged();
+    let gate = state.route_admission_gate.clone();
+    let bus = state.event_bus.clone();
+    let sub = IpcHost::subscribe(&mut state, AUDIT_TOPIC.to_string())
+        .expect("staged runtime may establish its route");
+
+    publish_audit(&bus, "alice");
+    assert!(
+        drained_principals(&mut state, &sub).is_empty(),
+        "prepared runtime must not receive external events before publication"
+    );
+
+    gate.publish();
+    publish_audit(&bus, "alice");
+    assert_eq!(drained_principals(&mut state, &sub), ["alice"]);
+}
+
+#[tokio::test]
 async fn subscribe_audit_default_is_scoped_regression() {
     // THE bug regression. A capsule with audit_firehose=false and the
     // audit topic in its ACL, owner=alice, must receive ONLY alice's
@@ -172,10 +193,10 @@ async fn subscribe_firehose_holder_unscoped() {
 }
 
 #[tokio::test]
-async fn subscribe_non_audit_topic_unaffected() {
-    // A non-audit subscription (pattern_covers_audit=false) stays
-    // unscoped even for a non-firehose capsule: cross-principal fan-in
-    // is untouched by the audit flip.
+async fn principal_route_admits_owner_and_system_but_rejects_peer() {
+    // Principal runtimes scope every route to their immutable owner, not only
+    // audit routes. Cross-principal fan-in belongs to an explicit System
+    // runtime (or the separately-granted audit firehose).
     let rt = tokio::runtime::Handle::current();
     let mut state = host_state_for(rt, "alice", false, &["astrid.v1.session.*"]);
     let bus = state.event_bus.clone();
@@ -196,11 +217,21 @@ async fn subscribe_non_audit_topic_unaffected() {
             message: msg,
         });
     }
+    bus.publish(AstridEvent::Ipc {
+        metadata: EventMetadata::new("kernel"),
+        message: InternalIpcMessage::new(
+            Topic::from_raw("astrid.v1.session.update"),
+            IpcPayload::RawJson(serde_json::json!({})),
+            uuid::Uuid::nil(),
+        ),
+    });
 
     let got = drained_principals(&mut state, &sub);
-    assert_eq!(got.len(), 2, "non-audit fan-in delivers all principals");
-    assert!(got.iter().any(|p| p == "alice"));
-    assert!(got.iter().any(|p| p == "bob"));
+    assert_eq!(
+        got,
+        vec!["alice", "<system>"],
+        "principal route must admit owner and kernel while rejecting peers"
+    );
 }
 
 #[tokio::test]
@@ -210,6 +241,7 @@ async fn subscription_poll_returns_single_principal_envelope() {
     // message executes under the first message's KV/env/secret/publish context.
     let rt = tokio::runtime::Handle::current();
     let mut state = host_state_for(rt, "alice", false, &["astrid.v1.session.*"]);
+    state.system_runtime = true;
     let bus = state.event_bus.clone();
 
     let sub = IpcHost::subscribe(&mut state, "astrid.v1.session.*".to_string())
@@ -296,6 +328,7 @@ async fn publish_as_verified_principal_overrides_claimed_name() {
     let rt = tokio::runtime::Handle::current();
     let mut state = minimal_host_state(rt);
     state.has_uplink_capability = true;
+    state.system_runtime = true;
     state.ipc_publish_patterns = vec!["client.v1.*".to_string()];
     state.ipc_subscribe_patterns = vec!["client.v1.*".to_string()];
     // The framed read recorded the connection's verified principal.
@@ -330,6 +363,7 @@ async fn publish_as_unbound_connection_is_stamped_anonymous() {
     let rt = tokio::runtime::Handle::current();
     let mut state = minimal_host_state(rt);
     state.has_uplink_capability = true;
+    state.system_runtime = true;
     state.ipc_publish_patterns = vec!["client.v1.*".to_string()];
     state.ipc_subscribe_patterns = vec!["client.v1.*".to_string()];
     // No in-flight verified principal (an unbound connection).

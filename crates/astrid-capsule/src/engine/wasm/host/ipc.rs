@@ -469,11 +469,7 @@ impl ipc::Host for HostState {
         // synthetic probe event, so evaluate it once and reuse for both the
         // scope decision and the audit log line.
         let covers_audit = pattern_covers_audit(&topic_pattern);
-        let scope: Option<astrid_events::PrincipalKey> = if covers_audit && !self.audit_firehose {
-            Some(Some(self.principal.to_string()))
-        } else {
-            None
-        };
+        let unscoped = self.system_runtime || (covers_audit && self.audit_firehose);
         if covers_audit {
             tracing::info!(
                 target: "astrid.audit.ipc",
@@ -481,7 +477,7 @@ impl ipc::Host for HostState {
                 capsule_id = %self.capsule_id.as_str(),
                 principal = %self.principal,
                 topic = %topic_pattern,
-                scoped = scope.is_some(),
+                scoped = !unscoped,
                 firehose = self.audit_firehose,
                 "ipc::subscribe: audit-covering subscription scoped to owner principal unless firehose holder",
             );
@@ -492,15 +488,29 @@ impl ipc::Host for HostState {
         // originating principal, so the guest never sees a
         // mixed-principal batch and the cross-principal fairness lives
         // in the bus's DRR drain — no consumer-side requeue logic
-        // needed here (#813). `scope` (Option B) additionally self-scopes
-        // an audit-covering subscription to the owner principal at enqueue.
-        let receiver = self.event_bus.subscribe_topic_routed_scoped(
-            self.capsule_uuid,
-            topic_pattern.clone(),
-            self.capsule_id.as_str().to_string(),
-            "capsule_guest",
-            scope,
-        );
+        // needed here (#813). Principal runtimes admit their owner plus
+        // kernel/system events; SystemResident and explicitly granted audit
+        // firehose routes are unscoped.
+        let receiver = if unscoped {
+            self.event_bus.subscribe_topic_routed_scoped_gated(
+                self.capsule_uuid,
+                topic_pattern.clone(),
+                self.capsule_id.as_str().to_string(),
+                "capsule_guest",
+                None,
+                self.route_admission_gate.clone(),
+            )
+        } else {
+            self.event_bus
+                .subscribe_topic_routed_principal_or_system_gated(
+                    self.capsule_uuid,
+                    topic_pattern.clone(),
+                    self.capsule_id.as_str().to_string(),
+                    "capsule_guest",
+                    self.principal.to_string(),
+                    self.route_admission_gate.clone(),
+                )
+        };
         let entry = SubscriptionEntry {
             receiver: Arc::new(Mutex::new(receiver)),
             topic_pattern: topic_pattern.clone(),

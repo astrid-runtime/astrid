@@ -12,6 +12,19 @@ mod tests {
 
     use astrid_mcp::testing::test_secure_mcp_client;
 
+    #[test]
+    fn mcp_servers_share_runtime_generation_without_manager_key_collision() {
+        let runtime = crate::registry::RuntimeId::for_test(
+            crate::capsule::CapsuleId::from_static("multi-mcp"),
+            7,
+        );
+        let first = crate::engine::mcp::runtime_server_id("multi-mcp", "first", &runtime);
+        let second = crate::engine::mcp::runtime_server_id("multi-mcp", "second", &runtime);
+        assert_ne!(first, second);
+        assert!(first.ends_with("generation-7"));
+        assert!(second.ends_with("generation-7"));
+    }
+
     fn dummy_manifest(command: &str, allowed_commands: Vec<&str>) -> CapsuleManifest {
         CapsuleManifest {
             package: PackageDef {
@@ -154,6 +167,7 @@ mod tests {
         // The user granted capability for "bin/my-tool"
         let manifest = dummy_manifest("bin/my-tool", vec!["bin/my-tool"]);
         let mcp_client = test_secure_mcp_client();
+        let mcp_probe = mcp_client.clone();
 
         let mut engine = McpHostEngine::new(
             manifest,
@@ -166,7 +180,11 @@ mod tests {
             },
             capsule_dir.to_path_buf(),
             mcp_client,
-        );
+        )
+        .with_runtime_id(Some(crate::registry::RuntimeId::for_test(
+            crate::capsule::CapsuleId::from_static("test-capsule"),
+            1,
+        )));
 
         let bus = std::sync::Arc::new(astrid_events::EventBus::new());
         let mem_kv = std::sync::Arc::new(astrid_storage::MemoryKvStore::new());
@@ -190,18 +208,35 @@ mod tests {
             audit_sink: None,
         };
 
-        let result = engine.load(&ctx).await;
+        engine.load(&ctx).await.expect("preparation should succeed");
+        assert!(
+            mcp_probe.inner().list_servers().await.is_empty(),
+            "load must not start the stdio child before generation activation"
+        );
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(1), engine.activate()).await;
         let _ = engine.unload().await;
 
         // It should attempt the connection and fail at the handshake step (meaning it successfully found and spawned the fat binary slice)
-        assert!(result.is_err(), "Test failed: {:?}", result.err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("MCP handshake failed")
-                || err_msg.contains("Failed to start MCP server"),
-            "Expected handshake or start failure, got: {}",
-            err_msg
-        );
+        match result {
+            Ok(Err(error)) => {
+                let message = error.to_string();
+                assert!(
+                    message.contains("MCP handshake failed")
+                        || message.contains("Failed to start MCP server")
+                        || message.contains("Failed to connect MCP host engine"),
+                    "Expected handshake or start failure, got: {message}"
+                );
+            },
+            Err(_) => {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                assert!(
+                    mcp_probe.inner().list_servers().await.is_empty(),
+                    "cancelled activation must remove the partially started server"
+                );
+            },
+            Ok(Ok(())) => panic!("exiting test binary unexpectedly completed MCP activation"),
+        }
     }
 
     #[tokio::test]

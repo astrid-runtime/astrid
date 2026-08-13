@@ -37,6 +37,9 @@ pub struct CapsuleLoader {
     /// config section and handed to every `WasmEngine`. A global `Copy` value.
     /// See [`HttpLimits`].
     http_limits: HttpLimits,
+    compiled_wasm: crate::engine::wasm::CompiledWasmCache,
+    defer_background_activation: bool,
+    runtime_id: Option<crate::registry::RuntimeId>,
 }
 
 impl CapsuleLoader {
@@ -67,7 +70,37 @@ impl CapsuleLoader {
             memory_ledger,
             runtime_limits,
             http_limits,
+            compiled_wasm: crate::engine::wasm::CompiledWasmCache::default(),
+            defer_background_activation: false,
+            runtime_id: None,
         }
+    }
+
+    /// Stamp external child engines with the preallocated runtime generation.
+    #[must_use]
+    pub fn with_runtime_id(mut self, runtime_id: crate::registry::RuntimeId) -> Self {
+        self.runtime_id = Some(runtime_id);
+        self
+    }
+
+    /// Prepare autonomous engines without starting their background work.
+    /// The kernel uses this while constructing a replacement generation, then
+    /// activates it only after publishing the corresponding registry view.
+    #[must_use]
+    pub fn with_deferred_background_activation(mut self) -> Self {
+        self.defer_background_activation = true;
+        self
+    }
+
+    /// Reuse immutable compiled WASM artifacts across authority-scoped
+    /// runtimes created by this loader family.
+    #[must_use]
+    pub fn with_compiled_wasm_cache(
+        mut self,
+        cache: crate::engine::wasm::CompiledWasmCache,
+    ) -> Self {
+        self.compiled_wasm = cache;
+        self
     }
 
     /// Parse a `CapsuleManifest` and build a unified `CompositeCapsule`.
@@ -88,15 +121,20 @@ impl CapsuleLoader {
 
         // 1. WASM Component Engine
         if !manifest.components.is_empty() {
-            composite.add_engine(Box::new(crate::engine::WasmEngine::new(
-                manifest.clone(),
-                capsule_dir.clone(),
-                self.fuel_ledger.clone(),
-                self.fuel_rate.clone(),
-                self.memory_ledger.clone(),
-                self.runtime_limits,
-                self.http_limits,
-            )));
+            composite.add_engine(Box::new(
+                crate::engine::WasmEngine::new(
+                    manifest.clone(),
+                    capsule_dir.clone(),
+                    self.fuel_ledger.clone(),
+                    self.fuel_rate.clone(),
+                    self.memory_ledger.clone(),
+                    self.runtime_limits,
+                    self.http_limits,
+                )
+                .with_compiled_cache(self.compiled_wasm.clone())
+                .with_runtime_id(self.runtime_id.clone())
+                .with_deferred_activation(self.defer_background_activation),
+            ));
         }
 
         // 2. Legacy Host MCP Engine (The Airlock Override)
@@ -104,12 +142,15 @@ impl CapsuleLoader {
             // If server.server_type == "stdio", then the user is explicitly requesting
             // a host process breakout.
             if server.server_type.as_deref() == Some("stdio") {
-                composite.add_engine(Box::new(crate::engine::McpHostEngine::new(
-                    manifest.clone(),
-                    server.clone(),
-                    capsule_dir.clone(),
-                    self.mcp_client.clone(),
-                )));
+                composite.add_engine(Box::new(
+                    crate::engine::McpHostEngine::new(
+                        manifest.clone(),
+                        server.clone(),
+                        capsule_dir.clone(),
+                        self.mcp_client.clone(),
+                    )
+                    .with_runtime_id(self.runtime_id.clone()),
+                ));
             }
         }
         // 3. Static Context Engine

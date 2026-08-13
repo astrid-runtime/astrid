@@ -370,6 +370,7 @@ fn install_recv_invocation_context_resolves_invoking_principal_profile() {
         .build()
         .unwrap();
     let mut state = minimal_host_state(rt.handle().clone());
+    state.system_runtime = true;
 
     // Seed on-disk profiles for `alice` (max_background_processes = 3) and the
     // capsule owner / `default` principal (= 7), behind a tempdir-rooted cache.
@@ -456,6 +457,7 @@ fn recv_path_installs_publisher_secret_store_not_neutral() {
         .build()
         .unwrap();
     let mut state = minimal_host_state(rt.handle().clone());
+    state.system_runtime = true;
     // Shared instance owned by default; the load-time secret store is neutral.
     assert_eq!(state.principal, astrid_core::PrincipalId::default());
     let neutral_secret_ptr = Arc::as_ptr(&state.secret_store);
@@ -514,7 +516,7 @@ fn recv_path_installs_publisher_secret_store_not_neutral() {
 }
 
 /// Every caller — the owner/`default` INCLUDED — resolves its OWN explicit scope
-/// via an installed overlay, never through a fallback. On a shared instance the
+/// via an installed overlay, never through a fallback. In this reused Store fixture the
 /// load-time fields are neutral, so even `default` serving itself must get a
 /// `default:capsule:{id}` overlay rather than reading the neutral placeholder.
 #[test]
@@ -554,6 +556,28 @@ fn recv_path_owner_gets_own_overlay_not_fallback() {
     );
 }
 
+#[test]
+fn principal_runtime_rejects_peer_recv_context() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let mut state = minimal_host_state(rt.handle().clone());
+    state.principal = astrid_core::PrincipalId::new("alice").unwrap();
+    let message = astrid_events::ipc::IpcMessage::new(
+        Topic::from_raw("some.v1.event"),
+        astrid_events::ipc::IpcPayload::RawJson(serde_json::json!({})),
+        uuid::Uuid::new_v4(),
+    )
+    .with_principal("bob");
+
+    state.install_recv_invocation_context(&message);
+
+    assert!(!state.invocation_profile_authorized);
+    assert!(state.invocation_kv.is_none());
+    assert!(state.invocation_secret_store.is_none());
+    assert!(!state.invocation_authority_active());
+}
+
 /// The KV overlay a caller receives is backed by the SHARED real backend
 /// (`kv_backend`), so writes persist to the principal's real namespace — the
 /// neutral fallback store is a SEPARATE physical store and must not be involved.
@@ -563,6 +587,7 @@ fn overlay_kv_uses_real_backend_not_neutral_store() {
         .build()
         .unwrap();
     let mut state = minimal_host_state(rt.handle().clone());
+    state.system_runtime = true;
 
     let alice = astrid_core::PrincipalId::new("alice").expect("valid alice");
     let msg = astrid_events::ipc::IpcMessage::new(
@@ -733,9 +758,9 @@ fn scoped_kv_namespacing_isolates_identical_session_keys_across_principals() {
 }
 
 #[test]
-fn shared_instance_isolates_kv_and_secrets_per_invocation() {
-    // No-cross-principal-host-state-bleed regression for SHARED instances
-    // (#1069). The runtime is loaded under `default` but the load-time fallbacks
+fn system_instance_isolates_kv_and_secrets_per_invocation() {
+    // No-cross-principal-host-state-bleed regression for explicit system
+    // instances. This fixture uses `default` as a neutral stand-in, but the load-time fallbacks
     // are NEUTRAL — `default` is an ordinary principal and reading its namespace
     // from another principal is a bleed. A non-owner invocation stamped for `bob`
     // reads/writes BOB's KV + secret namespaces; owner and principal-less
@@ -745,7 +770,7 @@ fn shared_instance_isolates_kv_and_secrets_per_invocation() {
         .build()
         .unwrap();
     let mut state = minimal_host_state(rt.handle().clone());
-    // Confirm the fixture models a default-owned shared instance.
+    // Confirm the fixture models the legacy neutral system shape.
     assert_eq!(state.principal, astrid_core::PrincipalId::default());
     // The load-time fallback is the NEUTRAL placeholder, NOT `default`'s real
     // namespace, and NOT any principal's `{p}:capsule:{id}`.
@@ -785,7 +810,7 @@ fn shared_instance_isolates_kv_and_secrets_per_invocation() {
     assert_eq!(
         state.effective_kv().namespace(),
         "bob:capsule:test",
-        "bob's invocation reads/writes BOB's KV namespace on the shared instance"
+        "bob's invocation reads/writes BOB's KV namespace in the reused Store fixture"
     );
     assert_ne!(
         state.effective_kv().namespace(),
@@ -794,7 +819,7 @@ fn shared_instance_isolates_kv_and_secrets_per_invocation() {
     );
     assert!(
         std::ptr::eq(Arc::as_ptr(state.effective_secret_store()), bob_secret_ptr),
-        "bob's invocation resolves to BOB's secret store on the shared instance"
+        "bob's invocation resolves to BOB's secret store in the reused Store fixture"
     );
     assert!(
         !std::ptr::eq(
@@ -812,14 +837,14 @@ fn shared_instance_isolates_kv_and_secrets_per_invocation() {
     assert_eq!(
         state.effective_kv().namespace(),
         neutral_kv_ns.as_str(),
-        "a principal-less event on a shared instance stays in the NEUTRAL KV scope"
+        "a principal-less event in the reused Store fixture stays in the NEUTRAL KV scope"
     );
     assert!(
         std::ptr::eq(
             Arc::as_ptr(state.effective_secret_store()),
             neutral_secret_ptr
         ),
-        "a principal-less event on a shared instance stays in the NEUTRAL secret store"
+        "a principal-less event in the reused Store fixture stays in the NEUTRAL secret store"
     );
 }
 
@@ -907,6 +932,7 @@ fn recv_profile_load_failure_installs_restricted_authority_floor() {
         .build()
         .unwrap();
     let mut state = minimal_host_state(rt.handle().clone());
+    state.system_runtime = true;
     let dir = tempfile::tempdir().unwrap();
     let home = astrid_core::dirs::AstridHome::from_path(dir.path());
     let principal = astrid_core::PrincipalId::new("broken-profile").unwrap();

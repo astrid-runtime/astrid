@@ -348,18 +348,32 @@ pub fn validate_server_name(name: &str) -> McpResult<()> {
 }
 
 /// Configuration file for all MCP servers.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServersConfig {
     /// Server configurations.
     #[serde(default)]
     pub servers: HashMap<String, ServerConfig>,
-    /// Timeout for graceful shutdown of MCP server sessions.
+    /// Threshold after which a still-running graceful shutdown is warned about.
     ///
-    /// Comes from `gateway.shutdown_timeout_secs` via the config bridge;
-    /// skipped during (de)serialization because it is not part of
-    /// `servers.toml`.
-    #[serde(skip)]
+    /// Astrid continues to own and await cleanup after this threshold. It is
+    /// not a cancellation deadline: abandoning rmcp's close future can orphan
+    /// the process tree it owns. This is skipped during (de)serialization
+    /// because it is not part of `servers.toml`.
+    #[serde(skip, default = "default_shutdown_timeout")]
     pub shutdown_timeout: std::time::Duration,
+}
+
+fn default_shutdown_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(10)
+}
+
+impl Default for ServersConfig {
+    fn default() -> Self {
+        Self {
+            servers: HashMap::new(),
+            shutdown_timeout: default_shutdown_timeout(),
+        }
+    }
 }
 
 impl ServersConfig {

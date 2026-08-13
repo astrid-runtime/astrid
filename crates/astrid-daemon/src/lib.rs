@@ -252,6 +252,15 @@ pub async fn run() -> Result<()> {
     )
     .await
     .map_err(|e| anyhow::anyhow!("Failed to boot Kernel: {e}"))?;
+    kernel
+        .set_system_capsules(
+            unified_cfg
+                .as_ref()
+                .into_iter()
+                .flat_map(|config| config.uplinks.iter())
+                .map(|uplink| uplink.plugin.clone()),
+        )
+        .await;
 
     // Astrid owns its baseline control plane. Start it before loading optional
     // distribution capsules so no capsule can race the canonical listener or

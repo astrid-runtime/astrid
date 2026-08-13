@@ -9,6 +9,9 @@
 
 use serde::{Deserialize, Serialize};
 
+use astrid_core::PrincipalId;
+use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
+
 use crate::capsule::{Capsule, InterceptResult};
 
 /// A single tool's descriptor, as emitted by the `#[astrid::tool]`-generated
@@ -77,6 +80,35 @@ pub async fn describe_loaded_capsule_status(
     capsule: &dyn Capsule,
 ) -> anyhow::Result<Option<Vec<ToolDescriptor>>> {
     interpret_describe_result(capsule.invoke_interceptor("tool_describe", &[], None).await)
+}
+
+/// Describe a capsule as one typed principal view.
+///
+/// The kernel uses this only with principals obtained from the registry's live
+/// view snapshot. Stamping the invocation is essential for SystemResident
+/// runtimes: their mutable instance is shared deliberately, but profile, KV,
+/// secrets, and filesystem overlays remain caller-specific.
+pub async fn describe_loaded_capsule_status_for(
+    capsule: &dyn Capsule,
+    principal: &PrincipalId,
+) -> anyhow::Result<Option<Vec<ToolDescriptor>>> {
+    let caller = principal_describe_caller(principal);
+    interpret_describe_result(
+        capsule
+            .invoke_interceptor("tool_describe", &[], Some(&caller))
+            .await,
+    )
+}
+
+fn principal_describe_caller(principal: &PrincipalId) -> IpcMessage {
+    IpcMessage::new(
+        Topic::from_raw("tool.v1.request.describe"),
+        IpcPayload::Custom {
+            data: serde_json::json!({}),
+        },
+        uuid::Uuid::new_v4(),
+    )
+    .with_principal(principal.to_string())
 }
 
 /// Pure mapping of a `tool_describe` interceptor outcome to a captured tool
@@ -194,6 +226,15 @@ fn is_unknown_action(reason: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn principal_describe_caller_preserves_typed_principal() {
+        let principal = PrincipalId::new("alice").expect("valid principal");
+        let caller = principal_describe_caller(&principal);
+
+        assert_eq!(caller.principal.as_deref(), Some(principal.as_str()));
+        assert_eq!(caller.topic.as_str(), "tool.v1.request.describe");
+    }
 
     /// #1198: a pool-less run-loop capsule's `NotSupported` describe maps to
     /// `None` (surface UNKNOWN → leave absent so the describe fan-out fires), NOT

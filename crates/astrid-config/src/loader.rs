@@ -420,6 +420,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn workspace_config_cannot_change_operator_uplinks() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let state = workspace.path().join(".astrid");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(
+            home.path().join("config.toml"),
+            r#"
+                [[uplinks]]
+                plugin = "operator-approved-uplink"
+                profile = "chat"
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            state.join("config.toml"),
+            r#"
+                [[uplinks]]
+                plugin = "workspace-controlled-uplink"
+                profile = "bridge"
+            "#,
+        )
+        .unwrap();
+
+        let resolved = load_with_layout(
+            Some(workspace.path()),
+            Some(home.path()),
+            &WorkspaceLayout::default(),
+        )
+        .unwrap();
+
+        assert_eq!(resolved.config.uplinks.len(), 1);
+        assert_eq!(
+            resolved.config.uplinks[0].plugin,
+            "operator-approved-uplink"
+        );
+        assert_eq!(resolved.config.uplinks[0].profile, "chat");
+    }
+
     #[cfg(unix)]
     #[test]
     fn workspace_config_rejects_redirected_state_directory() {

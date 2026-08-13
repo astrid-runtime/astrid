@@ -148,6 +148,7 @@ keyring = { version = "3", features = [
 landlock = "0.4"
 libc = "0.2"
 nix = { version = "0.31", features = ["process", "signal", "user", "fs", "resource"] }
+process-wrap = { version = "9", features = ["tokio1"] }
 # Async-signal-safe signal handling on a dedicated OS thread. Used by the
 # daemon's SIGTERM/SIGINT/SIGHUP watchdog, which owns those signals off the
 # tokio runtime so the daemon is killable even when every worker is pinned.
@@ -257,6 +258,7 @@ utoipa = { version = "5", features = ["axum_extras"] }
 uuid = { version = "1.0", default-features = false, features = ["v4", "v5", "serde", "rng-getrandom"] }
 walkdir = "2.5"
 wasm-encoder = "0.253"
+wat = "1.252"
 wasmparser = "0.253"
 windows-sys = "0.61"
 wit-component = "0.253"

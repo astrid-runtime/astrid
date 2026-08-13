@@ -428,6 +428,7 @@ dependencies = [
  "wasmparser 0.253.0",
  "wasmtime",
  "wasmtime-wasi",
+ "wat",
 ]
 
 [[package]]
@@ -743,6 +744,8 @@ dependencies = [
  "astrid-crypto",
  "astrid-workspace",
  "async-trait",
+ "nix 0.31.3",
+ "process-wrap",
  "rmcp",
  "serde",
  "serde_json",

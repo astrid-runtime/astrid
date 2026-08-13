@@ -67,12 +67,8 @@ pub(crate) fn open_log(path: &std::path::Path) -> Arc<std::sync::Mutex<std::fs::
 /// can run inside a `#[tokio::test]` or own their own `Builder`-created
 /// runtime (sync `#[test]`s do the latter).
 pub(crate) fn minimal_host_state(rt: tokio::runtime::Handle) -> HostState {
-    // Model the PRODUCTION shape of a shared, `default`-owned content-addressed
-    // instance (issue #1069): the load-time `kv` / `secret_store` fallbacks are
-    // NEUTRAL fail-closed placeholders holding no real principal's data, and a
-    // separate `kv_backend` handle carries the real backend used to build
-    // per-invocation overlays. Tests that want a real per-principal scope install
-    // an `invocation_kv` / `invocation_secret_store` overlay explicitly.
+    // Deliberately authority-free test context. Production principal and
+    // SystemResident runtimes receive concrete owner/system namespaces.
     let kv_backend: Arc<dyn astrid_storage::KvStore> =
         Arc::new(astrid_storage::MemoryKvStore::new());
     let kv = HostState::neutral_kv();
@@ -87,6 +83,7 @@ pub(crate) fn minimal_host_state(rt: tokio::runtime::Handle) -> HostState {
             crate::MemoryLedger::default(),
         ),
         principal: astrid_core::PrincipalId::default(),
+        system_runtime: false,
         capsule_uuid: uuid::Uuid::new_v4(),
         caller_context: None,
         interceptor_active: false,
@@ -111,6 +108,7 @@ pub(crate) fn minimal_host_state(rt: tokio::runtime::Handle) -> HostState {
         kv,
         kv_backend,
         event_bus: astrid_events::EventBus::with_capacity(128),
+        route_admission_gate: astrid_events::RouteAdmissionGate::default(),
         ipc_limiter: Arc::new(astrid_events::ipc::IpcRateLimiter::new()),
         config: HashMap::new(),
         secret_env: std::collections::HashSet::new(),

@@ -8,8 +8,8 @@ use tracing::{debug, trace, warn};
 
 use crate::event::AstridEvent;
 use crate::route::{
-    MAX_SUBSCRIPTION_BUDGET_BYTES, PrincipalKey, RouteEntry, RouteKey, RoutedEventReceiver,
-    SubscriptionRepAllocator, TopicMatcher,
+    MAX_SUBSCRIPTION_BUDGET_BYTES, PrincipalKey, RouteAdmissionGate, RouteEntry, RouteKey,
+    RoutedEventReceiver, SubscriptionRepAllocator, TopicMatcher,
 };
 use crate::subscriber::{EventSubscriber, SubscriberRegistry};
 
@@ -369,6 +369,31 @@ impl EventBus {
         subscriber: &'static str,
         scope: Option<PrincipalKey>,
     ) -> RoutedEventReceiver {
+        self.subscribe_topic_routed_scoped_gated(
+            capsule_uuid,
+            topic_pattern,
+            capsule_id_label,
+            subscriber,
+            scope,
+            RouteAdmissionGate::default(),
+        )
+    }
+
+    /// Routed subscription controlled by a runtime-generation publication gate.
+    ///
+    /// While `gate` is staged, matching events are rejected rather than queued.
+    /// Opening the gate admits only future publishes, so a prepared generation
+    /// cannot replay traffic that arrived before it became visible.
+    #[must_use]
+    pub fn subscribe_topic_routed_scoped_gated(
+        &self,
+        capsule_uuid: uuid::Uuid,
+        topic_pattern: impl Into<String>,
+        capsule_id_label: impl Into<String>,
+        subscriber: &'static str,
+        scope: Option<PrincipalKey>,
+        gate: RouteAdmissionGate,
+    ) -> RoutedEventReceiver {
         let topic_pattern = topic_pattern.into();
         let capsule_label = capsule_id_label.into();
         let route_key = RouteKey {
@@ -377,16 +402,74 @@ impl EventBus {
             subscription_rep: self.next_subscription_rep.next(),
         };
         let matcher = TopicMatcher::new(topic_pattern);
-        let entry = Arc::new(parking_lot::Mutex::new(RouteEntry::new(
-            matcher,
-            capsule_label,
-            scope,
-        )));
+        let entry = Arc::new(parking_lot::Mutex::new(
+            RouteEntry::new(matcher, capsule_label, scope).with_gate(gate),
+        ));
         let notify = Arc::clone(&entry.lock().notify);
         {
             let mut routes = self.routes.write();
             routes.insert(route_key.clone(), Arc::clone(&entry));
         }
+        RoutedEventReceiver {
+            route_key,
+            route_entry: entry,
+            notify,
+            routes: Arc::clone(&self.routes),
+            lagged_count: 0,
+            subscriber,
+        }
+    }
+
+    /// Routed subscription for one principal runtime. It admits events from
+    /// that principal and kernel/system events, while rejecting every peer at
+    /// enqueue time.
+    #[must_use]
+    pub fn subscribe_topic_routed_principal_or_system(
+        &self,
+        capsule_uuid: uuid::Uuid,
+        topic_pattern: impl Into<String>,
+        capsule_id_label: impl Into<String>,
+        subscriber: &'static str,
+        principal: impl Into<String>,
+    ) -> RoutedEventReceiver {
+        self.subscribe_topic_routed_principal_or_system_gated(
+            capsule_uuid,
+            topic_pattern,
+            capsule_id_label,
+            subscriber,
+            principal,
+            RouteAdmissionGate::default(),
+        )
+    }
+
+    /// Principal-or-system routed subscription controlled by a shared runtime
+    /// publication gate.
+    #[must_use]
+    pub fn subscribe_topic_routed_principal_or_system_gated(
+        &self,
+        capsule_uuid: uuid::Uuid,
+        topic_pattern: impl Into<String>,
+        capsule_id_label: impl Into<String>,
+        subscriber: &'static str,
+        principal: impl Into<String>,
+        gate: RouteAdmissionGate,
+    ) -> RoutedEventReceiver {
+        let topic_pattern = topic_pattern.into();
+        let capsule_label = capsule_id_label.into();
+        let route_key = RouteKey {
+            capsule_uuid,
+            topic_pattern: topic_pattern.clone(),
+            subscription_rep: self.next_subscription_rep.next(),
+        };
+        let matcher = TopicMatcher::new(topic_pattern);
+        let entry = Arc::new(parking_lot::Mutex::new(
+            RouteEntry::new_principal_or_system(matcher, capsule_label, principal.into())
+                .with_gate(gate),
+        ));
+        let notify = Arc::clone(&entry.lock().notify);
+        self.routes
+            .write()
+            .insert(route_key.clone(), Arc::clone(&entry));
         RoutedEventReceiver {
             route_key,
             route_entry: entry,

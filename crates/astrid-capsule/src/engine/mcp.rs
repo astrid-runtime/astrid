@@ -1,13 +1,30 @@
 use async_trait::async_trait;
 use std::path::PathBuf;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use super::ExecutionEngine;
+use super::mcp_teardown::McpTeardown;
 use crate::context::CapsuleContext;
 use crate::error::{CapsuleError, CapsuleResult};
 use crate::manifest::{CapsuleManifest, McpServerDef};
 
 use astrid_mcp::SecureMcpClient;
+
+pub(super) fn runtime_server_id(
+    capsule: &str,
+    server: &str,
+    runtime_id: &crate::registry::RuntimeId,
+) -> String {
+    let scope = match runtime_id.key().scope() {
+        crate::registry::RuntimeScope::Principal(uid) => format!("principal-{uid}"),
+        crate::registry::RuntimeScope::SystemResident => "system".to_string(),
+    };
+    format!(
+        "capsule:{capsule}:server-{server}:{scope}:generation-{}",
+        runtime_id.generation()
+    )
+}
 
 /// Executes Legacy Host MCP servers via `stdio`.
 ///
@@ -24,6 +41,13 @@ pub struct McpHostEngine {
     server_def: McpServerDef,
     capsule_dir: PathBuf,
     mcp_client: SecureMcpClient,
+    /// Unique to one authority-scoped runtime incarnation. Never keyed by
+    /// capsule name alone, which would let one principal replace another's
+    /// process in the global MCP manager.
+    teardown: McpTeardown,
+    pending_config: Option<astrid_mcp::ServerConfig>,
+    cancelled: CancellationToken,
+    runtime_id: Option<crate::registry::RuntimeId>,
 }
 
 impl McpHostEngine {
@@ -38,8 +62,21 @@ impl McpHostEngine {
             manifest,
             server_def,
             capsule_dir,
+            teardown: McpTeardown::new(mcp_client.clone()),
             mcp_client,
+            pending_config: None,
+            cancelled: CancellationToken::new(),
+            runtime_id: None,
         }
+    }
+
+    #[must_use]
+    pub(crate) fn with_runtime_id(
+        mut self,
+        runtime_id: Option<crate::registry::RuntimeId>,
+    ) -> Self {
+        self.runtime_id = runtime_id;
+        self
     }
 }
 
@@ -141,7 +178,13 @@ impl ExecutionEngine for McpHostEngine {
         // Resolve [env] from KV store / defaults / onboarding before spawning.
         let resolved_env = super::resolve_env(&self.manifest, ctx, &[], "mcp_host_engine").await?;
 
-        let server_id = format!("capsule:{}", self.manifest.package.name);
+        let runtime_id = self.runtime_id.as_ref().ok_or_else(|| {
+            CapsuleError::ExecutionFailed(
+                "MCP host engine requires a preallocated runtime generation".to_string(),
+            )
+        })?;
+        let server_id =
+            runtime_server_id(&self.manifest.package.name, &self.server_def.id, runtime_id);
 
         // Determine network access from the capsule's `net` capability.
         // If the capsule declared any net domains, allow network access.
@@ -159,8 +202,27 @@ impl ExecutionEngine for McpHostEngine {
             ..Default::default()
         };
 
-        // We use the `astrid-mcp` dynamic connection feature to spawn the `Command`
-        // and attach its `stdio` directly to the `McpClient`.
+        // Loading validates and prepares the process definition. The process is
+        // started only when the candidate generation is activated, so a failed
+        // replacement never runs alongside the current generation.
+        self.pending_config = Some(config);
+
+        Ok(())
+    }
+
+    async fn activate(&mut self) -> CapsuleResult<()> {
+        let config = self.pending_config.take().ok_or_else(|| {
+            CapsuleError::ExecutionFailed("MCP server has not been prepared".to_string())
+        })?;
+        let server_id = config.name.clone();
+        // Record ownership before the first await. If activation is cancelled
+        // or times out halfway through process startup, request_cancel/unload
+        // can still synchronously find and reclaim the manager entry.
+        if !self.teardown.register(server_id.clone()) {
+            return Err(CapsuleError::ExecutionFailed(
+                "MCP runtime generation was retired before activation".to_string(),
+            ));
+        }
         self.mcp_client
             .connect_dynamic(&server_id, config)
             .await
@@ -178,16 +240,24 @@ impl ExecutionEngine for McpHostEngine {
             capsule = %self.manifest.package.name,
             "Shutting down MCP host process"
         );
-        let server_id = format!("capsule:{}", self.manifest.package.name);
-
-        let _ = self.mcp_client.disconnect(&server_id).await;
+        self.cancelled.cancel();
+        self.teardown.wait().await;
 
         // Let astrid-mcp drop the Child process and `Stdio` streams.
         Ok(())
     }
 
+    fn request_cancel(&self) {
+        self.cancelled.cancel();
+        self.teardown.start();
+    }
+
     fn check_health(&self) -> crate::capsule::CapsuleState {
-        let server_id = format!("capsule:{}", self.manifest.package.name);
+        let Some(server_id) = self.teardown.server_id() else {
+            return crate::capsule::CapsuleState::Failed(
+                "MCP server has not been loaded".to_string(),
+            );
+        };
         // Requires multi-threaded tokio runtime (the kernel health monitor
         // satisfies this). `health_check()` calls `is_alive()` on each
         // running server, which checks `RunningService::is_closed()` to
@@ -225,7 +295,14 @@ impl ExecutionEngine for McpHostEngine {
         payload: &[u8],
         _caller: Option<&astrid_events::ipc::IpcMessage>,
     ) -> CapsuleResult<crate::capsule::InterceptResult> {
-        let server_id = format!("capsule:{}", self.manifest.package.name);
+        if self.cancelled.is_cancelled() {
+            return Err(CapsuleError::ExecutionFailed(
+                "MCP runtime generation is retired".to_string(),
+            ));
+        }
+        let server_id = self.teardown.server_id().ok_or_else(|| {
+            CapsuleError::ExecutionFailed("MCP server has not been loaded".to_string())
+        })?;
 
         let params: serde_json::Value = serde_json::from_slice(payload).map_err(|e| {
             CapsuleError::ExecutionFailed(format!("failed to deserialize interceptor payload: {e}"))
@@ -243,9 +320,15 @@ impl ExecutionEngine for McpHostEngine {
         // no capability check needed for the kernel invoking its own hooks.
         let client = self.mcp_client.inner().clone();
 
-        let result = client
-            .call_tool(&server_id, "astrid_hook_intercept", tool_args)
-            .await;
+        let result = client.call_tool(&server_id, "astrid_hook_intercept", tool_args);
+        let result = tokio::select! {
+            () = self.cancelled.cancelled() => {
+                return Err(CapsuleError::ExecutionFailed(
+                    "MCP runtime generation was retired during invocation".to_string(),
+                ));
+            }
+            result = result => result,
+        };
 
         match result {
             Ok(tool_result) => {

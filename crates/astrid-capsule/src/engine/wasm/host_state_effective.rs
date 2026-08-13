@@ -26,30 +26,12 @@ impl HostState {
     /// collide. A capsule therefore must not (and need not) fold the principal
     /// into its own keys.
     ///
-    /// Resolution: `invocation_kv` (the per-call store installed for the invoking
-    /// principal) wins; otherwise the NEUTRAL fail-closed
-    /// [`kv`](HostState::kv) placeholder.
-    ///
-    /// Runtimes are SHARED by content hash across principals (issue #1069) and
-    /// the kernel loads them under [`PrincipalId::default()`](astrid_core::PrincipalId::default),
-    /// but `default` is an ORDINARY principal — reading its namespace from
-    /// another principal would be a cross-principal bleed. So the load-time `kv`
-    /// fallback is NOT `default`'s namespace: it is a neutral, physically-
-    /// isolated placeholder holding no real principal's data (see the field doc).
-    /// EVERY caller carrying a principal — the owner/`default` included — gets an
-    /// `invocation_kv` overlay scoped to its own principal (installed by
-    /// `invoke_interceptor` / `install_recv_invocation_context`), so the fallback
-    /// is reached ONLY by principal-less contexts:
-    ///
-    /// - no caller in scope (load-time, a run-loop's own work, tests), or
-    /// - a principal-less system/lifecycle event (watchdog tick,
-    ///   `capsules_loaded`).
-    ///
-    /// In every one of those the fallback is the neutral placeholder, so no
-    /// invocation can EVER reach another principal's KV — nor `default`'s — via
-    /// the fallback. The degrade path (invocation-KV construction failing and
-    /// leaving `invocation_kv = None`) also falls back to the neutral placeholder.
-    /// Pinned by the `effective_kv_*` / `scoped_kv_*` tests. Relates to #977, #1069.
+    /// Resolution: `invocation_kv` (installed for the current caller when an
+    /// explicit system runtime multiplexes views) wins; otherwise the runtime's
+    /// load-time [`kv`](HostState::kv). Principal runtimes are constructed with
+    /// their owner's real namespace and are never reachable by a peer. System
+    /// runtimes are constructed with a neutral namespace, so a principal-less
+    /// system event cannot fall through into a human principal's state.
     #[must_use]
     pub fn effective_kv(&self) -> &ScopedKvStore {
         #[cfg(debug_assertions)]
@@ -63,9 +45,9 @@ impl HostState {
     /// Retained only for backward compatibility; superseded by
     /// [`effective_kv`](Self::effective_kv). This returns just a namespace
     /// STRING, so — unlike `effective_kv` — it cannot express the fail-closed,
-    /// physically-isolated NEUTRAL placeholder that a shared content-addressed
-    /// runtime (issue #1069) falls back to for a principal-less / load-time
-    /// context; it can only ever name a `{principal}:capsule:{id}` namespace.
+    /// physically-isolated neutral placeholder that an explicit system runtime
+    /// falls back to for a principal-less context; it can only ever name a
+    /// `{principal}:capsule:{id}` namespace.
     ///
     /// The body anchors [`effective_principal`](Self::effective_principal) (the
     /// INVOKING principal, falling back to the load owner only when no caller is
@@ -85,11 +67,9 @@ impl HostState {
     /// Return the effective home mount for the current invocation.
     ///
     /// Prefers `invocation_home` (installed for the invoking principal) over the
-    /// load-time `home`. On a SHARED runtime (issue #1069) `home` is `None`, so
-    /// this fallback is neutral/fail-closed — it can NEVER be another principal's
-    /// (nor `default`'s) home. `home` is set to a real principal's mount only on
-    /// the single-principal lifecycle/hook paths, which no other principal can
-    /// reach, so there is no cross-principal home fallback anywhere.
+    /// load-time `home`. Principal runtimes own that mount exclusively; an
+    /// explicit system runtime has no load-time home and therefore fails closed
+    /// for principal-less work.
     #[must_use]
     pub fn effective_home(&self) -> Option<&PrincipalMount> {
         self.invocation_home.as_ref().or(self.home.as_ref())

@@ -138,6 +138,30 @@ const WASM_CAPSULE_TIMEOUT_SECS: u64 = 5 * 60;
 /// granularity is `EPOCH_TICK_INTERVAL * epoch_deadline`.
 const EPOCH_TICK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
+async fn await_runtime_activation(
+    mut activation_rx: tokio::sync::watch::Receiver<bool>,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> bool {
+    while !*activation_rx.borrow() {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return false,
+            changed = activation_rx.changed() => {
+                if changed.is_err() {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+fn runtime_id_is_system(runtime_id: Option<&crate::registry::RuntimeId>) -> bool {
+    runtime_id.is_some_and(|runtime_id| {
+        runtime_id.key().scope() == crate::registry::RuntimeScope::SystemResident
+    })
+}
+
 /// Executes WASM Components via the wasmtime Component Model.
 ///
 /// This engine sandboxes execution in wasmtime and wires the
@@ -148,6 +172,10 @@ pub struct WasmEngine {
     _capsule_dir: PathBuf,
     /// The wasmtime engine shared between the store and epoch incrementer.
     wasmtime_engine: Option<wasmtime::Engine>,
+    /// Kernel-shared immutable compiled-artifact cache.
+    compiled_cache: CompiledWasmCache,
+    /// Pins compiled code and its single epoch ticker while Stores exist.
+    compiled_artifact: Option<Arc<CompiledWasmArtifact>>,
     /// The wasmtime store holding HostState. Wrapped in `Arc<AsyncMutex<>>`
     /// Pool of `(Store, Instance)` pairs for a non-run-loop capsule.
     ///
@@ -164,6 +192,12 @@ pub struct WasmEngine {
     pool: Option<pool::CapsuleInstancePool>,
     inbound_rx: Option<tokio::sync::mpsc::Receiver<astrid_core::InboundMessage>>,
     run_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Activation edge for a prepared run loop. Kernel-created runtimes wait
+    /// here until their exact generation is published in the registry.
+    activation_tx: Option<tokio::sync::watch::Sender<bool>>,
+    defer_activation: bool,
+    /// Shared publication fence for every routed subscription in this generation.
+    route_admission_gate: astrid_events::RouteAdmissionGate,
     /// Receiver for the readiness signal from the run loop.
     /// Only set for capsules that have a `run()` export.
     /// The Mutex is required because `wait_ready` takes `&self` but we need
@@ -177,16 +211,11 @@ pub struct WasmEngine {
     /// Shared per-principal cancellation-token map (children of
     /// [`cancel_token`](Self::cancel_token)), created at load alongside it and
     /// cloned into every pooled `HostState`. `request_cancel_for` cancels and
-    /// removes ONE principal's entry so releasing that principal's view of a
-    /// shared runtime interrupts its in-flight blocking host calls without
-    /// touching the other principals' work.
+    /// removes one admitted identity's entry without affecting other callers
+    /// multiplexed by an explicit SystemResident service.
     principal_cancel_tokens: Option<PrincipalCancelTokens>,
-    /// Admission fence and active-call counter for each principal sharing this
-    /// runtime. View retirement closes admission first, then waits for calls
-    /// admitted under the old view to return before reclamation proceeds.
+    /// Admission fence and active-call counter for this runtime's identities.
     principal_invocations: Option<Arc<PrincipalInvocationTracker>>,
-    /// RAII guard that stops the epoch ticker thread on drop.
-    epoch_ticker: Option<EpochTickerGuard>,
     /// Shared per-principal profile cache (Layer 3, issue #666).
     ///
     /// Populated at load time from the kernel-wide cache. `invoke_interceptor`
@@ -202,6 +231,14 @@ pub struct WasmEngine {
     /// `state.principal` is immutable after load, so caching it here is
     /// equivalent and hot-path friendly.
     owner_principal: Option<astrid_core::PrincipalId>,
+    /// Explicit kernel-classified SystemResident scope. Never inferred from a
+    /// caller at invocation time.
+    system_runtime: bool,
+    /// Preallocated authority identity for this mutable runtime generation.
+    /// Production loaders always stamp it before load; compatibility callers
+    /// without one remain principal-scoped rather than inferring authority
+    /// from context shape.
+    runtime_id: Option<crate::registry::RuntimeId>,
     /// Shared per-principal overlay VFS registry (Layer 4, issue #668).
     ///
     /// Populated at load time from the kernel-wide registry.
@@ -421,16 +458,22 @@ impl WasmEngine {
             manifest,
             _capsule_dir: capsule_dir,
             wasmtime_engine: None,
+            compiled_cache: CompiledWasmCache::default(),
+            compiled_artifact: None,
             pool: None,
             inbound_rx: None,
             run_handle: None,
+            activation_tx: None,
+            defer_activation: false,
+            route_admission_gate: astrid_events::RouteAdmissionGate::default(),
             ready_rx: None,
             cancel_token: None,
             principal_cancel_tokens: None,
             principal_invocations: None,
-            epoch_ticker: None,
             profile_cache: None,
             owner_principal: None,
+            system_runtime: false,
+            runtime_id: None,
             overlay_registry: None,
             fuel_ledger,
             memory_ledger,
@@ -442,6 +485,33 @@ impl WasmEngine {
             process_tracker: None,
             persistent_processes: None,
         }
+    }
+
+    /// Use a kernel-shared cache for verified immutable compiled artifacts.
+    #[must_use]
+    pub fn with_compiled_cache(mut self, cache: CompiledWasmCache) -> Self {
+        self.compiled_cache = cache;
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_runtime_id(
+        mut self,
+        runtime_id: Option<crate::registry::RuntimeId>,
+    ) -> Self {
+        self.runtime_id = runtime_id;
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_deferred_activation(mut self, defer: bool) -> Self {
+        self.defer_activation = defer;
+        self.route_admission_gate = if defer {
+            astrid_events::RouteAdmissionGate::staged()
+        } else {
+            astrid_events::RouteAdmissionGate::published()
+        };
+        self
     }
 
     /// Promote/rollback the OS-level copy-on-write workspace behind a QUIESCENCE
@@ -995,7 +1065,7 @@ fn build_wasi_ctx() -> wasmtime_wasi::WasiCtx {
 /// be `None`: a missing home directory yields a clean denial instead of a
 /// panic; the host-side fs functions treat `None` as "no VFS available"
 /// and return an error to the guest.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct PrincipalVfsBundle {
     home: Option<PrincipalMount>,
     tmp: Option<PrincipalMount>,
@@ -1060,30 +1130,26 @@ pub(crate) async fn build_principal_vfs_bundle(
 
 /// Install (or clear) the per-invocation host-state overlays for the caller.
 ///
-/// THE single source of truth for scoping a shared runtime's KV / secret store /
-/// home / tmp / capsule log to the invoking principal. Used by BOTH the
+/// The single source of truth for authenticated per-message KV / secret store /
+/// home / tmp / capsule-log overlays. Used by both the
 /// dispatcher-driven interceptor path and the guest-pulled `ipc::recv` path so
 /// the two can never drift.
 ///
-/// Semantics enforce the isolation invariant for a content-addressed shared
-/// runtime (issue #1069), whose load-time `kv`/`secret_store`/`home`/`tmp`/
-/// `capsule_log` fields are NEUTRAL fail-closed placeholders holding no real
-/// principal's data:
+/// Each mutable runtime is already authority-scoped. These overlays refine the
+/// active message context without changing runtime ownership:
 ///
 /// - `Some(p)` — install `p`-scoped overlays for EVERY caller carrying a present,
 ///   parseable principal, the load-owner (`default`) INCLUDED. The KV overlay is
-///   built from [`kv_backend`](HostState::kv_backend) (the real shared backend),
-///   NOT from the neutral `kv` fallback. The secret store is built over that KV
+///   built from [`kv_backend`](HostState::kv_backend). The secret store is built over that KV
 ///   overlay so both backends are principal-isolated.
 /// - `None` — principal-less system / lifecycle events (watchdog tick,
-///   capsules_loaded): clear every overlay so resolution falls back to the
-///   NEUTRAL placeholders. This is the fail-closed floor — never another
-///   principal's data.
+///   capsules_loaded): clear overlays so resolution returns to runtime-owned
+///   authority.
 ///
 /// Degrade path: if the KV overlay cannot be constructed (a `with_namespace`
 /// failure, which the `{principal}:capsule:{id}` format never produces), ALL
 /// overlays are cleared to `None` so resolution fails closed to the neutral
-/// placeholder — it never falls back to the load-owner's real store.
+/// placeholder rather than another principal's namespace.
 async fn install_principal_overlays(
     state: &mut HostState,
     principal: Option<&astrid_core::PrincipalId>,
@@ -1370,6 +1436,158 @@ impl Drop for EpochTickerGuard {
     }
 }
 
+struct CompiledWasmArtifact {
+    engine: wasmtime::Engine,
+    instance_pre: wasmtime::component::InstancePre<HostState>,
+    _epoch_ticker: EpochTickerGuard,
+}
+
+/// Deduplicates immutable verified compiled code across authority-scoped
+/// runtimes. It never stores a mutable `Store`, `Instance`, guest memory,
+/// resource table, run task, or principal host state.
+#[derive(Clone, Default)]
+pub struct CompiledWasmCache {
+    entries: Arc<
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<CompiledWasmArtifact>>>,
+    >,
+}
+
+impl CompiledWasmCache {
+    fn compile(
+        &self,
+        verified_hash: &str,
+        wasm_bytes: &[u8],
+    ) -> CapsuleResult<Arc<CompiledWasmArtifact>> {
+        // This domain is part of the cache identity. Bump it whenever the
+        // engine configuration or linked host ABI changes incompatibly.
+        const ENGINE_ABI: &str = "astrid-wasmtime46-component-abi-v1";
+        let key = format!("{ENGINE_ABI}:{verified_hash}");
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(compiled) = entries.get(&key).and_then(std::sync::Weak::upgrade) {
+            return Ok(compiled);
+        }
+
+        let engine = build_wasmtime_engine()?;
+        let mut linker: Linker<HostState> = Linker::new(&engine);
+        configure_kernel_linker(&mut linker).map_err(|error| {
+            CapsuleError::UnsupportedEntryPoint(format!(
+                "Failed to add Astrid host to linker: {error}"
+            ))
+        })?;
+        let component = Component::from_binary(&engine, wasm_bytes).map_err(|error| {
+            CapsuleError::UnsupportedEntryPoint(format!(
+                "Failed to compile WASM component: {error}"
+            ))
+        })?;
+        let instance_pre = linker.instantiate_pre(&component).map_err(|error| {
+            CapsuleError::UnsupportedEntryPoint(format!(
+                "Failed to pre-instantiate WASM component: {error}"
+            ))
+        })?;
+        let artifact = Arc::new(CompiledWasmArtifact {
+            _epoch_ticker: spawn_epoch_ticker(&engine),
+            engine,
+            instance_pre,
+        });
+        entries.insert(key, Arc::downgrade(&artifact));
+        Ok(artifact)
+    }
+}
+
+#[cfg(test)]
+mod compiled_artifact_cache_tests {
+    use super::*;
+
+    #[test]
+    fn identical_verified_bytes_share_only_the_compiled_artifact() {
+        let bytes = wasm_encoder::Component::new().finish();
+        let hash = blake3::hash(&bytes).to_hex().to_string();
+        let cache = CompiledWasmCache::default();
+
+        let first = cache.compile(&hash, &bytes).expect("first compilation");
+        let second = cache.compile(&hash, &bytes).expect("cached compilation");
+
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[tokio::test]
+    async fn shared_compiled_artifact_never_shares_guest_globals() {
+        let bytes = wat::parse_str(
+            r#"
+            (component
+              (core module $state
+                (global $value (mut i32) (i32.const 0))
+                (func (export "set") (param i32)
+                  local.get 0
+                  global.set $value)
+                (func (export "get") (result i32)
+                  global.get $value))
+              (core instance $state-instance (instantiate $state))
+              (func (export "set") (param "value" s32)
+                (canon lift (core func $state-instance "set")))
+              (func (export "get") (result s32)
+                (canon lift (core func $state-instance "get"))))
+            "#,
+        )
+        .expect("valid stateful component");
+        let hash = blake3::hash(&bytes).to_hex().to_string();
+        let artifact = CompiledWasmCache::default()
+            .compile(&hash, &bytes)
+            .expect("compiled artifact");
+
+        let mut alice_store = wasmtime::Store::new(
+            &artifact.engine,
+            test_fixtures::minimal_host_state(tokio::runtime::Handle::current()),
+        );
+        let mut bob_store = wasmtime::Store::new(
+            &artifact.engine,
+            test_fixtures::minimal_host_state(tokio::runtime::Handle::current()),
+        );
+        alice_store.set_fuel(10_000).expect("alice fuel");
+        bob_store.set_fuel(10_000).expect("bob fuel");
+        alice_store.set_epoch_deadline(u64::MAX);
+        bob_store.set_epoch_deadline(u64::MAX);
+        let alice = artifact
+            .instance_pre
+            .instantiate_async(&mut alice_store)
+            .await
+            .expect("alice instance");
+        let bob = artifact
+            .instance_pre
+            .instantiate_async(&mut bob_store)
+            .await
+            .expect("bob instance");
+        let alice_set = alice
+            .get_typed_func::<(i32,), ()>(&mut alice_store, "set")
+            .expect("alice set");
+        let alice_get = alice
+            .get_typed_func::<(), (i32,)>(&mut alice_store, "get")
+            .expect("alice get");
+        let bob_get = bob
+            .get_typed_func::<(), (i32,)>(&mut bob_store, "get")
+            .expect("bob get");
+
+        alice_set
+            .call_async(&mut alice_store, (0x5a5a_1234,))
+            .await
+            .expect("set alice global");
+        let alice_value = alice_get
+            .call_async(&mut alice_store, ())
+            .await
+            .expect("get alice global");
+        let bob_value = bob_get
+            .call_async(&mut bob_store, ())
+            .await
+            .expect("get bob global");
+
+        assert_eq!(alice_value, (0x5a5a_1234,));
+        assert_eq!(bob_value, (0,), "Bob must receive a fresh guest instance");
+    }
+}
+
 /// Spawn a background OS thread that periodically increments the engine
 /// epoch. Returns an RAII guard that stops the thread when dropped.
 ///
@@ -1470,28 +1688,9 @@ impl ExecutionEngine for WasmEngine {
                 )
             });
 
-        // Capsule identity, used as the IPC `source_id` (kernel-stamped, never
-        // guest-settable) and the per-(capsule, topic) route key.
-        // DETERMINISTIC (uuid v5 from capsule name + content hash) so it is
-        // STABLE across daemon restarts. The seed is content-addressed and
-        // deliberately carries NO principal segment: one runtime is shared by
-        // every principal that views the same content hash (issue #1069), so it
-        // must present a single stable identity to all of them. Per-principal
-        // host state (KV / secrets / home / env) is isolated per invocation via
-        // the `invocation_*` overlays, not by minting a distinct source id per
-        // principal. Cross-principal reply routing does not depend on this id:
-        // the gateway matches replies by the principal-scoped routed
-        // subscription plus the body correlation id (see
-        // `astrid-gateway/src/routes/sessions_bus.rs` and `models.rs`); the
-        // source id is only a defensive authenticity gate, so the gateway must
-        // derive it identically — see `capsule_source_id_v1` in
-        // `astrid-gateway/src/routes/capsule_sources.rs` (kept byte-identical).
-        //
-        // Namespace is a dedicated, fixed Astrid value — NOT `Uuid::NAMESPACE_OID`
-        // (reserved for ISO OIDs), so a capsule-name-derived id can never
-        // semantically collide with an OID-derived uuid from another system.
-        // Arbitrary but FIXED: changing it changes every capsule's identity, so
-        // it must never change.
+        // Preserve the public content-derived source identity. RuntimeId
+        // generation remains an internal lifecycle key; principal-scoped
+        // lookup resolves this wire identity only to the current generation.
         const CAPSULE_ID_NAMESPACE: uuid::Uuid =
             uuid::Uuid::from_u128(0x310714d5_9c6d_4c94_8187_75258f393bb6);
         let capsule_uuid_seed = format!("{}\0{}", self.manifest.package.name, wasm_hash.as_str());
@@ -1538,6 +1737,11 @@ impl ExecutionEngine for WasmEngine {
         let memory_ledger = self.memory_ledger.clone();
 
         let capsule_dir_for_verify = self._capsule_dir.clone();
+        let compiled_cache = self.compiled_cache.clone();
+        // Authority scope comes only from the kernel-reserved RuntimeId. A
+        // missing identity is a compatibility/test path and fails closed to a
+        // principal runtime; context shape must never grant system authority.
+        let system_runtime = runtime_id_is_system(self.runtime_id.as_ref());
         // Inlined async block — was previously wrapped in
         // `block_in_place` to permit nested `block_on` for the VFS
         // `register_dir` calls. Component-model async lets us `.await`
@@ -1551,6 +1755,7 @@ impl ExecutionEngine for WasmEngine {
             has_run,
             ready_rx,
             wt_engine,
+            compiled_artifact,
             workspace_cow_backend,
             process_tracker_for_engine,
             persistent_registry_for_engine,
@@ -1708,20 +1913,9 @@ impl ExecutionEngine for WasmEngine {
                 )
             };
 
-            // The per-principal home mount is NOT built at load time. A shared
-            // content-addressed runtime (issue #1069) is loaded under no real
-            // principal; `home://` is served by the per-invocation
-            // `invocation_home` overlay, mounted for the INVOKING principal on
-            // each call (see `invoke_interceptor` / the recv path). The load-time
-            // `home`/`tmp` fields stay neutral (`None`), never the load-owner's.
-
-            // NEUTRAL gate default: the gate must NOT carry a load-owner
-            // (`default`) home as its fallback. Every real `home://` access
-            // resolves through `effective_home()` and passes the INVOKING
-            // principal's home to the gate as `principal_home`, which supersedes
-            // this default. Leaving the default `None` makes the gate fail closed
-            // for principal-less / load-time contexts instead of authorizing
-            // `default`'s files.
+            // The security gate's workspace root is runtime-owned. Principal
+            // home mounts are supplied separately through HostState; the gate
+            // never infers `default` as an ownership fallback.
             // The gate confines file I/O to the SAME root the VFS and spawns
             // use — `effective_workspace_root` (the CoW merged path for non-git,
             // the pristine workspace for git-managed) — so a write the fs host
@@ -1813,7 +2007,8 @@ impl ExecutionEngine for WasmEngine {
             // and [`resolve_exemption`] for the pure, unit-tested branching.
             let has_run_export = wasm_exports_contain_run(&wasm_bytes);
             let owner_profile: Option<Arc<astrid_core::profile::PrincipalProfile>> =
-                ctx.profile_cache.as_ref().and_then(|cache| {
+                (!system_runtime).then_some(()).and_then(|()| {
+                    ctx.profile_cache.as_ref().and_then(|cache| {
                     cache
                         .resolve(&ctx.principal)
                         .map_err(|e| {
@@ -1826,6 +2021,7 @@ impl ExecutionEngine for WasmEngine {
                             e
                         })
                         .ok()
+                    })
                 });
             let load_group_config =
                 crate::context::live_group_config_for(&ctx.group_config)
@@ -1868,11 +2064,39 @@ impl ExecutionEngine for WasmEngine {
             // the `make_state` move closure below, beside `has_uplink`.
             // Fail-secure: `false` ⇒ audit subscriptions are scoped to the
             // owner principal. See [`resolve_audit_firehose`].
-            let audit_firehose = resolve_audit_firehose(
-                owner_profile.as_deref(),
-                load_group_config.as_ref().map(Arc::as_ref),
-                &ctx.principal,
-            );
+            let audit_firehose = !system_runtime
+                && resolve_audit_firehose(
+                    owner_profile.as_deref(),
+                    load_group_config.as_ref().map(Arc::as_ref),
+                    &ctx.principal,
+                );
+
+            // Executable runtimes are authority-scoped. Principal runtimes
+            // therefore carry their owner's real load-time state so an
+            // autonomous `run()` can use KV/home/secrets before its first
+            // recv. Explicit system runtimes retain the neutral deny-all
+            // fallback and are never aliases for the default human principal.
+            let owner_vfs = if system_runtime {
+                PrincipalVfsBundle::default()
+            } else {
+                build_principal_vfs_bundle(&ctx.principal).await
+            };
+            let owner_secret_store = Some(astrid_storage::build_secret_store(
+                &if system_runtime {
+                    format!("{}:system", capsule_id_val)
+                } else {
+                    format!("{}:{}", capsule_id_val, ctx.principal)
+                },
+                kv.clone(),
+                tokio::runtime::Handle::current(),
+            ));
+            let owner_capsule_log = (!system_runtime)
+                .then(|| open_capsule_log(&ctx.principal, capsule_id_val.as_str(), true))
+                .flatten();
+            let owner_file_secret_root = (!system_runtime)
+                .then(|| astrid_core::dirs::AstridHome::resolve().ok().map(|home| home.secrets_dir()))
+                .flatten();
+            let owner_kv = Some(kv.clone());
 
             // Per-instance `HostState` factory. Shared services clone (Arc or
             // cheap value clones); per-Store fields (`wasi_ctx`,
@@ -1899,11 +2123,18 @@ impl ExecutionEngine for WasmEngine {
             let persistent_registry = persistent_registry.clone();
             let memory_ledger = memory_ledger.clone();
             let st_principal = ctx.principal.clone();
+            let st_system_runtime = system_runtime;
             let st_capsule_registry = ctx.capsule_registry.clone();
             let st_allowance_store = ctx.allowance_store.clone();
             let st_identity_store = ctx.identity_store.clone();
             let st_profile_cache = ctx.profile_cache.clone();
             let st_audit_sink = ctx.audit_sink.clone();
+            let st_owner_home = owner_vfs.home.clone();
+            let st_owner_tmp = owner_vfs.tmp.clone();
+            let st_owner_kv = owner_kv.clone();
+            let st_owner_secret_store = owner_secret_store.clone();
+            let st_owner_capsule_log = owner_capsule_log.clone();
+            let st_owner_file_secret_root = owner_file_secret_root.clone();
             // Shared across the whole pool so a verified per-connection
             // principal (issue #45/#852) bound on the accepting instance is
             // visible to whichever pooled instance later serves that
@@ -1920,6 +2151,7 @@ impl ExecutionEngine for WasmEngine {
             > = Arc::new(dashmap::DashMap::new());
             let tcp_listener_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let capsule_net_stream_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let st_route_admission_gate = self.route_admission_gate.clone();
             let make_state: Arc<dyn Fn() -> HostState + Send + Sync> = Arc::new(move || HostState {
                 wasi_ctx: build_wasi_ctx(),
                 resource_table: wasmtime::component::ResourceTable::new(),
@@ -1935,18 +2167,14 @@ impl ExecutionEngine for WasmEngine {
                     memory_ledger.clone(),
                 ),
                 principal: st_principal.clone(),
+                system_runtime: st_system_runtime,
                 capsule_uuid,
                 caller_context: None,
                 interceptor_active: false,
                 invocation_kv: None,
-                // NEUTRAL fail-closed fallback. A shared content-addressed
-                // runtime (issue #1069) is loaded under no real principal, so
-                // the per-principal host-state FALLBACKS must hold no real
-                // principal's data — never the load-owner's (`default`'s). Every
-                // principal-carrying invocation installs its own `invocation_*`
-                // overlay (built from `kv_backend` for KV); this fallback is
-                // reached only by principal-less / load-time contexts and denies.
-                capsule_log: None,
+                // Runtime-owned log; SystemResident contexts deliberately have
+                // no human-principal log fallback.
+                capsule_log: st_owner_capsule_log.clone(),
                 capsule_id: capsule_id_val.clone(),
                 // The CoW merged path (non-git) or the pristine workspace
                 // (git-managed). This is the sandbox writable root + cwd for
@@ -1956,8 +2184,8 @@ impl ExecutionEngine for WasmEngine {
                 spawn_mask_paths: spawn_mask_paths.clone(),
                 vfs: Arc::clone(&workspace_vfs),
                 vfs_root_handle: root_handle.clone(),
-                home: None,
-                tmp: None,
+                home: st_owner_home.clone(),
+                tmp: st_owner_tmp.clone(),
                 invocation_home: None,
                 invocation_tmp: None,
                 invocation_secret_store: None,
@@ -1967,15 +2195,16 @@ impl ExecutionEngine for WasmEngine {
                 principal_invocations: Some(Arc::clone(&principal_invocations_for_state)),
                 profile_cache: st_profile_cache.clone(),
                 invocation_env_overlay: None,
-                // Neutral, physically-isolated KV fallback (see the `kv` field
-                // doc). Real per-invocation overlays are built from `kv_backend`.
-                kv: HostState::neutral_kv(),
+                // Concrete owner/system KV in production; neutral only in
+                // deliberately authority-free test/lifecycle contexts.
+                kv: st_owner_kv.clone().unwrap_or_else(HostState::neutral_kv),
                 kv_backend: kv.backend(),
                 event_bus: event_bus.clone(),
+                route_admission_gate: st_route_admission_gate.clone(),
                 ipc_limiter: Arc::clone(&ipc_limiter),
                 config: wasm_config.clone(),
                 secret_env: secret_env_set.clone(),
-                file_secret_root: None,
+                file_secret_root: st_owner_file_secret_root.clone(),
                 ipc_publish_patterns: ipc_publish_v.clone(),
                 ipc_subscribe_patterns: ipc_subscribe_v.clone(),
                 cli_socket_listener: cli_listener.clone(),
@@ -1995,11 +2224,10 @@ impl ExecutionEngine for WasmEngine {
                 inbound_tx: tx.clone(),
                 registered_uplinks: Vec::new(),
                 lifecycle_phase: None,
-                // NEUTRAL deny-all fallback (see the `secret_store` field doc):
-                // reached only by principal-less / load-time contexts on a shared
-                // runtime; every principal-carrying invocation installs an
-                // `invocation_secret_store` scoped to the caller.
-                secret_store: HostState::neutral_secret_store(),
+                // Concrete owner/system secret namespace in production.
+                secret_store: st_owner_secret_store
+                    .clone()
+                    .unwrap_or_else(HostState::neutral_secret_store),
                 ready_tx: None,
                 blocking_semaphore: blocking_semaphore.clone(),
                 io_semaphore: io_semaphore.clone(),
@@ -2069,23 +2297,9 @@ impl ExecutionEngine for WasmEngine {
             // Astrid-owned. Both this load path AND `run_lifecycle` go through
             // the same `configure_kernel_linker` helper so the linker config
             // stays in lockstep across the two paths.
-            let wt_engine = build_wasmtime_engine()?;
-            let mut linker: Linker<HostState> = Linker::new(&wt_engine);
-            configure_kernel_linker(&mut linker).map_err(|e| {
-                CapsuleError::UnsupportedEntryPoint(format!(
-                    "Failed to add Astrid host to linker: {e}"
-                ))
-            })?;
-            let wasm_component = Component::from_binary(&wt_engine, &wasm_bytes).map_err(|e| {
-                CapsuleError::UnsupportedEntryPoint(format!(
-                    "Failed to compile WASM component: {e}"
-                ))
-            })?;
-            let instance_pre = linker.instantiate_pre(&wasm_component).map_err(|e| {
-                CapsuleError::UnsupportedEntryPoint(format!(
-                    "Failed to pre-instantiate WASM component: {e}"
-                ))
-            })?;
+            let compiled_artifact = compiled_cache.compile(&actual_hash, &wasm_bytes)?;
+            let wt_engine = compiled_artifact.engine.clone();
+            let instance_pre = compiled_artifact.instance_pre.clone();
 
             // Dynamic-pool sizing. Run-loop and `host_process` capsules are
             // pinned to a single Store regardless of the configured pool max:
@@ -2323,6 +2537,7 @@ impl ExecutionEngine for WasmEngine {
                 has_run,
                 ready_rx,
                 wt_engine,
+                compiled_artifact,
                 workspace_cow_backend,
                 process_tracker_for_engine,
                 persistent_registry_for_engine,
@@ -2330,23 +2545,8 @@ impl ExecutionEngine for WasmEngine {
         }
         .await?;
 
-        // Register UUID-to-instance mapping so host functions can resolve IPC
-        // source UUIDs back to the exact content-addressed capsule instance
-        // that published a response.
-        //
-        // Ordering: this runs before the kernel's `registry.register(capsule)`.
-        // During the gap, the hash may resolve before the kernel has finished
-        // registering the instance; capability checks deny (fail-closed).
-        // This is safe because the capsule cannot publish IPC (and thus
-        // cannot appear as a hook response `source_id`) until it is fully
-        // loaded and running.
         let capsule_id = crate::capsule::CapsuleId::new(&self.manifest.package.name)
             .map_err(|e| CapsuleError::UnsupportedEntryPoint(e.to_string()))?;
-        if let Some(registry) = &ctx.capsule_registry {
-            let mut registry = registry.write().await;
-            registry.register_uuid(capsule_uuid, capsule_id.clone());
-            registry.register_instance_uuid(capsule_uuid, wasm_hash);
-        }
 
         // Register topic schemas unconditionally — schema_catalog is always
         // present, even when capsule_registry is None (e.g. in tests). Topics
@@ -2359,9 +2559,8 @@ impl ExecutionEngine for WasmEngine {
         self.principal_cancel_tokens = Some(principal_cancel_tokens);
         self.principal_invocations = Some(principal_invocations);
         self.wasmtime_engine = Some(wt_engine.clone());
-
-        // Start the epoch ticker for timeout enforcement.
-        self.epoch_ticker = Some(spawn_epoch_ticker(&wt_engine));
+        self.compiled_artifact = Some(compiled_artifact);
+        self.system_runtime = system_runtime;
 
         // Spawn a background cancel listener for capsules that can spawn
         // host processes. When `tool.v1.request.cancel` arrives, the listener
@@ -2371,14 +2570,30 @@ impl ExecutionEngine for WasmEngine {
             let tracker = process_tracker_for_listener;
             let ct = cancel_token.clone();
             let capsule_name = self.manifest.package.name.clone();
+            let runtime_principal = ctx.principal.to_string();
             tokio::task::spawn(async move {
-                let mut receiver = bus.subscribe_topic("tool.v1.request.cancel");
+                let mut receiver = if system_runtime {
+                    bus.subscribe_topic_routed(
+                        uuid::Uuid::new_v4(),
+                        "tool.v1.request.cancel",
+                        capsule_name.clone(),
+                        "process_cancel",
+                    )
+                } else {
+                    bus.subscribe_topic_routed_principal_or_system(
+                        uuid::Uuid::new_v4(),
+                        "tool.v1.request.cancel",
+                        capsule_name.clone(),
+                        "process_cancel",
+                        runtime_principal,
+                    )
+                };
                 let handle = tokio::runtime::Handle::current();
                 loop {
                     tokio::select! {
                         biased;
                         () = ct.cancelled() => break,
-                        event = receiver.recv() => {
+                        event = receiver.recv(None) => {
                             match event.as_deref() {
                                 Some(astrid_events::AstridEvent::Ipc { message, .. }) => {
                                     if let astrid_events::ipc::IpcPayload::ToolCancelRequest { call_ids } = &message.payload {
@@ -2424,6 +2639,9 @@ impl ExecutionEngine for WasmEngine {
 
         if has_run {
             self.ready_rx = ready_rx.map(tokio::sync::Mutex::new);
+            let (activation_tx, activation_rx) =
+                tokio::sync::watch::channel(!self.defer_activation);
+            self.activation_tx = Some(activation_tx);
 
             // The run loop holds the store mutex for its entire lifetime.
             // We must NOT store the instance for direct invoke_interceptor use,
@@ -2450,6 +2668,13 @@ impl ExecutionEngine for WasmEngine {
             // import boundary. The spawned task no longer needs to be a
             // blocking thread — it's an ordinary async task.
             self.run_handle = Some(tokio::task::spawn(async move {
+                if !await_runtime_activation(activation_rx, &run_cancel).await {
+                    tracing::info!(
+                        capsule = %capsule_name,
+                        "Prepared WASM run loop cancelled before activation"
+                    );
+                    return;
+                }
                 tracing::info!(capsule = %capsule_name, "Starting background WASM run loop");
                 let mut s = run_store.lock().await;
                 let typed = match run_inst.get_typed_func::<(), ()>(&mut *s, "run") {
@@ -2513,6 +2738,21 @@ impl ExecutionEngine for WasmEngine {
         Ok(())
     }
 
+    async fn activate(&mut self) -> CapsuleResult<()> {
+        if let Some(activation_tx) = &self.activation_tx {
+            activation_tx.send_replace(true);
+        }
+        Ok(())
+    }
+
+    fn publish(&self) {
+        self.route_admission_gate.publish();
+    }
+
+    fn retire(&self) {
+        self.route_admission_gate.retire();
+    }
+
     async fn unload(&mut self) -> CapsuleResult<()> {
         info!(
             capsule = %self.manifest.package.name,
@@ -2526,14 +2766,14 @@ impl ExecutionEngine for WasmEngine {
         if let Some(handle) = self.run_handle.take() {
             handle.abort();
         }
-        // Stop the epoch ticker thread (RAII guard joins on drop).
-        drop(self.epoch_ticker.take());
         // Drop the pool — releases every pooled Store's WASM memory. (Run-loop
         // capsules have `pool == None`; their Store is owned by the aborted
         // run_handle and dropped with it.)
         self.pool = None;
         self.wasmtime_engine = None;
+        self.compiled_artifact = None;
         self.ready_rx = None; // Prevent stale channel observation post-unload
+        self.activation_tx = None;
         // Tear down the OS-level CoW working tree (unmount / remove the clone).
         // Explicit because there is no async Drop for the engine; the backend's
         // own Drop is a backstop. Uncommitted changes are discarded here — the
@@ -2631,6 +2871,21 @@ impl ExecutionEngine for WasmEngine {
             .and_then(|p| astrid_core::PrincipalId::new(p).ok())
             .or_else(|| self.owner_principal.clone())
             .unwrap_or_default();
+        if !self.system_runtime
+            && self
+                .owner_principal
+                .as_ref()
+                .is_some_and(|owner| owner != &invoking_principal)
+        {
+            return Ok(crate::capsule::InterceptResult::Deny {
+                reason: format!(
+                    "principal '{invoking_principal}' cannot invoke runtime owned by '{}'",
+                    self.owner_principal
+                        .as_ref()
+                        .expect("checked owner principal")
+                ),
+            });
+        }
         let _invocation_guard = match self.principal_invocations.as_ref() {
             Some(tracker) => match tracker.begin(&invoking_principal) {
                 Some(guard) => Some(guard),
@@ -2873,20 +3128,9 @@ impl ExecutionEngine for WasmEngine {
                 state.invocation_env_overlay =
                     load_invocation_env_overlay(&invoking_principal, state.capsule_id.as_str());
 
-                // Install per-invocation host-state overlays for EVERY caller
-                // that carries a present, parseable principal — the load-owner
-                // (`default`) INCLUDED. A shared content-addressed runtime (issue
-                // #1069) is loaded under no real principal, so the load-time
-                // `kv`/`secret_store`/`home`/`tmp`/`capsule_log` fields are
-                // NEUTRAL fail-closed placeholders. Every real caller must
-                // therefore get its OWN scope explicitly here; the neutral
-                // fallback is reached only by principal-less / load-time contexts
-                // and NEVER exposes another principal's data.
-                //
-                // A caller with no parseable principal (principal-less system /
-                // lifecycle events: watchdog tick, capsules_loaded) installs NO
-                // overlay and resolves to the neutral placeholder — the correct
-                // fail-closed floor.
+                // Refine the invocation context. Principal runtimes reject peer
+                // callers before checkout; SystemResident runtimes may install
+                // an explicitly authenticated caller overlay.
                 let invocation_principal: Option<astrid_core::PrincipalId> = caller
                     .and_then(|msg| msg.principal.as_deref())
                     .and_then(|p| astrid_core::PrincipalId::new(p).ok());
@@ -3121,6 +3365,7 @@ async fn build_lifecycle_host_state(
         ),
         resource_table: wasmtime::component::ResourceTable::new(),
         principal: principal.clone(),
+        system_runtime: false,
         capsule_uuid: uuid::Uuid::new_v4(),
         caller_context: None,
         interceptor_active: false,
@@ -3154,6 +3399,7 @@ async fn build_lifecycle_host_state(
         kv_backend: cfg.kv.backend(),
         kv: cfg.kv.clone(),
         event_bus: cfg.event_bus.clone(),
+        route_admission_gate: astrid_events::RouteAdmissionGate::default(),
         ipc_limiter: Arc::new(astrid_events::ipc::IpcRateLimiter::new()),
         config: cfg.config.clone(),
         secret_env,
@@ -3610,6 +3856,21 @@ fn wasm_exports_contain(name: &str, wasm_bytes: &[u8]) -> bool {
 mod tests {
     use super::*;
     use astrid_events::ipc::Topic;
+
+    #[test]
+    fn runtime_scope_is_the_only_system_authority_source() {
+        let id = crate::capsule::CapsuleId::from_static("scope-test");
+        let principal = crate::registry::RuntimeId::for_test(id.clone(), 1);
+        let system = crate::registry::RuntimeId::for_test_scope(
+            id,
+            2,
+            crate::registry::RuntimeScope::SystemResident,
+        );
+
+        assert!(!runtime_id_is_system(None));
+        assert!(!runtime_id_is_system(Some(&principal)));
+        assert!(runtime_id_is_system(Some(&system)));
+    }
 
     // ── git-managed workspace detection (gitoxide work-tree discovery) ──
     //
@@ -4687,6 +4948,25 @@ mod tests {
         });
         let status = wait_ready_from_rx(&rx_mutex, std::time::Duration::from_millis(500)).await;
         assert_eq!(status, crate::capsule::ReadyStatus::Ready);
+    }
+
+    #[tokio::test]
+    async fn prepared_run_loop_waits_for_activation_edge() {
+        let (activation_tx, activation_rx) = tokio::sync::watch::channel(false);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let waiter_cancel = cancel.clone();
+        let waiter =
+            tokio::spawn(
+                async move { await_runtime_activation(activation_rx, &waiter_cancel).await },
+            );
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !waiter.is_finished(),
+            "prepared runtime started before publish"
+        );
+        activation_tx.send_replace(true);
+        assert!(waiter.await.unwrap());
     }
 
     // --- wasm_exports_contain_run pre-scan tests ---

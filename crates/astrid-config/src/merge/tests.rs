@@ -455,6 +455,60 @@ fn test_capsule_local_egress_workspace_cannot_widen_operator_value() {
 }
 
 #[test]
+fn test_uplinks_cannot_be_introduced_by_workspace() {
+    let baseline: toml::Value = toml::from_str("[model]\nprovider = \"unknown\"\n").unwrap();
+    let workspace: toml::Value = toml::from_str(
+        r#"
+        [[uplinks]]
+        plugin = "workspace-controlled-uplink"
+        profile = "bridge"
+    "#,
+    )
+    .unwrap();
+
+    let mut merged = baseline.clone();
+    deep_merge(&mut merged, &workspace);
+    enforce_restrictions(&mut merged, &baseline, &workspace);
+
+    assert!(
+        merged.as_table().unwrap().get("uplinks").is_none(),
+        "workspace config must not create the SystemResident allowlist"
+    );
+}
+
+#[test]
+fn test_uplinks_workspace_cannot_replace_operator_allowlist() {
+    let baseline: toml::Value = toml::from_str(
+        r#"
+        [[uplinks]]
+        plugin = "operator-approved-uplink"
+        profile = "chat"
+    "#,
+    )
+    .unwrap();
+    let workspace: toml::Value = toml::from_str(
+        r#"
+        [[uplinks]]
+        plugin = "workspace-controlled-uplink"
+        profile = "bridge"
+    "#,
+    )
+    .unwrap();
+
+    let mut merged = baseline.clone();
+    deep_merge(&mut merged, &workspace);
+    enforce_restrictions(&mut merged, &baseline, &workspace);
+
+    let uplinks = merged["uplinks"].as_array().unwrap();
+    assert_eq!(uplinks.len(), 1);
+    assert_eq!(
+        uplinks[0]["plugin"].as_str(),
+        Some("operator-approved-uplink")
+    );
+    assert_eq!(uplinks[0]["profile"].as_str(), Some("chat"));
+}
+
+#[test]
 fn test_http_section_cannot_be_set_by_workspace() {
     // The [http] host limits are widening controls (raising a timeout, redirect
     // cap, or body cap relaxes the host). A workspace/project layer must not be
