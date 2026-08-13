@@ -47,17 +47,6 @@ pub(super) async fn agent_delete(
         return err_internal(format!("identity store unlink failed: {e}"));
     }
 
-    let path = principal_profile_path(kernel, &principal);
-    if let Err(e) = std::fs::remove_file(&path)
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        return err_internal(format!(
-            "failed to remove profile.toml at {}: {e}",
-            path.display()
-        ));
-    }
-    kernel.profile_cache.invalidate(&principal);
-
     let (unloaded_capsules, reclaimed, cleanup_errors) =
         match retire_and_reclaim(kernel, &principal, pending.principal_uid).await {
             Ok(result) => result,
@@ -70,6 +59,20 @@ pub(super) async fn agent_delete(
             cleanup_errors.join("; ")
         ));
     }
+
+    // Native state reclamation resolves quota policy through the profile. Keep
+    // it until that purge has committed, while the capability retirement fence
+    // and identity unlink keep every authority and capsule-load edge closed.
+    let path = principal_profile_path(kernel, &principal);
+    if let Err(e) = std::fs::remove_file(&path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return err_internal(format!(
+            "failed to remove profile.toml at {}: {e}",
+            path.display()
+        ));
+    }
+    kernel.profile_cache.invalidate(&principal);
 
     if let Err(response) = finish_identity_removal(kernel, &principal, pending).await {
         return response;

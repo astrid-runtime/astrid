@@ -1501,15 +1501,21 @@ impl Kernel {
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     pub async fn ensure_principal_loaded(&self, principal: &PrincipalId) {
         let _load_guard = self.capsule_load_lock.lock().await;
-        // A deleted principal has no policy profile. Re-check under the same
-        // lock used by deletion/unload so a loader queued before the authz
-        // fence cannot re-attach capsule views after deletion has retired them.
-        if *principal != PrincipalId::default()
-            && !astrid_core::profile::PrincipalProfile::path_for(&self.astrid_home, principal)
+        if *principal != PrincipalId::default() {
+            // The retirement fence is authoritative while deletion retains the
+            // profile long enough for quota-aware state reclamation. Check it
+            // under the same load lock used by unload so a queued loader cannot
+            // re-attach a view after retirement begins.
+            if self.capabilities.is_principal_retiring(principal).await {
+                tracing::debug!(%principal, "Skipping capsule load for retiring principal");
+                return;
+            }
+            if !astrid_core::profile::PrincipalProfile::path_for(&self.astrid_home, principal)
                 .exists()
-        {
-            tracing::debug!(%principal, "Skipping capsule load for principal without a profile");
-            return;
+            {
+                tracing::debug!(%principal, "Skipping capsule load for principal without a profile");
+                return;
+            }
         }
         let sorted = self.sorted_principal_capsules(principal);
         validate_principal_capsules(principal, &sorted);
@@ -2681,14 +2687,37 @@ async fn open_test_runtime_kv(
 ) -> (
     Arc<dyn astrid_storage::KvStore>,
     astrid_storage::PrincipalDirectory,
+    astrid_storage::RuntimePrincipalStore,
 ) {
-    let quota: Arc<dyn astrid_storage::KvQuotaResolver<astrid_storage::StateOwner>> =
-        Arc::new(|_: &astrid_storage::StateOwner| Ok(None));
     let directory = astrid_storage::PrincipalDirectory::default();
-    let kv = astrid_storage::open_runtime_kv_with_directory(home, quota, directory.clone())
-        .await
-        .expect("test kernel: open authoritative principal store");
-    (kv, directory)
+    let quota_home = home.clone();
+    let quota_directory = directory.clone();
+    let quota: Arc<dyn astrid_storage::KvQuotaResolver<astrid_storage::StateOwner>> =
+        Arc::new(move |owner: &astrid_storage::StateOwner| match owner {
+            astrid_storage::StateOwner::System => Ok(None),
+            astrid_storage::StateOwner::Principal(uid) => {
+                quota_directory
+                    .alias_for(*uid)
+                    .map_or(Ok(None), |principal| {
+                        astrid_core::profile::PrincipalProfile::load_required(
+                            &quota_home,
+                            &principal,
+                        )
+                        .map(|profile| Some(profile.quotas.max_storage_bytes))
+                        .map_err(|error| {
+                            astrid_storage::StorageError::Internal(format!(
+                                "resolve storage quota for {principal}: {error}"
+                            ))
+                        })
+                    })
+            },
+        });
+    let store =
+        astrid_storage::open_runtime_principal_store_with_directory(home, quota, directory.clone())
+            .await
+            .expect("test kernel: open authoritative principal store");
+    let kv = store.kv();
+    (kv, directory, store)
 }
 
 #[cfg(test)]
@@ -2726,7 +2755,7 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
     // Use the same authoritative principal-store composition as native boot.
     // A test helper opening the legacy import source directly would let kernel
     // tests pass against a runtime topology that production cannot select.
-    let (kv, principal_directory) = open_test_runtime_kv(&home).await;
+    let (kv, principal_directory, principal_store) = open_test_runtime_kv(&home).await;
     let capabilities = Arc::new(
         CapabilityStore::with_kv_store(Arc::clone(&kv))
             .await
@@ -2796,7 +2825,7 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         singleton_lock: None,
         kv,
         #[cfg(not(target_family = "wasm"))]
-        principal_store: None,
+        principal_store: Some(principal_store),
         audit_log,
         runtime_key,
         active_connections: DashMap::new(),

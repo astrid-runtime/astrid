@@ -71,6 +71,10 @@ async fn create(kernel: &Arc<Kernel>, principal: &PrincipalId) {
 #[tokio::test(flavor = "multi_thread")]
 async fn agent_delete_reclaims_home_key_and_secrets_and_reports_them() {
     let (_dir, kernel) = fixture().await;
+    assert!(
+        kernel.principal_store.is_some(),
+        "deletion regressions must exercise the native production store"
+    );
     let principal = PrincipalId::new("ghost").unwrap();
     create(&kernel, &principal).await;
     let (home, key, secrets) = seed_footprint(&kernel, &principal);
