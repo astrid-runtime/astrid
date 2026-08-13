@@ -256,30 +256,30 @@ mod tests {
     #[test]
     fn merge_from_unions_every_field() {
         let mut base = CapabilitiesDef {
-            uplink: true,
+            uplink: false,
             net: vec!["a.example".into()],
             kv: vec!["k1".into()],
             fs_read: vec!["/r1".into()],
             fs_write: vec!["/w1".into()],
             host_process: vec!["/bin/a".into()],
-            allow_persistent: true,
+            allow_persistent: false,
             net_bind: vec!["127.0.0.1:1".into()],
             net_connect: vec!["h1:1".into()],
             identity: vec!["resolve".into()],
-            allow_prompt_injection: true,
+            allow_prompt_injection: false,
         };
         let other = CapabilitiesDef {
-            uplink: false,
+            uplink: true,
             net: vec!["b.example".into()],
             kv: vec!["k2".into()],
             fs_read: vec!["/r2".into()],
             fs_write: vec!["/w2".into()],
             host_process: vec!["/bin/b".into()],
-            allow_persistent: false,
+            allow_persistent: true,
             net_bind: vec!["127.0.0.1:2".into()],
             net_connect: vec!["h2:2".into()],
             identity: vec!["link".into()],
-            allow_prompt_injection: false,
+            allow_prompt_injection: true,
         };
         base.merge_from(&other);
 
@@ -295,7 +295,25 @@ mod tests {
         );
         assert_eq!(base.net_connect, ["h1:1", "h2:2"].map(String::from)); // the field #1232 dropped
         assert_eq!(base.identity, ["resolve", "link"].map(String::from));
-        // Flags are OR-ed (a component may request a flag the root did not).
+        // Flags requested only by the component are carried into the root.
+        // Starting these false is important: a merge that accidentally ignored
+        // the source flags would otherwise pass this exhaustiveness regression.
+        assert!(base.uplink);
+        assert!(base.allow_persistent);
+        assert!(base.allow_prompt_injection);
+    }
+
+    #[test]
+    fn merge_from_preserves_root_flags_when_component_flags_are_false() {
+        let mut base = CapabilitiesDef {
+            uplink: true,
+            allow_persistent: true,
+            allow_prompt_injection: true,
+            ..CapabilitiesDef::default()
+        };
+
+        base.merge_from(&CapabilitiesDef::default());
+
         assert!(base.uplink);
         assert!(base.allow_persistent);
         assert!(base.allow_prompt_injection);
