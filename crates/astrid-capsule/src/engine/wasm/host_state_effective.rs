@@ -4,6 +4,19 @@
 use super::*;
 
 impl HostState {
+    /// Admit one principal-scoped host operation and hold its lifecycle count
+    /// until the returned guard drops.
+    pub(crate) fn begin_host_operation(
+        &self,
+    ) -> Result<Option<crate::engine::wasm::PrincipalInvocationGuard>, ()> {
+        if !self.invocation_authority_active() {
+            return Err(());
+        }
+        self.principal_invocations
+            .as_ref()
+            .map(|tracker| tracker.begin(&self.effective_principal()).ok_or(()))
+            .transpose()
+    }
     /// Return the effective KV store for the current invocation.
     ///
     /// Per-principal isolation lives HERE, not in capsule keys. Every real store
@@ -187,6 +200,16 @@ impl HostState {
             .unwrap_or_else(|| self.cancel_token.clone())
     }
 
+    /// Whether the current principal-scoped host authority is still live.
+    ///
+    /// Authority-sensitive hosts use this common decision. Profile failure and
+    /// view retirement are revocations, not merely quota/liveness signals; a
+    /// guest that was already running must not retain principal-scoped access.
+    #[must_use]
+    pub(crate) fn invocation_authority_active(&self) -> bool {
+        self.invocation_profile_authorized && !self.effective_cancel_token().is_cancelled()
+    }
+
     /// Return the effective quota profile for the current invocation.
     ///
     /// Prefers `invocation_profile` (set by
@@ -206,5 +229,62 @@ impl HostState {
             Some(p) => p,
             None => astrid_core::profile::PrincipalProfile::default_ref(),
         }
+    }
+
+    /// Enforce the derived-principal network boundary while preserving legacy
+    /// profiles that predate principal-level host enforcement. Membership in
+    /// the built-in `restricted` group opts into fail-closed egress: only the
+    /// profile's explicit `network.egress` patterns may resolve/connect.
+    pub(crate) fn principal_egress_allows(&self, host: &str, port: Option<u16>) -> bool {
+        if !self.invocation_authority_active() {
+            return false;
+        }
+        let profile = self.effective_profile();
+        if !profile
+            .groups
+            .iter()
+            .any(|group| group == astrid_core::groups::BUILTIN_RESTRICTED)
+        {
+            return true;
+        }
+        profile.network.egress.iter().any(|pattern| {
+            let Some((pattern_host, pattern_port)) = pattern.rsplit_once(':') else {
+                return false;
+            };
+            if !pattern_host.eq_ignore_ascii_case(host) {
+                return false;
+            }
+            match port {
+                Some(port) => {
+                    pattern_port == "*"
+                        || pattern_port.parse::<u16>().is_ok_and(|value| value == port)
+                },
+                None => pattern_port == "*" || pattern_port.parse::<u16>().is_ok(),
+            }
+        })
+    }
+
+    /// Restricted principals may spawn only executables explicitly named in
+    /// their profile. Derived principals currently provision an empty list, so
+    /// a child process cannot bypass the host's network boundary.
+    pub(crate) fn principal_process_allows(&self, command: &str) -> bool {
+        if !self.invocation_authority_active() {
+            return false;
+        }
+        let profile = self.effective_profile();
+        if !profile
+            .groups
+            .iter()
+            .any(|group| group == astrid_core::groups::BUILTIN_RESTRICTED)
+        {
+            return true;
+        }
+        profile.process.allow.iter().any(|allowed| {
+            allowed == command
+                || (!allowed.contains('/')
+                    && std::path::Path::new(command)
+                        .file_name()
+                        .is_some_and(|name| name == std::ffi::OsStr::new(allowed)))
+        })
     }
 }

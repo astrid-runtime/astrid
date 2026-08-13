@@ -20,6 +20,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   dependencies in `Cargo.lock`. Removing the unused surface eliminates both
   RustSec exceptions and keeps the audit gate strict. The native principal
   store and live legacy-SurrealKV migration reader are unchanged. Closes #1448.
+### Added
+
+- **`astrid agent spawn` — atomic restricted throwaway session.** Creates a derived principal with no caller-selected capability grants from an explicit set of capsule installs, user-invocable capsules, capsule-scoped state namespaces, and outbound endpoints; omitted state and egress remain unavailable. Restricted-principal network and process policy is enforced at host-call time, the CLI provides the wall-clock watchdog and denies approval requests, and teardown reports any unreclaimed state instead of masking it. Part of #1217.
+
 ### Changed
 
 - **Rust API compatibility CI now enforces only Astrid's supported public Rust

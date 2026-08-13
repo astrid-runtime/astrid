@@ -21,10 +21,13 @@ impl HostState {
     /// `Some(p)` looks up `p`'s entry in the shared
     /// [`principal_cancel_tokens`](Self::principal_cancel_tokens) map, lazily
     /// minting a fresh [`child_token`](CancellationToken::child_token) of the
-    /// instance [`cancel_token`](Self::cancel_token) if absent — so a
-    /// full-instance cancel still cascades, and a principal whose token was
-    /// cancelled + removed on view release gets a FRESH, uncancelled token when
-    /// it re-registers and invokes again. `None` (principal-less context)
+    /// instance [`cancel_token`](Self::cancel_token) if absent. A cancelled
+    /// entry is deliberately retained as a retirement tombstone: an invocation
+    /// that lost the unregister race must inherit the cancelled token rather
+    /// than minting fresh authority. Explicit view registration calls
+    /// [`ExecutionEngine::resume_for`](crate::engine::ExecutionEngine::resume_for)
+    /// before a reused principal may receive a fresh token. `None`
+    /// (principal-less context)
     /// clears the overlay so waits fall back to the instance token.
     ///
     /// The map mutex is only ever held for this entry-or-clone, so a poisoned
@@ -78,6 +81,11 @@ impl HostState {
                 .as_ref()
                 .is_some_and(CancellationToken::is_cancelled)
         {
+            // Clear only the Store-local overlay so the shared recv pump can
+            // wait for another principal. The cancelled entry remains in the
+            // shared map as a retirement tombstone; if a queued message from
+            // the departed principal is received, context installation restores
+            // that cancelled token before guest code can act on the message.
             self.invocation_cancel_token = None;
         }
     }
@@ -159,7 +167,7 @@ impl HostState {
             .caller_context
             .as_ref()
             .and_then(|c| c.principal.clone());
-        if new_principal == existing_principal {
+        if new_principal == existing_principal && self.invocation_profile_authorized {
             // Refresh the caller context so e.g. topic name / payload
             // tracking stays current. Also refresh the env overlay: dashboard
             // onboarding can write config after a capsule is already loaded,
@@ -222,20 +230,31 @@ impl HostState {
         // the dispatcher-driven interceptor path. When `msg.principal` is
         // absent/unparseable the owner's own profile is resolved, mirroring
         // `invoke_interceptor`'s `owner_principal` fallback. Best-effort: a
-        // failed load logs and leaves `invocation_profile = None` (the same
-        // process-global default fall-back as a missing cache), never denying
-        // the message — the recv path has no error channel.
+        // failed load logs and installs a restricted deny profile. The recv
+        // path has no error channel, so carrying an explicit authority floor is
+        // the only fail-closed outcome that still lets the shared pump advance.
         let profile_principal = publisher.clone().unwrap_or_else(|| self.principal.clone());
-        self.invocation_profile = self.profile_cache.as_ref().and_then(|cache| {
+        let profile_cache = self.profile_cache.clone();
+        self.invocation_profile_authorized = true;
+        self.invocation_profile = profile_cache.as_ref().map(|cache| {
             match cache.resolve(&profile_principal) {
-                Ok(profile) => Some(profile),
+                Ok(profile) => profile,
                 Err(e) => {
+                    self.invocation_profile_authorized = false;
                     tracing::warn!(
                         principal = %profile_principal,
                         error = %e,
-                        "recv-path profile resolve failed; per-principal quotas fall back to the default profile"
+                        "recv-path profile resolve failed; installing restricted authority floor"
                     );
-                    None
+                    // This profile now gates authority as well as quotas. A
+                    // failed lookup must therefore retain the restricted
+                    // fail-closed marker instead of falling back to the
+                    // process-global legacy profile (which has no restricted
+                    // group and would permit network/process host calls).
+                    Arc::new(astrid_core::profile::PrincipalProfile {
+                        groups: vec![astrid_core::groups::BUILTIN_RESTRICTED.to_string()],
+                        ..Default::default()
+                    })
                 },
             }
         });

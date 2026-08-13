@@ -672,3 +672,38 @@ async fn publish_as_unbound_connection_stamps_system_origin() {
         "an unbound publish_as forward must stamp System (non-local), not LocalSocket"
     );
 }
+
+#[tokio::test]
+async fn retired_principal_cannot_publish_after_view_release() {
+    let rt = tokio::runtime::Handle::current();
+    let mut state = minimal_host_state(rt);
+    state.ipc_publish_patterns = vec!["capsule.v1.*".to_string()];
+    let principal = astrid_core::PrincipalId::new("retired-worker").unwrap();
+    assert!(crate::engine::wasm::install_principal_overlays_sync(
+        &mut state,
+        Some(&principal)
+    ));
+    crate::engine::wasm::cancel_principal_token(
+        &state.principal_cancel_tokens,
+        &state.cancel_token,
+        &principal,
+    );
+
+    assert!(matches!(
+        IpcHost::publish(&mut state, "capsule.v1.effect".into(), "{}".into()),
+        Err(ErrorCode::CapabilityDenied)
+    ));
+}
+
+#[tokio::test]
+async fn unresolved_invocation_profile_cannot_publish() {
+    let rt = tokio::runtime::Handle::current();
+    let mut state = minimal_host_state(rt);
+    state.ipc_publish_patterns = vec!["capsule.v1.*".to_string()];
+    state.invocation_profile_authorized = false;
+
+    assert!(matches!(
+        IpcHost::publish(&mut state, "capsule.v1.effect".into(), "{}".into()),
+        Err(ErrorCode::CapabilityDenied)
+    ));
+}

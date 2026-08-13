@@ -214,6 +214,16 @@ denial = ["cross-principal, stale, or unknown request id is rejected or ignored"
 state = ["elicit waiter is consumed once"]
 evidence = ["prompt SSE and elicit response artifacts"]
 
+[scenarios.ephemeral_spawn]
+status = "mapped"
+surfaces = ["cli"]
+auth = ["admin/default"]
+success = ["caller explicitly selects the runtime capsules, user-invocable capsules, inherited capsule state, grants, and egress for a derived restricted principal; one bounded job runs and the throwaway plus its footprint are torn down"]
+denial = ["omitted capsule state and egress are unavailable, restricted host network and process policy is fail-closed, and approval requests are auto-denied"]
+state = ["selected capsule installs and state are materialized before warm-up; teardown reclaims home, keys, and secrets and reports any residue"]
+evidence = ["agent spawn CLI transcript, derived profile and namespace assertions, and post-teardown agent list"]
+remaining = ["live loop execution (react + LLM capsule set) and fresh-principal warm-up are mapped but not yet executed by the harness"]
+
 [scenarios.first_party_capsule_commands]
 status = "mapped"
 surfaces = ["cli", "capsule"]

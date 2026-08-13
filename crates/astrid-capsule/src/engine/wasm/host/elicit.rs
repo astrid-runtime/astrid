@@ -159,6 +159,9 @@ impl elicit::Host for HostState {
     /// and publishes an `ElicitResponse` on the response topic.
     ///
     fn elicit(&mut self, request: ElicitRequest) -> Result<ElicitResponse, ErrorCode> {
+        let _operation = self
+            .begin_host_operation()
+            .map_err(|()| ErrorCode::Cancelled)?;
         let field = map_to_onboarding_field(&request)?;
         let request_id = Uuid::new_v4();
         let response_topic = Topic::elicit_response(request_id);
@@ -255,6 +258,12 @@ impl elicit::Host for HostState {
 
                         match request.kind {
                             ElicitType::Secret => {
+                                // Retirement may happen while the frontend is
+                                // answering. Re-check at the mutation edge so a
+                                // late response cannot recreate secret state.
+                                if !self.invocation_authority_active() {
+                                    return Err(ErrorCode::Cancelled);
+                                }
                                 // Persist the secret via the SecretStore
                                 // abstraction. OS keychain when available,
                                 // file fallback otherwise. The value is NOT
@@ -298,6 +307,9 @@ impl elicit::Host for HostState {
     ///
     /// Checks whether a secret key has been stored for this capsule.
     fn has_secret(&mut self, key: String) -> Result<bool, ErrorCode> {
+        let _operation = self
+            .begin_host_operation()
+            .map_err(|()| ErrorCode::Cancelled)?;
         self.effective_secret_store()
             .exists(&key)
             .map_err(|_| ErrorCode::StoreUnavailable)

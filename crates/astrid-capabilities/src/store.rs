@@ -513,6 +513,15 @@ impl CapabilityStore {
         self.retiring_principals.write().await.insert(principal);
     }
 
+    /// Return whether new authority for `principal` is currently fenced.
+    ///
+    /// Lifecycle code uses this at other admission edges, such as capsule
+    /// loading, so an on-disk profile retained temporarily for reclamation
+    /// policy cannot make a retiring principal live again.
+    pub async fn is_principal_retiring(&self, principal: &PrincipalId) -> bool {
+        self.retiring_principals.read().await.contains(principal)
+    }
+
     /// Release an in-process retirement fence after durable reclamation.
     pub async fn finish_principal_retirement(&self, principal: &PrincipalId) {
         self.retiring_principals.write().await.remove(principal);

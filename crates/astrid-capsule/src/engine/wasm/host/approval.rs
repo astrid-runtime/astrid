@@ -243,6 +243,9 @@ impl approval::Host for HostState {
         &mut self,
         mut request: ApprovalRequest,
     ) -> Result<ApprovalResponse, ErrorCode> {
+        if !self.invocation_authority_active() {
+            return Err(ErrorCode::StoreUnavailable);
+        }
         let allowance_store = self.allowance_store.clone();
         let event_bus = self.event_bus.clone();
         let runtime_handle = self.runtime_handle.clone();

@@ -63,6 +63,19 @@ pub(crate) trait ExecutionEngine: Send + Sync {
     /// that belongs to someone else.
     fn request_cancel_for(&self, _principal: &astrid_core::principal::PrincipalId) {}
 
+    /// Re-open per-principal work after a new dispatch view is registered.
+    ///
+    /// Engines that retain a cancellation tombstone use this explicit view
+    /// lifecycle edge to distinguish a legitimate delete-then-recreate from an
+    /// invocation that raced the previous view's removal.
+    fn resume_for(&self, _principal: &astrid_core::principal::PrincipalId) {}
+
+    /// Close admission, cancel principal-scoped waits, and wait until every
+    /// interceptor admitted before the fence has returned.
+    async fn quiesce_for(&self, principal: &astrid_core::principal::PrincipalId) {
+        self.request_cancel_for(principal);
+    }
+
     /// Extract the inbound receiver if this engine provides one.
     fn take_inbound_rx(
         &mut self,

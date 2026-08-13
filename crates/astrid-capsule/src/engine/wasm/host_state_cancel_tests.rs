@@ -12,11 +12,81 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 
 use super::super::test_fixtures::minimal_host_state;
-use super::super::{cancel_principal_token, install_principal_overlays_sync};
+use super::super::{
+    PrincipalInvocationTracker, cancel_principal_token, install_principal_overlays_sync,
+    resume_principal_token,
+};
+use crate::engine::wasm::bindings::astrid::elicit::host::Host as ElicitHost;
+use crate::engine::wasm::bindings::astrid::fs::host::{ErrorCode as FsError, Host as FsHost};
+use crate::engine::wasm::bindings::astrid::kv::host::{ErrorCode as KvError, Host as KvHost};
 use astrid_events::ipc::Topic;
 
 fn alice() -> astrid_core::PrincipalId {
     astrid_core::PrincipalId::new("agent-alice").expect("valid principal")
+}
+
+struct BlockingSetStore {
+    inner: astrid_storage::MemoryKvStore,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl astrid_storage::KvStore for BlockingSetStore {
+    async fn get(
+        &self,
+        namespace: &str,
+        key: &str,
+    ) -> astrid_storage::StorageResult<Option<Vec<u8>>> {
+        self.inner.get(namespace, key).await
+    }
+    async fn set(
+        &self,
+        namespace: &str,
+        key: &str,
+        value: Vec<u8>,
+    ) -> astrid_storage::StorageResult<()> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        self.inner.set(namespace, key, value).await
+    }
+    async fn delete(&self, namespace: &str, key: &str) -> astrid_storage::StorageResult<bool> {
+        self.inner.delete(namespace, key).await
+    }
+    async fn exists(&self, namespace: &str, key: &str) -> astrid_storage::StorageResult<bool> {
+        self.inner.exists(namespace, key).await
+    }
+    async fn list_keys(&self, namespace: &str) -> astrid_storage::StorageResult<Vec<String>> {
+        self.inner.list_keys(namespace).await
+    }
+    async fn list_keys_with_prefix(
+        &self,
+        namespace: &str,
+        prefix: &str,
+    ) -> astrid_storage::StorageResult<Vec<String>> {
+        self.inner.list_keys_with_prefix(namespace, prefix).await
+    }
+    async fn compare_and_swap(
+        &self,
+        namespace: &str,
+        key: &str,
+        expected: Option<&[u8]>,
+        new: Vec<u8>,
+    ) -> astrid_storage::StorageResult<bool> {
+        self.inner
+            .compare_and_swap(namespace, key, expected, new)
+            .await
+    }
+    async fn clear_namespace(&self, namespace: &str) -> astrid_storage::StorageResult<u64> {
+        self.inner.clear_namespace(namespace).await
+    }
+    async fn clear_prefix(
+        &self,
+        namespace: &str,
+        prefix: &str,
+    ) -> astrid_storage::StorageResult<u64> {
+        self.inner.clear_prefix(namespace, prefix).await
+    }
 }
 
 fn msg_from(principal: &astrid_core::PrincipalId) -> astrid_events::ipc::IpcMessage {
@@ -50,8 +120,7 @@ async fn view_release_cancel_unblocks_principal_wait_without_instance_cancel() {
         .await
     });
 
-    // The view-release path: cancel + REMOVE exactly A's token.
-    cancel_principal_token(&state.principal_cancel_tokens, &a);
+    cancel_principal_token(&state.principal_cancel_tokens, &state.cancel_token, &a);
 
     let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
         .await
@@ -67,11 +136,10 @@ async fn view_release_cancel_unblocks_principal_wait_without_instance_cancel() {
     );
 }
 
-/// (b) Regression pin for the remove → reinstall path: after a view-release
-/// cancel (which removes A's map entry), the NEXT overlay install for A must
-/// lazily mint a FRESH, uncancelled token — not resurrect the cancelled one.
+/// (b) A late invocation after unregister must keep the retirement tombstone;
+/// only explicit view re-registration may mint a fresh token.
 #[test]
-fn fresh_overlay_after_view_release_cancel_yields_uncancelled_token() {
+fn retired_overlay_stays_cancelled_until_explicit_resume() {
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap();
@@ -80,10 +148,15 @@ fn fresh_overlay_after_view_release_cancel_yields_uncancelled_token() {
 
     assert!(install_principal_overlays_sync(&mut state, Some(&a)));
     let first = state.effective_cancel_token();
-    cancel_principal_token(&state.principal_cancel_tokens, &a);
+    cancel_principal_token(&state.principal_cancel_tokens, &state.cancel_token, &a);
     assert!(first.is_cancelled(), "release must cancel the live token");
 
-    // A reinstalls the capsule and invokes again: a fresh overlay install.
+    // A late invocation that lost the unregister race remains cancelled.
+    assert!(install_principal_overlays_sync(&mut state, Some(&a)));
+    assert!(state.effective_cancel_token().is_cancelled());
+
+    // A legitimate delete-then-recreate crosses an explicit registration edge.
+    resume_principal_token(&state.principal_cancel_tokens, &a);
     assert!(install_principal_overlays_sync(&mut state, Some(&a)));
     assert!(
         !state.effective_cancel_token().is_cancelled(),
@@ -145,15 +218,21 @@ fn clear_stale_invocation_cancel_token_rearms_only_while_instance_alive() {
     let mut state = minimal_host_state(rt.handle().clone());
     let a = alice();
     assert!(install_principal_overlays_sync(&mut state, Some(&a)));
-    cancel_principal_token(&state.principal_cancel_tokens, &a);
+    cancel_principal_token(&state.principal_cancel_tokens, &state.cancel_token, &a);
     state.clear_stale_invocation_cancel_token();
     assert!(
         state.invocation_cancel_token.is_none(),
-        "a departed principal's cancelled token must not poison the pump"
+        "the local overlay must clear so the shared pump can receive another caller"
     );
     assert!(!state.effective_cancel_token().is_cancelled());
+    state.install_recv_invocation_context(&msg_from(&a));
+    assert!(
+        state.effective_cancel_token().is_cancelled(),
+        "a queued retired-principal message must restore the tombstone"
+    );
 
-    // Uncancelled overlay: left untouched.
+    // Explicit registration reopens the identity.
+    resume_principal_token(&state.principal_cancel_tokens, &a);
     assert!(install_principal_overlays_sync(&mut state, Some(&a)));
     state.clear_stale_invocation_cancel_token();
     assert!(
@@ -173,10 +252,8 @@ fn clear_stale_invocation_cancel_token_rearms_only_while_instance_alive() {
     assert!(torn_down.effective_cancel_token().is_cancelled());
 }
 
-/// The recv fast path (same-principal message) must refresh the token from
-/// the shared map: a principal that departed (token cancelled + removed) and
-/// re-registered gets a fresh token on its next message even though the
-/// data overlays are deliberately kept.
+/// The recv fast path must not mint authority after unregister. Explicit view
+/// registration is the only operation that may reopen the principal.
 #[test]
 fn recv_fast_path_refreshes_token_after_view_release_cancel() {
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -187,17 +264,141 @@ fn recv_fast_path_refreshes_token_after_view_release_cancel() {
 
     state.install_recv_invocation_context(&msg_from(&a));
     let first = state.effective_cancel_token();
-    cancel_principal_token(&state.principal_cancel_tokens, &a);
+    cancel_principal_token(&state.principal_cancel_tokens, &state.cancel_token, &a);
     assert!(first.is_cancelled());
 
-    // Same principal publishes again after re-registering: the fast path
-    // keeps the KV/log overlays but must re-mint the cancel token.
+    // Same principal publishes after unregister, without a registration edge.
     state.install_recv_invocation_context(&msg_from(&a));
     assert!(
         state
             .invocation_cancel_token
             .as_ref()
-            .is_some_and(|t| !t.is_cancelled()),
-        "the fast path must lazily mint a fresh token for a re-registered principal"
+            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled),
+        "the fast path must preserve the retirement tombstone"
+    );
+
+    resume_principal_token(&state.principal_cancel_tokens, &a);
+    state.install_recv_invocation_context(&msg_from(&a));
+    assert!(!state.effective_cancel_token().is_cancelled());
+}
+
+#[tokio::test]
+async fn retirement_fence_rejects_late_admission_and_drains_existing_call() {
+    let tracker = Arc::new(PrincipalInvocationTracker::default());
+    let principal = alice();
+    let admitted = tracker.begin(&principal).expect("initial admission");
+    tracker.retire(&principal);
+    assert!(
+        tracker.begin(&principal).is_none(),
+        "late work must be fenced"
+    );
+
+    let waiter = {
+        let tracker = Arc::clone(&tracker);
+        let principal = principal.clone();
+        tokio::spawn(async move { tracker.wait_for_quiescence(&principal).await })
+    };
+    tokio::task::yield_now().await;
+    assert!(
+        !waiter.is_finished(),
+        "retirement must wait for admitted work"
+    );
+    drop(admitted);
+    waiter.await.unwrap();
+
+    tracker.resume(&principal);
+    assert!(tracker.begin(&principal).is_some());
+}
+
+#[test]
+fn retired_principal_loses_kv_fs_and_secret_host_authority_without_harming_peer() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let mut state = minimal_host_state(rt.handle().clone());
+    let a = alice();
+    let bob = astrid_core::PrincipalId::new("agent-bob").unwrap();
+
+    assert!(install_principal_overlays_sync(&mut state, Some(&a)));
+    KvHost::kv_set(&mut state, "before".into(), b"allowed".to_vec()).unwrap();
+    cancel_principal_token(&state.principal_cancel_tokens, &state.cancel_token, &a);
+
+    assert!(matches!(
+        KvHost::kv_set(&mut state, "after".into(), b"denied".to_vec()),
+        Err(KvError::Unknown(_))
+    ));
+    assert!(matches!(
+        FsHost::write_file(
+            &mut state,
+            "cwd://retired-effect".into(),
+            b"denied".to_vec()
+        ),
+        Err(FsError::CapabilityDenied)
+    ));
+    assert!(ElicitHost::has_secret(&mut state, "token".into()).is_err());
+
+    // The same shared Store may subsequently serve a peer. Installing Bob's
+    // overlay selects his independent live token; Alice's tombstone remains.
+    assert!(install_principal_overlays_sync(&mut state, Some(&bob)));
+    KvHost::kv_set(&mut state, "peer".into(), b"alive".to_vec()).unwrap();
+    assert_eq!(
+        KvHost::kv_get(&mut state, "peer".into()).unwrap(),
+        Some(b"alive".to_vec())
+    );
+    assert!(!state.cancel_token.is_cancelled());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retirement_waits_for_admitted_recv_kv_effect_before_reclamation() {
+    let tracker = Arc::new(PrincipalInvocationTracker::default());
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let backend: Arc<dyn astrid_storage::KvStore> = Arc::new(BlockingSetStore {
+        inner: astrid_storage::MemoryKvStore::new(),
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+    });
+    let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    let a = alice();
+    state.principal_invocations = Some(Arc::clone(&tracker));
+    state.invocation_kv = Some(astrid_storage::ScopedKvStore::new(backend, "alice:test").unwrap());
+    assert!(install_principal_overlays_sync(&mut state, Some(&a)));
+    // Restore the barrier backend after overlay installation selected the
+    // production principal store.
+    let backend: Arc<dyn astrid_storage::KvStore> = Arc::new(BlockingSetStore {
+        inner: astrid_storage::MemoryKvStore::new(),
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+    });
+    state.invocation_kv = Some(astrid_storage::ScopedKvStore::new(backend, "alice:test").unwrap());
+
+    let operation = tokio::task::spawn_blocking(move || {
+        let result = KvHost::kv_set(&mut state, "effect".into(), b"committed".to_vec());
+        (state, result)
+    });
+    entered.notified().await;
+    tracker.retire(&a);
+    let draining = {
+        let tracker = Arc::clone(&tracker);
+        let a = a.clone();
+        tokio::spawn(async move { tracker.wait_for_quiescence(&a).await })
+    };
+    tokio::task::yield_now().await;
+    assert!(
+        !draining.is_finished(),
+        "reclamation must wait behind the KV effect"
+    );
+
+    release.notify_one();
+    let (mut state, result) = operation.await.unwrap();
+    result.unwrap();
+    draining.await.unwrap();
+
+    let bob = astrid_core::PrincipalId::new("agent-bob-barrier").unwrap();
+    tracker.resume(&bob);
+    assert!(install_principal_overlays_sync(&mut state, Some(&bob)));
+    assert!(
+        state.begin_host_operation().is_ok(),
+        "peer authority remains live"
     );
 }

@@ -212,7 +212,7 @@ async fn principal_scoped_cancel_unblocks_elicit_wait_without_instance_cancel() 
 
     let (_request_id, _principal) = await_request(req_rx).await;
     // The view-release path: cancel + remove exactly alice's token.
-    crate::engine::wasm::cancel_principal_token(&tokens, &alice);
+    crate::engine::wasm::cancel_principal_token(&tokens, &instance_token, &alice);
 
     let (result, state) = elicit_handle.await.expect("elicit thread joined");
     let elapsed = start.elapsed();

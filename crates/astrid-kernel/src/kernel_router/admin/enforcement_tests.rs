@@ -19,7 +19,9 @@ use astrid_core::dirs::AstridHome;
 use astrid_core::principal::PrincipalId;
 use astrid_core::profile::PrincipalProfile;
 use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
-use astrid_events::kernel_api::{AdminKernelRequest, AdminRequestKind};
+use astrid_events::kernel_api::{
+    AdminKernelRequest, AdminRequestKind, AgentDeriveKernelRequest, AgentDeriveRequest,
+};
 use tempfile::TempDir;
 
 use crate::Kernel;
@@ -89,6 +91,46 @@ async fn send_admin_with_raw_principal(
     })
     .await
     .expect("admin response within 2s")
+}
+
+async fn send_derive(
+    kernel: &Arc<Kernel>,
+    principal: Option<&str>,
+    request_id: &str,
+) -> serde_json::Value {
+    let topic = Topic::admin_request("agent.derive");
+    let response_topic = Topic::admin_response("agent.derive");
+    let mut rx = kernel.event_bus.subscribe_topic(response_topic.as_str());
+    let payload = serde_json::to_value(AgentDeriveKernelRequest {
+        request_id: Some(request_id.to_string()),
+        request: AgentDeriveRequest {
+            name: "derived-test".into(),
+            source: PrincipalId::default(),
+            load_capsules: vec!["missing-capsule".into()],
+            allow_capsules: Vec::new(),
+            inherit_capsule_state: Vec::new(),
+            network_egress: Vec::new(),
+        },
+    })
+    .unwrap();
+    let mut message = IpcMessage::new(topic, IpcPayload::RawJson(payload), kernel.session_id.0);
+    message.principal = principal.map(str::to_string);
+    let _ = kernel.event_bus.publish(astrid_events::AstridEvent::Ipc {
+        metadata: astrid_events::EventMetadata::new("test"),
+        message,
+    });
+    astrid_runtime::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let event = rx.recv().await.unwrap();
+            if let astrid_events::AstridEvent::Ipc { message, .. } = &*event
+                && let IpcPayload::RawJson(value) = &message.payload
+            {
+                return value.clone();
+            }
+        }
+    })
+    .await
+    .expect("derive response within 2s")
 }
 
 // ── enabled-flag enforcement (Layer 5 preamble + Layer 6 admin) ──
@@ -290,6 +332,35 @@ async fn admin_request_id_echoed_on_deny_path_too() {
     .await;
     assert_eq!(resp["request_id"], "req-deny-correlate");
     assert_eq!(resp["status"], "Error");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn additive_derive_endpoint_preserves_correlation_and_authorization() {
+    let (_dir, kernel) = fixture().await;
+    seed_profile(
+        &kernel,
+        &PrincipalId::default(),
+        &PrincipalProfile {
+            groups: vec!["admin".to_string()],
+            ..Default::default()
+        },
+    );
+
+    let authorized = send_derive(&kernel, Some("default"), "derive-authorized").await;
+    assert_eq!(authorized["request_id"], "derive-authorized");
+    assert_eq!(authorized["status"], "Error");
+    assert!(
+        authorized["data"]
+            .as_str()
+            .unwrap()
+            .contains("missing-capsule"),
+        "authorized request must reach derive input validation"
+    );
+
+    let denied = send_derive(&kernel, None, "derive-denied").await;
+    assert_eq!(denied["request_id"], "derive-denied");
+    assert_eq!(denied["status"], "Error");
+    assert_eq!(denied["data"], super::super::MANAGEMENT_CALLER_REQUIRED);
 }
 
 #[tokio::test(flavor = "multi_thread")]

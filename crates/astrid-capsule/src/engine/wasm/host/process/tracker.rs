@@ -14,11 +14,13 @@ use tracing::warn;
 #[cfg(unix)]
 const SIGKILL_GRACE_PERIOD: Duration = Duration::from_secs(2);
 
+type TrackedProcesses = HashMap<u32, (astrid_core::PrincipalId, Option<String>)>;
+
 /// Tracks active child process PIDs for cancellation, with optional
 /// call_id association for multi-session scoping.
 #[derive(Debug, Default)]
 pub struct ProcessTracker {
-    active_pids: Arc<Mutex<HashMap<u32, Option<String>>>>,
+    active_pids: Arc<Mutex<TrackedProcesses>>,
 }
 
 impl ProcessTracker {
@@ -28,15 +30,30 @@ impl ProcessTracker {
         Self::default()
     }
 
-    /// Register a child process PID with an optional call_id.
+    /// Register a child process PID with an optional call ID.
+    ///
+    /// This compatibility entry point associates legacy callers with the
+    /// default principal. Principal-aware host paths use
+    /// [`register_for_principal`](Self::register_for_principal) so retirement
+    /// can cancel exactly one tenant's process group.
     pub fn register(&self, pid: u32, call_id: Option<String>) {
+        self.register_for_principal(pid, astrid_core::PrincipalId::default(), call_id);
+    }
+
+    /// Register a child process PID under the principal that created it.
+    pub fn register_for_principal(
+        &self,
+        pid: u32,
+        principal: astrid_core::PrincipalId,
+        call_id: Option<String>,
+    ) {
         if pid == 0 {
             return; // Guard: PID 0 means "no process" on some platforms.
         }
         self.active_pids
             .lock()
             .expect("process tracker lock poisoned")
-            .insert(pid, call_id);
+            .insert(pid, (principal, call_id));
     }
 
     /// Whether any child process is currently registered as running.
@@ -76,7 +93,7 @@ impl ProcessTracker {
             .lock()
             .expect("process tracker lock poisoned")
             .iter()
-            .filter_map(|(&pid, stored_call_id)| match stored_call_id {
+            .filter_map(|(&pid, (_, stored_call_id))| match stored_call_id {
                 None => Some(pid),
                 Some(id) => call_id_set.contains(id).then_some(pid),
             })
@@ -96,6 +113,31 @@ impl ProcessTracker {
             .copied()
             .collect();
         self.signal_pids(&pids, handle);
+    }
+
+    /// Cancel every child created by one retiring principal while leaving
+    /// shared-runtime peers untouched.
+    pub fn cancel_for_principal(
+        &self,
+        principal: &astrid_core::PrincipalId,
+        _handle: &tokio::runtime::Handle,
+    ) {
+        let pids: Vec<u32> = self
+            .active_pids
+            .lock()
+            .expect("process tracker lock poisoned")
+            .iter()
+            .filter_map(|(&pid, (creator, _))| (creator == principal).then_some(pid))
+            .collect();
+        // Principal deletion is a reclamation boundary, unlike cooperative
+        // tool-call cancellation. Kill synchronously so filesystem/KV cleanup
+        // cannot race a child during the ordinary SIGINT grace window.
+        #[cfg(unix)]
+        for pid in pids {
+            super::managed::kill_process_group(pid);
+        }
+        #[cfg(not(unix))]
+        let _ = pids;
     }
 
     fn signal_pids(&self, pids: &[u32], handle: &tokio::runtime::Handle) {
@@ -168,18 +210,29 @@ mod tests {
     //! `spawn_background` relies on.
     use super::*;
 
+    fn principal() -> astrid_core::PrincipalId {
+        astrid_core::PrincipalId::new("tracker-test").unwrap()
+    }
+
     #[test]
     fn register_adds_pid() {
         let t = ProcessTracker::new();
-        t.register(42, None);
+        t.register_for_principal(42, principal(), None);
+        assert_eq!(t.active_pids_snapshot(), vec![42]);
+    }
+
+    #[test]
+    fn legacy_register_signature_remains_available() {
+        let t = ProcessTracker::new();
+        t.register(42, Some("legacy-call".into()));
         assert_eq!(t.active_pids_snapshot(), vec![42]);
     }
 
     #[test]
     fn unregister_removes_pid() {
         let t = ProcessTracker::new();
-        t.register(42, None);
-        t.register(99, Some("call-a".into()));
+        t.register_for_principal(42, principal(), None);
+        t.register_for_principal(99, principal(), Some("call-a".into()));
         t.unregister(42);
         assert_eq!(t.active_pids_snapshot(), vec![99]);
     }
@@ -187,7 +240,7 @@ mod tests {
     #[test]
     fn pid_zero_is_rejected() {
         let t = ProcessTracker::new();
-        t.register(0, None);
+        t.register_for_principal(0, principal(), None);
         assert!(t.active_pids_snapshot().is_empty());
     }
 
@@ -196,9 +249,63 @@ mod tests {
         // Re-registering a PID with a different call_id must replace
         // the prior entry, otherwise stale call_id associations leak.
         let t = ProcessTracker::new();
-        t.register(42, Some("call-a".into()));
-        t.register(42, Some("call-b".into()));
+        t.register_for_principal(42, principal(), Some("call-a".into()));
+        t.register_for_principal(42, principal(), Some("call-b".into()));
         assert_eq!(t.active_pids_snapshot(), vec![42]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn principal_cancel_kills_descendant_group_and_preserves_peer_group() {
+        use std::os::unix::process::CommandExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let alice_ready = dir.path().join("alice-ready");
+        let alice_effect = dir.path().join("alice-effect");
+        let bob_ready = dir.path().join("bob-ready");
+        let bob_effect = dir.path().join("bob-effect");
+        let script = |ready: &std::path::Path, effect: &std::path::Path| {
+            format!(
+                "touch '{}'; (sleep 0.8; echo survived > '{}') & wait",
+                ready.display(),
+                effect.display()
+            )
+        };
+        let mut alice_child = std::process::Command::new("/bin/sh")
+            .args(["-c", &script(&alice_ready, &alice_effect)])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut bob_child = std::process::Command::new("/bin/sh")
+            .args(["-c", &script(&bob_ready, &bob_effect)])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while (!alice_ready.exists() || !bob_ready.exists()) && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(alice_ready.exists() && bob_ready.exists());
+
+        let tracker = ProcessTracker::new();
+        tracker.register_for_principal(alice_child.id(), principal(), None);
+        let bob = astrid_core::PrincipalId::new("tracker-peer").unwrap();
+        tracker.register_for_principal(bob_child.id(), bob, None);
+        tracker.cancel_for_principal(&principal(), &tokio::runtime::Handle::current());
+
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        let _ = alice_child.try_wait();
+        let _ = bob_child.try_wait();
+        assert!(
+            !alice_effect.exists(),
+            "a descendant in the retired principal's process group must not outlive reclamation"
+        );
+        assert!(bob_effect.exists(), "peer process group must remain live");
+        crate::engine::wasm::host::process::managed::kill_process_group(bob_child.id());
+        let _ = bob_child.wait();
+        let _ = alice_child.wait();
     }
 
     #[test]
@@ -208,7 +315,7 @@ mod tests {
         // unregister, `cancel_by_call_ids` must find no PIDs to
         // signal — verified here by observing the snapshot is empty.
         let t = ProcessTracker::new();
-        t.register(42, Some("call-a".into()));
+        t.register_for_principal(42, principal(), Some("call-a".into()));
         t.unregister(42);
         assert!(t.active_pids_snapshot().is_empty());
     }

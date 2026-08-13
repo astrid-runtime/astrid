@@ -550,13 +550,9 @@ async fn agent_delete_removes_identity_profile_and_invalidates_cache() {
     // close the login route, not the policy.
     assert!(!path.exists(), "profile.toml must be removed post-delete");
 
-    // Cache cleared: re-resolving returns Default (enabled=true, no
-    // groups/grants/revokes), and the Layer 5 enforcement preamble
-    // grants no caps for that shape.
-    let after = kernel.profile_cache.resolve(&pid("bob")).unwrap();
-    assert!(after.groups.is_empty());
-    assert!(after.grants.is_empty());
-    assert!(after.revokes.is_empty());
+    // Cache cleared: a deleted non-default identity has no compatibility
+    // profile and therefore cannot regain host authority.
+    assert!(kernel.profile_cache.resolve(&pid("bob")).is_err());
 }
 
 #[tokio::test(flavor = "multi_thread")]

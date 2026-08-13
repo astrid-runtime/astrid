@@ -76,6 +76,8 @@ impl HostState {
             invocation_secret_store: None,
             invocation_capsule_log: None,
             invocation_profile: None,
+            invocation_profile_authorized: true,
+            principal_invocations: None,
             profile_cache: None,
             invocation_env_overlay: None,
             kv_backend,

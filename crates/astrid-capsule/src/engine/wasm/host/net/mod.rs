@@ -537,6 +537,15 @@ impl net::Host for HostState {
     fn connect_tcp(&mut self, host: String, port: u16) -> Result<Resource<TcpStream>, ErrorCode> {
         validate_host(&host)?;
 
+        if !self.principal_egress_allows(&host, Some(port)) {
+            record_net_denied(
+                self,
+                HostAuditEvent::NetConnect { host: &host, port },
+                "restricted principal network policy denied endpoint",
+            );
+            return Err(ErrorCode::CapabilityDenied);
+        }
+
         if let Some(ref gate) = self.security {
             let capsule_id = self.capsule_id.as_str().to_owned();
             let host_for_check = host.clone();
@@ -651,6 +660,9 @@ impl net::Host for HostState {
 
     fn lookup_host(&mut self, host: String) -> Result<Vec<String>, ErrorCode> {
         validate_host(&host)?;
+        if !self.principal_egress_allows(&host, None) {
+            return Err(ErrorCode::CapabilityDenied);
+        }
         if let Some(ref gate) = self.security {
             let capsule_id = self.capsule_id.as_str().to_owned();
             let host_for_check = host.clone();

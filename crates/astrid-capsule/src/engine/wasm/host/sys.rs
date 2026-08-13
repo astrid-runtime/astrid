@@ -22,6 +22,9 @@ const SLEEP_NS_CAP: u64 = 60_000_000_000;
 
 impl sys::Host for HostState {
     fn get_config(&mut self, key: String) -> Result<Option<String>, ErrorCode> {
+        let _operation = self
+            .begin_host_operation()
+            .map_err(|()| ErrorCode::CapabilityDenied)?;
         // Manifest-declared secrets route through the file-per-secret
         // store at invocation time, never through `self.config`. This
         // keeps plaintext secret material off disk and out of long-lived
@@ -74,6 +77,9 @@ impl sys::Host for HostState {
     }
 
     fn log(&mut self, level: LogLevel, message: String) {
+        if !self.invocation_authority_active() {
+            return;
+        }
         let capsule_id = self.capsule_id.as_str().to_owned();
         let log_file = self.effective_capsule_log().cloned();
 
@@ -204,6 +210,9 @@ impl sys::Host for HostState {
         &mut self,
         request: CapabilityCheckRequest,
     ) -> Result<CapabilityCheckResponse, ErrorCode> {
+        if !self.invocation_authority_active() {
+            return Err(ErrorCode::CapabilityDenied);
+        }
         let registry = self.capsule_registry.clone();
         let rt_handle = self.runtime_handle.clone();
         let blocking_semaphore = self.blocking_semaphore.clone();
@@ -230,6 +239,9 @@ impl sys::Host for HostState {
     }
 
     fn enumerate_capabilities(&mut self) -> Vec<String> {
+        if !self.invocation_authority_active() {
+            return Vec::new();
+        }
         // Infallible self-introspection (the WIT returns a bare `list<string>`,
         // no `result`). The held-capability snapshot is taken once at load
         // (`CapabilitiesDef::held_names`) and stored on `HostState`, so this
@@ -306,6 +318,75 @@ fn resolve_secret(state: &HostState, key: &str) -> String {
 /// daemon log, not only the per-capsule file.
 fn should_emit_to_daemon_log(wrote_to_file: bool, level: LogLevel) -> bool {
     !wrote_to_file || matches!(level, LogLevel::Error)
+}
+
+#[cfg(all(test, unix))]
+mod retirement_secret_tests {
+    use std::io::Write;
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::engine::wasm::PrincipalInvocationTracker;
+    use crate::engine::wasm::test_fixtures::minimal_host_state;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retirement_waits_for_inflight_secret_config_read_and_rejects_late_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let principal = astrid_core::PrincipalId::new("secret-reader").unwrap();
+        let secret_dir = temp.path().join(principal.as_str()).join("test");
+        std::fs::create_dir_all(&secret_dir).unwrap();
+        let fifo = secret_dir.join("API_KEY");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let tracker = Arc::new(PrincipalInvocationTracker::default());
+        let mut state = minimal_host_state(tokio::runtime::Handle::current());
+        state.principal = principal.clone();
+        state.principal_invocations = Some(Arc::clone(&tracker));
+        state.file_secret_root = Some(temp.path().to_path_buf());
+        state.secret_env.insert("API_KEY".to_string());
+
+        let reader = std::thread::spawn(move || {
+            let result = sys::Host::get_config(&mut state, "API_KEY".to_string());
+            (state, result)
+        });
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let mut file = std::fs::OpenOptions::new().write(true).open(fifo).unwrap();
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            file.write_all(b"secret-value").unwrap();
+        });
+        entered_rx.recv().unwrap();
+
+        tracker.retire(&principal);
+        let draining = {
+            let tracker = Arc::clone(&tracker);
+            let principal = principal.clone();
+            tokio::spawn(async move { tracker.wait_for_quiescence(&principal).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !draining.is_finished(),
+            "retirement must wait for the admitted secret read"
+        );
+
+        release_tx.send(()).unwrap();
+        writer.join().unwrap();
+        let (mut state, result) = reader.join().unwrap();
+        assert_eq!(result.unwrap().as_deref(), Some("secret-value"));
+        draining.await.unwrap();
+        assert!(matches!(
+            sys::Host::get_config(&mut state, "API_KEY".to_string()),
+            Err(ErrorCode::CapabilityDenied)
+        ));
+    }
 }
 
 #[cfg(test)]

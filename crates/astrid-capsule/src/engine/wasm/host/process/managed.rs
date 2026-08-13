@@ -55,8 +55,7 @@ pub(super) fn kill_and_reap(child: &mut tokio::process::Child) -> Option<i32> {
     #[cfg(unix)]
     {
         if let Some(raw_pid) = child.id() {
-            let pid = nix::unistd::Pid::from_raw(i32::try_from(raw_pid).unwrap_or(i32::MAX));
-            let _ = nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGKILL);
+            kill_process_group(raw_pid);
         }
     }
     let _ = child.start_kill();
@@ -64,6 +63,20 @@ pub(super) fn kill_and_reap(child: &mut tokio::process::Child) -> Option<i32> {
     // non-blocking; if the SIGKILL hasn't been observed by the OS yet
     // this returns Ok(None) and we surface `None` for the exit code.
     child.try_wait().ok().flatten().and_then(|s| s.code())
+}
+
+/// Kill the process group rooted at `raw_pid`, falling back to the exact child
+/// only when group signaling is unavailable. Invalid/overflowing identifiers
+/// are ignored rather than substituted with an unrelated PID.
+#[cfg(unix)]
+pub(super) fn kill_process_group(raw_pid: u32) {
+    let Ok(raw) = i32::try_from(raw_pid) else {
+        return;
+    };
+    let pid = nix::unistd::Pid::from_raw(raw);
+    if nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGKILL).is_err() {
+        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+    }
 }
 
 impl Drop for ManagedProcess {
