@@ -75,6 +75,11 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Changed
 
+- **Native TLS now uses rustls 0.23.43 and rcgen 0.14.9.** The rustls update
+  fixes a reachable pre-authentication panic in AWS-LC stateless ticket
+  decryption and tightens QUIC suite/version validation; Astrid's explicit
+  AWS-LC provider selection is unchanged. Closes #1516.
+
 - **Rust API compatibility CI now enforces only Astrid's supported public Rust
   contract.** Breaking changes to `astrid-types` remain merge-blocking unless
   explicitly declared, while semver and item-level diffs for internal workspace
