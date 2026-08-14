@@ -13,8 +13,9 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 - **The KV retirement regression now fails deterministically instead of
   wedging the workspace suite.** Its admitted-effect boundary uses an exact
-  two-party rendezvous and bounded completion assertions, preserving the
-  quiescence invariant without leaving CI blocked on a lost test signal.
+  two-party rendezvous, observes the quiescence waiter's active-operation
+  sample directly, and bounds completion assertions, preserving the
+  quiescence invariant without scheduler races or lost test signals.
   Closes #1498.
 
 - **Principal retirement no longer loses its final quiescence wakeup.** The
