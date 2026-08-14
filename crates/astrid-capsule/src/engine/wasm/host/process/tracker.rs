@@ -262,22 +262,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let alice_ready = dir.path().join("alice-ready");
         let alice_effect = dir.path().join("alice-effect");
+        let alice_release = dir.path().join("alice-release");
         let bob_ready = dir.path().join("bob-ready");
         let bob_effect = dir.path().join("bob-effect");
-        let script = |ready: &std::path::Path, effect: &std::path::Path| {
+        let bob_release = dir.path().join("bob-release");
+        let script = |ready: &std::path::Path,
+                      release: &std::path::Path,
+                      effect: &std::path::Path| {
             format!(
-                "touch '{}'; (sleep 0.8; echo survived > '{}') & wait",
+                "(touch '{}'; while [ ! -e '{}' ]; do sleep 0.02; done; echo survived > '{}') & wait",
                 ready.display(),
+                release.display(),
                 effect.display()
             )
         };
         let mut alice_child = std::process::Command::new("/bin/sh")
-            .args(["-c", &script(&alice_ready, &alice_effect)])
+            .args(["-c", &script(&alice_ready, &alice_release, &alice_effect)])
             .process_group(0)
             .spawn()
             .unwrap();
         let mut bob_child = std::process::Command::new("/bin/sh")
-            .args(["-c", &script(&bob_ready, &bob_effect)])
+            .args(["-c", &script(&bob_ready, &bob_release, &bob_effect)])
             .process_group(0)
             .spawn()
             .unwrap();
@@ -295,8 +300,14 @@ mod tests {
         tracker.register_for_principal(bob_child.id(), bob, None);
         tracker.cancel_for_principal(&principal(), &tokio::runtime::Handle::current());
 
-        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
-        let _ = alice_child.try_wait();
+        // Reap the signalled leader before opening the effect gate. SIGKILL is
+        // delivered to the whole group atomically; if group signalling ever
+        // regresses to killing only the leader, its descendant remains alive
+        // and will write the failure marker below.
+        let _ = alice_child.wait();
+        std::fs::write(&alice_release, b"release").unwrap();
+        std::fs::write(&bob_release, b"release").unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         let _ = bob_child.try_wait();
         assert!(
             !alice_effect.exists(),
@@ -305,7 +316,6 @@ mod tests {
         assert!(bob_effect.exists(), "peer process group must remain live");
         crate::engine::wasm::host::process::managed::kill_process_group(bob_child.id());
         let _ = bob_child.wait();
-        let _ = alice_child.wait();
     }
 
     #[test]
