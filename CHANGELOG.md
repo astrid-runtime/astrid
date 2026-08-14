@@ -128,6 +128,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   tool discovery across free, trait, default-trait, and implementation methods,
   while continuing to reject lookalike paths and non-literal tool names.
   Closes #1512.
+- **Git-managed workspace detection now uses gix-discover 0.54.** Repository
+  roots, nested paths, and linked-worktree `.git` files keep direct-write Git
+  rollback semantics, while malformed and non-repositories remain on the
+  fail-safe copy-on-write overlay path. Closes #1518.
 
 - **Rust API compatibility CI now enforces only Astrid's supported public Rust
   contract.** Breaking changes to `astrid-types` remain merge-blocking unless
