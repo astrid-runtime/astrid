@@ -93,7 +93,7 @@ impl FuelLedger {
     /// principal. The closure always returns `Some`, so `fetch_update` can never
     /// return `Err` here.
     fn saturating_add(counter: &AtomicU64, fuel: u64) {
-        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+        let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
             Some(v.saturating_add(fuel))
         });
     }
@@ -331,7 +331,7 @@ impl FuelRateLimiter {
         }
 
         let counter = self.reserved.entry(principal.clone()).or_default();
-        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
             Some(value.saturating_add(amount))
         });
 
@@ -405,7 +405,7 @@ impl FuelRateLimiter {
             if amount != 0
                 && let Some(counter) = self.reserved.get(principal)
             {
-                let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                     Some(value.saturating_sub(amount))
                 });
             }
