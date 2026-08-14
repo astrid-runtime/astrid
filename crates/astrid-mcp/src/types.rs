@@ -277,9 +277,9 @@ pub(crate) struct ServerInfo {
 }
 
 impl ServerInfo {
-    /// Convert from rmcp `InitializeResult` and a server name.
+    /// Convert from rmcp's negotiated server peer information and a server name.
     #[must_use]
-    pub(crate) fn from_rmcp(info: &rmcp_model::InitializeResult, name: &str) -> Self {
+    pub(crate) fn from_rmcp(info: &rmcp_model::ServerPeerInfo, name: &str) -> Self {
         Self {
             name: name.to_string(),
             protocol_version: info.protocol_version.to_string(),

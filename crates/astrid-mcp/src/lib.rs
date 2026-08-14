@@ -70,6 +70,7 @@ mod config;
 mod error;
 mod secure;
 mod server;
+mod server_process;
 mod types;
 
 pub use client::McpClient;

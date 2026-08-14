@@ -95,6 +95,15 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   patches.** Updated clap/clap_complete and which-rs after reviewing their
   help, derive, completion, and absolute-path lookup fixes. Astrid's command
   grammar and MCP stdio resolution contract are unchanged. Closes #1522.
+- **Astrid's MCP client now negotiates the MCP 2026-07-28 lifecycle while
+  retaining legacy server compatibility.** The RMCP 3.1 upgrade adds modern
+  `server/discover` negotiation and MRTR-aware tool calls for outbound MCP
+  servers, with automatic fallback to the 2025-11-25 initialize handshake.
+  RMCP's stale-on-error response cache stays disabled because Astrid owns tool
+  inventory and capability invalidation.
+  The inbound `astrid mcp serve` shim remains explicitly pinned to 2025-11-25
+  until its approval, ingress, and grant flows are converted from
+  server-initiated elicitation to MRTR. Closes #1504.
 
 - **Core Rust API compatibility reports now match Astrid's actual contract
   boundary.** Semver and item-level diffs for every core workspace library,
