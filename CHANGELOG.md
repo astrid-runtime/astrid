@@ -75,6 +75,11 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Changed
 
+- **The async runtime family is updated to Tokio 1.53.1.** This includes the
+  upstream alternate-timer cancellation/insertion race fix, runtime and channel
+  correctness fixes, and aligned `tokio-stream`, `tokio-util`, and `socket2`
+  releases. Closes #1514.
+
 - **Rust API compatibility CI now enforces only Astrid's supported public Rust
   contract.** Breaking changes to `astrid-types` remain merge-blocking unless
   explicitly declared, while semver and item-level diffs for internal workspace
