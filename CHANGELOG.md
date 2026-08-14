@@ -124,6 +124,17 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   compatibility. This prevents automation from forcing architecture
   distortions merely to preserve implementation-detail APIs. Closes #1533;
   part of #1480.
+- **Capsule source checks now parse Rust with Syn 3.** The checker preserves
+  tool discovery across free, trait, default-trait, and implementation methods,
+  while continuing to reject lookalike paths and non-literal tool names.
+  Closes #1512.
+
+- **Rust API compatibility CI now enforces only Astrid's supported public Rust
+  contract.** Breaking changes to `astrid-types` remain merge-blocking unless
+  explicitly declared, while semver and item-level diffs for internal workspace
+  crates remain visible as advisory review evidence. This prevents automation
+  from forcing architecture distortions merely to preserve implementation-detail
+  APIs while retaining maintainer visibility into every change. Part of #1480.
 
 - **`agent delete` now reclaims the deleted principal's full runtime footprint.** Delete fences new token and allowance authority, unlinks authentication, removes the profile, retires live capsule views, purges every immutable-UID KV namespace (including orphaned capsules), and reclaims the home tree, signing key (`keys/{principal}.key`), and secrets (`secrets/{principal}/`). Reclamation fails closed: incomplete cleanup returns an error, retains a durable alias reservation, and is safe to retry without letting a replacement identity inherit residual authority or state. Successful responses retain an empty `cleanup_errors` array for wire compatibility. Shared runtimes remain available to other principals. Replaces the previous "reclamation is an ops concern" leave-behind, and drops the interim `--purge-home` flag. Part of #1217.
 ### Fixed

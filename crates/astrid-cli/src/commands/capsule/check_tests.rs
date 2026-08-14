@@ -55,6 +55,64 @@ fn source_scan_extracts_literal_names() {
 }
 
 #[test]
+fn source_scan_preserves_all_supported_function_contexts() {
+    assert_eq!(
+        tool_names_in_source(
+            r#"
+            #[astrid::tool()]
+            pub async fn empty_args_infer_name() {}
+
+            trait CapsuleTools {
+                #[astrid::tool("declared_trait_tool")]
+                fn declared(&self);
+
+                #[astrid::tool]
+                fn default_trait_tool(&self) {}
+            }
+
+            impl CapsuleTools for Tools {
+                #[astrid::tool("implemented_tool", mutable)]
+                fn declared(&self) {}
+
+                fn default_trait_tool(&self) {}
+            }
+            "#,
+        )
+        .unwrap(),
+        names(&[
+            "empty_args_infer_name",
+            "declared_trait_tool",
+            "default_trait_tool",
+            "implemented_tool",
+        ]),
+    );
+}
+
+#[test]
+fn source_scan_rejects_lookalike_and_nonliteral_tool_attributes() {
+    assert_eq!(
+        tool_names_in_source(
+            r#"
+            #[other::tool("wrong_namespace")]
+            fn wrong_namespace() {}
+
+            #[astrid::tool::nested("wrong_path")]
+            fn wrong_path() {}
+
+            const NAME: &str = "not_static";
+            #[astrid::tool(NAME)]
+            fn nonliteral_argument() {}
+
+            #[astrid::tool = "unsupported_name_value"]
+            fn name_value() {}
+            "#,
+        )
+        .unwrap(),
+        Vec::<String>::new(),
+    );
+}
+
+#[test]
 fn source_scan_ignores_comments_calls_and_embedded_templates() {
     let source = r##"
         // #[astrid::tool("line_comment")]
