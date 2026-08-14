@@ -116,8 +116,10 @@ pub struct CapsuleContext {
     ///
     /// One instance per kernel boot, backing [`WasmEngine::invoke_interceptor`](
     /// crate::engine::wasm::WasmEngine::invoke_interceptor)'s per-invocation
-    /// quota resolution. Tests and single-tenant deployments may leave this
-    /// `None` — the engine falls back to the process-global default profile.
+    /// quota resolution. Unstamped compatibility callers may leave this `None`
+    /// and retain the process-global default profile. A typed principal runtime
+    /// with an autonomous `run` export requires it so owner authority and
+    /// sub-budgets cannot silently fall back to another context.
     pub profile_cache: Option<Arc<PrincipalProfileCache>>,
     /// Shared per-principal overlay VFS registry (Layer 4, issue #668).
     ///

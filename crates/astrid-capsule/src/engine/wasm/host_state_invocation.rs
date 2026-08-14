@@ -4,6 +4,52 @@
 use super::*;
 
 impl HostState {
+    /// Bind an autonomous principal runtime to its load owner's complete host
+    /// context before entering the guest's `run` export.
+    ///
+    /// Principal runtimes already receive authority-scoped KV, home/tmp mounts,
+    /// secrets, and logs when the Store is constructed. The dispatcher and recv
+    /// paths normally add the remaining invocation fields, but an autonomous
+    /// run export bypasses both. Snapshotting the owner resources here and
+    /// installing the resolved profile/env overlay makes every host call observe
+    /// one coherent owner context from the first instruction onward.
+    ///
+    /// The typed runtime identity is checked here, at the mutation boundary.
+    /// This helper deliberately accepts no principal argument: a default alias,
+    /// first loader, or message publisher can therefore never be substituted
+    /// for the Store's immutable load owner.
+    pub(crate) fn install_run_loop_owner_context(
+        &mut self,
+        runtime_id: &crate::registry::RuntimeId,
+        owner_profile: Arc<astrid_core::profile::PrincipalProfile>,
+        owner_env: Option<HashMap<String, String>>,
+    ) -> crate::error::CapsuleResult<()> {
+        if self.system_runtime
+            || !matches!(
+                runtime_id.key().scope(),
+                crate::registry::RuntimeScope::Principal(_)
+            )
+            || runtime_id.key().capsule_id() != &self.capsule_id
+        {
+            return Err(crate::error::CapsuleError::ExecutionFailed(format!(
+                "runtime '{}' is not the principal owner of capsule '{}'",
+                runtime_id.key().capsule_id(),
+                self.capsule_id
+            )));
+        }
+        self.invocation_kv = Some(self.kv.clone());
+        self.invocation_home = self.home.clone();
+        self.invocation_tmp = self.tmp.clone();
+        self.invocation_secret_store = Some(Arc::clone(&self.secret_store));
+        self.invocation_capsule_log = self.capsule_log.clone();
+        self.invocation_profile = Some(owner_profile);
+        self.invocation_profile_authorized = true;
+        self.invocation_env_overlay = owner_env;
+        let owner = self.principal.clone();
+        self.install_invocation_cancel_token(Some(&owner));
+        Ok(())
+    }
+
     /// Build a fresh, empty per-principal cancellation-token map.
     ///
     /// Out-of-pool constructors (lifecycle hooks, the hook handler, tests) use
@@ -365,6 +411,9 @@ fn mount_recv_dir(root: &std::path::Path) -> Option<crate::engine::wasm::Princip
 
 #[cfg(test)]
 mod recv_vfs_tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
     #[tokio::test]
     async fn recv_vfs_switches_principals_and_clears_without_one() {
         let root = tempfile::tempdir().expect("runtime home");
@@ -417,5 +466,146 @@ mod recv_vfs_tests {
         state.install_recv_invocation_vfs(None);
         assert!(state.invocation_home.is_none());
         assert!(state.invocation_tmp.is_none());
+    }
+
+    #[tokio::test]
+    async fn principal_run_loop_owner_context_persists_without_peer_visibility() {
+        use astrid_core::{PrincipalId, PrincipalUid};
+        use astrid_storage::{KvStore, MemoryKvStore, ScopedKvStore};
+
+        let runtime_id = crate::registry::RuntimeId::for_test_scope(
+            crate::capsule::CapsuleId::from_static("test"),
+            7,
+            crate::registry::RuntimeScope::Principal(PrincipalUid::from_bytes([0xA1; 32])),
+        );
+        let alice = PrincipalId::new("alice").unwrap();
+        let backend: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+        let alice_kv = ScopedKvStore::new(Arc::clone(&backend), "alice:capsule:test").unwrap();
+        let default_kv = ScopedKvStore::new(Arc::clone(&backend), "default:capsule:test").unwrap();
+        let bob_kv = ScopedKvStore::new(Arc::clone(&backend), "bob:capsule:test").unwrap();
+
+        let home_dir = tempfile::tempdir().unwrap();
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let home = crate::engine::wasm::mount_dir(home_dir.path())
+            .await
+            .unwrap();
+        let tmp = crate::engine::wasm::mount_dir(tmp_dir.path())
+            .await
+            .unwrap();
+        let secret_store = crate::engine::wasm::test_fixtures::mem_secret_store(
+            "alice:secret:test",
+            tokio::runtime::Handle::current(),
+        );
+        let secret_ptr = Arc::as_ptr(&secret_store);
+        let log_dir = tempfile::tempdir().unwrap();
+        let log = crate::engine::wasm::test_fixtures::open_log(&log_dir.path().join("alice.log"));
+        let mut profile = astrid_core::profile::PrincipalProfile::default();
+        profile.quotas.max_background_processes = 17;
+        let profile = Arc::new(profile);
+        let env = HashMap::from([("MODEL".to_string(), "alice-model".to_string())]);
+
+        let mut first = crate::engine::wasm::test_fixtures::minimal_host_state(
+            tokio::runtime::Handle::current(),
+        );
+        first.principal = alice.clone();
+        first.kv_backend = Arc::clone(&backend);
+        first.kv = alice_kv.clone();
+        first.home = Some(home.clone());
+        first.tmp = Some(tmp.clone());
+        first.secret_store = Arc::clone(&secret_store);
+        first.capsule_log = Some(Arc::clone(&log));
+        first
+            .install_run_loop_owner_context(&runtime_id, Arc::clone(&profile), Some(env.clone()))
+            .unwrap();
+
+        first
+            .effective_kv()
+            .set("run-loop-state", b"alice-state".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(first.effective_principal(), alice);
+        assert_eq!(first.effective_home().unwrap().root, home.root);
+        assert_eq!(first.effective_tmp().unwrap().root, tmp.root);
+        assert!(std::ptr::eq(
+            Arc::as_ptr(first.effective_secret_store()),
+            secret_ptr
+        ));
+        assert!(Arc::ptr_eq(first.effective_capsule_log().unwrap(), &log));
+        assert_eq!(
+            first.effective_profile().quotas.max_background_processes,
+            17
+        );
+        assert_eq!(first.invocation_env_overlay.as_ref(), Some(&env));
+
+        // A replacement Store for the same immutable owner sees the durable value.
+        let reloaded_runtime_id = crate::registry::RuntimeId::for_test_scope(
+            crate::capsule::CapsuleId::from_static("test"),
+            8,
+            crate::registry::RuntimeScope::Principal(PrincipalUid::from_bytes([0xA1; 32])),
+        );
+        let mut reloaded = crate::engine::wasm::test_fixtures::minimal_host_state(
+            tokio::runtime::Handle::current(),
+        );
+        reloaded.principal = alice;
+        reloaded.kv_backend = Arc::clone(&backend);
+        reloaded.kv = alice_kv;
+        reloaded
+            .install_run_loop_owner_context(&reloaded_runtime_id, profile, None)
+            .unwrap();
+        assert_eq!(
+            reloaded.effective_kv().get("run-loop-state").await.unwrap(),
+            Some(b"alice-state".to_vec())
+        );
+
+        // The bootstrap default principal and an unrelated principal share the
+        // physical backend but can neither observe nor overwrite Alice's key.
+        assert_eq!(default_kv.get("run-loop-state").await.unwrap(), None);
+        assert_eq!(bob_kv.get("run-loop-state").await.unwrap(), None);
+        default_kv
+            .set("run-loop-state", b"default-state".to_vec())
+            .await
+            .unwrap();
+        bob_kv
+            .set("run-loop-state", b"bob-state".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(
+            reloaded.effective_kv().get("run-loop-state").await.unwrap(),
+            Some(b"alice-state".to_vec())
+        );
+    }
+
+    #[test]
+    fn run_loop_owner_context_rejects_system_or_wrong_capsule_runtime() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let mut state = crate::engine::wasm::test_fixtures::minimal_host_state(rt.handle().clone());
+        let profile = Arc::new(astrid_core::profile::PrincipalProfile::default());
+        let system = crate::registry::RuntimeId::for_test_scope(
+            crate::capsule::CapsuleId::from_static("test"),
+            1,
+            crate::registry::RuntimeScope::SystemResident,
+        );
+        let wrong_capsule = crate::registry::RuntimeId::for_test_scope(
+            crate::capsule::CapsuleId::from_static("other"),
+            2,
+            crate::registry::RuntimeScope::Principal(astrid_core::PrincipalUid::from_bytes(
+                [2; 32],
+            )),
+        );
+
+        assert!(
+            state
+                .install_run_loop_owner_context(&system, Arc::clone(&profile), None)
+                .is_err()
+        );
+        assert!(
+            state
+                .install_run_loop_owner_context(&wrong_capsule, profile, None)
+                .is_err()
+        );
+        assert!(state.invocation_kv.is_none());
+        assert!(state.invocation_profile.is_none());
     }
 }
