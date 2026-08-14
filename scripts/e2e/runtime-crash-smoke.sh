@@ -75,6 +75,23 @@ raise SystemExit(proc.returncode)
 PY
 }
 
+wait_for_adversarial_command_route() {
+  local label=$1 principal=$2
+  local out="$ARTIFACTS/$label-command-route-wait.txt"
+  local deadline=$((SECONDS + 90))
+
+  while (( SECONDS < deadline )); do
+    if bounded_principal_cli "$principal" 8 "$out" \
+      capsule run astrid-capsule-adversarial adversarial; then
+      return 0
+    fi
+    sleep 1
+  done
+
+  cat "$out" >&2 2>/dev/null || true
+  fail "$label adversarial command route did not become ready"
+}
+
 run_inflight_prompt_crash_smoke() {
   local principal=$1
   local session=$2
@@ -258,14 +275,17 @@ run_crash_recovery_smoke() {
   start_daemon "restarting daemon after abrupt process death"
   wait_for_readiness_capsules crash-capsule-command "$user_bearer" \
     astrid-capsule-adversarial
+  wait_for_adversarial_command_route crash-capsule-command "$user_principal"
   run_mid_capsule_command_crash_smoke "$user_principal"
   start_daemon "restarting daemon after capsule command crash"
   wait_for_readiness_capsules crash-approval "$user_bearer" \
     astrid-capsule-adversarial
+  wait_for_adversarial_command_route crash-approval "$user_principal"
   run_mid_approval_wait_crash_smoke "$user_principal" "$user_bearer"
   start_daemon "restarting daemon after approval wait crash"
   wait_for_readiness_capsules crash-elicit "$user_bearer" \
     astrid-capsule-adversarial
+  wait_for_adversarial_command_route crash-elicit "$user_principal"
   run_mid_elicit_wait_crash_smoke "$user_principal" "$user_bearer"
   start_daemon "restarting daemon after elicit wait crash"
   run_post_admin_mutation_crash_smoke
