@@ -31,6 +31,13 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   principal.** Concurrent principals waiting on the same static response topic
   can no longer consume one another's replies. Persistent system fan-in and the
   explicitly authorized audit firehose remain unscoped. Closes #1476.
+- **Audit persistence no longer serializes unrelated principals or rewrites a
+  growing session index for every action.** Appends retain strict signed-chain
+  ordering per `(session, principal)` while independent chains persist
+  concurrently. Session discovery now uses bounded append-only commit records,
+  preserves insertion order, reads legacy indexes, and recovers safely across
+  write failures and cancellation before or after durable publication. Closes
+  #1478.
 
 - **Executable capsule runtimes are now scoped to immutable principal authority rather than shared by content hash.** Identical verified WASM still reuses compiled Wasmtime artifacts, but each `PrincipalUid` receives separate Stores, component instances, guest memory/globals, run tasks, subscriptions, MCP/native processes, readiness, cancellation, and health generations. Explicit `SystemResident` services remain intentional singletons; principal routes admit only their owner plus kernel events by default; and stale dispatcher, health, source-lookup, and process-handle state cannot cross a replacement generation. Closes #1486.
 

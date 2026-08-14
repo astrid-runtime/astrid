@@ -541,10 +541,9 @@ async fn test_mixed_session_verify_chain_passes() {
 ///
 /// A [`tokio::sync::Barrier`] aligns every task on its first append to force the
 /// race, and each task appends several entries to widen the collision window.
-/// The atomic per-chain critical section (the whole append under the
-/// `chain_heads` write lock, held across the persist `.await`) must make the
-/// chain verify cleanly with every entry present. This test fails on the pre-fix
-/// code.
+/// The atomic per-chain critical section (the whole append under that chain's
+/// mutex, held across the persist `.await`) must make the chain verify cleanly
+/// with every entry present. This test fails on the pre-fix code.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_concurrent_same_chain_appends_do_not_fork() {
     const TASKS: usize = 8;
@@ -605,4 +604,286 @@ async fn test_concurrent_same_chain_appends_do_not_fork() {
         result.issues
     );
     assert_eq!(result.entries_verified, TOTAL);
+}
+
+struct BlockingPrincipalStorage {
+    inner: SurrealKvAuditStorage,
+    blocked_principal: astrid_core::PrincipalId,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+struct BlockAfterCommitStorage {
+    inner: SurrealKvAuditStorage,
+    block_next: Arc<std::sync::atomic::AtomicBool>,
+    committed: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl AuditStorage for BlockAfterCommitStorage {
+    async fn store(&self, entry: &AuditEntry) -> AuditResult<()> {
+        self.inner.store(entry).await?;
+        if self
+            .block_next
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.committed.notify_one();
+            std::future::pending::<()>().await;
+        }
+        Ok(())
+    }
+
+    async fn get(&self, id: &AuditEntryId) -> AuditResult<Option<AuditEntry>> {
+        self.inner.get(id).await
+    }
+
+    async fn get_chain_head(
+        &self,
+        session_id: &SessionId,
+        principal: Option<&astrid_core::PrincipalId>,
+    ) -> AuditResult<Option<AuditEntryId>> {
+        self.inner.get_chain_head(session_id, principal).await
+    }
+
+    async fn get_session_entries(&self, session_id: &SessionId) -> AuditResult<Vec<AuditEntry>> {
+        self.inner.get_session_entries(session_id).await
+    }
+
+    async fn count(&self) -> AuditResult<usize> {
+        self.inner.count().await
+    }
+
+    async fn count_session(&self, session_id: &SessionId) -> AuditResult<usize> {
+        self.inner.count_session(session_id).await
+    }
+
+    async fn list_sessions(&self) -> AuditResult<Vec<SessionId>> {
+        self.inner.list_sessions().await
+    }
+
+    async fn flush(&self) -> AuditResult<()> {
+        self.inner.flush().await
+    }
+
+    async fn close(&self) -> AuditResult<()> {
+        self.inner.close().await
+    }
+}
+
+#[async_trait::async_trait]
+impl AuditStorage for BlockingPrincipalStorage {
+    async fn store(&self, entry: &AuditEntry) -> AuditResult<()> {
+        if entry.principal.as_ref() == Some(&self.blocked_principal) {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        self.inner.store(entry).await
+    }
+
+    async fn get(&self, id: &AuditEntryId) -> AuditResult<Option<AuditEntry>> {
+        self.inner.get(id).await
+    }
+
+    async fn get_chain_head(
+        &self,
+        session_id: &SessionId,
+        principal: Option<&astrid_core::PrincipalId>,
+    ) -> AuditResult<Option<AuditEntryId>> {
+        self.inner.get_chain_head(session_id, principal).await
+    }
+
+    async fn get_session_entries(&self, session_id: &SessionId) -> AuditResult<Vec<AuditEntry>> {
+        self.inner.get_session_entries(session_id).await
+    }
+
+    async fn count(&self) -> AuditResult<usize> {
+        self.inner.count().await
+    }
+
+    async fn count_session(&self, session_id: &SessionId) -> AuditResult<usize> {
+        self.inner.count_session(session_id).await
+    }
+
+    async fn list_sessions(&self) -> AuditResult<Vec<SessionId>> {
+        self.inner.list_sessions().await
+    }
+
+    async fn flush(&self) -> AuditResult<()> {
+        self.inner.flush().await
+    }
+
+    async fn close(&self) -> AuditResult<()> {
+        self.inner.close().await
+    }
+}
+
+/// A persist blocked on Alice's chain must not hold Bob's independent chain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocked_principal_store_does_not_block_another_principal() {
+    let alice = astrid_core::PrincipalId::new("alice").unwrap();
+    let bob = astrid_core::PrincipalId::new("bob").unwrap();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let storage = BlockingPrincipalStorage {
+        inner: SurrealKvAuditStorage::in_memory(),
+        blocked_principal: alice.clone(),
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+    };
+    let log = Arc::new(AuditLog {
+        storage: Box::new(storage),
+        runtime_key: Arc::new(KeyPair::generate()),
+        chain_heads: std::sync::Mutex::new(std::collections::HashMap::new()),
+    });
+    let session_id = SessionId::new();
+
+    let alice_append = {
+        let log = Arc::clone(&log);
+        let session_id = session_id.clone();
+        tokio::spawn(async move {
+            log.append_with_principal(
+                session_id,
+                alice,
+                AuditAction::FileRead {
+                    path: "alice.txt".into(),
+                },
+                AuthorizationProof::NotRequired {
+                    reason: "independent chain test".into(),
+                },
+                AuditOutcome::success(),
+            )
+            .await
+        })
+    };
+    entered.notified().await;
+
+    let bob_append = {
+        let log = Arc::clone(&log);
+        let session_id = session_id.clone();
+        tokio::spawn(async move {
+            log.append_with_principal(
+                session_id,
+                bob,
+                AuditAction::FileRead {
+                    path: "bob.txt".into(),
+                },
+                AuthorizationProof::NotRequired {
+                    reason: "independent chain test".into(),
+                },
+                AuditOutcome::success(),
+            )
+            .await
+        })
+    };
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), bob_append)
+        .await
+        .expect("Bob's independent chain must not wait for Alice's blocked store")
+        .expect("Bob task must not panic")
+        .expect("Bob append must succeed");
+    release.notify_one();
+    alice_append
+        .await
+        .expect("Alice task must not panic")
+        .expect("Alice append must succeed");
+
+    assert_eq!(log.count_session(&session_id).await.unwrap(), 2);
+    assert!(log.verify_chain(&session_id).await.unwrap().valid);
+}
+
+#[tokio::test]
+async fn verification_uses_append_order_when_wall_clock_moves_backward() {
+    use chrono::TimeZone;
+
+    let keypair = Arc::new(KeyPair::generate());
+    let session_id = SessionId::new();
+    let mut first = AuditEntry::create(
+        session_id.clone(),
+        AuditAction::ConfigReloaded,
+        AuthorizationProof::System {
+            reason: "clock test".into(),
+        },
+        AuditOutcome::success(),
+        ContentHash::zero(),
+        &keypair,
+    );
+    first.timestamp = astrid_core::Timestamp::from_datetime(
+        chrono::Utc.timestamp_opt(2_000, 0).single().unwrap(),
+    );
+    first.signature = keypair.sign(&first.signing_data());
+
+    let mut second = AuditEntry::create(
+        session_id.clone(),
+        AuditAction::ConfigReloaded,
+        AuthorizationProof::System {
+            reason: "clock test".into(),
+        },
+        AuditOutcome::success(),
+        first.content_hash(),
+        &keypair,
+    );
+    second.timestamp = astrid_core::Timestamp::from_datetime(
+        chrono::Utc.timestamp_opt(1_000, 0).single().unwrap(),
+    );
+    second.signature = keypair.sign(&second.signing_data());
+
+    let storage = SurrealKvAuditStorage::in_memory();
+    storage.store(&first).await.unwrap();
+    storage.store(&second).await.unwrap();
+    let log = AuditLog {
+        storage: Box::new(storage),
+        runtime_key: keypair,
+        chain_heads: std::sync::Mutex::new(std::collections::HashMap::new()),
+    };
+
+    let result = log.verify_chain(&session_id).await.unwrap();
+    assert!(result.valid, "clock rollback must not reorder the chain");
+    assert_eq!(result.entries_verified, 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancellation_after_durable_commit_recovers_head_without_fork() {
+    let block_next = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let committed = Arc::new(tokio::sync::Notify::new());
+    let log = Arc::new(AuditLog::with_test_storage(
+        Box::new(BlockAfterCommitStorage {
+            inner: SurrealKvAuditStorage::in_memory(),
+            block_next: Arc::clone(&block_next),
+            committed: Arc::clone(&committed),
+        }),
+        KeyPair::generate(),
+    ));
+    let session_id = SessionId::new();
+    let append = |reason: &'static str| {
+        let log = Arc::clone(&log);
+        let session_id = session_id.clone();
+        async move {
+            log.append(
+                session_id,
+                AuditAction::ConfigReloaded,
+                AuthorizationProof::System {
+                    reason: reason.into(),
+                },
+                AuditOutcome::success(),
+            )
+            .await
+        }
+    };
+
+    append("first").await.unwrap();
+    block_next.store(true, std::sync::atomic::Ordering::SeqCst);
+    let second = tokio::spawn(append("second"));
+    committed.notified().await;
+    second.abort();
+    assert!(second.await.unwrap_err().is_cancelled());
+
+    append("third").await.unwrap();
+    assert_eq!(log.count_session(&session_id).await.unwrap(), 3);
+    let verification = log.verify_chain(&session_id).await.unwrap();
+    assert!(
+        verification.valid,
+        "post-commit cancellation left a stale cached head: {:?}",
+        verification.issues
+    );
+    assert_eq!(verification.entries_verified, 3);
 }

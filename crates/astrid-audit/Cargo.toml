@@ -29,7 +29,7 @@ uuid = { workspace = true }
 tempfile = { workspace = true }
 # `rt-multi-thread` drives the `#[tokio::test(flavor = "multi_thread")]`
 # concurrency regressions; `macros` for `#[tokio::test]`.
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 
 [lints]
 workspace = true
