@@ -18,7 +18,13 @@ use crate::storage::{AuditStorage, SurrealKvAuditStorage};
 ///
 /// System entries (no principal) use `(session_id, None)`.
 /// Principal entries use `(session_id, Some(principal))`.
-type ChainKey = (SessionId, Option<astrid_core::PrincipalId>);
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ChainKey {
+    session_id: SessionId,
+    principal: Option<astrid_core::PrincipalId>,
+}
+
+type ChainHead = Arc<Mutex<Option<ContentHash>>>;
 
 /// Audit log for recording and verifying security events.
 pub struct AuditLog {
@@ -31,18 +37,16 @@ pub struct AuditLog {
     /// #929) without loading the key from disk twice — the audit log and the
     /// kernel's admin token-mint path sign with the exact same key bytes.
     runtime_key: Arc<KeyPair>,
-    /// Current chain heads per (session, principal) pair.
+    /// Per-(session, principal) append locks and cached chain heads.
     ///
     /// Each principal maintains its own independent chain within a session.
     /// System entries (no principal) use `(session_id, None)`.
     ///
-    /// This is a [`tokio::sync::Mutex`] (not a `std` one) because
-    /// [`append_inner`](Self::append_inner) holds the guard *across the
-    /// persistent `store().await`* to keep read-prev-hash → sign → persist →
-    /// advance-head atomic per chain — a `std` guard cannot legally live across
-    /// an `.await`. Access is exclusive-only, so a plain mutex (not `RwLock`)
-    /// is the honest primitive. See the locking contract on [`append_inner`].
-    chain_heads: Mutex<std::collections::HashMap<ChainKey, ContentHash>>,
+    /// The outer standard mutex protects only map lookup/insertion and is never
+    /// held across an await. Each value is its own async mutex, held across the
+    /// durable append so one chain remains strictly ordered without blocking an
+    /// unrelated principal's chain.
+    chain_heads: std::sync::Mutex<std::collections::HashMap<ChainKey, ChainHead>>,
 }
 
 impl AuditLog {
@@ -62,7 +66,7 @@ impl AuditLog {
         Ok(Self {
             storage: Box::new(storage),
             runtime_key: runtime_key.into(),
-            chain_heads: Mutex::new(std::collections::HashMap::new()),
+            chain_heads: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -75,7 +79,19 @@ impl AuditLog {
         Self {
             storage: Box::new(storage),
             runtime_key: runtime_key.into(),
-            chain_heads: Mutex::new(std::collections::HashMap::new()),
+            chain_heads: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_storage(
+        storage: Box<dyn AuditStorage>,
+        runtime_key: impl Into<Arc<KeyPair>>,
+    ) -> Self {
+        Self {
+            storage,
+            runtime_key: runtime_key.into(),
+            chain_heads: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -120,9 +136,9 @@ impl AuditLog {
     ///
     /// # Locking contract
     ///
-    /// The entire append critical section — resolving the chain's current head,
+    /// The entire append critical section — resolving this chain's current head,
     /// creating and signing the entry against that head, persisting it, and then
-    /// advancing the cached head — runs while holding the `chain_heads` mutex.
+    /// advancing the cached head — runs while holding that chain's mutex.
     /// This serializes appends to the same `(session, principal)` chain so
     /// that `previous_hash` and the head move together atomically.
     ///
@@ -132,17 +148,9 @@ impl AuditLog {
     /// `valid = false` (`BrokenLink` / duplicate genesis) under nothing more than
     /// normal concurrent host-call load.
     ///
-    /// Signing happens inside the lock. That serializes same-chain appends, which
-    /// is intentional and correct: a hash chain is inherently ordered, so a
-    /// well-defined append order IS the product. The lock spans every chain in
-    /// this log (one mutex), so it also serializes appends across chains; that
-    /// is a stronger guarantee than required and is acceptable — audit append is
-    /// not a hot path relative to the signed-ordering invariant it protects.
-    ///
-    /// The lock is a [`tokio::sync::Mutex`]: the guard is held *across the
-    /// persistent `store().await`*, which a `std` guard cannot legally do. An
-    /// async-aware lock is what lets the whole critical section stay atomic on
-    /// the now-genuinely-async persist path.
+    /// Signing happens inside the per-chain lock. That serialization is
+    /// intentional: a hash chain is inherently ordered. Independent chains use
+    /// independent locks and may persist concurrently.
     async fn append_inner(
         &self,
         session_id: SessionId,
@@ -151,17 +159,31 @@ impl AuditLog {
         authorization: AuthorizationProof,
         outcome: AuditOutcome,
     ) -> AuditResult<AuditEntryId> {
-        let chain_key: ChainKey = (session_id.clone(), principal.clone());
+        let chain_key = ChainKey {
+            session_id: session_id.clone(),
+            principal: principal.clone(),
+        };
 
         // Hold the lock across read-prev-hash -> create+sign -> store ->
         // head update so the whole append is atomic per chain (see the locking
         // contract above).
-        let mut heads = self.chain_heads.lock().await;
+        let chain_head = {
+            let mut heads = self
+                .chain_heads
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Arc::clone(
+                heads
+                    .entry(chain_key.clone())
+                    .or_insert_with(|| Arc::new(Mutex::new(None))),
+            )
+        };
+        let mut head = chain_head.lock().await;
 
         // Resolve the parent hash from the head cache we already hold (falling
         // back to storage), NOT via a fresh lock — re-locking would reopen the
         // fork window between the read and the head advance below.
-        let previous_hash = self.previous_hash_locked(&chain_key, &heads).await?;
+        let previous_hash = self.previous_hash_locked(&chain_key, head.as_ref()).await?;
 
         // Create and sign the entry. session_id is moved into create,
         // chain_key retains the clone for the cache update below.
@@ -195,12 +217,14 @@ impl AuditLog {
             "Appending audit entry"
         );
 
-        // Store the entry, then advance the head. Both happen under the lock, so
-        // a concurrent same-chain append cannot observe the stored entry without
-        // also observing the advanced head. On a store failure we return without
-        // touching the head — nothing was persisted, so the chain is unchanged.
+        // The storage future may be cancelled after its durable commit point but
+        // before it reports success. Invalidate the cache before awaiting so an
+        // error or cancellation leaves `None` behind and the next append recovers
+        // the authoritative committed head from storage. Only a reported success
+        // installs the new fast-path hash.
+        *head = None;
         self.storage.store(&entry).await?;
-        heads.insert(chain_key, entry_hash);
+        *head = Some(entry_hash);
 
         Ok(entry_id)
     }
@@ -208,25 +232,23 @@ impl AuditLog {
     /// Resolve a chain's parent hash from the caller-held head cache, falling
     /// back to storage, then to genesis (`ContentHash::zero()`).
     ///
-    /// `heads` MUST be the live `chain_heads` map the caller already holds the
-    /// write lock on. This method deliberately does NOT lock: reading the parent
-    /// hash and advancing the head must stay inside one critical section (see the
-    /// locking contract on [`append_inner`]). Taking a fresh lock here would
-    /// reopen the fork window this design closes.
+    /// `head` MUST belong to the per-chain mutex the caller holds. This method
+    /// deliberately does not lock: resolving the parent and advancing the head
+    /// must stay inside the same critical section.
     async fn previous_hash_locked(
         &self,
         chain_key: &ChainKey,
-        heads: &std::collections::HashMap<ChainKey, ContentHash>,
+        head: Option<&ContentHash>,
     ) -> AuditResult<ContentHash> {
         // Check the in-memory head cache first.
-        if let Some(hash) = heads.get(chain_key) {
+        if let Some(hash) = head {
             return Ok(*hash);
         }
 
         // Fall back to storage (first append after a restart / cache miss).
         if let Some(head_id) = self
             .storage
-            .get_chain_head(&chain_key.0, chain_key.1.as_ref())
+            .get_chain_head(&chain_key.session_id, chain_key.principal.as_ref())
             .await?
             && let Some(entry) = self.storage.get(&head_id).await?
         {
@@ -247,6 +269,9 @@ impl AuditLog {
     }
 
     /// Get all entries for a session.
+    ///
+    /// Entries are returned in durable insertion order, including across a
+    /// legacy-index migration.
     ///
     /// # Errors
     ///
@@ -297,10 +322,7 @@ impl AuditLog {
         let mut entries_verified: usize = 0;
 
         // Verify each chain independently.
-        for chain_entries in chains.values_mut() {
-            // Sort by timestamp within each chain.
-            chain_entries.sort_by_key(|a| a.timestamp.0);
-
+        for chain_entries in chains.values() {
             // Verify genesis (first entry has zero previous hash).
             if !chain_entries[0].previous_hash.is_zero() {
                 issues.push(ChainIssue::InvalidGenesis {
@@ -309,7 +331,7 @@ impl AuditLog {
             }
 
             // Verify signatures.
-            for entry in chain_entries.iter() {
+            for entry in chain_entries {
                 if let Err(e) = entry.verify_signature() {
                     error!(entry_id = %entry.id, error = %e, "Invalid signature");
                     issues.push(ChainIssue::InvalidSignature {
@@ -372,8 +394,9 @@ impl AuditLog {
         let mut issues = Vec::new();
         let mut entries_verified: usize = 0;
 
-        let mut sorted = entries;
-        sorted.sort_by_key(|a| a.timestamp.0);
+        // Storage order is the durable append order. Wall-clock timestamps are
+        // signed evidence, not an ordering primitive: clocks can move backward.
+        let sorted = entries;
 
         if !sorted[0].previous_hash.is_zero() {
             issues.push(ChainIssue::InvalidGenesis {
