@@ -2998,9 +2998,10 @@ impl ExecutionEngine for WasmEngine {
             return Ok(crate::capsule::InterceptResult::Deny { reason });
         }
 
-        // Is the capsule a daemon (uplink / long-lived)? Daemons keep their
-        // load-time `u64::MAX` epoch deadline; only non-daemon capsules
-        // accept a per-invocation timeout from the profile.
+        // Is the capsule a daemon (uplink / long-lived)? Daemon invocations
+        // preserve the Store's load-time epoch policy (including the finite,
+        // rearming exempt callback); only non-daemon capsules replace it with
+        // a per-invocation timeout from the profile.
         let is_daemon = !self.manifest.uplinks.is_empty() || self.manifest.capabilities.uplink;
 
         // Layer 4 (#668): resolve the per-principal overlay VFS. The
