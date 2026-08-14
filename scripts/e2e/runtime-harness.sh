@@ -724,6 +724,22 @@ PY
     "$ARTIFACTS/agent-set-active-model.json")"
   assert_status "agent set active model" "$status" 200
   json_assert_model_id "$ARTIFACTS/agent-set-active-model.json" "openai-compat:fake-slow"
+
+  # Inventory refresh is principal-scoped. Observing the regular user's
+  # provider list no longer implies that the operator's registry view has
+  # consumed its own capsules_loaded event, so wait on the view we are about
+  # to mutate instead of relying on fleet-wide refresh side effects.
+  local operator_models_out="$ARTIFACTS/operator-models.json"
+  deadline=$((SECONDS + 45))
+  until status="$(http_status GET /api/models "$ops_bearer" "" "$operator_models_out")" \
+    && [[ "$status" == 200 ]] \
+    && grep -q 'openai-compat:fake-toolish' "$operator_models_out"; do
+    if (( SECONDS >= deadline )); then
+      cat "$operator_models_out" >&2 2>/dev/null || true
+      fail "operator registry did not discover fake-toolish via openai-compat"
+    fi
+    sleep 1
+  done
   status="$(http_status PUT /api/models/active "$ops_bearer" \
     '{"id":"openai-compat:fake-toolish"}' \
     "$ARTIFACTS/operator-set-active-model.json")"
