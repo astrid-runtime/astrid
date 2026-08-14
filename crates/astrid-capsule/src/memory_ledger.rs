@@ -28,6 +28,8 @@ pub struct StoreMemoryMeter {
     /// Principal to attribute growth to (the invoking principal; the owner for a
     /// run-loop's dedicated Store).
     principal: PrincipalId,
+    /// Conservative element ceiling derived from `max_memory_bytes`.
+    max_table_elements: usize,
     /// Shared peak ledger.
     ledger: MemoryLedger,
 }
@@ -41,6 +43,7 @@ impl StoreMemoryMeter {
         Self {
             max_memory_bytes,
             principal,
+            max_table_elements: table_element_limit(max_memory_bytes),
             ledger,
         }
     }
@@ -50,8 +53,16 @@ impl StoreMemoryMeter {
     /// pooled Store crosses principals.
     pub fn set(&mut self, max_memory_bytes: usize, principal: PrincipalId) {
         self.max_memory_bytes = max_memory_bytes;
+        self.max_table_elements = table_element_limit(max_memory_bytes);
         self.principal = principal;
     }
+}
+
+/// Conservative host bytes accounted per table element.
+const TABLE_ELEMENT_SLOT_BYTES: usize = 32;
+
+fn table_element_limit(max_memory_bytes: usize) -> usize {
+    (max_memory_bytes / TABLE_ELEMENT_SLOT_BYTES).max(1)
 }
 
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -80,11 +91,17 @@ impl wasmtime::ResourceLimiter for StoreMemoryMeter {
     fn table_growing(
         &mut self,
         _current: usize,
-        _desired: usize,
+        desired: usize,
         _maximum: Option<usize>,
     ) -> wasmtime::Result<bool> {
-        // Tables are unbounded here, matching the prior `StoreLimits` (which set
-        // only `memory_size`). Only linear memory is metered.
+        if desired > self.max_table_elements {
+            return Ok(false);
+        }
+        if let Some(max) = _maximum
+            && desired > max
+        {
+            return Ok(false);
+        }
         Ok(true)
     }
 }
@@ -119,5 +136,26 @@ mod tests {
         assert!(meter.memory_growing(0, 200 * 1024, None).unwrap());
         assert_eq!(ledger.peak(&q), 200 * 1024);
         assert_eq!(ledger.peak(&p), 48 * 1024);
+    }
+
+    #[test]
+    fn table_growth_cannot_bypass_the_memory_ceiling() {
+        use wasmtime::ResourceLimiter;
+
+        let ledger = MemoryLedger::default();
+        let principal = PrincipalId::new("carol").unwrap();
+        let mut meter = StoreMemoryMeter::new(64 * 1024, principal.clone(), ledger.clone());
+
+        // 64 KiB / 32-byte conservative slots = 2048 elements.
+        assert!(meter.table_growing(0, 2_048, None).unwrap());
+        assert!(
+            !meter.table_growing(2_048, 2_049, None).unwrap(),
+            "table growth must not become an unbounded host-memory side channel"
+        );
+
+        meter.set(32 * 1024, principal);
+        assert!(meter.table_growing(0, 1_024, None).unwrap());
+        assert!(!meter.table_growing(1_024, 1_025, None).unwrap());
+        assert!(!meter.table_growing(0, 2, Some(1)).unwrap());
     }
 }
