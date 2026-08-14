@@ -11,6 +11,12 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Fixed
 
+- **WASM traps and host process spawning now coexist safely on macOS.** Astrid
+  uses Wasmtime's Unix signal trap handler on macOS instead of the default
+  Mach-port handler, which can abort embeddings that create child processes.
+  Other platforms and process-group lifecycle semantics are unchanged. Closes
+  #1502.
+
 - **The KV retirement regression now fails deterministically instead of
   wedging the workspace suite.** Its admitted-effect boundary uses an exact
   two-party rendezvous, observes the quiescence waiter's active-operation

@@ -178,6 +178,13 @@ async fn spawn_wait_read_and_owner_isolation() {
 
 #[tokio::test]
 async fn concurrent_cap_enforced_and_stop_reaps() {
+    // macOS regression: constructing the real Wasmtime engine installs its
+    // process-wide trap handler. The registry must still be able to spawn and
+    // reap children afterward without the trap-handler thread aborting the
+    // daemon (#1502).
+    #[cfg(target_os = "macos")]
+    let _engine = crate::engine::wasm::build_wasmtime_engine().expect("wasmtime engine");
+
     let reg = PersistentProcessRegistry::new(tokio::runtime::Handle::current());
     let p = PrincipalId::new("alice").unwrap();
 
@@ -212,6 +219,31 @@ async fn concurrent_cap_enforced_and_stop_reaps() {
         .spawn(params(&p, "cap", c3, o3, e3, pid3, 1))
         .expect("third spawn after slot freed");
     reg.stop(&id3, &p, "cap", None).await.expect("cleanup stop");
+
+    // Unix signal trap handling must remain functional after child-process
+    // lifecycle work, not merely avoid the Mach-port handler abort.
+    #[cfg(target_os = "macos")]
+    {
+        let module = wasmtime::Module::new(
+            &_engine,
+            r#"(module (func (export "answer") (result i32) i32.const 42))"#,
+        )
+        .expect("test module");
+        let mut store = wasmtime::Store::new(&_engine, ());
+        store.set_fuel(10_000).expect("test fuel");
+        store.set_epoch_deadline(1);
+        let instance = wasmtime::Linker::new(&_engine)
+            .instantiate_async(&mut store, &module)
+            .await
+            .expect("instantiate after child cleanup");
+        let answer = instance
+            .get_typed_func::<(), i32>(&mut store, "answer")
+            .expect("answer export")
+            .call_async(&mut store, ())
+            .await
+            .expect("guest call after child cleanup");
+        assert_eq!(answer, 42);
+    }
 }
 
 #[tokio::test]
