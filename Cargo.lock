@@ -256,7 +256,7 @@ dependencies = [
  "astrid-telemetry",
  "astrid-types",
  "astrid-uplink",
- "base64 0.22.1",
+ "base64 0.23.1",
  "blake3",
  "chrono",
  "clap",
@@ -398,7 +398,7 @@ dependencies = [
  "astrid-vfs",
  "astrid-workspace",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "blake3",
  "bytes",
  "dashmap",
@@ -492,7 +492,7 @@ name = "astrid-core"
 version = "0.10.4"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "blake3",
  "chrono",
  "directories",
@@ -515,7 +515,7 @@ dependencies = [
 name = "astrid-crypto"
 version = "0.10.4"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "blake3",
  "ed25519-dalek",
  "getrandom 0.4.3",
@@ -602,7 +602,7 @@ dependencies = [
  "async-stream",
  "axum",
  "axum-server",
- "base64 0.22.1",
+ "base64 0.23.1",
  "blake3",
  "chrono",
  "ed25519-dalek",
@@ -717,7 +717,7 @@ dependencies = [
  "astrid-storage",
  "astrid-vfs",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "dashmap",
  "hex",

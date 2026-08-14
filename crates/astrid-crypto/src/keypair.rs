@@ -340,6 +340,16 @@ mod tests {
     }
 
     #[test]
+    fn public_key_base64_wire_format_remains_standard_padded() {
+        let pk = PublicKey::try_from_slice(&[0u8; 32]).unwrap();
+        assert_eq!(
+            pk.to_base64(),
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        );
+        assert_eq!(PublicKey::from_base64(&pk.to_base64()).unwrap(), pk);
+    }
+
+    #[test]
     fn test_public_key_verify() {
         let keypair = KeyPair::generate();
         let pk = keypair.export_public_key();
