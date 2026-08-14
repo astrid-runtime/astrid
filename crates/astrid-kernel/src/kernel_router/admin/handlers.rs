@@ -501,7 +501,7 @@ fn warm_principal_capsules(kernel: &Arc<crate::Kernel>, principal: PrincipalId) 
     let kernel = Arc::clone(kernel);
     astrid_runtime::spawn(async move {
         kernel.ensure_principal_loaded(&principal).await;
-        kernel.publish_capsules_loaded().await;
+        kernel.publish_capsules_loaded_for(&principal).await;
     });
 }
 
