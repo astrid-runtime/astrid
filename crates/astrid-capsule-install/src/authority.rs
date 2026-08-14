@@ -5,7 +5,7 @@
 //! key; it does not grant those bytes authority on this runtime.
 
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
@@ -118,6 +118,17 @@ pub struct InstalledAuthority {
     pub signature: Option<String>,
     /// Full manifest capability snapshot accepted for this install.
     pub approved_capabilities: CapabilitiesDef,
+    /// Whether `approved_wasm_hash` has been established for this receipt.
+    ///
+    /// Older receipts predate executable pinning and are migrated once from
+    /// the installed content-addressed binary. `false` therefore means "not
+    /// yet pinned", while `Some(None)` in the hash field is represented by
+    /// `true` plus a `None` hash for non-WASM capsules.
+    #[serde(default)]
+    pub wasm_hash_pinned: bool,
+    /// BLAKE3 hash of the approved WASM executable, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_wasm_hash: Option<String>,
 }
 
 /// Read an installed authority receipt.
@@ -361,6 +372,7 @@ pub fn verify_installed_authority(
     let manifest_bytes = std::fs::read(target_dir.join("Capsule.toml"))
         .context("failed to read installed capsule manifest")?;
     let current_manifest_digest = digest_manifest(&manifest_bytes);
+    let executable_hash = verified_installed_wasm_hash(home, target_dir, manifest)?;
     let Some(authority) = read_installed_authority(home, target_dir)? else {
         // Snapshot pre-authority installs once. The receipt is outside the
         // capsule VFS, so absence is a migration state rather than a permanent
@@ -378,10 +390,13 @@ pub fn verify_installed_authority(
             signer: None,
             signature: None,
             approved_capabilities: manifest.capabilities.clone(),
+            wasm_hash_pinned: true,
+            approved_wasm_hash: executable_hash,
         };
         AuthorityReceiptTransaction::stage(home, target_dir, &migrated)?.commit()?;
         return Ok(());
     };
+    let mut authority = authority;
     if authority.schema_version != 1 {
         bail!(
             "unsupported installed authority schema {}",
@@ -417,7 +432,60 @@ pub fn verify_installed_authority(
             "installed Capsule.toml differs from the exact manifest approved at install; reinstall the capsule"
         );
     }
+    if !authority.wasm_hash_pinned {
+        authority.wasm_hash_pinned = true;
+        authority.approved_wasm_hash = executable_hash;
+        AuthorityReceiptTransaction::stage(home, target_dir, &authority)?
+            .commit()
+            .context("failed to migrate installed authority executable pin")?;
+    } else if authority.approved_wasm_hash != executable_hash {
+        bail!(
+            "installed WASM executable differs from its authority receipt (approved {}, found {})",
+            authority
+                .approved_wasm_hash
+                .as_deref()
+                .unwrap_or("<non-WASM>"),
+            executable_hash.as_deref().unwrap_or("<non-WASM>"),
+        );
+    }
     Ok(())
+}
+
+/// Read and hash the exact executable the WASM engine would load.
+///
+/// `meta.json` is treated as a pointer, never as proof: the pointed-to bytes
+/// are re-hashed before an authority receipt is compared or migrated.
+fn verified_installed_wasm_hash(
+    home: &AstridHome,
+    target_dir: &Path,
+    manifest: &CapsuleManifest,
+) -> anyhow::Result<Option<String>> {
+    let Some(component) = manifest.components.first() else {
+        return Ok(None);
+    };
+    let Some(expected) = crate::read_meta(target_dir).and_then(|meta| meta.wasm_hash) else {
+        bail!("WASM capsule has no BLAKE3 hash in meta.json");
+    };
+    let executable = if component.path.is_absolute() {
+        component.path.clone()
+    } else {
+        let local = target_dir.join(&component.path);
+        if local.exists() {
+            local
+        } else {
+            home.bin_dir().join(format!("{expected}.wasm"))
+        }
+    };
+    let mut bytes = Vec::new();
+    std::fs::File::open(&executable)
+        .with_context(|| format!("failed to open installed WASM {}", executable.display()))?
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read installed WASM {}", executable.display()))?;
+    let actual = blake3::hash(&bytes).to_hex().to_string();
+    if actual != expected {
+        bail!("installed WASM integrity check failed: expected BLAKE3 {expected}, got {actual}");
+    }
+    Ok(Some(actual))
 }
 
 /// A decision bound to one previously inspected content digest.
@@ -609,6 +677,8 @@ pub fn authorize_install(
         signer,
         signature,
         approved_capabilities: inspection.requested_capabilities.clone(),
+        wasm_hash_pinned: false,
+        approved_wasm_hash: None,
     })
 }
 
@@ -730,6 +800,8 @@ pub(crate) fn authority_for_install_source(
         signer,
         signature,
         approved_capabilities: manifest.capabilities.clone(),
+        wasm_hash_pinned: false,
+        approved_wasm_hash: None,
     })
 }
 
