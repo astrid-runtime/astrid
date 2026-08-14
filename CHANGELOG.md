@@ -11,6 +11,13 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Fixed
 
+- **Runtime regression checks no longer race scheduler and principal readiness.** Watchdog fan-out now pauses between bounded batches instead of treating a cooperative yield as broadcast backpressure; process-group cancellation tests use explicit descendant gates; and crash-recovery probes wait for the target principal's capsule view after each daemon restart. Closes #1493.
+
+- **Lazy WASM pool growth no longer traps after the engine epoch advances.**
+  Component initialization now uses a finite rearming epoch policy instead of
+  an overflowing relative deadline, while deadline-bound interceptor calls
+  still restore trap behavior before guest execution. Closes #1477.
+
 - **Executable capsule runtimes are now scoped to immutable principal authority rather than shared by content hash.** Identical verified WASM still reuses compiled Wasmtime artifacts, but each `PrincipalUid` receives separate Stores, component instances, guest memory/globals, run tasks, subscriptions, MCP/native processes, readiness, cancellation, and health generations. Explicit `SystemResident` services remain intentional singletons; principal routes admit only their owner plus kernel events by default; and stale dispatcher, health, source-lookup, and process-handle state cannot cross a replacement generation. Closes #1486.
 
 - **Run-loop capsule tools now appear in `tools/list`.** A pool-less run-loop capsule's tool-describe path returned `NotSupported`, which was captured as a present-but-empty tool set, so the describe fan-out — which fires only on *absent* tools — never consulted the capsule's own `tool.v1.request.describe` responder. The load-time capture now distinguishes "couldn't capture" from "captured, empty" and leaves tools absent for pool-less capsules so the fan-out fires. Closes #1198.

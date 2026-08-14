@@ -75,6 +75,37 @@ raise SystemExit(proc.returncode)
 PY
 }
 
+wait_for_adversarial_command_route() {
+  local label=$1 principal=$2
+  local out="$ARTIFACTS/$label-command-route-wait.txt"
+  local deadline=$((SECONDS + 90))
+
+  while (( SECONDS < deadline )); do
+    if bounded_principal_cli "$principal" 8 "$out" \
+      capsule run astrid-capsule-adversarial adversarial-ready; then
+      return 0
+    fi
+    sleep 1
+  done
+
+  cat "$out" >&2 2>/dev/null || true
+  fail "$label adversarial command route did not become ready"
+}
+
+wait_for_principal_log_marker() {
+  local principal=$1 marker=$2
+  local log_root="$ASTRID_HOME/home/$principal/.local/log"
+  local deadline=$((SECONDS + 10))
+
+  until grep -R --fixed-strings --binary-files=without-match -- "$marker" \
+    "$log_root" >/dev/null 2>&1; do
+    if (( SECONDS >= deadline )); then
+      return 1
+    fi
+    sleep 0.1
+  done
+}
+
 run_inflight_prompt_crash_smoke() {
   local principal=$1
   local session=$2
@@ -107,14 +138,24 @@ run_inflight_prompt_crash_smoke() {
 run_mid_capsule_command_crash_smoke() {
   local principal=$1
   local out="$ARTIFACTS/crash-capsule-command.txt"
+  local marker
+  marker="$(printf '%08x%08x' "$RANDOM" "$RANDOM")"
   local rc=0
 
   note "checking crash recovery while a capsule command is in flight"
   bounded_principal_cli "$principal" 12 "$out" \
-    capsule run astrid-capsule-adversarial adversarial-slow &
+    capsule run astrid-capsule-adversarial adversarial-slow "$marker" &
   local run_pid=$!
 
-  sleep 1
+  wait_for_principal_log_marker "$principal" "$marker" || {
+    terminate_pid "$run_pid"
+    cat "$out" >&2 2>/dev/null || true
+    fail "slow capsule command did not enter guest execution before crash deadline"
+  }
+  kill -0 "$run_pid" 2>/dev/null || {
+    cat "$out" >&2 2>/dev/null || true
+    fail "slow capsule command completed before the daemon crash"
+  }
   crash_daemon_process
   wait "$run_pid" || rc=$?
   if [[ "$rc" -eq 0 ]]; then
@@ -256,10 +297,19 @@ run_crash_recovery_smoke() {
 
   run_inflight_prompt_crash_smoke "$user_principal" "$user_session"
   start_daemon "restarting daemon after abrupt process death"
+  wait_for_readiness_capsules crash-capsule-command "$user_bearer" \
+    astrid-capsule-adversarial
+  wait_for_adversarial_command_route crash-capsule-command "$user_principal"
   run_mid_capsule_command_crash_smoke "$user_principal"
   start_daemon "restarting daemon after capsule command crash"
+  wait_for_readiness_capsules crash-approval "$user_bearer" \
+    astrid-capsule-adversarial
+  wait_for_adversarial_command_route crash-approval "$user_principal"
   run_mid_approval_wait_crash_smoke "$user_principal" "$user_bearer"
   start_daemon "restarting daemon after approval wait crash"
+  wait_for_readiness_capsules crash-elicit "$user_bearer" \
+    astrid-capsule-adversarial
+  wait_for_adversarial_command_route crash-elicit "$user_principal"
   run_mid_elicit_wait_crash_smoke "$user_principal" "$user_bearer"
   start_daemon "restarting daemon after elicit wait crash"
   run_post_admin_mutation_crash_smoke
