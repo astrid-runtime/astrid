@@ -24,6 +24,8 @@ pub mod audit_sink;
 mod bus_monitor;
 /// `astrid.v1.capsules_loaded` payload assembly (opaque per-capsule metadata).
 mod capsules_loaded;
+#[cfg(test)]
+mod capsules_loaded_tests;
 /// Grant-on-first-use consent handler (issue #998).
 ///
 /// Native-only: reuses the management-API admin grant machinery
@@ -1692,13 +1694,13 @@ impl Kernel {
 
             for principal in &principals {
                 kernel.ensure_principal_uplinks_loaded(principal).await;
-                kernel.publish_capsules_loaded().await;
+                kernel.publish_capsules_loaded_for(principal).await;
             }
 
             for principal in principals {
                 if principal != PrincipalId::default() {
                     kernel.ensure_principal_loaded(&principal).await;
-                    kernel.publish_capsules_loaded().await;
+                    kernel.publish_capsules_loaded_for(&principal).await;
                 }
             }
         });
@@ -2076,14 +2078,14 @@ impl Kernel {
                 Box::pin(async move {
                     if let Some(principal) = Self::scoped_probe_principal(&topic) {
                         kernel.ensure_principal_uplinks_loaded(&principal).await;
-                        kernel.publish_capsules_loaded().await;
+                        kernel.publish_capsules_loaded_for(&principal).await;
                         if Self::topic_has_subscriber(Arc::clone(&kernel.capsules), topic.clone())
                             .await
                         {
                             return true;
                         }
                         kernel.ensure_principal_loaded(&principal).await;
-                        kernel.publish_capsules_loaded().await;
+                        kernel.publish_capsules_loaded_for(&principal).await;
                     }
                     Self::topic_has_subscriber(Arc::clone(&kernel.capsules), topic).await
                 })
@@ -2282,6 +2284,36 @@ impl Kernel {
             reg.cloned_values_with_principal()
         };
 
+        self.publish_capsules_loaded_snapshot(capsules, &PrincipalId::default())
+            .await;
+    }
+
+    /// Publish the current capsule inventory for exactly one principal view.
+    ///
+    /// Provisioning and profile mutation already carry the affected principal;
+    /// re-describing every other live view in those paths turns one local
+    /// mutation into fleet-wide work. Snapshot the target view while holding the
+    /// registry lock, then perform all filesystem and guest calls after release.
+    /// An empty view still emits an empty inventory so consumers can discard a
+    /// previously cached tool surface for this principal.
+    pub(crate) async fn publish_capsules_loaded_for(&self, principal: &PrincipalId) {
+        let capsules = {
+            let reg = self.capsules.read().await;
+            reg.cloned_values_for(principal)
+                .into_iter()
+                .map(|capsule| (principal.clone(), capsule))
+                .collect()
+        };
+
+        self.publish_capsules_loaded_snapshot(capsules, principal)
+            .await;
+    }
+
+    async fn publish_capsules_loaded_snapshot(
+        &self,
+        capsules: Vec<(PrincipalId, Arc<dyn astrid_capsule::capsule::Capsule>)>,
+        empty_principal: &PrincipalId,
+    ) {
         let mut by_principal = std::collections::BTreeMap::<
             String,
             Vec<(String, String, Option<serde_json::Value>)>,
@@ -2364,7 +2396,7 @@ impl Kernel {
                 .push((principal.to_string(), name, meta));
         }
         if by_principal.is_empty() {
-            by_principal.insert(PrincipalId::default().to_string(), Vec::new());
+            by_principal.insert(empty_principal.to_string(), Vec::new());
         }
 
         for (principal, entries) in by_principal {

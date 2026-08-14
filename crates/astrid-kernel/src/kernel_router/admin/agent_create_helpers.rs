@@ -145,7 +145,7 @@ async fn finish_derived_principal(
         )
         .await;
     }
-    kernel.publish_capsules_loaded().await;
+    kernel.publish_capsules_loaded_for(&principal).await;
     info!(%principal, %source, ?load_capsules, "Layer 6 agent.derive");
     success_json(serde_json::json!({
         "principal": principal.as_str(),
@@ -574,7 +574,7 @@ fn warm_created_principal(kernel: &Arc<crate::Kernel>, principal: PrincipalId) {
     let kernel = Arc::clone(kernel);
     astrid_runtime::spawn(async move {
         kernel.ensure_principal_loaded(&principal).await;
-        kernel.publish_capsules_loaded().await;
+        kernel.publish_capsules_loaded_for(&principal).await;
     });
 }
 

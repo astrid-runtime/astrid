@@ -52,6 +52,11 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   write failures and cancellation before or after durable publication. Closes
   #1478.
 - **Principal-resident WASM run loops now enter `run` with their typed runtime owner's durable KV, home, secrets, env, profile, and host-call budgets.** Autonomous work no longer falls back to `default`, a first loader, or neutral state, and explicit system-resident loops remain authority-neutral. Closes #1224; refs #1197.
+- **Single-principal capsule provisioning no longer refreshes the full fleet's
+  tool inventory.** Agent creation, derivation, profile mutation, background
+  warm-up, and scoped readiness probes now describe and publish only the
+  affected principal view; genuinely global load and lifecycle changes retain
+  the existing all-principal refresh. Closes #1483.
 
 - **Executable capsule runtimes are now scoped to immutable principal authority rather than shared by content hash.** Identical verified WASM still reuses compiled Wasmtime artifacts, but each `PrincipalUid` receives separate Stores, component instances, guest memory/globals, run tasks, subscriptions, MCP/native processes, readiness, cancellation, and health generations. Explicit `SystemResident` services remain intentional singletons; principal routes admit only their owner plus kernel events by default; and stale dispatcher, health, source-lookup, and process-handle state cannot cross a replacement generation. Closes #1486.
 
