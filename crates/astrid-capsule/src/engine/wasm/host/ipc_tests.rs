@@ -40,7 +40,8 @@ fn pattern_covers_audit_via_route_matcher() {
     assert!(pattern_covers_audit("astrid.v1.*"));
     assert!(pattern_covers_audit("astrid.*"));
 
-    // Non-audit patterns are NOT covered → never scoped.
+    // Non-audit patterns are not covered by the audit-firehose rule. They may
+    // still be scoped by the invocation-local waiter rule (#1476).
     assert!(!pattern_covers_audit("astrid.v1.request.*"));
     assert!(!pattern_covers_audit("astrid.v1.session.*"));
     assert!(!pattern_covers_audit("astrid.v1.audit"));
@@ -101,6 +102,79 @@ fn host_state_for(
     state.audit_firehose = firehose;
     state.ipc_subscribe_patterns = subscribe_acl.iter().map(|s| (*s).to_string()).collect();
     state
+}
+
+fn set_interceptor_principal(state: &mut HostState, principal: &str) {
+    state.system_runtime = true;
+    state.interceptor_active = true;
+    state.caller_context = Some(
+        InternalIpcMessage::new(
+            Topic::from_raw("test.v1.request"),
+            IpcPayload::RawJson(serde_json::json!({})),
+            uuid::Uuid::new_v4(),
+        )
+        .with_principal(principal.to_string()),
+    );
+}
+
+fn publish_response(bus: &astrid_events::EventBus, topic: &str, principal: &str) {
+    let message = InternalIpcMessage::new(
+        Topic::from_raw(topic),
+        IpcPayload::RawJson(serde_json::json!({ "for": principal })),
+        uuid::Uuid::new_v4(),
+    )
+    .with_principal(principal.to_string());
+    bus.publish(AstridEvent::Ipc {
+        metadata: EventMetadata::new("test_provider"),
+        message,
+    });
+}
+
+#[tokio::test]
+async fn interceptor_created_waiters_are_scoped_to_effective_principals() {
+    let rt = tokio::runtime::Handle::current();
+    let mut alice = host_state_for(rt.clone(), "default", false, &["provider.v1.response"]);
+    let mut bob = host_state_for(rt, "default", false, &["provider.v1.response"]);
+    bob.event_bus = alice.event_bus.clone();
+    set_interceptor_principal(&mut alice, "alice");
+    set_interceptor_principal(&mut bob, "bob");
+
+    // Both invocation-local waiters use the same static response topic at the
+    // same time, matching the context-compaction failure in #1476.
+    let alice_waiter =
+        IpcHost::subscribe(&mut alice, "provider.v1.response".to_string()).expect("alice waiter");
+    let bob_waiter =
+        IpcHost::subscribe(&mut bob, "provider.v1.response".to_string()).expect("bob waiter");
+
+    let bus = alice.event_bus.clone();
+    publish_response(&bus, "provider.v1.response", "bob");
+    publish_response(&bus, "provider.v1.response", "alice");
+    bus.publish(AstridEvent::Ipc {
+        metadata: EventMetadata::new("kernel"),
+        message: InternalIpcMessage::new(
+            Topic::from_raw("provider.v1.response"),
+            IpcPayload::RawJson(serde_json::json!({ "for": "system" })),
+            uuid::Uuid::new_v4(),
+        ),
+    });
+
+    assert_eq!(drained_principals(&mut alice, &alice_waiter), ["alice"]);
+    assert_eq!(drained_principals(&mut bob, &bob_waiter), ["bob"]);
+}
+
+#[tokio::test]
+async fn interceptor_created_waiter_keeps_same_principal_delivery() {
+    let rt = tokio::runtime::Handle::current();
+    let mut alice = host_state_for(rt, "default", false, &["provider.v1.response"]);
+    set_interceptor_principal(&mut alice, "alice");
+    let bus = alice.event_bus.clone();
+    let waiter =
+        IpcHost::subscribe(&mut alice, "provider.v1.response".to_string()).expect("alice waiter");
+
+    publish_response(&bus, "provider.v1.response", "alice");
+    publish_response(&bus, "provider.v1.response", "alice");
+
+    assert_eq!(drained_principals(&mut alice, &waiter), ["alice", "alice"]);
 }
 
 #[tokio::test]
@@ -190,6 +264,24 @@ async fn subscribe_firehose_holder_unscoped() {
     assert_eq!(got.len(), 2, "firehose holder receives both principals");
     assert!(got.iter().any(|p| p == "alice"));
     assert!(got.iter().any(|p| p == "bob"));
+}
+
+#[tokio::test]
+async fn audit_firehose_holder_remains_unscoped_during_interceptor() {
+    let rt = tokio::runtime::Handle::current();
+    let mut state = host_state_for(rt, "default", true, &[AUDIT_TOPIC]);
+    set_interceptor_principal(&mut state, "alice");
+    let bus = state.event_bus.clone();
+
+    let sub = IpcHost::subscribe(&mut state, AUDIT_TOPIC.to_string())
+        .expect("firehose subscription should be allowed");
+    publish_audit(&bus, "alice");
+    publish_audit(&bus, "bob");
+
+    let got = drained_principals(&mut state, &sub);
+    assert_eq!(got.len(), 2, "explicit firehose authority remains unscoped");
+    assert!(got.iter().any(|principal| principal == "alice"));
+    assert!(got.iter().any(|principal| principal == "bob"));
 }
 
 #[tokio::test]

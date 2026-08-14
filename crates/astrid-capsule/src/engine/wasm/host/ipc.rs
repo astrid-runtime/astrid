@@ -440,21 +440,22 @@ impl ipc::Host for HostState {
         }
 
         // Audit self-scope: a subscription whose pattern COVERS the audit
-        // topic is route-scoped to the OWNER principal unless this capsule
+        // topic is route-scoped to the current invocation/owner principal
+        // unless this capsule
         // holds `audit:read_all` (the privileged firehose, resolved at load
         // — see `HostState::audit_firehose`). Default-deny: a capsule that
         // merely declared the audit topic in its `Capsule.toml` gets only
         // its own principal's entries, closing the firehose leak.
         //
-        // Scope identity is the LOAD-TIME owner (`self.principal`),
-        // DELIBERATELY NOT `effective_principal()`: this RouteEntry is
-        // created once at subscribe() and outlives every per-invocation
-        // `caller_context`, so the stable identity that owns the receiver is
-        // the owner principal. (At a dedicated run-loop's subscribe call
-        // `caller_context` is None anyway, so `effective_principal()` would
-        // already fall back to `self.principal` — binding it explicitly
-        // documents intent and removes any dependence on transient caller
-        // context. Do not "fix" this to `effective_principal()`.)
+        // A persistent run-loop subscription is owned by the load-time runtime
+        // and retains its existing admission shape: a principal runtime admits
+        // its owner plus system events, while an explicit SystemResident
+        // runtime intentionally provides cross-principal fan-in. A subscription
+        // created *during an interceptor*, however, is an invocation-local
+        // waiter. It must be bound to that invocation's effective principal or
+        // a shared SystemResident instance can let Bob's waiter consume Alice's
+        // matching response (#1476). The route stores an owned principal key,
+        // so it stays scoped after caller_context is cleared on pool return.
         //
         // AXIS: own-principal scoping matches against the bus bucket key,
         // which `record_admin_audit` sets to the audited CALLER (the actor who
@@ -469,17 +470,19 @@ impl ipc::Host for HostState {
         // synthetic probe event, so evaluate it once and reuse for both the
         // scope decision and the audit log line.
         let covers_audit = pattern_covers_audit(&topic_pattern);
-        let unscoped = self.system_runtime || (covers_audit && self.audit_firehose);
+        let firehose = covers_audit && self.audit_firehose;
+        let invocation_principal = self.interceptor_active.then(|| self.effective_principal());
+        let unscoped = firehose || (invocation_principal.is_none() && self.system_runtime);
         if covers_audit {
             tracing::info!(
                 target: "astrid.audit.ipc",
                 security_event = true,
                 capsule_id = %self.capsule_id.as_str(),
-                principal = %self.principal,
+                principal = %invocation_principal.as_ref().unwrap_or(&self.principal),
                 topic = %topic_pattern,
                 scoped = !unscoped,
                 firehose = self.audit_firehose,
-                "ipc::subscribe: audit-covering subscription scoped to owner principal unless firehose holder",
+                "ipc::subscribe: audit-covering subscription scoped to invocation/owner principal unless firehose holder",
             );
         }
 
@@ -488,10 +491,29 @@ impl ipc::Host for HostState {
         // originating principal, so the guest never sees a
         // mixed-principal batch and the cross-principal fairness lives
         // in the bus's DRR drain — no consumer-side requeue logic
-        // needed here (#813). Principal runtimes admit their owner plus
-        // kernel/system events; SystemResident and explicitly granted audit
-        // firehose routes are unscoped.
-        let receiver = if unscoped {
+        // needed here (#813). Invocation-local waiters admit exactly their
+        // effective principal. Persistent principal runtimes admit their owner
+        // plus kernel/system events; persistent SystemResident and explicitly
+        // granted audit firehose routes remain unscoped.
+        let receiver = if firehose {
+            self.event_bus.subscribe_topic_routed_scoped_gated(
+                self.capsule_uuid,
+                topic_pattern.clone(),
+                self.capsule_id.as_str().to_string(),
+                "capsule_guest",
+                None,
+                self.route_admission_gate.clone(),
+            )
+        } else if let Some(principal) = invocation_principal.as_ref() {
+            self.event_bus.subscribe_topic_routed_for_principal_gated(
+                self.capsule_uuid,
+                topic_pattern.clone(),
+                self.capsule_id.as_str().to_string(),
+                "capsule_guest",
+                principal,
+                self.route_admission_gate.clone(),
+            )
+        } else if self.system_runtime {
             self.event_bus.subscribe_topic_routed_scoped_gated(
                 self.capsule_uuid,
                 topic_pattern.clone(),
