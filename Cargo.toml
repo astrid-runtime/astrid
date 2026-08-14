@@ -249,14 +249,14 @@ url = "2"
 utoipa = { version = "5", features = ["axum_extras"] }
 uuid = { version = "1.0", default-features = false, features = ["v4", "v5", "serde", "rng-getrandom"] }
 walkdir = "2.5"
-wasm-encoder = "0.253"
-wat = "1.252"
-wasmparser = "0.253"
+wasm-encoder = "0.256"
+wat = "1.256"
+wasmparser = "0.256"
 windows-sys = "0.61"
-wit-component = "0.253"
-wit-parser = "0.253"
-wasmtime = { version = "46.0.2", features = ["component-model", "cranelift"] }
-wasmtime-wasi = "46.0.2"
+wit-component = "0.256"
+wit-parser = "0.256"
+wasmtime = { version = "47.0.3", features = ["component-model", "cranelift"] }
+wasmtime-wasi = "47.0.3"
 unicode-normalization = "=0.1.25"
 unicode-width = "0.2"
 which = "8"

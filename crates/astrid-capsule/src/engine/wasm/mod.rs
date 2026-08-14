@@ -758,7 +758,15 @@ pub fn call_hook_trigger(
 
 fn build_wasmtime_engine() -> CapsuleResult<wasmtime::Engine> {
     let mut config = wasmtime::Config::new();
-    config.wasm_component_model(true).epoch_interruption(true);
+    // Wasmtime 47 enables GC and exception handling by default. Astrid's guest
+    // language is a security boundary, so an engine upgrade must not silently
+    // expand the accepted proposal set. Enable new proposals only after an
+    // explicit runtime design and compatibility decision.
+    config
+        .wasm_component_model(true)
+        .wasm_gc(false)
+        .wasm_exceptions(false)
+        .epoch_interruption(true);
     // Astrid deliberately spawns sandboxed child processes. Wasmtime's
     // default macOS Mach-port exception handler does not compose safely with
     // fork-style process creation and can abort its handler thread while the
@@ -1497,13 +1505,26 @@ struct CompiledWasmArtifact {
     _epoch_ticker: EpochTickerGuard,
 }
 
+const COMPILED_ENGINE_ABI: &str = "astrid-wasmtime47-component-abi-v1";
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct CompiledArtifactKey(String);
+
+impl CompiledArtifactKey {
+    fn new(verified_hash: &str) -> Self {
+        Self(format!("{COMPILED_ENGINE_ABI}:{verified_hash}"))
+    }
+}
+
 /// Deduplicates immutable verified compiled code across authority-scoped
 /// runtimes. It never stores a mutable `Store`, `Instance`, guest memory,
 /// resource table, run task, or principal host state.
 #[derive(Clone, Default)]
 pub struct CompiledWasmCache {
     entries: Arc<
-        std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<CompiledWasmArtifact>>>,
+        std::sync::Mutex<
+            std::collections::HashMap<CompiledArtifactKey, std::sync::Weak<CompiledWasmArtifact>>,
+        >,
     >,
 }
 
@@ -1515,8 +1536,7 @@ impl CompiledWasmCache {
     ) -> CapsuleResult<Arc<CompiledWasmArtifact>> {
         // This domain is part of the cache identity. Bump it whenever the
         // engine configuration or linked host ABI changes incompatibly.
-        const ENGINE_ABI: &str = "astrid-wasmtime46-component-abi-v1";
-        let key = format!("{ENGINE_ABI}:{verified_hash}");
+        let key = CompiledArtifactKey::new(verified_hash);
         let mut entries = self
             .entries
             .lock()
@@ -1555,6 +1575,24 @@ impl CompiledWasmCache {
 #[cfg(test)]
 mod compiled_artifact_cache_tests {
     use super::*;
+
+    #[test]
+    fn engine_policy_preserves_the_explicit_guest_feature_boundary() {
+        let engine = build_wasmtime_engine().expect("engine");
+        let features = engine.get_wasm_features();
+
+        assert!(!features.contains(wasmtime::WasmFeatures::GC));
+        assert!(!features.contains(wasmtime::WasmFeatures::EXCEPTIONS));
+        assert!(features.contains(wasmtime::WasmFeatures::COMPONENT_MODEL));
+    }
+
+    #[test]
+    fn compiled_cache_key_is_bound_to_the_wasmtime_47_abi() {
+        assert_eq!(
+            CompiledArtifactKey::new("verified"),
+            CompiledArtifactKey("astrid-wasmtime47-component-abi-v1:verified".to_owned())
+        );
+    }
 
     #[test]
     fn identical_verified_bytes_share_only_the_compiled_artifact() {
