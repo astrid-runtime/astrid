@@ -1363,10 +1363,19 @@ pub(crate) fn load_invocation_env_overlay(
     principal: &astrid_core::PrincipalId,
     capsule_id: &str,
 ) -> Option<std::collections::HashMap<String, String>> {
-    const MAX_ENV_FILE_BYTES: u64 = 1 << 20;
     let astrid_home = astrid_core::dirs::AstridHome::resolve().ok()?;
-    let env_path = astrid_home
-        .principal_home(principal)
+    load_invocation_env_overlay_at(&astrid_home.principal_home(principal), capsule_id)
+}
+
+/// Testable core of [`load_invocation_env_overlay`] for an already-authorized
+/// principal home. Load-time owner setup uses the exact home supplied by the
+/// kernel instead of re-resolving process-global state.
+fn load_invocation_env_overlay_at(
+    principal_home: &astrid_core::dirs::PrincipalHome,
+    capsule_id: &str,
+) -> Option<std::collections::HashMap<String, String>> {
+    const MAX_ENV_FILE_BYTES: u64 = 1 << 20;
+    let env_path = principal_home
         .env_dir()
         .join(format!("{capsule_id}.env.json"));
 
@@ -2038,30 +2047,43 @@ impl ExecutionEngine for WasmEngine {
             // config. The capsule-authored manifest never grants exemption: a
             // capsule that merely declares `uplink`/`net_bind` without the
             // principal holding the granted capability is BOUNDED. The owner
-            // principal is resolved SYNC and NON-FATALLY from
+            // principal is resolved synchronously from
             // `ctx.profile_cache` (the load-time source — `self.profile_cache`
-            // is only assigned later, after `make_state`); a missing cache
-            // (tests / single-tenant) or resolve error falls through to BOUNDED
-            // (fail-secure), never to exempt. See [`resolve_run_loop_budget`]
-            // and [`resolve_exemption`] for the pure, unit-tested branching.
+            // is only assigned later, after `make_state`). Typed principal run
+            // loops require successful resolution because the same profile is
+            // also their host-call authority context. Unstamped compatibility
+            // callers retain the historical bounded fallback. See
+            // [`resolve_run_loop_budget`] and [`resolve_exemption`] for the
+            // pure, unit-tested budget branching.
             let has_run_export = wasm_exports_contain_run(&wasm_bytes);
-            let owner_profile: Option<Arc<astrid_core::profile::PrincipalProfile>> =
-                (!system_runtime).then_some(()).and_then(|()| {
-                    ctx.profile_cache.as_ref().and_then(|cache| {
-                    cache
-                        .resolve(&ctx.principal)
-                        .map_err(|e| {
-                            tracing::warn!(
-                                principal = %ctx.principal,
-                                error = %e,
-                                "owner profile resolve failed at load; bounding run-loop \
-                                 with the default finite budget (fail-secure)"
-                            );
-                            e
-                        })
-                        .ok()
-                    })
+            let principal_runtime_id = self.runtime_id.as_ref().filter(|runtime_id| {
+                matches!(
+                    runtime_id.key().scope(),
+                    crate::registry::RuntimeScope::Principal(_)
+                    )
                 });
+            let typed_principal_run = has_run_export && principal_runtime_id.is_some();
+            let owner_profile: Option<Arc<astrid_core::profile::PrincipalProfile>> =
+                if system_runtime {
+                    None
+                } else if typed_principal_run {
+                    let cache = ctx.profile_cache.as_ref().ok_or_else(|| {
+                        CapsuleError::ExecutionFailed(format!(
+                            "principal run-loop capsule '{}' has no owner profile resolver",
+                            manifest.package.name
+                        ))
+                    })?;
+                    Some(cache.resolve(&ctx.principal).map_err(|error| {
+                        CapsuleError::ExecutionFailed(format!(
+                            "principal run-loop capsule '{}' cannot resolve owner '{}' profile: {error}",
+                            manifest.package.name, ctx.principal
+                        ))
+                    })?)
+                } else {
+                    ctx.profile_cache
+                        .as_ref()
+                        .and_then(|cache| cache.resolve(&ctx.principal).ok())
+                };
             let load_group_config =
                 crate::context::live_group_config_for(&ctx.group_config)
                     .map(|groups| groups.load_full())
@@ -2115,10 +2137,16 @@ impl ExecutionEngine for WasmEngine {
             // autonomous `run()` can use KV/home/secrets before its first
             // recv. Explicit system runtimes retain the neutral deny-all
             // fallback and are never aliases for the default human principal.
-            let owner_vfs = if system_runtime {
-                PrincipalVfsBundle::default()
-            } else {
-                build_principal_vfs_bundle(&ctx.principal).await
+            let owner_principal_home = (!system_runtime)
+                .then(|| {
+                    ctx.home_root
+                        .as_ref()
+                        .map(astrid_core::dirs::PrincipalHome::from_path)
+                })
+                .flatten();
+            let owner_vfs = match owner_principal_home.as_ref() {
+                Some(principal_home) => build_principal_vfs_bundle_at(principal_home).await,
+                None => PrincipalVfsBundle::default(),
             };
             let owner_secret_store = Some(astrid_storage::build_secret_store(
                 &if system_runtime {
@@ -2129,9 +2157,9 @@ impl ExecutionEngine for WasmEngine {
                 kv.clone(),
                 tokio::runtime::Handle::current(),
             ));
-            let owner_capsule_log = (!system_runtime)
-                .then(|| open_capsule_log(&ctx.principal, capsule_id_val.as_str(), true))
-                .flatten();
+            let owner_capsule_log = owner_principal_home.as_ref().and_then(|principal_home| {
+                open_capsule_log_at(principal_home, capsule_id_val.as_str(), true)
+            });
             let owner_file_secret_root = (!system_runtime)
                 .then(|| astrid_core::dirs::AstridHome::resolve().ok().map(|home| home.secrets_dir()))
                 .flatten();
@@ -2569,6 +2597,29 @@ impl ExecutionEngine for WasmEngine {
                     count,
                     "Auto-subscribed interceptors for run-loop capsule"
                 );
+            }
+
+            // A typed principal runtime owns one durable authority context. Its
+            // autonomous `run` export bypasses dispatcher/recv setup, so install
+            // that owner's profile, sub-budgets, env, KV, mounts, secrets, log,
+            // and cancellation scope before the run task can start. Explicit
+            // SystemResident runtimes stay neutral; an unstamped compatibility
+            // runtime is never promoted by guessing from `ctx.principal`.
+            if has_run && typed_principal_run {
+                let owner_profile = owner_profile.clone().ok_or_else(|| {
+                    CapsuleError::ExecutionFailed(format!(
+                        "principal run-loop capsule '{}' has no resolved owner profile",
+                        manifest.package.name
+                    ))
+                })?;
+                let runtime_id = principal_runtime_id.expect("typed principal run has runtime id");
+                let owner_env = owner_principal_home.as_ref().and_then(|principal_home| {
+                    load_invocation_env_overlay_at(principal_home, manifest.package.name.as_str())
+                });
+                let mut store = store_arc.as_ref().expect("run-loop has store").lock().await;
+                store
+                    .data_mut()
+                    .install_run_loop_owner_context(runtime_id, owner_profile, owner_env)?;
             }
 
             Ok::<_, CapsuleError>((
@@ -3918,6 +3969,37 @@ mod tests {
         assert!(!runtime_id_is_system(None));
         assert!(!runtime_id_is_system(Some(&principal)));
         assert!(runtime_id_is_system(Some(&system)));
+    }
+
+    #[test]
+    fn owner_env_loader_reads_only_the_supplied_principal_home() {
+        let alice_dir = tempfile::tempdir().unwrap();
+        let bob_dir = tempfile::tempdir().unwrap();
+        let alice = astrid_core::dirs::PrincipalHome::from_path(alice_dir.path());
+        let bob = astrid_core::dirs::PrincipalHome::from_path(bob_dir.path());
+        std::fs::create_dir_all(alice.env_dir()).unwrap();
+        std::fs::create_dir_all(bob.env_dir()).unwrap();
+        std::fs::write(
+            alice.env_dir().join("runner.env.json"),
+            r#"{"OWNER":"alice"}"#,
+        )
+        .unwrap();
+        std::fs::write(bob.env_dir().join("runner.env.json"), r#"{"OWNER":"bob"}"#).unwrap();
+
+        assert_eq!(
+            load_invocation_env_overlay_at(&alice, "runner")
+                .unwrap()
+                .get("OWNER")
+                .map(String::as_str),
+            Some("alice")
+        );
+        assert_eq!(
+            load_invocation_env_overlay_at(&bob, "runner")
+                .unwrap()
+                .get("OWNER")
+                .map(String::as_str),
+            Some("bob")
+        );
     }
 
     // ── git-managed workspace detection (gitoxide work-tree discovery) ──
