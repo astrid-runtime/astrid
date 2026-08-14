@@ -11,6 +11,8 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Fixed
 
+- **Runtime regression checks no longer race scheduler and principal readiness.** Watchdog fan-out now pauses between bounded batches instead of treating a cooperative yield as broadcast backpressure; process-group cancellation tests use explicit descendant gates; and crash-recovery probes wait for the target principal's capsule view after each daemon restart. Closes #1493.
+
 - **Lazy WASM pool growth no longer traps after the engine epoch advances.**
   Component initialization now uses a finite rearming epoch policy instead of
   an overflowing relative deadline, while deadline-bound interceptor calls

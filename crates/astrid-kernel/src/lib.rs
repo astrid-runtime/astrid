@@ -76,6 +76,7 @@ const SCOPED_TOPIC_PROBE_SENTINEL: &str = "\0astrid.scoped-topic\0";
 const SCOPED_SERVICE_PROBE_SENTINEL: &str = "\0astrid.scoped-service\0";
 pub(crate) const REACT_WATCHDOG_TOPIC: &str = "astrid.v1.watchdog.tick";
 const WATCHDOG_PUBLISH_BATCH: usize = 32;
+const WATCHDOG_PUBLISH_PAUSE: std::time::Duration = std::time::Duration::from_millis(1);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CapsuleViewKey {
@@ -3814,7 +3815,12 @@ async fn publish_watchdog_ticks(
             message: msg,
         });
         if index != 0 && index.is_multiple_of(WATCHDOG_PUBLISH_BATCH) {
-            tokio::task::yield_now().await;
+            // `broadcast` has no receiver acknowledgement or async send. A
+            // cooperative yield may immediately reschedule this producer, so
+            // it is not backpressure and can still overrun every receiver on
+            // a busy runner. Give consumers one bounded scheduler interval
+            // between sub-capacity batches instead.
+            tokio::time::sleep(WATCHDOG_PUBLISH_PAUSE).await;
         }
     }
 }
