@@ -11,6 +11,11 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Fixed
 
+- **SurrealKV now preserves memtable rotation and compaction durability through
+  its 0.21.3 fixes.** The update corrects atomic memtable rotation and fsyncs
+  post-compaction state so power loss cannot strand the newly compacted store.
+  Closes #1508.
+
 - **WASM traps and host process spawning now coexist safely on macOS.** Astrid
   uses Wasmtime's Unix signal trap handler on macOS instead of the default
   Mach-port handler, which can abort embeddings that create child processes.
