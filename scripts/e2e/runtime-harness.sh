@@ -714,53 +714,8 @@ PY
   done
   run_cli capsule run astrid-capsule-registry models set openai-compat:fake-echo
 
-  note "checking per-principal active model isolation"
-  status="$(http_status GET /api/models "$user_bearer" "" "$ARTIFACTS/agent-models.json")"
-  assert_status "agent model list" "$status" 200
-  json_assert_model_list_contains "$ARTIFACTS/agent-models.json" "openai-compat:fake-echo"
-  json_assert_model_list_contains "$ARTIFACTS/agent-models.json" "openai-compat:fake-slow"
-  status="$(http_status PUT /api/models/active "$user_bearer" \
-    '{"id":"openai-compat:fake-slow"}' \
-    "$ARTIFACTS/agent-set-active-model.json")"
-  assert_status "agent set active model" "$status" 200
-  json_assert_model_id "$ARTIFACTS/agent-set-active-model.json" "openai-compat:fake-slow"
-
-  # Inventory refresh is principal-scoped. Observing the regular user's
-  # provider list no longer implies that the operator's registry view has
-  # consumed its own capsules_loaded event, so wait on the view we are about
-  # to mutate instead of relying on fleet-wide refresh side effects.
-  local operator_models_out="$ARTIFACTS/operator-models.json"
-  deadline=$((SECONDS + 45))
-  until status="$(http_status GET /api/models "$ops_bearer" "" "$operator_models_out")" \
-    && [[ "$status" == 200 ]] \
-    && grep -q 'openai-compat:fake-toolish' "$operator_models_out"; do
-    if (( SECONDS >= deadline )); then
-      cat "$operator_models_out" >&2 2>/dev/null || true
-      fail "operator registry did not discover fake-toolish via openai-compat"
-    fi
-    sleep 1
-  done
-  status="$(http_status PUT /api/models/active "$ops_bearer" \
-    '{"id":"openai-compat:fake-toolish"}' \
-    "$ARTIFACTS/operator-set-active-model.json")"
-  assert_status "operator set active model" "$status" 200
-  json_assert_model_id "$ARTIFACTS/operator-set-active-model.json" "openai-compat:fake-toolish"
-  status="$(http_status GET /api/models/active "$user_bearer" "" "$ARTIFACTS/agent-active-model.json")"
-  assert_status "agent active model" "$status" 200
-  json_assert_model_id "$ARTIFACTS/agent-active-model.json" "openai-compat:fake-slow"
-  status="$(http_status GET /api/models/active "$ops_bearer" "" "$ARTIFACTS/operator-active-model.json")"
-  assert_status "operator active model" "$status" 200
-  json_assert_model_id "$ARTIFACTS/operator-active-model.json" "openai-compat:fake-toolish"
-  status="$(http_status GET "/api/models/active?principal=$ops_principal" "$user_bearer" "" \
-    "$ARTIFACTS/agent-active-model-query-spoof.json")"
-  assert_status "agent active model query spoof ignored" "$status" 200
-  json_assert_model_id "$ARTIFACTS/agent-active-model-query-spoof.json" "openai-compat:fake-slow"
-  status="$(http_status PUT /api/models/active "$user_bearer" \
-    '{"id":"openai-compat:fake-slow","principal":"default"}' \
-    "$ARTIFACTS/agent-set-active-model-body-spoof.json")"
-  assert_status "agent active model body spoof ignored" "$status" 200
-  json_assert_model_id "$ARTIFACTS/agent-set-active-model-body-spoof.json" "openai-compat:fake-slow"
-  run_concurrent_model_write_smoke "$user_bearer" "$ops_bearer" "$user_principal" "$ops_principal"
+  run_active_model_isolation_smoke \
+    "$user_bearer" "$ops_bearer" "$user_principal" "$ops_principal"
   run_llm_provider_smoke "$user_bearer" "$user_principal" "$ARTIFACTS/agent-models.json" "$fake_base_url"
 
   run_multi_home_smoke "$fake_base_url" "$user_bearer" "$user_principal"
