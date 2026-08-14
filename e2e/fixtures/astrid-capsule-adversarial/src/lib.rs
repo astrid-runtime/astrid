@@ -124,14 +124,27 @@ fn publish_probe_report(req_id: &str) {
 }
 
 fn run_slow_command(req_id: &str, marker: Option<&str>) {
+    let sleeper = match ipc::subscribe(SESSION_LIST_REQUEST_TOPIC) {
+        Ok(sleeper) => sleeper,
+        Err(error) => {
+            let topic = format!("{CLI_RESULT_TOPIC_PREFIX}{req_id}");
+            let _ = ipc::publish_json(
+                &topic,
+                &serde_json::json!({
+                    "exit_code": 1,
+                    "output": "",
+                    "error": format!("slow command setup failed: {error}"),
+                }),
+            );
+            return;
+        },
+    };
     log::info(&format!(
         "adversarial slow command started marker={}",
         marker.unwrap_or("missing")
     ));
-    if let Ok(sleeper) = ipc::subscribe(SESSION_LIST_REQUEST_TOPIC) {
-        for _ in 0..40 {
-            let _ = sleeper.recv(250);
-        }
+    for _ in 0..40 {
+        let _ = sleeper.recv(250);
     }
     log::info("adversarial slow command completed");
     let topic = format!("{CLI_RESULT_TOPIC_PREFIX}{req_id}");

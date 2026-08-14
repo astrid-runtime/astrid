@@ -152,6 +152,10 @@ run_mid_capsule_command_crash_smoke() {
     cat "$out" >&2 2>/dev/null || true
     fail "slow capsule command did not enter guest execution before crash deadline"
   }
+  kill -0 "$run_pid" 2>/dev/null || {
+    cat "$out" >&2 2>/dev/null || true
+    fail "slow capsule command completed before the daemon crash"
+  }
   crash_daemon_process
   wait "$run_pid" || rc=$?
   if [[ "$rc" -eq 0 ]]; then
