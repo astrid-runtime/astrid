@@ -759,6 +759,13 @@ pub fn call_hook_trigger(
 fn build_wasmtime_engine() -> CapsuleResult<wasmtime::Engine> {
     let mut config = wasmtime::Config::new();
     config.wasm_component_model(true).epoch_interruption(true);
+    // Astrid deliberately spawns sandboxed child processes. Wasmtime's
+    // default macOS Mach-port exception handler does not compose safely with
+    // fork-style process creation and can abort its handler thread while the
+    // parent remains healthy. Use the supported Unix signal trap handler on
+    // macOS so WASM traps and host process lifecycle can coexist (#1502).
+    #[cfg(target_os = "macos")]
+    config.macos_use_mach_ports(false);
     // Fuel metering is the per-invocation CPU MEASUREMENT only (not the
     // run-loop CPU bound — that is the epoch mechanism below). Fuel counts
     // EXECUTED guest instructions independent of host-call yields, so
