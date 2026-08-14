@@ -1082,7 +1082,7 @@ mod tests {
     #[cfg(unix)]
     impl rmcp::ServerHandler for ReluctantMcpServer {}
 
-    /// Subprocess-only fixture driven by `stop_awaits_rmcp_process_tree_absence`.
+    /// Subprocess-only fixture driven by `stop_awaits_rmcp_process_tree_termination`.
     /// It completes the real MCP handshake, spawns a descendant, then refuses
     /// to exit after its stdio service closes so rmcp must take its forced
     /// process-tree termination path.
@@ -1112,9 +1112,48 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn stop_awaits_rmcp_process_tree_absence() {
+    fn assert_process_terminated(pid: nix::unistd::Pid) {
         use nix::errno::Errno;
+        use nix::sys::signal::kill;
+
+        match kill(pid, None) {
+            Err(Errno::ESRCH) => return,
+            Ok(()) => {},
+            Err(error) => panic!("failed to inspect descendant {pid}: {error}"),
+        }
+
+        // The process-group leader can reap only its own children. Once that
+        // leader exits, a killed descendant belongs to the platform reaper and
+        // can remain visible briefly as a zombie (not an executable process).
+        let output = std::process::Command::new("/bin/ps")
+            .args(["-o", "state=", "-p", &pid.as_raw().to_string()])
+            .output()
+            .expect("inspect descendant process state");
+        if !output.status.success() {
+            assert_eq!(
+                kill(pid, None),
+                Err(Errno::ESRCH),
+                "descendant disappeared from ps for an unexpected reason"
+            );
+            return;
+        }
+
+        let state = output
+            .stdout
+            .iter()
+            .copied()
+            .find(|byte| !byte.is_ascii_whitespace())
+            .map(char::from);
+        assert_eq!(
+            state,
+            Some('Z'),
+            "stop returned while descendant {pid} remained executable"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_awaits_rmcp_process_tree_termination() {
         use nix::sys::signal::kill;
         use nix::unistd::Pid;
 
@@ -1192,11 +1231,7 @@ mod tests {
             .expect("stop task should join")
             .expect("stop fixture server");
 
-        assert_eq!(
-            kill(Pid::from_raw(descendant_pid), None),
-            Err(Errno::ESRCH),
-            "stop must not return before the descendant is absent"
-        );
+        assert_process_terminated(Pid::from_raw(descendant_pid));
     }
 
     #[cfg(unix)]
