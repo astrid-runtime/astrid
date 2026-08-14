@@ -12,8 +12,8 @@ use tokio::sync::Semaphore;
 
 use super::super::test_fixtures::minimal_host_state;
 use super::super::{
-    PrincipalInvocationTracker, cancel_principal_token, install_principal_overlays_sync,
-    resume_principal_token,
+    PrincipalInvocationTracker, QuiescenceObservationHook, cancel_principal_token,
+    install_principal_overlays_sync, resume_principal_token,
 };
 use crate::engine::wasm::bindings::astrid::elicit::host::Host as ElicitHost;
 use crate::engine::wasm::bindings::astrid::fs::host::{ErrorCode as FsError, Host as FsHost};
@@ -400,4 +400,45 @@ async fn retirement_waits_for_admitted_recv_kv_effect_before_reclamation() {
         state.begin_host_operation().is_ok(),
         "peer authority remains live"
     );
+}
+
+#[tokio::test]
+async fn quiescence_wait_registers_before_sampling_active_operations() {
+    let tracker = Arc::new(PrincipalInvocationTracker::default());
+    let principal = alice();
+    let admitted = tracker
+        .begin(&principal)
+        .expect("principal operation should be admitted");
+    tracker.retire(&principal);
+
+    let (observed_tx, observed_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+    let waiting_tracker = Arc::clone(&tracker);
+    let waiting_principal = principal.clone();
+    let waiter = tokio::spawn(async move {
+        waiting_tracker
+            .wait_for_quiescence_with_observation_hook(
+                &waiting_principal,
+                QuiescenceObservationHook {
+                    observed: observed_tx,
+                    resume: resume_rx,
+                },
+            )
+            .await;
+    });
+
+    observed_rx
+        .await
+        .expect("waiter should observe the active operation");
+    // Drop the final guard in the exact historical lost-wakeup window: after
+    // the waiter sampled a non-zero count, but before it awaits notification.
+    drop(admitted);
+    resume_tx
+        .send(())
+        .expect("waiter should remain paused at the observation hook");
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+        .await
+        .expect("registered notification must wake quiescence")
+        .expect("quiescence task should join");
 }
