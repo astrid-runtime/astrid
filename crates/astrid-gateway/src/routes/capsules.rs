@@ -37,6 +37,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use astrid_capsule_install::github_source;
+use astrid_capsule_types::capability_presentation::{SemanticCapability, semantic_capabilities};
+use astrid_capsule_types::manifest::CapabilitiesDef;
 use astrid_core::kernel_api::{CapsuleMetadataEntry, KernelRequest, KernelResponse};
 use axum::Json;
 use axum::extract::{Path, State};
@@ -59,6 +61,31 @@ pub struct CapsuleDetail {
     pub id: String,
     /// Interceptor event patterns declared by the capsule.
     pub interceptor_events: Vec<String>,
+    /// Human-facing permission cards derived from the manifest.
+    pub permissions: Vec<CapsulePermissionView>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CapsulePermissionView {
+    /// Manifest capability field correlated with raw policy.
+    pub capability: String,
+    /// Plain-language action.
+    pub action: String,
+    /// Exact authorized scopes.
+    pub scope: Vec<String>,
+    /// Why this matters to the person approving or inspecting it.
+    pub impact: String,
+}
+
+impl From<SemanticCapability> for CapsulePermissionView {
+    fn from(value: SemanticCapability) -> Self {
+        Self {
+            capability: value.capability,
+            action: value.action,
+            scope: value.scope,
+            impact: value.impact,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -395,21 +422,39 @@ pub async fn get_capsule(
         .await
         .map_err(daemon_kernel_error)?;
     match resp {
-        KernelResponse::CapsuleMetadata(meta) => meta
-            .into_iter()
-            .find(|m: &CapsuleMetadataEntry| m.name == id)
-            .map(|m| {
-                Json(CapsuleDetail {
-                    id: m.name,
-                    interceptor_events: m.interceptor_events,
-                })
-            })
-            .ok_or(GatewayError::NotFound),
+        KernelResponse::CapsuleMetadata(meta) => {
+            let Some(m) = meta
+                .into_iter()
+                .find(|m: &CapsuleMetadataEntry| m.name == id)
+            else {
+                return Err(GatewayError::NotFound);
+            };
+            let permissions = permission_cards(&m.capabilities)?;
+            Ok(Json(CapsuleDetail {
+                id: m.name,
+                interceptor_events: m.interceptor_events,
+                permissions,
+            }))
+        },
         KernelResponse::Error(msg) => hidden_capsule_detail_denial(&caller.principal, &id, &msg),
         other => Err(internal(format!(
             "unexpected response shape for GetCapsuleMetadata: {other:?}"
         ))),
     }
+}
+
+fn permission_cards(
+    capabilities: &serde_json::Value,
+) -> Result<Vec<CapsulePermissionView>, GatewayError> {
+    if capabilities.is_null() {
+        return Ok(Vec::new());
+    }
+    let capabilities: CapabilitiesDef = serde_json::from_value(capabilities.clone())
+        .map_err(|e| internal(format!("capsule capability metadata is invalid: {e}")))?;
+    Ok(semantic_capabilities(&capabilities)
+        .into_iter()
+        .map(CapsulePermissionView::from)
+        .collect())
 }
 
 /// `GET /api/capsules/{id}/topics` — the capsule's declared
@@ -602,6 +647,35 @@ mod tests {
             _ => panic!("expected Error variant"),
         };
         assert!(matches!(mapped, GatewayError::Forbidden { .. }));
+    }
+
+    #[test]
+    fn permission_cards_translate_wildcard_ports_for_dashboards() {
+        let capabilities = serde_json::json!({
+            "net_connect": ["api.example.com:443", "service.example.com:*"]
+        });
+        let cards = permission_cards(&capabilities).expect("valid capability metadata");
+        let network = cards
+            .iter()
+            .find(|card| card.capability == "net_connect")
+            .expect("network card");
+        assert_eq!(
+            network.scope,
+            [
+                "api.example.com: port 443",
+                "service.example.com: any port, including OS-assigned ephemeral ports",
+            ]
+        );
+
+        assert!(
+            permission_cards(&serde_json::Value::Null)
+                .expect("older kernels may omit capabilities")
+                .is_empty()
+        );
+        assert!(
+            permission_cards(&serde_json::json!({"net_connect": 443})).is_err(),
+            "malformed capability metadata must fail closed rather than render an empty permission list"
+        );
     }
 
     /// A crafted release-asset name with path traversal is reduced to its
