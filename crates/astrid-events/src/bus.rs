@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::broadcast;
 use tracing::{debug, trace, warn};
 
+use astrid_core::PrincipalId;
+
 use crate::event::AstridEvent;
 use crate::route::{
     MAX_SUBSCRIPTION_BUDGET_BYTES, PrincipalKey, RouteAdmissionGate, RouteEntry, RouteKey,
@@ -418,6 +420,33 @@ impl EventBus {
             lagged_count: 0,
             subscriber,
         }
+    }
+
+    /// Routed subscription restricted to one typed principal.
+    ///
+    /// Unlike [`subscribe_topic_routed_principal_or_system_gated`](Self::subscribe_topic_routed_principal_or_system_gated),
+    /// this route does not admit principal-less kernel/system events. It is the
+    /// appropriate boundary for an invocation-local response waiter: the
+    /// response must carry the same authenticated principal as the invocation
+    /// that created the waiter.
+    #[must_use]
+    pub fn subscribe_topic_routed_for_principal_gated(
+        &self,
+        capsule_uuid: uuid::Uuid,
+        topic_pattern: impl Into<String>,
+        capsule_id_label: impl Into<String>,
+        subscriber: &'static str,
+        principal: &PrincipalId,
+        gate: RouteAdmissionGate,
+    ) -> RoutedEventReceiver {
+        self.subscribe_topic_routed_scoped_gated(
+            capsule_uuid,
+            topic_pattern,
+            capsule_id_label,
+            subscriber,
+            Some(Some(principal.to_string())),
+            gate,
+        )
     }
 
     /// Routed subscription for one principal runtime. It admits events from
