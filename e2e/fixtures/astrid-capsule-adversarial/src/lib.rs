@@ -11,6 +11,7 @@ const SESSION_LIST_REQUEST_TOPIC: &str = "session.v1.request.list";
 const SESSION_LIST_RESPONSE_PREFIX: &str = "session.v1.response.list.";
 const CLI_RUN_COMMAND: &str = "adversarial";
 const CLI_SLOW_COMMAND: &str = "adversarial-slow";
+const CLI_READY_COMMAND: &str = "adversarial-ready";
 const CLI_APPROVAL_COMMAND: &str = "adversarial-approval";
 const CLI_ELICIT_COMMAND: &str = "adversarial-elicit";
 const MAX_REQ_ID_LEN: usize = 64;
@@ -79,12 +80,34 @@ fn dispatch_cli_runs(result: &ipc::PollResult) {
         }
         match payload.get("command").and_then(|v| v.as_str()) {
             Some(CLI_RUN_COMMAND) => publish_probe_report(req_id),
-            Some(CLI_SLOW_COMMAND) => run_slow_command(req_id),
+            Some(CLI_SLOW_COMMAND) => run_slow_command(req_id, command_marker(&payload)),
+            Some(CLI_READY_COMMAND) => publish_ready(req_id),
             Some(CLI_APPROVAL_COMMAND) => run_approval_command(req_id),
             Some(CLI_ELICIT_COMMAND) => run_elicit_command(req_id),
             _ => {},
         }
     }
+}
+
+fn command_marker(payload: &serde_json::Value) -> Option<&str> {
+    payload
+        .get("args")
+        .and_then(|args| args.as_array())
+        .and_then(|args| args.first())
+        .and_then(|marker| marker.as_str())
+        .filter(|marker| is_valid_req_id(marker))
+}
+
+fn publish_ready(req_id: &str) {
+    let topic = format!("{CLI_RESULT_TOPIC_PREFIX}{req_id}");
+    let _ = ipc::publish_json(
+        &topic,
+        &serde_json::json!({
+            "exit_code": 0,
+            "output": "adversarial command route ready",
+            "error": "",
+        }),
+    );
 }
 
 fn publish_probe_report(req_id: &str) {
@@ -100,8 +123,11 @@ fn publish_probe_report(req_id: &str) {
     );
 }
 
-fn run_slow_command(req_id: &str) {
-    log::info("adversarial slow command started");
+fn run_slow_command(req_id: &str, marker: Option<&str>) {
+    log::info(&format!(
+        "adversarial slow command started marker={}",
+        marker.unwrap_or("missing")
+    ));
     if let Ok(sleeper) = ipc::subscribe(SESSION_LIST_REQUEST_TOPIC) {
         for _ in 0..40 {
             let _ = sleeper.recv(250);

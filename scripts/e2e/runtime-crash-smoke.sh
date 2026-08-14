@@ -82,7 +82,7 @@ wait_for_adversarial_command_route() {
 
   while (( SECONDS < deadline )); do
     if bounded_principal_cli "$principal" 8 "$out" \
-      capsule run astrid-capsule-adversarial adversarial; then
+      capsule run astrid-capsule-adversarial adversarial-ready; then
       return 0
     fi
     sleep 1
@@ -90,6 +90,20 @@ wait_for_adversarial_command_route() {
 
   cat "$out" >&2 2>/dev/null || true
   fail "$label adversarial command route did not become ready"
+}
+
+wait_for_principal_log_marker() {
+  local principal=$1 marker=$2
+  local log_root="$ASTRID_HOME/home/$principal/.local/log"
+  local deadline=$((SECONDS + 10))
+
+  until grep -R --fixed-strings --binary-files=without-match -- "$marker" \
+    "$log_root" >/dev/null 2>&1; do
+    if (( SECONDS >= deadline )); then
+      return 1
+    fi
+    sleep 0.1
+  done
 }
 
 run_inflight_prompt_crash_smoke() {
@@ -124,14 +138,20 @@ run_inflight_prompt_crash_smoke() {
 run_mid_capsule_command_crash_smoke() {
   local principal=$1
   local out="$ARTIFACTS/crash-capsule-command.txt"
+  local marker
+  marker="$(printf '%08x%08x' "$RANDOM" "$RANDOM")"
   local rc=0
 
   note "checking crash recovery while a capsule command is in flight"
   bounded_principal_cli "$principal" 12 "$out" \
-    capsule run astrid-capsule-adversarial adversarial-slow &
+    capsule run astrid-capsule-adversarial adversarial-slow "$marker" &
   local run_pid=$!
 
-  sleep 1
+  wait_for_principal_log_marker "$principal" "$marker" || {
+    terminate_pid "$run_pid"
+    cat "$out" >&2 2>/dev/null || true
+    fail "slow capsule command did not enter guest execution before crash deadline"
+  }
   crash_daemon_process
   wait "$run_pid" || rc=$?
   if [[ "$rc" -eq 0 ]]; then
