@@ -387,16 +387,27 @@ async fn retirement_waits_for_admitted_recv_kv_effect_before_reclamation() {
         panic!("KV effect must reach the storage mutation barrier");
     }
     tracker.retire(&a);
+    let (observed_tx, observed_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
     let mut draining = {
         let tracker = Arc::clone(&tracker);
         let a = a.clone();
-        tokio::spawn(async move { tracker.wait_for_quiescence(&a).await })
+        tokio::spawn(async move {
+            tracker
+                .wait_for_quiescence_with_observation_hook(
+                    &a,
+                    QuiescenceObservationHook {
+                        observed: observed_tx,
+                        resume: resume_rx,
+                    },
+                )
+                .await;
+        })
     };
-    tokio::task::yield_now().await;
-    assert!(
-        !draining.is_finished(),
-        "reclamation must wait behind the KV effect"
-    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), observed_rx)
+        .await
+        .expect("quiescence waiter must sample the admitted KV effect")
+        .expect("quiescence observation channel must remain open");
 
     if tokio::time::timeout(std::time::Duration::from_secs(5), release.wait())
         .await
@@ -414,6 +425,9 @@ async fn retirement_waits_for_admitted_recv_kv_effect_before_reclamation() {
             },
         };
     result.unwrap();
+    resume_tx
+        .send(())
+        .expect("quiescence waiter must remain paused until the KV effect drains");
     if tokio::time::timeout(std::time::Duration::from_secs(5), &mut draining)
         .await
         .is_err()
