@@ -26,8 +26,8 @@ fn alice() -> astrid_core::PrincipalId {
 
 struct BlockingSetStore {
     inner: astrid_storage::MemoryKvStore,
-    entered: Arc<tokio::sync::Notify>,
-    release: Arc<tokio::sync::Notify>,
+    entered: Arc<tokio::sync::Barrier>,
+    release: Arc<tokio::sync::Barrier>,
 }
 
 #[async_trait::async_trait]
@@ -45,8 +45,8 @@ impl astrid_storage::KvStore for BlockingSetStore {
         key: &str,
         value: Vec<u8>,
     ) -> astrid_storage::StorageResult<()> {
-        self.entered.notify_one();
-        self.release.notified().await;
+        self.entered.wait().await;
+        self.release.wait().await;
         self.inner.set(namespace, key, value).await
     }
     async fn delete(&self, namespace: &str, key: &str) -> astrid_storage::StorageResult<bool> {
@@ -350,8 +350,8 @@ fn retired_principal_loses_kv_fs_and_secret_host_authority_without_harming_peer(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retirement_waits_for_admitted_recv_kv_effect_before_reclamation() {
     let tracker = Arc::new(PrincipalInvocationTracker::default());
-    let entered = Arc::new(tokio::sync::Notify::new());
-    let release = Arc::new(tokio::sync::Notify::new());
+    let entered = Arc::new(tokio::sync::Barrier::new(2));
+    let release = Arc::new(tokio::sync::Barrier::new(2));
     let backend: Arc<dyn astrid_storage::KvStore> = Arc::new(BlockingSetStore {
         inner: astrid_storage::MemoryKvStore::new(),
         entered: Arc::clone(&entered),
@@ -371,13 +371,23 @@ async fn retirement_waits_for_admitted_recv_kv_effect_before_reclamation() {
     });
     state.invocation_kv = Some(astrid_storage::ScopedKvStore::new(backend, "alice:test").unwrap());
 
-    let operation = tokio::task::spawn_blocking(move || {
-        let result = KvHost::kv_set(&mut state, "effect".into(), b"committed".to_vec());
+    let mut operation = tokio::spawn(async move {
+        let _operation = state
+            .begin_host_operation()
+            .expect("principal storage operation should be admitted");
+        let kv = state.effective_kv().clone();
+        let result = kv.set("effect", b"committed".to_vec()).await;
         (state, result)
     });
-    entered.notified().await;
+    if tokio::time::timeout(std::time::Duration::from_secs(5), entered.wait())
+        .await
+        .is_err()
+    {
+        operation.abort();
+        panic!("KV effect must reach the storage mutation barrier");
+    }
     tracker.retire(&a);
-    let draining = {
+    let mut draining = {
         let tracker = Arc::clone(&tracker);
         let a = a.clone();
         tokio::spawn(async move { tracker.wait_for_quiescence(&a).await })
@@ -388,10 +398,29 @@ async fn retirement_waits_for_admitted_recv_kv_effect_before_reclamation() {
         "reclamation must wait behind the KV effect"
     );
 
-    release.notify_one();
-    let (mut state, result) = operation.await.unwrap();
+    if tokio::time::timeout(std::time::Duration::from_secs(5), release.wait())
+        .await
+        .is_err()
+    {
+        operation.abort();
+        panic!("KV effect must rendezvous at the release barrier");
+    }
+    let (mut state, result) =
+        match tokio::time::timeout(std::time::Duration::from_secs(5), &mut operation).await {
+            Ok(joined) => joined.unwrap(),
+            Err(_) => {
+                operation.abort();
+                panic!("released KV effect must complete");
+            },
+        };
     result.unwrap();
-    draining.await.unwrap();
+    if tokio::time::timeout(std::time::Duration::from_secs(5), &mut draining)
+        .await
+        .is_err()
+    {
+        draining.abort();
+        panic!("quiescence must complete after the KV effect drains");
+    }
 
     let bob = astrid_core::PrincipalId::new("agent-bob-barrier").unwrap();
     tracker.resume(&bob);
