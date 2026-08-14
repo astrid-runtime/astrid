@@ -12,15 +12,18 @@ cargo-fuzz = true
 [dependencies]
 arbitrary = { version = "1", features = ["derive"] }
 astrid-capabilities = { path = "../crates/astrid-capabilities", optional = true }
+astrid-capsule-types = { path = "../crates/astrid-capsule-types", optional = true }
 astrid-capsule = { path = "../crates/astrid-capsule", features = ["fuzzing"], optional = true }
 astrid-core = { path = "../crates/astrid-core", optional = true }
 astrid-crypto = { path = "../crates/astrid-crypto", optional = true }
 astrid-events = { path = "../crates/astrid-events", optional = true }
 libfuzzer-sys = "0.4"
+toml = "0.8"
 
 [features]
-default = ["core-target", "crypto-target", "events-target"]
+default = ["core-target", "crypto-target", "events-target", "manifest-target"]
 capabilities-target = ["dep:astrid-capabilities"]
+manifest-target = ["dep:astrid-capsule-types"]
 core-target = ["dep:astrid-core"]
 crypto-target = ["dep:astrid-crypto"]
 events-target = ["dep:astrid-events"]
@@ -33,6 +36,14 @@ test = false
 doc = false
 bench = false
 required-features = ["capabilities-target"]
+
+[[bin]]
+name = "manifest_capabilities"
+path = "fuzz_targets/manifest_capabilities.rs"
+test = false
+doc = false
+bench = false
+required-features = ["manifest-target"]
 
 [[bin]]
 name = "crypto_wire"
