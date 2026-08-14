@@ -59,6 +59,33 @@ pub(super) struct PooledInstance {
     pub(super) instance: Instance,
 }
 
+/// Epoch behavior while a fresh Store runs component initialization.
+///
+/// Wasmtime accepts deadlines as deltas from the engine's current epoch. A
+/// `u64::MAX` "never" sentinel therefore wraps as soon as that epoch is
+/// non-zero, making a lazily-created Store immediately interrupt. Exemption is
+/// represented as behavior instead: periodically continue without trapping.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum InstantiationEpochPolicy {
+    Deadline(u64),
+    Exempt { rearm_ticks: u64 },
+}
+
+impl InstantiationEpochPolicy {
+    fn apply(self, store: &mut Store<HostState>) {
+        match self {
+            Self::Deadline(ticks) => store.set_epoch_deadline(ticks),
+            Self::Exempt { rearm_ticks } => {
+                debug_assert!(rearm_ticks > 0, "exempt epoch window must be non-zero");
+                store.set_epoch_deadline(rearm_ticks);
+                store.epoch_deadline_callback(move |_store| {
+                    Ok(wasmtime::UpdateDeadline::Continue(rearm_ticks))
+                });
+            },
+        }
+    }
+}
+
 /// The immutable ingredients to mint a fresh `(Store, Instance)` on demand,
 /// captured once at load so the pool can grow lazily without re-running the
 /// linker.
@@ -73,9 +100,9 @@ pub(super) struct InstanceBuilder {
     engine: wasmtime::Engine,
     instance_pre: InstancePre<HostState>,
     make_state: Arc<dyn Fn() -> HostState + Send + Sync>,
-    /// Initial epoch deadline seeded on every fresh Store (the per-invocation
-    /// epoch is re-applied at invoke time, exactly as for eager instances).
-    epoch_deadline: u64,
+    /// Epoch policy applied while every fresh Store runs component init (the
+    /// per-invocation policy is re-applied at invoke time).
+    epoch_policy: InstantiationEpochPolicy,
     /// Fuel seed so `instantiate_async` (which runs guest component-init code)
     /// does not trap a fresh, zero-fuel Store on its first instruction.
     fuel_budget: u64,
@@ -86,14 +113,14 @@ impl InstanceBuilder {
         engine: wasmtime::Engine,
         instance_pre: InstancePre<HostState>,
         make_state: Arc<dyn Fn() -> HostState + Send + Sync>,
-        epoch_deadline: u64,
+        epoch_policy: InstantiationEpochPolicy,
         fuel_budget: u64,
     ) -> Self {
         Self {
             engine,
             instance_pre,
             make_state,
-            epoch_deadline,
+            epoch_policy,
             fuel_budget,
         }
     }
@@ -104,7 +131,7 @@ impl InstanceBuilder {
     pub(super) async fn build(&self) -> CapsuleResult<PooledInstance> {
         let mut store = Store::new(&self.engine, (self.make_state)());
         store.limiter(|state| &mut state.store_meter);
-        store.set_epoch_deadline(self.epoch_deadline);
+        self.epoch_policy.apply(&mut store);
         // Fuel is engine-wide; a fresh Store starts at 0 and would trap on the
         // first instruction of `instantiate_async`. Seed it; the per-invocation
         // budget re-sets fuel afterwards.
@@ -703,7 +730,13 @@ mod tests {
         let handle = tokio::runtime::Handle::current();
         let make_state: Arc<dyn Fn() -> HostState + Send + Sync> =
             Arc::new(move || minimal_host_state(handle.clone()));
-        let builder = InstanceBuilder::new(engine, instance_pre, make_state, u64::MAX, 1_000_000);
+        let builder = InstanceBuilder::new(
+            engine,
+            instance_pre,
+            make_state,
+            InstantiationEpochPolicy::Deadline(1_000_000),
+            1_000_000,
+        );
 
         let mut initial = Vec::with_capacity(min_idle);
         for _ in 0..min_idle {
@@ -741,6 +774,86 @@ mod tests {
             .expect("checkout after return");
 
         drop((c1, c2, c3, c5));
+        cancel.cancel();
+    }
+
+    /// Regression for #1477: the eager four-instance warm floor is created at
+    /// epoch zero, then the shared engine advances before a fifth concurrent
+    /// lease forces lazy instantiation. The old exempt `u64::MAX` delta wrapped
+    /// to an elapsed absolute deadline and trapped during component init.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn exempt_lazy_growth_after_epoch_advance_completes_fifth_request() {
+        let engine = super::super::build_wasmtime_engine().expect("engine");
+        let component = wasmtime::component::Component::new(
+            &engine,
+            r#"
+            (component
+              (core module $request
+                (func $start
+                  (local $remaining i32)
+                  i32.const 1000
+                  local.set $remaining
+                  (loop $work
+                    local.get $remaining
+                    i32.const 1
+                    i32.sub
+                    local.tee $remaining
+                    br_if $work))
+                (start $start)
+                (func (export "finish") (result i32)
+                  i32.const 42))
+              (core instance $request-instance (instantiate $request))
+              (func (export "finish") (result s32)
+                (canon lift (core func $request-instance "finish"))))
+            "#,
+        )
+        .expect("request component");
+        let linker: wasmtime::component::Linker<HostState> =
+            wasmtime::component::Linker::new(&engine);
+        let instance_pre = linker.instantiate_pre(&component).expect("instantiate_pre");
+        let handle = tokio::runtime::Handle::current();
+        let make_state: Arc<dyn Fn() -> HostState + Send + Sync> =
+            Arc::new(move || minimal_host_state(handle.clone()));
+        let builder = InstanceBuilder::new(
+            engine.clone(),
+            instance_pre,
+            make_state,
+            InstantiationEpochPolicy::Exempt { rearm_ticks: 1 },
+            1_000_000,
+        );
+
+        let mut warm = Vec::with_capacity(4);
+        for _ in 0..4 {
+            warm.push(builder.build().await.expect("warm instance"));
+        }
+        engine.increment_epoch();
+
+        let cancel = CancellationToken::new();
+        let pool = CapsuleInstancePool::new(warm, 5, 4, true, builder, &cancel);
+        let mut first_four = Vec::with_capacity(4);
+        for _ in 0..4 {
+            first_four.push(pool.checkout().await);
+        }
+        assert!(first_four.iter().all(Option::is_some));
+
+        let mut fifth = tokio::time::timeout(Duration::from_secs(1), pool.checkout())
+            .await
+            .expect("fifth request must reach a terminal result")
+            .expect("lazy growth must instantiate after the epoch advances");
+        let instance = fifth.instance();
+        let finish = instance
+            .get_typed_func::<(), (i32,)>(fifth.store_mut(), "finish")
+            .expect("finish export");
+        let (result,) = tokio::time::timeout(
+            Duration::from_secs(1),
+            finish.call_async(fifth.store_mut(), ()),
+        )
+        .await
+        .expect("fifth request must not hang")
+        .expect("fifth request must not interrupt-trap");
+        assert_eq!(result, 42);
+
+        drop((first_four, fifth));
         cancel.cancel();
     }
 

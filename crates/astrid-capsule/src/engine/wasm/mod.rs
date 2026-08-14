@@ -2268,25 +2268,28 @@ impl ExecutionEngine for WasmEngine {
                 audit_sink: st_audit_sink.clone(),
             });
 
-            // Initial epoch deadline applied to every freshly-instantiated
-            // pool Store below. This is a wall-clock placeholder, NOT the
-            // bound run-loop CPU mechanism:
-            //  - exempt: u64::MAX at the pool-load default. For an exempt
-            //    RUN-LOOP this placeholder is REPLACED below with a finite
-            //    yield-always window (`exempt_epoch_action`) so it cooperatively
-            //    yields the worker and can never starve the daemon. Exempt
-            //    interceptor POOL Stores keep u64::MAX here (see the STOP-AND-
-            //    REPORT note on the exempt interceptor epoch path).
+            // Initial epoch policy applied while every freshly-instantiated
+            // pool Store runs component initialization. This is NOT the bound
+            // run-loop CPU mechanism:
+            //  - exempt: a finite window whose callback always continues.
+            //    Exemption is explicit behavior, not a `u64::MAX` deadline
+            //    delta (which wraps once the shared engine epoch is non-zero).
+            //    An exempt RUN-LOOP replaces this below with its cooperative
+            //    yield-always callback.
             //  - interceptor pool Stores: the existing finite default; the real
             //    per-invocation epoch is re-applied per call in
             //    `invoke_interceptor` (unchanged).
             //  - bound run-loops: this default is replaced in the run-loop
             //    Store setup with the per-WINDOW epoch deadline + interrupt
             //    callback (`epoch_decision`).
-            let pool_epoch_deadline = if run_budget.exempt {
-                u64::MAX
+            let pool_epoch_policy = if run_budget.exempt {
+                pool::InstantiationEpochPolicy::Exempt {
+                    rearm_ticks: DEFAULT_RUN_LOOP_WINDOW_TICKS,
+                }
             } else {
-                WASM_CAPSULE_TIMEOUT_SECS * 1000 / EPOCH_TICK_INTERVAL.as_millis() as u64
+                pool::InstantiationEpochPolicy::Deadline(
+                    WASM_CAPSULE_TIMEOUT_SECS * 1000 / EPOCH_TICK_INTERVAL.as_millis() as u64,
+                )
             };
 
             // Build the engine, linker, and compiled component ONCE; the pool
@@ -2329,7 +2332,7 @@ impl ExecutionEngine for WasmEngine {
                 wt_engine.clone(),
                 instance_pre,
                 Arc::clone(&make_state),
-                pool_epoch_deadline,
+                pool_epoch_policy,
                 INTERCEPTOR_FUEL_BUDGET,
             );
             let mut initial_instances: Vec<pool::PooledInstance> =
@@ -3089,6 +3092,11 @@ impl ExecutionEngine for WasmEngine {
             if !is_daemon {
                 let deadline = applied_profile.quotas.max_timeout_secs.saturating_mul(1000)
                     / EPOCH_TICK_INTERVAL.as_millis() as u64;
+                // Component initialization may have installed the exempt
+                // continue callback. A short-lived interceptor invocation is
+                // always deadline-bound, so restore Wasmtime's trapping policy
+                // before applying its caller-profile timeout.
+                s.epoch_deadline_trap();
                 s.set_epoch_deadline(deadline);
             }
 
