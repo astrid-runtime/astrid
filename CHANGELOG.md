@@ -11,6 +11,16 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Fixed
 
+- **Principal retirement no longer loses its final quiescence wakeup.** The
+  host-operation drain registers for notification before sampling the active
+  count, so an operation completing in that window cannot leave agent deletion
+  or capsule unload waiting forever. Closes #1497.
+
+- **MCP teardown regression checks now distinguish terminated zombies from
+  executable descendants on macOS.** Process-tree shutdown remains strict for
+  live children while allowing the platform reaper to retain an already-dead
+  orphan briefly as a zombie. Closes #1495.
+
 - **Runtime regression checks no longer race scheduler and principal readiness.** Watchdog fan-out now pauses between bounded batches instead of treating a cooperative yield as broadcast backpressure; process-group cancellation tests use explicit descendant gates; and crash-recovery probes wait for the target principal's capsule view after each daemon restart. Closes #1493.
 
 - **Lazy WASM pool growth no longer traps after the engine epoch advances.**

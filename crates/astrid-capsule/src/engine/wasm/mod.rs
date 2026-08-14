@@ -351,6 +351,12 @@ pub(crate) struct PrincipalInvocationGuard {
     principal: astrid_core::PrincipalId,
 }
 
+#[cfg(test)]
+pub(crate) struct QuiescenceObservationHook {
+    pub(crate) observed: tokio::sync::oneshot::Sender<()>,
+    pub(crate) resume: tokio::sync::oneshot::Receiver<()>,
+}
+
 impl PrincipalInvocationTracker {
     pub(super) fn begin(
         self: &Arc<Self>,
@@ -387,8 +393,27 @@ impl PrincipalInvocationTracker {
     }
 
     async fn wait_for_quiescence(&self, principal: &astrid_core::PrincipalId) {
+        self.wait_for_quiescence_inner(
+            principal,
+            #[cfg(test)]
+            None,
+        )
+        .await;
+    }
+
+    async fn wait_for_quiescence_inner(
+        &self,
+        principal: &astrid_core::PrincipalId,
+        #[cfg(test)] mut observation_hook: Option<QuiescenceObservationHook>,
+    ) {
         loop {
             let notified = self.changed.notified();
+            tokio::pin!(notified);
+            // notify_waiters does not retain a permit for a future that has
+            // not registered yet. Register before sampling active, otherwise
+            // the final guard can drop between the sample and first poll and
+            // leave retirement asleep after the principal is already drained.
+            notified.as_mut().enable();
             let active = self
                 .state
                 .lock()
@@ -397,11 +422,25 @@ impl PrincipalInvocationTracker {
                 .get(principal)
                 .copied()
                 .unwrap_or(0);
+            #[cfg(test)]
+            if let Some(hook) = observation_hook.take() {
+                let _ = hook.observed.send(());
+                let _ = hook.resume.await;
+            }
             if active == 0 {
                 return;
             }
             notified.await;
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_for_quiescence_with_observation_hook(
+        &self,
+        principal: &astrid_core::PrincipalId,
+        hook: QuiescenceObservationHook,
+    ) {
+        self.wait_for_quiescence_inner(principal, Some(hook)).await;
     }
 }
 
