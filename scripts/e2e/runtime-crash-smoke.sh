@@ -256,10 +256,16 @@ run_crash_recovery_smoke() {
 
   run_inflight_prompt_crash_smoke "$user_principal" "$user_session"
   start_daemon "restarting daemon after abrupt process death"
+  wait_for_readiness_capsules crash-capsule-command "$user_bearer" \
+    astrid-capsule-adversarial
   run_mid_capsule_command_crash_smoke "$user_principal"
   start_daemon "restarting daemon after capsule command crash"
+  wait_for_readiness_capsules crash-approval "$user_bearer" \
+    astrid-capsule-adversarial
   run_mid_approval_wait_crash_smoke "$user_principal" "$user_bearer"
   start_daemon "restarting daemon after approval wait crash"
+  wait_for_readiness_capsules crash-elicit "$user_bearer" \
+    astrid-capsule-adversarial
   run_mid_elicit_wait_crash_smoke "$user_principal" "$user_bearer"
   start_daemon "restarting daemon after elicit wait crash"
   run_post_admin_mutation_crash_smoke
