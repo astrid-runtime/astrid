@@ -7,6 +7,7 @@ Last reviewed: 2026-07-18
 Baselines:
 
 - [Astrid Native Component Kernel](astrid-native-kernel.md)
+- [Astrid Fleet Computer and Principal Views](astrid-fleet-computer.md)
 - [Astrid Tensor Logic Composition](astrid-tensor-logic-composition.md)
 - [Astrid Driver Domain Contract](astrid-driver-domain-contract.md)
 - [AOS Principal Linux Realm](https://github.com/unicity-aos/aos-ce/blob/main/docs/principal-linux-realm.md)
@@ -47,6 +48,7 @@ recorded in the driver-domain contract.
 |---|---|---|
 | Native-kernel purpose and boundary | Protection domains, capability handles, IPC, budgets, recovery, minimal QEMU machine | Kernel charter, threat model, formal object model, skeleton, fault evidence |
 | Current Astrid preservation | Portability seams, host assumptions, stable capsule/WIT direction | Compile boundary audit, host conformance suite, explicit compatibility ledger |
+| Fleet computer | User/fleet/principal identity separation, composed resource views, fleet-shared and principal-private roots, human mounts, desktop leases, team service boundary | Fleet-owned root grammar, provider-neutral namespace core, two-principal Realm/desktop/mount proof, cross-platform adapters |
 | Principal Linux realm | Private guest ABI, bounded nested Wasmi process, installable no-`host_process` capsule, AOS Realm image direction | Principal-scoped durable VFS, processes, shell, toolchain, self-hosted capsule build |
 | Driver architecture | WASM/native split, role separation, mediated queues, deferred IRQ, IOMMU/DMA, lifecycle/transition contract, three GPU deployments | Formal models, resolved open decisions, reset evidence, prototype measurements |
 | Composition architecture | Principal catalog, exact relations, candidates, validator, materializer, Tensor Logic seam | Fixture corpus, executable sparse evaluator, Alloy/TLA+ models, production adapters |
