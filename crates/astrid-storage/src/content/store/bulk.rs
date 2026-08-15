@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use astrid_storage_engine::{ProjectionObserver, ProjectionPhase};
+use crate::engine::{ProjectionObserver, ProjectionPhase};
 use parking_lot::Mutex;
 
 use super::projection::{BatchAdmission, StagedObjectBatch, admit_object_batch_observed};
@@ -532,7 +532,7 @@ fn phase_durations(observer: Option<&BulkPhaseObserver>) -> BulkIngestPhaseDurat
 
 fn retain_final_catalog_records(
     catalog: Option<super::CatalogRoot>,
-    records: &mut BTreeMap<astrid_storage_model::ObjectId, astrid_storage_model::ObjectRecord>,
+    records: &mut BTreeMap<crate::storage_model::ObjectId, crate::storage_model::ObjectRecord>,
 ) {
     let mut reachable = BTreeSet::new();
     let mut pending = catalog
@@ -662,7 +662,7 @@ where
 
 fn batch_outcome(
     completed: &BTreeMap<ContentName, PreparedContent>,
-    root: astrid_storage_model::RootState,
+    root: crate::storage_model::RootState,
     objects_inserted: u64,
 ) -> ContentBatchWriteOutcome {
     let entries = completed

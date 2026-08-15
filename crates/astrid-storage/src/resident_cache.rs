@@ -4,13 +4,13 @@ use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
-use astrid_resources::{
-    ElasticLogicalMemoryPool, ElasticPhysicalMemoryPool, MemoryClass, MemorySubsystem,
-    ResidentMemoryAuthority,
-};
-use astrid_storage_engine::{
+use crate::engine::{
     ObjectCacheCapacity, ObjectCacheConfig, ObjectCacheController, ObjectCacheMemoryBudget,
     PrincipalObjectCacheBudget,
+};
+use crate::resources::{
+    ElasticLogicalMemoryPool, ElasticPhysicalMemoryPool, MemoryClass, MemorySubsystem,
+    ResidentMemoryAuthority,
 };
 use parking_lot::Mutex;
 

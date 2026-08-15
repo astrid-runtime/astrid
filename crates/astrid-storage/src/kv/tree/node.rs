@@ -1,6 +1,6 @@
 //! Canonical page grammar for the persistent KV B+-tree.
 
-use astrid_storage_model::{
+use crate::storage_model::{
     ObjectClass, ObjectId, ObjectKind, ObjectRecord, ObjectReference, ReferenceKind, ReferenceLabel,
 };
 
@@ -458,7 +458,7 @@ fn serialization(message: &str) -> StorageError {
     StorageError::Serialization(message.to_owned())
 }
 
-fn model_error(error: &astrid_storage_model::ModelError) -> StorageError {
+fn model_error(error: &crate::storage_model::ModelError) -> StorageError {
     StorageError::Serialization(error.to_string())
 }
 

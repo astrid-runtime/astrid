@@ -358,7 +358,7 @@ its predecessor. Cross-name resemblance is a secondary use of sketches.
 ### Implementation
 
 - The pinned DF-1 transform and canonical sketch grammar are implemented in
-  `astrid-storage-engine`.
+  `astrid-storage::engine`.
 - The shared evidence harness measures useful overlap and reconstructed
   COPY/ADD delta sizes across the registered curve.
 - Sketches use non-owning references, remain evictable, and recompute

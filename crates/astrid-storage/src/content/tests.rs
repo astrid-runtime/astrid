@@ -6,12 +6,12 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 
-use astrid_storage_engine::{
+use crate::engine::{
     CommitOutcome, DurableEngine, IdentityScheme, InMemoryEngine, PersistentObjectIdentity,
     PrincipalCodec, PrincipalProjectionEngine, PrincipalProjectionError, ProjectionCacheEntry,
     ProjectionCacheKey, RecoveryLimits, RootTransaction,
 };
-use astrid_storage_model::{
+use crate::storage_model::{
     InsertOutcome, ModelError, ObjectClass, ObjectId, ObjectIdentity, ObjectKind, ObjectRecord,
     ObjectReference, ReferenceKind, ReferenceLabel, RootState,
 };
@@ -714,7 +714,7 @@ fn cold_range_after_reopen_rejects_a_tampered_neighbour_chunk() {
     let owner = "alice".to_owned();
     let name = ContentName::new("durable-neighbour").unwrap();
     let value = bytes(8 * 1024 * 1024);
-    let profile = astrid_storage_content::ChunkingProfile::ASTRID_V1;
+    let profile = crate::content_dag::ChunkingProfile::ASTRID_V1;
     let chunks: Vec<_> = FastCDC::with_level_and_seed(
         &value,
         usize::try_from(profile.minimum_bytes()).unwrap(),
@@ -1642,12 +1642,12 @@ fn concurrent_catalog_updates_retry_the_shared_root_cas() {
 
 #[test]
 fn principal_content_error_preserves_nested_sources() {
-    let error = PrincipalContentError::Content(astrid_storage_content::ContentError::Model(
+    let error = PrincipalContentError::Content(crate::content_dag::ContentError::Model(
         ModelError::ArithmeticOverflow,
     ));
     let content_source = std::error::Error::source(&error).unwrap();
     let content_error = content_source
-        .downcast_ref::<astrid_storage_content::ContentError>()
+        .downcast_ref::<crate::content_dag::ContentError>()
         .unwrap();
     let model_source = std::error::Error::source(content_error).unwrap();
 

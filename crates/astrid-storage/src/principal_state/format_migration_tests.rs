@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use astrid_storage_model::{ObjectId, ObjectIdentity};
+use crate::storage_model::{ObjectId, ObjectIdentity};
 
 use super::bootstrap;
 use super::format_amendment::{

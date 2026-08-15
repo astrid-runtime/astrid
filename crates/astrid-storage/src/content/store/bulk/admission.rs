@@ -195,7 +195,7 @@ where
             store.engine.as_ref(),
             message.expected,
             message.prepared,
-            observer.map(|observer| observer as &dyn astrid_storage_engine::ProjectionObserver),
+            observer.map(|observer| observer as &dyn crate::engine::ProjectionObserver),
         );
         elapsed = elapsed.saturating_add(started.elapsed());
         gauge.release(message.retained_bytes);
@@ -276,8 +276,8 @@ where
 }
 
 struct AdmissionMessage {
-    expected: Vec<astrid_storage_model::ObjectId>,
-    prepared: astrid_storage_engine::PreparedProjectionBatch,
+    expected: Vec<crate::storage_model::ObjectId>,
+    prepared: crate::engine::PreparedProjectionBatch,
     retained_bytes: usize,
 }
 

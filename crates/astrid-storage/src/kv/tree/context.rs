@@ -3,8 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 
-use astrid_storage_engine::{KvProjectionEngine, RootTransaction};
-use astrid_storage_model::{
+use crate::engine::{KvProjectionEngine, RootTransaction};
+use crate::storage_model::{
     ModelError, ObjectClass, ObjectId, ObjectKind, ObjectRecord, ObjectReference, ReferenceKind,
 };
 
@@ -682,6 +682,6 @@ fn arithmetic_overflow() -> StorageError {
     StorageError::Internal("persistent KV tree arithmetic overflow".to_owned())
 }
 
-fn model_error(error: &astrid_storage_model::ModelError) -> StorageError {
+fn model_error(error: &crate::storage_model::ModelError) -> StorageError {
     StorageError::Serialization(error.to_string())
 }

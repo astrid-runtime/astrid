@@ -4,18 +4,18 @@ use std::io::Read;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use astrid_storage_content::{
+use crate::content_dag::{
     BuiltContent, ChunkingProfile, ContentDescriptor, ContentError, ContentObjectSink,
     ContentReadError, ContentSource, ContentStreamError, ContentVerificationState, OpenedContent,
     VerifiedContent, build_content, build_content_streaming, describe_content, open_content,
     read_opened_content_and_verify, read_opened_content_range_with_verification,
     read_verified_content, read_verified_content_range,
 };
-use astrid_storage_engine::{
+use crate::engine::{
     PrincipalProjectionEngine, PrincipalProjectionError, ProjectionCacheEntry, ProjectionCacheKey,
     ProjectionCachePayload, RootTransaction,
 };
-use astrid_storage_model::{
+use crate::storage_model::{
     InsertOutcome, ModelError, ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind,
     ObjectRecord, ObjectReference, ReferenceKind, ReferenceLabel, RootState,
 };

@@ -80,7 +80,7 @@ configurable runtime backend.
 
 Delivered:
 
-1. `astrid-storage-model` defines canonical identifiers, ownership classes,
+1. `astrid-storage::storage_model` defines canonical identifiers, ownership classes,
    object grammar, closure validation, accounting definitions, and a small
    executable state machine.
 2. Typed state views and structural transition witnesses bind

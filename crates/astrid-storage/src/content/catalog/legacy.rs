@@ -1,10 +1,10 @@
 use std::collections::BTreeMap;
 
-use astrid_storage_model::{
+use crate::storage_model::{
     ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord, ReferenceKind,
 };
 #[cfg(test)]
-use astrid_storage_model::{ObjectReference, ReferenceLabel};
+use crate::storage_model::{ObjectReference, ReferenceLabel};
 
 use super::super::{ContentName, PrincipalContentError};
 use super::CatalogValue;

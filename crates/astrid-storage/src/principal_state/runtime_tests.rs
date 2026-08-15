@@ -4,19 +4,17 @@ use std::num::NonZeroU64;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-#[cfg(feature = "legacy-surrealkv")]
-use astrid_core::profile::{DeviceKey, DeviceScope, PrincipalProfile};
-use astrid_resources::ResidentMemoryAuthority;
 #[cfg(not(target_os = "windows"))]
-use astrid_storage_engine::crash_replay::{
-    CrashTrace, CrashTraceRecorder, TraceEffect, TraceFileId,
-};
-use astrid_storage_engine::{ObjectCacheCapacity, ObjectCacheController, RootTransaction};
-use astrid_storage_model::{
+use crate::engine::crash_replay::{CrashTrace, CrashTraceRecorder, TraceEffect, TraceFileId};
+use crate::engine::{ObjectCacheCapacity, ObjectCacheController, RootTransaction};
+use crate::resources::ResidentMemoryAuthority;
+use crate::storage_model::{
     CanonicalChunkingProfile, ObjectClass, ObjectFormatVersion, ObjectKind, ObjectReference,
     PhysicalIdentity, ProfileKind, ReconstructionBounds, ReferenceLabel, RepresentationProfile,
     RootGeneration, RootState,
 };
+#[cfg(feature = "legacy-surrealkv")]
+use astrid_core::profile::{DeviceKey, DeviceScope, PrincipalProfile};
 
 use super::*;
 use crate::content::{CONTENT_COMPONENT_LABEL, CatalogValue, LegacyCatalog, encode_legacy_catalog};
@@ -350,7 +348,7 @@ fn assert_reader_rejects_substituted_format_specification(home: &AstridHome, scr
     )
     .unwrap();
     let (replacement_id, inserted) = engine.persist_standalone_object(&replacement_spec).unwrap();
-    assert_eq!(inserted, astrid_storage_model::InsertOutcome::Inserted);
+    assert_eq!(inserted, crate::storage_model::InsertOutcome::Inserted);
     engine.close().unwrap();
 
     let metadata = home.principal_store_path().join(STORE_METADATA_FILE);

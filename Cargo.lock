@@ -774,14 +774,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "astrid-resources"
-version = "0.10.4"
-dependencies = [
- "parking_lot",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "astrid-runtime"
 version = "0.10.4"
 dependencies = [
@@ -797,10 +789,6 @@ name = "astrid-storage"
 version = "0.10.4"
 dependencies = [
  "astrid-core",
- "astrid-resources",
- "astrid-storage-content",
- "astrid-storage-engine",
- "astrid-storage-model",
  "async-trait",
  "blake3",
  "cap-std 4.0.2",
@@ -808,6 +796,7 @@ dependencies = [
  "chrono",
  "ed25519-dalek",
  "fastcdc",
+ "fs2",
  "getrandom 0.4.3",
  "hex",
  "keyring",
@@ -832,9 +821,6 @@ version = "0.10.4"
 dependencies = [
  "anyhow",
  "astrid-storage",
- "astrid-storage-content",
- "astrid-storage-engine",
- "astrid-storage-model",
  "blake3",
  "fastcdc",
  "hex",
@@ -844,39 +830,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "walkdir",
-]
-
-[[package]]
-name = "astrid-storage-content"
-version = "0.10.4"
-dependencies = [
- "astrid-storage-model",
- "fastcdc",
-]
-
-[[package]]
-name = "astrid-storage-engine"
-version = "0.10.4"
-dependencies = [
- "astrid-storage-content",
- "astrid-storage-model",
- "blake3",
- "cap-std 4.0.2",
- "ed25519-dalek",
- "fs2",
- "libc",
- "parking_lot",
- "sha2 0.11.0",
- "tempfile",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "astrid-storage-model"
-version = "0.10.4"
-dependencies = [
- "blake3",
- "tempfile",
 ]
 
 [[package]]

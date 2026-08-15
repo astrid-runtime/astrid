@@ -13,7 +13,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use astrid_storage_engine::GroupCommitPolicy;
+use crate::engine::GroupCommitPolicy;
 use uuid::Uuid;
 
 #[cfg(test)]

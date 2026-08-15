@@ -3,8 +3,8 @@
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
+use crate::engine::PrincipalCodec;
 use astrid_core::principal::PrincipalId;
-use astrid_storage_engine::PrincipalCodec;
 use uuid::Uuid;
 
 use super::{StagedContentId, connection};

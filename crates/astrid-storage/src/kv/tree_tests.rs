@@ -3,15 +3,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use astrid_storage_engine::{
+use crate::engine::{
     CommitOutcome, InMemoryEngine, KvProjectionEngine, KvProjectionError, RootSnapshot,
     RootTransaction,
 };
 #[cfg(not(target_family = "wasm"))]
-use astrid_storage_engine::{
+use crate::engine::{
     DurableEngine, IdentityScheme, PersistentObjectIdentity, PrincipalCodec, RecoveryLimits,
 };
-use astrid_storage_model::{
+use crate::storage_model::{
     ObjectClass, ObjectId, ObjectIdentity, ObjectKind, ObjectRecord, ObjectReference,
     ReferenceKind, ReferenceLabel, RootState,
 };
