@@ -4685,6 +4685,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one ownership-bootstrap scenario must retain the same store across initial \
+                  adoption, idempotent replay, transfer, and non-legacy restart"
+    )]
     async fn legacy_root_ownership_bootstrap_is_deterministic_and_idempotent() {
         let backend: Arc<dyn astrid_storage::KvStore> =
             Arc::new(astrid_storage::MemoryKvStore::new());
