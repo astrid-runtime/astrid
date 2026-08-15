@@ -82,7 +82,10 @@ run_multi_home_smoke() {
   secondary_port="$(pick_loopback_port)"
   secondary_gateway="http://$GATEWAY_HOST:$secondary_port"
 
-  mkdir -p "$secondary_home/etc" "$secondary_artifacts"
+  mkdir -p "$secondary_artifacts"
+  multi_run_cli "$secondary_home" "$secondary_artifacts" start
+  multi_run_cli "$secondary_home" "$secondary_artifacts" stop
+  mkdir -p "$secondary_home/etc"
   cat > "$secondary_home/etc/gateway-http.toml" <<EOF
 enabled = true
 listen = "$GATEWAY_HOST:$secondary_port"
