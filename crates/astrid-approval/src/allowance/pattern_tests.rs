@@ -1,6 +1,7 @@
 use super::*;
 use crate::action::SensitiveAction;
 use astrid_core::types::Permission;
+use std::path::Path;
 
 // ---------------------------------------------------------------------------
 // AllowancePattern display tests
@@ -375,6 +376,73 @@ fn test_workspace_relative_read() {
         },
         None
     ));
+}
+
+#[test]
+fn test_workspace_relative_invoke_requires_workspace_and_matching_resource() {
+    let pattern = AllowancePattern::WorkspaceRelative {
+        pattern: "filesystem/*".to_string(),
+        permission: Permission::Invoke,
+    };
+    let action = SensitiveAction::McpToolCall {
+        server: "filesystem".to_string(),
+        tool: "read_file".to_string(),
+    };
+
+    assert!(pattern.matches(&action, Some(Path::new("/project"))));
+    assert!(
+        !pattern.matches(&action, None),
+        "workspace-relative invoke must not escape its workspace context"
+    );
+    assert!(!pattern.matches(
+        &SensitiveAction::McpToolCall {
+            server: "github".to_string(),
+            tool: "read_file".to_string(),
+        },
+        Some(Path::new("/project"))
+    ));
+}
+
+#[test]
+fn test_workspace_relative_execute_requires_workspace_and_matching_command() {
+    let pattern = AllowancePattern::WorkspaceRelative {
+        pattern: "cargo *".to_string(),
+        permission: Permission::Execute,
+    };
+    let action = SensitiveAction::ExecuteCommand {
+        command: "cargo build".to_string(),
+        args: vec![],
+    };
+
+    assert!(pattern.matches(&action, Some(Path::new("/project"))));
+    assert!(
+        !pattern.matches(&action, None),
+        "workspace-relative execute must not escape its workspace context"
+    );
+    assert!(!pattern.matches(
+        &SensitiveAction::ExecuteCommand {
+            command: "sudo build".to_string(),
+            args: vec![],
+        },
+        Some(Path::new("/project"))
+    ));
+}
+
+#[test]
+fn test_workspace_relative_file_isolation_uses_supplied_root() {
+    let pattern = AllowancePattern::WorkspaceRelative {
+        pattern: "/project-b/**".to_string(),
+        permission: Permission::Read,
+    };
+    assert!(
+        !pattern.matches(
+            &SensitiveAction::FileRead {
+                path: "/project-b/file.rs".to_string(),
+            },
+            Some(Path::new("/project-a"))
+        ),
+        "an allowance created in one workspace must not match another workspace"
+    );
 }
 
 #[test]
