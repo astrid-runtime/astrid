@@ -16,7 +16,8 @@ use crate::commands::{
     completions::CompletionsArgs, doctor::DoctorArgs, gc::GcArgs, group::GroupCommand,
     invite::InviteCommand, keypair::KeypairCommand, logs::LogsArgs, pair_device::PairDeviceCommand,
     ps::PsArgs, quota::QuotaCommand, run::RunArgs, secret::SecretCommand, setup::SetupArgs,
-    top::TopArgs, trust::TrustCommand, version::VersionArgs, voucher::VoucherCommand, who::WhoArgs,
+    storage::StorageCommand, top::TopArgs, trust::TrustCommand, version::VersionArgs,
+    voucher::VoucherCommand, who::WhoArgs,
 };
 
 /// Astrid - Secure Agent Runtime
@@ -292,6 +293,12 @@ pub(crate) enum Commands {
 
     /// Restart the Astrid daemon (graceful stop + start).
     Restart,
+
+    /// Mount and manage admitted filesystem views.
+    Storage {
+        #[command(subcommand)]
+        command: StorageCommand,
+    },
 
     /// Tail kernel or per-capsule logs.
     Logs(LogsArgs),

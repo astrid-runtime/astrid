@@ -37,6 +37,7 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+base64 = { workspace = true }
 blake3 = { workspace = true }
 ed25519-dalek = { workspace = true }
 fastcdc = { workspace = true }

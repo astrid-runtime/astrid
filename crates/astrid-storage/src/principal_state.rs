@@ -47,6 +47,8 @@ mod native_io;
 mod owner_migration;
 #[cfg(test)]
 mod projection_name_tests;
+#[cfg(all(test, feature = "legacy-surrealkv"))]
+mod release_fixture_tests;
 mod staging;
 
 #[cfg(test)]

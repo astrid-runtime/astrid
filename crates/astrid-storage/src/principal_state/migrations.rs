@@ -23,6 +23,9 @@ use crate::kv::migrate_legacy_avl;
 use crate::kv::{KvPrincipalResolver, SurrealKvStore};
 use astrid_core::dirs::AstridHome;
 
+#[cfg(feature = "legacy-surrealkv")]
+const LEGACY_SNAPSHOT_DIR: &str = "legacy-state-db.snapshot";
+
 pub(super) const MIGRATION_MARKER_FILE: &str = "migration.complete";
 #[cfg(feature = "legacy-surrealkv")]
 const MIGRATION_PAGE_ENTRIES: usize = 512;
@@ -201,8 +204,14 @@ async fn migrate_legacy(
     principals: &PrincipalDirectory,
 ) -> StorageResult<()> {
     let legacy_path = legacy_path.to_path_buf();
+    let snapshot_path = home.migrations_dir().join(LEGACY_SNAPSHOT_DIR);
+    let snapshot_source = legacy_path.clone();
+    let snapshot_target = snapshot_path.clone();
+    run_blocking_migration(move || prepare_legacy_snapshot(&snapshot_source, &snapshot_target))
+        .await?;
+    let open_snapshot = snapshot_path.clone();
     let legacy =
-        run_blocking_migration(move || SurrealKvStore::open(legacy_path).map(Arc::new)).await?;
+        run_blocking_migration(move || SurrealKvStore::open(open_snapshot).map(Arc::new)).await?;
     let legacy_kv: Arc<dyn crate::KvStore> = legacy.clone();
     owner_migration::populate_directory(home, principals, legacy_kv).await?;
     let migration_legacy = Arc::clone(&legacy);
@@ -217,7 +226,112 @@ async fn migrate_legacy(
         StateOwnerResolver::new(principals.clone()),
     ));
     owner_migration::backfill_principal_identities(home, principals, migrated).await?;
-    legacy.close().await
+    legacy.close().await?;
+    run_blocking_migration(move || cleanup_legacy_snapshot(&snapshot_path)).await
+}
+
+#[cfg(feature = "legacy-surrealkv")]
+fn prepare_legacy_snapshot(source: &Path, destination: &Path) -> StorageResult<()> {
+    if destination.exists() {
+        super::native_io::quarantine_directory(destination, "interrupted")?;
+    }
+    astrid_core::platform_fs::ensure_private_directory(destination).map_err(|error| {
+        StorageError::Connection(format!(
+            "create private legacy migration snapshot {}: {error}",
+            destination.display()
+        ))
+    })?;
+    copy_legacy_tree(source, destination)
+}
+
+#[cfg(feature = "legacy-surrealkv")]
+fn copy_legacy_tree(source: &Path, destination: &Path) -> StorageResult<()> {
+    let metadata = std::fs::symlink_metadata(source).map_err(|error| {
+        StorageError::Connection(format!(
+            "inspect legacy migration source {}: {error}",
+            source.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(StorageError::Connection(format!(
+            "legacy migration source is redirected: {}",
+            source.display()
+        )));
+    }
+    if metadata.is_dir() {
+        astrid_core::platform_fs::ensure_private_directory(destination).map_err(|error| {
+            StorageError::Connection(format!(
+                "create legacy snapshot directory {}: {error}",
+                destination.display()
+            ))
+        })?;
+        let entries = std::fs::read_dir(source).map_err(|error| {
+            StorageError::Connection(format!(
+                "enumerate legacy migration source {}: {error}",
+                source.display()
+            ))
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                StorageError::Connection(format!(
+                    "enumerate legacy migration source {}: {error}",
+                    source.display()
+                ))
+            })?;
+            copy_legacy_tree(&entry.path(), &destination.join(entry.file_name()))?;
+        }
+        super::native_io::sync_directory(destination)
+    } else if metadata.is_file() {
+        std::fs::copy(source, destination).map_err(|error| {
+            StorageError::Connection(format!(
+                "copy legacy migration source {} to {}: {error}",
+                source.display(),
+                destination.display()
+            ))
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(destination, std::fs::Permissions::from_mode(0o600)).map_err(
+                |error| {
+                    StorageError::Connection(format!(
+                        "secure legacy migration snapshot {}: {error}",
+                        destination.display()
+                    ))
+                },
+            )?;
+        }
+        std::fs::File::open(destination)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| {
+                StorageError::Connection(format!(
+                    "flush legacy migration snapshot {}: {error}",
+                    destination.display()
+                ))
+            })
+    } else {
+        Err(StorageError::Connection(format!(
+            "legacy migration source contains a special file: {}",
+            source.display()
+        )))
+    }
+}
+
+#[cfg(feature = "legacy-surrealkv")]
+fn cleanup_legacy_snapshot(snapshot: &Path) -> StorageResult<()> {
+    std::fs::remove_dir_all(snapshot).map_err(|error| {
+        StorageError::Connection(format!(
+            "remove consumed legacy migration snapshot {}: {error}",
+            snapshot.display()
+        ))
+    })?;
+    let parent = snapshot.parent().ok_or_else(|| {
+        StorageError::Connection(format!(
+            "legacy migration snapshot {} has no parent",
+            snapshot.display()
+        ))
+    })?;
+    super::native_io::sync_directory(parent)
 }
 
 #[cfg(feature = "legacy-surrealkv")]

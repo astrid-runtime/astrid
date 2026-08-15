@@ -218,6 +218,7 @@ async fn dispatch_subcommand(
             Ok(ExitCode::SUCCESS)
         },
         Some(Commands::Restart) => commands::restart::run().await,
+        Some(Commands::Storage { command }) => commands::storage::run(command),
         Some(Commands::Logs(args)) => commands::logs::run(&args),
         Some(Commands::Ps(args)) => commands::ps::run(args).await,
         Some(Commands::Top(args)) => commands::top::run(args).await,

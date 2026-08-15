@@ -1,6 +1,6 @@
 # Astrid fleet computer and principal views
 
-Status: proposed architecture
+Status: accepted architecture; layout and CLI provider handoff in progress
 
 Last reviewed: 2026-08-15
 
@@ -570,8 +570,8 @@ remote desktop client.
 
 ## 8. Human mounts and system administration
 
-The hosted-OS filesystem provider should mount the canonical Astrid hierarchy
-under an admitted view. Illustrative commands are:
+The hosted-OS filesystem provider mounts the canonical Astrid hierarchy under
+an admitted view. The cross-platform CLI contract is:
 
 ```text
 astrid storage mount --as <principal> [--read-only]
@@ -582,7 +582,48 @@ astrid storage status <mount>
 astrid storage unmount <mount>
 ```
 
-Command names are not yet a frozen CLI contract.
+All three mount forms bind the process-wide `--principal` as the one
+authenticated acting principal. `--as`, `--fleet`, and `--admin` select the
+view that principal asks the kernel to admit; they are mutually exclusive and
+never supply caller identity. Principal and fleet views default to read/write.
+The admin view defaults to read-only and requires `--read-write` before an
+operator can request supported configuration changes.
+
+The CLI delegates to one lifecycle-independent native companion while keeping
+the command and lease semantics identical:
+
+| Host | Native provider companion | Target when omitted |
+| --- | --- | --- |
+| macOS | `astrid-storage-provider-fskit` using FSKit | provider-selected mounted volume |
+| Linux | `astrid-storage-provider-fuse` using libfuse | provider-selected mount directory |
+| Windows | `astrid-storage-provider-winfsp` using WinFsp | provider-selected volume/drive |
+
+The provider executable must independently authenticate to the daemon and ask
+for a lease. CLI arguments are a request, not authority. Windows enters at the
+version-two contract because no public Windows release requires legacy layout
+migration.
+
+Explicit target examples use the same view grammar on each host:
+
+```text
+# macOS
+astrid --principal operator storage mount --as agent-a /Volumes/Astrid-agent-a
+astrid --principal operator storage mount --fleet <fleet_uid> /Volumes/Astrid-fleet
+astrid --principal sysadmin storage mount --admin --read-write /Volumes/Astrid-admin
+
+# Linux
+astrid --principal operator storage mount --as agent-a ~/mnt/astrid-agent-a
+astrid --principal operator storage mount --fleet <fleet_uid> ~/mnt/astrid-fleet
+astrid --principal sysadmin storage mount --admin --read-write ~/mnt/astrid-admin
+
+# Windows PowerShell
+astrid.exe --principal operator storage mount --as agent-a X:
+astrid.exe --principal operator storage mount --fleet <fleet_uid> Y:
+astrid.exe --principal sysadmin storage mount --admin --read-write Z:
+```
+
+These paths are examples, not privileged defaults. Omitting the target lets the
+native provider select and report an available volume or mount directory.
 
 Mounting never provisions an owner or store. User setup creates the home fleet
 and its empty root; agent creation creates the principal and its overlay; an
@@ -592,7 +633,8 @@ owner or view is absent or unauthorized.
 
 Every mode preserves the same canonical relative paths. A principal view exposes
 the shared resources admitted to that principal and `home/{principal}`. A future
-fleet view exposes fleet-owned shared state without selecting an agent overlay.
+fleet view exposes fleet-owned shared state without selecting an agent overlay,
+but is still bound to the one acting principal for authorization and audit.
 An administrative view exposes the supported system hierarchy according to the
 acting user's and principal's system capabilities; it is read-only by default.
 
@@ -780,13 +822,17 @@ derivation, cross-fleet denial, and a correct first mount of the new `srv/`
 subtree. Windows separately proves a clean version-two installation and mount;
 an unreleased developer-home importer has its own non-release evidence track.
 
-Current main already contains a digest-verifying SurrealKV importer, preserves
-the legacy source, quarantines an incomplete typed-store destination, and
-migrates alias-keyed roots to stable principal UIDs. Those are useful pieces,
-not completion of this contract. `LAYOUT_VERSION` is still `1`, `ensure()` only
-creates a missing sentinel, the owner codec has no fleet tag, `srv/` does not
-exist, and no exact v0.10.4 home fixture proves the complete macOS/Linux
-upgrade. The release remains blocked until these gaps close together.
+Current implementation contains the digest-verifying SurrealKV importer,
+preserves the legacy source, quarantines an incomplete typed-store destination,
+migrates alias-keyed roots to stable principal UIDs, strictly admits layout
+versions, commits version two only after store and ownership bootstrap, and
+creates the canonical `srv/` roots with intent and completion records. These
+are useful pieces, not completion of this contract. An exact macOS arm64
+v0.10.4 home fixture now exercises the importer without mutating the legacy
+source. The owner codec still has no fleet tag, the native provider companions
+do not yet exist, and an exact Linux v0.10.4 home plus the complete failure
+matrix remain unproven. The release remains blocked until these gaps close
+together.
 
 ## 11. Product story
 
@@ -813,35 +859,32 @@ The security qualification is:
 
 ## 12. Implementation order
 
-1. Freeze layout version two, strict version admission, and the canonical
-   `srv/fleets/{fleet_uid}/` projection. Check in real v0.10.4 migration
-   fixtures and their source identities.
-2. Implement the exclusive version-one-to-version-two macOS/Linux migration,
-   including durable intent and receipt, verified store import, ownership
-   adoption, restart recovery, and refusal by old binaries. Keep any Windows
-   development-home importer explicit and outside the public migration promise.
-3. Define `StateOwnerCodecV2`, the fleet-owned root, and fleet accounting without
+1. Complete the release migration evidence with an exact Linux v0.10.4 fixture,
+   interrupted-step recovery, byte-preservation checks, and refusal by old
+   binaries. Keep any Windows development-home importer explicit and outside
+   the public migration promise.
+2. Define `StateOwnerCodecV2`, the fleet-owned root, and fleet accounting without
    changing `StateOwnerCodecV1` in place.
-4. Expose read-only ownership inspection and authenticated user/fleet context.
-5. Define the versioned kernel-stamped actor context, capsule-composition
+3. Expose read-only ownership inspection and authenticated user/fleet context.
+4. Define the versioned kernel-stamped actor context, capsule-composition
    contract, and AOS connector contract. Admit unlike harness and service
    compositions to stable principals without giving a capsule or connector
    authority to self-select its identity.
-6. Implement the provider-neutral path/inode, staging, publication, mount-lease,
+5. Implement the provider-neutral path/inode, staging, publication, mount-lease,
    and doctor contracts.
-7. Project supported system, fleet, principal-overlay, application, browser, and
+6. Project supported system, fleet, principal-overlay, application, browser, and
    team resources through the canonical `AstridHome` hierarchy. Keep workspaces
    as explicit attachments.
-8. Add the fleet directory, team service, inboxes, tasks, receipts, wakeups, and
+7. Add the fleet directory, team service, inboxes, tasks, receipts, wakeups, and
    attenuated handle delegation.
-9. Implement one hosted mount, browser, and desktop adapter used concurrently by
+8. Implement one hosted mount, browser, and desktop adapter used concurrently by
    unlike harness compositions and external connectors, with crash, `mmap`,
    compiler, provider-death, daemon-upgrade, and repair evidence.
-10. Add the remaining macOS, Linux, and Windows mount/desktop adapters against the
+9. Add the remaining macOS, Linux, and Windows mount/desktop adapters against the
    same behavioral contract.
-11. Adapt the Linux Realm capsule to consume the same view. Add a fleet-affine
+10. Adapt the Linux Realm capsule to consume the same view. Add a fleet-affine
    cooperative mode without removing its principal-isolated mode.
-12. Optimize density through shared immutable pages, checkpoints, physical
+11. Optimize density through shared immutable pages, checkpoints, physical
    objects, workers, and provider-specific fleet residency without weakening
    cross-fleet isolation or principal attribution.
 
@@ -881,10 +924,10 @@ contract.
 
 Do not ship the fleet-computer claim if any of the following remains true:
 
-- the layout changes while `etc/layout-version` remains `1`, or an unknown
-  layout version is silently accepted;
+- a layout-one home is served before its version-two receipt and sentinel are
+  committed, or an unknown layout version is accepted;
 - a version-one binary can open a committed version-two home;
-- migration has not been exercised against exact macOS and Linux v0.10.4 homes;
+- migration has not yet been exercised against an exact Linux v0.10.4 home;
 - migration mutates or deletes the version-one source before the version-two
   receipt and sentinel commit;
 - existing principal homes or browser databases are implicitly merged into

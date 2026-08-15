@@ -969,6 +969,20 @@ impl Kernel {
         // through its own uplink instead.
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         {
+            let adopt_released_layout_principals = home
+                .layout_version()
+                .map_err(|error| {
+                    std::io::Error::other(format!(
+                        "Failed to read Astrid home layout version: {error}"
+                    ))
+                })?
+                .as_deref()
+                == Some(astrid_core::dirs::LEGACY_LAYOUT_VERSION);
+            if adopt_released_layout_principals && singleton_lock.is_none() {
+                return Err(std::io::Error::other(
+                    "layout-one migration requires the daemon singleton lock",
+                ));
+            }
             // Bootstrap the CLI root user (idempotent). Also seeds the
             // default principal's profile with `groups = ["admin"]` so
             // single-tenant deployments get full management-API access.
@@ -983,6 +997,7 @@ impl Kernel {
                 &principal_directory,
                 root_user,
                 root_principal_identity,
+                adopt_released_layout_principals,
             )
             .await
             .map_err(|error| {
@@ -991,6 +1006,18 @@ impl Kernel {
 
             // Apply pre-configured identity links from config.
             apply_identity_config(&identity_store, &workspace_root, &workspace_layout).await;
+
+            let ownership = ownership_store.load().await.map_err(|error| {
+                std::io::Error::other(format!(
+                    "Failed to read ownership graph for layout migration: {error}"
+                ))
+            })?;
+            home.complete_layout_v2(ownership.fleets().map(|fleet| fleet.identity().uid))
+                .map_err(|error| {
+                    std::io::Error::other(format!(
+                        "Failed to commit Astrid home layout migration: {error}"
+                    ))
+                })?;
         }
 
         let kernel = Arc::new(Self {
@@ -4208,6 +4235,7 @@ async fn bootstrap_cli_root_ownership(
     principal_directory: &astrid_storage::PrincipalDirectory,
     root_user: astrid_core::AstridUserId,
     root_principal_identity: astrid_core::PrincipalIdentity,
+    adopt_unowned_principals: bool,
 ) -> Result<(), astrid_storage::OwnershipError> {
     let user = astrid_core::UserIdentity::from_genesis(astrid_core::UserGenesis::from_parts(
         root_user.id,
@@ -4229,16 +4257,29 @@ async fn bootstrap_cli_root_ownership(
     let principal_uid = principal_directory
         .uid_for(&astrid_core::PrincipalId::default())
         .map_err(astrid_storage::OwnershipError::Storage)?;
-    if store.load().await?.principal_owner(principal_uid).is_some() {
-        return Ok(());
+    if store.load().await?.principal_owner(principal_uid).is_none() {
+        store
+            .assign_principal(astrid_core::PrincipalOwnership {
+                principal_uid,
+                fleet_uid: fleet.uid,
+                assigned_by: user.uid,
+            })
+            .await?;
     }
-    store
-        .assign_principal(astrid_core::PrincipalOwnership {
-            principal_uid,
-            fleet_uid: fleet.uid,
-            assigned_by: user.uid,
-        })
-        .await
+    if adopt_unowned_principals {
+        for (_, candidate) in principal_directory.bindings() {
+            if store.load().await?.principal_owner(candidate).is_none() {
+                store
+                    .assign_principal(astrid_core::PrincipalOwnership {
+                        principal_uid: candidate,
+                        fleet_uid: fleet.uid,
+                        assigned_by: user.uid,
+                    })
+                    .await?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn principal_initial_public_key(
@@ -4628,6 +4669,20 @@ mod tests {
         directory
             .register(astrid_core::PrincipalId::default(), principal_identity.uid)
             .unwrap();
+        let legacy_principal_identity = astrid_core::PrincipalIdentity::from_genesis(
+            astrid_core::PrincipalGenesis::from_parts(
+                uuid::Uuid::from_u128(4),
+                chrono::DateTime::from_timestamp(1_700_000_002, 0).unwrap(),
+                [4; 32],
+            ),
+        )
+        .unwrap();
+        directory
+            .register(
+                astrid_core::PrincipalId::new("legacy-agent").unwrap(),
+                legacy_principal_identity.uid,
+            )
+            .unwrap();
         let root_user = astrid_core::AstridUserId {
             id: uuid::Uuid::from_u128(1),
             principal: astrid_core::PrincipalId::default(),
@@ -4641,6 +4696,7 @@ mod tests {
             &directory,
             root_user.clone(),
             principal_identity.clone(),
+            true,
         )
         .await
         .unwrap();
@@ -4650,6 +4706,7 @@ mod tests {
             &directory,
             root_user.clone(),
             principal_identity.clone(),
+            true,
         )
         .await
         .unwrap();
@@ -4669,6 +4726,13 @@ mod tests {
         assert_eq!(root_user_uid, expected_user.uid);
         assert_eq!(second.fleets().count(), 1);
         assert!(second.fleet(principal_owner.fleet_uid).is_some());
+        assert_eq!(
+            second
+                .principal_owner(legacy_principal_identity.uid)
+                .unwrap()
+                .fleet_uid,
+            initial_fleet_uid
+        );
 
         let destination =
             astrid_core::FleetIdentity::from_genesis(astrid_core::FleetGenesis::from_parts(
@@ -4696,6 +4760,7 @@ mod tests {
             &directory,
             root_user,
             principal_identity.clone(),
+            false,
         )
         .await
         .unwrap();

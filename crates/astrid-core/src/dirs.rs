@@ -26,6 +26,8 @@
 //! │   └── layout-version                 layout version sentinel
 //! ├── var/
 //! │   ├── principal-store/               authoritative typed principal state
+//! │   ├── content-staging/                private acknowledged-write staging
+//! │   ├── migrations/                     durable layout intents and receipts
 //! │   └── state.db/                      read-only legacy SurrealKV import source
 //! ├── run/                               ephemeral runtime state
 //! │   ├── system.sock
@@ -36,6 +38,9 @@
 //! ├── keys/                              runtime signing key
 //! ├── bin/                               content-addressed compiled WASM binaries
 //! ├── lib/                               shared WASM component libraries (WIT, future)
+//! ├── srv/fleets/{fleet_uid}/            fleet-owned served data
+//! │   ├── shared/                        durable common files
+//! │   └── workspaces/                    admitted attachment points
 //! └── home/
 //!     └── {principal}/                   per-principal home
 //!         ├── .local/
@@ -66,7 +71,13 @@ use uuid::Uuid;
 use crate::principal::PrincipalId;
 
 /// Current layout version. Written to `etc/layout-version` on first boot.
-pub const LAYOUT_VERSION: &str = "1";
+pub const LAYOUT_VERSION: &str = "2";
+
+/// Latest released layout accepted for an in-place upgrade.
+pub const LEGACY_LAYOUT_VERSION: &str = "1";
+
+#[path = "dirs_layout.rs"]
+mod dirs_layout;
 
 /// Default per-project runtime state directory.
 pub const DEFAULT_WORKSPACE_STATE_DIR: &str = ".astrid";
@@ -331,8 +342,10 @@ impl AstridHome {
 
     /// Ensure the system directory structure exists with secure permissions.
     ///
-    /// Creates `etc/`, `var/`, `run/`, `log/`, `keys/`, `secrets/`, `lib/`, and `home/`.
-    /// Writes `etc/layout-version` with the current version.
+    /// Creates the common private directory skeleton. A new home is initialized
+    /// directly at the current layout. A released version-one home remains at
+    /// version one until the kernel has migrated and verified its durable store
+    /// and calls [`Self::complete_layout_v2`].
     /// Sets all directories to `0o700` on Unix.
     ///
     /// Note: `capsules/` (system/distro capsules) is NOT created eagerly.
@@ -343,6 +356,16 @@ impl AstridHome {
     ///
     /// Returns an error if directory creation or permission setting fails.
     pub fn ensure(&self) -> io::Result<()> {
+        let existing_layout = self.layout_version()?;
+        if let Some(version) = existing_layout.as_deref()
+            && version != LEGACY_LAYOUT_VERSION
+            && version != LAYOUT_VERSION
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported Astrid home layout version {version:?}"),
+            ));
+        }
         let dirs = [
             self.etc_dir(),
             self.hooks_dir(),
@@ -367,13 +390,17 @@ impl AstridHome {
             std::fs::create_dir_all(dir)?;
         }
 
-        // Write layout version sentinel (idempotent).
-        let version_path = self.etc_dir().join("layout-version");
-        if !version_path.exists() {
-            std::fs::write(&version_path, LAYOUT_VERSION)?;
+        match existing_layout.as_deref() {
+            None => {
+                self.ensure_layout_v2_dirs()?;
+                self.write_layout_version(LAYOUT_VERSION)?;
+            },
+            Some(LEGACY_LAYOUT_VERSION) => {},
+            Some(LAYOUT_VERSION) => self.ensure_layout_v2_dirs()?,
+            Some(_) => unreachable!("layout version was validated before directory creation"),
         }
         #[cfg(windows)]
-        crate::platform_fs::restrict_private_file(&version_path)?;
+        crate::platform_fs::restrict_private_file(&self.layout_version_path())?;
 
         #[cfg(unix)]
         {

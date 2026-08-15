@@ -793,6 +793,7 @@ version = "0.10.4"
 dependencies = [
  "astrid-core",
  "async-trait",
+ "base64",
  "blake3",
  "cap-std",
  "caseless",

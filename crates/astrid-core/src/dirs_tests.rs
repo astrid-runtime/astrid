@@ -82,6 +82,10 @@ fn test_astrid_home_ensure_creates_dirs() {
     assert!(home.secrets_dir().exists());
     assert!(home.bin_dir().exists());
     assert!(home.home_dir().exists());
+    assert!(home.content_staging_path().exists());
+    assert!(home.migrations_dir().exists());
+    assert!(home.cow_dir().exists());
+    assert!(home.fleets_dir().exists());
 }
 
 #[test]
@@ -102,6 +106,111 @@ fn test_astrid_home_ensure_idempotent() {
     let home = AstridHome::from_path(dir.path());
     home.ensure().unwrap();
     home.ensure().unwrap(); // second call should not fail
+}
+
+#[test]
+fn test_astrid_home_rejects_unknown_layout_before_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(dir.path());
+    std::fs::create_dir_all(home.etc_dir()).unwrap();
+    std::fs::write(home.layout_version_path(), "999").unwrap();
+
+    let error = home.ensure().unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(!home.var_dir().exists());
+    assert_eq!(
+        std::fs::read_to_string(home.layout_version_path()).unwrap(),
+        "999"
+    );
+}
+
+#[test]
+fn test_layout_v1_is_not_committed_until_store_and_ownership_finish() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(dir.path());
+    std::fs::create_dir_all(home.etc_dir()).unwrap();
+    std::fs::write(home.layout_version_path(), LEGACY_LAYOUT_VERSION).unwrap();
+
+    home.ensure().unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(home.layout_version_path()).unwrap(),
+        LEGACY_LAYOUT_VERSION
+    );
+    assert!(!home.srv_dir().exists());
+    assert!(!home.migrations_dir().exists());
+}
+
+#[test]
+fn test_layout_v1_completion_preserves_existing_tree_and_creates_fleet_roots() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(dir.path());
+    std::fs::create_dir_all(home.etc_dir()).unwrap();
+    std::fs::write(home.layout_version_path(), LEGACY_LAYOUT_VERSION).unwrap();
+    home.ensure().unwrap();
+    let preserved = home
+        .principal_home(&PrincipalId::default())
+        .root()
+        .join("note");
+    std::fs::create_dir_all(preserved.parent().unwrap()).unwrap();
+    std::fs::write(&preserved, b"released-home-bytes").unwrap();
+    let fleet = crate::FleetUid::from_bytes([7; 32]);
+
+    home.complete_layout_v2([fleet]).unwrap();
+
+    assert_eq!(std::fs::read(&preserved).unwrap(), b"released-home-bytes");
+    assert!(home.fleet_shared_dir(fleet).is_dir());
+    assert!(home.fleet_workspaces_dir(fleet).is_dir());
+    assert!(
+        home.migrations_dir()
+            .join("layout-v1-to-v2.intent")
+            .is_file()
+    );
+    assert!(
+        home.migrations_dir()
+            .join("layout-v1-to-v2.complete")
+            .is_file()
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.layout_version_path()).unwrap(),
+        LAYOUT_VERSION
+    );
+    home.complete_layout_v2([fleet]).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn test_layout_v1_completion_makes_legacy_store_read_only() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(dir.path());
+    std::fs::create_dir_all(home.etc_dir()).unwrap();
+    std::fs::write(home.layout_version_path(), LEGACY_LAYOUT_VERSION).unwrap();
+    home.ensure().unwrap();
+    std::fs::create_dir_all(home.state_db_path()).unwrap();
+    let legacy_file = home.state_db_path().join("legacy.data");
+    std::fs::write(&legacy_file, b"legacy").unwrap();
+
+    home.complete_layout_v2([]).unwrap();
+
+    assert_eq!(
+        std::fs::metadata(&legacy_file)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o400
+    );
+    assert_eq!(
+        std::fs::metadata(home.state_db_path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o500
+    );
 }
 
 #[cfg(unix)]
@@ -164,6 +273,10 @@ fn test_astrid_home_fhs_paths() {
     assert_eq!(home.hooks_dir(), PathBuf::from(format!("{r}/etc/hooks")));
     assert_eq!(home.var_dir(), PathBuf::from(format!("{r}/var")));
     assert_eq!(
+        home.layout_version_path(),
+        PathBuf::from(format!("{r}/etc/layout-version"))
+    );
+    assert_eq!(
         home.state_db_path(),
         PathBuf::from(format!("{r}/var/state.db"))
     );
@@ -174,6 +287,10 @@ fn test_astrid_home_fhs_paths() {
     assert_eq!(
         home.content_staging_path(),
         PathBuf::from(format!("{r}/var/content-staging"))
+    );
+    assert_eq!(
+        home.migrations_dir(),
+        PathBuf::from(format!("{r}/var/migrations"))
     );
     assert_eq!(home.run_dir(), PathBuf::from(format!("{r}/run")));
     assert_eq!(
@@ -200,6 +317,15 @@ fn test_astrid_home_fhs_paths() {
     );
     assert_eq!(home.bin_dir(), PathBuf::from(format!("{r}/bin")));
     assert_eq!(home.home_dir(), PathBuf::from(format!("{r}/home")));
+    let fleet = crate::FleetUid::from_bytes([9; 32]);
+    assert_eq!(
+        home.fleet_shared_dir(fleet),
+        PathBuf::from(format!("{r}/srv/fleets/{fleet}/shared"))
+    );
+    assert_eq!(
+        home.fleet_workspaces_dir(fleet),
+        PathBuf::from(format!("{r}/srv/fleets/{fleet}/workspaces"))
+    );
 }
 
 // ── PrincipalHome ────────────────────────────────────────────────

@@ -535,6 +535,30 @@ status = "covered"
 mode = "filesystem"
 principal = "local_cli"
 
+[commands."storage mount"]
+scenario = "storage_mount_lifecycle"
+status = "mapped"
+mode = "process"
+principal = "agent_and_admin"
+
+[commands."storage sync"]
+scenario = "storage_mount_lifecycle"
+status = "mapped"
+mode = "process"
+principal = "agent_and_admin"
+
+[commands."storage status"]
+scenario = "storage_mount_lifecycle"
+status = "mapped"
+mode = "process"
+principal = "agent_and_admin"
+
+[commands."storage unmount"]
+scenario = "storage_mount_lifecycle"
+status = "mapped"
+mode = "process"
+principal = "agent_and_admin"
+
 [commands."start"]
 scenario = "daemon_lifecycle"
 status = "covered"

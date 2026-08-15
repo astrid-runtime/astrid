@@ -30,6 +30,7 @@ pub(crate) mod secret;
 pub(crate) mod self_update;
 pub(crate) mod sessions;
 pub(crate) mod setup;
+pub(crate) mod storage;
 pub(crate) mod stub;
 pub(crate) mod top;
 pub(crate) mod trust;

@@ -160,6 +160,16 @@ denial = ["invalid or inaccessible temp content path fails safely"]
 state = ["content store remains internally consistent"]
 evidence = ["gc transcript and post-gc content listing"]
 
+[scenarios.storage_mount_lifecycle]
+status = "mapped"
+surfaces = ["cli"]
+auth = ["authenticated acting principal plus provider lease admission"]
+success = ["mount selects exactly one principal, fleet, or admin view; sync publishes acknowledged dirty state; status reports the lease; unmount revokes it"]
+denial = ["unauthorized view selection, writable admin access without explicit request, stale lease, and missing native provider fail closed"]
+state = ["mount does not provision storage; acknowledged writes remain staged until generation-checked publication; unmount revokes only the selected lease"]
+evidence = ["platform provider transcript, lease and staging receipts, canonical path walk, and post-unmount access denial"]
+remaining = ["kernel mount leases, durable staging and publication, and native FSKit, libfuse, and WinFsp provider companions are not implemented"]
+
 [scenarios.core_capsule_install]
 status = "covered"
 surfaces = ["capability"]

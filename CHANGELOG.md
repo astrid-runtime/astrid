@@ -22,6 +22,19 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   support stack are updated without changing rmcp, Wasmtime/WASM tooling,
   TOML, base64, or other dependencies that require dedicated migration review.
   Closes #1529.
+### Added
+
+- **Astrid home layout version two now has a crash-resumable release upgrade
+  boundary and canonical fleet-served paths.** New homes create
+  `srv/fleets/{fleet_uid}/{shared,workspaces}` and durable migration records;
+  released layout-one homes keep their sentinel until the principal store and
+  ownership graph have migrated, adopt otherwise-unowned legacy principals
+  into the operator's home fleet, preserve principal and system files, retain
+  `var/state.db` read-only on Unix, and write layout `2` last. Unknown layouts
+  fail closed. The new `astrid storage mount|sync|status|unmount` grammar hands
+  one acting principal's admitted principal, fleet, or admin view to the native
+  FSKit, libfuse, or WinFsp companion provider without provisioning storage.
+  Refs #1391.
 
 ### Fixed
 
