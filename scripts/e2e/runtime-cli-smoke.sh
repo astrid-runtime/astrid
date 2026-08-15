@@ -350,7 +350,9 @@ run_standalone_admin_smoke() {
   standalone_home="$standalone_root/home"
   standalone_workspace="$standalone_root/workspace"
   standalone_poison="$standalone_root/poison-home"
-  mkdir -p "$standalone_home" "$standalone_workspace" "$standalone_poison"
+  # Leave ASTRID_HOME absent so first boot owns initialization and can commit
+  # the layout sentinel before any other content appears.
+  mkdir -p "$standalone_workspace" "$standalone_poison"
 
   note "checking capsule-free Astrid start/status/stop/restart"
   set +e
