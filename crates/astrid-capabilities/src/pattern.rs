@@ -364,6 +364,32 @@ mod tests {
         assert_eq!(pattern, decoded);
     }
 
+    #[test]
+    fn pattern_public_api_contract_is_stable() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let exact = ResourcePattern::exact("mcp://filesystem:read_file").unwrap();
+        let glob = ResourcePattern::mcp_server("filesystem").unwrap();
+        let other = ResourcePattern::exact("mcp://filesystem:write_file").unwrap();
+
+        assert_eq!(exact.as_str(), "mcp://filesystem:read_file");
+        assert_eq!(glob.as_str(), "mcp://filesystem:*");
+        assert_eq!(exact.to_string(), "mcp://filesystem:read_file");
+        assert_eq!(glob.to_string(), "mcp://filesystem:*");
+
+        assert!(!exact.is_glob());
+        assert!(glob.is_glob());
+        assert_eq!(exact, exact.clone());
+        assert_ne!(exact, other);
+
+        let mut exact_hasher = DefaultHasher::new();
+        exact.hash(&mut exact_hasher);
+        let mut other_hasher = DefaultHasher::new();
+        other.hash(&mut other_hasher);
+        assert_ne!(exact_hasher.finish(), other_hasher.finish());
+    }
+
     // --- Helper constructor tests ---
 
     #[test]
