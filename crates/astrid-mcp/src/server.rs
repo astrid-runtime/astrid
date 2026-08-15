@@ -289,18 +289,28 @@ impl ServerManager {
             server.config.clone()
         };
 
-        match config.transport {
+        let connected = match config.transport {
             Transport::Stdio => {
                 self.connect_stdio_server(name, &config, handler, notice_tx)
-                    .await?;
+                    .await
             },
-            Transport::Sse => {
-                return Err(McpError::ConfigError(
-                    "SSE transport not yet supported; enable `transport-streamable-http-client` \
+            Transport::Sse => Err(McpError::ConfigError(
+                "SSE transport not yet supported; enable `transport-streamable-http-client` \
                      feature in rmcp"
-                        .to_string(),
-                ));
-            },
+                    .to_string(),
+            )),
+        };
+
+        if let Err(error) = connected {
+            if let Err(cleanup_error) = self.stop(name).await {
+                error!(
+                    server = name,
+                    connection_error = %error,
+                    cleanup_error = %cleanup_error,
+                    "Failed to clean up partially connected MCP server"
+                );
+            }
+            return Err(error);
         }
 
         Ok(())
@@ -662,7 +672,7 @@ impl ServerManager {
     ///
     /// Returns an error if the server is not running.
     pub async fn stop(&self, name: &str) -> McpResult<()> {
-        let mut server = {
+        let server = {
             let mut running = self.running.write().await;
             running
                 .remove(name)
@@ -671,6 +681,14 @@ impl ServerManager {
                 })?
         };
 
+        self.stop_owned(name, server).await
+    }
+
+    /// Close a server already removed from the running map.
+    ///
+    /// The map entry is removed before close so a slow process-tree teardown
+    /// cannot make the old generation appear available for restart.
+    async fn stop_owned(&self, name: &str, mut server: RunningServer) -> McpResult<()> {
         info!(server = name, "Stopping MCP server");
 
         // Gracefully close the MCP session before dropping. Never abandon this
@@ -909,11 +927,13 @@ impl ServerManager {
         let backoff = Self::restart_backoff();
 
         // Atomic: check policy + backoff + remove server under a single write lock.
-        let prev_count = {
+        let (prev_count, previous_server) = {
             let mut running = self.running.write().await;
-            let (count, last_attempt) = running
-                .get(name)
-                .map_or((0, None), |s| (s.restart_count, s.last_restart_attempt));
+            let Some(server) = running.get(name) else {
+                return Ok(false);
+            };
+            let count = server.restart_count;
+            let last_attempt = server.last_restart_attempt;
 
             let allowed = match &config.restart_policy {
                 RestartPolicy::Never => false,
@@ -934,11 +954,15 @@ impl ServerManager {
                 }
             }
 
-            // Remove while holding the write lock — prevents concurrent
-            // callers from also passing the policy check for the same server.
-            running.remove(name);
-            count
+            let Some(server) = running.remove(name) else {
+                return Ok(false);
+            };
+            // Removing while holding the lock prevents concurrent callers from
+            // claiming the same retry slot; the owned server is closed after
+            // the lock is released so teardown never blocks peer operations.
+            (count, server)
         };
+        self.stop_owned(name, previous_server).await?;
         // Write lock released. The server entry is gone, so any concurrent
         // caller will see restart_count = 0 (map_or default) but the server
         // is absent, and `start()` will re-register it fresh.
