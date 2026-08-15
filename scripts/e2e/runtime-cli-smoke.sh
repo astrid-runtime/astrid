@@ -281,7 +281,9 @@ run_cli_offline_init_smoke() {
   local home="$ARTIFACTS/cli-init-home"
   local cwd="$ARTIFACTS/cli-init-cwd"
   local distro="$ARTIFACTS/cli-init-distro.toml"
-  mkdir -p "$home/etc" "$cwd"
+  # Leave the isolated Astrid home absent so `init` owns first admission and
+  # writes the layout sentinel before any other content appears.
+  mkdir -p "$cwd"
   cat > "$distro" <<EOF
 schema-version = 1
 
