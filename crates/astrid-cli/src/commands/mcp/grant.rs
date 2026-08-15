@@ -72,7 +72,7 @@ use std::fmt::Write as _;
 
 use rmcp::schemars::{self, JsonSchema};
 use rmcp::service::{ElicitationError, Peer, RoleServer};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
@@ -103,7 +103,7 @@ rmcp::elicit_safe!(GrantForm);
 /// derives the grant target from its own observed signal, never a body
 /// field), so they can never be used to forge a grant for a different
 /// capsule or principal.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub(super) struct GrantRequest {
     /// Kernel-minted grant correlation id; echoed onto the respond body.
     request_id: String,
@@ -192,7 +192,7 @@ impl GrantRequest {
     /// Render the human-facing consent prompt. Only the display fields are
     /// woven in; the grant correlation id (`request_id`) never reaches the
     /// user.
-    fn prompt(&self) -> String {
+    pub(super) fn prompt(&self) -> String {
         let mut p = String::from(
             "An MCP client invoked a tool from a capsule this identity is not yet allowed to use.",
         );

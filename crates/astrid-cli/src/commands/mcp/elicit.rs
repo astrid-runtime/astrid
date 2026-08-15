@@ -105,7 +105,7 @@ impl ApprovalChoice {
     /// serialization — they deliberately differ (`ApproveOnce` serializes
     /// to `approve_once` but its verb is the bare `approve`). Always forward
     /// `verb()`; never send the serialized name to the broker.
-    fn verb(self) -> &'static str {
+    pub(super) fn verb(self) -> &'static str {
         match self {
             Self::ApproveOnce => "approve",
             Self::ApproveSession => "approve_session",
@@ -122,7 +122,7 @@ impl ApprovalChoice {
 /// echoed verbatim back to the broker so it can route the decision and
 /// re-establish the result drain; `action` / `resource` / `reason` are
 /// rendered into the elicitation prompt for the user.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub(super) struct ApprovalRequest {
     /// Host-minted approval correlation id; echoed onto the respond body.
     request_id: String,
@@ -172,7 +172,7 @@ impl ApprovalRequest {
     /// token for the terminal reply; `decision` is the chosen verb. No
     /// `reason` is forwarded — the shim has no free-form audit text to add,
     /// and omitting it keeps the bridge strictly to the constrained verb.
-    fn respond_body(&self, req_id: &str, decision: &str) -> Value {
+    pub(super) fn respond_body(&self, req_id: &str, decision: &str) -> Value {
         json!({
             "req_id": req_id,
             "request_id": self.request_id,
@@ -185,7 +185,7 @@ impl ApprovalRequest {
     /// Render the human-facing elicitation prompt from the host-sanitized
     /// display fields. Only `action` / `resource` / `reason` are shown; the
     /// routing tokens never reach the user.
-    fn prompt(&self) -> String {
+    pub(super) fn prompt(&self) -> String {
         let mut p = String::from("A capsule tool is requesting capability approval.");
         // `write!` to a `String` is infallible; the `let _` discards the
         // always-`Ok` result without an `unwrap`.

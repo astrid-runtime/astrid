@@ -117,7 +117,7 @@ impl IngressRequest {
     /// Render the human-facing consent prompt. Only the tool name (display)
     /// is woven in; the `source_id` is shown for transparency but is not a
     /// secret.
-    fn prompt(&self) -> String {
+    pub(super) fn prompt(&self) -> String {
         let mut p = String::from(
             "An MCP client is asking Astrid to run tool calls through this session for the first time.",
         );

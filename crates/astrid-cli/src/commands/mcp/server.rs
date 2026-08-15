@@ -9,8 +9,7 @@
 //! * [`call_tool`](ServerHandler::call_tool) — bridges to
 //!   `astrid.v1.request.mcp.tool.call`.
 //!
-//! Every other MCP method falls through to rmcp's `method_not_found`
-//! defaults — this is a pure tool broker.
+//! Other MCP methods fall through to rmcp's `method_not_found` defaults.
 //!
 //! ## Correlation contract
 //!
@@ -19,10 +18,8 @@
 //! accepts), mirrors it into the request body, publishes on the request
 //! topic, then awaits the single-segment reply topic
 //! `astrid.v1.response.<req_id>` for up to [`REQUEST_DEADLINE`]. The
-//! broker echoes `req_id` in the body, but the shim correlates purely on
-//! the response topic (unique per request); the body copy exists for the
-//! broker's own logging and is not read back here. Concurrent calls never
-//! collide because each holds a distinct response topic.
+//! The shim correlates on the unique response topic; the broker's body copy is
+//! diagnostic only. Concurrent calls therefore cannot collide.
 //!
 //! ## Connection lifetime
 //!
@@ -57,6 +54,9 @@ use crate::socket_client::SocketClient;
 use super::elicit;
 use super::grant;
 use super::ingress;
+use super::mrtr::{ConsentResolution, MrtrBridge, ResolvedConsent};
+
+mod consent;
 
 /// Request topic for the broker `tools/list` front door.
 pub(super) const TOOLS_LIST_TOPIC: &str = "astrid.v1.request.mcp.tools.list";
@@ -98,8 +98,9 @@ const GRANT_DENIED_MESSAGE: &str = "Capsule access was not granted for this tool
 const GRANT_BOUND_EXCEEDED_MESSAGE: &str = "Astrid needed to resolve more capsule grants than a single tool call allows; the tool call \
      was dropped. Re-run the tool to continue granting the remaining capsules.";
 
-const ASTRID_MCP_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2025_11_25;
-const ASTRID_MCP_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[ASTRID_MCP_PROTOCOL_VERSION];
+const ASTRID_MCP_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2026_07_28;
+const ASTRID_MCP_PROTOCOL_VERSIONS: &[ProtocolVersion] =
+    &[ProtocolVersion::V_2026_07_28, ProtocolVersion::V_2025_11_25];
 
 /// MCP server shim bridging a stdio client to the daemon tool broker.
 pub(crate) struct AstridMcpServer {
@@ -118,6 +119,8 @@ pub(crate) struct AstridMcpServer {
     /// the flag is already serialized by that lock and needs no inter-thread
     /// ordering of its own — all accesses use `Ordering::Relaxed`.
     needs_reconnect: AtomicBool,
+    /// Integrity protection for attacker-echoed MCP 2026 `requestState`.
+    mrtr: MrtrBridge,
 }
 
 impl AstridMcpServer {
@@ -127,6 +130,7 @@ impl AstridMcpServer {
             client,
             principal,
             needs_reconnect: AtomicBool::new(false),
+            mrtr: MrtrBridge::new(),
         }
     }
 
@@ -348,6 +352,49 @@ enum GrantStep {
     Fail(&'static str),
 }
 
+#[derive(Clone, Copy)]
+enum ConsentProtocol {
+    Modern { supports_form: bool },
+    Legacy,
+}
+
+impl ConsentProtocol {
+    fn from_context(context: &RequestContext<RoleServer>) -> Self {
+        if context
+            .protocol_version()
+            .is_none_or(|version| version < ProtocolVersion::V_2026_07_28)
+        {
+            return Self::Legacy;
+        }
+        let supports_form = context
+            .client_capabilities()
+            .and_then(|capabilities| capabilities.elicitation)
+            .and_then(|elicitation| elicitation.form)
+            .is_some();
+        Self::Modern { supports_form }
+    }
+}
+
+struct ToolInvocation {
+    name: String,
+    arguments: Value,
+}
+
+impl ToolInvocation {
+    fn body(&self, req_id: &str) -> Value {
+        json!({
+            "req_id": req_id,
+            "name": self.name,
+            "arguments": self.arguments,
+        })
+    }
+}
+
+enum CallFlow<T> {
+    Continue(T),
+    Complete(CallToolResponse),
+}
+
 /// Decide the next grant-loop action for `reply`, given how many grants have
 /// already been resolved on this call.
 ///
@@ -390,9 +437,8 @@ impl ServerHandler for AstridMcpServer {
         // struct literal.
         ServerInfo::new(capabilities)
             .with_server_info(Implementation::new("astrid", env!("CARGO_PKG_VERSION")))
-            // Keep this aligned with `supported_protocol_versions`. The 2026
-            // protocol replaces server-initiated elicitation with MRTR, while
-            // Astrid's approval bridge still uses the legacy request flow.
+            // Keep this aligned with the preferred entry in
+            // `supported_protocol_versions`; legacy clients negotiate 2025.
             .with_protocol_version(ASTRID_MCP_PROTOCOL_VERSION)
             .with_instructions("Astrid secure agent runtime — capsule tools bridged over MCP.")
     }
@@ -421,106 +467,32 @@ impl ServerHandler for AstridMcpServer {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
-        let arguments = request.arguments.map_or(Value::Null, Value::Object);
-
-        // Build the broker `tool.call` body for a fresh `req_id`. The same
-        // (name, arguments) may be sent twice — once that trips the ingress
-        // consent gate, then once more after consent is recorded — each with
-        // its own correlation id so their replies never collide.
-        let call_body = |req_id: &str| {
-            json!({
-                "req_id": req_id,
-                "name": request.name,
-                "arguments": arguments,
-            })
+        let protocol = ConsentProtocol::from_context(&context);
+        let invocation = ToolInvocation {
+            name: request.name.clone().into_owned(),
+            arguments: request.arguments.clone().map_or(Value::Null, Value::Object),
         };
-
-        let req_id = new_req_id();
-        let reply = self
-            .round_trip(TOOL_CALL_TOPIC, &req_id, call_body(&req_id))
-            .await?;
-
-        // If the broker gated the call on an untrusted ingress, it replies an
-        // `ingress_approval_required` signal (NOT a result). Elicit the user's
-        // consent; on accept, record trust via the broker and RE-SEND the
-        // original call (now passing the gate). On deny / no-capability /
-        // error, fail secure with an MCP error.
-        let reply = if let Some(ingress) = ingress::IngressRequest::from_reply(&reply) {
-            let granted = self.resolve_ingress(&context.peer, &ingress).await?;
-            if !granted {
-                return Ok(CallToolResult::error(vec![ContentBlock::text(
-                    "Astrid tool calls were not authorized for this session.",
-                )])
-                .into());
-            }
-            // Re-send the original call now that the ingress is trusted.
-            let retry_id = new_req_id();
-            self.round_trip(TOOL_CALL_TOPIC, &retry_id, call_body(&retry_id))
-                .await?
-        } else {
-            reply
+        let grants_resolved = match self.resume_mrtr(&invocation, &request, protocol).await? {
+            CallFlow::Continue(count) => count,
+            CallFlow::Complete(result) => return Ok(result),
         };
-
-        // If the broker gated the call on a capsule the caller does not hold,
-        // it replies a `grant_required` signal (NOT a result) — the kernel
-        // DROPPED the original call at the access gate. Elicit the user's
-        // consent; on approve the kernel persists the capsule grant and we
-        // RE-SEND the original call (now passing the gate, exactly as the
-        // ingress flow re-sends). On deny / no-capability / error, fail secure
-        // with an MCP error. This sits AFTER the ingress block and BEFORE the
-        // approval block, so a re-sent call still flows into the approval gate:
-        // a tool that is both ungranted and capability-gated resolves in
-        // sequence.
-        //
-        // LOOP, do not resolve once (#1117): a fresh principal can be missing
-        // SEVERAL view capsules, and each re-sent call trips the access gate on
-        // the NEXT ungranted capsule. Resolve-and-re-send until the reply is
-        // grant-free, bounded by `MAX_GRANT_RESOLUTIONS` so a broker that keeps
-        // replying `grant_required` cannot spin the shim. The invariant that
-        // keeps an ungranted call from masquerading as an empty success lives
-        // in `next_grant_step`: a present grant signal is never `Terminal`, so
-        // the only ways out of this loop are a grant-free reply (`break`) or a
-        // terminal error (malformed / denied / bound exceeded).
-        let mut reply = reply;
-        let mut grants_resolved = 0usize;
-        let reply = loop {
-            match next_grant_step(&reply, grants_resolved) {
-                GrantStep::Terminal => break reply,
-                GrantStep::Fail(message) => {
-                    return Ok(CallToolResult::error(vec![ContentBlock::text(message)]).into());
-                },
-                GrantStep::Resolve(grant) => {
-                    let granted = self.resolve_grant(&context.peer, &grant).await?;
-                    if !granted {
-                        return Ok(CallToolResult::error(vec![ContentBlock::text(
-                            GRANT_DENIED_MESSAGE,
-                        )])
-                        .into());
-                    }
-                    grants_resolved = grants_resolved.saturating_add(1);
-                    // Re-send the original call now that this capsule is
-                    // granted; the next reply may itself carry a further
-                    // `grant_required` for the NEXT ungranted view capsule.
-                    let retry_id = new_req_id();
-                    reply = self
-                        .round_trip(TOOL_CALL_TOPIC, &retry_id, call_body(&retry_id))
-                        .await?;
-                },
-            }
+        let reply = self.invoke_tool(&invocation).await?;
+        let reply = match self
+            .handle_ingress(reply, &invocation, &context, protocol)
+            .await?
+        {
+            CallFlow::Continue(reply) => reply,
+            CallFlow::Complete(result) => return Ok(result),
         };
-
-        // If the routed tool parked on a capability approval, the broker
-        // surfaces an `approval_required` flag instead of a terminal result.
-        // Elicit the choice from the client, forward the decision to the
-        // broker, and use the broker's resumed/denied reply as the terminal
-        // result. The non-parked path skips this entirely.
-        let reply = if let Some(approval) = elicit::ApprovalRequest::from_reply(&reply) {
-            self.resolve_approval(&context.peer, &approval).await?
-        } else {
-            reply
+        let reply = match self
+            .handle_grants(reply, &invocation, &context, protocol, grants_resolved)
+            .await?
+        {
+            CallFlow::Continue(reply) => reply,
+            CallFlow::Complete(result) => return Ok(result),
         };
-
-        Ok(call_tool_result_from_reply(&reply).into())
+        self.finish_approval(reply, &invocation, &context, protocol)
+            .await
     }
 }
 
@@ -542,15 +514,9 @@ impl AstridMcpServer {
         approval: &elicit::ApprovalRequest,
     ) -> Result<Value, McpError> {
         let respond_req_id = new_req_id();
-        let (_decision, respond_body) =
+        let (decision, _respond_body) =
             elicit::resolve_decision(peer, approval, &respond_req_id).await;
-
-        self.round_trip(
-            elicit::APPROVAL_RESPOND_TOPIC,
-            &respond_req_id,
-            respond_body,
-        )
-        .await
+        self.forward_approval_decision(approval, decision).await
     }
 
     /// Drive the ingress-consent bridge for a `tools/call` the broker gated on
@@ -574,6 +540,10 @@ impl AstridMcpServer {
             return Ok(false);
         }
 
+        self.record_ingress_accept().await
+    }
+
+    async fn record_ingress_accept(&self) -> Result<bool, McpError> {
         // The respond body carries NO source_id — the broker trusts the
         // kernel-stamped caller of this message. A fresh req_id keys the ack.
         let respond_req_id = new_req_id();
@@ -622,8 +592,15 @@ impl AstridMcpServer {
         request: &grant::GrantRequest,
     ) -> Result<bool, McpError> {
         let approved = grant::elicit_grant(peer, request).await;
-        let decision = grant::grant_decision(approved);
+        self.forward_grant_decision(request, approved).await
+    }
 
+    async fn forward_grant_decision(
+        &self,
+        request: &grant::GrantRequest,
+        approved: bool,
+    ) -> Result<bool, McpError> {
+        let decision = grant::grant_decision(approved);
         // A fresh req_id keys the ack. The respond body echoes the kernel-minted
         // grant `request_id` so the broker routes the decision; the grant target
         // is never a body field (the kernel derives it from its own signal).
@@ -645,6 +622,21 @@ impl AstridMcpServer {
             warn!("MCP shim: broker did not confirm capsule grant; not retrying call");
         }
         Ok(granted)
+    }
+
+    async fn forward_approval_decision(
+        &self,
+        approval: &elicit::ApprovalRequest,
+        decision: &str,
+    ) -> Result<Value, McpError> {
+        let respond_req_id = new_req_id();
+        let respond_body = approval.respond_body(&respond_req_id, decision);
+        self.round_trip(
+            elicit::APPROVAL_RESPOND_TOPIC,
+            &respond_req_id,
+            respond_body,
+        )
+        .await
     }
 }
 
@@ -671,6 +663,17 @@ fn call_tool_result_from_reply(reply: &Value) -> CallToolResult {
     } else {
         CallToolResult::success(content)
     }
+}
+
+fn consent_denied_result() -> CallToolResponse {
+    CallToolResult::error(vec![ContentBlock::text(
+        "Astrid tool calls were not authorized for this session.",
+    )])
+    .into()
+}
+
+fn grant_denied_result() -> CallToolResponse {
+    CallToolResult::error(vec![ContentBlock::text(GRANT_DENIED_MESSAGE)]).into()
 }
 
 /// Mint a fresh correlation id: a dashless UUID is exactly one
@@ -767,12 +770,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn inbound_protocol_remains_pinned_until_approval_uses_mrtr() {
+    fn inbound_protocol_prefers_modern_and_retains_legacy_fallback() {
         assert_eq!(
             ASTRID_MCP_PROTOCOL_VERSIONS,
-            &[ProtocolVersion::V_2025_11_25]
+            &[ProtocolVersion::V_2026_07_28, ProtocolVersion::V_2025_11_25,]
         );
-        assert!(!ASTRID_MCP_PROTOCOL_VERSIONS.contains(&ProtocolVersion::V_2026_07_28));
+        assert_eq!(ASTRID_MCP_PROTOCOL_VERSION, ProtocolVersion::V_2026_07_28);
     }
 
     #[test]
