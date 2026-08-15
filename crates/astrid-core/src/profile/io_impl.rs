@@ -256,6 +256,38 @@ mod tests {
     }
 
     #[test]
+    fn load_accepts_toml_1_1_multiline_inline_tables() {
+        let (_d, home, principal) = scratch_home();
+        let path = PrincipalProfile::path_for(&home, &principal);
+        fs::write(
+            &path,
+            r#"
+                [network]
+                capsule_egress = {
+                    "openai-compat" = ["127.0.0.1:1234"],
+                }
+            "#,
+        )
+        .unwrap();
+
+        let loaded = PrincipalProfile::load(&home, &principal).unwrap();
+        assert_eq!(
+            loaded.network.capsule_egress["openai-compat"],
+            ["127.0.0.1:1234"]
+        );
+    }
+
+    #[test]
+    fn load_rejects_malformed_radix_integer_without_panicking() {
+        let (_d, home, principal) = scratch_home();
+        let path = PrincipalProfile::path_for(&home, &principal);
+        fs::write(&path, "profile_version = 0x_FG\n").unwrap();
+
+        let err = PrincipalProfile::load(&home, &principal).unwrap_err();
+        assert!(matches!(err, ProfileError::Parse(_)), "got: {err:?}");
+    }
+
+    #[test]
     fn load_rejects_unknown_nested_field() {
         let (_d, home, principal) = scratch_home();
         let path = PrincipalProfile::path_for(&home, &principal);
