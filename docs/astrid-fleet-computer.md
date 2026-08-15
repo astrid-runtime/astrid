@@ -96,64 +96,102 @@ access is always an explicit, audited delegation.
 
 ## 3. The filesystem is a composed view
 
-There is one fleet-owned computer root plus per-principal view roots. The
-principal store holds their immutable objects and authoritative generations. A
-filesystem provider composes them for a particular user, fleet, acting
-principal, session, and generation.
-
-A normal human or application filesystem projection is:
+Astrid already has one canonical, Linux FHS-aligned hierarchy. It is defined by
+`AstridHome` and must remain the visible contract when storage moves behind a
+mounted provider:
 
 ```text
-/                   signed, immutable distribution and shared tools
-├── home/fleet/     shared user home, configuration, and ordinary files
-├── home/agent/     fleet base plus this principal's overlay view
-├── workspace/      shared fleet project or explicit task attachment
-├── apps/           application-scoped state and projections
-├── team/           synthetic collaboration service, not ordinary storage
-├── run/aos/        typed portals, handles, and session services
-└── tmp/            principal-private ephemeral state
+Astrid/
+├── etc/                         deployment configuration and policy
+│   ├── config.toml
+│   ├── servers.toml
+│   ├── gateway.toml
+│   ├── hooks/
+│   ├── profiles/
+│   └── layout-version
+├── var/                         persistent system state
+│   ├── principal-store/         authoritative typed store
+│   ├── content-staging/         private acknowledged-write staging
+│   └── state.db/                legacy import source
+├── run/                         ephemeral runtime endpoints and state
+├── log/                         system logs
+├── keys/                        runtime and local identity keys
+├── secrets/                     capability-mediated secret backing
+├── bin/                         content-addressed compiled components
+├── lib/                         shared component libraries
+├── wit/                         canonical and content-addressed WIT
+├── home/
+│   └── {principal}/
+│       ├── .local/
+│       │   ├── capsules/
+│       │   ├── kv/
+│       │   ├── log/
+│       │   ├── audit/
+│       │   ├── tokens/
+│       │   └── tmp/
+│       └── .config/env/
+└── cow/                         host-managed workspace copy-on-write state
 ```
 
-The names are an illustrative projection contract, not a requirement that
-Astrid itself run Linux or make every typed resource a file. A hosted mount,
-native host, Linux Realm capsule, or remote provider may render the same owned
-resources through its native path conventions. None reveals physical host paths
-or the principal store's private arena, journals, indexes, keys, locks, or
-staging layout.
+On Unix the physical host root currently defaults to `~/.astrid`; Windows uses
+the user's `LocalAppData`; `$ASTRID_HOME` may select another physical root. Those
+host locations are placement details. The mounted administrative root preserves
+the canonical hierarchy and names on every OS.
+
+Different agents do not receive different invented hierarchies. They receive
+different capability-filtered namespace views of this hierarchy. A normal
+principal may see shared executable/interface resources and its own
+`home/{principal}`. A fleet-cooperative profile may add explicitly shared roots.
+A sysadmin-authorized principal may receive the broader administrative view.
+Paths never grant authority by themselves.
+
+| View | Canonical visibility |
+| --- | --- |
+| Ordinary principal | Shared admitted `bin/`, `lib/`, and `wit/`; its own `home/{principal}`; explicit workspace attachments |
+| Cooperative fleet agent | Ordinary principal view plus the versioned fleet-owned shared subtree and services |
+| Sysadmin principal | Supported `etc/`, `var/`, `run/`, `log/`, `home/`, lifecycle, and policy projections according to system capabilities |
+| Recovery operator | Separately admitted repair views; never implicit raw-store write authority |
+
+An agent can therefore be the sysadmin without ceasing to be a principal. Its
+system capabilities select a broader view of the same hierarchy, and every
+operation remains principal-attributed and audited.
 
 ### 3.1 Shared system view
 
-The system projection contains signed release and toolchain artifacts. Its
-immutable bytes, page cache, and prewarmed machine state may be shared physically
-across every principal. It is read-only inside agent views. A human-facing or
-provider-specific projection may label this resource `System`, but that label is
-not authority.
+`bin/`, `lib/`, and `wit/` are the normal shared software/interface projection.
+Their immutable bytes and caches may be shared physically across principals and
+fleets. `etc/`, `var/`, `run/`, `log/`, `keys/`, and `secrets/` are
+administrative namespaces whose visibility and mutability depend on explicit
+system capabilities.
 
-This is not the same thing as `StateOwner::System`. The current system-owned
-store root contains kernel-owned administrative state such as identity and
-ownership records. That state is not an ambient guest filesystem and must not
-be exposed merely by mounting the immutable system projection.
+`StateOwner::System` contains kernel-owned state such as identity and ownership
+records. A sysadmin view may expose supported logical administration files at
+their canonical paths, but raw arena frames, indexes, journals, locks, key bytes,
+and staging internals are not made safely editable merely because their backing
+directories exist. Unsupported raw mutation remains refused.
 
 ### 3.2 Fleet view
 
-The fleet computer root is the deliberate collaboration boundary. It contains
-the user's ordinary shared files, installed application state selected for
-sharing, browser identity service, and default workspaces. It supports ordinary
-file operations, durable staging, generation-checked publication, conflicts,
-quota, audit, and recovery.
+Fleet-owned shared files are the deliberate collaboration boundary. They support
+ordinary file operations, durable staging, generation-checked publication,
+conflicts, quota, audit, and recovery. Agents in the user's home fleet may also
+share browser and application state through their owning services.
 
 Fleet ownership does not currently exist in `StateOwnerCodecV1`, whose frozen
 grammar contains only `System` and `Principal(PrincipalUid)`. Fleet-owned roots
 therefore require a versioned owner grammar and migration, or a distinct
-authoritative fleet-root journal. A fleet must never be encoded as a synthetic
-principal or hidden beneath `StateOwner::System`.
+authoritative fleet-root journal. The current canonical hierarchy does not yet
+define a fleet-owned path. That path must be added deliberately to the
+`AstridHome` layout and version sentinel; this design does not invent an ad hoc
+`/fleet` or `/home/fleet` convention. A fleet must never be encoded as a
+synthetic principal or hidden beneath `StateOwner::System`.
 
 ### 3.3 Principal overlay view
 
-`/home/agent` is a composed view: the fleet home is its common lower/base state
-and one `PrincipalUid` owns its writable overlay and session metadata. The
-overlay gives an agent stable working context without making a complete copy of
-the fleet computer.
+`home/{principal}` remains the canonical principal path. The object store may
+compose fleet-common base state with a principal-owned writable overlay behind
+that path, but the visible layout does not change. The overlay gives an agent
+stable working context without making a complete copy of shared state.
 
 The overlay is primarily a collision and lifecycle boundary, not a claim that a
 cooperative fleet peer lacks the ambient authority to reach equivalent shared
@@ -167,7 +205,9 @@ fleet filesystem and are leased only to the intended invocation.
 
 ### 3.4 Workspace attachment
 
-`/workspace` is selected for a job or desktop session. It may be:
+The project workspace is not silently moved into `AstridHome`. Its existing
+per-project `.astrid/` state and opaque workspace identity remain separate. A
+workspace attached to a job or desktop session may be:
 
 - the fleet's default shared project root;
 - a principal-owned project root;
@@ -185,7 +225,9 @@ Application state declares whether it is fleet-common, principal-overlay, or an
 isolated capability-mediated volume. Applications do not silently choose the
 scope. Two instances may share fleet state only when the application contract
 and fleet policy select it; session-local state still receives an instance and
-generation boundary.
+generation boundary. Existing principal-installed capsules and their data retain
+the canonical `home/{principal}/.local/` and `.config/` placement until a
+versioned layout change says otherwise.
 
 The complete execution key is at least:
 
@@ -356,13 +398,13 @@ remote desktop client.
 
 ## 8. Human mounts and system administration
 
-The hosted-OS filesystem provider should offer explicit mounts for different
-resource owners and views. Illustrative commands are:
+The hosted-OS filesystem provider should mount the canonical Astrid hierarchy
+under an admitted view. Illustrative commands are:
 
 ```text
-astrid storage mount principal <principal> [--read-only]
-astrid storage mount fleet <fleet> [--read-only]
-astrid storage mount system --read-only
+astrid storage mount --as <principal> [--read-only]
+astrid storage mount --fleet <fleet> [--read-only]
+astrid storage mount --admin [--read-only]
 astrid storage sync <mount>
 astrid storage status <mount>
 astrid storage unmount <mount>
@@ -370,10 +412,18 @@ astrid storage unmount <mount>
 
 Command names are not yet a frozen CLI contract.
 
-A principal mount presents that agent's composed fleet-base-plus-overlay view.
-A fleet mount presents the common computer root without selecting an agent's
-overlay. A system mount presents a supported administrative projection and is
-read-only by default. None exposes raw engine files.
+Every mode preserves the same canonical relative paths. A principal view exposes
+the shared resources admitted to that principal and `home/{principal}`. A future
+fleet view exposes fleet-owned shared state without selecting an agent overlay.
+An administrative view exposes the supported system hierarchy according to the
+acting user's and principal's system capabilities; it is read-only by default.
+
+This is what permits an agent to be the sysadmin. The agent does not receive a
+different filesystem API or a magic bypass. It receives an administrative
+namespace view and explicit rights over paths such as `etc/`, `log/`, supported
+`var/` projections, principal homes, and lifecycle endpoints. Particularly
+sensitive operations over `keys/`, `secrets/`, raw store state, and runtime
+endpoints remain narrower capabilities even for an administrator.
 
 Filesystem writes update crash-durable working state. `fsync` means the staged
 bytes and namespace mutation are durable; it does not falsely claim that the
@@ -501,8 +551,10 @@ The security qualification is:
    `StateOwnerCodecV1` in place.
 3. Implement the provider-neutral path/inode, staging, publication, mount-lease,
    and doctor contracts.
-4. Compose system, fleet, principal overlay, application, workspace, browser,
-   and synthetic team resources into one provider-neutral principal view.
+4. Project supported system, fleet, principal-overlay, application, browser, and
+   team resources through the canonical `AstridHome` hierarchy. Add any new
+   fleet path only through a versioned layout change. Keep workspaces as explicit
+   attachments.
 5. Implement one hosted mount and desktop adapter with crash, `mmap`, browser,
    compiler, provider-death, daemon-upgrade, and repair evidence.
 6. Add the remaining macOS, Linux, and Windows mount/desktop adapters against the
@@ -518,6 +570,8 @@ The first release slice should prove two users with distinct home fleets and at
 least two principals in one user's fleet:
 
 - every user recovers the same stable home fleet and never another user's fleet;
+- every mount preserves canonical `AstridHome` paths across macOS, Windows, and
+  Linux while applying the admitted principal or sysadmin view;
 - same-fleet principals share the ambient computer-authority profile, common
   files, browser sign-ins, and cookies;
 - same-fleet principals retain independent overlays, working contexts, process
@@ -548,13 +602,14 @@ Do not ship the fleet-computer claim if any of the following remains true:
   session state;
 - multiple Chrome processes concurrently mutate one unsupported profile
   directory;
-- shared cookies or ambient Linux authority cross a home-fleet boundary;
+- shared cookies, ambient computer authority, or provider-specific Linux
+  authority cross a home-fleet boundary;
 - an application silently chooses fleet-common rather than overlay or isolated
   state;
 - a guest path or UID selects an authority-bearing host resource;
 - desktop observation is implied by ownership-management authority;
-- the immutable guest system view exposes mutable kernel administrative state to
-  agents;
+- an ordinary principal view exposes administrative `etc/`, `var/`, `keys/`,
+  `secrets/`, or `run/` state without the corresponding system capability;
 - raw principal-store engine files are the human administration interface;
 - provider failure can lose acknowledged staged bytes or hang clients without a
   bounded error;
