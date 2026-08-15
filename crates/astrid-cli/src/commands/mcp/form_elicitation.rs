@@ -14,7 +14,7 @@ use rmcp::service::{
 };
 
 /// Build the restricted form schema accepted by strict MCP clients.
-fn interoperable_schema<T>() -> Result<ElicitationSchema, ElicitationError>
+pub(super) fn interoperable_schema<T>() -> Result<ElicitationSchema, ElicitationError>
 where
     T: ElicitationSafe,
 {

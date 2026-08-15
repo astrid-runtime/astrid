@@ -14,4 +14,6 @@ mod roots;
 mod sampling;
 
 pub(crate) use client::{AstridClientHandler, ServerNotice};
+#[cfg(test)]
+pub(crate) use elicitation::ElicitationHandler;
 pub(crate) use handler::CapabilitiesHandler;
