@@ -96,12 +96,14 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   help, derive, completion, and absolute-path lookup fixes. Astrid's command
   grammar and MCP stdio resolution contract are unchanged. Closes #1522.
 
-- **Rust API compatibility CI now enforces only Astrid's supported public Rust
-  contract.** Breaking changes to `astrid-types` remain merge-blocking unless
-  explicitly declared, while semver and item-level diffs for internal workspace
-  crates remain visible as advisory review evidence. This prevents automation
-  from forcing architecture distortions merely to preserve implementation-detail
-  APIs while retaining maintainer visibility into every change. Part of #1480.
+- **Core Rust API compatibility reports now match Astrid's actual contract
+  boundary.** Semver and item-level diffs for every core workspace library,
+  including `astrid-types`, remain visible as advisory review evidence, while
+  tool, compiler, and workflow failures remain blocking. Capsule-facing Rust
+  types belong to `sdk-rust`; canonical WIT and wire behavior define runtime
+  compatibility. This prevents automation from forcing architecture
+  distortions merely to preserve implementation-detail APIs. Closes #1533;
+  part of #1480.
 
 - **`agent delete` now reclaims the deleted principal's full runtime footprint.** Delete fences new token and allowance authority, unlinks authentication, removes the profile, retires live capsule views, purges every immutable-UID KV namespace (including orphaned capsules), and reclaims the home tree, signing key (`keys/{principal}.key`), and secrets (`secrets/{principal}/`). Reclamation fails closed: incomplete cleanup returns an error, retains a durable alias reservation, and is safe to retry without letting a replacement identity inherit residual authority or state. Successful responses retain an empty `cleanup_errors` array for wire compatibility. Shared runtimes remain available to other principals. Replaces the previous "reclamation is an ops concern" leave-behind, and drops the interim `--purge-home` flag. Part of #1217.
 ### Fixed
