@@ -666,6 +666,10 @@ fn sync_directory(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
+// Keep the fallible contract shared with Unix callers. These platforms do not
+// expose a portable directory-fsync operation, so retirement ends after the
+// successful directory removal.
+#[allow(clippy::unnecessary_wraps)]
 fn sync_directory(_path: &Path) -> io::Result<()> {
     Ok(())
 }
