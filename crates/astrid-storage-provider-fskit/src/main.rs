@@ -295,49 +295,51 @@ fn prepare_mountpoint(
     Ok((mountpoint, !existed))
 }
 
+#[cfg(target_os = "macos")]
 async fn native_mount(lease: &StorageMountLeaseV1, mountpoint: &Path) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        let status = tokio::process::Command::new("/sbin/mount")
-            .arg("-t")
-            .arg("astridfs")
-            .arg(&lease.resource_path)
-            .arg(mountpoint)
-            .status()
-            .await
-            .context("invoke macOS FSKit mount")?;
-        if !status.success() {
-            bail!(
-                "macOS FSKit mount failed with {status}; install and enable the Astrid file-system extension"
-            );
-        }
-        Ok(())
+    let status = tokio::process::Command::new("/sbin/mount")
+        .arg("-t")
+        .arg("astridfs")
+        .arg(&lease.resource_path)
+        .arg(mountpoint)
+        .status()
+        .await
+        .context("invoke macOS FSKit mount")?;
+    if !status.success() {
+        bail!(
+            "macOS FSKit mount failed with {status}; install and enable the Astrid file-system extension"
+        );
     }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (lease, mountpoint);
-        bail!("the FSKit provider is available only on macOS")
-    }
+    Ok(())
 }
 
+#[cfg(not(target_os = "macos"))]
+fn native_mount(lease: &StorageMountLeaseV1, mountpoint: &Path) -> std::future::Ready<Result<()>> {
+    let _ = (lease, mountpoint);
+    std::future::ready(Err(anyhow::anyhow!(
+        "the FSKit provider is available only on macOS"
+    )))
+}
+
+#[cfg(target_os = "macos")]
 async fn native_unmount(mountpoint: &Path) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        let status = tokio::process::Command::new("/sbin/umount")
-            .arg(mountpoint)
-            .status()
-            .await
-            .context("invoke macOS unmount")?;
-        if !status.success() {
-            bail!("macOS unmount failed with {status}");
-        }
-        Ok(())
+    let status = tokio::process::Command::new("/sbin/umount")
+        .arg(mountpoint)
+        .status()
+        .await
+        .context("invoke macOS unmount")?;
+    if !status.success() {
+        bail!("macOS unmount failed with {status}");
     }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = mountpoint;
-        bail!("the FSKit provider is available only on macOS")
-    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn native_unmount(mountpoint: &Path) -> std::future::Ready<Result<()>> {
+    let _ = mountpoint;
+    std::future::ready(Err(anyhow::anyhow!(
+        "the FSKit provider is available only on macOS"
+    )))
 }
 
 fn resolve_record(selector: &StorageMountSelectorV1) -> Result<MountRecord> {
