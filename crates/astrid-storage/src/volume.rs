@@ -9,8 +9,10 @@ use std::fmt;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 
+#[cfg(not(target_family = "wasm"))]
 mod hosted;
 
+#[cfg(not(target_family = "wasm"))]
 pub use hosted::HostedFileVolume;
 
 const MAX_REGION_NAME_BYTES: usize = 512;

@@ -8,18 +8,14 @@ import sys
 from pathlib import Path
 
 from runatal_v1_blake3 import derive_key
-from runatal_v1_fastcdc import (
-    ASTRID_V1,
-    cut,
-    is_canonical_boundary,
-    validate_profile,
-    verify_golden_vectors,
-)
+from runatal_v1_fastcdc import ASTRID_V1, cut, is_canonical_boundary
+from runatal_v1_fastcdc import validate_profile, verify_golden_vectors
 from runatal_v1_frames import frames, frames_bytes
 from runatal_v1_kv import validate_principal_kv
 from runatal_v1_physical import decode_store as decode_physical_store, identity_bytes
 from runatal_v1_sha384 import verify_cross_hash_attestations
 from runatal_v1_sketch import verify_bottom_k_sketches
+from runatal_v1_volume import VolumeFormatError, recover_volume
 
 OBJECT_CONTEXT = "astrid principal store object identity v1"
 ARENA_MAGIC = b"ASTOBJ1\0"
@@ -77,13 +73,6 @@ LEGACY_FORMAT_SPECIFICATIONS = {
 CHUNK_TREE_FANOUT = 128
 CONTENT_LABEL = b"content"
 U64_MAX = (1 << 64) - 1
-VOLUME_MAGIC = b"ASTVOL1\0"
-VOLUME_RECORD_MAGIC = b"ASTREG1\0"
-VOLUME_RECORD_BYTES = 75
-VOLUME_CONTEXT = "astrid volume record v1"
-VOLUME_TRANSACTION_REGION = "system/volume-metadata-transaction"
-
-
 class FormatError(Exception):
     pass
 
@@ -107,132 +96,6 @@ class Cursor:
     def done(self):
         if self.offset != len(self.data):
             raise FormatError("trailing payload bytes")
-
-
-def volume_region_name(raw):
-    try:
-        name = raw.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise FormatError("non-UTF-8 volume region") from error
-    parts = name.split("/")
-    if (
-        not name
-        or len(raw) > 512
-        or name.startswith("/")
-        or name.endswith("/")
-        or "\\" in name
-        or any(not part or part in (".", "..") for part in parts)
-        or any(ord(character) < 32 or ord(character) == 127 for character in name)
-    ):
-        raise FormatError("invalid volume region name")
-    return name
-
-
-def volume_metadata_mutations(payload):
-    cursor = Cursor(payload)
-    count = cursor.integer(2)
-    if not 1 <= count <= 1024:
-        raise FormatError("invalid volume metadata transaction count")
-    mutations = []
-    for _ in range(count):
-        kind = cursor.integer(1)
-        source = volume_region_name(cursor.take(cursor.integer(2)))
-        destination = volume_region_name(cursor.take(cursor.integer(2)))
-        if kind not in (1, 2):
-            raise FormatError("unknown volume metadata mutation")
-        mutations.append((kind, source, destination))
-    cursor.done()
-    return mutations
-
-
-def apply_volume_mutations(regions, mutations):
-    for kind, source, destination in mutations:
-        if source not in regions:
-            raise FormatError("volume metadata source is absent")
-        if kind == 1 and destination in regions:
-            raise FormatError("volume metadata rename destination exists")
-        if kind == 2 and destination not in regions:
-            raise FormatError("volume metadata replace destination is absent")
-        value = regions.pop(source)
-        regions[destination] = value
-
-
-def recover_volume(path):
-    data = path.read_bytes()
-    if not data.startswith(VOLUME_MAGIC):
-        raise FormatError("invalid Astrid volume header")
-    regions = {}
-    sequence = 0
-    offset = len(VOLUME_MAGIC)
-    while offset < len(data):
-        if len(data) - offset < VOLUME_RECORD_BYTES:
-            break
-        header = data[offset : offset + VOLUME_RECORD_BYTES]
-        if header[:8] != VOLUME_RECORD_MAGIC:
-            raise FormatError(f"invalid volume record magic at byte {offset}")
-        total, current = struct.unpack("<QQ", header[8:24])
-        operation = header[24]
-        name_length = int.from_bytes(header[25:27], "little")
-        logical_offset, payload_length = struct.unpack("<QQ", header[27:43])
-        if (
-            total < VOLUME_RECORD_BYTES
-            or total != VOLUME_RECORD_BYTES + name_length + payload_length
-            or offset + total > len(data)
-            or not 1 <= name_length <= 512
-        ):
-            break
-        if current != sequence + 1 or operation not in range(1, 8):
-            raise FormatError("invalid volume record sequence or operation")
-        name_start = offset + VOLUME_RECORD_BYTES
-        payload_start = name_start + name_length
-        name_raw = data[name_start:payload_start]
-        payload = data[payload_start : offset + total]
-        material = (
-            header[16:24]
-            + header[24:25]
-            + header[25:27]
-            + header[27:35]
-            + header[35:43]
-            + name_raw
-            + payload
-        )
-        if derive_key(VOLUME_CONTEXT, material) != header[43:75]:
-            raise FormatError(f"volume checksum mismatch at byte {offset}")
-        name = volume_region_name(name_raw)
-        if operation == 1:
-            if payload or name in regions:
-                raise FormatError("invalid volume create")
-            regions[name] = bytearray()
-        elif operation == 2:
-            if not payload or name not in regions:
-                raise FormatError("invalid volume write")
-            end = logical_offset + len(payload)
-            region = regions[name]
-            if end > len(region):
-                region.extend(bytes(end - len(region)))
-            region[logical_offset:end] = payload
-        elif operation == 3:
-            if payload or name not in regions:
-                raise FormatError("invalid volume truncate")
-            region = regions[name]
-            if logical_offset < len(region):
-                del region[logical_offset:]
-            else:
-                region.extend(bytes(logical_offset - len(region)))
-        elif operation == 4:
-            if payload or name not in regions:
-                raise FormatError("invalid volume remove")
-            del regions[name]
-        elif operation in (5, 6):
-            destination = volume_region_name(payload)
-            apply_volume_mutations(regions, [(operation - 4, name, destination)])
-        else:
-            if name != VOLUME_TRANSACTION_REGION or logical_offset != 0:
-                raise FormatError("invalid volume metadata transaction envelope")
-            apply_volume_mutations(regions, volume_metadata_mutations(payload))
-        sequence = current
-        offset += total
-    return {name: bytes(value) for name, value in regions.items()}
 
 
 def identity(cursor):
@@ -973,7 +836,10 @@ def recover(store, include_payloads):
     verify_content_summary_vectors()
     volume = store.is_file()
     if volume:
-        regions = recover_volume(store)
+        try:
+            regions = recover_volume(store)
+        except VolumeFormatError as error:
+            raise FormatError(str(error)) from error
         try:
             arena_bytes = regions["objects.arena"]
             root_bytes = regions["roots.journal"]
