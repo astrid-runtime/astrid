@@ -167,9 +167,12 @@ impl RepresentationStore {
         retire_loose_blob_tree(&self.root_directory)
     }
 
-    pub(in crate::engine::durable) fn rebuild_contiguous_index<I: PersistentObjectIdentity>(
+    pub(in crate::engine::durable) fn rebuild_contiguous_index<
+        I: PersistentObjectIdentity,
+        F: super::super::DurableIo,
+    >(
         &mut self,
-        arena: &mut File,
+        arena: &mut F,
         index: &BTreeMap<ObjectId, ArenaLocation>,
         identity: &I,
         limits: RecoveryLimits,

@@ -2,10 +2,12 @@
 
 use std::io::ErrorKind;
 use std::path::Path;
+use std::sync::Arc;
 
 use cap_std::fs::Dir;
 
 use crate::storage_model::{GcCommitId, ObjectId};
+use crate::volume::{AstridVolume, VolumeMetadataMutation, VolumeRegion};
 
 use super::evidence::{CompactionEvidenceBundle, validate_bundle};
 use super::{
@@ -21,6 +23,107 @@ const OUTBOX_FILE_NAME: &str = "GC evidence outbox";
 const PREPARED_SUFFIX: &str = ".prepared";
 const READY_SUFFIX: &str = ".ready";
 const TEMP_SUFFIX: &str = ".tmp";
+const VOLUME_OUTBOX_PREFIX: &str = "system/gc-outbox/";
+
+pub(super) fn prepare_volume<I: PersistentObjectIdentity>(
+    volume: Arc<dyn AstridVolume>,
+    bundle: &CompactionEvidenceBundle,
+    identity: &I,
+    limits: RecoveryLimits,
+) -> Result<(), DurableError> {
+    let ready = volume_bundle_region(bundle.commit_id(), READY_SUFFIX)?;
+    if volume
+        .region_exists(&ready)
+        .map_err(|source| io_error("inspect volume GC evidence", source))?
+    {
+        return require_same_volume_bundle(volume, &ready, bundle, identity, limits);
+    }
+    let prepared = volume_bundle_region(bundle.commit_id(), PREPARED_SUFFIX)?;
+    if volume
+        .region_exists(&prepared)
+        .map_err(|source| io_error("inspect volume GC evidence", source))?
+    {
+        return require_same_volume_bundle(volume, &prepared, bundle, identity, limits);
+    }
+    write_volume_bundle(volume.clone(), &prepared, bundle, identity, limits)?;
+    volume
+        .sync()
+        .map_err(|source| io_error("flush prepared volume GC evidence", source))
+}
+
+pub(super) fn commit_volume_replacement<I: PersistentObjectIdentity>(
+    volume: Arc<dyn AstridVolume>,
+    source: VolumeRegion,
+    destination: VolumeRegion,
+    bundle: &CompactionEvidenceBundle,
+    identity: &I,
+    limits: RecoveryLimits,
+) -> Result<(), DurableError> {
+    let prepared = volume_bundle_region(bundle.commit_id(), PREPARED_SUFFIX)?;
+    require_same_volume_bundle(Arc::clone(&volume), &prepared, bundle, identity, limits)?;
+    let ready = volume_bundle_region(bundle.commit_id(), READY_SUFFIX)?;
+    volume
+        .commit_metadata(&[
+            VolumeMetadataMutation::Replace {
+                source,
+                destination,
+            },
+            VolumeMetadataMutation::Rename {
+                source: prepared,
+                destination: ready.clone(),
+            },
+        ])
+        .map_err(|source| io_error("commit volume compaction transaction", source))?;
+    volume
+        .sync()
+        .map_err(|source| io_error("flush volume compaction transaction", source))?;
+    require_same_volume_bundle(volume, &ready, bundle, identity, limits)
+}
+
+pub(super) fn pending_volume<I: PersistentObjectIdentity>(
+    volume: &Arc<dyn AstridVolume>,
+    identity: &I,
+    limits: RecoveryLimits,
+) -> Result<Vec<CompactionEvidenceBundle>, DurableError> {
+    let mut regions = volume
+        .list_regions(VOLUME_OUTBOX_PREFIX)
+        .map_err(|source| io_error("list volume GC evidence", source))?;
+    regions.sort();
+    regions
+        .into_iter()
+        .filter(|region| region.as_str().ends_with(READY_SUFFIX))
+        .map(|region| {
+            let name = region
+                .as_str()
+                .strip_prefix(VOLUME_OUTBOX_PREFIX)
+                .ok_or(invalid_outbox("invalid volume GC outbox region"))?;
+            let commit = parse_bundle_name(name, READY_SUFFIX)?;
+            read_volume_bundle(volume.clone(), &region, Some(commit), identity, limits)
+        })
+        .collect()
+}
+
+pub(super) fn acknowledge_volume<I: PersistentObjectIdentity>(
+    volume: &Arc<dyn AstridVolume>,
+    commit: GcCommitId,
+    identity: &I,
+    limits: RecoveryLimits,
+) -> Result<(), DurableError> {
+    let ready = volume_bundle_region(commit, READY_SUFFIX)?;
+    if !volume
+        .region_exists(&ready)
+        .map_err(|source| io_error("inspect volume GC evidence", source))?
+    {
+        return Ok(());
+    }
+    read_volume_bundle(volume.clone(), &ready, Some(commit), identity, limits)?;
+    volume
+        .remove_region(&ready)
+        .map_err(|source| io_error("acknowledge volume GC evidence", source))?;
+    volume
+        .sync()
+        .map_err(|source| io_error("flush volume GC acknowledgement", source))
+}
 
 pub(super) fn prepare<I: PersistentObjectIdentity>(
     directory: &Dir,
@@ -199,9 +302,18 @@ fn read_bundle<I: PersistentObjectIdentity>(
     limits: RecoveryLimits,
 ) -> Result<CompactionEvidenceBundle, DurableError> {
     let mut file = open_rw_capability(directory, Path::new(name), false)?;
+    read_bundle_file(&mut file, expected, identity, limits)
+}
+
+fn read_bundle_file<I: PersistentObjectIdentity, F: super::super::DurableIo>(
+    file: &mut F,
+    expected: Option<GcCommitId>,
+    identity: &I,
+    limits: RecoveryLimits,
+) -> Result<CompactionEvidenceBundle, DurableError> {
     let mut records = Vec::new();
     scan_frames(
-        &mut file,
+        file,
         OUTBOX_FILE_NAME,
         OUTBOX_MAGIC,
         limits,
@@ -242,6 +354,67 @@ fn require_same_bundle<I: PersistentObjectIdentity>(
         identity,
         limits,
     )?;
+    if &actual != expected {
+        return Err(invalid_outbox(
+            "GC receipt identity names a different evidence bundle",
+        ));
+    }
+    Ok(())
+}
+
+fn volume_bundle_region(commit: GcCommitId, suffix: &str) -> Result<VolumeRegion, DurableError> {
+    VolumeRegion::new(format!(
+        "{VOLUME_OUTBOX_PREFIX}{}",
+        bundle_name(commit, suffix)
+    ))
+    .map_err(|source| io_error("validate volume GC evidence region", source))
+}
+
+fn write_volume_bundle<I: PersistentObjectIdentity>(
+    volume: Arc<dyn AstridVolume>,
+    region: &VolumeRegion,
+    bundle: &CompactionEvidenceBundle,
+    identity: &I,
+    limits: RecoveryLimits,
+) -> Result<(), DurableError> {
+    if volume
+        .region_exists(region)
+        .map_err(|source| io_error("inspect volume GC bundle", source))?
+    {
+        volume
+            .remove_region(region)
+            .map_err(|source| io_error("remove stale volume GC bundle", source))?;
+    }
+    let mut file = super::super::File::volume(volume, region.as_str(), true)?;
+    for record in bundle.records() {
+        let id = identity.identify(record);
+        let payload = encode_object_frame(identity.scheme(), id, record)?;
+        ensure_payload_limit(OUTBOX_FILE_NAME, 0, payload.len(), limits)?;
+        append_frame(&mut file, OUTBOX_MAGIC, &payload)?;
+    }
+    file.sync_data()
+        .map_err(|source| io_error("flush volume GC bundle", source))
+}
+
+fn read_volume_bundle<I: PersistentObjectIdentity>(
+    volume: Arc<dyn AstridVolume>,
+    region: &VolumeRegion,
+    expected: Option<GcCommitId>,
+    identity: &I,
+    limits: RecoveryLimits,
+) -> Result<CompactionEvidenceBundle, DurableError> {
+    let mut file = super::super::File::volume(volume, region.as_str(), false)?;
+    read_bundle_file(&mut file, expected, identity, limits)
+}
+
+fn require_same_volume_bundle<I: PersistentObjectIdentity>(
+    volume: Arc<dyn AstridVolume>,
+    region: &VolumeRegion,
+    expected: &CompactionEvidenceBundle,
+    identity: &I,
+    limits: RecoveryLimits,
+) -> Result<(), DurableError> {
+    let actual = read_volume_bundle(volume, region, Some(expected.commit_id()), identity, limits)?;
     if &actual != expected {
         return Err(invalid_outbox(
             "GC receipt identity names a different evidence bundle",

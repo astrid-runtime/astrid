@@ -9,6 +9,7 @@ Related documents:
 - [Astrid user and fleet ownership](astrid-user-fleet-ownership.md)
 - [Astrid Principal Store](astrid-principal-store.md)
 - [Astrid Principal Store Runtime Realization](astrid-principal-store-runtime.md)
+- [Astrid Hosted Volume Format 1](../crates/astrid-storage/formats/astrid-volume-v1.txt)
 - [Astrid Native Component Kernel](astrid-native-kernel.md)
 - [AOS Principal Linux Realm](https://github.com/unicity-aos/aos-ce/blob/main/docs/principal-linux-realm.md), an optional Linux capsule consumer
 
@@ -108,12 +109,16 @@ access is always an explicit, audited delegation.
 
 ## 3. The filesystem is an authoritative owner view
 
-There are two deliberately different trees. The private runtime layout under
-`ASTRID_HOME` contains engine arenas, journals, keys, configuration, logs,
-migration receipts, and ephemeral mount leases. It is implementation backing;
-it is never the filesystem served to a principal, fleet, or sysadmin. In
-particular, layout two has no physical `srv/fleets/...` or other host-directory
-copy of mounted files.
+There are two deliberately different surfaces. The private runtime layout under
+`ASTRID_HOME` contains one hosted Astrid volume plus keys, configuration, logs,
+migration records, transient ingestion staging, and ephemeral mount leases. The
+volume contains the authoritative object arena, root journal, disposable index,
+cutover receipt, and GC outbox as named regions; those are not separate host
+files or directories. On bare metal, the same `AstridVolume` contract is backed
+directly by governed storage media instead of `var/astrid.volume`. Neither form
+is the filesystem served to a principal, fleet, or sysadmin. In particular,
+layout two has no physical `srv/fleets/...`, `principal-store/`, or other
+host-directory copy of mounted files.
 
 The mounted tree is materialized from the selected `StateOwner` root in the
 Astrid store. Regular files are immutable content DAGs. Directory entries are
@@ -695,9 +700,11 @@ The migration is an exclusive, crash-resumable ownership transaction:
    to that operator's home fleet with explicit receipts. A development home that
    already contains a valid ownership graph preserves that graph instead of
    reassigning principals.
-4. Convert the imported store to the version-two owner grammar and create the
-   stable fleet and principal owners. No host-directory filesystem projection
-   is created. Existing private runtime configuration, keys, capsule data, and
+4. Convert the imported store to the version-two owner grammar, create the
+   stable fleet and principal owners, and snapshot every verified owner closure
+   into a fresh Astrid volume. Reopen and compare every root and record before
+   retiring `var/principal-store/`. No host-directory filesystem projection is
+   created. Existing private runtime configuration, keys, capsule data, and
    logs remain private runtime inputs; they are not copied into a mounted owner
    tree or merged into fleet-owned files.
 5. Preserve existing principal-scoped browser and capsule state. A fleet browser
@@ -708,9 +715,11 @@ The migration is an exclusive, crash-resumable ownership transaction:
    and atomically replace `etc/layout-version` with `2` as the final commit
    point. Only then may the daemon serve principals or mounts.
 7. After the receipt and version-two sentinel are durable, delete the verified
-   `var/state.db/` import source and synchronize its parent. Re-entry completes
-   this retirement after a crash. Running a version-one binary against the home
-   is refused; rollback requires an operator-owned pre-migration backup.
+   `var/state.db/` import source and, after the volume cutover receipt and exact
+   snapshot verification are durable, delete `var/principal-store/`. Synchronize
+   the parent after each retirement. Re-entry completes either retirement after
+   a crash. Running a version-one binary against the home is refused; rollback
+   requires an operator-owned pre-migration backup.
 
 Migration restart is idempotent. Before the version-two sentinel is committed,
 the intent and verified target determine whether to resume, quarantine, or
@@ -739,10 +748,11 @@ ownership bootstrap. Unix migration copy and directory creation retain
 directory capabilities and reject redirects; a non-empty home without a
 sentinel is refused. `StateOwnerCodecV2` supplies the fleet tag without changing
 the frozen version-one domain, and the CLI/provider boundary is versioned and
-typed. The authoritative filesystem, kernel lease callback service, CLI
-contract, and native macOS FSKit implementation are present. An exact macOS
-arm64 v0.10.4 home fixture imports, verifies, commits, and deletes the legacy
-store. Linux and Windows native adapters, capsule-governed user/fleet allocation
+typed. The authoritative filesystem, path-free volume boundary, hosted
+single-file volume, kernel lease callback service, CLI contract, and native
+macOS FSKit implementation are present. An exact macOS arm64 v0.10.4 home
+fixture imports, verifies, commits, reopens the volume, and deletes both legacy
+stores. Linux and Windows native adapters, capsule-governed user/fleet allocation
 policy, an exact Linux v0.10.4 home, low-disk evidence, and the complete fault
 matrix remain follow-up evidence.
 
@@ -757,7 +767,6 @@ The simple truthful story is:
 > independent view, overlay, active processes, desktop, working context, and
 > identity. Each agent may use a different capsule-composed harness and external
 > AI connector. The same fleet may also contain non-cognitive principals such as
-> vaults and schedulers. Open any agent's terminal or desktop and let the team
 > work together without stepping on one another's active state.
 
 The shorter phrase is:

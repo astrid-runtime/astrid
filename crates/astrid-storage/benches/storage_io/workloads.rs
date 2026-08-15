@@ -351,7 +351,7 @@ async fn benchmark_runtime(
 
         samples
             .authority_validation
-            .push(benchmark_representation_authority_validation(&home)?);
+            .push(benchmark_volume_authority_validation(&home).await?);
     }
     samples.record(config, report)?;
     Ok(())
@@ -367,13 +367,13 @@ async fn benchmark_publication(
     let (unique_name, unique_staged, stage_write, stage_seal) =
         stage_source(store, source, owner, "large/unique.bin", config.block_bytes)?;
     let authoritative_before = authoritative_store_bytes(home)?;
-    let representation_before = representation_metadata_bytes(home)?;
+    let representation_before = 0_u64;
     let started = Instant::now();
     let unique_outcome = store.publish_staged(unique_staged).await?;
     black_box(unique_outcome);
     let unique_publish = started.elapsed();
     let authoritative_after_unique = authoritative_store_bytes(home)?;
-    let representation_after_unique = representation_metadata_bytes(home)?;
+    let representation_after_unique = 0_u64;
     let unique_authoritative_bytes = authoritative_after_unique
         .checked_sub(authoritative_before)
         .ok_or("authoritative store shrank during unique publication")?;
@@ -390,13 +390,13 @@ async fn benchmark_publication(
         config.block_bytes,
     )?;
     let authoritative_before_duplicate = authoritative_store_bytes(home)?;
-    let representation_before_duplicate = representation_metadata_bytes(home)?;
+    let representation_before_duplicate = 0_u64;
     let started = Instant::now();
     let duplicate_outcome = store.publish_staged(duplicate_staged).await?;
     black_box(duplicate_outcome);
     let duplicate_publish = started.elapsed();
     let authoritative_after_duplicate = authoritative_store_bytes(home)?;
-    let representation_after_duplicate = representation_metadata_bytes(home)?;
+    let representation_after_duplicate = 0_u64;
     let duplicate_authoritative_bytes = authoritative_after_duplicate
         .checked_sub(authoritative_before_duplicate)
         .ok_or("authoritative store shrank during duplicate publication")?;
@@ -512,7 +512,7 @@ impl RuntimeSamples {
             self.read_after_reopen,
         );
         report.record_operations(
-            "astrid_representation_authority_validation",
+            "astrid_volume_authority_validation",
             1,
             self.authority_validation,
         );
@@ -521,118 +521,15 @@ impl RuntimeSamples {
 }
 
 fn authoritative_store_bytes(home: &AstridHome) -> BenchResult<u64> {
-    let logical = ["objects.arena", "roots.journal"].into_iter().try_fold(
-        0_u64,
-        |total, file_name| -> BenchResult<u64> {
-            let bytes = std::fs::metadata(home.principal_store_path().join(file_name))?.len();
-            total
-                .checked_add(bytes)
-                .ok_or_else(|| "authoritative store byte count overflow".into())
-        },
-    )?;
-    logical
-        .checked_add(representation_authority_bytes(home)?)
-        .ok_or_else(|| "authoritative store byte count overflow".into())
+    Ok(std::fs::metadata(home.storage_volume_path())?.len())
 }
 
-fn representation_authority_bytes(home: &AstridHome) -> BenchResult<u64> {
-    directory_file_bytes(&home.principal_store_path().join("representations"))
-}
-
-fn representation_metadata_bytes(home: &AstridHome) -> BenchResult<u64> {
-    directory_file_bytes_except_blobs(&home.principal_store_path().join("representations"))
-}
-
-fn directory_file_bytes(path: &Path) -> BenchResult<u64> {
-    let mut total = 0_u64;
-    for entry in std::fs::read_dir(path)? {
-        let entry = entry?;
-        let metadata = entry.metadata()?;
-        let bytes = if metadata.is_dir() {
-            directory_file_bytes(&entry.path())?
-        } else if metadata.is_file() {
-            metadata.len()
-        } else {
-            return Err(format!(
-                "authoritative representation path is not a regular file: {}",
-                entry.path().display()
-            )
-            .into());
-        };
-        total = total
-            .checked_add(bytes)
-            .ok_or("representation authority byte count overflow")?;
-    }
-    Ok(total)
-}
-
-fn directory_file_bytes_except_blobs(path: &Path) -> BenchResult<u64> {
-    let mut total = 0_u64;
-    for entry in std::fs::read_dir(path)? {
-        let entry = entry?;
-        let metadata = entry.metadata()?;
-        let bytes = if metadata.is_dir() {
-            directory_file_bytes_except_blobs(&entry.path())?
-        } else if metadata.is_file() {
-            if entry
-                .path()
-                .extension()
-                .is_some_and(|extension| extension == "blob")
-            {
-                0
-            } else {
-                metadata.len()
-            }
-        } else {
-            return Err(format!(
-                "authoritative representation path is not a regular file: {}",
-                entry.path().display()
-            )
-            .into());
-        };
-        total = total
-            .checked_add(bytes)
-            .ok_or("representation metadata byte count overflow")?;
-    }
-    Ok(total)
-}
-
-fn benchmark_representation_authority_validation(home: &AstridHome) -> BenchResult<Duration> {
-    let store = home.principal_store_path();
-    let representations = store.join("representations");
-    let metadata = std::fs::symlink_metadata(&representations)?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err("representation authority is redirected or not a directory".into());
-    }
-    let metadata = std::fs::read_to_string(store.join("store.meta"))?;
-    let format_spec = metadata_object_id(&metadata, "format-spec-object=")?;
-    let catalog_spec = metadata_object_id(&metadata, "content-catalog-spec-object=")?;
-
+async fn benchmark_volume_authority_validation(home: &AstridHome) -> BenchResult<Duration> {
     let started = Instant::now();
-    let engine = DurableEngine::<StateOwner, Blake3ObjectIdentityV1, StateOwnerCodecV2>::open(
-        store,
-        Blake3ObjectIdentityV1,
-        StateOwnerCodecV2,
-        RecoveryLimits::process_addressable(),
-    )?;
-    engine.ensure_direct_representation_catalogue(format_spec, &[format_spec, catalog_spec])?;
+    let store = open_store(home, Some(0)).await?;
     let elapsed = started.elapsed();
-    drop(engine);
+    store.kv().close().await?;
     Ok(elapsed)
-}
-
-fn metadata_object_id(metadata: &str, prefix: &str) -> BenchResult<ObjectId> {
-    let encoded = metadata
-        .lines()
-        .find_map(|line| line.strip_prefix(prefix))
-        .ok_or_else(|| format!("store metadata omitted {prefix}"))?;
-    let (_, digest) = encoded
-        .rsplit_once(':')
-        .ok_or_else(|| format!("store metadata has malformed {prefix}"))?;
-    let decoded = hex::decode(digest)?;
-    let bytes = <[u8; 32]>::try_from(decoded)
-        .map_err(|_| format!("store metadata has non-256-bit {prefix}"))?;
-    Ok(ObjectId::new(bytes))
 }
 
 fn benchmark_native_reads(

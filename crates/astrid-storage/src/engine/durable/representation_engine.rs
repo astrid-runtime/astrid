@@ -112,8 +112,8 @@ where
                 },
             )?;
             RepresentationStore::activate(
-                &self.directory,
-                &self.directory_capability,
+                self.hosted_path()?,
+                self.hosted_directory()?,
                 self.limits,
                 frozen_specification,
                 objects.into_iter().map(Ok),

@@ -1,11 +1,12 @@
 //! Native arena and root-journal framing, parsing, and recovery.
 
+#[cfg(test)]
+use super::File;
 use super::{
-    ARENA_FILE, ARENA_MAGIC, ArenaLocation, BTreeMap, CHECKSUM_START, DurableError,
-    FRAME_HEADER_LEN, FRAME_HEADER_LEN_USIZE, FRAME_VERSION, File, IdentityScheme, ModelError,
+    ARENA_FILE, ARENA_MAGIC, ArenaLocation, BTreeMap, CHECKSUM_START, DurableError, DurableIo,
+    FRAME_HEADER_LEN, FRAME_HEADER_LEN_USIZE, FRAME_VERSION, IdentityScheme, ModelError,
     ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord, ObjectReference,
-    PersistentObjectIdentity, Read, RecoveryLimits, ReferenceKind, ReferenceLabel, Seek, SeekFrom,
-    Write, io,
+    PersistentObjectIdentity, RecoveryLimits, ReferenceKind, ReferenceLabel, SeekFrom, io,
 };
 #[cfg(test)]
 use std::fs::OpenOptions;
@@ -34,15 +35,15 @@ pub(super) use indexed::{
 pub(super) use prepared::{PreparedFrame, append_prepared_frames};
 use reader::SliceReader;
 
-pub(super) fn verify_indexed_location(
-    arena: &mut File,
+pub(super) fn verify_indexed_location<F: DurableIo>(
+    arena: &mut F,
     expected_id: ObjectId,
     location: ArenaLocation,
     scheme: IdentityScheme,
     limits: RecoveryLimits,
 ) -> Result<(), DurableError> {
     let file_len = arena
-        .metadata()
+        .durable_metadata()
         .map_err(|source| io_error("read indexed arena metadata", source))?
         .len();
     let frame_end = location
@@ -115,8 +116,8 @@ pub(super) fn verify_indexed_location(
     Ok(())
 }
 
-pub(super) fn verify_indexed_tail(
-    arena: &mut File,
+pub(super) fn verify_indexed_tail<F: DurableIo>(
+    arena: &mut F,
     location: ArenaLocation,
     limits: RecoveryLimits,
 ) -> Result<(), DurableError> {
@@ -134,8 +135,8 @@ pub(super) fn verify_indexed_tail(
     Ok(())
 }
 
-fn read_frame_at(
-    file: &File,
+fn read_frame_at<F: DurableIo>(
+    file: &F,
     file_name: &'static str,
     magic: [u8; 8],
     offset: u64,
@@ -191,7 +192,7 @@ fn read_frame_at(
     Ok(payload)
 }
 
-fn read_exact_at(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<()> {
+fn read_exact_at<F: DurableIo>(file: &F, buffer: &mut [u8], offset: u64) -> io::Result<()> {
     let mut filled = 0_usize;
     while filled != buffer.len() {
         let relative = u64::try_from(filled)
@@ -213,21 +214,8 @@ fn read_exact_at(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<()> 
     Ok(())
 }
 
-#[cfg(unix)]
-fn positioned_read(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
-    std::os::unix::fs::FileExt::read_at(file, buffer, offset)
-}
-
-#[cfg(windows)]
-fn positioned_read(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
-    std::os::windows::fs::FileExt::seek_read(file, buffer, offset)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn positioned_read(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
-    let mut reader = file.try_clone()?;
-    reader.seek(SeekFrom::Start(offset))?;
-    reader.read(buffer)
+fn positioned_read<F: DurableIo>(file: &F, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
+    file.durable_read_at(buffer, offset)
 }
 
 #[cfg(test)]
@@ -241,6 +229,7 @@ pub(super) fn open_rw(path: &Path) -> Result<File, DurableError> {
     }
     options
         .open(path)
+        .map(File::native)
         .map_err(|source| io_error("open principal-store file", source))
 }
 
@@ -248,8 +237,8 @@ pub(super) fn io_error(operation: &'static str, source: io::Error) -> DurableErr
     DurableError::Io { operation, source }
 }
 
-pub(super) fn recover_arena<I: PersistentObjectIdentity>(
-    arena: &mut File,
+pub(super) fn recover_arena<I: PersistentObjectIdentity, F: DurableIo>(
+    arena: &mut F,
     identity: &I,
     limits: RecoveryLimits,
     protected_len: u64,
@@ -302,8 +291,8 @@ pub(super) fn recover_arena<I: PersistentObjectIdentity>(
     Ok((index, tail))
 }
 
-pub(super) fn scan_frames(
-    file: &mut File,
+pub(super) fn scan_frames<F: DurableIo>(
+    file: &mut F,
     file_name: &'static str,
     magic: [u8; 8],
     limits: RecoveryLimits,
@@ -312,8 +301,8 @@ pub(super) fn scan_frames(
     scan_frames_with_protected_prefix(file, file_name, magic, limits, 0, accept)
 }
 
-fn scan_frames_with_protected_prefix(
-    file: &mut File,
+fn scan_frames_with_protected_prefix<F: DurableIo>(
+    file: &mut F,
     file_name: &'static str,
     magic: [u8; 8],
     limits: RecoveryLimits,
@@ -418,13 +407,13 @@ fn scan_frames_with_protected_prefix(
     Ok(())
 }
 
-fn validated_file_len(
-    file: &File,
+fn validated_file_len<F: DurableIo>(
+    file: &F,
     file_name: &'static str,
     protected_len: u64,
 ) -> Result<u64, DurableError> {
     let file_len = file
-        .metadata()
+        .durable_metadata()
         .map_err(|source| io_error("read principal-store metadata", source))?
         .len();
     if file_len < protected_len {
@@ -479,7 +468,10 @@ fn decode_frame_header(
     })
 }
 
-fn read_frame_payload(file: &mut File, payload_len: u64) -> Result<Vec<u8>, DurableError> {
+fn read_frame_payload<F: DurableIo>(
+    file: &mut F,
+    payload_len: u64,
+) -> Result<Vec<u8>, DurableError> {
     let payload_usize = usize::try_from(payload_len).map_err(|_| DurableError::EncodingOverflow)?;
     let mut payload = Vec::new();
     payload
@@ -491,8 +483,8 @@ fn read_frame_payload(file: &mut File, payload_len: u64) -> Result<Vec<u8>, Dura
     Ok(payload)
 }
 
-fn truncate_unpublished_tail_or_fail(
-    file: &mut File,
+fn truncate_unpublished_tail_or_fail<F: DurableIo>(
+    file: &mut F,
     policy: FrameScanPolicy,
     offset: u64,
     known_interior: bool,
@@ -507,8 +499,8 @@ fn truncate_unpublished_tail_or_fail(
     truncate_tail(file, offset)
 }
 
-fn valid_frame_follows(
-    file: &mut File,
+fn valid_frame_follows<F: DurableIo>(
+    file: &mut F,
     magic: [u8; 8],
     invalid_offset: u64,
     file_len: u64,
@@ -564,8 +556,8 @@ fn valid_frame_follows(
     Ok(false)
 }
 
-fn physical_frame_is_valid(
-    file: &mut File,
+fn physical_frame_is_valid<F: DurableIo>(
+    file: &mut F,
     magic: [u8; 8],
     offset: u64,
     file_len: u64,
@@ -628,15 +620,15 @@ fn physical_frame_is_valid(
     Ok(hasher.finalize().as_bytes() == &expected)
 }
 
-fn truncate_tail(file: &mut File, valid_len: u64) -> Result<(), DurableError> {
-    file.set_len(valid_len)
+fn truncate_tail<F: DurableIo>(file: &mut F, valid_len: u64) -> Result<(), DurableError> {
+    file.durable_set_len(valid_len)
         .map_err(|source| io_error("truncate incomplete durable tail", source))?;
-    file.sync_data()
+    file.durable_sync_data()
         .map_err(|source| io_error("flush durable tail truncation", source))
 }
 
-pub(super) fn append_frame(
-    file: &mut File,
+pub(super) fn append_frame<F: DurableIo>(
+    file: &mut F,
     magic: [u8; 8],
     payload: &[u8],
 ) -> Result<ArenaLocation, DurableError> {
@@ -661,8 +653,8 @@ pub(super) fn append_frame(
     })
 }
 
-pub(super) fn append_frames<T: AsRef<[u8]>>(
-    file: &mut File,
+pub(super) fn append_frames<T: AsRef<[u8]>, F: DurableIo>(
+    file: &mut F,
     magic: [u8; 8],
     payloads: &[T],
 ) -> Result<Vec<ArenaLocation>, DurableError> {

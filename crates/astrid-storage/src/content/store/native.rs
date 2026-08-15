@@ -22,6 +22,7 @@ impl<P: Ord, E> PrincipalContentStore<P, E> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn engine(&self) -> Arc<E> {
         Arc::clone(&self.engine)
     }

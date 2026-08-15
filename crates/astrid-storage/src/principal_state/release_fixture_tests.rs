@@ -104,11 +104,8 @@ async fn published_v0104_home_imports_verifies_and_retires_legacy_store() {
             .unwrap()
             .is_some()
     );
-    assert!(
-        home.principal_store_path()
-            .join("migration.complete")
-            .is_file()
-    );
+    assert!(home.storage_volume_path().is_file());
+    assert!(!home.principal_store_path().exists());
     home.complete_layout_v2(&migration_target).unwrap();
     assert!(!home.state_db_path().exists());
     assert!(!home.root().join("srv").exists());
@@ -124,6 +121,19 @@ async fn published_v0104_home_imports_verifies_and_retires_legacy_store() {
     assert!(
         home.profile_path(&astrid_core::PrincipalId::default())
             .is_file()
+    );
+
+    drop(store);
+    let reopened = open_runtime_principal_store(&home, Arc::new(|_: &StateOwner| Ok(None)))
+        .await
+        .unwrap();
+    assert!(
+        reopened
+            .kv()
+            .get("system:identity", "link/cli/local")
+            .await
+            .unwrap()
+            .is_some()
     );
 }
 

@@ -52,6 +52,7 @@ mod projection_name_tests;
 #[cfg(all(test, feature = "legacy-surrealkv"))]
 mod release_fixture_tests;
 mod staging;
+mod volume_migration;
 
 /// Durable runtime format admitted before layout version two can commit.
 pub const RUNTIME_STORE_FORMAT_ID: &str = "astrid-principal-store-v1;state-owner-v2";
@@ -430,11 +431,6 @@ impl RuntimePrincipalStore {
             .publish_batch(staged, Arc::clone(&self.content))
             .await
     }
-
-    #[cfg(test)]
-    fn validated_catalog_count(&self) -> usize {
-        self.content.validated_catalog_count()
-    }
 }
 
 /// Open every native projection over the authoritative principal store.
@@ -535,6 +531,13 @@ async fn open_runtime_principal_store_with_options(
     principals: PrincipalDirectory,
     policy: DurableEnginePolicy<StateOwner>,
 ) -> StorageResult<RuntimePrincipalStore> {
+    if home.storage_volume_path().exists() {
+        let engine = volume_migration::open_existing(home, policy)?.ok_or_else(|| {
+            StorageError::Connection("Astrid volume disappeared while opening".to_owned())
+        })?;
+        volume_migration::retire_verified_directory_if_present(home)?;
+        return assemble_runtime_store(home, quota, principals, Arc::new(engine)).await;
+    }
     let store_path = home.principal_store_path();
     let open_path = store_path.clone();
     let format_spec = bootstrap::format_specification()?;
@@ -554,7 +557,7 @@ async fn open_runtime_principal_store_with_options(
             Blake3ObjectIdentityV1,
             StateOwnerCodecV2,
             RecoveryLimits::process_addressable(),
-            policy,
+            DurableEnginePolicy::default(),
         )
         .map_err(|error| {
             StorageError::Connection(format!("open durable principal store: {error}"))
@@ -584,7 +587,6 @@ async fn open_runtime_principal_store_with_options(
     let (engine, metadata_current) = opened;
     let engine = Arc::new(engine);
     let validated_catalogs = Arc::new(Mutex::new(BTreeMap::<StateOwner, CatalogValidation>::new()));
-    let validated_kv = Arc::new(crate::kv::KvValidationCache::default());
 
     migrations::apply_required(home, &store_path, &engine, &validated_catalogs, &principals)
         .await?;
@@ -598,6 +600,21 @@ async fn open_runtime_principal_store_with_options(
                 ))
             })??;
     }
+
+    let engine = Arc::new(volume_migration::migrate_directory_store(
+        home, engine, policy,
+    )?);
+    assemble_runtime_store(home, quota, principals, engine).await
+}
+
+async fn assemble_runtime_store(
+    home: &AstridHome,
+    quota: Arc<dyn KvQuotaResolver<StateOwner>>,
+    principals: PrincipalDirectory,
+    engine: Arc<RuntimeEngine>,
+) -> StorageResult<RuntimePrincipalStore> {
+    let validated_catalogs = Arc::new(Mutex::new(BTreeMap::<StateOwner, CatalogValidation>::new()));
+    let validated_kv = Arc::new(crate::kv::KvValidationCache::default());
 
     let runtime_kv = Arc::new(RuntimeStore::from_engine_with_quota_and_content_validation(
         Arc::clone(&engine),

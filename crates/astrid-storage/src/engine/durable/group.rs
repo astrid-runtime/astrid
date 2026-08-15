@@ -1,7 +1,6 @@
 //! Caller-coordinated durability batching for principal-root commits.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::fs::File;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -13,7 +12,7 @@ use super::representations::{PendingRepresentationUpdate, RepresentationStore};
 
 use super::{
     ARENA_MAGIC, CommitOutcome, DurableEngine, DurableError, DurableFiles, DurableInner,
-    FaultPoint, Persisted, PersistentObjectIdentity, Prepared, PrincipalCodec, ROOT_MAGIC,
+    FaultPoint, File, Persisted, PersistentObjectIdentity, Prepared, PrincipalCodec, ROOT_MAGIC,
     RootTransaction, append_frames, canonical_record_bytes, io_error, live_files_mut,
     read_indexed_object_with_payload,
 };

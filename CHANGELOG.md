@@ -34,6 +34,15 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   drive. The provider-neutral contract reserves Linux FUSE and Windows WinFsp
   adapters without pretending those native adapters are already shipped.
   Mounting does not provision storage. Refs #1391 and #1534.
+- **The authoritative principal store now opens through a path-free Astrid
+  volume contract.** Hosted systems keep all arena, root, index, cutover, and
+  GC-outbox regions in one locked `var/astrid.volume` container; bare-metal
+  storage can implement the same exact-offset and transactional contract over a
+  device without inheriting host-directory semantics. Volume metadata commits
+  atomically bind a compacted arena replacement to its ready audit receipt, and
+  recovery rejects interior corruption while retiring only incomplete tails.
+  The verified directory-backed store is now migration input and is deleted
+  after exact owner snapshots reopen from the volume.
 - **Astrid home layout version two now has a crash-resumable release upgrade
   boundary and canonical fleet-served paths.** New homes create
   `srv/fleets/{fleet_uid}/{shared,workspaces}` and durable migration records;

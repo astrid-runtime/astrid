@@ -589,7 +589,7 @@ mod tests {
     use crate::kv::{KvQuotaResolver, ScopedKvStore};
     use crate::principal_state::bootstrap;
     use crate::principal_state::format_amendment::{
-        PRE_PRINCIPAL_UID_FORMAT_SPEC_ID, legacy_store_metadata, store_metadata,
+        PRE_PRINCIPAL_UID_FORMAT_SPEC_ID, legacy_store_metadata,
     };
     use crate::principal_state::migrations::{CATALOG_TREE_MARKER, MIGRATION_MARKER_FILE};
     use crate::principal_state::{StateOwner, open_runtime_principal_store_with_directory};
@@ -604,6 +604,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn alias_roots_migrate_without_changing_generation_or_commit() {
         let directory = tempfile::tempdir().unwrap();
         let home = AstridHome::from_path(directory.path());
@@ -696,17 +697,24 @@ mod tests {
             identity.genesis.created_at_seconds,
             user.created_at.timestamp()
         );
-        assert!(store_path.join(PREVIOUS_ROOT_FILE).exists());
-        assert!(!store_path.join(MIGRATION_INTENT_FILE).exists());
+        assert!(!store_path.exists());
+        assert!(home.storage_volume_path().is_file());
 
         let format_spec = bootstrap::format_specification().unwrap();
         let catalog_spec = bootstrap::content_catalog_format_specification().unwrap();
         assert_eq!(
-            std::fs::read(store_path.join(STORE_METADATA_FILE)).unwrap(),
-            store_metadata(
-                Blake3ObjectIdentityV1.identify(&format_spec),
-                Blake3ObjectIdentityV1.identify(&catalog_spec),
-            )
+            migrated
+                .engine
+                .object(Blake3ObjectIdentityV1.identify(&format_spec))
+                .unwrap(),
+            Some(format_spec)
+        );
+        assert_eq!(
+            migrated
+                .engine
+                .object(Blake3ObjectIdentityV1.identify(&catalog_spec))
+                .unwrap(),
+            Some(catalog_spec)
         );
         migrated.kv().close().await.unwrap();
     }

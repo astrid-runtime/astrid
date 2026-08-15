@@ -25,7 +25,7 @@
 //! │   ├── hooks/                         system hooks
 //! │   └── layout-version                 layout version sentinel
 //! ├── var/
-//! │   ├── principal-store/               authoritative typed principal state
+//! │   ├── astrid.volume                  hosted Astrid-owned storage volume
 //! │   ├── content-staging/                private acknowledged-write staging
 //! │   ├── migrations/                     durable layout intents and receipts
 //! │   └── state.db/                      temporary legacy import source (removed after verification)
@@ -522,12 +522,6 @@ impl AstridHome {
     #[must_use]
     pub fn state_db_path(&self) -> PathBuf {
         self.var_dir().join("state.db")
-    }
-
-    /// Path to the typed durable principal store (`var/principal-store/`).
-    #[must_use]
-    pub fn principal_store_path(&self) -> PathBuf {
-        self.var_dir().join("principal-store")
     }
 
     /// Private native write-staging area for principal content (`var/content-staging/`).

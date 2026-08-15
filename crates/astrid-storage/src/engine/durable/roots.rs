@@ -1,23 +1,22 @@
 //! Canonical root-journal transitions, compaction snapshots, and recovery.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
 
 use crate::storage_model::{ModelError, ObjectId, RootGeneration, RootState};
 
 use super::representations::RepresentationStore;
 use super::{
-    ArenaLocation, DurableError, IdentityScheme, PersistentObjectIdentity, PrincipalCodec,
-    ROOT_FILE, ROOT_MAGIC, RecoveryLimits, corrupt, materialize_closure, recovery_closure_error,
-    scan_frames, validate_commit_closure,
+    ArenaLocation, DurableError, DurableIo, File, IdentityScheme, PersistentObjectIdentity,
+    PrincipalCodec, ROOT_FILE, ROOT_MAGIC, RecoveryLimits, corrupt, materialize_closure,
+    recovery_closure_error, scan_frames, validate_commit_closure,
 };
 
 const SNAPSHOT_SENTINEL: u64 = u64::MAX;
 const SNAPSHOT_RECORD: u8 = 1;
 const CURRENT_DIGEST_BYTES: u32 = 32;
 
-pub(super) fn recover_roots<P, I, C>(
-    roots: &mut File,
+pub(super) fn recover_roots<P, I, C, R>(
+    roots: &mut R,
     arena: &mut File,
     index: &BTreeMap<ObjectId, ArenaLocation>,
     representations: Option<&RepresentationStore>,
@@ -29,6 +28,7 @@ where
     P: Clone + Ord,
     I: PersistentObjectIdentity,
     C: PrincipalCodec<P>,
+    R: DurableIo,
 {
     let scheme = identity.scheme();
     let mut recovered = BTreeMap::<P, (RootState, u64)>::new();

@@ -7,7 +7,9 @@ use super::{
     RecoveryLimits, Seek, SeekFrom, io, io_error, open_rw_capability, recover_arena, recover_index,
     recover_interrupted_compaction, recover_roots, replace_index, sync_store_directory_capability,
 };
+use crate::volume::AstridVolume;
 use std::path::Path;
+use std::sync::Arc;
 
 #[derive(Default)]
 pub(super) struct RecoveryScope {
@@ -113,6 +115,77 @@ where
     })
 }
 
+pub(super) fn recover_volume<P, I, C>(
+    volume: &Arc<dyn AstridVolume>,
+    principal_codec: &C,
+    identity: &I,
+    limits: RecoveryLimits,
+) -> Result<RecoveredStore<P>, DurableError>
+where
+    P: Clone + Ord,
+    I: PersistentObjectIdentity,
+    C: PrincipalCodec<P>,
+{
+    let mut arena = super::File::volume(Arc::clone(volume), ARENA_FILE, true)?;
+    let mut roots = super::File::volume(Arc::clone(volume), ROOT_FILE, true)?;
+    let mut index_cache = super::File::volume(Arc::clone(volume), INDEX_FILE, true).ok();
+    volume
+        .sync()
+        .map_err(|source| io_error("flush Astrid volume namespace", source))?;
+    let scheme = identity.scheme();
+    let arena_len = arena
+        .metadata()
+        .map_err(|source| io_error("read object-arena metadata", source))?
+        .len();
+    let cached = index_cache
+        .as_mut()
+        .and_then(|file| recover_index(file, &mut arena, scheme, limits, arena_len));
+    let (index, arena_tail) = if let Some(state) = cached {
+        (state.objects, state.arena_tail)
+    } else {
+        // The index is disposable. Rebuild authority from the arena and allow
+        // ordinary future admissions to repopulate the cache region.
+        drop(index_cache.take());
+        recover_arena(&mut arena, identity, limits, 0)?
+    };
+    let (roots_by_principal, validated) = recover_roots(
+        &mut roots,
+        &mut arena,
+        &index,
+        None,
+        principal_codec,
+        identity,
+        limits,
+    )?;
+    let arena_len = arena
+        .metadata()
+        .map_err(|source| io_error("read recovered arena metadata", source))?
+        .len();
+    arena
+        .seek(SeekFrom::End(0))
+        .map_err(|source| io_error("seek object arena", source))?;
+    roots
+        .seek(SeekFrom::End(0))
+        .map_err(|source| io_error("seek root journal", source))?;
+    let arena_reader = arena
+        .try_clone()
+        .map_err(|source| io_error("clone object arena for positional reads", source))?;
+    Ok(RecoveredStore {
+        roots_by_principal,
+        index,
+        validated,
+        files: DurableFiles {
+            arena,
+            roots,
+            index_cache,
+            arena_len,
+            arena_tail,
+        },
+        representations: None,
+        arena_reader,
+    })
+}
+
 fn stabilize_recovered_store<P: Ord>(
     recovered: &mut RecoveredStore<P>,
     faults: &dyn FaultInjector,
@@ -205,14 +278,7 @@ where
                     io::Error::other("injected recovery I/O failure"),
                 ))
             } else {
-                recover_store(
-                    &self.directory,
-                    &self.directory_capability,
-                    &self.principal_codec,
-                    &self.identity,
-                    self.limits,
-                )
-                .and_then(|mut recovered| {
+                self.recover_media().and_then(|mut recovered| {
                     stabilize_recovered_store(&mut recovered, self.faults.as_ref())?;
                     Ok(recovered)
                 })
@@ -249,6 +315,29 @@ where
             }
         }
         Err(last_error.unwrap_or(DurableError::RequiresRecovery))
+    }
+
+    fn recover_media(&self) -> Result<RecoveredStore<P>, DurableError> {
+        let volume = self.volume.read();
+        match (
+            self.directory.as_deref(),
+            self.directory_capability.as_deref(),
+            volume.as_ref(),
+        ) {
+            (Some(path), Some(directory), None) => recover_store(
+                path,
+                directory,
+                &self.principal_codec,
+                &self.identity,
+                self.limits,
+            ),
+            (None, None, Some(volume)) => {
+                recover_volume(volume, &self.principal_codec, &self.identity, self.limits)
+            },
+            _ => Err(DurableError::InvalidRepresentationState(
+                "durable engine media configuration is inconsistent",
+            )),
+        }
     }
 
     pub(super) fn lock_usable(&self) -> Result<MutexGuard<'_, DurableInner<P>>, DurableError> {

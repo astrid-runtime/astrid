@@ -3,10 +3,10 @@
 use std::collections::BTreeMap;
 
 use super::{
-    ARENA_FILE, ARENA_MAGIC, ArenaLocation, CHECKSUM_START, DurableError, FRAME_HEADER_LEN,
-    FRAME_HEADER_LEN_USIZE, FRAME_VERSION, File, ObjectId, ObjectRecord, PersistentObjectIdentity,
-    RecoveryLimits, corrupt, decode_object_frame, frame_checksum, io_error, read_exact_at,
-    read_frame_at,
+    ARENA_FILE, ARENA_MAGIC, ArenaLocation, CHECKSUM_START, DurableError, DurableIo,
+    FRAME_HEADER_LEN, FRAME_HEADER_LEN_USIZE, FRAME_VERSION, ObjectId, ObjectRecord,
+    PersistentObjectIdentity, RecoveryLimits, corrupt, decode_object_frame, frame_checksum,
+    io_error, read_exact_at, read_frame_at,
 };
 
 #[cfg(test)]
@@ -14,8 +14,8 @@ thread_local! {
     static LAST_BATCH_SPANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-pub(in crate::engine::durable) fn read_indexed_object<I: PersistentObjectIdentity>(
-    arena: &File,
+pub(in crate::engine::durable) fn read_indexed_object<I: PersistentObjectIdentity, F: DurableIo>(
+    arena: &F,
     expected_id: ObjectId,
     location: ArenaLocation,
     identity: &I,
@@ -29,8 +29,11 @@ pub(in crate::engine::durable) fn read_indexed_object<I: PersistentObjectIdentit
 ///
 /// Physical consumers use the returned payload to derive representation
 /// identity without serializing the decoded record a second time.
-pub(in crate::engine::durable) fn read_indexed_object_with_payload<I: PersistentObjectIdentity>(
-    arena: &File,
+pub(in crate::engine::durable) fn read_indexed_object_with_payload<
+    I: PersistentObjectIdentity,
+    F: DurableIo,
+>(
+    arena: &F,
     expected_id: ObjectId,
     location: ArenaLocation,
     identity: &I,
@@ -67,8 +70,11 @@ pub(in crate::engine::durable) fn read_indexed_object_with_payload<I: Persistent
     Ok((record, payload))
 }
 
-pub(in crate::engine::durable) fn read_indexed_objects<I: PersistentObjectIdentity>(
-    arena: &File,
+pub(in crate::engine::durable) fn read_indexed_objects<
+    I: PersistentObjectIdentity,
+    F: DurableIo,
+>(
+    arena: &F,
     requested: &[(ObjectId, ArenaLocation)],
     identity: &I,
     limits: RecoveryLimits,
@@ -88,8 +94,11 @@ pub(in crate::engine::durable) fn read_indexed_objects<I: PersistentObjectIdenti
     Ok(records)
 }
 
-pub(in crate::engine::durable) fn visit_indexed_objects<I: PersistentObjectIdentity>(
-    arena: &File,
+pub(in crate::engine::durable) fn visit_indexed_objects<
+    I: PersistentObjectIdentity,
+    F: DurableIo,
+>(
+    arena: &F,
     requested: &[(ObjectId, ArenaLocation)],
     target_span_bytes: u64,
     identity: &I,

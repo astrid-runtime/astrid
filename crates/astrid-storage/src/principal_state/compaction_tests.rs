@@ -2,7 +2,6 @@
 
 #![cfg(not(target_os = "windows"))]
 
-use std::path::Path;
 use std::sync::Arc;
 
 use crate::engine::{
@@ -16,7 +15,6 @@ use astrid_core::identity::PrincipalUid;
 use astrid_core::principal::PrincipalId;
 
 use super::bootstrap::RuntimeBootstrapObject;
-use super::format_amendment::object_id_hex;
 use super::{
     IdentityStore, KvIdentityStore, KvQuotaResolver, RuntimePrincipalStore, ScopedKvStore,
     StateOwner, open_runtime_principal_store,
@@ -97,11 +95,6 @@ async fn production_retention_preserves_bootstraps_during_compaction() {
             (store.engine.identify(&record), record)
         })
         .collect::<Vec<_>>();
-    let format_spec_id = store.engine.identify(
-        &RuntimeBootstrapObject::RunatalFormatSpecification
-            .record()
-            .unwrap(),
-    );
     let policy = evidence(b"test-runtime-retention");
     let retention = store
         .prepare_compaction_retention(
@@ -150,30 +143,24 @@ async fn production_retention_preserves_bootstraps_during_compaction() {
             Some(record)
         );
     }
+    assert_eq!(
+        reopened
+            .engine
+            .root(&StateOwner::Principal(alice_uid))
+            .unwrap()
+            .unwrap()
+            .generation
+            .get(),
+        0
+    );
     reopened.engine.close().unwrap();
     drop(reopened);
-
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/runatal_v1_reader.py");
-    let compacted = std::process::Command::new("python3")
-        .arg(script)
-        .arg(home.principal_store_path())
-        .output()
-        .unwrap();
-    assert!(
-        compacted.status.success(),
-        "independent reader rejected compacted root snapshot: {}",
-        String::from_utf8_lossy(&compacted.stderr)
-    );
-    let decoded: serde_json::Value = serde_json::from_slice(&compacted.stdout).unwrap();
-    assert_eq!(decoded["roots"][alice_uid.to_string()]["generation"], 0);
-    assert_eq!(
-        decoded["format_spec_object"],
-        format!("1:1:32:{}", object_id_hex(format_spec_id))
-    );
+    assert!(home.storage_volume_path().is_file());
+    assert!(!home.principal_store_path().exists());
 }
 
 #[tokio::test]
-async fn physical_profiles_and_runtime_retention_both_pin_bootstrap_dependencies() {
+async fn runtime_retention_pins_volume_bootstrap_dependencies() {
     let directory = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(directory.path());
     let store = open_runtime_principal_store(&home, unlimited_quota())
@@ -199,11 +186,10 @@ async fn physical_profiles_and_runtime_retention_both_pin_bootstrap_dependencies
         .engine
         .capture_compaction_facts(&raw_retention)
         .unwrap();
-    assert!(!facts.condemned().contains(&format_spec_id));
-    // Physical profiles pin their own logical specification dependencies.
-    // Runtime composition additionally keeps the engine private and exposes
-    // the constructor below, which adds and verifies every registered System
-    // root, including bootstraps not named by physical authority.
+    assert!(facts.condemned().contains(&format_spec_id));
+    // The volume has no separate host-file representation catalogue. Runtime
+    // composition therefore owns the only bootstrap retention boundary and
+    // adds every registered System root before a destructive plan is minted.
 
     let policy = evidence(b"subsequent-runtime-retention");
     let retention = store

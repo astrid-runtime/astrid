@@ -234,11 +234,6 @@ impl<P: Ord, E> PrincipalContentStore<P, E> {
             validated_kv: Arc::new(KvValidationCache::default()),
         }
     }
-
-    #[cfg(test)]
-    pub(crate) fn validated_catalog_count(&self) -> usize {
-        self.validated_catalogs.lock().len()
-    }
 }
 
 impl<P: Ord, E> fmt::Debug for PrincipalContentStore<P, E> {
@@ -426,17 +421,20 @@ where
         source: R,
         profile: ChunkingProfile,
     ) -> Result<ContentWriteOutcome, PrincipalContentError> {
+        let (verified, objects_inserted) = self.stage_streaming(source, profile)?;
+        self.publish(principal, name, verified, None, objects_inserted)
+    }
+
+    pub(crate) fn stage_streaming<R: Read>(
+        &self,
+        source: R,
+        profile: ChunkingProfile,
+    ) -> Result<(VerifiedContent, u64), PrincipalContentError> {
         let mut sink = EngineSink::<P, E>::new(self.engine.as_ref());
         let streamed =
             build_content_streaming(profile, source, &mut sink).map_err(map_stream_error)?;
         sink.finish()?;
-        self.publish(
-            principal,
-            name,
-            streamed.verified_content(),
-            None,
-            sink.objects_inserted,
-        )
+        Ok((streamed.verified_content(), sink.objects_inserted))
     }
 
     fn publish(

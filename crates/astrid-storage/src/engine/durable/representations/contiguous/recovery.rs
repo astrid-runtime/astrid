@@ -101,16 +101,16 @@ pub(super) fn active_contiguous_records(
     Ok(records)
 }
 
-pub(super) struct RecoveryStore<'a, I> {
-    arena: &'a mut File,
+pub(super) struct RecoveryStore<'a, I, F: super::super::super::DurableIo> {
+    arena: &'a mut F,
     index: &'a BTreeMap<ObjectId, ArenaLocation>,
     identity: &'a I,
     limits: RecoveryLimits,
 }
 
-impl<'a, I: PersistentObjectIdentity> RecoveryStore<'a, I> {
+impl<'a, I: PersistentObjectIdentity, F: super::super::super::DurableIo> RecoveryStore<'a, I, F> {
     pub(super) const fn new(
-        arena: &'a mut File,
+        arena: &'a mut F,
         index: &'a BTreeMap<ObjectId, ArenaLocation>,
         identity: &'a I,
         limits: RecoveryLimits,
@@ -144,14 +144,17 @@ impl<'a, I: PersistentObjectIdentity> RecoveryStore<'a, I> {
     }
 }
 
-fn recover_contiguous_record_with_store<I: PersistentObjectIdentity>(
+fn recover_contiguous_record_with_store<
+    I: PersistentObjectIdentity,
+    F: super::super::super::DurableIo,
+>(
     representation_directory: &cap_std::fs::Dir,
     representation_root: &Path,
     record_id: crate::storage_model::RepresentationRecordId,
     record: &RepresentationRecord,
     profile: &RepresentationProfile,
     namespace_generation: u64,
-    store: &mut RecoveryStore<'_, I>,
+    store: &mut RecoveryStore<'_, I, F>,
 ) -> Result<ContiguousIndexes, DurableError> {
     let Coverage::CanonicalFileChunks {
         file,
@@ -225,8 +228,8 @@ fn recover_contiguous_record_with_store<I: PersistentObjectIdentity>(
     ))
 }
 
-fn verify_admission_evidence<I: PersistentObjectIdentity>(
-    store: &mut RecoveryStore<'_, I>,
+fn verify_admission_evidence<I: PersistentObjectIdentity, F: super::super::super::DurableIo>(
+    store: &mut RecoveryStore<'_, I, F>,
     profile: &RepresentationProfile,
     record: &RepresentationRecord,
     blob: crate::storage_model::BlobId,
@@ -309,8 +312,8 @@ fn active_entries(
     Ok(entries)
 }
 
-struct RecoverySink<'a, I> {
-    arena: &'a mut File,
+struct RecoverySink<'a, I, F: super::super::super::DurableIo> {
+    arena: &'a mut F,
     index: &'a BTreeMap<ObjectId, ArenaLocation>,
     identity: &'a I,
     limits: RecoveryLimits,
@@ -321,7 +324,9 @@ struct RecoverySink<'a, I> {
     canonical_output_bytes: u64,
 }
 
-impl<I: PersistentObjectIdentity> ContentObjectSink for RecoverySink<'_, I> {
+impl<I: PersistentObjectIdentity, F: super::super::super::DurableIo> ContentObjectSink
+    for RecoverySink<'_, I, F>
+{
     type Error = DurableError;
 
     fn stage_content_object(&mut self, record: ObjectRecord) -> Result<ObjectId, Self::Error> {

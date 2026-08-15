@@ -57,6 +57,7 @@ pub mod resources;
 pub mod secret;
 /// Portable executable model for principal state.
 pub mod storage_model;
+pub mod volume;
 
 #[cfg(not(target_family = "wasm"))]
 pub use content::{

@@ -1,7 +1,6 @@
 //! Proof-bound liveness capture and crash-recoverable arena compaction.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
 use std::io::{Seek, SeekFrom};
 use std::path::Path;
 
@@ -10,17 +9,16 @@ use crate::storage_model::{
     ObjectKind, ObjectRecord, PlacementSetId, RootState, TensorLogicProofId,
 };
 
-use crate::engine::refinery::{EngineCompactionPass, NativeArenaCompactionPass};
-
 use super::{
     ARENA_FILE, ARENA_MAGIC, ArenaLocation, DurableEngine, DurableError, DurableFiles,
-    DurableInner, FaultPoint, INDEX_FILE, IndexState, PersistentObjectIdentity, PrincipalCodec,
-    ROOT_FILE, ROOT_MAGIC, RecoveryLimits, append_frame, create_private_file_capability,
-    decode_object_frame, encode_object_frame, encode_root_snapshot, ensure_payload_limit, io_error,
-    live_files_mut, materialize_closure, open_directory_capability, open_rw_capability,
-    read_indexed_object, recover_arena, recover_roots, replace_index, scan_frames,
-    sync_store_directory_capability,
+    DurableInner, FaultPoint, File, INDEX_FILE, IndexState, PersistentObjectIdentity,
+    PrincipalCodec, ROOT_FILE, ROOT_MAGIC, RecoveryLimits, append_frame,
+    create_private_file_capability, decode_object_frame, encode_object_frame, encode_root_snapshot,
+    ensure_payload_limit, io_error, live_files_mut, materialize_closure, open_directory_capability,
+    open_rw_capability, read_indexed_object, recover_arena, recover_roots, replace_index,
+    replace_volume_index, scan_frames, sync_store_directory_capability,
 };
+use crate::engine::refinery::{EngineCompactionPass, NativeArenaCompactionPass};
 
 const FACT_SNAPSHOT_PREFIX: &[u8] = b"astrid-gc-fact-snapshot-v1\0";
 pub(super) const COMPACTION_INTENT_FILE: &str = "compaction.intent";
@@ -37,6 +35,7 @@ mod facts;
 mod outbox;
 mod policy;
 mod recovery;
+mod volume;
 
 pub use evidence::CompactionEvidenceBundle;
 use facts::{encode_current_roots, encode_retained_roots};
@@ -284,7 +283,12 @@ where
         if facts != authorization.facts {
             return Err(DurableError::CompactionSnapshotChanged);
         }
-        let result = self.compact_locked(&mut inner, authorization, &live);
+        let volume = self.volume.read().as_ref().cloned();
+        let result = if let Some(volume) = volume {
+            self.compact_volume_locked(&mut inner, authorization, &live, &volume)
+        } else {
+            self.compact_locked(&mut inner, authorization, &live)
+        };
         if inner.files.is_none()
             || matches!(
                 &result,
@@ -308,7 +312,11 @@ where
         &self,
     ) -> Result<Vec<CompactionEvidenceBundle>, DurableError> {
         let _inner = self.lock_usable()?;
-        outbox::pending(&self.directory_capability, &self.identity, self.limits)
+        if let Some(volume) = self.volume.read().as_ref().cloned() {
+            outbox::pending_volume(&volume, &self.identity, self.limits)
+        } else {
+            outbox::pending(self.hosted_directory()?, &self.identity, self.limits)
+        }
     }
 
     /// Acknowledge one receipt after the independent audit sink is durable.
@@ -321,12 +329,16 @@ where
     /// Returns a recovery-required, I/O, framing, identity, or evidence error.
     pub fn acknowledge_compaction_evidence(&self, commit: GcCommitId) -> Result<(), DurableError> {
         let _inner = self.lock_usable()?;
-        outbox::acknowledge(
-            &self.directory_capability,
-            commit,
-            &self.identity,
-            self.limits,
-        )
+        if let Some(volume) = self.volume.read().as_ref().cloned() {
+            outbox::acknowledge_volume(&volume, commit, &self.identity, self.limits)
+        } else {
+            outbox::acknowledge(
+                self.hosted_directory()?,
+                commit,
+                &self.identity,
+                self.limits,
+            )
+        }
     }
 
     fn capture_facts_locked(
@@ -532,14 +544,14 @@ where
         let prepared = self.prepare_compaction(inner, authorization, live)?;
         self.fail_if(FaultPoint::AfterCompactionFilesFlush)?;
         outbox::prepare(
-            &self.directory_capability,
+            self.hosted_directory()?,
             &prepared.bundle,
             &self.identity,
             self.limits,
         )?;
         self.fail_if(FaultPoint::AfterCompactionEvidencePrepare)?;
         write_compaction_intent(
-            &self.directory_capability,
+            self.hosted_directory()?,
             prepared.intent,
             &self.identity,
             self.limits,
@@ -548,7 +560,7 @@ where
 
         drop(inner.files.take());
         self.promote_replacement_files()?;
-        sync_store_directory_capability(&self.directory_capability)?;
+        sync_store_directory_capability(self.hosted_directory()?)?;
         self.fail_if(FaultPoint::AfterCompactionDirectoryFlush)?;
         let replacement = self.open_replacement_files()?;
         let promoted = evidence::placement_record(
@@ -568,8 +580,7 @@ where
             ));
         }
         if let Some(representations) = inner.representations.as_mut() {
-            let arena =
-                open_rw_capability(&self.directory_capability, Path::new(ARENA_FILE), false)?;
+            let arena = open_rw_capability(self.hosted_directory()?, Path::new(ARENA_FILE), false)?;
             representations.rebase_compacted_arena(
                 &arena,
                 &replacement.index,
@@ -583,7 +594,7 @@ where
         let arena_bytes_after = replacement.arena_len;
         self.install_replacement(inner, replacement)?;
         let ready = outbox::mark_ready(
-            &self.directory_capability,
+            self.hosted_directory()?,
             prepared.intent.commit,
             &self.identity,
             self.limits,
@@ -594,9 +605,9 @@ where
             ));
         }
         self.fail_if(FaultPoint::AfterCompactionEvidenceReady)?;
-        prepare_finish_compaction(&self.directory_capability)?;
+        prepare_finish_compaction(self.hosted_directory()?)?;
         self.fail_if(FaultPoint::BeforeCompactionIntentRemoval)?;
-        remove_compaction_intent(&self.directory_capability)?;
+        remove_compaction_intent(self.hosted_directory()?)?;
         Ok(CompactionReport {
             objects_before: prepared.objects_before,
             objects_after: prepared.objects_after,
@@ -614,7 +625,7 @@ where
         authorization: &VerifiedCompactionPlan,
         live: &BTreeSet<ObjectId>,
     ) -> Result<PreparedCompaction, DurableError> {
-        cleanup_without_intent(&self.directory_capability)?;
+        cleanup_without_intent(self.hosted_directory()?)?;
         let objects_before = u64::try_from(Self::object_universe(inner).len())
             .map_err(|_| DurableError::EncodingOverflow)?;
         let (arena_bytes_before, root_bytes_before, root_digest_before) = {
@@ -704,14 +715,12 @@ where
             objects: replacement.index.clone(),
         };
         let index_cache = replace_index(
-            &self.directory_capability,
+            self.hosted_directory()?,
             &index_state,
             self.identity.scheme(),
         );
-        let mut arena =
-            open_rw_capability(&self.directory_capability, Path::new(ARENA_FILE), false)?;
-        let mut roots =
-            open_rw_capability(&self.directory_capability, Path::new(ROOT_FILE), false)?;
+        let mut arena = open_rw_capability(self.hosted_directory()?, Path::new(ARENA_FILE), false)?;
+        let mut roots = open_rw_capability(self.hosted_directory()?, Path::new(ROOT_FILE), false)?;
         arena
             .seek(SeekFrom::End(0))
             .map_err(|source| io_error("seek compacted object arena", source))?;
@@ -750,7 +759,7 @@ where
         live: &BTreeSet<ObjectId>,
     ) -> Result<ReplacementState<P>, DurableError> {
         let mut arena = super::create_private_file_capability(
-            &self.directory_capability,
+            self.hosted_directory()?,
             Path::new(ARENA_COMPACTING),
         )?;
         let mut new_index = BTreeMap::new();
@@ -769,14 +778,14 @@ where
         let payload = encode_root_snapshot(self.identity.scheme(), &roots)?;
         ensure_payload_limit(ROOT_FILE, 0, payload.len(), self.limits)?;
         let mut journal = super::create_private_file_capability(
-            &self.directory_capability,
+            self.hosted_directory()?,
             Path::new(ROOTS_COMPACTING),
         )?;
         append_frame(&mut journal, ROOT_MAGIC, &payload)?;
         journal
             .sync_data()
             .map_err(|source| io_error("flush compacted root snapshot", source))?;
-        sync_store_directory_capability(&self.directory_capability)?;
+        sync_store_directory_capability(self.hosted_directory()?)?;
         validate_replacement(
             &mut arena,
             &mut journal,
@@ -788,21 +797,19 @@ where
     }
 
     fn promote_replacement_files(&self) -> Result<(), DurableError> {
-        backup_active(&self.directory_capability, ARENA_FILE, ARENA_PREVIOUS)?;
+        backup_active(self.hosted_directory()?, ARENA_FILE, ARENA_PREVIOUS)?;
         self.fail_if(FaultPoint::AfterCompactionArenaBackup)?;
-        promote_compacting(&self.directory_capability, ARENA_COMPACTING, ARENA_FILE)?;
+        promote_compacting(self.hosted_directory()?, ARENA_COMPACTING, ARENA_FILE)?;
         self.fail_if(FaultPoint::AfterCompactionArenaPromote)?;
-        backup_active(&self.directory_capability, ROOT_FILE, ROOTS_PREVIOUS)?;
+        backup_active(self.hosted_directory()?, ROOT_FILE, ROOTS_PREVIOUS)?;
         self.fail_if(FaultPoint::AfterCompactionRootsBackup)?;
-        promote_compacting(&self.directory_capability, ROOTS_COMPACTING, ROOT_FILE)?;
+        promote_compacting(self.hosted_directory()?, ROOTS_COMPACTING, ROOT_FILE)?;
         self.fail_if(FaultPoint::AfterCompactionRootsPromote)
     }
 
     fn open_replacement_files(&self) -> Result<ReplacementState<P>, DurableError> {
-        let mut arena =
-            open_rw_capability(&self.directory_capability, Path::new(ARENA_FILE), false)?;
-        let mut roots =
-            open_rw_capability(&self.directory_capability, Path::new(ROOT_FILE), false)?;
+        let mut arena = open_rw_capability(self.hosted_directory()?, Path::new(ARENA_FILE), false)?;
+        let mut roots = open_rw_capability(self.hosted_directory()?, Path::new(ROOT_FILE), false)?;
         let (index, arena_tail) = recover_arena(&mut arena, &self.identity, self.limits, 0)?;
         let (roots_by_principal, validated) = recover_roots(
             &mut roots,

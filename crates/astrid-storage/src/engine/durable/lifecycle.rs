@@ -2,7 +2,8 @@
 
 use super::{
     DurableEngine, DurableError, DurableInner, FRAME_HEADER_LEN, IndexState, LIFECYCLE_CLOSED,
-    PersistentObjectIdentity, PrincipalCodec, io_error, live_files_mut, replace_index,
+    PersistentObjectIdentity, PrincipalCodec, StoreLock, io_error, live_files_mut, replace_index,
+    replace_volume_index,
 };
 
 impl<P, I, C> DurableEngine<P, I, C>
@@ -64,10 +65,11 @@ where
         self.lifecycle
             .store(LIFECYCLE_CLOSED, std::sync::atomic::Ordering::Release);
         let unlock = match inner.lock.take() {
-            Some(lock) => fs2::FileExt::unlock(&lock)
+            Some(StoreLock::Native(lock)) => fs2::FileExt::unlock(&lock)
                 .map_err(|source| io_error("unlock principal store while closing", source)),
-            None => Ok(()),
+            Some(StoreLock::Volume) | None => Ok(()),
         };
+        drop(self.volume.write().take());
         result.and(unlock)
     }
 
@@ -118,8 +120,16 @@ where
             return;
         };
         drop(files.index_cache.take());
-        files.index_cache =
-            replace_index(&self.directory_capability, &state, self.identity.scheme());
+        let volume = self.volume.read();
+        files.index_cache = match (self.directory_capability.as_deref(), volume.as_ref()) {
+            (Some(directory), None) => replace_index(directory, &state, self.identity.scheme()),
+            (None, Some(volume)) => replace_volume_index(
+                std::sync::Arc::clone(volume),
+                &state,
+                self.identity.scheme(),
+            ),
+            _ => None,
+        };
         files.arena_len = arena_len;
         files.arena_tail = arena_tail;
         inner.pending_index_locations.clear();

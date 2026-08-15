@@ -120,6 +120,18 @@ struct LayoutMigrationReceiptV1 {
 }
 
 impl AstridHome {
+    /// Retired directory-backed principal-store upgrade source.
+    #[must_use]
+    pub fn principal_store_path(&self) -> PathBuf {
+        self.var_dir().join("principal-store")
+    }
+
+    /// Hosted Astrid volume; bare metal implements the same path-free contract.
+    #[must_use]
+    pub fn storage_volume_path(&self) -> PathBuf {
+        self.var_dir().join("astrid.volume")
+    }
+
     /// Path to the canonical layout-version sentinel (`etc/layout-version`).
     #[must_use]
     pub fn layout_version_path(&self) -> PathBuf {
@@ -329,7 +341,7 @@ impl LayoutMigrationRecordV1 {
             to_layout: LAYOUT_VERSION.to_owned(),
             source: inventory_tree(&home.state_db_path())?,
             target_path_encoding: "os-str-encoded-bytes-v1".to_owned(),
-            target_physical_path_hex: physical_path_hex(&home.principal_store_path())?,
+            target_physical_path_hex: physical_path_hex(&home.storage_volume_path())?,
             target_store_format: target.store_format.clone(),
             binary_identity: target.binary_identity.clone(),
         };

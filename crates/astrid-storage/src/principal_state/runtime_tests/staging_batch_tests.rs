@@ -22,7 +22,7 @@ async fn duplicate_names_fail_before_physical_publication() {
         writer.write_all(value).unwrap();
         staged.push(writer.seal().unwrap());
     }
-    let metadata_before = representation_metadata_len(&home);
+    let volume_before = volume_file_len(&home);
 
     let error = store
         .publish_staged_batch(staged.clone())
@@ -30,7 +30,7 @@ async fn duplicate_names_fail_before_physical_publication() {
         .unwrap_err();
 
     assert!(error.to_string().contains("repeats content name"));
-    assert_eq!(representation_metadata_len(&home), metadata_before);
+    assert_eq!(volume_file_len(&home), volume_before);
     assert_eq!(store.staging().ready().unwrap(), staged);
     assert_eq!(store.content().describe(&owner, &name).unwrap(), None);
 }

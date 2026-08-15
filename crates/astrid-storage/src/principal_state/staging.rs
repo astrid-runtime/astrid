@@ -402,42 +402,16 @@ impl NativeContentStagingArea {
                 &staged.intent(),
                 Some(staged.source_identity),
             )?;
-            let engine = content.engine();
-            let prepared = engine
-                .prepare_contiguous_file(
-                    staged.profile,
-                    staged.logical_bytes,
-                    source
-                        .try_clone()
-                        .map_err(|error| {
-                            connection(format!(
-                                "clone staged content handle {}: {error}",
-                                staged.id
-                            ))
-                        })?
-                        .take(staged.logical_bytes),
-                )
+            let (verified, objects_inserted) = content
+                .stage_streaming(source.take(staged.logical_bytes), staged.profile)
                 .map_err(|error| {
                     StorageError::Internal(format!(
-                        "prepare staged contiguous content {}: {error}",
-                        staged.id
-                    ))
-                })?;
-            let published = engine
-                .publish_contiguous_from_file(prepared, &source)
-                .map_err(|error| {
-                    StorageError::Internal(format!(
-                        "publish staged contiguous content {}: {error}",
+                        "stage content {} into Astrid storage: {error}",
                         staged.id
                     ))
                 })?;
             let outcome = content
-                .publish_verified_content(
-                    &staged.owner,
-                    &staged.name,
-                    published.verified_content(),
-                    published.objects_inserted(),
-                )
+                .publish_verified_content(&staged.owner, &staged.name, verified, objects_inserted)
                 .map_err(|error| {
                     StorageError::Internal(format!("publish staged content {}: {error}", staged.id))
                 })?;
@@ -493,7 +467,6 @@ impl NativeContentStagingArea {
         }
         let area = self.clone();
         tokio::task::spawn_blocking(move || {
-            let engine = content.engine();
             let mut completed = Vec::with_capacity(staged.len());
             let mut objects_inserted = 0_u64;
             for entry in &staged {
@@ -503,40 +476,18 @@ impl NativeContentStagingArea {
                     &entry.intent(),
                     Some(entry.source_identity),
                 )?;
-                let prepared = engine
-                    .prepare_contiguous_file(
-                        entry.profile,
-                        entry.logical_bytes,
-                        source
-                            .try_clone()
-                            .map_err(|error| {
-                                connection(format!(
-                                    "clone staged content handle {}: {error}",
-                                    entry.id
-                                ))
-                            })?
-                            .take(entry.logical_bytes),
-                    )
+                let (verified, inserted) = content
+                    .stage_streaming(source.take(entry.logical_bytes), entry.profile)
                     .map_err(|error| {
                         StorageError::Internal(format!(
-                            "prepare staged contiguous content {}: {error}",
+                            "stage content {} into Astrid storage: {error}",
                             entry.id
                         ))
                     })?;
-                let published = engine
-                    .publish_contiguous_from_file(prepared, &source)
-                    .map_err(|error| {
-                        StorageError::Internal(format!(
-                            "publish staged contiguous content {}: {error}",
-                            entry.id
-                        ))
-                    })?;
-                objects_inserted = objects_inserted
-                    .checked_add(published.objects_inserted())
-                    .ok_or_else(|| {
-                        StorageError::Internal("staged batch object accounting overflow".to_owned())
-                    })?;
-                completed.push((entry.name.clone(), published.verified_content()));
+                objects_inserted = objects_inserted.checked_add(inserted).ok_or_else(|| {
+                    StorageError::Internal("staged batch object accounting overflow".to_owned())
+                })?;
+                completed.push((entry.name.clone(), verified));
             }
             let outcome = content
                 .publish_verified_batch(&owner, completed, objects_inserted)
