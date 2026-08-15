@@ -15,17 +15,19 @@ Related documents:
 ## 1. Product ruling
 
 Astrid should host lightweight fleet computers for multiple users. Every user
-has a home fleet. That fleet contains the user's agent principals and owns their
-shared computer authority, filesystem, browser identity, applications, and
-budget. Every agent receives an independent view and session over that shared
-computer.
+has a home fleet. That fleet contains the user's agent and service principals
+and owns their shared computer authority, filesystem, browser identity,
+applications, and budget. Every agent receives an independent view and session
+over that shared computer; services receive only the views their compositions
+need.
 
 The ordinary experience is:
 
 1. A person starts Astrid and receives a durable `UserUid`, a home fleet, and
    one agent principal.
-2. The person creates additional specialized agents in that fleet. Each may run
-   through a different AI harness while retaining an Astrid principal identity.
+2. The person creates additional specialized agents in that fleet. Each may use
+   a different capsule-composed harness while retaining an Astrid principal
+   identity. External AI hosts attach through AOS connectors.
 3. Every agent uses the same fleet computer: common files, installed software,
    browser sign-ins, cookies, and ambient fleet authority. Linux is available
    when the optional Linux Realm capsule is installed.
@@ -55,11 +57,11 @@ The tenancy model therefore has two nested cardinalities:
 one Astrid installation
   -> many UserUid tenants
   -> one stable home FleetUid per user
-  -> many PrincipalUid agent tenants per home fleet
+  -> many PrincipalUid actor tenants per home fleet
 ```
 
-The user fleet is the security and ownership tenant. Agent principals are
-independent actors and views inside that tenant.
+The user fleet is the security and ownership tenant. Principals are independent
+actors and views inside that tenant.
 
 ## 2. Identity and ownership boundaries
 
@@ -73,6 +75,15 @@ The existing concepts retain distinct jobs:
 | `GroupName` | Reusable capability role; never an ownership container |
 | application identity | Identity and lifecycle of installed software below its owning fleet or principal |
 | invocation or job | One bounded execution under an acting principal |
+
+A principal does not imply a brain, model, prompt, or conversational agent. It
+is the durable identity of something that acts with separately attributable
+authority. A principal may run an AI harness, a vault, an indexer, a scheduler,
+a browser service, or another capsule-composed service. A vault merits its own
+principal when it actively receives requests, holds capabilities, owns state,
+and needs independent revocation, accounting, or audit. Passive vault data may
+instead remain a fleet- or principal-owned resource served by an existing
+principal; not every object needs another actor identity.
 
 A specialized durable bot is a separate principal owned by the fleet. It is not
 a sub-agent sharing a parent principal's identity. "Sub-agent" may describe a
@@ -140,7 +151,7 @@ host locations are placement details. The mounted administrative root preserves
 the canonical hierarchy and names on every OS.
 
 The Linux inspiration is deliberate and remains useful. Familiar path classes
-give people, shell tools, and otherwise unrelated AI harnesses a discoverable
+give people, shell tools, and otherwise unrelated agent harnesses a discoverable
 administrative model: inspect the tree, read supported configuration, find logs,
 and understand what is durable. Astrid should preserve those names and ordinary
 filesystem behavior where practical without treating POSIX mode bits, a Unix
@@ -359,54 +370,77 @@ resource names its exact resource, rights, generation, and lifetime.
 Files remain useful for human-readable collaboration and ordinary tools. The
 team service remains the authority-preserving coordination plane.
 
-### 6.1 Harness-neutral agents
+### 6.1 Principal compositions, harnesses, and AOS connectors
 
-A harness is an execution adapter, not an Astrid owner or security identity.
-Codex, Claude Code, Grok, a local model loop, a custom Python process, and a
-non-LLM automation may all execute different principals in the same fleet. A
-durable teammate remains its `PrincipalUid` even if the user replaces its
-harness. Changing the harness must not silently create a new owner, move files,
-discard the inbox, or reset audit history.
+A principal runs an identified, versioned composition of capsules. When those
+capsules operate together as an agent system, that composition is a harness.
+Its capsules may provide the agent loop, model or external cognition edge,
+context assembly, memory, skills, tools, policy, and team behavior. A
+non-cognitive service such as a vault may instead run a service composition with
+no harness, model, prompt, or agent loop. Different principals in the same fleet
+may use entirely different compositions. The composition is part of the
+principal's admitted runtime shape; it is not itself an owner or security
+identity.
 
-An authenticated host binding should carry at least:
+Codex, Claude Code, Grok, and similar external AI hosts sit at a different
+boundary. Their AOS host connectors attach a host-native agent session to an
+Astrid principal and, when present, its capsule harness. A connector translates
+host-native tools, events, approvals, and lifecycle into the common governed
+surface. It does not become the harness and does not own the principal. A local
+capsule-only agent or non-cognitive service may run without one of these
+external connectors.
+
+The durable principal runtime binding should carry at least:
 
 ```text
 (UserUid, home FleetUid, PrincipalUid,
- harness identity, device identity, host session and generation)
+ capsule composition and generation)
 ```
 
-The user and device authenticate at the host boundary. Astrid selects the fleet
-and principal from admitted ownership state. The host adapter identifies its
-harness implementation and receives a generation-bound principal session. No
-harness may self-assert a principal or fleet in an IPC payload, environment
-variable, mount path, model prompt, or tool argument.
+Each external attachment adds a separately admitted connector session:
 
-Every harness adapter has the same small set of responsibilities:
+```text
+(PrincipalUid, connector identity, device identity,
+ connector session and generation)
+```
+
+The user and device authenticate at the connector boundary. Astrid selects the
+fleet and principal from admitted ownership state and loads the principal's
+identified capsule composition. No connector or capsule may self-assert a
+principal or fleet in an IPC payload, environment variable, mount path, model
+prompt, or tool argument.
+
+Every AOS connector has the same small set of responsibilities:
 
 - authenticate its host connection and bind a stable acting principal;
+- attach to the admitted principal composition rather than selecting capsules
+  through untrusted host input;
 - obtain generation-bound filesystem, terminal, browser, desktop, and team
   handles instead of deriving authority from paths;
 - preserve kernel-stamped actor context on commands, messages, and artifacts;
-- expose those handles through the harness's native tool protocol; and
+- translate those handles into the external host's native tool protocol; and
 - reconnect or fail boundedly when its session, provider, or generation expires.
 
 The common semantic surface should be available through the Astrid event bus
-and typed host APIs, with MCP, CLI, HTTP, or WebSocket bridges where useful.
-Harnesses do not need identical user interfaces or prompt formats. They need
-identical identity, resource, delegation, receipt, and failure semantics.
+and typed AOS surfaces, with MCP, CLI, HTTP, or WebSocket bridges where useful.
+Principal compositions and connectors do not need identical internal loops,
+user interfaces, or prompt formats. They need identical identity, resource,
+delegation, receipt, and failure semantics at the shared boundary.
 
 The admitted actor context needs to become explicit and kernel-stamped. The
 current message envelope carries a validated principal plus host-derived device
-and origin information, but it does not carry the complete user, fleet, harness,
-session, application, instance, and generation context required here. A future
-versioned context should resemble:
+and origin information, but it does not carry the complete user, fleet,
+composition, connector, session, application, instance, and generation context
+required here. A future versioned context should resemble:
 
 ```text
 ActorContext {
     user_uid,
     home_fleet_uid,
     principal_uid,
-    harness_id,
+    composition_ref,
+    composition_generation,
+    connector_id,
     device_key_id,
     host_session_id,
     application_id,
@@ -419,16 +453,18 @@ ActorContext {
 Not every field must appear on every public wire message. The kernel or trusted
 host boundary must nevertheless be able to recover and stamp the applicable
 context, and receipts must retain enough of it to attribute actions after
-restart. `harness_id` describes the executing adapter; it never replaces
+restart. The composition reference identifies the admitted capsule closure and
+the optional connector identifies an external attachment. Neither replaces
 `principal_uid` as the actor.
 
 ### 6.2 Fleet directory and shared services
 
 Each home fleet has a policy-filtered directory of its durable teammates. A
 directory entry contains a stable principal identity, user-facing alias,
-harness kind, declared capabilities or specialties, availability, active
-session references, and admitted inbox topics. It does not expose another
-agent's private prompt, model context, overlay, or credentials.
+composition reference and service kind, declared capabilities or specialties,
+availability, active connector/session references, and admitted inbox topics.
+It does not expose another principal's private prompt, model context, overlay,
+or credentials.
 
 The fleet computer composes four state scopes:
 
@@ -436,31 +472,34 @@ The fleet computer composes four state scopes:
 | --- | --- |
 | System | Admitted immutable software and interfaces; supported administrative projections only for system-capable principals |
 | Home fleet | Common files, installed applications, browser identity, selected profile state, team directory, inboxes, tasks, artifact references, shared service endpoints, policy, and fleet budgets |
-| Principal | Memory, preferences, harness configuration, working overlay, downloads in progress, process/session state, desktop/window state, and audit identity |
+| Principal | Capsule namespaces, service state, optional agent memory and preferences, working overlay, process/session state, desktop/window state, and audit identity |
 | Invocation | Selected workspace attachments, temporary state, task inputs and outputs, attenuated handles, limits, and expiry |
 
-The common filesystem is one fleet-owned root, not a copy per harness. A
-principal view composes that root with the principal's overlay and explicit
-workspace attachments. View handles are bound to at least the fleet, acting
-principal, admitted root generation, overlay generation, and workspace epoch.
+The common filesystem is one fleet-owned root, not a copy per composition or
+connector. A principal view composes that root with the principal's overlay and
+explicit workspace attachments. View handles are bound to at least the fleet,
+acting principal, admitted root generation, overlay generation, and workspace
+epoch.
 Same-fleet common paths resolve to the same published objects; overlay-local
 paths resolve to the acting principal's working delta. Publication into shared
 state is generation-checked and emits a fleet event so teammates can react
 without polling.
 
-Team communication is similarly harness-neutral. Principals can discover
+Team communication is similarly composition-neutral. Principals can discover
 admitted teammates, send direct or topic messages, offer and accept tasks,
-delegate attenuated handles, report status, and reference artifacts. A harness
-may render those operations as native sub-agents, chats, tools, or jobs, but the
-underlying sender, recipient, fleet, task, resource, and receipt identities stay
-the same. A temporary orchestration child stays within its parent's principal
-unless it is explicitly promoted to a durable fleet principal.
+delegate attenuated handles, report status, and reference artifacts. An agent
+harness or its connector may render those operations as native sub-agents,
+chats, tools, or jobs; a vault may expose a narrower request/reply interface.
+The underlying sender, recipient, fleet, task, resource, and receipt identities
+stay the same. A temporary orchestration child stays within its parent's
+principal unless it is explicitly promoted to a durable fleet principal.
 
 The browser follows the same split: browser identity, cookies, and selected
 profile policy are fleet services; tabs, windows, active automation, screenshots,
 and action attribution belong to a principal session. The browser service
 serializes mutations to the shared profile rather than allowing independent
-harness processes to corrupt the same profile database.
+capsule or connector-hosted browser processes to corrupt the same profile
+database.
 
 ## 7. Desktop and browser views
 
@@ -624,19 +663,21 @@ create or authenticate UserUid
   -> optionally start the first principal view
 ```
 
-Creating another specialized agent creates another principal, assigns it to the
-home fleet, allocates its resource slice, and creates an empty overlay root. The
-new agent immediately receives the fleet computer's common files, applications,
-browser identity, cookies, and ambient authority profile. It does not copy
-another agent's overlay, running processes, desktop session, or audit identity.
-Its selected harness is bound as an execution adapter and may differ completely
-from every other principal's harness.
+Creating another agent or service creates another principal, assigns it to the
+home fleet, allocates its resource slice, creates an empty overlay root, and
+installs its admitted capsule composition. An agent may select a harness that
+differs completely from every other agent's harness. A service principal such
+as a vault may select a non-cognitive composition instead. Both immediately see
+the fleet resources admitted to them without copying another principal's
+overlay, running processes, session state, or audit identity.
 
-Replacing an agent's harness revokes or expires the old host session, binds the
-new adapter to the same durable principal, and reconstructs its admitted view.
-The operation preserves the principal's ownership, roots, inbox, task history,
-and audit identity. Harness-private caches may be migrated only through an
-explicit application contract; they are not mistaken for principal state.
+Changing a principal's capsule composition advances an explicit composition
+generation while retaining the same durable principal. Capsule namespace state
+is preserved or migrated only through declared lifecycle contracts. Replacing
+an external AOS connector is a separate operation: expire the old connector
+session, admit the new connector to the same principal, and reconstruct its
+view. Neither operation silently changes ownership, roots, inbox, task history,
+or audit identity.
 
 Provider RAM, desktop processes, and temporary state are lazy and evictable. The
 principal identity, roots, published state, application identity, service
@@ -659,9 +700,10 @@ The simple truthful story is:
 > browser sign-ins, cookies, and ambient authority. Linux is one available
 > compatibility environment, not the computer's identity. Each agent keeps an
 > independent view, overlay, active processes, desktop, working context, and
-> identity. Each agent may run through a different AI harness. Open any agent's
-> terminal or desktop and let the team work together without stepping on one
-> another's active state.
+> identity. Each agent may use a different capsule-composed harness and external
+> AI connector. The same fleet may also contain non-cognitive principals such as
+> vaults and schedulers. Open any agent's terminal or desktop and let the team
+> work together without stepping on one another's active state.
 
 The shorter phrase is:
 
@@ -677,9 +719,10 @@ The security qualification is:
 1. Expose read-only ownership inspection and authenticated user/fleet context.
 2. Define the versioned fleet-owned root and accounting grammar without changing
    `StateOwnerCodecV1` in place.
-3. Define the versioned kernel-stamped actor context and harness adapter
-   contract. Bind unlike harnesses to stable principals without giving an
-   adapter authority to self-select its identity.
+3. Define the versioned kernel-stamped actor context, capsule-composition
+   contract, and AOS connector contract. Admit unlike harness and service
+   compositions to stable principals without giving a capsule or connector
+   authority to self-select its identity.
 4. Implement the provider-neutral path/inode, staging, publication, mount-lease,
    and doctor contracts.
 5. Project supported system, fleet, principal-overlay, application, browser, and
@@ -689,8 +732,8 @@ The security qualification is:
 6. Add the fleet directory, team service, inboxes, tasks, receipts, wakeups, and
    attenuated handle delegation.
 7. Implement one hosted mount, browser, and desktop adapter used concurrently by
-   at least two unlike harnesses, with crash, `mmap`, compiler, provider-death,
-   daemon-upgrade, and repair evidence.
+   unlike harness compositions and external connectors, with crash, `mmap`,
+   compiler, provider-death, daemon-upgrade, and repair evidence.
 8. Add the remaining macOS, Linux, and Windows mount/desktop adapters against the
    same behavioral contract.
 9. Adapt the Linux Realm capsule to consume the same view. Add a fleet-affine
@@ -700,8 +743,9 @@ The security qualification is:
    cross-fleet isolation or principal attribution.
 
 The first release slice should prove two users with distinct home fleets and at
-least three principals using at least two different harness implementations in
-one user's fleet:
+least three principals using at least two different capsule compositions in one
+user's fleet. At least one composition is an agent harness, one is a
+non-cognitive service such as a vault, and an external AOS connector is present:
 
 - every user recovers the same stable home fleet and never another user's fleet;
 - every mount preserves canonical `AstridHome` paths across macOS, Windows, and
@@ -710,16 +754,18 @@ one user's fleet:
   files, browser sign-ins, and cookies;
 - same-fleet principals retain independent overlays, working contexts, process
   sessions, desktops, and audit attribution;
-- unlike harnesses discover one another, exchange kernel-stamped messages,
-  offer and complete a task, and reference the same shared artifact;
-- replacing the harness bound to one principal preserves that principal's
-  identity, files, inbox, task history, and receipts;
+- unlike principal compositions discover one another, exchange kernel-stamped
+  messages, complete an admitted request or task, and reference the same shared
+  artifact;
+- changing a capsule composition or replacing an external connector preserves
+  the principal's identity, files, inbox, task history, and receipts according
+  to the declared migration policy;
 - a shared browser service remains correct under concurrent agent sessions and
   provider crash;
 - different home fleets cannot access one another's writable files, cookies,
   processes, tokens, or displays;
-- exchange delegated file handles without allowing a harness to claim another
-  sender, fleet, or generation;
+- exchange delegated file handles without allowing a capsule or connector to
+  claim another sender, fleet, or generation;
 - survive provider and daemon restart with acknowledged writes intact; and
 - can each be mounted or remotely viewed by an independently authorized user.
 
@@ -733,10 +779,11 @@ contract.
 Do not ship the fleet-computer claim if any of the following remains true:
 
 - specialized durable agents share one `PrincipalUid`;
-- a harness name, process, prompt, or connection can self-select a
+- a capsule, connector, process, prompt, or connection can self-select a
   `PrincipalUid` or `FleetUid`;
-- replacing a harness silently replaces the durable principal or loses its
-  owned state and team history;
+- a principal is required to contain a model, prompt, or agent loop;
+- changing a composition or connector silently replaces the durable principal
+  or loses its owned state and team history;
 - a user can be provisioned without one stable home fleet;
 - a fleet or group name is treated as authentication;
 - the cooperative profile is described as adversarial isolation between its
