@@ -547,6 +547,13 @@ async fn kernel_and_gateway_boot_against_shared_home() {
     let home_dir = tempfile::tempdir().expect("tempdir");
     set_astrid_home(&home_dir);
 
+    // Initialize the layout sentinel before adding application-owned content.
+    // Production homes intentionally reject a populated, sentinel-less root.
+    astrid_core::dirs::AstridHome::resolve()
+        .expect("ASTRID_HOME")
+        .ensure()
+        .expect("initialize Astrid home");
+
     let workspace = home_dir.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace dir");
 

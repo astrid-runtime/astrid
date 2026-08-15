@@ -219,13 +219,14 @@ ordinary file operations, durable staging, generation-checked publication,
 conflicts, quota, audit, and recovery. Agents in the user's home fleet may also
 share browser and application state through their owning services.
 
-Fleet ownership does not currently exist in `StateOwnerCodecV1`, whose frozen
-grammar contains only `System` and `Principal(PrincipalUid)`. Fleet-owned roots
-therefore require `StateOwnerCodecV2` or an equivalently explicit versioned
-owner grammar. Layout version two fixes the canonical visible path at
-`srv/fleets/{fleet_uid}/`. A fleet must never be encoded as a synthetic
-principal or hidden beneath `StateOwner::System`. The path is a projection of
-the fleet-owned root in the typed store; it is not a second authoritative copy.
+`StateOwnerCodecV1` remains frozen over the separate `StateOwnerV1` domain of
+`System` and `Principal(PrincipalUid)`. The runtime uses `StateOwnerCodecV2`,
+which preserves those bytes and adds the explicit `Fleet(FleetUid)` tag. A
+fleet is never encoded as a synthetic principal or hidden beneath
+`StateOwner::System`. Layout version two fixes its canonical visible path at
+`srv/fleets/{fleet_uid}/`; that path is a projection of the fleet-owned root in
+the typed store, not a second authoritative copy. Fleet writes remain refused
+until their user/fleet quota policy is admitted.
 
 ### 3.3 Principal overlay view
 
@@ -598,8 +599,14 @@ the command and lease semantics identical:
 | Linux | `astrid-storage-provider-fuse` using libfuse | provider-selected mount directory |
 | Windows | `astrid-storage-provider-winfsp` using WinFsp | provider-selected volume/drive |
 
-The provider executable must independently authenticate to the daemon and ask
-for a lease. CLI arguments are a request, not authority. Windows enters at the
+The CLI accepts a provider only when it is co-installed beside the authenticated
+Astrid executable set; it never falls back to `PATH`. Handoff uses the exported
+JSON standard-I/O protocol v1 rather than an argv ABI. Each request carries a
+fresh correlation ID, typed operation, requested view and access; each response
+echoes the protocol and request IDs, advertises capabilities, and returns a
+stable `MountId` or bounded structured error. The provider must still
+independently authenticate to the daemon and ask for a lease: the acting
+principal in the request is a selector, not authority. Windows enters at the
 version-two contract because no public Windows release requires legacy layout
 migration.
 
@@ -824,15 +831,20 @@ an unreleased developer-home importer has its own non-release evidence track.
 
 Current implementation contains the digest-verifying SurrealKV importer,
 preserves the legacy source, quarantines an incomplete typed-store destination,
-migrates alias-keyed roots to stable principal UIDs, strictly admits layout
-versions, commits version two only after store and ownership bootstrap, and
-creates the canonical `srv/` roots with intent and completion records. These
-are useful pieces, not completion of this contract. An exact macOS arm64
-v0.10.4 home fixture now exercises the importer without mutating the legacy
-source. The owner codec still has no fleet tag, the native provider companions
-do not yet exist, and an exact Linux v0.10.4 home plus the complete failure
-matrix remain unproven. The release remains blocked until these gaps close
-together.
+migrates alias-keyed roots to stable principal UIDs, and strictly admits exact
+layout sentinels. Under the singleton lock it writes a canonical, content-bound
+intent before opening either store; the record binds source inventory and
+physical roots, target store and owner-codec format, and exact executable bytes.
+It commits a matching fleet-bearing receipt and layout two only after store and
+ownership bootstrap. Unix migration copy and directory creation retain
+directory capabilities and reject redirects; a non-empty home without a
+sentinel is refused. `StateOwnerCodecV2` supplies the fleet tag without changing
+the frozen version-one domain, and the CLI/provider boundary is versioned and
+typed. These are useful pieces, not completion of the release contract. An
+exact macOS arm64 v0.10.4 home fixture exercises the importer without mutating
+the legacy source. Native provider companions, fleet quota accounting, an exact
+Linux v0.10.4 home, low-disk evidence, and the complete fault matrix remain
+unproven. The release remains blocked until these gaps close together.
 
 ## 11. Product story
 
@@ -863,8 +875,8 @@ The security qualification is:
    interrupted-step recovery, byte-preservation checks, and refusal by old
    binaries. Keep any Windows development-home importer explicit and outside
    the public migration promise.
-2. Define `StateOwnerCodecV2`, the fleet-owned root, and fleet accounting without
-   changing `StateOwnerCodecV1` in place.
+2. Materialize fleet-owned roots and user/fleet accounting through the admitted
+   `StateOwnerCodecV2`; keep the separate `StateOwnerV1` grammar frozen.
 3. Expose read-only ownership inspection and authenticated user/fleet context.
 4. Define the versioned kernel-stamped actor context, capsule-composition
    contract, and AOS connector contract. Admit unlike harness and service

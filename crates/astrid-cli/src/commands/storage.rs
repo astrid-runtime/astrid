@@ -1,11 +1,20 @@
 //! Hosted filesystem mount command and native-provider handoff.
 
-use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::io::{Read as _, Write as _};
+use std::path::PathBuf;
+use std::process::{Command, ExitCode, Stdio};
 
 use anyhow::{Context, Result, bail};
+use astrid_core::storage_provider::{
+    STORAGE_PROVIDER_PROTOCOL_V1, StorageMountSelectorV1, StorageProviderAccessV1,
+    StorageProviderCapabilityV1, StorageProviderOperationV1, StorageProviderOutcomeV1,
+    StorageProviderRequestV1, StorageProviderResponseV1, StorageProviderSuccessV1,
+    StorageProviderViewV1,
+};
 use astrid_core::{FleetUid, PrincipalId};
 use clap::{ArgGroup, Args, Subcommand};
+
+const MAX_PROVIDER_RESPONSE_BYTES: u64 = 64 * 1024;
 
 /// Hosted Astrid filesystem operations.
 #[derive(Debug, Clone, Subcommand)]
@@ -91,72 +100,217 @@ impl MountArgs {
 /// Run a storage command through the platform's lifecycle-independent provider.
 pub(crate) fn run(command: StorageCommand) -> Result<ExitCode> {
     let provider_name = platform_provider_name();
-    let provider = crate::bootstrap::find_companion_binary(provider_name).with_context(|| {
-        format!(
-            "the {provider_name} native filesystem provider is required on {}; \
+    let provider = crate::bootstrap::find_coinstalled_companion_binary(provider_name)
+        .with_context(|| {
+            format!(
+                "the {provider_name} native filesystem provider is required on {}; \
              mounting does not provision storage or bypass Astrid authorization",
-            std::env::consts::OS
-        )
-    })?;
+                std::env::consts::OS
+            )
+        })?;
     let acting = crate::principal::current();
-    let mut process = Command::new(provider);
-    match command {
-        StorageCommand::Mount(args) => {
-            let view = args.view()?;
-            process
-                .arg("mount")
-                .arg("--acting-principal")
-                .arg(acting.as_str())
-                .arg("--access")
-                .arg(args.access(&view));
-            match view {
-                MountView::Principal(principal) => {
-                    process.arg("--view").arg("principal");
-                    process.arg("--target-principal").arg(principal.as_str());
-                },
-                MountView::Fleet(fleet) => {
-                    process.arg("--view").arg("fleet");
-                    process.arg("--target-fleet").arg(fleet.to_string());
-                },
-                MountView::Admin => {
-                    process.arg("--view").arg("admin");
-                },
-            }
-            if let Some(mountpoint) = args.mountpoint {
-                process.arg("--mountpoint").arg(mountpoint);
-            }
-        },
-        StorageCommand::Sync(args) => {
-            provider_mount_command(&mut process, "sync", &acting, &args.mountpoint);
-        },
-        StorageCommand::Status(args) => {
-            provider_mount_command(&mut process, "status", &acting, &args.mountpoint);
-        },
-        StorageCommand::Unmount(args) => {
-            provider_mount_command(&mut process, "unmount", &acting, &args.mountpoint);
-        },
-    }
-    let status = process
-        .status()
+    let (operation, required_capabilities) = provider_operation(command)?;
+    let request = StorageProviderRequestV1::new(acting.clone(), operation);
+    let mut child = Command::new(provider)
+        .arg("--astrid-provider-stdio-v1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
         .with_context(|| format!("failed to start {provider_name}"))?;
-    Ok(status
-        .code()
-        .and_then(|code| u8::try_from(code).ok())
-        .map_or(ExitCode::FAILURE, ExitCode::from))
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("native provider stdin is unavailable")?;
+    serde_json::to_writer(&mut stdin, &request).context("encode native provider request")?;
+    stdin
+        .write_all(b"\n")
+        .context("terminate native provider request")?;
+    drop(stdin);
+    let stdout = child
+        .stdout
+        .take()
+        .context("native provider stdout is unavailable")?;
+    let mut response_bytes = Vec::new();
+    stdout
+        .take(MAX_PROVIDER_RESPONSE_BYTES + 1)
+        .read_to_end(&mut response_bytes)
+        .context("read native provider response")?;
+    if response_bytes.len() as u64 > MAX_PROVIDER_RESPONSE_BYTES {
+        let _ = child.kill();
+        let _ = child.wait();
+        bail!("{provider_name} exceeded the bounded protocol response size");
+    }
+    let status = child.wait().context("wait for native storage provider")?;
+    if !status.success() {
+        bail!("{provider_name} exited without a successful protocol response: {status}");
+    }
+    let response: StorageProviderResponseV1 =
+        serde_json::from_slice(&response_bytes).context("decode native provider response")?;
+    validate_response(provider_name, &request, &response, &required_capabilities)?;
+    render_response(response.outcome)
 }
 
-fn provider_mount_command(
-    process: &mut Command,
-    operation: &str,
-    acting: &PrincipalId,
-    mountpoint: &Path,
-) {
-    process
-        .arg(operation)
-        .arg("--acting-principal")
-        .arg(acting.as_str())
-        .arg("--mountpoint")
-        .arg(mountpoint);
+fn provider_operation(
+    command: StorageCommand,
+) -> Result<(StorageProviderOperationV1, Vec<StorageProviderCapabilityV1>)> {
+    Ok(match command {
+        StorageCommand::Mount(args) => {
+            let view = args.view()?;
+            let access = if args.access(&view) == "read-only" {
+                StorageProviderAccessV1::ReadOnly
+            } else {
+                StorageProviderAccessV1::ReadWrite
+            };
+            let view_capability = match &view {
+                MountView::Principal(_) => StorageProviderCapabilityV1::PrincipalView,
+                MountView::Fleet(_) => StorageProviderCapabilityV1::FleetView,
+                MountView::Admin => StorageProviderCapabilityV1::AdminView,
+            };
+            let access_capability = match access {
+                StorageProviderAccessV1::ReadOnly => StorageProviderCapabilityV1::ReadOnly,
+                StorageProviderAccessV1::ReadWrite => StorageProviderCapabilityV1::ReadWrite,
+            };
+            let view = match view {
+                MountView::Principal(principal) => StorageProviderViewV1::Principal(principal),
+                MountView::Fleet(fleet) => StorageProviderViewV1::Fleet(fleet),
+                MountView::Admin => StorageProviderViewV1::Admin,
+            };
+            (
+                StorageProviderOperationV1::Mount {
+                    view,
+                    access,
+                    mountpoint: args.mountpoint,
+                },
+                vec![view_capability, access_capability],
+            )
+        },
+        StorageCommand::Sync(args) => (
+            StorageProviderOperationV1::Sync {
+                selector: StorageMountSelectorV1::NativePath(args.mountpoint),
+            },
+            vec![StorageProviderCapabilityV1::Lifecycle],
+        ),
+        StorageCommand::Status(args) => (
+            StorageProviderOperationV1::Status {
+                selector: StorageMountSelectorV1::NativePath(args.mountpoint),
+            },
+            vec![StorageProviderCapabilityV1::Lifecycle],
+        ),
+        StorageCommand::Unmount(args) => (
+            StorageProviderOperationV1::Unmount {
+                selector: StorageMountSelectorV1::NativePath(args.mountpoint),
+            },
+            vec![StorageProviderCapabilityV1::Lifecycle],
+        ),
+    })
+}
+
+fn validate_response(
+    provider_name: &str,
+    request: &StorageProviderRequestV1,
+    response: &StorageProviderResponseV1,
+    required_capabilities: &[StorageProviderCapabilityV1],
+) -> Result<()> {
+    if response.protocol_version != STORAGE_PROVIDER_PROTOCOL_V1 {
+        bail!(
+            "{provider_name} protocol mismatch: expected {}, received {}",
+            STORAGE_PROVIDER_PROTOCOL_V1,
+            response.protocol_version
+        );
+    }
+    if response.request_id != request.request_id {
+        bail!("{provider_name} returned a response for a different request");
+    }
+    if response.provider.name != provider_name
+        || response.provider.version.is_empty()
+        || response.provider.version.len() > 128
+        || response.provider.version.chars().any(char::is_control)
+        || response.provider.capabilities.len() > 16
+        || !capabilities_are_unique(&response.provider.capabilities)
+    {
+        bail!("native provider identity does not match the co-installed executable");
+    }
+    for capability in required_capabilities {
+        if !response.provider.capabilities.contains(capability) {
+            bail!("{provider_name} does not advertise required capability {capability:?}");
+        }
+    }
+    let operation_matches = matches!(
+        (&request.operation, &response.outcome),
+        (
+            StorageProviderOperationV1::Mount { .. },
+            StorageProviderOutcomeV1::Success(StorageProviderSuccessV1::Mounted { .. })
+        ) | (
+            StorageProviderOperationV1::Sync { .. },
+            StorageProviderOutcomeV1::Success(StorageProviderSuccessV1::Synced { .. })
+        ) | (
+            StorageProviderOperationV1::Status { .. },
+            StorageProviderOutcomeV1::Success(StorageProviderSuccessV1::Status { .. })
+        ) | (
+            StorageProviderOperationV1::Unmount { .. },
+            StorageProviderOutcomeV1::Success(StorageProviderSuccessV1::Unmounted { .. })
+        ) | (_, StorageProviderOutcomeV1::Failure(_))
+    );
+    if !operation_matches {
+        bail!("{provider_name} returned a result for a different operation");
+    }
+    Ok(())
+}
+
+fn capabilities_are_unique(capabilities: &[StorageProviderCapabilityV1]) -> bool {
+    let mut admitted = Vec::with_capacity(capabilities.len());
+    for capability in capabilities {
+        if admitted.contains(capability) {
+            return false;
+        }
+        admitted.push(*capability);
+    }
+    true
+}
+
+fn render_response(outcome: StorageProviderOutcomeV1) -> Result<ExitCode> {
+    match outcome {
+        StorageProviderOutcomeV1::Success(StorageProviderSuccessV1::Mounted {
+            mount_id,
+            mountpoint,
+        }) => println!("mounted {mount_id} at {}", mountpoint.display()),
+        StorageProviderOutcomeV1::Success(StorageProviderSuccessV1::Synced { mount_id }) => {
+            println!("synced {mount_id}");
+        },
+        StorageProviderOutcomeV1::Success(StorageProviderSuccessV1::Status {
+            mount_id,
+            mountpoint,
+            access,
+            dirty,
+        }) => println!(
+            "mount {mount_id} at {}: {access:?}, dirty={dirty}",
+            mountpoint.display()
+        ),
+        StorageProviderOutcomeV1::Success(StorageProviderSuccessV1::Unmounted { mount_id }) => {
+            println!("unmounted {mount_id}");
+        },
+        StorageProviderOutcomeV1::Failure(failure) => {
+            if failure.code.is_empty()
+                || failure.code.len() > 64
+                || !failure
+                    .code
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+                || failure.message.is_empty()
+                || failure.message.len() > 4096
+                || failure.message.chars().any(char::is_control)
+            {
+                bail!("native provider returned an invalid structured error");
+            }
+            eprintln!(
+                "storage provider error [{}]: {}",
+                failure.code, failure.message
+            );
+            return Ok(ExitCode::FAILURE);
+        },
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn platform_provider_name() -> &'static str {
@@ -177,10 +331,16 @@ fn platform_provider_name() -> &'static str {
 #[cfg(test)]
 mod tests {
     use clap::Parser as _;
+    use uuid::Uuid;
 
     use crate::cli::{Cli, Commands};
 
-    use super::{MountView, StorageCommand};
+    use super::{MountView, StorageCommand, validate_response};
+    use astrid_core::storage_provider::{
+        StorageMountId, StorageProviderCapabilityV1, StorageProviderIdentityV1,
+        StorageProviderOperationV1, StorageProviderOutcomeV1, StorageProviderRequestV1,
+        StorageProviderResponseV1, StorageProviderSuccessV1,
+    };
 
     fn mount(arguments: &[&str]) -> super::MountArgs {
         let cli = Cli::try_parse_from(arguments).unwrap();
@@ -216,5 +376,71 @@ mod tests {
         assert_eq!(args.access(&args.view().unwrap()), "read-only");
         let args = mount(&["astrid", "storage", "mount", "--admin", "--read-write"]);
         assert_eq!(args.access(&args.view().unwrap()), "read-write");
+    }
+
+    fn status_exchange() -> (StorageProviderRequestV1, StorageProviderResponseV1) {
+        let request = StorageProviderRequestV1::new(
+            "operator".parse().unwrap(),
+            StorageProviderOperationV1::Status {
+                selector: astrid_core::storage_provider::StorageMountSelectorV1::NativePath(
+                    "/mnt/astrid".into(),
+                ),
+            },
+        );
+        let response = StorageProviderResponseV1 {
+            protocol_version: astrid_core::storage_provider::STORAGE_PROVIDER_PROTOCOL_V1,
+            request_id: request.request_id,
+            provider: StorageProviderIdentityV1 {
+                name: super::platform_provider_name().to_owned(),
+                version: "1.0.0".to_owned(),
+                capabilities: vec![StorageProviderCapabilityV1::Lifecycle],
+            },
+            outcome: StorageProviderOutcomeV1::Success(StorageProviderSuccessV1::Status {
+                mount_id: StorageMountId::from_uuid(Uuid::from_bytes([9; 16])),
+                mountpoint: "/mnt/astrid".into(),
+                access: astrid_core::storage_provider::StorageProviderAccessV1::ReadOnly,
+                dirty: false,
+            }),
+        };
+        (request, response)
+    }
+
+    #[test]
+    fn provider_response_binds_protocol_identity_capability_and_request() {
+        let (request, response) = status_exchange();
+        validate_response(
+            super::platform_provider_name(),
+            &request,
+            &response,
+            &[StorageProviderCapabilityV1::Lifecycle],
+        )
+        .unwrap();
+
+        let mut wrong_protocol = response.clone();
+        wrong_protocol.protocol_version += 1;
+        assert!(
+            validate_response(
+                super::platform_provider_name(),
+                &request,
+                &wrong_protocol,
+                &[StorageProviderCapabilityV1::Lifecycle],
+            )
+            .is_err()
+        );
+
+        let mut wrong_operation = response;
+        wrong_operation.outcome =
+            StorageProviderOutcomeV1::Success(StorageProviderSuccessV1::Unmounted {
+                mount_id: StorageMountId::from_uuid(Uuid::from_bytes([9; 16])),
+            });
+        assert!(
+            validate_response(
+                super::platform_provider_name(),
+                &request,
+                &wrong_operation,
+                &[StorageProviderCapabilityV1::Lifecycle],
+            )
+            .is_err()
+        );
     }
 }

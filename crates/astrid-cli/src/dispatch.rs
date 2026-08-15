@@ -49,7 +49,7 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<ExitCode> {
     };
 
     if let Some(prompt_text) = cli.prompt {
-        bootstrap::ensure_global_config().await;
+        bootstrap::ensure_global_config().await?;
         if cli.snapshot_tui {
             commands::headless::run_snapshot_tui(
                 prompt_text,
@@ -74,7 +74,7 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<ExitCode> {
 
     // Piped stdin with no subcommand → headless.
     if cli.command.is_none() && !std::io::stdin().is_terminal() {
-        bootstrap::ensure_global_config().await;
+        bootstrap::ensure_global_config().await?;
         let mut stdin_text = String::new();
         std::io::Read::read_to_string(&mut std::io::stdin(), &mut stdin_text)?;
         if !stdin_text.is_empty() {
@@ -124,7 +124,7 @@ async fn dispatch_subcommand(
             if output_format == OutputFormat::Json {
                 print_banner();
             }
-            bootstrap::ensure_global_config().await;
+            bootstrap::ensure_global_config().await?;
             let workspace = std::env::current_dir().ok();
             bootstrap::run_or_connect(session, workspace, output_format).await?;
             Ok(ExitCode::SUCCESS)
@@ -133,7 +133,7 @@ async fn dispatch_subcommand(
             if output_format == OutputFormat::Json {
                 print_banner();
             }
-            bootstrap::ensure_global_config().await;
+            bootstrap::ensure_global_config().await?;
             let workspace = std::env::current_dir().ok();
             bootstrap::run_or_connect(None, workspace, output_format).await?;
             Ok(ExitCode::SUCCESS)
@@ -205,7 +205,7 @@ async fn dispatch_subcommand(
         Some(Commands::Config { command }) => dispatch_config(command),
         Some(Commands::Session { command }) => dispatch_session(command),
         Some(Commands::Start) => {
-            bootstrap::ensure_global_config().await;
+            bootstrap::ensure_global_config().await?;
             commands::daemon::handle_start().await?;
             Ok(ExitCode::SUCCESS)
         },

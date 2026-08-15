@@ -37,6 +37,7 @@ pub mod principal;
 pub mod profile;
 pub mod retry;
 pub mod session_token;
+pub mod storage_provider;
 pub mod types;
 pub mod uplink;
 pub(crate) mod utils;

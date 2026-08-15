@@ -26,7 +26,7 @@ fn unlimited_quota() -> Arc<dyn KvQuotaResolver<StateOwner>> {
     Arc::new(|owner: &StateOwner| {
         Ok(match owner {
             StateOwner::System => None,
-            StateOwner::Principal(_) => Some(u64::MAX),
+            StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(u64::MAX),
         })
     })
 }
@@ -334,7 +334,7 @@ fn assert_reader_rejects_substituted_format_specification(home: &AstridHome, scr
     let engine = RuntimeEngine::open(
         home.principal_store_path(),
         Blake3ObjectIdentityV1,
-        StateOwnerCodecV1,
+        StateOwnerCodecV2,
         RecoveryLimits::process_addressable(),
     )
     .unwrap();
@@ -415,8 +415,12 @@ fn assert_reader_requires_catalog_specification(home: &AstridHome, script: &Path
 
 #[test]
 fn owner_codec_round_trips_only_canonical_values() {
-    let codec = StateOwnerCodecV1;
-    let owners = [StateOwner::System, test_owner("alice")];
+    let codec = StateOwnerCodecV2;
+    let owners = [
+        StateOwner::System,
+        test_owner("alice"),
+        StateOwner::Fleet(astrid_core::FleetUid::from_bytes([7; 32])),
+    ];
     for owner in owners {
         let encoded = codec.encode(&owner);
         assert_eq!(codec.decode(&encoded), Some(owner));
@@ -425,6 +429,17 @@ fn owner_codec_round_trips_only_canonical_values() {
     assert_eq!(codec.decode(&[0, 0]), None);
     assert_eq!(codec.decode(&[1]), None);
     assert_eq!(codec.decode(&[1, b':']), None);
+}
+
+#[test]
+fn owner_codec_v1_remains_frozen_without_a_fleet_tag() {
+    let codec = StateOwnerCodecV1;
+    let principal = PrincipalUid::from_bytes([9; 32]);
+    for owner in [StateOwnerV1::System, StateOwnerV1::Principal(principal)] {
+        let encoded = codec.encode(&owner);
+        assert_eq!(codec.decode(&encoded), Some(owner));
+    }
+    assert_eq!(codec.decode(&[2; 33]), None);
 }
 
 #[test]
@@ -499,7 +514,7 @@ fn format_specification_has_a_tagged_metadata_identity() {
     assert!(record.references().is_empty());
     assert_eq!(
         object_id_hex(id),
-        "9d701dc87360e634b25b7b7f5d5e79315f9f27bcf4d50e09c2181e439b0c7d75"
+        "f9b17fa5e6b4ac4562c7e4ab2da1f0c756da07945d808794ad75544a132b0d91"
     );
     assert_eq!(
         object_id_hex(catalog_id),
@@ -510,10 +525,10 @@ fn format_specification_has_a_tagged_metadata_identity() {
         "format=astrid-principal-store-v1\n\
          identity=blake3-object-identity-v1\n\
          identity-wire=tagged-identity-v1\n\
-         format-spec-object=1:1:32:9d701dc87360e634b25b7b7f5d5e79315f9f27bcf4d50e09c2181e439b0c7d75\n\
+         format-spec-object=1:1:32:f9b17fa5e6b4ac4562c7e4ab2da1f0c756da07945d808794ad75544a132b0d91\n\
          content-catalog-spec-object=1:1:32:8f3999b066b666396259c4a92f9de7c5b8e67df9d38a69fb4fb824968b56ecdb\n\
          representations=authoritative-direct-v1\n\
-         principal-codec=principal-uid-v1\n\
+         principal-codec=state-owner-v2\n\
          projection=kv-transition-bplus-v4\n"
     );
 }
@@ -526,7 +541,7 @@ fn pre_derivation_v1_runatal_upgrade_is_idempotent_and_preserves_history() {
     let engine = RuntimeEngine::open(
         &store_path,
         Blake3ObjectIdentityV1,
-        StateOwnerCodecV1,
+        StateOwnerCodecV2,
         RecoveryLimits::process_addressable(),
     )
     .unwrap();
@@ -608,7 +623,7 @@ fn prior_metadata_that_declared_a_catalog_specification_requires_it() {
     let engine = RuntimeEngine::open(
         directory.path(),
         Blake3ObjectIdentityV1,
-        StateOwnerCodecV1,
+        StateOwnerCodecV2,
         RecoveryLimits::process_addressable(),
     )
     .unwrap();
@@ -690,7 +705,7 @@ async fn new_store_persists_and_verifies_the_in_band_specification() {
     let engine = RuntimeEngine::open(
         home.principal_store_path(),
         Blake3ObjectIdentityV1,
-        StateOwnerCodecV1,
+        StateOwnerCodecV2,
         RecoveryLimits::process_addressable(),
     )
     .unwrap();
@@ -816,7 +831,7 @@ async fn install_legacy_catalog_fixtures(
     let engine = RuntimeEngine::open(
         home.principal_store_path(),
         Blake3ObjectIdentityV1,
-        StateOwnerCodecV1,
+        StateOwnerCodecV2,
         RecoveryLimits::process_addressable(),
     )
     .unwrap();
@@ -987,7 +1002,7 @@ async fn flat_content_catalog_migration_resumes_and_is_idempotent() {
         RuntimeEngine::open(
             home.principal_store_path(),
             Blake3ObjectIdentityV1,
-            StateOwnerCodecV1,
+            StateOwnerCodecV2,
             RecoveryLimits::process_addressable(),
         )
         .unwrap(),
@@ -1016,7 +1031,7 @@ async fn flat_content_catalog_migration_resumes_and_is_idempotent() {
     let migrated_engine = RuntimeEngine::open(
         home.principal_store_path(),
         Blake3ObjectIdentityV1,
-        StateOwnerCodecV1,
+        StateOwnerCodecV2,
         RecoveryLimits::process_addressable(),
     )
     .unwrap();
@@ -1059,7 +1074,7 @@ async fn flat_content_catalog_migration_resumes_and_is_idempotent() {
     let reopened_engine = RuntimeEngine::open(
         home.principal_store_path(),
         Blake3ObjectIdentityV1,
-        StateOwnerCodecV1,
+        StateOwnerCodecV2,
         RecoveryLimits::process_addressable(),
     )
     .unwrap();
@@ -1460,7 +1475,7 @@ async fn independent_reader_accepts_a_replayed_durable_prefix() {
     let recovered_engine = RuntimeEngine::open(
         &replay_store,
         Blake3ObjectIdentityV1,
-        StateOwnerCodecV1,
+        StateOwnerCodecV2,
         RecoveryLimits::process_addressable(),
     )
     .unwrap();
@@ -1593,7 +1608,7 @@ async fn completed_store_does_not_self_heal_a_missing_runatal_object() {
         RuntimeEngine::open(
             &path,
             Blake3ObjectIdentityV1,
-            StateOwnerCodecV1,
+            StateOwnerCodecV2,
             RecoveryLimits::process_addressable(),
         )
         .unwrap(),
@@ -1632,7 +1647,7 @@ async fn current_metadata_does_not_self_heal_a_missing_catalog_specification() {
     let engine = RuntimeEngine::open(
         &path,
         Blake3ObjectIdentityV1,
-        StateOwnerCodecV1,
+        StateOwnerCodecV2,
         RecoveryLimits::process_addressable(),
     )
     .unwrap();
@@ -1769,7 +1784,7 @@ async fn live_quota_blocks_growth_but_allows_recovery_and_system_state() {
     let quota: Arc<dyn KvQuotaResolver<StateOwner>> = Arc::new(|owner: &StateOwner| {
         Ok(match owner {
             StateOwner::System => None,
-            StateOwner::Principal(_) => Some(27),
+            StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(27),
         })
     });
     let store = open_runtime_principal_store(&home, quota).await.unwrap();
@@ -1854,7 +1869,7 @@ async fn durable_point_update_has_height_bounded_write_amplification() {
         RuntimeEngine::open(
             directory.path(),
             Blake3ObjectIdentityV1,
-            StateOwnerCodecV1,
+            StateOwnerCodecV2,
             limits,
         )
         .unwrap(),
@@ -1892,7 +1907,7 @@ async fn durable_point_update_has_height_bounded_write_amplification() {
         RuntimeEngine::open(
             directory.path(),
             Blake3ObjectIdentityV1,
-            StateOwnerCodecV1,
+            StateOwnerCodecV2,
             limits,
         )
         .unwrap(),
@@ -1919,7 +1934,7 @@ async fn native_kv_group_commit_scale_probe() {
             RuntimeEngine::open(
                 directory.path(),
                 Blake3ObjectIdentityV1,
-                StateOwnerCodecV1,
+                StateOwnerCodecV2,
                 RecoveryLimits::process_addressable(),
             )
             .unwrap(),

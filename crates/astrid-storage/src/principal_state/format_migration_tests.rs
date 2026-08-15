@@ -8,11 +8,12 @@ use super::bootstrap;
 use super::format_amendment::{
     DestinationFormat, PRE_BOTTOM_K_SKETCH_FORMAT_SPEC_ID, PRE_COMPACTION_FORMAT_SPEC_ID,
     PRE_DENSE_RADIX_FORMAT_SPEC_ID, PRE_FASTCDC_FREEZE_FORMAT_SPEC_ID,
-    PRE_GC_OUTBOX_FORMAT_SPEC_ID, PRE_KV_TRANSITION_FORMAT_SPEC_ID,
+    PRE_FLEET_OWNER_FORMAT_SPEC_ID, PRE_GC_OUTBOX_FORMAT_SPEC_ID, PRE_KV_TRANSITION_FORMAT_SPEC_ID,
     PRE_MECHANICAL_AUDIT_FORMAT_SPEC_ID, PRE_PHYSICAL_CATALOGUE_FORMAT_SPEC_ID,
     PRE_RUNATAL_NAMING_FORMAT_SPEC_ID, PRE_SHA384_ATTESTATION_FORMAT_SPEC_ID, STORE_METADATA_FILE,
-    format_spec_record, legacy_store_metadata, pre_representation_store_metadata,
-    prepare_destination, previous_store_metadata, store_metadata,
+    format_spec_record, legacy_store_metadata, pre_fleet_owner_store_metadata,
+    pre_representation_store_metadata, prepare_destination, previous_store_metadata,
+    store_metadata,
 };
 use super::{Blake3ObjectIdentityV1, KvQuotaResolver, StateOwner, open_runtime_kv};
 use astrid_core::dirs::AstridHome;
@@ -21,7 +22,7 @@ fn unlimited_quota() -> Arc<dyn KvQuotaResolver<StateOwner>> {
     Arc::new(|owner: &StateOwner| {
         Ok(match owner {
             StateOwner::System => None,
-            StateOwner::Principal(_) => Some(u64::MAX),
+            StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(u64::MAX),
         })
     })
 }
@@ -42,7 +43,38 @@ async fn completed_prior_v1_stores_are_selected_for_runatal_amendment() {
     assert_prior_current_projection_is_selected(PRE_BOTTOM_K_SKETCH_FORMAT_SPEC_ID).await;
     assert_prior_current_projection_is_selected(PRE_MECHANICAL_AUDIT_FORMAT_SPEC_ID).await;
     assert_prior_current_projection_is_selected(PRE_DENSE_RADIX_FORMAT_SPEC_ID).await;
+    assert_pre_fleet_owner_format_is_selected().await;
     assert_pre_representation_format_is_selected(PRE_PHYSICAL_CATALOGUE_FORMAT_SPEC_ID).await;
+}
+
+async fn assert_pre_fleet_owner_format_is_selected() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    let store = open_runtime_kv(&home, unlimited_quota()).await.unwrap();
+    store.close().await.unwrap();
+    drop(store);
+
+    let store_path = home.principal_store_path();
+    let catalog_spec = bootstrap::content_catalog_format_specification().unwrap();
+    let catalog_spec_id = Blake3ObjectIdentityV1.identify(&catalog_spec);
+    std::fs::write(
+        store_path.join(STORE_METADATA_FILE),
+        pre_fleet_owner_store_metadata(PRE_FLEET_OWNER_FORMAT_SPEC_ID, catalog_spec_id),
+    )
+    .unwrap();
+    let current_spec_id = Blake3ObjectIdentityV1.identify(&format_spec_record().unwrap());
+    assert_eq!(
+        prepare_destination(
+            &store_path,
+            &store_metadata(current_spec_id, catalog_spec_id),
+            catalog_spec_id,
+        )
+        .unwrap(),
+        DestinationFormat::PriorV1 {
+            format_spec: PRE_FLEET_OWNER_FORMAT_SPEC_ID,
+            catalog_spec_was_declared: true,
+        }
+    );
 }
 
 async fn assert_pre_representation_format_is_selected(prior: ObjectId) {

@@ -6,6 +6,8 @@
 //! history.
 
 use std::collections::BTreeMap;
+#[cfg(feature = "legacy-surrealkv")]
+use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -241,80 +243,43 @@ fn prepare_legacy_snapshot(source: &Path, destination: &Path) -> StorageResult<(
             destination.display()
         ))
     })?;
-    copy_legacy_tree(source, destination)
+    let source = super::native_io::PrivateDirectory::open(source)?;
+    let destination = super::native_io::PrivateDirectory::open(destination)?;
+    copy_legacy_tree(&source, &destination)
 }
 
 #[cfg(feature = "legacy-surrealkv")]
-fn copy_legacy_tree(source: &Path, destination: &Path) -> StorageResult<()> {
-    let metadata = std::fs::symlink_metadata(source).map_err(|error| {
-        StorageError::Connection(format!(
-            "inspect legacy migration source {}: {error}",
-            source.display()
-        ))
-    })?;
-    if metadata.file_type().is_symlink() {
-        return Err(StorageError::Connection(format!(
-            "legacy migration source is redirected: {}",
-            source.display()
-        )));
-    }
-    if metadata.is_dir() {
-        astrid_core::platform_fs::ensure_private_directory(destination).map_err(|error| {
-            StorageError::Connection(format!(
-                "create legacy snapshot directory {}: {error}",
-                destination.display()
-            ))
-        })?;
-        let entries = std::fs::read_dir(source).map_err(|error| {
-            StorageError::Connection(format!(
-                "enumerate legacy migration source {}: {error}",
-                source.display()
-            ))
-        })?;
-        for entry in entries {
-            let entry = entry.map_err(|error| {
+fn copy_legacy_tree(
+    source: &super::native_io::PrivateDirectory,
+    destination: &super::native_io::PrivateDirectory,
+) -> StorageResult<()> {
+    let mut entries = source.entries()?;
+    entries.sort();
+    for name in entries {
+        let relative = Path::new(&name);
+        if source.entry_is_directory(relative)? {
+            let source_child = source.open_child(relative)?;
+            let destination_child = destination.ensure_child(relative)?;
+            copy_legacy_tree(&source_child, &destination_child)?;
+            destination_child.sync()?;
+        } else {
+            let mut input = source.open_file(relative)?;
+            let mut output = destination.create_file(relative)?;
+            io::copy(&mut input, &mut output).map_err(|error| {
                 StorageError::Connection(format!(
-                    "enumerate legacy migration source {}: {error}",
-                    source.display()
+                    "copy legacy migration entry {}: {error}",
+                    name.to_string_lossy()
                 ))
             })?;
-            copy_legacy_tree(&entry.path(), &destination.join(entry.file_name()))?;
-        }
-        super::native_io::sync_directory(destination)
-    } else if metadata.is_file() {
-        std::fs::copy(source, destination).map_err(|error| {
-            StorageError::Connection(format!(
-                "copy legacy migration source {} to {}: {error}",
-                source.display(),
-                destination.display()
-            ))
-        })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(destination, std::fs::Permissions::from_mode(0o600)).map_err(
-                |error| {
-                    StorageError::Connection(format!(
-                        "secure legacy migration snapshot {}: {error}",
-                        destination.display()
-                    ))
-                },
-            )?;
-        }
-        std::fs::File::open(destination)
-            .and_then(|file| file.sync_all())
-            .map_err(|error| {
+            output.sync_all().map_err(|error| {
                 StorageError::Connection(format!(
-                    "flush legacy migration snapshot {}: {error}",
-                    destination.display()
+                    "flush legacy migration entry {}: {error}",
+                    name.to_string_lossy()
                 ))
-            })
-    } else {
-        Err(StorageError::Connection(format!(
-            "legacy migration source contains a special file: {}",
-            source.display()
-        )))
+            })?;
+        }
     }
+    destination.sync()
 }
 
 #[cfg(feature = "legacy-surrealkv")]
@@ -518,5 +483,24 @@ mod tests {
         .await
         .unwrap();
         release_after_entry.await.unwrap();
+    }
+
+    #[cfg(all(unix, feature = "legacy-surrealkv"))]
+    #[test]
+    fn legacy_snapshot_copy_rejects_redirected_entries() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let destination = root.path().join("destination");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, source.join("redirect")).unwrap();
+
+        let error = prepare_legacy_snapshot(&source, &destination).unwrap_err();
+
+        assert!(error.to_string().contains("redirected"));
+        assert_eq!(std::fs::read(outside).unwrap(), b"outside");
     }
 }

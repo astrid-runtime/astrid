@@ -78,6 +78,7 @@ pub const LEGACY_LAYOUT_VERSION: &str = "1";
 
 #[path = "dirs_layout.rs"]
 mod dirs_layout;
+pub use dirs_layout::LayoutMigrationTarget;
 
 /// Default per-project runtime state directory.
 pub const DEFAULT_WORKSPACE_STATE_DIR: &str = ".astrid";
@@ -366,6 +367,36 @@ impl AstridHome {
                 format!("unsupported Astrid home layout version {version:?}"),
             ));
         }
+        if existing_layout.is_none() {
+            match std::fs::symlink_metadata(self.root()) {
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "Astrid home without a layout sentinel is redirected or not a directory: {}",
+                            self.root().display()
+                        ),
+                    ));
+                },
+                Ok(_)
+                    if std::fs::read_dir(self.root())?
+                        .next()
+                        .transpose()?
+                        .is_some() =>
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "refusing to initialize non-empty Astrid home without etc/layout-version: {}",
+                            self.root().display()
+                        ),
+                    ));
+                },
+                Ok(_) => {},
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+                Err(error) => return Err(error),
+            }
+        }
         let dirs = [
             self.etc_dir(),
             self.hooks_dir(),
@@ -384,10 +415,7 @@ impl AstridHome {
         crate::platform_fs::ensure_private_directory(self.root())?;
 
         for dir in &dirs {
-            #[cfg(windows)]
             crate::platform_fs::ensure_private_directory(dir)?;
-            #[cfg(not(windows))]
-            std::fs::create_dir_all(dir)?;
         }
 
         match existing_layout.as_deref() {

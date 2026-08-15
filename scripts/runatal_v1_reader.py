@@ -49,7 +49,7 @@ REFERENCE_NAMES = ("Owns", "Evidence", "Lineage", "Derived")
 FORMAT_SPECIFICATION = (
     1,
     1,
-    bytes.fromhex("9d701dc87360e634b25b7b7f5d5e79315f9f27bcf4d50e09c2181e439b0c7d75"),
+    bytes.fromhex("f9b17fa5e6b4ac4562c7e4ab2da1f0c756da07945d808794ad75544a132b0d91"),
 )
 CONTENT_CATALOG_SPECIFICATION = (
     1,
@@ -71,6 +71,7 @@ LEGACY_FORMAT_SPECIFICATIONS = {
         "c3fd6c43a5b6a05ffe11c339502ce35090f6643ee3070177e5802fc155d2b8c0",
         "82e46f53ba9bb2f52d6b942088d5965eaa17c2720e61ce842ed9d5e3c0d1219d",
         "900d1eface3294bc9e47369c0fcb64dca56ff334dfbc1288f349090e10c09e6f",
+        "9d701dc87360e634b25b7b7f5d5e79315f9f27bcf4d50e09c2181e439b0c7d75",
     )
 }
 CHUNK_TREE_FANOUT = 128
@@ -755,7 +756,9 @@ def principal_text(principal):
         return "system"
     if len(principal) == 33 and principal[:1] == b"\1":
         return principal[1:].hex()
-    raise FormatError("invalid principal-uid encoding")
+    if len(principal) == 33 and principal[:1] == b"\2":
+        return f"fleet:{principal[1:].hex()}"
+    raise FormatError("invalid state-owner-v2 encoding")
 
 
 def parse_metadata(path):
@@ -770,7 +773,7 @@ def parse_metadata(path):
         "identity": "blake3-object-identity-v1",
         "identity-wire": "tagged-identity-v1",
         "representations": "authoritative-direct-v1",
-        "principal-codec": "principal-uid-v1",
+        "principal-codec": "state-owner-v2",
         "projection": "kv-transition-bplus-v4",
     }
     for key, value in required.items():

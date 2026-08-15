@@ -95,3 +95,33 @@ fn unix_replacement_preserves_backups_and_cleans_staging() {
     assert_eq!(std::fs::read(install.join("astrid.bak")).unwrap(), b"old");
     assert!(!install.join(".astrid.new").exists());
 }
+
+#[cfg(unix)]
+#[test]
+fn unix_private_directory_creation_rejects_redirected_components() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let redirect = root.path().join("redirect");
+    symlink(outside.path(), &redirect).unwrap();
+
+    assert!(ensure_private_directory(&redirect.join("private")).is_err());
+    assert!(verify_no_redirects(&redirect).is_err());
+    assert!(!outside.path().join("private").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_redirect_validation_accepts_regular_leaf_files_but_not_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("intent");
+    let redirect = root.path().join("redirect");
+    std::fs::write(&file, b"intent").unwrap();
+    symlink(&file, &redirect).unwrap();
+
+    verify_no_redirects(&file).unwrap();
+    assert!(verify_no_redirects(&redirect).is_err());
+}

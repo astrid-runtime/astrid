@@ -15,7 +15,7 @@ use super::native_io::{atomic_write, rename_private_entry, sync_directory};
 use super::staging;
 use super::{
     Blake3ObjectIdentityV1, PrincipalDirectory, RuntimeEngine, RuntimeStore, StateOwner,
-    StateOwnerCodecV1, StateOwnerResolver,
+    StateOwnerCodecV2, StateOwnerResolver,
 };
 use crate::error::{StorageError, StorageResult};
 use crate::identity::{IdentityStore, KvIdentityStore};
@@ -190,7 +190,7 @@ async fn resume_uid_store(
     let Ok(engine) = RuntimeEngine::open(
         store,
         Blake3ObjectIdentityV1,
-        StateOwnerCodecV1,
+        StateOwnerCodecV2,
         RecoveryLimits::process_addressable(),
     ) else {
         return Ok(false);
@@ -260,7 +260,7 @@ async fn migrate_alias_store(
         RuntimeEngine::open(
             store,
             Blake3ObjectIdentityV1,
-            StateOwnerCodecV1,
+            StateOwnerCodecV2,
             RecoveryLimits::process_addressable(),
         )
         .map_err(|error| {
@@ -305,7 +305,7 @@ fn write_uid_root_snapshot(
 ) -> StorageResult<()> {
     let replacement = store.join(REPLACEMENT_ROOT_FILE);
     legacy
-        .write_mapped_root_snapshot(&replacement, &StateOwnerCodecV1, |owner| match owner {
+        .write_mapped_root_snapshot(&replacement, &StateOwnerCodecV2, |owner| match owner {
             AliasStateOwner::System => Ok(StateOwner::System),
             AliasStateOwner::Principal(alias) => {
                 let uid = by_alias
@@ -598,7 +598,7 @@ mod tests {
         Arc::new(|owner: &StateOwner| {
             Ok(match owner {
                 StateOwner::System => None,
-                StateOwner::Principal(_) => Some(u64::MAX),
+                StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(u64::MAX),
             })
         })
     }

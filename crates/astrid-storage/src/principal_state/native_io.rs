@@ -131,6 +131,19 @@ impl PrivateDirectory {
                     self.path.join(name).display()
                 ))
             })?;
+            #[cfg(unix)]
+            {
+                use cap_std::fs::PermissionsExt as _;
+
+                self.directory
+                    .set_permissions(name, cap_std::fs::Permissions::from_mode(0o700))
+                    .map_err(|error| {
+                        connection(format!(
+                            "restrict private directory {}: {error}",
+                            self.path.join(name).display()
+                        ))
+                    })?;
+            }
             self.sync()?;
         }
         self.open_child(name)

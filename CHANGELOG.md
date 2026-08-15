@@ -30,10 +30,12 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   released layout-one homes keep their sentinel until the principal store and
   ownership graph have migrated, adopt otherwise-unowned legacy principals
   into the operator's home fleet, preserve principal and system files, retain
-  `var/state.db` read-only on Unix, and write layout `2` last. Unknown layouts
-  fail closed. The new `astrid storage mount|sync|status|unmount` grammar hands
-  one acting principal's admitted principal, fleet, or admin view to the native
-  FSKit, libfuse, or WinFsp companion provider without provisioning storage.
+  `var/state.db` read-only on Unix, and write layout `2` last. Canonical
+  content-bound intent/receipt records, exact sentinel admission, redirected
+  path rejection, and the separate fleet-aware owner codec fail closed. The new
+  `astrid storage mount|sync|status|unmount` grammar uses a versioned typed
+  exchange with a co-installed FSKit, libfuse, or WinFsp provider, including
+  capability validation and stable mount IDs, without provisioning storage.
   Refs #1391.
 
 ### Fixed

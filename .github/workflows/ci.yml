@@ -321,6 +321,22 @@ jobs:
         shell: pwsh
         run: cargo test --locked --target ${{ matrix.target }} -p astrid-core platform_fs -- --nocapture
 
+      - name: Run layout migration policy tests natively
+        shell: pwsh
+        run: cargo test --locked --target ${{ matrix.target }} -p astrid-core dirs::tests -- --nocapture
+
+      - name: Check the typed storage-provider handoff natively
+        shell: pwsh
+        run: >-
+          cargo test
+          --locked
+          --target ${{ matrix.target }}
+          -p astrid
+          --bin astrid
+          commands::storage::tests
+          --
+          --nocapture
+
       - name: Run fresh runtime signing provisioning natively
         shell: pwsh
         run: >-

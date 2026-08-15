@@ -17,7 +17,7 @@ use astrid_storage::storage_model::{
 use astrid_storage::{
     Blake3ObjectIdentityV1, ChunkingProfile, ContentName, KvQuotaResolver,
     NativeContentStagingArea, NativePrincipalContentStore, ObjectCacheCapacity, ObjectCacheConfig,
-    ObjectCacheController, RuntimePrincipalStore, StateOwner, StateOwnerCodecV1,
+    ObjectCacheController, RuntimePrincipalStore, StateOwner, StateOwnerCodecV2,
     open_runtime_principal_store, open_runtime_principal_store_with_object_cache,
 };
 
@@ -77,10 +77,10 @@ fn benchmark_contiguous_copy_fallback(
     let mut samples = Vec::with_capacity(config.samples);
     for _ in 0..config.samples {
         let directory = tempfile::tempdir_in(root)?;
-        let engine = DurableEngine::<StateOwner, Blake3ObjectIdentityV1, StateOwnerCodecV1>::open(
+        let engine = DurableEngine::<StateOwner, Blake3ObjectIdentityV1, StateOwnerCodecV2>::open(
             directory.path(),
             Blake3ObjectIdentityV1,
-            StateOwnerCodecV1,
+            StateOwnerCodecV2,
             RecoveryLimits::process_addressable(),
         )?;
         let specification = ObjectRecord::new(
@@ -609,10 +609,10 @@ fn benchmark_representation_authority_validation(home: &AstridHome) -> BenchResu
     let catalog_spec = metadata_object_id(&metadata, "content-catalog-spec-object=")?;
 
     let started = Instant::now();
-    let engine = DurableEngine::<StateOwner, Blake3ObjectIdentityV1, StateOwnerCodecV1>::open(
+    let engine = DurableEngine::<StateOwner, Blake3ObjectIdentityV1, StateOwnerCodecV2>::open(
         store,
         Blake3ObjectIdentityV1,
-        StateOwnerCodecV1,
+        StateOwnerCodecV2,
         RecoveryLimits::process_addressable(),
     )?;
     engine.ensure_direct_representation_catalogue(format_spec, &[format_spec, catalog_spec])?;

@@ -61,11 +61,15 @@ pub(super) const PRE_DENSE_RADIX_FORMAT_SPEC_ID: ObjectId = ObjectId::new([
     144, 13, 30, 250, 206, 50, 148, 188, 158, 71, 54, 156, 15, 203, 100, 220, 165, 111, 243, 52,
     223, 188, 18, 136, 243, 73, 9, 14, 16, 192, 158, 111,
 ]);
+pub(super) const PRE_FLEET_OWNER_FORMAT_SPEC_ID: ObjectId = ObjectId::new([
+    157, 112, 29, 200, 115, 96, 230, 52, 178, 91, 123, 127, 93, 94, 121, 49, 95, 159, 39, 188, 244,
+    213, 14, 9, 194, 24, 30, 67, 155, 12, 125, 117,
+]);
 const CONTENT_CATALOG_FORMAT_SPEC_ID: ObjectId = ObjectId::new([
     143, 57, 153, 176, 102, 182, 102, 57, 98, 89, 196, 169, 47, 157, 231, 197, 184, 230, 125, 249,
     211, 138, 105, 251, 79, 184, 36, 150, 139, 86, 236, 219,
 ]);
-const PRIOR_V1_FORMAT_SPEC_IDS: [ObjectId; 11] = [
+const PRIOR_V1_FORMAT_SPEC_IDS: [ObjectId; 12] = [
     PRE_DERIVATION_FORMAT_SPEC_ID,
     PRE_COMPACTION_FORMAT_SPEC_ID,
     PRE_GC_OUTBOX_FORMAT_SPEC_ID,
@@ -77,6 +81,7 @@ const PRIOR_V1_FORMAT_SPEC_IDS: [ObjectId; 11] = [
     PRE_MECHANICAL_AUDIT_FORMAT_SPEC_ID,
     PRE_PHYSICAL_CATALOGUE_FORMAT_SPEC_ID,
     PRE_DENSE_RADIX_FORMAT_SPEC_ID,
+    PRE_FLEET_OWNER_FORMAT_SPEC_ID,
 ];
 
 pub(super) fn format_spec_record() -> StorageResult<ObjectRecord> {
@@ -96,6 +101,29 @@ pub(super) fn format_spec_record() -> StorageResult<ObjectRecord> {
 }
 
 pub(super) fn store_metadata(format_spec: ObjectId, catalog_spec: ObjectId) -> Vec<u8> {
+    let digest = object_id_hex(format_spec);
+    let catalog_digest = object_id_hex(catalog_spec);
+    format!(
+        "format=astrid-principal-store-v1\n\
+         identity=blake3-object-identity-v1\n\
+         identity-wire=tagged-identity-v1\n\
+         format-spec-object={}:{}:32:{digest}\n\
+         content-catalog-spec-object={}:{}:32:{catalog_digest}\n\
+         representations=authoritative-direct-v1\n\
+         principal-codec=state-owner-v2\n\
+         projection=kv-transition-bplus-v4\n",
+        BLAKE3_OBJECT_IDENTITY_V1_SCHEME.algorithm(),
+        BLAKE3_OBJECT_IDENTITY_V1_SCHEME.construction(),
+        BLAKE3_OBJECT_IDENTITY_V1_SCHEME.algorithm(),
+        BLAKE3_OBJECT_IDENTITY_V1_SCHEME.construction(),
+    )
+    .into_bytes()
+}
+
+pub(super) fn pre_fleet_owner_store_metadata(
+    format_spec: ObjectId,
+    catalog_spec: ObjectId,
+) -> Vec<u8> {
     let digest = object_id_hex(format_spec);
     let catalog_digest = object_id_hex(catalog_spec);
     format!(
@@ -289,6 +317,12 @@ pub(super) fn prepare_destination(
                                         current_catalog_spec,
                                     )
                                 || actual == store_metadata(candidate, current_catalog_spec)
+                                || (candidate == PRE_FLEET_OWNER_FORMAT_SPEC_ID
+                                    && actual
+                                        == pre_fleet_owner_store_metadata(
+                                            candidate,
+                                            current_catalog_spec,
+                                        ))
                             {
                                 Some(DestinationFormat::PriorV1 {
                                     format_spec: candidate,

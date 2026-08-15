@@ -119,10 +119,7 @@ pub fn default_astrid_home_root() -> io::Result<PathBuf> {
 pub fn ensure_private_directory(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        std::fs::create_dir_all(path)?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        ensure_private_directory_unix(path)
     }
 
     #[cfg(windows)]
@@ -270,12 +267,13 @@ pub fn atomic_write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// Windows checks the reparse attribute on every existing component, covering
 /// symlinks, junctions, and mount points. It also rejects parent owners or ACLs
 /// that let untrusted principals replace checked components, and identity-locks
-/// the chain while validating it. Existing Unix call sites retain their current
-/// `symlink_metadata` and canonical-path checks.
+/// the chain while validating it. Unix opens the nearest existing directory
+/// authority and rejects a redirect at the requested or nearest-existing path;
+/// callers retain directory capabilities across multi-step mutations.
 ///
 /// # Errors
 ///
-/// Returns an error if an existing Windows path component is a reparse point,
+/// Returns an error if an existing security-sensitive path is redirected,
 /// changes identity, or belongs to an untrusted parent chain.
 pub fn verify_no_redirects(path: &Path) -> io::Result<()> {
     #[cfg(windows)]
@@ -283,11 +281,163 @@ pub fn verify_no_redirects(path: &Path) -> io::Result<()> {
         windows::verify_no_redirects(path)
     }
 
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    {
+        verify_no_redirects_unix(path)
+    }
+
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = path;
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn verify_no_redirects_unix(path: &Path) -> io::Result<()> {
+    use nix::fcntl::{OFlag, openat};
+    use nix::sys::stat::Mode;
+
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("private path is redirected: {}", path.display()),
+        )),
+        Ok(metadata) if metadata.is_dir() => open_directory_no_follow_unix(path).map(drop),
+        Ok(_) => {
+            let parent = path.parent().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("private path has no parent: {}", path.display()),
+                )
+            })?;
+            let name = path.file_name().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("private path has no file name: {}", path.display()),
+                )
+            })?;
+            let directory = open_directory_no_follow_unix(parent)?;
+            let flags = OFlag::O_RDONLY
+                | OFlag::O_NOFOLLOW
+                | OFlag::O_CLOEXEC
+                | OFlag::O_NONBLOCK;
+            openat(&directory, name, flags, Mode::empty())
+                .map(std::fs::File::from)
+                .map(drop)
+                .map_err(nix_io_error)
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            open_directory_no_follow_unix(path).map(drop)
+        },
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn ensure_private_directory_unix(path: &Path) -> io::Result<()> {
+    use nix::errno::Errno;
+    use nix::fcntl::{OFlag, openat};
+    use nix::sys::stat::{Mode, fchmod, mkdirat};
+
+    let (mut directory, components) = unix_directory_walk(path)?;
+    for component in components {
+        let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+        let next = match openat(&directory, component.as_os_str(), flags, Mode::empty()) {
+            Ok(next) => next,
+            Err(Errno::ENOENT) => {
+                match mkdirat(
+                    &directory,
+                    component.as_os_str(),
+                    Mode::from_bits_truncate(0o700),
+                ) {
+                    Ok(()) | Err(Errno::EEXIST) => {},
+                    Err(error) => return Err(nix_io_error(error)),
+                }
+                openat(&directory, component.as_os_str(), flags, Mode::empty())
+                    .map_err(nix_io_error)?
+            },
+            Err(error) => return Err(nix_io_error(error)),
+        };
+        directory = std::fs::File::from(next);
+    }
+    fchmod(&directory, Mode::from_bits_truncate(0o700)).map_err(nix_io_error)
+}
+
+#[cfg(unix)]
+fn open_directory_no_follow_unix(path: &Path) -> io::Result<std::fs::File> {
+    let (directory, _) = unix_directory_walk(path)?;
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn unix_directory_walk(path: &Path) -> io::Result<(std::fs::File, Vec<std::ffi::OsString>)> {
+    use std::path::Component;
+
+    for component in path.components() {
+        if matches!(component, Component::ParentDir | Component::Prefix(_)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("private directory contains traversal: {}", path.display()),
+            ));
+        }
+    }
+    let mut candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    if candidate.file_name().is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "private directory must name a path below its root: {}",
+                path.display()
+            ),
+        ));
+    }
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "private directory contains a redirect or non-directory component: {}",
+                        candidate.display()
+                    ),
+                ));
+            },
+            Ok(_) => {
+                let canonical = std::fs::canonicalize(&candidate)?;
+                let directory = std::fs::File::open(canonical)?;
+                missing.reverse();
+                return Ok((directory, missing));
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let name = candidate.file_name().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "private directory has no existing ancestor: {}",
+                            path.display()
+                        ),
+                    )
+                })?;
+                missing.push(name.to_os_string());
+                candidate = candidate
+                    .parent()
+                    .ok_or_else(|| io::Error::other("private directory has no parent"))?
+                    .to_path_buf();
+            },
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn nix_io_error(error: nix::errno::Errno) -> io::Error {
+    io::Error::from_raw_os_error(error as i32)
 }
 
 /// Back up and replace a complete set of authenticated executables.

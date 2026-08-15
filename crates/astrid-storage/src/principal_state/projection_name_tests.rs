@@ -13,7 +13,7 @@ fn unlimited_quota() -> Arc<dyn KvQuotaResolver<StateOwner>> {
     Arc::new(|owner: &StateOwner| {
         Ok(match owner {
             StateOwner::System => None,
-            StateOwner::Principal(_) => Some(u64::MAX),
+            StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(u64::MAX),
         })
     })
 }

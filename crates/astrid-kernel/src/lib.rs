@@ -599,6 +599,9 @@ impl Kernel {
                 "Failed to resolve Astrid home (set $ASTRID_HOME or $HOME): {e}"
             ))
         })?;
+        home.ensure().map_err(|error| {
+            std::io::Error::other(format!("Failed to validate Astrid home layout: {error}"))
+        })?;
 
         // Acquire the singleton advisory lock as the FIRST fallible boot step —
         // BEFORE opening any shared state store. A boot-race loser then fails
@@ -608,6 +611,13 @@ impl Kernel {
         // the store layer after having opened one. The listener bind below does
         // NOT re-acquire the lock — it is already held for the process lifetime.
         let singleton_lock = socket::acquire_boot_singleton_lock(&home)?;
+        if home.layout_version()?.as_deref() == Some(astrid_core::dirs::LEGACY_LAYOUT_VERSION) {
+            let migration_target =
+                astrid_core::dirs::LayoutMigrationTarget::for_current_executable(
+                    astrid_storage::RUNTIME_STORE_FORMAT_ID,
+                )?;
+            home.begin_layout_v2_migration(&migration_target)?;
+        }
 
         // Resolve quota policy before opening state so the durable adapter and
         // capsule engine share exactly one invalidatable profile cache.
@@ -615,8 +625,9 @@ impl Kernel {
         let principal_directory = astrid_storage::PrincipalDirectory::default();
         let quota_cache = Arc::clone(&profile_cache);
         let quota_principals = principal_directory.clone();
-        let quota: Arc<dyn astrid_storage::KvQuotaResolver<astrid_storage::StateOwner>> =
-            Arc::new(move |owner: &astrid_storage::StateOwner| match owner {
+        let quota: Arc<dyn astrid_storage::KvQuotaResolver<astrid_storage::StateOwner>> = Arc::new(
+            move |owner: &astrid_storage::StateOwner| {
+                match owner {
                 astrid_storage::StateOwner::System => Ok(None),
                 astrid_storage::StateOwner::Principal(owner) => {
                     quota_principals.alias_for(*owner).and_then(|principal| {
@@ -630,7 +641,15 @@ impl Kernel {
                             })
                     })
                 },
-            });
+                astrid_storage::StateOwner::Fleet(_) => Err(
+                    astrid_storage::StorageError::Internal(
+                        "fleet-owned storage is not writable until a user/fleet quota policy is admitted"
+                            .to_owned(),
+                    ),
+                ),
+            }
+            },
+        );
 
         // Open the authoritative state store. First cutover imports and
         // verifies legacy SurrealKV under the singleton lock before serving.
@@ -1012,12 +1031,23 @@ impl Kernel {
                     "Failed to read ownership graph for layout migration: {error}"
                 ))
             })?;
-            home.complete_layout_v2(ownership.fleets().map(|fleet| fleet.identity().uid))
-                .map_err(|error| {
-                    std::io::Error::other(format!(
-                        "Failed to commit Astrid home layout migration: {error}"
-                    ))
-                })?;
+            let fleet_uids = ownership
+                .fleets()
+                .map(|fleet| fleet.identity().uid)
+                .collect::<Vec<_>>();
+            let layout_result = if adopt_released_layout_principals {
+                astrid_core::dirs::LayoutMigrationTarget::for_current_executable(
+                    astrid_storage::RUNTIME_STORE_FORMAT_ID,
+                )
+                .and_then(|target| home.complete_layout_v2(fleet_uids, &target))
+            } else {
+                home.ensure_layout_v2_fleet_dirs(fleet_uids)
+            };
+            layout_result.map_err(|error| {
+                std::io::Error::other(format!(
+                    "Failed to commit Astrid home layout migration: {error}"
+                ))
+            })?;
         }
 
         let kernel = Arc::new(Self {
@@ -3058,6 +3088,9 @@ async fn open_test_runtime_kv(
                         })
                     })
             },
+            astrid_storage::StateOwner::Fleet(_) => Err(astrid_storage::StorageError::Internal(
+                "fleet-owned storage is not writable in this test composition".to_owned(),
+            )),
         });
     let store =
         astrid_storage::open_runtime_principal_store_with_directory(home, quota, directory.clone())
