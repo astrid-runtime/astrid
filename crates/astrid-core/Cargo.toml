@@ -16,7 +16,6 @@ test-support = []
 async-trait = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true, features = ["clock"] }
-fs2 = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
@@ -38,6 +37,9 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 # RUSTFLAGS='--cfg getrandom_backend="wasm_js"' (see scripts/check-wasm-portability.sh).
 [target.'cfg(target_family = "wasm")'.dependencies]
 getrandom = { version = "0.4", features = ["wasm_js"] }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+fs2 = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }

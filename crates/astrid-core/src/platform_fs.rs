@@ -318,10 +318,7 @@ fn verify_no_redirects_unix(path: &Path) -> io::Result<()> {
                 )
             })?;
             let directory = open_directory_no_follow_unix(parent)?;
-            let flags = OFlag::O_RDONLY
-                | OFlag::O_NOFOLLOW
-                | OFlag::O_CLOEXEC
-                | OFlag::O_NONBLOCK;
+            let flags = OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK;
             openat(&directory, name, flags, Mode::empty())
                 .map(std::fs::File::from)
                 .map(drop)

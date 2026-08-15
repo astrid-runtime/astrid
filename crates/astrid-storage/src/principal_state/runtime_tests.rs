@@ -432,17 +432,6 @@ fn owner_codec_round_trips_only_canonical_values() {
 }
 
 #[test]
-fn owner_codec_v1_remains_frozen_without_a_fleet_tag() {
-    let codec = StateOwnerCodecV1;
-    let principal = PrincipalUid::from_bytes([9; 32]);
-    for owner in [StateOwnerV1::System, StateOwnerV1::Principal(principal)] {
-        let encoded = codec.encode(&owner);
-        assert_eq!(codec.decode(&encoded), Some(owner));
-    }
-    assert_eq!(codec.decode(&[2; 33]), None);
-}
-
-#[test]
 fn object_identity_v1_has_a_stable_golden_vector() {
     let record = ObjectRecord::new(
         ObjectKind::KvLeaf,

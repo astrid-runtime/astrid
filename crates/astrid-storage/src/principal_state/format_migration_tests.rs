@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use crate::engine::PrincipalCodec;
 use crate::storage_model::{ObjectId, ObjectIdentity};
 
 use super::bootstrap;
@@ -15,8 +16,23 @@ use super::format_amendment::{
     pre_representation_store_metadata, prepare_destination, previous_store_metadata,
     store_metadata,
 };
-use super::{Blake3ObjectIdentityV1, KvQuotaResolver, StateOwner, open_runtime_kv};
+use super::{
+    Blake3ObjectIdentityV1, KvQuotaResolver, StateOwner, StateOwnerCodecV1, StateOwnerV1,
+    open_runtime_kv,
+};
 use astrid_core::dirs::AstridHome;
+use astrid_core::identity::PrincipalUid;
+
+#[test]
+fn owner_codec_v1_remains_frozen_without_a_fleet_tag() {
+    let codec = StateOwnerCodecV1;
+    let principal = PrincipalUid::from_bytes([9; 32]);
+    for owner in [StateOwnerV1::System, StateOwnerV1::Principal(principal)] {
+        let encoded = codec.encode(&owner);
+        assert_eq!(codec.decode(&encoded), Some(owner));
+    }
+    assert_eq!(codec.decode(&[2; 33]), None);
+}
 
 fn unlimited_quota() -> Arc<dyn KvQuotaResolver<StateOwner>> {
     Arc::new(|owner: &StateOwner| {

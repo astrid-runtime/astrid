@@ -18,6 +18,7 @@ use super::{AstridHome, LAYOUT_VERSION, LEGACY_LAYOUT_VERSION};
 const LAYOUT_MIGRATION_INTENT: &str = "layout-v1-to-v2.intent";
 const LAYOUT_MIGRATION_RECEIPT: &str = "layout-v1-to-v2.complete";
 const LAYOUT_MIGRATION_SCHEMA: u32 = 1;
+#[cfg(not(target_family = "wasm"))]
 const LAYOUT_MIGRATION_HEADROOM_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Storage-format and executable identity committed into a layout migration.
@@ -604,6 +605,7 @@ fn hash_inventory_field(hasher: &mut blake3::Hasher, label: &[u8], value: &[u8])
     hasher.update(value);
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn ensure_migration_capacity(target: &Path, source_bytes: u64) -> io::Result<()> {
     let required = source_bytes
         .checked_mul(2)
@@ -619,6 +621,14 @@ fn ensure_migration_capacity(target: &Path, source_bytes: u64) -> io::Result<()>
         ));
     }
     Ok(())
+}
+
+#[cfg(target_family = "wasm")]
+fn ensure_migration_capacity(_target: &Path, _source_bytes: u64) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "layout migration capacity probing is unavailable in a WebAssembly guest",
+    ))
 }
 
 fn physical_path_hex(path: &Path) -> io::Result<String> {
