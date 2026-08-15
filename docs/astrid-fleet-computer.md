@@ -10,23 +10,24 @@ Related documents:
 - [Astrid Principal Store](astrid-principal-store.md)
 - [Astrid Principal Store Runtime Realization](astrid-principal-store-runtime.md)
 - [Astrid Native Component Kernel](astrid-native-kernel.md)
-- [AOS Principal Linux Realm](https://github.com/unicity-aos/aos-ce/blob/main/docs/principal-linux-realm.md)
+- [AOS Principal Linux Realm](https://github.com/unicity-aos/aos-ce/blob/main/docs/principal-linux-realm.md), an optional Linux capsule consumer
 
 ## 1. Product ruling
 
-AOS should be a multi-user host of lightweight fleet computers. Every user has a
-home fleet. That fleet contains the user's agent principals and owns their
-shared computer, browser identity, Linux authority, files, applications, and
+Astrid should host lightweight fleet computers for multiple users. Every user
+has a home fleet. That fleet contains the user's agent principals and owns their
+shared computer authority, filesystem, browser identity, applications, and
 budget. Every agent receives an independent view and session over that shared
 computer.
 
 The ordinary experience is:
 
-1. A person starts AOS and receives a durable `UserUid`, a home fleet, and one
-   agent principal.
+1. A person starts Astrid and receives a durable `UserUid`, a home fleet, and
+   one agent principal.
 2. The person creates additional specialized agents in that fleet.
-3. Every agent uses the same fleet computer: Linux environment, common files,
-   installed software, browser sign-ins, cookies, and ambient fleet authority.
+3. Every agent uses the same fleet computer: common files, installed software,
+   browser sign-ins, cookies, and ambient fleet authority. Linux is available
+   when the optional Linux Realm capsule is installed.
 4. Every agent has its own overlay, process/session view, desktop, working
    context, history, and attribution, so concurrent agents do not accidentally
    overwrite or commandeer one another's active work.
@@ -36,20 +37,21 @@ The ordinary experience is:
    to the desktop belonging to a selected agent.
 
 Within one user's cooperative fleet, "one computer" is literal at the product
-level: agents may share an ambient Linux user, browser identity, writable fleet
-root, and authority profile. Principal views prevent collisions and preserve
-identity; they are not falsely claimed as adversarial isolation. Separate users'
-home fleets remain separate tenant security domains.
+level: agents may share browser identity, writable fleet roots, application
+state, and an ambient computer-authority profile. A Linux provider may project
+that profile as one shared Unix user. Principal views prevent collisions and
+preserve identity; they are not falsely claimed as adversarial isolation.
+Separate users' home fleets remain separate tenant security domains.
 
 The referenced Grok Bot desktops establish the desired user-visible experience,
-not their internal implementation. Shared cookies and ambient Linux authority
-are accepted here as reported target behavior; AOS must still define and verify
-its own storage, concurrency, recovery, and tenant boundaries.
+not their internal implementation. Shared cookies and ambient computer authority
+are accepted here as reported target behavior; Astrid must define and verify its
+own storage, concurrency, recovery, and tenant boundaries.
 
 The tenancy model therefore has two nested cardinalities:
 
 ```text
-one AOS installation
+one Astrid installation
   -> many UserUid tenants
   -> one stable home FleetUid per user
   -> many PrincipalUid agent tenants per home fleet
@@ -99,7 +101,7 @@ principal store holds their immutable objects and authoritative generations. A
 filesystem provider composes them for a particular user, fleet, acting
 principal, session, and generation.
 
-A normal Linux Realm view is:
+A normal human or application filesystem projection is:
 
 ```text
 /                   signed, immutable distribution and shared tools
@@ -112,22 +114,25 @@ A normal Linux Realm view is:
 └── tmp/            principal-private ephemeral state
 ```
 
-The names are a guest contract. They do not reveal physical host paths or the
-principal store's private arena, journals, indexes, keys, locks, or staging
-layout.
+The names are an illustrative projection contract, not a requirement that
+Astrid itself run Linux or make every typed resource a file. A hosted mount,
+native host, Linux Realm capsule, or remote provider may render the same owned
+resources through its native path conventions. None reveals physical host paths
+or the principal store's private arena, journals, indexes, keys, locks, or
+staging layout.
 
 ### 3.1 Shared system view
 
-The guest root filesystem contains signed release and toolchain artifacts. Its
+The system projection contains signed release and toolchain artifacts. Its
 immutable bytes, page cache, and prewarmed machine state may be shared physically
-across every principal. It is read-only inside agent views. A human-facing host
-projection may label this resource `System`, but that label is not guest
-authority.
+across every principal. It is read-only inside agent views. A human-facing or
+provider-specific projection may label this resource `System`, but that label is
+not authority.
 
 This is not the same thing as `StateOwner::System`. The current system-owned
 store root contains kernel-owned administrative state such as identity and
 ownership records. That state is not an ambient guest filesystem and must not
-be exposed merely by mounting the immutable guest system view.
+be exposed merely by mounting the immutable system projection.
 
 ### 3.2 Fleet view
 
@@ -157,7 +162,7 @@ and process/session metadata can remain overlay-local. Agents deliberately
 publish work into the common fleet root when it should become team-visible.
 
 Secrets that require principal isolation do not live as ambient files in the
-shared Linux account. They remain capability-mediated resources outside the
+shared computer view. They remain capability-mediated resources outside the
 fleet filesystem and are leased only to the intended invocation.
 
 ### 3.4 Workspace attachment
@@ -188,8 +193,9 @@ The complete execution key is at least:
 (fleet, acting principal, application, instance, execution generation)
 ```
 
-The current principal-affine Realm proves the outer principal boundary but does
-not yet supply every application and instance component of this key.
+The current Astrid runtime does not yet supply every application and instance
+component of this key. The Linux Realm capsule is one consumer that currently
+binds residency and durable home state to a principal.
 
 ## 4. One store, several authorities
 
@@ -225,41 +231,58 @@ checkpoints may reduce host cost. They never reveal whether another owner has
 the same bytes and never reduce the caller's logical charge in a way that forms
 a cross-owner equality oracle.
 
-## 5. Linux execution boundary
+## 5. Execution providers and the Linux Realm adapter
 
-The Grok-like cooperative profile should use one fleet-affine resident Realm per
-active home fleet/profile. Its principals share:
+The fleet computer is an Astrid ownership, storage, authority, and resource-view
+contract. It does not require Linux and is not itself a Realm.
+
+Astrid providers may materialize a fleet computer through:
+
+- hosted macOS, Windows, or Linux filesystem and process adapters;
+- native Astrid components and applications;
+- a graphical desktop or browser provider;
+- a remote attested execution provider; or
+- the optional AOS Linux Realm capsule.
+
+Every provider receives an admitted view rather than choosing its owner or
+authority from a path or payload. Each command, application, browser action, or
+desktop session retains the kernel-stamped acting `PrincipalUid`, even when the
+provider supplies a cooperative fleet-wide environment.
+
+### 5.1 Linux Realm projection
+
+Realm is the Linux capsule's compatibility abstraction. It may render an
+Astrid-owned fleet computer as a Linux filesystem, process environment, browser,
+or desktop, but it does not own the canonical fleet, principal, storage, or mount
+semantics.
+
+A Grok-like Linux profile may use one fleet-affine resident Realm per active home
+fleet/profile. Same-fleet principals may share:
 
 - the signed kernel and immutable system image;
 - principal-free prewarm checkpoints;
-- content-addressed physical objects;
-- page cache and fleet-owned writable files;
-- compute workers and scheduling infrastructure; and
-- network, graphics, storage, and device provider implementations;
-- an ambient Linux authority profile and ordinary Unix user environment; and
-- fleet-owned browser identity and application services.
+- content-addressed physical objects and page cache;
+- fleet-owned writable files and browser identity;
+- compute workers and scheduling infrastructure;
+- network, graphics, storage, and device provider implementations; and
+- an ambient Linux authority profile and ordinary Unix user environment.
 
-Each admitted command or desktop still carries the kernel-stamped acting
-`PrincipalUid`. The Realm constructs a principal view with its overlay,
-workspace attachment, process/session namespace, resource slice, and audit
-context. Independent views prevent accidental interference; shared ambient
-fleet authority means they are not a hostile-tenancy boundary.
+The Realm constructs a principal view with its overlay, workspace attachment,
+process/session namespace, resource slice, and audit context. Independent views
+prevent accidental interference; shared ambient fleet authority means they are
+not a hostile-tenancy boundary.
 
-The hard tenant boundary is between home fleets. Different users' fleet Realms
-must not share writable RAM, Unix credentials, session buses, browser identity,
-home generations, writable file handles, or capability tokens. They may share
-verified immutable pages and physical content below the authority line.
+Different users' home-fleet Realms must not share writable RAM, Unix credentials,
+session buses, browser identity, home generations, writable file handles, or
+capability tokens. They may share verified immutable pages and physical content
+below the authority line. UID 1000 in separate fleet Realms names unrelated
+guest users and confers no cross-fleet authority.
 
-Linux remains a compatibility provider. The kernel-stamped principal, Astrid
-capabilities, root identities, quotas, and audit trail remain outside Linux.
-UID 1000 is permitted to represent the cooperative ambient user inside one home
-fleet Realm. UID 1000 in a different fleet Realm is unrelated and confers no
-cross-fleet authority.
-
-The existing Realm is principal-affine. Moving the cooperative product to a
-fleet-affine machine is therefore an explicit refactor, not a documentation
-rename. A principal-isolated Realm profile should remain available for agents or
-applications that are not trusted with the fleet computer's ambient authority.
+The existing Linux Realm capsule is principal-affine. A fleet-affine cooperative
+mode is therefore separate AOS capsule work, not an Astrid core rename or a
+prerequisite for the provider-neutral storage mount. A principal-isolated Realm
+profile should remain available for agents or applications that are not trusted
+with fleet-wide ambient Linux authority.
 
 ## 6. Team communication
 
@@ -286,16 +309,20 @@ team service remains the authority-preserving coordination plane.
 
 ## 7. Desktop and browser views
 
-A desktop is one principal session's view of the fleet Realm. Principals may
-share the same ambient Linux account, browser identity, cookies, and application
-authority while retaining independent windows, process/session namespaces,
-overlays, work contexts, and audit attribution.
+A desktop is an Astrid projection of one principal session over the fleet
+computer. It may be implemented by a hosted-native provider, Linux Realm
+capsule, future native Astrid desktop, or remote provider. The contract does not
+assume Linux.
+
+Principals may share browser identity, cookies, application authority, and—in a
+Linux provider—the same ambient Unix account, while retaining independent
+windows, process/session views, overlays, work contexts, and audit attribution.
 
 Each desktop session binds:
 
 ```text
 (authenticated UserUid, FleetUid, PrincipalUid,
- application/profile, desktop session, Realm generation)
+ application/profile, desktop session, provider generation)
 ```
 
 The selected principal receives its own display/session, terminal processes,
@@ -434,8 +461,7 @@ new agent immediately receives the fleet computer's common files, applications,
 browser identity, cookies, and ambient authority profile. It does not copy
 another agent's overlay, running processes, desktop session, or audit identity.
 
-Fleet Realm RAM, desktop processes, and temporary state are lazy and evictable.
-The
+Provider RAM, desktop processes, and temporary state are lazy and evictable. The
 principal identity, roots, published state, application identity, service
 identity, ownership graph, and audit evidence survive shutdown. Restart
 reconstructs execution from those durable objects rather than preserving an
@@ -444,19 +470,20 @@ ambient machine as authority.
 Removing an agent revokes its sessions and handles, stops its processes and
 desktop, publishes or preserves blocked overlay state according to policy,
 detaches it from the fleet, and then retires its roots under explicit retention
-or erasure rules. The fleet Realm and shared objects survive while the user or
-other agents still retain them.
+or erasure rules. The fleet computer and shared objects survive while the user
+or other agents still retain them.
 
 ## 11. Product story
 
 The simple truthful story is:
 
-> Every AOS user gets a fleet computer and a first agent. Add specialists as
-> your work grows. Your agents share that computer's Linux environment, files,
-> applications, browser sign-ins, cookies, and ambient authority, while each
-> keeps an independent view, overlay, active processes, desktop, working context,
-> and identity. Open any agent's terminal or desktop and let the team work
-> together without stepping on one another's active state.
+> Every Astrid user gets a fleet computer and a first agent. Add specialists as
+> your work grows. Your agents share that computer's files, applications,
+> browser sign-ins, cookies, and ambient authority. Linux is one available
+> compatibility environment, not the computer's identity. Each agent keeps an
+> independent view, overlay, active processes, desktop, working context, and
+> identity. Open any agent's terminal or desktop and let the team work together
+> without stepping on one another's active state.
 
 The shorter phrase is:
 
@@ -475,25 +502,24 @@ The security qualification is:
 3. Implement the provider-neutral path/inode, staging, publication, mount-lease,
    and doctor contracts.
 4. Compose system, fleet, principal overlay, application, workspace, browser,
-   and synthetic team resources into one principal view.
-5. Refactor the existing principal-affine Linux Realm into a fleet-affine
-   cooperative profile while preserving kernel-stamped acting-principal identity
-   and retaining an isolated-principal profile.
-6. Implement one hosted mount and desktop adapter with crash, `mmap`, browser,
+   and synthetic team resources into one provider-neutral principal view.
+5. Implement one hosted mount and desktop adapter with crash, `mmap`, browser,
    compiler, provider-death, daemon-upgrade, and repair evidence.
-7. Add the remaining macOS, Linux, and Windows mount/desktop adapters against the
+6. Add the remaining macOS, Linux, and Windows mount/desktop adapters against the
    same behavioral contract.
+7. Adapt the Linux Realm capsule to consume the same view. Add a fleet-affine
+   cooperative mode without removing its principal-isolated mode.
 8. Add the fleet team service and handle delegation.
 9. Optimize density through shared immutable pages, checkpoints, physical
-   objects, workers, and one resident machine per active fleet without weakening
+   objects, workers, and provider-specific fleet residency without weakening
    cross-fleet isolation or principal attribution.
 
 The first release slice should prove two users with distinct home fleets and at
 least two principals in one user's fleet:
 
 - every user recovers the same stable home fleet and never another user's fleet;
-- same-fleet principals share the Linux environment, ambient authority profile,
-  common files, browser sign-ins, and cookies;
+- same-fleet principals share the ambient computer-authority profile, common
+  files, browser sign-ins, and cookies;
 - same-fleet principals retain independent overlays, working contexts, process
   sessions, desktops, and audit attribution;
 - a shared browser service remains correct under concurrent agent sessions and
@@ -503,6 +529,11 @@ least two principals in one user's fleet:
 - exchange kernel-stamped messages and delegated file handles;
 - survive provider and daemon restart with acknowledged writes intact; and
 - can each be mounted or remotely viewed by an independently authorized user.
+
+The Linux Realm adapter separately proves that the same roots, acting-principal
+attribution, overlays, cookies, and cross-fleet denials survive projection into
+its Linux environment. That adapter evidence does not define the Astrid core
+contract.
 
 ## 13. Stop conditions
 
