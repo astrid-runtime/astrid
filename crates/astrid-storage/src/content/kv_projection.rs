@@ -1,10 +1,10 @@
 //! Read-only KV projection adapter used by content-side quota validation.
 
-use astrid_storage_engine::{
+use crate::engine::{
     CommitOutcome, KvProjectionEngine, KvProjectionError, PrincipalProjectionEngine,
     PrincipalProjectionError, RootSnapshot, RootTransaction,
 };
-use astrid_storage_model::{ObjectId, ObjectRecord, RootState};
+use crate::storage_model::{ObjectId, ObjectRecord, RootState};
 
 pub(super) struct PrincipalKvAdapter<'a, E>(&'a E);
 
@@ -52,6 +52,5 @@ fn map_error(error: PrincipalProjectionError) -> KvProjectionError {
     match error {
         PrincipalProjectionError::Model(error) => KvProjectionError::Model(error),
         PrincipalProjectionError::Engine(error) => KvProjectionError::Engine(error),
-        other => KvProjectionError::Engine(other.to_string()),
     }
 }

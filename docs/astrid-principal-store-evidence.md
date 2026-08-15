@@ -245,7 +245,7 @@ regression test.
 
 ## 4. Reference-model properties
 
-`astrid-storage-model` supplies a deterministic in-memory world. Property tests
+`astrid-storage::storage_model` supplies a deterministic in-memory world. Property tests
 generate operation traces and compare the resulting world to simple
 specification functions.
 

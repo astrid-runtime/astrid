@@ -1,5 +1,5 @@
-use astrid_storage_content::{ChunkingProfile, build_content};
-use astrid_storage_model::ObjectIdentity;
+use crate::content_dag::{ChunkingProfile, build_content};
+use crate::storage_model::ObjectIdentity;
 
 use super::*;
 

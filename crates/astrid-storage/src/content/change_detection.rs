@@ -5,7 +5,7 @@ use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use astrid_storage_content::{ChunkingProfile, VerifiedContent};
+use crate::content_dag::{ChunkingProfile, VerifiedContent};
 use parking_lot::Mutex;
 
 /// Identity of a source namespace whose change tokens share one trust policy.

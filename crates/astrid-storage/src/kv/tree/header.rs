@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use astrid_storage_engine::{KvProjectionEngine, PrincipalProjectionError};
-use astrid_storage_model::{
+use crate::engine::{KvProjectionEngine, PrincipalProjectionError};
+use crate::storage_model::{
     ModelError, ObjectClass, ObjectId, ObjectKind, ObjectRecord, ObjectReference, ReferenceKind,
     ReferenceLabel, RootState,
 };

@@ -5,15 +5,15 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::engine::{
+    CompactionFacts, CompactionProofVerifier, CompactionRetention, CompactionRootKind,
+};
+use crate::storage_model::{
+    ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord, RetentionPolicyId,
+};
 use astrid_core::dirs::AstridHome;
 use astrid_core::identity::PrincipalUid;
 use astrid_core::principal::PrincipalId;
-use astrid_storage_engine::{
-    CompactionFacts, CompactionProofVerifier, CompactionRetention, CompactionRootKind,
-};
-use astrid_storage_model::{
-    ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord, RetentionPolicyId,
-};
 
 use super::bootstrap::RuntimeBootstrapObject;
 use super::format_amendment::object_id_hex;

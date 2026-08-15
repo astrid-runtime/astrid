@@ -5,10 +5,10 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::engine::{DurableEngine, DurableError, PrincipalCodec, RecoveryLimits};
 use astrid_core::dirs::AstridHome;
 use astrid_core::identity::PrincipalIdentity;
 use astrid_core::principal::PrincipalId;
-use astrid_storage_engine::{DurableEngine, DurableError, PrincipalCodec, RecoveryLimits};
 
 use super::format_amendment::{STORE_METADATA_FILE, is_supported_alias_owner_metadata};
 use super::native_io::{atomic_write, rename_private_entry, sync_directory};
@@ -122,8 +122,8 @@ struct PrincipalBinding {
 pub(super) async fn apply_if_required(
     home: &AstridHome,
     principals: &PrincipalDirectory,
-    format_spec: &astrid_storage_model::ObjectRecord,
-    catalog_spec: &astrid_storage_model::ObjectRecord,
+    format_spec: &crate::storage_model::ObjectRecord,
+    catalog_spec: &crate::storage_model::ObjectRecord,
     metadata: &[u8],
 ) -> StorageResult<()> {
     let store = home.principal_store_path();
@@ -181,8 +181,8 @@ pub(super) async fn apply_if_required(
 async fn resume_uid_store(
     home: &AstridHome,
     principals: &PrincipalDirectory,
-    format_spec: &astrid_storage_model::ObjectRecord,
-    catalog_spec: &astrid_storage_model::ObjectRecord,
+    format_spec: &crate::storage_model::ObjectRecord,
+    catalog_spec: &crate::storage_model::ObjectRecord,
     metadata: &[u8],
     store: &Path,
     intent: &Path,
@@ -211,8 +211,8 @@ async fn resume_uid_store(
 async fn migrate_alias_store(
     home: &AstridHome,
     principals: &PrincipalDirectory,
-    format_spec: &astrid_storage_model::ObjectRecord,
-    catalog_spec: &astrid_storage_model::ObjectRecord,
+    format_spec: &crate::storage_model::ObjectRecord,
+    catalog_spec: &crate::storage_model::ObjectRecord,
     metadata: &[u8],
     store: &Path,
     intent: &Path,
@@ -326,8 +326,8 @@ async fn finish_uid_store(
     home: &AstridHome,
     principals: &PrincipalDirectory,
     engine: Arc<RuntimeEngine>,
-    format_spec: &astrid_storage_model::ObjectRecord,
-    catalog_spec: &astrid_storage_model::ObjectRecord,
+    format_spec: &crate::storage_model::ObjectRecord,
+    catalog_spec: &crate::storage_model::ObjectRecord,
     metadata: &[u8],
 ) -> StorageResult<()> {
     engine
@@ -582,8 +582,8 @@ fn cleanup(store: &Path, intent: &Path) -> StorageResult<()> {
 mod tests {
     use std::sync::Arc;
 
+    use crate::storage_model::ObjectIdentity;
     use astrid_core::profile::{DeviceKey, DeviceScope, PrincipalProfile};
-    use astrid_storage_model::ObjectIdentity;
 
     use super::*;
     use crate::kv::{KvQuotaResolver, ScopedKvStore};

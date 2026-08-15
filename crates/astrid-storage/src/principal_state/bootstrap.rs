@@ -2,8 +2,8 @@
 
 use std::sync::Arc;
 
-use astrid_storage_engine::{CompactionRetainedRoot, CompactionRetention, CompactionRootKind};
-use astrid_storage_model::{
+use crate::engine::{CompactionRetainedRoot, CompactionRetention, CompactionRootKind};
+use crate::storage_model::{
     ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord, RetentionPolicyId,
 };
 
@@ -19,8 +19,7 @@ pub(super) enum RuntimeBootstrapObject {
     ContentCatalogFormatSpecification,
 }
 
-const CONTENT_CATALOG_FORMAT_SPEC: &[u8] =
-    include_bytes!("../../../../docs/astrid-content-catalog-format-v2.txt");
+const CONTENT_CATALOG_FORMAT_SPEC: &[u8] = include_bytes!("../../formats/content-catalog-v2.txt");
 const RUNTIME_BOOTSTRAP_OBJECTS: &[RuntimeBootstrapObject] = &[
     RuntimeBootstrapObject::RunatalFormatSpecification,
     RuntimeBootstrapObject::ContentCatalogFormatSpecification,

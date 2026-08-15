@@ -9,18 +9,18 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use astrid_core::dirs::AstridHome;
-use astrid_core::identity::PrincipalUid;
-use astrid_core::kernel_api::{ProjectionNameDiagnostic, ProjectionNamePolicyPreset};
-use astrid_core::principal::PrincipalId;
-use astrid_storage_engine::{
+use crate::engine::{
     DurableEngine, DurableEnginePolicy, GroupCommitPolicy, IdentityScheme, ObjectCacheConfig,
     ObjectCacheStats, PersistentObjectIdentity, PrincipalCodec, RecoveryLimits,
     RecoveryRetryPolicy,
 };
-use astrid_storage_model::{
+use crate::storage_model::{
     ObjectClass, ObjectId, ObjectIdentity, ObjectRecord, PhysicalIdentity, ReferenceKind,
 };
+use astrid_core::dirs::AstridHome;
+use astrid_core::identity::PrincipalUid;
+use astrid_core::kernel_api::{ProjectionNameDiagnostic, ProjectionNamePolicyPreset};
+use astrid_core::principal::PrincipalId;
 use parking_lot::Mutex;
 
 pub use crate::PrincipalDirectory;

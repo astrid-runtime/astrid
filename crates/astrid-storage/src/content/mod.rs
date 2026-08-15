@@ -17,11 +17,11 @@ use std::num::NonZeroUsize;
 use std::time::Duration;
 use std::{fmt, io};
 
-use astrid_storage_engine::PrincipalProjectionError;
-use astrid_storage_model::{ObjectId, RootState};
+use crate::engine::PrincipalProjectionError;
+use crate::storage_model::{ObjectId, RootState};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-pub use astrid_storage_content::{ChunkingProfile, ContentDescriptor};
+pub use crate::content_dag::{ChunkingProfile, ContentDescriptor};
 pub use change_detection::{
     ContentChangeCache, SourceEpoch, SourceFingerprint, SourceObservation, SourceScopeId,
     SourceTrust, StableSourceId,
@@ -36,7 +36,7 @@ pub use projection_names::{
 };
 pub use store::{PrincipalContentReadHandle, PrincipalContentStore};
 
-use astrid_storage_content::ContentError;
+use crate::content_dag::ContentError;
 
 pub(crate) use catalog::{
     CONTENT_COMPONENT_LABEL, CatalogValidation, root_from_record, validate_catalog,

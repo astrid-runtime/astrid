@@ -6,8 +6,8 @@ use super::{
     STAGING_BATCH_TARGET_BYTES, VerifiedContent,
 };
 #[cfg(not(target_family = "wasm"))]
-use astrid_storage_engine::PreparedProjectionBatch;
-use astrid_storage_engine::ProjectionObserver;
+use crate::engine::PreparedProjectionBatch;
+use crate::engine::ProjectionObserver;
 
 #[derive(Clone)]
 pub(super) struct ContentHeader {
@@ -81,7 +81,7 @@ impl<'a, P, E> EngineIdentity<'a, P, E> {
     }
 }
 
-impl<P, E> astrid_storage_model::ObjectIdentity for EngineIdentity<'_, P, E>
+impl<P, E> crate::storage_model::ObjectIdentity for EngineIdentity<'_, P, E>
 where
     E: PrincipalProjectionEngine<P>,
 {

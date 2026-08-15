@@ -2,8 +2,8 @@
 
 use std::sync::Arc;
 
-use astrid_storage_content::VerifiedContent;
-use astrid_storage_engine::PrincipalProjectionEngine;
+use crate::content_dag::VerifiedContent;
+use crate::engine::PrincipalProjectionEngine;
 
 use super::super::{ContentName, ContentWriteOutcome, PrincipalContentError};
 use super::PrincipalContentStore;

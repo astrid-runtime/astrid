@@ -5,8 +5,8 @@
 
 use std::collections::BTreeMap;
 
-use astrid_storage_engine::{KvProjectionEngine, KvProjectionError};
-use astrid_storage_model::{
+use crate::engine::{KvProjectionEngine, KvProjectionError};
+use crate::storage_model::{
     ModelError, ObjectClass, ObjectId, ObjectKind, ObjectRecord, ReferenceKind, ReferenceLabel,
     RootState,
 };
@@ -360,7 +360,7 @@ fn graph_is_current<P, E>(
     owner: &P,
     commit: &ObjectRecord,
     state: &ObjectRecord,
-    kv_reference: Option<&astrid_storage_model::ObjectReference>,
+    kv_reference: Option<&crate::storage_model::ObjectReference>,
 ) -> StorageResult<bool>
 where
     P: Clone + Ord,
@@ -389,7 +389,7 @@ where
 
 fn legacy_entries<P, E>(
     engine: &E,
-    kv_reference: Option<&astrid_storage_model::ObjectReference>,
+    kv_reference: Option<&crate::storage_model::ObjectReference>,
 ) -> StorageResult<(LegacyEntries, u64)>
 where
     P: Ord,

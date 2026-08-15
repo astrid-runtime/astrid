@@ -1,5 +1,5 @@
 use super::*;
-use astrid_storage_engine::PreparedProjectionBatch;
+use crate::engine::PreparedProjectionBatch;
 
 struct RejectFirstBatchEngine {
     inner: Engine,

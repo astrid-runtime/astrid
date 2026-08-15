@@ -557,7 +557,7 @@ host path.
 Nonzero blob arenas and packs are sequences of the common 52-byte format-one
 physical frame. Arena magic is `ASTBLA1\0`; pack magic is `ASTBLP1\0`.
 Frame version, reserved bytes, checksum context/material, and torn-tail rules
-are exactly those in `astrid-principal-store-format-v1.txt` section 2. Both use:
+are exactly those in `crates/astrid-storage/formats/principal-store-v1.txt` section 2. Both use:
 
 ```text
 BlobFrameV1 = blob:BlobId || profile:RepresentationProfileId

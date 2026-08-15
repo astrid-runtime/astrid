@@ -2,8 +2,8 @@
 
 use std::collections::BTreeMap;
 
-use astrid_storage_engine::KvProjectionEngine;
-use astrid_storage_model::ObjectId;
+use crate::engine::KvProjectionEngine;
+use crate::storage_model::ObjectId;
 
 use super::context::TreeContext;
 use super::node::{ChildPointer, Node, NodeHandle, NodeTotals};
@@ -215,8 +215,8 @@ fn take_validated_child(
 
 #[cfg(test)]
 mod tests {
-    use astrid_storage_engine::{CommitOutcome, KvProjectionError, RootSnapshot, RootTransaction};
-    use astrid_storage_model::{ObjectRecord, RootState};
+    use crate::engine::{CommitOutcome, KvProjectionError, RootSnapshot, RootTransaction};
+    use crate::storage_model::{ObjectRecord, RootState};
 
     use super::*;
     use crate::kv::tree::node::{LeafEntry, ValueSlot, branch_record, decode_node, leaf_record};

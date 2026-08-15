@@ -9,8 +9,8 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use astrid_storage_engine::{KvProjectionEngine, KvProjectionError};
-use astrid_storage_model::ModelError;
+use crate::engine::{KvProjectionEngine, KvProjectionError};
+use crate::storage_model::ModelError;
 use parking_lot::Mutex;
 
 use self::context::TreeContext;
@@ -38,7 +38,7 @@ pub(crate) use self::header::validated_projection_quota;
 pub(crate) use self::legacy_avl::migrate_principal as migrate_legacy_avl;
 pub(super) use self::validation::TreeValidation;
 
-pub(super) const FORMAT_VERSION: astrid_storage_model::ObjectFormatVersion =
+pub(super) const FORMAT_VERSION: crate::storage_model::ObjectFormatVersion =
     PRINCIPAL_GRAPH_VERSION;
 pub(super) const KV_LABEL: &[u8] = b"kv";
 const PARENT_LABEL: &[u8] = b"parent";

@@ -8,7 +8,7 @@ state and authority model.
 
 ## In-memory engine contract
 
-The first `astrid-storage-engine` implementation refines the model behind a
+The first `astrid-storage::engine` implementation refines the model behind a
 thread-safe user-space API without selecting a persistent object encoding. It:
 
 - accepts an injected `ObjectIdentity` implementation;
@@ -117,7 +117,7 @@ operator pool capacity and watermarks.
 
 ## First durable host-file realization
 
-`astrid-storage-engine::DurableEngine` is the first actual I/O realization of
+`astrid-storage::engine::DurableEngine` is the first actual I/O realization of
 the model. It uses one active append-only object arena and a separate
 append-only root journal:
 
@@ -275,7 +275,7 @@ on the engine mutex therefore consume blocking workers rather than parking the
 asynchronous workers that schedule capsules and IPC.
 
 The frozen byte-level specification is
-[`astrid-principal-store-format-v1.txt`](astrid-principal-store-format-v1.txt).
+[`principal-store-v1.txt`](../crates/astrid-storage/formats/principal-store-v1.txt).
 It defines both frame magics, every field width and byte order, both exact
 BLAKE3 derive-key context strings, all object/reference tags, identity
 construction, current KV/content canonical grammars, and root-journal replay.

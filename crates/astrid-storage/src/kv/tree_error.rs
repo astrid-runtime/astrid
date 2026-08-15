@@ -1,7 +1,7 @@
 //! Error mapping and reference validation for the persistent KV projection.
 
-use astrid_storage_engine::KvProjectionError;
-use astrid_storage_model::{ObjectId, ObjectRecord, ReferenceKind, ReferenceLabel};
+use crate::engine::KvProjectionError;
+use crate::storage_model::{ObjectId, ObjectRecord, ReferenceKind, ReferenceLabel};
 
 use crate::error::{StorageError, StorageResult};
 

@@ -3,8 +3,8 @@
 use std::path::Path;
 
 #[cfg(test)]
-use astrid_storage_model::InsertOutcome;
-use astrid_storage_model::{ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord};
+use crate::storage_model::InsertOutcome;
+use crate::storage_model::{ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord};
 
 use super::migrations;
 use super::native_io::quarantine_directory;
@@ -12,8 +12,7 @@ use super::{BLAKE3_OBJECT_IDENTITY_V1_SCHEME, RuntimeEngine};
 use crate::error::{StorageError, StorageResult};
 
 pub(super) const STORE_METADATA_FILE: &str = "store.meta";
-pub(super) const STORE_FORMAT_SPEC: &[u8] =
-    include_bytes!("../../../../docs/astrid-principal-store-format-v1.txt");
+pub(super) const STORE_FORMAT_SPEC: &[u8] = include_bytes!("../../formats/principal-store-v1.txt");
 pub(super) const PRE_DERIVATION_FORMAT_SPEC_ID: ObjectId = ObjectId::new([
     98, 205, 237, 154, 91, 1, 254, 117, 215, 120, 27, 102, 48, 63, 95, 254, 140, 237, 85, 164, 48,
     37, 160, 56, 158, 239, 174, 165, 160, 197, 143, 226,

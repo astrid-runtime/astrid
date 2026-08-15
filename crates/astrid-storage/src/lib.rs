@@ -32,7 +32,13 @@
 #![deny(clippy::unwrap_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
+extern crate alloc;
+
 pub mod content;
+/// Canonical content-defined chunk DAG implementation.
+pub mod content_dag;
+/// Principal-store execution engine.
+pub mod engine;
 pub mod error;
 pub mod identity;
 pub mod kv;
@@ -43,7 +49,12 @@ mod principal_graph;
 pub mod principal_state;
 #[cfg(not(target_family = "wasm"))]
 mod resident_cache;
+#[cfg(not(target_family = "wasm"))]
+/// Kernel-owned resident-memory authorities used by native storage.
+pub mod resources;
 pub mod secret;
+/// Portable executable model for principal state.
+pub mod storage_model;
 
 #[cfg(not(target_family = "wasm"))]
 pub use content::{
@@ -79,7 +90,7 @@ pub use secret::{
 pub use secret::{FallbackSecretStore, KeychainSecretStore};
 
 #[cfg(not(target_family = "wasm"))]
-pub use astrid_storage_engine::{
+pub use engine::{
     DurableEnginePolicy, GroupCommitPolicy, ObjectCacheCapacity, ObjectCacheConfig,
     ObjectCacheController, ObjectCacheMemoryBudget, ObjectCacheStats, PrincipalObjectCacheBudget,
     RecoveryRetryPolicy,

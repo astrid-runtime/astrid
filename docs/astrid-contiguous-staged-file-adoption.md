@@ -4,7 +4,7 @@ Status: format-one design contract. This document is the normative adoption
 protocol referenced by [astrid-physical-representations.md](astrid-physical-representations.md).
 It uses the identities, catalogue, placement, and publication rules defined
 there and the common physical frame from
-[astrid-principal-store-format-v1.txt](astrid-principal-store-format-v1.txt).
+[principal-store-v1.txt](../crates/astrid-storage/formats/principal-store-v1.txt).
 
 The native staging file is already the one physical write made on the
 user-visible path. Adoption turns that sealed file into the raw-content blob

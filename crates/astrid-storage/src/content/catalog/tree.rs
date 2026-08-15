@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 
-use astrid_storage_content::{ContentReadError, ContentSource, describe_content};
-use astrid_storage_model::{
+use crate::content_dag::{ContentReadError, ContentSource, describe_content};
+use crate::storage_model::{
     ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord, ObjectReference,
     ReferenceKind, ReferenceLabel,
 };

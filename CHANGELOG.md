@@ -75,6 +75,13 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Changed
 
+- **The unpublished storage model, content DAG, engine, and resource-authority
+  packages are now internal `astrid-storage` modules.** This preserves their
+  tested boundaries without creating four additional crates.io products,
+  restores the protected release planner to its expected 26-package graph,
+  and begins the broader consolidation toward publishing only `astrid` and
+  `astrid-types`. Refs #1480.
+
 - **CLI parsing, completions, and executable discovery use current compatible
   patches.** Updated clap/clap_complete and which-rs after reviewing their
   help, derive, completion, and absolute-path lookup fixes. Astrid's command

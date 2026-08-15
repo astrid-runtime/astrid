@@ -10,6 +10,7 @@ description = "Unified storage integration for Astrid principal state and raw KV
 
 [features]
 default = []
+crash-replay = []
 # Deprecated compatibility alias. KV is always backed by the native object
 # store; this remains only so existing downstream feature selections compile.
 kv = []
@@ -19,17 +20,16 @@ full = ["kv", "legacy-surrealkv"]
 
 [dependencies]
 astrid-core = { workspace = true }
-astrid-storage-content = { workspace = true }
-astrid-storage-engine = { workspace = true }
-astrid-storage-model = { workspace = true }
 async-trait = { workspace = true }
 blake3 = { workspace = true }
 chrono = { workspace = true, features = ["clock"] }
+fastcdc = { workspace = true }
 hex = { workspace = true }
 keyring = { workspace = true, optional = true }
 parking_lot = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 surrealkv = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync"] }
@@ -37,7 +37,6 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
-astrid-storage-engine = { workspace = true, features = ["crash-replay"] }
 blake3 = { workspace = true }
 ed25519-dalek = { workspace = true }
 fastcdc = { workspace = true }
@@ -60,16 +59,14 @@ harness = false
 getrandom = { version = "0.4", features = ["wasm_js"] }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
-astrid-resources = { workspace = true }
 cap-std = "4.0.2"
 caseless = { workspace = true }
+fs2 = { workspace = true }
+libc = { workspace = true }
 unicode-normalization = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
-
-[target.'cfg(unix)'.dependencies]
-libc = { workspace = true }
 
 [lints]
 workspace = true

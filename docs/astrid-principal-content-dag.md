@@ -7,7 +7,7 @@ meaning, and no capsule interface is changed.
 
 ## Outcome
 
-`astrid-storage-content` converts ordinary bytes into a canonical immutable
+`astrid-storage::content_dag` converts ordinary bytes into a canonical immutable
 closure:
 
 ```text

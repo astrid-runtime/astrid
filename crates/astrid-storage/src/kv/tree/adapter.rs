@@ -4,7 +4,7 @@
 //! pool. The WASM build has no blocking executor and delegates inline to its
 //! host-backed engine.
 
-use astrid_storage_engine::KvProjectionEngine;
+use crate::engine::KvProjectionEngine;
 use async_trait::async_trait;
 
 use super::{TreeKvStore, map_engine};

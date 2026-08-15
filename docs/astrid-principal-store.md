@@ -132,7 +132,7 @@ The migration must therefore be additive:
 
 Avoid a crate per data structure. Two new crates are enough.
 
-### 5.1 `astrid-storage-model`
+### 5.1 `astrid-storage::storage_model`
 
 `#![no_std]` with `alloc`.
 
@@ -156,7 +156,7 @@ This crate is usable by:
 - a future native Astrid storage domain;
 - formal or exhaustive test harnesses.
 
-### 5.2 `astrid-storage-engine`
+### 5.2 `astrid-storage::engine`
 
 `std` user-space implementation.
 

@@ -9,11 +9,11 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use astrid_storage_engine::{
+use crate::engine::{
     InMemoryEngine, KvProjectionEngine, KvProjectionError, KvState, commit_kv_with_engine,
     kv_snapshot_with_engine,
 };
-use astrid_storage_model::ModelError;
+use crate::storage_model::ModelError;
 use async_trait::async_trait;
 
 use super::{KvStore, validate_key, validate_namespace, validate_prefix};
@@ -145,7 +145,7 @@ where
     E: KvProjectionEngine<P>,
     R: KvPrincipalResolver<P>,
 {
-    fn snapshot(&self, principal: &P) -> StorageResult<astrid_storage_engine::KvStateSnapshot<P>> {
+    fn snapshot(&self, principal: &P) -> StorageResult<crate::engine::KvStateSnapshot<P>> {
         kv_snapshot_with_engine(self.engine.as_ref(), principal.clone())
             .map_err(|error| map_projection_error(&error))
     }
@@ -316,8 +316,8 @@ fn map_projection_error(error: &KvProjectionError) -> StorageError {
 mod tests {
     use std::sync::Arc;
 
-    use astrid_storage_engine::InMemoryEngine;
-    use astrid_storage_model::{
+    use crate::engine::InMemoryEngine;
+    use crate::storage_model::{
         ObjectClass, ObjectId, ObjectIdentity, ObjectRecord, ReferenceKind,
     };
 

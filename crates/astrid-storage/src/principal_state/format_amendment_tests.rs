@@ -4,13 +4,13 @@
 
 use std::path::{Path, PathBuf};
 
-use astrid_storage_content::{ChunkingProfile, build_content};
-use astrid_storage_engine::{
+use crate::content_dag::{ChunkingProfile, build_content};
+use crate::engine::{
     BottomKSketchDescriptor, CrossHashSigner, RecoveryLimits, RefineryBatchContext,
     RefineryPassDescriptorId, RefineryResourceBudget, RefinerySnapshotId, attest_sha384_closure,
     build_bottom_k_sketch,
 };
-use astrid_storage_model::{
+use crate::storage_model::{
     AuthorityEpochId, CanonicalParametersId, ComputationSharingDomainId, DerivationContractId,
     DerivationEvidence, DerivationInvocation, DerivationOutput, DeterministicSeedId, EngineBuildId,
     ExecutionClass, ExecutionMeasurementsId, GcCommitEvidence, GcFactSnapshotId, GcPlanEvidence,
@@ -182,7 +182,7 @@ fn cross_hash_records() -> Vec<ObjectRecord> {
     let authority = FixedCrossHashAuthority(SigningKey::from_bytes(&[37; 32]));
     let context = RefineryBatchContext::new(
         RefinerySnapshotId::new(id(80)),
-        astrid_storage_model::PlacementEpoch::new(81),
+        crate::storage_model::PlacementEpoch::new(81),
         RefineryResourceBudget::new(u64::MAX, u128::MAX, u64::MAX, u64::MAX, u64::MAX, u64::MAX),
         None,
     );
@@ -216,7 +216,7 @@ fn bottom_k_records() -> Vec<ObjectRecord> {
         descriptor,
         RefineryBatchContext::new(
             RefinerySnapshotId::new(id(90)),
-            astrid_storage_model::PlacementEpoch::new(91),
+            crate::storage_model::PlacementEpoch::new(91),
             RefineryResourceBudget::new(
                 u64::MAX,
                 u128::MAX,
