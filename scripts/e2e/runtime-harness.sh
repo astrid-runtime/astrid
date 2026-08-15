@@ -322,13 +322,17 @@ redaction_check() {
 }
 
 main() {
-  mkdir -p "$ASTRID_HOME/etc" "$ARTIFACTS"
   export ASTRID_HOME
 
   note "building Astrid binaries"
   if [[ -z "${ASTRID_E2E_SKIP_BUILD:-}" ]]; then
     cargo build -p astrid --bins
   fi
+
+  note "admitting primary Astrid home through the public lifecycle"
+  "$CORE_DIR/target/debug/astrid" start
+  "$CORE_DIR/target/debug/astrid" stop
+  mkdir -p "$ARTIFACTS"
 
   run_standalone_admin_smoke
 
