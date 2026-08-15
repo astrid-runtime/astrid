@@ -9,6 +9,7 @@
 //! `wasm32-unknown-unknown` without dragging in the kernel).
 
 mod agent;
+mod impls;
 mod projection_names;
 mod readiness;
 pub use agent::{AgentDeriveKernelRequest, AgentDeriveRequest};
@@ -234,15 +235,6 @@ pub enum CommandKind {
     Cli,
 }
 
-impl CommandKind {
-    /// Returns `true` for the default kind so serializers can omit it
-    /// (matches the rest of the manifest fields' conventions).
-    #[must_use]
-    pub fn is_default(&self) -> bool {
-        matches!(self, Self::Slash)
-    }
-}
-
 /// Built-in `astrid capsule` subcommand names that a capsule-declared CLI
 /// verb (`kind = "cli"`) may NOT shadow.
 ///
@@ -294,32 +286,6 @@ pub struct AdminKernelRequest {
     /// The typed request body — `tag = "method", content = "params"`.
     #[serde(flatten)]
     pub kind: AdminRequestKind,
-}
-
-impl AdminKernelRequest {
-    /// Build a request with no correlation ID.
-    #[must_use]
-    pub const fn new(kind: AdminRequestKind) -> Self {
-        Self {
-            request_id: None,
-            kind,
-        }
-    }
-
-    /// Build a request with a correlation ID.
-    #[must_use]
-    pub fn with_request_id(request_id: impl Into<String>, kind: AdminRequestKind) -> Self {
-        Self {
-            request_id: Some(request_id.into()),
-            kind,
-        }
-    }
-}
-
-impl From<AdminRequestKind> for AdminKernelRequest {
-    fn from(kind: AdminRequestKind) -> Self {
-        Self::new(kind)
-    }
 }
 
 /// Requested capability scope for a [`AdminRequestKind::PairDeviceIssue`]
@@ -792,23 +758,6 @@ pub struct AdminKernelResponse {
     /// The typed response body — `tag = "status", content = "data"`.
     #[serde(flatten)]
     pub body: AdminResponseBody,
-}
-
-impl AdminKernelResponse {
-    /// Build a response with the given body and no correlation ID.
-    #[must_use]
-    pub const fn new(body: AdminResponseBody) -> Self {
-        Self {
-            request_id: None,
-            body,
-        }
-    }
-
-    /// Build a response that echoes a request's correlation ID.
-    #[must_use]
-    pub fn for_request(request_id: Option<String>, body: AdminResponseBody) -> Self {
-        Self { request_id, body }
-    }
 }
 
 /// Typed admin response body.
