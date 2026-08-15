@@ -48,7 +48,7 @@ recorded in the driver-domain contract.
 |---|---|---|
 | Native-kernel purpose and boundary | Protection domains, capability handles, IPC, budgets, recovery, minimal QEMU machine | Kernel charter, threat model, formal object model, skeleton, fault evidence |
 | Current Astrid preservation | Portability seams, host assumptions, stable capsule/WIT direction | Compile boundary audit, host conformance suite, explicit compatibility ledger |
-| Fleet computer | User/fleet/principal identity separation, composed resource views, fleet-shared and principal-private roots, human mounts, desktop leases, team service boundary | Fleet-owned root grammar, provider-neutral namespace core, two-principal Realm/desktop/mount proof, cross-platform adapters |
+| Fleet computer | Multi-user home-fleet tenancy, fleet-affine Linux and browser authority, composed shared roots plus principal overlays, human mounts, desktop leases, and team service boundary | Fleet-owned root grammar, provider-neutral namespace core, two-user/two-agent Realm/browser/desktop/mount proof, cross-platform adapters |
 | Principal Linux realm | Private guest ABI, bounded nested Wasmi process, installable no-`host_process` capsule, AOS Realm image direction | Principal-scoped durable VFS, processes, shell, toolchain, self-hosted capsule build |
 | Driver architecture | WASM/native split, role separation, mediated queues, deferred IRQ, IOMMU/DMA, lifecycle/transition contract, three GPU deployments | Formal models, resolved open decisions, reset evidence, prototype measurements |
 | Composition architecture | Principal catalog, exact relations, candidates, validator, materializer, Tensor Logic seam | Fixture corpus, executable sparse evaluator, Alloy/TLA+ models, production adapters |

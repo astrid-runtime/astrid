@@ -14,26 +14,49 @@ Related documents:
 
 ## 1. Product ruling
 
-AOS should present one lightweight computer owned by a fleet, with one private
-view for each agent principal and explicit shared views for team resources.
+AOS should be a multi-user host of lightweight fleet computers. Every user has a
+home fleet. That fleet contains the user's agent principals and owns their
+shared computer, browser identity, Linux authority, files, applications, and
+budget. Every agent receives an independent view and session over that shared
+computer.
 
 The ordinary experience is:
 
-1. A person starts AOS and receives a durable `UserUid`, a personal fleet, and
-   one agent principal.
+1. A person starts AOS and receives a durable `UserUid`, a home fleet, and one
+   agent principal.
 2. The person creates additional specialized agents in that fleet.
-3. Every agent sees the same signed software distribution and any explicitly
-   shared fleet workspace.
-4. Every agent has its own home, processes, browser profile, desktop session,
-   temporary state, credentials, and authority.
+3. Every agent uses the same fleet computer: Linux environment, common files,
+   installed software, browser sign-ins, cookies, and ambient fleet authority.
+4. Every agent has its own overlay, process/session view, desktop, working
+   context, history, and attribution, so concurrent agents do not accidentally
+   overwrite or commandeer one another's active work.
 5. Agents communicate through a kernel-stamped team service and may cooperate
-   through fleet-owned files without acquiring each other's private authority.
+   directly through fleet-owned files and applications.
 6. An authorized person can open a terminal, mount a filesystem view, or attach
    to the desktop belonging to a selected agent.
 
-The phrase "one computer" describes shared custody, software, storage economy,
-and team experience. It does not mean one ambient Unix user, one writable root,
-or one undifferentiated security domain.
+Within one user's cooperative fleet, "one computer" is literal at the product
+level: agents may share an ambient Linux user, browser identity, writable fleet
+root, and authority profile. Principal views prevent collisions and preserve
+identity; they are not falsely claimed as adversarial isolation. Separate users'
+home fleets remain separate tenant security domains.
+
+The referenced Grok Bot desktops establish the desired user-visible experience,
+not their internal implementation. Shared cookies and ambient Linux authority
+are accepted here as reported target behavior; AOS must still define and verify
+its own storage, concurrency, recovery, and tenant boundaries.
+
+The tenancy model therefore has two nested cardinalities:
+
+```text
+one AOS installation
+  -> many UserUid tenants
+  -> one stable home FleetUid per user
+  -> many PrincipalUid agent tenants per home fleet
+```
+
+The user fleet is the security and ownership tenant. Agent principals are
+independent actors and views inside that tenant.
 
 ## 2. Identity and ownership boundaries
 
@@ -42,8 +65,8 @@ The existing concepts retain distinct jobs:
 | Concept | Role in the fleet computer |
 | --- | --- |
 | `UserUid` | Durable human authority and authentication subject |
-| `FleetUid` | Administrative ownership, team policy, shared resources, and aggregate budget boundary |
-| `PrincipalUid` | Durable executable identity of one agent or service |
+| `FleetUid` | One user's home-computer tenant, team policy, shared authority, shared resources, and aggregate budget boundary |
+| `PrincipalUid` | Durable executable actor identity of one agent or service within the fleet computer |
 | `GroupName` | Reusable capability role; never an ownership container |
 | application identity | Identity and lifecycle of installed software below its owning fleet or principal |
 | invocation or job | One bounded execution under an acting principal |
@@ -57,30 +80,32 @@ An ephemeral worker may remain inside one principal only when it requires no
 independent durable identity, policy, state, or revocation boundary. Promotion
 from worker to durable teammate creates a new principal explicitly.
 
-One principal has at most one owning fleet. A user can belong to several fleets,
-and a fleet can contain several users and principals. Transferring a principal
-between fleets is an explicit ownership transition, not a filesystem move or an
-alias change.
+Every user has one home fleet for their own computer and agents. A user may also
+receive a role or bounded collaboration grant in another user's fleet without
+losing their home fleet. One principal has at most one owning fleet.
+Transferring a principal between fleets is an explicit ownership transition,
+not a filesystem move or alias change.
 
-Fleet roles authorize management of the ownership graph. They do not by
-themselves disclose every principal's files, secrets, browser profile, or active
-desktop. Data access, observation, recovery, and impersonation remain separate,
-audited grants.
+The home fleet's default cooperative profile intentionally gives its agents the
+same baseline computer authority and common data. Separate rights still govern
+human administration, remote desktop observation, recovery, fleet transfer,
+principal impersonation, and access to non-filesystem secrets. Cross-fleet
+access is always an explicit, audited delegation.
 
 ## 3. The filesystem is a composed view
 
-There is no single authoritative directory that all agents share. The principal
-store holds immutable objects and authoritative roots. A filesystem provider
-assembles a namespace for a particular subject, principal, session, and
-generation.
+There is one fleet-owned computer root plus per-principal view roots. The
+principal store holds their immutable objects and authoritative generations. A
+filesystem provider composes them for a particular user, fleet, acting
+principal, session, and generation.
 
 A normal Linux Realm view is:
 
 ```text
 /                   signed, immutable distribution and shared tools
-├── fleet/          explicitly fleet-owned shared files
-├── home/agent/     principal-private durable home
-├── workspace/      explicit task or project attachment
+├── home/fleet/     shared user home, configuration, and ordinary files
+├── home/agent/     fleet base plus this principal's overlay view
+├── workspace/      shared fleet project or explicit task attachment
 ├── apps/           application-scoped state and projections
 ├── team/           synthetic collaboration service, not ordinary storage
 ├── run/aos/        typed portals, handles, and session services
@@ -106,10 +131,11 @@ be exposed merely by mounting the immutable guest system view.
 
 ### 3.2 Fleet view
 
-`/fleet` is the deliberate collaboration boundary. Files placed there are
-visible only to principals and users holding the required fleet-resource grant.
-It supports ordinary file operations, durable staging, generation-checked
-publication, conflicts, quota, audit, and recovery.
+The fleet computer root is the deliberate collaboration boundary. It contains
+the user's ordinary shared files, installed application state selected for
+sharing, browser identity service, and default workspaces. It supports ordinary
+file operations, durable staging, generation-checked publication, conflicts,
+quota, audit, and recovery.
 
 Fleet ownership does not currently exist in `StateOwnerCodecV1`, whose frozen
 grammar contains only `System` and `Principal(PrincipalUid)`. Fleet-owned roots
@@ -117,22 +143,28 @@ therefore require a versioned owner grammar and migration, or a distinct
 authoritative fleet-root journal. A fleet must never be encoded as a synthetic
 principal or hidden beneath `StateOwner::System`.
 
-### 3.3 Principal-private view
+### 3.3 Principal overlay view
 
-`/home/agent` is owned by exactly one `PrincipalUid`. It contains the agent's
-durable working memory, personal configuration, browser profile, caches that
-must survive restart, and other private state admitted by policy.
+`/home/agent` is a composed view: the fleet home is its common lower/base state
+and one `PrincipalUid` owns its writable overlay and session metadata. The
+overlay gives an agent stable working context without making a complete copy of
+the fleet computer.
 
-Other principals in the same fleet do not receive this root automatically.
-Collaboration occurs through `/fleet`, explicit object grants, or the team
-service. This prevents a convenient team feature from becoming universal
-credential, cookie, history, or memory sharing.
+The overlay is primarily a collision and lifecycle boundary, not a claim that a
+cooperative fleet peer lacks the ambient authority to reach equivalent shared
+resources. Agent memory, scratch changes, window state, downloads-in-progress,
+and process/session metadata can remain overlay-local. Agents deliberately
+publish work into the common fleet root when it should become team-visible.
+
+Secrets that require principal isolation do not live as ambient files in the
+shared Linux account. They remain capability-mediated resources outside the
+fleet filesystem and are leased only to the intended invocation.
 
 ### 3.4 Workspace attachment
 
 `/workspace` is selected for a job or desktop session. It may be:
 
-- a fleet-owned project root;
+- the fleet's default shared project root;
 - a principal-owned project root;
 - a user-selected host directory exposed through a bounded portal; or
 - a disposable copy-on-write worktree.
@@ -144,10 +176,11 @@ different workspace.
 
 ### 3.5 Application state
 
-Application state is isolated below both principal and application identity.
-Two applications invoked by the same principal must not silently share a home,
-browser profile, service credentials, process namespace, or writable Realm
-state. Explicit state volumes may be shared through a named grant.
+Application state declares whether it is fleet-common, principal-overlay, or an
+isolated capability-mediated volume. Applications do not silently choose the
+scope. Two instances may share fleet state only when the application contract
+and fleet policy select it; session-local state still receives an instance and
+generation boundary.
 
 The complete execution key is at least:
 
@@ -172,16 +205,18 @@ PrincipalOwner(PrincipalUid)
 ApplicationOwner(application identity, owning FleetUid or PrincipalUid)
 ```
 
-`UserUid` is normally an authorization subject rather than the owner of agent
-state. A personal fleet supplies the ordinary one-person ownership boundary.
+`UserUid` is normally an authorization subject rather than the direct owner of
+agent state. The user's home fleet supplies their computer ownership boundary.
 User-private settings or credentials may gain a separate user-owned root later;
 they must not be smuggled into a principal or fleet root for convenience.
 
 Logical accounting follows the owner whose root retains the object:
 
 - signed system artifacts are operator/system cost;
-- fleet files are charged to the fleet budget;
-- private home and memory are charged to the principal under its fleet ceiling;
+- common home, browser, application, and workspace state are charged to the
+  home fleet budget;
+- principal overlays and memory are charged to the principal under its fleet
+  ceiling;
 - application state is charged to its declared owner and application slice;
 - external workspace portals retain their external accounting policy.
 
@@ -192,30 +227,39 @@ a cross-owner equality oracle.
 
 ## 5. Linux execution boundary
 
-The first implementation should retain one principal-affine Realm per active
-principal/profile. Realms may share:
+The Grok-like cooperative profile should use one fleet-affine resident Realm per
+active home fleet/profile. Its principals share:
 
 - the signed kernel and immutable system image;
 - principal-free prewarm checkpoints;
 - content-addressed physical objects;
-- read-only page cache;
+- page cache and fleet-owned writable files;
 - compute workers and scheduling infrastructure; and
-- network, graphics, storage, and device provider implementations.
+- network, graphics, storage, and device provider implementations;
+- an ambient Linux authority profile and ordinary Unix user environment; and
+- fleet-owned browser identity and application services.
 
-They do not share writable guest RAM, process tables, Unix credentials, session
-buses, browser profiles, home generations, file handles, or capability tokens.
+Each admitted command or desktop still carries the kernel-stamped acting
+`PrincipalUid`. The Realm constructs a principal view with its overlay,
+workspace attachment, process/session namespace, resource slice, and audit
+context. Independent views prevent accidental interference; shared ambient
+fleet authority means they are not a hostile-tenancy boundary.
 
-This gives the product density of one shared computer without moving the
-security boundary into a general-purpose Linux kernel. A future provider may
-host several views inside one hardware VM or native kernel only after it proves
-equivalent principal isolation, revocation, accounting, crash recovery, and
-denied-path behavior. The namespace and authority contract must not depend on
-that optimization.
+The hard tenant boundary is between home fleets. Different users' fleet Realms
+must not share writable RAM, Unix credentials, session buses, browser identity,
+home generations, writable file handles, or capability tokens. They may share
+verified immutable pages and physical content below the authority line.
 
 Linux remains a compatibility provider. The kernel-stamped principal, Astrid
 capabilities, root identities, quotas, and audit trail remain outside Linux.
-UID 1000 inside two Realms does not make them the same user and does not confer
-cross-principal authority.
+UID 1000 is permitted to represent the cooperative ambient user inside one home
+fleet Realm. UID 1000 in a different fleet Realm is unrelated and confers no
+cross-fleet authority.
+
+The existing Realm is principal-affine. Moving the cooperative product to a
+fleet-affine machine is therefore an explicit refactor, not a documentation
+rename. A principal-isolated Realm profile should remain available for agents or
+applications that are not trusted with the fleet computer's ambient authority.
 
 ## 6. Team communication
 
@@ -233,17 +277,19 @@ The team service should provide:
 - explicit bridges to a human operator.
 
 The sender principal is derived from the authenticated connection. A payload
-cannot claim another sender. Receiving a message does not confer the sender's
-filesystem, network, secret, or application authority. Any delegated handle
-names its exact resource, rights, generation, and lifetime.
+cannot claim another sender. Receiving a message does not add authority beyond
+the common fleet profile. Any delegated handle for a narrower or external
+resource names its exact resource, rights, generation, and lifetime.
 
 Files remain useful for human-readable collaboration and ordinary tools. The
 team service remains the authority-preserving coordination plane.
 
 ## 7. Desktop and browser views
 
-A desktop is a projection of one principal's Realm, not a remote login to an
-ambient shared host account.
+A desktop is one principal session's view of the fleet Realm. Principals may
+share the same ambient Linux account, browser identity, cookies, and application
+authority while retaining independent windows, process/session namespaces,
+overlays, work contexts, and audit attribution.
 
 Each desktop session binds:
 
@@ -252,9 +298,18 @@ Each desktop session binds:
  application/profile, desktop session, Realm generation)
 ```
 
-The selected principal receives its own display server/session, browser profile,
-terminal processes, clipboard namespace, downloads, and home. Immutable Chrome
-and desktop binaries may be shared; their mutable state may not.
+The selected principal receives its own display/session, terminal processes,
+working overlay, and window state. The home fleet may deliberately share
+clipboard, downloads, browser sign-ins, cookies, history, extensions, and other
+profile state.
+
+Two Chrome processes must not be pointed concurrently at one mutable
+SQLite/LevelDB profile directory and called safe sharing. A fleet browser
+service should own the common browser profile and serialize its mutation while
+exposing independent principal windows or sessions. A simpler provider may
+snapshot a verified fleet profile at session start and merge only supported
+state through a typed service. The chosen semantics must be visible and
+crash-tested.
 
 Graphics, input, clipboard, screenshots, downloads, notifications, camera, and
 microphone cross typed portals. A screenshot capability returns pixels from a
@@ -262,11 +317,11 @@ named desktop surface; it does not grant filesystem or general display access.
 Clipboard and file-picker grants are scoped resources rather than ambient host
 integration.
 
-Remote desktop attaches through an authenticated gateway to one named desktop
-session. Its lease is short-lived, revocable, and audited. Fleet ownership
-permits management but does not automatically permit silent observation.
-Observation, interactive control, recovery control, and principal impersonation
-are separate rights.
+Remote desktop attaches through an authenticated gateway to one named principal
+desktop session in the user's home fleet. Its lease is short-lived, revocable,
+and audited. A user can open their own agents' desktops as the ordinary product
+flow. A user entering another user's fleet requires a separate delegated
+observation or control grant.
 
 Provider or daemon failure must produce bounded errors and reconnect behavior.
 It must not strand acknowledged filesystem writes or indefinitely hang the
@@ -288,10 +343,10 @@ astrid storage unmount <mount>
 
 Command names are not yet a frozen CLI contract.
 
-A principal mount presents that principal's composed administrative view. A
-fleet mount presents shared fleet-owned state, not every member principal's
-private home. A system mount presents a supported administrative projection and
-is read-only by default. None exposes raw engine files.
+A principal mount presents that agent's composed fleet-base-plus-overlay view.
+A fleet mount presents the common computer root without selecting an agent's
+overlay. A system mount presents a supported administrative projection and is
+read-only by default. None exposes raw engine files.
 
 Filesystem writes update crash-durable working state. `fsync` means the staged
 bytes and namespace mutation are durable; it does not falsely claim that the
@@ -329,9 +384,9 @@ Mount, shell, desktop, and team authorization all use the same intersection:
 
 ```text
 authenticated user and device
-∩ fleet membership and delegated role
+∩ home-fleet ownership or cross-fleet delegated role
 ∩ selected acting principal
-∩ target resource grant
+∩ cooperative fleet profile or narrower target resource grant
 ∩ provider declaration
 ∩ per-session attenuation and limits
 ```
@@ -353,9 +408,10 @@ system.storage.inspect
 system.storage.repair
 ```
 
-Exact capability grammar is future contract work. A broad fleet administrator
-role may authorize issuing or revoking these grants under fleet policy; it must
-not silently collapse them into one superuser permission.
+Exact capability grammar is future contract work. Agents in the user's home
+fleet may receive the cooperative fleet-computer profile by default. Broader
+human administration, cross-fleet access, isolated-principal resources, system
+repair, and impersonation remain explicit grants.
 
 ## 10. Provisioning and lifecycle
 
@@ -363,7 +419,7 @@ Fresh setup performs one recoverable ownership transaction:
 
 ```text
 create or authenticate UserUid
-  -> create personal FleetUid
+  -> create or recover exactly one home FleetUid
   -> create first PrincipalUid
   -> assign principal to fleet
   -> allocate fleet and principal budgets
@@ -373,39 +429,43 @@ create or authenticate UserUid
 ```
 
 Creating another specialized agent creates another principal, assigns it to the
-fleet, allocates its resource slice, and creates empty private roots. It does not
-copy the first agent's home or credentials. Shared fleet resources become visible
-through the new principal's composed namespace according to policy.
+home fleet, allocates its resource slice, and creates an empty overlay root. The
+new agent immediately receives the fleet computer's common files, applications,
+browser identity, cookies, and ambient authority profile. It does not copy
+another agent's overlay, running processes, desktop session, or audit identity.
 
-Realm RAM, desktop processes, and temporary state are lazy and evictable. The
+Fleet Realm RAM, desktop processes, and temporary state are lazy and evictable.
+The
 principal identity, roots, published state, application identity, service
 identity, ownership graph, and audit evidence survive shutdown. Restart
 reconstructs execution from those durable objects rather than preserving an
 ambient machine as authority.
 
-Removing an agent revokes sessions and handles, stops or evicts its Realm,
-publishes or preserves blocked dirty state according to policy, detaches it from
-the fleet, and then retires its roots under explicit retention or erasure rules.
-Shared fleet objects survive because their owner is the fleet, not the removed
-principal.
+Removing an agent revokes its sessions and handles, stops its processes and
+desktop, publishes or preserves blocked overlay state according to policy,
+detaches it from the fleet, and then retires its roots under explicit retention
+or erasure rules. The fleet Realm and shared objects survive while the user or
+other agents still retain them.
 
 ## 11. Product story
 
 The simple truthful story is:
 
-> Start AOS and meet your first agent. Add specialists as your work grows. They
-> share one fleet computer, its software, and the workspaces you give the team,
-> while each keeps an independent home, browser, desktop, memory, credentials,
-> and authority. Open any agent's terminal or desktop, mount shared or private
-> files when authorized, and let the agents coordinate through the team fabric.
+> Every AOS user gets a fleet computer and a first agent. Add specialists as
+> your work grows. Your agents share that computer's Linux environment, files,
+> applications, browser sign-ins, cookies, and ambient authority, while each
+> keeps an independent view, overlay, active processes, desktop, working context,
+> and identity. Open any agent's terminal or desktop and let the team work
+> together without stepping on one another's active state.
 
 The shorter phrase is:
 
-> One computer. A team of agents. A private view for each.
+> Your computer. Your fleet of agents. An independent view for each.
 
 The security qualification is:
 
-> Shared bytes and shared workspaces do not imply shared identity or authority.
+> Principals preserve attribution and independent views inside the cooperative
+> fleet; the hard tenant boundary is between users' home fleets.
 
 ## 12. Implementation order
 
@@ -414,24 +474,32 @@ The security qualification is:
    `StateOwnerCodecV1` in place.
 3. Implement the provider-neutral path/inode, staging, publication, mount-lease,
    and doctor contracts.
-4. Compose system, fleet, principal, application, workspace, and synthetic team
-   resources into one principal view.
-5. Connect the existing principal-affine Linux Realm to that composed view while
-   preserving kernel-stamped principal identity.
+4. Compose system, fleet, principal overlay, application, workspace, browser,
+   and synthetic team resources into one principal view.
+5. Refactor the existing principal-affine Linux Realm into a fleet-affine
+   cooperative profile while preserving kernel-stamped acting-principal identity
+   and retaining an isolated-principal profile.
 6. Implement one hosted mount and desktop adapter with crash, `mmap`, browser,
    compiler, provider-death, daemon-upgrade, and repair evidence.
 7. Add the remaining macOS, Linux, and Windows mount/desktop adapters against the
    same behavioral contract.
 8. Add the fleet team service and handle delegation.
 9. Optimize density through shared immutable pages, checkpoints, physical
-   objects, and workers without changing logical isolation.
+   objects, workers, and one resident machine per active fleet without weakening
+   cross-fleet isolation or principal attribution.
 
-The first release slice should prove two principals in one fleet:
+The first release slice should prove two users with distinct home fleets and at
+least two principals in one user's fleet:
 
-- see identical immutable system bytes;
-- see and concurrently update an explicitly shared fleet workspace;
-- retain different homes, browser profiles, process trees, and desktops;
-- cannot access one another's private files, tokens, clipboard, or display;
+- every user recovers the same stable home fleet and never another user's fleet;
+- same-fleet principals share the Linux environment, ambient authority profile,
+  common files, browser sign-ins, and cookies;
+- same-fleet principals retain independent overlays, working contexts, process
+  sessions, desktops, and audit attribution;
+- a shared browser service remains correct under concurrent agent sessions and
+  provider crash;
+- different home fleets cannot access one another's writable files, cookies,
+  processes, tokens, or displays;
 - exchange kernel-stamped messages and delegated file handles;
 - survive provider and daemon restart with acknowledged writes intact; and
 - can each be mounted or remotely viewed by an independently authorized user.
@@ -441,9 +509,17 @@ The first release slice should prove two principals in one fleet:
 Do not ship the fleet-computer claim if any of the following remains true:
 
 - specialized durable agents share one `PrincipalUid`;
+- a user can be provisioned without one stable home fleet;
 - a fleet or group name is treated as authentication;
-- fleet membership automatically exposes every principal's private state;
-- two same-principal applications silently share writable Realm state;
+- the cooperative profile is described as adversarial isolation between its
+  same-fleet principals;
+- a principal view can accidentally overwrite another agent's overlay or active
+  session state;
+- multiple Chrome processes concurrently mutate one unsupported profile
+  directory;
+- shared cookies or ambient Linux authority cross a home-fleet boundary;
+- an application silently chooses fleet-common rather than overlay or isolated
+  state;
 - a guest path or UID selects an authority-bearing host resource;
 - desktop observation is implied by ownership-management authority;
 - the immutable guest system view exposes mutable kernel administrative state to
@@ -453,4 +529,5 @@ Do not ship the fleet-computer claim if any of the following remains true:
   bounded error;
 - physical deduplication becomes an authorization or cross-owner equality oracle;
   or
-- a shared Linux guest becomes the only isolation boundary between principals.
+- a shared Linux guest becomes the only isolation boundary between different
+  users' home fleets.
