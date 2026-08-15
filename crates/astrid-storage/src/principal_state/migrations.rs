@@ -57,7 +57,7 @@ const MIGRATION_HISTORY: &[MigrationDescriptor] = &[
         id: "surrealkv-to-principal-store",
         from: "legacy",
         to: 1,
-        rollback: "legacy source preserved; post-cutover writes require export",
+        rollback: "legacy source retained until verified cutover; rollback afterward requires export",
     },
     MigrationDescriptor {
         id: "flat-content-catalog-to-radix-tree",
@@ -447,7 +447,11 @@ mod tests {
         assert_eq!(MIGRATION_HISTORY[1].to, 2);
         assert_eq!(MIGRATION_HISTORY[2].from, "2");
         assert_eq!(MIGRATION_HISTORY[2].to, CURRENT_STORE_VERSION);
-        assert!(MIGRATION_HISTORY[0].rollback.contains("source preserved"));
+        assert!(
+            MIGRATION_HISTORY[0]
+                .rollback
+                .contains("retained until verified cutover")
+        );
         assert!(MIGRATION_HISTORY[1].rollback.contains("commit lineage"));
         assert!(MIGRATION_HISTORY[2].rollback.contains("commit lineage"));
     }

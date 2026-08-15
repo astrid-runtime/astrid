@@ -49,6 +49,9 @@ mod runtime_policy_tests;
 /// acquires the singleton advisory lock.
 #[cfg(unix)]
 pub mod socket;
+/// Authenticated native filesystem lease and callback service.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+mod storage_mount;
 
 use arc_swap::ArcSwap;
 use astrid_audit::AuditLog;
@@ -302,6 +305,19 @@ pub struct Kernel {
     identity_store: Arc<dyn astrid_storage::IdentityStore>,
     /// Durable human, fleet, and exclusive principal ownership graph.
     ownership_store: Arc<astrid_storage::OwnershipStore>,
+    /// Live native filesystem leases, each fixed to one authenticated caller
+    /// and one typed storage owner.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    pub(crate) storage_mounts: Arc<
+        DashMap<
+            astrid_core::storage_provider::StorageMountId,
+            Arc<storage_mount::StorageMountLeaseState>,
+        >,
+    >,
+    /// Linearizes read-modify-publish filesystem mutations across all native
+    /// mounts so concurrent views cannot lose non-overlapping writes.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    pub(crate) storage_mount_mutations: tokio::sync::Mutex<()>,
     /// System-wide per-principal profile cache (Layer 3 quota enforcement).
     ///
     /// One instance per kernel boot. Every capsule load plumbs this into
@@ -625,31 +641,32 @@ impl Kernel {
         let principal_directory = astrid_storage::PrincipalDirectory::default();
         let quota_cache = Arc::clone(&profile_cache);
         let quota_principals = principal_directory.clone();
-        let quota: Arc<dyn astrid_storage::KvQuotaResolver<astrid_storage::StateOwner>> = Arc::new(
-            move |owner: &astrid_storage::StateOwner| {
+        let quota: Arc<dyn astrid_storage::KvQuotaResolver<astrid_storage::StateOwner>> =
+            Arc::new(move |owner: &astrid_storage::StateOwner| {
                 match owner {
-                astrid_storage::StateOwner::System => Ok(None),
-                astrid_storage::StateOwner::Principal(owner) => {
-                    quota_principals.alias_for(*owner).and_then(|principal| {
-                        quota_cache
-                            .resolve(&principal)
-                            .map(|profile| Some(profile.quotas.max_storage_bytes))
-                            .map_err(|error| {
-                                astrid_storage::StorageError::Internal(format!(
-                                    "resolve storage quota for {principal}: {error}"
-                                ))
-                            })
-                    })
-                },
-                astrid_storage::StateOwner::Fleet(_) => Err(
-                    astrid_storage::StorageError::Internal(
-                        "fleet-owned storage is not writable until a user/fleet quota policy is admitted"
-                            .to_owned(),
-                    ),
-                ),
-            }
-            },
-        );
+                    astrid_storage::StateOwner::System => Ok(None),
+                    astrid_storage::StateOwner::Principal(owner) => {
+                        quota_principals.alias_for(*owner).and_then(|principal| {
+                            quota_cache
+                                .resolve(&principal)
+                                .map(|profile| Some(profile.quotas.max_storage_bytes))
+                                .map_err(|error| {
+                                    astrid_storage::StorageError::Internal(format!(
+                                        "resolve storage quota for {principal}: {error}"
+                                    ))
+                                })
+                        })
+                    },
+                    // A fleet is a real writable owner. Until the allocation-policy
+                    // capsule admits a tighter fleet budget, retain the same hard
+                    // storage ceiling used by an unconfigured principal. Accounting
+                    // and enforcement remain in the kernel; policy does not run in
+                    // the storage transaction.
+                    astrid_storage::StateOwner::Fleet(_) => {
+                        Ok(Some(astrid_core::profile::DEFAULT_MAX_STORAGE_BYTES))
+                    },
+                }
+            });
 
         // Open the authoritative state store. First cutover imports and
         // verifies legacy SurrealKV under the singleton lock before serving.
@@ -1026,22 +1043,13 @@ impl Kernel {
             // Apply pre-configured identity links from config.
             apply_identity_config(&identity_store, &workspace_root, &workspace_layout).await;
 
-            let ownership = ownership_store.load().await.map_err(|error| {
-                std::io::Error::other(format!(
-                    "Failed to read ownership graph for layout migration: {error}"
-                ))
-            })?;
-            let fleet_uids = ownership
-                .fleets()
-                .map(|fleet| fleet.identity().uid)
-                .collect::<Vec<_>>();
             let layout_result = if adopt_released_layout_principals {
                 astrid_core::dirs::LayoutMigrationTarget::for_current_executable(
                     astrid_storage::RUNTIME_STORE_FORMAT_ID,
                 )
-                .and_then(|target| home.complete_layout_v2(fleet_uids, &target))
+                .and_then(|target| home.complete_layout_v2(&target))
             } else {
-                home.ensure_layout_v2_fleet_dirs(fleet_uids)
+                Ok(())
             };
             layout_result.map_err(|error| {
                 std::io::Error::other(format!(
@@ -1096,6 +1104,10 @@ impl Kernel {
             allowance_store,
             identity_store,
             ownership_store,
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+            storage_mounts: Arc::new(DashMap::new()),
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+            storage_mount_mutations: tokio::sync::Mutex::new(()),
             profile_cache: profile_cache
                 .unwrap_or_else(|| Arc::new(PrincipalProfileCache::with_home(home.clone()))),
             groups,
@@ -3088,9 +3100,9 @@ async fn open_test_runtime_kv(
                         })
                     })
             },
-            astrid_storage::StateOwner::Fleet(_) => Err(astrid_storage::StorageError::Internal(
-                "fleet-owned storage is not writable in this test composition".to_owned(),
-            )),
+            astrid_storage::StateOwner::Fleet(_) => {
+                Ok(Some(astrid_core::profile::DEFAULT_MAX_STORAGE_BYTES))
+            },
         });
     let store =
         astrid_storage::open_runtime_principal_store_with_directory(home, quota, directory.clone())
@@ -3240,6 +3252,10 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         allowance_store,
         identity_store,
         ownership_store,
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        storage_mounts: Arc::new(DashMap::new()),
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        storage_mount_mutations: tokio::sync::Mutex::new(()),
         profile_cache: Arc::new(PrincipalProfileCache::with_home(home.clone())),
         groups,
         astrid_home: home,

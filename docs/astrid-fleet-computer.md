@@ -1,6 +1,6 @@
 # Astrid fleet computer and principal views
 
-Status: accepted architecture; layout and CLI provider handoff in progress
+Status: accepted architecture; authoritative owner filesystem and macOS provider implemented
 
 Last reviewed: 2026-08-15
 
@@ -106,146 +106,51 @@ human administration, remote desktop observation, recovery, fleet transfer,
 principal impersonation, and access to non-filesystem secrets. Cross-fleet
 access is always an explicit, audited delegation.
 
-## 3. The filesystem is a composed view
+## 3. The filesystem is an authoritative owner view
 
-Astrid already has a canonical, Linux FHS-aligned version-one hierarchy. Layout
-version two extends it rather than replacing it. The final visible contract is:
+There are two deliberately different trees. The private runtime layout under
+`ASTRID_HOME` contains engine arenas, journals, keys, configuration, logs,
+migration receipts, and ephemeral mount leases. It is implementation backing;
+it is never the filesystem served to a principal, fleet, or sysadmin. In
+particular, layout two has no physical `srv/fleets/...` or other host-directory
+copy of mounted files.
 
-```text
-Astrid/
-├── etc/                         deployment configuration and policy
-│   ├── config.toml
-│   ├── servers.toml
-│   ├── gateway.toml
-│   ├── groups.toml
-│   ├── hooks/
-│   ├── profiles/{principal}.toml
-│   └── layout-version           contains 2 after committed migration
-├── var/                         persistent system state
-│   ├── principal-store/         authoritative typed multi-owner store
-│   ├── content-staging/         private acknowledged-write staging
-│   ├── migrations/              durable layout intents and receipts
-│   └── state.db/                retained v0.10.4 legacy import source
-├── run/                         ephemeral runtime endpoints, mounts, sessions
-├── log/                         system logs
-├── keys/                        runtime and local identity keys
-├── secrets/                     capability-mediated secret backing
-├── bin/                         content-addressed compiled components
-├── lib/                         shared component libraries
-├── wit/                         canonical and content-addressed WIT
-│   └── store/
-├── srv/                         fleet-owned data served by Astrid
-│   └── fleets/
-│       └── {fleet_uid}/
-│           ├── shared/          durable common files
-│           └── workspaces/      explicit attachment points, not copied roots
-├── home/
-│   └── {principal}/
-│       ├── .local/
-│       │   ├── capsules/
-│       │   ├── kv/
-│       │   ├── log/
-│       │   ├── audit/
-│       │   ├── tokens/
-│       │   └── tmp/
-│       └── .config/env/
-└── cow/                         host-managed workspace copy-on-write state
-```
+The mounted tree is materialized from the selected `StateOwner` root in the
+Astrid store. Regular files are immutable content DAGs. Directory entries are
+canonical namespace markers in that same owner catalog, and the root directory
+is implicit. Create, write, remove, and rename publish a new owner root through
+the store's generation-checked transaction. There is therefore one
+authoritative copy, even while several OS clients mount it.
 
-`srv/fleets/{fleet_uid}/shared` is the one canonical fleet-common filesystem
-root. The FHS `/srv` class is used because this is durable data served by the
-fleet computer, not a human login home and not private engine state. A
-principal's existing `home/{principal}` remains its independent home and
-overlay boundary. `srv/fleets/{fleet_uid}/workspaces` contains admitted mount
-points for external or object-backed workspaces; attachment never moves the
-workspace's authoritative backing data into `AstridHome`.
+| Mount selector | Authoritative owner | Intended use |
+| --- | --- | --- |
+| `--as <principal>` | `StateOwner::Principal(PrincipalUid)` | One actor's private files and working view |
+| `--fleet <fleet>` | `StateOwner::Fleet(FleetUid)` | Files shared by every authorized principal in that user's fleet |
+| `--admin` | `StateOwner::System` | Supported system-level files, read-only unless explicitly elevated |
 
-Browser cookies, team inboxes, vault records, capability tokens, indexes, and
-other service databases are not made ordinary editable files under `srv/`.
-They remain typed state in the authoritative store and are reached through
-their owning services. Supported exports, downloads, and artifacts may be
-published into `shared/` as normal fleet-owned files.
+The Linux-like naming convention remains the human interface. An owner may use
+familiar `etc/`, `var/`, `home/`, `srv/`, `tmp/`, `bin/`, and `lib/` paths, and
+an admin-capable agent can inspect the system owner's supported tree with normal
+filesystem tools. These are logical paths inside an owner root, not paths into
+the daemon's private backing directory. Path reachability and host mode bits do
+not grant Astrid authority; the kernel fixes the owner and access class into an
+authenticated lease before a provider sees a path.
 
-On Unix the physical host root currently defaults to `~/.astrid`; Windows uses
-the user's `LocalAppData`; `$ASTRID_HOME` may select another physical root. Those
-host locations are placement details. The mounted administrative root preserves
-the canonical hierarchy and names on every OS.
+A principal mount and a fleet mount are intentionally separate views rather
+than a magical merged directory. A Linux Realm, desktop, or other hosted OS can
+mount the fleet owner as its shared disk, mount the principal owner as its
+private disk, or attach both at explicit guest paths. That choice gives all
+agents the same shared computer without forcing them to share scratch files or
+active session state.
 
-The Linux inspiration is deliberate and remains useful. Familiar path classes
-give people, shell tools, and otherwise unrelated agent harnesses a discoverable
-administrative model: inspect the tree, read supported configuration, find logs,
-and understand what is durable. Astrid should preserve those names and ordinary
-filesystem behavior where practical without treating POSIX mode bits, a Unix
-UID, or path reachability as its authorization model. Linux familiarity is the
-interface affordance; typed Astrid ownership and capabilities remain the
-authority.
+Browser cookies, inboxes, vault records, capability tokens, and service
+databases need not be ordinary files. They may remain typed state behind their
+own capsule. A browser capsule can nevertheless place an admitted shared
+profile in the fleet filesystem when that is the desired concurrency model.
+Multiple browser processes must not concurrently mutate one SQLite or LevelDB
+profile unless the owning service serializes those writes.
 
-Different agents do not receive different invented hierarchies. They receive
-different capability-filtered namespace views of this hierarchy. A normal
-principal may see shared executable/interface resources and its own
-`home/{principal}`. A fleet-cooperative profile may add explicitly shared roots.
-A sysadmin-authorized principal may receive the broader administrative view.
-Paths never grant authority by themselves.
-
-| View | Canonical visibility |
-| --- | --- |
-| Ordinary principal | Shared admitted `bin/`, `lib/`, and `wit/`; its own `home/{principal}`; explicit workspace attachments |
-| Cooperative fleet agent | Ordinary principal view plus its owning `srv/fleets/{fleet_uid}/` subtree and services |
-| Sysadmin principal | Supported `etc/`, `var/`, `run/`, `log/`, `home/`, lifecycle, and policy projections according to system capabilities |
-| Recovery operator | Separately admitted repair views; never implicit raw-store write authority |
-
-An agent can therefore be the sysadmin without ceasing to be a principal. Its
-system capabilities select a broader view of the same hierarchy, and every
-operation remains principal-attributed and audited.
-
-### 3.1 Shared system view
-
-`bin/`, `lib/`, and `wit/` are the normal shared software/interface projection.
-Their immutable bytes and caches may be shared physically across principals and
-fleets. `etc/`, `var/`, `run/`, `log/`, `keys/`, and `secrets/` are
-administrative namespaces whose visibility and mutability depend on explicit
-system capabilities.
-
-`StateOwner::System` contains kernel-owned state such as identity and ownership
-records. A sysadmin view may expose supported logical administration files at
-their canonical paths, but raw arena frames, indexes, journals, locks, key bytes,
-and staging internals are not made safely editable merely because their backing
-directories exist. Unsupported raw mutation remains refused.
-
-### 3.2 Fleet view
-
-Fleet-owned shared files are the deliberate collaboration boundary. They support
-ordinary file operations, durable staging, generation-checked publication,
-conflicts, quota, audit, and recovery. Agents in the user's home fleet may also
-share browser and application state through their owning services.
-
-`StateOwnerCodecV1` remains frozen over the separate `StateOwnerV1` domain of
-`System` and `Principal(PrincipalUid)`. The runtime uses `StateOwnerCodecV2`,
-which preserves those bytes and adds the explicit `Fleet(FleetUid)` tag. A
-fleet is never encoded as a synthetic principal or hidden beneath
-`StateOwner::System`. Layout version two fixes its canonical visible path at
-`srv/fleets/{fleet_uid}/`; that path is a projection of the fleet-owned root in
-the typed store, not a second authoritative copy. Fleet writes remain refused
-until their user/fleet quota policy is admitted.
-
-### 3.3 Principal overlay view
-
-`home/{principal}` remains the canonical principal path. The object store may
-compose fleet-common base state with a principal-owned writable overlay behind
-that path, but the visible layout does not change. The overlay gives an agent
-stable working context without making a complete copy of shared state.
-
-The overlay is primarily a collision and lifecycle boundary, not a claim that a
-cooperative fleet peer lacks the ambient authority to reach equivalent shared
-resources. Agent memory, scratch changes, window state, downloads-in-progress,
-and process/session metadata can remain overlay-local. Agents deliberately
-publish work into the common fleet root when it should become team-visible.
-
-Secrets that require principal isolation do not live as ambient files in the
-shared computer view. They remain capability-mediated resources outside the
-fleet filesystem and are leased only to the intended invocation.
-
-### 3.4 Workspace attachment
+### 3.1 Workspace attachment
 
 The project workspace is not silently moved into `AstridHome`. Its existing
 per-project `.astrid/` state and opaque workspace identity remain separate. A
@@ -261,7 +166,7 @@ mode, and lifetime. A guest path never selects a host directory. Stale handles
 fail after detach or generation change rather than silently resolving against a
 different workspace.
 
-### 3.5 Application state
+### 3.2 Application state
 
 Application state declares whether it is fleet-common, principal-overlay, or an
 isolated capability-mediated volume. Applications do not silently choose the
@@ -591,13 +496,15 @@ The admin view defaults to read-only and requires `--read-write` before an
 operator can request supported configuration changes.
 
 The CLI delegates to one lifecycle-independent native companion while keeping
-the command and lease semantics identical:
+the command and lease semantics identical. The provider-neutral contract is
+implemented for all hosts; the native macOS provider is included in this
+release slice, while Linux and Windows adapters consume the same contract:
 
 | Host | Native provider companion | Target when omitted |
 | --- | --- | --- |
 | macOS | `astrid-storage-provider-fskit` using FSKit | provider-selected mounted volume |
-| Linux | `astrid-storage-provider-fuse` using libfuse | provider-selected mount directory |
-| Windows | `astrid-storage-provider-winfsp` using WinFsp | provider-selected volume/drive |
+| Linux | `astrid-storage-provider-fuse` using libfuse (adapter pending) | provider-selected mount directory |
+| Windows | `astrid-storage-provider-winfsp` using WinFsp (adapter pending) | provider-selected volume/drive |
 
 The CLI accepts a provider only when it is co-installed beside the authenticated
 Astrid executable set; it never falls back to `PATH`. Handoff uses the exported
@@ -638,42 +545,35 @@ explicit application or workspace operation creates those resources. A mount
 only admits and projects resources that already exist, and fails if its selected
 owner or view is absent or unauthorized.
 
-Every mode preserves the same canonical relative paths. A principal view exposes
-the shared resources admitted to that principal and `home/{principal}`. A future
-fleet view exposes fleet-owned shared state without selecting an agent overlay,
-but is still bound to the one acting principal for authorization and audit.
-An administrative view exposes the supported system hierarchy according to the
-acting user's and principal's system capabilities; it is read-only by default.
+Every mode uses the same path semantics but selects exactly one authoritative
+owner root. A principal view exposes principal-owned files. A fleet view exposes
+fleet-owned shared files without selecting an agent overlay, but remains bound
+to the acting principal for authorization and audit. An administrative view
+exposes the system owner according to the acting principal's capabilities and
+is read-only by default.
 
 This is what permits an agent to be the sysadmin. The agent does not receive a
 different filesystem API or a magic bypass. It receives an administrative
-namespace view and explicit rights over paths such as `etc/`, `log/`, supported
-`var/` projections, principal homes, and lifecycle endpoints. Particularly
-sensitive operations over `keys/`, `secrets/`, raw store state, and runtime
-endpoints remain narrower capabilities even for an administrator.
+system-owner namespace and explicit rights over supported logical paths such as
+`etc/`, `log/`, and `var/`. The mount never exposes raw store arenas, journals,
+keys, private runtime configuration, or callback endpoints.
 
-Filesystem writes update crash-durable working state. `fsync` means the staged
-bytes and namespace mutation are durable; it does not falsely claim that the
-authoritative content root has advanced. Publication seals an immutable
-generation, verifies identity and closure, charges quota, and advances the root
-with compare-and-swap. `storage sync` waits for that publication outcome.
-
-An invalid, conflicting, or over-quota edit remains staged and visible with a
-typed blocked state. Doctor and repair tooling must never discard acknowledged
-dirty bytes merely because they differ from the last published root.
+Each acknowledged filesystem mutation has already built immutable content,
+checked the kernel's hard storage ceiling, and atomically advanced the selected
+owner root. A rejected conflict or over-quota write is not acknowledged and
+cannot become a divergent second copy. `fsync` and `storage sync` flush the
+authoritative engine; status therefore reports no unpublished dirty state.
 
 Administrative access uses a mount lease such as:
 
 ```text
 MountLease {
-    authenticated_user,
-    authenticated_device,
-    selected_fleet,
-    target_owner,
+    mount_id,
     view_kind,
     access_mode,
-    granted_rights,
-    admitted_generation,
+    private_resource_path,
+    private_callback_path,
+    random_bearer_secret,
     expires_at,
 }
 ```
@@ -726,7 +626,7 @@ create or authenticate UserUid
   -> create or recover exactly one home FleetUid
   -> create first PrincipalUid
   -> assign principal to fleet
-  -> allocate fleet and principal budgets
+  -> admit fleet and principal storage allocations through policy
   -> create empty authoritative roots
   -> install signed system/application closure
   -> optionally start the first principal view
@@ -762,7 +662,7 @@ or other agents still retain them.
 
 ### 10.1 Upgrade from Astrid v0.10.4
 
-The latest published release at the time of this design is
+The migration source release is
 [`v0.10.4`](https://github.com/astrid-runtime/astrid/releases/tag/v0.10.4).
 It writes layout version one, uses `var/state.db/` as its authoritative
 SurrealKV state, and stores principal files under `home/{principal}/`. The
@@ -795,23 +695,22 @@ The migration is an exclusive, crash-resumable ownership transaction:
    to that operator's home fleet with explicit receipts. A development home that
    already contains a valid ownership graph preserves that graph instead of
    reassigning principals.
-4. Convert the imported store to the version-two owner grammar, create one empty
-   fleet root, and project it at `srv/fleets/{fleet_uid}/shared`. Existing
-   `home/{principal}/`, `etc/`, `keys/`, `secrets/`, `bin/`, `lib/`, `wit/`,
-   and `cow/` content remains in place. Principal homes are never merged into
-   the fleet root.
+4. Convert the imported store to the version-two owner grammar and create the
+   stable fleet and principal owners. No host-directory filesystem projection
+   is created. Existing private runtime configuration, keys, capsule data, and
+   logs remain private runtime inputs; they are not copied into a mounted owner
+   tree or merged into fleet-owned files.
 5. Preserve existing principal-scoped browser and capsule state. A fleet browser
    profile starts empty unless the operator explicitly selects one principal
    profile for typed import; multiple browser databases are never merged by
    copying files.
-6. Synchronize the new roots and directories, write a durable migration receipt,
+6. Synchronize the new roots, write a durable migration receipt,
    and atomically replace `etc/layout-version` with `2` as the final commit
    point. Only then may the daemon serve principals or mounts.
-7. Retain `var/state.db/` read-only as the authenticated rollback/export source
-   until an explicit later cleanup after backup. Once version-two writes have
-   been acknowledged, running a version-one binary against the home is refused;
-   rollback requires a supported export or restoration of the pre-migration
-   snapshot.
+7. After the receipt and version-two sentinel are durable, delete the verified
+   `var/state.db/` import source and synchronize its parent. Re-entry completes
+   this retirement after a crash. Running a version-one binary against the home
+   is refused; rollback requires an operator-owned pre-migration backup.
 
 Migration restart is idempotent. Before the version-two sentinel is committed,
 the intent and verified target determine whether to resume, quarantine, or
@@ -824,27 +723,28 @@ binaries on macOS and Linux. It covers empty, single-principal, and
 multi-principal installations; an already partially migrated development home;
 and fault injection at every durable migration boundary. It must also prove
 repeat execution, corrupt-source refusal, low-disk refusal, permission repair or
-refusal, byte preservation of every existing principal home, stable owner
-derivation, cross-fleet denial, and a correct first mount of the new `srv/`
-subtree. Windows separately proves a clean version-two installation and mount;
+refusal, preservation of private runtime inputs, stable owner derivation,
+cross-fleet denial, legacy-source retirement, and a correct first logical owner
+mount. Windows separately proves a clean version-two installation and mount;
 an unreleased developer-home importer has its own non-release evidence track.
 
 Current implementation contains the digest-verifying SurrealKV importer,
-preserves the legacy source, quarantines an incomplete typed-store destination,
+retires the verified legacy source, quarantines an incomplete typed-store destination,
 migrates alias-keyed roots to stable principal UIDs, and strictly admits exact
 layout sentinels. Under the singleton lock it writes a canonical, content-bound
 intent before opening either store; the record binds source inventory and
 physical roots, target store and owner-codec format, and exact executable bytes.
-It commits a matching fleet-bearing receipt and layout two only after store and
+It commits a matching receipt and layout two only after store and
 ownership bootstrap. Unix migration copy and directory creation retain
 directory capabilities and reject redirects; a non-empty home without a
 sentinel is refused. `StateOwnerCodecV2` supplies the fleet tag without changing
 the frozen version-one domain, and the CLI/provider boundary is versioned and
-typed. These are useful pieces, not completion of the release contract. An
-exact macOS arm64 v0.10.4 home fixture exercises the importer without mutating
-the legacy source. Native provider companions, fleet quota accounting, an exact
-Linux v0.10.4 home, low-disk evidence, and the complete fault matrix remain
-unproven. The release remains blocked until these gaps close together.
+typed. The authoritative filesystem, kernel lease callback service, CLI
+contract, and native macOS FSKit implementation are present. An exact macOS
+arm64 v0.10.4 home fixture imports, verifies, commits, and deletes the legacy
+store. Linux and Windows native adapters, capsule-governed user/fleet allocation
+policy, an exact Linux v0.10.4 home, low-disk evidence, and the complete fault
+matrix remain follow-up evidence.
 
 ## 11. Product story
 
@@ -869,34 +769,30 @@ The security qualification is:
 > Principals preserve attribution and independent views inside the cooperative
 > fleet; the hard tenant boundary is between users' home fleets.
 
-## 12. Implementation order
+## 12. Remaining implementation order
 
-1. Complete the release migration evidence with an exact Linux v0.10.4 fixture,
-   interrupted-step recovery, byte-preservation checks, and refusal by old
-   binaries. Keep any Windows development-home importer explicit and outside
-   the public migration promise.
-2. Materialize fleet-owned roots and user/fleet accounting through the admitted
-   `StateOwnerCodecV2`; keep the separate `StateOwnerV1` grammar frozen.
-3. Expose read-only ownership inspection and authenticated user/fleet context.
-4. Define the versioned kernel-stamped actor context, capsule-composition
-   contract, and AOS connector contract. Admit unlike harness and service
-   compositions to stable principals without giving a capsule or connector
-   authority to self-select its identity.
-5. Implement the provider-neutral path/inode, staging, publication, mount-lease,
-   and doctor contracts.
-6. Project supported system, fleet, principal-overlay, application, browser, and
-   team resources through the canonical `AstridHome` hierarchy. Keep workspaces
-   as explicit attachments.
-7. Add the fleet directory, team service, inboxes, tasks, receipts, wakeups, and
-   attenuated handle delegation.
-8. Implement one hosted mount, browser, and desktop adapter used concurrently by
-   unlike harness compositions and external connectors, with crash, `mmap`,
-   compiler, provider-death, daemon-upgrade, and repair evidence.
-9. Add the remaining macOS, Linux, and Windows mount/desktop adapters against the
-   same behavioral contract.
-10. Adapt the Linux Realm capsule to consume the same view. Add a fleet-affine
-   cooperative mode without removing its principal-isolated mode.
-11. Optimize density through shared immutable pages, checkpoints, physical
+The provider-neutral filesystem operations, owner-bound kernel leases, CLI
+handoff, macOS FSKit adapter, and exact macOS v0.10.4 migration fixture are now
+implemented. Remaining work is ordered as follows:
+
+1. Complete release migration evidence with an exact Linux v0.10.4 fixture,
+   interrupted-step recovery, refusal by old binaries, and the low-disk and
+   corrupt-source matrix. Keep any Windows development-home importer explicit
+   and outside the public migration promise.
+2. Move user/fleet allocation decisions into a fleet-scoped policy capsule as
+   tracked by [issue #1539](https://github.com/astrid-runtime/astrid/issues/1539).
+   The kernel continues to meter usage, enforce admitted limits and hard
+   ceilings, and fail closed without synchronous capsule IPC in a store
+   transaction.
+3. Implement the native Linux FUSE and Windows WinFsp adapters against the same
+   callback protocol, then adapt the AOS Linux Realm to choose a principal disk,
+   fleet-shared disk, or both without changing storage authority.
+4. Extend filesystem compatibility where workloads justify it: durable rich
+   metadata, symbolic links, extended attributes, locking, `mmap`, sparse-file
+   policy, provider restart recovery, and adversarial compiler/editor tests.
+5. Add the fleet directory, team service, inboxes, tasks, receipts, wakeups,
+   attenuated handle delegation, browser service, and desktop adapters.
+6. Optimize density through shared immutable pages, checkpoints, physical
    objects, workers, and provider-specific fleet residency without weakening
    cross-fleet isolation or principal attribution.
 
@@ -906,8 +802,8 @@ user's fleet. At least one composition is an agent harness, one is a
 non-cognitive service such as a vault, and an external AOS connector is present:
 
 - every user recovers the same stable home fleet and never another user's fleet;
-- every mount preserves canonical `AstridHome` paths across macOS, Windows, and
-  Linux while applying the admitted principal or sysadmin view;
+- every mount preserves canonical logical paths across macOS, Windows, and
+  Linux while applying the admitted principal, fleet, or system-owner view;
 - same-fleet principals share the ambient computer-authority profile, common
   files, browser sign-ins, and cookies;
 - same-fleet principals retain independent overlays, working contexts, process

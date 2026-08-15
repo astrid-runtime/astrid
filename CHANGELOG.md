@@ -24,6 +24,16 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   Closes #1529.
 ### Added
 
+- **Astrid storage now exposes authoritative principal, fleet, and system-owner
+  filesystem views without a host-directory projection.** Regular files remain
+  immutable content DAGs, directories live in the same owner catalog, and
+  acknowledged create, write, truncate, remove, rename, and sync operations
+  atomically publish through the typed store. Kernel-issued leases bind owner,
+  access, expiry, and a private callback secret; the native macOS 26 FSKit app
+  extension and co-installed lifecycle companion implement the first mounted
+  drive. The provider-neutral contract reserves Linux FUSE and Windows WinFsp
+  adapters without pretending those native adapters are already shipped.
+  Mounting does not provision storage. Refs #1391 and #1534.
 - **Astrid home layout version two now has a crash-resumable release upgrade
   boundary and canonical fleet-served paths.** New homes create
   `srv/fleets/{fleet_uid}/{shared,workspaces}` and durable migration records;
@@ -37,6 +47,23 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   exchange with a co-installed FSKit, libfuse, or WinFsp provider, including
   capability validation and stable mount IDs, without provisioning storage.
   Refs #1391.
+  boundary.** Released layout-one homes keep their sentinel until the principal
+  store and ownership graph have migrated, adopt otherwise-unowned legacy
+  principals into the operator's home fleet, and preserve private runtime
+  configuration. After the content-bound receipt and layout `2` sentinel are
+  durable, the verified `var/state.db` import source is deleted. No physical
+  `srv/fleets/...` or other served copy is created. Exact sentinel admission,
+  redirected-path rejection, and the separate fleet-aware owner codec fail
+  closed.
+
+### Changed
+
+- **Reviewed semver-compatible Rust dependencies were refreshed independently
+  of migration-sensitive upgrades.** Routine fixes and additive releases for
+  the async runtime, serialization, TLS, storage, CLI, matching, and platform
+  support stack are updated without changing rmcp, Wasmtime/WASM tooling,
+  TOML, base64, or other dependencies that require dedicated migration review.
+  Closes #1529.
 
 ### Fixed
 

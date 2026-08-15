@@ -30,6 +30,8 @@ astrid-events = { workspace = true }
 astrid-runtime = { workspace = true }
 astrid-storage = { workspace = true, features = ["legacy-surrealkv"] }
 base64 = { workspace = true }
+blake3 = { workspace = true }
+nix = { workspace = true }
 # Used to build the `chrono::Duration` TTL passed to `CapabilityToken::create`
 # in the admin token-mint handler (issue #929). The token API takes a signed
 # chrono duration; `default-features = false` (workspace) is sufficient —

@@ -28,7 +28,7 @@
 //! │   ├── principal-store/               authoritative typed principal state
 //! │   ├── content-staging/                private acknowledged-write staging
 //! │   ├── migrations/                     durable layout intents and receipts
-//! │   └── state.db/                      read-only legacy SurrealKV import source
+//! │   └── state.db/                      temporary legacy import source (removed after verification)
 //! ├── run/                               ephemeral runtime state
 //! │   ├── system.sock
 //! │   ├── system.token
@@ -38,9 +38,6 @@
 //! ├── keys/                              runtime signing key
 //! ├── bin/                               content-addressed compiled WASM binaries
 //! ├── lib/                               shared WASM component libraries (WIT, future)
-//! ├── srv/fleets/{fleet_uid}/            fleet-owned served data
-//! │   ├── shared/                        durable common files
-//! │   └── workspaces/                    admitted attachment points
 //! └── home/
 //!     └── {principal}/                   per-principal home
 //!         ├── .local/
@@ -424,7 +421,10 @@ impl AstridHome {
                 self.write_layout_version(LAYOUT_VERSION)?;
             },
             Some(LEGACY_LAYOUT_VERSION) => {},
-            Some(LAYOUT_VERSION) => self.ensure_layout_v2_dirs()?,
+            Some(LAYOUT_VERSION) => {
+                self.ensure_layout_v2_dirs()?;
+                self.retire_verified_legacy_source()?;
+            },
             Some(_) => unreachable!("layout version was validated before directory creation"),
         }
         #[cfg(windows)]

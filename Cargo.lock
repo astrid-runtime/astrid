@@ -722,10 +722,12 @@ dependencies = [
  "astrid-vfs",
  "async-trait",
  "base64 0.23.1",
+ "blake3",
  "chrono",
  "dashmap",
  "hex",
  "metrics",
+ "nix 0.31.3",
  "rand 0.10.2",
  "semver",
  "serde",
@@ -835,6 +837,19 @@ dependencies = [
  "serde_json",
  "tempfile",
  "walkdir",
+]
+
+[[package]]
+name = "astrid-storage-provider-fskit"
+version = "0.10.4"
+dependencies = [
+ "anyhow",
+ "astrid-core",
+ "astrid-uplink",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

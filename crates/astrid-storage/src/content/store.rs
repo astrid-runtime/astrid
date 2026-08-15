@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::Read;
 use std::marker::PhantomData;
@@ -39,6 +39,25 @@ pub(super) const STAGING_BATCH_TARGET_BYTES: usize = 4 * 1024 * 1024;
 const VERIFIED_CONTENT_CACHE_KEY: ProjectionCacheKey = ProjectionCacheKey::new(1);
 const PARTIAL_VERIFICATION_CACHE_KEY: ProjectionCacheKey = ProjectionCacheKey::new(2);
 const DECODED_HEADER_CACHE_KEY: ProjectionCacheKey = ProjectionCacheKey::new(3);
+
+fn validated_rename_sets<'a>(
+    moves: &'a [(ContentName, ContentName)],
+    replacements: &'a [ContentName],
+) -> Option<(BTreeSet<&'a ContentName>, BTreeSet<&'a ContentName>)> {
+    let sources = moves
+        .iter()
+        .map(|(source, _)| source)
+        .collect::<BTreeSet<_>>();
+    let destinations = moves
+        .iter()
+        .map(|(_, destination)| destination)
+        .collect::<BTreeSet<_>>();
+    let replacement_set = replacements.iter().collect::<BTreeSet<_>>();
+    (sources.len() == moves.len()
+        && destinations.len() == moves.len()
+        && replacement_set.len() == replacements.len())
+    .then_some((sources, replacement_set))
+}
 
 /// Named content projection over one shared principal-state engine.
 pub struct PrincipalContentStore<P: Ord, E> {
@@ -511,6 +530,138 @@ where
             let catalog = header.catalog;
             let transaction =
                 self.encode_transaction(principal.clone(), header, None, mutation.records)?;
+            match self.engine.commit_root(transaction) {
+                Ok(_) => {
+                    self.validated_catalogs.lock().insert(
+                        principal.clone(),
+                        CatalogValidation {
+                            root: catalog.map(|root| root.object),
+                            summary: catalog.map_or(CatalogSummary::default(), |root| root.summary),
+                        },
+                    );
+                    return Ok(true);
+                },
+                Err(PrincipalProjectionError::Model(ModelError::RootConflict { .. })) => {},
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
+    /// Atomically rename exact catalog names without reconstructing file bytes.
+    ///
+    /// Every source must exist, destinations must be unique, and a destination
+    /// may not exist unless it is also one of the supplied sources. Validation
+    /// and publication occur against the same owner-root generation; root
+    /// conflicts retry the complete move from a fresh snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns a projection, quota, or validation error. `Ok(false)` means the
+    /// source/destination preconditions did not hold and no root was published.
+    pub fn rename_batch(
+        &self,
+        principal: &P,
+        moves: &[(ContentName, ContentName)],
+    ) -> Result<bool, PrincipalContentError> {
+        self.rename_batch_replacing(principal, moves, &[])
+    }
+
+    /// Atomically rename exact catalog names and remove admitted destinations.
+    ///
+    /// `replacements` are deleted in the same owner-root transition before
+    /// the moved values are inserted. Callers must perform filesystem type and
+    /// empty-directory checks before admitting replacement names.
+    ///
+    /// # Errors
+    ///
+    /// Returns a principal-graph, projection, or quota error without partially
+    /// changing the catalog.
+    pub fn rename_batch_replacing(
+        &self,
+        principal: &P,
+        moves: &[(ContentName, ContentName)],
+        replacements: &[ContentName],
+    ) -> Result<bool, PrincipalContentError> {
+        if moves.is_empty() {
+            return Ok(true);
+        }
+        let Some((sources, replacements)) = validated_rename_sets(moves, replacements) else {
+            return Ok(false);
+        };
+        loop {
+            let mut header = self.header(principal)?.as_ref().clone();
+            let mut values = Vec::with_capacity(moves.len());
+            for (source, destination) in moves {
+                let Some(value) = self.catalog_lookup(principal, header.catalog, source)? else {
+                    return Ok(false);
+                };
+                if !sources.contains(destination)
+                    && !replacements.contains(destination)
+                    && self
+                        .catalog_lookup(principal, header.catalog, destination)?
+                        .is_some()
+                {
+                    return Ok(false);
+                }
+                values.push(value);
+            }
+
+            let mut records = BTreeMap::<ObjectId, ObjectRecord>::new();
+            for (source, _) in moves {
+                let mutation = delete(
+                    header.catalog,
+                    source,
+                    &mut |object| match records.get(&object) {
+                        Some(record) => Ok(record.clone()),
+                        None => self.load_required_for(principal, object),
+                    },
+                    &|record| self.engine.identify_object(record),
+                )?;
+                if mutation.previous.is_none() {
+                    return Ok(false);
+                }
+                header.catalog = mutation.root;
+                records.extend(mutation.records);
+            }
+            for replacement in &replacements {
+                if sources.contains(replacement) {
+                    continue;
+                }
+                let mutation = delete(
+                    header.catalog,
+                    replacement,
+                    &mut |object| match records.get(&object) {
+                        Some(record) => Ok(record.clone()),
+                        None => self.load_required_for(principal, object),
+                    },
+                    &|record| self.engine.identify_object(record),
+                )?;
+                if mutation.previous.is_none() {
+                    return Ok(false);
+                }
+                header.catalog = mutation.root;
+                records.extend(mutation.records);
+            }
+            for ((_, destination), value) in moves.iter().zip(values) {
+                let mutation = insert(
+                    header.catalog,
+                    destination,
+                    value,
+                    &mut |object| match records.get(&object) {
+                        Some(record) => Ok(record.clone()),
+                        None => self.load_required_for(principal, object),
+                    },
+                    &|record| self.engine.identify_object(record),
+                )?;
+                if mutation.previous.is_some() {
+                    return Ok(false);
+                }
+                header.catalog = mutation.root;
+                records.extend(mutation.records);
+            }
+            self.enforce_quota(principal, &header)?;
+            let catalog = header.catalog;
+            let transaction = self.encode_transaction(principal.clone(), header, None, records)?;
             match self.engine.commit_root(transaction) {
                 Ok(_) => {
                     self.validated_catalogs.lock().insert(

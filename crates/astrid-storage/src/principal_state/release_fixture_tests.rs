@@ -9,7 +9,7 @@ use sha2::{Digest as _, Sha256};
 
 use super::{StateOwner, open_runtime_principal_store};
 use crate::KvQuotaResolver;
-use astrid_core::dirs::{AstridHome, LEGACY_LAYOUT_VERSION};
+use astrid_core::dirs::{AstridHome, LEGACY_LAYOUT_VERSION, LayoutMigrationTarget};
 
 #[derive(Deserialize)]
 struct StateDbFixture {
@@ -64,7 +64,7 @@ fn assert_fixture_identity() {
 }
 
 #[tokio::test]
-async fn published_v0104_home_imports_without_mutating_legacy_bytes() {
+async fn published_v0104_home_imports_verifies_and_retires_legacy_store() {
     assert_fixture_identity();
     let directory = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(directory.path());
@@ -75,6 +75,18 @@ async fn published_v0104_home_imports_without_mutating_legacy_bytes() {
             .trim(),
         LEGACY_LAYOUT_VERSION
     );
+    for (relative, expected) in &source_files {
+        assert_eq!(
+            std::fs::read(home.state_db_path().join(relative)).unwrap(),
+            expected.as_slice()
+        );
+    }
+    let migration_target = LayoutMigrationTarget::new(
+        super::RUNTIME_STORE_FORMAT_ID,
+        "v0.10.4-release-fixture-test-binary",
+    )
+    .unwrap();
+    home.begin_layout_v2_migration(&migration_target).unwrap();
     let quota: Arc<dyn KvQuotaResolver<StateOwner>> = Arc::new(|owner: &StateOwner| {
         Ok(match owner {
             StateOwner::System => None,
@@ -92,21 +104,25 @@ async fn published_v0104_home_imports_without_mutating_legacy_bytes() {
             .unwrap()
             .is_some()
     );
-    for (relative, expected) in source_files {
-        assert_eq!(
-            std::fs::read(home.state_db_path().join(relative)).unwrap(),
-            expected
-        );
-    }
-    assert_eq!(
-        std::fs::read_to_string(home.layout_version_path())
-            .unwrap()
-            .trim(),
-        LEGACY_LAYOUT_VERSION
-    );
     assert!(
         home.principal_store_path()
             .join("migration.complete")
+            .is_file()
+    );
+    home.complete_layout_v2(&migration_target).unwrap();
+    assert!(!home.state_db_path().exists());
+    assert!(!home.root().join("srv").exists());
+    assert!(
+        home.migrations_dir()
+            .join("layout-v1-to-v2.complete")
+            .is_file()
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.layout_version_path()).unwrap(),
+        astrid_core::dirs::LAYOUT_VERSION
+    );
+    assert!(
+        home.profile_path(&astrid_core::PrincipalId::default())
             .is_file()
     );
 }

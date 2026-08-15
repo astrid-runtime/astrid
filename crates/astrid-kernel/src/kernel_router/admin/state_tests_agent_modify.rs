@@ -42,6 +42,7 @@ fn assert_success(res: &AdminResponseBody) {
         | AdminResponseBody::PairToken(_)
         | AdminResponseBody::PairTokenRedeemed(_)
         | AdminResponseBody::PairDeviceListed(_)
+        | AdminResponseBody::StorageMountLease(_)
         | AdminResponseBody::PairDeviceRevoked { .. } => {},
         AdminResponseBody::Error(msg) => panic!("expected success, got Error: {msg}"),
     }

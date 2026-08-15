@@ -55,6 +55,7 @@ mod state_tests_caps_tokens;
 mod state_tests_group;
 #[cfg(test)]
 mod state_tests_usage;
+mod storage_mount_handlers;
 #[cfg(test)]
 mod tests;
 
@@ -231,7 +232,11 @@ pub fn resolve_admin_scope(req: &AdminRequestKind, caller: &PrincipalId) -> Auth
         // a principal lists / revokes its own devices with `self:auth:pair`;
         // operating on another principal's devices needs the global form.
         | AdminRequestKind::PairDeviceList { principal }
-        | AdminRequestKind::PairDeviceRevoke { principal, .. } => {
+        | AdminRequestKind::PairDeviceRevoke { principal, .. }
+        | AdminRequestKind::StorageMountIssue {
+            view: astrid_core::storage_provider::StorageProviderViewV1::Principal(principal),
+            ..
+        } => {
             if principal == caller {
                 AuthorityScope::Self_
             } else {
@@ -252,7 +257,14 @@ pub fn resolve_admin_scope(req: &AdminRequestKind, caller: &PrincipalId) -> Auth
         // `AuthorityScope::Global` below, so this widening is read-only.
         AdminRequestKind::AgentList
         | AdminRequestKind::GroupList
-        | AdminRequestKind::PairDeviceIssue { .. } => AuthorityScope::Self_,
+        | AdminRequestKind::PairDeviceIssue { .. }
+        | AdminRequestKind::StorageMountStatus { .. }
+        | AdminRequestKind::StorageMountSync { .. }
+        | AdminRequestKind::StorageMountRevoke { .. }
+        | AdminRequestKind::StorageMountIssue {
+            view: astrid_core::storage_provider::StorageProviderViewV1::Fleet(_),
+            ..
+        } => AuthorityScope::Self_,
         AdminRequestKind::AgentCreate { .. }
         | AdminRequestKind::AgentDelete { .. }
         | AdminRequestKind::AgentEnable { .. }
@@ -270,7 +282,11 @@ pub fn resolve_admin_scope(req: &AdminRequestKind, caller: &PrincipalId) -> Auth
         | AdminRequestKind::InviteRedeem { .. }
         | AdminRequestKind::InviteList
         | AdminRequestKind::InviteRevoke { .. }
-        | AdminRequestKind::PairDeviceRedeem { .. } => AuthorityScope::Global,
+        | AdminRequestKind::PairDeviceRedeem { .. }
+        | AdminRequestKind::StorageMountIssue {
+            view: astrid_core::storage_provider::StorageProviderViewV1::Admin,
+            ..
+        } => AuthorityScope::Global,
         // Note: PairDeviceIssue is intrinsically self-scoped — the
         // kernel binds the token to the caller's own principal
         // regardless of any wire-level hint. Folded into the Self_
@@ -374,6 +390,64 @@ pub fn required_capability_for_admin_request(
             AdminRequestKind::PairDeviceList { .. } | AdminRequestKind::PairDeviceRevoke { .. },
             AuthorityScope::Global,
         ) => "auth:pair",
+        (
+            request @ (AdminRequestKind::StorageMountIssue { .. }
+            | AdminRequestKind::StorageMountStatus { .. }
+            | AdminRequestKind::StorageMountSync { .. }
+            | AdminRequestKind::StorageMountRevoke { .. }),
+            scope,
+        ) => storage_mount_required_capability(request, scope),
+    }
+}
+
+fn storage_mount_required_capability(
+    request: &AdminRequestKind,
+    scope: AuthorityScope,
+) -> &'static str {
+    use astrid_core::storage_provider::{StorageProviderAccessV1, StorageProviderViewV1};
+
+    match (request, scope) {
+        (
+            AdminRequestKind::StorageMountIssue {
+                view: StorageProviderViewV1::Admin,
+                access: StorageProviderAccessV1::ReadOnly,
+                ..
+            },
+            _,
+        ) => "storage:mount:system:read",
+        (
+            AdminRequestKind::StorageMountIssue {
+                view: StorageProviderViewV1::Admin,
+                access: StorageProviderAccessV1::ReadWrite,
+                ..
+            },
+            _,
+        ) => "storage:mount:system:write",
+        (
+            AdminRequestKind::StorageMountIssue {
+                access: StorageProviderAccessV1::ReadOnly,
+                ..
+            },
+            AuthorityScope::Self_,
+        ) => "self:storage:mount:read",
+        (
+            AdminRequestKind::StorageMountIssue {
+                access: StorageProviderAccessV1::ReadWrite,
+                ..
+            },
+            AuthorityScope::Self_,
+        ) => "self:storage:mount:write",
+        (
+            AdminRequestKind::StorageMountIssue {
+                access: StorageProviderAccessV1::ReadOnly,
+                ..
+            },
+            AuthorityScope::Global,
+        ) => "storage:mount:read",
+        (AdminRequestKind::StorageMountIssue { .. }, AuthorityScope::Global) => {
+            "storage:mount:write"
+        },
+        _ => "self:storage:mount",
     }
 }
 
@@ -408,6 +482,10 @@ pub fn admin_request_method(req: &AdminRequestKind) -> &'static str {
         AdminRequestKind::PairDeviceRedeem { .. } => "admin.auth.pair.redeem",
         AdminRequestKind::PairDeviceList { .. } => "admin.auth.pair.list",
         AdminRequestKind::PairDeviceRevoke { .. } => "admin.auth.pair.revoke",
+        AdminRequestKind::StorageMountIssue { .. } => "admin.storage.mount.issue",
+        AdminRequestKind::StorageMountStatus { .. } => "admin.storage.mount.status",
+        AdminRequestKind::StorageMountSync { .. } => "admin.storage.mount.sync",
+        AdminRequestKind::StorageMountRevoke { .. } => "admin.storage.mount.revoke",
     }
 }
 
@@ -528,7 +606,11 @@ pub fn admin_target_principal(req: &AdminRequestKind) -> Option<&PrincipalId> {
         | AdminRequestKind::InviteList
         | AdminRequestKind::InviteRevoke { .. }
         | AdminRequestKind::PairDeviceIssue { .. }
-        | AdminRequestKind::PairDeviceRedeem { .. } => None,
+        | AdminRequestKind::PairDeviceRedeem { .. }
+        | AdminRequestKind::StorageMountIssue { .. }
+        | AdminRequestKind::StorageMountStatus { .. }
+        | AdminRequestKind::StorageMountSync { .. }
+        | AdminRequestKind::StorageMountRevoke { .. } => None,
     }
 }
 

@@ -17,7 +17,7 @@ use crate::{FleetUid, PrincipalId};
 pub const STORAGE_PROVIDER_PROTOCOL_V1: u16 = 1;
 
 /// Correlation identity for one provider request.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Hash, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct StorageProviderRequestId(Uuid);
 
@@ -35,16 +35,28 @@ impl Default for StorageProviderRequestId {
     }
 }
 
-/// Stable provider-issued identity for one admitted mount lease.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+/// Stable kernel-issued identity for one admitted mount lease.
+#[derive(Clone, Copy, Debug, Deserialize, Hash, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct StorageMountId(Uuid);
 
 impl StorageMountId {
+    /// Generate a fresh mount identity.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
     /// Construct a mount identity from provider-generated UUID bytes.
     #[must_use]
     pub const fn from_uuid(value: Uuid) -> Self {
         Self(value)
+    }
+}
+
+impl Default for StorageMountId {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -155,7 +167,7 @@ impl StorageProviderRequestV1 {
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StorageProviderCapabilityV1 {
-    /// Provider supports principal-overlay views.
+    /// Provider supports principal-owned authoritative filesystem views.
     PrincipalView,
     /// Provider supports fleet-shared views.
     FleetView,

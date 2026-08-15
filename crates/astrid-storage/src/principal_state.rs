@@ -3,8 +3,9 @@
 //! The legacy raw KV database is migrated under the kernel's singleton boot
 //! lock. A durable store is not served until every legacy entry has been
 //! imported, independently verified by owner, flushed, and covered by a
-//! completion marker. The legacy database remains untouched as a recovery
-//! source.
+//! completion marker. The layout cutover retains the legacy database until
+//! that verification succeeds, records a content-bound receipt, and then
+//! removes the retired source.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

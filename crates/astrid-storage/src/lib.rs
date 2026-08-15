@@ -40,6 +40,8 @@ pub mod content_dag;
 /// Principal-store execution engine.
 pub mod engine;
 pub mod error;
+/// Filesystem namespace semantics over authoritative Astrid content.
+pub mod filesystem;
 pub mod identity;
 pub mod kv;
 pub mod ownership;
@@ -72,6 +74,9 @@ pub use content::{
     SourceObservation, SourceScopeId, SourceTrust, StableSourceId,
 };
 pub use error::{StorageError, StorageResult};
+pub use filesystem::{
+    AstridFilesystem, FilesystemEntry, FilesystemEntryKind, FilesystemError, FilesystemPath,
+};
 pub use identity::{IdentityError, IdentityStore, KvIdentityStore};
 pub use kv::{
     KvEntry, KvPrincipalResolver, KvQuotaResolver, KvStore, MemoryKvStore, PrincipalKvStore,

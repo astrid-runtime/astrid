@@ -1,6 +1,5 @@
-//! Versioned Astrid-home layout migration and fleet-served paths.
+//! Versioned Astrid-home layout migration.
 
-use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::io::Read as _;
@@ -10,8 +9,6 @@ use std::path::{Path, PathBuf};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-
-use crate::FleetUid;
 
 use super::{AstridHome, LAYOUT_VERSION, LEGACY_LAYOUT_VERSION};
 
@@ -120,7 +117,6 @@ struct LayoutMigrationReceiptV1 {
     schema: u32,
     transaction_id: String,
     intent: LayoutMigrationRecordV1,
-    fleet_uids: Vec<String>,
 }
 
 impl AstridHome {
@@ -134,36 +130,6 @@ impl AstridHome {
     #[must_use]
     pub fn migrations_dir(&self) -> PathBuf {
         self.var_dir().join("migrations")
-    }
-
-    /// Fleet-owned served-data root (`srv/`).
-    #[must_use]
-    pub fn srv_dir(&self) -> PathBuf {
-        self.root().join("srv")
-    }
-
-    /// All fleet served-data roots (`srv/fleets/`).
-    #[must_use]
-    pub fn fleets_dir(&self) -> PathBuf {
-        self.srv_dir().join("fleets")
-    }
-
-    /// One fleet's canonical served-data root (`srv/fleets/{fleet_uid}/`).
-    #[must_use]
-    pub fn fleet_dir(&self, fleet_uid: FleetUid) -> PathBuf {
-        self.fleets_dir().join(fleet_uid.to_string())
-    }
-
-    /// One fleet's durable common-file projection root.
-    #[must_use]
-    pub fn fleet_shared_dir(&self, fleet_uid: FleetUid) -> PathBuf {
-        self.fleet_dir(fleet_uid).join("shared")
-    }
-
-    /// One fleet's admitted workspace-attachment root.
-    #[must_use]
-    pub fn fleet_workspaces_dir(&self, fleet_uid: FleetUid) -> PathBuf {
-        self.fleet_dir(fleet_uid).join("workspaces")
     }
 
     /// Persist the content-bound layout migration intent before opening stores.
@@ -194,7 +160,7 @@ impl AstridHome {
             },
         }
         reject_automatic_windows_layout_one()?;
-        self.preflight_layout_v2_paths(&BTreeSet::new())?;
+        self.preflight_layout_v2_paths()?;
         let intent = LayoutMigrationRecordV1::capture(self, target)?;
         ensure_migration_capacity(&self.var_dir(), intent.material.source.bytes)?;
         Self::ensure_private_dir(&self.migrations_dir())?;
@@ -205,52 +171,23 @@ impl AstridHome {
         )
     }
 
-    /// Ensure projection directories for an already committed layout-two home.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error unless the admitted layout is exactly version two or a
-    /// projection directory cannot be securely created.
-    pub fn ensure_layout_v2_fleet_dirs<I>(&self, fleet_uids: I) -> io::Result<()>
-    where
-        I: IntoIterator<Item = FleetUid>,
-    {
-        if self.layout_version()?.as_deref() != Some(LAYOUT_VERSION) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "layout-two projection directories require a committed layout-two sentinel",
-            ));
-        }
-        let fleets = fleet_uids.into_iter().collect::<BTreeSet<_>>();
-        self.preflight_layout_v2_paths(&fleets)?;
-        self.ensure_layout_v2_dirs()?;
-        self.ensure_fleet_dirs(&fleets)
-    }
-
     /// Commit layout version two after store and ownership migration succeeds.
     ///
     /// The caller must hold the daemon singleton lock and must have completed
     /// the principal-store migration. This method first records an intent,
-    /// creates every fleet root, makes the released legacy database read-only
-    /// on Unix, writes a completion receipt, and replaces the layout sentinel
-    /// last. Re-entry is idempotent.
+    /// writes a completion receipt, replaces the layout sentinel, and only
+    /// then removes the verified legacy source. Re-entry finishes an
+    /// interrupted retirement without exposing a physical projection.
     ///
     /// # Errors
     ///
     /// Returns an error for an unknown source layout, redirected legacy state,
     /// directory creation, durability, or permission failures.
-    pub fn complete_layout_v2<I>(
-        &self,
-        fleet_uids: I,
-        target: &LayoutMigrationTarget,
-    ) -> io::Result<()>
-    where
-        I: IntoIterator<Item = FleetUid>,
-    {
-        let fleets = fleet_uids.into_iter().collect::<BTreeSet<_>>();
+    pub fn complete_layout_v2(&self, target: &LayoutMigrationTarget) -> io::Result<()> {
         match self.layout_version()?.as_deref() {
             Some(LAYOUT_VERSION) => {
-                return self.ensure_layout_v2_fleet_dirs(fleets);
+                self.ensure_layout_v2_dirs()?;
+                return self.retire_verified_legacy_source();
             },
             Some(LEGACY_LAYOUT_VERSION) => {},
             None => {
@@ -269,7 +206,7 @@ impl AstridHome {
 
         reject_automatic_windows_layout_one()?;
 
-        self.preflight_layout_v2_paths(&fleets)?;
+        self.preflight_layout_v2_paths()?;
         let intent = LayoutMigrationRecordV1::capture(self, target)?;
         admit_or_write_canonical(
             &self.migrations_dir().join(LAYOUT_MIGRATION_INTENT),
@@ -277,20 +214,18 @@ impl AstridHome {
             false,
         )?;
         self.ensure_layout_v2_dirs()?;
-        self.ensure_fleet_dirs(&fleets)?;
-        protect_legacy_source(&self.state_db_path())?;
         let receipt = LayoutMigrationReceiptV1 {
             schema: LAYOUT_MIGRATION_SCHEMA,
             transaction_id: intent.transaction_id.clone(),
             intent,
-            fleet_uids: fleets.iter().map(ToString::to_string).collect(),
         };
         admit_or_write_canonical(
             &self.migrations_dir().join(LAYOUT_MIGRATION_RECEIPT),
             &receipt,
             true,
         )?;
-        self.write_layout_version(LAYOUT_VERSION)
+        self.write_layout_version(LAYOUT_VERSION)?;
+        self.retire_verified_legacy_source()
     }
 
     /// Read the exact admitted layout version, or `None` when uninitialized.
@@ -315,43 +250,40 @@ impl AstridHome {
             self.content_staging_path(),
             self.migrations_dir(),
             self.cow_dir(),
-            self.srv_dir(),
-            self.fleets_dir(),
         ] {
             Self::ensure_private_dir(&path)?;
         }
         Ok(())
     }
 
-    fn ensure_fleet_dirs(&self, fleets: &BTreeSet<FleetUid>) -> io::Result<()> {
-        for fleet in fleets {
-            Self::ensure_private_dir(&self.fleet_shared_dir(*fleet))?;
-            Self::ensure_private_dir(&self.fleet_workspaces_dir(*fleet))?;
-        }
-        Ok(())
-    }
-
-    fn preflight_layout_v2_paths(&self, fleets: &BTreeSet<FleetUid>) -> io::Result<()> {
-        let mut paths = vec![
+    fn preflight_layout_v2_paths(&self) -> io::Result<()> {
+        let paths = [
             self.root().to_path_buf(),
             self.var_dir(),
             self.migrations_dir(),
             self.principal_store_path(),
             self.content_staging_path(),
             self.cow_dir(),
-            self.srv_dir(),
-            self.fleets_dir(),
             self.state_db_path(),
         ];
-        for fleet in fleets {
-            paths.push(self.fleet_dir(*fleet));
-            paths.push(self.fleet_shared_dir(*fleet));
-            paths.push(self.fleet_workspaces_dir(*fleet));
-        }
         for path in paths {
             verify_existing_ancestor(&path)?;
         }
         Ok(())
+    }
+
+    pub(super) fn retire_verified_legacy_source(&self) -> io::Result<()> {
+        let receipt_path = self.migrations_dir().join(LAYOUT_MIGRATION_RECEIPT);
+        if !receipt_path.is_file() {
+            if self.state_db_path().exists() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "layout-two home contains legacy state without a migration receipt",
+                ));
+            }
+            return Ok(());
+        }
+        retire_legacy_source(&self.state_db_path())
     }
 
     fn ensure_private_dir(path: &Path) -> io::Result<()> {
@@ -702,10 +634,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     }
 }
 
-#[cfg(unix)]
-fn protect_legacy_source(path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
-
+fn retire_legacy_source(path: &Path) -> io::Result<()> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -717,28 +646,26 @@ fn protect_legacy_source(path: &Path) -> io::Result<()> {
             format!("legacy state source is redirected: {}", path.display()),
         ));
     }
-    if metadata.is_dir() {
-        for entry in std::fs::read_dir(path)? {
-            protect_legacy_source(&entry?.path())?;
-        }
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o500))
-    } else if metadata.is_file() {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o400))
-    } else {
-        Err(io::Error::new(
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "legacy state source contains a special file: {}",
-                path.display()
-            ),
-        ))
+            format!("legacy state source is not a directory: {}", path.display()),
+        ));
     }
+    crate::platform_fs::verify_no_redirects(path)?;
+    std::fs::remove_dir_all(path)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("legacy state source has no parent"))?;
+    sync_directory(parent)
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
 }
 
 #[cfg(not(unix))]
-fn protect_legacy_source(_path: &Path) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "legacy layout protection is unsupported on this operating system",
-    ))
+fn sync_directory(_path: &Path) -> io::Result<()> {
+    Ok(())
 }

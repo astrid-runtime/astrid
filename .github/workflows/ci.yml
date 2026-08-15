@@ -448,6 +448,12 @@ jobs:
           key: ${{ runner.os }}-${{ github.job }}
           cache-on-failure: true
 
+      - name: Validate the native macOS FSKit provider
+        if: matrix.os == 'macos-latest'
+        env:
+          ASTRID_FSKIT_VALIDATE_PROJECT: "1"
+        run: scripts/check-macos-fskit.sh
+
       - name: Run tests
         if: matrix.os != 'macos-latest'
         run: cargo test --workspace --locked

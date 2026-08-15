@@ -72,6 +72,10 @@ pub const fn topic_suffix(req: &AdminRequestKind) -> &'static str {
         AdminRequestKind::PairDeviceRedeem { .. } => "auth.pair.redeem",
         AdminRequestKind::PairDeviceList { .. } => "auth.pair.list",
         AdminRequestKind::PairDeviceRevoke { .. } => "auth.pair.revoke",
+        AdminRequestKind::StorageMountIssue { .. } => "storage.mount.issue",
+        AdminRequestKind::StorageMountStatus { .. } => "storage.mount.status",
+        AdminRequestKind::StorageMountSync { .. } => "storage.mount.sync",
+        AdminRequestKind::StorageMountRevoke { .. } => "storage.mount.revoke",
     }
 }
 

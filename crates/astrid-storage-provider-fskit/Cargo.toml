@@ -1,0 +1,23 @@
+[package]
+name = "astrid-storage-provider-fskit"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Native macOS FSKit lifecycle provider for Astrid storage mounts"
+
+[dependencies]
+anyhow = { workspace = true }
+astrid-core = { workspace = true }
+astrid-uplink = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "process"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

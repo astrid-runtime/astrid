@@ -122,7 +122,7 @@ fn test_astrid_home_ensure_creates_dirs() {
     assert!(home.content_staging_path().exists());
     assert!(home.migrations_dir().exists());
     assert!(home.cow_dir().exists());
-    assert!(home.fleets_dir().exists());
+    assert!(!home.root().join("srv").exists());
 }
 
 #[test]
@@ -161,7 +161,7 @@ fn test_nonempty_home_without_layout_sentinel_is_refused_without_mutation() {
         std::fs::read(legacy.join("legacy")).unwrap(),
         b"preserve-me"
     );
-    assert!(!home.srv_dir().exists());
+    assert!(!home.root().join("srv").exists());
 }
 
 #[test]
@@ -207,13 +207,13 @@ fn test_layout_v1_is_not_committed_until_store_and_ownership_finish() {
         std::fs::read_to_string(home.layout_version_path()).unwrap(),
         LEGACY_LAYOUT_VERSION
     );
-    assert!(!home.srv_dir().exists());
+    assert!(!home.root().join("srv").exists());
     assert!(!home.migrations_dir().exists());
 }
 
 #[cfg(not(windows))]
 #[test]
-fn test_layout_v1_completion_preserves_existing_tree_and_creates_fleet_roots() {
+fn test_layout_v1_completion_preserves_private_home_without_served_projections() {
     let dir = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(test_home_root(&dir));
     crate::platform_fs::ensure_private_directory(&home.etc_dir()).unwrap();
@@ -225,15 +225,11 @@ fn test_layout_v1_completion_preserves_existing_tree_and_creates_fleet_roots() {
         .join("note");
     std::fs::create_dir_all(preserved.parent().unwrap()).unwrap();
     std::fs::write(&preserved, b"released-home-bytes").unwrap();
-    let fleet = crate::FleetUid::from_bytes([7; 32]);
-
     home.begin_layout_v2_migration(&migration_target()).unwrap();
-    home.complete_layout_v2([fleet], &migration_target())
-        .unwrap();
+    home.complete_layout_v2(&migration_target()).unwrap();
 
     assert_eq!(std::fs::read(&preserved).unwrap(), b"released-home-bytes");
-    assert!(home.fleet_shared_dir(fleet).is_dir());
-    assert!(home.fleet_workspaces_dir(fleet).is_dir());
+    assert!(!home.root().join("srv").exists());
     assert!(
         home.migrations_dir()
             .join("layout-v1-to-v2.intent")
@@ -248,8 +244,7 @@ fn test_layout_v1_completion_preserves_existing_tree_and_creates_fleet_roots() {
         std::fs::read_to_string(home.layout_version_path()).unwrap(),
         LAYOUT_VERSION
     );
-    home.complete_layout_v2([fleet], &migration_target())
-        .unwrap();
+    home.complete_layout_v2(&migration_target()).unwrap();
 }
 
 #[cfg(not(windows))]
@@ -263,11 +258,8 @@ fn test_layout_migration_records_are_canonical_and_content_bound() {
     std::fs::create_dir_all(home.state_db_path()).unwrap();
     std::fs::write(home.state_db_path().join("legacy"), b"legacy-bytes").unwrap();
     std::fs::create_dir_all(home.principal_store_path()).unwrap();
-    let fleet = crate::FleetUid::from_bytes([11; 32]);
-
     home.begin_layout_v2_migration(&migration_target()).unwrap();
-    home.complete_layout_v2([fleet], &migration_target())
-        .unwrap();
+    home.complete_layout_v2(&migration_target()).unwrap();
 
     let intent_path = home.migrations_dir().join("layout-v1-to-v2.intent");
     let receipt_path = home.migrations_dir().join("layout-v1-to-v2.complete");
@@ -286,17 +278,10 @@ fn test_layout_migration_records_are_canonical_and_content_bound() {
     assert_eq!(value["transaction_id"].as_str().unwrap().len(), 64);
     assert_eq!(receipt_value["intent"], value);
     assert_eq!(receipt_value["transaction_id"], value["transaction_id"]);
-    assert_eq!(
-        receipt_value["fleet_uids"],
-        serde_json::json!([fleet.to_string()])
-    );
+    assert!(receipt_value.get("fleet_uids").is_none());
+    assert!(!home.state_db_path().exists());
 
-    std::fs::write(home.layout_version_path(), LEGACY_LAYOUT_VERSION).unwrap();
-    let other_fleet = crate::FleetUid::from_bytes([12; 32]);
-    let error = home
-        .complete_layout_v2([other_fleet], &migration_target())
-        .unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    home.complete_layout_v2(&migration_target()).unwrap();
     assert_eq!(std::fs::read(intent_path).unwrap(), intent);
 }
 
@@ -311,7 +296,7 @@ fn test_layout_migration_rejects_redirected_destination_before_intent() {
     crate::platform_fs::ensure_private_directory(&home.etc_dir()).unwrap();
     std::fs::write(home.layout_version_path(), LEGACY_LAYOUT_VERSION).unwrap();
     home.ensure().unwrap();
-    symlink(outside.path(), home.srv_dir()).unwrap();
+    symlink(outside.path(), home.principal_store_path()).unwrap();
 
     let error = home
         .begin_layout_v2_migration(&migration_target())
@@ -349,9 +334,7 @@ fn test_windows_layout_one_requires_explicit_developer_import() {
 
 #[cfg(unix)]
 #[test]
-fn test_layout_v1_completion_makes_legacy_store_read_only() {
-    use std::os::unix::fs::PermissionsExt as _;
-
+fn test_layout_v1_completion_removes_verified_legacy_store() {
     let dir = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(test_home_root(&dir));
     crate::platform_fs::ensure_private_directory(&home.etc_dir()).unwrap();
@@ -362,24 +345,32 @@ fn test_layout_v1_completion_makes_legacy_store_read_only() {
     std::fs::write(&legacy_file, b"legacy").unwrap();
 
     home.begin_layout_v2_migration(&migration_target()).unwrap();
-    home.complete_layout_v2([], &migration_target()).unwrap();
+    home.complete_layout_v2(&migration_target()).unwrap();
 
-    assert_eq!(
-        std::fs::metadata(&legacy_file)
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
-        0o400
-    );
-    assert_eq!(
-        std::fs::metadata(home.state_db_path())
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
-        0o500
-    );
+    assert!(!legacy_file.exists());
+    assert!(!home.state_db_path().exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn test_layout_v2_startup_finishes_interrupted_legacy_retirement() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+    crate::platform_fs::ensure_private_directory(&home.etc_dir()).unwrap();
+    std::fs::write(home.layout_version_path(), LEGACY_LAYOUT_VERSION).unwrap();
+    home.ensure().unwrap();
+    std::fs::create_dir_all(home.state_db_path()).unwrap();
+    std::fs::write(home.state_db_path().join("legacy.data"), b"legacy").unwrap();
+    home.begin_layout_v2_migration(&migration_target()).unwrap();
+    home.complete_layout_v2(&migration_target()).unwrap();
+
+    // Recreate the exact post-sentinel/pre-retirement crash shape. Startup
+    // must use the durable receipt to finish retirement before serving.
+    std::fs::create_dir_all(home.state_db_path()).unwrap();
+    std::fs::write(home.state_db_path().join("legacy.data"), b"legacy").unwrap();
+    home.ensure().unwrap();
+
+    assert!(!home.state_db_path().exists());
 }
 
 #[cfg(unix)]
@@ -488,15 +479,6 @@ fn test_astrid_home_fhs_paths() {
     );
     assert_eq!(home.bin_dir(), PathBuf::from(format!("{r}/bin")));
     assert_eq!(home.home_dir(), PathBuf::from(format!("{r}/home")));
-    let fleet = crate::FleetUid::from_bytes([9; 32]);
-    assert_eq!(
-        home.fleet_shared_dir(fleet),
-        PathBuf::from(format!("{r}/srv/fleets/{fleet}/shared"))
-    );
-    assert_eq!(
-        home.fleet_workspaces_dir(fleet),
-        PathBuf::from(format!("{r}/srv/fleets/{fleet}/workspaces"))
-    );
 }
 
 // ── PrincipalHome ────────────────────────────────────────────────

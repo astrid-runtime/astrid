@@ -21,6 +21,8 @@ pub use readiness::{AgentLoopReadiness, AgentReadinessProbe, CapsuleTopicProbe, 
 
 use crate::PrincipalId;
 use crate::profile::Quotas;
+use crate::storage_filesystem::StorageMountLeaseV1;
+use crate::storage_provider::{StorageMountId, StorageProviderAccessV1, StorageProviderViewV1};
 use serde::{Deserialize, Serialize};
 
 /// The well-known system session UUID string used by the background daemon.
@@ -749,6 +751,34 @@ pub enum AdminRequestKind {
         /// The deterministic `key_id` of the device to remove.
         key_id: String,
     },
+    /// Issue an authenticated native filesystem lease. The handler resolves
+    /// the selected view to a typed store owner and starts a private callback
+    /// endpoint; the provider never receives a general daemon session token.
+    StorageMountIssue {
+        /// Principal, fleet, or supported system view.
+        view: StorageProviderViewV1,
+        /// Read-only or read-write access enforced on every callback.
+        access: StorageProviderAccessV1,
+        /// Native provider implementation requesting the lease.
+        provider: String,
+        /// Native mount target used for lifecycle lookup and audit.
+        mountpoint: std::path::PathBuf,
+    },
+    /// Inspect one live native filesystem lease.
+    StorageMountStatus {
+        /// Kernel-issued mount identity.
+        mount_id: StorageMountId,
+    },
+    /// Flush one live native filesystem lease.
+    StorageMountSync {
+        /// Kernel-issued mount identity.
+        mount_id: StorageMountId,
+    },
+    /// Revoke one native filesystem lease and its callback endpoint.
+    StorageMountRevoke {
+        /// Kernel-issued mount identity.
+        mount_id: StorageMountId,
+    },
 }
 
 /// Admin management API response wrapper carrying the echoed
@@ -822,6 +852,8 @@ pub enum AdminResponseBody {
         /// The `key_id` of the revoked device.
         key_id: String,
     },
+    /// Response for [`AdminRequestKind::StorageMountIssue`].
+    StorageMountLease(Box<StorageMountLeaseV1>),
     /// The request failed.
     Error(String),
 }

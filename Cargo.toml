@@ -25,6 +25,7 @@ members = [
     "crates/astrid-runtime",
     "crates/astrid-storage",
     "crates/astrid-storage-chunker-evidence",
+    "crates/astrid-storage-provider-fskit",
     "crates/astrid-telemetry",
     "crates/astrid-test",
     "crates/astrid-uplink",

@@ -182,6 +182,12 @@ async fn dispatch_inner(
         | AdminRequestKind::PairDeviceRevoke { .. }) => {
             pair_device_dispatch(kernel, caller, authorization, device_key_id, req).await
         },
+        req @ (AdminRequestKind::StorageMountIssue { .. }
+        | AdminRequestKind::StorageMountStatus { .. }
+        | AdminRequestKind::StorageMountSync { .. }
+        | AdminRequestKind::StorageMountRevoke { .. }) => {
+            super::storage_mount_handlers::dispatch(kernel, caller, authorization, req).await
+        },
     }
 }
 
