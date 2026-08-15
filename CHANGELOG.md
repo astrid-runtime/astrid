@@ -79,6 +79,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   patches.** Updated clap/clap_complete and which-rs after reviewing their
   help, derive, completion, and absolute-path lookup fixes. Astrid's command
   grammar and MCP stdio resolution contract are unchanged. Closes #1522.
+- **Reviewed patch-level runtime dependencies are current.** Updated anyhow,
+  async-trait, BLAKE3, libc, regex, Serde/serde_json, thiserror, UUID, the
+  `http` types crate, and toml_edit after reviewing each upstream change.
+  Persistent hash/wire formats and public APIs are unchanged. Closes #1520.
 
 - **Rust API compatibility CI now enforces only Astrid's supported public Rust
   contract.** Breaking changes to `astrid-types` remain merge-blocking unless
