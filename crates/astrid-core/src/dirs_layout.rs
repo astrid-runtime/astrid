@@ -737,5 +737,8 @@ fn protect_legacy_source(path: &Path) -> io::Result<()> {
 
 #[cfg(not(unix))]
 fn protect_legacy_source(_path: &Path) -> io::Result<()> {
-    Ok(())
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "legacy layout protection is unsupported on this operating system",
+    ))
 }

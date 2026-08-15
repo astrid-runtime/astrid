@@ -7,6 +7,39 @@ fn migration_target() -> LayoutMigrationTarget {
     LayoutMigrationTarget::new("test-store/3;state-owner-codec/2", "test-binary/1").unwrap()
 }
 
+fn test_home_root(dir: &tempfile::TempDir) -> PathBuf {
+    #[cfg(windows)]
+    {
+        dir.path().join("astrid-home")
+    }
+    #[cfg(not(windows))]
+    {
+        dir.path().to_path_buf()
+    }
+}
+
+fn parent_traversal_path() -> String {
+    #[cfg(windows)]
+    {
+        r"C:\tmp\..\etc".to_owned()
+    }
+    #[cfg(not(windows))]
+    {
+        "/tmp/../etc".to_owned()
+    }
+}
+
+fn absolute_test_home() -> String {
+    #[cfg(windows)]
+    {
+        r"C:\Users\astrid-test".to_owned()
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_owned())
+    }
+}
+
 // ── AstridHome resolution ────────────────────────────────────────
 
 #[test]
@@ -21,7 +54,7 @@ fn test_astrid_home_resolve_with_env() {
 
 #[test]
 fn test_astrid_home_resolve_default() {
-    let home_val = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let home_val = absolute_test_home();
     let home = AstridHome::resolve_with_env(None, Some(home_val.clone())).unwrap();
     let expected = PathBuf::from(home_val).join(".astrid");
     assert_eq!(home.root(), expected);
@@ -29,7 +62,7 @@ fn test_astrid_home_resolve_default() {
 
 #[test]
 fn test_astrid_home_rejects_traversal_in_astrid_home() {
-    let result = AstridHome::resolve_with_env(Some("/tmp/../etc".to_string()), None);
+    let result = AstridHome::resolve_with_env(Some(parent_traversal_path()), None);
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(
@@ -40,7 +73,7 @@ fn test_astrid_home_rejects_traversal_in_astrid_home() {
 
 #[test]
 fn test_astrid_home_rejects_traversal_in_home() {
-    let result = AstridHome::resolve_with_env(None, Some("/tmp/../etc".to_string()));
+    let result = AstridHome::resolve_with_env(None, Some(parent_traversal_path()));
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(
@@ -74,7 +107,7 @@ fn test_astrid_home_rejects_relative_home() {
 #[test]
 fn test_astrid_home_ensure_creates_dirs() {
     let dir = tempfile::tempdir().unwrap();
-    let home = AstridHome::from_path(dir.path());
+    let home = AstridHome::from_path(test_home_root(&dir));
     home.ensure().unwrap();
 
     assert!(home.etc_dir().exists());
@@ -95,7 +128,7 @@ fn test_astrid_home_ensure_creates_dirs() {
 #[test]
 fn test_astrid_home_ensure_writes_layout_version() {
     let dir = tempfile::tempdir().unwrap();
-    let home = AstridHome::from_path(dir.path());
+    let home = AstridHome::from_path(test_home_root(&dir));
     home.ensure().unwrap();
 
     let version_path = home.etc_dir().join("layout-version");
@@ -107,7 +140,7 @@ fn test_astrid_home_ensure_writes_layout_version() {
 #[test]
 fn test_astrid_home_ensure_idempotent() {
     let dir = tempfile::tempdir().unwrap();
-    let home = AstridHome::from_path(dir.path());
+    let home = AstridHome::from_path(test_home_root(&dir));
     home.ensure().unwrap();
     home.ensure().unwrap(); // second call should not fail
 }
@@ -115,9 +148,9 @@ fn test_astrid_home_ensure_idempotent() {
 #[test]
 fn test_nonempty_home_without_layout_sentinel_is_refused_without_mutation() {
     let dir = tempfile::tempdir().unwrap();
-    let home = AstridHome::from_path(dir.path());
+    let home = AstridHome::from_path(test_home_root(&dir));
     let legacy = home.var_dir().join("state.db");
-    std::fs::create_dir_all(&legacy).unwrap();
+    crate::platform_fs::ensure_private_directory(&legacy).unwrap();
     std::fs::write(legacy.join("legacy"), b"preserve-me").unwrap();
 
     let error = home.ensure().unwrap_err();
@@ -134,8 +167,8 @@ fn test_nonempty_home_without_layout_sentinel_is_refused_without_mutation() {
 #[test]
 fn test_layout_version_requires_canonical_exact_bytes() {
     let dir = tempfile::tempdir().unwrap();
-    let home = AstridHome::from_path(dir.path());
-    std::fs::create_dir_all(home.etc_dir()).unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+    crate::platform_fs::ensure_private_directory(&home.etc_dir()).unwrap();
     std::fs::write(home.layout_version_path(), b"1\n").unwrap();
 
     let error = home.ensure().unwrap_err();
@@ -147,8 +180,8 @@ fn test_layout_version_requires_canonical_exact_bytes() {
 #[test]
 fn test_astrid_home_rejects_unknown_layout_before_mutation() {
     let dir = tempfile::tempdir().unwrap();
-    let home = AstridHome::from_path(dir.path());
-    std::fs::create_dir_all(home.etc_dir()).unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+    crate::platform_fs::ensure_private_directory(&home.etc_dir()).unwrap();
     std::fs::write(home.layout_version_path(), "999").unwrap();
 
     let error = home.ensure().unwrap_err();
@@ -164,8 +197,8 @@ fn test_astrid_home_rejects_unknown_layout_before_mutation() {
 #[test]
 fn test_layout_v1_is_not_committed_until_store_and_ownership_finish() {
     let dir = tempfile::tempdir().unwrap();
-    let home = AstridHome::from_path(dir.path());
-    std::fs::create_dir_all(home.etc_dir()).unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+    crate::platform_fs::ensure_private_directory(&home.etc_dir()).unwrap();
     std::fs::write(home.layout_version_path(), LEGACY_LAYOUT_VERSION).unwrap();
 
     home.ensure().unwrap();
@@ -182,8 +215,8 @@ fn test_layout_v1_is_not_committed_until_store_and_ownership_finish() {
 #[test]
 fn test_layout_v1_completion_preserves_existing_tree_and_creates_fleet_roots() {
     let dir = tempfile::tempdir().unwrap();
-    let home = AstridHome::from_path(dir.path());
-    std::fs::create_dir_all(home.etc_dir()).unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+    crate::platform_fs::ensure_private_directory(&home.etc_dir()).unwrap();
     std::fs::write(home.layout_version_path(), LEGACY_LAYOUT_VERSION).unwrap();
     home.ensure().unwrap();
     let preserved = home
@@ -223,8 +256,8 @@ fn test_layout_v1_completion_preserves_existing_tree_and_creates_fleet_roots() {
 #[test]
 fn test_layout_migration_records_are_canonical_and_content_bound() {
     let dir = tempfile::tempdir().unwrap();
-    let home = AstridHome::from_path(dir.path());
-    std::fs::create_dir_all(home.etc_dir()).unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+    crate::platform_fs::ensure_private_directory(&home.etc_dir()).unwrap();
     std::fs::write(home.layout_version_path(), LEGACY_LAYOUT_VERSION).unwrap();
     home.ensure().unwrap();
     std::fs::create_dir_all(home.state_db_path()).unwrap();
@@ -274,8 +307,8 @@ fn test_layout_migration_rejects_redirected_destination_before_intent() {
 
     let dir = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
-    let home = AstridHome::from_path(dir.path());
-    std::fs::create_dir_all(home.etc_dir()).unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+    crate::platform_fs::ensure_private_directory(&home.etc_dir()).unwrap();
     std::fs::write(home.layout_version_path(), LEGACY_LAYOUT_VERSION).unwrap();
     home.ensure().unwrap();
     symlink(outside.path(), home.srv_dir()).unwrap();
@@ -297,8 +330,8 @@ fn test_layout_migration_rejects_redirected_destination_before_intent() {
 #[test]
 fn test_windows_layout_one_requires_explicit_developer_import() {
     let dir = tempfile::tempdir().unwrap();
-    let home = AstridHome::from_path(dir.path());
-    std::fs::create_dir_all(home.etc_dir()).unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+    crate::platform_fs::ensure_private_directory(&home.etc_dir()).unwrap();
     std::fs::write(home.layout_version_path(), LEGACY_LAYOUT_VERSION).unwrap();
     home.ensure().unwrap();
 
@@ -320,8 +353,8 @@ fn test_layout_v1_completion_makes_legacy_store_read_only() {
     use std::os::unix::fs::PermissionsExt as _;
 
     let dir = tempfile::tempdir().unwrap();
-    let home = AstridHome::from_path(dir.path());
-    std::fs::create_dir_all(home.etc_dir()).unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+    crate::platform_fs::ensure_private_directory(&home.etc_dir()).unwrap();
     std::fs::write(home.layout_version_path(), LEGACY_LAYOUT_VERSION).unwrap();
     home.ensure().unwrap();
     std::fs::create_dir_all(home.state_db_path()).unwrap();
@@ -355,7 +388,7 @@ fn test_astrid_home_ensure_sets_permissions() {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = tempfile::tempdir().unwrap();
-    let home = AstridHome::from_path(dir.path());
+    let home = AstridHome::from_path(test_home_root(&dir));
     home.ensure().unwrap();
 
     let root_perms = std::fs::metadata(home.root()).unwrap().permissions();
@@ -371,9 +404,9 @@ fn test_astrid_home_ensure_repairs_secrets_permissions_without_touching_contents
     use std::os::unix::fs::PermissionsExt;
 
     let dir = tempfile::tempdir().unwrap();
-    let home = AstridHome::from_path(dir.path());
+    let home = AstridHome::from_path(test_home_root(&dir));
     std::fs::create_dir_all(home.secrets_dir()).unwrap();
-    std::fs::create_dir_all(home.etc_dir()).unwrap();
+    crate::platform_fs::ensure_private_directory(&home.etc_dir()).unwrap();
     std::fs::write(home.layout_version_path(), LAYOUT_VERSION).unwrap();
     let secret = home.secrets_dir().join("existing-secret");
     let bytes = b"preserve-these-secret-bytes";
@@ -835,8 +868,15 @@ fn test_workspace_id_adopts_existing() {
     let dir = tempfile::tempdir().unwrap();
     let ws = WorkspaceDir::from_path(dir.path());
 
-    std::fs::create_dir_all(ws.dot_astrid()).unwrap();
+    crate::platform_fs::ensure_private_directory(&ws.dot_astrid()).unwrap();
     let pre_id = uuid::Uuid::new_v4();
+    #[cfg(windows)]
+    crate::platform_fs::atomic_write_private_file(
+        &ws.workspace_id_path(),
+        pre_id.to_string().as_bytes(),
+    )
+    .unwrap();
+    #[cfg(not(windows))]
     std::fs::write(ws.workspace_id_path(), pre_id.to_string()).unwrap();
 
     let id = ws.workspace_id().unwrap();
