@@ -9,6 +9,15 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+### Changed
+
+- **Reviewed semver-compatible Rust dependencies were refreshed independently
+  of migration-sensitive upgrades.** Routine fixes and additive releases for
+  the async runtime, serialization, TLS, storage, CLI, matching, and platform
+  support stack are updated without changing rmcp, Wasmtime/WASM tooling,
+  TOML, base64, or other dependencies that require dedicated migration review.
+  Closes #1529.
+
 ### Fixed
 
 - **WASM traps and host process spawning now coexist safely on macOS.** Astrid
