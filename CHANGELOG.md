@@ -75,6 +75,11 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Changed
 
+- **Capability and VFS pattern engines use reviewed compatible patches.**
+  Updated globset and ignore after auditing Astrid's authority-sensitive use of
+  single glob matchers and `.astridignore` deny rules. Added regressions for
+  file, directory, negation, and relative-file semantics. Closes #1524.
+
 - **Rust API compatibility CI now enforces only Astrid's supported public Rust
   contract.** Breaking changes to `astrid-types` remain merge-blocking unless
   explicitly declared, while semver and item-level diffs for internal workspace

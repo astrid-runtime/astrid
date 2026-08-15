@@ -72,3 +72,36 @@ impl IgnoreBoundary {
         self.matcher.matched(path, is_dir).is_ignore()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::IgnoreBoundary;
+
+    #[test]
+    fn content_rules_preserve_deny_and_negation_semantics() {
+        let root = tempfile::tempdir().unwrap();
+        let boundary = IgnoreBoundary::from_content(
+            root.path(),
+            ".env\nsecrets/**\n!secrets/public.txt\ncache/\n",
+        )
+        .unwrap();
+
+        assert!(boundary.is_ignored(root.path().join(".env"), false));
+        assert!(boundary.is_ignored(root.path().join("secrets/private.key"), false));
+        assert!(!boundary.is_ignored(root.path().join("secrets/public.txt"), false));
+        assert!(boundary.is_ignored(root.path().join("cache"), true));
+        assert!(!boundary.is_ignored(root.path().join("cache"), false));
+        assert!(!boundary.is_ignored(root.path().join("src/lib.rs"), false));
+    }
+
+    #[test]
+    fn file_rules_are_relative_to_the_ignore_file_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let ignore_path = root.path().join(".astridignore");
+        std::fs::write(&ignore_path, "private/**\n").unwrap();
+        let boundary = IgnoreBoundary::from_file(&ignore_path).unwrap();
+
+        assert!(boundary.is_ignored(root.path().join("private/token"), false));
+        assert!(!boundary.is_ignored(root.path().join("public/token"), false));
+    }
+}
