@@ -75,6 +75,11 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Changed
 
+- **CLI parsing, completions, and executable discovery use current compatible
+  patches.** Updated clap/clap_complete and which-rs after reviewing their
+  help, derive, completion, and absolute-path lookup fixes. Astrid's command
+  grammar and MCP stdio resolution contract are unchanged. Closes #1522.
+
 - **Rust API compatibility CI now enforces only Astrid's supported public Rust
   contract.** Breaking changes to `astrid-types` remain merge-blocking unless
   explicitly declared, while semver and item-level diffs for internal workspace
