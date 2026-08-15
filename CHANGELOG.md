@@ -84,6 +84,13 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Changed
 
+- **Astrid's MCP bridge now speaks the 2026-07-28 protocol through rmcp 3.1.**
+  Clients prefer stateless discovery and fall back explicitly to the
+  2025-11-25 initialization lifecycle for older stdio servers. Tool-call
+  responses use the new multi-round-trip result envelope, while rmcp's
+  stale-on-error response cache remains disabled because Astrid owns tool
+  inventory and capability invalidation. Closes #1531.
+
 - **The unpublished storage model, content DAG, engine, and resource-authority
   packages are now internal `astrid-storage` modules.** This preserves their
   tested boundaries without creating four additional crates.io products,

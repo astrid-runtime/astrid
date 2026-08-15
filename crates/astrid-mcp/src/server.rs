@@ -16,9 +16,10 @@ use process_wrap::tokio::JobObject;
 #[cfg(unix)]
 use process_wrap::tokio::ProcessGroup;
 use process_wrap::tokio::{CommandWrap, KillOnDrop};
-use rmcp::ServiceExt;
+use rmcp::model::ProtocolVersion;
 use rmcp::service::{Peer, RoleClient, RunningService};
 use rmcp::transport::TokioChildProcess;
+use rmcp::{ClientCacheConfig, ClientLifecycleMode, ClientServiceExt};
 
 use crate::capabilities::CapabilitiesHandler;
 use crate::capabilities::{AstridClientHandler, ServerNotice};
@@ -30,6 +31,15 @@ use tokio::sync::mpsc;
 
 /// Type alias for a running MCP client service.
 type McpService = RunningService<RoleClient, AstridClientHandler>;
+
+/// Prefer the current stateless discovery lifecycle while retaining explicit
+/// interoperability with pre-2026 servers.
+fn client_lifecycle_mode() -> ClientLifecycleMode {
+    ClientLifecycleMode::Auto {
+        preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+        legacy_version: Some(ProtocolVersion::V_2025_11_25),
+    }
+}
 
 /// Wrap an MCP subprocess in the platform's process-tree ownership primitive.
 ///
@@ -432,14 +442,22 @@ impl ServerManager {
         if let Some(tx) = notice_tx {
             client_handler = client_handler.with_notice_tx(tx);
         }
-        let service = client_handler.serve(transport).await.map_err(|e| {
-            McpError::InitializationFailed(format!("MCP handshake failed for {name}: {e}"))
-        })?;
+        let service = client_handler
+            .serve_with_lifecycle(transport, client_lifecycle_mode())
+            .await
+            .map_err(|e| {
+                McpError::InitializationFailed(format!("MCP handshake failed for {name}: {e}"))
+            })?;
 
-        // Get server info from the handshake result. rmcp 1.8 changed
-        // `peer_info()` to return `Option<Arc<InitializeResult>>` (was
-        // `Option<&InitializeResult>`); `as_deref()` recovers the borrow
-        // `from_rmcp` takes and works against the pre-1.8 signature too.
+        // Astrid already owns tool-inventory caching and invalidation. Keep
+        // rmcp's new response cache disabled so a server error cannot silently
+        // surface a stale list after a capability or tool-set change.
+        service
+            .peer()
+            .set_response_cache_config(ClientCacheConfig::disabled())
+            .await;
+
+        // Discovery and legacy initialization normalize into ServerPeerInfo.
         let server_info = service
             .peer_info()
             .as_deref()
@@ -1070,6 +1088,21 @@ impl std::fmt::Debug for ServerManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rmcp::ServiceExt;
+
+    #[test]
+    fn lifecycle_prefers_current_discovery_with_legacy_fallback() {
+        let ClientLifecycleMode::Auto {
+            preferred_versions,
+            legacy_version,
+        } = client_lifecycle_mode()
+        else {
+            panic!("Astrid MCP clients must use the negotiated auto lifecycle");
+        };
+
+        assert_eq!(preferred_versions, vec![ProtocolVersion::V_2026_07_28]);
+        assert_eq!(legacy_version, Some(ProtocolVersion::V_2025_11_25));
+    }
 
     #[cfg(unix)]
     const RELUCTANT_FIXTURE_ENV: &str = "ASTRID_MCP_RELUCTANT_FIXTURE";

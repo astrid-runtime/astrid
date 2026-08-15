@@ -43,8 +43,8 @@ use astrid_uplink::socket_client::ReadError;
 use rmcp::ErrorData as McpError;
 use rmcp::ServerHandler;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ContentBlock, Implementation, ListToolsResult,
-    PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
+    ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use serde_json::{Value, json};
@@ -62,6 +62,8 @@ use super::ingress;
 pub(super) const TOOLS_LIST_TOPIC: &str = "astrid.v1.request.mcp.tools.list";
 /// Request topic for the broker `tools/call` front door.
 const TOOL_CALL_TOPIC: &str = "astrid.v1.request.mcp.tool.call";
+/// MCP revision implemented by the Astrid tool bridge.
+const MCP_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2026_07_28;
 
 /// Shim-side deadline for a single broker round trip. The broker bounds
 /// its own tool drain at 50 s; this sits just above that so a slow tool
@@ -383,12 +385,10 @@ impl ServerHandler for AstridMcpServer {
         // struct literal.
         ServerInfo::new(capabilities)
             .with_server_info(Implementation::new("astrid", env!("CARGO_PKG_VERSION")))
-            // Pin the advertised revision to exactly the one this server is
-            // built and verified against, rather than `ProtocolVersion::LATEST`
-            // (which would silently advance on a future rmcp bump to a spec we
-            // have not yet implemented). Bump deliberately when adopting a newer
-            // revision. rmcp negotiates older clients down at `initialize`.
-            .with_protocol_version(ProtocolVersion::V_2025_11_25)
+            // Pin the advertised revision to the spec this bridge is verified
+            // against. rmcp still negotiates older clients during legacy
+            // initialization; modern peers use server/discover.
+            .with_protocol_version(MCP_PROTOCOL_VERSION)
             .with_instructions("Astrid secure agent runtime — capsule tools bridged over MCP.")
     }
 
@@ -415,7 +415,7 @@ impl ServerHandler for AstridMcpServer {
         &self,
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResponse, McpError> {
         let arguments = request.arguments.map_or(Value::Null, Value::Object);
 
         // Build the broker `tool.call` body for a fresh `req_id`. The same
@@ -445,7 +445,8 @@ impl ServerHandler for AstridMcpServer {
             if !granted {
                 return Ok(CallToolResult::error(vec![ContentBlock::text(
                     "Astrid tool calls were not authorized for this session.",
-                )]));
+                )])
+                .into());
             }
             // Re-send the original call now that the ingress is trusted.
             let retry_id = new_req_id();
@@ -481,14 +482,15 @@ impl ServerHandler for AstridMcpServer {
             match next_grant_step(&reply, grants_resolved) {
                 GrantStep::Terminal => break reply,
                 GrantStep::Fail(message) => {
-                    return Ok(CallToolResult::error(vec![ContentBlock::text(message)]));
+                    return Ok(CallToolResult::error(vec![ContentBlock::text(message)]).into());
                 },
                 GrantStep::Resolve(grant) => {
                     let granted = self.resolve_grant(&context.peer, &grant).await?;
                     if !granted {
                         return Ok(CallToolResult::error(vec![ContentBlock::text(
                             GRANT_DENIED_MESSAGE,
-                        )]));
+                        )])
+                        .into());
                     }
                     grants_resolved = grants_resolved.saturating_add(1);
                     // Re-send the original call now that this capsule is
@@ -513,7 +515,7 @@ impl ServerHandler for AstridMcpServer {
             reply
         };
 
-        Ok(call_tool_result_from_reply(&reply))
+        Ok(call_tool_result_from_reply(&reply).into())
     }
 }
 
@@ -758,6 +760,11 @@ fn content_from_block(block: &Value) -> ContentBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_advertises_the_verified_protocol_revision() {
+        assert_eq!(MCP_PROTOCOL_VERSION, ProtocolVersion::V_2026_07_28);
+    }
 
     #[test]
     fn failed_reconnect_remains_armed_until_a_checked_replacement_succeeds() {

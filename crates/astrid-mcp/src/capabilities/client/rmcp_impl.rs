@@ -65,10 +65,8 @@ impl rmcp::ClientHandler for AstridClientHandler {
         let mut client_info = Implementation::new("astrid", env!("CARGO_PKG_VERSION"));
         client_info.title = Some("Astrid Secure Agent Runtime".to_string());
 
-        ClientInfo::new(capabilities, client_info).with_protocol_version(
-            serde_json::from_value(serde_json::json!("2025-11-25"))
-                .expect("valid protocol version"),
-        )
+        ClientInfo::new(capabilities, client_info)
+            .with_protocol_version(rmcp::model::ProtocolVersion::V_2026_07_28)
     }
 
     async fn create_message(

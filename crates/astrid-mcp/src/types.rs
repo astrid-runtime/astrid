@@ -277,9 +277,9 @@ pub(crate) struct ServerInfo {
 }
 
 impl ServerInfo {
-    /// Convert from rmcp `InitializeResult` and a server name.
+    /// Convert from rmcp's lifecycle-neutral negotiated peer information.
     #[must_use]
-    pub(crate) fn from_rmcp(info: &rmcp_model::InitializeResult, name: &str) -> Self {
+    pub(crate) fn from_rmcp(info: &rmcp_model::ServerPeerInfo, name: &str) -> Self {
         Self {
             name: name.to_string(),
             protocol_version: info.protocol_version.to_string(),
@@ -292,6 +292,21 @@ impl ServerInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_info_accepts_discovery_peer_metadata() {
+        let peer = rmcp_model::ServerPeerInfo::new(
+            rmcp_model::ProtocolVersion::V_2026_07_28,
+            rmcp_model::ServerCapabilities::default(),
+        )
+        .with_server_info(rmcp_model::Implementation::new("example", "1.0"))
+        .with_instructions("Use carefully");
+
+        let info = ServerInfo::from_rmcp(&peer, "configured-name");
+        assert_eq!(info.name, "configured-name");
+        assert_eq!(info.protocol_version, "2026-07-28");
+        assert_eq!(info.instructions.as_deref(), Some("Use carefully"));
+    }
 
     #[test]
     fn test_tool_definition() {
