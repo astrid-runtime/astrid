@@ -182,6 +182,7 @@ fn write_readiness_then_arm_ephemeral<T, E>(
 ///
 /// Returns an error if the kernel fails to boot, the native local uplink cannot
 /// claim its listener, or the readiness file cannot be written.
+#[cfg(unix)]
 #[expect(
     clippy::too_many_lines,
     reason = "boot sequence: sequential config resolution + kernel/capsule setup that does not benefit from splitting"
@@ -403,6 +404,20 @@ pub async fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Report that native daemon startup is unavailable on this platform.
+///
+/// The Windows filesystem and local-transport substrates compile and test
+/// independently, but daemon composition still requires the Unix socket
+/// listener and readiness-file implementation.
+///
+/// # Errors
+///
+/// Always returns an explicit unsupported-platform error.
+#[cfg(not(unix))]
+pub async fn run() -> Result<()> {
+    anyhow::bail!("native Astrid daemon startup is not yet supported on this platform")
 }
 
 /// Load `etc/gateway-http.toml`. Returns `Ok(None)` when the file
