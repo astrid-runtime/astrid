@@ -20,6 +20,13 @@ struct UpdateCache {
 
 fn cache_path() -> anyhow::Result<PathBuf> {
     let home = astrid_core::dirs::AstridHome::resolve()?;
+    cache_path_for(&home)
+}
+
+fn cache_path_for(home: &astrid_core::dirs::AstridHome) -> anyhow::Result<PathBuf> {
+    if home.layout_version()?.as_deref() != Some(astrid_core::dirs::LAYOUT_VERSION) {
+        bail!("update notices require an initialized Astrid home");
+    }
     Ok(home.var_dir().join("update-check.json"))
 }
 
@@ -165,4 +172,33 @@ pub(super) fn handle_managed_channel(
         }
     );
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_notice_does_not_initialize_an_undeclared_home() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("astrid-home");
+        let home = astrid_core::dirs::AstridHome::from_path(&path);
+
+        let error = cache_path_for(&home).unwrap_err();
+
+        assert!(error.to_string().contains("initialized Astrid home"));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn update_notice_uses_the_admitted_layout() {
+        let root = tempfile::tempdir().unwrap();
+        let home = astrid_core::dirs::AstridHome::from_path(root.path().join("astrid-home"));
+        home.ensure().unwrap();
+
+        assert_eq!(
+            cache_path_for(&home).unwrap(),
+            home.var_dir().join("update-check.json")
+        );
+    }
 }
