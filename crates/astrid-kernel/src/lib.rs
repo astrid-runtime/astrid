@@ -3172,8 +3172,7 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
 
     // Audit log at the tempdir — chain verification is trivially Ok on a
     // fresh log, no historical entries.
-    let runtime_key =
-        Arc::new(load_or_generate_runtime_key(&home.keys_dir()).expect("test kernel: runtime key"));
+    let runtime_key = Arc::new(astrid_crypto::KeyPair::generate());
     let default_principal = astrid_core::PrincipalId::default();
     let principal_home = home.principal_home(&default_principal);
     principal_home
@@ -3253,6 +3252,7 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         boot_time: astrid_runtime::time::Instant::now(),
         shutdown_tx: tokio::sync::watch::channel(false).0,
         session_token: Arc::new(astrid_core::session_token::SessionToken::generate()),
+        #[cfg(unix)]
         token_path: home.token_path(),
         allowance_store,
         identity_store,

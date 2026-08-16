@@ -135,7 +135,7 @@ fn create(path: &str) -> StorageFilesystemOperationV1 {
 }
 
 #[tokio::test]
-async fn private_mount_manifest_and_socket_are_owner_only() {
+async fn private_mount_manifest_and_callback_endpoint_are_owner_scoped() {
     let temporary = tempfile::tempdir().unwrap();
     astrid_core::platform_fs::ensure_private_directory(temporary.path()).unwrap();
     let lease = StorageMountLeaseV1 {
@@ -148,15 +148,31 @@ async fn private_mount_manifest_and_socket_are_owner_only() {
         expires_at_epoch_secs: u64::MAX,
     };
 
-    write_private_manifest(&temporary.path().join("lease.json"), &lease).unwrap();
+    let manifest_path = temporary.path().join("lease.json");
+    write_private_manifest(&manifest_path, &lease).unwrap();
     let listener = bind_private_listener(&lease.callback_path).unwrap();
 
-    let manifest = std::fs::symlink_metadata(temporary.path().join("lease.json")).unwrap();
-    let socket = std::fs::symlink_metadata(&lease.callback_path).unwrap();
+    astrid_core::platform_fs::validate_private_file(&manifest_path).unwrap();
+    let manifest = std::fs::symlink_metadata(&manifest_path).unwrap();
     assert!(manifest.is_file());
-    assert_eq!(manifest.permissions().mode() & 0o777, 0o600);
-    assert!(socket.file_type().is_socket());
-    assert_eq!(socket.permissions().mode() & 0o777, 0o600);
+
+    #[cfg(unix)]
+    {
+        let socket = std::fs::symlink_metadata(&lease.callback_path).unwrap();
+        assert_eq!(manifest.permissions().mode() & 0o777, 0o600);
+        assert!(socket.file_type().is_socket());
+        assert_eq!(socket.permissions().mode() & 0o777, 0o600);
+    }
+
+    #[cfg(windows)]
+    {
+        let (client, server) = tokio::join!(
+            astrid_core::local_transport::connect(&lease.callback_path),
+            astrid_core::local_transport::accept(&listener),
+        );
+        drop(client.unwrap());
+        drop(server.unwrap());
+    }
     drop(listener);
 }
 
