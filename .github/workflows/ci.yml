@@ -540,7 +540,7 @@ jobs:
         shell: pwsh
         run: >-
           cargo test --locked --target ${{ matrix.target }} -p astrid-core
-          local_transport -- --nocapture
+          local_transport -- --nocapture --test-threads=1
 
       - name: Run storage callback transport tests natively
         if: matrix.target == 'x86_64-pc-windows-msvc'

@@ -55,7 +55,7 @@ fn different_user_identity_is_rejected() {
 
 #[tokio::test]
 async fn native_backend_bind_instances_shutdown_and_reconnect() {
-    let endpoint = Path::new(r"C:\ignored\system.sock");
+    let endpoint = Path::new(r"C:\ignored\lifecycle.sock");
     assert!(!endpoint_is_present(endpoint).unwrap());
     assert!(matches!(
         connect_outcome(endpoint).await.unwrap(),
@@ -114,7 +114,7 @@ async fn native_backend_bind_instances_shutdown_and_reconnect() {
 
 #[tokio::test]
 async fn busy_and_missing_peer_identity_fail_closed() {
-    let endpoint = Path::new(r"C:\ignored\system.sock");
+    let endpoint = Path::new(r"C:\ignored\peer-identity.sock");
     let name = pipe_name(endpoint).unwrap();
     let pending = create_server(&name, true).unwrap();
 
@@ -139,7 +139,7 @@ async fn busy_and_missing_peer_identity_fail_closed() {
 
 #[tokio::test]
 async fn cancelled_pre_read_preserves_replacement_instance() {
-    let endpoint = Path::new(r"C:\ignored\system.sock");
+    let endpoint = Path::new(r"C:\ignored\cancelled-pre-read.sock");
     let listener = std::sync::Arc::new(bind(endpoint).unwrap());
 
     let timed_out =
@@ -185,7 +185,7 @@ async fn cancelled_pre_read_preserves_replacement_instance() {
 
 #[tokio::test]
 async fn production_probe_then_immediate_connect_waits_for_replacement_instance() {
-    let endpoint = Path::new(r"C:\ignored\system.sock");
+    let endpoint = Path::new(r"C:\ignored\probe-replacement.sock");
     let listener = std::sync::Arc::new(bind(endpoint).unwrap());
 
     let probe = connect_outcome(endpoint).await.unwrap();
@@ -222,7 +222,7 @@ async fn production_probe_then_immediate_connect_waits_for_replacement_instance(
 
 #[tokio::test]
 async fn simultaneous_clients_wait_for_successive_instances() {
-    let endpoint = Path::new(r"C:\ignored\system.sock");
+    let endpoint = Path::new(r"C:\ignored\simultaneous-clients.sock");
     let listener = std::sync::Arc::new(bind(endpoint).unwrap());
 
     let first = tokio::spawn(async move {
@@ -250,7 +250,7 @@ async fn simultaneous_clients_wait_for_successive_instances() {
 
 #[tokio::test]
 async fn cancelled_busy_connect_does_not_poison_endpoint() {
-    let endpoint = Path::new(r"C:\ignored\system.sock");
+    let endpoint = Path::new(r"C:\ignored\cancelled-busy.sock");
     let listener = std::sync::Arc::new(bind(endpoint).unwrap());
     let name = pipe_name(endpoint).unwrap();
     let mut options = ClientOptions::new();
@@ -277,7 +277,7 @@ async fn cancelled_busy_connect_does_not_poison_endpoint() {
 
 #[tokio::test]
 async fn permissive_acl_is_rejected_before_wire_handshake() {
-    let endpoint = Path::new(r"C:\ignored\system.sock");
+    let endpoint = Path::new(r"C:\ignored\permissive-acl.sock");
     let name = pipe_name(endpoint).unwrap();
     let permissive = ServerOptions::new()
         .first_pipe_instance(true)
@@ -296,7 +296,7 @@ async fn permissive_acl_is_rejected_before_wire_handshake() {
 
 #[tokio::test]
 async fn exact_aces_without_protected_dacl_are_rejected_before_handshake() {
-    let endpoint = Path::new(r"C:\ignored\system.sock");
+    let endpoint = Path::new(r"C:\ignored\unprotected-dacl.sock");
     let name = pipe_name(endpoint).unwrap();
     let user = current_user_sid().unwrap().to_sddl().unwrap();
     let descriptor =
