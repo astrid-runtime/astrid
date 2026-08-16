@@ -36,6 +36,7 @@
 //! The host owns the materialized bytes in both modes, so it never live-binds
 //! bytes the capsule can still reach.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use astrid_crypto::ContentHash;
@@ -44,9 +45,23 @@ use crate::engine::wasm::bindings::astrid::process1_1_0::host::{
     ErrorCode, FileInjection, InjectionPlacement,
 };
 
-/// Per-injection content ceiling. Managed-policy files are kilobytes; this
-/// bounds a capsule's host-scratch footprint per spawn. Oversize => `too-large`.
-const MAX_INJECTION_BYTES: usize = 1024 * 1024;
+/// Per-injection content ceiling. Most managed-policy files are kilobytes;
+/// the larger ceiling leaves room for legitimate bundles (pinned CA sets,
+/// model-adjacent config) without making a single entry the DoS surface.
+/// Oversize => `too-large`.
+const MAX_INJECTION_BYTES: usize = 8 * 1024 * 1024;
+
+/// Per-spawn aggregate content ceiling. This bounds the total host scratch a
+/// single spawn can allocate, no matter how the per-entry and count limits
+/// are combined. Oversize => `too-large`.
+const MAX_TOTAL_INJECTION_BYTES: usize = 16 * 1024 * 1024;
+
+/// Per-spawn injection count ceiling. Each injection allocates a snapshot
+/// file and a sandbox ro-bind, so an unbounded list would let one spawn
+/// request exhaust host fds / temp space before the sandbox even starts.
+/// 128 leaves room for a real config tree while keeping mount-table growth
+/// bounded.
+const MAX_INJECTIONS: usize = 128;
 
 /// RAII cleanup for a spawn's injections. Every snapshot lives in `_scratch`
 /// (a private `TempDir`) on every platform, removed when it drops. The owner of
@@ -188,6 +203,39 @@ pub(super) fn prepare_injections(
 ) -> Result<PreparedInjections, ErrorCode> {
     if injections.is_empty() {
         return Ok(PreparedInjections::empty());
+    }
+    if injections.len() > MAX_INJECTIONS {
+        return Err(ErrorCode::TooLarge);
+    }
+    let mut total_bytes = 0usize;
+    for inj in injections {
+        total_bytes = total_bytes.saturating_add(inj.content.len());
+        if total_bytes > MAX_TOTAL_INJECTION_BYTES {
+            return Err(ErrorCode::TooLarge);
+        }
+    }
+
+    // Placement identities must be unique. Duplicates would otherwise make
+    // the final exposure depend on iteration order (last env assignment or
+    // last mount wins), which is exactly the kind of ambiguity a policy
+    // surface must not have.
+    let mut env_names = HashSet::new();
+    let mut fixed_targets = HashSet::new();
+    for inj in injections {
+        match &inj.placement {
+            InjectionPlacement::EnvPointer(var) => {
+                validate_env_name(var)?;
+                if !env_names.insert(var.clone()) {
+                    return Err(ErrorCode::InvalidInput);
+                }
+            },
+            InjectionPlacement::FixedPath(path) => {
+                validate_fixed_path(path)?;
+                if !fixed_targets.insert(path.clone()) {
+                    return Err(ErrorCode::InvalidInput);
+                }
+            },
+        }
     }
 
     let mut prepared = PreparedInjections::empty();
@@ -390,5 +438,115 @@ mod tests {
         assert!(prepared.sandbox.is_empty());
         assert!(prepared.env.is_empty());
         assert!(prepared.audit.is_empty());
+    }
+
+    #[test]
+    fn injection_count_is_capped() {
+        fn env_injection(var: &str) -> FileInjection {
+            FileInjection {
+                content: vec![b'x'],
+                placement: InjectionPlacement::EnvPointer(var.to_string()),
+            }
+        }
+
+        let exactly_cap: Vec<FileInjection> = (0..MAX_INJECTIONS)
+            .map(|i| env_injection(&format!("ASTRID_FILE_{i}")))
+            .collect();
+        let prepared = prepare_injections(&exactly_cap).expect("cap is allowed");
+        assert_eq!(prepared.sandbox.len(), MAX_INJECTIONS);
+
+        let over_cap: Vec<FileInjection> = (0..=MAX_INJECTIONS)
+            .map(|i| env_injection(&format!("ASTRID_FILE_{i}")))
+            .collect();
+        assert!(matches!(
+            prepare_injections(&over_cap),
+            Err(ErrorCode::TooLarge)
+        ));
+    }
+
+    #[test]
+    fn injection_total_bytes_are_capped_before_scratch_allocation() {
+        let mut injections = Vec::new();
+        let mut remaining = MAX_TOTAL_INJECTION_BYTES;
+        while remaining > 0 {
+            let len = remaining.min(MAX_INJECTION_BYTES);
+            injections.push(FileInjection {
+                content: vec![0u8; len],
+                placement: InjectionPlacement::EnvPointer(format!(
+                    "ASTRID_FILE_{}",
+                    injections.len()
+                )),
+            });
+            remaining -= len;
+        }
+        injections.push(FileInjection {
+            content: vec![0u8],
+            placement: InjectionPlacement::EnvPointer("ASTRID_FILE_OVERFLOW".to_string()),
+        });
+
+        assert!(matches!(
+            prepare_injections(&injections),
+            Err(ErrorCode::TooLarge)
+        ));
+    }
+
+    #[test]
+    fn duplicate_placements_are_rejected() {
+        let duplicate_env = vec![
+            FileInjection {
+                content: b"a".to_vec(),
+                placement: InjectionPlacement::EnvPointer("ASTRID_FILE".to_string()),
+            },
+            FileInjection {
+                content: b"b".to_vec(),
+                placement: InjectionPlacement::EnvPointer("ASTRID_FILE".to_string()),
+            },
+        ];
+        assert!(matches!(
+            prepare_injections(&duplicate_env),
+            Err(ErrorCode::InvalidInput)
+        ));
+
+        let duplicate_target = vec![
+            FileInjection {
+                content: b"a".to_vec(),
+                placement: InjectionPlacement::FixedPath("/etc/agent/a.toml".to_string()),
+            },
+            FileInjection {
+                content: b"b".to_vec(),
+                placement: InjectionPlacement::FixedPath("/etc/agent/a.toml".to_string()),
+            },
+        ];
+        assert!(matches!(
+            prepare_injections(&duplicate_target),
+            Err(ErrorCode::InvalidInput)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fixed_path_injections_can_express_a_config_tree() {
+        let tree = ["a.toml", "nested/b.toml", "nested/c.toml"]
+            .into_iter()
+            .map(|name| FileInjection {
+                content: name.as_bytes().to_vec(),
+                placement: InjectionPlacement::FixedPath(format!("/etc/agent/conf.d/{name}")),
+            })
+            .collect::<Vec<_>>();
+
+        let prepared = prepare_injections(&tree).expect("tree should materialize");
+        let targets = prepared
+            .sandbox
+            .iter()
+            .map(|inj| inj.target.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            targets,
+            [
+                "/etc/agent/conf.d/a.toml",
+                "/etc/agent/conf.d/nested/b.toml",
+                "/etc/agent/conf.d/nested/c.toml",
+            ]
+        );
     }
 }
