@@ -176,6 +176,20 @@ impl FaultInjector for FailAt {
 }
 
 #[derive(Debug)]
+struct PanicForPanicPrincipalCodec;
+
+impl PrincipalCodec<String> for PanicForPanicPrincipalCodec {
+    fn encode(&self, principal: &String) -> Vec<u8> {
+        assert!(principal != "panic", "intentional group-leader panic");
+        principal.as_bytes().to_vec()
+    }
+
+    fn decode(&self, bytes: &[u8]) -> Option<String> {
+        std::str::from_utf8(bytes).ok().map(str::to_owned)
+    }
+}
+
+#[derive(Debug)]
 struct PauseAfterRootFlush {
     reached: Arc<Barrier>,
     release: Arc<Barrier>,
@@ -333,6 +347,50 @@ fn invalid_group_member_does_not_cancel_an_independent_commit() {
     ));
     assert_eq!(engine.root(&"alice".to_owned()).unwrap(), Some(installed));
     assert_eq!(engine.root(&"mallory".to_owned()).unwrap(), None);
+}
+
+#[test]
+fn group_leader_panic_cannot_wedge_later_commits() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = Arc::new(
+        DurableEngine::open(
+            directory.path(),
+            TestIdentity,
+            PanicForPanicPrincipalCodec,
+            limits(),
+        )
+        .unwrap(),
+    );
+
+    let panic_engine = Arc::clone(&engine);
+    let (_, panic_transaction) = transaction("panic", None, b"leader panics");
+    let panicking = thread::spawn(move || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            panic_engine.commit(panic_transaction)
+        }))
+    });
+    let caught = panicking
+        .join()
+        .expect("panic thread")
+        .expect("coordinator handled the codec panic");
+    assert!(
+        matches!(caught, Err(DurableError::RequiresRecovery)),
+        "leader panic must fail conservatively"
+    );
+
+    let good_engine = Arc::clone(&engine);
+    let (_, good_transaction) = transaction("alice", None, b"later commit");
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let result = good_engine.commit(good_transaction);
+        let _ = sender.send(result);
+    });
+
+    let outcome = receiver
+        .recv_timeout(Duration::from_secs(3))
+        .expect("group leader panic wedged later commits");
+    outcome.expect("later commit should succeed after leader panic");
+    assert!(engine.root(&"alice".to_owned()).unwrap().is_some());
 }
 
 #[test]
