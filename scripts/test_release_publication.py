@@ -109,14 +109,14 @@ class ReleasePublicationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             self.fixture(root)
-            self.assertEqual(len(self.validate(root)), 7)
+            self.assertEqual(len(self.validate(root)), 8)
 
     def test_accepts_exact_combined_inventory_with_musl_extension(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             self.fixture(root)
             self.add_musl_extension(root)
-            self.assertEqual(len(self.validate(root)), 10)
+            self.assertEqual(len(self.validate(root)), 11)
 
     def test_rejects_every_partial_musl_extension_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

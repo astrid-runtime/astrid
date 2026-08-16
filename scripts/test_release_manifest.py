@@ -94,7 +94,7 @@ class ReleaseManifestTests(unittest.TestCase):
     def test_rejects_missing_or_extra_checksum_assets(self) -> None:
         path = self.artifacts / "BLAKE3SUMS.txt"
         path.write_text(path.read_text() + f"{'f' * 64}  extra.tar.gz\n")
-        with self.assertRaisesRegex(ValueError, "exactly the four legacy"):
+        with self.assertRaisesRegex(ValueError, "exactly the five fixed"):
             self.manifest()
 
     def test_legacy_manifest_shape_is_unchanged_with_combined_checksums(self) -> None:

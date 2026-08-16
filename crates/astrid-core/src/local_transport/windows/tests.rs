@@ -25,12 +25,19 @@ fn canonical_pipe_full_control_accepts_only_generic_or_mapped_exact_masks() {
 }
 
 #[test]
-fn endpoint_name_is_sid_derived_not_path_derived() {
+fn endpoint_name_is_user_and_path_derived_without_revealing_either() {
     let first = pipe_name(Path::new(r"C:\controlled\one.sock")).unwrap();
     let second = pipe_name(Path::new(r"D:\different\two.sock")).unwrap();
-    assert_eq!(first, second);
+    assert_ne!(first, second);
     assert!(first.to_string_lossy().starts_with(PIPE_PREFIX));
     assert!(!first.to_string_lossy().contains("controlled"));
+    assert!(!first.to_string_lossy().contains("different"));
+}
+
+#[test]
+fn endpoint_name_rejects_parent_components() {
+    let error = pipe_name(Path::new(r"C:\controlled\..\escape.sock")).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
 }
 
 #[test]

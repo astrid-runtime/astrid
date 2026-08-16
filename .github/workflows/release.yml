@@ -87,6 +87,10 @@ jobs:
             os: macos-latest
             archive: tar.gz
             libc: native
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: tar.gz
+            libc: native
           - target: aarch64-apple-darwin
             os: macos-latest
             archive: tar.gz
@@ -207,6 +211,28 @@ jobs:
         if: matrix.libc == 'native'
         run: echo "BINARY_ROOT=target/${{ matrix.target }}/release" >> "$GITHUB_ENV"
 
+      - name: Build the Windows WinFsp provider
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        run: cargo build --release --target ${{ matrix.target }} -p astrid-storage-provider-winfsp --locked
+
+      - name: Stage the pinned Windows WinFsp runtime
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $msi = Join-Path $env:RUNNER_TEMP "winfsp-2.1.25156.msi"
+          Invoke-WebRequest -Uri "https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi" -OutFile $msi
+          $hash = (Get-FileHash -LiteralPath $msi -Algorithm SHA256).Hash
+          if ($hash -ne "073A70E00F77423E34BED98B86E600DEF93393BA5822204FAC57A29324DB9F7A") {
+            throw "WinFsp MSI digest mismatch: $hash"
+          }
+          $exitCode = (Start-Process -FilePath "msiexec.exe" -ArgumentList @("/i", "`"$msi`"", "/qn", "/norestart") -Wait -PassThru).ExitCode
+          if ($exitCode -ne 0 -and $exitCode -ne 3010) {
+            throw "WinFsp installation failed with exit code $exitCode"
+          }
+          $installRoot = (Get-ItemProperty -Path "HKLM:\SOFTWARE\WOW6432Node\WinFsp").InstallDir
+          "WINFSP_MSI=$msi" | Add-Content -Encoding ascii -Path $env:GITHUB_ENV
+          "WINFSP_ROOT=$installRoot" | Add-Content -Encoding ascii -Path $env:GITHUB_ENV
+
       - name: Build Linux binaries against the glibc 2.31 baseline
         if: matrix.libc == 'gnu'
         env:
@@ -311,15 +337,24 @@ jobs:
             '
 
       - name: Package binaries
+        shell: bash
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           TARGET="${{ matrix.target }}"
           DIR="astrid-${VERSION}-${{ matrix.target }}"
           mkdir "$DIR"
-          cp "$BINARY_ROOT/astrid" "$DIR/"
-          cp "$BINARY_ROOT/astrid-daemon" "$DIR/"
-          cp "$BINARY_ROOT/astrid-build" "$DIR/"
-          cp "$BINARY_ROOT/astrid-emit" "$DIR/"
+          EXE=""
+          if [[ "$TARGET" == x86_64-pc-windows-msvc ]]; then
+            EXE=".exe"
+            cp "$BINARY_ROOT/astrid-storage-provider-winfsp.exe" "$DIR/"
+            cp "$WINFSP_ROOT/bin/winfsp-x64.dll" "$DIR/"
+            cp "$WINFSP_MSI" "$DIR/winfsp-2.1.25156.msi"
+            cp scripts/install-windows.ps1 scripts/uninstall-windows.ps1 "$DIR/"
+          fi
+          cp "$BINARY_ROOT/astrid$EXE" "$DIR/"
+          cp "$BINARY_ROOT/astrid-daemon$EXE" "$DIR/"
+          cp "$BINARY_ROOT/astrid-build$EXE" "$DIR/"
+          cp "$BINARY_ROOT/astrid-emit$EXE" "$DIR/"
           cp LICENSE* README.md "$DIR/" 2>/dev/null || true
           if [[ "$TARGET" == *-apple-darwin ]]; then
             cp "$BINARY_ROOT/astrid-storage-provider-fskit" "$DIR/"

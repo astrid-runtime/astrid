@@ -26,6 +26,10 @@ fn platform_target_selects_linux_libc_at_compile_time_boundary() {
         platform_target_for("macos", "aarch64", "").unwrap(),
         "aarch64-apple-darwin"
     );
+    assert_eq!(
+        platform_target_for("windows", "x86_64", "").unwrap(),
+        "x86_64-pc-windows-msvc"
+    );
     for unsupported in ["", "uclibc", "newlib"] {
         assert!(
             platform_target_for("linux", "x86_64", unsupported)

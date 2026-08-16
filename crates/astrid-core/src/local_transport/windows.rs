@@ -372,6 +372,10 @@ pub(super) fn peer_is_current_user(stream: &LocalStream) -> io::Result<bool> {
     Ok(matches)
 }
 
+pub(super) fn current_user_sddl() -> io::Result<String> {
+    current_user_sid()?.to_sddl()
+}
+
 fn peer_process_id(stream: &LocalStream) -> io::Result<u32> {
     let mut process_id = 0_u32;
     let ok = unsafe {
@@ -562,12 +566,23 @@ fn create_server_with_security(
 }
 
 fn pipe_name(path: &Path) -> io::Result<OsString> {
-    let _ = path;
+    let absolute = std::path::absolute(path)?;
+    if absolute
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "named-pipe endpoint path must not contain a parent component",
+        ));
+    }
     let sid = current_user_sid()?;
+    let endpoint = blake3::hash(absolute.as_os_str().as_encoded_bytes());
     let digest = blake3::hash(sid.as_bytes());
     Ok(OsString::from(format!(
-        "{PIPE_PREFIX}{}",
-        &digest.to_hex()[..32]
+        "{PIPE_PREFIX}{}{}",
+        &digest.to_hex()[..24],
+        &endpoint.to_hex()[..40]
     )))
 }
 

@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use astrid_core::PrincipalId;
+use astrid_core::local_transport::{self, LocalListener, LocalStream};
 use astrid_core::storage_filesystem::{
     STORAGE_FILESYSTEM_MAX_IO_BYTES, STORAGE_FILESYSTEM_PROTOCOL_V1,
     STORAGE_FILESYSTEM_PROTOCOL_V2, StorageFilesystemEntryKindV1, StorageFilesystemEntryV1,
@@ -175,17 +176,20 @@ pub(crate) async fn issue_lease(
         mutation_test_gate: std::sync::Mutex::new(None),
     });
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let listener = bind_private_listener(&callback_path)?;
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     return Err("native mount callback transport is not implemented on this platform".to_owned());
 
     let lease = state.public_lease(token);
-    write_private_manifest(&resource_path.join(LEASE_MANIFEST_NAME), &lease)
-        .map_err(|error| format!("write private mount manifest: {error}"))?;
+    if let Err(error) = write_private_manifest(&resource_path.join(LEASE_MANIFEST_NAME), &lease) {
+        drop(listener);
+        cleanup_resource(&resource_path, &callback_path);
+        return Err(format!("write private mount manifest: {error}"));
+    }
     kernel.storage_mounts.insert(mount_id, Arc::clone(&state));
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         let weak_kernel = Arc::downgrade(kernel);
         astrid_runtime::spawn(serve_listener(weak_kernel, state, listener, shutdown_rx));
@@ -330,15 +334,20 @@ async fn resolve_owner(
     }
 }
 
-#[cfg(unix)]
-fn bind_private_listener(callback_path: &Path) -> Result<tokio::net::UnixListener, String> {
-    use std::os::unix::fs::PermissionsExt as _;
+#[cfg(any(unix, windows))]
+fn bind_private_listener(callback_path: &Path) -> Result<LocalListener, String> {
+    let listener = local_transport::bind(callback_path)
+        .map_err(|error| format!("bind private mount callback endpoint: {error}"))?;
 
-    let listener = tokio::net::UnixListener::bind(callback_path)
-        .map_err(|error| format!("bind private mount callback socket: {error}"))?;
-    std::fs::set_permissions(callback_path, std::fs::Permissions::from_mode(0o600))
-        .map_err(|error| format!("restrict private mount callback socket: {error}"))?;
-    validate_private_listener(callback_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        std::fs::set_permissions(callback_path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("restrict private mount callback socket: {error}"))?;
+        validate_private_listener(callback_path)?;
+    }
+
     Ok(listener)
 }
 
@@ -380,11 +389,11 @@ fn private_mount_resource_path(mount_id: StorageMountId) -> Result<PathBuf, Stri
     Ok(root.join(mount_id.to_string()))
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn serve_listener(
     kernel: std::sync::Weak<Kernel>,
     state: Arc<StorageMountLeaseState>,
-    listener: tokio::net::UnixListener,
+    listener: LocalListener,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let mut expiry_check = tokio::time::interval(std::time::Duration::from_mins(1));
@@ -402,23 +411,32 @@ async fn serve_listener(
                     break;
                 }
             },
-            accepted = listener.accept() => {
-                let Ok((stream, _)) = accepted else { break };
-                let Some(kernel) = kernel.upgrade() else { break };
-                let state = Arc::clone(&state);
-                astrid_runtime::spawn(async move {
-                    handle_connection(kernel, state, stream).await;
-                });
+            accepted = local_transport::accept(&listener) => {
+                match accepted {
+                    Ok(stream) => {
+                        let Some(kernel) = kernel.upgrade() else { break };
+                        let state = Arc::clone(&state);
+                        astrid_runtime::spawn(async move {
+                            handle_connection(kernel, state, stream).await;
+                        });
+                    },
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::UnexpectedEof | io::ErrorKind::WouldBlock
+                        ) => {},
+                    Err(_) => break,
+                }
             }
         }
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn handle_connection(
     kernel: Arc<Kernel>,
     state: Arc<StorageMountLeaseState>,
-    mut stream: tokio::net::UnixStream,
+    mut stream: LocalStream,
 ) {
     loop {
         let Ok(Some(request)) = read_request(&mut stream).await else {
@@ -431,10 +449,8 @@ async fn handle_connection(
     }
 }
 
-#[cfg(unix)]
-async fn read_request(
-    stream: &mut tokio::net::UnixStream,
-) -> Result<Option<CallbackRequest>, io::Error> {
+#[cfg(any(unix, windows))]
+async fn read_request(stream: &mut LocalStream) -> Result<Option<CallbackRequest>, io::Error> {
     let mut length = [0_u8; 4];
     match stream.read_exact(&mut length).await {
         Ok(_) => {},
@@ -537,9 +553,9 @@ fn decode_operation_v2(
     })
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn write_response(
-    stream: &mut tokio::net::UnixStream,
+    stream: &mut LocalStream,
     response: CallbackResponse,
 ) -> Result<(), io::Error> {
     let bytes = match response {
@@ -938,7 +954,7 @@ fn write_private_manifest(path: &Path, lease: &StorageMountLeaseV1) -> io::Resul
 }
 
 fn cleanup_resource(resource_path: &Path, callback_path: &Path) {
-    let _ = std::fs::remove_file(callback_path);
+    let _ = local_transport::remove_endpoint(callback_path);
     let _ = std::fs::remove_file(resource_path.join(LEASE_MANIFEST_NAME));
     let _ = std::fs::remove_dir(resource_path);
     if let Some(root) = resource_path.parent() {
@@ -946,5 +962,5 @@ fn cleanup_resource(resource_path: &Path, callback_path: &Path) {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, windows)))]
 mod tests;

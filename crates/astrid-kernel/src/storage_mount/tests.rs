@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
 
 use super::*;
@@ -7,7 +8,7 @@ async fn callback(
     token: &str,
     operation: StorageFilesystemOperationV1,
 ) -> StorageFilesystemOutcomeV1 {
-    let mut stream = tokio::net::UnixStream::connect(&lease.callback_path)
+    let mut stream = astrid_core::local_transport::connect(&lease.callback_path)
         .await
         .unwrap();
     let request = StorageFilesystemRequestV2 {
@@ -176,30 +177,38 @@ async fn private_callbacks_bind_authority_and_isolate_principal_and_fleet_views(
     )
     .await
     .unwrap();
-    assert_eq!(
-        std::fs::metadata(&principal.resource_path)
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
-        0o700
-    );
-    assert_eq!(
-        std::fs::metadata(principal.resource_path.join(LEASE_MANIFEST_NAME))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
-        0o600
-    );
-    assert_eq!(
-        std::fs::metadata(&principal.callback_path)
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
-        0o600
-    );
+    let transient = astrid_core::local_transport::connect(&principal.callback_path)
+        .await
+        .unwrap();
+    drop(transient);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            std::fs::metadata(&principal.resource_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(principal.resource_path.join(LEASE_MANIFEST_NAME))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(&principal.callback_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
 
     assert_eq!(
         callback(&principal, &principal.lease_token, create("private.txt")).await,

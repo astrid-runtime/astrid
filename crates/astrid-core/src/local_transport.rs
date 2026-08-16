@@ -8,10 +8,10 @@
 //!
 //! On Unix, the stream, listener, and owned-half aliases are the exact Tokio
 //! types used before this seam was introduced. On Windows, the caller's path
-//! is only a portable API token: endpoint naming comes exclusively from the
-//! current process token SID. Backends own endpoint presence checks, stale
-//! cleanup, connection probing, and same-user peer verification so callers do
-//! not assume filesystem sockets.
+//! is a portable API token combined with the current process token SID to form
+//! a private, path-scoped pipe name. Backends own endpoint presence checks,
+//! stale cleanup, connection probing, and same-user peer verification so
+//! callers do not assume filesystem sockets and unrelated endpoints stay independent.
 
 use std::io;
 use std::path::Path;
@@ -206,6 +206,15 @@ pub fn peer_is_current_user(stream: &LocalStream) -> io::Result<bool> {
     backend::peer_is_current_user(stream)
 }
 
+/// Resolve the current process user's SID in SDDL form.
+///
+/// Native filesystem providers use this identifier to synthesize fixed
+/// owner-bound descriptors without embedding an operating-system identity.
+#[cfg(windows)]
+pub fn current_user_security_identifier() -> io::Result<String> {
+    backend::current_user_sddl()
+}
+
 /// Resolve the backend-owned endpoint name for native security harnesses.
 #[cfg(all(windows, feature = "test-support"))]
 #[doc(hidden)]
@@ -233,7 +242,7 @@ pub async fn listener_rejects_remote_clients_for_test(
 #[cfg(unix)]
 mod backend {
     use std::io;
-    use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt as _};
     use std::path::Path;
 
     use super::{ConnectOutcome, LocalListener, LocalReadHalf, LocalStream, LocalWriteHalf};
@@ -260,7 +269,16 @@ mod backend {
 
     pub(super) fn bind(path: &Path) -> io::Result<LocalListener> {
         prepare_endpoint_for_bind(path)?;
-        tokio::net::UnixListener::bind(path)
+        let listener = tokio::net::UnixListener::bind(path);
+        let listener = listener.inspect_err(|_error| {
+            let _ = std::fs::remove_file(path);
+        })?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).inspect_err(
+            |_error| {
+                let _ = std::fs::remove_file(path);
+            },
+        )?;
+        Ok(listener)
     }
 
     pub(super) async fn accept(listener: &LocalListener) -> io::Result<LocalStream> {

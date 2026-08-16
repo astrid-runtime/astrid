@@ -5,6 +5,8 @@ on:
     branches: [main, stream-*]
     paths:
       - '**.rs'
+      - 'scripts/install-windows.ps1'
+      - 'scripts/uninstall-windows.ps1'
       - 'scripts/release_manifest.py'
       - 'scripts/test_release_manifest.py'
       - 'scripts/musl_release_manifest.py'
@@ -36,6 +38,8 @@ on:
     branches: [main]
     paths:
       - '**.rs'
+      - 'scripts/install-windows.ps1'
+      - 'scripts/uninstall-windows.ps1'
       - 'scripts/release_manifest.py'
       - 'scripts/test_release_manifest.py'
       - 'scripts/musl_release_manifest.py'
@@ -360,6 +364,77 @@ jobs:
       - name: Run the filesystem prerequisite tests natively
         shell: pwsh
         run: cargo test --locked --target ${{ matrix.target }} -p astrid-core platform_fs -- --nocapture
+
+      - name: Parse the Windows install scripts
+        shell: pwsh
+        run: |
+          foreach ($script in "scripts/install-windows.ps1", "scripts/uninstall-windows.ps1") {
+            $null = [scriptblock]::Create((Get-Content -LiteralPath $script -Raw))
+          }
+
+      - name: Lint the Windows provider
+        shell: pwsh
+        run: >-
+          cargo clippy --locked --target ${{ matrix.target }}
+          -p astrid-storage-provider-winfsp --all-targets -- -D warnings
+
+      - name: Lint the Windows CLI updater
+        shell: pwsh
+        run: >-
+          cargo clippy --locked --target ${{ matrix.target }} -p astrid
+          --bin astrid -- -D warnings
+
+      - name: Run portable WinFsp provider tests natively
+        shell: pwsh
+        run: cargo test --locked --target ${{ matrix.target }} -p astrid-storage-provider-winfsp -- --nocapture
+
+      - name: Run Windows updater tests natively
+        shell: pwsh
+        run: >-
+          cargo test --locked --target ${{ matrix.target }} -p astrid
+          --bin astrid commands::self_update -- --nocapture
+
+      - name: Install pinned WinFsp runtime
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $msi = Join-Path $env:RUNNER_TEMP "winfsp-2.1.25156.msi"
+          Invoke-WebRequest `
+            -Uri "https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi" `
+            -OutFile $msi
+          $hash = (Get-FileHash -LiteralPath $msi -Algorithm SHA256).Hash
+          if ($hash -ne "073A70E00F77423E34BED98B86E600DEF93393BA5822204FAC57A29324DB9F7A") {
+            throw "WinFsp MSI digest mismatch: $hash"
+          }
+          $exitCode = (Start-Process -FilePath "msiexec.exe" `
+            -ArgumentList @("/i", "`"$msi`"", "/qn", "/norestart") `
+            -Wait -PassThru).ExitCode
+          if ($exitCode -ne 0 -and $exitCode -ne 3010) {
+            throw "WinFsp installation failed with exit code $exitCode"
+          }
+
+      - name: Run local transport security tests natively
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: >-
+          cargo test --locked --target ${{ matrix.target }} -p astrid-core
+          local_transport -- --nocapture
+
+      - name: Run storage callback transport tests natively
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: >-
+          cargo test --locked --target ${{ matrix.target }} -p astrid-kernel
+          storage_mount -- --nocapture --test-threads=1
+
+      - name: Run the native WinFsp filesystem round trip
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        env:
+          ASTRID_WINFSP_NATIVE_TEST: "1"
+        shell: pwsh
+        run: >-
+          cargo test --locked --target ${{ matrix.target }}
+          -p astrid-storage-provider-winfsp -- --nocapture --test-threads=1
 
       - name: Run layout migration policy tests natively
         shell: pwsh

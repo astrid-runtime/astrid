@@ -40,6 +40,19 @@ const MAX_MANIFEST_BYTES: usize = 256 * 1024;
 /// Return every executable managed by an authenticated target's update set.
 fn managed_binaries_for_target(target: &str) -> Vec<&'static str> {
     let mut names = vec!["astrid", "astrid-daemon"];
+    if target == "x86_64-pc-windows-msvc" {
+        return vec![
+            "astrid.exe",
+            "astrid-daemon.exe",
+            "astrid-build.exe",
+            "astrid-emit.exe",
+            "astrid-storage-provider-winfsp.exe",
+            "winfsp-x64.dll",
+            "winfsp-2.1.25156.msi",
+            "install-windows.ps1",
+            "uninstall-windows.ps1",
+        ];
+    }
     if target.contains("-unknown-linux-") {
         names.push("astrid-storage-provider-fuse");
     } else if target.contains("-apple-darwin") {
@@ -108,6 +121,8 @@ fn platform_target_for(os: &str, arch: &str, target_env: &str) -> anyhow::Result
         ("linux", "x86_64" | "aarch64", env) => {
             bail!("Unsupported Linux target environment: {env}")
         },
+        ("windows", "x86_64", _) => Ok("x86_64-pc-windows-msvc"),
+        ("windows", arch, _) => bail!("Unsupported Windows architecture: {arch}"),
         _ => bail!("Unsupported platform: {os}/{arch}"),
     }
 }
@@ -411,14 +426,6 @@ fn confirm(prompt: &str, assume_yes: bool) -> anyhow::Result<bool> {
 /// swap the binary in place with rollback, restart the daemon, then update
 /// capsules. Distro refresh requires explicit recorded source provenance and is
 /// deliberately skipped by this path. Homebrew installs are deferred to `brew upgrade`.
-#[cfg(windows)]
-pub(crate) async fn run_self_update(_args: UpdateArgs) -> anyhow::Result<()> {
-    anyhow::bail!(
-        "Astrid self-update is not enabled on Windows; native packaging and code-signing support are not complete"
-    )
-}
-
-#[cfg(not(windows))]
 pub(crate) async fn run_self_update(args: UpdateArgs) -> anyhow::Result<()> {
     let target = platform_target()?;
     let (owner, repo) = resolve_repo(args.source.as_deref())?;
