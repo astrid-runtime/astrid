@@ -399,7 +399,7 @@ fn backup_and_swap_replaces_and_keeps_backup() {
     std::fs::create_dir_all(&install).unwrap();
     std::fs::create_dir_all(&extract).unwrap();
 
-    let managed = super::managed_binaries_for_target(super::platform_target().unwrap());
+    let managed = super::managed_binaries_for_target("x86_64-unknown-linux-gnu");
     for name in &managed {
         std::fs::write(install.join(name), format!("OLD-{name}")).unwrap();
         std::fs::write(extract.join(name), format!("NEW-{name}")).unwrap();
@@ -537,7 +537,7 @@ fn backup_and_swap_bails_when_archive_missing_a_binary() {
     std::fs::create_dir_all(&install).unwrap();
     std::fs::create_dir_all(&extract).unwrap();
 
-    let managed = super::managed_binaries_for_target(super::platform_target().unwrap());
+    let managed = super::managed_binaries_for_target("x86_64-unknown-linux-gnu");
     for name in &managed {
         std::fs::write(install.join(name), format!("OLD-{name}")).unwrap();
     }
@@ -594,5 +594,23 @@ fn linux_managed_updates_introduce_the_fuse_provider() {
     assert_eq!(
         std::fs::read(install.join("astrid-storage-provider-fuse")).unwrap(),
         b"NEW-FUSE"
+    );
+}
+
+#[test]
+fn windows_managed_updates_include_the_native_provider_and_installer() {
+    assert_eq!(
+        super::managed_binaries_for_target("x86_64-pc-windows-msvc"),
+        vec![
+            "astrid.exe",
+            "astrid-daemon.exe",
+            "astrid-build.exe",
+            "astrid-emit.exe",
+            "astrid-storage-provider-winfsp.exe",
+            "winfsp-x64.dll",
+            "winfsp-2.1.25156.msi",
+            "install-windows.ps1",
+            "uninstall-windows.ps1",
+        ]
     );
 }
