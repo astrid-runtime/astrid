@@ -26,6 +26,9 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 - **Approved capsule executables are pinned to approved content.** The
   kernel-owned install receipt records the exact approved WASM hash and rejects
   both pointer and content swaps after authority approval.
+- **Uplink authentication honors the keypair method gate.** A device key that
+  remains on disk cannot authenticate a principal after keypair authentication
+  is removed from the profile's active methods.
 
 - **SurrealKV now preserves memtable rotation and compaction durability through
   its 0.21.3 fixes.** The update corrects atomic memtable rotation and fsyncs
