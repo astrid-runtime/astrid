@@ -137,18 +137,19 @@ fn create(path: &str) -> StorageFilesystemOperationV1 {
 #[tokio::test]
 async fn private_mount_manifest_and_callback_endpoint_are_owner_scoped() {
     let temporary = tempfile::tempdir().unwrap();
-    astrid_core::platform_fs::ensure_private_directory(temporary.path()).unwrap();
+    let private_root = temporary.path().join("private");
+    astrid_core::platform_fs::ensure_private_directory(&private_root).unwrap();
     let lease = StorageMountLeaseV1 {
         mount_id: StorageMountId::new(),
         view: StorageProviderViewV1::Principal(PrincipalId::default()),
         access: StorageProviderAccessV1::ReadOnly,
-        resource_path: temporary.path().to_path_buf(),
-        callback_path: temporary.path().join("control.sock"),
+        resource_path: private_root.clone(),
+        callback_path: private_root.join("control.sock"),
         lease_token: "test-token".to_owned(),
         expires_at_epoch_secs: u64::MAX,
     };
 
-    let manifest_path = temporary.path().join("lease.json");
+    let manifest_path = private_root.join("lease.json");
     write_private_manifest(&manifest_path, &lease).unwrap();
     let listener = bind_private_listener(&lease.callback_path).unwrap();
 
