@@ -84,6 +84,12 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Changed
 
+- **Core configuration parsing now uses one TOML 0.9 family.** `astrid-core`
+  joins the workspace TOML dependency instead of retaining 0.8 solely to
+  preserve an internal Rust error-type identity. Configuration schemas and
+  emitted documents are unchanged; readers now accept TOML 1.1 syntax and
+  include the 0.9 parser's malformed-integer panic fix. Closes #1526.
+
 - **The unpublished storage model, content DAG, engine, and resource-authority
   packages are now internal `astrid-storage` modules.** This preserves their
   tested boundaries without creating four additional crates.io products,
