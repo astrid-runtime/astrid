@@ -20,6 +20,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Fixed
 
+- **Host-process file injections are bounded.** Injection payload size and
+  count are capped so a guest cannot exhaust host memory through injection
+  volume.
+
 - **SurrealKV now preserves memtable rotation and compaction durability through
   its 0.21.3 fixes.** The update corrects atomic memtable rotation and fsyncs
   post-compaction state so power loss cannot strand the newly compacted store.
