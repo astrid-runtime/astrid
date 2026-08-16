@@ -350,6 +350,7 @@ fn set_owner_private_dir(path: &Path) -> anyhow::Result<()> {
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
 fn set_owner_private_dir(_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
