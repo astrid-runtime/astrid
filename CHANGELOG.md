@@ -20,6 +20,20 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Fixed
 
+- **Shared runtime resources now stay bounded under adversarial capsules.**
+  WASM table growth, concurrent in-flight CPU fuel, host-process file
+  injection size, and approved executable resolution are each capped or pinned
+  so a guest cannot exhaust host accounting or swap an approved binary after
+  installation.
+
+- **Uplink authentication honors the keypair method gate.** A device key that
+  remains on disk can no longer authenticate a principal after keypair
+  authentication is removed from the profile's active methods.
+
+- **Storage group leadership recovers after a leader panic.** Surviving
+  members now reclaim the group instead of leaving recovery permanently
+  wedged behind the departed leader.
+
 - **SurrealKV now preserves memtable rotation and compaction durability through
   its 0.21.3 fixes.** The update corrects atomic memtable rotation and fsyncs
   post-compaction state so power loss cannot strand the newly compacted store.
