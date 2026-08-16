@@ -320,6 +320,7 @@ jobs:
           cp "$BINARY_ROOT/astrid-daemon" "$DIR/"
           cp "$BINARY_ROOT/astrid-build" "$DIR/"
           cp "$BINARY_ROOT/astrid-emit" "$DIR/"
+          cp LICENSE* README.md "$DIR/" 2>/dev/null || true
           if [[ "$TARGET" == *-apple-darwin ]]; then
             cp "$BINARY_ROOT/astrid-storage-provider-fskit" "$DIR/"
             ditto "$ASTRID_FSKIT_APP" "$DIR/AstridFS.app"
@@ -343,7 +344,6 @@ jobs:
             if [[ "$TARGET" == *-unknown-linux-* ]]; then
               cp "$BINARY_ROOT/astrid-storage-provider-fuse" "$DIR/"
             fi
-            cp LICENSE* README.md "$DIR/" 2>/dev/null || true
             tar czf "${DIR}.tar.gz" "$DIR"
           fi
           echo "ASSET=${DIR}.tar.gz" >> "$GITHUB_ENV"

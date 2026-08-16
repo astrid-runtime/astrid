@@ -357,6 +357,8 @@ fn validate_private_listener(callback_path: &Path) -> Result<(), String> {
     if metadata.permissions().mode() & 0o777 != 0o600 {
         return Err("private mount callback socket is not owner-only".to_owned());
     }
+    astrid_core::platform_fs::validate_no_extended_acl(callback_path)
+        .map_err(|error| format!("validate private mount callback ACL: {error}"))?;
     let parent = callback_path
         .parent()
         .ok_or_else(|| "private mount callback socket has no parent".to_owned())?;

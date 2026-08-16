@@ -12,7 +12,7 @@ if [[ $# -ne 1 ]]; then
 fi
 
 APP_PATH=$1
-EXTENSION_PATH="$APP_PATH/Contents/PlugIns/AstridFSAppEx.app"
+EXTENSION_PATH="$APP_PATH/Contents/Extensions/AstridFSAppEx.appex"
 APP_BINARY="$APP_PATH/Contents/MacOS/AstridFS"
 EXTENSION_BINARY="$EXTENSION_PATH/Contents/MacOS/AstridFSAppEx"
 
@@ -25,4 +25,4 @@ codesign --verify --deep --strict --verbose=2 "$EXTENSION_PATH"
 ENTITLEMENTS="$(codesign --display --entitlements - "$EXTENSION_PATH" 2>/dev/null)"
 grep -Fq "com.apple.developer.fskit.fsmodule" <<<"$ENTITLEMENTS"
 xcrun stapler validate "$APP_PATH"
-spctl -a -vvv -t exec "$APP_BINARY"
+spctl -a -vvv -t exec "$APP_PATH"

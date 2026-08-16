@@ -134,6 +134,28 @@ fn unix_private_directory_validation_rejects_permissive_modes() {
     );
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_private_file_validation_rejects_and_restriction_removes_extended_acl() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("secret");
+    std::fs::write(&path, b"secret").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let status = std::process::Command::new("/bin/chmod")
+        .arg("+a")
+        .arg("everyone allow read")
+        .arg(&path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    assert!(validate_private_file(&path).is_err());
+    restrict_private_file(&path).unwrap();
+    assert!(validate_private_file(&path).is_ok());
+}
+
 #[cfg(unix)]
 #[test]
 fn unix_private_directory_creation_rejects_redirected_components() {

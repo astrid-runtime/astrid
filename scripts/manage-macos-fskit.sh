@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-usage: astrid-fskit-lifecycle.sh install|update|enable|status|uninstall|validate
+usage: manage-macos-fskit.sh install|update|enable|status|uninstall|validate
 environment: ASTRID_FSKIT_APP_DEST, ASTRID_FSKIT_BIN_DIR
 EOF
 }
@@ -58,15 +58,28 @@ companion_path() {
 install_companion() {
   local source target
   source="$(companion_path)"
-  if [[ -n "${ASTRID_FSKIT_BIN_DIR:-}" ]]; then
-    target="$ASTRID_FSKIT_BIN_DIR/astrid-storage-provider-fskit"
-  elif command -v astrid >/dev/null 2>&1; then
-    target="$(dirname "$(command -v astrid)")/astrid-storage-provider-fskit"
-  else
-    target="/usr/local/bin/astrid-storage-provider-fskit"
+  target="$(companion_target)"
+  if [[ -e "$target" && "$source" -ef "$target" ]]; then
+    return
   fi
   mkdir -p "$(dirname "$target")"
-  install -m 0755 "$source" "$target"
+  local stage="${target}.new.$$"
+  rm -f "$stage"
+  if ! install -m 0755 "$source" "$stage"; then
+    rm -f "$stage"
+    return 1
+  fi
+  mv -f "$stage" "$target"
+}
+
+companion_target() {
+  if [[ -n "${ASTRID_FSKIT_BIN_DIR:-}" ]]; then
+    printf '%s\n' "$ASTRID_FSKIT_BIN_DIR/astrid-storage-provider-fskit"
+  elif command -v astrid >/dev/null 2>&1; then
+    printf '%s\n' "$(dirname "$(command -v astrid)")/astrid-storage-provider-fskit"
+  else
+    printf '%s\n' "/usr/local/bin/astrid-storage-provider-fskit"
+  fi
 }
 
 install_app() {
@@ -125,16 +138,16 @@ case "$COMMAND" in
       echo "unmount every Astrid filesystem before uninstalling AstridFS" >&2
       exit 1
     fi
-    osascript -e "tell application \"Finder\" to delete POSIX file \"$DESTINATION_APP\""
+    osascript - "$DESTINATION_APP" <<'APPLESCRIPT'
+on run arguments
+  tell application "Finder" to delete POSIX file (item 1 of arguments)
+end run
+APPLESCRIPT
     [[ ! -e "$DESTINATION_APP" ]] || {
       echo "AstridFS was not removed" >&2
       exit 1
     }
-    if [[ -n "${ASTRID_FSKIT_BIN_DIR:-}" ]]; then
-      rm -f "$ASTRID_FSKIT_BIN_DIR/astrid-storage-provider-fskit"
-    elif command -v astrid >/dev/null 2>&1; then
-      rm -f "$(dirname "$(command -v astrid)")/astrid-storage-provider-fskit"
-    fi
+    rm -f "$(companion_target)"
     ;;
   validate)
     if [[ -d "$DESTINATION_APP" ]]; then

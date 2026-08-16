@@ -42,6 +42,8 @@ fn managed_binaries_for_target(target: &str) -> Vec<&'static str> {
     let mut names = vec!["astrid", "astrid-daemon"];
     if target.contains("-unknown-linux-") {
         names.push("astrid-storage-provider-fuse");
+    } else if target.contains("-apple-darwin") {
+        names.push("astrid-storage-provider-fskit");
     }
     names
 }

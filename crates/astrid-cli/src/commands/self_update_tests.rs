@@ -397,33 +397,34 @@ fn backup_and_swap_replaces_and_keeps_backup() {
 
     let managed = super::managed_binaries_for_target(super::platform_target().unwrap());
     for name in &managed {
-        std::fs::write(install.join(name), b"OLD").unwrap();
-    }
-    std::fs::write(install.join("astrid-daemon"), b"OLD-D").unwrap();
-    std::fs::write(extract.join("astrid"), b"NEW").unwrap();
-    std::fs::write(extract.join("astrid-daemon"), b"NEW-D").unwrap();
-    for name in managed.iter().skip(2) {
-        std::fs::write(extract.join(name), b"NEW-P").unwrap();
+        std::fs::write(install.join(name), format!("OLD-{name}")).unwrap();
+        std::fs::write(extract.join(name), format!("NEW-{name}")).unwrap();
     }
 
     backup_and_swap(&install, &extract, &managed).unwrap();
 
-    assert_eq!(std::fs::read(install.join("astrid")).unwrap(), b"NEW");
-    assert_eq!(
-        std::fs::read(install.join("astrid-daemon")).unwrap(),
-        b"NEW-D"
-    );
-    for name in managed.iter().skip(2) {
-        assert_eq!(std::fs::read(install.join(name)).unwrap(), b"NEW-P");
+    for name in &managed {
+        assert_eq!(
+            std::fs::read_to_string(install.join(name)).unwrap(),
+            format!("NEW-{name}")
+        );
+        // Previous binaries are preserved for manual rollback.
+        assert_eq!(
+            std::fs::read_to_string(install.join(format!("{name}.bak"))).unwrap(),
+            format!("OLD-{name}")
+        );
     }
-    // Previous binaries preserved for manual rollback.
-    assert_eq!(std::fs::read(install.join("astrid.bak")).unwrap(), b"OLD");
-    assert_eq!(
-        std::fs::read(install.join("astrid-daemon.bak")).unwrap(),
-        b"OLD-D"
-    );
     // No staging temps left behind.
     assert!(!install.join(".astrid.new").exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_self_update_keeps_the_native_storage_provider_in_the_atomic_set() {
+    assert!(
+        super::managed_binaries_for_target("aarch64-apple-darwin")
+            .contains(&"astrid-storage-provider-fskit")
+    );
 }
 
 #[test]
@@ -436,22 +437,22 @@ fn backup_and_swap_bails_when_archive_missing_a_binary() {
 
     let managed = super::managed_binaries_for_target(super::platform_target().unwrap());
     for name in &managed {
-        std::fs::write(install.join(name), b"OLD").unwrap();
+        std::fs::write(install.join(name), format!("OLD-{name}")).unwrap();
     }
-    std::fs::write(install.join("astrid-daemon"), b"OLD-D").unwrap();
-    // Archive only ships `astrid`; `astrid-daemon` is absent.
+    // Archive only ships `astrid`; the remaining managed binaries are absent.
     std::fs::write(extract.join("astrid"), b"NEW").unwrap();
 
     assert!(backup_and_swap(&install, &extract, &managed).is_err());
 
     // The completeness check runs before anything is touched: live binaries
     // are unchanged and no backups or staging temps were created.
-    assert_eq!(std::fs::read(install.join("astrid")).unwrap(), b"OLD");
-    assert_eq!(
-        std::fs::read(install.join("astrid-daemon")).unwrap(),
-        b"OLD-D"
-    );
-    assert!(!install.join("astrid.bak").exists());
+    for name in &managed {
+        assert_eq!(
+            std::fs::read_to_string(install.join(name)).unwrap(),
+            format!("OLD-{name}")
+        );
+        assert!(!install.join(format!("{name}.bak")).exists());
+    }
     assert!(!install.join(".astrid.new").exists());
 }
 

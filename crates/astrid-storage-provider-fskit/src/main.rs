@@ -189,13 +189,20 @@ async fn mount(
         };
     }
     if let Err(error) = native_mount(&lease, &mountpoint).await {
-        let rollback =
-            rollback_after_native_failure(client, &lease.mount_id, &mountpoint, auto_created).await;
+        let rollback = rollback_after_native_failure(
+            client,
+            &lease.mount_id,
+            &mountpoint,
+            auto_created,
+            false,
+        )
+        .await;
         return Err(error).context(rollback);
     }
-    if let Err(error) = validate_mountpoint(&mountpoint) {
+    if let Err(error) = validate_mounted_mountpoint(&mountpoint) {
         let rollback =
-            rollback_after_native_failure(client, &lease.mount_id, &mountpoint, auto_created).await;
+            rollback_after_native_failure(client, &lease.mount_id, &mountpoint, auto_created, true)
+                .await;
         return Err(error).context(rollback);
     }
     Ok(StorageProviderSuccessV1::Mounted {
@@ -210,10 +217,14 @@ async fn unmount(
     selector: &StorageMountSelectorV1,
 ) -> Result<StorageProviderSuccessV1> {
     let record = resolve_record(selector)?;
-    validate_mountpoint(&record.mountpoint)?;
-    if &record.requested_by != acting_principal {
-        bail!("mount was issued to another acting principal");
-    }
+    validate_mountpoint_layout(&record.mountpoint)?;
+    validate_mountpoint_ancestors(&record.mountpoint)?;
+    astrid_core::platform_fs::verify_no_redirects(&record.mountpoint).with_context(|| {
+        format!(
+            "reject redirected mountpoint {}",
+            record.mountpoint.display()
+        )
+    })?;
     // Validate lease ownership before changing native mount state. The
     // registry is lifecycle bookkeeping, not an authorization source.
     let lease_is_live = unmount_status(
@@ -223,8 +234,11 @@ async fn unmount(
             })
             .await?,
     )?;
-    native_unmount(&record.mountpoint).await?;
-    validate_mountpoint(&record.mountpoint)?;
+    authorize_stale_cleanup(lease_is_live, &record.requested_by, acting_principal)?;
+    if native_mount_is_active(&record.mountpoint)? {
+        native_unmount(&record.mountpoint).await?;
+    }
+    validate_unmounted_mountpoint(&record.mountpoint)?;
     if lease_is_live {
         into_success(
             client
@@ -242,6 +256,17 @@ async fn unmount(
     Ok(StorageProviderSuccessV1::Unmounted {
         mount_id: record.mount_id,
     })
+}
+
+fn authorize_stale_cleanup(
+    lease_is_live: bool,
+    requested_by: &astrid_core::PrincipalId,
+    acting_principal: &astrid_core::PrincipalId,
+) -> Result<()> {
+    if !lease_is_live && requested_by != acting_principal {
+        bail!("stale mount recovery belongs to another acting principal");
+    }
+    Ok(())
 }
 
 fn lease_from_response(body: AdminResponseBody) -> Result<StorageMountLeaseV1> {
@@ -288,14 +313,32 @@ async fn rollback_after_native_failure(
     mount_id: &StorageMountId,
     mountpoint: &Path,
     auto_created: bool,
+    native_mount_command_succeeded: bool,
 ) -> anyhow::Error {
     let mut errors = Vec::new();
-    let native_unmounted = match native_unmount(mountpoint).await {
-        Ok(()) => true,
-        Err(error) => {
-            errors.push(format!("unmount: {error:#}"));
-            false
-        },
+    let native_unmounted = if native_mount_command_succeeded {
+        match native_unmount(mountpoint).await {
+            Ok(()) => true,
+            Err(error) => {
+                errors.push(format!("unmount: {error:#}"));
+                false
+            },
+        }
+    } else {
+        match native_mount_is_active(mountpoint) {
+            Ok(false) => true,
+            Ok(true) => match native_unmount(mountpoint).await {
+                Ok(()) => true,
+                Err(error) => {
+                    errors.push(format!("unmount: {error:#}"));
+                    false
+                },
+            },
+            Err(error) => {
+                errors.push(format!("inspect mount: {error:#}"));
+                false
+            },
+        }
     };
     if !native_unmounted {
         return anyhow::anyhow!(
@@ -331,7 +374,7 @@ fn cleanup_created_mountpoint(mountpoint: &Path, auto_created: bool) -> Result<(
     if !auto_created {
         return Ok(());
     }
-    validate_mountpoint(mountpoint)?;
+    validate_unmounted_mountpoint(mountpoint)?;
     let mut entries = std::fs::read_dir(mountpoint)
         .with_context(|| format!("read auto-created mountpoint {}", mountpoint.display()))?;
     if entries.next().is_some() {
@@ -360,11 +403,11 @@ fn prepare_mountpoint(
         },
     };
     if existed {
-        validate_mountpoint(&mountpoint)?;
+        validate_unmounted_mountpoint(&mountpoint)?;
     } else {
         astrid_core::platform_fs::ensure_private_directory(&mountpoint)
             .with_context(|| format!("create private mountpoint {}", mountpoint.display()))?;
-        validate_mountpoint(&mountpoint)?;
+        validate_unmounted_mountpoint(&mountpoint)?;
     }
     Ok((mountpoint, !existed))
 }
@@ -389,8 +432,9 @@ fn default_mountpoint(
     Ok(home.join("Astrid").join(leaf))
 }
 
-fn validate_mountpoint(mountpoint: &Path) -> Result<()> {
+fn validate_unmounted_mountpoint(mountpoint: &Path) -> Result<()> {
     validate_mountpoint_layout(mountpoint)?;
+    validate_mountpoint_ancestors(mountpoint)?;
     astrid_core::platform_fs::verify_no_redirects(mountpoint)
         .with_context(|| format!("reject redirected mountpoint {}", mountpoint.display()))?;
     astrid_core::platform_fs::validate_private_directory(mountpoint)
@@ -398,6 +442,46 @@ fn validate_mountpoint(mountpoint: &Path) -> Result<()> {
     if std::fs::read_dir(mountpoint)?.next().is_some() {
         bail!("mountpoint is not empty: {}", mountpoint.display());
     }
+    Ok(())
+}
+
+fn validate_mounted_mountpoint(mountpoint: &Path) -> Result<()> {
+    validate_mountpoint_layout(mountpoint)?;
+    validate_mountpoint_ancestors(mountpoint)?;
+    astrid_core::platform_fs::verify_no_redirects(mountpoint)
+        .with_context(|| format!("reject redirected mountpoint {}", mountpoint.display()))?;
+    if !native_mount_is_active(mountpoint)? {
+        bail!(
+            "macOS did not activate an astridfs mount at {}",
+            mountpoint.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_mountpoint_ancestors(mountpoint: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let mut ancestor = mountpoint.parent();
+    while let Some(path) = ancestor {
+        let metadata = std::fs::symlink_metadata(path)
+            .with_context(|| format!("inspect mountpoint ancestor {}", path.display()))?;
+        let mode = metadata.mode();
+        if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+            bail!(
+                "mountpoint ancestor is writable without sticky protection: {}",
+                path.display()
+            );
+        }
+        ancestor = path.parent();
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_mountpoint_ancestors(mountpoint: &Path) -> Result<()> {
+    let _ = mountpoint;
     Ok(())
 }
 
@@ -458,12 +542,25 @@ async fn native_unmount(mountpoint: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn native_mount_is_active(mountpoint: &Path) -> Result<bool> {
+    let status = nix::sys::statfs::statfs(mountpoint)
+        .with_context(|| format!("inspect native mountpoint {}", mountpoint.display()))?;
+    Ok(status.filesystem_type_name() == "astridfs")
+}
+
 #[cfg(not(target_os = "macos"))]
 fn native_unmount(mountpoint: &Path) -> std::future::Ready<Result<()>> {
     let _ = mountpoint;
     std::future::ready(Err(anyhow::anyhow!(
         "the FSKit provider is available only on macOS"
     )))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn native_mount_is_active(mountpoint: &Path) -> Result<bool> {
+    let _ = mountpoint;
+    bail!("the FSKit provider is available only on macOS")
 }
 
 fn resolve_record(selector: &StorageMountSelectorV1) -> Result<MountRecord> {
@@ -653,6 +750,49 @@ mod tests {
     }
 
     #[test]
+    fn unmounted_mountpoint_must_remain_empty() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let mountpoint = root.path().join("mount");
+        astrid_core::platform_fs::ensure_private_directory(&mountpoint)
+            .expect("private mountpoint");
+        std::fs::write(mountpoint.join("unexpected"), b"data").expect("unexpected underlying file");
+
+        let error = validate_unmounted_mountpoint(&mountpoint)
+            .expect_err("nonempty underlying mountpoint must be rejected");
+
+        assert!(error.to_string().contains("not empty"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mountpoint_rejects_a_writable_nonsticky_ancestor() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let shared = root.path().join("shared");
+        let mountpoint = shared.join("mount");
+        std::fs::create_dir(&shared).expect("shared directory");
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777))
+            .expect("writable shared directory");
+        std::fs::create_dir(&mountpoint).expect("mountpoint");
+        std::fs::set_permissions(&mountpoint, std::fs::Permissions::from_mode(0o700))
+            .expect("private mountpoint");
+
+        let error = validate_unmounted_mountpoint(&mountpoint)
+            .expect_err("unsafe writable ancestor must be rejected");
+
+        assert!(error.to_string().contains("sticky protection"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ordinary_private_directory_is_not_an_active_astrid_mount() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        astrid_core::platform_fs::ensure_private_directory(root.path()).expect("private directory");
+
+        assert!(!native_mount_is_active(root.path()).expect("inspect filesystem type"));
+        assert!(validate_mounted_mountpoint(root.path()).is_err());
+    }
+
+    #[test]
     fn unmount_allows_local_cleanup_after_a_stale_kernel_lease() {
         assert!(
             unmount_status(AdminResponseBody::Success(serde_json::json!({})))
@@ -670,6 +810,12 @@ mod tests {
             ))
             .is_err()
         );
+
+        let owner = astrid_core::PrincipalId::new("owner").expect("owner principal");
+        let operator = astrid_core::PrincipalId::new("operator").expect("operator principal");
+        assert!(authorize_stale_cleanup(true, &owner, &operator).is_ok());
+        assert!(authorize_stale_cleanup(false, &owner, &owner).is_ok());
+        assert!(authorize_stale_cleanup(false, &owner, &operator).is_err());
     }
 
     #[cfg(unix)]
@@ -731,25 +877,11 @@ mod tests {
         native_mount(&lease, &mountpoint)
             .await
             .expect("actual FSKit mount");
-        let output = std::process::Command::new("/sbin/mount")
-            .output()
-            .expect("read macOS mount table");
-        assert!(output.status.success());
-        let table = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            table.contains(&format!(" on {} ", mountpoint.display())),
-            "mount table does not contain {}: {table}",
-            mountpoint.display()
-        );
+        validate_mounted_mountpoint(&mountpoint).expect("active astridfs mount");
 
         native_unmount(&mountpoint)
             .await
             .expect("actual FSKit unmount");
-        let output = std::process::Command::new("/sbin/mount")
-            .output()
-            .expect("read macOS mount table after unmount");
-        assert!(output.status.success());
-        let table = String::from_utf8_lossy(&output.stdout);
-        assert!(!table.contains(&format!(" on {} ", mountpoint.display())));
+        validate_unmounted_mountpoint(&mountpoint).expect("restored private mountpoint");
     }
 }

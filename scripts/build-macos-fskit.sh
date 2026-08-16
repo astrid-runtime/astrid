@@ -42,7 +42,7 @@ if [[ ! -d "$APP_PATH" ]]; then
   exit 1
 fi
 
-EXTENSION_PATH="$APP_PATH/Contents/PlugIns/AstridFSAppEx.app"
+EXTENSION_PATH="$APP_PATH/Contents/Extensions/AstridFSAppEx.appex"
 if [[ ! -d "$EXTENSION_PATH" ]]; then
   echo "FSKit app extension was not produced at $EXTENSION_PATH" >&2
   exit 1

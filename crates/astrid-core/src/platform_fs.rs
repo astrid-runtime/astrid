@@ -239,6 +239,28 @@ pub fn validate_private_file(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Reject a native path carrying an extended access-control list.
+///
+/// macOS ACL entries can grant access beyond owner-only POSIX mode bits, so
+/// security-sensitive paths must satisfy both checks. Platforms without this
+/// additional ACL surface accept the path unchanged.
+///
+/// # Errors
+///
+/// Returns an error when the ACL cannot be inspected or contains any entry.
+pub fn validate_no_extended_acl(path: &Path) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        validate_no_extended_acl_macos(path)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
 /// Read one private text file through the platform's protected filesystem
 /// boundary.
 ///
@@ -403,9 +425,9 @@ fn ensure_private_directory_unix(path: &Path) -> io::Result<()> {
         };
         directory = std::fs::File::from(next);
     }
-    fchmod(&directory, Mode::from_bits_truncate(0o700))
-        .map_err(nix_io_error)
-        .and_then(|()| validate_private_directory_unix(path))
+    fchmod(&directory, Mode::from_bits_truncate(0o700)).map_err(nix_io_error)?;
+    remove_extended_acl_macos(path)?;
+    validate_private_directory_unix(path)
 }
 
 #[cfg(unix)]
@@ -429,6 +451,7 @@ fn validate_private_directory_unix(path: &Path) -> io::Result<()> {
             format!("private directory is not owner-only: {}", path.display()),
         ));
     }
+    validate_no_extended_acl(path)?;
     Ok(())
 }
 
@@ -447,6 +470,7 @@ fn restrict_private_file_unix(path: &Path) -> io::Result<()> {
     fchmod(&file, Mode::from_bits_truncate(0o600)).map_err(nix_io_error)?;
     file.sync_all()?;
     drop(file);
+    remove_extended_acl_macos(path)?;
     validate_private_file_unix(path)
 }
 
@@ -477,7 +501,69 @@ fn validate_private_file_unix(path: &Path) -> io::Result<()> {
             format!("private file is not owner-only: {}", path.display()),
         ));
     }
+    validate_no_extended_acl(path)?;
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn remove_extended_acl_macos(path: &Path) -> io::Result<()> {
+    let path = absolute_command_path(path)?;
+    let status = std::process::Command::new("/bin/chmod")
+        .arg("-N")
+        .arg(path)
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(
+            "failed to remove extended access-control list",
+        ))
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn remove_extended_acl_macos(path: &Path) -> io::Result<()> {
+    let _ = path;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn validate_no_extended_acl_macos(path: &Path) -> io::Result<()> {
+    let path = absolute_command_path(path)?;
+    let output = std::process::Command::new("/bin/ls")
+        .arg("-lde")
+        .arg(path)
+        .env("LC_ALL", "C")
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(
+            "failed to inspect extended access-control list",
+        ));
+    }
+    let listing = String::from_utf8(output.stdout)
+        .map_err(|_| io::Error::other("access-control listing is not UTF-8"))?;
+    let has_acl_entry = listing.lines().skip(1).any(|line| {
+        line.trim_start()
+            .split_once(':')
+            .is_some_and(|(index, _)| index.parse::<usize>().is_ok())
+    });
+    if has_acl_entry {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "private path has an extended access-control list",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn absolute_command_path(path: &Path) -> io::Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
 }
 
 #[cfg(unix)]

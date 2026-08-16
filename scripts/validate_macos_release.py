@@ -62,7 +62,7 @@ def validate(archive_path: pathlib.Path, mtime: int | None = None) -> None:
         f"{root}/macos/manage-macos-fskit.sh": 0o755,
         f"{root}/macos/validate-macos-fskit.sh": 0o755,
         f"{root}/AstridFS.app/Contents/MacOS/AstridFS": 0o755,
-        f"{root}/AstridFS.app/Contents/PlugIns/AstridFSAppEx.app/Contents/MacOS/AstridFSAppEx": 0o755,
+        f"{root}/AstridFS.app/Contents/Extensions/AstridFSAppEx.appex/Contents/MacOS/AstridFSAppEx": 0o755,
     }
     with tarfile.open(archive_path, mode="r:gz") as archive:
         for name, mode in expected.items():
@@ -74,7 +74,7 @@ def validate(archive_path: pathlib.Path, mtime: int | None = None) -> None:
                 fail(f"required macOS release member is missing or non-executable: {name}")
         app_info = archive.getmember(f"{root}/AstridFS.app/Contents/Info.plist")
         extension_info = archive.getmember(
-            f"{root}/AstridFS.app/Contents/PlugIns/AstridFSAppEx.app/Contents/Info.plist"
+            f"{root}/AstridFS.app/Contents/Extensions/AstridFSAppEx.appex/Contents/Info.plist"
         )
         if not app_info.isfile() or not extension_info.isfile():
             fail("required AstridFS Info.plist members are missing")

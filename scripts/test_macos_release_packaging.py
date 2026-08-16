@@ -24,7 +24,7 @@ validator = load_script("validate_macos_release.py")
 
 def write_release(root: pathlib.Path) -> None:
     app = root / "AstridFS.app/Contents"
-    extension = app / "PlugIns/AstridFSAppEx.app/Contents"
+    extension = app / "Extensions/AstridFSAppEx.appex/Contents"
     macos = root / "macos"
     app.mkdir(parents=True)
     extension.mkdir(parents=True)
