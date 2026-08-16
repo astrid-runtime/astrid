@@ -501,10 +501,14 @@ jobs:
             throw "WinFsp MSI digest mismatch: $hash"
           }
           $exitCode = (Start-Process -FilePath "msiexec.exe" `
-            -ArgumentList @("/i", "`"$msi`"", "/qn", "/norestart") `
+            -ArgumentList @("/i", "`"$msi`"", "ADDLOCAL=F.Developer", "/qn", "/norestart") `
             -Wait -PassThru).ExitCode
           if ($exitCode -ne 0 -and $exitCode -ne 3010) {
             throw "WinFsp installation failed with exit code $exitCode"
+          }
+          $importLibrary = Join-Path ${env:ProgramFiles(x86)} "WinFsp\lib\winfsp-x64.lib"
+          if (-not (Test-Path -LiteralPath $importLibrary -PathType Leaf)) {
+            throw "WinFsp Developer import library was not installed: $importLibrary"
           }
 
       - name: Lint the Windows provider
