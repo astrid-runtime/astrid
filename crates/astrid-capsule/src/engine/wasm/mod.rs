@@ -953,12 +953,11 @@ fn cpu_rate_deny(
 ) -> Option<String> {
     // Exemption resolves the INVOKING principal's profile against the cached
     // group config — fail-CLOSED (bounded) on any missing input.
-    if resolve_exemption(invocation_profile, group_config, principal) {
+    let budget = cpu_rate_budget(invocation_profile, group_config, principal);
+    if budget == 0 {
         return None;
     }
-    let budget = invocation_profile
-        .map(|p| p.quotas.max_cpu_fuel_per_sec)
-        .unwrap_or(astrid_core::profile::DEFAULT_MAX_CPU_FUEL_PER_SEC);
+
     // 0 = unlimited; never deny-all. Window math fails OPEN (cannot fail).
     if budget > 0 && fuel_rate.over_budget(principal, budget, now) {
         return Some(format!(
@@ -966,6 +965,23 @@ fn cpu_rate_deny(
         ));
     }
     None
+}
+
+/// Resolve the per-principal CPU-rate budget used for admission.
+///
+/// `0` means unlimited (the capability-driven exemption set). A bounded caller
+/// uses its profile quota, or the process default when no cache is configured.
+fn cpu_rate_budget(
+    invocation_profile: Option<&astrid_core::profile::PrincipalProfile>,
+    group_config: Option<&astrid_core::GroupConfig>,
+    principal: &astrid_core::PrincipalId,
+) -> u64 {
+    if resolve_exemption(invocation_profile, group_config, principal) {
+        return 0;
+    }
+    invocation_profile
+        .map(|p| p.quotas.max_cpu_fuel_per_sec)
+        .unwrap_or(astrid_core::profile::DEFAULT_MAX_CPU_FUEL_PER_SEC)
 }
 
 /// Pure resolution of a capsule's run-loop resource bound from the owner
@@ -3078,20 +3094,10 @@ impl ExecutionEngine for WasmEngine {
 
         // ── Per-principal CPU-rate DENY gate (PR2, security boundary) ──────
         //
-        // The deny side of the per-principal CPU budget: if the invoking
-        // principal has burned more than `max_cpu_fuel_per_sec` in the current
-        // rolling 1-second window, refuse THIS invocation before it costs any
-        // CPU (before pool checkout / fuel seeding). The `record` feed AFTER
-        // the call (next to `fuel_ledger.charge`) is what populates the window;
-        // this is purely the read, stamped with a fresh `Instant::now()` taken
-        // HERE at the admission decision — NOT the earlier `invoke_start`.
-        // `invoke_start` is captured at the very top of the invocation, before
-        // the per-invocation setup and profile resolution that can hit disk
-        // (`PrincipalProfile::load`); reusing it here would read the window
-        // seconds in the past and can underflow `now < window_start` against a
-        // window a concurrent `record` just stamped. The matching `record` is
-        // stamped at call COMPLETION (see its call site), so a long call's fuel
-        // lands in the live window rather than a stale one.
+        // The deny side of the per-principal CPU budget. The read below also
+        // includes outstanding reservations, but production admission is not
+        // complete until `try_reserve` below atomically adds this call's
+        // conservative fuel amount.
         //
         // Two orthogonal axes, deliberately opposite fail directions:
         //   • EXEMPTION fails CLOSED. `resolve_exemption` returns `false`
@@ -3132,6 +3138,41 @@ impl ExecutionEngine for WasmEngine {
             // enforcement bypass.
             return Ok(crate::capsule::InterceptResult::Deny { reason });
         }
+
+        // Reserve CPU before pool checkout so concurrent calls cannot multiply
+        // the per-principal rate budget. The reservation is conservative; it is
+        // settled to exact wasmtime fuel once the call returns, is cancelled,
+        // or begins unwinding.
+        let rate_budget = cpu_rate_budget(
+            invocation_profile.as_deref(),
+            live_group_config.as_ref().map(Arc::as_ref),
+            &invoking_principal,
+        );
+        let invocation_fuel_budget = if rate_budget == 0 {
+            INTERCEPTOR_FUEL_BUDGET
+        } else {
+            rate_budget.min(INTERCEPTOR_FUEL_BUDGET)
+        };
+        let mut fuel_reservation = match self.fuel_rate.try_reserve(
+            &invoking_principal,
+            rate_budget,
+            invocation_fuel_budget,
+            now,
+        ) {
+            Some(reservation) => reservation,
+            None => {
+                let reason = format!(
+                    "principal '{invoking_principal}' exceeded in-flight CPU budget of {rate_budget} fuel/sec"
+                );
+                tracing::warn!(
+                    principal = %invoking_principal,
+                    capsule = %self.manifest.package.name,
+                    action,
+                    "CPU-rate reservation exceeded; denying invocation"
+                );
+                return Ok(crate::capsule::InterceptResult::Deny { reason });
+            },
+        };
 
         // Is the capsule a daemon (uplink / long-lived)? Daemon invocations
         // preserve the Store's load-time epoch policy (including the finite,
@@ -3239,13 +3280,13 @@ impl ExecutionEngine for WasmEngine {
             // Per-invocation CPU: fuel is engine-wide, so re-seed the leased
             // Store to a known budget before the call. This (a) bounds a
             // runaway single interceptor call, and (b) makes
-            // `INTERCEPTOR_FUEL_BUDGET - get_fuel()` after the call the EXACT
+            // `invocation_fuel_budget - get_fuel()` after the call the EXACT
             // deterministic instruction count for THIS invocation, attributable
             // to the invoking principal — independent of whatever the previous
             // leaseholder of this pooled Store consumed. Errors only if fuel is
             // disabled (it is not); on the impossible error we leave fuel as-is
             // (fail-secure: a smaller budget traps sooner).
-            let _ = s.set_fuel(INTERCEPTOR_FUEL_BUDGET);
+            let _ = s.set_fuel(invocation_fuel_budget);
 
             {
                 let state = s.data_mut();
@@ -3324,23 +3365,13 @@ impl ExecutionEngine for WasmEngine {
         // ENFORCED by the epoch interrupt mechanism, not fuel; windowed
         // deny/throttle on this aggregate is the deliberate follow-up).
         let fuel_after = checkout.store_mut().get_fuel().unwrap_or(0);
-        let fuel_used = INTERCEPTOR_FUEL_BUDGET.saturating_sub(fuel_after);
+        let fuel_used = invocation_fuel_budget.saturating_sub(fuel_after);
         self.fuel_ledger.charge(&invoking_principal, fuel_used);
-        // Feed this call's fuel into the CPU-rate window stamped at the moment
-        // the burn FINISHED, not `invoke_start`. The gate at the top reads the
-        // window with a fresh admission-time `Instant::now()` (it asks what this
-        // principal had burned *before* this call), but the fuel itself was
-        // spent over the whole
-        // call. A long call (interceptors run up to WASM_CAPSULE_TIMEOUT_SECS —
-        // minutes, for LLM streaming) stamped at `invoke_start` lands its fuel
-        // in a window that is already stale by the time it returns, so the next
-        // invocation's `over_budget` roll discards it — a principal issuing
-        // back-to-back >1s calls would never be throttled despite each call
-        // burning up to 5x the per-second budget (INTERCEPTOR_FUEL_BUDGET vs
-        // max_cpu_fuel_per_sec). Stamping at completion places the fuel in the
-        // live window so the next call sees it.
-        self.fuel_rate
-            .record(&invoking_principal, fuel_used, std::time::Instant::now());
+        // Settle exact usage in the live window at completion. If the future is
+        // dropped before this point, the reservation's Drop charges its full
+        // conservative amount, so cancellation cannot reclaim budget that an
+        // in-flight guest may already have spent.
+        fuel_reservation.settle(fuel_used, std::time::Instant::now());
         // Drop the lease: Phase 3 CLEAR runs and the instance returns to the
         // pool, so a parallel invocation can lease it with clean state.
         drop(checkout);

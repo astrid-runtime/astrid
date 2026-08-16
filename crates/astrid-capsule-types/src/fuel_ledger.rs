@@ -182,6 +182,10 @@ pub struct FuelRateLimiter {
     /// `parking_lot::Mutex`; distinct principals live on distinct DashMap
     /// shards and never contend.
     inner: Arc<DashMap<PrincipalId, Mutex<FuelWindow>>>,
+    /// Fuel already promised to in-flight calls but not yet settled. This is
+    /// separate from the rolling window so a long pool wait cannot roll away an
+    /// outstanding reservation and reopen a concurrency hole.
+    reserved: Arc<DashMap<PrincipalId, AtomicU64>>,
     /// Timestamp of the last prune pass, throttling prunes to once per
     /// [`PRUNE_INTERVAL`]. `try_lock`'d, never blocked on, so a prune in flight
     /// never stalls a `record`.
@@ -192,10 +196,46 @@ impl Default for FuelRateLimiter {
     fn default() -> Self {
         Self {
             inner: Arc::new(DashMap::new()),
+            reserved: Arc::new(DashMap::new()),
             // `Instant` has no zero; stamp with a real `now` so the first prune
             // is correctly throttled.
             last_prune: Arc::new(Mutex::new(Instant::now())),
         }
+    }
+}
+
+/// A conservative in-flight fuel reservation.
+///
+/// The reservation counts its full amount against the caller's one-second
+/// budget until [`settle`](Self::settle) observes the exact fuel consumed. If
+/// an invocation is cancelled or panics before settling, `Drop` charges the
+/// full reserved amount. This deliberately errs toward throttling rather than
+/// allowing concurrent calls to multiply a rate budget.
+pub struct FuelReservation {
+    limiter: FuelRateLimiter,
+    principal: PrincipalId,
+    amount: u64,
+    settled: bool,
+}
+
+impl FuelReservation {
+    /// Replace the conservative reservation with exact post-call fuel usage.
+    ///
+    /// Safe to call more than once; only the first call affects the window.
+    pub fn settle(&mut self, actual_fuel: u64, now: Instant) {
+        if self.settled {
+            return;
+        }
+        self.settled = true;
+        self.limiter
+            .settle_reserved(&self.principal, self.amount, actual_fuel, now);
+    }
+}
+
+impl Drop for FuelReservation {
+    fn drop(&mut self) {
+        let now = Instant::now();
+        self.settle(self.amount, now);
     }
 }
 
@@ -236,11 +276,71 @@ impl FuelRateLimiter {
         // Cold principal: no window yet => admit. Do NOT create an entry here;
         // entry creation is `record`'s job, on the post-hoc feed.
         let Some(cell) = self.inner.get(principal) else {
-            return false;
+            return self.reserved_amount(principal) > max_fuel_per_sec;
         };
         let mut window = cell.lock();
         Self::roll(&mut window, now);
-        window.fuel_in_window > max_fuel_per_sec
+        let reserved = self.reserved_amount(principal);
+        window.fuel_in_window.saturating_add(reserved) > max_fuel_per_sec
+    }
+
+    /// Atomically admit and reserve `amount` fuel for one in-flight call.
+    ///
+    /// The check includes fuel already settled in this window plus every
+    /// outstanding reservation for the principal. A successful reservation must
+    /// later settle to the exact fuel consumed; dropping it charges the full
+    /// conservative amount. `max_fuel_per_sec == 0` means unlimited and returns
+    /// a no-op reservation.
+    ///
+    /// # Errors
+    ///
+    /// Returns `None` when granting the reservation would exceed the budget.
+    #[must_use]
+    pub fn try_reserve(
+        &self,
+        principal: &PrincipalId,
+        max_fuel_per_sec: u64,
+        amount: u64,
+        now: Instant,
+    ) -> Option<FuelReservation> {
+        if max_fuel_per_sec == 0 {
+            return Some(FuelReservation {
+                limiter: self.clone(),
+                principal: principal.clone(),
+                amount: 0,
+                settled: false,
+            });
+        }
+
+        let cell = self.inner.entry(principal.clone()).or_insert_with(|| {
+            Mutex::new(FuelWindow {
+                window_start: now,
+                fuel_in_window: 0,
+            })
+        });
+        let mut window = cell.lock();
+        Self::roll(&mut window, now);
+        let reserved = self.reserved_amount(principal);
+        if window
+            .fuel_in_window
+            .saturating_add(reserved)
+            .saturating_add(amount)
+            > max_fuel_per_sec
+        {
+            return None;
+        }
+
+        let counter = self.reserved.entry(principal.clone()).or_default();
+        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            Some(value.saturating_add(amount))
+        });
+
+        Some(FuelReservation {
+            limiter: self.clone(),
+            principal: principal.clone(),
+            amount,
+            settled: false,
+        })
     }
 
     /// Attribute `fuel` to `principal`'s current 1-second window (post-hoc, from
@@ -280,6 +380,40 @@ impl FuelRateLimiter {
         self.maybe_prune(now);
     }
 
+    fn reserved_amount(&self, principal: &PrincipalId) -> u64 {
+        self.reserved
+            .get(principal)
+            .map_or(0, |value| value.load(Ordering::Relaxed))
+    }
+
+    fn settle_reserved(
+        &self,
+        principal: &PrincipalId,
+        amount: u64,
+        actual_fuel: u64,
+        now: Instant,
+    ) {
+        {
+            let cell = self.inner.entry(principal.clone()).or_insert_with(|| {
+                Mutex::new(FuelWindow {
+                    window_start: now,
+                    fuel_in_window: 0,
+                })
+            });
+            let mut window = cell.lock();
+            Self::roll(&mut window, now);
+            if amount != 0
+                && let Some(counter) = self.reserved.get(principal)
+            {
+                let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                    Some(value.saturating_sub(amount))
+                });
+            }
+            window.fuel_in_window = window.fuel_in_window.saturating_add(actual_fuel);
+        }
+        self.maybe_prune(now);
+    }
+
     /// Lazily drop principals whose window has gone stale, bounding map growth.
     ///
     /// Only eligible above [`PRUNE_THRESHOLD`] entries and at most once per
@@ -302,6 +436,8 @@ impl FuelRateLimiter {
             return;
         }
         *last = now;
+        self.reserved
+            .retain(|_, value| value.load(Ordering::Relaxed) > 0);
         self.inner.retain(|_, cell| {
             // Keep any cell we cannot lock (a concurrent holder => live).
             // Keep any cell whose window is still fresh (< 1s stale).
@@ -519,6 +655,83 @@ mod tests {
         assert!(
             rl.inner.get(&p).is_none(),
             "a zero record must not create a window entry"
+        );
+    }
+
+    #[test]
+    fn in_flight_reservations_prevent_concurrent_overshoot() {
+        let rl = FuelRateLimiter::default();
+        let p = pid("alice");
+        let t0 = Instant::now();
+
+        let mut first = rl
+            .try_reserve(&p, BUDGET, BUDGET * 3 / 5, t0)
+            .expect("first reservation fits");
+        let mut second = rl
+            .try_reserve(&p, BUDGET, BUDGET * 2 / 5, t0)
+            .expect("second reservation reaches but does not exceed budget");
+        assert!(
+            rl.try_reserve(&p, BUDGET, 1, t0).is_none(),
+            "a third in-flight call must not multiply the rate budget"
+        );
+
+        first.settle(BUDGET / 2, t0);
+        assert!(
+            rl.try_reserve(&p, BUDGET, BUDGET / 10 + 1, t0).is_none(),
+            "the still-out second reservation remains charged"
+        );
+        second.settle(0, t0);
+
+        assert!(
+            !rl.over_budget(&p, BUDGET, t0),
+            "settling exact usage leaves the principal within budget"
+        );
+        assert!(
+            rl.try_reserve(&p, BUDGET, BUDGET / 2, t0).is_some(),
+            "released reservation capacity is available again"
+        );
+    }
+
+    #[test]
+    fn dropped_reservations_charge_their_conservative_amount() {
+        let rl = FuelRateLimiter::default();
+        let p = pid("alice");
+        let t0 = Instant::now();
+
+        drop(
+            rl.try_reserve(&p, BUDGET, BUDGET - 1, t0)
+                .expect("reservation fits"),
+        );
+        assert!(
+            rl.try_reserve(&p, BUDGET, 2, t0).is_none(),
+            "a dropped reservation conservatively consumes its amount"
+        );
+    }
+
+    #[test]
+    fn reservations_survive_a_window_roll() {
+        let rl = FuelRateLimiter::default();
+        let p = pid("alice");
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(1_001);
+
+        let mut first = rl
+            .try_reserve(&p, BUDGET, BUDGET * 3 / 5, t0)
+            .expect("first reservation fits");
+        let mut second = rl
+            .try_reserve(&p, BUDGET, BUDGET * 2 / 5, t0)
+            .expect("second reservation reaches but does not exceed budget");
+        assert!(
+            rl.try_reserve(&p, BUDGET, 1, t1).is_none(),
+            "rolling the window must not erase an outstanding reservation"
+        );
+
+        first.settle(1, t1);
+        second.settle(0, t1);
+        assert!(!rl.over_budget(&p, BUDGET, t1));
+        assert!(
+            rl.try_reserve(&p, BUDGET, BUDGET - 1, t1).is_some(),
+            "settled usage, not the stale reservation, consumes the new window"
         );
     }
 
