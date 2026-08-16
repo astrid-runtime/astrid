@@ -13,15 +13,18 @@ use astrid_core::storage_filesystem::{
 };
 use astrid_core::storage_provider::StorageProviderAccessV1;
 use fuser::{
-    Config, Errno, FileAttr, FileHandle, FileType, Filesystem, Generation, INodeNo, MountOption,
-    OpenFlags, RenameFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
-    ReplyWrite, Request, Session, SessionACL,
+    Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo,
+    MountOption, OpenFlags, RenameFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty,
+    ReplyEntry, ReplyOpen, ReplyWrite, Request, Session, SessionACL,
 };
 
 use crate::callback::{CALLBACK_CHUNK_BYTES, CallbackClient, callback_errno};
 use crate::mountpoint::owner_ids;
 
-const ATTRIBUTE_TTL: Duration = Duration::from_secs(1);
+// Astrid is the authority and may be changed through another principal view or
+// native client. Do not let the kernel serve stale lengths or bytes from an
+// earlier callback result.
+const ATTRIBUTE_TTL: Duration = Duration::ZERO;
 
 /// Start a real kernel FUSE session for one admitted lease.
 pub(crate) type FuseBackgroundSession = fuser::BackgroundSession;
@@ -258,6 +261,10 @@ impl AstridFuseFilesystem {
 }
 
 impl Filesystem for AstridFuseFilesystem {
+    fn open(&self, _req: &Request, _ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        reply.opened(FileHandle(0), FopenFlags::FOPEN_DIRECT_IO);
+    }
+
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         match self.child_path(parent, name) {
             Ok(path) => self.entry_reply(&path, reply),

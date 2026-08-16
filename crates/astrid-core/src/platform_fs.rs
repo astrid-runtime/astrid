@@ -212,9 +212,18 @@ pub fn restrict_private_file(path: &Path) -> io::Result<()> {
         windows::restrict_private_file(path)
     }
 
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     {
         restrict_private_file_unix(path)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "private host-file permissions are unavailable on this target",
+        ))
     }
 }
 
@@ -233,9 +242,18 @@ pub fn validate_private_file(path: &Path) -> io::Result<()> {
         windows::validate_private_file(path)
     }
 
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     {
         validate_private_file_unix(path)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "private host-file validation is unavailable on this target",
+        ))
     }
 }
 
