@@ -188,6 +188,19 @@ mod tests {
     }
 
     #[test]
+    fn signature_base64_wire_format_remains_standard_padded() {
+        let signature = Signature::try_from_slice(&[0u8; 64]).unwrap();
+        assert_eq!(
+            signature.to_base64(),
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
+        );
+        assert_eq!(
+            Signature::from_base64(&signature.to_base64()).unwrap(),
+            signature
+        );
+    }
+
+    #[test]
     fn test_signature_verification() {
         let keypair = KeyPair::generate();
         let message = b"test message";

@@ -92,7 +92,7 @@ axum-server = { version = "0.8", features = ["tls-rustls"] }
 # axum's `Sse` responder can consume the kernel event bus directly.
 # The `sync` feature is the only thing that does it; not on by default.
 tokio-stream = { version = "0.1", features = ["sync"] }
-base64 = "0.22"
+base64 = { version = "0.23", default-features = false, features = ["std"] }
 blake3 = "1.5"
 caseless = "=0.2.2"
 # `default-features = false` strips chrono's `clock` feature, which on

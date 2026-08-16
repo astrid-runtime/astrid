@@ -132,6 +132,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   roots, nested paths, and linked-worktree `.git` files keep direct-write Git
   rollback semantics, while malformed and non-repositories remain on the
   fail-safe copy-on-write overlay path. Closes #1518.
+- **Base64 encoding now uses `base64` 0.23's scalar implementation explicitly.**
+  Existing standard and URL-safe wire formats remain byte-for-byte compatible;
+  the release's new default-on unsafe SIMD backend is deliberately disabled at
+  the workspace boundary. Closes #1510.
 
 - **Rust API compatibility CI now enforces only Astrid's supported public Rust
   contract.** Breaking changes to `astrid-types` remain merge-blocking unless

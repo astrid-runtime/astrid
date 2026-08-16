@@ -189,6 +189,16 @@ mod tests {
     }
 
     #[test]
+    fn base64_wire_format_remains_standard_padded() {
+        let zero = ContentHash::zero();
+        assert_eq!(
+            zero.to_base64(),
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        );
+        assert_eq!(ContentHash::from_base64(&zero.to_base64()), Ok(zero));
+    }
+
+    #[test]
     fn test_serde() {
         let hash = ContentHash::hash(b"test");
         let json = serde_json::to_string(&hash).unwrap();
