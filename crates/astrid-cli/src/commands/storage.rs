@@ -402,11 +402,16 @@ mod tests {
     }
 
     fn status_exchange() -> (StorageProviderRequestV1, StorageProviderResponseV1) {
+        let mountpoint = if cfg!(windows) {
+            std::path::PathBuf::from(r"C:\Astrid")
+        } else {
+            std::path::PathBuf::from("/mnt/astrid")
+        };
         let request = StorageProviderRequestV1::new(
             "operator".parse().unwrap(),
             StorageProviderOperationV1::Status {
                 selector: astrid_core::storage_provider::StorageMountSelectorV1::NativePath(
-                    "/mnt/astrid".into(),
+                    mountpoint.clone(),
                 ),
             },
         );
@@ -420,7 +425,7 @@ mod tests {
             },
             outcome: StorageProviderOutcomeV1::Success(StorageProviderSuccessV1::Status {
                 mount_id: StorageMountId::from_uuid(Uuid::from_bytes([9; 16])),
-                mountpoint: "/mnt/astrid".into(),
+                mountpoint,
                 access: astrid_core::storage_provider::StorageProviderAccessV1::ReadOnly,
                 dirty: false,
             }),
