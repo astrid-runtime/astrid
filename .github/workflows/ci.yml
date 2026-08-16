@@ -488,28 +488,6 @@ jobs:
             throw "tampered MSI rejection mutated the installation"
           }
 
-      - name: Lint the Windows provider
-        shell: pwsh
-        run: >-
-          cargo clippy --locked --target ${{ matrix.target }}
-          -p astrid-storage-provider-winfsp --all-targets -- -D warnings
-
-      - name: Lint the Windows CLI updater
-        shell: pwsh
-        run: >-
-          cargo clippy --locked --target ${{ matrix.target }} -p astrid
-          --bin astrid -- -D warnings
-
-      - name: Run portable WinFsp provider tests natively
-        shell: pwsh
-        run: cargo test --locked --target ${{ matrix.target }} -p astrid-storage-provider-winfsp -- --nocapture
-
-      - name: Run Windows updater tests natively
-        shell: pwsh
-        run: >-
-          cargo test --locked --target ${{ matrix.target }} -p astrid
-          --bin astrid commands::self_update -- --nocapture
-
       - name: Install pinned WinFsp runtime
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
@@ -528,6 +506,30 @@ jobs:
           if ($exitCode -ne 0 -and $exitCode -ne 3010) {
             throw "WinFsp installation failed with exit code $exitCode"
           }
+
+      - name: Lint the Windows provider
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: >-
+          cargo clippy --locked --target ${{ matrix.target }}
+          -p astrid-storage-provider-winfsp --all-targets -- -D warnings
+
+      - name: Lint the Windows CLI updater
+        shell: pwsh
+        run: >-
+          cargo clippy --locked --target ${{ matrix.target }} -p astrid
+          --bin astrid -- -D warnings
+
+      - name: Run portable WinFsp provider tests natively
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: cargo test --locked --target ${{ matrix.target }} -p astrid-storage-provider-winfsp -- --nocapture
+
+      - name: Run Windows updater tests natively
+        shell: pwsh
+        run: >-
+          cargo test --locked --target ${{ matrix.target }} -p astrid
+          --bin astrid commands::self_update -- --nocapture
 
       - name: Run local transport security tests natively
         if: matrix.target == 'x86_64-pc-windows-msvc'
