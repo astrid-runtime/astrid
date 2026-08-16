@@ -45,6 +45,9 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 - **Storage group leadership recovers after a leader panic.** Surviving
   members reclaim the group instead of leaving recovery permanently wedged
   behind the departed leader.
+- **Failed MCP server connections clean up their child processes.** A failed
+  handshake awaits owned process-tree termination instead of leaking the
+  failed startup's descendants.
 
 - **SurrealKV now preserves memtable rotation and compaction durability through
   its 0.21.3 fixes.** The update corrects atomic memtable rotation and fsyncs
