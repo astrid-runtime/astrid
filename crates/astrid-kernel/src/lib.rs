@@ -63,6 +63,7 @@ use astrid_core::SessionId;
 use astrid_core::dirs::{WorkspaceLayout, WorkspaceSelection};
 use astrid_core::groups::GroupConfig;
 use astrid_core::principal::PrincipalId;
+#[cfg(unix)]
 use astrid_crypto::KeyPair;
 use astrid_events::EventBus;
 // MCP client + the cap-std VFS are native-only (the Wasmtime host surface);
@@ -295,6 +296,7 @@ pub struct Kernel {
     pub session_token: Arc<astrid_core::session_token::SessionToken>,
     /// Path where the session token was written at boot. Stored so shutdown
     /// uses the exact same path (avoids fallback mismatch if env changes).
+    #[cfg(unix)]
     token_path: PathBuf,
     /// Shared allowance store for capsule-level approval decisions.
     ///
@@ -887,6 +889,8 @@ impl Kernel {
             cli_socket_listener,
             singleton_lock,
         } = resources;
+        #[cfg(not(unix))]
+        let _ = token_path;
 
         let workspace_selection = workspace_layout.resolve(&workspace_root).map_err(|error| {
             std::io::Error::new(error.kind(), format!("unsafe workspace selection: {error}"))
@@ -1100,6 +1104,7 @@ impl Kernel {
             boot_time: astrid_runtime::time::Instant::now(),
             shutdown_tx: tokio::sync::watch::channel(false).0,
             session_token,
+            #[cfg(unix)]
             token_path,
             allowance_store,
             identity_store,
@@ -3342,6 +3347,7 @@ async fn open_audit_log(
 /// Load the runtime ed25519 signing key from disk, or generate and persist a new one.
 ///
 /// The key file is 32 bytes of raw secret key material at `{keys_dir}/runtime.key`.
+#[cfg(unix)]
 fn load_or_generate_runtime_key(keys_dir: &Path) -> std::io::Result<KeyPair> {
     astrid_core::platform_fs::ensure_private_directory(keys_dir)?;
     let key_path = keys_dir.join("runtime.key");
@@ -5763,6 +5769,7 @@ mod tests {
         assert_eq!(registry.refcount_for_hash(&hash), Some(3));
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_load_or_generate_creates_new_key() {
         let dir = tempfile::tempdir().unwrap();
@@ -5785,6 +5792,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_load_or_generate_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
@@ -5800,6 +5808,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_load_or_generate_rejects_bad_key_length() {
         use std::os::unix::fs::PermissionsExt as _;
