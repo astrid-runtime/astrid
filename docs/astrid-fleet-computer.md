@@ -501,18 +501,21 @@ The admin view defaults to read-only and requires `--read-write` before an
 operator can request supported configuration changes.
 
 The CLI delegates to one lifecycle-independent native companion while keeping
-the command and lease semantics identical. The provider-neutral contract is
-implemented for all hosts; the native macOS provider is included in this
-release slice, while Linux and Windows adapters consume the same contract:
+the command and lease semantics identical. The native macOS and Linux providers
+are included in this release slice; the Windows adapter remains future work:
 
 | Host | Native provider companion | Target when omitted |
 | --- | --- | --- |
 | macOS | `astrid-storage-provider-fskit` using FSKit | provider-selected mounted volume |
-| Linux | `astrid-storage-provider-fuse` using libfuse (adapter pending) | provider-selected mount directory |
+| Linux | `astrid-storage-provider-fuse` using Linux FUSE | provider-selected mount directory |
 | Windows | `astrid-storage-provider-winfsp` using WinFsp (adapter pending) | provider-selected volume/drive |
 
 The CLI accepts a provider only when it is co-installed beside the authenticated
-Astrid executable set; it never falls back to `PATH`. Handoff uses the exported
+Astrid executable set; it never falls back to `PATH`. Linux release archives,
+fresh installations, and managed updates carry the FUSE companion, and
+uninstalling the executable set removes it with that set. A Linux host must
+expose `/dev/fuse` and `fusermount3`; providers fail explicitly when native
+mounting is unavailable. Handoff uses the exported
 JSON standard-I/O protocol v1 rather than an argv ABI. Each request carries a
 fresh correlation ID, typed operation, requested view and access; each response
 echoes the protocol and request IDs, advertises capabilities, and returns a
@@ -793,9 +796,9 @@ implemented. Remaining work is ordered as follows:
    The kernel continues to meter usage, enforce admitted limits and hard
    ceilings, and fail closed without synchronous capsule IPC in a store
    transaction.
-3. Implement the native Linux FUSE and Windows WinFsp adapters against the same
-   callback protocol, then adapt the AOS Linux Realm to choose a principal disk,
-   fleet-shared disk, or both without changing storage authority.
+3. Adapt the AOS Linux Realm to choose a principal disk, fleet-shared disk, or
+   both without changing storage authority; implement Windows WinFsp against
+   the same callback protocol.
 4. Extend filesystem compatibility where workloads justify it: durable rich
    metadata, symbolic links, extended attributes, locking, `mmap`, sparse-file
    policy, provider restart recovery, and adversarial compiler/editor tests.

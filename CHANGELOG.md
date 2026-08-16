@@ -30,10 +30,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   acknowledged create, write, truncate, remove, rename, and sync operations
   atomically publish through the typed store. Kernel-issued leases bind owner,
   access, expiry, and a private callback secret; the native macOS 26 FSKit app
-  extension and co-installed lifecycle companion implement the first mounted
-  drive. The provider-neutral contract reserves Linux FUSE and Windows WinFsp
-  adapters without pretending those native adapters are already shipped.
-  Mounting does not provision storage. Refs #1391 and #1534.
+  extension plus lifecycle companion and the native Linux FUSE lifecycle
+  companion implement mounted views. The provider-neutral contract reserves
+  Windows WinFsp without pretending that adapter is already shipped. Mounting
+  does not provision storage. Refs #1391 and #1534.
 - **The authoritative principal store now opens through a path-free Astrid
   volume contract.** Hosted systems keep all arena, root, index, cutover, and
   GC-outbox regions in one locked `var/astrid.volume` container; bare-metal

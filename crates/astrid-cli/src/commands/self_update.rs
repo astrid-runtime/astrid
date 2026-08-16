@@ -37,7 +37,14 @@ const MAX_RELEASE_ASSETS: usize = 1_024;
 const MAX_BUNDLE_BYTES: usize = 256 * 1024;
 const MAX_MANIFEST_BYTES: usize = 256 * 1024;
 
-const MANAGED_BINARIES: &[&str] = &["astrid", "astrid-daemon"];
+/// Return every executable managed by an authenticated target's update set.
+fn managed_binaries_for_target(target: &str) -> Vec<&'static str> {
+    let mut names = vec!["astrid", "astrid-daemon"];
+    if target.contains("-unknown-linux-") {
+        names.push("astrid-storage-provider-fuse");
+    }
+    names
+}
 
 /// GitHub API base URL. `ASTRID_UPDATE_API` overrides it so the flow can be
 /// rehearsed against a local/staging mock server.
@@ -503,7 +510,11 @@ pub(crate) async fn run_self_update(args: UpdateArgs) -> anyhow::Result<()> {
     .await
     .map_err(anyhow::Error::new)?;
 
-    backup_and_swap(&install_dir, &extract_dir, MANAGED_BINARIES)?;
+    backup_and_swap(
+        &install_dir,
+        &extract_dir,
+        &managed_binaries_for_target(target),
+    )?;
     println!(
         "{}",
         Theme::success(&format!(

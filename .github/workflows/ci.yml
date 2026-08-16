@@ -140,7 +140,8 @@ jobs:
                 --locked \
                 --target "$TARGET" \
                 --target-dir target/glibc-2.31 \
-                -p astrid
+                -p astrid \
+                -p astrid-storage-provider-fuse
             '
 
       - name: Enforce the Linux glibc compatibility ceiling
@@ -153,7 +154,8 @@ jobs:
             "$BINARY_ROOT/astrid" \
             "$BINARY_ROOT/astrid-daemon" \
             "$BINARY_ROOT/astrid-build" \
-            "$BINARY_ROOT/astrid-emit"
+            "$BINARY_ROOT/astrid-emit" \
+            "$BINARY_ROOT/astrid-storage-provider-fuse"
 
       - name: Build in the native Linux musl environment
         if: matrix.libc == 'musl'
@@ -181,14 +183,16 @@ jobs:
                 --locked \
                 --target "$TARGET" \
                 --target-dir target/musl \
-                -p astrid
+                -p astrid \
+                -p astrid-storage-provider-fuse
               BINARY_ROOT="target/musl/$TARGET/release"
               ARCHITECTURE="${TARGET%%-*}"
               python3 scripts/check_static_elf.py --architecture "$ARCHITECTURE" \
                 "$BINARY_ROOT/astrid" \
                 "$BINARY_ROOT/astrid-daemon" \
                 "$BINARY_ROOT/astrid-build" \
-                "$BINARY_ROOT/astrid-emit"
+                "$BINARY_ROOT/astrid-emit" \
+                "$BINARY_ROOT/astrid-storage-provider-fuse"
             '
 
       - name: Exercise the Linux musl binaries
@@ -209,6 +213,42 @@ jobs:
                 "target/musl/$TARGET/release/$binary" --version
               done
             '
+
+  linux-fuse-e2e:
+    name: Linux native FUSE E2E
+    if: vars.ASTRID_FUSE_E2E == 'true'
+    runs-on: [self-hosted, linux, fuse]
+    permissions:
+      contents: read
+    env:
+      ASTRID_FUSE_E2E: "1"
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: "1"
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: "1.95.0"
+
+      - name: Require native FUSE support
+        run: |
+          [[ -c /dev/fuse ]] || { echo "::error::ASTRID_FUSE_E2E is enabled but /dev/fuse is unavailable" >&2; exit 1; }
+          command -v fusermount3 >/dev/null || { echo "::error::ASTRID_FUSE_E2E is enabled but fusermount3 is unavailable" >&2; exit 1; }
+
+      - name: Exercise the real Linux mount
+        run: >
+          cargo test --locked -p astrid-storage-provider-fuse
+          linux_native_fuse_mount_supports_all_required_operations --
+          --ignored --nocapture
 
   check:
     name: Check
