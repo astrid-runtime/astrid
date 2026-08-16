@@ -123,7 +123,20 @@ async fn published_v0104_home_imports_verifies_and_retires_legacy_store() {
             .is_file()
     );
 
+    // The receipt proves the cutover that allowed legacy retirement. It must
+    // not freeze the live destination at that historical byte identity.
+    store
+        .kv()
+        .set(
+            "system:identity",
+            "post-cutover",
+            b"live-volume-write".to_vec(),
+        )
+        .await
+        .unwrap();
+
     drop(store);
+    home.ensure().unwrap();
     let reopened = open_runtime_principal_store(&home, Arc::new(|_: &StateOwner| Ok(None)))
         .await
         .unwrap();
@@ -134,6 +147,14 @@ async fn published_v0104_home_imports_verifies_and_retires_legacy_store() {
             .await
             .unwrap()
             .is_some()
+    );
+    assert_eq!(
+        reopened
+            .kv()
+            .get("system:identity", "post-cutover")
+            .await
+            .unwrap(),
+        Some(b"live-volume-write".to_vec())
     );
 }
 
