@@ -254,14 +254,16 @@ fn append_file(
         .with_context(|| format!("Failed to append file to archive: {}", fs_path.display()))
 }
 
-fn normalized_file_mode(_metadata: &fs::Metadata, file: &mut File) -> Result<u32> {
+fn normalized_file_mode(metadata: &fs::Metadata, file: &mut File) -> Result<u32> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if _metadata.permissions().mode() & 0o111 != 0 {
+        if metadata.permissions().mode() & 0o111 != 0 {
             return Ok(0o755);
         }
     }
+    #[cfg(not(unix))]
+    let _ = metadata;
 
     // Windows has no Unix execute bits. Preserve executable intent from
     // self-describing file formats so a checked-out script or native binary
