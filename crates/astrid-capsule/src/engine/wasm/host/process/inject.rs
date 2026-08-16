@@ -130,6 +130,28 @@ fn validate_fixed_path(target: &str) -> Result<(), ErrorCode> {
     Ok(())
 }
 
+/// Identity for duplicate env-pointer detection. Windows environment
+/// variables are case-insensitive, so names differing only by case must
+/// collide rather than resolve by iteration order.
+fn env_identity(var: &str) -> String {
+    if cfg!(windows) {
+        var.to_ascii_lowercase()
+    } else {
+        var.to_owned()
+    }
+}
+
+/// Identity for duplicate fixed-path detection. Component iteration
+/// normalizes interior `.` components, repeated separators, and trailing
+/// slashes, so textual aliases of one mount target collide.
+fn fixed_path_identity(path: &str) -> String {
+    std::path::Path::new(path)
+        .components()
+        .collect::<PathBuf>()
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Write `bytes` to `dest` with mode 0600, then VERIFY by re-reading and
 /// re-hashing against `pin`. Closes the copy->expose TOCTOU.
 fn write_and_verify(
@@ -225,13 +247,13 @@ pub(super) fn prepare_injections(
         match &inj.placement {
             InjectionPlacement::EnvPointer(var) => {
                 validate_env_name(var)?;
-                if !env_names.insert(var.clone()) {
+                if !env_names.insert(env_identity(var)) {
                     return Err(ErrorCode::InvalidInput);
                 }
             },
             InjectionPlacement::FixedPath(path) => {
                 validate_fixed_path(path)?;
-                if !fixed_targets.insert(path.clone()) {
+                if !fixed_targets.insert(fixed_path_identity(path)) {
                     return Err(ErrorCode::InvalidInput);
                 }
             },
@@ -519,6 +541,46 @@ mod tests {
         ];
         assert!(matches!(
             prepare_injections(&duplicate_target),
+            Err(ErrorCode::InvalidInput)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn duplicate_fixed_path_aliases_are_rejected() {
+        let duplicate_target = vec![
+            FileInjection {
+                content: b"a".to_vec(),
+                placement: InjectionPlacement::FixedPath("/etc/agent/a.toml".to_string()),
+            },
+            FileInjection {
+                content: b"b".to_vec(),
+                placement: InjectionPlacement::FixedPath("/etc/agent/./a.toml".to_string()),
+            },
+        ];
+
+        assert!(matches!(
+            prepare_injections(&duplicate_target),
+            Err(ErrorCode::InvalidInput)
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn duplicate_env_names_differing_only_by_case_are_rejected() {
+        let duplicate_env = vec![
+            FileInjection {
+                content: b"a".to_vec(),
+                placement: InjectionPlacement::EnvPointer("ASTRID_FILE".to_string()),
+            },
+            FileInjection {
+                content: b"b".to_vec(),
+                placement: InjectionPlacement::EnvPointer("astrid_file".to_string()),
+            },
+        ];
+
+        assert!(matches!(
+            prepare_injections(&duplicate_env),
             Err(ErrorCode::InvalidInput)
         ));
     }
