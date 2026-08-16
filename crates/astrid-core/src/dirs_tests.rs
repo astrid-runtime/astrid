@@ -414,6 +414,31 @@ fn test_layout_v2_startup_finishes_interrupted_legacy_retirement() {
 
 #[cfg(not(windows))]
 #[test]
+fn test_layout_v2_startup_accepts_live_volume_changes_after_retirement() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+    crate::platform_fs::ensure_private_directory(&home.etc_dir()).unwrap();
+    std::fs::write(home.layout_version_path(), LEGACY_LAYOUT_VERSION).unwrap();
+    home.ensure().unwrap();
+    write_released_legacy_store(&home, b"legacy");
+    home.begin_layout_v2_migration(&migration_target()).unwrap();
+    write_test_storage_volume(&home, b"cutover-volume");
+    home.complete_layout_v2(&migration_target()).unwrap();
+    assert!(!home.state_db_path().exists());
+
+    // The completion receipt records the cutover point, not an immutable
+    // identity for the live volume after Astrid begins serving writes.
+    write_test_storage_volume(&home, b"live-post-cutover-write");
+
+    home.ensure().unwrap();
+    assert_eq!(
+        std::fs::read(home.storage_volume_path()).unwrap(),
+        b"live-post-cutover-write"
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
 fn test_layout_v2_startup_rejects_corrupt_receipt_without_retiring_source() {
     let dir = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(test_home_root(&dir));

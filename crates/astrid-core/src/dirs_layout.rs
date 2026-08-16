@@ -317,12 +317,10 @@ impl AstridHome {
 
         let receipt: LayoutMigrationReceiptV1 = read_canonical_record(&receipt_path)?;
         let intent: LayoutMigrationRecordV1 = read_canonical_record(&intent_path)?;
-        let destination = inventory_regular_file(&self.storage_volume_path())?;
         if receipt.schema != LAYOUT_MIGRATION_SCHEMA
             || receipt.transaction_id != intent.transaction_id
             || receipt.intent != intent
             || !intent.has_recomputable_identity()
-            || receipt.destination != destination
             || receipt.destination.physical_path_hex != intent.material.target_physical_path_hex
         {
             return Err(io::Error::new(
@@ -338,6 +336,21 @@ impl AstridHome {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error),
             Ok(_) => {
+                // The destination identity proves that a still-present legacy
+                // source is retired only against the exact cutover result.
+                // Once that source is gone, the volume is live mutable state;
+                // comparing it with the historical receipt would reject every
+                // legitimate post-migration write on the next startup.
+                let destination = inventory_regular_file(&self.storage_volume_path())?;
+                if receipt.destination != destination {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "layout migration receipt does not match its destination: {}",
+                            receipt_path.display()
+                        ),
+                    ));
+                }
                 let source = inventory_tree(&self.state_db_path())?;
                 if source != receipt.intent.material.source {
                     return Err(io::Error::new(
