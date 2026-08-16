@@ -31,6 +31,31 @@ fn write_archive(path: &Path, name: &str, version: &str, capabilities: &str) {
     archive.into_inner().unwrap().finish().unwrap();
 }
 
+fn write_wasm_archive(path: &Path, name: &str, version: &str, wasm: &[u8]) {
+    let manifest = format!(
+        "[package]\nname = \"{name}\"\nversion = \"{version}\"\n\n\
+         [[component]]\nid = \"module\"\nfile = \"module.wasm\"\n"
+    );
+    let file = File::create(path).unwrap();
+    let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+    let mut archive = tar::Builder::new(encoder);
+    let mut header = tar::Header::new_gnu();
+    header.set_size(manifest.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    archive
+        .append_data(&mut header, "Capsule.toml", manifest.as_bytes())
+        .unwrap();
+    let mut header = tar::Header::new_gnu();
+    header.set_size(wasm.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    archive
+        .append_data(&mut header, "module.wasm", wasm)
+        .unwrap();
+    archive.into_inner().unwrap().finish().unwrap();
+}
+
 fn install_home(root: &Path, key: &KeyPair) -> AstridHome {
     let home = AstridHome::from_path(root);
     std::fs::create_dir_all(home.keys_dir()).unwrap();
@@ -115,6 +140,63 @@ fn same_runtime_build_installs_automatically_and_records_authority() {
         astrid_capsule::discovery::load_manifest(&output.target_dir.join("Capsule.toml")).unwrap();
     let error = verify_installed_authority(&home, &output.target_dir, &expanded).unwrap_err();
     assert!(error.to_string().contains("net_connect=[db.example:5432]"));
+}
+
+#[test]
+fn installed_wasm_cannot_be_repointed_after_authority_approval() {
+    let temp = tempfile::tempdir().unwrap();
+    let key = KeyPair::generate();
+    let home = install_home(&temp.path().join("runtime"), &key);
+    let archive = temp.path().join("wasm-example.capsule");
+    let original_wasm = wat::parse_str("(component)").unwrap();
+    write_wasm_archive(&archive, "wasm-example", "1.0.0", &original_wasm);
+    sign_archive(&archive, &key).unwrap();
+    let principal = PrincipalId::new("alice").unwrap();
+    let layout = WorkspaceLayout::default();
+    let output = unpack_and_install_authorized_for_principal_with_layout(
+        &archive,
+        &home,
+        InstallOptions::default(),
+        &principal,
+        &AuthorityDecision::Automatic,
+        &layout,
+    )
+    .unwrap();
+
+    let manifest =
+        astrid_capsule::discovery::load_manifest(&output.target_dir.join("Capsule.toml")).unwrap();
+    verify_installed_authority(&home, &output.target_dir, &manifest).unwrap();
+    let authority = read_installed_authority(&home, &output.target_dir)
+        .unwrap()
+        .unwrap();
+    assert!(authority.wasm_hash_pinned);
+    assert_eq!(
+        authority.approved_wasm_hash.as_deref(),
+        Some(blake3::hash(&original_wasm).to_hex().to_string().as_str()),
+        "the exact approved executable must be pinned in the kernel-owned receipt"
+    );
+
+    // Swap both the pointer and the content-addressed bytes while leaving the
+    // approved manifest byte-identical. A name-only authority receipt would
+    // accept this after restart; the executable pin must reject it.
+    let malicious_wasm = wat::parse_str("(component (core module))").unwrap();
+    let malicious_hash = blake3::hash(&malicious_wasm).to_hex().to_string();
+    std::fs::write(
+        home.bin_dir().join(format!("{malicious_hash}.wasm")),
+        malicious_wasm,
+    )
+    .unwrap();
+    let meta_path = output.target_dir.join("meta.json");
+    let mut meta: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+    meta["wasm_hash"] = serde_json::Value::String(malicious_hash);
+    std::fs::write(&meta_path, serde_json::to_string(&meta).unwrap()).unwrap();
+
+    let error = verify_installed_authority(&home, &output.target_dir, &manifest).unwrap_err();
+    assert!(
+        error.to_string().contains("WASM executable differs"),
+        "unexpected authority error: {error:#}"
+    );
 }
 
 #[test]
