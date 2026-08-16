@@ -785,11 +785,16 @@ fn hash_inventory_field(hasher: &mut blake3::Hasher, label: &[u8], value: &[u8])
 
 #[cfg(not(target_family = "wasm"))]
 fn ensure_migration_capacity(target: &Path, source_bytes: u64) -> io::Result<()> {
+    let available = fs2::available_space(target)?;
+    ensure_available_migration_capacity(available, source_bytes)
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn ensure_available_migration_capacity(available: u64, source_bytes: u64) -> io::Result<()> {
     let required = source_bytes
         .checked_mul(2)
         .and_then(|bytes| bytes.checked_add(LAYOUT_MIGRATION_HEADROOM_BYTES))
         .ok_or_else(|| io::Error::other("layout migration capacity requirement overflow"))?;
-    let available = fs2::available_space(target)?;
     if available < required {
         return Err(io::Error::new(
             io::ErrorKind::StorageFull,
@@ -918,4 +923,42 @@ fn sync_directory(path: &Path) -> io::Result<()> {
 #[allow(clippy::unnecessary_wraps)]
 fn sync_directory(_path: &Path) -> io::Result<()> {
     Ok(())
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migration_capacity_refuses_one_byte_below_the_required_boundary() {
+        let source_bytes = 4096_u64;
+        let required = source_bytes
+            .checked_mul(2)
+            .and_then(|bytes| bytes.checked_add(LAYOUT_MIGRATION_HEADROOM_BYTES))
+            .unwrap();
+        let insufficient = required.checked_sub(1).unwrap();
+
+        let error = ensure_available_migration_capacity(insufficient, source_bytes).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::StorageFull);
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("need {required} bytes"))
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("have {insufficient} bytes"))
+        );
+        ensure_available_migration_capacity(required, source_bytes).unwrap();
+    }
+
+    #[test]
+    fn migration_capacity_rejects_an_overflowing_requirement() {
+        let error = ensure_available_migration_capacity(u64::MAX, u64::MAX).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(error.to_string().contains("requirement overflow"));
+    }
 }

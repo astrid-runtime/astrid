@@ -41,6 +41,11 @@ struct CallbackRequest {
     response_version: u16,
 }
 
+#[derive(serde::Deserialize)]
+struct ProtocolProbe {
+    protocol_version: u16,
+}
+
 enum CallbackResponse {
     V1(StorageFilesystemResponseV1),
     V2(StorageFilesystemResponseV2),
@@ -466,15 +471,14 @@ async fn read_request(stream: &mut LocalStream) -> Result<Option<CallbackRequest
     }
     let mut bytes = vec![0_u8; length];
     stream.read_exact(&mut bytes).await?;
-    if let Ok(request) = serde_json::from_slice::<StorageFilesystemRequestV2>(&bytes) {
-        if request.protocol_version != STORAGE_FILESYSTEM_PROTOCOL_V2 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "unsupported storage filesystem protocol",
-            ));
-        }
+    let protocol = serde_json::from_slice::<ProtocolProbe>(&bytes)
+        .map_err(io::Error::other)?
+        .protocol_version;
+    if protocol == STORAGE_FILESYSTEM_PROTOCOL_V2 {
+        let request = serde_json::from_slice::<StorageFilesystemRequestV2>(&bytes)
+            .map_err(io::Error::other)?;
         let operation = decode_operation_v2(request.operation)?;
-        return Ok(Some(CallbackRequest {
+        Ok(Some(CallbackRequest {
             request: StorageFilesystemRequestV1 {
                 protocol_version: STORAGE_FILESYSTEM_PROTOCOL_V1,
                 request_id: request.request_id,
@@ -482,20 +486,20 @@ async fn read_request(stream: &mut LocalStream) -> Result<Option<CallbackRequest
                 operation,
             },
             response_version: STORAGE_FILESYSTEM_PROTOCOL_V2,
-        }));
-    }
-    let request =
-        serde_json::from_slice::<StorageFilesystemRequestV1>(&bytes).map_err(io::Error::other)?;
-    if request.protocol_version != STORAGE_FILESYSTEM_PROTOCOL_V1 {
-        return Err(io::Error::new(
+        }))
+    } else if protocol == STORAGE_FILESYSTEM_PROTOCOL_V1 {
+        let request = serde_json::from_slice::<StorageFilesystemRequestV1>(&bytes)
+            .map_err(io::Error::other)?;
+        Ok(Some(CallbackRequest {
+            request,
+            response_version: STORAGE_FILESYSTEM_PROTOCOL_V1,
+        }))
+    } else {
+        Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "unsupported storage filesystem protocol",
-        ));
+        ))
     }
-    Ok(Some(CallbackRequest {
-        request,
-        response_version: STORAGE_FILESYSTEM_PROTOCOL_V1,
-    }))
 }
 
 fn decode_operation_v2(

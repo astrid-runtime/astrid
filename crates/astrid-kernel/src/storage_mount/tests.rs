@@ -32,6 +32,34 @@ async fn callback(
     )
 }
 
+async fn callback_v1(
+    lease: &StorageMountLeaseV1,
+    operation: StorageFilesystemOperationV1,
+) -> StorageFilesystemOutcomeV1 {
+    let mut stream = astrid_core::local_transport::connect(&lease.callback_path)
+        .await
+        .unwrap();
+    let request = StorageFilesystemRequestV1 {
+        protocol_version: STORAGE_FILESYSTEM_PROTOCOL_V1,
+        request_id: "v1-compatibility-request".to_owned(),
+        lease_token: lease.lease_token.clone(),
+        operation,
+    };
+    let bytes = serde_json::to_vec(&request).unwrap();
+    stream
+        .write_all(&u32::try_from(bytes.len()).unwrap().to_be_bytes())
+        .await
+        .unwrap();
+    stream.write_all(&bytes).await.unwrap();
+    let mut response_length = [0_u8; 4];
+    stream.read_exact(&mut response_length).await.unwrap();
+    let mut response = vec![0_u8; u32::from_be_bytes(response_length) as usize];
+    stream.read_exact(&mut response).await.unwrap();
+    let response: StorageFilesystemResponseV1 = serde_json::from_slice(&response).unwrap();
+    assert_eq!(response.protocol_version, STORAGE_FILESYSTEM_PROTOCOL_V1);
+    response.outcome
+}
+
 fn encode_operation_v2(operation: StorageFilesystemOperationV1) -> StorageFilesystemOperationV2 {
     match operation {
         StorageFilesystemOperationV1::Stat { path } => StorageFilesystemOperationV2::Stat { path },
@@ -434,6 +462,56 @@ async fn private_callbacks_bind_authority_and_isolate_principal_and_fleet_views(
         .await
         .unwrap();
     revoke_lease(&kernel, &caller, false, read_only.mount_id)
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn version_one_callback_round_trips_small_binary_io() {
+    let temporary = tempfile::tempdir().unwrap();
+    let home = astrid_core::dirs::AstridHome::from_path(temporary.path().join(".astrid"));
+    let kernel = crate::test_kernel_with_home(home).await;
+    let lease = issue_lease(
+        &kernel,
+        PrincipalId::default(),
+        true,
+        StorageProviderViewV1::Admin,
+        StorageProviderAccessV1::ReadWrite,
+        "v1-test-provider".to_owned(),
+        temporary.path().join("mount"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        callback_v1(&lease, create("legacy.bin")).await,
+        StorageFilesystemOutcomeV1::Success(StorageFilesystemSuccessV1::Done)
+    );
+    let expected = vec![0, 1, 127, 128, 255];
+    assert_eq!(
+        callback_v1(
+            &lease,
+            StorageFilesystemOperationV1::Write {
+                path: "legacy.bin".to_owned(),
+                offset: 0,
+                data: expected.clone(),
+            },
+        )
+        .await,
+        StorageFilesystemOutcomeV1::Success(StorageFilesystemSuccessV1::Written(5))
+    );
+    assert_eq!(
+        callback_v1(
+            &lease,
+            StorageFilesystemOperationV1::Read {
+                path: "legacy.bin".to_owned(),
+                offset: 0,
+                length: 5,
+            },
+        )
+        .await,
+        StorageFilesystemOutcomeV1::Success(StorageFilesystemSuccessV1::Data(expected))
+    );
+    revoke_lease(&kernel, &PrincipalId::default(), true, lease.mount_id)
         .await
         .unwrap();
 }
