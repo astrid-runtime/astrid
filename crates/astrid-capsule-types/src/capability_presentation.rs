@@ -247,6 +247,119 @@ mod tests {
     }
 
     #[test]
+    fn semantic_expansion_translates_every_known_capability() {
+        let cases = [
+            (
+                "uplink",
+                vec!["enabled"],
+                "Run continuously as an uplink service",
+                vec!["enabled"],
+                "This grants authority beyond the previously approved install.",
+            ),
+            (
+                "net",
+                vec!["api.example"],
+                "Make web requests to additional domains",
+                vec!["api.example"],
+                "This is new outbound authority; check the destination before approving.",
+            ),
+            (
+                "kv",
+                vec!["records"],
+                "Use additional Astrid key-value namespaces",
+                vec!["records"],
+                "This grants authority beyond the previously approved install.",
+            ),
+            (
+                "fs_read",
+                vec!["/workspace"],
+                "Read additional files or folders",
+                vec!["/workspace"],
+                "This grants authority beyond the previously approved install.",
+            ),
+            (
+                "fs_write",
+                vec!["/workspace"],
+                "Change additional files or folders",
+                vec!["/workspace"],
+                "This expands where this capsule can modify data.",
+            ),
+            (
+                "host_process",
+                vec!["git"],
+                "Launch additional host programs",
+                vec!["git"],
+                "This expands which host executables the capsule can launch.",
+            ),
+            (
+                "allow_persistent",
+                vec!["enabled"],
+                "Keep host processes running after a tool call",
+                vec!["enabled"],
+                "This grants authority beyond the previously approved install.",
+            ),
+            (
+                "net_bind",
+                vec!["127.0.0.1:9", "127.0.0.1:*"],
+                "Accept additional local network connections",
+                vec![
+                    "127.0.0.1: port 9",
+                    "127.0.0.1: any port, including OS-assigned ephemeral ports",
+                ],
+                "This is a new local listening endpoint; wildcard ports also cover ephemeral ports.",
+            ),
+            (
+                "net_connect",
+                vec!["api.example:443", "api.example:*"],
+                "Connect to additional network services",
+                vec![
+                    "api.example: port 443",
+                    "api.example: any port, including OS-assigned ephemeral ports",
+                ],
+                "This is new outbound authority; check the destination before approving.",
+            ),
+            (
+                "identity",
+                vec!["admin"],
+                "Use additional identity operations",
+                vec!["admin"],
+                "This expands identity authority; 'admin' is the highest level.",
+            ),
+            (
+                "allow_prompt_injection",
+                vec!["enabled"],
+                "Change the agent's system instructions",
+                vec!["enabled"],
+                "This can change hidden agent instructions; treat it as high trust.",
+            ),
+        ];
+
+        for (name, added, action, scope, impact) in cases {
+            let expansion = CapabilityExpansion {
+                name: name.to_string(),
+                added: added.into_iter().map(str::to_string).collect(),
+            };
+            let semantic = semantic_expansion(&expansion);
+            assert_eq!(semantic.capability, name);
+            assert_eq!(semantic.action, action);
+            assert_eq!(semantic.scope, scope);
+            assert_eq!(semantic.impact, impact);
+        }
+
+        for name in ["allow_persistent", "allow_prompt_injection", "uplink"] {
+            let expansion = CapabilityExpansion {
+                name: name.to_string(),
+                added: vec!["true".to_string()],
+            };
+            assert_eq!(
+                semantic_expansion(&expansion).scope,
+                ["enabled"],
+                "boolean authority must render consistently even for non-canonical input"
+            );
+        }
+    }
+
+    #[test]
     fn high_impact_capabilities_are_not_flattened() {
         let capabilities = CapabilitiesDef {
             uplink: true,
