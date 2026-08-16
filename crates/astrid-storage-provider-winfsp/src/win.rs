@@ -58,7 +58,9 @@ pub(crate) fn daemon_main() -> Result<()> {
     let start: DaemonStart =
         serde_json::from_slice(&bytes).context("decode WinFsp daemon lease")?;
     let lease = start.lease;
-    if !start.mountpoint.is_absolute() || !lease.callback_path.is_absolute() {
+    if (!start.mountpoint.is_absolute() && !is_drive_designator(&start.mountpoint))
+        || !lease.callback_path.is_absolute()
+    {
         bail!("WinFsp daemon lease contains a relative endpoint");
     }
 
@@ -68,7 +70,8 @@ pub(crate) fn daemon_main() -> Result<()> {
             .build()
             .context("start WinFsp callback runtime")?,
     );
-    let callback = CallbackFs::new(lease.clone(), Arc::clone(&runtime));
+    let callback = CallbackFs::new(lease.clone(), Arc::clone(&runtime))
+        .map_err(|failure| anyhow::anyhow!("build WinFsp callback filesystem: {failure:?}"))?;
     let control_path = provider_control_path(&lease.mount_id)?;
     let control_listener = local_transport::bind(&control_path)
         .with_context(|| format!("bind WinFsp control endpoint {}", control_path.display()))?;
@@ -147,7 +150,7 @@ pub(crate) async fn spawn_daemon(lease: &StorageMountLeaseV1, mountpoint: &Path)
             .context("WinFsp daemon stdin is unavailable")?;
         let start = DaemonStart {
             lease: lease.clone(),
-            mountpoint: mountpoint.to_path_buf(),
+            mountpoint: native_mountpoint(mountpoint)?,
         };
         let bytes = serde_json::to_vec(&start).context("encode WinFsp daemon lease")?;
         stdin.write_all(&bytes).await.context("send daemon lease")?;
@@ -190,6 +193,31 @@ pub(crate) async fn spawn_daemon(lease: &StorageMountLeaseV1, mountpoint: &Path)
             bail!("WinFsp daemon did not report readiness within 30 seconds");
         },
     }
+}
+
+fn native_mountpoint(mountpoint: &Path) -> Result<PathBuf> {
+    let text = mountpoint
+        .to_str()
+        .context("WinFsp mountpoint is not valid Unicode")?;
+    let bytes = text.as_bytes();
+    if bytes.len() == 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/')
+    {
+        // FspFileSystemSetMountPoint accepts drive designators (`X:`), not
+        // drive-root paths (`X:\\`). Keep the latter in the public lifecycle
+        // record while passing the native spelling to WinFsp.
+        return Ok(PathBuf::from(&text[..2]));
+    }
+    Ok(mountpoint.to_path_buf())
+}
+
+fn is_drive_designator(path: &Path) -> bool {
+    path.to_str().is_some_and(|text| {
+        let bytes = text.as_bytes();
+        bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+    })
 }
 
 pub(crate) async fn stop_daemon(control_path: &Path) -> Result<()> {
@@ -303,14 +331,32 @@ struct OpenEntry {
 struct CallbackFs {
     client: CallbackClient,
     read_only: bool,
+    // `PSecurityDescriptor` is a borrowed pointer. Keep its backing bytes for
+    // the complete filesystem lifetime so WinFsp can copy them after the trait
+    // method returns.
+    security_descriptor: SecurityDescriptor,
 }
 
 impl CallbackFs {
-    fn new(lease: StorageMountLeaseV1, runtime: Arc<tokio::runtime::Runtime>) -> Self {
-        Self {
+    fn new(
+        lease: StorageMountLeaseV1,
+        runtime: Arc<tokio::runtime::Runtime>,
+    ) -> Result<Self, AdapterFailure> {
+        let read_only = lease.access == StorageProviderAccessV1::ReadOnly;
+        let user = local_transport::current_user_security_identifier().map_err(|error| {
+            AdapterFailure::Transport(format!("resolve Windows user SID: {error}"))
+        })?;
+        let access = if read_only { "GR" } else { "GA" };
+        let sddl = format!("O:{user}D:P(A;;{access};;;SY)(A;;{access};;;{user})");
+        let encoded = U16CString::from_str(&sddl)
+            .map_err(|error| AdapterFailure::Transport(format!("encode Windows ACL: {error}")))?;
+        let security_descriptor = SecurityDescriptor::from_wstr(&encoded)
+            .map_err(|error| AdapterFailure::Transport(format!("build Windows ACL: {error}")))?;
+        Ok(Self {
             client: CallbackClient::new(lease.callback_path, lease.lease_token, runtime),
-            read_only: lease.access == StorageProviderAccessV1::ReadOnly,
-        }
+            read_only,
+            security_descriptor,
+        })
     }
 
     fn invoke(
@@ -320,13 +366,8 @@ impl CallbackFs {
         self.client.invoke(operation).map_err(map_failure)
     }
 
-    fn security_descriptor(&self) -> Result<SecurityDescriptor, NTSTATUS> {
-        let user = local_transport::current_user_security_identifier()
-            .map_err(|_| STATUS_INTERNAL_ERROR)?;
-        let access = if self.read_only { "GR" } else { "GA" };
-        let sddl = format!("O:{user}D:P(A;;{access};;;SY)(A;;{access};;;{user})");
-        let encoded = U16CString::from_str(&sddl).map_err(|_| STATUS_INTERNAL_ERROR)?;
-        SecurityDescriptor::from_wstr(&encoded).map_err(|_| STATUS_INTERNAL_ERROR)
+    fn security_descriptor(&self) -> PSecurityDescriptor {
+        self.security_descriptor.as_ptr()
     }
 }
 
@@ -389,10 +430,9 @@ impl FileSystemInterface for CallbackFs {
     ) -> Result<(FileAttributes, PSecurityDescriptor, bool), NTSTATUS> {
         let path = native_path(&file_name.to_string_lossy())?;
         let entry = self.stat(&path)?;
-        let descriptor = self.security_descriptor()?;
         Ok((
             attributes(entry.kind, self.read_only),
-            descriptor.as_ptr(),
+            self.security_descriptor(),
             false,
         ))
     }
@@ -664,8 +704,7 @@ impl FileSystemInterface for CallbackFs {
         file_context: Self::FileContext,
     ) -> Result<PSecurityDescriptor, NTSTATUS> {
         let _ = file_context;
-        let descriptor = self.security_descriptor()?;
-        Ok(descriptor.as_ptr())
+        Ok(self.security_descriptor())
     }
 
     fn read_directory(
@@ -765,14 +804,29 @@ mod tests {
     use std::io::Write as _;
 
     use astrid_core::storage_filesystem::{
-        StorageFilesystemEntryV1, StorageFilesystemFailureV1, StorageFilesystemOutcomeV1,
-        StorageFilesystemRequestV1, StorageFilesystemResponseV1,
+        STORAGE_FILESYSTEM_PROTOCOL_V2, StorageFilesystemEntryV1, StorageFilesystemFailureV1,
+        StorageFilesystemOperationV2, StorageFilesystemOutcomeV2, StorageFilesystemRequestV2,
+        StorageFilesystemResponseV2, StorageFilesystemSuccessV2,
     };
     use astrid_core::storage_provider::{StorageMountId, StorageProviderViewV1};
+    use base64::Engine as _;
 
     use super::*;
 
     type FakeState = Arc<Mutex<BTreeMap<String, (StorageFilesystemEntryKindV1, Vec<u8>)>>>;
+
+    #[test]
+    fn winfsp_drive_root_is_passed_as_a_drive_designator() {
+        assert_eq!(
+            native_mountpoint(Path::new("Q:\\")).unwrap(),
+            Path::new("Q:")
+        );
+        assert!(is_drive_designator(Path::new("Q:")));
+        assert_eq!(
+            native_mountpoint(Path::new(r"C:\mounts\astrid")).unwrap(),
+            Path::new(r"C:\mounts\astrid")
+        );
+    }
 
     #[tokio::test]
     async fn native_winfsp_translates_filesystem_operations() {
@@ -801,7 +855,7 @@ mod tests {
             lease_token: "native-test-token".to_owned(),
             expires_at_epoch_secs: u64::MAX,
         };
-        let callback = CallbackFs::new(lease, runtime);
+        let callback = CallbackFs::new(lease, runtime).expect("build callback filesystem");
         let native_mountpoint =
             U16CString::from_os_str(mountpoint.as_os_str()).expect("mountpoint UTF-16");
         let filesystem = FileSystem::start(
@@ -886,20 +940,24 @@ mod tests {
                 if stream.read_exact(&mut request).await.is_err() {
                     return;
                 }
-                let Ok(request) = serde_json::from_slice::<StorageFilesystemRequestV1>(&request)
+                let Ok(request) = serde_json::from_slice::<StorageFilesystemRequestV2>(&request)
                 else {
                     return;
                 };
                 let outcome = if request.lease_token.as_str() == "native-test-token" {
-                    match fake_apply(&state, request.operation) {
-                        Ok(success) => StorageFilesystemOutcomeV1::Success(success),
+                    match decode_fake_operation(request.operation)
+                        .and_then(|operation| fake_apply(&state, operation))
+                    {
+                        Ok(success) => {
+                            StorageFilesystemOutcomeV2::Success(encode_fake_success(success))
+                        },
                         Err((code, message)) => fake_failure(&code, &message),
                     }
                 } else {
                     fake_failure("unauthorized", "invalid test token")
                 };
-                let response = StorageFilesystemResponseV1 {
-                    protocol_version: 1,
+                let response = StorageFilesystemResponseV2 {
+                    protocol_version: STORAGE_FILESYSTEM_PROTOCOL_V2,
                     request_id: request.request_id,
                     outcome,
                 };
@@ -920,11 +978,72 @@ mod tests {
         }
     }
 
-    fn fake_failure(code: &str, message: &str) -> StorageFilesystemOutcomeV1 {
-        StorageFilesystemOutcomeV1::Failure(StorageFilesystemFailureV1 {
+    fn fake_failure(code: &str, message: &str) -> StorageFilesystemOutcomeV2 {
+        StorageFilesystemOutcomeV2::Failure(StorageFilesystemFailureV1 {
             code: code.to_owned(),
             message: message.to_owned(),
         })
+    }
+
+    fn decode_fake_operation(
+        operation: StorageFilesystemOperationV2,
+    ) -> Result<StorageFilesystemOperationV1, (String, String)> {
+        Ok(match operation {
+            StorageFilesystemOperationV2::Stat { path } => {
+                StorageFilesystemOperationV1::Stat { path }
+            },
+            StorageFilesystemOperationV2::ReadDirectory { path } => {
+                StorageFilesystemOperationV1::ReadDirectory { path }
+            },
+            StorageFilesystemOperationV2::Read {
+                path,
+                offset,
+                length,
+            } => StorageFilesystemOperationV1::Read {
+                path,
+                offset,
+                length,
+            },
+            StorageFilesystemOperationV2::Write {
+                path,
+                offset,
+                data_base64,
+            } => {
+                let data = base64::engine::general_purpose::STANDARD
+                    .decode(data_base64.as_bytes())
+                    .map_err(|error| ("invalid-data".to_owned(), error.to_string()))?;
+                StorageFilesystemOperationV1::Write { path, offset, data }
+            },
+            StorageFilesystemOperationV2::SetLength { path, length } => {
+                StorageFilesystemOperationV1::SetLength { path, length }
+            },
+            StorageFilesystemOperationV2::Create { path, kind } => {
+                StorageFilesystemOperationV1::Create { path, kind }
+            },
+            StorageFilesystemOperationV2::Remove { path } => {
+                StorageFilesystemOperationV1::Remove { path }
+            },
+            StorageFilesystemOperationV2::Rename { from, to, replace } => {
+                StorageFilesystemOperationV1::Rename { from, to, replace }
+            },
+            StorageFilesystemOperationV2::Sync => StorageFilesystemOperationV1::Sync,
+        })
+    }
+
+    fn encode_fake_success(success: StorageFilesystemSuccessV1) -> StorageFilesystemSuccessV2 {
+        match success {
+            StorageFilesystemSuccessV1::Done => StorageFilesystemSuccessV2::Done,
+            StorageFilesystemSuccessV1::Entry(entry) => StorageFilesystemSuccessV2::Entry(entry),
+            StorageFilesystemSuccessV1::Entries(entries) => {
+                StorageFilesystemSuccessV2::Entries(entries)
+            },
+            StorageFilesystemSuccessV1::Data(data) => StorageFilesystemSuccessV2::Data {
+                data_base64: base64::engine::general_purpose::STANDARD.encode(data),
+            },
+            StorageFilesystemSuccessV1::Written(length) => {
+                StorageFilesystemSuccessV2::Written(length)
+            },
+        }
     }
 
     #[allow(clippy::too_many_lines)]

@@ -878,6 +878,7 @@ dependencies = [
  "anyhow",
  "astrid-core",
  "astrid-uplink",
+ "base64 0.22.1",
  "blake3",
  "serde",
  "serde_json",

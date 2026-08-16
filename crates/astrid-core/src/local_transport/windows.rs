@@ -1,11 +1,11 @@
 //! Windows named-pipe backend for the host-local transport seam.
 //!
-//! The filesystem-shaped argument accepted by the portable API is deliberately
-//! ignored here. Windows endpoint authority comes from the current process
-//! token SID, not a working directory, profile path, display name, or
-//! environment variable. The pipe namespace is protected twice: the first
-//! instance must own the name, and every instance carries an exact protected
-//! DACL for the current user plus Local System.
+//! The filesystem-shaped argument accepted by the portable API is reduced to a
+//! path digest and combined with the current process token SID. Authority never
+//! comes from a working directory, profile path, display name, or environment
+//! variable. The pipe namespace is protected twice: the first instance must own
+//! the name, and every instance carries an exact protected DACL for the current
+//! user plus Local System.
 
 use std::ffi::{OsStr, OsString, c_void};
 use std::io;

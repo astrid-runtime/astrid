@@ -29,6 +29,10 @@ $marker = Get-Content -LiteralPath $markerPath -Raw | ConvertFrom-Json
 if ($marker.product -ne "astrid") {
     throw "The installation marker does not belong to Astrid"
 }
+$WinFspMsi = "winfsp-2.1.25156.msi"
+if ($marker.winfsp_installer -ne $WinFspMsi) {
+    throw "The installation marker names an unexpected WinFsp installer"
+}
 
 $names = @(
     "astrid.exe",
@@ -39,12 +43,12 @@ $names = @(
     "winfsp-x64.dll",
     "install-windows.ps1",
     "uninstall-windows.ps1",
-    $marker.winfsp_installer,
+    $WinFspMsi,
     "astrid-install.json"
 ) | Select-Object -Unique
 
 if ($RemoveWinFsp -and $marker.winfsp_installed_by_astrid -eq $true) {
-    $msi = Join-Path $InstallDir $marker.winfsp_installer
+    $msi = Join-Path $InstallDir $WinFspMsi
     if (-not (Test-Path -LiteralPath $msi -PathType Leaf)) {
         throw "Cannot uninstall WinFsp because its cached installer is missing"
     }
@@ -56,7 +60,8 @@ if ($RemoveWinFsp -and $marker.winfsp_installed_by_astrid -eq $true) {
 
 foreach ($name in $names) {
     $path = [System.IO.Path]::GetFullPath((Join-Path $InstallDir $name))
-    if (-not $path.StartsWith($InstallDir, [System.StringComparison]::OrdinalIgnoreCase)) {
+    $installPrefix = $InstallDir.TrimEnd('\') + '\'
+    if (-not $path.StartsWith($installPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
         throw "Refusing to remove a path outside the install directory: $path"
     }
     if (Test-Path -LiteralPath $path -PathType Leaf) {

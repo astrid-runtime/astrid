@@ -54,6 +54,9 @@ if (-not $SkipWinFsp) {
     if (Test-Path -LiteralPath $installedDll -PathType Leaf) {
         $wasInstalledBefore = $true
         $installedVersion = [version](Get-Item -LiteralPath $installedDll).VersionInfo.FileVersion
+        if ($installedVersion.Major -lt 2) {
+            throw "WinFsp 1.x cannot be upgraded in place by the bundled 2.x installer; preserve dependent mounts, remove 1.x deliberately, then rerun this installer"
+        }
         $needsInstall = $installedVersion -lt [version]"2.1.25156"
     }
     if ($needsInstall) {

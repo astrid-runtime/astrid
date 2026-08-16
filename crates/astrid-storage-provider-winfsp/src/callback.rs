@@ -4,10 +4,11 @@ use std::time::Duration;
 
 use astrid_core::local_transport;
 use astrid_core::storage_filesystem::{
-    STORAGE_FILESYSTEM_MAX_IO_BYTES, STORAGE_FILESYSTEM_PROTOCOL_V1, StorageFilesystemOperationV1,
-    StorageFilesystemOutcomeV1, StorageFilesystemRequestV1, StorageFilesystemResponseV1,
-    StorageFilesystemSuccessV1,
+    STORAGE_FILESYSTEM_MAX_IO_BYTES, STORAGE_FILESYSTEM_PROTOCOL_V2, StorageFilesystemOperationV1,
+    StorageFilesystemOperationV2, StorageFilesystemOutcomeV2, StorageFilesystemRequestV2,
+    StorageFilesystemResponseV2, StorageFilesystemSuccessV1, StorageFilesystemSuccessV2,
 };
+use base64::Engine as _;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::runtime::Runtime;
 
@@ -52,11 +53,11 @@ impl CallbackClient {
         let sequence = self
             .request_sequence
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let request = StorageFilesystemRequestV1 {
-            protocol_version: STORAGE_FILESYSTEM_PROTOCOL_V1,
+        let request = StorageFilesystemRequestV2 {
+            protocol_version: STORAGE_FILESYSTEM_PROTOCOL_V2,
             request_id: format!("winfsp-{sequence}"),
             lease_token: self.lease_token.to_string(),
-            operation,
+            operation: encode_operation(operation)?,
         };
         let bytes = serde_json::to_vec(&request)
             .map_err(|error| AdapterFailure::Transport(format!("encode callback: {error}")))?;
@@ -88,11 +89,11 @@ impl CallbackClient {
                     AdapterFailure::Transport(format!("read callback length: {error}"))
                 })?;
             let response_bytes = receive_bounded(&mut stream, response_length).await?;
-            let response = serde_json::from_slice::<StorageFilesystemResponseV1>(&response_bytes)
+            let response = serde_json::from_slice::<StorageFilesystemResponseV2>(&response_bytes)
                 .map_err(|error| {
                 AdapterFailure::Transport(format!("decode callback: {error}"))
             })?;
-            if response.protocol_version != STORAGE_FILESYSTEM_PROTOCOL_V1 {
+            if response.protocol_version != STORAGE_FILESYSTEM_PROTOCOL_V2 {
                 return Err(AdapterFailure::Transport(
                     "unsupported callback response protocol".to_owned(),
                 ));
@@ -103,8 +104,8 @@ impl CallbackClient {
                 ));
             }
             match response.outcome {
-                StorageFilesystemOutcomeV1::Success(success) => Ok(success),
-                StorageFilesystemOutcomeV1::Failure(failure) => Err(AdapterFailure::Filesystem {
+                StorageFilesystemOutcomeV2::Success(success) => decode_success(success),
+                StorageFilesystemOutcomeV2::Failure(failure) => Err(AdapterFailure::Filesystem {
                     code: failure.code,
                     message: failure.message,
                 }),
@@ -114,6 +115,79 @@ impl CallbackClient {
         tokio::time::timeout(CALLBACK_TIMEOUT, future)
             .await
             .map_err(|_| AdapterFailure::Transport("callback timed out".to_owned()))?
+    }
+}
+
+fn encode_operation(
+    operation: StorageFilesystemOperationV1,
+) -> Result<StorageFilesystemOperationV2, AdapterFailure> {
+    Ok(match operation {
+        StorageFilesystemOperationV1::Stat { path } => StorageFilesystemOperationV2::Stat { path },
+        StorageFilesystemOperationV1::ReadDirectory { path } => {
+            StorageFilesystemOperationV2::ReadDirectory { path }
+        },
+        StorageFilesystemOperationV1::Read {
+            path,
+            offset,
+            length,
+        } => StorageFilesystemOperationV2::Read {
+            path,
+            offset,
+            length,
+        },
+        StorageFilesystemOperationV1::Write { path, offset, data } => {
+            if u64::try_from(data.len()).unwrap_or(u64::MAX) > STORAGE_FILESYSTEM_MAX_IO_BYTES {
+                return Err(AdapterFailure::Transport(
+                    "callback write exceeds I/O limit".to_owned(),
+                ));
+            }
+            StorageFilesystemOperationV2::Write {
+                path,
+                offset,
+                data_base64: base64::engine::general_purpose::STANDARD.encode(data),
+            }
+        },
+        StorageFilesystemOperationV1::SetLength { path, length } => {
+            StorageFilesystemOperationV2::SetLength { path, length }
+        },
+        StorageFilesystemOperationV1::Create { path, kind } => {
+            StorageFilesystemOperationV2::Create { path, kind }
+        },
+        StorageFilesystemOperationV1::Remove { path } => {
+            StorageFilesystemOperationV2::Remove { path }
+        },
+        StorageFilesystemOperationV1::Rename { from, to, replace } => {
+            StorageFilesystemOperationV2::Rename { from, to, replace }
+        },
+        StorageFilesystemOperationV1::Sync => StorageFilesystemOperationV2::Sync,
+    })
+}
+
+fn decode_success(
+    success: StorageFilesystemSuccessV2,
+) -> Result<StorageFilesystemSuccessV1, AdapterFailure> {
+    match success {
+        StorageFilesystemSuccessV2::Done => Ok(StorageFilesystemSuccessV1::Done),
+        StorageFilesystemSuccessV2::Entry(entry) => Ok(StorageFilesystemSuccessV1::Entry(entry)),
+        StorageFilesystemSuccessV2::Entries(entries) => {
+            Ok(StorageFilesystemSuccessV1::Entries(entries))
+        },
+        StorageFilesystemSuccessV2::Data { data_base64 } => {
+            let data = base64::engine::general_purpose::STANDARD
+                .decode(data_base64.as_bytes())
+                .map_err(|error| {
+                    AdapterFailure::Transport(format!("decode callback data: {error}"))
+                })?;
+            if u64::try_from(data.len()).unwrap_or(u64::MAX) > STORAGE_FILESYSTEM_MAX_IO_BYTES {
+                return Err(AdapterFailure::Transport(
+                    "callback data exceeds I/O limit".to_owned(),
+                ));
+            }
+            Ok(StorageFilesystemSuccessV1::Data(data))
+        },
+        StorageFilesystemSuccessV2::Written(length) => {
+            Ok(StorageFilesystemSuccessV1::Written(length))
+        },
     }
 }
 
@@ -247,6 +321,42 @@ mod tests {
         }
     }
 
+    #[test]
+    fn protocol_v2_carries_the_full_io_limit_without_json_byte_arrays() {
+        let data = vec![0xa5; usize::try_from(STORAGE_FILESYSTEM_MAX_IO_BYTES).unwrap()];
+        let operation = encode_operation(StorageFilesystemOperationV1::Write {
+            path: "large.bin".to_owned(),
+            offset: 0,
+            data: data.clone(),
+        })
+        .unwrap();
+        let StorageFilesystemOperationV2::Write { data_base64, .. } = operation else {
+            panic!("write operation changed kind");
+        };
+        assert!(!data_base64.contains('['));
+        assert!(data_base64.len() < MAX_FRAME_BYTES);
+
+        let decoded = decode_success(StorageFilesystemSuccessV2::Data { data_base64 }).unwrap();
+        assert_eq!(decoded, StorageFilesystemSuccessV1::Data(data));
+    }
+
+    #[test]
+    fn protocol_v2_rejects_decoded_data_above_the_io_limit() {
+        let too_large = usize::try_from(STORAGE_FILESYSTEM_MAX_IO_BYTES)
+            .unwrap()
+            .saturating_add(1);
+        let data_base64 = base64::engine::general_purpose::STANDARD.encode(vec![0_u8; too_large]);
+        assert!(decode_success(StorageFilesystemSuccessV2::Data { data_base64 }).is_err());
+        assert!(
+            encode_operation(StorageFilesystemOperationV1::Write {
+                path: "too-large.bin".to_owned(),
+                offset: 0,
+                data: vec![0_u8; too_large],
+            })
+            .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn callback_frames_bind_protocol_token_and_correlation() {
         let temporary = tempfile::tempdir().unwrap();
@@ -260,16 +370,16 @@ mod tests {
             stream.read_exact(&mut request).await.unwrap();
             let value = serde_json::from_slice::<serde_json::Value>(&request).unwrap();
             let text = value.to_string();
-            assert_eq!(value["protocol_version"], 1);
+            assert_eq!(value["protocol_version"], 2);
             assert_eq!(value["lease_token"], "test-token");
             assert!(!text.contains("\"principal\""));
             assert!(!text.contains("\"fleet\""));
             assert!(!text.contains("\"admin\""));
 
-            let response = StorageFilesystemResponseV1 {
-                protocol_version: STORAGE_FILESYSTEM_PROTOCOL_V1,
+            let response = StorageFilesystemResponseV2 {
+                protocol_version: STORAGE_FILESYSTEM_PROTOCOL_V2,
                 request_id: value["request_id"].as_str().unwrap().to_owned(),
-                outcome: StorageFilesystemOutcomeV1::Success(StorageFilesystemSuccessV1::Done),
+                outcome: StorageFilesystemOutcomeV2::Success(StorageFilesystemSuccessV2::Done),
             };
             let bytes = serde_json::to_vec(&response).unwrap();
             let length = u32::try_from(bytes.len()).unwrap();

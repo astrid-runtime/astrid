@@ -372,6 +372,25 @@ jobs:
             $null = [scriptblock]::Create((Get-Content -LiteralPath $script -Raw))
           }
 
+      - name: Reject a tampered Windows uninstall marker
+        shell: pwsh
+        run: |
+          $install = Join-Path $env:RUNNER_TEMP "astrid-uninstall-marker-test"
+          New-Item -ItemType Directory -Path $install -Force | Out-Null
+          @{ product = "astrid"; winfsp_installed_by_astrid = $false; winfsp_installer = "..\outside.txt" } |
+            ConvertTo-Json | Set-Content -LiteralPath (Join-Path $install "astrid-install.json")
+          $outside = Join-Path $env:RUNNER_TEMP "outside.txt"
+          Set-Content -LiteralPath $outside -Value "keep"
+          try {
+            & scripts/uninstall-windows.ps1 -InstallDir $install
+            throw "tampered uninstall marker was accepted"
+          } catch {
+            if ($_.Exception.Message -eq "tampered uninstall marker was accepted") { throw }
+          }
+          if (-not (Test-Path -LiteralPath $outside -PathType Leaf)) {
+            throw "tampered uninstall marker removed an external file"
+          }
+
       - name: Lint the Windows provider
         shell: pwsh
         run: >-

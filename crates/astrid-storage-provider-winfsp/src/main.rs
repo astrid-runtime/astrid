@@ -173,6 +173,10 @@ async fn mount(
     requested: Option<PathBuf>,
 ) -> Result<StorageProviderSuccessV1> {
     let (mountpoint, auto_created) = prepare_mountpoint(requested, &view)?;
+    let registry_key = path_key(&mountpoint)?;
+    if load_registry()?.mounts.contains_key(&registry_key) {
+        bail!("mountpoint is already registered: {}", mountpoint.display());
+    }
     let body = client
         .request(AdminRequestKind::StorageMountIssue {
             view,
@@ -182,7 +186,6 @@ async fn mount(
         })
         .await?;
     let lease = lease_from_response(body)?;
-    let registry_key = path_key(&mountpoint)?;
     let control_path = provider_control_path(&lease.mount_id)?;
 
     if let Err(error) = native_mount(&lease, &mountpoint).await {
@@ -190,6 +193,12 @@ async fn mount(
         return Err(error);
     }
     let registered = update_registry(|registry| {
+        if registry.mounts.contains_key(&registry_key) {
+            bail!(
+                "mountpoint was concurrently registered: {}",
+                mountpoint.display()
+            );
+        }
         registry.mounts.insert(
             registry_key.clone(),
             MountRecord {
