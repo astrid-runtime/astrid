@@ -199,6 +199,104 @@ async fn host_subscription_uses_shared_runtime_publication_gate() {
 }
 
 #[tokio::test]
+async fn persistent_subscription_drops_foreign_principal_messages() {
+    let rt = tokio::runtime::Handle::current();
+    // Principal runtimes are isolated per owner: a persistent run-loop
+    // subscription admits the owner plus system events only. A message from
+    // a foreign principal must be refused at route admission, never reach
+    // the guest, and never retarget the host's invocation context.
+    let mut state = host_state_for(
+        rt,
+        "default",
+        false,
+        &["cli.v1.command.run.*", "session.v1.request.list"],
+    );
+    assert_eq!(state.principal, astrid_core::PrincipalId::default());
+    let bus = state.event_bus.clone();
+
+    // Faithful to the adversarial run loop: two subscriptions.
+    let session_sub = IpcHost::subscribe(&mut state, "session.v1.request.list".to_string())
+        .expect("subscribe session allowed");
+    let run_sub = IpcHost::subscribe(&mut state, "cli.v1.command.run.*".to_string())
+        .expect("subscribe run allowed");
+
+    // A same-principal session request is admitted and installs the owner's
+    // invocation context.
+    let sess = InternalIpcMessage::new(
+        Topic::from_raw("session.v1.request.list"),
+        IpcPayload::RawJson(serde_json::json!({"correlation_id":"deadbeef"})),
+        uuid::Uuid::nil(),
+    )
+    .with_principal("default".to_string());
+    bus.publish(AstridEvent::Ipc {
+        metadata: EventMetadata::new("kernel"),
+        message: sess,
+    });
+    // recv is async; use poll to drain deterministically (same install path).
+    let _ = HostSubscription::poll(&mut state, Resource::new_borrow(session_sub.rep()))
+        .expect("poll session ok");
+    assert_eq!(
+        state.effective_principal(),
+        astrid_core::PrincipalId::default()
+    );
+
+    // A foreign principal's command on a pattern the run loop also watches
+    // must never be delivered by the owner-scoped route.
+    let msg = InternalIpcMessage::new(
+        Topic::from_raw("cli.v1.command.run.astrid-capsule-adversarial"),
+        IpcPayload::RawJson(serde_json::json!({"req_id":"abc","command":"adversarial-elicit"})),
+        uuid::Uuid::nil(),
+    )
+    .with_principal("agent-user".to_string());
+    bus.publish(AstridEvent::Ipc {
+        metadata: EventMetadata::new("cli"),
+        message: msg,
+    });
+
+    let env = HostSubscription::poll(&mut state, Resource::new_borrow(run_sub.rep()))
+        .expect("poll run ok");
+    assert!(
+        env.messages.is_empty(),
+        "foreign-principal message must not reach a principal-owned run loop"
+    );
+    assert_eq!(
+        state.effective_principal(),
+        astrid_core::PrincipalId::default(),
+        "dropped foreign message must not retarget invocation context"
+    );
+}
+
+#[tokio::test]
+async fn persistent_subscription_delivers_and_stamps_owner_principal() {
+    let rt = tokio::runtime::Handle::current();
+    let mut state = host_state_for(rt, "agent-user", false, &["cli.v1.command.run.*"]);
+
+    let run_sub = IpcHost::subscribe(&mut state, "cli.v1.command.run.*".to_string())
+        .expect("subscribe run allowed");
+    let bus = state.event_bus.clone();
+
+    let msg = InternalIpcMessage::new(
+        Topic::from_raw("cli.v1.command.run.astrid-capsule-adversarial"),
+        IpcPayload::RawJson(serde_json::json!({"req_id":"abc","command":"adversarial-elicit"})),
+        uuid::Uuid::nil(),
+    )
+    .with_principal("agent-user".to_string());
+    bus.publish(AstridEvent::Ipc {
+        metadata: EventMetadata::new("cli"),
+        message: msg,
+    });
+
+    let env = HostSubscription::poll(&mut state, Resource::new_borrow(run_sub.rep()))
+        .expect("poll run ok");
+    assert_eq!(env.messages.len(), 1, "owner message must be delivered");
+    assert_eq!(
+        state.effective_principal(),
+        astrid_core::PrincipalId::new("agent-user").unwrap(),
+        "delivered owner message must stamp the invocation context"
+    );
+}
+
+#[tokio::test]
 async fn subscribe_audit_default_is_scoped_regression() {
     // THE bug regression. A capsule with audit_firehose=false and the
     // audit topic in its ACL, owner=alice, must receive ONLY alice's
