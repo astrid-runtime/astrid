@@ -30,6 +30,7 @@ astrid-emit = { workspace = true }
 anyhow = { workspace = true }
 arboard = { workspace = true }
 astrid-capsule = { workspace = true }
+astrid-capsule-types = { workspace = true }
 astrid-capsule-install = { workspace = true }
 astrid-config = { workspace = true }
 astrid-core = { workspace = true }

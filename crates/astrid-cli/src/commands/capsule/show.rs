@@ -8,6 +8,7 @@
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
+use astrid_capsule_types::capability_presentation::{SemanticCapability, semantic_capabilities};
 use astrid_core::dirs::AstridHome;
 use clap::Args;
 use colored::Colorize;
@@ -56,6 +57,8 @@ pub(crate) struct CapsuleShow {
     pub contracts_status: String,
     /// Verbatim `Capsule.toml` body.
     pub manifest: String,
+    /// Human-facing permissions derived from the manifest.
+    pub permissions: Vec<SemanticCapability>,
 }
 
 /// Entry point for `astrid capsule show`.
@@ -87,6 +90,14 @@ pub(crate) fn run(args: &ShowArgs) -> Result<ExitCode> {
         .with_context(|| format!("Failed to read {}", meta_path.display()))?;
     let meta: serde_json::Value = serde_json::from_str(&meta_raw)
         .with_context(|| format!("{} is not valid JSON", meta_path.display()))?;
+    let parsed_manifest: astrid_capsule_types::manifest::CapsuleManifest =
+        toml::from_str(&manifest).with_context(|| {
+            format!(
+                "{} is not a valid capsule manifest",
+                manifest_path.display()
+            )
+        })?;
+    let permissions = semantic_capabilities(&parsed_manifest.capabilities);
 
     // Contracts skew — compare this capsule's astrid-contracts.wit pin
     // against the daemon canonical. Warn-only and degrades silently when
@@ -125,6 +136,7 @@ pub(crate) fn run(args: &ShowArgs) -> Result<ExitCode> {
         contracts_canonical,
         contracts_status: contracts_status.to_string(),
         manifest,
+        permissions,
     };
 
     if !format.is_pretty() {
@@ -143,11 +155,28 @@ pub(crate) fn run(args: &ShowArgs) -> Result<ExitCode> {
     println!("  Updated:      {}", record.updated_at);
     println!("  Agent:        {principal}");
     println!();
+    print_permissions(&record.permissions);
+    println!();
     println!("{}", "Manifest".bold());
     for line in record.manifest.lines() {
         println!("  {line}");
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn print_permissions(permissions: &[SemanticCapability]) {
+    println!("{}", "Permissions".bold());
+    if permissions.is_empty() {
+        println!("  No host capabilities beyond in-sandbox execution");
+        return;
+    }
+    for permission in permissions {
+        println!("  - {}", permission.action);
+        if !permission.scope.is_empty() {
+            println!("    Scope: {}", permission.scope.join("; "));
+        }
+        println!("    Impact: {}", permission.impact);
+    }
 }
 
 /// Classify a capsule's contracts skew by reading its on-disk `meta.json`
@@ -280,6 +309,7 @@ mod tests {
             contracts_canonical: Some("abc123".into()),
             contracts_status: "match".into(),
             manifest: "[package]\nname = \"x\"\n".into(),
+            permissions: Vec::new(),
         };
         let json = serde_json::to_string(&rec).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();

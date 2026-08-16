@@ -184,6 +184,10 @@ pub struct CapsuleMetadataEntry {
     pub name: String,
     /// Interceptor event patterns declared by this capsule.
     pub interceptor_events: Vec<String>,
+    /// Serialized `CapabilitiesDef`. The kernel remains engine-agnostic; the
+    /// gateway translates this into semantic permission cards for UI.
+    #[serde(default)]
+    pub capabilities: serde_json::Value,
 }
 
 /// How a capsule-declared command is surfaced to operators.

@@ -519,6 +519,8 @@ async fn handle_request(
             for manifest in visible_inventory_manifests(kernel, &visibility).await {
                 entries.push(astrid_events::kernel_api::CapsuleMetadataEntry {
                     name: manifest.package.name.clone(),
+                    capabilities: serde_json::to_value(&manifest.capabilities)
+                        .unwrap_or(serde_json::Value::Null),
                     interceptor_events: manifest
                         .subscribes
                         .iter()

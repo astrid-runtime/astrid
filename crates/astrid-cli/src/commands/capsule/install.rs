@@ -38,6 +38,7 @@ use astrid_capsule_install::{
     inspect_archive_for_principal_with_layout, inspect_directory_for_principal_with_layout,
     resolve_target_dir_for_with_layout,
 };
+use astrid_capsule_types::capability_presentation::semantic_expansion;
 use astrid_core::dirs::AstridHome;
 
 use super::install_finish::{finish_install, run_with_elicit};
@@ -959,11 +960,16 @@ fn authority_decision(
     }
     eprintln!("  Content: {}", inspection.content_digest);
     if inspection.capability_expansions.is_empty() {
-        eprintln!("  New host capabilities: none");
+        eprintln!("  New authority beyond the current install: none");
     } else {
-        eprintln!("  New host capabilities:");
+        eprintln!("  NEW AUTHORITY REQUESTED");
         for expansion in &inspection.capability_expansions {
-            eprintln!("    {}: {}", expansion.name, expansion.added.join(", "));
+            let semantic = semantic_expansion(expansion);
+            eprintln!("    - {}", semantic.action);
+            if !semantic.scope.is_empty() {
+                eprintln!("      Scope: {}", semantic.scope.join("; "));
+            }
+            eprintln!("      Impact: {}", semantic.impact);
         }
     }
     eprint!("Approve this exact install once? [y/N] ");
