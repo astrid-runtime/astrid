@@ -284,7 +284,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sigstore-verify",
- "syn 2.0.118",
+ "syn 3.0.3",
  "syntect",
  "tar",
  "tempfile",
