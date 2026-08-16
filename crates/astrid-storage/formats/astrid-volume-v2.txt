@@ -1,4 +1,4 @@
-ASTRID HOSTED VOLUME FORMAT 1
+ASTRID HOSTED VOLUME FORMAT 2
 =============================
 
 Status: hosted-media recovery specification
@@ -12,12 +12,12 @@ implementing the same region, transaction, and durability contract.
 
 The hosted container starts with these exact eight bytes:
 
-  41 53 54 56 4f 4c 31 00        ASCII "ASTVOL1" followed by NUL
+  41 53 54 56 4f 4c 32 00        ASCII "ASTVOL2" followed by NUL
 
 Every following record is:
 
   offset  size  field
-       0     8  magic = 41 53 54 52 45 47 31 00 ("ASTREG1" + NUL)
+  0     8  magic = 41 53 54 52 45 47 32 00 ("ASTREG2" + NUL)
        8     8  total_record_length, including this header, name, and payload
       16     8  sequence, starting at 1 and increasing exactly by 1
       24     1  operation
@@ -33,7 +33,7 @@ Region names are relative, slash-separated UTF-8. They are non-empty, at most
 backslashes, control characters, leading slashes, and trailing slashes.
 
 The checksum is the 32-byte output of a BLAKE3 derive-key hasher using context
-"astrid volume record v1" over this exact concatenation:
+"astrid volume record v2" over this exact concatenation:
 
   sequence[8]
   operation[1]
@@ -52,7 +52,17 @@ Operation codes are:
   5  rename an existing source to an absent destination named by payload
   6  replace an existing destination named by payload with an existing source
   7  commit a metadata transaction; region is exactly
-     system/volume-metadata-transaction and logical_offset is zero
+      system/volume-metadata-transaction and logical_offset is zero
+   8  durable commit boundary; region is exactly system/volume-commit,
+      logical_offset is zero, and payload is empty
+
+A mutation record is recoverable data but is not a durability boundary by
+itself. Version two admits records only after the most recent operation-8
+boundary. A physically short final record after the last boundary is an
+uncommitted tail. Complete records without a later boundary are also an
+uncommitted tail, including a terminal checksum-damaged record. A damaged
+record with a later physically valid successor is interior corruption and
+recovery fails rather than truncating it.
 
 A metadata-transaction payload begins with u16 mutation_count, followed by
 mutation_count entries. Each entry is u8 kind (1 rename, 2 replace), then a
@@ -60,13 +70,15 @@ u16 source length and source bytes, then a u16 destination length and
 destination bytes. Count is 1 through 1024. All mutations validate and become
 visible as one record or none become visible.
 
-Recovery admits only a contiguous sequence of complete, checksummed records
-whose namespace transitions are valid. A physically incomplete final record is
-an uncommitted tail and is truncated. A damaged length cannot hide a later
-physically valid record; that is interior corruption and fails recovery. Write
-payload checksums are streamed with bounded memory. Non-write payloads are
-bounded to 2 MiB before allocation.
+Recovery scans a contiguous sequence of records whose namespace transitions are
+valid, then exposes the state at the latest operation-8 boundary. A physically
+incomplete final record is truncated to that boundary. A damaged length cannot
+hide a later physically valid record; that is interior corruption and fails
+recovery. Write payload checksums are streamed with bounded memory. Non-write
+payloads are bounded to 2 MiB before allocation.
 
-sync() makes every preceding admitted record durable. HostedFileVolume holds an
+sync() appends operation 8 when mutations are pending and returns only after
+that boundary is durable. Graceful close performs the same boundary. A crash
+before the boundary can discard the uncommitted tail. HostedFileVolume holds an
 exclusive lock for the open lifetime. The engine close boundary releases that
 lock even when other references to the closed engine remain.

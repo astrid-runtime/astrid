@@ -797,7 +797,7 @@ fn cold_range_after_reopen_rejects_a_tampered_neighbour_chunk() {
 }
 
 #[test]
-fn streaming_source_failure_stages_only_unreachable_objects() {
+fn unmetered_streaming_source_failure_stages_only_unreachable_objects() {
     let engine = Arc::new(Engine::new(TestIdentity));
     let store = PrincipalContentStore::from_engine(Arc::clone(&engine));
     let owner = "alice".to_owned();
@@ -819,6 +819,27 @@ fn streaming_source_failure_stages_only_unreachable_objects() {
     );
     assert_eq!(engine.root(&owner), None);
     assert!(engine.object_count() > 0);
+    assert!(store.list(&owner).unwrap().is_empty());
+}
+
+#[test]
+fn metered_streaming_source_failure_stages_no_objects() {
+    let engine = Arc::new(Engine::new(TestIdentity));
+    let quota = Arc::new(|_: &String| Ok(Some(16 * 1024 * 1024)));
+    let store = PrincipalContentStore::from_engine_with_quota(Arc::clone(&engine), quota);
+    let owner = "alice".to_owned();
+    let source = FailAfter {
+        bytes: bytes(8 * 1024 * 1024),
+        offset: 0,
+        limit: 6 * 1024 * 1024,
+    };
+
+    let error = store
+        .put_streaming(&owner, &ContentName::new("broken").unwrap(), source)
+        .unwrap_err();
+    assert!(matches!(&error, PrincipalContentError::ContentSource(_)));
+    assert_eq!(engine.root(&owner), None);
+    assert_eq!(engine.object_count(), 0);
     assert!(store.list(&owner).unwrap().is_empty());
 }
 

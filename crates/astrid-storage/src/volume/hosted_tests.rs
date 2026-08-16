@@ -1,6 +1,40 @@
 use super::*;
 use crate::volume::VolumeFile;
 
+fn append_valid_uncommitted_write(path: &std::path::Path, sequence: u64, payload: &[u8]) {
+    let name = b"objects";
+    let name_len = u16::try_from(name.len()).unwrap();
+    let payload_len = u64::try_from(payload.len()).unwrap();
+    let total = u64::try_from(RECORD_FIXED_BYTES)
+        .unwrap()
+        .checked_add(u64::from(name_len))
+        .and_then(|value| value.checked_add(payload_len))
+        .unwrap();
+    let mut hasher = blake3::Hasher::new_derive_key("astrid volume record v2");
+    hasher.update(&sequence.to_le_bytes());
+    hasher.update(&[Operation::Write as u8]);
+    hasher.update(&name_len.to_le_bytes());
+    hasher.update(&0_u64.to_le_bytes());
+    hasher.update(&payload_len.to_le_bytes());
+    hasher.update(name);
+    hasher.update(payload);
+    let checksum = *hasher.finalize().as_bytes();
+    let mut record = Vec::new();
+    record.extend_from_slice(&RECORD_MAGIC);
+    record.extend_from_slice(&total.to_le_bytes());
+    record.extend_from_slice(&sequence.to_le_bytes());
+    record.extend_from_slice(&[Operation::Write as u8]);
+    record.extend_from_slice(&name_len.to_le_bytes());
+    record.extend_from_slice(&0_u64.to_le_bytes());
+    record.extend_from_slice(&payload_len.to_le_bytes());
+    record.extend_from_slice(&checksum);
+    record.extend_from_slice(name);
+    record.extend_from_slice(payload);
+    let mut file = OpenOptions::new().append(true).open(path).unwrap();
+    file.write_all(&record).unwrap();
+    file.sync_all().unwrap();
+}
+
 #[test]
 fn hosted_volume_recovers_regions_without_host_directory_projection() {
     let temporary = tempfile::tempdir().unwrap();
@@ -60,6 +94,76 @@ fn torn_tail_is_retired_on_reopen() {
     let mut bytes = [0; 7];
     volume.read_region_at(&region, 0, &mut bytes).unwrap();
     assert_eq!(&bytes, b"durable");
+}
+
+#[test]
+fn complete_or_checksum_damaged_uncommitted_record_is_retired() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("astrid.volume");
+    let region = VolumeRegion::new("objects").unwrap();
+    {
+        let volume = HostedFileVolume::open(&path).unwrap();
+        volume.create_region(&region, true).unwrap();
+        volume.write_region_at(&region, 0, b"durable").unwrap();
+        volume.sync().unwrap();
+    }
+    let committed_len = std::fs::metadata(&path).unwrap().len();
+    append_valid_uncommitted_write(&path, 4, b"pending");
+
+    let volume = HostedFileVolume::open(&path).unwrap();
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), committed_len);
+    let mut bytes = [0; 7];
+    volume.read_region_at(&region, 0, &mut bytes).unwrap();
+    assert_eq!(&bytes, b"durable");
+    drop(volume);
+
+    append_valid_uncommitted_write(&path, 4, b"corrupt!");
+    let mut bytes = std::fs::read(&path).unwrap();
+    let checksum_offset = usize::try_from(committed_len)
+        .unwrap()
+        .checked_add(43)
+        .unwrap();
+    bytes[checksum_offset] ^= 0x80;
+    std::fs::write(&path, bytes).unwrap();
+    let volume = HostedFileVolume::open(&path).unwrap();
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), committed_len);
+    let mut recovered = [0_u8; 7];
+    volume.read_region_at(&region, 0, &mut recovered).unwrap();
+    assert_eq!(&recovered, b"durable");
+}
+
+#[test]
+fn concurrent_volume_writes_recover_in_a_single_durable_generation() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("astrid.volume");
+    let region = VolumeRegion::new("shared").unwrap();
+    let volume = HostedFileVolume::open(&path).unwrap();
+    volume.create_region(&region, true).unwrap();
+    volume.sync().unwrap();
+
+    std::thread::scope(|scope| {
+        for index in 0_u8..8 {
+            let volume = Arc::clone(&volume);
+            let region = region.clone();
+            scope.spawn(move || {
+                volume
+                    .write_region_at(&region, u64::from(index) * 2, &[index, index + 1])
+                    .unwrap();
+            });
+        }
+    });
+    volume.sync().unwrap();
+    drop(volume);
+
+    let volume = HostedFileVolume::open(&path).unwrap();
+    let mut bytes = [0_u8; 16];
+    assert_eq!(volume.read_region_at(&region, 0, &mut bytes).unwrap(), 16);
+    for index in 0_u8..8 {
+        assert_eq!(
+            &bytes[usize::from(index) * 2..usize::from(index) * 2 + 2],
+            &[index, index + 1]
+        );
+    }
 }
 
 #[test]
@@ -189,4 +293,44 @@ fn corrupt_record_length_cannot_hide_a_valid_successor() {
     let error = HostedFileVolume::open(&path).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     assert!(error.to_string().contains("interior"), "{error}");
+}
+
+#[test]
+fn corrupt_record_checksum_cannot_hide_a_valid_successor() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("astrid.volume");
+    let region = VolumeRegion::new("objects").unwrap();
+    {
+        let volume = HostedFileVolume::open(&path).unwrap();
+        volume.create_region(&region, true).unwrap();
+        volume.write_region_at(&region, 0, b"first").unwrap();
+        volume.write_region_at(&region, 5, b"second").unwrap();
+        volume.sync().unwrap();
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    file.seek(SeekFrom::Start(VOLUME_MAGIC.len() as u64 + 8))
+        .unwrap();
+    let mut encoded = [0_u8; 8];
+    file.read_exact(&mut encoded).unwrap();
+    let create_length = u64::from_le_bytes(encoded);
+    let first_write = (VOLUME_MAGIC.len() as u64)
+        .checked_add(create_length)
+        .unwrap();
+    let checksum = first_write.checked_add(43).unwrap();
+    file.seek(SeekFrom::Start(checksum)).unwrap();
+    let mut byte = [0_u8; 1];
+    file.read_exact(&mut byte).unwrap();
+    byte[0] ^= 0x80;
+    file.seek(SeekFrom::Start(checksum)).unwrap();
+    file.write_all(&byte).unwrap();
+    file.sync_all().unwrap();
+
+    let error = HostedFileVolume::open(&path).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("interior"), "{error}");
+    assert!(error.to_string().contains("checksum"), "{error}");
 }

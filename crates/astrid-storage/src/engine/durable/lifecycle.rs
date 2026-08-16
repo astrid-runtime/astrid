@@ -1,9 +1,9 @@
 //! Explicit flush and close lifecycle for the durable engine.
 
 use super::{
-    DurableEngine, DurableError, DurableInner, FRAME_HEADER_LEN, IndexState, LIFECYCLE_CLOSED,
-    PersistentObjectIdentity, PrincipalCodec, StoreLock, io_error, live_files_mut, replace_index,
-    replace_volume_index,
+    DurableEngine, DurableError, DurableInner, FRAME_HEADER_LEN, FRAME_HEADER_LEN_USIZE, File,
+    IndexState, LIFECYCLE_CLOSED, PersistentObjectIdentity, PrincipalCodec, StoreLock, io_error,
+    live_files_mut, replace_index, replace_volume_index,
 };
 
 impl<P, I, C> DurableEngine<P, I, C>
@@ -98,6 +98,18 @@ where
     }
 
     fn checkpoint_index(&self, inner: &mut DurableInner<P>) {
+        if inner.pending_index_locations.is_empty() && inner.pending_direct_objects.is_empty() {
+            let Ok(files) = live_files_mut(&mut inner.files) else {
+                return;
+            };
+            if files
+                .index_cache
+                .as_mut()
+                .is_some_and(index_cache_has_one_frame)
+            {
+                return;
+            }
+        }
         let arena_tail = inner
             .index
             .values()
@@ -135,4 +147,22 @@ where
         inner.pending_index_locations.clear();
         inner.pending_direct_objects.clear();
     }
+}
+
+fn index_cache_has_one_frame(file: &mut File) -> bool {
+    let Ok(length) = file.metadata().map(|metadata| metadata.len()) else {
+        return false;
+    };
+    if length < FRAME_HEADER_LEN {
+        return false;
+    }
+    let mut header = [0_u8; FRAME_HEADER_LEN_USIZE];
+    let read_len = file.read_at(&mut header, 0);
+    if !matches!(read_len, Ok(read) if read == FRAME_HEADER_LEN_USIZE) {
+        return false;
+    }
+    let payload_len = u64::from_le_bytes(header[12..20].try_into().unwrap_or([0; 8]));
+    FRAME_HEADER_LEN
+        .checked_add(payload_len)
+        .is_some_and(|frame_end| frame_end == length)
 }

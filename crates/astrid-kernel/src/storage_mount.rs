@@ -8,10 +8,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use astrid_core::PrincipalId;
 use astrid_core::storage_filesystem::{
-    STORAGE_FILESYSTEM_MAX_IO_BYTES, STORAGE_FILESYSTEM_PROTOCOL_V1, StorageFilesystemEntryKindV1,
-    StorageFilesystemEntryV1, StorageFilesystemFailureV1, StorageFilesystemOperationV1,
-    StorageFilesystemOutcomeV1, StorageFilesystemRequestV1, StorageFilesystemResponseV1,
-    StorageFilesystemSuccessV1, StorageMountLeaseV1,
+    STORAGE_FILESYSTEM_MAX_IO_BYTES, STORAGE_FILESYSTEM_PROTOCOL_V1,
+    STORAGE_FILESYSTEM_PROTOCOL_V2, StorageFilesystemEntryKindV1, StorageFilesystemEntryV1,
+    StorageFilesystemFailureV1, StorageFilesystemOperationV1, StorageFilesystemOperationV2,
+    StorageFilesystemOutcomeV1, StorageFilesystemOutcomeV2, StorageFilesystemRequestV1,
+    StorageFilesystemRequestV2, StorageFilesystemResponseV1, StorageFilesystemResponseV2,
+    StorageFilesystemSuccessV1, StorageFilesystemSuccessV2, StorageMountLeaseV1,
 };
 use astrid_core::storage_provider::{
     StorageMountId, StorageProviderAccessV1, StorageProviderViewV1,
@@ -32,6 +34,16 @@ use crate::Kernel;
 const LEASE_IDLE_TTL_SECS: u64 = 60 * 60;
 const MAX_CALLBACK_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const LEASE_MANIFEST_NAME: &str = "lease.json";
+
+struct CallbackRequest {
+    request: StorageFilesystemRequestV1,
+    response_version: u16,
+}
+
+enum CallbackResponse {
+    V1(StorageFilesystemResponseV1),
+    V2(StorageFilesystemResponseV2),
+}
 
 /// In-memory authority fixed when a native filesystem lease is issued.
 pub(crate) struct StorageMountLeaseState {
@@ -180,6 +192,10 @@ pub(crate) async fn sync_lease(
     mount_id: StorageMountId,
 ) -> Result<(), String> {
     let state = owned_lease(kernel, caller, allow_cross_owner, mount_id)?;
+    let _mutation_guard = kernel.storage_mount_mutations.lock().await;
+    if !state.is_live() {
+        return Err("storage mount lease is expired or revoked".to_owned());
+    }
     let store = kernel
         .principal_store
         .clone()
@@ -194,8 +210,8 @@ pub(crate) async fn sync_lease(
     Ok(())
 }
 
-/// Revoke one lease and retire its callback resource.
-pub(crate) fn revoke_lease(
+/// Revoke one lease and drain any in-flight mutation before cleanup.
+pub(crate) async fn revoke_lease(
     kernel: &Kernel,
     caller: &PrincipalId,
     allow_cross_owner: bool,
@@ -204,6 +220,7 @@ pub(crate) fn revoke_lease(
     let state = owned_lease(kernel, caller, allow_cross_owner, mount_id)?;
     state.revoked.store(true, Ordering::Release);
     let _ = state.shutdown_tx.send(true);
+    let _mutation_guard = kernel.storage_mount_mutations.lock().await;
     kernel.storage_mounts.remove(&mount_id);
     cleanup_resource(&state.resource_path, &state.callback_path);
     Ok(())
@@ -350,7 +367,7 @@ async fn handle_connection(
             return;
         };
         let response = dispatch_request(&kernel, &state, request).await;
-        if write_response(&mut stream, &response).await.is_err() {
+        if write_response(&mut stream, response).await.is_err() {
             return;
         }
     }
@@ -359,7 +376,7 @@ async fn handle_connection(
 #[cfg(unix)]
 async fn read_request(
     stream: &mut tokio::net::UnixStream,
-) -> Result<Option<StorageFilesystemRequestV1>, io::Error> {
+) -> Result<Option<CallbackRequest>, io::Error> {
     let mut length = [0_u8; 4];
     match stream.read_exact(&mut length).await {
         Ok(_) => {},
@@ -375,17 +392,109 @@ async fn read_request(
     }
     let mut bytes = vec![0_u8; length];
     stream.read_exact(&mut bytes).await?;
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .map_err(io::Error::other)
+    if let Ok(request) = serde_json::from_slice::<StorageFilesystemRequestV2>(&bytes) {
+        if request.protocol_version != STORAGE_FILESYSTEM_PROTOCOL_V2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported storage filesystem protocol",
+            ));
+        }
+        let operation = decode_operation_v2(request.operation)?;
+        return Ok(Some(CallbackRequest {
+            request: StorageFilesystemRequestV1 {
+                protocol_version: STORAGE_FILESYSTEM_PROTOCOL_V1,
+                request_id: request.request_id,
+                lease_token: request.lease_token,
+                operation,
+            },
+            response_version: STORAGE_FILESYSTEM_PROTOCOL_V2,
+        }));
+    }
+    let request =
+        serde_json::from_slice::<StorageFilesystemRequestV1>(&bytes).map_err(io::Error::other)?;
+    if request.protocol_version != STORAGE_FILESYSTEM_PROTOCOL_V1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported storage filesystem protocol",
+        ));
+    }
+    Ok(Some(CallbackRequest {
+        request,
+        response_version: STORAGE_FILESYSTEM_PROTOCOL_V1,
+    }))
+}
+
+fn decode_operation_v2(
+    operation: StorageFilesystemOperationV2,
+) -> io::Result<StorageFilesystemOperationV1> {
+    Ok(match operation {
+        StorageFilesystemOperationV2::Stat { path } => StorageFilesystemOperationV1::Stat { path },
+        StorageFilesystemOperationV2::ReadDirectory { path } => {
+            StorageFilesystemOperationV1::ReadDirectory { path }
+        },
+        StorageFilesystemOperationV2::Read {
+            path,
+            offset,
+            length,
+        } => StorageFilesystemOperationV1::Read {
+            path,
+            offset,
+            length,
+        },
+        StorageFilesystemOperationV2::Write {
+            path,
+            offset,
+            data_base64,
+        } => {
+            let data = base64::engine::general_purpose::STANDARD
+                .decode(data_base64.as_bytes())
+                .map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid base64 filesystem payload: {error}"),
+                    )
+                })?;
+            let data_length = u64::try_from(data.len()).unwrap_or(u64::MAX);
+            if data_length > STORAGE_FILESYSTEM_MAX_IO_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "filesystem payload exceeds limit",
+                ));
+            }
+            StorageFilesystemOperationV1::Write { path, offset, data }
+        },
+        StorageFilesystemOperationV2::SetLength { path, length } => {
+            StorageFilesystemOperationV1::SetLength { path, length }
+        },
+        StorageFilesystemOperationV2::Create { path, kind } => {
+            StorageFilesystemOperationV1::Create { path, kind }
+        },
+        StorageFilesystemOperationV2::Remove { path } => {
+            StorageFilesystemOperationV1::Remove { path }
+        },
+        StorageFilesystemOperationV2::Rename { from, to, replace } => {
+            StorageFilesystemOperationV1::Rename { from, to, replace }
+        },
+        StorageFilesystemOperationV2::Sync => StorageFilesystemOperationV1::Sync,
+    })
 }
 
 #[cfg(unix)]
 async fn write_response(
     stream: &mut tokio::net::UnixStream,
-    response: &StorageFilesystemResponseV1,
+    response: CallbackResponse,
 ) -> Result<(), io::Error> {
-    let bytes = serde_json::to_vec(response).map_err(io::Error::other)?;
+    let bytes = match response {
+        CallbackResponse::V1(response) => serde_json::to_vec(&response),
+        CallbackResponse::V2(response) => serde_json::to_vec(&response),
+    }
+    .map_err(io::Error::other)?;
+    if bytes.len() > MAX_CALLBACK_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "mount callback response exceeds limit",
+        ));
+    }
     let length = u32::try_from(bytes.len()).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -400,12 +509,11 @@ async fn write_response(
 async fn dispatch_request(
     kernel: &Kernel,
     state: &StorageMountLeaseState,
-    request: StorageFilesystemRequestV1,
-) -> StorageFilesystemResponseV1 {
+    callback: CallbackRequest,
+) -> CallbackResponse {
+    let request = callback.request;
     let request_id = request.request_id.clone();
-    let outcome = if request.protocol_version != STORAGE_FILESYSTEM_PROTOCOL_V1 {
-        failure("protocol", "unsupported storage filesystem protocol")
-    } else if !state.is_live() {
+    let outcome = if !state.is_live() {
         failure("stale-lease", "storage mount lease is expired or revoked")
     } else if !token_matches(&state.token_hash, &request.lease_token) {
         failure("unauthorized", "storage mount lease token is invalid")
@@ -413,9 +521,44 @@ async fn dispatch_request(
         state.renew();
         execute_operation(kernel, state, request.operation).await
     };
-    StorageFilesystemResponseV1 {
+    let response = StorageFilesystemResponseV1 {
         protocol_version: STORAGE_FILESYSTEM_PROTOCOL_V1,
         request_id,
+        outcome,
+    };
+    match callback.response_version {
+        STORAGE_FILESYSTEM_PROTOCOL_V1 => CallbackResponse::V1(response),
+        STORAGE_FILESYSTEM_PROTOCOL_V2 => CallbackResponse::V2(response_v2(response)),
+        _ => unreachable!("read_request validated the callback protocol version"),
+    }
+}
+
+fn response_v2(response: StorageFilesystemResponseV1) -> StorageFilesystemResponseV2 {
+    let outcome = match response.outcome {
+        StorageFilesystemOutcomeV1::Success(success) => {
+            StorageFilesystemOutcomeV2::Success(match success {
+                StorageFilesystemSuccessV1::Done => StorageFilesystemSuccessV2::Done,
+                StorageFilesystemSuccessV1::Entry(entry) => {
+                    StorageFilesystemSuccessV2::Entry(entry)
+                },
+                StorageFilesystemSuccessV1::Entries(entries) => {
+                    StorageFilesystemSuccessV2::Entries(entries)
+                },
+                StorageFilesystemSuccessV1::Data(data) => StorageFilesystemSuccessV2::Data {
+                    data_base64: base64::engine::general_purpose::STANDARD.encode(data),
+                },
+                StorageFilesystemSuccessV1::Written(length) => {
+                    StorageFilesystemSuccessV2::Written(length)
+                },
+            })
+        },
+        StorageFilesystemOutcomeV1::Failure(failure) => {
+            StorageFilesystemOutcomeV2::Failure(failure)
+        },
+    };
+    StorageFilesystemResponseV2 {
+        protocol_version: STORAGE_FILESYSTEM_PROTOCOL_V2,
+        request_id: response.request_id,
         outcome,
     }
 }
@@ -428,8 +571,15 @@ async fn execute_operation(
     if is_mutation(&operation) && state.access != StorageProviderAccessV1::ReadWrite {
         return failure("read-only", "storage mount lease is read-only");
     }
-    let _mutation_guard = if is_mutation(&operation) {
-        Some(kernel.storage_mount_mutations.lock().await)
+    let _mutation_guard = if requires_mutation_serialization(&operation) {
+        let guard = kernel.storage_mount_mutations.lock().await;
+        if !state.is_live() {
+            return failure("stale-lease", "storage mount lease is expired or revoked");
+        }
+        if is_mutation(&operation) {
+            state.dirty.store(true, Ordering::Release);
+        }
+        Some(guard)
     } else {
         None
     };
@@ -664,6 +814,10 @@ fn is_mutation(operation: &StorageFilesystemOperationV1) -> bool {
             | StorageFilesystemOperationV1::Remove { .. }
             | StorageFilesystemOperationV1::Rename { .. }
     )
+}
+
+fn requires_mutation_serialization(operation: &StorageFilesystemOperationV1) -> bool {
+    is_mutation(operation) || matches!(operation, StorageFilesystemOperationV1::Sync)
 }
 
 fn generate_lease_token() -> Result<(String, [u8; 32]), String> {

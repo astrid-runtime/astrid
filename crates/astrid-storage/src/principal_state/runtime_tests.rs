@@ -12,12 +12,13 @@ use crate::storage_model::{
     RootGeneration, RootState,
 };
 use crate::volume::AstridVolume as _;
+use crate::{AstridFilesystem, FilesystemPath};
 #[cfg(feature = "legacy-surrealkv")]
 use astrid_core::profile::{DeviceKey, DeviceScope, PrincipalProfile};
 
 use super::*;
 use crate::content::{CONTENT_COMPONENT_LABEL, CatalogValue, LegacyCatalog, encode_legacy_catalog};
-use crate::{ChunkingProfile, ContentName};
+use crate::{ChunkingProfile, ContentIngest, ContentName};
 
 mod staging_batch_tests;
 
@@ -1312,6 +1313,31 @@ async fn independent_reader_accepts_a_rust_produced_volume() {
     );
 }
 
+#[test]
+fn independent_volume_validator_rejects_the_full_unicode_control_set() {
+    let script_directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts");
+    let output = std::process::Command::new("python3")
+        .current_dir(script_directory)
+        .arg("-c")
+        .arg(
+            r#"from runatal_v1_volume import VolumeFormatError, volume_region_name
+for codepoint in range(0x80, 0xa0):
+    try:
+        volume_region_name(chr(codepoint).encode())
+    except VolumeFormatError:
+        continue
+    raise AssertionError(f"U+{codepoint:04X} was accepted")
+assert volume_region_name(" Astrid ".encode()) == " Astrid ""#,
+        )
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "independent validator failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[tokio::test]
 async fn completed_store_does_not_self_heal_a_missing_runatal_object() {
     let directory = tempfile::tempdir().unwrap();
@@ -1540,6 +1566,100 @@ async fn live_quota_blocks_growth_but_allows_recovery_and_system_state() {
         .set("system:identity", "unmetered", vec![0; 64])
         .await
         .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rejected_streaming_writes_do_not_grow_the_physical_volume() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    let quota: Arc<dyn KvQuotaResolver<StateOwner>> = Arc::new(|owner: &StateOwner| {
+        Ok(match owner {
+            StateOwner::System => None,
+            StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(27),
+        })
+    });
+    let store = open_runtime_principal_store(&home, quota).await.unwrap();
+    let uid = create_test_principal(&store, "alice").await;
+    let owner = StateOwner::Principal(uid);
+    let filesystem = AstridFilesystem::new(store.content(), owner);
+    let accepted = FilesystemPath::new("accepted").unwrap();
+    filesystem
+        .write_streaming(&accepted, std::io::Cursor::new(b"first".to_vec()))
+        .unwrap();
+    filesystem.sync().unwrap();
+
+    filesystem
+        .write_streaming(&accepted, std::io::Cursor::new(b"first".to_vec()))
+        .unwrap();
+    filesystem.sync().unwrap();
+    let warmup = FilesystemPath::new("rejected-warmup").unwrap();
+    let error = filesystem
+        .write_streaming(&warmup, std::io::Cursor::new(vec![7_u8; 64]))
+        .unwrap_err();
+    assert!(error.to_string().contains("quota exceeded"));
+    filesystem.sync().unwrap();
+    let bounded_len = std::fs::metadata(home.storage_volume_path()).unwrap().len();
+
+    for index in 0..8 {
+        let name = FilesystemPath::new(format!("rejected-{index}")).unwrap();
+        let error = filesystem
+            .write_streaming(&name, std::io::Cursor::new(vec![7_u8; 64]))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("quota exceeded"),
+            "unexpected error: {error}"
+        );
+        filesystem.sync().unwrap();
+        assert_eq!(
+            std::fs::metadata(home.storage_volume_path()).unwrap().len(),
+            bounded_len
+        );
+    }
+
+    let mut workers = Vec::new();
+    for index in 0..8 {
+        let content = store.content();
+        let name = ContentName::new(format!("concurrent-{index}")).unwrap();
+        workers.push(tokio::task::spawn_blocking(move || {
+            content.put_streaming(&owner, &name, std::io::Cursor::new(vec![9_u8; 64]))
+        }));
+    }
+    for worker in workers {
+        let error = worker.await.unwrap().unwrap_err();
+        assert!(
+            error.to_string().contains("quota exceeded"),
+            "unexpected concurrent error: {error}"
+        );
+    }
+    filesystem.sync().unwrap();
+    assert_eq!(
+        std::fs::metadata(home.storage_volume_path()).unwrap().len(),
+        bounded_len
+    );
+
+    for index in 0..4 {
+        let first = ContentIngest::new(
+            ContentName::new(format!("batch-{index}-first")).unwrap(),
+            std::io::Cursor::new(vec![3_u8; 64]),
+        );
+        let second = ContentIngest::new(
+            ContentName::new(format!("batch-{index}-second")).unwrap(),
+            std::io::Cursor::new(vec![4_u8; 64]),
+        );
+        let error = store
+            .content()
+            .put_streaming_batch(&owner, [first, second])
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("quota exceeded"),
+            "unexpected batch error: {error}"
+        );
+        filesystem.sync().unwrap();
+        assert_eq!(
+            std::fs::metadata(home.storage_volume_path()).unwrap().len(),
+            bounded_len
+        );
+    }
 }
 
 #[tokio::test]

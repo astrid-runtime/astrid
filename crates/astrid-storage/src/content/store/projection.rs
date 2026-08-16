@@ -170,6 +170,51 @@ where
     }
 }
 
+#[derive(Default)]
+pub(super) struct DeferredAdmission {
+    records: BTreeMap<ObjectId, ObjectRecord>,
+    retained_bytes: usize,
+    peak_retained_bytes: usize,
+}
+
+impl DeferredAdmission {
+    pub(super) fn take_records(&mut self) -> Vec<ObjectRecord> {
+        self.retained_bytes = 0;
+        std::mem::take(&mut self.records).into_values().collect()
+    }
+
+    pub(super) const fn peak_retained_bytes(&self) -> usize {
+        self.peak_retained_bytes
+    }
+}
+
+impl<P, E> BatchAdmission<P, E> for DeferredAdmission {
+    fn admit(
+        &mut self,
+        _engine: &E,
+        batch: StagedObjectBatch,
+    ) -> Result<u64, PrincipalProjectionError> {
+        for (id, record) in batch.records {
+            match self.records.get(&id) {
+                Some(existing) if existing == &record => {},
+                Some(_) => {
+                    return Err(PrincipalProjectionError::Model(
+                        ModelError::ObjectCollision(id),
+                    ));
+                },
+                None => {
+                    self.retained_bytes = self
+                        .retained_bytes
+                        .saturating_add(crate::engine::object_record_retained_bytes(&record));
+                    self.peak_retained_bytes = self.peak_retained_bytes.max(self.retained_bytes);
+                    self.records.insert(id, record);
+                },
+            }
+        }
+        Ok(0)
+    }
+}
+
 pub(super) struct EngineSink<'a, P, E, A = DirectAdmission> {
     engine: &'a E,
     admission: A,
@@ -201,6 +246,10 @@ impl<'a, P, E, A> EngineSink<'a, P, E, A> {
 
     pub(super) const fn admission(&self) -> &A {
         &self.admission
+    }
+
+    pub(super) fn admission_mut(&mut self) -> &mut A {
+        &mut self.admission
     }
 
     pub(super) const fn peak_pending_bytes(&self) -> usize {

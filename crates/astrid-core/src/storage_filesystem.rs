@@ -14,6 +14,9 @@ use crate::storage_provider::{StorageMountId, StorageProviderAccessV1, StoragePr
 /// Current private mount-service protocol version.
 pub const STORAGE_FILESYSTEM_PROTOCOL_V1: u16 = 1;
 
+/// Version-two framing encodes byte payloads as base64 strings.
+pub const STORAGE_FILESYSTEM_PROTOCOL_V2: u16 = 2;
+
 /// Maximum byte payload accepted in one filesystem callback.
 pub const STORAGE_FILESYSTEM_MAX_IO_BYTES: u64 = 4 * 1024 * 1024;
 
@@ -140,6 +143,85 @@ pub struct StorageFilesystemRequestV1 {
     pub operation: StorageFilesystemOperationV1,
 }
 
+/// Version-two wire operation with bounded base64 byte fields.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case", tag = "operation")]
+pub enum StorageFilesystemOperationV2 {
+    /// Inspect a relative path. The empty string is the root.
+    Stat {
+        /// Canonical slash-separated relative path.
+        path: String,
+    },
+    /// Enumerate direct children.
+    ReadDirectory {
+        /// Canonical slash-separated relative path.
+        path: String,
+    },
+    /// Read one exact file range.
+    Read {
+        /// Canonical slash-separated relative path.
+        path: String,
+        /// Initial byte offset.
+        offset: u64,
+        /// Requested byte count, bounded by [`STORAGE_FILESYSTEM_MAX_IO_BYTES`].
+        length: u64,
+    },
+    /// Replace a range, extending with zeroes when necessary.
+    Write {
+        /// Canonical slash-separated relative path.
+        path: String,
+        /// Initial byte offset.
+        offset: u64,
+        /// Standard base64 with padding, bounded after decoding by
+        /// [`STORAGE_FILESYSTEM_MAX_IO_BYTES`].
+        data_base64: String,
+    },
+    /// Set exact file length, truncating or zero-extending.
+    SetLength {
+        /// Canonical slash-separated relative path.
+        path: String,
+        /// New logical byte length.
+        length: u64,
+    },
+    /// Create an empty regular file or directory.
+    Create {
+        /// Canonical slash-separated relative path.
+        path: String,
+        /// Requested entry kind.
+        kind: StorageFilesystemEntryKindV1,
+    },
+    /// Remove one file or empty directory.
+    Remove {
+        /// Canonical slash-separated relative path.
+        path: String,
+    },
+    /// Rename an entry within the same mounted owner view.
+    Rename {
+        /// Existing relative path.
+        from: String,
+        /// New relative path.
+        to: String,
+        /// Atomically replace a compatible destination when it exists.
+        replace: bool,
+    },
+    /// Flush all acknowledged mutations to durable storage.
+    Sync,
+}
+
+/// One authenticated version-two callback request.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageFilesystemRequestV2 {
+    /// Exact protocol version.
+    pub protocol_version: u16,
+    /// Caller-generated correlation identity.
+    pub request_id: String,
+    /// Random secret from [`StorageMountLeaseV1`].
+    pub lease_token: String,
+    /// Requested operation.
+    pub operation: StorageFilesystemOperationV2,
+}
+
 /// Successful filesystem result.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case", tag = "result", content = "value")]
@@ -152,6 +234,25 @@ pub enum StorageFilesystemSuccessV1 {
     Entries(Vec<StorageFilesystemEntryV1>),
     /// Exact bytes read.
     Data(Vec<u8>),
+    /// A write published this exact logical file length.
+    Written(u64),
+}
+
+/// Version-two successful result with bounded base64 byte payloads.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case", tag = "result", content = "value")]
+pub enum StorageFilesystemSuccessV2 {
+    /// Operation completed without a value.
+    Done,
+    /// One entry was found.
+    Entry(StorageFilesystemEntryV1),
+    /// Directory children in canonical order.
+    Entries(Vec<StorageFilesystemEntryV1>),
+    /// Exact bytes read as standard base64 with padding.
+    Data {
+        /// Standard base64 with padding.
+        data_base64: String,
+    },
     /// A write published this exact logical file length.
     Written(u64),
 }
@@ -188,6 +289,28 @@ pub struct StorageFilesystemResponseV1 {
     pub outcome: StorageFilesystemOutcomeV1,
 }
 
+/// One version-two callback result.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case", tag = "status", content = "detail")]
+pub enum StorageFilesystemOutcomeV2 {
+    /// The operation completed.
+    Success(StorageFilesystemSuccessV2),
+    /// The operation failed without changing lease authority.
+    Failure(StorageFilesystemFailureV1),
+}
+
+/// One version-two response on a private mount callback endpoint.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageFilesystemResponseV2 {
+    /// Exact protocol version.
+    pub protocol_version: u16,
+    /// Correlation identity copied from the request.
+    pub request_id: String,
+    /// Operation result.
+    pub outcome: StorageFilesystemOutcomeV2,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,5 +332,25 @@ mod tests {
         assert!(!text.contains("principal"));
         assert!(!text.contains("fleet"));
         assert!(!text.contains("admin"));
+    }
+
+    #[test]
+    fn version_two_fits_a_maximum_write_in_the_transport_frame() {
+        let request = StorageFilesystemRequestV2 {
+            protocol_version: STORAGE_FILESYSTEM_PROTOCOL_V2,
+            request_id: "frame-test".to_owned(),
+            lease_token: "secret".to_owned(),
+            operation: StorageFilesystemOperationV2::Write {
+                path: "maximum.bin".to_owned(),
+                offset: 0,
+                data_base64: "A".repeat(5_592_408),
+            },
+        };
+        let encoded = serde_json::to_vec(&request).unwrap();
+        assert!(
+            encoded.len() <= 8 * 1024 * 1024,
+            "version-two frame length {}",
+            encoded.len()
+        );
     }
 }

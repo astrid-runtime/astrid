@@ -395,33 +395,11 @@ impl NativeContentStagingArea {
         }
         self.ensure_publication_order(&staged)?;
         let area = self.clone();
-        tokio::task::spawn_blocking(move || {
-            let (source, _) = open_generation_in(
-                &area.inner.generations_directory,
-                &staged.content_path(),
-                &staged.intent(),
-                Some(staged.source_identity),
-            )?;
-            let (verified, objects_inserted) = content
-                .stage_streaming(source.take(staged.logical_bytes), staged.profile)
-                .map_err(|error| {
-                    StorageError::Internal(format!(
-                        "stage content {} into Astrid storage: {error}",
-                        staged.id
-                    ))
-                })?;
-            let outcome = content
-                .publish_verified_content(&staged.owner, &staged.name, verified, objects_inserted)
-                .map_err(|error| {
-                    StorageError::Internal(format!("publish staged content {}: {error}", staged.id))
-                })?;
-            area.mark_published(&staged)?;
-            Ok(outcome)
-        })
-        .await
-        .map_err(|error| {
-            StorageError::Internal(format!("staged content publication worker failed: {error}"))
-        })?
+        tokio::task::spawn_blocking(move || publish_ready(&area, &staged, &content))
+            .await
+            .map_err(|error| {
+                StorageError::Internal(format!("staged content publication worker failed: {error}"))
+            })?
     }
 
     /// Publish several sealed writes through one authoritative root commit.
@@ -466,41 +444,11 @@ impl NativeContentStagingArea {
             self.ensure_publication_order_excluding(entry, &staged)?;
         }
         let area = self.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut completed = Vec::with_capacity(staged.len());
-            let mut objects_inserted = 0_u64;
-            for entry in &staged {
-                let (source, _) = open_generation_in(
-                    &area.inner.generations_directory,
-                    &entry.content_path(),
-                    &entry.intent(),
-                    Some(entry.source_identity),
-                )?;
-                let (verified, inserted) = content
-                    .stage_streaming(source.take(entry.logical_bytes), entry.profile)
-                    .map_err(|error| {
-                        StorageError::Internal(format!(
-                            "stage content {} into Astrid storage: {error}",
-                            entry.id
-                        ))
-                    })?;
-                objects_inserted = objects_inserted.checked_add(inserted).ok_or_else(|| {
-                    StorageError::Internal("staged batch object accounting overflow".to_owned())
-                })?;
-                completed.push((entry.name.clone(), verified));
-            }
-            let outcome = content
-                .publish_verified_batch(&owner, completed, objects_inserted)
-                .map_err(|error| {
-                    StorageError::Internal(format!("publish staged content batch: {error}"))
-                })?;
-            area.mark_published_batch(&staged)?;
-            Ok(outcome)
-        })
-        .await
-        .map_err(|error| {
-            StorageError::Internal(format!("staged content batch worker failed: {error}"))
-        })?
+        tokio::task::spawn_blocking(move || publish_ready_batch(&area, &staged, owner, &content))
+            .await
+            .map_err(|error| {
+                StorageError::Internal(format!("staged content batch worker failed: {error}"))
+            })?
     }
 
     fn ensure_publication_order(&self, staged: &ReadyStagedContent) -> StorageResult<()> {
@@ -672,6 +620,148 @@ pub struct StagedContentWriter {
     path: Option<PathBuf>,
     file: Option<File>,
     preserve_on_drop: bool,
+}
+
+fn publish_ready(
+    area: &NativeContentStagingArea,
+    staged: &ReadyStagedContent,
+    content: &NativePrincipalContentStore,
+) -> StorageResult<ContentWriteOutcome> {
+    let (source, _) = open_generation_in(
+        &area.inner.generations_directory,
+        &staged.content_path(),
+        &staged.intent(),
+        Some(staged.source_identity),
+    )?;
+    let outcome = if let Some((bound, limit)) =
+        content
+            .quota_staging_bound(&staged.owner)
+            .map_err(|error| {
+                StorageError::Internal(format!(
+                    "resolve staged content {} quota: {error}",
+                    staged.id
+                ))
+            })? {
+        let (verified, records) = content
+            .stage_deferred_bounded(
+                source.take(staged.logical_bytes),
+                staged.profile,
+                bound,
+                limit,
+            )
+            .map_err(|error| {
+                StorageError::Internal(format!(
+                    "stage content {} into Astrid storage: {error}",
+                    staged.id
+                ))
+            })?;
+        content
+            .publish_deferred(&staged.owner, &staged.name, verified, &records)
+            .map_err(|error| {
+                StorageError::Internal(format!("publish staged content {}: {error}", staged.id))
+            })?
+    } else {
+        let (verified, objects_inserted) = content
+            .stage_streaming(source.take(staged.logical_bytes), staged.profile)
+            .map_err(|error| {
+                StorageError::Internal(format!(
+                    "stage content {} into Astrid storage: {error}",
+                    staged.id
+                ))
+            })?;
+        content
+            .publish_verified_content(&staged.owner, &staged.name, verified, objects_inserted)
+            .map_err(|error| {
+                StorageError::Internal(format!("publish staged content {}: {error}", staged.id))
+            })?
+    };
+    area.mark_published(staged)?;
+    Ok(outcome)
+}
+
+fn publish_ready_batch(
+    area: &NativeContentStagingArea,
+    staged: &[ReadyStagedContent],
+    owner: StateOwner,
+    content: &NativePrincipalContentStore,
+) -> StorageResult<ContentBatchWriteOutcome> {
+    let outcome = if let Some((mut remaining, limit)) =
+        content.quota_staging_bound(&owner).map_err(|error| {
+            StorageError::Internal(format!("resolve staged content batch quota: {error}"))
+        })? {
+        let mut completed = Vec::with_capacity(staged.len());
+        for entry in staged {
+            let (source, _) = open_generation_in(
+                &area.inner.generations_directory,
+                &entry.content_path(),
+                &entry.intent(),
+                Some(entry.source_identity),
+            )?;
+            let (verified, records) = content
+                .stage_deferred_bounded(
+                    source.take(entry.logical_bytes),
+                    entry.profile,
+                    remaining,
+                    limit,
+                )
+                .map_err(|error| {
+                    StorageError::Internal(format!(
+                        "stage content {} into Astrid storage: {error}",
+                        entry.id
+                    ))
+                })?;
+            remaining = remaining
+                .checked_sub(verified.descriptor().logical_bytes())
+                .ok_or_else(|| {
+                    StorageError::Internal(
+                        "staged content batch quota accounting underflow".to_owned(),
+                    )
+                })?;
+            completed.push((entry.name.clone(), verified, records));
+        }
+        content
+            .publish_verified_batch_deferred(&owner, completed)
+            .map_err(|error| {
+                StorageError::Internal(format!("publish staged content batch: {error}"))
+            })?
+    } else {
+        publish_ready_batch_unmetered(area, staged, &owner, content)?
+    };
+    area.mark_published_batch(staged)?;
+    Ok(outcome)
+}
+
+fn publish_ready_batch_unmetered(
+    area: &NativeContentStagingArea,
+    staged: &[ReadyStagedContent],
+    owner: &StateOwner,
+    content: &NativePrincipalContentStore,
+) -> StorageResult<ContentBatchWriteOutcome> {
+    let mut completed = Vec::with_capacity(staged.len());
+    let mut objects_inserted = 0_u64;
+    for entry in staged {
+        let (source, _) = open_generation_in(
+            &area.inner.generations_directory,
+            &entry.content_path(),
+            &entry.intent(),
+            Some(entry.source_identity),
+        )?;
+        let (verified, inserted) = content
+            .stage_streaming(source.take(entry.logical_bytes), entry.profile)
+            .map_err(|error| {
+                StorageError::Internal(format!(
+                    "stage content {} into Astrid storage: {error}",
+                    entry.id
+                ))
+            })?;
+        objects_inserted = objects_inserted.checked_add(inserted).ok_or_else(|| {
+            StorageError::Internal("staged batch object accounting overflow".to_owned())
+        })?;
+        completed.push((entry.name.clone(), verified));
+    }
+    content
+        .publish_verified_batch(owner, completed, objects_inserted)
+        .map_err(|error| StorageError::Internal(format!("publish staged content batch: {error}")))
 }
 
 impl StagedContentWriter {

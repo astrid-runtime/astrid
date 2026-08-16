@@ -12,11 +12,12 @@ use parking_lot::Mutex;
 
 use super::{AstridVolume, MAX_REGION_NAME_BYTES, VolumeMetadataMutation, VolumeRegion};
 
-const VOLUME_MAGIC: [u8; 8] = *b"ASTVOL1\0";
-const RECORD_MAGIC: [u8; 8] = *b"ASTREG1\0";
+const VOLUME_MAGIC: [u8; 8] = *b"ASTVOL2\0";
+const RECORD_MAGIC: [u8; 8] = *b"ASTREG2\0";
 const RECORD_FIXED_BYTES: usize = 8 + 8 + 8 + 1 + 2 + 8 + 8 + 32;
 const MAX_METADATA_MUTATIONS: usize = 1_024;
 const METADATA_TRANSACTION_REGION: &str = "system/volume-metadata-transaction";
+const COMMIT_REGION: &str = "system/volume-commit";
 const RECOVERY_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_METADATA_PAYLOAD_BYTES: u64 = 2 * 1024 * 1024;
 
@@ -37,6 +38,8 @@ struct ContainerState {
     file: File,
     sequence: u64,
     valid_len: u64,
+    durable_len: u64,
+    boundary_pending: bool,
     regions: BTreeMap<VolumeRegion, RegionState>,
 }
 
@@ -114,7 +117,7 @@ impl HostedFileVolume {
                 ));
             }
         }
-        let (regions, sequence, valid_len) = recover_container(&mut file)?;
+        let (regions, sequence, valid_len, durable_len) = recover_container(&mut file)?;
         if file.metadata()?.len() != valid_len {
             file.set_len(valid_len)?;
             file.sync_all()?;
@@ -125,6 +128,8 @@ impl HostedFileVolume {
                 file,
                 sequence,
                 valid_len,
+                durable_len,
+                boundary_pending: false,
                 regions,
             }),
         }))
@@ -151,7 +156,7 @@ impl HostedFileVolume {
             .and_then(|fixed| fixed.checked_add(u64::from(name_len)))
             .and_then(|total| total.checked_add(payload_len))
             .ok_or_else(|| io::Error::other("volume record length overflow"))?;
-        let mut hasher = blake3::Hasher::new_derive_key("astrid volume record v1");
+        let mut hasher = blake3::Hasher::new_derive_key("astrid volume record v2");
         hasher.update(&next_sequence.to_le_bytes());
         hasher.update(&[operation as u8]);
         hasher.update(&name_len.to_le_bytes());
@@ -177,6 +182,7 @@ impl HostedFileVolume {
             .and_then(|value| value.checked_add(u64::from(name_len)))
             .ok_or_else(|| io::Error::other("volume physical offset overflow"))?;
         state.file.write_all(payload)?;
+        state.boundary_pending = false;
         state.valid_len = state
             .valid_len
             .checked_add(total_len)
@@ -184,12 +190,24 @@ impl HostedFileVolume {
         state.sequence = next_sequence;
         Ok((physical_payload, payload_len))
     }
+
+    fn make_durable(state: &mut ContainerState) -> io::Result<()> {
+        if state.valid_len != state.durable_len && !state.boundary_pending {
+            let region = VolumeRegion::new(COMMIT_REGION)?;
+            Self::append(state, Operation::Commit, &region, 0, &[])?;
+            state.boundary_pending = true;
+        }
+        state.file.sync_all()?;
+        state.durable_len = state.valid_len;
+        state.boundary_pending = false;
+        Ok(())
+    }
 }
 
 impl Drop for HostedFileVolume {
     fn drop(&mut self) {
         let state = self.state.get_mut();
-        let _ = state.file.sync_data();
+        let _ = Self::make_durable(state);
         let _ = state.file.unlock();
     }
 }
@@ -406,7 +424,7 @@ impl AstridVolume for HostedFileVolume {
     }
 
     fn sync(&self) -> io::Result<()> {
-        self.state.lock().file.sync_data()
+        Self::make_durable(&mut self.state.lock())
     }
 }
 
@@ -420,6 +438,7 @@ enum Operation {
     Rename = 5,
     Replace = 6,
     MetadataTransaction = 7,
+    Commit = 8,
 }
 
 impl Operation {
@@ -432,6 +451,7 @@ impl Operation {
             5 => Ok(Self::Rename),
             6 => Ok(Self::Replace),
             7 => Ok(Self::MetadataTransaction),
+            8 => Ok(Self::Commit),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "unknown Astrid volume operation",
@@ -443,11 +463,14 @@ impl Operation {
 #[allow(clippy::too_many_lines)]
 fn recover_container(
     file: &mut File,
-) -> io::Result<(BTreeMap<VolumeRegion, RegionState>, u64, u64)> {
+) -> io::Result<(BTreeMap<VolumeRegion, RegionState>, u64, u64, u64)> {
     let physical_len = file.metadata()?.len();
     let mut offset = VOLUME_MAGIC.len() as u64;
     let mut sequence = 0_u64;
     let mut regions = BTreeMap::new();
+    let mut committed_regions = BTreeMap::new();
+    let mut committed_sequence = 0_u64;
+    let mut committed_offset = VOLUME_MAGIC.len() as u64;
     while offset < physical_len {
         let remaining = physical_len.saturating_sub(offset);
         if remaining < RECORD_FIXED_BYTES as u64 {
@@ -463,7 +486,34 @@ fn recover_container(
             ));
         }
         let total_len = u64::from_le_bytes(fixed[8..16].try_into().unwrap_or([0; 8]));
-        if total_len < RECORD_FIXED_BYTES as u64 || total_len > remaining {
+        let name_length = usize::from(u16::from_le_bytes(
+            fixed[25..27].try_into().unwrap_or([0; 2]),
+        ));
+        let payload_length = u64::from_le_bytes(fixed[35..43].try_into().unwrap_or([0; 8]));
+        let declared = (RECORD_FIXED_BYTES as u64)
+            .checked_add(name_length as u64)
+            .and_then(|value| value.checked_add(payload_length));
+        if total_len < RECORD_FIXED_BYTES as u64
+            || declared != Some(total_len)
+            || name_length == 0
+            || name_length > MAX_REGION_NAME_BYTES
+        {
+            if total_len > remaining {
+                if has_physically_valid_record_after(file, offset.saturating_add(1), physical_len)?
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid interior Astrid volume record length at {offset}"),
+                    ));
+                }
+                break;
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid Astrid volume record length at {offset}"),
+            ));
+        }
+        if total_len > remaining {
             if has_physically_valid_record_after(file, offset.saturating_add(1), physical_len)? {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -480,36 +530,22 @@ fn recover_container(
             ));
         }
         let operation = Operation::decode(fixed[24])?;
-        let name_len = usize::from(u16::from_le_bytes(
-            fixed[25..27].try_into().unwrap_or([0; 2]),
-        ));
         let logical_offset = u64::from_le_bytes(fixed[27..35].try_into().unwrap_or([0; 8]));
-        let payload_len = u64::from_le_bytes(fixed[35..43].try_into().unwrap_or([0; 8]));
         let checksum: [u8; 32] = fixed[43..75].try_into().unwrap_or([0; 32]);
-        let declared = (RECORD_FIXED_BYTES as u64)
-            .checked_add(name_len as u64)
-            .and_then(|value| value.checked_add(payload_len))
-            .ok_or_else(|| io::Error::other("volume record length overflow"))?;
-        if declared != total_len || name_len == 0 || name_len > MAX_REGION_NAME_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid Astrid volume record lengths",
-            ));
-        }
-        let mut name = vec![0_u8; name_len];
+        let mut name = vec![0_u8; name_length];
         file.read_exact(&mut name)?;
         let name = String::from_utf8(name)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-UTF-8 region name"))?;
         let region = VolumeRegion::new(name)?;
         let retain_payload = operation != Operation::Write;
-        if retain_payload && payload_len > MAX_METADATA_PAYLOAD_BYTES {
+        if retain_payload && payload_length > MAX_METADATA_PAYLOAD_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Astrid volume metadata payload exceeds the recovery bound",
             ));
         }
         let payload_capacity = if retain_payload {
-            usize::try_from(payload_len).map_err(|_| {
+            usize::try_from(payload_length).map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     "volume metadata payload too large",
@@ -519,16 +555,16 @@ fn recover_container(
             0
         };
         let mut payload = Vec::with_capacity(payload_capacity);
-        let mut hasher = blake3::Hasher::new_derive_key("astrid volume record v1");
+        let mut hasher = blake3::Hasher::new_derive_key("astrid volume record v2");
         hasher.update(&record_sequence.to_le_bytes());
         hasher.update(&[operation as u8]);
-        let name_len = u16::try_from(name_len)
+        let name_len = u16::try_from(name_length)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "region name too long"))?;
         hasher.update(&name_len.to_le_bytes());
         hasher.update(&logical_offset.to_le_bytes());
-        hasher.update(&payload_len.to_le_bytes());
+        hasher.update(&payload_length.to_le_bytes());
         hasher.update(region.as_str().as_bytes());
-        let mut remaining_payload = payload_len;
+        let mut remaining_payload = payload_length;
         let mut buffer = vec![0_u8; RECOVERY_BUFFER_BYTES];
         while remaining_payload != 0 {
             let length = usize::try_from(remaining_payload.min(RECOVERY_BUFFER_BYTES as u64))
@@ -541,9 +577,12 @@ fn recover_container(
             remaining_payload = remaining_payload.saturating_sub(length as u64);
         }
         if hasher.finalize().as_bytes() != &checksum {
+            if !has_physically_valid_record_after(file, offset.saturating_add(1), physical_len)? {
+                break;
+            }
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("Astrid volume record checksum mismatch at {offset}"),
+                format!("interior Astrid volume record checksum mismatch at {offset}"),
             ));
         }
         let physical_payload = offset
@@ -556,15 +595,25 @@ fn recover_container(
             region,
             logical_offset,
             physical_payload,
-            payload_len,
+            payload_length,
             payload,
         )?;
         sequence = record_sequence;
         offset = offset
             .checked_add(total_len)
             .ok_or_else(|| io::Error::other("volume scan offset overflow"))?;
+        if operation == Operation::Commit {
+            committed_regions = regions.clone();
+            committed_sequence = sequence;
+            committed_offset = offset;
+        }
     }
-    Ok((regions, sequence, offset))
+    Ok((
+        committed_regions,
+        committed_sequence,
+        committed_offset,
+        committed_offset,
+    ))
 }
 
 fn has_physically_valid_record_after(file: &mut File, start: u64, end: u64) -> io::Result<bool> {
@@ -643,7 +692,7 @@ fn physically_valid_record_at(file: &mut File, offset: u64, end: u64) -> io::Res
     {
         return Ok(false);
     }
-    let mut hasher = blake3::Hasher::new_derive_key("astrid volume record v1");
+    let mut hasher = blake3::Hasher::new_derive_key("astrid volume record v2");
     hasher.update(&fixed[16..24]);
     hasher.update(&fixed[24..25]);
     hasher.update(&fixed[25..27]);
@@ -736,6 +785,11 @@ fn apply_recovered(
             }
             let mutations = decode_metadata_mutations(&payload)?;
             apply_metadata_mutations(regions, &mutations)?;
+        },
+        Operation::Commit => {
+            if region.as_str() != COMMIT_REGION || offset != 0 || !payload.is_empty() {
+                return Err(invalid_transition("invalid volume commit boundary"));
+            }
         },
     }
     Ok(())

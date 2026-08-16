@@ -51,6 +51,7 @@ pub use muninn::{
     InMemoryMuninnIndex, MuninnAdmission, MuninnHit, MuninnTrustState, MuninnVerificationError,
     VerifiedDerivationEvidence, verify_derivation_evidence,
 };
+pub(crate) use projection::object_record_retained_bytes;
 pub use projection::{
     PreparedProjectionBatch, PrincipalProjectionEngine, PrincipalProjectionError,
     ProjectionCacheEntry, ProjectionCacheKey, ProjectionCachePayload, ProjectionObserver,

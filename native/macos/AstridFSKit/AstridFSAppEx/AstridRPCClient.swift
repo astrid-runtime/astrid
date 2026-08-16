@@ -68,7 +68,10 @@ final class AstridRPCClient {
 
     func write(path: String, offset: UInt64, data: Data) throws -> Int {
         guard case .written = try call([
-            "operation": "write", "path": path, "offset": offset, "data": Array(data)
+            "operation": "write",
+            "path": path,
+            "offset": offset,
+            "data_base64": data.base64EncodedString()
         ]) else {
             throw POSIXError(.EIO)
         }
@@ -112,12 +115,13 @@ final class AstridRPCClient {
     private func call(_ operation: [String: Any]) throws -> AstridRPCSuccess {
         try queue.sync {
             let request: [String: Any] = [
-                "protocol_version": 1,
+                "protocol_version": 2,
                 "request_id": UUID().uuidString,
                 "lease_token": lease.lease_token,
                 "operation": operation,
             ]
             let requestData = try JSONSerialization.data(withJSONObject: request)
+            guard requestData.count <= 8 * 1024 * 1024 else { throw POSIXError(.EFBIG) }
             let descriptor = try connectSocket()
             defer { Darwin.close(descriptor) }
             var length = UInt32(requestData.count).bigEndian
@@ -205,7 +209,12 @@ final class AstridRPCClient {
         case "entries":
             return .entries(try decodeValue([AstridEntry].self, value))
         case "data":
-            return .data(Data(try decodeValue([UInt8].self, value)))
+            guard let dictionary = value as? [String: Any],
+                  let encoded = dictionary["data_base64"] as? String,
+                  let decoded = Data(base64Encoded: encoded) else {
+                throw POSIXError(.EIO)
+            }
+            return .data(decoded)
         case "written":
             guard let number = value as? NSNumber else { throw POSIXError(.EIO) }
             return .written(number.uint64Value)

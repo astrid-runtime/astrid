@@ -189,6 +189,30 @@ where
         Ok(())
     }
 
+    pub(crate) fn quota_staging_bound(
+        &self,
+        principal: &P,
+    ) -> Result<Option<(u64, u64)>, PrincipalContentError> {
+        let Some(quota) = &self.quota else {
+            return Ok(None);
+        };
+        let Some(limit) = quota
+            .max_logical_bytes(principal)
+            .map_err(PrincipalContentError::QuotaPolicy)?
+        else {
+            return Ok(None);
+        };
+        if limit == u64::MAX {
+            return Ok(None);
+        }
+        let header = self.header(principal)?;
+        let current = header
+            .other_quota_bytes
+            .checked_add(header.catalog.map_or(0, |root| root.summary.quota_bytes))
+            .ok_or(PrincipalContentError::AccountingOverflow)?;
+        Ok(Some((limit.max(current), limit)))
+    }
+
     pub(super) fn encode_transaction(
         &self,
         principal: P,

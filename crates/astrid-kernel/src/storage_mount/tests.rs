@@ -10,11 +10,11 @@ async fn callback(
     let mut stream = tokio::net::UnixStream::connect(&lease.callback_path)
         .await
         .unwrap();
-    let request = StorageFilesystemRequestV1 {
-        protocol_version: STORAGE_FILESYSTEM_PROTOCOL_V1,
+    let request = StorageFilesystemRequestV2 {
+        protocol_version: STORAGE_FILESYSTEM_PROTOCOL_V2,
         request_id: "test-request".to_owned(),
         lease_token: token.to_owned(),
-        operation,
+        operation: encode_operation_v2(operation),
     };
     let bytes = serde_json::to_vec(&request).unwrap();
     let length = u32::try_from(bytes.len()).expect("bounded callback request");
@@ -24,9 +24,78 @@ async fn callback(
     stream.read_exact(&mut response_length).await.unwrap();
     let mut response = vec![0_u8; u32::from_be_bytes(response_length) as usize];
     stream.read_exact(&mut response).await.unwrap();
-    serde_json::from_slice::<StorageFilesystemResponseV1>(&response)
-        .unwrap()
-        .outcome
+    decode_outcome_v2(
+        serde_json::from_slice::<StorageFilesystemResponseV2>(&response)
+            .unwrap()
+            .outcome,
+    )
+}
+
+fn encode_operation_v2(operation: StorageFilesystemOperationV1) -> StorageFilesystemOperationV2 {
+    match operation {
+        StorageFilesystemOperationV1::Stat { path } => StorageFilesystemOperationV2::Stat { path },
+        StorageFilesystemOperationV1::ReadDirectory { path } => {
+            StorageFilesystemOperationV2::ReadDirectory { path }
+        },
+        StorageFilesystemOperationV1::Read {
+            path,
+            offset,
+            length,
+        } => StorageFilesystemOperationV2::Read {
+            path,
+            offset,
+            length,
+        },
+        StorageFilesystemOperationV1::Write { path, offset, data } => {
+            StorageFilesystemOperationV2::Write {
+                path,
+                offset,
+                data_base64: base64::engine::general_purpose::STANDARD.encode(data),
+            }
+        },
+        StorageFilesystemOperationV1::SetLength { path, length } => {
+            StorageFilesystemOperationV2::SetLength { path, length }
+        },
+        StorageFilesystemOperationV1::Create { path, kind } => {
+            StorageFilesystemOperationV2::Create { path, kind }
+        },
+        StorageFilesystemOperationV1::Remove { path } => {
+            StorageFilesystemOperationV2::Remove { path }
+        },
+        StorageFilesystemOperationV1::Rename { from, to, replace } => {
+            StorageFilesystemOperationV2::Rename { from, to, replace }
+        },
+        StorageFilesystemOperationV1::Sync => StorageFilesystemOperationV2::Sync,
+    }
+}
+
+fn decode_outcome_v2(outcome: StorageFilesystemOutcomeV2) -> StorageFilesystemOutcomeV1 {
+    match outcome {
+        StorageFilesystemOutcomeV2::Success(success) => {
+            StorageFilesystemOutcomeV1::Success(match success {
+                StorageFilesystemSuccessV2::Done => StorageFilesystemSuccessV1::Done,
+                StorageFilesystemSuccessV2::Entry(entry) => {
+                    StorageFilesystemSuccessV1::Entry(entry)
+                },
+                StorageFilesystemSuccessV2::Entries(entries) => {
+                    StorageFilesystemSuccessV1::Entries(entries)
+                },
+                StorageFilesystemSuccessV2::Data { data_base64 } => {
+                    StorageFilesystemSuccessV1::Data(
+                        base64::engine::general_purpose::STANDARD
+                            .decode(data_base64)
+                            .unwrap(),
+                    )
+                },
+                StorageFilesystemSuccessV2::Written(length) => {
+                    StorageFilesystemSuccessV1::Written(length)
+                },
+            })
+        },
+        StorageFilesystemOutcomeV2::Failure(failure) => {
+            StorageFilesystemOutcomeV1::Failure(failure)
+        },
+    }
 }
 
 fn create(path: &str) -> StorageFilesystemOperationV1 {
@@ -274,6 +343,27 @@ async fn private_callbacks_bind_authority_and_isolate_principal_and_fleet_views(
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].name, "private.txt");
 
+    let system_lease = issue_lease(
+        &kernel,
+        caller.clone(),
+        true,
+        StorageProviderViewV1::Admin,
+        StorageProviderAccessV1::ReadWrite,
+        "test-provider".to_owned(),
+        temporary.path().join("system-mount"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        callback(
+            &system_lease,
+            &system_lease.lease_token,
+            create("system.txt")
+        )
+        .await,
+        StorageFilesystemOutcomeV1::Success(StorageFilesystemSuccessV1::Done)
+    );
+
     let unauthorized = callback(&principal, "wrong-token", create("denied.txt")).await;
     assert!(matches!(
         unauthorized,
@@ -299,7 +389,137 @@ async fn private_callbacks_bind_authority_and_isolate_principal_and_fleet_views(
             if code == "read-only"
     ));
 
-    revoke_lease(&kernel, &caller, false, principal.mount_id).unwrap();
-    revoke_lease(&kernel, &caller, false, fleet_lease.mount_id).unwrap();
-    revoke_lease(&kernel, &caller, false, read_only.mount_id).unwrap();
+    revoke_lease(&kernel, &caller, false, principal.mount_id)
+        .await
+        .unwrap();
+    revoke_lease(&kernel, &caller, false, fleet_lease.mount_id)
+        .await
+        .unwrap();
+    revoke_lease(&kernel, &caller, false, system_lease.mount_id)
+        .await
+        .unwrap();
+    revoke_lease(&kernel, &caller, false, read_only.mount_id)
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn version_two_framing_transports_maximum_file_io() {
+    let temporary = tempfile::tempdir().unwrap();
+    let home = astrid_core::dirs::AstridHome::from_path(temporary.path().join(".astrid"));
+    let kernel = crate::test_kernel_with_home(home).await;
+    let lease = issue_lease(
+        &kernel,
+        PrincipalId::default(),
+        true,
+        StorageProviderViewV1::Admin,
+        StorageProviderAccessV1::ReadWrite,
+        "test-provider".to_owned(),
+        temporary.path().join("mount"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        callback(&lease, &lease.lease_token, create("maximum.bin")).await,
+        StorageFilesystemOutcomeV1::Success(StorageFilesystemSuccessV1::Done)
+    );
+    let expected = vec![0x5a_u8; usize::try_from(STORAGE_FILESYSTEM_MAX_IO_BYTES).unwrap()];
+    assert_eq!(
+        callback(
+            &lease,
+            &lease.lease_token,
+            StorageFilesystemOperationV1::Write {
+                path: "maximum.bin".to_owned(),
+                offset: 0,
+                data: expected.clone(),
+            },
+        )
+        .await,
+        StorageFilesystemOutcomeV1::Success(StorageFilesystemSuccessV1::Written(
+            STORAGE_FILESYSTEM_MAX_IO_BYTES
+        ))
+    );
+    assert_eq!(
+        callback(
+            &lease,
+            &lease.lease_token,
+            StorageFilesystemOperationV1::Read {
+                path: "maximum.bin".to_owned(),
+                offset: 0,
+                length: STORAGE_FILESYSTEM_MAX_IO_BYTES,
+            },
+        )
+        .await,
+        StorageFilesystemOutcomeV1::Success(StorageFilesystemSuccessV1::Data(expected))
+    );
+    revoke_lease(&kernel, &PrincipalId::default(), true, lease.mount_id)
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoke_drains_an_in_flight_mutation_and_fences_new_mutation() {
+    let temporary = tempfile::tempdir().unwrap();
+    let home = astrid_core::dirs::AstridHome::from_path(temporary.path().join(".astrid"));
+    let kernel = Arc::new(crate::test_kernel_with_home(home).await);
+    let caller = PrincipalId::default();
+    let lease = issue_lease(
+        &kernel,
+        caller.clone(),
+        true,
+        StorageProviderViewV1::Admin,
+        StorageProviderAccessV1::ReadWrite,
+        "test-provider".to_owned(),
+        temporary.path().join("mount"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        callback(&lease, &lease.lease_token, create("in-flight.bin")).await,
+        StorageFilesystemOutcomeV1::Success(StorageFilesystemSuccessV1::Done)
+    );
+    sync_lease(&kernel, &caller, true, lease.mount_id)
+        .await
+        .unwrap();
+    let state = Arc::clone(kernel.storage_mounts.get(&lease.mount_id).unwrap().value());
+    let mutation_kernel = Arc::clone(&kernel);
+    let mutation_state = Arc::clone(&state);
+    let mutation_bytes = vec![0x36_u8; usize::try_from(STORAGE_FILESYSTEM_MAX_IO_BYTES).unwrap()];
+    let mutation = tokio::spawn(async move {
+        execute_operation(
+            &mutation_kernel,
+            &mutation_state,
+            StorageFilesystemOperationV1::Write {
+                path: "in-flight.bin".to_owned(),
+                offset: 0,
+                data: mutation_bytes,
+            },
+        )
+        .await
+    });
+    while !state.dirty.load(Ordering::Acquire) {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    let revocation_kernel = Arc::clone(&kernel);
+    let revocation_caller = caller.clone();
+    let revocation = tokio::spawn(async move {
+        revoke_lease(&revocation_kernel, &revocation_caller, true, lease.mount_id).await
+    });
+
+    let outcome = mutation.await.unwrap();
+    assert!(matches!(
+        outcome,
+        StorageFilesystemOutcomeV1::Success(StorageFilesystemSuccessV1::Written(
+            STORAGE_FILESYSTEM_MAX_IO_BYTES
+        ))
+    ));
+    revocation.await.unwrap().unwrap();
+    assert!(!kernel.storage_mounts.contains_key(&lease.mount_id));
+    assert!(!lease.callback_path.exists());
+    let fenced = execute_operation(&kernel, &state, create("after-revoke.txt")).await;
+    assert!(matches!(
+        fenced,
+        StorageFilesystemOutcomeV1::Failure(StorageFilesystemFailureV1 { code, .. })
+            if code == "stale-lease"
+    ));
 }

@@ -406,9 +406,9 @@ where
 
     /// Stream bytes under `name` using an explicit persistent profile.
     ///
-    /// Source or staging failure may leave unreachable immutable objects for
-    /// compaction, but no principal root can observe them. Root conflicts
-    /// retry only catalog publication; source bytes are not read again.
+    /// Source failure leaves no immutable objects. Deferred records enter the
+    /// engine only after quota authorization in the root transaction. Root
+    /// conflicts retry only catalog publication; source bytes are not read again.
     ///
     /// # Errors
     ///
@@ -421,8 +421,13 @@ where
         source: R,
         profile: ChunkingProfile,
     ) -> Result<ContentWriteOutcome, PrincipalContentError> {
-        let (verified, objects_inserted) = self.stage_streaming(source, profile)?;
-        self.publish(principal, name, verified, None, objects_inserted)
+        if let Some((bound, limit)) = self.quota_staging_bound(principal)? {
+            let (verified, records) = self.stage_deferred_bounded(source, profile, bound, limit)?;
+            self.publish_deferred(principal, name, verified, &records)
+        } else {
+            let (verified, objects_inserted) = self.stage_streaming(source, profile)?;
+            self.publish(principal, name, verified, None, objects_inserted)
+        }
     }
 
     pub(crate) fn stage_streaming<R: Read>(
@@ -435,6 +440,39 @@ where
             build_content_streaming(profile, source, &mut sink).map_err(map_stream_error)?;
         sink.finish()?;
         Ok((streamed.verified_content(), sink.objects_inserted))
+    }
+
+    pub(crate) fn stage_deferred<R: Read>(
+        &self,
+        source: R,
+        profile: ChunkingProfile,
+    ) -> Result<(VerifiedContent, Vec<ObjectRecord>), PrincipalContentError> {
+        let mut sink = EngineSink::<P, E, _>::with_admission(
+            self.engine.as_ref(),
+            DeferredAdmission::default(),
+        );
+        let streamed =
+            build_content_streaming(profile, source, &mut sink).map_err(map_stream_error)?;
+        sink.finish()?;
+        let records = sink.admission_mut().take_records();
+        Ok((streamed.verified_content(), records))
+    }
+
+    pub(crate) fn stage_deferred_bounded<R: Read>(
+        &self,
+        source: R,
+        profile: ChunkingProfile,
+        bound: u64,
+        limit: u64,
+    ) -> Result<(VerifiedContent, Vec<ObjectRecord>), PrincipalContentError> {
+        let probe = bound
+            .checked_add(1)
+            .ok_or(PrincipalContentError::AccountingOverflow)?;
+        let (verified, records) = self.stage_deferred(source.take(probe), profile)?;
+        if verified.descriptor().logical_bytes() > bound {
+            return Err(PrincipalContentError::QuotaExceeded { used: probe, limit });
+        }
+        Ok((verified, records))
     }
 
     fn publish(
@@ -495,6 +533,71 @@ where
                         descriptor,
                         outcome.root(),
                         objects_inserted,
+                    ));
+                },
+                Err(PrincipalProjectionError::Model(ModelError::RootConflict { .. })) => {},
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
+    pub(crate) fn publish_deferred(
+        &self,
+        principal: &P,
+        name: &ContentName,
+        verified: VerifiedContent,
+        staged_records: &[ObjectRecord],
+    ) -> Result<ContentWriteOutcome, PrincipalContentError> {
+        let descriptor = verified.descriptor();
+        loop {
+            let mut header = self.header(principal)?.as_ref().clone();
+            let previous = self.catalog_lookup(principal, header.catalog, name)?;
+            if previous.is_some_and(|entry| entry.file == descriptor.file()) {
+                let root = header.root.ok_or_else(|| {
+                    invalid(
+                        descriptor.file(),
+                        "catalog entry exists without a principal root",
+                    )
+                })?;
+                self.mark_verified(principal, verified);
+                return Ok(ContentWriteOutcome::new(descriptor, root, 0));
+            }
+            let mutation = insert(
+                header.catalog,
+                name,
+                CatalogValue {
+                    file: descriptor.file(),
+                    logical_bytes: descriptor.logical_bytes(),
+                },
+                &mut |object| self.load_required_for(principal, object),
+                &|record| self.engine.identify_object(record),
+            )?;
+            header.catalog = mutation.root;
+            self.enforce_quota(principal, &header)?;
+            let mut records = staged_records
+                .iter()
+                .cloned()
+                .map(|record| (self.engine.identify_object(&record), record))
+                .collect::<BTreeMap<_, _>>();
+            for (_, record) in mutation.records {
+                self.insert(&mut records, record)?;
+            }
+            let catalog = header.catalog;
+            let transaction = self.encode_transaction(principal.clone(), header, None, records)?;
+            match self.engine.commit_root(transaction) {
+                Ok(outcome) => {
+                    self.validated_catalogs.lock().insert(
+                        principal.clone(),
+                        CatalogValidation {
+                            root: catalog.map(|root| root.object),
+                            summary: catalog.map_or(CatalogSummary::default(), |root| root.summary),
+                        },
+                    );
+                    self.mark_verified(principal, verified);
+                    return Ok(ContentWriteOutcome::new(
+                        descriptor,
+                        outcome.root(),
+                        outcome.objects_inserted(),
                     ));
                 },
                 Err(PrincipalProjectionError::Model(ModelError::RootConflict { .. })) => {},
@@ -854,6 +957,7 @@ mod native;
 mod projection;
 
 use projection::{
-    CachedPartialVerification, CachedVerifiedContent, ContentHeader, EngineIdentity, EngineSink,
-    EngineSource, invalid, map_read_error, map_stream_error, owned_target, require_structural,
+    CachedPartialVerification, CachedVerifiedContent, ContentHeader, DeferredAdmission,
+    EngineIdentity, EngineSink, EngineSource, invalid, map_read_error, map_stream_error,
+    owned_target, require_structural,
 };
