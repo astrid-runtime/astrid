@@ -178,10 +178,30 @@ jobs:
         if: contains(matrix.target, 'apple-darwin')
         env:
           ASTRID_FSKIT_VALIDATE_PROJECT: "1"
+          ASTRID_FSKIT_ARCHS: ${{ matrix.target == 'x86_64-apple-darwin' && 'x86_64' || 'arm64' }}
         run: |
           cargo build --release --target ${{ matrix.target }} \
             -p astrid-storage-provider-fskit --locked
           scripts/check-macos-fskit.sh
+
+      - name: Build, sign, and notarize AstridFS
+        if: contains(matrix.target, 'apple-darwin')
+        env:
+          ASTRID_FSKIT_DEVELOPMENT_TEAM: ${{ secrets.ASTRID_MACOS_DEVELOPMENT_TEAM_ID }}
+          ASTRID_FSKIT_CODE_SIGN_IDENTITY: ${{ vars.ASTRID_MACOS_DEVELOPER_ID_IDENTITY || 'Developer ID Application' }}
+          ASTRID_FSKIT_ARCHS: ${{ matrix.target == 'x86_64-apple-darwin' && 'x86_64' || 'arm64' }}
+          ASTRID_FSKIT_NOTARIZE: "1"
+          ASTRID_FSKIT_NOTARY_KEY_ID: ${{ secrets.ASTRID_MACOS_NOTARY_KEY_ID }}
+          ASTRID_FSKIT_NOTARY_ISSUER_ID: ${{ secrets.ASTRID_MACOS_NOTARY_ISSUER_ID }}
+          ASTRID_FSKIT_NOTARY_KEY: ${{ secrets.ASTRID_MACOS_NOTARY_KEY }}
+        run: |
+          NOTARY_KEY_PATH="$RUNNER_TEMP/astrid-notary.p8"
+          printf '%s' "$ASTRID_FSKIT_NOTARY_KEY" > "$NOTARY_KEY_PATH"
+          chmod 0600 "$NOTARY_KEY_PATH"
+          export ASTRID_FSKIT_NOTARY_KEY_PATH="$NOTARY_KEY_PATH"
+          trap 'rm -f "$NOTARY_KEY_PATH"' EXIT
+          scripts/build-macos-fskit.sh
+          echo "ASTRID_FSKIT_APP=$PWD/target/macos-fskit/DerivedData/Build/Products/Release/AstridFS.app" >> "$GITHUB_ENV"
 
       - name: Select native binary root
         if: matrix.libc == 'native'
@@ -302,12 +322,30 @@ jobs:
           cp "$BINARY_ROOT/astrid-emit" "$DIR/"
           if [[ "$TARGET" == *-apple-darwin ]]; then
             cp "$BINARY_ROOT/astrid-storage-provider-fskit" "$DIR/"
+            ditto "$ASTRID_FSKIT_APP" "$DIR/AstridFS.app"
+            mkdir "$DIR/macos"
+            cp scripts/manage-macos-fskit.sh "$DIR/macos/"
+            cp scripts/validate-macos-fskit.sh "$DIR/macos/"
+            cp LICENSE* README.md "$DIR/" 2>/dev/null || true
+            SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+            python3 scripts/package_release_archive.py \
+              --root "$DIR" \
+              --output "${DIR}.tar.gz" \
+              --mtime "$SOURCE_DATE_EPOCH"
+            python3 scripts/validate_macos_release.py "${DIR}.tar.gz" \
+              --mtime "$SOURCE_DATE_EPOCH"
+            EXTRACTION="$RUNNER_TEMP/validate-astrid-release"
+            rm -rf "$EXTRACTION"
+            mkdir -p "$EXTRACTION"
+            tar -xzf "${DIR}.tar.gz" -C "$EXTRACTION"
+            scripts/validate-macos-fskit.sh "$EXTRACTION/$DIR/AstridFS.app"
+          else
+            if [[ "$TARGET" == *-unknown-linux-* ]]; then
+              cp "$BINARY_ROOT/astrid-storage-provider-fuse" "$DIR/"
+            fi
+            cp LICENSE* README.md "$DIR/" 2>/dev/null || true
+            tar czf "${DIR}.tar.gz" "$DIR"
           fi
-          if [[ "$TARGET" == *-unknown-linux-* ]]; then
-            cp "$BINARY_ROOT/astrid-storage-provider-fuse" "$DIR/"
-          fi
-          cp LICENSE* README.md "$DIR/" 2>/dev/null || true
-          tar czf "${DIR}.tar.gz" "$DIR"
           echo "ASSET=${DIR}.tar.gz" >> "$GITHUB_ENV"
 
       - name: Upload artifact
@@ -416,7 +454,15 @@ jobs:
           Download the archive for your platform, extract, and add to PATH:
           ```
           tar xzf astrid-*-$(uname -m)-*.tar.gz
-          sudo mv astrid-*/astrid astrid-*/astrid-daemon astrid-*/astrid-build astrid-*/astrid-emit /usr/local/bin/
+          sudo install -m 0755 astrid-*/astrid astrid-*/astrid-daemon \
+            astrid-*/astrid-build astrid-*/astrid-emit \
+            astrid-*/astrid-storage-provider-fskit /usr/local/bin/
+          ```
+
+          On macOS, also install, enable, and manage the signed AstridFS app:
+          ```
+          astrid-*/macos/manage-macos-fskit.sh install
+          astrid-*/macos/manage-macos-fskit.sh enable
           ```
 
           Astrid Runtime does not bundle a product distro. To compose it with a

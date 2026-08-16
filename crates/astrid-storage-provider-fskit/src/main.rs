@@ -109,46 +109,7 @@ async fn execute(request: StorageProviderRequestV1) -> Result<StorageProviderSuc
             view,
             access,
             mountpoint,
-        } => {
-            let (mountpoint, auto_created) = prepare_mountpoint(mountpoint, &view)?;
-            let body = client
-                .request(AdminRequestKind::StorageMountIssue {
-                    view,
-                    access,
-                    provider: PROVIDER_NAME.to_owned(),
-                    mountpoint: mountpoint.clone(),
-                })
-                .await?;
-            let lease = lease_from_response(body)?;
-            if let Err(error) = native_mount(&lease, &mountpoint).await {
-                let _ = client
-                    .request(AdminRequestKind::StorageMountRevoke {
-                        mount_id: lease.mount_id,
-                    })
-                    .await;
-                if auto_created {
-                    let _ = std::fs::remove_dir(&mountpoint);
-                }
-                return Err(error);
-            }
-            update_registry(|registry| {
-                registry.mounts.insert(
-                    path_key(&mountpoint),
-                    MountRecord {
-                        mount_id: lease.mount_id,
-                        requested_by: acting_principal,
-                        mountpoint: mountpoint.clone(),
-                        access,
-                        auto_created_mountpoint: auto_created,
-                    },
-                );
-                Ok(())
-            })?;
-            Ok(StorageProviderSuccessV1::Mounted {
-                mount_id: lease.mount_id,
-                mountpoint,
-            })
-        },
+        } => mount(&mut client, &acting_principal, view, access, mountpoint).await,
         StorageProviderOperationV1::Sync { selector } => {
             let record = resolve_record(&selector)?;
             into_success(
@@ -188,12 +149,68 @@ async fn execute(request: StorageProviderRequestV1) -> Result<StorageProviderSuc
     }
 }
 
+async fn mount(
+    client: &mut AdminClient,
+    acting_principal: &astrid_core::PrincipalId,
+    view: astrid_core::storage_provider::StorageProviderViewV1,
+    access: astrid_core::storage_provider::StorageProviderAccessV1,
+    requested_mountpoint: Option<PathBuf>,
+) -> Result<StorageProviderSuccessV1> {
+    let (mountpoint, auto_created) = prepare_mountpoint(requested_mountpoint, &view)?;
+    let body = client
+        .request(AdminRequestKind::StorageMountIssue {
+            view: view.clone(),
+            access,
+            provider: PROVIDER_NAME.to_owned(),
+            mountpoint: mountpoint.clone(),
+        })
+        .await?;
+    let lease = lease_from_response(body)?;
+    if let Err(error) = update_registry(|registry| {
+        if registry.mounts.contains_key(&path_key(&mountpoint)) {
+            bail!("mountpoint is already registered: {}", mountpoint.display());
+        }
+        registry.mounts.insert(
+            path_key(&mountpoint),
+            MountRecord {
+                mount_id: lease.mount_id,
+                requested_by: acting_principal.clone(),
+                mountpoint: mountpoint.clone(),
+                access,
+                auto_created_mountpoint: auto_created,
+            },
+        );
+        Ok(())
+    }) {
+        revoke_after_registry_failure(client, lease.mount_id).await;
+        return match cleanup_created_mountpoint(&mountpoint, auto_created) {
+            Err(cleanup) => Err(error.context(cleanup)),
+            Ok(()) => Err(error),
+        };
+    }
+    if let Err(error) = native_mount(&lease, &mountpoint).await {
+        let rollback =
+            rollback_after_native_failure(client, &lease.mount_id, &mountpoint, auto_created).await;
+        return Err(error).context(rollback);
+    }
+    if let Err(error) = validate_mountpoint(&mountpoint) {
+        let rollback =
+            rollback_after_native_failure(client, &lease.mount_id, &mountpoint, auto_created).await;
+        return Err(error).context(rollback);
+    }
+    Ok(StorageProviderSuccessV1::Mounted {
+        mount_id: lease.mount_id,
+        mountpoint,
+    })
+}
+
 async fn unmount(
     client: &mut AdminClient,
     acting_principal: &astrid_core::PrincipalId,
     selector: &StorageMountSelectorV1,
 ) -> Result<StorageProviderSuccessV1> {
     let record = resolve_record(selector)?;
+    validate_mountpoint(&record.mountpoint)?;
     if &record.requested_by != acting_principal {
         bail!("mount was issued to another acting principal");
     }
@@ -207,6 +224,7 @@ async fn unmount(
             .await?,
     )?;
     native_unmount(&record.mountpoint).await?;
+    validate_mountpoint(&record.mountpoint)?;
     if lease_is_live {
         into_success(
             client
@@ -220,9 +238,7 @@ async fn unmount(
         registry.mounts.remove(&path_key(&record.mountpoint));
         Ok(())
     })?;
-    if record.auto_created_mountpoint {
-        let _ = std::fs::remove_dir(&record.mountpoint);
-    }
+    cleanup_created_mountpoint(&record.mountpoint, record.auto_created_mountpoint)?;
     Ok(StorageProviderSuccessV1::Unmounted {
         mount_id: record.mount_id,
     })
@@ -261,38 +277,146 @@ fn unmount_status(body: AdminResponseBody) -> Result<bool> {
     }
 }
 
+async fn revoke_after_registry_failure(client: &mut AdminClient, mount_id: StorageMountId) {
+    let _ = client
+        .request(AdminRequestKind::StorageMountRevoke { mount_id })
+        .await;
+}
+
+async fn rollback_after_native_failure(
+    client: &mut AdminClient,
+    mount_id: &StorageMountId,
+    mountpoint: &Path,
+    auto_created: bool,
+) -> anyhow::Error {
+    let mut errors = Vec::new();
+    let native_unmounted = match native_unmount(mountpoint).await {
+        Ok(()) => true,
+        Err(error) => {
+            errors.push(format!("unmount: {error:#}"));
+            false
+        },
+    };
+    if !native_unmounted {
+        return anyhow::anyhow!(
+            "mount rollback left the lease registered for recovery; {}",
+            errors.join("; ")
+        );
+    }
+    if let Err(error) = client
+        .request(AdminRequestKind::StorageMountRevoke {
+            mount_id: *mount_id,
+        })
+        .await
+    {
+        errors.push(format!("revoke: {error:#}"));
+    }
+    if errors.is_empty()
+        && let Err(error) = update_registry(|registry| {
+            registry.mounts.remove(&path_key(mountpoint));
+            Ok(())
+        })
+    {
+        errors.push(format!("registry: {error:#}"));
+    }
+    if errors.is_empty()
+        && let Err(error) = cleanup_created_mountpoint(mountpoint, auto_created)
+    {
+        errors.push(format!("cleanup: {error:#}"));
+    }
+    anyhow::anyhow!("mount rollback incomplete: {}", errors.join("; "))
+}
+
+fn cleanup_created_mountpoint(mountpoint: &Path, auto_created: bool) -> Result<()> {
+    if !auto_created {
+        return Ok(());
+    }
+    validate_mountpoint(mountpoint)?;
+    let mut entries = std::fs::read_dir(mountpoint)
+        .with_context(|| format!("read auto-created mountpoint {}", mountpoint.display()))?;
+    if entries.next().is_some() {
+        bail!(
+            "auto-created mountpoint is not empty: {}",
+            mountpoint.display()
+        );
+    }
+    std::fs::remove_dir(mountpoint)
+        .with_context(|| format!("remove auto-created mountpoint {}", mountpoint.display()))
+}
+
 fn prepare_mountpoint(
     requested: Option<PathBuf>,
     view: &astrid_core::storage_provider::StorageProviderViewV1,
 ) -> Result<(PathBuf, bool)> {
-    let mountpoint = requested.unwrap_or_else(|| {
-        let leaf = match view {
-            astrid_core::storage_provider::StorageProviderViewV1::Principal(principal) => {
-                principal.to_string()
-            },
-            astrid_core::storage_provider::StorageProviderViewV1::Fleet(fleet) => fleet.to_string(),
-            astrid_core::storage_provider::StorageProviderViewV1::Admin => "system".to_owned(),
-        };
-        std::env::var_os("HOME")
-            .map_or_else(|| PathBuf::from("/tmp"), PathBuf::from)
-            .join("Astrid")
-            .join(leaf)
-    });
+    let mountpoint =
+        requested.map_or_else(|| default_mountpoint(std::env::var_os("HOME"), view), Ok)?;
+    validate_mountpoint_layout(&mountpoint)?;
+    let existed = match std::fs::symlink_metadata(&mountpoint) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspect mountpoint {}", mountpoint.display()));
+        },
+    };
+    if existed {
+        validate_mountpoint(&mountpoint)?;
+    } else {
+        astrid_core::platform_fs::ensure_private_directory(&mountpoint)
+            .with_context(|| format!("create private mountpoint {}", mountpoint.display()))?;
+        validate_mountpoint(&mountpoint)?;
+    }
+    Ok((mountpoint, !existed))
+}
+
+fn default_mountpoint(
+    home: Option<std::ffi::OsString>,
+    view: &astrid_core::storage_provider::StorageProviderViewV1,
+) -> Result<PathBuf> {
+    let home = home
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("HOME is required to choose a private mountpoint"))?;
+    if !home.is_absolute() {
+        bail!("HOME must be absolute to choose a private mountpoint");
+    }
+    let leaf = match view {
+        astrid_core::storage_provider::StorageProviderViewV1::Principal(principal) => {
+            principal.to_string()
+        },
+        astrid_core::storage_provider::StorageProviderViewV1::Fleet(fleet) => fleet.to_string(),
+        astrid_core::storage_provider::StorageProviderViewV1::Admin => "system".to_owned(),
+    };
+    Ok(home.join("Astrid").join(leaf))
+}
+
+fn validate_mountpoint(mountpoint: &Path) -> Result<()> {
+    validate_mountpoint_layout(mountpoint)?;
+    astrid_core::platform_fs::verify_no_redirects(mountpoint)
+        .with_context(|| format!("reject redirected mountpoint {}", mountpoint.display()))?;
+    astrid_core::platform_fs::validate_private_directory(mountpoint)
+        .with_context(|| format!("reject unsafe mountpoint {}", mountpoint.display()))?;
+    if std::fs::read_dir(mountpoint)?.next().is_some() {
+        bail!("mountpoint is not empty: {}", mountpoint.display());
+    }
+    Ok(())
+}
+
+fn validate_mountpoint_layout(mountpoint: &Path) -> Result<()> {
     if !mountpoint.is_absolute() {
         bail!("mountpoint must be absolute");
     }
-    let existed = mountpoint.exists();
-    std::fs::create_dir_all(&mountpoint)
-        .with_context(|| format!("create mountpoint {}", mountpoint.display()))?;
-    astrid_core::platform_fs::verify_no_redirects(&mountpoint)
-        .with_context(|| format!("reject redirected mountpoint {}", mountpoint.display()))?;
-    if !std::fs::symlink_metadata(&mountpoint)?.is_dir() {
-        bail!("mountpoint is not a directory: {}", mountpoint.display());
+    if mountpoint.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::CurDir
+        )
+    }) {
+        bail!("mountpoint contains traversal: {}", mountpoint.display());
     }
-    if std::fs::read_dir(&mountpoint)?.next().is_some() {
-        bail!("mountpoint is not empty: {}", mountpoint.display());
+    if mountpoint.parent().is_none() {
+        bail!("mountpoint must be below a parent directory");
     }
-    Ok((mountpoint, !existed))
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -368,10 +492,22 @@ fn registry_path() -> Result<PathBuf> {
 
 fn load_registry() -> Result<MountRegistry> {
     let path = registry_path()?;
-    match std::fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).context("decode FSKit mount registry"),
+    let parent = path.parent().context("FSKit registry path has no parent")?;
+    astrid_core::platform_fs::validate_private_directory(parent)
+        .context("validate private FSKit registry directory")?;
+    read_registry(&path)
+}
+
+fn read_registry(path: &Path) -> Result<MountRegistry> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {
+            astrid_core::platform_fs::validate_private_file(path)
+                .context("validate private FSKit mount registry")?;
+            let bytes = std::fs::read(path).context("read FSKit mount registry")?;
+            serde_json::from_slice(&bytes).context("decode FSKit mount registry")
+        },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(MountRegistry::default()),
-        Err(error) => Err(error).context("read FSKit mount registry"),
+        Err(error) => Err(error).context("inspect FSKit mount registry"),
     }
 }
 
@@ -379,12 +515,62 @@ fn update_registry(operation: impl FnOnce(&mut MountRegistry) -> Result<()>) -> 
     let path = registry_path()?;
     let parent = path.parent().context("FSKit registry path has no parent")?;
     astrid_core::platform_fs::ensure_private_directory(parent)?;
-    let mut registry = load_registry()?;
+    let _lock = acquire_registry_lock(parent)?;
+    let mut registry = read_registry(&path)?;
     operation(&mut registry)?;
     let mut bytes = serde_json::to_vec(&registry)?;
     bytes.push(b'\n');
     astrid_core::platform_fs::atomic_write_private_file(&path, &bytes)?;
     Ok(())
+}
+
+fn acquire_registry_lock(parent: &Path) -> Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        use fs2::FileExt as _;
+        use nix::fcntl::OFlag;
+
+        let path = parent.join("fskit-mounts.json.lock");
+        if path.exists() {
+            astrid_core::platform_fs::validate_private_file(&path)
+                .context("validate private FSKit registry lock")?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(OFlag::O_NOFOLLOW.bits())
+            .open(&path)
+            .context("open FSKit registry lock")?;
+        astrid_core::platform_fs::validate_private_file(&path)
+            .context("validate private FSKit registry lock")?;
+        file.lock_exclusive().context("lock FSKit mount registry")?;
+        Ok(file)
+    }
+
+    #[cfg(not(unix))]
+    {
+        use fs2::FileExt as _;
+
+        let path = parent.join("fskit-mounts.json.lock");
+        if path.exists() {
+            astrid_core::platform_fs::validate_private_file(&path)
+                .context("validate private FSKit registry lock")?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&path)
+            .context("open FSKit registry lock")?;
+        astrid_core::platform_fs::validate_private_file(&path)
+            .context("validate private FSKit registry lock")?;
+        file.lock_exclusive().context("lock FSKit mount registry")?;
+        Ok(file)
+    }
 }
 
 fn path_key(path: &Path) -> String {
@@ -398,6 +584,7 @@ fn path_key(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
 
     #[test]
     fn prepare_mountpoint_creates_an_empty_directory() {
@@ -411,6 +598,58 @@ mod tests {
         assert_eq!(prepared, mountpoint);
         assert!(created);
         assert!(prepared.is_dir());
+        assert_eq!(
+            std::fs::metadata(&prepared)
+                .expect("prepared mountpoint metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_mountpoint_rejects_an_existing_public_directory() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let mountpoint = root.path().join("mount");
+        std::fs::create_dir(&mountpoint).expect("public mountpoint");
+        std::fs::set_permissions(&mountpoint, std::fs::Permissions::from_mode(0o755))
+            .expect("public mountpoint mode");
+        let view = astrid_core::storage_provider::StorageProviderViewV1::Admin;
+
+        let error = prepare_mountpoint(Some(mountpoint.clone()), &view)
+            .expect_err("public mountpoint must be rejected");
+
+        assert!(error.to_string().contains("unsafe mountpoint"));
+        assert_eq!(
+            std::fs::metadata(&mountpoint)
+                .expect("rejected public mountpoint metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+    }
+
+    #[test]
+    fn default_mountpoint_requires_an_absolute_home() {
+        let view = astrid_core::storage_provider::StorageProviderViewV1::Admin;
+
+        assert!(default_mountpoint(None, &view).is_err());
+        assert!(default_mountpoint(Some("relative".into()), &view).is_err());
+        assert_eq!(
+            default_mountpoint(Some("/Users/operator".into()), &view)
+                .expect("absolute default mountpoint"),
+            PathBuf::from("/Users/operator/Astrid/system")
+        );
+    }
+
+    #[test]
+    fn prepare_mountpoint_rejects_traversal() {
+        let view = astrid_core::storage_provider::StorageProviderViewV1::Admin;
+
+        assert!(prepare_mountpoint(Some("/tmp/../escape".into()), &view).is_err());
     }
 
     #[test]
@@ -444,5 +683,73 @@ mod tests {
         let view = astrid_core::storage_provider::StorageProviderViewV1::Admin;
 
         assert!(prepare_mountpoint(Some(redirected), &view).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_mountpoint_rejects_a_redirected_parent() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("temporary directory");
+        let outside = tempfile::tempdir().expect("outside directory");
+        let redirect = root.path().join("redirect");
+        symlink(outside.path(), &redirect).expect("redirected parent");
+        let view = astrid_core::storage_provider::StorageProviderViewV1::Admin;
+
+        assert!(prepare_mountpoint(Some(redirect.join("mount")), &view).is_err());
+        assert!(!outside.path().join("mount").exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[ignore = "actual FSKit runtime: requires macOS 26, a signed enabled extension, and a live lease resource"]
+    async fn actual_fskit_mount_and_unmount_round_trip() {
+        let resource = PathBuf::from(
+            std::env::var("ASTRID_FSKIT_ACTUAL_RESOURCE")
+                .expect("ASTRID_FSKIT_ACTUAL_RESOURCE must name a live lease resource"),
+        );
+        let mountpoint = PathBuf::from(
+            std::env::var("ASTRID_FSKIT_ACTUAL_MOUNTPOINT")
+                .expect("ASTRID_FSKIT_ACTUAL_MOUNTPOINT must name a private empty mountpoint"),
+        );
+        let token = std::env::var("ASTRID_FSKIT_ACTUAL_TOKEN")
+            .expect("ASTRID_FSKIT_ACTUAL_TOKEN must name the live lease bearer token");
+        astrid_core::platform_fs::validate_private_directory(&resource)
+            .expect("live lease resource must be private");
+        astrid_core::platform_fs::validate_private_file(&resource.join("lease.json"))
+            .expect("live lease manifest must be private");
+        let lease = StorageMountLeaseV1 {
+            mount_id: StorageMountId::new(),
+            view: astrid_core::storage_provider::StorageProviderViewV1::Admin,
+            access: astrid_core::storage_provider::StorageProviderAccessV1::ReadOnly,
+            callback_path: resource.join("control.sock"),
+            resource_path: resource,
+            lease_token: token,
+            expires_at_epoch_secs: u64::MAX,
+        };
+
+        native_mount(&lease, &mountpoint)
+            .await
+            .expect("actual FSKit mount");
+        let output = std::process::Command::new("/sbin/mount")
+            .output()
+            .expect("read macOS mount table");
+        assert!(output.status.success());
+        let table = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            table.contains(&format!(" on {} ", mountpoint.display())),
+            "mount table does not contain {}: {table}",
+            mountpoint.display()
+        );
+
+        native_unmount(&mountpoint)
+            .await
+            .expect("actual FSKit unmount");
+        let output = std::process::Command::new("/sbin/mount")
+            .output()
+            .expect("read macOS mount table after unmount");
+        assert!(output.status.success());
+        let table = String::from_utf8_lossy(&output.stdout);
+        assert!(!table.contains(&format!(" on {} ", mountpoint.display())));
     }
 }

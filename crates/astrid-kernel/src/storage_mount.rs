@@ -338,7 +338,31 @@ fn bind_private_listener(callback_path: &Path) -> Result<tokio::net::UnixListene
         .map_err(|error| format!("bind private mount callback socket: {error}"))?;
     std::fs::set_permissions(callback_path, std::fs::Permissions::from_mode(0o600))
         .map_err(|error| format!("restrict private mount callback socket: {error}"))?;
+    validate_private_listener(callback_path)?;
     Ok(listener)
+}
+
+#[cfg(unix)]
+fn validate_private_listener(callback_path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
+
+    let metadata = std::fs::symlink_metadata(callback_path)
+        .map_err(|error| format!("inspect private mount callback socket: {error}"))?;
+    if !metadata.file_type().is_socket() {
+        return Err("private mount callback path is not a socket".to_owned());
+    }
+    if metadata.uid() != nix::unistd::getuid().as_raw() {
+        return Err("private mount callback socket is foreign-owned".to_owned());
+    }
+    if metadata.permissions().mode() & 0o777 != 0o600 {
+        return Err("private mount callback socket is not owner-only".to_owned());
+    }
+    let parent = callback_path
+        .parent()
+        .ok_or_else(|| "private mount callback socket has no parent".to_owned())?;
+    astrid_core::platform_fs::validate_private_directory(parent)
+        .map_err(|error| format!("validate private mount callback parent: {error}"))?;
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -908,21 +932,7 @@ fn now_epoch_secs() -> u64 {
 fn write_private_manifest(path: &Path, lease: &StorageMountLeaseV1) -> io::Result<()> {
     let mut bytes = serde_json::to_vec(lease).map_err(io::Error::other)?;
     bytes.push(b'\n');
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)?;
-        file.write_all(&bytes)?;
-        file.sync_all()
-    }
-    #[cfg(not(unix))]
-    {
-        astrid_core::platform_fs::atomic_write_private_file(path, &bytes)
-    }
+    astrid_core::platform_fs::atomic_write_private_file(path, &bytes)
 }
 
 fn cleanup_resource(resource_path: &Path, callback_path: &Path) {

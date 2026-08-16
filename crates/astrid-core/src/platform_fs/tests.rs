@@ -98,6 +98,44 @@ fn unix_replacement_preserves_backups_and_cleans_staging() {
 
 #[cfg(unix)]
 #[test]
+fn unix_private_atomic_write_repairs_permissive_replacement() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("secret");
+    std::fs::write(&path, b"old").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(validate_private_file(&path).is_err());
+
+    atomic_write_private_file(&path, b"new").unwrap();
+
+    assert_eq!(std::fs::read(&path).unwrap(), b"new");
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert!(validate_private_file(&path).is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_private_directory_validation_rejects_permissive_modes() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(validate_private_directory(root.path()).is_err());
+
+    ensure_private_directory(root.path()).unwrap();
+    assert!(validate_private_directory(root.path()).is_ok());
+    assert_eq!(
+        std::fs::metadata(root.path()).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn unix_private_directory_creation_rejects_redirected_components() {
     use std::os::unix::fs::symlink;
 

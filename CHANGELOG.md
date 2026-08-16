@@ -34,6 +34,17 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   companion implement mounted views. The provider-neutral contract reserves
   Windows WinFsp without pretending that adapter is already shipped. Mounting
   does not provision storage. Refs #1391 and #1534.
+  extension and co-installed lifecycle companion implement the first mounted
+  drive. The provider-neutral contract reserves Linux FUSE and Windows WinFsp
+  adapters without pretending those native adapters are already shipped.
+  Mounting does not provision storage. Refs #1391 and #1534.
+- **macOS storage mounts now ship as a complete governed release surface.**
+  The archive includes the signed Developer ID AstridFS app and FSKit
+  extension, the Rust companion, deterministic metadata, notarization and staple
+  validation, and install/update/enable/status/uninstall lifecycle tooling.
+  Mount resources and registries use current-owner `0700`/`0600` entries,
+  reject redirected paths, and refuse public or foreign mountpoints unless the
+  provider creates an owner-private governed entry.
 - **The authoritative principal store now opens through a path-free Astrid
   volume contract.** Hosted systems keep all arena, root, index, cutover, and
   GC-outbox regions in one locked `var/astrid.volume` container; bare-metal

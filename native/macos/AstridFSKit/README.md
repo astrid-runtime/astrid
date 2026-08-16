@@ -16,7 +16,8 @@ under `/Applications`, and enable the extension in System Settings. The
 co-installed `astrid-storage-provider-fskit` Rust companion handles mount,
 status, sync, and unmount lifecycle requests from the CLI.
 
-For a syntax-only check that does not require signing:
+The source-tree check is a syntax/typecheck and unsigned Xcode contract check;
+it does not claim that `astridfs` can be mounted:
 
 ```sh
 scripts/check-macos-fskit.sh
@@ -29,9 +30,26 @@ team that owns the bundle identifiers, then run:
 ASTRID_FSKIT_DEVELOPMENT_TEAM=<team-id> scripts/build-macos-fskit.sh
 ```
 
-The script refuses to emit an unsigned app and verifies the resulting bundle's
-embedded app extension signature. Distribution notarization remains part of
-the release-signing environment rather than source validation.
+The script refuses to emit an unsigned app, verifies both signatures, and checks
+the extension's FSKit entitlement. Release builds set
+`ASTRID_FSKIT_NOTARIZE=1` with real App Store Connect API credentials; the
+script calls `notarytool`, staples the ticket, and validates the staple. Missing
+credentials are a build failure, never a fake-signing path.
+
+The macOS release archive includes the signed, notarized app, extension, Rust
+companion, validator, and lifecycle manager. After extracting the archive:
+
+```sh
+macos/manage-macos-fskit.sh install
+macos/manage-macos-fskit.sh enable
+macos/manage-macos-fskit.sh status
+```
+
+To replace it with a newly downloaded and extracted release, run `update`. To
+remove it, first unmount every Astrid filesystem and run `uninstall`; the app is
+moved to the Finder Trash. A release-gated ignored Rust test performs an actual
+FSKit mount/unmount round trip when supplied a live lease; ordinary CI stops at
+typecheck and artifact validation.
 
 Once installed, a principal can mount its own view with:
 

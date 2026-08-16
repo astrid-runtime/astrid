@@ -1,4 +1,4 @@
-use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
 
 use super::*;
 
@@ -103,6 +103,32 @@ fn create(path: &str) -> StorageFilesystemOperationV1 {
         path: path.to_owned(),
         kind: StorageFilesystemEntryKindV1::File,
     }
+}
+
+#[tokio::test]
+async fn private_mount_manifest_and_socket_are_owner_only() {
+    let temporary = tempfile::tempdir().unwrap();
+    astrid_core::platform_fs::ensure_private_directory(temporary.path()).unwrap();
+    let lease = StorageMountLeaseV1 {
+        mount_id: StorageMountId::new(),
+        view: StorageProviderViewV1::Principal(PrincipalId::default()),
+        access: StorageProviderAccessV1::ReadOnly,
+        resource_path: temporary.path().to_path_buf(),
+        callback_path: temporary.path().join("control.sock"),
+        lease_token: "test-token".to_owned(),
+        expires_at_epoch_secs: u64::MAX,
+    };
+
+    write_private_manifest(&temporary.path().join("lease.json"), &lease).unwrap();
+    let listener = bind_private_listener(&lease.callback_path).unwrap();
+
+    let manifest = std::fs::symlink_metadata(temporary.path().join("lease.json")).unwrap();
+    let socket = std::fs::symlink_metadata(&lease.callback_path).unwrap();
+    assert!(manifest.is_file());
+    assert_eq!(manifest.permissions().mode() & 0o777, 0o600);
+    assert!(socket.file_type().is_socket());
+    assert_eq!(socket.permissions().mode() & 0o777, 0o600);
+    drop(listener);
 }
 
 async fn root_fleet(kernel: &Kernel) -> astrid_core::FleetUid {

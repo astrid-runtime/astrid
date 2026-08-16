@@ -5802,12 +5802,19 @@ mod tests {
 
     #[test]
     fn test_load_or_generate_rejects_bad_key_length() {
+        use std::os::unix::fs::PermissionsExt as _;
+
         let dir = tempfile::tempdir().unwrap();
         let keys_dir = dir.path().join("keys");
         std::fs::create_dir_all(&keys_dir).unwrap();
 
         // Write a key file with wrong length.
         std::fs::write(keys_dir.join("runtime.key"), [0u8; 16]).unwrap();
+        std::fs::set_permissions(
+            keys_dir.join("runtime.key"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
 
         let result = load_or_generate_runtime_key(&keys_dir);
         assert!(result.is_err());

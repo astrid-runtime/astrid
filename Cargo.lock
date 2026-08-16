@@ -846,6 +846,8 @@ dependencies = [
  "anyhow",
  "astrid-core",
  "astrid-uplink",
+ "fs2",
+ "nix 0.31.3",
  "serde",
  "serde_json",
  "tempfile",

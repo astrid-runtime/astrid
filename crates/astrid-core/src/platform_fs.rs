@@ -133,6 +133,40 @@ pub fn ensure_private_directory(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Validate an existing directory against the platform's private-access policy.
+///
+/// Unix requires a current-user-owned directory with exactly owner-only mode
+/// bits and rejects redirects in every existing path component. Windows uses
+/// the same protected-DACL contract as creation.
+///
+/// # Errors
+///
+/// Returns an error when the directory is missing, redirected, not owned by the
+/// current user, or does not satisfy the platform private-access policy.
+pub fn validate_private_directory(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        validate_private_directory_unix(path)
+    }
+
+    #[cfg(windows)]
+    {
+        windows::ensure_private_directory(path)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "private path is not a directory",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Rename one filesystem entry with the strongest supported namespace
 /// durability for the host platform.
 ///
@@ -180,8 +214,7 @@ pub fn restrict_private_file(path: &Path) -> io::Result<()> {
 
     #[cfg(not(windows))]
     {
-        let _ = path;
-        Ok(())
+        restrict_private_file_unix(path)
     }
 }
 
@@ -202,8 +235,7 @@ pub fn validate_private_file(path: &Path) -> io::Result<()> {
 
     #[cfg(not(windows))]
     {
-        let _ = path;
-        Ok(())
+        validate_private_file_unix(path)
     }
 }
 
@@ -225,13 +257,21 @@ pub(crate) fn read_private_file_to_string(path: &Path) -> io::Result<String> {
         windows::read_private_file_to_string(path)
     }
 
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    {
+        if validate_private_file(path).is_err() {
+            restrict_private_file(path)?;
+        }
+        std::fs::read_to_string(path)
+    }
+
+    #[cfg(not(any(unix, windows)))]
     {
         std::fs::read_to_string(path)
     }
 }
 
-/// Atomically write one private file on Windows.
+/// Atomically write one private file.
 ///
 /// The temporary is created exclusively beside the destination, secured before
 /// it becomes visible under the live name, flushed through the supported file
@@ -252,7 +292,12 @@ pub fn atomic_write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
         windows::atomic_write_private_file(path, bytes)
     }
 
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    {
+        atomic_write_private_file_unix(path, bytes)
+    }
+
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (path, bytes);
         Err(io::Error::new(
@@ -358,7 +403,141 @@ fn ensure_private_directory_unix(path: &Path) -> io::Result<()> {
         };
         directory = std::fs::File::from(next);
     }
-    fchmod(&directory, Mode::from_bits_truncate(0o700)).map_err(nix_io_error)
+    fchmod(&directory, Mode::from_bits_truncate(0o700))
+        .map_err(nix_io_error)
+        .and_then(|()| validate_private_directory_unix(path))
+}
+
+#[cfg(unix)]
+fn validate_private_directory_unix(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let directory = open_directory_no_follow_unix(path)?;
+    let metadata = directory.metadata()?;
+    if metadata.uid() != nix::unistd::getuid().as_raw() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "private directory is not owned by the current user: {}",
+                path.display()
+            ),
+        ));
+    }
+    if metadata.permissions().mode() & 0o777 != 0o700 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("private directory is not owner-only: {}", path.display()),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restrict_private_file_unix(path: &Path) -> io::Result<()> {
+    use nix::sys::stat::{Mode, fchmod, fstat};
+
+    let file = open_file_no_follow_unix(path)?;
+    let metadata = fstat(&file).map_err(nix_io_error)?;
+    if metadata.st_mode & 0o170_000 != 0o100_000 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("private path is not a regular file: {}", path.display()),
+        ));
+    }
+    fchmod(&file, Mode::from_bits_truncate(0o600)).map_err(nix_io_error)?;
+    file.sync_all()?;
+    drop(file);
+    validate_private_file_unix(path)
+}
+
+#[cfg(unix)]
+fn validate_private_file_unix(path: &Path) -> io::Result<()> {
+    use nix::sys::stat::fstat;
+
+    let file = open_file_no_follow_unix(path)?;
+    let metadata = fstat(&file).map_err(nix_io_error)?;
+    if metadata.st_mode & 0o170_000 != 0o100_000 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("private path is not a regular file: {}", path.display()),
+        ));
+    }
+    if metadata.st_uid != nix::unistd::getuid().as_raw() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "private file is not owned by the current user: {}",
+                path.display()
+            ),
+        ));
+    }
+    if metadata.st_mode & 0o777 != 0o600 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("private file is not owner-only: {}", path.display()),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_file_no_follow_unix(path: &Path) -> io::Result<std::fs::File> {
+    use nix::fcntl::{OFlag, openat};
+    use nix::sys::stat::Mode;
+
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("private file has no parent: {}", path.display()),
+        )
+    })?;
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("private file has no name: {}", path.display()),
+        )
+    })?;
+    let directory = open_directory_no_follow_unix(parent)?;
+    let flags = OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+    openat(&directory, name, flags, Mode::from_bits_truncate(0o600))
+        .map(std::fs::File::from)
+        .map_err(nix_io_error)
+}
+
+#[cfg(unix)]
+fn atomic_write_private_file_unix(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("private atomic file has no parent: {}", path.display()),
+        )
+    })?;
+    ensure_private_directory(parent)?;
+    let temporary = parent.join(format!(".astrid-private-{}", uuid::Uuid::new_v4().simple()));
+    let write = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()
+    })();
+    if let Err(error) = write {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if let Err(error) = rename_with_write_through(&temporary, path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if let Ok(parent_handle) = open_directory_no_follow_unix(parent) {
+        parent_handle.sync_all()?;
+    }
+    validate_private_file(path)
 }
 
 #[cfg(unix)]
@@ -369,67 +548,81 @@ fn open_directory_no_follow_unix(path: &Path) -> io::Result<std::fs::File> {
 
 #[cfg(unix)]
 fn unix_directory_walk(path: &Path) -> io::Result<(std::fs::File, Vec<std::ffi::OsString>)> {
+    use nix::errno::Errno;
+    use nix::fcntl::{OFlag, openat};
+    use nix::sys::stat::Mode;
     use std::path::Component;
 
-    for component in path.components() {
-        if matches!(component, Component::ParentDir | Component::Prefix(_)) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("private directory contains traversal: {}", path.display()),
-            ));
-        }
+    let components = path.components().collect::<Vec<_>>();
+    if components
+        .iter()
+        .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("private directory contains traversal: {}", path.display()),
+        ));
     }
-    let mut candidate = if path.is_absolute() {
+
+    let absolute = normalize_unix_system_alias(if path.is_absolute() {
         path.to_path_buf()
     } else {
         std::env::current_dir()?.join(path)
-    };
-    if candidate.file_name().is_none() {
+    });
+    let mut directory = if absolute
+        .components()
+        .next()
+        .is_some_and(|component| matches!(component, Component::RootDir))
+    {
+        std::fs::File::open("/")
+    } else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!(
-                "private directory must name a path below its root: {}",
-                path.display()
-            ),
+            format!("private directory has no Unix root: {}", path.display()),
         ));
-    }
+    }?;
     let mut missing = Vec::new();
-    loop {
-        match std::fs::symlink_metadata(&candidate) {
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "private directory contains a redirect or non-directory component: {}",
-                        candidate.display()
-                    ),
-                ));
-            },
-            Ok(_) => {
-                let canonical = std::fs::canonicalize(&candidate)?;
-                let directory = std::fs::File::open(canonical)?;
-                missing.reverse();
-                return Ok((directory, missing));
-            },
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                let name = candidate.file_name().ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "private directory has no existing ancestor: {}",
-                            path.display()
-                        ),
-                    )
-                })?;
-                missing.push(name.to_os_string());
-                candidate = candidate
-                    .parent()
-                    .ok_or_else(|| io::Error::other("private directory has no parent"))?
-                    .to_path_buf();
-            },
-            Err(error) => return Err(error),
+    for component in absolute
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => Some(name.to_os_string()),
+            _ => None,
+        })
+    {
+        if missing.is_empty() {
+            let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+            match openat(&directory, component.as_os_str(), flags, Mode::empty()) {
+                Ok(next) => directory = std::fs::File::from(next),
+                Err(Errno::ENOENT) => missing.push(component),
+                Err(error) => return Err(nix_io_error(error)),
+            }
+        } else {
+            missing.push(component);
         }
     }
+
+    if directory.metadata()?.is_dir() {
+        Ok((directory, missing))
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("private directory is not a directory: {}", path.display()),
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn normalize_unix_system_alias(path: PathBuf) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let bytes = path.as_os_str().as_bytes();
+    if bytes == b"/tmp" || bytes.starts_with(b"/tmp/") {
+        return PathBuf::from("/private/tmp").join(path.strip_prefix("/tmp").expect("prefix"));
+    }
+    if bytes == b"/var" || bytes.starts_with(b"/var/") {
+        return PathBuf::from("/private/var").join(path.strip_prefix("/var").expect("prefix"));
+    }
+    path
 }
 
 #[cfg(unix)]

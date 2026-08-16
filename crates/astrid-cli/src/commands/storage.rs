@@ -1,7 +1,7 @@
 //! Hosted filesystem mount command and native-provider handoff.
 
 use std::io::{Read as _, Write as _};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
 use anyhow::{Context, Result, bail};
@@ -255,6 +255,29 @@ fn validate_response(
     if !operation_matches {
         bail!("{provider_name} returned a result for a different operation");
     }
+    match &response.outcome {
+        StorageProviderOutcomeV1::Success(
+            StorageProviderSuccessV1::Mounted { mountpoint, .. }
+            | StorageProviderSuccessV1::Status { mountpoint, .. },
+        ) => validate_response_mountpoint(provider_name, mountpoint),
+        _ => Ok(()),
+    }
+}
+
+fn validate_response_mountpoint(provider_name: &str, mountpoint: &Path) -> Result<()> {
+    if !mountpoint.is_absolute()
+        || mountpoint.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+    {
+        bail!(
+            "{provider_name} returned a relative or traversing native mountpoint: {}",
+            mountpoint.display()
+        );
+    }
     Ok(())
 }
 
@@ -439,6 +462,49 @@ mod tests {
                 &request,
                 &wrong_operation,
                 &[StorageProviderCapabilityV1::Lifecycle],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn provider_response_rejects_relative_mountpoints() {
+        let request = StorageProviderRequestV1::new(
+            "operator".parse().unwrap(),
+            StorageProviderOperationV1::Mount {
+                view: astrid_core::storage_provider::StorageProviderViewV1::Principal(
+                    "operator".parse().unwrap(),
+                ),
+                access: astrid_core::storage_provider::StorageProviderAccessV1::ReadWrite,
+                mountpoint: None,
+            },
+        );
+        let response = StorageProviderResponseV1 {
+            protocol_version: astrid_core::storage_provider::STORAGE_PROVIDER_PROTOCOL_V1,
+            request_id: request.request_id,
+            provider: StorageProviderIdentityV1 {
+                name: super::platform_provider_name().to_owned(),
+                version: "1.0.0".to_owned(),
+                capabilities: vec![
+                    StorageProviderCapabilityV1::PrincipalView,
+                    StorageProviderCapabilityV1::ReadWrite,
+                ],
+            },
+            outcome: StorageProviderOutcomeV1::Success(StorageProviderSuccessV1::Mounted {
+                mount_id: StorageMountId::from_uuid(Uuid::from_bytes([11; 16])),
+                mountpoint: "relative/astrid".into(),
+            }),
+        };
+
+        assert!(
+            validate_response(
+                super::platform_provider_name(),
+                &request,
+                &response,
+                &[
+                    StorageProviderCapabilityV1::PrincipalView,
+                    StorageProviderCapabilityV1::ReadWrite
+                ],
             )
             .is_err()
         );
