@@ -10,11 +10,15 @@
 #![deny(unreachable_pub)]
 #![deny(clippy::unwrap_used)]
 
-use anyhow::{Context, Result};
+#[cfg(unix)]
+use anyhow::Context;
+use anyhow::Result;
 use clap::Parser;
 
+#[cfg(unix)]
 mod signal;
 
+#[cfg(unix)]
 const DAEMON_LOG_TARGET_ENV: &str = "ASTRID_DAEMON_LOG_TARGET";
 
 /// Astrid Daemon - Background kernel process
@@ -70,6 +74,7 @@ fn parse_nonzero_concurrency(s: &str) -> Result<usize, String> {
     }
 }
 
+#[cfg(unix)]
 fn daemon_log_config(
     verbose: bool,
     unified_cfg: Option<&astrid_config::Config>,
@@ -106,6 +111,7 @@ fn daemon_log_config(
     Ok(log_config)
 }
 
+#[cfg(unix)]
 fn init_logging(
     verbose: bool,
     unified_cfg: Option<&astrid_config::Config>,
@@ -123,6 +129,7 @@ fn init_logging(
 /// Resolve the capsule host-call concurrency ceilings from CLI flags, the
 /// loaded config (which already folded in `ASTRID_CAPSULE_*` env), and the
 /// host-derived defaults. Precedence: CLI flag > config file > env > host.
+#[cfg(unix)]
 fn resolve_capsule_limits(
     args: &Args,
     cfg: Option<&astrid_config::Config>,
@@ -148,6 +155,7 @@ fn resolve_capsule_limits(
 /// `HttpSection::default`, which equals the host's historical hardcoded
 /// constants — so this resolution changes nothing unless the operator set
 /// explicit `[http]` values.
+#[cfg(unix)]
 fn resolve_http_limits(cfg: Option<&astrid_config::Config>) -> astrid_capsule::HttpLimits {
     let http = cfg.map(|c| c.http.clone()).unwrap_or_default();
     astrid_capsule::HttpLimits::from_config_values(
@@ -161,6 +169,7 @@ fn resolve_http_limits(cfg: Option<&astrid_config::Config>) -> astrid_capsule::H
     )
 }
 
+#[cfg(unix)]
 fn write_readiness_then_arm_ephemeral<T, E>(
     ephemeral: bool,
     write_readiness: impl FnOnce() -> Result<T, E>,
@@ -416,12 +425,17 @@ pub async fn run() -> Result<()> {
 ///
 /// Always returns an explicit unsupported-platform error.
 #[cfg(not(unix))]
+#[expect(
+    clippy::unused_async,
+    reason = "the cross-platform daemon entry point remains async even when startup is unsupported"
+)]
 pub async fn run() -> Result<()> {
     anyhow::bail!("native Astrid daemon startup is not yet supported on this platform")
 }
 
 /// Load `etc/gateway-http.toml`. Returns `Ok(None)` when the file
 /// doesn't exist (single-tenant default).
+#[cfg(unix)]
 async fn load_gateway_config() -> Result<Option<astrid_gateway::GatewayConfig>> {
     let home = astrid_core::dirs::AstridHome::resolve()
         .map_err(|e| anyhow::anyhow!("resolve AstridHome: {e}"))?;
@@ -437,6 +451,7 @@ async fn load_gateway_config() -> Result<Option<astrid_gateway::GatewayConfig>> 
     Ok(Some(cfg))
 }
 
+#[cfg(unix)]
 fn spawn_gateway(
     cfg: astrid_gateway::GatewayConfig,
     kernel: &std::sync::Arc<astrid_kernel::Kernel>,
@@ -498,7 +513,7 @@ fn spawn_gateway(
     Ok(notify)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::{DAEMON_LOG_TARGET_ENV, daemon_log_config, write_readiness_then_arm_ephemeral};
     use std::sync::Mutex;
