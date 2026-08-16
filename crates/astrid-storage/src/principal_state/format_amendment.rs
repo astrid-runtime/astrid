@@ -7,7 +7,7 @@ use crate::storage_model::InsertOutcome;
 use crate::storage_model::{ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord};
 
 use super::migrations;
-use super::native_io::quarantine_directory;
+use super::native_io::{ensure_private_directory, quarantine_directory};
 use super::{BLAKE3_OBJECT_IDENTITY_V1_SCHEME, RuntimeEngine};
 use crate::error::{StorageError, StorageResult};
 
@@ -283,12 +283,7 @@ pub(super) fn prepare_destination(
             quarantine_incomplete(path)?;
         }
     }
-    std::fs::create_dir_all(path).map_err(|error| {
-        StorageError::Connection(format!(
-            "create principal store directory {}: {error}",
-            path.display()
-        ))
-    })?;
+    ensure_private_directory(path)?;
     let metadata = path.join(STORE_METADATA_FILE);
     if metadata.exists() {
         let actual = std::fs::read(&metadata).map_err(|error| {

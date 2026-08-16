@@ -32,6 +32,36 @@ fn owner_codec_v1_remains_frozen_without_a_fleet_tag() {
     assert_eq!(codec.decode(&[2; 33]), None);
 }
 
+#[test]
+fn new_destination_is_created_with_the_private_directory_contract() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("principal-store");
+    let format = bootstrap::format_specification().unwrap();
+    let format_id = Blake3ObjectIdentityV1.identify(&format);
+    let catalog = bootstrap::content_catalog_format_specification().unwrap();
+    let catalog_id = Blake3ObjectIdentityV1.identify(&catalog);
+
+    assert_eq!(
+        prepare_destination(&path, &store_metadata(format_id, catalog_id), catalog_id).unwrap(),
+        DestinationFormat::New,
+    );
+    #[cfg(windows)]
+    astrid_core::platform_fs::ensure_private_directory(&path).unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+        );
+    }
+}
+
 pub(super) fn seed_current_directory_store(home: &AstridHome) {
     let path = home.principal_store_path();
     let format = bootstrap::format_specification().unwrap();
