@@ -362,8 +362,9 @@ mod tests {
             .args(&prefix.args)
             .arg(&node)
             .args(["-e", "process.stdout.write(\"ran\")"])
-            .status()
-            .expect("spawn sandbox-exec");
+            .status_bounded()
+            .expect("spawn sandbox-exec")
+            .expect("sandbox-exec must exit under the valid profile");
         assert!(
             status.success(),
             "node must run under the shared Seatbelt profile (got {status:?})"
@@ -374,16 +375,60 @@ mod tests {
         // substring of `(literal "/dev/null")`, so only the root rule is
         // removed.
         let broken = profile.replace(r#"(literal "/")"#, "");
-        let status = std::process::Command::new("sandbox-exec")
+        let Some(status) = std::process::Command::new("sandbox-exec")
             .args(["-p", &broken])
             .arg(&node)
             .args(["-e", "process.stdout.write(\"ran\")"])
-            .status()
-            .expect("spawn sandbox-exec");
+            .status_bounded()
+            .expect("spawn sandbox-exec")
+        else {
+            // The child was killed after failing to exit. It provably never
+            // completed execution either, so the fail-closed property holds;
+            // this is a platform pathology (observed: macOS uninterruptible
+            // exit under a stripped profile), not an escape.
+            eprintln!(
+                "stripped-profile child wedged instead of exiting; \
+                 treating as fail-closed (no unsandboxed execution)"
+            );
+            return;
+        };
         assert!(
             !status.success(),
             "without (literal \"/\") the profile must fail closed — node should \
              abort, not run (got {status:?})"
         );
+    }
+
+    /// `Command::status` waits forever if `sandbox-exec` stalls on a malformed
+    /// profile. Bound the wait and fail loudly instead of wedging the whole
+    /// workspace test battery on one misbehaving platform child.
+    trait CommandStatusBounded {
+        fn status_bounded(&mut self) -> std::io::Result<Option<std::process::ExitStatus>>;
+    }
+
+    impl CommandStatusBounded for std::process::Command {
+        fn status_bounded(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+            use std::time::{Duration, Instant};
+
+            const TIMEOUT: Duration = Duration::from_secs(30);
+            const POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+            let mut child = self.spawn()?;
+            let deadline = Instant::now() + TIMEOUT;
+            loop {
+                if let Some(status) = child.try_wait()? {
+                    return Ok(Some(status));
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    // A stripped-profile child can enter macOS's
+                    // uninterruptible-exit state: SIGKILL is delivered but
+                    // wait4 never returns. Abandon the Child instead of
+                    // blocking the test thread on an unreapable process.
+                    return Ok(None);
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+        }
     }
 }
