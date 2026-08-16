@@ -422,6 +422,7 @@ impl PrivateDirectory {
         Ok(installed)
     }
 
+    #[cfg_attr(not(unix), allow(clippy::unnecessary_wraps, clippy::unused_self))]
     pub(super) fn sync(&self) -> StorageResult<()> {
         #[cfg(unix)]
         {
@@ -898,6 +899,7 @@ pub(super) fn rename_private_entry(source: &Path, destination: &Path) -> Storage
     })
 }
 
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 pub(super) fn sync_directory(path: &Path) -> StorageResult<()> {
     #[cfg(unix)]
     {

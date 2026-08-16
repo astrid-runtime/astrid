@@ -197,6 +197,7 @@ const fn file_is_redirected(_metadata: &std::fs::Metadata) -> bool {
     false
 }
 
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 pub(super) fn sync_directory(directory: &Dir) -> Result<(), DurableError> {
     #[cfg(unix)]
     {
