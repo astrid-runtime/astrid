@@ -170,6 +170,15 @@ fn verify_signature(
     if !profile.enabled {
         return Err(format!("principal {principal} is disabled"));
     }
+    if !profile
+        .auth
+        .methods
+        .contains(&astrid_core::profile::AuthMethod::Keypair)
+    {
+        return Err(format!(
+            "principal {principal} has keypair authentication disabled"
+        ));
+    }
     verify_signature_against_keys(
         principal,
         &profile.auth.public_keys,
@@ -381,5 +390,27 @@ mod tests {
         };
         assert!(!exchange(&mut client, &second).await.is_ok());
         assert!(task.await.expect("server task").is_err());
+    }
+
+    #[test]
+    fn registered_key_cannot_authenticate_when_keypair_method_is_disabled() {
+        let principal = PrincipalId::new("alice").expect("principal");
+        let keypair = astrid_crypto::KeyPair::generate();
+        let (_temp, home) = home_with_key(&principal, &keypair);
+        let profile_path = astrid_core::PrincipalProfile::path_for(&home, &principal);
+        let mut profile = astrid_core::PrincipalProfile::load_from_path(&profile_path)
+            .expect("load generated profile");
+        profile.auth.methods.clear();
+        profile.save_to_path(&profile_path).expect("save profile");
+
+        let nonce_hex = "00".repeat(PRINCIPAL_AUTH_NONCE_LEN);
+        let message = principal_auth_challenge_message(principal.as_str(), &nonce_hex);
+        let signature = keypair.sign(message.as_bytes()).to_hex();
+        let error = verify_signature(&principal, &nonce_hex, &signature, &home)
+            .expect_err("keypair method must gate registered keys");
+        assert!(
+            error.contains("keypair authentication disabled"),
+            "unexpected error: {error}"
+        );
     }
 }
