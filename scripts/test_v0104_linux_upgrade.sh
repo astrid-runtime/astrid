@@ -98,8 +98,18 @@ curl --fail --location --proto '=https' --tlsv1.2 --retry 3 \
 printf '%s  %s\n' "${RELEASE_SHA256}" "${ARCHIVE}" | sha256sum --check --strict
 tar --extract --gzip --file "${ARCHIVE}" --directory "${RELEASE_ROOT}"
 
-[[ "$(run_old version)" == "astrid ${RELEASE_VERSION}" ]] \
-  || fail "published binary did not report astrid ${RELEASE_VERSION}"
+published_version="$(run_old version --format json)"
+python3 - "${published_version}" "${RELEASE_VERSION}" <<'PY'
+import json
+import sys
+
+reported = json.loads(sys.argv[1]).get("version")
+expected = sys.argv[2]
+if reported != expected:
+    raise SystemExit(
+        f"published binary reported version {reported!r}, expected {expected!r}"
+    )
+PY
 
 # v0.10.4 deliberately refuses to serve without a distro-provided socket
 # uplink, but that boot reaches and durably creates the released layout-one

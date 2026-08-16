@@ -156,6 +156,23 @@ fn unix_private_directory_validation_rejects_permissive_modes() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_private_paths_do_not_use_macos_system_aliases() {
+    let path = PathBuf::from("/tmp/astrid-private");
+
+    assert_eq!(normalize_unix_system_alias(path.clone()), path);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_private_paths_resolve_system_tmp_alias() {
+    assert_eq!(
+        normalize_unix_system_alias(PathBuf::from("/tmp/astrid-private")),
+        PathBuf::from("/private/tmp/astrid-private")
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn macos_private_file_validation_rejects_and_restriction_removes_extended_acl() {

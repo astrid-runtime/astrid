@@ -6,7 +6,9 @@
 
 use std::fmt;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::Read;
+#[cfg(test)]
+use std::io::SeekFrom;
 use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -18,9 +20,10 @@ use uuid::Uuid;
 
 #[cfg(test)]
 use super::native_io::open_private_file;
+#[cfg(test)]
+use super::native_io::private_file_identity;
 use super::native_io::{
     PrivateDirectory, PrivateFileIdentity, create_private_file, ensure_private_directory,
-    private_file_identity,
 };
 use super::{NativePrincipalContentStore, StateOwner};
 use crate::content::{ChunkingProfile, ContentBatchWriteOutcome, ContentName, ContentWriteOutcome};
@@ -35,8 +38,11 @@ mod recovery;
 mod retirement;
 #[cfg(test)]
 mod tests;
+mod writer;
 
-use format::{StagingIntent, append_generation_footer};
+use format::StagingIntent;
+#[cfg(test)]
+use format::append_generation_footer;
 use group::SealGroup;
 use journal::{
     JournalRecord, StageKey, append_records, flush_journal, open_journal, truncate_empty,
@@ -45,6 +51,7 @@ pub(super) use migration::migrate_alias_owner_intents;
 use migration::{MigrationDirectories, migrate_legacy};
 use recovery::{load_generation, open_generation_in, recover_generations, sealed_generation_name};
 use retirement::{establish_in as establish_retired_generation, remove_in as remove_generation};
+pub use writer::StagedContentWriter;
 
 const GENERATIONS_DIRECTORY: &str = "generations";
 const QUARANTINE_DIRECTORY: &str = "quarantine";
@@ -609,19 +616,6 @@ impl NativeContentStagingArea {
     }
 }
 
-/// Random-access native file being prepared for later content publication.
-#[derive(Debug)]
-pub struct StagedContentWriter {
-    area: NativeContentStagingArea,
-    id: StagedContentId,
-    owner: StateOwner,
-    name: ContentName,
-    profile: ChunkingProfile,
-    path: Option<PathBuf>,
-    file: Option<File>,
-    preserve_on_drop: bool,
-}
-
 fn publish_ready(
     area: &NativeContentStagingArea,
     staged: &ReadyStagedContent,
@@ -764,139 +758,6 @@ fn publish_ready_batch_unmetered(
         .map_err(|error| StorageError::Internal(format!("publish staged content batch: {error}")))
 }
 
-impl StagedContentWriter {
-    /// Return the staging identifier.
-    #[must_use]
-    pub const fn id(&self) -> StagedContentId {
-        self.id
-    }
-
-    /// Resize the native staging file.
-    ///
-    /// # Errors
-    ///
-    /// Returns an I/O error if the host filesystem cannot resize the file.
-    pub fn set_len(&self, length: u64) -> std::io::Result<()> {
-        self.file
-            .as_ref()
-            .ok_or_else(closed_writer)?
-            .set_len(length)
-    }
-
-    /// Flush bytes and intent, then make this write recoverably publishable.
-    ///
-    /// Returning from this method is the hosted-provider acknowledgement
-    /// boundary. It does not wait for chunking, hashing, or root publication.
-    ///
-    /// # Errors
-    ///
-    /// Returns a storage error if bytes or intent cannot be made durable or the
-    /// ready transition fails.
-    pub fn seal(mut self) -> StorageResult<ReadyStagedContent> {
-        let mut file = self
-            .file
-            .take()
-            .ok_or_else(|| connection("staged writer is already closed".to_owned()))?;
-        // `seal` consumes the writer. Preserve unacknowledged bytes for
-        // quarantine/recovery if any durability step fails.
-        self.preserve_on_drop = true;
-        let path = self
-            .path
-            .as_ref()
-            .ok_or_else(|| connection("staged writer has no generation path".to_owned()))?;
-        let source_identity = private_file_identity(&file)?;
-        let logical_bytes = file
-            .metadata()
-            .map_err(|error| {
-                connection(format!(
-                    "inspect staged content handle {}: {error}",
-                    self.id
-                ))
-            })?
-            .len();
-        let active = self.area.register_seal(&self.owner, &self.name)?;
-        let sequence = active.sequence;
-        let intent = StagingIntent {
-            sequence,
-            id: self.id,
-            owner: self.owner,
-            name: self.name.clone(),
-            profile: self.profile,
-            logical_bytes,
-        };
-        append_generation_footer(&mut file, &intent, source_identity)?;
-        file.sync_all()
-            .map_err(|error| connection(format!("flush staged content {}: {error}", self.id)))?;
-        self.area.fail_if(StagingFaultPoint::ContentFlushed)?;
-        drop(file);
-        let sealed_path = self
-            .area
-            .inner
-            .generations
-            .join(sealed_generation_name(sequence, self.id));
-        let source_name = path.file_name().ok_or_else(|| {
-            connection(format!(
-                "staged generation {} has no file name",
-                path.display()
-            ))
-        })?;
-        let destination_name = sealed_path.file_name().ok_or_else(|| {
-            connection(format!(
-                "sealed generation {} has no file name",
-                sealed_path.display()
-            ))
-        })?;
-        self.area.inner.generations_directory.rename_with_identity(
-            Path::new(source_name),
-            Path::new(destination_name),
-            source_identity,
-        )?;
-        self.area.fail_if(StagingFaultPoint::GenerationRenamed)?;
-        self.path = None;
-        self.area.submit_seal(intent, sealed_path, source_identity)
-    }
-}
-
-impl Read for StagedContentWriter {
-    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        self.file.as_mut().ok_or_else(closed_writer)?.read(buffer)
-    }
-}
-
-impl Write for StagedContentWriter {
-    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-        self.file.as_mut().ok_or_else(closed_writer)?.write(buffer)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.file.as_mut().ok_or_else(closed_writer)?.flush()
-    }
-}
-
-impl Seek for StagedContentWriter {
-    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
-        self.file.as_mut().ok_or_else(closed_writer)?.seek(position)
-    }
-}
-
-impl Drop for StagedContentWriter {
-    fn drop(&mut self) {
-        if self.preserve_on_drop {
-            return;
-        }
-        self.file.take();
-        if let Some(path) = self.path.take() {
-            let _ = std::fs::remove_file(path);
-        }
-        self.area
-            .inner
-            .seal_order
-            .lock()
-            .reserved_identifiers
-            .remove(&self.id);
-    }
-}
-
 /// One sealed native write awaiting authoritative content publication.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReadyStagedContent {
@@ -1009,13 +870,6 @@ fn claim_generation_key(
 
 fn open_generation_name(id: StagedContentId) -> String {
     format!("{id}.open")
-}
-
-fn closed_writer() -> std::io::Error {
-    std::io::Error::new(
-        std::io::ErrorKind::BrokenPipe,
-        "staged content writer is closed",
-    )
 }
 
 fn connection(message: String) -> StorageError {

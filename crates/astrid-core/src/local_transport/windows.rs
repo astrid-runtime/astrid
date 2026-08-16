@@ -49,10 +49,13 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use self::acl::{ValidatedAce, ValidatedAcl, validate_descriptor_control};
+use self::helpers::{last_error, wide_nul};
 use super::ConnectOutcome;
 
 #[path = "windows/acl.rs"]
 mod acl;
+#[path = "windows/helpers.rs"]
+mod helpers;
 
 const PIPE_PREFIX: &str = r"\\.\pipe\astrid-local-";
 const CONNECT_BUSY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -566,8 +569,7 @@ fn create_server_with_security(
 }
 
 fn pipe_name(path: &Path) -> io::Result<OsString> {
-    let absolute = std::path::absolute(path)?;
-    if absolute
+    if path
         .components()
         .any(|component| matches!(component, std::path::Component::ParentDir))
     {
@@ -576,6 +578,7 @@ fn pipe_name(path: &Path) -> io::Result<OsString> {
             "named-pipe endpoint path must not contain a parent component",
         ));
     }
+    let absolute = std::path::absolute(path)?;
     let sid = current_user_sid()?;
     let endpoint = blake3::hash(absolute.as_os_str().as_encoded_bytes());
     let digest = blake3::hash(sid.as_bytes());
@@ -984,16 +987,6 @@ fn is_canonical_pipe_full_control(mask: u32) -> bool {
     // mask when attaching a descriptor to a named pipe. Accept the exact SDDL
     // source form and its exact mapped form, but no weaker or augmented mask.
     mask == GENERIC_ALL || mask == FILE_ALL_ACCESS
-}
-
-fn wide_nul(value: &OsStr) -> Vec<u16> {
-    use std::os::windows::ffi::OsStrExt;
-    value.encode_wide().chain(std::iter::once(0)).collect()
-}
-
-fn last_error(context: &str) -> io::Error {
-    let source = io::Error::last_os_error();
-    io::Error::new(source.kind(), format!("{context}: {source}"))
 }
 
 #[cfg(test)]

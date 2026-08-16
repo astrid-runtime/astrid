@@ -711,7 +711,7 @@ fn unix_directory_walk(path: &Path) -> io::Result<(std::fs::File, Vec<std::ffi::
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn normalize_unix_system_alias(path: PathBuf) -> PathBuf {
     use std::os::unix::ffi::OsStrExt as _;
 
@@ -722,6 +722,11 @@ fn normalize_unix_system_alias(path: PathBuf) -> PathBuf {
     if bytes == b"/var" || bytes.starts_with(b"/var/") {
         return PathBuf::from("/private/var").join(path.strip_prefix("/var").expect("prefix"));
     }
+    path
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn normalize_unix_system_alias(path: PathBuf) -> PathBuf {
     path
 }
 

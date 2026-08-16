@@ -486,6 +486,8 @@ impl AsyncWrite for LocalStream {
 
 #[cfg(all(test, unix))]
 mod tests {
+    use std::time::Duration;
+
     use super::{
         ConnectOutcome, accept, bind, connect, connect_outcome, endpoint_is_present,
         peer_is_current_user, probe, remove_endpoint, split, unsupported_backend_error,
@@ -524,16 +526,32 @@ mod tests {
         ));
 
         let listener = bind(&endpoint).unwrap();
-        assert!(matches!(
-            connect_outcome(&endpoint).await.unwrap(),
-            ConnectOutcome::Connected(_)
-        ));
+        let ConnectOutcome::Connected(client) = connect_outcome(&endpoint).await.unwrap() else {
+            panic!("live listener must accept a connection");
+        };
+        let server = accept(&listener).await.unwrap();
+        drop(client);
+        drop(server);
         drop(listener);
+        // Tokio's reactor may retain the registered descriptor briefly while
+        // unrelated tests are active. Build the stale-state fixture with an
+        // unregistered standard listener so the assertion is deterministic.
+        remove_endpoint(&endpoint).unwrap();
+        drop(std::os::unix::net::UnixListener::bind(&endpoint).unwrap());
 
-        assert!(matches!(
-            connect_outcome(&endpoint).await.unwrap(),
-            ConnectOutcome::Stale
-        ));
+        let mut observed_stale = false;
+        for _ in 0..100 {
+            match connect_outcome(&endpoint).await.unwrap() {
+                ConnectOutcome::Stale => {
+                    observed_stale = true;
+                    break;
+                },
+                ConnectOutcome::Connected(stream) => drop(stream),
+                ConnectOutcome::Absent => panic!("bound stale socket must remain present"),
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(observed_stale, "stale endpoint remained transiently live");
         assert!(endpoint_is_present(&endpoint).unwrap());
     }
 
@@ -545,9 +563,28 @@ mod tests {
 
         let error = bind(&endpoint).unwrap_err();
         assert!(error.to_string().contains("already running"));
+        // The live-listener probe established a real queued connection. Drain
+        // it before closing the listener so the kernel cannot transiently
+        // report that queued socket as live during the stale-endpoint check.
+        drop(accept(&listener).await.unwrap());
         drop(listener);
+        remove_endpoint(&endpoint).unwrap();
+        drop(std::os::unix::net::UnixListener::bind(&endpoint).unwrap());
 
-        let replacement = bind(&endpoint).expect("stale endpoint should be replaced");
+        let mut replacement = None;
+        for _ in 0..100 {
+            match bind(&endpoint) {
+                Ok(listener) => {
+                    replacement = Some(listener);
+                    break;
+                },
+                Err(error) if error.to_string().contains("already running") => {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                },
+                Err(error) => panic!("stale endpoint should be replaced: {error}"),
+            }
+        }
+        let replacement = replacement.expect("stale endpoint remained transiently live");
         drop(replacement);
         remove_endpoint(&endpoint).unwrap();
     }

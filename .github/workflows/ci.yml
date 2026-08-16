@@ -24,6 +24,7 @@ on:
       - 'scripts/validate_macos_release.py'
       - 'scripts/test_macos_release_packaging.py'
       - 'scripts/test_v0104_linux_upgrade.sh'
+      - 'scripts/ci/**'
       - 'scripts/fixtures/windows-release-extension.toml'
       - 'scripts/check_glibc.py'
       - 'scripts/test_check_glibc.py'
@@ -75,6 +76,7 @@ on:
       - 'scripts/validate_macos_release.py'
       - 'scripts/test_macos_release_packaging.py'
       - 'scripts/test_v0104_linux_upgrade.sh'
+      - 'scripts/ci/**'
       - 'scripts/fixtures/windows-release-extension.toml'
       - 'scripts/check_glibc.py'
       - 'scripts/test_check_glibc.py'
@@ -361,21 +363,7 @@ jobs:
         run: cargo check --workspace --all-features --locked
 
       - name: Test release manifest contract
-        run: |
-          python3 scripts/test_release_manifest.py
-          python3 scripts/test_musl_release_manifest.py
-          python3 scripts/test_windows_release_manifest.py
-          python3 scripts/test_validate_release_archive.py
-          python3 scripts/test_check_glibc.py
-          python3 scripts/test_check_dco.py
-          python3 scripts/test_check_static_elf.py
-          python3 scripts/test_release_publication.py
-          python3 scripts/test_release_draft_recovery.py
-          python3 scripts/test_crate_publication.py
-          python3 scripts/test_channel_metadata.py
-          python3 scripts/test_channel_publication.py
-          python3 scripts/test_nightly_version.py
-          bash scripts/test_channel_workflow_contract.sh
+        run: scripts/ci/test-release-contracts.sh
 
   wasm-portability:
     name: Wasm portability
@@ -451,7 +439,7 @@ jobs:
             $null = [scriptblock]::Create($contents[$script])
           }
           foreach ($variable in "WinFspMsi", "WinFspSha256") {
-            $pattern = '(?m)^\${0} = "([^"]+)"$' -f [regex]::Escape($variable)
+            $pattern = '(?m)^\${0} = "([^"]+)"\r?$' -f [regex]::Escape($variable)
             $installPin = [regex]::Match($contents["scripts/install-windows.ps1"], $pattern)
             $uninstallPin = [regex]::Match($contents["scripts/uninstall-windows.ps1"], $pattern)
             if (-not $installPin.Success -or -not $uninstallPin.Success -or
@@ -714,52 +702,9 @@ jobs:
 
       - name: Run tests (macOS serial)
         if: matrix.os == 'macos-latest'
-        shell: bash
         env:
           RUST_BACKTRACE: full
-        run: |
-          set -o pipefail
-
-          set +e
-          cargo test --workspace --locked -- --test-threads=1
-          status=$?
-          set -e
-
-          if [[ $status -ne 0 ]]; then
-            echo "::group::macOS failure diagnostics"
-            echo "exit_status=$status"
-            uname -a || true
-            sw_vers || true
-            sysctl -n hw.optional.arm64 hw.memsize hw.ncpu || true
-            ulimit -a || true
-
-            echo "::group::Recent relevant processes"
-            ps -axo pid,ppid,pgid,stat,comm,args \
-              | grep -E 'astrid_capsule|cargo|rustc|sleep| sh ' \
-              | grep -v grep || true
-            echo "::endgroup::"
-
-            echo "::group::Recent macOS abort/crash log entries"
-            log show --last 10m --style compact --info --debug \
-              --predicate 'eventMessage CONTAINS[c] "SIGABRT" OR eventMessage CONTAINS[c] "abort" OR eventMessage CONTAINS[c] "crash" OR eventMessage CONTAINS[c] "killed" OR eventMessage CONTAINS[c] "terminated" OR process CONTAINS[c] "astrid_capsule" OR process CONTAINS[c] "sleep"' \
-              || true
-            echo "::endgroup::"
-
-            echo "::group::Diagnostic reports"
-            for dir in "$HOME/Library/Logs/DiagnosticReports" "/Library/Logs/DiagnosticReports"; do
-              [[ -d "$dir" ]] || continue
-              echo "Reports in $dir"
-              find "$dir" -maxdepth 1 -type f \( -name '*astrid*' -o -name '*cargo*' -o -name '*rustc*' -o -name '*sleep*' \) -print \
-                | while read -r report; do
-                    echo "--- $report"
-                    sed -n '1,220p' "$report" || true
-                  done
-            done
-            echo "::endgroup::"
-            echo "::endgroup::"
-          fi
-
-          exit "$status"
+        run: scripts/ci/test-workspace-macos.sh
 
   msrv:
     name: MSRV
@@ -862,40 +807,7 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           INTERNAL_EXCLUDES: ${{ steps.api-inputs.outputs.internal-excludes }}
           CARGO_TARGET_DIR: semver-checks/target
-        run: |
-          set -o pipefail
-
-          IFS=',' read -ra excludes <<< "$INTERNAL_EXCLUDES"
-          exclude_args=()
-          for package in "${excludes[@]}"; do
-            if [ -n "$package" ]; then
-              exclude_args+=(--exclude "$package")
-            fi
-          done
-
-          set +e
-          cargo semver-checks check-release \
-            --manifest-path Cargo.toml \
-            --baseline-rev "$BASE_SHA" \
-            --all-features \
-            "${exclude_args[@]}" 2>&1 | tee internal-semver-checks.log
-          status=${PIPESTATUS[0]}
-          set -e
-
-          case "$status" in
-            0)
-              echo "result=success" >> "$GITHUB_OUTPUT"
-              ;;
-            100)
-              echo "result=findings" >> "$GITHUB_OUTPUT"
-              echo "::warning title=Core Rust API change::Review the advisory cargo-semver-checks findings. Core library compatibility requires maintainer judgment and is not a merge blocker."
-              ;;
-            *)
-              echo "result=error" >> "$GITHUB_OUTPUT"
-              echo "::error title=Internal Rust API check failed::cargo-semver-checks could not complete (exit $status); this is a tool, build, or infrastructure failure, not an advisory API finding."
-              exit "$status"
-              ;;
-          esac
+        run: scripts/ci/report-core-api-compatibility.sh
 
       - name: Summarize Rust API compatibility policy
         if: always() && steps.api-inputs.outputs.run == 'true'
@@ -968,38 +880,7 @@ jobs:
         if: steps.api-inputs.outputs.run == 'true'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: |
-          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
-          ### Core Rust API item diff
-
-          Core library diffs are report-only because these crates are implementation details whose compatibility requires maintainer judgment. Tool, compiler, and workflow failures remain blocking.
-          EOF
-
-          packages=$(cargo metadata --locked --format-version 1 --no-deps \
-            | jq -r '.packages[]
-              | select(.publish == null)
-              | select(any(.targets[]; any(.kind[]; . == "lib")))
-              | [.name, .manifest_path] | @tsv')
-
-          while IFS=$'\t' read -r package manifest_path; do
-            # A crate introduced by this PR has no manifest at the base SHA;
-            # cargo-public-api cannot diff against a baseline where the
-            # package does not exist, and the entire API is additive anyway.
-            rel_manifest="${manifest_path#"$GITHUB_WORKSPACE/"}"
-            if ! git cat-file -e "$BASE_SHA:$rel_manifest" 2>/dev/null; then
-              echo "$package is new in this PR (no baseline at $BASE_SHA); skipping diff."
-              continue
-            fi
-            echo "::group::cargo public-api $package"
-            cargo +nightly-2026-06-29 public-api \
-              --package "$package" \
-              --all-features \
-              -ss \
-              diff \
-              --force \
-              "$BASE_SHA..HEAD"
-            echo "::endgroup::"
-          done <<< "$packages"
+        run: scripts/ci/report-public-rust-api-diff.sh
 
   gateway-openapi-contract:
     name: Gateway OpenAPI contract
@@ -1070,39 +951,7 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           OPENAPI_CONTRACT_CHANGE: ${{ steps.openapi-contract-change.outputs.found }}
-        run: |
-          mkdir -p /tmp/astrid-openapi
-          cp crates/astrid-gateway/examples/print-openapi.rs /tmp/astrid-openapi/print-openapi.rs
-          cp Cargo.lock /tmp/astrid-openapi/Cargo.lock
-
-          generate_spec() {
-            local ref="$1"
-            local out="$2"
-
-            git reset --hard
-            git clean -fd -e .openapi-target
-            git checkout "$ref"
-            mkdir -p crates/astrid-gateway/examples
-            cp /tmp/astrid-openapi/print-openapi.rs crates/astrid-gateway/examples/print-openapi.rs
-            if [ ! -f Cargo.lock ]; then
-              cp /tmp/astrid-openapi/Cargo.lock Cargo.lock
-            fi
-
-            cargo run --locked -p astrid-gateway --example print-openapi > "$out"
-          }
-
-          generate_spec "$BASE_SHA" /tmp/astrid-openapi/base.json
-          generate_spec "$HEAD_SHA" /tmp/astrid-openapi/head.json
-
-          if diff -u /tmp/astrid-openapi/base.json /tmp/astrid-openapi/head.json; then
-            exit 0
-          fi
-          if [ "$OPENAPI_CONTRACT_CHANGE" = "true" ]; then
-            echo "OpenAPI contract changed and was acknowledged by commit marker."
-            exit 0
-          fi
-          echo "::error::OpenAPI contract changed without an API-CONTRACT-CHANGE: marker in a commit message."
-          exit 1
+        run: scripts/ci/diff-gateway-openapi.sh
 
   audit:
     name: Security Audit

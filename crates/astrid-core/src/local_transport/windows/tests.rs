@@ -36,8 +36,14 @@ fn endpoint_name_is_user_and_path_derived_without_revealing_either() {
 
 #[test]
 fn endpoint_name_rejects_parent_components() {
-    let error = pipe_name(Path::new(r"C:\controlled\..\escape.sock")).unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    for path in [
+        Path::new(".."),
+        Path::new(r"..\escape.sock"),
+        Path::new(r"C:\controlled\..\escape.sock"),
+    ] {
+        let error = pipe_name(path).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{path:?}");
+    }
 }
 
 #[test]
