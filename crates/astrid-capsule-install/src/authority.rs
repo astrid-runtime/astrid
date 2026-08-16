@@ -207,13 +207,14 @@ impl AuthorityReceiptTransaction {
         authority: &InstalledAuthority,
     ) -> anyhow::Result<Self> {
         let paths = authority_paths(home, target_dir)?;
-        std::fs::create_dir_all(&paths.directory).with_context(|| {
-            format!(
-                "failed to create capsule authority directory {}",
-                paths.directory.display()
-            )
-        })?;
-        set_owner_private_dir(&paths.directory)?;
+        astrid_core::platform_fs::ensure_private_directory(&paths.directory).with_context(
+            || {
+                format!(
+                    "failed to secure capsule authority directory {}",
+                    paths.directory.display()
+                )
+            },
+        )?;
 
         if paths.pending.exists() {
             bail!(
@@ -340,19 +341,6 @@ fn authority_paths(home: &AstridHome, target_dir: &Path) -> anyhow::Result<Autho
         previous: directory.join(format!("{name}.previous")),
         directory,
     })
-}
-
-#[cfg(unix)]
-fn set_owner_private_dir(path: &Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-#[allow(clippy::unnecessary_wraps)]
-fn set_owner_private_dir(_path: &Path) -> anyhow::Result<()> {
-    Ok(())
 }
 
 /// Verify that an installed manifest stays within its accepted authority.

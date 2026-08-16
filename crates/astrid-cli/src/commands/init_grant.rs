@@ -135,9 +135,8 @@ pub(super) struct ProvisioningLock {
 impl ProvisioningLock {
     pub(super) fn acquire(home: &AstridHome, target: &PrincipalId) -> anyhow::Result<Self> {
         let config_dir = home.principal_home(target).config_dir();
-        std::fs::create_dir_all(&config_dir)
-            .with_context(|| format!("failed to create {}", config_dir.display()))?;
-        set_owner_private_dir(&config_dir)?;
+        astrid_core::platform_fs::ensure_private_directory(&config_dir)
+            .with_context(|| format!("failed to secure {}", config_dir.display()))?;
 
         let path = config_dir.join("distro.init.lock");
         let mut options = OpenOptions::new();
@@ -150,7 +149,8 @@ impl ProvisioningLock {
         let file = options
             .open(&path)
             .with_context(|| format!("failed to open {}", path.display()))?;
-        set_owner_private_file(&path)?;
+        astrid_core::platform_fs::restrict_private_file(&path)
+            .with_context(|| format!("failed to secure {}", path.display()))?;
         FileExt::try_lock_exclusive(&file).with_context(|| {
             format!("another distro provision is already running for target principal '{target}'")
         })?;
@@ -305,30 +305,6 @@ fn manifest_declares_wasm(manifest: &CapsuleManifest) -> bool {
         .components
         .iter()
         .any(|component| component.path.extension().and_then(|ext| ext.to_str()) == Some("wasm"))
-}
-
-#[cfg(unix)]
-fn set_owner_private_dir(path: &std::path::Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_owner_private_dir(_path: &std::path::Path) -> anyhow::Result<()> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_owner_private_file(path: &std::path::Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_owner_private_file(_path: &std::path::Path) -> anyhow::Result<()> {
-    Ok(())
 }
 
 /// Apply capsule-access grants for the installed set (opt-in), or print
