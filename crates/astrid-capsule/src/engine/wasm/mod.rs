@@ -4021,11 +4021,14 @@ mod tests {
         /// Create the minimal on-disk structure `gix_discover` accepts as a git
         /// work tree: a symref `HEAD`, plus the `objects/` and `refs/`
         /// directories its validation requires. Hermetic — no `git` binary.
+        fn init_git_dir(git_dir: &std::path::Path) {
+            std::fs::create_dir_all(git_dir.join("objects")).unwrap();
+            std::fs::create_dir_all(git_dir.join("refs")).unwrap();
+            std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        }
+
         fn init_git_worktree(root: &std::path::Path) {
-            let dot_git = root.join(".git");
-            std::fs::create_dir_all(dot_git.join("objects")).unwrap();
-            std::fs::create_dir_all(dot_git.join("refs")).unwrap();
-            std::fs::write(dot_git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+            init_git_dir(&root.join(".git"));
         }
 
         #[test]
@@ -4044,6 +4047,22 @@ mod tests {
             let sub = ws.path().join("crates").join("inner");
             std::fs::create_dir_all(&sub).unwrap();
             assert!(workspace_is_git_managed(&sub));
+        }
+
+        #[test]
+        fn detects_worktree_through_gitfile() {
+            let parent = tempfile::tempdir().unwrap();
+            let worktree = parent.path().join("linked-worktree");
+            let git_dir = parent.path().join("git-metadata");
+            std::fs::create_dir(&worktree).unwrap();
+            init_git_dir(&git_dir);
+            std::fs::write(
+                worktree.join(".git"),
+                format!("gitdir: {}\n", git_dir.display()),
+            )
+            .unwrap();
+
+            assert!(workspace_is_git_managed(&worktree));
         }
 
         #[test]
