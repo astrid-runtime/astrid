@@ -136,6 +136,11 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   Existing standard and URL-safe wire formats remain byte-for-byte compatible;
   the release's new default-on unsafe SIMD backend is deliberately disabled at
   the workspace boundary. Closes #1510.
+- **The capsule runtime now uses Wasmtime 47.0.3 and wasm-tools 0.256 with an
+  explicit guest-feature policy.** WebAssembly GC and exception handling stay
+  disabled instead of inheriting Wasmtime 47's new defaults, and the compiled
+  component cache uses a new ABI generation so Wasmtime 46 artifacts cannot be
+  reused. Closes #1506.
 
 - **Rust API compatibility CI now enforces only Astrid's supported public Rust
   contract.** Breaking changes to `astrid-types` remain merge-blocking unless
