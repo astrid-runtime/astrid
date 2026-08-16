@@ -167,12 +167,27 @@ async fn private_mount_manifest_and_callback_endpoint_are_owner_scoped() {
 
     #[cfg(windows)]
     {
-        let (client, server) = tokio::join!(
-            astrid_core::local_transport::connect(&lease.callback_path),
-            astrid_core::local_transport::accept(&listener),
-        );
-        drop(client.unwrap());
-        drop(server.unwrap());
+        let exchange = async {
+            let client = async {
+                let mut client =
+                    astrid_core::local_transport::connect(&lease.callback_path).await?;
+                client.write_all(&[0xA5]).await?;
+                client.flush().await?;
+                Ok::<_, std::io::Error>(client)
+            };
+            let (client, server) =
+                tokio::join!(client, astrid_core::local_transport::accept(&listener),);
+            let client = client.unwrap();
+            let mut server = server.unwrap();
+            let mut replayed = [0_u8; 1];
+            server.read_exact(&mut replayed).await.unwrap();
+            assert_eq!(replayed, [0xA5]);
+            drop(client);
+            drop(server);
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), exchange)
+            .await
+            .expect("Windows callback endpoint exchange timed out");
     }
     drop(listener);
 }
