@@ -380,6 +380,8 @@ jobs:
               cp "$BINARY_ROOT/astrid-storage-provider-fuse" "$DIR/"
             fi
             tar czf "${DIR}.tar.gz" "$DIR"
+            python3 scripts/validate_release_archive.py "${DIR}.tar.gz" \
+              --target "$TARGET"
           fi
           echo "ASSET=${DIR}.tar.gz" >> "$GITHUB_ENV"
 
@@ -485,19 +487,30 @@ jobs:
 
           cat >> "$NOTES" <<'INSTALL'
 
-          **Pre-built binaries:**
-          Download the archive for your platform, extract, and add to PATH:
+          **Linux pre-built archive:**
           ```
-          tar xzf astrid-*-$(uname -m)-*.tar.gz
+          tar xzf astrid-*-$(uname -m)-unknown-linux-*.tar.gz
           sudo install -m 0755 astrid-*/astrid astrid-*/astrid-daemon \
             astrid-*/astrid-build astrid-*/astrid-emit \
-            astrid-*/astrid-storage-provider-fskit /usr/local/bin/
+            astrid-*/astrid-storage-provider-fuse /usr/local/bin/
           ```
 
-          On macOS, also install, enable, and manage the signed AstridFS app:
+          **macOS pre-built archive and signed AstridFS app:**
           ```
+          ARCH=$(uname -m); [[ "$ARCH" == arm64 ]] && ARCH=aarch64
+          tar xzf astrid-*-${ARCH}-apple-darwin.tar.gz
+          sudo install -m 0755 astrid-*/astrid astrid-*/astrid-daemon \
+            astrid-*/astrid-build astrid-*/astrid-emit /usr/local/bin/
           astrid-*/macos/manage-macos-fskit.sh install
           astrid-*/macos/manage-macos-fskit.sh enable
+          ```
+
+          **Windows pre-built archive (PowerShell):**
+          ```powershell
+          tar -xzf astrid-*-x86_64-pc-windows-msvc.tar.gz
+          $release = Get-ChildItem -Directory "astrid-*-x86_64-pc-windows-msvc" |
+            Select-Object -First 1
+          & (Join-Path $release.FullName "install-windows.ps1")
           ```
 
           Astrid Runtime does not bundle a product distro. To compose it with a
@@ -570,6 +583,15 @@ jobs:
             --output "artifacts/astrid-${VERSION}-musl-release.toml"
           python3 scripts/musl_release_manifest.py validate \
             "artifacts/astrid-${VERSION}-musl-release.toml" \
+            --legacy-manifest "artifacts/astrid-${VERSION}-release.toml" \
+            --artifacts artifacts \
+            --verify-artifacts
+          python3 scripts/windows_release_manifest.py generate \
+            --artifacts artifacts \
+            --legacy-manifest "artifacts/astrid-${VERSION}-release.toml" \
+            --output "artifacts/astrid-${VERSION}-windows-release.toml"
+          python3 scripts/windows_release_manifest.py validate \
+            "artifacts/astrid-${VERSION}-windows-release.toml" \
             --legacy-manifest "artifacts/astrid-${VERSION}-release.toml" \
             --artifacts artifacts \
             --verify-artifacts
@@ -774,6 +796,28 @@ jobs:
               exit 1
             fi
           fi
+
+      - name: Require native FSKit mount certification for the tagged source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CERTIFICATION_CHECK: Native FSKit mount certification
+        run: |
+          CHECKS="$RUNNER_TEMP/native-fskit-certification.json"
+          gh api --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/commits/$SOURCE_COMMIT/check-runs?per_page=100" \
+            > "$CHECKS"
+          jq -e \
+            --arg name "$CERTIFICATION_CHECK" \
+            --arg source "$SOURCE_COMMIT" \
+            '[.[] | .check_runs[] |
+              select(.name == $name and .head_sha == $source and
+                     .app.slug == "github-actions")] |
+             sort_by(.started_at) | last |
+             .status == "completed" and .conclusion == "success"' \
+            "$CHECKS" >/dev/null || {
+              echo "the tagged source lacks a successful native FSKit mount certification" >&2
+              exit 1
+            }
 
       - name: Require the release tag to remain unused before draft creation
         if: env.EXISTING_RELEASE != '1'

@@ -7,10 +7,24 @@ on:
       - '**.rs'
       - 'scripts/install-windows.ps1'
       - 'scripts/uninstall-windows.ps1'
+      - 'scripts/windows_release_manifest.py'
+      - 'scripts/test_windows_release_manifest.py'
       - 'scripts/release_manifest.py'
       - 'scripts/test_release_manifest.py'
       - 'scripts/musl_release_manifest.py'
       - 'scripts/test_musl_release_manifest.py'
+      - 'scripts/package_release_archive.py'
+      - 'scripts/test_validate_release_archive.py'
+      - 'scripts/validate_release_archive.py'
+      - 'scripts/build-macos-fskit.sh'
+      - 'scripts/check-macos-fskit.sh'
+      - 'scripts/manage-macos-fskit.sh'
+      - 'scripts/test_manage_macos_fskit.sh'
+      - 'scripts/validate-macos-fskit.sh'
+      - 'scripts/validate_macos_release.py'
+      - 'scripts/test_macos_release_packaging.py'
+      - 'scripts/test_v0104_linux_upgrade.sh'
+      - 'scripts/fixtures/windows-release-extension.toml'
       - 'scripts/check_glibc.py'
       - 'scripts/test_check_glibc.py'
       - 'scripts/check_dco.py'
@@ -31,19 +45,37 @@ on:
       - 'scripts/nightly_version.py'
       - 'scripts/test_nightly_version.py'
       - 'release/nightly.toml'
+      - 'crates/astrid-storage-provider-fskit/**'
+      - 'native/macos/**'
       - '**/Cargo.toml'
       - '**/Cargo.lock'
       - '.github/workflows/ci.yml'
+      - '.github/workflows/native-storage-certification.yml'
+      - '.github/workflows/release.yml'
   pull_request:
     branches: [main]
     paths:
       - '**.rs'
       - 'scripts/install-windows.ps1'
       - 'scripts/uninstall-windows.ps1'
+      - 'scripts/windows_release_manifest.py'
+      - 'scripts/test_windows_release_manifest.py'
       - 'scripts/release_manifest.py'
       - 'scripts/test_release_manifest.py'
       - 'scripts/musl_release_manifest.py'
       - 'scripts/test_musl_release_manifest.py'
+      - 'scripts/package_release_archive.py'
+      - 'scripts/test_validate_release_archive.py'
+      - 'scripts/validate_release_archive.py'
+      - 'scripts/build-macos-fskit.sh'
+      - 'scripts/check-macos-fskit.sh'
+      - 'scripts/manage-macos-fskit.sh'
+      - 'scripts/test_manage_macos_fskit.sh'
+      - 'scripts/validate-macos-fskit.sh'
+      - 'scripts/validate_macos_release.py'
+      - 'scripts/test_macos_release_packaging.py'
+      - 'scripts/test_v0104_linux_upgrade.sh'
+      - 'scripts/fixtures/windows-release-extension.toml'
       - 'scripts/check_glibc.py'
       - 'scripts/test_check_glibc.py'
       - 'scripts/check_dco.py'
@@ -64,9 +96,13 @@ on:
       - 'scripts/nightly_version.py'
       - 'scripts/test_nightly_version.py'
       - 'release/nightly.toml'
+      - 'crates/astrid-storage-provider-fskit/**'
+      - 'native/macos/**'
       - '**/Cargo.toml'
       - '**/Cargo.lock'
       - '.github/workflows/ci.yml'
+      - '.github/workflows/native-storage-certification.yml'
+      - '.github/workflows/release.yml'
 
 permissions:
   contents: read
@@ -218,10 +254,43 @@ jobs:
               done
             '
 
+  linux-v0104-upgrade:
+    name: Published v0.10.4 Linux upgrade
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: "1.95.0"
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          key: ${{ runner.os }}-${{ github.job }}
+          cache-on-failure: true
+
+      - name: Build the current upgrade binaries
+        run: cargo build --locked -p astrid --bins
+
+      - name: Upgrade the pinned published Linux release
+        run: scripts/test_v0104_linux_upgrade.sh
+
   linux-fuse-e2e:
     name: Linux native FUSE E2E
-    if: vars.ASTRID_FUSE_E2E == 'true'
-    runs-on: [self-hosted, linux, fuse]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
     env:
@@ -243,10 +312,16 @@ jobs:
         with:
           toolchain: "1.95.0"
 
-      - name: Require native FUSE support
+      - name: Install and require native FUSE support
         run: |
-          [[ -c /dev/fuse ]] || { echo "::error::ASTRID_FUSE_E2E is enabled but /dev/fuse is unavailable" >&2; exit 1; }
-          command -v fusermount3 >/dev/null || { echo "::error::ASTRID_FUSE_E2E is enabled but fusermount3 is unavailable" >&2; exit 1; }
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends fuse3 libfuse3-dev
+          if [[ ! -c /dev/fuse ]]; then
+            sudo modprobe fuse
+          fi
+          [[ -c /dev/fuse ]] || { echo "::error::hosted runner has no Linux FUSE device" >&2; exit 1; }
+          command -v fusermount3 >/dev/null || { echo "::error::hosted runner has no fusermount3" >&2; exit 1; }
+          sudo chmod 0666 /dev/fuse
 
       - name: Exercise the real Linux mount
         run: >
@@ -289,6 +364,8 @@ jobs:
         run: |
           python3 scripts/test_release_manifest.py
           python3 scripts/test_musl_release_manifest.py
+          python3 scripts/test_windows_release_manifest.py
+          python3 scripts/test_validate_release_archive.py
           python3 scripts/test_check_glibc.py
           python3 scripts/test_check_dco.py
           python3 scripts/test_check_static_elf.py
@@ -368,8 +445,19 @@ jobs:
       - name: Parse the Windows install scripts
         shell: pwsh
         run: |
+          $contents = @{}
           foreach ($script in "scripts/install-windows.ps1", "scripts/uninstall-windows.ps1") {
-            $null = [scriptblock]::Create((Get-Content -LiteralPath $script -Raw))
+            $contents[$script] = Get-Content -LiteralPath $script -Raw
+            $null = [scriptblock]::Create($contents[$script])
+          }
+          foreach ($variable in "WinFspMsi", "WinFspSha256") {
+            $pattern = '(?m)^\${0} = "([^"]+)"$' -f [regex]::Escape($variable)
+            $installPin = [regex]::Match($contents["scripts/install-windows.ps1"], $pattern)
+            $uninstallPin = [regex]::Match($contents["scripts/uninstall-windows.ps1"], $pattern)
+            if (-not $installPin.Success -or -not $uninstallPin.Success -or
+                $installPin.Groups[1].Value -ne $uninstallPin.Groups[1].Value) {
+              throw "Windows install and uninstall scripts disagree on $variable"
+            }
           }
 
       - name: Reject a tampered Windows uninstall marker
@@ -389,6 +477,27 @@ jobs:
           }
           if (-not (Test-Path -LiteralPath $outside -PathType Leaf)) {
             throw "tampered uninstall marker removed an external file"
+          }
+
+      - name: Reject a tampered cached WinFsp installer
+        shell: pwsh
+        run: |
+          $install = Join-Path $env:RUNNER_TEMP "astrid-uninstall-msi-test"
+          New-Item -ItemType Directory -Path $install -Force | Out-Null
+          @{ product = "astrid"; winfsp_installed_by_astrid = $true; winfsp_installer = "winfsp-2.1.25156.msi" } |
+            ConvertTo-Json | Set-Content -LiteralPath (Join-Path $install "astrid-install.json")
+          $msi = Join-Path $install "winfsp-2.1.25156.msi"
+          Set-Content -LiteralPath $msi -Value "not the pinned WinFsp installer"
+          try {
+            & scripts/uninstall-windows.ps1 -InstallDir $install -RemoveWinFsp
+            throw "tampered cached WinFsp installer was accepted"
+          } catch {
+            if ($_.Exception.Message -eq "tampered cached WinFsp installer was accepted") { throw }
+            if ($_.Exception.Message -notlike "Cached WinFsp installer digest mismatch:*") { throw }
+          }
+          if (-not (Test-Path -LiteralPath $msi -PathType Leaf) -or
+              -not (Test-Path -LiteralPath (Join-Path $install "astrid-install.json") -PathType Leaf)) {
+            throw "tampered MSI rejection mutated the installation"
           }
 
       - name: Lint the Windows provider
@@ -594,8 +703,10 @@ jobs:
           bash -n scripts/build-macos-fskit.sh \
             scripts/check-macos-fskit.sh \
             scripts/manage-macos-fskit.sh \
+            scripts/test_manage_macos_fskit.sh \
             scripts/validate-macos-fskit.sh
           python3 -m unittest scripts/test_macos_release_packaging.py
+          scripts/test_manage_macos_fskit.sh
 
       - name: Run tests
         if: matrix.os != 'macos-latest'

@@ -94,7 +94,7 @@ class ReleaseManifestTests(unittest.TestCase):
     def test_rejects_missing_or_extra_checksum_assets(self) -> None:
         path = self.artifacts / "BLAKE3SUMS.txt"
         path.write_text(path.read_text() + f"{'f' * 64}  extra.tar.gz\n")
-        with self.assertRaisesRegex(ValueError, "exactly the five fixed"):
+        with self.assertRaisesRegex(ValueError, "exactly the four fixed"):
             self.manifest()
 
     def test_legacy_manifest_shape_is_unchanged_with_combined_checksums(self) -> None:
@@ -102,7 +102,7 @@ class ReleaseManifestTests(unittest.TestCase):
         legacy_rendered = release_manifest.render_manifest(legacy)
         b3 = self.artifacts / "BLAKE3SUMS.txt"
         sha = self.artifacts / "SHA256SUMS.txt"
-        for index, target in enumerate(release_manifest.MUSL_TARGETS, 20):
+        for index, target in enumerate(release_manifest.EXTENSION_TARGETS, 20):
             name = release_manifest.expected_asset(VERSION, target)
             (self.artifacts / name).write_bytes(bytes([index]) * index)
             with b3.open("a") as output:
@@ -112,6 +112,21 @@ class ReleaseManifestTests(unittest.TestCase):
         combined = self.manifest()
         self.assertEqual(combined, legacy)
         self.assertEqual(release_manifest.render_manifest(combined), legacy_rendered)
+        self.assertEqual(len(combined["targets"]), 4)
+
+    def test_frozen_base_manifest_remains_four_target_v1_for_released_clients(self) -> None:
+        manifest = self.manifest()
+        self.assertEqual(manifest["schema-version"], 1)
+        self.assertEqual(manifest["kind"], "astrid-release")
+        self.assertEqual(
+            [target["triple"] for target in manifest["targets"]],
+            [
+                "aarch64-apple-darwin",
+                "aarch64-unknown-linux-gnu",
+                "x86_64-apple-darwin",
+                "x86_64-unknown-linux-gnu",
+            ],
+        )
 
     def test_rejects_duplicate_target(self) -> None:
         manifest = self.manifest()

@@ -98,6 +98,28 @@ fn unix_replacement_preserves_backups_and_cleans_staging() {
 
 #[cfg(unix)]
 #[test]
+fn unix_replacement_staging_failure_cleans_partial_new_files() {
+    let root = tempfile::tempdir().unwrap();
+    let install = root.path().join("install");
+    let extract = root.path().join("extract");
+    std::fs::create_dir_all(&install).unwrap();
+    std::fs::create_dir_all(&extract).unwrap();
+    std::fs::write(extract.join("astrid"), b"new").unwrap();
+    std::fs::write(extract.join("astrid-daemon"), b"new-daemon").unwrap();
+    std::fs::create_dir(install.join(".astrid-daemon.new")).unwrap();
+
+    let error = replace_executable_set(&install, &extract, &["astrid", "astrid-daemon"])
+        .expect_err("a directory at a staging path must prevent replacement");
+
+    assert!(error.to_string().contains("failed to stage"));
+    assert!(!install.join("astrid").exists());
+    assert!(!install.join("astrid-daemon").exists());
+    assert!(!install.join(".astrid.new").exists());
+    assert!(install.join(".astrid-daemon.new").is_dir());
+}
+
+#[cfg(unix)]
+#[test]
 fn unix_private_atomic_write_repairs_permissive_replacement() {
     use std::os::unix::fs::PermissionsExt as _;
 

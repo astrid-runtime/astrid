@@ -13,10 +13,13 @@ exact platform archive:
 2. An immutable release manifest matching the pointer's BLAKE3 digest and
    signed by the exact release workflow at the selected tag.
 3. For a musl-compiled updater, an `astrid-<version>-musl-release.toml`
-   extension and bundle from that same immutable tag. The extension must carry
-   exactly the two supported musl targets, match the authenticated release
-   identity, and bind the exact legacy manifest asset and BLAKE3 digest. GNU
-   and macOS updaters continue using only the unchanged four-target documents.
+   extension and bundle from that same immutable tag; for Windows, the
+   equivalent `astrid-<version>-windows-release.toml` extension and bundle.
+   Each extension must carry exactly its supported targets, match the
+   authenticated tag/source/workflow identity, and bind the exact legacy
+   manifest asset and BLAKE3 digest. GNU and macOS updaters continue using only
+   the unchanged four-target documents, which preserves compatibility with
+   already released clients.
 4. One archive asset with the canonical version and target name.
 5. One `<archive>.sigstore.json` bundle whose certificate identity is exactly
    Astrid's `release.yml` workflow at that version tag and whose issuer is
@@ -24,7 +27,7 @@ exact platform archive:
 6. Fresh Sigstore public-good trust material refreshed through TUF from the
    pinned verifier's embedded production root.
 7. One strict lowercase BLAKE3 entry for the archive in `BLAKE3SUMS.txt` that
-   also equals the digest in the signed legacy manifest or musl extension.
+   also equals the digest in the signed legacy manifest or platform extension.
 
 Publisher authentication happens before the independent BLAKE3 integrity
 check. The archive is not written, extracted, or installed until both stages

@@ -11,6 +11,7 @@ from pathlib import Path
 
 import release_manifest
 import musl_release_manifest
+import windows_release_manifest
 
 
 FIXED_PAYLOADS = ("BLAKE3SUMS.txt", "SHA256SUMS.txt")
@@ -69,13 +70,10 @@ def validate_release_assets(
 
     archives = {target["asset"] for target in metadata["targets"]}
     payloads = archives | set(FIXED_PAYLOADS) | {metadata_name}
-    musl_metadata_name = musl_release_manifest.metadata_name(version)
-    musl_archives = {
-        release_manifest.expected_asset(version, target)
-        for target in release_manifest.MUSL_TARGETS
-    }
-    musl_markers = {musl_metadata_name, *musl_archives}
-    musl_markers |= {f"{name}.sigstore.json" for name in musl_markers}
+    extension_contracts = (
+        (musl_release_manifest, release_manifest.MUSL_TARGETS),
+        (windows_release_manifest, release_manifest.WINDOWS_TARGETS),
+    )
     checksum_assets = set(
         release_manifest.read_checksums(
             directory / "BLAKE3SUMS.txt", "BLAKE3"
@@ -85,23 +83,30 @@ def validate_release_assets(
             directory / "SHA256SUMS.txt", "SHA-256"
         )
     )
-    has_musl_extension = bool(
-        ({path.name for path in entries} & musl_markers)
-        or (checksum_assets & musl_archives)
-    )
-    musl_metadata = None
-    if has_musl_extension:
-        musl_metadata_path = directory / musl_metadata_name
-        musl_metadata = musl_release_manifest.load_manifest(musl_metadata_path)
-        musl_release_manifest.validate_manifest(
-            musl_metadata,
+    extension_metadata = []
+    entry_names = {path.name for path in entries}
+    for module, extension_targets in extension_contracts:
+        extension_name = module.metadata_name(version)
+        extension_archives = {
+            release_manifest.expected_asset(version, target)
+            for target in extension_targets
+        }
+        markers = {extension_name, *extension_archives}
+        markers |= {f"{name}.sigstore.json" for name in markers}
+        if not ((entry_names & markers) or (checksum_assets & extension_archives)):
+            continue
+        extension_path = directory / extension_name
+        extension = module.load_manifest(extension_path)
+        module.validate_manifest(
+            extension,
             legacy_manifest=metadata,
             legacy_manifest_blake3=release_manifest.blake3_file(metadata_path),
             artifacts=directory,
             verify_artifacts=True,
             require_bundles=True,
         )
-        payloads |= musl_archives | {musl_metadata_name}
+        extension_metadata.append(extension)
+        payloads |= extension_archives | {extension_name}
 
     expected = payloads | {f"{name}.sigstore.json" for name in payloads}
     actual = {path.name for path in entries}
@@ -118,8 +123,9 @@ def validate_release_assets(
         metadata, directory / "SHA256SUMS.txt", "sha256"
     )
     targets = list(metadata["targets"])
-    if musl_metadata is not None:
-        targets.extend(musl_metadata["targets"])
+    if extension_metadata:
+        for extension in extension_metadata:
+            targets.extend(extension["targets"])
         for algorithm, checksum_name in (
             ("blake3", "BLAKE3SUMS.txt"),
             ("sha256", "SHA256SUMS.txt"),

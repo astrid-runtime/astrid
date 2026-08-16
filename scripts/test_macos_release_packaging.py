@@ -39,6 +39,9 @@ def write_release(root: pathlib.Path) -> None:
     (extension / "MacOS/AstridFSAppEx").chmod(0o755)
     (root / "astrid-storage-provider-fskit").write_bytes(b"provider\n")
     (root / "astrid-storage-provider-fskit").chmod(0o755)
+    for name in ("astrid", "astrid-daemon", "astrid-build", "astrid-emit"):
+        (root / name).write_bytes(f"{name}\n".encode())
+        (root / name).chmod(0o755)
     for name in ("manage-macos-fskit.sh", "validate-macos-fskit.sh"):
         (macos / name).write_bytes(b"#!/bin/sh\n")
         (macos / name).chmod(0o755)
@@ -98,6 +101,18 @@ class MacOSReleasePackagingTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "unsafe"):
                 validator.validate(unsafe, 123456)
+
+    def test_validation_requires_every_common_executable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = pathlib.Path(temporary)
+            root = base / "release"
+            archive = base / "release.tar.gz"
+            write_release(root)
+            (root / "astrid-emit").unlink()
+            packager.package(root, archive, 123456)
+
+            with self.assertRaisesRegex(ValueError, "astrid-emit"):
+                validator.validate(archive, 123456)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 # Astrid fleet computer and principal views
 
-Status: accepted architecture; authoritative owner filesystem and macOS provider implemented
+Status: accepted architecture; authoritative owner filesystem and native mount providers implemented
 
 Last reviewed: 2026-08-15
 
@@ -9,7 +9,7 @@ Related documents:
 - [Astrid user and fleet ownership](astrid-user-fleet-ownership.md)
 - [Astrid Principal Store](astrid-principal-store.md)
 - [Astrid Principal Store Runtime Realization](astrid-principal-store-runtime.md)
-- [Astrid Hosted Volume Format 1](../crates/astrid-storage/formats/astrid-volume-v1.txt)
+- [Astrid Hosted Volume Format 2](../crates/astrid-storage/formats/astrid-volume-v2.txt)
 - [Astrid Native Component Kernel](astrid-native-kernel.md)
 - [AOS Principal Linux Realm](https://github.com/unicity-aos/aos-ce/blob/main/docs/principal-linux-realm.md), an optional Linux capsule consumer
 
@@ -501,14 +501,14 @@ The admin view defaults to read-only and requires `--read-write` before an
 operator can request supported configuration changes.
 
 The CLI delegates to one lifecycle-independent native companion while keeping
-the command and lease semantics identical. The native macOS and Linux providers
-are included in this release slice; the Windows adapter remains future work:
+the command and lease semantics identical. Native providers for macOS, Linux,
+and Windows are included in this release slice:
 
 | Host | Native provider companion | Target when omitted |
 | --- | --- | --- |
 | macOS | `astrid-storage-provider-fskit` using FSKit | provider-selected mounted volume |
 | Linux | `astrid-storage-provider-fuse` using Linux FUSE | provider-selected mount directory |
-| Windows | `astrid-storage-provider-winfsp` using WinFsp (adapter pending) | provider-selected volume/drive |
+| Windows | `astrid-storage-provider-winfsp` using WinFsp | provider-selected volume/drive |
 
 The CLI accepts a provider only when it is co-installed beside the authenticated
 Astrid executable set; it never falls back to `PATH`. Linux release archives,
@@ -516,8 +516,8 @@ fresh installations, and managed updates carry the FUSE companion, and
 uninstalling the executable set removes it with that set. A Linux host must
 expose `/dev/fuse` and `fusermount3`; providers fail explicitly when native
 mounting is unavailable. Handoff uses the exported
-JSON standard-I/O protocol v1 rather than an argv ABI. Each request carries a
-fresh correlation ID, typed operation, requested view and access; each response
+JSON standard-I/O lifecycle protocol rather than an argv ABI. Each request
+carries a fresh correlation ID, typed operation, requested view and access; each response
 echoes the protocol and request IDs, advertises capabilities, and returns a
 stable `MountId` or bounded structured error. The provider must still
 independently authenticate to the daemon and ask for a lease: the acting
@@ -753,11 +753,12 @@ sentinel is refused. `StateOwnerCodecV2` supplies the fleet tag without changing
 the frozen version-one domain, and the CLI/provider boundary is versioned and
 typed. The authoritative filesystem, path-free volume boundary, hosted
 single-file volume, kernel lease callback service, CLI contract, and native
-macOS FSKit implementation are present. An exact macOS arm64 v0.10.4 home
-fixture imports, verifies, commits, reopens the volume, and deletes both legacy
-stores. Linux and Windows native adapters, capsule-governed user/fleet allocation
-policy, an exact Linux v0.10.4 home, low-disk evidence, and the complete fault
-matrix remain follow-up evidence.
+macOS FSKit, Linux FUSE, and Windows WinFsp implementations are present. An
+exact macOS arm64 v0.10.4 home fixture imports, verifies, commits, reopens the
+volume, and deletes both legacy stores. Capsule-governed user/fleet allocation
+policy remains tracked separately in issue #1539. Exact Linux release-upgrade,
+low-disk, native-mount, and extended fault evidence are release gates rather
+than unimplemented adapter claims.
 
 ## 11. Product story
 
@@ -770,7 +771,8 @@ The simple truthful story is:
 > independent view, overlay, active processes, desktop, working context, and
 > identity. Each agent may use a different capsule-composed harness and external
 > AI connector. The same fleet may also contain non-cognitive principals such as
-> work together without stepping on one another's active state.
+> vaults and automation services. They work together without stepping on one
+> another's active state.
 
 The shorter phrase is:
 
@@ -784,7 +786,7 @@ The security qualification is:
 ## 12. Remaining implementation order
 
 The provider-neutral filesystem operations, owner-bound kernel leases, CLI
-handoff, macOS FSKit adapter, and exact macOS v0.10.4 migration fixture are now
+handoff, all three native adapters, and exact macOS v0.10.4 migration fixture are
 implemented. Remaining work is ordered as follows:
 
 1. Complete release migration evidence with an exact Linux v0.10.4 fixture,
@@ -797,8 +799,7 @@ implemented. Remaining work is ordered as follows:
    ceilings, and fail closed without synchronous capsule IPC in a store
    transaction.
 3. Adapt the AOS Linux Realm to choose a principal disk, fleet-shared disk, or
-   both without changing storage authority; implement Windows WinFsp against
-   the same callback protocol.
+   both without changing storage authority.
 4. Extend filesystem compatibility where workloads justify it: durable rich
    metadata, symbolic links, extended attributes, locking, `mmap`, sparse-file
    policy, provider restart recovery, and adversarial compiler/editor tests.

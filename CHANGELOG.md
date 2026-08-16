@@ -29,15 +29,12 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   immutable content DAGs, directories live in the same owner catalog, and
   acknowledged create, write, truncate, remove, rename, and sync operations
   atomically publish through the typed store. Kernel-issued leases bind owner,
-  access, expiry, and a private callback secret; the native macOS 26 FSKit app
-  extension plus lifecycle companion and the native Linux FUSE lifecycle
-  companion implement mounted views. The provider-neutral contract reserves
-  Windows WinFsp without pretending that adapter is already shipped. Mounting
-  does not provision storage. Refs #1391 and #1534.
-  extension and co-installed lifecycle companion implement the first mounted
-  drive. The provider-neutral contract reserves Linux FUSE and Windows WinFsp
-  adapters without pretending those native adapters are already shipped.
-  Mounting does not provision storage. Refs #1391 and #1534.
+  access, expiry, and a private callback secret. Native mounted views ship through
+  the macOS 26 FSKit app and lifecycle companion, Linux FUSE companion, and
+  Windows WinFsp companion. All three adapters use the same bounded V2 callback
+  contract while the kernel retains V1 decoding compatibility. Mounting exposes
+  an already-authorized owner root; it never provisions a user, principal, fleet,
+  store, or allocation. Refs #1391 and #1534.
 - **macOS storage mounts now ship as a complete governed release surface.**
   The archive includes the signed Developer ID AstridFS app and FSKit
   extension, the Rust companion, deterministic metadata, notarization and staple

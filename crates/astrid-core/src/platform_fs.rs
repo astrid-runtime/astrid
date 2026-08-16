@@ -426,6 +426,7 @@ fn ensure_private_directory_unix(path: &Path) -> io::Result<()> {
         directory = std::fs::File::from(next);
     }
     fchmod(&directory, Mode::from_bits_truncate(0o700)).map_err(nix_io_error)?;
+    #[cfg(target_os = "macos")]
     remove_extended_acl_macos(path)?;
     validate_private_directory_unix(path)
 }
@@ -470,6 +471,7 @@ fn restrict_private_file_unix(path: &Path) -> io::Result<()> {
     fchmod(&file, Mode::from_bits_truncate(0o600)).map_err(nix_io_error)?;
     file.sync_all()?;
     drop(file);
+    #[cfg(target_os = "macos")]
     remove_extended_acl_macos(path)?;
     validate_private_file_unix(path)
 }
@@ -519,12 +521,6 @@ fn remove_extended_acl_macos(path: &Path) -> io::Result<()> {
             "failed to remove extended access-control list",
         ))
     }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn remove_extended_acl_macos(path: &Path) -> io::Result<()> {
-    let _ = path;
-    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -818,11 +814,24 @@ fn replace_executable_set_by_rename(
     let mut staged = Vec::new();
     for name in names {
         let temporary = install_dir.join(format!(".{name}.new"));
-        std::fs::copy(extract_dir.join(name), &temporary)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o755))?;
+        let stage_result = (|| -> io::Result<()> {
+            std::fs::copy(extract_dir.join(name), &temporary)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o755))?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = stage_result {
+            let _ = std::fs::remove_file(&temporary);
+            for (staged_temporary, _) in &staged {
+                let _ = std::fs::remove_file(staged_temporary);
+            }
+            return Err(io::Error::new(
+                error.kind(),
+                format!("failed to stage {}: {error}", temporary.display()),
+            ));
         }
         staged.push((temporary, install_dir.join(name)));
     }
@@ -830,9 +839,17 @@ fn replace_executable_set_by_rename(
     for (index, (temporary, live)) in staged.iter().enumerate() {
         if let Err(error) = std::fs::rename(temporary, live) {
             let mut rollback_errors = Vec::new();
-            for (backup_live, backup) in &backups {
-                if let Err(rollback_error) = std::fs::rename(backup, backup_live) {
-                    rollback_errors.push(format!("{}: {rollback_error}", backup_live.display()));
+            for (_, installed_live) in &staged[..index] {
+                if let Some((_, backup)) = backups
+                    .iter()
+                    .find(|(backup_live, _)| backup_live == installed_live)
+                {
+                    if let Err(rollback_error) = std::fs::rename(backup, installed_live) {
+                        rollback_errors
+                            .push(format!("{}: {rollback_error}", installed_live.display()));
+                    }
+                } else if let Err(rollback_error) = std::fs::remove_file(installed_live) {
+                    rollback_errors.push(format!("{}: {rollback_error}", installed_live.display()));
                 }
             }
             for (remaining, _) in &staged[index..] {

@@ -1,0 +1,20 @@
+schema-version = 1
+kind = "astrid-release-windows-extension"
+product = "astrid-runtime"
+repository = "astrid-runtime/astrid"
+version = "1.2.3"
+tag = "v1.2.3"
+source-commit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+release-workflow-identity = "https://github.com/astrid-runtime/astrid/.github/workflows/release.yml@refs/tags/v1.2.3"
+
+[legacy-release]
+metadata-asset = "astrid-1.2.3-release.toml"
+metadata-blake3 = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[[targets]]
+triple = "x86_64-pc-windows-msvc"
+asset = "astrid-1.2.3-x86_64-pc-windows-msvc.tar.gz"
+size = 50
+blake3 = "0000000000000000000000000000000000000000000000000000000000000032"
+sha256 = "000000000000000000000000000000000000000000000000000000000000003c"
+sigstore-bundle = "astrid-1.2.3-x86_64-pc-windows-msvc.tar.gz.sigstore.json"

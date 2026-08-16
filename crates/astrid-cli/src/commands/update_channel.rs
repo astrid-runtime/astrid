@@ -22,6 +22,7 @@ const TARGETS: &[&str] = &[
     "x86_64-unknown-linux-gnu",
 ];
 const MUSL_TARGETS: &[&str] = &["aarch64-unknown-linux-musl", "x86_64-unknown-linux-musl"];
+const WINDOWS_TARGETS: &[&str] = &["x86_64-pc-windows-msvc"];
 const MAX_RELEASE_METADATA_BYTES: usize = 2 * 1024 * 1024;
 const MAX_BUNDLE_BYTES: usize = 256 * 1024;
 const MAX_MANIFEST_BYTES: usize = 256 * 1024;
@@ -56,19 +57,19 @@ pub(super) struct ResolvedChannelRelease {
     pub(super) target_blake3: String,
 }
 
-trait MuslMetadataSource {
+trait ExtensionMetadataSource {
     async fn download(&self, url: &str, limit: usize, label: &str) -> anyhow::Result<Vec<u8>>;
 
     fn authenticate(&self, bytes: Vec<u8>, bundle: &[u8], version: &str)
     -> anyhow::Result<Vec<u8>>;
 }
 
-struct ProductionMuslMetadataSource<'a> {
+struct ProductionExtensionMetadataSource<'a> {
     client: &'a reqwest::Client,
     authenticator: &'a MetadataAuthenticator,
 }
 
-impl MuslMetadataSource for ProductionMuslMetadataSource<'_> {
+impl ExtensionMetadataSource for ProductionExtensionMetadataSource<'_> {
     async fn download(&self, url: &str, limit: usize, label: &str) -> anyhow::Result<Vec<u8>> {
         download_bounded(self.client, url, limit, label).await
     }
@@ -177,7 +178,7 @@ pub(super) async fn resolve_signed_channel(
         .map_err(anyhow::Error::new)?
         .into_bytes();
     verify_release_manifest(&manifest, &parsed)?;
-    let metadata_source = ProductionMuslMetadataSource {
+    let metadata_source = ProductionExtensionMetadataSource {
         client,
         authenticator: &authenticator,
     };
@@ -262,7 +263,7 @@ struct LegacyReleaseBinding {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
-struct MuslReleaseExtension {
+struct ReleaseExtension {
     schema_version: i64,
     kind: String,
     product: String,
@@ -380,8 +381,12 @@ fn musl_metadata_asset(version: &str) -> String {
     format!("astrid-{version}-musl-release.toml")
 }
 
+fn windows_metadata_asset(version: &str) -> String {
+    format!("astrid-{version}-windows-release.toml")
+}
+
 async fn resolve_target_blake3(
-    source: &impl MuslMetadataSource,
+    source: &impl ExtensionMetadataSource,
     release: &serde_json::Value,
     legacy_manifest: &[u8],
     pointer: &ChannelPointer,
@@ -390,11 +395,24 @@ async fn resolve_target_blake3(
     if TARGETS.contains(&target) {
         return Ok(pointer.target(target)?.blake3.clone());
     }
-    if !MUSL_TARGETS.contains(&target) {
-        bail!("signed release metadata does not support target '{target}'");
-    }
-
-    let extension_asset = musl_metadata_asset(pointer.version());
+    let (extension_asset, extension_kind, extension_targets, label) =
+        if MUSL_TARGETS.contains(&target) {
+            (
+                musl_metadata_asset(pointer.version()),
+                "astrid-release-musl-extension",
+                MUSL_TARGETS,
+                "musl",
+            )
+        } else if WINDOWS_TARGETS.contains(&target) {
+            (
+                windows_metadata_asset(pointer.version()),
+                "astrid-release-windows-extension",
+                WINDOWS_TARGETS,
+                "Windows",
+            )
+        } else {
+            bail!("signed release metadata does not support target '{target}'");
+        };
     let extension_url = exact_asset_url(release, &extension_asset)?.to_owned();
     let extension_bundle_url =
         exact_asset_url(release, &format!("{extension_asset}.sigstore.json"))?.to_owned();
@@ -402,18 +420,26 @@ async fn resolve_target_blake3(
         .download(
             &extension_url,
             MAX_MANIFEST_BYTES,
-            "immutable musl release metadata",
+            &format!("immutable {label} release metadata"),
         )
         .await?;
     let extension_bundle = source
         .download(
             &extension_bundle_url,
             MAX_BUNDLE_BYTES,
-            "musl release metadata authentication bundle",
+            &format!("{label} release metadata authentication bundle"),
         )
         .await?;
     let extension = source.authenticate(extension, &extension_bundle, pointer.version())?;
-    verify_musl_extension(&extension, legacy_manifest, pointer, target)
+    verify_release_extension(
+        &extension,
+        legacy_manifest,
+        pointer,
+        target,
+        extension_kind,
+        extension_targets,
+        label,
+    )
 }
 
 pub(super) fn parse_channel(
@@ -581,19 +607,58 @@ fn verify_musl_extension(
     pointer: &ChannelPointer,
     target: &str,
 ) -> anyhow::Result<String> {
+    verify_release_extension(
+        bytes,
+        legacy_manifest_bytes,
+        pointer,
+        target,
+        "astrid-release-musl-extension",
+        MUSL_TARGETS,
+        "musl",
+    )
+}
+
+fn verify_windows_extension(
+    bytes: &[u8],
+    legacy_manifest_bytes: &[u8],
+    pointer: &ChannelPointer,
+    target: &str,
+) -> anyhow::Result<String> {
+    verify_release_extension(
+        bytes,
+        legacy_manifest_bytes,
+        pointer,
+        target,
+        "astrid-release-windows-extension",
+        WINDOWS_TARGETS,
+        "Windows",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_release_extension(
+    bytes: &[u8],
+    legacy_manifest_bytes: &[u8],
+    pointer: &ChannelPointer,
+    target: &str,
+    expected_kind: &str,
+    expected_targets: &[&str],
+    label: &str,
+) -> anyhow::Result<String> {
     ensure!(
-        MUSL_TARGETS.contains(&target),
-        "musl release metadata does not support target '{target}'"
+        expected_targets.contains(&target),
+        "{label} release metadata does not support target '{target}'"
     );
-    let text = std::str::from_utf8(bytes).context("musl release metadata is not UTF-8")?;
-    let extension: MuslReleaseExtension =
-        toml::from_str(text).context("musl release metadata is invalid TOML")?;
+    let text = std::str::from_utf8(bytes)
+        .with_context(|| format!("{label} release metadata is not UTF-8"))?;
+    let extension: ReleaseExtension = toml::from_str(text)
+        .with_context(|| format!("{label} release metadata is invalid TOML"))?;
     ensure!(
         extension.schema_version == 1
-            && extension.kind == "astrid-release-musl-extension"
+            && extension.kind == expected_kind
             && extension.product == PRODUCT
             && extension.repository == REPOSITORY,
-        "musl release metadata identity is invalid"
+        "{label} release metadata identity is invalid"
     );
     canonical_version(&extension.version)?;
     ensure!(
@@ -601,26 +666,26 @@ fn verify_musl_extension(
             && extension.tag == pointer.release.tag
             && extension.source_commit == pointer.release.source_commit
             && extension.release_workflow_identity == pointer.release.release_workflow_identity,
-        "musl release metadata does not match the authenticated legacy release"
+        "{label} release metadata does not match the authenticated legacy release"
     );
     ensure!(
         extension.legacy_release.metadata_asset == pointer.release.metadata_asset
             && extension.legacy_release.metadata_blake3 == pointer.release.metadata_blake3
             && blake3::hash(legacy_manifest_bytes).to_hex().as_str()
                 == extension.legacy_release.metadata_blake3,
-        "musl release metadata does not bind the authenticated legacy release manifest"
+        "{label} release metadata does not bind the authenticated legacy release manifest"
     );
     validate_targets_for(
         &extension.targets,
-        MUSL_TARGETS,
+        expected_targets,
         &extension.version,
-        "musl release metadata",
+        &format!("{label} release metadata"),
     )?;
     Ok(extension
         .targets
         .iter()
         .find(|entry| entry.triple == target)
-        .context("musl release metadata target set is incomplete")?
+        .with_context(|| format!("{label} release metadata target set is incomplete"))?
         .blake3
         .clone())
 }

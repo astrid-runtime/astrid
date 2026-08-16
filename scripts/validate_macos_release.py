@@ -58,6 +58,10 @@ def validate(archive_path: pathlib.Path, mtime: int | None = None) -> None:
         fail("release archive must contain exactly one top-level directory")
     root = next(iter(top_names))
     expected = {
+        f"{root}/astrid": 0o755,
+        f"{root}/astrid-daemon": 0o755,
+        f"{root}/astrid-build": 0o755,
+        f"{root}/astrid-emit": 0o755,
         f"{root}/astrid-storage-provider-fskit": 0o755,
         f"{root}/macos/manage-macos-fskit.sh": 0o755,
         f"{root}/macos/validate-macos-fskit.sh": 0o755,
