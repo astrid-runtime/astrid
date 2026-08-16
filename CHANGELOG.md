@@ -11,6 +11,11 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Changed
 
+- **Adversarial regression coverage now pins public runtime boundaries.**
+  Principal-owned IPC subscriptions, bounded seatbelt checks, event topic depth
+  and accessors, workspace-relative approval boundaries, and resource-pattern
+  semantics are each locked by dedicated regressions.
+
 - **Reviewed semver-compatible Rust dependencies were refreshed independently
   of migration-sensitive upgrades.** Routine fixes and additive releases for
   the async runtime, serialization, TLS, storage, CLI, matching, and platform
