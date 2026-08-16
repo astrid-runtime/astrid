@@ -117,6 +117,7 @@ struct LayoutMigrationReceiptV1 {
     schema: u32,
     transaction_id: String,
     intent: LayoutMigrationRecordV1,
+    destination: LayoutTreeIdentityV1,
 }
 
 impl AstridHome {
@@ -173,6 +174,9 @@ impl AstridHome {
         }
         reject_automatic_windows_layout_one()?;
         self.preflight_layout_v2_paths()?;
+        if std::fs::symlink_metadata(self.storage_volume_path()).is_ok() {
+            inventory_regular_file(&self.storage_volume_path())?;
+        }
         let intent = LayoutMigrationRecordV1::capture(self, target)?;
         ensure_migration_capacity(&self.var_dir(), intent.material.source.bytes)?;
         Self::ensure_private_dir(&self.migrations_dir())?;
@@ -230,6 +234,7 @@ impl AstridHome {
             schema: LAYOUT_MIGRATION_SCHEMA,
             transaction_id: intent.transaction_id.clone(),
             intent,
+            destination: inventory_regular_file(&self.storage_volume_path())?,
         };
         admit_or_write_canonical(
             &self.migrations_dir().join(LAYOUT_MIGRATION_RECEIPT),
@@ -286,21 +291,99 @@ impl AstridHome {
 
     pub(super) fn retire_verified_legacy_source(&self) -> io::Result<()> {
         let receipt_path = self.migrations_dir().join(LAYOUT_MIGRATION_RECEIPT);
-        if !receipt_path.is_file() {
-            if self.state_db_path().exists() {
+        let intent_path = self.migrations_dir().join(LAYOUT_MIGRATION_INTENT);
+        match std::fs::symlink_metadata(&receipt_path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if self.state_db_path().exists() || intent_path.exists() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "layout-two home contains migration state without a completion receipt",
+                    ));
+                }
+                return Ok(());
+            },
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "layout-two home contains legacy state without a migration receipt",
+                    format!(
+                        "layout migration receipt is redirected or not a regular file: {}",
+                        receipt_path.display()
+                    ),
                 ));
-            }
-            return Ok(());
+            },
+            Ok(_) => {},
+            Err(error) => return Err(error),
         }
-        retire_legacy_source(&self.state_db_path())
+
+        let receipt: LayoutMigrationReceiptV1 = read_canonical_record(&receipt_path)?;
+        let intent: LayoutMigrationRecordV1 = read_canonical_record(&intent_path)?;
+        let destination = inventory_regular_file(&self.storage_volume_path())?;
+        if receipt.schema != LAYOUT_MIGRATION_SCHEMA
+            || receipt.transaction_id != intent.transaction_id
+            || receipt.intent != intent
+            || !intent.has_recomputable_identity()
+            || receipt.destination != destination
+            || receipt.destination.physical_path_hex != intent.material.target_physical_path_hex
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "layout migration receipt does not match its intent or destination: {}",
+                    receipt_path.display()
+                ),
+            ));
+        }
+
+        match std::fs::symlink_metadata(self.state_db_path()) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+            Ok(_) => {
+                let source = inventory_tree(&self.state_db_path())?;
+                if source != receipt.intent.material.source {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "surviving legacy state differs from the verified migration source: {}",
+                            self.state_db_path().display()
+                        ),
+                    ));
+                }
+                retire_legacy_source(&self.state_db_path())
+            },
+        }
     }
 
     fn ensure_private_dir(path: &Path) -> io::Result<()> {
         crate::platform_fs::ensure_private_directory(path)
     }
+}
+
+fn read_canonical_record<T>(path: &Path) -> io::Result<T>
+where
+    T: DeserializeOwned + PartialEq + Serialize,
+{
+    let actual = std::fs::read(path)?;
+    let parsed: T = serde_json::from_slice(&actual).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "invalid layout migration record {}: {error}",
+                path.display()
+            ),
+        )
+    })?;
+    let mut expected = serde_json::to_vec(&parsed).map_err(io::Error::other)?;
+    expected.push(b'\n');
+    if actual != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "layout migration record is not canonical: {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(parsed)
 }
 
 fn verify_existing_ancestor(path: &Path) -> io::Result<()> {
@@ -334,6 +417,17 @@ fn verify_existing_ancestor(path: &Path) -> io::Result<()> {
 }
 
 impl LayoutMigrationRecordV1 {
+    fn has_recomputable_identity(&self) -> bool {
+        self.schema == LAYOUT_MIGRATION_SCHEMA
+            && self.transaction_id == layout_transaction_id(&self.material).unwrap_or_default()
+            && self.material.migration == "astrid-home-layout"
+            && self.material.from_layout == LEGACY_LAYOUT_VERSION
+            && self.material.to_layout == LAYOUT_VERSION
+            && self.material.source.path_encoding == "os-str-encoded-bytes-v1"
+            && self.material.source.inventory_algorithm == "blake3-derive-key-v1"
+            && self.material.target_path_encoding == "os-str-encoded-bytes-v1"
+    }
+
     fn capture(home: &AstridHome, target: &LayoutMigrationTarget) -> io::Result<Self> {
         let material = LayoutMigrationMaterialV1 {
             migration: "astrid-home-layout".to_owned(),
@@ -345,17 +439,20 @@ impl LayoutMigrationRecordV1 {
             target_store_format: target.store_format.clone(),
             binary_identity: target.binary_identity.clone(),
         };
-        let material_bytes = serde_json::to_vec(&material).map_err(io::Error::other)?;
-        let transaction_id = blake3::derive_key(
-            "astrid home layout migration transaction v1",
-            &material_bytes,
-        );
         Ok(Self {
             schema: LAYOUT_MIGRATION_SCHEMA,
-            transaction_id: hex::encode(transaction_id),
+            transaction_id: layout_transaction_id(&material)?,
             material,
         })
     }
+}
+
+fn layout_transaction_id(material: &LayoutMigrationMaterialV1) -> io::Result<String> {
+    let material_bytes = serde_json::to_vec(material).map_err(io::Error::other)?;
+    Ok(hex::encode(blake3::derive_key(
+        "astrid home layout migration transaction v1",
+        &material_bytes,
+    )))
 }
 
 fn admit_or_write_canonical<T>(path: &Path, expected: &T, allow_create: bool) -> io::Result<()>
@@ -447,6 +544,75 @@ fn inventory_tree(path: &Path) -> io::Result<LayoutTreeIdentityV1> {
     })
 }
 
+fn inventory_regular_file(path: &Path) -> io::Result<LayoutTreeIdentityV1> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "layout migration destination is redirected or not a regular file: {}",
+                path.display()
+            ),
+        ));
+    }
+    crate::platform_fs::verify_no_redirects(path)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "layout migration destination changed type: {}",
+                path.display()
+            ),
+        ));
+    }
+    let mut hasher = blake3::Hasher::new_derive_key("astrid layout destination inventory v1");
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+    let mut bytes = 0_u64;
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        bytes = bytes
+            .checked_add(read as u64)
+            .ok_or_else(|| io::Error::other("layout destination length overflow"))?;
+        hasher.update(&buffer[..read]);
+    }
+    if bytes != metadata.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "layout migration destination changed while inventoried: {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(LayoutTreeIdentityV1 {
+        path_encoding: "os-str-encoded-bytes-v1".to_owned(),
+        physical_path_hex: physical_path_hex(path)?,
+        inventory_algorithm: "blake3-derive-key-v1".to_owned(),
+        inventory_digest: hasher.finalize().to_hex().to_string(),
+        entries: 1,
+        bytes,
+    })
+}
+
 fn inventory_directory(
     root: &Path,
     directory: &Path,
@@ -470,6 +636,7 @@ fn inventory_directory(
                 ),
             ));
         }
+        validate_legacy_surrealkv_entry(relative, metadata.is_dir(), metadata.is_file())?;
         *entries = entries
             .checked_add(1)
             .ok_or_else(|| io::Error::other("layout inventory entry count overflow"))?;
@@ -540,6 +707,60 @@ fn inventory_directory(
         }
     }
     Ok(())
+}
+
+fn validate_legacy_surrealkv_entry(
+    relative: &Path,
+    is_directory: bool,
+    is_file: bool,
+) -> io::Result<()> {
+    let components: Vec<_> = relative.components().collect();
+    let valid = match components.as_slice() {
+        [entry] if entry.as_os_str() == "LOCK" => is_file,
+        [entry]
+            if matches!(
+                entry.as_os_str().to_str(),
+                Some("manifest" | "wal" | "sstables" | "vlog" | "versioned_index")
+            ) =>
+        {
+            is_directory
+        },
+        [directory, name] if directory.as_os_str() == "manifest" && is_file => {
+            is_numbered_legacy_file(name.as_os_str(), b".manifest")
+        },
+        [directory, name] if directory.as_os_str() == "wal" && is_file => {
+            is_numbered_legacy_file(name.as_os_str(), b".wal")
+        },
+        [directory, name] if directory.as_os_str() == "sstables" && is_file => {
+            is_numbered_legacy_file(name.as_os_str(), b".sst")
+        },
+        [directory, name] if directory.as_os_str() == "vlog" && is_file => {
+            is_numbered_legacy_file(name.as_os_str(), b".vlog")
+        },
+        [directory, name]
+            if directory.as_os_str() == "versioned_index" && name.as_os_str() == "index.bpt" =>
+        {
+            is_file
+        },
+        _ => false,
+    };
+    if !valid {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unexpected entry in released legacy SurrealKV source: {}",
+                relative.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn is_numbered_legacy_file(name: &std::ffi::OsStr, extension: &[u8]) -> bool {
+    let bytes = name.as_encoded_bytes();
+    bytes.split_at_checked(20).is_some_and(|(digits, suffix)| {
+        digits.iter().all(u8::is_ascii_digit) && suffix == extension
+    })
 }
 
 fn hash_inventory_field(hasher: &mut blake3::Hasher, label: &[u8], value: &[u8]) {

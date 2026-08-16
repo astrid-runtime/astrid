@@ -535,7 +535,7 @@ async fn open_runtime_principal_store_with_options(
         let engine = volume_migration::open_existing(home, policy)?.ok_or_else(|| {
             StorageError::Connection("Astrid volume disappeared while opening".to_owned())
         })?;
-        volume_migration::retire_verified_directory_if_present(home)?;
+        volume_migration::retire_verified_directory_if_present(home, &engine)?;
         return assemble_runtime_store(home, quota, principals, Arc::new(engine)).await;
     }
     let store_path = home.principal_store_path();

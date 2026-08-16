@@ -554,6 +554,47 @@ async fn volume_without_its_cutover_receipt_fails_closed() {
     assert!(error.to_string().contains("cutover receipt"), "{error}");
 }
 
+#[tokio::test]
+async fn changed_surviving_directory_store_is_retained_after_cutover() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    super::format_migration_tests::seed_current_directory_store(&home);
+    let migrated = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    migrated.engine.close().unwrap();
+    drop(migrated);
+    assert!(!home.principal_store_path().exists());
+
+    super::format_migration_tests::seed_current_directory_store(&home);
+    let source = Arc::new(
+        RuntimeEngine::open(
+            home.principal_store_path(),
+            Blake3ObjectIdentityV1,
+            StateOwnerCodecV2,
+            RecoveryLimits::process_addressable(),
+        )
+        .unwrap(),
+    );
+    let changed = RuntimeStore::from_engine(
+        Arc::clone(&source),
+        StateOwnerResolver::new(test_directory(&["alice"])),
+    );
+    changed
+        .set("alice:capsule:shell", "drift", b"changed".to_vec())
+        .await
+        .unwrap();
+    source.close().unwrap();
+    drop(changed);
+    drop(source);
+
+    let Err(error) = open_runtime_principal_store(&home, unlimited_quota()).await else {
+        panic!("changed surviving directory store was retired and served");
+    };
+    assert!(error.to_string().contains("cutover receipt"), "{error}");
+    assert!(home.principal_store_path().exists());
+}
+
 fn replace_catalog_with_legacy(
     engine: &RuntimeEngine,
     owner: &StateOwner,
