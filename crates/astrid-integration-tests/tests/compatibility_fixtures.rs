@@ -12,7 +12,9 @@ use astrid_kernel::pair_token::PairTokenStore;
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
+        .parent()
+        .and_then(Path::parent)
+        .expect("integration-test crate lives beneath the repository root")
         .join("e2e/fixtures/compat")
         .join(name)
 }
