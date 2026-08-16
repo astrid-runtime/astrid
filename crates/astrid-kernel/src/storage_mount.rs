@@ -60,7 +60,35 @@ pub(crate) struct StorageMountLeaseState {
     expires_at_epoch_secs: AtomicU64,
     revoked: AtomicBool,
     dirty: AtomicBool,
+    in_flight_mutations: AtomicU64,
     shutdown_tx: watch::Sender<bool>,
+    #[cfg(test)]
+    mutation_test_gate: std::sync::Mutex<Option<Arc<MutationTestGate>>>,
+}
+
+struct InFlightMutation<'a> {
+    count: &'a AtomicU64,
+}
+
+impl<'a> InFlightMutation<'a> {
+    fn begin(state: &'a StorageMountLeaseState) -> Self {
+        state.in_flight_mutations.fetch_add(1, Ordering::AcqRel);
+        Self {
+            count: &state.in_flight_mutations,
+        }
+    }
+}
+
+impl Drop for InFlightMutation<'_> {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[cfg(test)]
+struct MutationTestGate {
+    entered: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
 }
 
 impl StorageMountLeaseState {
@@ -141,7 +169,10 @@ pub(crate) async fn issue_lease(
         expires_at_epoch_secs: AtomicU64::new(now_epoch_secs().saturating_add(LEASE_IDLE_TTL_SECS)),
         revoked: AtomicBool::new(false),
         dirty: AtomicBool::new(false),
+        in_flight_mutations: AtomicU64::new(0),
         shutdown_tx,
+        #[cfg(test)]
+        mutation_test_gate: std::sync::Mutex::new(None),
     });
 
     #[cfg(unix)]
@@ -180,6 +211,7 @@ pub(crate) fn lease_status(
         "resource_path": state.resource_path,
         "callback_path": state.callback_path,
         "dirty": state.dirty.load(Ordering::Acquire),
+        "in_flight_mutations": state.in_flight_mutations.load(Ordering::Acquire),
         "expires_at_epoch_secs": state.expires_at_epoch_secs.load(Ordering::Acquire),
     }))
 }
@@ -568,7 +600,9 @@ async fn execute_operation(
     state: &StorageMountLeaseState,
     operation: StorageFilesystemOperationV1,
 ) -> StorageFilesystemOutcomeV1 {
-    if is_mutation(&operation) && state.access != StorageProviderAccessV1::ReadWrite {
+    let is_mutation = is_mutation(&operation);
+    let is_sync = matches!(&operation, StorageFilesystemOperationV1::Sync);
+    if is_mutation && state.access != StorageProviderAccessV1::ReadWrite {
         return failure("read-only", "storage mount lease is read-only");
     }
     let _mutation_guard = if requires_mutation_serialization(&operation) {
@@ -576,13 +610,15 @@ async fn execute_operation(
         if !state.is_live() {
             return failure("stale-lease", "storage mount lease is expired or revoked");
         }
-        if is_mutation(&operation) {
-            state.dirty.store(true, Ordering::Release);
-        }
         Some(guard)
     } else {
         None
     };
+    let _in_flight = is_mutation.then(|| InFlightMutation::begin(state));
+    #[cfg(test)]
+    if is_mutation {
+        pause_mutation_for_test(state).await;
+    }
     let Some(store) = kernel.principal_store.clone() else {
         return failure("unavailable", "native principal store is unavailable");
     };
@@ -592,10 +628,33 @@ async fn execute_operation(
         execute_blocking(&filesystem, operation)
     })
     .await;
-    match result {
+    let outcome = match result {
         Ok(Ok(success)) => StorageFilesystemOutcomeV1::Success(success),
         Ok(Err(error)) => map_filesystem_error(&error),
         Err(error) => failure("internal", &format!("filesystem worker failed: {error}")),
+    };
+    if matches!(&outcome, StorageFilesystemOutcomeV1::Success(_)) {
+        if is_mutation {
+            state.dirty.store(true, Ordering::Release);
+        } else if is_sync {
+            state.dirty.store(false, Ordering::Release);
+        }
+    }
+    outcome
+}
+
+#[cfg(test)]
+async fn pause_mutation_for_test(state: &StorageMountLeaseState) {
+    let gate = state
+        .mutation_test_gate
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(gate) = gate {
+        gate.entered.add_permits(1);
+        if let Ok(permit) = gate.release.acquire().await {
+            permit.forget();
+        }
     }
 }
 

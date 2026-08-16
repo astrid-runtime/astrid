@@ -458,6 +458,83 @@ async fn version_two_framing_transports_maximum_file_io() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dirty_tracks_only_successfully_acknowledged_unsynced_mutations() {
+    let temporary = tempfile::tempdir().unwrap();
+    let home = astrid_core::dirs::AstridHome::from_path(temporary.path().join(".astrid"));
+    let kernel = crate::test_kernel_with_home(home).await;
+    let caller = PrincipalId::default();
+    let lease = issue_lease(
+        &kernel,
+        caller.clone(),
+        true,
+        StorageProviderViewV1::Admin,
+        StorageProviderAccessV1::ReadWrite,
+        "test-provider".to_owned(),
+        temporary.path().join("mount"),
+    )
+    .await
+    .unwrap();
+    let state = Arc::clone(kernel.storage_mounts.get(&lease.mount_id).unwrap().value());
+
+    let missing = callback(
+        &lease,
+        &lease.lease_token,
+        StorageFilesystemOperationV1::Remove {
+            path: "missing.txt".to_owned(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        missing,
+        StorageFilesystemOutcomeV1::Failure(StorageFilesystemFailureV1 { code, .. })
+            if code == "not-found"
+    ));
+    assert!(!state.dirty.load(Ordering::Acquire));
+    assert_eq!(state.in_flight_mutations.load(Ordering::Acquire), 0);
+
+    assert_eq!(
+        callback(&lease, &lease.lease_token, create("created.txt")).await,
+        StorageFilesystemOutcomeV1::Success(StorageFilesystemSuccessV1::Done)
+    );
+    assert!(state.dirty.load(Ordering::Acquire));
+    assert_eq!(state.in_flight_mutations.load(Ordering::Acquire), 0);
+
+    let still_missing = callback(
+        &lease,
+        &lease.lease_token,
+        StorageFilesystemOperationV1::Remove {
+            path: "still-missing.txt".to_owned(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        still_missing,
+        StorageFilesystemOutcomeV1::Failure(StorageFilesystemFailureV1 { code, .. })
+            if code == "not-found"
+    ));
+    assert!(state.dirty.load(Ordering::Acquire));
+
+    assert_eq!(
+        callback(
+            &lease,
+            &lease.lease_token,
+            StorageFilesystemOperationV1::Sync,
+        )
+        .await,
+        StorageFilesystemOutcomeV1::Success(StorageFilesystemSuccessV1::Done)
+    );
+    assert!(!state.dirty.load(Ordering::Acquire));
+    assert_eq!(state.in_flight_mutations.load(Ordering::Acquire), 0);
+    let status = lease_status(&kernel, &caller, true, lease.mount_id).unwrap();
+    assert_eq!(status["dirty"], false);
+    assert_eq!(status["in_flight_mutations"], 0);
+
+    revoke_lease(&kernel, &caller, true, lease.mount_id)
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn revoke_drains_an_in_flight_mutation_and_fences_new_mutation() {
     let temporary = tempfile::tempdir().unwrap();
     let home = astrid_core::dirs::AstridHome::from_path(temporary.path().join(".astrid"));
@@ -482,9 +559,13 @@ async fn revoke_drains_an_in_flight_mutation_and_fences_new_mutation() {
         .await
         .unwrap();
     let state = Arc::clone(kernel.storage_mounts.get(&lease.mount_id).unwrap().value());
+    let gate = Arc::new(MutationTestGate {
+        entered: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+    });
+    *state.mutation_test_gate.lock().unwrap() = Some(Arc::clone(&gate));
     let mutation_kernel = Arc::clone(&kernel);
     let mutation_state = Arc::clone(&state);
-    let mutation_bytes = vec![0x36_u8; usize::try_from(STORAGE_FILESYSTEM_MAX_IO_BYTES).unwrap()];
     let mutation = tokio::spawn(async move {
         execute_operation(
             &mutation_kernel,
@@ -492,28 +573,34 @@ async fn revoke_drains_an_in_flight_mutation_and_fences_new_mutation() {
             StorageFilesystemOperationV1::Write {
                 path: "in-flight.bin".to_owned(),
                 offset: 0,
-                data: mutation_bytes,
+                data: vec![0x36_u8; 64],
             },
         )
         .await
     });
-    while !state.dirty.load(Ordering::Acquire) {
-        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-    }
+    gate.entered.acquire().await.unwrap().forget();
+    assert_eq!(state.in_flight_mutations.load(Ordering::Acquire), 1);
+    assert!(!state.dirty.load(Ordering::Acquire));
     let revocation_kernel = Arc::clone(&kernel);
     let revocation_caller = caller.clone();
     let revocation = tokio::spawn(async move {
         revoke_lease(&revocation_kernel, &revocation_caller, true, lease.mount_id).await
     });
+    while !state.revoked.load(Ordering::Acquire) {
+        tokio::task::yield_now().await;
+    }
+    assert!(!revocation.is_finished());
+    assert_eq!(state.in_flight_mutations.load(Ordering::Acquire), 1);
+    gate.release.add_permits(1);
 
     let outcome = mutation.await.unwrap();
     assert!(matches!(
         outcome,
-        StorageFilesystemOutcomeV1::Success(StorageFilesystemSuccessV1::Written(
-            STORAGE_FILESYSTEM_MAX_IO_BYTES
-        ))
+        StorageFilesystemOutcomeV1::Success(StorageFilesystemSuccessV1::Written(64))
     ));
     revocation.await.unwrap().unwrap();
+    assert_eq!(state.in_flight_mutations.load(Ordering::Acquire), 0);
+    assert!(state.dirty.load(Ordering::Acquire));
     assert!(!kernel.storage_mounts.contains_key(&lease.mount_id));
     assert!(!lease.callback_path.exists());
     let fenced = execute_operation(&kernel, &state, create("after-revoke.txt")).await;
