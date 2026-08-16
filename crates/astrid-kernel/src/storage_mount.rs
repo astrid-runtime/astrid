@@ -401,8 +401,17 @@ async fn serve_listener(
     listener: LocalListener,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
-    let mut expiry_check = tokio::time::interval(std::time::Duration::from_mins(1));
+    let expiry_period = std::time::Duration::from_mins(1);
+    let first_expiry_check = tokio::time::Instant::now()
+        .checked_add(expiry_period)
+        .expect("one-minute mount expiry interval must fit in a monotonic instant");
+    let mut expiry_check = tokio::time::interval_at(first_expiry_check, expiry_period);
     expiry_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Windows acceptance claims a connected pipe, installs its replacement,
+    // then pre-reads one byte before authenticating the client. Keep that one
+    // future alive across harmless expiry ticks: recreating it on every
+    // `select!` iteration could drop a claimed pipe and break a valid client.
+    let mut accepted = Box::pin(local_transport::accept(&listener));
     loop {
         tokio::select! {
             _ = shutdown_rx.changed() => break,
@@ -416,8 +425,9 @@ async fn serve_listener(
                     break;
                 }
             },
-            accepted = local_transport::accept(&listener) => {
-                match accepted {
+            result = accepted.as_mut() => {
+                accepted.set(local_transport::accept(&listener));
+                match result {
                     Ok(stream) => {
                         let Some(kernel) = kernel.upgrade() else { break };
                         let state = Arc::clone(&state);
