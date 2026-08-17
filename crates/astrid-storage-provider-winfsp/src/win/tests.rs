@@ -31,8 +31,8 @@ fn winfsp_drive_root_is_passed_as_a_drive_designator() {
     );
 }
 
-#[tokio::test]
-async fn native_winfsp_translates_filesystem_operations() {
+#[test]
+fn native_winfsp_translates_filesystem_operations() {
     if std::env::var_os("ASTRID_WINFSP_NATIVE_TEST").is_none() {
         eprintln!("skipping native WinFsp runtime test; set ASTRID_WINFSP_NATIVE_TEST=1");
         return;
@@ -50,7 +50,8 @@ async fn native_winfsp_translates_filesystem_operations() {
     assert!(mountpoint.symlink_metadata().is_err());
     let listener = Arc::new(local_transport::bind(&callback_path).expect("fake callback"));
     let state: FakeState = Arc::new(Mutex::new(BTreeMap::new()));
-    let server = tokio::spawn(fake_callback_server(
+    let server_runtime = tokio::runtime::Runtime::new().expect("fake callback runtime");
+    let server = server_runtime.spawn(fake_callback_server(
         Arc::clone(&listener),
         Arc::clone(&state),
     ));
@@ -137,6 +138,7 @@ async fn native_winfsp_translates_filesystem_operations() {
         "WinFsp must remove the owned mountpoint leaf after stop"
     );
     server.abort();
+    drop(server_runtime);
 }
 
 async fn fake_callback_server(listener: Arc<local_transport::LocalListener>, state: FakeState) {
