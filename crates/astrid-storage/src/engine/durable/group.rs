@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::File;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -96,6 +97,49 @@ impl<P> Default for CommitGroup<P> {
             queue: VecDeque::new(),
             #[cfg(test)]
             drain_gate: None,
+        }
+    }
+}
+
+/// RAII ownership of the one active group-leader role.
+///
+/// Normal execution hands leadership to the next queued caller explicitly.
+/// If the leader unwinds, `Drop` performs the same handoff so a panic cannot
+/// leave `leader_active` true forever and wedge later commits.
+struct LeaderLease<'a, P> {
+    group: &'a Mutex<CommitGroup<P>>,
+    active: bool,
+}
+
+impl<'a, P> LeaderLease<'a, P> {
+    const fn new(group: &'a Mutex<CommitGroup<P>>) -> Self {
+        Self {
+            group,
+            active: true,
+        }
+    }
+
+    fn release(&mut self) -> Option<Arc<CommitReceipt>> {
+        if !self.active {
+            return None;
+        }
+        self.active = false;
+        let mut group = self.group.lock();
+        group
+            .queue
+            .front()
+            .map(|next| Arc::clone(&next.receipt))
+            .or_else(|| {
+                group.leader_active = false;
+                None
+            })
+    }
+}
+
+impl<P> Drop for LeaderLease<'_, P> {
+    fn drop(&mut self) {
+        if let Some(next) = self.release() {
+            next.promote();
         }
     }
 }
@@ -270,6 +314,7 @@ where
     }
 
     fn run_one_commit_group(&self) {
+        let mut lease = LeaderLease::new(&self.commit_group);
         if !self.group_policy.initial_delay().is_zero() {
             std::thread::sleep(self.group_policy.initial_delay());
         }
@@ -292,21 +337,31 @@ where
         };
         self.process_commit_group(batch);
 
-        let next_leader = {
-            let mut group = self.commit_group.lock();
-            if let Some(next) = group.queue.front() {
-                Some(Arc::clone(&next.receipt))
-            } else {
-                group.leader_active = false;
-                None
-            }
-        };
+        let next_leader = lease.release();
         if let Some(next) = next_leader {
             next.promote();
         }
     }
 
     fn process_commit_group(&self, batch: Vec<QueuedCommit<P>>) {
+        let receipts: Vec<_> = batch
+            .iter()
+            .map(|request| Arc::clone(&request.receipt))
+            .collect();
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            self.process_commit_batch(batch);
+        }));
+        if let Err(_error) = result {
+            let mut inner = self.inner.lock();
+            self.mark_requires_recovery(&mut inner);
+            drop(inner);
+            for receipt in receipts {
+                receipt.complete(Err(DurableError::RequiresRecovery));
+            }
+        }
+    }
+
+    fn process_commit_batch(&self, batch: Vec<QueuedCommit<P>>) {
         let mut completions = Vec::new();
         let mut inner = match self.lock_usable() {
             Ok(inner) => inner,

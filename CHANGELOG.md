@@ -42,6 +42,9 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   allowance is configurable as `quotas.max_in_flight_calls` (default 4, bounds
   1-64); the fuel-share helper in `astrid-capsule-types` stays policy-free and
   takes the allowance as a parameter.
+- **Storage group leadership recovers after a leader panic.** Surviving
+  members reclaim the group instead of leaving recovery permanently wedged
+  behind the departed leader.
 
 - **SurrealKV now preserves memtable rotation and compaction durability through
   its 0.21.3 fixes.** The update corrects atomic memtable rotation and fsyncs
