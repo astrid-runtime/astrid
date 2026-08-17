@@ -3148,8 +3148,12 @@ impl ExecutionEngine for WasmEngine {
             live_group_config.as_ref().map(Arc::as_ref),
             &invoking_principal,
         );
+        let max_in_flight = invocation_profile.as_deref().map_or(
+            astrid_core::profile::DEFAULT_MAX_IN_FLIGHT_CALLS,
+            |profile| profile.quotas.max_in_flight_calls,
+        );
         let invocation_fuel_budget =
-            crate::invocation_fuel_share(rate_budget, INTERCEPTOR_FUEL_BUDGET);
+            crate::invocation_fuel_share(rate_budget, INTERCEPTOR_FUEL_BUDGET, max_in_flight);
         let mut fuel_reservation = match self.fuel_rate.try_reserve(
             &invoking_principal,
             rate_budget,
