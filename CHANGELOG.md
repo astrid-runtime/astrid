@@ -31,7 +31,7 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   is removed from the profile's active methods.
 - **WASM table growth and in-flight CPU fuel are now bounded.** Guests
   cannot exceed advertised table-size or fuel budgets through table growth or
-  concurrent in-flight calls. Each invocation reserves a divided share of the
+  concurrent in-flight calls. Each invocation now reserves a divided share of the
   per-principal window so nested prompt-pipeline calls coexist while total
   in-flight reservations stay within the per-second budget.
 
