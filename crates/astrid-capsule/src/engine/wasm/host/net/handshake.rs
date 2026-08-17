@@ -236,6 +236,15 @@ fn verify_principal_signature(
     if !profile.enabled {
         return Err(format!("principal {principal} is disabled"));
     }
+    if !profile
+        .auth
+        .methods
+        .contains(&astrid_core::profile::AuthMethod::Keypair)
+    {
+        return Err(format!(
+            "principal {principal} has keypair authentication disabled"
+        ));
+    }
 
     verify_signature_against_keys(
         principal,

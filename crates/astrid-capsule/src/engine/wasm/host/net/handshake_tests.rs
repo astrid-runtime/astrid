@@ -109,6 +109,30 @@ fn home_with_registered_key(
     (dir, home)
 }
 
+#[test]
+fn registered_key_cannot_authenticate_when_keypair_method_is_disabled() {
+    let principal = PrincipalId::new("alice").expect("valid principal");
+    let keypair = astrid_crypto::KeyPair::generate();
+    let (dir, home) = home_with_registered_key(&principal, &keypair);
+
+    let profile_path = astrid_core::PrincipalProfile::path_for(&home, &principal);
+    let mut profile = astrid_core::PrincipalProfile::load_from_path(&profile_path)
+        .expect("load generated profile");
+    profile.auth.methods.clear();
+    profile.save_to_path(&profile_path).expect("save profile");
+
+    let nonce_hex = hex::encode([3u8; PRINCIPAL_AUTH_NONCE_LEN]);
+    let message = principal_auth_challenge_message(principal.as_str(), &nonce_hex);
+    let signature = keypair.sign(message.as_bytes()).to_hex();
+    let error = verify_principal_signature(&principal, &nonce_hex, &signature, &home)
+        .expect_err("keypair method must gate registered keys");
+    assert!(
+        error.contains("keypair authentication disabled"),
+        "unexpected error: {error}"
+    );
+    let _keep_home = dir;
+}
+
 /// Write one length-prefixed JSON value, then read one back.
 async fn client_send_recv<T, R, S>(stream: &mut S, value: &T) -> R
 where
