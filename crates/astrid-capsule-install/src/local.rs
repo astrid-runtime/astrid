@@ -537,7 +537,7 @@ pub(crate) fn install_from_local_path_internal(
     // Re-verify the exact source immediately before any target mutation. This
     // closes the gap between pre-install approval and the transactional copy,
     // including provenance-envelope swaps that leave content bytes unchanged.
-    let installed_authority =
+    let mut installed_authority =
         authority_for_install_source(source_dir, &manifest, installed_authority)?;
 
     // A user install may scan existing principal capsule metadata below.
@@ -606,6 +606,8 @@ pub(crate) fn install_from_local_path_internal(
     // any) is intact.
     let wasm = content_address_wasm(home, source_dir, &manifest)
         .context("failed to content-address WASM binary")?;
+    installed_authority.wasm_hash_pinned = true;
+    installed_authority.approved_wasm_hash = wasm.as_ref().map(|w| w.hash.clone());
     let wit_files =
         content_address_wit(home, source_dir).context("failed to content-address WIT files")?;
 
