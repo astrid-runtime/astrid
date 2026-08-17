@@ -38,6 +38,12 @@ async fn native_winfsp_translates_filesystem_operations() {
         return;
     }
 
+    // Mirror daemon startup before touching any delay-loaded WinFsp symbol. The
+    // developer import library is sufficient to link this test, but the runtime
+    // DLL lives under WinFsp's registered installation directory rather than on
+    // the test process PATH.
+    initialize_winfsp().expect("initialize installed WinFsp runtime");
+
     let temporary = tempfile::tempdir().expect("temporary WinFsp directory");
     let callback_path = temporary.path().join("callback.endpoint");
     let mountpoint = temporary.path().join("mount");

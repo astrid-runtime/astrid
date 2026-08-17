@@ -510,6 +510,14 @@ jobs:
           if (-not (Test-Path -LiteralPath $importLibrary -PathType Leaf)) {
             throw "WinFsp Developer import library was not installed: $importLibrary"
           }
+          $registry = Get-ItemProperty -LiteralPath "HKLM:\SOFTWARE\WOW6432Node\WinFsp" -ErrorAction Stop
+          if ([string]::IsNullOrWhiteSpace($registry.InstallDir)) {
+            throw "WinFsp installation did not publish InstallDir"
+          }
+          $runtimeLibrary = Join-Path $registry.InstallDir "bin\winfsp-x64.dll"
+          if (-not (Test-Path -LiteralPath $runtimeLibrary -PathType Leaf)) {
+            throw "WinFsp x64 runtime DLL was not installed: $runtimeLibrary"
+          }
 
       - name: Lint the Windows provider
         if: matrix.target == 'x86_64-pc-windows-msvc'
