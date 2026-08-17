@@ -1,5 +1,6 @@
 //! No-follow retirement of the released directory-backed state tree.
 
+#[cfg(unix)]
 use std::fs::File;
 use std::io;
 use std::path::Path;

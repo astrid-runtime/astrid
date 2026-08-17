@@ -189,10 +189,14 @@ fn installed_wasm_cannot_be_repointed_after_authority_approval() {
     sign_archive(&archive, &key).unwrap();
     let principal = PrincipalId::new("alice").unwrap();
     let layout = WorkspaceLayout::default();
+    let storage = install_store(&home, &principal);
     let output = unpack_and_install_authorized_for_principal_with_layout(
         &archive,
         &home,
-        InstallOptions::default(),
+        InstallOptions {
+            storage: Some(storage),
+            ..Default::default()
+        },
         &principal,
         &AuthorityDecision::Automatic,
         &layout,

@@ -341,6 +341,8 @@ mod tests {
             signer: None,
             signature: None,
             approved_capabilities: CapabilitiesDef::default(),
+            wasm_hash_pinned: false,
+            approved_wasm_hash: None,
         };
         let mut exports = HashMap::new();
         exports.insert(

@@ -113,7 +113,7 @@ async fn service_loop(
             accepted = listener.accept() => {
                 let (mut stream, _) = accepted.context("accept FUSE service control")?;
                 let mut line = String::new();
-                let mut reader = tokio::io::BufReader::new(&mut stream);
+                let reader = tokio::io::BufReader::new(&mut stream);
                 let read = reader
                     .take((MAX_CONTROL_BYTES + 1) as u64)
                     .read_line(&mut line)
