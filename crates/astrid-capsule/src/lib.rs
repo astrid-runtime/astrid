@@ -46,7 +46,7 @@ pub(crate) mod watcher;
 pub use access::CapsuleAccessResolver;
 pub use astrid_capsule_types::limits::{CapsuleRuntimeLimits, HttpLimits};
 pub use audit_sink::{HostAuditEvent, HostAuditOutcome, HostAuditSink};
-pub use fuel_ledger::{FuelLedger, FuelRateLimiter};
+pub use fuel_ledger::{FuelLedger, FuelRateLimiter, invocation_fuel_share};
 pub use memory_ledger::MemoryLedger;
 // `StoreMemoryMeter` is the Wasmtime `ResourceLimiter`; native-only.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]

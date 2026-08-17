@@ -48,6 +48,36 @@ use astrid_core::PrincipalId;
 use dashmap::DashMap;
 use parking_lot::Mutex;
 
+/// Maximum number of concurrent in-flight calls whose reservations together
+/// fit inside one per-principal rate window.
+///
+/// A prompt pipeline nests capsule invocations under one principal (the outer
+/// orchestration capsule holds its reservation across the nested model call),
+/// so a reservation equal to the whole per-second budget self-denies the
+/// pipeline's own nested calls. Dividing the per-call share keeps total
+/// in-flight reservations bounded by the window budget while leaving room for
+/// realistic nesting and concurrency.
+pub const MAX_IN_FLIGHT_CALLS_PER_PRINCIPAL: u64 = 4;
+
+/// Fuel provisioned, and reserved, for one invocation under an active
+/// per-principal rate budget.
+///
+/// `rate_budget == 0` means unlimited and returns the caller's per-invocation
+/// cap. Otherwise the share is one [`MAX_IN_FLIGHT_CALLS_PER_PRINCIPAL`]th of
+/// the window budget, floored at one fuel unit and capped by the per-invocation
+/// ceiling. Because the reservation equals the maximum fuel the call can
+/// consume, the ledger still bounds total in-flight consumption to the
+/// per-second budget.
+#[must_use]
+pub fn invocation_fuel_share(rate_budget: u64, invocation_fuel_cap: u64) -> u64 {
+    if rate_budget == 0 {
+        return invocation_fuel_cap;
+    }
+    (rate_budget / MAX_IN_FLIGHT_CALLS_PER_PRINCIPAL)
+        .max(1)
+        .min(invocation_fuel_cap)
+}
+
 /// Shared, cloneable handle to the per-principal CPU fuel ledger.
 ///
 /// Cloning is cheap (an `Arc` bump) and every clone observes the same map, so
@@ -656,6 +686,47 @@ mod tests {
             rl.inner.get(&p).is_none(),
             "a zero record must not create a window entry"
         );
+    }
+
+    #[test]
+    fn invocation_share_splits_the_window_across_in_flight_calls() {
+        let cap = BUDGET * 5;
+        assert_eq!(invocation_fuel_share(0, cap), cap);
+        assert_eq!(
+            invocation_fuel_share(BUDGET, cap),
+            BUDGET / MAX_IN_FLIGHT_CALLS_PER_PRINCIPAL
+        );
+        // A budget smaller than the in-flight allowance still admits one call.
+        assert_eq!(invocation_fuel_share(2, cap), 1);
+        // A huge rate budget never exceeds the per-invocation ceiling.
+        assert_eq!(invocation_fuel_share(u64::MAX, cap), cap);
+    }
+
+    #[test]
+    fn invocation_share_admits_nested_calls_without_overshoot() {
+        let rl = FuelRateLimiter::default();
+        let p = pid("pipeline");
+        let t0 = Instant::now();
+        let share = invocation_fuel_share(BUDGET, BUDGET * 5);
+
+        // A prompt pipeline holds its outer reservation across the nested
+        // model call. Reserving the whole window budget per call made the
+        // nested invocation self-deny and wedged the pipeline; the divided
+        // share must admit the full in-flight allowance...
+        let mut held = Vec::new();
+        for _ in 0..MAX_IN_FLIGHT_CALLS_PER_PRINCIPAL {
+            held.push(
+                rl.try_reserve(&p, BUDGET, share, t0)
+                    .expect("in-flight share must fit"),
+            );
+        }
+
+        // ...while still bounding total reservations to the window budget.
+        assert!(
+            rl.try_reserve(&p, BUDGET, 1, t0).is_none(),
+            "reservations beyond the window budget must be denied"
+        );
+        drop(held);
     }
 
     #[test]

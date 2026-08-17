@@ -3148,11 +3148,8 @@ impl ExecutionEngine for WasmEngine {
             live_group_config.as_ref().map(Arc::as_ref),
             &invoking_principal,
         );
-        let invocation_fuel_budget = if rate_budget == 0 {
-            INTERCEPTOR_FUEL_BUDGET
-        } else {
-            rate_budget.min(INTERCEPTOR_FUEL_BUDGET)
-        };
+        let invocation_fuel_budget =
+            crate::invocation_fuel_share(rate_budget, INTERCEPTOR_FUEL_BUDGET);
         let mut fuel_reservation = match self.fuel_rate.try_reserve(
             &invoking_principal,
             rate_budget,
