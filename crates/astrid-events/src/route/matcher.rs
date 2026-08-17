@@ -140,6 +140,7 @@ mod tests {
     #[test]
     fn topic_matcher_exact() {
         let m = TopicMatcher::new("a.b.c");
+        assert_eq!(m.pattern(), "a.b.c");
         assert!(m.matches(&ipc("a.b.c")));
         assert!(!m.matches(&ipc("a.b.d")));
         assert!(!m.matches(&ipc("a.b")));
@@ -153,6 +154,15 @@ mod tests {
         assert!(m.matches(&ipc("a.b.c.d")));
         assert!(!m.matches(&ipc("a.b")));
         assert!(!m.matches(&ipc("a.c.b")));
+    }
+
+    #[test]
+    fn topic_matcher_accepts_topic_exactly_at_depth_cap() {
+        let topic: String = std::iter::repeat_n("a", TopicMatcher::MAX_TOPIC_DEPTH)
+            .collect::<Vec<_>>()
+            .join(".");
+        let m = TopicMatcher::new("a.*");
+        assert!(m.matches_topic(&topic));
     }
 
     #[test]
