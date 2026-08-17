@@ -342,20 +342,30 @@ fn prepare_mountpoint(
         return Ok((mountpoint, false));
     }
 
-    let existed = mountpoint.exists();
-    if !existed {
-        std::fs::create_dir_all(&mountpoint)
-            .with_context(|| format!("create mountpoint {}", mountpoint.display()))?;
+    let parent = mountpoint
+        .parent()
+        .context("WinFsp directory mountpoint has no parent")?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("create mountpoint parent {}", parent.display()))?;
+    astrid_core::platform_fs::verify_no_redirects(parent)
+        .with_context(|| format!("reject redirected mountpoint parent {}", parent.display()))?;
+    if !std::fs::symlink_metadata(parent)?.is_dir() {
+        bail!("mountpoint parent is not a directory: {}", parent.display());
     }
-    astrid_core::platform_fs::verify_no_redirects(&mountpoint)
-        .with_context(|| format!("reject redirected mountpoint {}", mountpoint.display()))?;
-    if !std::fs::symlink_metadata(&mountpoint)?.is_dir() {
-        bail!("mountpoint is not a directory: {}", mountpoint.display());
+    match std::fs::symlink_metadata(&mountpoint) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspect mountpoint {}", mountpoint.display()));
+        },
+        Ok(_) => bail!(
+            "WinFsp directory mountpoint must not already exist: {}",
+            mountpoint.display()
+        ),
     }
-    if std::fs::read_dir(&mountpoint)?.next().is_some() {
-        bail!("mountpoint is not empty: {}", mountpoint.display());
-    }
-    Ok((mountpoint, !existed))
+    // WinFsp creates and owns directory mountpoint leaves. Treat the leaf as
+    // provider-created so failure and unmount cleanup remain idempotent.
+    Ok((mountpoint, true))
 }
 
 #[cfg(not(windows))]
@@ -490,6 +500,31 @@ fn path_key(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn directory_mountpoint_leaf_is_reserved_for_winfsp() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mountpoint = temporary.path().join("mount");
+        let (prepared, auto_created) = prepare_mountpoint(
+            Some(mountpoint.clone()),
+            &astrid_core::storage_provider::StorageProviderViewV1::Admin,
+        )
+        .unwrap();
+
+        assert_eq!(prepared, mountpoint);
+        assert!(auto_created);
+        assert!(prepared.symlink_metadata().is_err());
+
+        std::fs::create_dir(&prepared).unwrap();
+        assert!(
+            prepare_mountpoint(
+                Some(prepared),
+                &astrid_core::storage_provider::StorageProviderViewV1::Admin,
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn unmount_status_distinguishes_stale_and_refused_leases() {

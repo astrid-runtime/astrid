@@ -47,7 +47,7 @@ async fn native_winfsp_translates_filesystem_operations() {
     let temporary = tempfile::tempdir().expect("temporary WinFsp directory");
     let callback_path = temporary.path().join("callback.endpoint");
     let mountpoint = temporary.path().join("mount");
-    std::fs::create_dir(&mountpoint).expect("empty mountpoint");
+    assert!(mountpoint.symlink_metadata().is_err());
     let listener = Arc::new(local_transport::bind(&callback_path).expect("fake callback"));
     let state: FakeState = Arc::new(Mutex::new(BTreeMap::new()));
     let server = tokio::spawn(fake_callback_server(
@@ -73,6 +73,10 @@ async fn native_winfsp_translates_filesystem_operations() {
         callback,
     )
     .expect("start native WinFsp filesystem");
+    assert!(
+        mountpoint.is_dir(),
+        "WinFsp must create the mountpoint leaf"
+    );
 
     std::fs::write(mountpoint.join("hello.txt"), b"astrid").expect("write through WinFsp");
     assert_eq!(
@@ -128,6 +132,10 @@ async fn native_winfsp_translates_filesystem_operations() {
     );
 
     filesystem.stop();
+    assert!(
+        mountpoint.symlink_metadata().is_err(),
+        "WinFsp must remove the owned mountpoint leaf after stop"
+    );
     server.abort();
 }
 

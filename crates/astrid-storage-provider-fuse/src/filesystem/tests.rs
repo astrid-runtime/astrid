@@ -413,11 +413,13 @@ fn callback_io_is_chunked_and_authenticated() {
         .expect("chunked FUSE read");
 
     assert_eq!(read, data);
-    let telemetry = telemetry.lock().unwrap();
-    assert!(telemetry.authenticated_calls >= 6);
-    assert!(telemetry.maximum_write <= CALLBACK_CHUNK_BYTES);
-    assert!(telemetry.maximum_read <= CALLBACK_CHUNK_BYTES);
-    assert_eq!(telemetry.rejected_calls, 0);
+    {
+        let telemetry = telemetry.lock().unwrap();
+        assert!(telemetry.authenticated_calls >= 6);
+        assert!(telemetry.maximum_write <= CALLBACK_CHUNK_BYTES);
+        assert!(telemetry.maximum_read <= CALLBACK_CHUNK_BYTES);
+        assert_eq!(telemetry.rejected_calls, 0);
+    }
 
     let mut unauthorized = lease;
     unauthorized.lease_token = "wrong-token".to_owned();
@@ -432,7 +434,7 @@ fn callback_io_is_chunked_and_authenticated() {
         fuser::Errno::EACCES,
         "unauthorized callback must map to EACCES"
     );
-    assert_eq!(telemetry.rejected_calls, 1);
+    assert_eq!(telemetry.lock().unwrap().rejected_calls, 1);
 }
 
 #[test]
