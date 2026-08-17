@@ -327,7 +327,10 @@ fn load_adjacent_winfsp() -> Result<()> {
 fn volume_params(access: StorageProviderAccessV1) -> Params {
     let mut volume = VolumeParams::default();
     volume
-        .set_case_sensitive_search(false)
+        // Astrid logical paths are case-sensitive on every backend. Advertising
+        // case-insensitive lookup lets WinFsp probe differently cased aliases
+        // that cannot identify the same storage key.
+        .set_case_sensitive_search(true)
         .set_case_preserved_names(true)
         .set_unicode_on_disk(true)
         .set_persistent_acls(false)
