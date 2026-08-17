@@ -65,7 +65,9 @@ pub mod socket;
 mod storage_mount;
 
 use arc_swap::ArcSwap;
-use astrid_audit::{AuditCapacityProvider, AuditError, AuditLog};
+use astrid_audit::AuditLog;
+#[cfg(not(target_family = "wasm"))]
+use astrid_audit::{AuditCapacityProvider, AuditError};
 use astrid_capabilities::{CapabilityStore, DirHandle};
 use astrid_capsule::profile_cache::PrincipalProfileCache;
 use astrid_capsule::registry::CapsuleRegistry;
@@ -85,8 +87,10 @@ use astrid_mcp::{McpClient, SecureMcpClient, ServerManager, ServersConfig};
 use astrid_vfs::{HostVfs, OverlayVfsRegistry, Vfs};
 use dashmap::DashMap;
 use std::path::{Path, PathBuf};
+#[cfg(not(target_family = "wasm"))]
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Weak};
 use tokio::sync::{Mutex, RwLock};
 
 const SCOPED_TOPIC_PROBE_SENTINEL: &str = "\0astrid.scoped-topic\0";
@@ -2948,6 +2952,7 @@ impl Kernel {
     ///
     /// Returns an error when the durable store or owner mapping is unavailable,
     /// the registry mutation fails, or the live view cannot be unloaded.
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) async fn remove_one_capsule(
         &self,
         id: &astrid_capsule_types::CapsuleId,
@@ -2992,6 +2997,17 @@ impl Kernel {
             ));
         }
         Ok(true)
+    }
+
+    #[cfg(target_family = "wasm")]
+    pub(crate) async fn remove_one_capsule(
+        &self,
+        _id: &astrid_capsule_types::CapsuleId,
+        _principal: &PrincipalId,
+    ) -> Result<bool, anyhow::Error> {
+        Err(anyhow::anyhow!(
+            "durable capsule removal is unavailable on portable hosts"
+        ))
     }
 
     /// Remove every capsule view owned by `principal` before that principal's
@@ -3725,10 +3741,12 @@ fn seed_test_migration_ledger(home: &astrid_core::dirs::AstridHome) {
     .expect("test kernel: write migration ledger");
 }
 
+#[cfg(not(target_family = "wasm"))]
 struct RuntimeAuditCapacityProvider {
     store: astrid_storage::RuntimePrincipalStore,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl AuditCapacityProvider for RuntimeAuditCapacityProvider {
     fn available_bytes(&self) -> astrid_audit::AuditResult<Option<u64>> {
         self.store
@@ -4067,21 +4085,33 @@ fn audit_mountpoint(path: &Path) -> std::io::Result<bool> {
         let bytes = encoded.as_bytes();
         let mut index = 0;
         while index < bytes.len() {
-            if bytes[index] == b'\\' && index.saturating_add(4) <= bytes.len() {
-                let digits = &bytes[index + 1..index + 4];
+            let escape_end = index.checked_add(4).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "mount path overflow")
+            })?;
+            let escape_start = index.checked_add(1).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "mount path overflow")
+            })?;
+            if bytes[index] == b'\\' && escape_end <= bytes.len() {
+                let digits = bytes.get(escape_start..escape_end).ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid mount escape")
+                })?;
                 if digits.iter().all(|digit| (b'0'..=b'7').contains(digit)) {
-                    let value = digits
-                        .iter()
-                        .fold(0_u8, |value, digit| value * 8 + digit.saturating_sub(b'0'));
+                    let value = u8::from_str_radix(
+                        std::str::from_utf8(digits).map_err(std::io::Error::other)?,
+                        8,
+                    )
+                    .map_err(std::io::Error::other)?;
                     decoded.push(value);
-                    index += 4;
+                    index = escape_end;
                     continue;
                 }
             }
             decoded.push(bytes[index]);
-            index += 1;
+            index = index.checked_add(1).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "mount path overflow")
+            })?;
         }
-        if std::path::PathBuf::from(std::ffi::OsString::from_vec(decoded)) == canonical {
+        if std::ffi::OsString::from_vec(decoded) == canonical.as_os_str() {
             return Ok(true);
         }
     }

@@ -332,35 +332,6 @@ fn env_schema_from_metadata(entry: &CapsuleMetadataEntry) -> HashMap<String, Env
         .collect()
 }
 
-/// Parse `[env]` from the caller's principal install or verified workspace
-/// `Capsule.toml`, in runtime discovery precedence.
-///
-/// The gateway intentionally does NOT take a dep on
-/// `astrid-capsule` (which would drag in wasmtime); a minimal TOML
-/// read of just the `[env]` subtable is enough.
-#[cfg(test)]
-fn load_env_schema(
-    principal: &PrincipalId,
-    capsule_id: &str,
-    workspace: &WorkspaceContext,
-) -> GatewayResult<HashMap<String, EnvFieldSchema>> {
-    if !is_safe_field_name(capsule_id) {
-        return Err(GatewayError::BadRequest(format!(
-            "invalid capsule id {capsule_id:?}"
-        )));
-    }
-    let home = AstridHome::resolve()
-        .map_err(|e| GatewayError::Internal(anyhow::anyhow!("resolve ASTRID_HOME: {e}")))?;
-    load_env_schema_from_home_in_workspace(
-        &home,
-        principal,
-        capsule_id,
-        Some(&workspace.root),
-        &workspace.layout,
-    )
-}
-
-#[cfg(test)]
 #[cfg(test)]
 fn load_env_schema_from_home(
     home: &AstridHome,

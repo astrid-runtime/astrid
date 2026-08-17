@@ -4,8 +4,9 @@
 //! are deliberately separate. A foreign signature proves bytes came from one
 //! key; it does not grant those bytes authority on this runtime.
 
-use std::collections::BTreeSet;
-use std::fs::{File, OpenOptions};
+#[cfg(unix)]
+use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -18,6 +19,9 @@ use astrid_core::dirs::{AstridHome, WorkspaceLayout};
 use serde::{Deserialize, Serialize};
 
 use crate::paths::resolve_target_dir_for_in_workspace;
+
+mod status;
+pub use status::{LegacyAuthorityReceiptStatus, legacy_authority_receipt_status};
 
 const AUTHORITY_RECEIPT_DIR: &str = "capsule-authority";
 const RECEIPT_PATH_DOMAIN: &[u8] = b"astrid:capsule-authority-path:v1\0";
@@ -286,103 +290,6 @@ pub(crate) fn retire_legacy_authority_receipt(
     sync_authority_directory(&paths.directory)
 }
 
-/// Status of the global legacy authority receipt directory.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct LegacyAuthorityReceiptStatus {
-    /// Active receipts that do not correspond to a permitted workspace portal.
-    pub unknown_active: Vec<PathBuf>,
-    /// Incomplete pending transaction artifacts.
-    pub pending: Vec<PathBuf>,
-    /// Stale previous-receipt transaction artifacts.
-    pub previous: Vec<PathBuf>,
-}
-
-/// Inspect global legacy authority receipts without deleting any file.
-///
-/// `workspace_targets` identifies explicit project portals whose active
-/// receipts are intentionally retained.  Every other active receipt is an
-/// unknown leftover and must block layout cutover.  Pending/previous files
-/// always block cutover, including under a workspace portal.
-///
-/// # Errors
-///
-/// Returns an error when the receipt directory or one of its entries is
-/// redirected, special, or unreadable.
-pub fn legacy_authority_receipt_status(
-    home: &AstridHome,
-    workspace_targets: &[PathBuf],
-) -> anyhow::Result<LegacyAuthorityReceiptStatus> {
-    let directory = home.etc_dir().join(AUTHORITY_RECEIPT_DIR);
-    let metadata = match std::fs::symlink_metadata(&directory) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(LegacyAuthorityReceiptStatus::default());
-        },
-        Err(error) => {
-            return Err(error).with_context(|| format!("inspect {}", directory.display()));
-        },
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        bail!(
-            "legacy capsule authority root is not a regular directory: {}",
-            directory.display()
-        );
-    }
-    astrid_core::platform_fs::verify_no_redirects(&directory).with_context(|| {
-        format!(
-            "verify legacy capsule authority root {}",
-            directory.display()
-        )
-    })?;
-
-    let permitted = workspace_targets
-        .iter()
-        .map(|target| authority_paths(home, target).map(|paths| paths.active))
-        .collect::<anyhow::Result<BTreeSet<_>>>()?;
-    let mut status = LegacyAuthorityReceiptStatus::default();
-    let mut entries = std::fs::read_dir(&directory)
-        .with_context(|| format!("read legacy capsule authority root {}", directory.display()))?
-        .collect::<Result<Vec<_>, _>>()
-        .with_context(|| format!("read legacy capsule authority root {}", directory.display()))?;
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-    for entry in entries {
-        let path = entry.path();
-        let metadata = std::fs::symlink_metadata(&path)
-            .with_context(|| format!("inspect legacy capsule authority {}", path.display()))?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            bail!(
-                "legacy capsule authority root contains a non-regular entry: {}",
-                path.display()
-            );
-        }
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            bail!(
-                "legacy capsule authority entry has a non-UTF-8 name: {}",
-                path.display()
-            );
-        };
-        if name.ends_with(".pending") {
-            status.pending.push(path);
-        } else if name.ends_with(".previous") {
-            status.previous.push(path);
-        } else if path
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
-            && !permitted.contains(&path)
-        {
-            status.unknown_active.push(path);
-        } else if !path
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
-        {
-            // Unknown sidecars are not workspace receipts and must not be
-            // silently ignored during a destructive layout cutover.
-            status.unknown_active.push(path);
-        }
-    }
-    Ok(status)
-}
-
 fn sync_authority_directory(directory: &Path) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
@@ -393,7 +300,8 @@ fn sync_authority_directory(directory: &Path) -> anyhow::Result<()> {
     }
     #[cfg(not(unix))]
     {
-        let _ = directory;
+        std::fs::metadata(directory)
+            .with_context(|| format!("inspect authority directory {}", directory.display()))?;
     }
     Ok(())
 }
@@ -1062,196 +970,5 @@ fn ensure_bound_digest(
 }
 
 #[cfg(test)]
-mod tests {
-    use std::fs;
-
-    use super::*;
-
-    fn inspection(provenance: ArtifactProvenance) -> InstallInspection {
-        InstallInspection {
-            capsule_id: CapsuleId::new("example").unwrap(),
-            version: "1.0.0".into(),
-            content_digest: "abc".into(),
-            provenance,
-            capability_expansions: Vec::new(),
-            manifest_digest: "manifest".into(),
-            requested_capabilities: CapabilitiesDef::default(),
-        }
-    }
-
-    #[test]
-    fn automatic_accepts_only_same_runtime_signature() {
-        let local = inspection(ArtifactProvenance::LocalRuntime {
-            signer: "key".into(),
-            signature: "sig".into(),
-        });
-        assert_eq!(
-            authorize_install(&local, &AuthorityDecision::Automatic)
-                .unwrap()
-                .source,
-            AuthoritySource::LocalRuntimeBuild
-        );
-        assert!(
-            authorize_install(
-                &inspection(ArtifactProvenance::ForeignRuntime {
-                    signer: "key".into(),
-                    signature: "sig".into(),
-                }),
-                &AuthorityDecision::Automatic,
-            )
-            .is_err()
-        );
-        assert!(
-            authorize_install(
-                &inspection(ArtifactProvenance::Unsigned),
-                &AuthorityDecision::Automatic,
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn explicit_approval_is_bound_to_digest() {
-        let input = inspection(ArtifactProvenance::Unsigned);
-        assert!(
-            authorize_install(
-                &input,
-                &AuthorityDecision::ExplicitApproval {
-                    content_digest: "wrong".into(),
-                },
-            )
-            .is_err()
-        );
-        assert_eq!(
-            authorize_install(
-                &input,
-                &AuthorityDecision::ExplicitApproval {
-                    content_digest: "abc".into(),
-                },
-            )
-            .unwrap()
-            .source,
-            AuthoritySource::ExplicitApproval
-        );
-    }
-
-    #[test]
-    fn pending_authority_transaction_fails_closed_and_cleans_up_on_error() {
-        let temp = tempfile::tempdir().unwrap();
-        let home = AstridHome::from_path(temp.path().join("home"));
-        let target = temp.path().join("installed/example");
-        let authority = authorize_install(
-            &inspection(ArtifactProvenance::Unsigned),
-            &AuthorityDecision::ExplicitApproval {
-                content_digest: "abc".into(),
-            },
-        )
-        .unwrap();
-
-        let transaction = AuthorityReceiptTransaction::stage(&home, &target, &authority).unwrap();
-        assert!(read_installed_authority(&home, &target).is_err());
-        drop(transaction);
-        assert!(read_installed_authority(&home, &target).unwrap().is_none());
-    }
-
-    #[test]
-    fn legacy_authority_retirement_removes_only_the_exact_receipt() {
-        let temp = tempfile::tempdir().unwrap();
-        let home = AstridHome::from_path(temp.path().join("home"));
-        let target = temp.path().join("installed/example");
-        let authority = authorize_install(
-            &inspection(ArtifactProvenance::Unsigned),
-            &AuthorityDecision::ExplicitApproval {
-                content_digest: "abc".into(),
-            },
-        )
-        .unwrap();
-        AuthorityReceiptTransaction::stage(&home, &target, &authority)
-            .unwrap()
-            .commit()
-            .unwrap();
-        let bytes = read_installed_authority_bytes(&home, &target)
-            .unwrap()
-            .expect("active receipt");
-        let paths = authority_paths(&home, &target).unwrap();
-        retire_legacy_authority_receipt(&home, &target, &bytes).unwrap();
-        assert!(!paths.active.exists(), "exact active receipt is retired");
-        assert!(paths.directory.exists(), "authority parent remains durable");
-    }
-
-    #[test]
-    fn legacy_authority_retirement_preserves_mutated_receipt() {
-        let temp = tempfile::tempdir().unwrap();
-        let home = AstridHome::from_path(temp.path().join("home"));
-        let target = temp.path().join("installed/example");
-        let authority = authorize_install(
-            &inspection(ArtifactProvenance::Unsigned),
-            &AuthorityDecision::ExplicitApproval {
-                content_digest: "abc".into(),
-            },
-        )
-        .unwrap();
-        AuthorityReceiptTransaction::stage(&home, &target, &authority)
-            .unwrap()
-            .commit()
-            .unwrap();
-        let paths = authority_paths(&home, &target).unwrap();
-        let expected = fs::read(&paths.active).unwrap();
-        fs::write(&paths.active, b"mutated").unwrap();
-        assert!(retire_legacy_authority_receipt(&home, &target, &expected).is_err());
-        assert_eq!(fs::read(&paths.active).unwrap(), b"mutated");
-    }
-
-    #[test]
-    fn legacy_authority_pending_artifact_blocks_and_is_preserved() {
-        let temp = tempfile::tempdir().unwrap();
-        let home = AstridHome::from_path(temp.path().join("home"));
-        let target = temp.path().join("installed/example");
-        let authority = authorize_install(
-            &inspection(ArtifactProvenance::Unsigned),
-            &AuthorityDecision::ExplicitApproval {
-                content_digest: "abc".into(),
-            },
-        )
-        .unwrap();
-        let transaction = AuthorityReceiptTransaction::stage(&home, &target, &authority).unwrap();
-        let paths = authority_paths(&home, &target).unwrap();
-        let error = retire_legacy_authority_receipt(&home, &target, b"expected").unwrap_err();
-        assert!(error.to_string().contains("pending"));
-        assert!(paths.pending.exists());
-        drop(transaction);
-    }
-
-    #[test]
-    fn authority_status_blocks_unknown_but_preserves_workspace_portal_receipts() {
-        let temp = tempfile::tempdir().unwrap();
-        let home = AstridHome::from_path(temp.path().join("home"));
-        let workspace_target = temp.path().join("project/.astrid/capsules/example");
-        let workspace_parent = workspace_target.parent().unwrap();
-        fs::create_dir_all(workspace_parent).unwrap();
-        let authority = authorize_install(
-            &inspection(ArtifactProvenance::Unsigned),
-            &AuthorityDecision::ExplicitApproval {
-                content_digest: "abc".into(),
-            },
-        )
-        .unwrap();
-        AuthorityReceiptTransaction::stage(&home, &workspace_target, &authority)
-            .unwrap()
-            .commit()
-            .unwrap();
-        let portal =
-            legacy_authority_receipt_status(&home, std::slice::from_ref(&workspace_target))
-                .unwrap();
-        assert!(portal.unknown_active.is_empty());
-        let paths = authority_paths(&home, &workspace_target).unwrap();
-        assert!(paths.active.exists());
-
-        let unknown = paths.directory.join("unknown.json");
-        fs::write(&unknown, b"unknown").unwrap();
-        let status =
-            legacy_authority_receipt_status(&home, std::slice::from_ref(&workspace_target))
-                .unwrap();
-        assert_eq!(status.unknown_active, vec![unknown]);
-    }
-}
+#[path = "authority/unit_tests.rs"]
+mod tests;

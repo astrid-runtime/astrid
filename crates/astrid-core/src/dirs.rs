@@ -249,10 +249,10 @@ fn reject_parent_traversal(path: &Path, var_name: &str) -> io::Result<()> {
 /// Global Astrid home directory (`~/.astrid/`, Windows `LocalAppData`, or
 /// `$ASTRID_HOME`).
 ///
-/// FHS-aligned system layout. Contains config (`etc/`), persistent state
-/// (`var/`), ephemeral runtime (`run/`), logs (`log/`), keys (`keys/`),
-/// shared WASM modules (`lib/`), system capsules (`capsules/`), and
-/// per-principal home directories (`home/`).
+/// FHS-aligned system layout with config (`etc/`), persistent state (`var/`),
+/// runtime (`run/`), logs (`log/`), keys (`keys/`), and shared modules (`lib/`).
+/// Principal content is authoritative in `AstridFilesystem`; native `home/` is
+/// retained only as a legacy migration source.
 #[derive(Debug, Clone)]
 pub struct AstridHome {
     root: PathBuf,
@@ -327,15 +327,11 @@ impl AstridHome {
 
     /// Ensure the system directory structure exists with secure permissions.
     ///
-    /// Creates the common private directory skeleton. A new home is initialized
-    /// directly at the current layout. A released version-one home remains at
-    /// version one until the kernel has migrated and verified its durable store
-    /// and calls [`Self::complete_layout_v2`].
-    /// Sets all directories to `0o700` on Unix.
-    ///
-    /// Note: `capsules/` (system/distro capsules) is NOT created eagerly.
-    /// Nothing writes there yet — user installs go to principal home.
-    /// It will be created when an operator install mechanism lands.
+    /// Creates the common private skeleton. New homes initialize at the current
+    /// layout; released v1 homes remain there until the kernel verifies durable
+    /// migration and calls [`Self::complete_layout_v2`]. Directories are `0o700`
+    /// on Unix. `capsules/` is not created eagerly; user installs use principal
+    /// storage until an operator install mechanism exists.
     ///
     /// # Errors
     ///
@@ -408,12 +404,10 @@ impl AstridHome {
             Some(LEGACY_LAYOUT_VERSION) => {},
             Some(LAYOUT_VERSION) => {
                 self.ensure_layout_v2_dirs()?;
-                // Layout-v2 boot runs before the kernel's singleton-owned
-                // migration barrier. It may validate legacy paths so a
-                // redirect or special entry fails closed, but it must never
-                // recursively retire state on this pre-barrier path. The
-                // barrier owns source admission and destination receipts;
-                // `complete_layout_v2` is the only retirement entry point.
+                // Before the singleton-owned migration barrier, v2 boot only
+                // validates legacy paths (redirects/special entries fail closed).
+                // The barrier owns source admission/receipts; complete_layout_v2
+                // is the only retirement entry point.
                 self.validate_layout_v2_legacy_sources()?;
             },
             Some(_) => unreachable!("layout version was validated before directory creation"),
@@ -441,8 +435,6 @@ impl AstridHome {
         }
         Ok(())
     }
-
-    // ── Path accessors ───────────────────────────────────────────────
 
     /// Root directory path (`~/.astrid/`).
     #[must_use]

@@ -135,13 +135,3 @@ pub(crate) fn run(args: &ConfigArgs) -> Result<ExitCode> {
     );
     Ok(ExitCode::SUCCESS)
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn module_has_no_native_env_helpers() {
-        // Compile-time regression marker: all production access is routed
-        // through install_headless's daemon admin helpers.
-        assert!(true);
-    }
-}

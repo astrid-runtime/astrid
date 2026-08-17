@@ -51,6 +51,16 @@ denial = ["regular caller cannot read cross-principal firehose entries"]
 state = ["audit log remains append-only"]
 evidence = ["agent-audit.json and operator-audit.json artifacts"]
 
+[scenarios.audit_operator_controls]
+status = "mapped"
+surfaces = ["cli"]
+auth = ["admin CLI with audit operator authority"]
+success = ["stats and health report bounded accounting and ingestion state; prune returns a signed retention receipt"]
+denial = ["regular principals cannot inspect global audit accounting or prune retained history"]
+state = ["stats and health are read-only; prune removes only an eligible sealed segment and preserves the retained suffix"]
+evidence = ["structured stats and health output, signed prune receipt, and retained-chain verification artifacts"]
+remaining = ["exercise healthy and degraded stats and health, authorized prune, and denied non-operator calls in the runtime CLI harness"]
+
 [scenarios.bearer_session]
 status = "covered"
 surfaces = ["http"]

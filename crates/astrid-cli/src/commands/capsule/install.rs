@@ -645,10 +645,6 @@ async fn clone_and_build(
     bail!("astrid-build produced no .capsule archive.");
 }
 
-// ---------------------------------------------------------------------------
-// Local-source dispatcher — archive vs directory vs Rust-source autobuild.
-// ---------------------------------------------------------------------------
-
 fn install_from_local(
     source: &str,
     workspace: bool,
@@ -727,10 +723,6 @@ fn install_from_local(
     )
     .map(|installed| vec![installed])
 }
-
-// ---------------------------------------------------------------------------
-// CLI wrappers around the install lib.
-// ---------------------------------------------------------------------------
 
 /// Install a capsule from a directory containing `Capsule.toml`.
 /// CLI-facing wrapper that wires up an in-process event bus with a
@@ -997,8 +989,8 @@ fn authority_decision(
     }
 }
 
-// Tests cover source-resolution helpers only; install machinery lives in
-// `astrid-capsule-install`, update tests in `install_update`.
+// Source-resolution tests live here; install machinery is tested in
+// `astrid-capsule-install` and `install_update`.
 #[cfg(test)]
 #[path = "install_tests.rs"]
 mod tests;

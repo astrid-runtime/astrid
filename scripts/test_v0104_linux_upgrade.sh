@@ -7,6 +7,7 @@ readonly RELEASE_VERSION="0.10.4"
 readonly RELEASE_ASSET="astrid-${RELEASE_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
 readonly RELEASE_SHA256="a7c955ff5901d98059e8e6fba6f6b6e2033224e39c06db93e48a2ebe2a4f4725"
 readonly RELEASE_URL="https://github.com/astrid-runtime/astrid/releases/download/v${RELEASE_VERSION}/${RELEASE_ASSET}"
+readonly CAPSULE_BUILD_TARGET="wasm32-unknown-unknown"
 
 REPOSITORY_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly REPOSITORY_ROOT
@@ -47,6 +48,17 @@ trap cleanup EXIT
 fail() {
   printf 'v0.10.4 Linux upgrade test: %s\n' "$*" >&2
   exit 1
+}
+
+ensure_capsule_build_target() {
+  command -v rustup >/dev/null 2>&1 \
+    || fail "rustup is required to install ${CAPSULE_BUILD_TARGET}"
+  if ! rustup target list --installed | grep -Fqx -- "${CAPSULE_BUILD_TARGET}"; then
+    rustup target add "${CAPSULE_BUILD_TARGET}" \
+      || fail "could not install Rust target ${CAPSULE_BUILD_TARGET}"
+  fi
+  rustup target list --installed | grep -Fqx -- "${CAPSULE_BUILD_TARGET}" \
+    || fail "Rust target ${CAPSULE_BUILD_TARGET} is unavailable after installation"
 }
 
 run_old() {
@@ -207,6 +219,7 @@ compgen -G "${ASTRID_HOME}/var/state.db/wal/*.wal" >/dev/null \
 # released CLI can build and install it into the legacy native tree. Do not
 # silently skip package/authority/WIT coverage when the published CLI loses
 # this capability: that is a release-fixture failure, not an optional branch.
+ensure_capsule_build_target
 if ! run_old_bounded 180s capsule install --yes \
   --var adversarial_lifecycle_probe=runtime-lifecycle-ok \
   "${REPOSITORY_ROOT}/e2e/fixtures/astrid-capsule-adversarial" \

@@ -4,8 +4,6 @@
 use std::collections::HashMap;
 
 #[cfg(test)]
-use astrid_capsule_install::mismatching_contracts;
-#[cfg(test)]
 use astrid_core::dirs::AstridHome;
 use astrid_core::kernel_api::{KernelRequest, KernelResponse};
 use colored::Colorize;

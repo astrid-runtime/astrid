@@ -31,9 +31,9 @@ mod fs_support;
 mod ledger;
 use fs_support::retire_tree;
 use fs_support::{
-    add_source, ensure_legacy_secret_aliases, path_exists, read_bounded_file,
-    require_layout_provenance, retire_empty_directory, snapshot_path, storage_io, sync_parent,
-    validate_source_path,
+    add_source, collect_workspace_targets, ensure_legacy_secret_aliases, path_exists,
+    read_bounded_file, require_layout_provenance, retire_empty_directory, snapshot_path,
+    storage_io, sync_parent, validate_source_path,
 };
 #[cfg(test)]
 use ledger::{MigrationComponent, canonical_json};
@@ -490,61 +490,6 @@ fn workspace_portal_targets(
         Err(error) => return Err(error),
     };
     collect_workspace_targets(&capsules)
-}
-
-fn collect_workspace_targets(root: &Path) -> io::Result<Vec<PathBuf>> {
-    const MAX_WORKSPACE_TARGETS: usize = 4096;
-    let metadata = match fs::symlink_metadata(root) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error),
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "workspace capsule portal is not a regular directory: {}",
-                root.display()
-            ),
-        ));
-    }
-    astrid_core::platform_fs::verify_no_redirects(root)?;
-    let mut targets = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let mut entries = fs::read_dir(&dir)
-            .map_err(io::Error::other)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(io::Error::other)?;
-        entries.sort_by_key(std::fs::DirEntry::file_name);
-        for entry in entries {
-            let path = entry.path();
-            let metadata = fs::symlink_metadata(&path).map_err(io::Error::other)?;
-            if metadata.file_type().is_symlink() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "workspace capsule portal contains a redirect: {}",
-                        path.display()
-                    ),
-                ));
-            }
-            if !metadata.is_dir() {
-                continue;
-            }
-            astrid_core::platform_fs::verify_no_redirects(&path)?;
-            if path.join("Capsule.toml").is_file() {
-                targets.push(path.clone());
-                if targets.len() > MAX_WORKSPACE_TARGETS {
-                    return Err(io::Error::other(
-                        "workspace capsule portal exceeds target limit",
-                    ));
-                }
-            }
-            stack.push(path);
-        }
-    }
-    Ok(targets)
 }
 
 /// Agent deletion/rollback must not discard a released source that has not

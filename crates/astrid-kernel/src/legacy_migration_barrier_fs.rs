@@ -91,6 +91,64 @@ pub(super) fn ensure_legacy_secret_aliases(
     Ok(())
 }
 
+/// Collect capsule directories below a workspace portal without following
+/// redirects.  The migration barrier uses this inventory when checking that
+/// no legacy authority receipts remain attached to a workspace capsule.
+pub(super) fn collect_workspace_targets(root: &Path) -> io::Result<Vec<PathBuf>> {
+    const MAX_WORKSPACE_TARGETS: usize = 4096;
+    let metadata = match fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "workspace capsule portal is not a regular directory: {}",
+                root.display()
+            ),
+        ));
+    }
+    astrid_core::platform_fs::verify_no_redirects(root)?;
+    let mut targets = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let mut entries = fs::read_dir(&dir)
+            .map_err(io::Error::other)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(io::Error::other)?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).map_err(io::Error::other)?;
+            if metadata.file_type().is_symlink() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "workspace capsule portal contains a redirect: {}",
+                        path.display()
+                    ),
+                ));
+            }
+            if !metadata.is_dir() {
+                continue;
+            }
+            astrid_core::platform_fs::verify_no_redirects(&path)?;
+            if path.join("Capsule.toml").is_file() {
+                targets.push(path.clone());
+                if targets.len() > MAX_WORKSPACE_TARGETS {
+                    return Err(io::Error::other(
+                        "workspace capsule portal exceeds target limit",
+                    ));
+                }
+            }
+            stack.push(path);
+        }
+    }
+    Ok(targets)
+}
+
 /// A completed v2 ledger must be tied either to the explicit fresh-home
 /// disposition or to the durable layout cutover intent and receipt.  This
 /// check runs before stores open, so a canonical but invented component list
@@ -435,12 +493,12 @@ fn active_mountpoint(path: &Path) -> io::Result<bool> {
     {
         let canonical = fs::canonicalize(path)?;
         let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
-        return Ok(mountinfo.lines().any(|line| {
+        Ok(mountinfo.lines().any(|line| {
             line.split_whitespace()
                 .nth(4)
-                .and_then(|raw| decode_mountinfo_path(raw))
+                .and_then(decode_mountinfo_path)
                 .is_some_and(|mount| mount == canonical)
-        }));
+        }))
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -456,15 +514,19 @@ fn decode_mountinfo_path(raw: &str) -> Option<PathBuf> {
     let bytes = raw.as_bytes();
     let mut index = 0;
     while index < bytes.len() {
-        if bytes[index] == b'\\' && index + 3 < bytes.len() {
-            let value =
-                u8::from_str_radix(std::str::from_utf8(&bytes[index + 1..index + 4]).ok()?, 8)
-                    .ok()?;
+        let escape_end = index.checked_add(4)?;
+        let escape_start = index.checked_add(1)?;
+        if bytes[index] == b'\\' && escape_end <= bytes.len() {
+            let value = u8::from_str_radix(
+                std::str::from_utf8(bytes.get(escape_start..escape_end)?).ok()?,
+                8,
+            )
+            .ok()?;
             decoded.push(value);
-            index += 4;
+            index = escape_end;
         } else {
             decoded.push(bytes[index]);
-            index += 1;
+            index = index.checked_add(1)?;
         }
     }
     Some(PathBuf::from(std::ffi::OsString::from_vec(decoded)))

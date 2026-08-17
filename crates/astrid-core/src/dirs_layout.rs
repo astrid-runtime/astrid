@@ -15,8 +15,8 @@ use super::{AstridHome, LAYOUT_VERSION, LEGACY_LAYOUT_VERSION};
 #[path = "dirs_layout_retirement.rs"]
 mod retirement;
 use retirement::{
-    delete_legacy_tree, legacy_tree_device, sync_directory, validate_legacy_retirement_candidate,
-    validate_legacy_tree,
+    retire_legacy_source_tree as retire_legacy_source_tree_impl,
+    validate_legacy_retirement_candidate, validate_legacy_surrealkv_entry,
 };
 
 const LAYOUT_MIGRATION_INTENT: &str = "layout-v1-to-v2.intent";
@@ -757,60 +757,6 @@ fn inventory_directory(
     Ok(())
 }
 
-fn validate_legacy_surrealkv_entry(
-    relative: &Path,
-    is_directory: bool,
-    is_file: bool,
-) -> io::Result<()> {
-    let components: Vec<_> = relative.components().collect();
-    let valid = match components.as_slice() {
-        [entry] if entry.as_os_str() == "LOCK" => is_file,
-        [entry]
-            if matches!(
-                entry.as_os_str().to_str(),
-                Some("manifest" | "wal" | "sstables" | "vlog" | "versioned_index")
-            ) =>
-        {
-            is_directory
-        },
-        [directory, name] if directory.as_os_str() == "manifest" && is_file => {
-            is_numbered_legacy_file(name.as_os_str(), b".manifest")
-        },
-        [directory, name] if directory.as_os_str() == "wal" && is_file => {
-            is_numbered_legacy_file(name.as_os_str(), b".wal")
-        },
-        [directory, name] if directory.as_os_str() == "sstables" && is_file => {
-            is_numbered_legacy_file(name.as_os_str(), b".sst")
-        },
-        [directory, name] if directory.as_os_str() == "vlog" && is_file => {
-            is_numbered_legacy_file(name.as_os_str(), b".vlog")
-        },
-        [directory, name]
-            if directory.as_os_str() == "versioned_index" && name.as_os_str() == "index.bpt" =>
-        {
-            is_file
-        },
-        _ => false,
-    };
-    if !valid {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "unexpected entry in released legacy SurrealKV source: {}",
-                relative.display()
-            ),
-        ));
-    }
-    Ok(())
-}
-
-fn is_numbered_legacy_file(name: &std::ffi::OsStr, extension: &[u8]) -> bool {
-    let bytes = name.as_encoded_bytes();
-    bytes.split_at_checked(20).is_some_and(|(digits, suffix)| {
-        digits.iter().all(u8::is_ascii_digit) && suffix == extension
-    })
-}
-
 fn hash_inventory_field(hasher: &mut blake3::Hasher, label: &[u8], value: &[u8]) {
     hasher.update(&(label.len() as u64).to_le_bytes());
     hasher.update(label);
@@ -931,36 +877,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// Returns an I/O error and leaves the tree untouched when validation finds a
 /// redirect, special entry, filesystem boundary, or active mount.
 pub fn retire_legacy_source_tree(path: &Path) -> io::Result<()> {
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
-    };
-    if metadata.file_type().is_symlink() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("legacy state source is redirected: {}", path.display()),
-        ));
-    }
-    if !metadata.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("legacy state source is not a directory: {}", path.display()),
-        ));
-    }
-
-    // Validate the complete tree before removing anything. In particular,
-    // `remove_dir_all` is intentionally not used: it can walk into a mount
-    // boundary and its path-based recursion has no type check for special
-    // entries. A failed validation leaves every legacy byte available for a
-    // later operator repair or an idempotent restart.
-    let root_device = legacy_tree_device(&metadata);
-    validate_legacy_tree(path, root_device)?;
-    delete_legacy_tree(path, root_device)?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| io::Error::other("legacy state source has no parent"))?;
-    sync_directory(parent)
+    retire_legacy_source_tree_impl(path)
 }
 
 #[cfg(all(test, not(target_family = "wasm")))]
