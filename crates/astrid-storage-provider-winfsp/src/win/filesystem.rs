@@ -47,8 +47,8 @@ impl CallbackFs {
         let user = local_transport::current_user_security_identifier().map_err(|error| {
             AdapterFailure::Transport(format!("resolve Windows user SID: {error}"))
         })?;
-        let access = if read_only { "GR" } else { "GA" };
-        let sddl = format!("O:{user}D:P(A;;{access};;;SY)(A;;{access};;;{user})");
+        let access = if read_only { "FRFX" } else { "FA" };
+        let sddl = format!("O:{user}G:{user}D:P(A;;{access};;;SY)(A;;{access};;;{user})");
         let encoded = U16CString::from_str(&sddl)
             .map_err(|error| AdapterFailure::Transport(format!("encode Windows ACL: {error}")))?;
         let security_descriptor = SecurityDescriptor::from_wstr(&encoded)
