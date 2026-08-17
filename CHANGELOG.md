@@ -111,6 +111,11 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   store and live legacy-SurrealKV migration reader are unchanged. Closes #1448.
 ### Added
 
+- **Semantic capability grants are exposed for consent surfaces.** Consent and
+  introspection consumers receive action, scope, and impact cards translated
+  from the raw manifest, with wildcard ports and ephemeral-port grants kept
+  explicit and malformed capability metadata failing closed.
+
 - **`astrid agent spawn` — atomic restricted throwaway session.** Creates a derived principal with no caller-selected capability grants from an explicit set of capsule installs, user-invocable capsules, capsule-scoped state namespaces, and outbound endpoints; omitted state and egress remain unavailable. Restricted-principal network and process policy is enforced at host-call time, the CLI provides the wall-clock watchdog and denies approval requests, and teardown reports any unreclaimed state instead of masking it. Part of #1217.
 
 ### Changed

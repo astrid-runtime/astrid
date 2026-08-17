@@ -14,6 +14,7 @@ Install `cargo-fuzz`, then run targets from the repository root:
 
 ```sh
 cargo fuzz run ip_blockset
+cargo fuzz run manifest_capabilities
 cargo fuzz run topic_patterns
 cargo fuzz run crypto_wire
 cargo fuzz run capability_patterns --features capabilities-target
@@ -39,7 +40,9 @@ Fuzz targets should assert Astrid invariants, not only "does not panic":
   crate.
 
 The default target set covers cheap, deterministic Tier 1 predicates from
-issue #1084. `capability_patterns` is feature-gated because the full
+issue #1084. `manifest_capabilities` also checks that capability TOML,
+authority expansion, and human-facing semantic cards cannot disagree.
+`capability_patterns` is feature-gated because the full
 `astrid-capabilities` crate pulls storage dependencies, and `ssrf_helpers` is
 feature-gated because it compiles the Wasmtime-backed `astrid-capsule` crate.
 Parser, archive, admin-state, HTTP, CLI, and Wasm/WIT targets should be added

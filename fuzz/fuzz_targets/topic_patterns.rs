@@ -59,10 +59,15 @@ fuzz_target!(|data: &[u8]| {
             let mid_pattern = mid.join(".");
             let same_depth = segments.join(".");
             assert!(topic_pattern_matches(&mid_pattern, &same_depth));
-            assert!(!topic_pattern_matches(
-                &mid_pattern,
-                &format!("{same_depth}.extra")
-            ));
+            // Replacing the final segment produces a trailing subtree
+            // wildcard, which intentionally matches every deeper topic. An
+            // interior wildcard is the exact-depth case.
+            if segments.len() >= 3 {
+                assert!(!topic_pattern_matches(
+                    &mid_pattern,
+                    &format!("{same_depth}.extra")
+                ));
+            }
         }
     }
 });

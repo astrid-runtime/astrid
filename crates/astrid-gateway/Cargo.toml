@@ -46,6 +46,7 @@ anyhow = { workspace = true }
 async-stream = { workspace = true }
 astrid-audit = { workspace = true }
 astrid-capsule-install = { workspace = true }
+astrid-capsule-types = { workspace = true }
 astrid-core = { workspace = true }
 astrid-events = { workspace = true }
 astrid-storage = { workspace = true }

@@ -9,6 +9,7 @@
 //! wasm-clean crate (no `wasmtime`, no `tokio`) lets every engine depend on the
 //! shared vocabulary without pulling one engine's runtime.
 
+pub mod capability_presentation;
 pub mod capsule;
 pub mod error;
 pub mod fuel_ledger;
