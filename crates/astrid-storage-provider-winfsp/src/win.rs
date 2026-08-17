@@ -5,7 +5,7 @@ use std::os::windows::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
 use astrid_core::local_transport;
@@ -26,6 +26,7 @@ use filesystem::CallbackFs;
 
 const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const DAEMON_STOP_TIMEOUT: Duration = Duration::from_secs(30);
+const MOUNTPOINT_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_LEASE_BYTES: u64 = 64 * 1024;
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -71,6 +72,7 @@ pub(crate) fn daemon_main() -> Result<()> {
         .map_err(|status| {
             anyhow::anyhow!("WinFsp failed to start mount with status {status:#x}")
         })?;
+    wait_for_mountpoint_ready(&start.mountpoint)?;
 
     let mut stdout = std::io::stdout().lock();
     writeln!(stdout, "READY {0}", lease.mount_id).context("report WinFsp readiness")?;
@@ -82,6 +84,36 @@ pub(crate) fn daemon_main() -> Result<()> {
         return Err(error);
     }
     Ok(())
+}
+
+fn wait_for_mountpoint_ready(mountpoint: &Path) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        match std::fs::symlink_metadata(mountpoint) {
+            Ok(metadata) if metadata.is_dir() => return Ok(()),
+            Ok(_) => bail!(
+                "WinFsp mountpoint is not a directory: {}",
+                mountpoint.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "inspect WinFsp mountpoint readiness {}",
+                        mountpoint.display()
+                    )
+                });
+            },
+        }
+        if started.elapsed() >= MOUNTPOINT_READY_TIMEOUT {
+            bail!(
+                "WinFsp mountpoint did not become ready within {} seconds: {}",
+                MOUNTPOINT_READY_TIMEOUT.as_secs(),
+                mountpoint.display()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 async fn daemon_loop(

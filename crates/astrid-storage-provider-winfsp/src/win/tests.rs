@@ -77,10 +77,7 @@ fn native_winfsp_translates_filesystem_operations() {
         callback,
     )
     .expect("start native WinFsp filesystem");
-    assert!(
-        mountpoint.is_dir(),
-        "WinFsp must create the mountpoint leaf"
-    );
+    wait_for_mountpoint_ready(&mountpoint).expect("wait for native WinFsp mountpoint");
 
     std::fs::write(mountpoint.join("hello.txt"), b"astrid").expect("write through WinFsp");
     assert_eq!(
