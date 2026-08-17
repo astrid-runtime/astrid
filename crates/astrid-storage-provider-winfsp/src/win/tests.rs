@@ -48,9 +48,12 @@ fn native_winfsp_translates_filesystem_operations() {
     let callback_path = temporary.path().join("callback.endpoint");
     let mountpoint = temporary.path().join("mount");
     assert!(mountpoint.symlink_metadata().is_err());
-    let listener = Arc::new(local_transport::bind(&callback_path).expect("fake callback"));
     let state: FakeState = Arc::new(Mutex::new(BTreeMap::new()));
     let server_runtime = tokio::runtime::Runtime::new().expect("fake callback runtime");
+    let listener = {
+        let _runtime_guard = server_runtime.enter();
+        Arc::new(local_transport::bind(&callback_path).expect("fake callback"))
+    };
     let server = server_runtime.spawn(fake_callback_server(
         Arc::clone(&listener),
         Arc::clone(&state),
