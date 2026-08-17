@@ -139,7 +139,7 @@ pub(crate) fn from_provenance(provenance: DistroProvenance) -> DistroLock {
     }
 }
 
-/// Compute the optimistic-concurrency digest used by the kernel DistroLock
+/// Compute the optimistic-concurrency digest used by the kernel `DistroLock`
 /// API. JSON field order is fixed by the typed struct declaration.
 pub(crate) fn provenance_digest(provenance: &DistroProvenance) -> anyhow::Result<String> {
     let bytes = serde_json::to_vec(provenance).context("encode distro provenance")?;

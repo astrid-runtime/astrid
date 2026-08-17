@@ -377,46 +377,7 @@ async fn dispatch_capsule(command: crate::cli::CapsuleCommands) -> Result<ExitCo
             workspace,
             force,
             purge,
-        } => {
-            if workspace {
-                commands::capsule::remove::validate_capsule_removal(&name, true, force)?;
-                commands::capsule::remove::remove_capsule(&name, true, force, purge)?;
-            } else {
-                let mut client = crate::socket_client::connect_kernel_for_workspace(None).await?;
-                match client
-                    .request(astrid_core::kernel_api::KernelRequest::RemoveCapsule {
-                        id: name.clone(),
-                        force,
-                    })
-                    .await?
-                {
-                    astrid_core::kernel_api::KernelResponse::Success(_) => {
-                        if purge {
-                            let principal = crate::principal::current();
-                            let entries = commands::capsule::install_headless::list_env_entries(
-                                &principal, &name,
-                            )?;
-                            for entry in entries {
-                                if matches!(
-                                    entry.scope,
-                                    astrid_core::kernel_api::EnvStorageScope::Agent
-                                ) {
-                                    commands::capsule::install_headless::delete_env_entry(
-                                        &principal, &name, &entry.key, entry.kind,
-                                    )?;
-                                }
-                            }
-                        }
-                        eprintln!("Removed '{name}'.");
-                    },
-                    astrid_core::kernel_api::KernelResponse::Error(message) => {
-                        anyhow::bail!("daemon rejected capsule removal: {message}");
-                    },
-                    other => anyhow::bail!("unexpected daemon response: {other:?}"),
-                }
-            }
-            Ok(ExitCode::SUCCESS)
-        },
+        } => dispatch_capsule_remove(name, workspace, force, purge).await,
         CapsuleCommands::Tree | CapsuleCommands::Deps => {
             commands::capsule::deps::show_tree()?;
             Ok(ExitCode::SUCCESS)
@@ -442,6 +403,49 @@ async fn dispatch_capsule(command: crate::cli::CapsuleCommands) -> Result<ExitCo
         } => commands::capsule_verb::run_explicit(provider, verb, args).await,
         CapsuleCommands::External(tokens) => commands::capsule_verb::run_external(tokens).await,
     }
+}
+
+async fn dispatch_capsule_remove(
+    name: String,
+    workspace: bool,
+    force: bool,
+    purge: bool,
+) -> Result<ExitCode> {
+    if workspace {
+        commands::capsule::remove::validate_capsule_removal(&name, true, force)?;
+        commands::capsule::remove::remove_capsule(&name, true, force, purge)?;
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let mut client = crate::socket_client::connect_kernel_for_workspace(None).await?;
+    match client
+        .request(astrid_core::kernel_api::KernelRequest::RemoveCapsule {
+            id: name.clone(),
+            force,
+        })
+        .await?
+    {
+        astrid_core::kernel_api::KernelResponse::Success(_) => {
+            if purge {
+                let principal = crate::principal::current();
+                let entries =
+                    commands::capsule::install_headless::list_env_entries(&principal, &name)?;
+                for entry in entries {
+                    if matches!(entry.scope, astrid_core::kernel_api::EnvStorageScope::Agent) {
+                        commands::capsule::install_headless::delete_env_entry(
+                            &principal, &name, &entry.key, entry.kind,
+                        )?;
+                    }
+                }
+            }
+            eprintln!("Removed '{name}'.");
+        },
+        astrid_core::kernel_api::KernelResponse::Error(message) => {
+            anyhow::bail!("daemon rejected capsule removal: {message}");
+        },
+        other => anyhow::bail!("unexpected daemon response: {other:?}"),
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 async fn dispatch_mcp(command: McpCommands) -> Result<ExitCode> {

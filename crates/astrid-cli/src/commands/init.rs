@@ -871,12 +871,15 @@ pub(crate) fn write_env_files(
         }
         for (key, template) in &cap.env {
             let value = resolve_template(template, vars);
-            let kind = extract_var_refs(template)
+            let kind = if extract_var_refs(template)
                 .iter()
                 .filter_map(|name| variables.get(*name))
                 .any(|definition| definition.secret)
-                .then_some(EnvValueKind::Secret)
-                .unwrap_or(EnvValueKind::Text);
+            {
+                EnvValueKind::Secret
+            } else {
+                EnvValueKind::Text
+            };
             super::capsule::install_headless::set_env_entry(
                 principal,
                 &cap.name,

@@ -304,7 +304,7 @@ fn source_digest(path: &Path) -> anyhow::Result<String> {
     let mut file = std::fs::File::open(path)
         .with_context(|| format!("open capsule source {}", path.display()))?;
     let mut hasher = blake3::Hasher::new();
-    let mut buffer = [0_u8; 1024 * 1024];
+    let mut buffer = vec![0_u8; 1024 * 1024].into_boxed_slice();
     loop {
         let count = file.read(&mut buffer)?;
         if count == 0 {

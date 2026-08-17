@@ -3,7 +3,7 @@
 //! Routes through the capsule manifest's declared `env_type`:
 //!
 //! * `type = "secret"` — value lands in the daemon's host-only typed
-//!   SecretStore projection. `<scope>` is the principal when
+//!   `SecretStore` projection. `<scope>` is the principal when
 //!   `--scope=agent` (the fail-closed default) or the system owner when
 //!   `--scope=shared`.
 //!
@@ -468,7 +468,7 @@ pub(crate) struct SecretKey {
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum SecretStorage {
-    /// Host-only typed SecretStore projection.
+    /// Host-only typed `SecretStore` projection.
     SecretStore,
     /// Host-only typed non-secret environment projection.
     EnvStore,
