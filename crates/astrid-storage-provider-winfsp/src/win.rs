@@ -89,7 +89,10 @@ pub(crate) fn daemon_main() -> Result<()> {
 fn wait_for_mountpoint_ready(mountpoint: &Path) -> Result<()> {
     let started = Instant::now();
     loop {
-        match std::fs::symlink_metadata(mountpoint) {
+        // A directory mount is represented by a WinFsp junction. Follow that
+        // reparse point so readiness proves the mounted root is serving I/O,
+        // rather than inspecting the junction object itself.
+        match std::fs::metadata(mountpoint) {
             Ok(metadata) if metadata.is_dir() => return Ok(()),
             Ok(_) => bail!(
                 "WinFsp mountpoint is not a directory: {}",
