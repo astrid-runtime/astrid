@@ -129,7 +129,7 @@ impl MemoryLedger {
     /// returns `None` (no write) when `bytes` is not larger, so `fetch_update`
     /// returns `Err` and we ignore it — lock-free and uncontended per principal.
     fn raise_to(counter: &AtomicU64, bytes: u64) {
-        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+        let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
             (bytes > v).then_some(bytes)
         });
     }

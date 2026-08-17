@@ -64,6 +64,15 @@ pub const DEFAULT_MAX_TIMEOUT_SECS: u64 = 300;
 pub const DEFAULT_MAX_IPC_THROUGHPUT_BYTES: u64 = 10 * 1024 * 1024;
 /// Default max concurrent background processes per principal.
 pub const DEFAULT_MAX_BACKGROUND_PROCESSES: u32 = 8;
+
+/// Default per-principal in-flight interceptor-call allowance.
+///
+/// Derived from the measured pipeline shape: the runtime E2E's concurrent
+/// prompt nests two capsule invocations under one principal (outer
+/// orchestration plus the model call), so 2 is the measured lower bound; the
+/// default doubles it to admit one tool-loop nesting level. Audit-derived
+/// concurrency measurement should replace this judgment default.
+pub const DEFAULT_MAX_IN_FLIGHT_CALLS: u32 = 4;
 /// Default per-principal storage ceiling.
 ///
 /// The maximum positive integer representable by TOML is the wire-compatible
@@ -92,6 +101,13 @@ pub const DEFAULT_MAX_CPU_FUEL_PER_SEC: u64 = 2_000_000_000;
 pub const TIMEOUT_SECS_UPPER_BOUND: u64 = 86_400;
 /// Absolute upper bound on [`Quotas::max_background_processes`].
 pub const BACKGROUND_PROCESSES_UPPER_BOUND: u32 = 256;
+
+/// Absolute upper bound on [`Quotas::max_in_flight_calls`].
+///
+/// Keeps the configured allowance in the range where a divided fuel share
+/// remains meaningful; the reservation sum is bounded by the per-second
+/// budget regardless of this value.
+pub const IN_FLIGHT_CALLS_UPPER_BOUND: u32 = 64;
 
 /// Maximum length of a single entry in [`PrincipalProfile::groups`].
 pub const MAX_GROUP_NAME_LEN: usize = 64;
@@ -357,6 +373,16 @@ pub struct Quotas {
     /// `admin`) is exempt from the run-loop bound regardless of this value.
     #[serde(default = "default_max_cpu_fuel_per_sec")]
     pub max_cpu_fuel_per_sec: u64,
+
+    /// Maximum concurrent in-flight interceptor calls for one principal.
+    ///
+    /// Each in-flight call reserves a divided share of
+    /// [`Quotas::max_cpu_fuel_per_sec`]; the reservation sum never exceeds the
+    /// per-second budget. Must be `1..=`[`IN_FLIGHT_CALLS_UPPER_BOUND`]. The
+    /// default of 4 admits the measured prompt-pipeline nesting (2) plus one
+    /// tool-loop level.
+    #[serde(default = "default_max_in_flight_calls")]
+    pub max_in_flight_calls: u32,
 }
 
 // ── serde default helpers ────────────────────────────────────────────────
@@ -391,6 +417,10 @@ fn default_max_storage_bytes() -> u64 {
 
 fn default_max_cpu_fuel_per_sec() -> u64 {
     DEFAULT_MAX_CPU_FUEL_PER_SEC
+}
+
+fn default_max_in_flight_calls() -> u32 {
+    DEFAULT_MAX_IN_FLIGHT_CALLS
 }
 
 // ── Default impls ────────────────────────────────────────────────────────
@@ -436,6 +466,7 @@ impl Default for Quotas {
             max_background_processes: DEFAULT_MAX_BACKGROUND_PROCESSES,
             max_storage_bytes: DEFAULT_MAX_STORAGE_BYTES,
             max_cpu_fuel_per_sec: DEFAULT_MAX_CPU_FUEL_PER_SEC,
+            max_in_flight_calls: DEFAULT_MAX_IN_FLIGHT_CALLS,
         }
     }
 }
@@ -469,6 +500,7 @@ mod tests {
         );
         assert_eq!(p.quotas.max_storage_bytes, DEFAULT_MAX_STORAGE_BYTES);
         assert_eq!(p.quotas.max_cpu_fuel_per_sec, DEFAULT_MAX_CPU_FUEL_PER_SEC);
+        assert_eq!(p.quotas.max_in_flight_calls, DEFAULT_MAX_IN_FLIGHT_CALLS);
         p.validate().expect("defaults validate");
     }
 
@@ -517,6 +549,7 @@ mod tests {
                 max_background_processes: 16,
                 max_storage_bytes: 2 * 1024 * 1024 * 1024,
                 max_cpu_fuel_per_sec: 4_000_000_000,
+                max_in_flight_calls: 6,
             },
         };
         let s = toml::to_string_pretty(&p).unwrap();

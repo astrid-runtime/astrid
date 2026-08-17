@@ -29,6 +29,14 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 - **Uplink authentication honors the keypair method gate.** A device key that
   remains on disk cannot authenticate a principal after keypair authentication
   is removed from the profile's active methods.
+- **WASM table growth and in-flight CPU fuel are now bounded.** Guests
+  cannot exceed advertised table-size or fuel budgets through table growth or
+  concurrent in-flight calls. Each invocation now reserves a divided share of the
+  per-principal window so nested prompt-pipeline calls coexist while total
+  in-flight reservations stay within the per-second budget. The per-principal
+  allowance is configurable as `quotas.max_in_flight_calls` (default 4, bounds
+  1-64); the fuel-share helper in `astrid-capsule-types` stays policy-free and
+  takes the allowance as a parameter.
 
 - **SurrealKV now preserves memtable rotation and compaction durability through
   its 0.21.3 fixes.** The update corrects atomic memtable rotation and fsyncs

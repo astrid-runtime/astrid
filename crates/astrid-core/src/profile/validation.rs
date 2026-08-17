@@ -7,8 +7,9 @@
 use crate::capability_grammar::validate_capability;
 
 use super::{
-    AuthConfig, BACKGROUND_PROCESSES_UPPER_BOUND, CURRENT_PROFILE_VERSION, NetworkConfig,
-    PrincipalProfile, ProcessConfig, ProfileError, ProfileResult, Quotas, TIMEOUT_SECS_UPPER_BOUND,
+    AuthConfig, BACKGROUND_PROCESSES_UPPER_BOUND, CURRENT_PROFILE_VERSION,
+    IN_FLIGHT_CALLS_UPPER_BOUND, NetworkConfig, PrincipalProfile, ProcessConfig, ProfileError,
+    ProfileResult, Quotas, TIMEOUT_SECS_UPPER_BOUND,
 };
 
 impl PrincipalProfile {
@@ -74,6 +75,11 @@ impl Quotas {
             return Err(ProfileError::Invalid(
                 "quotas.max_cpu_fuel_per_sec must be > 0".into(),
             ));
+        }
+        if self.max_in_flight_calls == 0 || self.max_in_flight_calls > IN_FLIGHT_CALLS_UPPER_BOUND {
+            return Err(ProfileError::Invalid(format!(
+                "quotas.max_in_flight_calls must be in 1..={IN_FLIGHT_CALLS_UPPER_BOUND}",
+            )));
         }
         Ok(())
     }
@@ -243,6 +249,25 @@ mod tests {
         let mut p = PrincipalProfile::default();
         p.quotas.max_cpu_fuel_per_sec = 0;
         assert!(matches!(p.validate(), Err(ProfileError::Invalid(_))));
+    }
+
+    #[test]
+    fn rejects_in_flight_calls_out_of_bounds() {
+        let mut p = PrincipalProfile::default();
+        p.quotas.max_in_flight_calls = 0;
+        assert!(matches!(p.validate(), Err(ProfileError::Invalid(_))));
+
+        p.quotas.max_in_flight_calls = IN_FLIGHT_CALLS_UPPER_BOUND + 1;
+        assert!(matches!(p.validate(), Err(ProfileError::Invalid(_))));
+    }
+
+    #[test]
+    fn accepts_in_flight_calls_at_bounds() {
+        let mut p = PrincipalProfile::default();
+        p.quotas.max_in_flight_calls = 1;
+        p.validate().unwrap();
+        p.quotas.max_in_flight_calls = IN_FLIGHT_CALLS_UPPER_BOUND;
+        p.validate().unwrap();
     }
 
     // ── Auth ──────────────────────────────────────────────────────────
