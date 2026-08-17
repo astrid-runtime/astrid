@@ -24,6 +24,14 @@ pub(super) async fn agent_delete(
     }
 
     let _guard = kernel.admin_write_lock.lock().await;
+    if let Err(error) = crate::legacy_migration_barrier::ensure_principal_delete_allowed(
+        &kernel.astrid_home,
+        &principal,
+    ) {
+        return err_internal(format!(
+            "principal deletion blocked by legacy migration barrier: {error}"
+        ));
+    }
     let pending = match prepare_identity_removal(kernel, &principal).await {
         Ok(pending) => pending,
         Err(response) => return response,
@@ -97,6 +105,12 @@ pub(super) struct PendingIdentityRemoval {
     user: Option<astrid_core::AstridUserId>,
     principal_uid: Option<astrid_core::PrincipalUid>,
     ownership_guard: Option<astrid_storage::PrincipalDeletionGuard>,
+}
+
+impl PendingIdentityRemoval {
+    pub(super) const fn principal_uid(&self) -> Option<astrid_core::PrincipalUid> {
+        self.principal_uid
+    }
 }
 
 pub(super) async fn prepare_identity_removal(
@@ -271,17 +285,11 @@ async fn retire_and_reclaim(
             authority_errors.push(format!("principal state: {error}"));
         }
     } else {
-        let capsule_dir = kernel.astrid_home.principal_home(principal).capsules_dir();
-        let mut capsule_ids: BTreeSet<String> = unloaded.iter().map(ToString::to_string).collect();
-        if let Ok(entries) = std::fs::read_dir(&capsule_dir) {
-            capsule_ids.extend(entries.flatten().filter_map(|entry| {
-                entry
-                    .file_type()
-                    .ok()
-                    .filter(std::fs::FileType::is_dir)
-                    .and_then(|_| entry.file_name().into_string().ok())
-            }));
-        }
+        // Portable/test kernels without a principal store have no durable
+        // package registry to enumerate. Never recover authority by scanning
+        // a host capsule directory; only namespaces observed in the live
+        // registry are safe to clear in this compatibility branch.
+        let capsule_ids: BTreeSet<String> = unloaded.iter().map(ToString::to_string).collect();
         for capsule in capsule_ids {
             let namespace = format!("{principal}:capsule:{capsule}");
             if let Err(error) = kernel.kv.clear_namespace(&namespace).await {
@@ -302,9 +310,12 @@ async fn retire_and_reclaim(
     let secrets = kernel.astrid_home.secrets_dir().join(principal.as_str());
     let outcomes = tokio::task::spawn_blocking(move || {
         [
-            ("home", reclaim_dir_all(&home)),
+            ("home", reclaim_empty_dir(&home)),
             ("keys", reclaim_file(&key)),
-            ("secrets", reclaim_dir_all(&secrets)),
+            // Legacy file-secrets are no longer authoritative.  Retire only
+            // the caller-owned, verified root; never recursively follow a
+            // symlink or delete an arbitrary home tree.
+            ("secrets", reclaim_legacy_secret_root(&secrets)),
         ]
     })
     .await
@@ -327,12 +338,39 @@ async fn retire_and_reclaim(
     Ok((unloaded, reclaimed, cleanup_errors))
 }
 
-fn reclaim_dir_all(path: &Path) -> Result<(), String> {
-    match std::fs::remove_dir_all(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("{}: {e}", path.display())),
+/// Retire only an already-empty legacy root.  Agent deletion is not a layout
+/// migration and must never recursively remove a native source; the global
+/// migration barrier owns that operation.  Re-checking immediately before
+/// `remove_dir` makes a source that appears after the admission check fail
+/// closed instead of being discarded.
+pub(super) fn reclaim_empty_dir(path: &Path) -> Result<(), String> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "{}: refusing to retire a non-directory legacy root",
+            path.display()
+        ));
     }
+    astrid_core::platform_fs::verify_no_redirects(path)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let mut entries =
+        std::fs::read_dir(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    if entries
+        .next()
+        .transpose()
+        .map_err(|error| format!("{}: {error}", path.display()))?
+        .is_some()
+    {
+        return Err(format!(
+            "{}: legacy root became non-empty; migration retirement is required",
+            path.display()
+        ));
+    }
+    std::fs::remove_dir(path).map_err(|error| format!("{}: {error}", path.display()))
 }
 
 fn reclaim_file(path: &Path) -> Result<(), String> {
@@ -341,4 +379,35 @@ fn reclaim_file(path: &Path) -> Result<(), String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(format!("{}: {e}", path.display())),
     }
+}
+
+pub(super) fn reclaim_legacy_secret_root(path: &Path) -> Result<(), String> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+    };
+    if !metadata.is_dir() {
+        return Err(format!(
+            "{}: legacy secret root is not a directory",
+            path.display()
+        ));
+    }
+    let entries =
+        std::fs::read_dir(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("{}: {error}", path.display()))?;
+        let entry_path = entry.path();
+        let entry_metadata = std::fs::symlink_metadata(&entry_path)
+            .map_err(|error| format!("{}: {error}", entry_path.display()))?;
+        if !entry_metadata.file_type().is_file() {
+            return Err(format!(
+                "{}: refusing to retire non-regular legacy secret entry",
+                entry_path.display()
+            ));
+        }
+        std::fs::remove_file(&entry_path)
+            .map_err(|error| format!("{}: {error}", entry_path.display()))?;
+    }
+    std::fs::remove_dir(path).map_err(|error| format!("{}: {error}", path.display()))
 }

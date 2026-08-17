@@ -56,6 +56,46 @@ fn hosted_volume_recovers_regions_without_host_directory_projection() {
 }
 
 #[test]
+fn hosted_volume_reclaim_shrinks_and_recovers_swap_artifacts() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("astrid.volume");
+    let region = VolumeRegion::new("objects").unwrap();
+    {
+        let volume = HostedFileVolume::open(&path).unwrap();
+        volume.create_region(&region, true).unwrap();
+        volume
+            .write_region_at(&region, 0, &vec![0xAA; 256 * 1024])
+            .unwrap();
+        volume.write_region_at(&region, 0, b"small").unwrap();
+        volume.set_region_len(&region, 5).unwrap();
+        volume.sync().unwrap();
+        let before = std::fs::metadata(&path).unwrap().len();
+        volume.reclaim().unwrap();
+        let after = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            after < before,
+            "reclaim did not shrink volume: {before} -> {after}"
+        );
+    }
+
+    let previous = PathBuf::from(format!("{}.previous", path.display()));
+    let temporary_path = PathBuf::from(format!("{}.compacting", path.display()));
+    std::fs::copy(&path, &previous).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    let volume = HostedFileVolume::open(&path).unwrap();
+    let mut bytes = [0; 5];
+    volume.read_region_at(&region, 0, &mut bytes).unwrap();
+    assert_eq!(&bytes, b"small");
+    assert!(!previous.exists());
+    drop(volume);
+
+    std::fs::write(&temporary_path, b"uncommitted replacement").unwrap();
+    let volume = HostedFileVolume::open(&path).unwrap();
+    assert!(!temporary_path.exists());
+    drop(volume);
+}
+
+#[test]
 fn volume_file_has_independent_clone_cursors() {
     let temporary = tempfile::tempdir().unwrap();
     let volume: Arc<dyn AstridVolume> =

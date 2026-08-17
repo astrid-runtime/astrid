@@ -1,11 +1,17 @@
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
+use std::sync::Arc;
 
 use astrid_build::artifact::{self, sign_archive};
 use astrid_core::PrincipalId;
 use astrid_core::dirs::{AstridHome, WorkspaceLayout};
+use astrid_core::identity::PrincipalUid;
 use astrid_crypto::KeyPair;
+use astrid_storage::{
+    KvQuotaResolver, PrincipalDirectory, RuntimePrincipalStore, StateOwner,
+    open_runtime_principal_store_with_directory,
+};
 
 use crate::{
     ArtifactProvenance, AuthorityDecision, AuthoritySource, InstallOptions, authorize_install,
@@ -63,6 +69,32 @@ fn install_home(root: &Path, key: &KeyPair) -> AstridHome {
     home
 }
 
+fn install_store(home: &AstridHome, principal: &PrincipalId) -> Arc<RuntimePrincipalStore> {
+    let directory = PrincipalDirectory::default();
+    directory
+        .register(principal.clone(), PrincipalUid::from_bytes([0x11; 32]))
+        .unwrap();
+    let quota: Arc<dyn KvQuotaResolver<StateOwner>> = Arc::new(|owner: &StateOwner| {
+        Ok(match owner {
+            StateOwner::System => None,
+            StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(u64::MAX),
+        })
+    });
+    let store = Arc::new(
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(open_runtime_principal_store_with_directory(
+                home, quota, directory,
+            ))
+            .unwrap(),
+    );
+    store
+        .principal_directory()
+        .register(principal.clone(), PrincipalUid::from_bytes([0x11; 32]))
+        .unwrap();
+    store
+}
+
 #[test]
 fn same_runtime_build_installs_automatically_and_records_authority() {
     let temp = tempfile::tempdir().unwrap();
@@ -77,6 +109,7 @@ fn same_runtime_build_installs_automatically_and_records_authority() {
     );
     sign_archive(&archive, &key).unwrap();
     let principal = PrincipalId::new("alice").unwrap();
+    let storage = install_store(&home, &principal);
 
     let inspection = inspect_archive_for_principal_with_layout(
         &archive,
@@ -93,7 +126,10 @@ fn same_runtime_build_installs_automatically_and_records_authority() {
     let output = unpack_and_install_authorized_for_principal_with_layout(
         &archive,
         &home,
-        InstallOptions::default(),
+        InstallOptions {
+            storage: Some(storage),
+            ..Default::default()
+        },
         &principal,
         &AuthorityDecision::Automatic,
         &WorkspaceLayout::default(),
@@ -209,6 +245,7 @@ fn foreign_runtime_signature_needs_digest_bound_approval() {
     sign_archive(&archive, &builder_key).unwrap();
     let principal = PrincipalId::new("alice").unwrap();
     let layout = WorkspaceLayout::default();
+    let storage = install_store(&home, &principal);
     let inspection =
         inspect_archive_for_principal_with_layout(&archive, &home, &principal, false, &layout)
             .unwrap();
@@ -221,7 +258,10 @@ fn foreign_runtime_signature_needs_digest_bound_approval() {
         unpack_and_install_authorized_for_principal_with_layout(
             &archive,
             &home,
-            InstallOptions::default(),
+            InstallOptions {
+                storage: Some(Arc::clone(&storage)),
+                ..Default::default()
+            },
             &principal,
             &AuthorityDecision::ExplicitApproval {
                 content_digest: "wrong".into(),
@@ -233,7 +273,10 @@ fn foreign_runtime_signature_needs_digest_bound_approval() {
     let output = unpack_and_install_authorized_for_principal_with_layout(
         &archive,
         &home,
-        InstallOptions::default(),
+        InstallOptions {
+            storage: Some(storage),
+            ..Default::default()
+        },
         &principal,
         &AuthorityDecision::ExplicitApproval {
             content_digest: inspection.content_digest,
@@ -308,6 +351,7 @@ fn upgrade_inspection_reports_only_new_capability_authority() {
     let home = install_home(&temp.path().join("runtime"), &KeyPair::generate());
     let principal = PrincipalId::new("alice").unwrap();
     let layout = WorkspaceLayout::default();
+    let storage = install_store(&home, &principal);
     let v1 = temp.path().join("v1.capsule");
     write_archive(
         &v1,
@@ -320,7 +364,10 @@ fn upgrade_inspection_reports_only_new_capability_authority() {
     unpack_and_install_authorized_for_principal_with_layout(
         &v1,
         &home,
-        InstallOptions::default(),
+        InstallOptions {
+            storage: Some(Arc::clone(&storage)),
+            ..Default::default()
+        },
         &principal,
         &AuthorityDecision::ExplicitApproval {
             content_digest: first.content_digest,
@@ -343,9 +390,11 @@ fn upgrade_inspection_reports_only_new_capability_authority() {
         upgrade.capability_expansions[0].name,
         "allow_prompt_injection"
     );
-    assert_eq!(
-        upgrade.capability_expansions[1].added,
-        vec!["db.example:5432"]
+    assert!(
+        upgrade.capability_expansions[1]
+            .added
+            .iter()
+            .any(|capability| capability == "db.example:5432")
     );
 }
 

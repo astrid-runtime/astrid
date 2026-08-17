@@ -6,6 +6,7 @@ mod device_scope;
 /// `astrid-capsule-install` library so the daemon and the CLI reach
 /// disk through the same code path.
 mod install;
+mod inventory;
 mod projection_names;
 mod rate_limit;
 /// Kernel-response publishing envelope + the long-request keepalive pinger.
@@ -15,7 +16,6 @@ mod visibility;
 pub(crate) use rate_limit::{ManagementRateLimiter, rate_limit_for_request};
 pub(crate) use response::{KeepalivePinger, publish_response, workspace_commit_response};
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -32,6 +32,7 @@ use tracing::{debug, info, warn};
 use caller::CallerResolutionError;
 use caller::{MANAGEMENT_CALLER_REQUIRED, resolve_caller, resolve_connection_principal};
 use device_scope::resolve_device_scope;
+use inventory::{durable_wit_hashes, visible_inventory_manifests};
 use visibility::CapsuleVisibility;
 
 #[cfg(test)]
@@ -258,6 +259,7 @@ async fn handle_request(
     // below is reached without `authorize_request` returning Ok.
     let method = kernel_request_method(&req);
     let scope = resolve_scope(&req, &caller);
+    let requested_target = request_target_principal(&req, &caller);
     let required_cap = required_capability(&req, scope);
     let authorization =
         match authorize_request(kernel, &caller, device_key_id.as_deref(), required_cap) {
@@ -277,7 +279,7 @@ async fn handle_request(
                         method,
                         required_cap,
                         device_key_id: device_key_id.as_deref(),
-                        target_principal: None,
+                        target_principal: requested_target.clone(),
                         params: None,
                         authorization: AuthorizationProof::Denied {
                             reason: e.to_string(),
@@ -318,7 +320,7 @@ async fn handle_request(
                 method,
                 required_cap,
                 device_key_id: device_key_id.as_deref(),
-                target_principal: None,
+                target_principal: requested_target.clone(),
                 params: None,
                 authorization: authorization_proof,
                 outcome: AuditOutcome::failure(reason.clone()),
@@ -341,7 +343,7 @@ async fn handle_request(
             method,
             required_cap,
             device_key_id: device_key_id.as_deref(),
-            target_principal: None,
+            target_principal: requested_target,
             params: None,
             authorization: authorization_proof,
             outcome: AuditOutcome::success(),
@@ -366,9 +368,29 @@ async fn handle_request(
     );
 
     let res = match req {
-        KernelRequest::InstallCapsule { source, workspace } => {
-            info!(source = %source, workspace, "Kernel received install request");
-            install::handle_install_capsule(kernel, &caller, &source, workspace).await
+        KernelRequest::InstallCapsule {
+            source,
+            workspace,
+            target_principal,
+            provenance,
+            env,
+        } => {
+            info!(
+                source = %source,
+                workspace,
+                target = ?target_principal,
+                "Kernel received install request"
+            );
+            install::handle_install_capsule(
+                kernel,
+                &caller,
+                target_principal.as_ref(),
+                &source,
+                workspace,
+                provenance.as_ref(),
+                &env,
+            )
+            .await
         },
         KernelRequest::ApproveCapability {
             request_id,
@@ -460,6 +482,22 @@ async fn handle_request(
                 Err(e) => KernelResponse::Error(format!("invalid capsule id '{id}': {e}")),
             }
         },
+        KernelRequest::RemoveCapsule { id, force: _ } => {
+            match astrid_capsule::capsule::CapsuleId::new(id.clone()) {
+                Ok(cap_id) => match kernel.remove_one_capsule(&cap_id, &caller).await {
+                    Ok(true) => KernelResponse::Success(
+                        serde_json::json!({"status": "removed", "capsule": id}),
+                    ),
+                    Ok(false) => KernelResponse::Error(format!(
+                        "capsule '{id}' is not installed for principal '{caller}'"
+                    )),
+                    Err(error) => {
+                        KernelResponse::Error(format!("remove of capsule '{id}' failed: {error}"))
+                    },
+                },
+                Err(error) => KernelResponse::Error(format!("invalid capsule id '{id}': {error}")),
+            }
+        },
         KernelRequest::PromoteWorkspace { id } => {
             workspace_commit_response(kernel, &caller, &id, true).await
         },
@@ -515,18 +553,49 @@ async fn handle_request(
         },
         KernelRequest::GetCapsuleMetadata => {
             let visibility = CapsuleVisibility::new(&authorization);
+            let manifests = visible_inventory_manifests(kernel, &visibility).await;
+            let registry = kernel.capsules.read().await;
+            let owner_uid = kernel.principal_directory.uid_for(&caller).ok();
             let mut entries = Vec::new();
-            for manifest in visible_inventory_manifests(kernel, &visibility).await {
+            for manifest in manifests {
+                let source_id =
+                    astrid_capsule::capsule::CapsuleId::new(manifest.package.name.clone())
+                        .ok()
+                        .and_then(|id| registry.source_id_for(&caller, &id));
+                let env = manifest
+                    .env
+                    .iter()
+                    .map(|(name, def)| {
+                        (
+                            name.clone(),
+                            astrid_events::kernel_api::CapsuleEnvMetadata {
+                                env_type: def.env_type.clone(),
+                                request: def.request.clone(),
+                                description: def.description.clone(),
+                                default: def.default.clone(),
+                                enum_values: def.enum_values.clone(),
+                                placeholder: def.placeholder.clone(),
+                            },
+                        )
+                    })
+                    .collect();
+                let wit_hashes = durable_wit_hashes(kernel, owner_uid, &manifest.package.name);
                 entries.push(astrid_events::kernel_api::CapsuleMetadataEntry {
                     name: manifest.package.name.clone(),
                     capabilities: serde_json::to_value(&manifest.capabilities)
                         .unwrap_or(serde_json::Value::Null),
+                    version: manifest.package.version.clone(),
+                    description: manifest.package.description.clone(),
                     interceptor_events: manifest
                         .subscribes
                         .iter()
                         .filter(|(_, def)| def.handler.is_some())
                         .map(|(topic, _)| topic.clone())
                         .collect(),
+                    env,
+                    wit_hashes,
+                    source_id,
+                    owner_uid,
                 });
             }
             KernelResponse::CapsuleMetadata(entries)
@@ -549,59 +618,6 @@ async fn handle_request(
         device_key_id.as_deref(),
         res,
     );
-}
-
-async fn inventory_manifest_map(
-    kernel: &crate::Kernel,
-    visibility: &CapsuleVisibility,
-) -> BTreeMap<String, astrid_capsule::manifest::CapsuleManifest> {
-    let paths = crate::capsule_discovery_paths_for(
-        &kernel.astrid_home,
-        &kernel.workspace_root,
-        &visibility.principal,
-        &kernel.workspace_layout,
-    );
-    let workspace_layout = kernel.workspace_layout.clone();
-    let workspace_root = kernel.workspace_root.clone();
-    let discovered = match tokio::task::spawn_blocking(move || {
-        astrid_capsule::discovery::discover_manifests_in_workspace(
-            Some(&paths),
-            Some(&workspace_root),
-            &workspace_layout,
-        )
-    })
-    .await
-    {
-        Ok(discovered) => discovered,
-        Err(err) => {
-            warn!(error = %err, "Capsule inventory discovery task failed");
-            Vec::new()
-        },
-    };
-
-    discovered
-        .into_iter()
-        .filter_map(|(manifest, _)| {
-            let id = astrid_capsule::capsule::CapsuleId::new(manifest.package.name.clone()).ok()?;
-            visibility.allows(&id).then_some((id.to_string(), manifest))
-        })
-        .collect()
-}
-
-async fn visible_inventory_manifests(
-    kernel: &crate::Kernel,
-    visibility: &CapsuleVisibility,
-) -> Vec<astrid_capsule::manifest::CapsuleManifest> {
-    let mut manifests = inventory_manifest_map(kernel, visibility).await;
-    let registry = kernel.capsules.read().await;
-    for capsule in visibility.capsules(&registry) {
-        if visibility.allows(capsule.id()) {
-            manifests
-                .entry(capsule.id().to_string())
-                .or_insert_with(|| capsule.manifest().clone());
-        }
-    }
-    manifests.into_values().collect()
 }
 
 fn schedule_reload_capsules(kernel: Arc<crate::Kernel>) -> bool {
@@ -669,19 +685,31 @@ pub enum AuthorityScope {
 
 /// Return the authority scope the caller is exercising for `req`.
 ///
-/// A daemon-side capsule install with `workspace = false` mutates the daemon's
-/// configured install target, so it requires the global install capability even
-/// though it does not grant any principal visibility by itself. Workspace
-/// installs remain self-scoped; the daemon rejects them later because it has no
-/// meaningful current workspace.
+/// A daemon-side capsule install defaults to the authenticated caller's
+/// principal. Selecting another principal is a global operation and therefore
+/// requires the global install capability. Workspace installs remain
+/// self-scoped; the daemon rejects them later because it has no meaningful
+/// current workspace.
 #[must_use]
-pub fn resolve_scope(req: &KernelRequest, _caller: &PrincipalId) -> AuthorityScope {
+pub fn resolve_scope(req: &KernelRequest, caller: &PrincipalId) -> AuthorityScope {
     match req {
-        KernelRequest::ReloadCapsules
-        | KernelRequest::InstallCapsule {
-            workspace: false, ..
-        } => AuthorityScope::Global,
+        KernelRequest::ReloadCapsules => AuthorityScope::Global,
+        KernelRequest::InstallCapsule {
+            target_principal: Some(target),
+            ..
+        } if target != caller => AuthorityScope::Global,
         _ => AuthorityScope::Self_,
+    }
+}
+
+/// Return an explicit cross-principal target for audit records.
+fn request_target_principal(req: &KernelRequest, caller: &PrincipalId) -> Option<PrincipalId> {
+    match req {
+        KernelRequest::InstallCapsule {
+            target_principal: Some(target),
+            ..
+        } if target != caller => Some(target.clone()),
+        _ => None,
     }
 }
 
@@ -703,8 +731,13 @@ pub fn required_capability(req: &KernelRequest, scope: AuthorityScope) -> &'stat
         (KernelRequest::ReloadCapsules | KernelRequest::ReloadCapsule { .. }, _) => {
             "capsule:reload"
         },
-        (KernelRequest::UnloadCapsule { .. }, AuthorityScope::Self_) => "self:capsule:remove",
-        (KernelRequest::UnloadCapsule { .. }, _) => "capsule:remove",
+        (
+            KernelRequest::UnloadCapsule { .. } | KernelRequest::RemoveCapsule { .. },
+            AuthorityScope::Self_,
+        ) => "self:capsule:remove",
+        (KernelRequest::UnloadCapsule { .. } | KernelRequest::RemoveCapsule { .. }, _) => {
+            "capsule:remove"
+        },
         // Promote/rollback are self-scoped (no target-principal field), so
         // `resolve_scope` always yields `Self_`; the `_` arm is for exhaustiveness.
         (KernelRequest::PromoteWorkspace { .. }, _) => "self:workspace:promote",
@@ -737,6 +770,7 @@ pub fn kernel_request_method(req: &KernelRequest) -> &'static str {
         KernelRequest::ReloadCapsules => "ReloadCapsules",
         KernelRequest::ReloadCapsule { .. } => "ReloadCapsule",
         KernelRequest::UnloadCapsule { .. } => "UnloadCapsule",
+        KernelRequest::RemoveCapsule { .. } => "RemoveCapsule",
         KernelRequest::PromoteWorkspace { .. } => "PromoteWorkspace",
         KernelRequest::RollbackWorkspace { .. } => "RollbackWorkspace",
         KernelRequest::InstallCapsule { .. } => "InstallCapsule",
@@ -962,6 +996,5 @@ async fn record_admin_audit(kernel: &crate::Kernel, entry: AdminAuditEntry<'_>) 
         message: msg,
     });
 }
-
 #[cfg(test)]
 mod tests;

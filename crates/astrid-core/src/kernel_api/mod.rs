@@ -12,6 +12,7 @@ mod agent;
 mod impls;
 mod projection_names;
 mod readiness;
+mod response_types;
 pub use agent::{AgentDeriveKernelRequest, AgentDeriveRequest};
 pub use projection_names::{
     PROJECTION_NAME_DIAGNOSTIC_METHOD, PROJECTION_NAME_DIAGNOSTIC_TOPIC,
@@ -19,12 +20,66 @@ pub use projection_names::{
     ProjectionNamePolicyPreset,
 };
 pub use readiness::{AgentLoopReadiness, AgentReadinessProbe, CapsuleTopicProbe, MissingImport};
+pub use response_types::{
+    AdminResponseBody, AgentSummary, AuditHealth, AuditPruneResult, AuditStats,
+    DistroCapsuleProvenance, DistroProvenance, GroupSummary, InviteIssued, InviteRedeemed,
+    InviteSummary, PairTokenIssued, PairTokenRedeemed, ResourceUsage,
+};
 
 use crate::PrincipalId;
 use crate::profile::Quotas;
 use crate::storage_filesystem::StorageMountLeaseV1;
 use crate::storage_provider::{StorageMountId, StorageProviderAccessV1, StorageProviderViewV1};
 use serde::{Deserialize, Serialize};
+
+/// Host-owned projection selected by an env/secret admin request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum EnvStorageScope {
+    /// Principal-scoped control namespace.
+    Agent,
+    /// System/host-scoped control namespace.
+    Shared,
+}
+
+/// Typed values managed by the env admin API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum EnvValueKind {
+    /// Non-secret environment configuration.
+    Text,
+    /// Secret-typed environment configuration.
+    Secret,
+}
+
+/// A redacted env/secret key returned by the admin list API.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvEntry {
+    /// Capsule whose host-owned projection contains the key.
+    pub capsule: String,
+    /// Manifest env/secret key.
+    pub key: String,
+    /// Whether this row is secret-typed.
+    pub kind: EnvValueKind,
+    /// Principal or host scope containing the value.
+    pub scope: EnvStorageScope,
+}
+
+/// Bounded provenance supplied with a daemon-owned capsule install.
+///
+/// Provenance is descriptive input to the kernel's integrity gate, never an
+/// authority grant.  The kernel validates the fields against the local source
+/// before publishing the durable package and rejects overlong or malformed
+/// values.  Keeping this as a small typed object avoids allowing a caller to
+/// smuggle an unbounded distro manifest or arbitrary metadata through the
+/// management wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapsuleInstallProvenance {
+    /// Stable distro identifier, when the source came from a sealed distro.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distro: Option<String>,
+    /// Canonical BLAKE3 digest of the source artifact, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_digest: Option<String>,
+}
 
 /// The well-known system session UUID string used by the background daemon.
 ///
@@ -43,6 +98,21 @@ pub enum KernelRequest {
         source: String,
         /// True if this should be installed locally in the workspace.
         workspace: bool,
+        /// Optional durable principal target.  When absent, the
+        /// authenticated caller is the target.  Selecting another principal
+        /// requires the global capsule-install capability and is resolved to
+        /// that principal's immutable UID by the kernel.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_principal: Option<PrincipalId>,
+        /// Optional bounded distro/source provenance.  This is integrity
+        /// evidence only; it never widens install authority.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provenance: Option<CapsuleInstallProvenance>,
+        /// Typed owner-scoped values staged by the daemon before lifecycle.
+        /// Values are redacted from audit payloads and are bounded by the
+        /// kernel's environment limits.
+        #[serde(default)]
+        env: Vec<CapsuleInstallEnv>,
     },
     /// Request to approve a capability grant (usually following an `ApprovalNeeded` response).
     ApproveCapability {
@@ -71,6 +141,16 @@ pub enum KernelRequest {
     UnloadCapsule {
         /// The capsule id (its `[package].name`).
         id: String,
+    },
+    /// Remove one capsule package from the authenticated owner's durable
+    /// registry and unload its live runtime. The daemon is the sole writer;
+    /// clients never delete install paths directly.
+    RemoveCapsule {
+        /// Capsule identifier.
+        id: String,
+        /// Force removal even when dependency metadata is unavailable.
+        #[serde(default)]
+        force: bool,
     },
     /// Promote a capsule's OS-level copy-on-write workspace changes into the
     /// pristine workspace — the gate's "approve" (Fix #2). For a non-git
@@ -104,6 +184,21 @@ pub enum KernelRequest {
     /// Request agent-loop readiness: whether the loaded capsule set can serve
     /// an agent chat turn. Read-only, name-agnostic — see [`AgentLoopReadiness`].
     GetAgentReadiness,
+}
+
+/// One bounded, typed environment value accompanying a daemon capsule install.
+///
+/// This wire shape is intentionally separate from [`AdminRequestKind::EnvSet`]
+/// so the kernel can snapshot and roll back the previous value if an install
+/// lifecycle fails. Secret bytes never appear in kernel errors or audit rows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapsuleInstallEnv {
+    /// Manifest-declared field name.
+    pub key: String,
+    /// Value to stage in the owner's host-only control namespace.
+    pub value: String,
+    /// Secret or non-secret projection.
+    pub kind: EnvValueKind,
 }
 
 /// Management API responses from the core daemon.
@@ -185,12 +280,58 @@ pub struct PrincipalConnectionCount {
 pub struct CapsuleMetadataEntry {
     /// The capsule's unique name.
     pub name: String,
+    /// Package version from the authoritative manifest snapshot.
+    #[serde(default)]
+    pub version: String,
+    /// Optional package description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     /// Interceptor event patterns declared by this capsule.
     pub interceptor_events: Vec<String>,
     /// Serialized `CapabilitiesDef`. The kernel remains engine-agnostic; the
     /// gateway translates this into semantic permission cards for UI.
     #[serde(default)]
     pub capabilities: serde_json::Value,
+    /// Host-owned environment schema declared by this capsule. Values are
+    /// metadata only; secret values never cross the kernel API.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub env: std::collections::HashMap<String, CapsuleEnvMetadata>,
+    /// Content-addressed WIT blob hashes retained by the owner registry.
+    /// This lets admin clients perform GC without reading install paths.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wit_hashes: Vec<String>,
+    /// Kernel-stamped source identity for the loaded runtime, when one is
+    /// available. Gateways use this instead of inspecting install paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<uuid::Uuid>,
+    /// Stable UID of the authenticated owner view, when that alias is
+    /// admitted. Gateways use this typed identity for control-KV requests;
+    /// mutable aliases are never used as storage keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_uid: Option<crate::identity::PrincipalUid>,
+}
+
+/// Non-secret metadata for one capsule-declared environment field.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapsuleEnvMetadata {
+    /// Declared field type (`text`, `secret`, `select`, or `array`).
+    #[serde(rename = "type")]
+    pub env_type: String,
+    /// Prompt requested by the capsule author, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<String>,
+    /// Human-readable field description, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Non-secret default value, if declared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<serde_json::Value>,
+    /// Allowed values for select fields.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enum_values: Vec<String>,
+    /// Optional input placeholder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placeholder: Option<String>,
 }
 
 /// How a capsule-declared command is surfaced to operators.
@@ -390,8 +531,8 @@ pub enum AdminRequestKind {
         #[serde(default)]
         grants: Vec<String>,
         /// Opt-in inheritance source. When `Some`, the new principal
-        /// receives a full copy of this source principal's `.config/env/`,
-        /// per-capsule KV namespaces, and per-capsule secret files. When
+        /// receives a full copy of this source principal's typed env/secret
+        /// control namespaces and per-capsule KV namespaces. When
         /// `None` (the default) the new principal inherits **nothing** —
         /// least privilege, no silent credential leak from `default`.
         ///
@@ -402,7 +543,7 @@ pub enum AdminRequestKind {
         /// Opt-in clone source. When `Some`, the new principal is a full
         /// replica of this source: its capability **profile** (groups,
         /// grants, revokes, network egress, process-spawn allow-list,
-        /// quotas) AND its **state** (the same env/KV/secret copy
+        /// quotas) AND its **state** (the same typed env/secret/KV copy
         /// `inherit_from` performs). The source's `auth` (public keys /
         /// authenticators) is deliberately NOT copied — each principal keeps
         /// its own identity. Mutually exclusive with `inherit_from`,
@@ -502,6 +643,66 @@ pub enum AdminRequestKind {
     UsageGet {
         /// Principal whose usage is being read.
         principal: PrincipalId,
+    },
+    /// Set one host-owned capsule environment or secret value.
+    EnvSet {
+        /// Principal whose agent-scoped projection is addressed. For shared
+        /// scope this is still the authenticated target used for audit and
+        /// authorization; the value is stored under the system owner.
+        principal: PrincipalId,
+        /// Capsule id whose typed projection is addressed.
+        capsule: String,
+        /// Manifest env/secret key.
+        key: String,
+        /// Value to store. Secret values are never echoed in responses/audit.
+        value: String,
+        /// Typed value class.
+        kind: EnvValueKind,
+        /// Principal (`Agent`) or host/system (`Shared`) scope.
+        scope: EnvStorageScope,
+        /// Append to an array-typed text field instead of replacing it.
+        /// Secret values must never set this flag.
+        #[serde(default)]
+        append: bool,
+    },
+    /// List redacted keys in host-owned capsule projections.
+    EnvList {
+        /// Principal whose agent-scoped entries are listed.
+        principal: PrincipalId,
+        /// Optional capsule filter. Omitted means all currently loaded
+        /// capsules; arbitrary namespace strings are never accepted.
+        #[serde(default)]
+        capsule: Option<String>,
+    },
+    /// Delete one host-owned capsule environment or secret value.
+    EnvDelete {
+        /// Principal whose agent-scoped projection is addressed.
+        principal: PrincipalId,
+        /// Capsule id whose typed projection is addressed.
+        capsule: String,
+        /// Manifest env/secret key.
+        key: String,
+        /// Typed value class.
+        kind: EnvValueKind,
+        /// Principal or host/system scope.
+        scope: EnvStorageScope,
+    },
+    /// Read the authenticated principal's durable distro provenance.
+    DistroLockGet {
+        /// Principal whose control record is addressed.
+        principal: PrincipalId,
+    },
+    /// Atomically replace the authenticated principal's durable distro
+    /// provenance. The kernel validates and bounds every field before write.
+    DistroLockSet {
+        /// Principal whose control record is addressed.
+        principal: PrincipalId,
+        /// New provenance record.
+        lock: DistroProvenance,
+        /// BLAKE3 digest of the previously read canonical record. `None`
+        /// means the caller expects no record to exist (create semantics).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_hash: Option<String>,
     },
     /// Create a custom group, validated through the same rules the boot
     /// loader applies to `groups.toml`.
@@ -605,9 +806,9 @@ pub enum AdminRequestKind {
         principal: PrincipalId,
     },
     /// Issue a new invite token. Capability-gated by `invite:issue`.
-    /// The kernel persists the token under `etc/invites.toml` with
-    /// expiry + remaining use count, and the caller publishes the
-    /// returned redeem URL out-of-band.
+    /// The kernel persists the token in system-owner durable control storage
+    /// with expiry and remaining-use count. The caller publishes the returned
+    /// redeem URL out-of-band.
     InviteIssue {
         /// Group new redeemers join. Must already exist (built-in or
         /// custom) — validated against the live `GroupConfig`.
@@ -717,6 +918,24 @@ pub enum AdminRequestKind {
         /// The deterministic `key_id` of the device to remove.
         key_id: String,
     },
+    /// Read O(1) system-owned audit retention/accounting counters.
+    ///
+    /// This request is deliberately global-only: audit records and their
+    /// retention metadata never belong to a principal home projection.
+    AuditStats,
+    /// Prune the oldest eligible sealed audit segment while retaining at
+    /// least `retain_entries` entries in its chain. The signed archive
+    /// receipt is returned to the operator; entry payloads never cross the
+    /// admin wire.
+    AuditPrune {
+        /// Minimum suffix entries to retain. Must be at least one.
+        retain_entries: u64,
+        /// Optional minimum retained canonical bytes. Zero is rejected.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retain_bytes: Option<u64>,
+    },
+    /// Read bounded ingestion queue health for the system audit writer.
+    AuditHealth,
     /// Issue an authenticated native filesystem lease. The handler resolves
     /// the selected view to a typed store owner and starts a private callback
     /// endpoint; the provider never receives a general daemon session token.
@@ -758,220 +977,6 @@ pub struct AdminKernelResponse {
     /// The typed response body — `tag = "status", content = "data"`.
     #[serde(flatten)]
     pub body: AdminResponseBody,
-}
-
-/// Typed admin response body.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "status", content = "data")]
-pub enum AdminResponseBody {
-    /// Generic success payload — used by mutating variants where the
-    /// interesting result is "the write landed."
-    Success(serde_json::Value),
-    /// Response for [`AdminRequestKind::AgentList`].
-    AgentList(Vec<AgentSummary>),
-    /// Response for [`AdminRequestKind::GroupList`].
-    GroupList(Vec<GroupSummary>),
-    /// Response for [`AdminRequestKind::QuotaGet`].
-    Quotas(Quotas),
-    /// Response for [`AdminRequestKind::UsageGet`].
-    Usage(ResourceUsage),
-    /// Response for [`AdminRequestKind::InviteIssue`] — the freshly
-    /// minted token plus its persisted metadata. The redemption URL is
-    /// derived client-side from the deployment's public gateway base
-    /// URL; the kernel never knows where the gateway is reachable.
-    Invite(InviteIssued),
-    /// Response for [`AdminRequestKind::InviteRedeem`] — the new
-    /// principal id (so the redeemer can locally pin the binding) and
-    /// the assigned group. The redeemer also gets back the issuing
-    /// public-key fingerprint so out-of-band verification of the
-    /// minted principal becomes possible.
-    InviteRedeemed(InviteRedeemed),
-    /// Response for [`AdminRequestKind::InviteList`].
-    InviteList(Vec<InviteSummary>),
-    /// Response for [`AdminRequestKind::PairDeviceIssue`].
-    PairToken(PairTokenIssued),
-    /// Response for [`AdminRequestKind::PairDeviceRedeem`].
-    PairTokenRedeemed(PairTokenRedeemed),
-    /// Response for [`AdminRequestKind::PairDeviceList`] — the principal's
-    /// paired devices as fingerprint-level summaries (never the raw pubkey).
-    PairDeviceListed(Vec<DeviceKeyInfo>),
-    /// Response for [`AdminRequestKind::PairDeviceRevoke`] — the `key_id`
-    /// of the device that was removed.
-    PairDeviceRevoked {
-        /// The `key_id` of the revoked device.
-        key_id: String,
-    },
-    /// Response for [`AdminRequestKind::StorageMountIssue`].
-    StorageMountLease(Box<StorageMountLeaseV1>),
-    /// The request failed.
-    Error(String),
-}
-
-/// Per-principal resource usage vs configured budget — the payload of
-/// [`AdminRequestKind::UsageGet`], rendered by `astrid quota`/`astrid top` and
-/// `GET /api/sys/principals/{id}/usage` so per-principal usage is measurable.
-///
-/// **CPU** is the live cross-capsule aggregate: the kernel's shared fuel ledger
-/// sums every interceptor's exact wasmtime-fuel cost per invoking principal
-/// across all capsules. **Memory** is reported as a per-principal *peak*
-/// (`memory_bytes_peak_total`): the kernel's shared memory ledger records the
-/// high-water linear-memory size each invoking principal grows a Store to,
-/// max'd across all capsules. A live cross-capsule *current* total
-/// (`memory_bytes_current_total`) is not implemented — under pooled, shared
-/// Stores it is not cleanly attributable — so it stays `None`; the limit field
-/// reports the per-instance ceiling.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResourceUsage {
-    /// Principal this usage report describes.
-    pub principal: PrincipalId,
-    /// Cumulative interceptor CPU burned across ALL capsules, in wasmtime fuel
-    /// units (exact deterministic instruction count, monotonic for the process
-    /// lifetime).
-    pub cpu_fuel_consumed_total: u64,
-    /// Configured CPU rate ceiling ([`Quotas::max_cpu_fuel_per_sec`]), always
-    /// `> 0` (validation rejects `0` — there is no "unlimited" sentinel;
-    /// unbounded CPU is a capability, surfaced by `exempt`).
-    pub cpu_fuel_per_sec_limit: u64,
-    /// Whether the principal is exempt from resource budgets — it holds
-    /// `system:resources:unbounded`, `net_bind`, or `uplink` (admins via `*`).
-    /// When `true` the limit fields are advisory, never enforced.
-    pub exempt: bool,
-    /// Per-capsule-instance memory ceiling ([`Quotas::max_memory_bytes`]). This
-    /// is a per-Store cap, not a cross-capsule total.
-    pub memory_bytes_limit_per_instance: u64,
-    /// Current cross-capsule resident memory total, or `None` — a live
-    /// "current" total is not cleanly attributable under pooled, shared Stores,
-    /// so the peak (below) is the reported memory signal instead.
-    pub memory_bytes_current_total: Option<u64>,
-    /// Peak cross-capsule linear-memory high-water mark this principal has
-    /// driven, in bytes, max'd across every capsule it invokes (from the shared
-    /// memory ledger). `None` while no peak has been recorded — including
-    /// single-tenant deployments before any guest grows memory. The principal
-    /// that *grows* a Store owns the peak; one reusing an already-grown Store
-    /// without growing is not charged.
-    pub memory_bytes_peak_total: Option<u64>,
-}
-
-/// Summary of an agent principal returned by
-/// [`AdminKernelRequest::AgentList`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AgentSummary {
-    /// The principal identifier.
-    pub principal: PrincipalId,
-    /// Whether the principal is currently enabled (master switch).
-    pub enabled: bool,
-    /// Group memberships as written to `profile.toml`.
-    pub groups: Vec<String>,
-    /// Direct capability grants beyond group inheritance.
-    pub grants: Vec<String>,
-    /// Explicit revokes (highest-precedence deny).
-    pub revokes: Vec<String>,
-}
-
-/// Response payload for [`AdminRequestKind::InviteIssue`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct InviteIssued {
-    /// Typed `astrid_inv_` bearer token. The caller delivers this to the
-    /// redeemer out-of-band — e.g. printed by the CLI, surfaced by the
-    /// gateway as a redeem URL fragment, or pasted into a chat.
-    pub token: String,
-    /// Group the redeemer will join on success.
-    pub group: String,
-    /// Number of remaining redemptions before the token is invalidated.
-    pub remaining_uses: u32,
-    /// Wall-clock Unix-epoch timestamp at which the token expires.
-    /// `None` when the issuer requested no expiry.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expires_at_epoch: Option<u64>,
-    /// Operator-supplied label (`metadata` from the issue request).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<String>,
-}
-
-/// Response payload for [`AdminRequestKind::InviteRedeem`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct InviteRedeemed {
-    /// The freshly minted principal id. The redeemer pins this locally
-    /// alongside its keypair so subsequent gateway sessions can verify
-    /// the binding.
-    pub principal: PrincipalId,
-    /// Group the new principal is now a member of.
-    pub group: String,
-    /// Domain-separated `blake3:<hex>` fingerprint of the registered Ed25519 public key.
-    /// Lets the redeemer verify that the kernel registered the key it
-    /// sent rather than substituting one of its own.
-    pub public_key_fingerprint: String,
-}
-
-/// Response payload for [`AdminRequestKind::PairDeviceIssue`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PairTokenIssued {
-    /// Typed `astrid_pair_` bearer token. The issuing device hands this to the new
-    /// device out-of-band (QR code, NFC, manual copy).
-    pub token: String,
-    /// Principal the new device's key will attach to (always the
-    /// caller, never request-body derived).
-    pub principal: PrincipalId,
-    /// Wall-clock Unix-epoch timestamp at which the token expires.
-    pub expires_at_epoch: u64,
-    /// Operator-supplied label (echoed; not yet bound).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub label: Option<String>,
-}
-
-/// Response payload for [`AdminRequestKind::PairDeviceRedeem`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PairTokenRedeemed {
-    /// The principal the new device is now bound to.
-    pub principal: PrincipalId,
-    /// Domain-separated `blake3:<hex>` fingerprint of the registered Ed25519 key.
-    /// Lets the redeemer verify the kernel registered the key it
-    /// sent rather than substituting one of its own.
-    pub public_key_fingerprint: String,
-    /// Deterministic `key_id` of the registered device key (the stable
-    /// per-device handle derived from the pubkey). The gateway mints the new
-    /// device's bearer scoped to THIS `key_id` so the device authenticates
-    /// with — and is attenuated to — its own registered key.
-    pub key_id: String,
-}
-
-/// Summary of an outstanding invite returned by
-/// [`AdminRequestKind::InviteList`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct InviteSummary {
-    /// Domain-separated `blake3:<hex>` fingerprint of the token — the kernel does not
-    /// leak the raw token through list responses. Issuers retain the
-    /// raw value from the original [`InviteIssued`] response.
-    pub token_fingerprint: String,
-    /// Group the redeemer will join.
-    pub group: String,
-    /// Remaining redemptions.
-    pub remaining_uses: u32,
-    /// Wall-clock Unix-epoch timestamp at which the token expires.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expires_at_epoch: Option<u64>,
-    /// Wall-clock Unix-epoch timestamp at which the token was issued.
-    pub issued_at_epoch: u64,
-    /// Operator-supplied label.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<String>,
-}
-
-/// Summary of a group returned by [`AdminKernelRequest::GroupList`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GroupSummary {
-    /// Group name.
-    pub name: String,
-    /// Capability patterns conferred by this group.
-    pub capabilities: Vec<String>,
-    /// Human-readable description.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    /// Whether the group opted in to granting the universal `*`.
-    pub unsafe_admin: bool,
-    /// `true` for built-in groups (`admin`, `agent`, `restricted`).
-    /// Clients should treat built-ins as read-only.
-    pub builtin: bool,
 }
 
 #[cfg(test)]

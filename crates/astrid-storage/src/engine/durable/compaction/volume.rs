@@ -143,6 +143,9 @@ where
             self.limits,
         )?;
         self.install_volume_replacement(inner, replacement, Arc::clone(volume))?;
+        volume
+            .reclaim()
+            .map_err(|source| io_error("physically reclaim compacted volume", source))?;
         Ok(CompactionReport {
             objects_before,
             objects_after,

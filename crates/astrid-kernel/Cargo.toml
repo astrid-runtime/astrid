@@ -17,6 +17,7 @@ description = "Astrid micro-kernel, the core of the Astrid OS"
 # `wasm32-unknown-unknown`.
 [dependencies]
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 arc-swap = { workspace = true }
 astrid-approval = { workspace = true }
 astrid-audit = { workspace = true }
@@ -67,6 +68,15 @@ astrid-capsule-install = { workspace = true }
 astrid-mcp = { workspace = true }
 astrid-vfs = { workspace = true }
 tokio = { workspace = true, features = ["full", "signal"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libproc = "0.14.11"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 async-trait = { workspace = true }

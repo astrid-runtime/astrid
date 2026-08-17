@@ -38,6 +38,10 @@ use tracing::{info, warn};
 
 use crate::kernel_router::AuthorizedRequest;
 
+#[path = "env_handlers.rs"]
+mod env_handlers;
+use env_handlers::{EnvSetRequest, env_delete, env_list, env_set};
+
 /// Platform label used by the identity store for agent principals
 /// created via [`AdminRequestKind::AgentCreate`]. The per-principal
 /// `platform_user_id` equals the `PrincipalId` string.
@@ -116,6 +120,91 @@ async fn dispatch_inner(
         },
         AdminRequestKind::QuotaGet { principal } => super::quota::quota_get(kernel, &principal),
         AdminRequestKind::UsageGet { principal } => super::quota::usage_get(kernel, &principal),
+        req @ (AdminRequestKind::EnvSet { .. }
+        | AdminRequestKind::EnvList { .. }
+        | AdminRequestKind::EnvDelete { .. }
+        | AdminRequestKind::DistroLockGet { .. }
+        | AdminRequestKind::DistroLockSet { .. }
+        | AdminRequestKind::GroupCreate { .. }
+        | AdminRequestKind::GroupDelete { .. }
+        | AdminRequestKind::GroupModify { .. }
+        | AdminRequestKind::GroupList
+        | AdminRequestKind::CapsGrant { .. }
+        | AdminRequestKind::CapsRevoke { .. }
+        | AdminRequestKind::CapsTokenMint { .. }
+        | AdminRequestKind::CapsTokenRevoke { .. }
+        | AdminRequestKind::CapsTokenList { .. }) => {
+            dispatch_policy(kernel, caller, authorization, device_key_id, req).await
+        },
+        req @ (AdminRequestKind::InviteIssue { .. }
+        | AdminRequestKind::InviteRedeem { .. }
+        | AdminRequestKind::InviteList
+        | AdminRequestKind::InviteRevoke { .. }
+        | AdminRequestKind::PairDeviceIssue { .. }
+        | AdminRequestKind::PairDeviceRedeem { .. }
+        | AdminRequestKind::PairDeviceList { .. }
+        | AdminRequestKind::PairDeviceRevoke { .. }
+        | AdminRequestKind::StorageMountIssue { .. }
+        | AdminRequestKind::StorageMountStatus { .. }
+        | AdminRequestKind::StorageMountSync { .. }
+        | AdminRequestKind::StorageMountRevoke { .. }
+        | AdminRequestKind::AuditStats
+        | AdminRequestKind::AuditPrune { .. }
+        | AdminRequestKind::AuditHealth) => {
+            dispatch_services(kernel, caller, authorization, device_key_id, req).await
+        },
+    }
+}
+
+async fn dispatch_policy(
+    kernel: &Arc<crate::Kernel>,
+    caller: &PrincipalId,
+    authorization: Option<&AuthorizedRequest>,
+    device_key_id: Option<&str>,
+    req: AdminRequestKind,
+) -> AdminResponseBody {
+    match req {
+        AdminRequestKind::EnvSet {
+            principal,
+            capsule,
+            key,
+            value,
+            kind,
+            scope,
+            append,
+        } => {
+            env_set(
+                kernel,
+                EnvSetRequest {
+                    principal,
+                    capsule,
+                    key,
+                    value,
+                    kind,
+                    scope,
+                    append,
+                },
+            )
+            .await
+        },
+        AdminRequestKind::EnvList { principal, capsule } => {
+            env_list(kernel, principal, capsule).await
+        },
+        AdminRequestKind::EnvDelete {
+            principal,
+            capsule,
+            key,
+            kind,
+            scope,
+        } => env_delete(kernel, principal, capsule, key, kind, scope).await,
+        AdminRequestKind::DistroLockGet { principal } => {
+            super::distro_handlers::get(kernel, &principal).await
+        },
+        AdminRequestKind::DistroLockSet {
+            principal,
+            lock,
+            expected_hash,
+        } => super::distro_handlers::set(kernel, &principal, lock, expected_hash).await,
         AdminRequestKind::GroupCreate {
             name,
             capabilities,
@@ -158,6 +247,18 @@ async fn dispatch_inner(
         | AdminRequestKind::CapsTokenList { .. }) => {
             super::caps_tokens::dispatch(kernel, req).await
         },
+        _ => AdminResponseBody::Error("not a policy request".to_owned()),
+    }
+}
+
+async fn dispatch_services(
+    kernel: &Arc<crate::Kernel>,
+    caller: &PrincipalId,
+    authorization: Option<&AuthorizedRequest>,
+    device_key_id: Option<&str>,
+    req: AdminRequestKind,
+) -> AdminResponseBody {
+    match req {
         AdminRequestKind::InviteIssue {
             group,
             expires_secs,
@@ -188,6 +289,13 @@ async fn dispatch_inner(
         | AdminRequestKind::StorageMountRevoke { .. }) => {
             super::storage_mount_handlers::dispatch(kernel, caller, authorization, req).await
         },
+        AdminRequestKind::AuditStats => super::audit_handlers::stats(kernel).await,
+        AdminRequestKind::AuditPrune {
+            retain_entries,
+            retain_bytes,
+        } => super::audit_handlers::prune(kernel, retain_entries, retain_bytes).await,
+        AdminRequestKind::AuditHealth => super::audit_handlers::health(kernel),
+        _ => AdminResponseBody::Error("not a service request".to_owned()),
     }
 }
 
@@ -516,34 +624,47 @@ fn materialize_added_capsule_installs(
     principal: &PrincipalId,
     add_capsules: &[String],
 ) -> Result<(), String> {
-    let default = PrincipalId::default();
-    let default_capsules = kernel.astrid_home.principal_home(&default).capsules_dir();
-    let target_capsules = kernel.astrid_home.principal_home(principal).capsules_dir();
-
+    let store = kernel
+        .principal_store
+        .as_ref()
+        .ok_or_else(|| "authoritative principal store is unavailable".to_owned())?;
+    let source_uid = kernel
+        .principal_directory
+        .uid_for(&PrincipalId::default())
+        .map_err(|error| format!("resolve default principal UID: {error}"))?;
+    let target_uid = kernel
+        .principal_directory
+        .uid_for(principal)
+        .map_err(|error| format!("resolve target principal UID: {error}"))?;
+    let source_owner = astrid_storage::StateOwner::Principal(source_uid);
+    let target_owner = astrid_storage::StateOwner::Principal(target_uid);
     for capsule in add_capsules {
-        let source = default_capsules.join(capsule);
-        let target = target_capsules.join(capsule);
-        if target.exists() {
+        if store
+            .capsules()
+            .get_snapshot(&target_owner, capsule)
+            .map_err(|error| format!("read target capsule '{capsule}': {error}"))?
+            .is_some()
+        {
             continue;
         }
-        if !source.exists() {
+        let Some(snapshot) = store
+            .capsules()
+            .get_snapshot(&source_owner, capsule)
+            .map_err(|error| format!("read default capsule '{capsule}': {error}"))?
+        else {
             continue;
-        }
-        if let Some(parent) = target.parent()
-            && let Err(e) = std::fs::create_dir_all(parent)
-        {
-            return Err(format!("create capsule install parent: {e}"));
-        }
-        astrid_capsule_install::copy_capsule_dir(&source, &target)
-            .map_err(|e| format!("materialize capsule '{capsule}' for {principal}: {e:#}"))?;
-        let target_env = target.join(".env.json");
-        if target_env.exists()
-            && let Err(e) = std::fs::remove_file(&target_env)
-        {
-            return Err(format!(
-                "remove copied capsule env for '{capsule}' under {principal}: {e}"
-            ));
-        }
+        };
+        store
+            .capsules()
+            .install(
+                &target_owner,
+                capsule,
+                snapshot.package(),
+                astrid_storage::CapsuleInstallExpectation::Absent,
+            )
+            .map_err(|error| {
+                format!("copy durable capsule '{capsule}' for {principal}: {error}")
+            })?;
     }
     Ok(())
 }
@@ -703,6 +824,7 @@ fn agent_list(
             },
         };
         summaries.push(AgentSummary {
+            owner_uid: kernel.principal_directory.uid_for(&principal).ok(),
             principal,
             enabled: profile.enabled,
             groups: profile.groups.clone(),

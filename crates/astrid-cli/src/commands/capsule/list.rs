@@ -1,11 +1,16 @@
 //! `astrid capsule list` - display all installed capsules with interface metadata.
 
+#[cfg(test)]
 use std::collections::HashMap;
 
+#[cfg(test)]
 use astrid_capsule_install::mismatching_contracts;
+#[cfg(test)]
 use astrid_core::dirs::AstridHome;
+use astrid_core::kernel_api::{KernelRequest, KernelResponse};
 use colored::Colorize;
 
+#[cfg(test)]
 use super::meta::scan_installed_capsules_in_home_for_with_layout;
 use crate::theme::Theme;
 
@@ -14,11 +19,17 @@ use crate::theme::Theme;
 /// In default mode, shows a compact one-line-per-capsule view with capability
 /// counts. With `--verbose`, expands each capsule to show the full capability
 /// list and install source.
-pub(crate) fn list_capsules(verbose: bool) -> anyhow::Result<()> {
-    let home = AstridHome::resolve()?;
-    let capsules = installed_capsules_for(&home, &crate::principal::current())?;
+pub(crate) async fn list_capsules(verbose: bool) -> anyhow::Result<()> {
+    let mut client = crate::socket_client::connect_kernel_for_workspace(None).await?;
+    let entries = match client.request(KernelRequest::GetCapsuleMetadata).await? {
+        KernelResponse::CapsuleMetadata(entries) => entries,
+        KernelResponse::Error(message) => {
+            anyhow::bail!("daemon rejected capsule metadata request: {message}")
+        },
+        other => anyhow::bail!("unexpected daemon response: {other:?}"),
+    };
 
-    if capsules.is_empty() {
+    if entries.is_empty() {
         println!("{}", Theme::info("No capsules installed."));
         return Ok(());
     }
@@ -26,50 +37,37 @@ pub(crate) fn list_capsules(verbose: bool) -> anyhow::Result<()> {
     println!(
         "{} ({})",
         Theme::header("Installed Capsules"),
-        capsules.len()
+        entries.len()
     );
     println!("{}", Theme::separator());
-
-    if verbose {
-        print_verbose(&home, &capsules);
-    } else {
-        print_compact(&capsules);
+    for entry in &entries {
+        let source = entry
+            .source_id
+            .map_or_else(|| "unloaded".to_owned(), |id| id.to_string());
+        if verbose {
+            println!("{}", entry.name.bold());
+            println!("  {}", Theme::kv("Source", &source));
+            if !entry.interceptor_events.is_empty() {
+                println!(
+                    "  {}: {}",
+                    "Interceptors".bold(),
+                    entry.interceptor_events.join(", ")
+                );
+            }
+            println!("  {}: {}", "Env fields".bold(), entry.env.len());
+        } else {
+            println!("  {:<32} {}", entry.name.bold(), Theme::dimmed(&source));
+        }
     }
 
     println!(
         "\n{} capsule(s) installed",
-        capsules.len().to_string().bold()
+        entries.len().to_string().bold()
     );
-
-    // Contracts skew — one summary line naming any capsule whose
-    // `astrid-contracts.wit` pin differs from the daemon canonical.
-    // Warn-only, and silent when there is no canonical to compare
-    // against. Detailed pins live in `--verbose` / `capsule show`.
-    let mismatched = mismatching_contracts(&home, &capsules);
-    if !mismatched.is_empty() {
-        println!();
-        println!(
-            "{}",
-            Theme::warning(&format!(
-                "Contracts skew: astrid-contracts.wit pin differs from the daemon canonical for {}: {}.",
-                if mismatched.len() == 1 {
-                    "capsule"
-                } else {
-                    "capsules"
-                },
-                mismatched.join(", ")
-            ))
-        );
-        println!(
-            "{}",
-            Theme::dimmed(
-                "  Run `astrid capsule show <name>` (or `list --verbose`) for pins. Warning only."
-            )
-        );
-    }
     Ok(())
 }
 
+#[cfg(test)]
 fn installed_capsules_for(
     home: &AstridHome,
     principal: &astrid_core::PrincipalId,
@@ -82,6 +80,7 @@ fn installed_capsules_for(
 }
 
 /// Compact: one line per capsule.
+#[cfg(test)]
 fn print_compact(capsules: &[super::meta::InstalledCapsule]) {
     let max_name_len = capsules.iter().map(|c| c.name.len()).max().unwrap_or(30);
     let max_version_len = capsules
@@ -118,6 +117,7 @@ fn print_compact(capsules: &[super::meta::InstalledCapsule]) {
 }
 
 /// Verbose: full details per capsule.
+#[cfg(test)]
 fn print_verbose(home: &AstridHome, capsules: &[super::meta::InstalledCapsule]) {
     for (i, cap) in capsules.iter().enumerate() {
         if i > 0 {
@@ -161,6 +161,7 @@ fn print_verbose(home: &AstridHome, capsules: &[super::meta::InstalledCapsule]) 
 }
 
 /// Print a labelled interface map (imports or exports), or "(none)" if empty.
+#[cfg(test)]
 fn print_interface_map(
     label: &str,
     map: &std::collections::HashMap<String, std::collections::HashMap<String, String>>,

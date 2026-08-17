@@ -7,12 +7,13 @@
 use crate::engine::KvProjectionEngine;
 use async_trait::async_trait;
 
-use super::{TreeKvStore, map_engine};
+use super::{BlockingTreeStore, TreeKvStore, map_engine};
 use crate::error::{StorageError, StorageResult};
 use crate::kv::principal::KvPrincipalResolver;
 use crate::kv::{
-    KvStore, composite_key, namespace_range_end, namespace_range_start, prefix_range_end,
-    validate_key, validate_namespace, validate_prefix,
+    KvBatchCondition, KvBatchMutation, KvBatchOutcome, KvConditionResult, KvMutationBatch, KvStore,
+    composite_key, namespace_range_end, namespace_range_start, prefix_range_end, validate_key,
+    validate_namespace, validate_prefix,
 };
 
 #[async_trait]
@@ -23,6 +24,10 @@ where
     E: KvProjectionEngine<P> + 'static,
     R: KvPrincipalResolver<P> + Send + Sync + 'static,
 {
+    fn supports_atomic_batch(&self) -> bool {
+        true
+    }
+
     async fn close(&self) -> StorageResult<()> {
         let blocking = self.blocking_store();
         run_blocking(move || {
@@ -153,6 +158,13 @@ where
         .await
     }
 
+    async fn apply_batch(&self, batch: &KvMutationBatch) -> StorageResult<KvBatchOutcome> {
+        let owner = resolve_batch_owner(self, batch)?;
+        let blocking = self.blocking_store();
+        let batch = batch.clone();
+        run_blocking(move || apply_batch_blocking(&blocking, &owner, &batch)).await
+    }
+
     async fn clear_namespace(&self, namespace: &str) -> StorageResult<u64> {
         validate_namespace(namespace)?;
         let owner = self.resolver.resolve(namespace)?;
@@ -171,6 +183,87 @@ where
         let blocking = self.blocking_store();
         run_blocking(move || blocking.clear_range(&owner, &start, &end)).await
     }
+}
+
+fn resolve_batch_owner<P, I, R, E>(
+    store: &TreeKvStore<P, I, R, E>,
+    batch: &KvMutationBatch,
+) -> StorageResult<P>
+where
+    P: Clone + Ord + Send + Sync + 'static,
+    E: KvProjectionEngine<P> + 'static,
+    R: KvPrincipalResolver<P>,
+{
+    let keys = batch
+        .conditions()
+        .iter()
+        .map(KvBatchCondition::key)
+        .chain(batch.mutations().iter().map(KvBatchMutation::key));
+    let mut owner = None;
+    for key in keys {
+        // `KvEntryKey` validates at construction. Revalidate at the backend
+        // boundary as well so every key is checked before any owner is used.
+        validate_namespace(key.namespace())?;
+        validate_key(key.key())?;
+        let candidate = store.resolver.resolve(key.namespace())?;
+        if let Some(current) = owner.as_ref()
+            && &candidate != current
+        {
+            return Err(StorageError::InvalidKey(
+                "KV mutation batch spans multiple principal owners".to_owned(),
+            ));
+        }
+        owner = Some(candidate);
+    }
+    owner.ok_or_else(|| StorageError::Serialization("KV mutation batch has no keys".to_owned()))
+}
+
+fn apply_batch_blocking<P, E>(
+    blocking: &BlockingTreeStore<P, E>,
+    owner: &P,
+    batch: &KvMutationBatch,
+) -> StorageResult<KvBatchOutcome>
+where
+    P: Clone + Ord + Send + Sync + 'static,
+    E: KvProjectionEngine<P> + 'static,
+{
+    blocking.mutate(owner, |context, header| {
+        let mut conditions = Vec::with_capacity(batch.conditions().len());
+        let mut all_match = true;
+        for condition in batch.conditions() {
+            let KvBatchCondition::ValueEquals { key, expected } = condition;
+            let composite = key.composite();
+            let current = context.projected_get(header, &composite)?;
+            let matched = current.as_deref() == expected.as_deref();
+            all_match &= matched;
+            conditions.push(KvConditionResult {
+                key: key.clone(),
+                matched,
+            });
+        }
+        let outcome = KvBatchOutcome {
+            applied: all_match,
+            conditions,
+        };
+        if !all_match {
+            return Ok((outcome, Vec::new(), false));
+        }
+
+        // The mutation projection rejects no-op replacements. Filter those
+        // against this same header so a successful batch can legitimately
+        // overwrite a value with itself or delete an already-missing key
+        // without generating an unnecessary root.
+        let mut mutations = Vec::with_capacity(batch.mutations().len());
+        for mutation in batch.mutations() {
+            let key = mutation.key().composite();
+            let replacement = mutation.replacement().map(<[u8]>::to_vec);
+            if context.projected_get(header, &key)? != replacement {
+                mutations.push((key, replacement));
+            }
+        }
+        let changed = !mutations.is_empty();
+        Ok((outcome, mutations, changed))
+    })
 }
 
 #[cfg(not(target_family = "wasm"))]

@@ -69,7 +69,15 @@ const CONTENT_CATALOG_FORMAT_SPEC_ID: ObjectId = ObjectId::new([
     143, 57, 153, 176, 102, 182, 102, 57, 98, 89, 196, 169, 47, 157, 231, 197, 184, 230, 125, 249,
     211, 138, 105, 251, 79, 184, 36, 150, 139, 86, 236, 219,
 ]);
-const PRIOR_V1_FORMAT_SPEC_IDS: [ObjectId; 12] = [
+/// The format-1 specification identity before the workspace-branch kind was
+/// registered. Stores bearing this exact published profile are upgraded by
+/// replacing the in-band specification object; live object graphs remain
+/// unchanged and are validated before the new profile is activated.
+pub(super) const PRE_WORKSPACE_BRANCH_FORMAT_SPEC_ID: ObjectId = ObjectId::new([
+    249, 177, 127, 165, 230, 180, 172, 69, 98, 199, 228, 171, 45, 161, 240, 199, 86, 218, 7, 148,
+    93, 128, 135, 148, 173, 117, 84, 74, 19, 43, 13, 145,
+]);
+const PRIOR_V1_FORMAT_SPEC_IDS: [ObjectId; 13] = [
     PRE_DERIVATION_FORMAT_SPEC_ID,
     PRE_COMPACTION_FORMAT_SPEC_ID,
     PRE_GC_OUTBOX_FORMAT_SPEC_ID,
@@ -82,6 +90,7 @@ const PRIOR_V1_FORMAT_SPEC_IDS: [ObjectId; 12] = [
     PRE_PHYSICAL_CATALOGUE_FORMAT_SPEC_ID,
     PRE_DENSE_RADIX_FORMAT_SPEC_ID,
     PRE_FLEET_OWNER_FORMAT_SPEC_ID,
+    PRE_WORKSPACE_BRANCH_FORMAT_SPEC_ID,
 ];
 
 pub(super) fn format_spec_record() -> StorageResult<ObjectRecord> {

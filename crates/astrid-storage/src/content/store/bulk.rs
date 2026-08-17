@@ -23,8 +23,8 @@ use super::{
 };
 use crate::content::{
     BulkIngestDiagnostics, BulkIngestPhaseDurations, BulkIngestPolicy, ChunkingProfile,
-    ContentBatchEntry, ContentBatchWriteOutcome, ContentChangeCache, ContentIngest, ContentName,
-    ContentObservation, PrincipalContentError, SourceObservation,
+    ContentBatchEntry, ContentBatchExpectation, ContentBatchWriteOutcome, ContentChangeCache,
+    ContentIngest, ContentName, ContentObservation, PrincipalContentError, SourceObservation,
 };
 
 type PendingIngest<R> = (ContentName, (R, ChunkingProfile, Option<SourceObservation>));
@@ -103,7 +103,14 @@ where
         if completed.is_empty() {
             return Err(PrincipalContentError::EmptyBatch);
         }
-        self.publish_batch(principal, &completed, staged_objects_inserted, None, None)
+        self.publish_batch(
+            principal,
+            &completed,
+            staged_objects_inserted,
+            None,
+            None,
+            None,
+        )
     }
 
     pub(crate) fn publish_verified_batch_deferred(
@@ -133,7 +140,7 @@ where
         if completed.is_empty() {
             return Err(PrincipalContentError::EmptyBatch);
         }
-        self.publish_batch(principal, &completed, 0, None, Some(&records))
+        self.publish_batch(principal, &completed, 0, None, Some(&records), None)
     }
 
     /// Stream and atomically publish several names under one principal root.
@@ -164,6 +171,7 @@ where
             BulkIngestPolicy::default(),
             None,
             false,
+            None,
         )
         .map(|execution| execution.outcome)
     }
@@ -188,8 +196,38 @@ where
         R: Read + Send,
         I: IntoIterator<Item = ContentIngest<R>>,
     {
-        self.put_streaming_batch_internal(principal, ingests, policy, None, false)
+        self.put_streaming_batch_internal(principal, ingests, policy, None, false, None)
             .map(|execution| execution.outcome)
+    }
+
+    /// Stream and atomically publish a batch only when its admitted names
+    /// still satisfy `expectation`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same source, content, quota, and projection errors as
+    /// [`Self::put_streaming_batch`], plus
+    /// [`PrincipalContentError::BatchPreconditionFailed`] when the owner
+    /// catalog changed before publication.
+    pub fn put_streaming_batch_with_expectation<R, I>(
+        &self,
+        principal: &P,
+        ingests: I,
+        expectation: &ContentBatchExpectation,
+    ) -> Result<ContentBatchWriteOutcome, PrincipalContentError>
+    where
+        R: Read + Send,
+        I: IntoIterator<Item = ContentIngest<R>>,
+    {
+        self.put_streaming_batch_internal(
+            principal,
+            ingests,
+            BulkIngestPolicy::default(),
+            None,
+            false,
+            Some(expectation),
+        )
+        .map(|execution| execution.outcome)
     }
 
     /// Stream a batch with trusted change-token reuse and explicit policy.
@@ -213,7 +251,7 @@ where
         R: Read + Send,
         I: IntoIterator<Item = ContentIngest<R>>,
     {
-        self.put_streaming_batch_internal(principal, ingests, policy, Some(cache), false)
+        self.put_streaming_batch_internal(principal, ingests, policy, Some(cache), false, None)
             .map(|execution| execution.outcome)
     }
 
@@ -238,7 +276,7 @@ where
         R: Read + Send,
         I: IntoIterator<Item = ContentIngest<R>>,
     {
-        self.put_streaming_batch_internal(principal, ingests, policy, cache, true)
+        self.put_streaming_batch_internal(principal, ingests, policy, cache, true, None)
             .map(|execution| (execution.outcome, execution.diagnostics))
     }
 
@@ -249,6 +287,7 @@ where
         policy: BulkIngestPolicy,
         cache: Option<&ContentChangeCache>,
         observe: bool,
+        expectation: Option<&ContentBatchExpectation>,
     ) -> Result<BulkExecution, PrincipalContentError>
     where
         R: Read + Send,
@@ -266,6 +305,7 @@ where
                 limit,
                 cache,
                 phase_observer.as_ref(),
+                expectation,
             );
         }
         self.put_streaming_batch_direct(
@@ -275,9 +315,11 @@ where
             policy,
             cache,
             phase_observer.as_ref(),
+            expectation,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn put_streaming_batch_direct<R>(
         &self,
         principal: &P,
@@ -286,13 +328,14 @@ where
         policy: BulkIngestPolicy,
         cache: Option<&ContentChangeCache>,
         phase_observer: Option<&Arc<BulkPhaseObserver>>,
+        expectation: Option<&ContentBatchExpectation>,
     ) -> Result<BulkExecution, PrincipalContentError>
     where
         R: Read + Send,
     {
         let pipeline_started = Instant::now();
         if pending.is_empty() {
-            return self.publish_cached_batch(principal, &completed, phase_observer);
+            return self.publish_cached_batch(principal, &completed, phase_observer, expectation);
         }
         let worker_count = policy.worker_threads().get().min(pending.len());
         let (results, staged_objects_inserted, peak_pending_bytes, admission_elapsed) =
@@ -361,6 +404,7 @@ where
             objects_inserted,
             phase_observer,
             None,
+            expectation,
         )?;
         Ok(BulkExecution {
             outcome,
@@ -385,12 +429,13 @@ where
         limit: u64,
         cache: Option<&ContentChangeCache>,
         observer: Option<&Arc<BulkPhaseObserver>>,
+        expectation: Option<&ContentBatchExpectation>,
     ) -> Result<BulkExecution, PrincipalContentError>
     where
         R: Read + Send,
     {
         if pending.is_empty() {
-            return self.publish_cached_batch(principal, &completed, observer);
+            return self.publish_cached_batch(principal, &completed, observer, expectation);
         }
 
         let pipeline_started = Instant::now();
@@ -443,7 +488,14 @@ where
             .collect::<BTreeMap<_, _>>();
         let pipeline_elapsed = pipeline_started.elapsed();
         let publication_started = Instant::now();
-        let outcome = self.publish_batch(principal, &completed, 0, observer, Some(&records))?;
+        let outcome = self.publish_batch(
+            principal,
+            &completed,
+            0,
+            observer,
+            Some(&records),
+            expectation,
+        )?;
         if let Some(cache) = cache {
             for (observation, verified) in cache_updates {
                 cache.record(&observation, verified);
@@ -467,9 +519,10 @@ where
         principal: &P,
         completed: &BTreeMap<ContentName, PreparedContent>,
         observer: Option<&Arc<BulkPhaseObserver>>,
+        expectation: Option<&ContentBatchExpectation>,
     ) -> Result<BulkExecution, PrincipalContentError> {
         let publication_started = Instant::now();
-        let outcome = self.publish_batch(principal, completed, 0, observer, None)?;
+        let outcome = self.publish_batch(principal, completed, 0, observer, None, expectation)?;
         Ok(BulkExecution {
             outcome,
             diagnostics: BulkIngestDiagnostics::new(
@@ -552,9 +605,11 @@ where
         staged_objects_inserted: u64,
         observer: Option<&Arc<BulkPhaseObserver>>,
         deferred_records: Option<&BTreeMap<ObjectId, ObjectRecord>>,
+        expectation: Option<&ContentBatchExpectation>,
     ) -> Result<ContentBatchWriteOutcome, PrincipalContentError> {
         loop {
             let mut header = self.header(principal)?.as_ref().clone();
+            self.check_batch_expectation(principal, &header, expectation)?;
             let mut catalog_records = BTreeMap::new();
             let mut changed = false;
             for (name, prepared) in completed {

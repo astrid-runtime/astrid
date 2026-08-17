@@ -156,7 +156,7 @@ async fn production_retention_preserves_bootstraps_during_compaction() {
     reopened.engine.close().unwrap();
     drop(reopened);
     assert!(home.storage_volume_path().is_file());
-    assert!(!home.principal_store_path().exists());
+    assert!(home.principal_store_path().is_dir());
 }
 
 #[tokio::test]
@@ -204,4 +204,132 @@ async fn runtime_retention_pins_volume_bootstrap_dependencies() {
         root.kind() == CompactionRootKind::System && root.object() == format_spec_id
     }));
     store.engine.close().unwrap();
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the regression covers the complete crash/reopen/audit-delivery boundary"
+)]
+async fn deterministic_runtime_compaction_reclaims_and_delivers_receipt() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    let store = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let alice_uid = create_alice(&store).await;
+    store
+        .kv()
+        .set("alice:capsule:shell", "cwd", b"/workspace".to_vec())
+        .await
+        .unwrap();
+    let mut orphan_payload = vec![0_u8; 512 * 1024];
+    orphan_payload.fill(0xAB);
+    let (orphan, _) = store
+        .engine
+        .persist_standalone_object(&evidence(&orphan_payload))
+        .unwrap();
+    let volume_before = std::fs::metadata(home.storage_volume_path()).unwrap().len();
+    let policy = evidence(b"runtime-compaction-policy");
+    let report = store
+        .compact_with_deterministic_proof(ObjectId::new([0xD0; 32]), policy, Vec::new())
+        .await
+        .unwrap();
+    assert!(report.objects_reclaimed() >= 1);
+    assert_eq!(store.engine.object(orphan).unwrap(), None);
+    let volume_after = std::fs::metadata(home.storage_volume_path()).unwrap().len();
+    assert!(
+        volume_after < volume_before,
+        "compaction must reclaim hosted volume bytes: before={volume_before}, after={volume_after}"
+    );
+
+    let pending = store.pending_compaction_evidence().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].commit_id(), report.gc_commit());
+
+    // Model the independent audit append boundary: a failed append must not
+    // acknowledge the GC outbox. The first attempt deliberately emits no
+    // durable audit marker, then the process is reopened and the exact bundle
+    // is persisted once before acknowledgement.
+    let commit = pending[0].commit_id();
+    let audit_projection = store.system_control_kv("audit").unwrap().backend();
+    let marker_key = format!("gc-receipt:{}", hex::encode(commit.object_id().as_bytes()));
+    let failed_append: Result<(), &str> = Err("audit sink unavailable");
+    assert!(failed_append.is_err());
+    // No marker was written because the independent audit append failed.
+    assert!(
+        !audit_projection
+            .exists("audit:gc_receipts", &marker_key)
+            .await
+            .unwrap()
+    );
+    assert_eq!(store.pending_compaction_evidence().unwrap().len(), 1);
+    drop(audit_projection);
+
+    // A reopened runtime sees the same pending bundle. Persist a canonical
+    // marker exactly once, then acknowledge; repeated delivery is idempotent.
+    store.engine.close().unwrap();
+    drop(store);
+    let reopened = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let pending = reopened.pending_compaction_evidence().unwrap();
+    assert_eq!(pending.len(), 1);
+    let audit_projection = reopened.system_control_kv("audit").unwrap().backend();
+    let records = [
+        pending[0].fact_snapshot(),
+        pending[0].retention_policy(),
+        pending[0].tensor_logic_proof(),
+        pending[0].plan(),
+        pending[0].placement_before(),
+        pending[0].placement_after(),
+        pending[0].execution_measurements(),
+        pending[0].commit(),
+    ];
+    let mut receipt_bytes = Vec::new();
+    for record in records {
+        receipt_bytes.extend_from_slice(record.canonical_bytes());
+    }
+    assert!(
+        audit_projection
+            .compare_and_swap(
+                "audit:gc_receipts",
+                &marker_key,
+                None,
+                receipt_bytes.clone(),
+            )
+            .await
+            .unwrap()
+    );
+    assert!(
+        !audit_projection
+            .compare_and_swap(
+                "audit:gc_receipts",
+                &marker_key,
+                None,
+                receipt_bytes.clone(),
+            )
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        audit_projection
+            .get("audit:gc_receipts", &marker_key)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(receipt_bytes.as_slice())
+    );
+    reopened
+        .acknowledge_compaction_evidence(report.gc_commit())
+        .unwrap();
+    assert!(reopened.pending_compaction_evidence().unwrap().is_empty());
+    assert!(
+        reopened
+            .engine
+            .root(&StateOwner::Principal(alice_uid))
+            .unwrap()
+            .is_some()
+    );
+    reopened.engine.close().unwrap();
 }

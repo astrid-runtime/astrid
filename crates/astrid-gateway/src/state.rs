@@ -159,10 +159,13 @@ impl RedeemRateLimiter {
 }
 
 /// State shared across every HTTP handler.
-#[derive(Debug)]
 pub struct GatewayState {
     /// Configuration loaded at boot.
     pub config: GatewayConfig,
+    /// Authoritative kernel KV projection used for capsule env/secret state.
+    /// `None` is retained only by standalone route tests; production daemon
+    /// composition always supplies the live kernel backend.
+    pub storage_kv: Option<Arc<dyn astrid_storage::KvStore>>,
     /// Per-boot signing material.
     pub signing: SigningMaterial,
     /// Live event bus handle for the audit SSE stream. `Some` when
@@ -191,11 +194,10 @@ pub struct GatewayState {
     /// [`crate::metrics::install_recorder`].
     pub metrics_handle: PrometheusHandle,
     /// Bearer revocation map: `principal → epoch when the principal
-    /// was deleted`. Populated by a background task that watches the
-    /// kernel's audit-event stream for successful `AgentDelete` ops,
-    /// persisted to `$ASTRID_HOME/etc/gateway-revocations.json`. The
-    /// auth middleware rejects any bearer whose `iat` is at or before
-    /// the recorded epoch — see [`crate::auth::verify_bearer`].
+    /// was deleted`. Hydrated from the kernel-owned system control KV before
+    /// the listener is exposed, then updated by the audit watcher. The auth
+    /// middleware rejects any bearer whose `iat` is at or before the recorded
+    /// epoch — see [`crate::auth::verify_bearer`].
     /// `std::sync::RwLock` because the read path (every authenticated
     /// request) outweighs the write path (admin-only delete events)
     /// by orders of magnitude, and the critical sections are
@@ -272,15 +274,42 @@ pub struct GatewayState {
     pub registry_timeout: Option<Duration>,
 }
 
+impl std::fmt::Debug for GatewayState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GatewayState")
+            .field("config", &self.config)
+            // `KvStore` is intentionally object-safe and does not require
+            // `Debug`; never expose backend internals in a state dump.
+            .field("storage_kv", &self.storage_kv.as_ref().map(|_| "<kv>"))
+            .field("signing", &self.signing)
+            .field("event_bus", &self.event_bus)
+            .field("distribution", &self.distribution)
+            .field("onboarding", &self.onboarding)
+            .field("redeem_limiter", &self.redeem_limiter)
+            .field("metrics_handle", &self.metrics_handle)
+            .field("revoked_at", &self.revoked_at)
+            .field("revoked_key_ids", &self.revoked_key_ids)
+            .field("audit_log", &self.audit_log)
+            .field("session_id", &self.session_id)
+            .field("gateway_route_uuid", &self.gateway_route_uuid)
+            .field("readiness_probe", &self.readiness_probe)
+            .field("topic_probe", &self.topic_probe)
+            .field("registry_timeout", &self.registry_timeout)
+            .finish()
+    }
+}
+
 impl GatewayState {
     /// Build the gateway state at daemon boot.
     ///
     /// # Errors
     /// Returns an error if `distro_path` points at a file that can't
-    /// be read or whose contents fail to parse, or if the persisted
-    /// revocation file is present but corrupt.
+    /// be read or whose contents fail to parse. Revocation state is hydrated
+    /// asynchronously from the kernel KV immediately before serving.
     pub fn new(
         config: GatewayConfig,
+        storage_kv: Option<Arc<dyn astrid_storage::KvStore>>,
         event_bus: Option<Arc<astrid_events::EventBus>>,
         audit_log: Option<Arc<astrid_audit::AuditLog>>,
         session_id: Option<astrid_core::SessionId>,
@@ -309,13 +338,12 @@ impl GatewayState {
         };
         let signing =
             SigningMaterial::load_or_generate().context("load or generate gateway signing key")?;
-        let revoked_at = Arc::new(RwLock::new(
-            crate::revocations::load_from_disk().context("load gateway revocations")?,
-        ));
+        let revoked_at = Arc::new(RwLock::new(HashMap::new()));
         let metrics_handle =
             crate::metrics::install_recorder().context("install Prometheus recorder")?;
         Ok(Arc::new(Self {
             config,
+            storage_kv,
             signing,
             distribution: Arc::new(distribution),
             onboarding: Arc::new(onboarding),
@@ -331,6 +359,38 @@ impl GatewayState {
             topic_probe,
             registry_timeout: None,
         }))
+    }
+
+    /// Hydrate principal and device revocation epochs from the authoritative
+    /// kernel control KV before the HTTP listener is exposed. A legacy JSON
+    /// index is imported exactly once when present and then retired after KV
+    /// receipt/read-back verification. Standalone route tests without a KV
+    /// remain usable only when no legacy file exists.
+    ///
+    /// # Panics
+    ///
+    /// Panics if either in-memory revocation lock is poisoned, indicating an
+    /// earlier panic while mutating gateway security state.
+    pub async fn hydrate_revocations(&self) -> anyhow::Result<()> {
+        let Some(store) = self.storage_kv.as_deref() else {
+            if crate::revocations::legacy_file_exists()? {
+                anyhow::bail!(
+                    "gateway revocation storage is unavailable while a legacy revocation file exists"
+                );
+            }
+            return Ok(());
+        };
+        let _ = crate::revocations::migrate_legacy_file(store).await?;
+        let (principals, devices) = crate::revocations::load_from_store(store).await?;
+        *self
+            .revoked_at
+            .write()
+            .expect("revocation map poisoned during startup hydration") = principals;
+        *self
+            .revoked_key_ids
+            .write()
+            .expect("device revocation map poisoned during startup hydration") = devices;
+        Ok(())
     }
 
     /// Build a bus-direct admin client bound to `caller`. Routes

@@ -10,11 +10,15 @@ use std::io::Write;
 use anyhow::{Context, bail};
 use astrid_capsule::capsule::CapsuleId;
 use astrid_core::dirs::AstridHome;
+use astrid_core::kernel_api::{EnvStorageScope, EnvValueKind};
 use indicatif::{ProgressBar, ProgressStyle};
 
 use super::distro::lock::{
-    DistroLock, DistroLockMeta, LockedCapsule, is_lock_fresh, load_lock, write_lock,
+    DistroLock, DistroLockMeta, LockedCapsule, is_lock_fresh, load_lock_from_daemon,
+    write_lock_to_daemon,
 };
+#[cfg(test)]
+use super::distro::lock::{load_lock, write_lock};
 use super::distro::manifest::{DistroCapsule, DistroManifest, parse_manifest};
 use crate::theme::Theme;
 
@@ -95,7 +99,7 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
         home.ensure()?;
         let _provisioning_lock = grant::ProvisioningLock::acquire(&home, &target)?;
         init_workspace()?;
-        return run_init_from_shuttle(distro_source, opts);
+        return run_init_from_shuttle(distro_source, opts).await;
     }
 
     // Refuse an unauthorized or nonexistent grant target before creating any
@@ -112,11 +116,6 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
     // under the resolved principal's home, matching bootstrap's auto-init
     // freshness check (`should_auto_init`) so a scoped principal isn't
     // re-provisioned on every run.
-    let lock_path = home
-        .principal_home(&target)
-        .config_dir()
-        .join("distro.lock");
-
     // Fetch and parse the distro manifest. Network is forbidden under
     // --offline unless the source resolves to a local file.
     let manifest = fetch_and_parse_manifest(distro_source, opts.offline).await?;
@@ -128,7 +127,7 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
     super::distro::validate::enforce_astrid_version(&manifest)?;
 
     // Check lock freshness AFTER parsing manifest (need manifest to compare).
-    if let Some(existing_lock) = load_lock(&lock_path)?
+    if let Some(existing_lock) = load_lock_from_daemon(&target).await?
         && is_lock_fresh(&existing_lock, &manifest)
         && let Some(installed) =
             grant::validated_grant_set_for_reuse(&home, &target, &existing_lock.capsules)
@@ -181,7 +180,7 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
     // Write per-capsule env files BEFORE installing capsules so that
     // install_capsule's onboarding check finds existing values and
     // doesn't re-prompt for fields the distro already configured.
-    write_env_files(&home, &target, &selected, &vars)?;
+    write_env_files(&home, &target, &selected, &variables, &vars)?;
 
     // Install each capsule with progress. `install_capsules` writes the
     // capsule files under `principal`'s home and returns one LockedCapsule
@@ -226,7 +225,7 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
     // grants derive from what was installed, on explicit `--grant-capsules`).
     let installed_names: Vec<String> = locked.iter().map(|c| c.name.clone()).collect();
     let lock = create_lock_from_parts(schema_version, &distro_id, &distro_version, locked);
-    let wrote_lock = persist_lock_if_earned(&lock_path, total, succeeded, &lock)?;
+    let wrote_lock = persist_lock_if_earned_daemon(&target, total, succeeded, &lock).await?;
 
     eprintln!();
     if wrote_lock {
@@ -256,8 +255,8 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
 /// Implemented in [`super::distro::shuttle_install`] (Part C/D): unpack
 /// to a mirror, verify the signature against the trust store, then
 /// install each capsule offline from the mirror.
-fn run_init_from_shuttle(source: &str, opts: &InitOpts) -> anyhow::Result<()> {
-    super::distro::shuttle_install::install_from_shuttle(std::path::Path::new(source), opts)
+async fn run_init_from_shuttle(source: &str, opts: &InitOpts) -> anyhow::Result<()> {
+    super::distro::shuttle_install::install_from_shuttle(std::path::Path::new(source), opts).await
 }
 
 /// Initialize the current directory as an Astrid workspace (if not already).
@@ -617,6 +616,7 @@ fn should_write_lock(total: usize, succeeded: usize) -> bool {
 /// caller can pick the honest completion message. Kept as a small helper so
 /// the "partial run leaves no lock on disk" invariant is unit-testable
 /// without a network install.
+#[cfg(test)]
 fn persist_lock_if_earned(
     lock_path: &std::path::Path,
     total: usize,
@@ -625,6 +625,19 @@ fn persist_lock_if_earned(
 ) -> anyhow::Result<bool> {
     if should_write_lock(total, succeeded) {
         write_lock(lock_path, lock)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+async fn persist_lock_if_earned_daemon(
+    principal: &astrid_core::PrincipalId,
+    total: usize,
+    succeeded: usize,
+    lock: &DistroLock,
+) -> anyhow::Result<bool> {
+    if should_write_lock(total, succeeded) {
+        write_lock_to_daemon(principal, lock).await?;
         return Ok(true);
     }
     Ok(false)
@@ -839,44 +852,39 @@ fn validate_batch_install(
     })
 }
 
-/// Write per-capsule .env.json files with resolved variable templates.
+/// Persist distro variable templates through the daemon's typed env API.
+///
+/// Init may run before a capsule has been installed, so this deliberately
+/// does not require a capsule manifest to classify fields. Variable metadata
+/// from `Distro.toml` carries the secret bit; unresolved literal fields are
+/// ordinary text. The daemon remains the only writer for durable env state.
 pub(crate) fn write_env_files(
-    home: &AstridHome,
+    _home: &AstridHome,
     principal: &astrid_core::PrincipalId,
     selected: &[DistroCapsule],
+    variables: &HashMap<String, super::distro::manifest::VariableDef>,
     vars: &HashMap<String, String>,
 ) -> anyhow::Result<()> {
-    let env_dir = home.principal_home(principal).env_dir();
-    std::fs::create_dir_all(&env_dir)?;
-
     for cap in selected {
         if cap.env.is_empty() {
             continue;
         }
-
-        let env_path = env_dir.join(format!("{}.env.json", cap.name));
-        if env_path.exists() {
-            // Don't overwrite existing env config — user may have customized.
-            continue;
-        }
-
-        let mut resolved: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
         for (key, template) in &cap.env {
-            // Write all keys — even empty values. An empty string means
-            // "use default" and prevents install-time onboarding from
-            // re-prompting for fields the distro already configured.
             let value = resolve_template(template, vars);
-            resolved.insert(key.clone(), serde_json::Value::String(value));
-        }
-
-        if !resolved.is_empty() {
-            let json = serde_json::to_string_pretty(&resolved)?;
-            std::fs::write(&env_path, &json)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&env_path, std::fs::Permissions::from_mode(0o600))?;
-            }
+            let kind = extract_var_refs(template)
+                .iter()
+                .filter_map(|name| variables.get(*name))
+                .any(|definition| definition.secret)
+                .then_some(EnvValueKind::Secret)
+                .unwrap_or(EnvValueKind::Text);
+            super::capsule::install_headless::set_env_entry(
+                principal,
+                &cap.name,
+                key,
+                &value,
+                kind,
+                EnvStorageScope::Agent,
+            )?;
         }
     }
 
@@ -901,8 +909,6 @@ fn onboard_llm_providers(
     principal: &astrid_core::PrincipalId,
     selected: &[DistroCapsule],
 ) {
-    let env_dir = home.principal_home(principal).env_dir();
-
     for cap in selected {
         if cap.group.as_deref() != Some("llm") {
             continue;
@@ -932,13 +938,10 @@ fn onboard_llm_providers(
 
         eprintln!();
         eprintln!("{}", Theme::header(&format!("Configure {}", cap.name)));
-        let env_path = env_dir.join(format!("{}.env.json", cap.name));
         if let Err(e) = super::capsule::install_prompts::prompt_env_fields(
             &manifest.env,
-            &env_path,
             &cap.name,
             &home.config_path(),
-            home,
             principal,
         ) {
             eprintln!("  Configuration for {} failed: {e}", cap.name);

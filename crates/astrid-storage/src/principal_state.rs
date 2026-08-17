@@ -26,6 +26,7 @@ use astrid_core::principal::PrincipalId;
 use parking_lot::Mutex;
 
 pub use crate::PrincipalDirectory;
+use crate::capsule_registry::CapsuleRegistry;
 use crate::content::{
     CatalogValidation, ContentBatchWriteOutcome, ContentWriteOutcome, PrincipalContentStore,
     ProjectionNamePolicy, plan_projection_names,
@@ -55,7 +56,8 @@ mod staging;
 mod volume_migration;
 
 /// Durable runtime format admitted before layout version two can commit.
-pub const RUNTIME_STORE_FORMAT_ID: &str = "astrid-principal-store-v1;state-owner-v2";
+pub const RUNTIME_STORE_FORMAT_ID: &str =
+    "astrid-principal-store-v1;state-owner-v2;workspace-branch-v1";
 
 #[cfg(test)]
 use format_amendment::{
@@ -257,10 +259,67 @@ impl StateOwnerResolver {
 
 impl KvPrincipalResolver<StateOwner> for StateOwnerResolver {
     fn resolve(&self, namespace: &str) -> StorageResult<StateOwner> {
+        if let Some((principal, control)) = namespace.split_once(":control:") {
+            if principal == "system" && matches!(control, "audit" | "invites" | "pair-tokens") {
+                return Ok(StateOwner::System);
+            }
+            // The fixed distro control projection is principal-owned but has
+            // no capsule suffix. It is kept distinct from env/secret views
+            // so ordinary capsule code cannot address distro provenance.
+            if control == "distro" {
+                let uid_text = principal.strip_prefix("principal-uid:").ok_or_else(|| {
+                    StorageError::InvalidKey(
+                        "principal distro namespace must use immutable principal-uid".to_owned(),
+                    )
+                })?;
+                let uid = uid_text.parse::<PrincipalUid>().map_err(|error| {
+                    StorageError::InvalidKey(format!("invalid principal distro UID: {error}"))
+                })?;
+                if !self.principals.contains_uid(uid) {
+                    return Err(StorageError::InvalidKey(
+                        "principal distro UID is not an admitted durable identity".to_owned(),
+                    ));
+                }
+                return Ok(StateOwner::Principal(uid));
+            }
+            // Host-only control namespaces share the same durable owner and
+            // quota as a principal's capsule namespace, while remaining
+            // unreachable through the guest KV view. They are keyed only by
+            // immutable UIDs; mutable aliases are rejected so rename/reuse
+            // cannot redirect durable env or secret state.
+            let Some((kind, capsule)) = control.split_once(':') else {
+                return Err(StorageError::InvalidKey(
+                    "control namespace must name env or secret and a capsule".to_owned(),
+                ));
+            };
+            if !matches!(kind, "env" | "secret") || capsule.is_empty() || capsule.contains(':') {
+                return Err(StorageError::InvalidKey(
+                    "control namespace has an invalid projection or capsule".to_owned(),
+                ));
+            }
+            if principal == "system" {
+                return Ok(StateOwner::System);
+            }
+            let uid_text = principal.strip_prefix("principal-uid:").ok_or_else(|| {
+                StorageError::InvalidKey(
+                    "principal control namespace must use immutable principal-uid".to_owned(),
+                )
+            })?;
+            let uid = uid_text.parse::<PrincipalUid>().map_err(|error| {
+                StorageError::InvalidKey(format!("invalid principal control UID: {error}"))
+            })?;
+            if !self.principals.contains_uid(uid) {
+                return Err(StorageError::InvalidKey(
+                    "principal control UID is not an admitted durable identity".to_owned(),
+                ));
+            }
+            return Ok(StateOwner::Principal(uid));
+        }
+
         let Some((principal, capsule)) = namespace.split_once(":capsule:") else {
             return Ok(StateOwner::System);
         };
-        if capsule.is_empty() {
+        if capsule.is_empty() || capsule.contains(':') {
             return Err(StorageError::InvalidKey(
                 "host-stamped capsule namespace has an empty capsule identifier".to_owned(),
             ));
@@ -290,6 +349,7 @@ pub type NativePrincipalContentStore = PrincipalContentStore<
 #[derive(Clone)]
 pub struct RuntimePrincipalStore {
     engine: Arc<RuntimeEngine>,
+    directory_cutover_receipt: Arc<str>,
     runtime_kv: Arc<RuntimeStore>,
     kv: Arc<dyn KvStore>,
     content: Arc<NativePrincipalContentStore>,
@@ -298,6 +358,28 @@ pub struct RuntimePrincipalStore {
 }
 
 impl RuntimePrincipalStore {
+    /// Retire the verified directory-store cutover source after the caller's
+    /// global migration barrier is durable.
+    ///
+    /// Opening a runtime store deliberately retains `var/principal-store`:
+    /// storage-local cutover verification cannot authorize deletion before
+    /// the kernel has receipted every other released-layout component. The
+    /// post-barrier caller invokes this method only after its component ledger
+    /// is committed. A surviving source is independently reopened, matched to
+    /// the immutable volume cutover receipt and current destination roots, and
+    /// then removed with no-follow tree retirement.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error if the source changed, the cutover receipt or
+    /// destination does not match it, or safe no-follow retirement fails.
+    pub fn retire_verified_legacy_directory_store(&self, home: &AstridHome) -> StorageResult<()> {
+        volume_migration::retire_verified_directory_if_present(
+            home,
+            &self.directory_cutover_receipt,
+        )
+    }
+
     /// Return privileged decoded-object cache diagnostics.
     ///
     /// These values are for kernel and operator accounting. Guest surfaces
@@ -321,10 +403,85 @@ impl RuntimePrincipalStore {
         self.engine.reclaim_object_cache();
     }
 
+    /// Return backend-reported free capacity and active arena bytes.
+    ///
+    /// This read-only media capability is suitable for audit or migration
+    /// preflight. It never derives capacity from an `AstridHome` path and
+    /// returns `None` when the selected bare-metal adapter cannot report it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error if the backend capacity query fails.
+    pub fn compaction_capacity(&self) -> StorageResult<Option<(u64, u64)>> {
+        self.engine
+            .compaction_capacity()
+            .map_err(|error| StorageError::Connection(format!("read storage capacity: {error}")))
+    }
+
     /// Clone the runtime KV projection.
     #[must_use]
     pub fn kv(&self) -> Arc<dyn KvStore> {
         Arc::clone(&self.kv)
+    }
+
+    /// Return a host-only system-control projection over the authoritative
+    /// principal store.
+    ///
+    /// Control projections are deliberately separate from principal capsule
+    /// namespaces and are never handed to a guest or filesystem mount. The
+    /// component grammar is intentionally narrow so callers cannot turn this
+    /// convenience into an unrestricted namespace selector.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::InvalidKey`] when `component` is empty, too
+    /// long, or contains characters outside the narrow control grammar.
+    pub fn system_control_kv(&self, component: &str) -> StorageResult<ScopedKvStore> {
+        if component.is_empty()
+            || component.len() > 64
+            || !component
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        {
+            return Err(StorageError::InvalidKey(
+                "system control component must be lowercase alphanumeric or '-'".to_owned(),
+            ));
+        }
+        ScopedKvStore::new(Arc::clone(&self.kv), format!("system:control:{component}"))
+    }
+
+    /// Return a host-only control projection owned by one immutable principal
+    /// UID. This is the only constructor for durable principal control state;
+    /// callers cannot select an alias-derived namespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::InvalidKey`] when the component is invalid or
+    /// when `principal` is not an admitted durable identity.
+    pub fn principal_control_kv(
+        &self,
+        principal: PrincipalUid,
+        component: &str,
+    ) -> StorageResult<ScopedKvStore> {
+        if !self.principals.contains_uid(principal) {
+            return Err(StorageError::InvalidKey(
+                "principal control UID is not an admitted durable identity".to_owned(),
+            ));
+        }
+        if component.is_empty()
+            || component.len() > 64
+            || !component
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        {
+            return Err(StorageError::InvalidKey(
+                "principal control component must be lowercase alphanumeric or '-'".to_owned(),
+            ));
+        }
+        ScopedKvStore::new(
+            Arc::clone(&self.kv),
+            format!("principal-uid:{principal}:control:{component}"),
+        )
     }
 
     /// Clone the named content projection.
@@ -333,10 +490,29 @@ impl RuntimePrincipalStore {
         Arc::clone(&self.content)
     }
 
+    /// Return the durable per-principal installed-capsule registry.
+    ///
+    /// The registry is backed by the same owner-root content projection as KV;
+    /// callers must supply an explicit [`StateOwner::Principal`] when reading
+    /// or mutating packages. No host directory is consulted for authority.
+    #[must_use]
+    pub fn capsules(&self) -> CapsuleRegistry<StateOwner, RuntimeEngine> {
+        CapsuleRegistry::new(Arc::clone(&self.content))
+    }
+
     /// Clone the private native content-staging area.
     #[must_use]
     pub fn staging(&self) -> Arc<NativeContentStagingArea> {
         Arc::clone(&self.staging)
+    }
+
+    /// Return file roots held by currently open immutable content handles.
+    ///
+    /// Compaction retention includes these closures so a handle never reads a
+    /// reclaimed generation after an unrelated catalog update.
+    #[must_use]
+    pub(crate) fn compaction_read_handle_roots(&self) -> Vec<(StateOwner, ObjectId)> {
+        self.content.compaction_read_handle_roots()
     }
 
     /// Clone the live alias-to-UID directory used by every projection.
@@ -532,11 +708,11 @@ async fn open_runtime_principal_store_with_options(
     policy: DurableEnginePolicy<StateOwner>,
 ) -> StorageResult<RuntimePrincipalStore> {
     if home.storage_volume_path().exists() {
-        let engine = volume_migration::open_existing(home, policy)?.ok_or_else(|| {
-            StorageError::Connection("Astrid volume disappeared while opening".to_owned())
-        })?;
-        volume_migration::retire_verified_directory_if_present(home, &engine)?;
-        return assemble_runtime_store(home, quota, principals, Arc::new(engine)).await;
+        let (engine, receipt) =
+            volume_migration::open_existing(home, policy)?.ok_or_else(|| {
+                StorageError::Connection("Astrid volume disappeared while opening".to_owned())
+            })?;
+        return assemble_runtime_store(home, quota, principals, Arc::new(engine), receipt).await;
     }
     let store_path = home.principal_store_path();
     let open_path = store_path.clone();
@@ -601,10 +777,8 @@ async fn open_runtime_principal_store_with_options(
             })??;
     }
 
-    let engine = Arc::new(volume_migration::migrate_directory_store(
-        home, engine, policy,
-    )?);
-    assemble_runtime_store(home, quota, principals, engine).await
+    let (engine, receipt) = volume_migration::migrate_directory_store(home, engine, policy)?;
+    assemble_runtime_store(home, quota, principals, Arc::new(engine), receipt).await
 }
 
 async fn assemble_runtime_store(
@@ -612,6 +786,7 @@ async fn assemble_runtime_store(
     quota: Arc<dyn KvQuotaResolver<StateOwner>>,
     principals: PrincipalDirectory,
     engine: Arc<RuntimeEngine>,
+    directory_cutover_receipt: String,
 ) -> StorageResult<RuntimePrincipalStore> {
     let validated_catalogs = Arc::new(Mutex::new(BTreeMap::<StateOwner, CatalogValidation>::new()));
     let validated_kv = Arc::new(crate::kv::KvValidationCache::default());
@@ -646,6 +821,7 @@ async fn assemble_runtime_store(
     let staging = Arc::new(NativeContentStagingArea::open(home.content_staging_path())?);
     Ok(RuntimePrincipalStore {
         engine,
+        directory_cutover_receipt: Arc::from(directory_cutover_receipt),
         runtime_kv,
         kv,
         content,

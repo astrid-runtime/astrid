@@ -1771,20 +1771,16 @@ mod access_enforcement {
     }
 }
 
-// ── Injected-home auto-provisioning (#1145) ─────────────────────
+// ── Principal admission has no native-home side effects (#1145) ─────────
 //
-// The dispatcher's per-principal auto-provision used to call
-// `AstridHome::resolve()` (process env) and write directory trees from
-// library code, so `cargo test` with no `ASTRID_HOME` isolation scaffolded
-// fixture principals into the developer's real `~/.astrid`. The home is
-// now injected: the kernel passes its booted home, tests pass a tempdir,
-// and with no home injected the dispatcher never touches the filesystem.
+// Principal home state is durable UID-bound storage owned by the kernel. The
+// dispatcher only validates the kernel-stamped principal and caches admission;
+// it never resolves a native home or creates a directory tree.
 
-/// With an injected tempdir home, dispatching an event stamped with an
-/// unknown principal auto-provisions that principal's home under the
-/// tempdir — and only there.
+/// Dispatching an event stamped with an unknown principal still invokes the
+/// matching capsule, without creating native principal-home state.
 #[tokio::test]
-async fn dispatch_with_injected_home_provisions_principal_under_it() {
+async fn dispatch_does_not_provision_native_home() {
     let (capsule, invoked) = MockCapsule::new("prov-capsule", "prov.topic");
 
     let mut registry = CapsuleRegistry::new();
@@ -1792,12 +1788,8 @@ async fn dispatch_with_injected_home_provisions_principal_under_it() {
     let registry = Arc::new(RwLock::new(registry));
 
     let dir = tempfile::tempdir().unwrap();
-    let home = astrid_core::dirs::AstridHome::from_path(dir.path());
-    let prov_user = astrid_core::PrincipalId::new("prov-user").unwrap();
-    let expected = home.principal_home(&prov_user).root().to_path_buf();
-
     let bus = Arc::new(EventBus::with_capacity(64));
-    let dispatcher = EventDispatcher::new(Arc::clone(&registry), Arc::clone(&bus)).with_home(home);
+    let dispatcher = EventDispatcher::new(Arc::clone(&registry), Arc::clone(&bus));
     let handle = tokio::spawn(dispatcher.run());
     tokio::task::yield_now().await;
 
@@ -1806,24 +1798,18 @@ async fn dispatch_with_injected_home_provisions_principal_under_it() {
 
     assert!(
         invoked.load(Ordering::SeqCst),
-        "the event must dispatch normally alongside provisioning"
+        "the event must dispatch normally alongside admission"
     );
     assert!(
-        expected.is_dir(),
-        "the unknown principal's home must be auto-provisioned under the injected tempdir home"
+        std::fs::read_dir(dir.path()).unwrap().next().is_none(),
+        "dispatch must not create native principal-home state"
     );
 
     handle.abort();
 }
 
-/// With NO injected home, the same event still dispatches successfully
-/// while auto-provisioning stays disabled: a tempdir standing where an
-/// injected home would be remains untouched. The full fail-closed
-/// contract — no filesystem writes and no `$ASTRID_HOME`/`$HOME`
-/// resolution without an injected home — is proven at the unit level in
-/// `dispatcher::provision::tests::no_injected_home_never_provisions`;
-/// the `AstridHome::resolve()` call is deleted from the dispatch path
-/// (#1145).
+/// Dispatch remains successful for an unknown principal while a native
+/// directory standing where a home would be remains untouched.
 #[tokio::test]
 async fn dispatch_without_home_creates_nothing_and_still_dispatches() {
     let (capsule, invoked) = MockCapsule::new("nohome-capsule", "nohome.topic");
@@ -1832,8 +1818,7 @@ async fn dispatch_without_home_creates_nothing_and_still_dispatches() {
     register_system_test_capsule(&mut registry, Box::new(capsule));
     let registry = Arc::new(RwLock::new(registry));
 
-    // A tempdir that is deliberately never injected — it stands where an
-    // injected home would be, so it must remain empty throughout.
+    // A tempdir unrelated to dispatch; it must remain empty throughout.
     let never_injected = tempfile::tempdir().unwrap();
 
     let bus = Arc::new(EventBus::with_capacity(64));
@@ -1846,14 +1831,14 @@ async fn dispatch_without_home_creates_nothing_and_still_dispatches() {
 
     assert!(
         invoked.load(Ordering::SeqCst),
-        "dispatch must succeed for an unknown principal even with provisioning disabled"
+        "dispatch must succeed for an unknown principal"
     );
     assert!(
         std::fs::read_dir(never_injected.path())
             .unwrap()
             .next()
             .is_none(),
-        "the never-injected tempdir must stay empty — provisioning is disabled without an injected home"
+        "the tempdir must stay empty — dispatch has no native-home authority"
     );
 
     handle.abort();

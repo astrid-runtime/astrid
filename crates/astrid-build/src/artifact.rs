@@ -9,7 +9,7 @@
 
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::Read;
+use std::io::{Cursor, Read};
 use std::path::{Component, Path};
 
 use anyhow::{Context, bail};
@@ -153,6 +153,21 @@ pub fn verify_archive(archive_path: &Path) -> anyhow::Result<ArtifactVerificatio
     verify_records(records, envelope.as_deref())
 }
 
+/// Verify a gzip/tar capsule archive supplied as bytes.
+///
+/// This is the byte-oriented counterpart to [`verify_archive`]. It performs
+/// the same traversal, canonical content-digest, and provenance-signature
+/// checks without requiring a host filesystem temporary file. Storage-backed
+/// capsule loaders use it while keeping the durable package authoritative.
+///
+/// # Errors
+///
+/// Fails on malformed or unsafe archive entries and invalid provenance.
+pub fn verify_archive_bytes(archive: &[u8]) -> anyhow::Result<ArtifactVerification> {
+    let (records, envelope) = read_archive_reader(GzDecoder::new(Cursor::new(archive)))?;
+    verify_records(records, envelope.as_deref())
+}
+
 /// Verify a staged directory using the same canonical tree algorithm as a
 /// `.capsule` archive.
 ///
@@ -218,7 +233,13 @@ pub fn read_archive_text(archive_path: &Path, requested: &str) -> anyhow::Result
 fn read_archive(archive_path: &Path) -> anyhow::Result<(Vec<ContentRecord>, Option<Vec<u8>>)> {
     let file = File::open(archive_path)
         .with_context(|| format!("failed to open {}", archive_path.display()))?;
-    let mut archive = tar::Archive::new(GzDecoder::new(file));
+    read_archive_reader(GzDecoder::new(file))
+}
+
+fn read_archive_reader<R: Read>(
+    reader: R,
+) -> anyhow::Result<(Vec<ContentRecord>, Option<Vec<u8>>)> {
+    let mut archive = tar::Archive::new(reader);
     let mut records = Vec::new();
     let mut envelope = None;
     let mut seen = HashSet::new();

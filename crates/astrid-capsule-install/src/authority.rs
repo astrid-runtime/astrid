@@ -4,7 +4,8 @@
 //! are deliberately separate. A foreign signature proves bytes came from one
 //! key; it does not grant those bytes authority on this runtime.
 
-use std::fs::OpenOptions;
+use std::collections::BTreeSet;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -79,6 +80,21 @@ pub struct InstallInspection {
     pub capability_expansions: Vec<CapabilityExpansion>,
     pub(crate) manifest_digest: String,
     pub(crate) requested_capabilities: CapabilitiesDef,
+}
+
+/// Read and fully validate the manifest embedded in a `.capsule` archive.
+///
+/// This is a read-only preflight used by daemon install transactions to bind
+/// typed configuration to the artifact identity before any storage mutation.
+/// The archive remains untrusted input: traversal/special-entry checks are
+/// performed by the artifact reader and manifest validation by discovery.
+pub fn read_archive_manifest(archive_path: &Path) -> anyhow::Result<CapsuleManifest> {
+    let manifest_text = artifact::read_archive_text(archive_path, "Capsule.toml")?;
+    let staged = tempfile::tempdir().context("failed to stage capsule manifest")?;
+    let manifest_path = staged.path().join("Capsule.toml");
+    std::fs::write(&manifest_path, manifest_text)?;
+    astrid_capsule::discovery::load_manifest(&manifest_path)
+        .context("failed to validate capsule manifest")
 }
 
 /// How a successfully-installed authority snapshot was accepted.
@@ -163,6 +179,223 @@ pub fn read_installed_authority(
     let receipt = serde_json::from_str(&content)
         .with_context(|| format!("invalid authority receipt {}", path.display()))?;
     Ok(Some(receipt))
+}
+
+/// Read the exact active authority receipt bytes for migration into durable
+/// storage. The bytes are validated through [`read_installed_authority`] first
+/// so a malformed receipt never becomes authoritative content.
+pub(crate) fn read_installed_authority_bytes(
+    home: &AstridHome,
+    target_dir: &Path,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let _ = read_installed_authority(home, target_dir)?;
+    let paths = authority_paths(home, target_dir)?;
+    match std::fs::read(&paths.active) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to read authority receipt {}",
+                paths.active.display()
+            )
+        }),
+    }
+}
+
+/// Remove the exact legacy authority receipt bound to one native capsule
+/// target after its durable package has been read back and verified.
+///
+/// The active receipt is compared byte-for-byte with the bytes that were
+/// published to the durable registry.  Pending or previous transaction
+/// artifacts are never guessed at or swept: they make retirement fail closed
+/// and remain on disk for recovery.  The authority directory is synced after
+/// unlinking so a crash cannot report retirement before the directory entry is
+/// durable.
+pub(crate) fn retire_legacy_authority_receipt(
+    home: &AstridHome,
+    target_dir: &Path,
+    expected_bytes: &[u8],
+) -> anyhow::Result<()> {
+    let paths = authority_paths(home, target_dir)?;
+    for (label, path) in [("pending", &paths.pending), ("previous", &paths.previous)] {
+        match std::fs::symlink_metadata(path) {
+            Ok(_metadata) => {
+                bail!(
+                    "cannot retire legacy capsule authority while {label} transaction artifact exists at {}",
+                    path.display()
+                );
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "inspect legacy capsule authority {label} {}",
+                        path.display()
+                    )
+                });
+            },
+        }
+    }
+
+    let metadata = std::fs::symlink_metadata(&paths.active).with_context(|| {
+        format!(
+            "legacy capsule authority receipt disappeared before retirement: {}",
+            paths.active.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!(
+            "legacy capsule authority receipt is not a regular file: {}",
+            paths.active.display()
+        );
+    }
+    astrid_core::platform_fs::verify_no_redirects(&paths.active).with_context(|| {
+        format!(
+            "verify legacy capsule authority receipt {}",
+            paths.active.display()
+        )
+    })?;
+    let actual = std::fs::read(&paths.active)
+        .with_context(|| format!("read legacy capsule authority {}", paths.active.display()))?;
+    if actual != expected_bytes {
+        bail!(
+            "legacy capsule authority receipt changed before retirement: {}",
+            paths.active.display()
+        );
+    }
+    // Re-stat and re-read immediately before unlinking.  This does not turn a
+    // host filesystem into a transaction, but closes the ordinary mutation
+    // window exercised by migration/recovery and preserves a changed source.
+    let final_metadata = std::fs::symlink_metadata(&paths.active)?;
+    if final_metadata.file_type().is_symlink()
+        || !final_metadata.is_file()
+        || final_metadata.len() != actual.len() as u64
+        || std::fs::read(&paths.active)?.as_slice() != expected_bytes
+    {
+        bail!(
+            "legacy capsule authority receipt changed during retirement: {}",
+            paths.active.display()
+        );
+    }
+    std::fs::remove_file(&paths.active).with_context(|| {
+        format!(
+            "retire legacy capsule authority receipt {}",
+            paths.active.display()
+        )
+    })?;
+    sync_authority_directory(&paths.directory)
+}
+
+/// Status of the global legacy authority receipt directory.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LegacyAuthorityReceiptStatus {
+    /// Active receipts that do not correspond to a permitted workspace portal.
+    pub unknown_active: Vec<PathBuf>,
+    /// Incomplete pending transaction artifacts.
+    pub pending: Vec<PathBuf>,
+    /// Stale previous-receipt transaction artifacts.
+    pub previous: Vec<PathBuf>,
+}
+
+/// Inspect global legacy authority receipts without deleting any file.
+///
+/// `workspace_targets` identifies explicit project portals whose active
+/// receipts are intentionally retained.  Every other active receipt is an
+/// unknown leftover and must block layout cutover.  Pending/previous files
+/// always block cutover, including under a workspace portal.
+///
+/// # Errors
+///
+/// Returns an error when the receipt directory or one of its entries is
+/// redirected, special, or unreadable.
+pub fn legacy_authority_receipt_status(
+    home: &AstridHome,
+    workspace_targets: &[PathBuf],
+) -> anyhow::Result<LegacyAuthorityReceiptStatus> {
+    let directory = home.etc_dir().join(AUTHORITY_RECEIPT_DIR);
+    let metadata = match std::fs::symlink_metadata(&directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(LegacyAuthorityReceiptStatus::default());
+        },
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspect {}", directory.display()));
+        },
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!(
+            "legacy capsule authority root is not a regular directory: {}",
+            directory.display()
+        );
+    }
+    astrid_core::platform_fs::verify_no_redirects(&directory).with_context(|| {
+        format!(
+            "verify legacy capsule authority root {}",
+            directory.display()
+        )
+    })?;
+
+    let permitted = workspace_targets
+        .iter()
+        .map(|target| authority_paths(home, target).map(|paths| paths.active))
+        .collect::<anyhow::Result<BTreeSet<_>>>()?;
+    let mut status = LegacyAuthorityReceiptStatus::default();
+    let mut entries = std::fs::read_dir(&directory)
+        .with_context(|| format!("read legacy capsule authority root {}", directory.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .with_context(|| format!("read legacy capsule authority root {}", directory.display()))?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)
+            .with_context(|| format!("inspect legacy capsule authority {}", path.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            bail!(
+                "legacy capsule authority root contains a non-regular entry: {}",
+                path.display()
+            );
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            bail!(
+                "legacy capsule authority entry has a non-UTF-8 name: {}",
+                path.display()
+            );
+        };
+        if name.ends_with(".pending") {
+            status.pending.push(path);
+        } else if name.ends_with(".previous") {
+            status.previous.push(path);
+        } else if path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+            && !permitted.contains(&path)
+        {
+            status.unknown_active.push(path);
+        } else if !path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+        {
+            // Unknown sidecars are not workspace receipts and must not be
+            // silently ignored during a destructive layout cutover.
+            status.unknown_active.push(path);
+        }
+    }
+    Ok(status)
+}
+
+fn sync_authority_directory(directory: &Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(directory)
+            .with_context(|| format!("open authority directory {}", directory.display()))?
+            .sync_all()
+            .with_context(|| format!("sync authority directory {}", directory.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = directory;
+    }
+    Ok(())
 }
 
 /// Remove the authority state for an uninstalled capsule.
@@ -806,7 +1039,7 @@ fn verification_provenance(
     }
 }
 
-fn digest_manifest(bytes: &[u8]) -> String {
+pub(crate) fn digest_manifest(bytes: &[u8]) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(MANIFEST_DIGEST_DOMAIN);
     hasher.update(bytes);
@@ -830,6 +1063,8 @@ fn ensure_bound_digest(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
 
     fn inspection(provenance: ArtifactProvenance) -> InstallInspection {
@@ -917,5 +1152,106 @@ mod tests {
         assert!(read_installed_authority(&home, &target).is_err());
         drop(transaction);
         assert!(read_installed_authority(&home, &target).unwrap().is_none());
+    }
+
+    #[test]
+    fn legacy_authority_retirement_removes_only_the_exact_receipt() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(temp.path().join("home"));
+        let target = temp.path().join("installed/example");
+        let authority = authorize_install(
+            &inspection(ArtifactProvenance::Unsigned),
+            &AuthorityDecision::ExplicitApproval {
+                content_digest: "abc".into(),
+            },
+        )
+        .unwrap();
+        AuthorityReceiptTransaction::stage(&home, &target, &authority)
+            .unwrap()
+            .commit()
+            .unwrap();
+        let bytes = read_installed_authority_bytes(&home, &target)
+            .unwrap()
+            .expect("active receipt");
+        let paths = authority_paths(&home, &target).unwrap();
+        retire_legacy_authority_receipt(&home, &target, &bytes).unwrap();
+        assert!(!paths.active.exists(), "exact active receipt is retired");
+        assert!(paths.directory.exists(), "authority parent remains durable");
+    }
+
+    #[test]
+    fn legacy_authority_retirement_preserves_mutated_receipt() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(temp.path().join("home"));
+        let target = temp.path().join("installed/example");
+        let authority = authorize_install(
+            &inspection(ArtifactProvenance::Unsigned),
+            &AuthorityDecision::ExplicitApproval {
+                content_digest: "abc".into(),
+            },
+        )
+        .unwrap();
+        AuthorityReceiptTransaction::stage(&home, &target, &authority)
+            .unwrap()
+            .commit()
+            .unwrap();
+        let paths = authority_paths(&home, &target).unwrap();
+        let expected = fs::read(&paths.active).unwrap();
+        fs::write(&paths.active, b"mutated").unwrap();
+        assert!(retire_legacy_authority_receipt(&home, &target, &expected).is_err());
+        assert_eq!(fs::read(&paths.active).unwrap(), b"mutated");
+    }
+
+    #[test]
+    fn legacy_authority_pending_artifact_blocks_and_is_preserved() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(temp.path().join("home"));
+        let target = temp.path().join("installed/example");
+        let authority = authorize_install(
+            &inspection(ArtifactProvenance::Unsigned),
+            &AuthorityDecision::ExplicitApproval {
+                content_digest: "abc".into(),
+            },
+        )
+        .unwrap();
+        let transaction = AuthorityReceiptTransaction::stage(&home, &target, &authority).unwrap();
+        let paths = authority_paths(&home, &target).unwrap();
+        let error = retire_legacy_authority_receipt(&home, &target, b"expected").unwrap_err();
+        assert!(error.to_string().contains("pending"));
+        assert!(paths.pending.exists());
+        drop(transaction);
+    }
+
+    #[test]
+    fn authority_status_blocks_unknown_but_preserves_workspace_portal_receipts() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(temp.path().join("home"));
+        let workspace_target = temp.path().join("project/.astrid/capsules/example");
+        let workspace_parent = workspace_target.parent().unwrap();
+        fs::create_dir_all(workspace_parent).unwrap();
+        let authority = authorize_install(
+            &inspection(ArtifactProvenance::Unsigned),
+            &AuthorityDecision::ExplicitApproval {
+                content_digest: "abc".into(),
+            },
+        )
+        .unwrap();
+        AuthorityReceiptTransaction::stage(&home, &workspace_target, &authority)
+            .unwrap()
+            .commit()
+            .unwrap();
+        let portal =
+            legacy_authority_receipt_status(&home, std::slice::from_ref(&workspace_target))
+                .unwrap();
+        assert!(portal.unknown_active.is_empty());
+        let paths = authority_paths(&home, &workspace_target).unwrap();
+        assert!(paths.active.exists());
+
+        let unknown = paths.directory.join("unknown.json");
+        fs::write(&unknown, b"unknown").unwrap();
+        let status =
+            legacy_authority_receipt_status(&home, std::slice::from_ref(&workspace_target))
+                .unwrap();
+        assert_eq!(status.unknown_active, vec![unknown]);
     }
 }

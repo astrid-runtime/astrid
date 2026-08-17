@@ -1,7 +1,9 @@
 //! Native filesystem lease lifecycle and private callback service.
 
-use std::io::{self, Seek as _, Write as _};
+use std::future::Future;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -10,27 +12,43 @@ use astrid_core::PrincipalId;
 use astrid_core::local_transport::{self, LocalListener, LocalStream};
 use astrid_core::storage_filesystem::{
     STORAGE_FILESYSTEM_MAX_IO_BYTES, STORAGE_FILESYSTEM_PROTOCOL_V1,
-    STORAGE_FILESYSTEM_PROTOCOL_V2, StorageFilesystemEntryKindV1, StorageFilesystemEntryV1,
-    StorageFilesystemFailureV1, StorageFilesystemOperationV1, StorageFilesystemOperationV2,
-    StorageFilesystemOutcomeV1, StorageFilesystemOutcomeV2, StorageFilesystemRequestV1,
-    StorageFilesystemRequestV2, StorageFilesystemResponseV1, StorageFilesystemResponseV2,
-    StorageFilesystemSuccessV1, StorageFilesystemSuccessV2, StorageMountLeaseV1,
+    STORAGE_FILESYSTEM_PROTOCOL_V2, STORAGE_FILESYSTEM_SERVICE_LAUNCH_SCHEMA_V1,
+    STORAGE_FILESYSTEM_SERVICE_READY_SCHEMA_V1, StorageFilesystemEntryKindV1,
+    StorageFilesystemEntryV1, StorageFilesystemFailureV1, StorageFilesystemOperationV1,
+    StorageFilesystemOperationV2, StorageFilesystemOutcomeV1, StorageFilesystemOutcomeV2,
+    StorageFilesystemRequestV1, StorageFilesystemRequestV2, StorageFilesystemResponseV1,
+    StorageFilesystemResponseV2, StorageFilesystemSuccessV1, StorageFilesystemSuccessV2,
+    StorageFilesystemTargetV1, StorageMountLeaseV1, StorageProviderParentLifetimeV1,
+    StorageProviderServiceLaunchV1, StorageProviderServiceReadyV1,
+    storage_provider_service_ready_challenge,
 };
 use astrid_core::storage_provider::{
     StorageMountId, StorageProviderAccessV1, StorageProviderViewV1,
 };
 use astrid_storage::{
     AstridFilesystem, FilesystemEntry, FilesystemEntryKind, FilesystemError, FilesystemPath,
-    StateOwner,
+    OwnerSubtreeFilesystem, StateOwner, WorkspaceBranchStore,
 };
 use base64::Engine as _;
 use rand::{TryRng as _, rngs::SysRng};
 use serde_json::json;
 use subtle::ConstantTimeEq as _;
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::watch;
 
 use crate::Kernel;
+
+mod filesystem;
+use filesystem::{CallbackFilesystem, PrefixedFilesystem, execute_blocking};
+#[cfg(any(unix, windows))]
+mod process_broker;
+#[cfg(any(unix, windows))]
+pub(crate) use process_broker::KernelProcessStorageMountBroker;
+#[cfg(all(test, any(unix, windows)))]
+pub(super) use process_broker::{
+    CachedProcessProjection, ProcessProjectionKey, cached_projection_mount,
+    platform_process_provider_name, retry_failed_projection, validate_process_provider_ready,
+};
 
 const LEASE_IDLE_TTL_SECS: u64 = 60 * 60;
 const MAX_CALLBACK_FRAME_BYTES: usize = 8 * 1024 * 1024;
@@ -57,6 +75,7 @@ pub(crate) struct StorageMountLeaseState {
     requested_by: PrincipalId,
     owner: StateOwner,
     view: StorageProviderViewV1,
+    target: StorageFilesystemTargetV1,
     access: StorageProviderAccessV1,
     provider: String,
     mountpoint: PathBuf,
@@ -128,11 +147,13 @@ impl StorageMountLeaseState {
 }
 
 /// Resolve and issue one native mount lease.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn issue_lease(
     kernel: &Arc<Kernel>,
     caller: PrincipalId,
     allow_cross_owner: bool,
     view: StorageProviderViewV1,
+    target: StorageFilesystemTargetV1,
     access: StorageProviderAccessV1,
     provider: String,
     mountpoint: PathBuf,
@@ -143,7 +164,7 @@ pub(crate) async fn issue_lease(
     if !mountpoint.is_absolute() {
         return Err("native storage mountpoint must be absolute".to_owned());
     }
-    let owner = resolve_owner(kernel, &caller, allow_cross_owner, &view).await?;
+    let (owner, target) = resolve_owner(kernel, &caller, allow_cross_owner, &view, target).await?;
     let mount_id = StorageMountId::new();
     #[cfg(unix)]
     let resource_path = private_mount_resource_path(mount_id)?;
@@ -166,6 +187,7 @@ pub(crate) async fn issue_lease(
         requested_by: caller,
         owner,
         view,
+        target,
         access,
         provider,
         mountpoint,
@@ -214,6 +236,7 @@ pub(crate) fn lease_status(
     Ok(json!({
         "mount_id": state.mount_id,
         "view": state.view,
+        "target": state.target,
         "access": state.access,
         "provider": state.provider,
         "mountpoint": state.mountpoint,
@@ -242,10 +265,33 @@ pub(crate) async fn sync_lease(
         .clone()
         .ok_or_else(|| "native principal store is unavailable".to_owned())?;
     let owner = state.owner;
-    tokio::task::spawn_blocking(move || AstridFilesystem::new(store.content(), owner).sync())
-        .await
-        .map_err(|error| format!("mount sync worker failed: {error}"))?
-        .map_err(|error| error.to_string())?;
+    let target = state.target.clone();
+    tokio::task::spawn_blocking(move || match target {
+        StorageFilesystemTargetV1::OwnerRoot => AstridFilesystem::new(store.content(), owner)
+            .sync()
+            .map_err(|error| error.to_string()),
+        StorageFilesystemTargetV1::WorkspaceBranch { workspace } => {
+            WorkspaceBranchStore::new(store.content())
+                .filesystem(owner, workspace)
+                .sync()
+                .map_err(|error| error.to_string())
+        },
+        StorageFilesystemTargetV1::OwnerSubtree { prefix } => {
+            if prefix == "shared" {
+                AstridFilesystem::new_fleet_shared(store.content(), owner)
+                    .sync()
+                    .map_err(|error| error.to_string())
+            } else {
+                let filesystem = PrefixedFilesystem {
+                    inner: AstridFilesystem::new(store.content(), owner),
+                    prefix,
+                };
+                filesystem.sync().map_err(|error| error.to_string())
+            }
+        },
+    })
+    .await
+    .map_err(|error| format!("mount sync worker failed: {error}"))??;
     state.dirty.store(false, Ordering::Release);
     state.renew();
     Ok(())
@@ -292,8 +338,9 @@ async fn resolve_owner(
     caller: &PrincipalId,
     allow_cross_owner: bool,
     view: &StorageProviderViewV1,
-) -> Result<StateOwner, String> {
-    match view {
+    target: StorageFilesystemTargetV1,
+) -> Result<(StateOwner, StorageFilesystemTargetV1), String> {
+    let owner = match view {
         StorageProviderViewV1::Principal(principal) => {
             if principal != caller && !allow_cross_owner {
                 return Err("principal filesystem view belongs to another principal".to_owned());
@@ -304,7 +351,7 @@ async fn resolve_owner(
                 .map(StateOwner::Principal)
                 .map_err(|error| {
                     format!("principal `{principal}` has no immutable storage identity: {error}")
-                })
+                })?
         },
         StorageProviderViewV1::Fleet(fleet) => {
             if !allow_cross_owner {
@@ -328,15 +375,57 @@ async fn resolve_owner(
                     );
                 }
             }
-            Ok(StateOwner::Fleet(*fleet))
+            StateOwner::Fleet(*fleet)
         },
         StorageProviderViewV1::Admin => {
             if !allow_cross_owner {
                 return Err("system filesystem view requires global storage authority".to_owned());
             }
-            Ok(StateOwner::System)
+            StateOwner::System
         },
+    };
+
+    if let StorageFilesystemTargetV1::WorkspaceBranch { workspace } = &target {
+        let store = kernel
+            .principal_store
+            .clone()
+            .ok_or_else(|| "native principal store is unavailable".to_owned())?;
+        let branches = WorkspaceBranchStore::new(store.content());
+        let descriptor = branches
+            .describe(&owner, *workspace)
+            .map_err(|error| format!("resolve workspace branch: {error}"))?;
+        // A caller-scoped branch lease may only target the branch that the
+        // kernel's durable workspace binding assigned to that immutable UID.
+        // Fleet membership authorizes the shared base owner, not another
+        // principal's divergent branch. Global storage authority may inspect
+        // an explicitly selected branch through the administrative path.
+        if !allow_cross_owner {
+            let caller_uid = kernel
+                .principal_directory
+                .uid_for(caller)
+                .map_err(|error| format!("resolve workspace branch caller UID: {error}"))?;
+            if descriptor.binding_uid() != Some(caller_uid) {
+                return Err(
+                    "workspace branch is not bound to the authenticated principal".to_owned(),
+                );
+            }
+        }
     }
+    if let StorageFilesystemTargetV1::OwnerSubtree { prefix } = &target {
+        if prefix != "home" && prefix != "shared" {
+            return Err("owner subtree prefix is not a kernel-admitted attachment".to_owned());
+        }
+        if prefix == "home" && !matches!(owner, StateOwner::Principal(_)) {
+            return Err("principal HOME must resolve to the principal owner".to_owned());
+        }
+        if prefix == "shared" && !matches!(owner, StateOwner::Fleet(_)) {
+            return Err("Fleet shared attachment requires a Fleet owner".to_owned());
+        }
+        FilesystemPath::new(prefix.clone())
+            .map_err(|error| format!("resolve owner subtree prefix: {error}"))?;
+    }
+
+    Ok((owner, target))
 }
 
 #[cfg(any(unix, windows))]
@@ -679,9 +768,29 @@ async fn execute_operation(
         return failure("unavailable", "native principal store is unavailable");
     };
     let owner = state.owner;
-    let result = tokio::task::spawn_blocking(move || {
-        let filesystem = AstridFilesystem::new(store.content(), owner);
-        execute_blocking(&filesystem, operation)
+    let target = state.target.clone();
+    let result = tokio::task::spawn_blocking(move || match target {
+        StorageFilesystemTargetV1::OwnerRoot => {
+            let filesystem = AstridFilesystem::new(store.content(), owner);
+            execute_blocking(&filesystem, operation)
+        },
+        StorageFilesystemTargetV1::WorkspaceBranch { workspace } => {
+            let branches = WorkspaceBranchStore::new(store.content());
+            let filesystem = branches.filesystem(owner, workspace);
+            execute_blocking(&filesystem, operation)
+        },
+        StorageFilesystemTargetV1::OwnerSubtree { prefix } => {
+            if prefix == "shared" {
+                let filesystem = AstridFilesystem::new_fleet_shared(store.content(), owner);
+                execute_blocking(&filesystem, operation)
+            } else {
+                let filesystem = PrefixedFilesystem {
+                    inner: AstridFilesystem::new(store.content(), owner),
+                    prefix,
+                };
+                execute_blocking(&filesystem, operation)
+            }
+        },
     })
     .await;
     let outcome = match result {
@@ -712,179 +821,6 @@ async fn pause_mutation_for_test(state: &StorageMountLeaseState) {
             permit.forget();
         }
     }
-}
-
-fn execute_blocking<E>(
-    filesystem: &AstridFilesystem<StateOwner, E>,
-    operation: StorageFilesystemOperationV1,
-) -> Result<StorageFilesystemSuccessV1, FilesystemError>
-where
-    E: astrid_storage::engine::PrincipalProjectionEngine<StateOwner>,
-{
-    match operation {
-        StorageFilesystemOperationV1::Stat { path } => {
-            let path = FilesystemPath::new(path)?;
-            Ok(StorageFilesystemSuccessV1::Entry(entry(
-                &filesystem.stat(&path)?,
-            )))
-        },
-        StorageFilesystemOperationV1::ReadDirectory { path } => {
-            let path = FilesystemPath::new(path)?;
-            Ok(StorageFilesystemSuccessV1::Entries(
-                filesystem.read_dir(&path)?.iter().map(entry).collect(),
-            ))
-        },
-        StorageFilesystemOperationV1::Read {
-            path,
-            offset,
-            length,
-        } => {
-            if length > STORAGE_FILESYSTEM_MAX_IO_BYTES {
-                return Err(FilesystemError::InvalidPath(path));
-            }
-            let path = FilesystemPath::new(path)?;
-            let stat = filesystem.stat(&path)?;
-            let available = stat.logical_bytes().saturating_sub(offset);
-            let length = length.min(available);
-            Ok(StorageFilesystemSuccessV1::Data(
-                filesystem.read(&path, offset, length)?,
-            ))
-        },
-        StorageFilesystemOperationV1::Write { path, offset, data } => {
-            write_range(filesystem, path, offset, &data)
-        },
-        StorageFilesystemOperationV1::SetLength { path, length } => {
-            let path = FilesystemPath::new(path)?;
-            let current_length = require_file(filesystem, &path)?;
-            if current_length == length {
-                return Ok(StorageFilesystemSuccessV1::Written(length));
-            }
-            let mut staged = stage_existing_file(filesystem, &path, current_length)?;
-            staged
-                .set_len(length)
-                .map_err(|error| staging_error(&error))?;
-            staged
-                .seek(io::SeekFrom::Start(0))
-                .map_err(|error| staging_error(&error))?;
-            filesystem.write_streaming(&path, staged)?;
-            Ok(StorageFilesystemSuccessV1::Written(length))
-        },
-        StorageFilesystemOperationV1::Create { path, kind } => {
-            let path = FilesystemPath::new(path)?;
-            match kind {
-                StorageFilesystemEntryKindV1::File => {
-                    match filesystem.stat(&path) {
-                        Ok(_) => return Err(FilesystemError::AlreadyExists(path)),
-                        Err(FilesystemError::NotFound(_)) => {},
-                        Err(error) => return Err(error),
-                    }
-                    filesystem.write(&path, &[])?;
-                },
-                StorageFilesystemEntryKindV1::Directory => filesystem.create_dir(&path)?,
-            }
-            Ok(StorageFilesystemSuccessV1::Done)
-        },
-        StorageFilesystemOperationV1::Remove { path } => {
-            filesystem.remove(&FilesystemPath::new(path)?)?;
-            Ok(StorageFilesystemSuccessV1::Done)
-        },
-        StorageFilesystemOperationV1::Rename { from, to, replace } => {
-            let from = FilesystemPath::new(from)?;
-            let to = FilesystemPath::new(to)?;
-            if replace {
-                filesystem.rename_replacing(&from, &to)?;
-            } else {
-                filesystem.rename(&from, &to)?;
-            }
-            Ok(StorageFilesystemSuccessV1::Done)
-        },
-        StorageFilesystemOperationV1::Sync => {
-            filesystem.sync()?;
-            Ok(StorageFilesystemSuccessV1::Done)
-        },
-    }
-}
-
-fn write_range<E>(
-    filesystem: &AstridFilesystem<StateOwner, E>,
-    path: String,
-    offset: u64,
-    data: &[u8],
-) -> Result<StorageFilesystemSuccessV1, FilesystemError>
-where
-    E: astrid_storage::engine::PrincipalProjectionEngine<StateOwner>,
-{
-    let data_length = u64::try_from(data.len()).unwrap_or(u64::MAX);
-    if data_length > STORAGE_FILESYSTEM_MAX_IO_BYTES {
-        return Err(FilesystemError::InvalidPath(path));
-    }
-    let path = FilesystemPath::new(path)?;
-    let current_length = require_file(filesystem, &path)?;
-    if data.is_empty() {
-        return Ok(StorageFilesystemSuccessV1::Written(current_length));
-    }
-    let end = offset
-        .checked_add(data_length)
-        .ok_or_else(|| FilesystemError::InvalidPath(path.as_str().to_owned()))?;
-    let mut staged = stage_existing_file(filesystem, &path, current_length)?;
-    staged
-        .seek(io::SeekFrom::Start(offset))
-        .map_err(|error| staging_error(&error))?;
-    staged
-        .write_all(data)
-        .map_err(|error| staging_error(&error))?;
-    staged
-        .seek(io::SeekFrom::Start(0))
-        .map_err(|error| staging_error(&error))?;
-    filesystem.write_streaming(&path, staged)?;
-    Ok(StorageFilesystemSuccessV1::Written(current_length.max(end)))
-}
-
-fn require_file<E>(
-    filesystem: &AstridFilesystem<StateOwner, E>,
-    path: &FilesystemPath,
-) -> Result<u64, FilesystemError>
-where
-    E: astrid_storage::engine::PrincipalProjectionEngine<StateOwner>,
-{
-    let stat = filesystem.stat(path)?;
-    if stat.kind() != FilesystemEntryKind::File {
-        return Err(FilesystemError::IsDirectory(path.clone()));
-    }
-    Ok(stat.logical_bytes())
-}
-
-fn stage_existing_file<E>(
-    filesystem: &AstridFilesystem<StateOwner, E>,
-    path: &FilesystemPath,
-    length: u64,
-) -> Result<std::fs::File, FilesystemError>
-where
-    E: astrid_storage::engine::PrincipalProjectionEngine<StateOwner>,
-{
-    let mut staged = tempfile::tempfile().map_err(|error| staging_error(&error))?;
-    let mut offset = 0_u64;
-    while offset < length {
-        let wanted = length
-            .checked_sub(offset)
-            .ok_or_else(|| FilesystemError::InvalidPath(path.as_str().to_owned()))?
-            .min(STORAGE_FILESYSTEM_MAX_IO_BYTES);
-        let bytes = filesystem.read(path, offset, wanted)?;
-        if bytes.is_empty() {
-            return Err(FilesystemError::InvalidPath(path.as_str().to_owned()));
-        }
-        staged
-            .write_all(&bytes)
-            .map_err(|error| staging_error(&error))?;
-        offset = offset
-            .checked_add(bytes.len() as u64)
-            .ok_or_else(|| FilesystemError::InvalidPath(path.as_str().to_owned()))?;
-    }
-    Ok(staged)
-}
-
-fn staging_error(error: &io::Error) -> FilesystemError {
-    FilesystemError::Staging(error.to_string())
 }
 
 fn entry(value: &FilesystemEntry) -> StorageFilesystemEntryV1 {

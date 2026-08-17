@@ -186,6 +186,7 @@ where
         .local_addr()
         .context("failed to read pre-bound gateway listener address")?;
     warn_if_plaintext_non_loopback(addr);
+    state.hydrate_revocations().await?;
     let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     serve_http_listener(
         state,
@@ -213,6 +214,7 @@ async fn run_inner(
     })?;
 
     if let Some(tls_cfg) = state.config.tls.as_ref() {
+        state.hydrate_revocations().await?;
         // TLS path: bind via axum-server, layer rustls in front of
         // the same router. The plain-HTTP TcpListener::bind dance
         // doesn't apply here — axum-server opens its own listener.
@@ -228,6 +230,8 @@ async fn run_inner(
     }
 
     warn_if_plaintext_non_loopback(addr);
+
+    state.hydrate_revocations().await?;
 
     let listener = TcpListener::bind(addr)
         .await
@@ -269,10 +273,18 @@ async fn serve_http_listener(
     // bus. Detached: the task exits when the bus drops at daemon
     // shutdown, so no explicit join is needed.
     if let Some(bus) = state.event_bus.clone() {
-        revocations::spawn_watcher(bus.clone(), Arc::clone(&state.revoked_at));
+        revocations::spawn_watcher(
+            bus.clone(),
+            Arc::clone(&state.revoked_at),
+            state.storage_kv.clone(),
+        );
         // Per-device bearer revocation: evict a device-scoped bearer the
         // instant its key_id is revoked via PairDeviceRevoke.
-        revocations::spawn_key_revocation_watcher(bus, Arc::clone(&state.revoked_key_ids));
+        revocations::spawn_key_revocation_watcher(
+            bus,
+            Arc::clone(&state.revoked_key_ids),
+            state.storage_kv.clone(),
+        );
     } else {
         tracing::warn!(
             "gateway running without a kernel event bus — bearer revocations on principal delete will NOT take effect for this process"

@@ -1,15 +1,16 @@
 //! `astrid capsule show <name>` — manifest, interfaces, source.
 //!
-//! Reads the installed capsule's `Capsule.toml` and `meta.json` from
-//! `<principal_home>/.local/capsules/<name>/`. No daemon round-trip is
-//! needed — the manifest is on disk, identical for every connected
-//! client.
+//! Reads the authenticated capsule metadata snapshot from the daemon-owned
+//! registry. The CLI never opens a principal's native home or cache as an
+//! authority; any materialized capsule directory is disposable projection
+//! state owned by the daemon.
 
 use std::process::ExitCode;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use astrid_capsule_types::capability_presentation::{SemanticCapability, semantic_capabilities};
 use astrid_core::dirs::AstridHome;
+use astrid_core::kernel_api::{KernelRequest, KernelResponse};
 use clap::Args;
 use colored::Colorize;
 use serde::Serialize;
@@ -36,21 +37,20 @@ pub(crate) struct ShowArgs {
 pub(crate) struct CapsuleShow {
     /// Capsule name.
     pub name: String,
-    /// On-disk version recorded in `meta.json`.
+    /// Version recorded in the daemon registry snapshot.
     pub version: String,
-    /// Where the capsule was installed from (registry id, local path).
+    /// Registry source identity, when present.
     pub source: String,
-    /// `BLAKE3` content hash of the WASM blob.
+    /// `BLAKE3` content hash of the WASM blob, when surfaced by the registry.
     pub wasm_hash: String,
-    /// ISO 8601 install timestamp.
+    /// ISO 8601 install timestamp, when surfaced by the registry.
     pub installed_at: String,
-    /// ISO 8601 last-update timestamp.
+    /// ISO 8601 last-update timestamp, when surfaced by the registry.
     pub updated_at: String,
     /// This capsule's pinned `astrid-contracts.wit` BLAKE3 hex, if it
     /// vendors one (`None` otherwise).
     pub contracts_pin: Option<String>,
-    /// The daemon canonical `astrid-contracts.wit` BLAKE3 hex, if a
-    /// canonical exists on this home (`None` on a fresh home).
+    /// The daemon canonical `astrid-contracts.wit` BLAKE3 hex, when queried.
     pub contracts_canonical: Option<String>,
     /// Skew classification: `match`, `mismatch`, `no-canonical`, or
     /// `not-pinned`.
@@ -62,17 +62,18 @@ pub(crate) struct CapsuleShow {
 }
 
 /// Entry point for `astrid capsule show`.
-pub(crate) fn run(args: &ShowArgs) -> Result<ExitCode> {
+pub(crate) async fn run(args: &ShowArgs) -> Result<ExitCode> {
     let principal = context::resolve_agent(args.agent.as_deref())?;
     let format = ValueFormat::parse(&args.format);
-    let home = AstridHome::resolve().context("Failed to resolve Astrid home directory")?;
-    let capsule_dir = home
-        .principal_home(&principal)
-        .root()
-        .join(".local")
-        .join("capsules")
-        .join(&args.name);
-    if !capsule_dir.exists() {
+    let mut client = crate::socket_client::connect_kernel_for_workspace(None).await?;
+    let entries = match client.request(KernelRequest::GetCapsuleMetadata).await? {
+        KernelResponse::CapsuleMetadata(entries) => entries,
+        KernelResponse::Error(message) => {
+            anyhow::bail!("daemon rejected capsule metadata request: {message}")
+        },
+        other => anyhow::bail!("unexpected daemon response: {other:?}"),
+    };
+    let Some(entry) = entries.into_iter().find(|entry| entry.name == args.name) else {
         eprintln!(
             "{}",
             Theme::error(&format!(
@@ -81,60 +82,32 @@ pub(crate) fn run(args: &ShowArgs) -> Result<ExitCode> {
             ))
         );
         return Ok(ExitCode::from(1));
-    }
-    let manifest_path = capsule_dir.join("Capsule.toml");
-    let meta_path = capsule_dir.join("meta.json");
-    let manifest = std::fs::read_to_string(&manifest_path)
-        .with_context(|| format!("Failed to read {}", manifest_path.display()))?;
-    let meta_raw = std::fs::read_to_string(&meta_path)
-        .with_context(|| format!("Failed to read {}", meta_path.display()))?;
-    let meta: serde_json::Value = serde_json::from_str(&meta_raw)
-        .with_context(|| format!("{} is not valid JSON", meta_path.display()))?;
-    let parsed_manifest: astrid_capsule_types::manifest::CapsuleManifest =
-        toml::from_str(&manifest).with_context(|| {
-            format!(
-                "{} is not a valid capsule manifest",
-                manifest_path.display()
-            )
-        })?;
-    let permissions = semantic_capabilities(&parsed_manifest.capabilities);
-
-    // Contracts skew — compare this capsule's astrid-contracts.wit pin
-    // against the daemon canonical. Warn-only and degrades silently when
-    // no canonical exists.
-    let skew = contracts_skew_from_meta(&home, &meta);
-    let (contracts_status, contracts_pin, contracts_canonical) = skew_fields(&skew);
+    };
+    let capabilities: astrid_capsule_types::manifest::CapabilitiesDef =
+        serde_json::from_value(entry.capabilities.clone())?;
+    let permissions = semantic_capabilities(&capabilities);
+    let manifest = serde_json::to_string_pretty(&serde_json::json!({
+        "package": {
+            "name": entry.name,
+            "version": entry.version,
+            "description": entry.description,
+        },
+        "env": entry.env,
+        "interceptor_events": entry.interceptor_events,
+    }))?;
 
     let record = CapsuleShow {
         name: args.name.clone(),
-        version: meta
-            .get("version")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_string(),
-        source: meta
-            .get("source")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_string(),
-        wasm_hash: meta
-            .get("wasm_hash")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string(),
-        installed_at: meta
-            .get("installed_at")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string(),
-        updated_at: meta
-            .get("updated_at")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string(),
-        contracts_pin,
-        contracts_canonical,
-        contracts_status: contracts_status.to_string(),
+        version: entry.version,
+        source: entry
+            .source_id
+            .map_or_else(|| "unloaded".to_owned(), |id| id.to_string()),
+        wasm_hash: String::new(),
+        installed_at: String::new(),
+        updated_at: String::new(),
+        contracts_pin: None,
+        contracts_canonical: None,
+        contracts_status: "daemon-registry".to_owned(),
         manifest,
         permissions,
     };
@@ -147,12 +120,7 @@ pub(crate) fn run(args: &ShowArgs) -> Result<ExitCode> {
     println!("{} {}", "Capsule".bold(), args.name.cyan());
     println!("  Version:      {}", record.version);
     println!("  Source:       {}", record.source);
-    println!("  Hash:         {}", record.wasm_hash);
-    if let Some(line) = contracts_line(&skew) {
-        println!("  Contracts:    {line}");
-    }
-    println!("  Installed:    {}", record.installed_at);
-    println!("  Updated:      {}", record.updated_at);
+    println!("  Registry:     daemon-owned");
     println!("  Agent:        {principal}");
     println!();
     print_permissions(&record.permissions);

@@ -1,312 +1,136 @@
-//! Explicit helper for materializing a principal's capsule introspection view.
+//! Typed installed-capsule introspection over the authoritative registry.
 //!
-//! This module is for callers that explicitly need to expose public capsule
-//! introspection metadata from the install principal's home to another
-//! principal. In addition to manifests and `meta.json`, the capsule registry
-//! may contain generic declarative public assets. The kernel does not call it
-//! during boot or principal creation:
-//! `default` is a principal, not a shared tenant, and fresh principals must
-//! not implicitly receive a copy of its installed-capsule registry.
-//!
-//! [`materialize_principal_introspection`] copies the two read-only
-//! introspection subdirectories from the install principal's home into a
-//! target principal's home when invoked deliberately.
-//!
-//! ## Security
-//!
-//! This copies ONLY public, non-secret material: capsule manifests,
-//! `meta.json`, declarative capsule assets, and WIT interface definitions. It
-//! deliberately NEVER touches the target's `.config/env/` (per-principal
-//! secrets — API keys), nor its
-//! `.local/kv`, `.local/audit`, `.local/tokens`, `.local/log`, or anything
-//! else under the home. Only the two mirror subdirectories
-//! (`.local/capsules` and `wit`) are ever removed or written under the
-//! target. Crossing the `.config/env/` boundary would leak one principal's
-//! secrets into another's home, so it is hard-excluded by construction.
+//! Installed package metadata is owner-scoped Astrid content. This module
+//! intentionally has no native-home mirror or recursive filesystem copy API:
+//! callers receive verified archive/metadata/authority bytes and can render
+//! their own read-only view without making a host directory authoritative.
 
-use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Context;
-use astrid_core::PrincipalId;
-use astrid_core::dirs::AstridHome;
+use astrid_core::identity::PrincipalUid;
+use astrid_storage::{CapsulePackageSnapshot, RuntimePrincipalStore, StateOwner};
 
-/// Mirror the read-only introspection view (installed-capsule registry +
-/// `home://wit/`) from the install principal's home into `target`'s home.
-///
-/// SECURITY: copies ONLY public capsule introspection content (manifests,
-/// meta.json, declarative assets) and WIT interface definitions. It MUST NOT
-/// copy `.config/env/` — that holds per-principal secrets (API keys) that must
-/// never cross principal boundaries. Idempotent. No-op when `target` is the
-/// install principal (that home is authoritative, not a mirror).
-pub fn materialize_principal_introspection(
-    home: &AstridHome,
-    target: &PrincipalId,
-) -> anyhow::Result<()> {
-    // The install principal's home is the authoritative source — it is the
-    // mirror's origin, never its destination. Refuse to overwrite it.
-    if *target == crate::paths::install_principal() {
-        return Ok(());
-    }
-
-    let src = home.principal_home(&crate::paths::install_principal());
-    let dst = home.principal_home(target);
-
-    // `.local/capsules/` — the installed-capsule registry (per-capsule
-    // dirs + meta.json) that explicit metadata mirrors expose to the target.
-    mirror_subtree(&src.capsules_dir(), &dst.capsules_dir())
-        .context("failed to mirror .local/capsules into principal home")?;
-
-    // `wit/` — the human-named WIT interface mirror `list_interfaces` /
-    // `read_interface` read.
-    mirror_subtree(&src.root().join("wit"), &dst.root().join("wit"))
-        .context("failed to mirror wit/ into principal home")?;
-
-    Ok(())
+/// One package snapshot suitable for read-only introspection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DurableCapsuleIntrospection {
+    /// Canonical capsule identifier.
+    pub id: String,
+    /// Verified package bytes and exact generation token.
+    pub snapshot: CapsulePackageSnapshot,
 }
 
-/// Replace `dst` with a fresh recursive copy of `src`.
+/// List every installed package for an immutable principal UID.
 ///
-/// Idempotent and self-healing: `dst` is removed first so capsules dropped
-/// from the authoritative set don't linger in the mirror. When `src` does
-/// not exist (fresh system, nothing installed), `dst` is left absent rather
-/// than erroring — an empty mirror is the correct end state.
-fn mirror_subtree(src: &Path, dst: &Path) -> anyhow::Result<()> {
-    // Always clear the destination first so this is a true mirror, not an
-    // accreting union. Removing a non-existent path is a no-op for us.
-    if dst.exists() {
-        std::fs::remove_dir_all(dst)
-            .with_context(|| format!("failed to remove stale mirror {}", dst.display()))?;
-    }
-
-    // Nothing to mirror — leave `dst` absent. `system_status` /
-    // `list_interfaces` treat a missing dir as "empty", which is exactly
-    // right when the authoritative set is empty.
-    if !src.is_dir() {
-        return Ok(());
-    }
-
-    if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-
-    copy_dir_recursive(src, dst)
+/// The UID is the authority boundary; aliases are resolved by the kernel
+/// before calling this function. Registry discovery is prefix-scoped and
+/// malformed/partial package sets fail closed.
+///
+/// # Errors
+///
+/// Returns an error when the owner content graph is unavailable, a reserved
+/// package path is malformed, or a package disappears during readback.
+pub fn list_durable_capsule_packages(
+    store: &Arc<RuntimePrincipalStore>,
+    uid: PrincipalUid,
+) -> anyhow::Result<Vec<DurableCapsuleIntrospection>> {
+    let owner = StateOwner::Principal(uid);
+    let registry = store.capsules();
+    registry
+        .list(&owner)?
+        .into_iter()
+        .map(|summary| {
+            let id = summary.id().to_owned();
+            let snapshot = registry
+                .get_snapshot(&owner, &id)?
+                .ok_or_else(|| anyhow::anyhow!("capsule {id} disappeared during introspection"))?;
+            Ok(DurableCapsuleIntrospection { id, snapshot })
+        })
+        .collect()
 }
 
-/// Plain recursive directory copy. Regular files are copied byte-for-byte;
-/// subdirectories recurse. Symlinks and other special files are skipped —
-/// the source is the install principal's own mirror (`meta.json`,
-/// `Capsule.toml`, `.wit`), which contains only regular files and dirs by
-/// construction, so there is nothing legitimate to follow.
-fn copy_dir_recursive(src: &Path, dst: &Path) -> anyhow::Result<()> {
-    std::fs::create_dir_all(dst).with_context(|| format!("failed to create {}", dst.display()))?;
-
-    for entry in
-        std::fs::read_dir(src).with_context(|| format!("failed to read {}", src.display()))?
-    {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
-
-        if file_type.is_dir() {
-            copy_dir_recursive(&src_path, &dst_path)?;
-        } else if file_type.is_file() {
-            std::fs::copy(&src_path, &dst_path)
-                .with_context(|| format!("failed to copy {}", src_path.display()))?;
-        }
-        // Symlinks / sockets / fifos: skipped — not part of the mirror.
-    }
-
-    Ok(())
+/// Read one installed package by immutable UID and canonical identifier.
+///
+/// # Errors
+///
+/// Returns an error when the identifier is invalid, the package is absent or
+/// malformed, or the owner content graph cannot be verified.
+pub fn read_durable_capsule_package(
+    store: &Arc<RuntimePrincipalStore>,
+    uid: PrincipalUid,
+    id: &str,
+) -> anyhow::Result<DurableCapsuleIntrospection> {
+    let owner = StateOwner::Principal(uid);
+    let snapshot = store
+        .capsules()
+        .get_snapshot(&owner, id)?
+        .with_context(|| format!("durable capsule {id} is not installed"))?;
+    Ok(DurableCapsuleIntrospection {
+        id: id.to_owned(),
+        snapshot,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astrid_core::dirs::AstridHome;
+    use astrid_storage::{
+        CapsuleInstallExpectation, CapsulePackage, KvQuotaResolver, open_runtime_principal_store,
+    };
 
-    fn write_file(path: &Path, contents: &str) {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).expect("mkdir parent");
-        }
-        std::fs::write(path, contents).expect("write file");
+    fn unlimited_quota() -> Arc<dyn KvQuotaResolver<StateOwner>> {
+        Arc::new(|owner: &StateOwner| {
+            Ok(match owner {
+                StateOwner::System => None,
+                StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(u64::MAX),
+            })
+        })
     }
 
-    /// Seed the install principal's home with a couple of installed-capsule
-    /// registry entries and a WIT file, returning the `AstridHome`.
-    fn seed_install_home(home: &AstridHome) {
-        let install = home.principal_home(&crate::paths::install_principal());
-
-        write_file(
-            &install.capsules_dir().join("alpha").join("meta.json"),
-            r#"{"version":"1.0.0"}"#,
-        );
-        write_file(
-            &install.capsules_dir().join("bravo").join("meta.json"),
-            r#"{"version":"2.0.0"}"#,
-        );
-        write_file(
-            &install
-                .capsules_dir()
-                .join("alpha")
-                .join("assets")
-                .join("alpha")
-                .join("README.md"),
-            "# Alpha asset",
-        );
-        write_file(
-            &install.root().join("wit").join("system.wit"),
-            "interface system {}",
-        );
+    fn uid(byte: u8) -> PrincipalUid {
+        PrincipalUid::from_bytes([byte; 32])
     }
 
-    #[test]
-    fn mirrors_registry_and_wit_into_target() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let home = AstridHome::from_path(tmp.path());
-        seed_install_home(&home);
-
-        let target = PrincipalId::new("claude-code").expect("principal id");
-        let target_home = home.principal_home(&target);
-
-        // Seed a target-side secret to prove it is never touched.
-        let secret_path = target_home.env_dir().join("secret.env.json");
-        write_file(&secret_path, r#"{"API_KEY":"top-secret"}"#);
-
-        materialize_principal_introspection(&home, &target).expect("materialize");
-
-        // Registry entries mirrored.
-        assert_eq!(
-            std::fs::read_to_string(target_home.capsules_dir().join("alpha").join("meta.json"))
-                .expect("alpha meta"),
-            r#"{"version":"1.0.0"}"#
+    #[tokio::test]
+    async fn reads_metadata_from_storage_without_native_home_mirror() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(directory.path());
+        let store = Arc::new(
+            open_runtime_principal_store(&home, unlimited_quota())
+                .await
+                .unwrap(),
         );
-        assert_eq!(
-            std::fs::read_to_string(target_home.capsules_dir().join("bravo").join("meta.json"))
-                .expect("bravo meta"),
-            r#"{"version":"2.0.0"}"#
-        );
-        assert_eq!(
-            std::fs::read_to_string(
-                target_home
-                    .capsules_dir()
-                    .join("alpha")
-                    .join("assets")
-                    .join("alpha")
-                    .join("README.md")
+        let owner = StateOwner::Principal(uid(1));
+        store
+            .capsules()
+            .install(
+                &owner,
+                "demo-cap",
+                &CapsulePackage::new(
+                    b"archive".to_vec(),
+                    br#"{"version":"1.0.0"}"#.to_vec(),
+                    br#"{"capsule_id":"demo-cap"}"#.to_vec(),
+                ),
+                CapsuleInstallExpectation::Absent,
             )
-            .expect("alpha asset"),
-            "# Alpha asset"
-        );
-
-        // WIT mirrored.
+            .unwrap();
+        let result = read_durable_capsule_package(&store, uid(1), "demo-cap").unwrap();
+        assert_eq!(result.id, "demo-cap");
         assert_eq!(
-            std::fs::read_to_string(target_home.root().join("wit").join("system.wit"))
-                .expect("system wit"),
-            "interface system {}"
+            result.snapshot.package().metadata,
+            br#"{"version":"1.0.0"}"#
         );
-
-        // CRITICAL: the per-principal secret was neither deleted nor
-        // overwritten — env config never crosses the principal boundary.
-        assert_eq!(
-            std::fs::read_to_string(&secret_path).expect("secret survives"),
-            r#"{"API_KEY":"top-secret"}"#
-        );
-    }
-
-    #[test]
-    fn install_principal_is_a_noop() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let home = AstridHome::from_path(tmp.path());
-        seed_install_home(&home);
-
-        let install = crate::paths::install_principal();
-        let install_home = home.principal_home(&install);
-
-        // Snapshot the authoritative registry before the call.
-        let before =
-            std::fs::read_to_string(install_home.capsules_dir().join("alpha").join("meta.json"))
-                .expect("alpha meta before");
-
-        // No-op: returns Ok, does not error, does not duplicate or disturb.
-        materialize_principal_introspection(&home, &install).expect("noop");
-
-        let after =
-            std::fs::read_to_string(install_home.capsules_dir().join("alpha").join("meta.json"))
-                .expect("alpha meta after");
-        assert_eq!(before, after);
-
-        // Exactly the two seeded entries remain — nothing duplicated.
-        let count = std::fs::read_dir(install_home.capsules_dir())
-            .expect("read capsules")
-            .count();
-        assert_eq!(count, 2);
-    }
-
-    #[test]
-    fn is_idempotent() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let home = AstridHome::from_path(tmp.path());
-        seed_install_home(&home);
-
-        let target = PrincipalId::new("claude-code").expect("principal id");
-        let target_home = home.principal_home(&target);
-
-        materialize_principal_introspection(&home, &target).expect("first");
-        materialize_principal_introspection(&home, &target).expect("second");
-
-        // Same end state after two runs: exactly the two seeded entries and
-        // the single WIT file.
-        let capsule_count = std::fs::read_dir(target_home.capsules_dir())
-            .expect("read capsules")
-            .count();
-        assert_eq!(capsule_count, 2);
-
-        let wit_count = std::fs::read_dir(target_home.root().join("wit"))
-            .expect("read wit")
-            .count();
-        assert_eq!(wit_count, 1);
-    }
-
-    #[test]
-    fn dropped_capsules_are_pruned_from_mirror() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let home = AstridHome::from_path(tmp.path());
-        seed_install_home(&home);
-
-        let target = PrincipalId::new("claude-code").expect("principal id");
-        let target_home = home.principal_home(&target);
-
-        materialize_principal_introspection(&home, &target).expect("first");
-
-        // Authoritative set shrinks: drop `bravo`.
-        std::fs::remove_dir_all(
-            home.principal_home(&crate::paths::install_principal())
+        assert!(
+            !home
+                .principal_home(&astrid_core::PrincipalId::default())
                 .capsules_dir()
-                .join("bravo"),
-        )
-        .expect("remove bravo");
-
-        materialize_principal_introspection(&home, &target).expect("re-mirror");
-
-        // Mirror reflects the shrink — `bravo` is gone, `alpha` remains.
-        assert!(target_home.capsules_dir().join("alpha").exists());
-        assert!(!target_home.capsules_dir().join("bravo").exists());
-    }
-
-    #[test]
-    fn empty_source_yields_no_mirror() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let home = AstridHome::from_path(tmp.path());
-        // Do NOT seed — fresh system, nothing installed.
-
-        let target = PrincipalId::new("claude-code").expect("principal id");
-        let target_home = home.principal_home(&target);
-
-        // Must not error even though the source mirror dirs don't exist.
-        materialize_principal_introspection(&home, &target).expect("empty ok");
-
-        assert!(!target_home.capsules_dir().exists());
-        assert!(!target_home.root().join("wit").exists());
+                .exists()
+        );
+        assert!(
+            list_durable_capsule_packages(&store, uid(2))
+                .unwrap()
+                .is_empty()
+        );
     }
 }

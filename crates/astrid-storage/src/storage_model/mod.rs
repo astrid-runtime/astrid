@@ -25,11 +25,9 @@
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
 extern crate alloc;
-
 use alloc::vec::Vec;
 use core::fmt;
 use core::num::{NonZeroU16, NonZeroU32};
-
 /// Logical identity of one canonical typed object.
 ///
 /// The model treats digest construction as an integration boundary. A
@@ -320,6 +318,8 @@ pub enum ObjectKind {
     PrincipalState,
     /// Principal-root transition envelope.
     Commit,
+    /// Durable owner-internal workspace branch record.
+    WorkspaceBranch,
     /// Observation, receipt, or audit evidence.
     Evidence,
     /// Rebuildable index or materialization.
@@ -351,6 +351,7 @@ impl ObjectKind {
             Self::NamespaceMap => 7,
             Self::PrincipalState => 8,
             Self::Commit => 9,
+            Self::WorkspaceBranch => 17,
             Self::Evidence => 10,
             Self::Derived => 11,
             Self::RuntimeSemanticProfile => 12,
@@ -375,6 +376,7 @@ impl ObjectKind {
             7 => Some(Self::NamespaceMap),
             8 => Some(Self::PrincipalState),
             9 => Some(Self::Commit),
+            17 => Some(Self::WorkspaceBranch),
             10 => Some(Self::Evidence),
             11 => Some(Self::Derived),
             12 => Some(Self::RuntimeSemanticProfile),
@@ -985,7 +987,6 @@ impl fmt::Display for ModelError {
 impl core::error::Error for ModelError {}
 
 mod world;
-
 pub use world::World;
 
 #[cfg(test)]

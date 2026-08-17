@@ -719,10 +719,13 @@ The migration is an exclusive, crash-resumable ownership transaction:
    point. Only then may the daemon serve principals or mounts.
 7. After the receipt and version-two sentinel are durable, delete the verified
    `var/state.db/` import source and, after the volume cutover receipt and exact
-   snapshot verification are durable, delete `var/principal-store/`. Synchronize
-   the parent after each retirement. Re-entry completes either retirement after
-   a crash. Running a version-one binary against the home is refused; rollback
-   requires an operator-owned pre-migration backup.
+   snapshot verification are durable, delete `var/principal-store/`. Any
+   legacy `~/.astrid/cow/` workspace tree is disposable and is retired with
+   the same no-follow, no-special-entry, no-active-mount boundary checks;
+   layout v2 never recreates it. Synchronize the parent after each retirement.
+   Re-entry completes either retirement after a crash. Running a version-one
+   binary against the home is refused; rollback requires an operator-owned
+   pre-migration backup.
 
 Migration restart is idempotent. Before the version-two sentinel is committed,
 the intent and verified target determine whether to resume, quarantine, or

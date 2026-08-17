@@ -40,12 +40,13 @@ KIND_NAMES = (
     "DerivationEvidence",
     "GcPlanEvidence",
     "GcCommitEvidence",
+    "WorkspaceBranch",
 )
 REFERENCE_NAMES = ("Owns", "Evidence", "Lineage", "Derived")
 FORMAT_SPECIFICATION = (
     1,
     1,
-    bytes.fromhex("f9b17fa5e6b4ac4562c7e4ab2da1f0c756da07945d808794ad75544a132b0d91"),
+    bytes.fromhex("58726b3c243c30ebc0941f656427520094a6bb10e7b2190be732b5a61300144d"),
 )
 CONTENT_CATALOG_SPECIFICATION = (
     1,
@@ -55,6 +56,7 @@ CONTENT_CATALOG_SPECIFICATION = (
 LEGACY_FORMAT_SPECIFICATIONS = {
     (1, 1, bytes.fromhex(digest))
     for digest in (
+        "f9b17fa5e6b4ac4562c7e4ab2da1f0c756da07945d808794ad75544a132b0d91",
         "62cded9a5b01fe75d7781b66303f5ffe8ced55a43025a0389eefaea5a0c58fe2",
         "35b446fbd19ca4ad0b1343b40c1a32b2eed8eef795034261a4092a0a2ae806fe",
         "d8f2cb250736799fd8b26f307e20c4d949d6cea1836614a5547210e82bbfcec1",

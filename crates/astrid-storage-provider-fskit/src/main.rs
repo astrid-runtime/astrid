@@ -21,6 +21,8 @@ use astrid_core::storage_provider::{
 use astrid_uplink::admin_client::AdminClient;
 use serde::{Deserialize, Serialize};
 
+mod service;
+
 const PROVIDER_NAME: &str = "astrid-storage-provider-fskit";
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 
@@ -40,6 +42,15 @@ struct MountRegistry {
 
 #[tokio::main]
 async fn main() {
+    if std::env::args_os().skip(1).collect::<Vec<_>>().as_slice()
+        == [std::ffi::OsStr::new("--astrid-provider-fskit-service-v1")]
+    {
+        if let Err(error) = service::run().await {
+            eprintln!("{PROVIDER_NAME}: private service failed: {error:#}");
+            std::process::exit(2);
+        }
+        return;
+    }
     let response = run().await;
     match response {
         Ok(response) => {
@@ -504,7 +515,7 @@ fn validate_mountpoint_layout(mountpoint: &Path) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-async fn native_mount(lease: &StorageMountLeaseV1, mountpoint: &Path) -> Result<()> {
+pub(crate) async fn native_mount(lease: &StorageMountLeaseV1, mountpoint: &Path) -> Result<()> {
     let status = tokio::process::Command::new("/sbin/mount")
         .arg("-t")
         .arg("astridfs")
@@ -522,7 +533,10 @@ async fn native_mount(lease: &StorageMountLeaseV1, mountpoint: &Path) -> Result<
 }
 
 #[cfg(not(target_os = "macos"))]
-fn native_mount(lease: &StorageMountLeaseV1, mountpoint: &Path) -> std::future::Ready<Result<()>> {
+pub(crate) fn native_mount(
+    lease: &StorageMountLeaseV1,
+    mountpoint: &Path,
+) -> std::future::Ready<Result<()>> {
     let _ = (lease, mountpoint);
     std::future::ready(Err(anyhow::anyhow!(
         "the FSKit provider is available only on macOS"
@@ -530,7 +544,7 @@ fn native_mount(lease: &StorageMountLeaseV1, mountpoint: &Path) -> std::future::
 }
 
 #[cfg(target_os = "macos")]
-async fn native_unmount(mountpoint: &Path) -> Result<()> {
+pub(crate) async fn native_unmount(mountpoint: &Path) -> Result<()> {
     let status = tokio::process::Command::new("/sbin/umount")
         .arg(mountpoint)
         .status()
@@ -550,7 +564,7 @@ fn native_mount_is_active(mountpoint: &Path) -> Result<bool> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn native_unmount(mountpoint: &Path) -> std::future::Ready<Result<()>> {
+pub(crate) fn native_unmount(mountpoint: &Path) -> std::future::Ready<Result<()>> {
     let _ = mountpoint;
     std::future::ready(Err(anyhow::anyhow!(
         "the FSKit provider is available only on macOS"
@@ -558,7 +572,7 @@ fn native_unmount(mountpoint: &Path) -> std::future::Ready<Result<()>> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn native_mount_is_active(mountpoint: &Path) -> Result<bool> {
+pub(crate) fn native_mount_is_active(mountpoint: &Path) -> Result<bool> {
     let _ = mountpoint;
     bail!("the FSKit provider is available only on macOS")
 }

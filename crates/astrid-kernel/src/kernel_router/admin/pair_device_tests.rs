@@ -19,6 +19,7 @@
 use std::sync::Arc;
 
 use astrid_core::dirs::AstridHome;
+use astrid_core::identity::PrincipalUid;
 use astrid_core::principal::PrincipalId;
 use astrid_core::profile::{
     AuthMethod, DeviceKey, DeviceScope, PrincipalProfile, device_key_id_fingerprint,
@@ -28,7 +29,7 @@ use tempfile::TempDir;
 
 use super::handlers;
 use crate::Kernel;
-use crate::pair_token::PairTokenStore;
+use crate::pair_token::DurablePairTokenStore;
 
 async fn fixture() -> (TempDir, Arc<Kernel>) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -66,6 +67,11 @@ fn seed_policy(
     let path = PrincipalProfile::path_for(&kernel.astrid_home, principal);
     profile.save_to_path(&path).expect("seed profile");
     kernel.profile_cache.invalidate(principal);
+    let uid = PrincipalUid::from_bytes(*blake3::hash(principal.as_str().as_bytes()).as_bytes());
+    kernel
+        .principal_directory
+        .register(principal.clone(), uid)
+        .expect("register seeded principal identity");
 }
 
 /// Read a principal's profile back from disk (post-mutation assertions).
@@ -414,9 +420,20 @@ async fn malformed_explicit_patterns_are_rejected_before_persistence() {
         }
     }
 
-    let store = PairTokenStore::new(PairTokenStore::path_for(&kernel.astrid_home));
+    let store = DurablePairTokenStore::new(
+        kernel
+            .principal_store
+            .as_ref()
+            .expect("principal store")
+            .kv(),
+    )
+    .expect("pair-token storage");
     assert!(
-        store.load().expect("load pair-token store").is_empty(),
+        store
+            .list()
+            .await
+            .expect("load pair-token store")
+            .is_empty(),
         "invalid allow or deny patterns must never be persisted"
     );
 }

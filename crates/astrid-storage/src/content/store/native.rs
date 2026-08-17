@@ -19,6 +19,7 @@ impl<P: Ord, E> PrincipalContentStore<P, E> {
                 parking_lot::Mutex::new(std::collections::BTreeMap::new()),
             ),
             validated_kv: Arc::new(crate::kv::KvValidationCache::default()),
+            read_leases: Arc::new(super::ContentReadLeaseRegistry::default()),
         }
     }
 

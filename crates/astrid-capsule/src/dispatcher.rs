@@ -122,10 +122,9 @@ pub struct EventDispatcher {
     event_bus: Arc<EventBus>,
     /// Pre-created receiver so the subscription is counted before `run()` is spawned.
     receiver: EventReceiver,
-    /// Identity store for validating principals before auto-provisioning.
-    /// When set, only principals with a matching identity record get
-    /// home directories created. When `None`, provisioning is ungated
-    /// (pre-production behavior).
+    /// Identity-store presence enables the legacy single-tenant admission
+    /// gate. Durable identity and home storage remain kernel-owned; dispatch
+    /// never creates or inspects native home paths.
     identity_store: Option<Arc<dyn astrid_storage::IdentityStore>>,
     /// Per-(capsule, principal) chain serialization mutexes.
     /// Chains for the same `(RuntimeId, PrincipalKey)` are mutually
@@ -141,15 +140,6 @@ pub struct EventDispatcher {
     /// the surface is ungated — the kernel always wires the resolver in
     /// production so the security boundary is present at runtime.
     access_resolver: Option<CapsuleAccessResolver>,
-    /// The Astrid home under which new principals' home directories are
-    /// auto-provisioned. The kernel injects its already-booted home; tests
-    /// inject a tempdir home. When `None`, auto-provisioning is disabled
-    /// entirely (fail-closed): the dispatcher never resolves a home from
-    /// the process environment and never writes to the filesystem —
-    /// library dispatch code deciding filesystem roots from ambient env
-    /// is how `cargo test` once scaffolded a thousand fixture principals
-    /// into a developer's real `~/.astrid` (#1145).
-    home: Option<astrid_core::dirs::AstridHome>,
 }
 
 impl EventDispatcher {
@@ -167,28 +157,14 @@ impl EventDispatcher {
             identity_store: None,
             chain_locks: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             access_resolver: None,
-            home: None,
         }
     }
 
-    /// Set the identity store for principal validation during auto-provisioning.
+    /// Set the identity store used to enable the legacy default-principal
+    /// admission gate. This does not provision or inspect home state.
     #[must_use]
     pub fn with_identity_store(mut self, store: Arc<dyn astrid_storage::IdentityStore>) -> Self {
         self.identity_store = Some(store);
-        self
-    }
-
-    /// Set the Astrid home under which new principals' home directories
-    /// are auto-provisioned.
-    ///
-    /// The kernel passes its already-booted home at construction; tests
-    /// pass a tempdir home and get filesystem isolation for free. Without
-    /// this call, auto-provisioning is disabled entirely — the dispatcher
-    /// never consults the process environment and never writes to the
-    /// filesystem (fail-closed, #1145).
-    #[must_use]
-    pub fn with_home(mut self, home: astrid_core::dirs::AstridHome) -> Self {
-        self.home = Some(home);
         self
     }
 
@@ -224,11 +200,9 @@ impl EventDispatcher {
         // is N independent FIFO consumers, not a single class-keyed
         // queue collapsing the load (#813 Layer 3).
         let capsule_queues: CapsuleQueues = Arc::new(parking_lot::Mutex::new(HashMap::new()));
-        // Auto-provisions home directories for newly seen principals under
-        // the injected home. With no injected home, provisioning is disabled
-        // entirely — no env resolution, no filesystem writes (#1145).
-        let mut provisioner =
-            provision::PrincipalProvisioner::new(self.home.clone(), self.identity_store.is_some());
+        // Admission is intentionally filesystem-free. Durable principal
+        // homes are bound by the kernel's UID-backed storage view.
+        let mut provisioner = provision::PrincipalProvisioner::new(self.identity_store.is_some());
         debug!("Event dispatcher started");
 
         while let Some(event) = self.receiver.recv().await {
@@ -284,8 +258,8 @@ impl EventDispatcher {
                 },
             };
 
-            // Auto-provision home directories for new principals under the
-            // injected home (see `dispatcher::provision`).
+            // Admit valid stamped principals to the bounded in-memory cache;
+            // see `dispatcher::provision` for the filesystem-free gate.
             provisioner.observe(ipc_message.as_deref().and_then(|m| m.principal.as_deref()));
 
             // Caller principal (kernel-stamped on the IPC message; `None`

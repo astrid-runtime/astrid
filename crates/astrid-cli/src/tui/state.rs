@@ -703,6 +703,7 @@ pub(crate) enum PendingAction {
     SubmitOnboarding {
         capsule_id: String,
         answers: std::collections::HashMap<String, String>,
+        field_kinds: std::collections::HashMap<String, astrid_core::kernel_api::EnvValueKind>,
     },
     /// Re-fetch the dynamic slash command palette from the kernel.
     RefreshCommands,
@@ -785,7 +786,7 @@ pub(crate) struct App {
     // ── Lifecycle Elicit ──
     /// When set, the current onboarding UI is driven by a lifecycle `elicit`
     /// request. On completion, an `ElicitResponse` is published to the event
-    /// bus instead of writing `.env.json`.
+    /// bus instead of writing a native configuration file.
     pub elicit_request_id: Option<uuid::Uuid>,
 
     // ── Session Hydration ──

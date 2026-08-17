@@ -26,7 +26,8 @@
 //! 6. Backup existing `target_dir` (rename to `.bak`).
 //! 7. Copy non-WASM tree → `target_dir` (excludes `*.wasm` and
 //!    `wit/`).
-//! 8. Restore `.env.json` from the backup if present.
+//! 8. Preserve durable env state through daemon control storage; no native
+//!    env file is copied from the backup.
 //! 9. Run lifecycle hook with bytes from `bin/`.
 //! 10. Write `meta.json`.
 //! 11. Cleanup backup.
@@ -34,6 +35,7 @@
 //! Failure after step 7 restores the backup over `target_dir`.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use astrid_capsule::capsule::CapsuleId;
@@ -42,24 +44,24 @@ use astrid_capsule::engine::wasm::host_state::LifecyclePhase;
 use astrid_core::PrincipalId;
 use astrid_core::dirs::{AstridHome, WorkspaceLayout};
 use astrid_events::EventBus;
+use astrid_storage::RuntimePrincipalStore;
 
 use crate::authority::{
     AuthorityDecision, AuthorityReceiptTransaction, InstalledAuthority,
     authority_for_install_source, authorize_install, inspect_directory_for_principal_in_workspace,
 };
-use crate::contracts::seed_canonical_contracts_if_absent;
 use crate::copy::copy_capsule_dir;
-use crate::lifecycle::run_lifecycle_for_principal;
+use crate::lifecycle::{run_lifecycle_for_principal, run_lifecycle_for_principal_with_storage};
 use crate::manifest_check::{
-    ExportConflict, MissingImport, check_export_conflicts_in_workspace,
+    ExportConflict, MissingImport, check_export_conflicts_in_storage,
+    check_export_conflicts_in_workspace, validate_imports_in_storage,
     validate_imports_in_workspace,
 };
 use crate::meta::{CapsuleMeta, read_meta, write_meta};
-use crate::paths::{
-    resolve_env_path_for, resolve_target_dir_for_in_workspace, restore_env_from_backup_for,
-};
+use crate::paths::{resolve_cache_target_dir, resolve_target_dir_for_in_workspace};
+use crate::storage::read_durable_meta;
 use crate::wasm::{WasmAddressed, content_address_wasm};
-use crate::wit::{content_address_wit, materialize_wit_mirror, version_map_to_strings};
+use crate::wit::{content_address_wit, version_map_to_strings};
 
 #[derive(Clone, Copy)]
 pub(crate) struct InstallWorkspace<'a> {
@@ -94,6 +96,18 @@ pub struct InstallOptions {
     /// kernel-side handler passes `None` — no human at the daemon end
     /// to answer prompts.
     pub lifecycle_bus: Option<EventBus>,
+    /// Authoritative principal store used to publish the package. When set,
+    /// the native target is only a verified disposable materialization; the
+    /// durable package is committed before this function reports success.
+    /// It may be absent only for an explicitly external workspace install;
+    /// non-workspace callers fail closed and must route through the typed
+    /// kernel install API.
+    pub storage: Option<Arc<RuntimePrincipalStore>>,
+    /// Bounded distro provenance copied into the durable `meta.json` package
+    /// record. These fields are integrity/audit metadata only.
+    pub provenance_distro: Option<String>,
+    /// Canonical source-artifact digest copied into durable metadata.
+    pub provenance_source_digest: Option<String>,
 }
 
 /// What an install produced.
@@ -113,13 +127,11 @@ pub struct InstallOutput {
     pub previous_version: Option<String>,
     /// BLAKE3 hex of the WASM binary, if the capsule had one.
     pub wasm_hash: Option<String>,
-    /// Path of `.env.json` for this capsule. The CLI checks if the
-    /// file exists; if not and the manifest declares `[env]` entries,
-    /// it prompts. Kernel-side ignores.
+    /// Legacy env path slot retained for wire compatibility. It is always
+    /// empty; durable configuration is queried through daemon storage.
     pub env_path: PathBuf,
-    /// True when the manifest has `[env]` entries that don't yet have
-    /// values on disk. Caller decides whether to prompt or surface as
-    /// a "needs configuration" hint.
+    /// True when the manifest declares `[env]` entries. The CLI's prompt
+    /// consults daemon storage and skips fields already configured.
     pub env_needs_prompt: bool,
     /// Non-optional imports the capsule needs that aren't satisfied
     /// by another currently-installed capsule. Empty when
@@ -498,6 +510,12 @@ pub(crate) fn install_from_local_path_internal(
     expected: Option<ExpectedCapsuleIdentity<'_>>,
     installed_authority: Option<InstalledAuthority>,
 ) -> anyhow::Result<InstallOutput> {
+    if !options.workspace && options.storage.is_none() {
+        bail!(
+            "non-workspace capsule installation requires the authoritative \
+             RuntimePrincipalStore; route the request through KernelRequest::InstallCapsule"
+        );
+    }
     let checked_workspace = if options.workspace {
         let root = workspace
             .root
@@ -540,61 +558,114 @@ pub(crate) fn install_from_local_path_internal(
     let mut installed_authority =
         authority_for_install_source(source_dir, &manifest, installed_authority)?;
 
-    // A user install may scan existing principal capsule metadata below.
-    // Validate or create the Windows boundaries before any read traverses that
-    // namespace. Existing unsafe homes fail closed and are never repaired.
-    #[cfg(windows)]
-    if checked_workspace.is_none() {
-        home.ensure()
-            .context("failed to provision private Astrid home for capsule install")?;
-        home.principal_home(target_principal)
-            .ensure()
-            .with_context(|| {
-                format!("failed to provision private principal home for '{target_principal}'")
-            })?;
-    }
-
     // Pre-flight checks — pure reads, no target mutation.
-    let export_conflicts = check_export_conflicts_in_workspace(
-        &manifest,
-        home,
-        target_principal,
-        workspace.root,
-        workspace.layout,
-    )?;
+    let export_conflicts = if let Some(store) = options.storage.as_ref() {
+        let uid = store
+            .principal_directory()
+            .uid_for(target_principal)
+            .with_context(|| format!("resolve durable uid for principal {target_principal}"))?;
+        check_export_conflicts_in_storage(&manifest, store, uid)?
+    } else {
+        check_export_conflicts_in_workspace(
+            &manifest,
+            home,
+            target_principal,
+            workspace.root,
+            workspace.layout,
+        )?
+    };
 
     // Resolve and provision the target boundary before the backup rename.
     // Windows must create a fresh user/principal tree through the typed home
     // boundaries so it never inherits an ambient parent ACL.
-    let target_dir = resolve_target_dir_for_in_workspace(
-        home,
-        target_principal,
-        id.as_str(),
-        options.workspace,
-        workspace.root,
-        workspace.layout,
+    // A storage-backed install gets a fresh, owner- and generation-scoped
+    // disposable target. The durable registry remains authoritative; the
+    // native directory is never used to infer whether an install exists.
+    let cache_scope = if let Some(store) = options.storage.as_ref() {
+        let uid = store
+            .principal_directory()
+            .uid_for(target_principal)
+            .with_context(|| format!("resolve durable uid for principal {target_principal}"))?;
+        let archive = crate::storage::canonical_capsule_archive(source_dir)
+            .context("canonicalize capsule archive for cache generation")?;
+        let digest = blake3::hash(&archive).to_hex().to_string();
+        let target = resolve_cache_target_dir(
+            home,
+            uid,
+            id.as_str(),
+            &digest,
+            options.workspace,
+            workspace.root,
+            workspace.layout,
+        )?;
+        Some((uid, digest, target))
+    } else {
+        None
+    };
+    let target_dir = cache_scope.as_ref().map_or_else(
+        || {
+            resolve_target_dir_for_in_workspace(
+                home,
+                target_principal,
+                id.as_str(),
+                options.workspace,
+                workspace.root,
+                workspace.layout,
+            )
+        },
+        |(_, _, target)| Ok(target.clone()),
     )?;
     if let Some(selection) = &checked_workspace {
+        let cache_parent = cache_scope.as_ref().map_or_else(
+            || PathBuf::from("capsules").join(id.as_str()),
+            |(uid, _, _)| {
+                PathBuf::from("capsules")
+                    .join(uid.to_string())
+                    .join(id.as_str())
+            },
+        );
         selection
-            .ensure_directory("capsules")
+            .ensure_directory(&cache_parent)
             .context("failed to create checked workspace capsule directory")?;
+        let cache_relative = cache_scope.as_ref().map_or_else(
+            || cache_parent.clone(),
+            |(uid, digest, _)| {
+                PathBuf::from("capsules")
+                    .join(uid.to_string())
+                    .join(id.as_str())
+                    .join(digest)
+            },
+        );
         selection
-            .resolve_directory(Path::new("capsules").join(id.as_str()))
+            .resolve_directory(cache_relative)
             .context("workspace capsule target changed after selection")?;
         selection
             .verify_tree("capsules")
             .context("workspace capsule tree contains an unsafe redirect")?;
     } else {
-        #[cfg(not(windows))]
-        {
-            let parent = target_dir.parent().context("target dir has no parent")?;
+        let parent = target_dir.parent().context("target dir has no parent")?;
+        if cache_scope.is_some() {
+            astrid_core::platform_fs::verify_no_redirects(parent)
+                .context("capsule cache parent is redirected or unsafe")?;
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+            astrid_core::platform_fs::verify_no_redirects(parent)
+                .context("capsule cache parent changed during creation")?;
+        } else {
+            #[cfg(not(windows))]
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
     }
 
-    // Phase detection from existing meta (read-only).
-    let existing_meta = read_meta(&target_dir);
+    // Phase detection comes from the durable registry whenever an authorized
+    // store is supplied. The native target is only a disposable cache and may
+    // be absent or stale after restart; consulting it would let cache residue
+    // overwrite the authoritative generation.
+    let existing_meta = options.storage.as_ref().map_or_else(
+        || Ok(read_meta(&target_dir)),
+        |store| read_durable_meta(store, target_principal, id.as_str()),
+    )?;
     let (phase, previous_version) = if let Some(ref meta) = existing_meta {
         (InstallPhase::Upgrade, Some(meta.version.clone()))
     } else {
@@ -660,27 +731,34 @@ pub(crate) fn install_from_local_path_internal(
         return Err(e).context("failed to copy capsule source to target");
     }
 
-    // Preserve existing .env.json (user configuration survives reinstall).
-    if let Some(ref backup) = backup_dir {
-        if let Some(selection) = &checked_workspace {
-            selection
-                .verify_tree("capsules")
-                .context("workspace backup contains an unsafe redirect")?;
-        }
-        restore_env_from_backup_for(home, target_principal, backup, id.as_str());
-    }
-
     // Lifecycle hook — bytes from the content store, not the target.
     if let Some(ref w) = wasm {
-        let lifecycle_result = run_lifecycle_for_principal(
-            &target_dir,
-            w.bytes.clone(),
-            &manifest,
-            home,
-            target_principal,
-            phase.to_lifecycle(),
-            previous_version.as_deref(),
-            options.lifecycle_bus.clone(),
+        let lifecycle_result = options.storage.as_ref().map_or_else(
+            || {
+                run_lifecycle_for_principal(
+                    &target_dir,
+                    w.bytes.clone(),
+                    &manifest,
+                    home,
+                    target_principal,
+                    phase.to_lifecycle(),
+                    previous_version.as_deref(),
+                    options.lifecycle_bus.clone(),
+                )
+            },
+            |storage| {
+                run_lifecycle_for_principal_with_storage(
+                    &target_dir,
+                    w.bytes.clone(),
+                    &manifest,
+                    home,
+                    target_principal,
+                    storage,
+                    phase.to_lifecycle(),
+                    previous_version.as_deref(),
+                    options.lifecycle_bus.clone(),
+                )
+            },
         );
         if let Err(e) = lifecycle_result {
             rollback(&target_dir, backup_dir.as_deref());
@@ -699,18 +777,41 @@ pub(crate) fn install_from_local_path_internal(
         source: options
             .original_source
             .clone()
-            .or_else(|| existing_meta.and_then(|m| m.source)),
+            .or_else(|| existing_meta.as_ref().and_then(|m| m.source.clone())),
         imports: version_map_to_strings(&manifest.imports, |d| d.version.to_string()),
         exports: version_map_to_strings(&manifest.exports, |d| d.version.to_string()),
         wasm_hash: wasm.as_ref().map(|w: &WasmAddressed| w.hash.clone()),
         wit_files,
         // Provenance fields are stamped by the distro install path
         // (offline `.shuttle`), not the generic local install.
+        provenance_distro: options.provenance_distro.clone().or_else(|| {
+            existing_meta
+                .as_ref()
+                .and_then(|meta| meta.provenance_distro.clone())
+        }),
+        provenance_source_digest: options.provenance_source_digest.clone().or_else(|| {
+            existing_meta
+                .as_ref()
+                .and_then(|meta| meta.provenance_source_digest.clone())
+        }),
         ..Default::default()
     };
     if let Err(e) = write_meta(&target_dir, &meta) {
         rollback(&target_dir, backup_dir.as_deref());
         return Err(e);
+    }
+    if let Some(store) = options.storage.as_ref()
+        && let Err(error) = crate::storage::publish_directory_package(
+            store,
+            target_principal,
+            source_dir,
+            &target_dir,
+            &meta,
+            &installed_authority,
+        )
+    {
+        rollback(&target_dir, backup_dir.as_deref());
+        return Err(error).context("failed to publish authoritative capsule package");
     }
     if let Some(selection) = &checked_workspace {
         let validation = (|| {
@@ -732,39 +833,21 @@ pub(crate) fn install_from_local_path_internal(
         return Err(e);
     }
 
-    // Mirror the capsule's WIT into the principal's `home://wit/` so the
-    // system capsule's `list_interfaces` / `read_interface` tools can
-    // read it — the canonical content store is BLAKE3-keyed and outside
-    // any VFS scheme a capsule can reach. Best-effort: the capsule is
-    // already installed and committed, so a mirror failure must not roll
-    // it back. It degrades introspection visibility, not the install.
-    if let Err(e) = materialize_wit_mirror(home, target_principal, &meta.wit_files) {
-        tracing::warn!(
-            capsule = %id,
-            error = %format!("{e:#}"),
-            "failed to materialize home://wit mirror; introspection tools may not see this capsule's interfaces"
-        );
-    }
-
-    // Seed the daemon canonical `astrid-contracts.wit` on the first
-    // install that vendors it (first-writer-wins; never overwritten).
-    // Best-effort: the capsule is already installed and committed, so a
-    // retention failure must not roll it back — it only means later skew
-    // checks have no baseline to compare against.
-    if let Err(e) = seed_canonical_contracts_if_absent(home, &meta.wit_files) {
-        tracing::warn!(
-            capsule = %id,
-            error = %format!("{e:#}"),
-            "failed to seed canonical astrid-contracts.wit; contracts skew checks may lack a baseline"
-        );
-    }
-
-    // Determine env-prompt signal for the caller.
-    let env_path = resolve_env_path_for(home, target_principal, id.as_str())?;
-    let env_needs_prompt = !manifest.env.is_empty() && !env_path.exists();
+    // Durable env values live in daemon control storage.  The install library
+    // cannot inspect that authority directly, so the CLI always gets a prompt
+    // signal for manifests with env declarations; its storage-backed prompt is
+    // idempotent and skips fields already present.
+    let env_path = PathBuf::new();
+    let env_needs_prompt = !manifest.env.is_empty();
 
     let missing_imports = if options.skip_import_check {
         Vec::new()
+    } else if let Some(store) = options.storage.as_ref() {
+        let uid = store
+            .principal_directory()
+            .uid_for(target_principal)
+            .with_context(|| format!("resolve durable uid for principal {target_principal}"))?;
+        validate_imports_in_storage(&manifest, store, uid)?
     } else {
         validate_imports_in_workspace(
             &manifest,

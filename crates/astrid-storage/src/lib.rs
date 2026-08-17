@@ -34,11 +34,15 @@
 
 extern crate alloc;
 
+/// Durable owner-scoped installed capsule package registry.
+pub mod capsule_registry;
 pub mod content;
 /// Canonical content-defined chunk DAG implementation.
 pub mod content_dag;
 /// Principal-store execution engine.
 pub mod engine;
+/// Typed capsule environment state over the authoritative KV projection.
+pub mod env;
 pub mod error;
 /// Filesystem namespace semantics over authoritative Astrid content.
 pub mod filesystem;
@@ -59,6 +63,10 @@ pub mod secret;
 pub mod storage_model;
 pub mod volume;
 
+pub use capsule_registry::{
+    CAPSULES_PREFIX, CapsuleInstallExpectation, CapsulePackage, CapsulePackageGeneration,
+    CapsulePackageSnapshot, CapsulePackageSummary, CapsuleRegistry, CapsuleRegistryError,
+};
 #[cfg(not(target_family = "wasm"))]
 pub use content::{
     AtomicProjectionNameReservation, ProjectedContentPath, ProjectedNameSegment,
@@ -69,19 +77,24 @@ pub use content::{
 };
 pub use content::{
     BulkIngestDiagnostics, BulkIngestPolicy, ChunkingProfile, ContentBatchEntry,
-    ContentBatchWriteOutcome, ContentChangeCache, ContentDescriptor, ContentEntry, ContentIngest,
-    ContentName, ContentNameError, ContentObservation, ContentWriteOutcome, PrincipalContentError,
-    PrincipalContentReadHandle, PrincipalContentStore, SourceEpoch, SourceFingerprint,
-    SourceObservation, SourceScopeId, SourceTrust, StableSourceId,
+    ContentBatchExpectation, ContentBatchWriteOutcome, ContentChangeCache, ContentDescriptor,
+    ContentEntry, ContentIngest, ContentName, ContentNameError, ContentObservation,
+    ContentReadBatchEntry, ContentWriteOutcome, PrincipalContentError, PrincipalContentReadHandle,
+    PrincipalContentStore, PrincipalUid, SourceEpoch, SourceFingerprint, SourceObservation,
+    SourceScopeId, SourceTrust, StableSourceId, WorkspaceBindingLifecycle, WorkspaceBranchBinding,
+    WorkspaceBranchDescriptor, WorkspaceBranchError, WorkspaceBranchStore, WorkspaceFilesystem,
+    WorkspaceUid,
 };
 pub use error::{StorageError, StorageResult};
 pub use filesystem::{
     AstridFilesystem, FilesystemEntry, FilesystemEntryKind, FilesystemError, FilesystemPath,
+    OwnerSubtreeFilesystem,
 };
 pub use identity::{IdentityError, IdentityStore, KvIdentityStore};
 pub use kv::{
-    KvEntry, KvPrincipalResolver, KvQuotaResolver, KvStore, MemoryKvStore, PrincipalKvStore,
-    ScopedKvStore, TreeKvStore,
+    KvBatchCondition, KvBatchMutation, KvBatchOutcome, KvConditionResult, KvEntry, KvEntryKey,
+    KvMutationBatch, KvPrincipalResolver, KvQuotaResolver, KvStore, MAX_KV_BATCH_OPERATIONS,
+    MAX_KV_BATCH_PAYLOAD_BYTES, MemoryKvStore, PrincipalKvStore, ScopedKvStore, TreeKvStore,
 };
 pub use ownership::{
     FleetRecord, OwnershipError, OwnershipSnapshot, OwnershipStore, PrincipalDeletionGuard,

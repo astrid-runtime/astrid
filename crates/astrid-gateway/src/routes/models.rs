@@ -636,6 +636,7 @@ mod tests {
     fn model_test_state(bus: Arc<EventBus>) -> GatewayState {
         GatewayState {
             config: crate::config::GatewayConfig::default(),
+            storage_kv: None,
             signing: SigningMaterial::fresh(),
             event_bus: Some(bus),
             distribution: Arc::new(crate::routes::distribution::DistributionInfo::single_tenant()),

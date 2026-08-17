@@ -107,7 +107,7 @@ fn test_keypair() -> KeyPair {
 
 #[tokio::test]
 async fn test_store_and_retrieve() {
-    let storage = SurrealKvAuditStorage::in_memory();
+    let storage = KvAuditStorage::in_memory();
     let keypair = test_keypair();
     let session_id = SessionId::new();
 
@@ -135,7 +135,7 @@ async fn test_store_and_retrieve() {
 
 #[tokio::test]
 async fn test_session_index() {
-    let storage = SurrealKvAuditStorage::in_memory();
+    let storage = KvAuditStorage::in_memory();
     let keypair = test_keypair();
     let session_id = SessionId::new();
 
@@ -171,7 +171,7 @@ async fn failed_precommit_writes_remain_invisible_and_reopen_cleanly() {
     for fail_at in 1..=3 {
         let raw = Arc::new(FailOneMutationStore::new(fail_at));
         let store: Arc<dyn KvStore> = raw;
-        let storage = SurrealKvAuditStorage {
+        let storage = KvAuditStorage {
             store: Arc::clone(&store),
         };
         let keypair = KeyPair::generate();
@@ -200,7 +200,7 @@ async fn failed_precommit_writes_remain_invisible_and_reopen_cleanly() {
         // A fresh storage/log view over the same durable bytes must ignore
         // any orphan lookup entry or sequence gap and start one valid chain.
         let reopened =
-            crate::AuditLog::with_test_storage(Box::new(SurrealKvAuditStorage { store }), keypair);
+            crate::AuditLog::with_test_storage(Box::new(KvAuditStorage { store }), keypair);
         reopened
             .append(
                 session_id.clone(),
@@ -226,7 +226,7 @@ async fn failed_precommit_writes_remain_invisible_and_reopen_cleanly() {
 async fn cancelled_before_commit_remains_invisible_and_reopens_cleanly() {
     let raw = Arc::new(FailOneMutationStore::blocking_commit());
     let store: Arc<dyn KvStore> = raw.clone();
-    let storage = Arc::new(SurrealKvAuditStorage {
+    let storage = Arc::new(KvAuditStorage {
         store: Arc::clone(&store),
     });
     let keypair = KeyPair::generate();
@@ -262,7 +262,7 @@ async fn cancelled_before_commit_remains_invisible_and_reopens_cleanly() {
         }
     }
     let reopened = crate::AuditLog::with_test_storage(
-        Box::new(SurrealKvAuditStorage {
+        Box::new(KvAuditStorage {
             store: reopened_store,
         }),
         keypair,
@@ -284,7 +284,7 @@ async fn cancelled_before_commit_remains_invisible_and_reopens_cleanly() {
 
 #[tokio::test]
 async fn append_only_index_has_bounded_per_entry_records() {
-    let storage = SurrealKvAuditStorage::in_memory();
+    let storage = KvAuditStorage::in_memory();
     let keypair = test_keypair();
     let session_id = SessionId::new();
 
@@ -341,7 +341,7 @@ async fn append_only_index_has_bounded_per_entry_records() {
 
 #[tokio::test]
 async fn legacy_and_append_only_indexes_merge_without_duplicates_in_order() {
-    let storage = SurrealKvAuditStorage::in_memory();
+    let storage = KvAuditStorage::in_memory();
     let keypair = test_keypair();
     let session_id = SessionId::new();
     let create_entry = || {
@@ -398,7 +398,7 @@ async fn legacy_and_append_only_indexes_merge_without_duplicates_in_order() {
 
 #[tokio::test]
 async fn list_and_count_cover_legacy_and_new_sessions() {
-    let storage = SurrealKvAuditStorage::in_memory();
+    let storage = KvAuditStorage::in_memory();
     let keypair = test_keypair();
     let legacy_session = SessionId::new();
     let new_session = SessionId::new();
@@ -453,7 +453,7 @@ async fn list_and_count_cover_legacy_and_new_sessions() {
 
 #[tokio::test]
 async fn test_chain_head() {
-    let storage = SurrealKvAuditStorage::in_memory();
+    let storage = KvAuditStorage::in_memory();
     let keypair = test_keypair();
     let session_id = SessionId::new();
 
@@ -501,7 +501,7 @@ async fn test_chain_head() {
 /// multi-threaded runtime (the production path fixed by #305).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_store_and_retrieve_multi_thread() {
-    let storage = SurrealKvAuditStorage::in_memory();
+    let storage = KvAuditStorage::in_memory();
     let keypair = test_keypair();
     let session_id = SessionId::new();
 
@@ -541,7 +541,7 @@ async fn test_store_and_retrieve_multi_thread() {
 /// Exercises the async persist path under the load pattern from #305.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_concurrent_stores_multi_thread() {
-    let storage = std::sync::Arc::new(SurrealKvAuditStorage::in_memory());
+    let storage = std::sync::Arc::new(KvAuditStorage::in_memory());
     let mut handles = Vec::new();
 
     for _ in 0..8 {

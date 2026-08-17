@@ -146,10 +146,10 @@ async fn dispatch_subcommand(
         Some(Commands::Invite { command }) => commands::invite::run(command).await,
         Some(Commands::Keypair { command }) => commands::keypair::run(command),
         Some(Commands::PairDevice { command }) => commands::pair_device::run(command).await,
-        Some(Commands::Secret { command }) => commands::secret::run(command),
+        Some(Commands::Secret { command }) => commands::secret::run(command).await,
         Some(Commands::Voucher { command }) => commands::voucher::run(command),
         Some(Commands::Trust { command }) => commands::trust::run(command),
-        Some(Commands::Audit(args)) => commands::audit::run(&args),
+        Some(Commands::Audit(args)) => commands::audit::run(&args).await,
         Some(Commands::Budget { command }) => commands::budget::run(command),
         Some(Commands::Build {
             path,
@@ -219,7 +219,7 @@ async fn dispatch_subcommand(
         },
         Some(Commands::Restart) => commands::restart::run().await,
         Some(Commands::Storage { command }) => commands::storage::run(command),
-        Some(Commands::Logs(args)) => commands::logs::run(&args),
+        Some(Commands::Logs(args)) => commands::logs::run(&args).await,
         Some(Commands::Ps(args)) => commands::ps::run(args).await,
         Some(Commands::Top(args)) => commands::top::run(args).await,
         Some(Commands::Who(args)) => commands::who::run(args).await,
@@ -369,7 +369,7 @@ async fn dispatch_capsule(command: crate::cli::CapsuleCommands) -> Result<ExitCo
             Ok(ExitCode::SUCCESS)
         },
         CapsuleCommands::List { verbose } => {
-            commands::capsule::list::list_capsules(verbose)?;
+            commands::capsule::list::list_capsules(verbose).await?;
             Ok(ExitCode::SUCCESS)
         },
         CapsuleCommands::Remove {
@@ -378,11 +378,42 @@ async fn dispatch_capsule(command: crate::cli::CapsuleCommands) -> Result<ExitCo
             force,
             purge,
         } => {
-            commands::capsule::remove::validate_capsule_removal(&name, workspace, force)?;
-            let live_unload = commands::capsule::live_load::try_daemon_unload(&name).await?;
-            commands::capsule::remove::remove_capsule(&name, workspace, force, purge)?;
-            if live_unload == commands::capsule::live_load::LiveUnload::Unloaded {
-                eprintln!("Live: the running daemon unloaded '{name}' — no restart needed.");
+            if workspace {
+                commands::capsule::remove::validate_capsule_removal(&name, true, force)?;
+                commands::capsule::remove::remove_capsule(&name, true, force, purge)?;
+            } else {
+                let mut client = crate::socket_client::connect_kernel_for_workspace(None).await?;
+                match client
+                    .request(astrid_core::kernel_api::KernelRequest::RemoveCapsule {
+                        id: name.clone(),
+                        force,
+                    })
+                    .await?
+                {
+                    astrid_core::kernel_api::KernelResponse::Success(_) => {
+                        if purge {
+                            let principal = crate::principal::current();
+                            let entries = commands::capsule::install_headless::list_env_entries(
+                                &principal, &name,
+                            )?;
+                            for entry in entries {
+                                if matches!(
+                                    entry.scope,
+                                    astrid_core::kernel_api::EnvStorageScope::Agent
+                                ) {
+                                    commands::capsule::install_headless::delete_env_entry(
+                                        &principal, &name, &entry.key, entry.kind,
+                                    )?;
+                                }
+                            }
+                        }
+                        eprintln!("Removed '{name}'.");
+                    },
+                    astrid_core::kernel_api::KernelResponse::Error(message) => {
+                        anyhow::bail!("daemon rejected capsule removal: {message}");
+                    },
+                    other => anyhow::bail!("unexpected daemon response: {other:?}"),
+                }
             }
             Ok(ExitCode::SUCCESS)
         },
@@ -403,7 +434,7 @@ async fn dispatch_capsule(command: crate::cli::CapsuleCommands) -> Result<ExitCo
         ),
         CapsuleCommands::Check { path } => commands::capsule::check::run(path.as_deref()),
         CapsuleCommands::Config(args) => commands::capsule::config::run(&args),
-        CapsuleCommands::Show(args) => commands::capsule::show::run(&args),
+        CapsuleCommands::Show(args) => commands::capsule::show::run(&args).await,
         CapsuleCommands::Run {
             provider,
             verb,
@@ -465,7 +496,7 @@ async fn dispatch_distro(command: DistroCommands) -> Result<ExitCode> {
             eprintln!(
                 "{}",
                 theme::Theme::info(
-                    "`distro show` is not yet wired — see lockfile under ~/.astrid/home/<agent>/.config/distro.lock"
+                    "`distro show` is not yet wired — use the daemon-owned distro provenance via an authenticated admin client"
                 )
             );
             Ok(ExitCode::from(2))

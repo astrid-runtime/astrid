@@ -130,12 +130,14 @@ fn test_astrid_home_ensure_creates_dirs() {
     assert!(home.run_dir().exists());
     assert!(home.log_dir().exists());
     assert!(home.keys_dir().exists());
-    assert!(home.secrets_dir().exists());
+    assert!(!home.secrets_dir().exists());
     assert!(home.bin_dir().exists());
-    assert!(home.home_dir().exists());
+    // `home/` is a legacy import source and is not recreated on a fresh v2
+    // boot. It is created only when an upgrade fixture explicitly provides it.
+    assert!(!home.home_dir().exists());
     assert!(home.content_staging_path().exists());
     assert!(home.migrations_dir().exists());
-    assert!(home.cow_dir().exists());
+    assert!(!home.cow_dir().exists());
     assert!(!home.root().join("srv").exists());
 }
 
@@ -157,6 +159,16 @@ fn test_astrid_home_ensure_idempotent() {
     let home = AstridHome::from_path(test_home_root(&dir));
     home.ensure().unwrap();
     home.ensure().unwrap(); // second call should not fail
+}
+
+#[test]
+fn test_fresh_home_restart_does_not_recreate_legacy_secret_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+    home.ensure().unwrap();
+    assert!(!home.secrets_dir().exists());
+    home.ensure().unwrap();
+    assert!(!home.secrets_dir().exists());
 }
 
 #[test]
@@ -393,7 +405,7 @@ fn test_layout_v1_completion_removes_verified_legacy_store() {
 
 #[cfg(unix)]
 #[test]
-fn test_layout_v2_startup_finishes_interrupted_legacy_retirement() {
+fn test_layout_v2_startup_defers_interrupted_legacy_retirement_to_kernel_barrier() {
     let dir = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(test_home_root(&dir));
     crate::platform_fs::ensure_private_directory(&home.etc_dir()).unwrap();
@@ -404,12 +416,168 @@ fn test_layout_v2_startup_finishes_interrupted_legacy_retirement() {
     write_test_storage_volume(&home, b"test-volume");
     home.complete_layout_v2(&migration_target()).unwrap();
 
-    // Recreate the exact post-sentinel/pre-retirement crash shape. Startup
-    // must use the durable receipt to finish retirement before serving.
+    // Recreate the exact post-sentinel/pre-retirement crash shape. The
+    // directory bootstrap must retain both sources because only the kernel's
+    // global component ledger can authorize post-barrier retirement.
     write_released_legacy_store(&home, b"legacy");
+    let legacy_cow_file = home.cow_dir().join("workspace").join("merged");
+    std::fs::create_dir_all(legacy_cow_file.parent().unwrap()).unwrap();
+    std::fs::write(&legacy_cow_file, b"disposable-cow-bytes").unwrap();
     home.ensure().unwrap();
 
-    assert!(!home.state_db_path().exists());
+    assert!(home.state_db_path().exists());
+    assert!(home.cow_dir().exists());
+    home.ensure().unwrap();
+    assert!(home.state_db_path().exists());
+    assert!(home.cow_dir().exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn test_layout_v2_ensure_retains_reappeared_legacy_cow_for_barrier() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+    home.ensure().unwrap();
+    assert!(!home.cow_dir().exists());
+
+    std::fs::create_dir(home.cow_dir()).unwrap();
+    home.ensure().unwrap();
+    assert!(home.cow_dir().exists());
+
+    let nested_file = home.cow_dir().join("capsule").join("merged").join("file");
+    std::fs::create_dir_all(nested_file.parent().unwrap()).unwrap();
+    std::fs::write(&nested_file, b"legacy workspace bytes").unwrap();
+    home.ensure().unwrap();
+    assert_eq!(
+        std::fs::read(&nested_file).unwrap(),
+        b"legacy workspace bytes"
+    );
+    home.ensure().unwrap();
+    assert!(home.cow_dir().exists());
+
+    // A v2 home without a cut-over receipt cannot authorize source deletion,
+    // even through the explicit finalizer. The barrier must publish its
+    // component ledger before CoW retirement is allowed.
+    let error = home.complete_layout_v2(&migration_target()).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("without a completion receipt"));
+    assert!(nested_file.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn test_layout_v2_ensure_rejects_but_does_not_delete_legacy_cow_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let outside_file = outside.path().join("must-survive");
+    std::fs::write(&outside_file, b"outside bytes").unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+    home.ensure().unwrap();
+    symlink(outside.path(), home.cow_dir()).unwrap();
+
+    let error = home.ensure().unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("redirect"));
+    assert_eq!(std::fs::read(outside_file).unwrap(), b"outside bytes");
+    assert!(
+        std::fs::symlink_metadata(home.cow_dir())
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_layout_v2_ensure_rejects_but_does_not_delete_legacy_cow_special_entry() {
+    use nix::sys::stat::Mode;
+    use nix::unistd::mkfifo;
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+    home.ensure().unwrap();
+    let retained = home.cow_dir().join("workspace").join("retained");
+    std::fs::create_dir_all(retained.parent().unwrap()).unwrap();
+    std::fs::write(&retained, b"must survive rejection").unwrap();
+    let fifo = home.cow_dir().join("workspace").join("unsafe.fifo");
+    mkfifo(&fifo, Mode::from_bits_truncate(0o600)).unwrap();
+
+    let error = home.ensure().unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("special file"));
+    assert_eq!(std::fs::read(retained).unwrap(), b"must survive rejection");
+    assert!(fifo.exists());
+    assert!(home.cow_dir().exists());
+}
+
+#[test]
+fn runtime_principal_scratch_is_cleared_on_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+    home.ensure().unwrap();
+    let stale = home.run_dir().join("principals").join("uid-a").join("tmp");
+    std::fs::create_dir_all(&stale).unwrap();
+    std::fs::write(stale.join("leftover"), b"ephemeral").unwrap();
+
+    home.clear_runtime_principal_scratch().unwrap();
+
+    assert!(home.run_dir().join("principals").is_dir());
+    assert!(!stale.parent().unwrap().exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_principal_scratch_rejects_redirects_without_following_or_deleting() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+    home.ensure().unwrap();
+    let principals = home.run_dir().join("principals");
+    std::fs::create_dir_all(&principals).unwrap();
+    let outside_file = outside.path().join("survive");
+    std::fs::write(&outside_file, b"outside").unwrap();
+    let redirect = principals.join("uid-a");
+    symlink(outside.path(), &redirect).unwrap();
+
+    let error = home.clear_runtime_principal_scratch().unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("redirect"));
+    assert_eq!(std::fs::read(outside_file).unwrap(), b"outside");
+    assert!(
+        std::fs::symlink_metadata(redirect)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_principal_scratch_rejects_special_entries_without_partial_delete() {
+    use nix::sys::stat::Mode;
+    use nix::unistd::mkfifo;
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+    home.ensure().unwrap();
+    let principal = home.run_dir().join("principals").join("uid-a");
+    std::fs::create_dir_all(&principal).unwrap();
+    let retained = principal.join("retained");
+    std::fs::write(&retained, b"must survive").unwrap();
+    let fifo = principal.join("unsafe.fifo");
+    mkfifo(&fifo, Mode::from_bits_truncate(0o600)).unwrap();
+
+    let error = home.clear_runtime_principal_scratch().unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("special file"));
+    assert_eq!(std::fs::read(retained).unwrap(), b"must survive");
+    assert!(fifo.exists());
 }
 
 #[cfg(not(windows))]
@@ -455,7 +623,7 @@ fn test_layout_v2_startup_rejects_corrupt_receipt_without_retiring_source() {
     )
     .unwrap();
 
-    let error = home.ensure().unwrap_err();
+    let error = home.complete_layout_v2(&migration_target()).unwrap_err();
 
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     assert!(surviving.exists());
@@ -476,7 +644,7 @@ fn test_layout_v2_startup_rejects_changed_volume_without_retiring_source() {
     let surviving = write_released_legacy_store(&home, b"");
     write_test_storage_volume(&home, b"changed-volume");
 
-    let error = home.ensure().unwrap_err();
+    let error = home.complete_layout_v2(&migration_target()).unwrap_err();
 
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     assert!(error.to_string().contains("destination"), "{error}");
@@ -502,7 +670,7 @@ fn test_astrid_home_ensure_sets_permissions() {
 
 #[cfg(unix)]
 #[test]
-fn test_astrid_home_ensure_repairs_secrets_permissions_without_touching_contents() {
+fn test_astrid_home_ensure_leaves_legacy_secrets_untouched() {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = tempfile::tempdir().unwrap();
@@ -518,7 +686,9 @@ fn test_astrid_home_ensure_repairs_secrets_permissions_without_touching_contents
     home.ensure().unwrap();
 
     let permissions = std::fs::metadata(home.secrets_dir()).unwrap().permissions();
-    assert_eq!(permissions.mode() & 0o777, 0o700);
+    // Legacy file-secret roots are an explicit migration source only; a
+    // steady-state ensure must not recreate or rewrite their permissions.
+    assert_eq!(permissions.mode() & 0o777, 0o755);
     assert_eq!(std::fs::read(secret).unwrap(), bytes);
 }
 
@@ -633,7 +803,7 @@ fn test_principal_home_ensure_creates_dirs() {
     assert!(ph.audit_dir().exists());
     assert!(ph.tokens_dir().exists());
     assert!(ph.tmp_dir().exists());
-    assert!(ph.env_dir().exists());
+    assert!(!ph.env_dir().exists());
 }
 
 #[cfg(unix)]
@@ -653,10 +823,10 @@ fn test_principal_home_ensure_sets_permissions() {
         .permissions();
     assert_eq!(local_perms.mode() & 0o777, 0o700);
 
-    let config_perms = std::fs::metadata(ph.root().join(".config"))
-        .unwrap()
-        .permissions();
-    assert_eq!(config_perms.mode() & 0o777, 0o700);
+    assert!(
+        !ph.root().join(".config").exists(),
+        "fresh principal homes must not recreate the legacy config/env tree"
+    );
 }
 
 #[test]

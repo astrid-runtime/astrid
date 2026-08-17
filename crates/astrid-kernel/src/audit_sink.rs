@@ -5,13 +5,16 @@
 //! [`HostAuditSink`](astrid_capsule::HostAuditSink) trait. The kernel holds
 //! both the durable audit log and the runtime ed25519 signing key, so it is
 //! the side that can map those neutral events onto a signed, hash-chained
-//! [`AuditEntry`](astrid_audit::AuditEntry) and append it synchronously.
-//!
-//! This mirrors `kernel_router::record_admin_audit`: persistence failures are
-//! logged and swallowed (audit degrades to "continue + alert"), never panic
-//! or block the host call.
+//! [`AuditEntry`](astrid_audit::AuditEntry). A bounded writer coalesces
+//! concurrent reports; host calls return after enqueue and durability is
+//! exposed through [`AuditSinkHealth`]. Queue saturation supplies explicit
+//! backpressure rather than dropping audit evidence.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc, Mutex,
+    mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel},
+};
+use std::thread::{self, JoinHandle};
 
 use astrid_audit::{AuditAction, AuditLog, AuditOutcome, AuthorizationProof};
 use astrid_capsule::{HostAuditEvent, HostAuditOutcome, HostAuditSink};
@@ -39,6 +42,251 @@ const MANIFEST_GATED_REASON: &str = "manifest-gated host call";
 /// useful.
 const MAX_AUDIT_STR_BYTES: usize = 1024;
 
+const AUDIT_QUEUE_CAPACITY: usize = 1024;
+const AUDIT_MAX_BATCH: usize = 64;
+
+struct AuditWork {
+    session_id: SessionId,
+    principal: PrincipalId,
+    action: AuditAction,
+    authorization: AuthorizationProof,
+    outcome: AuditOutcome,
+}
+
+#[derive(Default)]
+struct AuditHealthState {
+    accepted: u64,
+    persisted: u64,
+    failed: u64,
+    queue_full: u64,
+    queued: u64,
+    worker_alive: bool,
+    last_error: Option<String>,
+}
+
+/// Operator-visible health for the bounded host-audit ingestion queue.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AuditSinkHealth {
+    /// Events accepted into the bounded queue.
+    pub accepted: u64,
+    /// Events acknowledged after durable append.
+    pub persisted: u64,
+    /// Events whose durable append failed.
+    pub failed: u64,
+    /// Number of times producers observed a full queue.
+    pub queue_full: u64,
+    /// Events accepted but not yet removed from the writer queue.
+    pub queue_depth: u64,
+    /// Whether the dedicated writer thread is alive.
+    pub worker_alive: bool,
+    /// Whether a failure or dead writer has degraded ingestion.
+    pub degraded: bool,
+    /// Most recent persistence/worker error, if degraded.
+    pub last_error: Option<String>,
+}
+
+struct AuditQueue {
+    sender: Mutex<Option<SyncSender<Box<AuditWork>>>>,
+    health: Arc<Mutex<AuditHealthState>>,
+    worker: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl AuditQueue {
+    fn new(audit_log: Arc<AuditLog>) -> Arc<Self> {
+        let (sender, receiver) = sync_channel(AUDIT_QUEUE_CAPACITY);
+        let health = Arc::new(Mutex::new(AuditHealthState::default()));
+        let worker_health = Arc::clone(&health);
+        let worker = thread::Builder::new()
+            .name("astrid-audit-writer".to_owned())
+            .spawn(move || audit_writer(&audit_log, &receiver, &worker_health))
+            .ok();
+        let queue = Arc::new(Self {
+            sender: Mutex::new(Some(sender)),
+            health,
+            worker: Mutex::new(worker),
+        });
+        if queue
+            .worker
+            .lock()
+            .ok()
+            .and_then(|worker| worker.as_ref().map(|_| ()))
+            .is_none()
+        {
+            queue.record_failure("failed to spawn bounded audit writer".to_owned());
+            if let Ok(mut sender) = queue.sender.lock() {
+                sender.take();
+            }
+        }
+        queue
+    }
+
+    fn submit(&self, work: Box<AuditWork>) -> Result<(), Box<AuditWork>> {
+        let sender = self
+            .sender
+            .lock()
+            .ok()
+            .and_then(|sender| sender.as_ref().cloned());
+        let Some(sender) = sender else {
+            return Err(work);
+        };
+        match sender.try_send(work) {
+            Ok(()) => {
+                if let Ok(mut health) = self.health.lock() {
+                    health.accepted = health.accepted.saturating_add(1);
+                    health.queued = health.queued.saturating_add(1);
+                }
+                Ok(())
+            },
+            Err(TrySendError::Full(work)) => {
+                self.mark_queue_full();
+                match sender.send(work) {
+                    Ok(()) => {
+                        if let Ok(mut health) = self.health.lock() {
+                            health.accepted = health.accepted.saturating_add(1);
+                            health.queued = health.queued.saturating_add(1);
+                        }
+                        Ok(())
+                    },
+                    Err(error) => Err(error.0),
+                }
+            },
+            Err(TrySendError::Disconnected(work)) => Err(work),
+        }
+    }
+
+    fn record_failure(&self, error: String) {
+        if let Ok(mut health) = self.health.lock() {
+            health.failed = health.failed.saturating_add(1);
+            health.worker_alive = false;
+            health.last_error = Some(error);
+        }
+    }
+
+    fn mark_queue_full(&self) {
+        if let Ok(mut health) = self.health.lock() {
+            health.queue_full = health.queue_full.saturating_add(1);
+        }
+    }
+
+    fn health(&self) -> AuditSinkHealth {
+        self.health.lock().map_or_else(
+            |_| AuditSinkHealth {
+                failed: 1,
+                worker_alive: false,
+                degraded: true,
+                queue_depth: 0,
+                last_error: Some("audit health mutex poisoned".to_owned()),
+                ..AuditSinkHealth::default()
+            },
+            |health| AuditSinkHealth {
+                accepted: health.accepted,
+                persisted: health.persisted,
+                failed: health.failed,
+                queue_full: health.queue_full,
+                queue_depth: health.queued,
+                worker_alive: health.worker_alive,
+                degraded: health.failed > 0 || !health.worker_alive,
+                last_error: health.last_error.clone(),
+            },
+        )
+    }
+
+    fn shutdown(&self) {
+        self.sender.lock().ok().and_then(|mut sender| sender.take());
+        if let Ok(mut worker) = self.worker.lock()
+            && let Some(worker) = worker.take()
+        {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for AuditQueue {
+    fn drop(&mut self) {
+        if let Ok(sender) = self.sender.get_mut() {
+            sender.take();
+        }
+        if let Ok(worker) = self.worker.get_mut()
+            && let Some(worker) = worker.take()
+        {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn audit_writer(
+    audit_log: &Arc<AuditLog>,
+    receiver: &Receiver<Box<AuditWork>>,
+    health: &Arc<Mutex<AuditHealthState>>,
+) {
+    if let Ok(mut state) = health.lock() {
+        state.worker_alive = true;
+    }
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let reason = format!("failed to create audit writer runtime: {error}");
+            while receiver.recv().is_ok() {}
+            if let Ok(mut state) = health.lock() {
+                state.failed = state.failed.saturating_add(1);
+                state.worker_alive = false;
+                state.last_error = Some(reason);
+            }
+            return;
+        },
+    };
+
+    while let Ok(first) = receiver.recv() {
+        if let Ok(mut state) = health.lock() {
+            state.queued = state.queued.saturating_sub(1);
+        }
+        let mut batch = Vec::with_capacity(AUDIT_MAX_BATCH);
+        batch.push(first);
+        while batch.len() < AUDIT_MAX_BATCH {
+            match receiver.try_recv() {
+                Ok(work) => {
+                    if let Ok(mut state) = health.lock() {
+                        state.queued = state.queued.saturating_sub(1);
+                    }
+                    batch.push(work);
+                },
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            }
+        }
+        let requests = batch
+            .iter()
+            .map(|work| {
+                (
+                    work.session_id.clone(),
+                    work.principal.clone(),
+                    work.action.clone(),
+                    work.authorization.clone(),
+                    work.outcome.clone(),
+                )
+            })
+            .collect();
+        let results = runtime.block_on(audit_log.append_batch_with_principal(requests));
+        for result in results {
+            if result.is_ok() {
+                if let Ok(mut state) = health.lock() {
+                    state.persisted = state.persisted.saturating_add(1);
+                }
+            } else if let Err(error) = &result
+                && let Ok(mut state) = health.lock()
+            {
+                state.failed = state.failed.saturating_add(1);
+                state.last_error = Some(error.to_string());
+            }
+        }
+    }
+    if let Ok(mut state) = health.lock() {
+        state.worker_alive = false;
+    }
+}
+
 /// Truncate a guest-controlled string to at most [`MAX_AUDIT_STR_BYTES`],
 /// snapping to a UTF-8 char boundary so the stored value is always valid UTF-8.
 ///
@@ -62,14 +310,15 @@ fn truncate_guest_str(s: &str) -> String {
 /// Persists capsule per-action host calls onto the kernel's signed audit
 /// chain.
 ///
-/// Cloned (cheap — `Arc` + `SessionId`) into a `dyn HostAuditSink` handed to
-/// every capsule engine at load. One per kernel boot, bound to the kernel's
-/// single `session_id`.
+/// Moved into a `dyn HostAuditSink` handed to every capsule engine at load. One
+/// per kernel boot, bound to the kernel's single `session_id`.
+#[derive(Clone)]
 pub struct KernelAuditSink {
-    /// The kernel's durable, signed audit log (shared `Arc`).
-    audit_log: Arc<AuditLog>,
     /// The kernel session every entry is chained under.
     session_id: SessionId,
+    /// Bounded writer queue. Producers wait only when capacity is exhausted;
+    /// durable acknowledgement is reported through [`AuditSinkHealth`].
+    queue: Arc<AuditQueue>,
 }
 
 impl KernelAuditSink {
@@ -80,10 +329,22 @@ impl KernelAuditSink {
     /// `Into<SessionId>`.
     #[must_use]
     pub fn new(audit_log: impl Into<Arc<AuditLog>>, session_id: impl Into<SessionId>) -> Self {
+        let audit_log = audit_log.into();
         Self {
-            audit_log: audit_log.into(),
             session_id: session_id.into(),
+            queue: AuditQueue::new(audit_log),
         }
+    }
+
+    /// Return operator-visible queue and persistence health.
+    #[must_use]
+    pub fn health(&self) -> AuditSinkHealth {
+        self.queue.health()
+    }
+
+    /// Stop the bounded writer after draining all accepted events.
+    pub fn shutdown(&self) {
+        self.queue.shutdown();
     }
 
     /// Map a neutral host event onto the internal audit action.
@@ -135,24 +396,25 @@ impl KernelAuditSink {
         outcome: HostAuditOutcome<'_>,
     ) {
         let (proof, audit_outcome) = Self::to_proof_outcome(outcome);
-        // Native-only sync bridge onto the async audit log; see
-        // [`block_on_audit`]. Persistence failure degrades to "continue +
-        // alert", never a panic or a blocked host call.
-        let result = block_on_audit(self.audit_log.append_with_principal(
-            self.session_id.clone(),
-            principal.clone(),
+        let work = Box::new(AuditWork {
+            session_id: self.session_id.clone(),
+            principal: principal.clone(),
             action,
-            proof,
-            audit_outcome,
-        ));
-        if let Err(e) = result {
+            authorization: proof,
+            outcome: audit_outcome,
+        });
+        if self.queue.submit(work).is_err() {
+            self.queue
+                .record_failure("audit writer unavailable".to_owned());
             warn!(
                 security_event = true,
                 %principal,
-                error = %e,
-                "Failed to persist per-action audit entry — continuing"
+                "Failed to enqueue per-action audit entry"
             );
         }
+        // The writer owns signing/storage latency. A full bounded queue blocks
+        // here (explicit backpressure); a healthy enqueue is not reported as a
+        // durable commit until the writer increments `persisted`.
     }
 
     /// Build the authorization proof + outcome pair for an outcome.
@@ -180,52 +442,6 @@ impl KernelAuditSink {
     }
 }
 
-/// Drive an audit-log future to completion synchronously from the host-fn
-/// blocking context.
-///
-/// This is the one remaining sync boundary onto the now-genuinely-async audit
-/// log (the storage layer no longer hides a `block_on`). It is sound and
-/// deliberately native-only:
-///
-/// - The host fn that reports here already runs inside the WASM engine's
-///   `bounded_block_on` blocking context (a pinned tokio worker on the
-///   multi-threaded runtime) — see the [`HostAuditSink`] "why synchronous"
-///   contract. So the common path is `block_in_place` + `block_on`, the same
-///   blocking concurrency class the surrounding gate already uses; it adds **no
-///   new** class (no extra semaphore permit) and spawns no OS thread.
-/// - A `current_thread` runtime (single-threaded tests) can't `block_in_place`,
-///   so it falls back to a scoped thread that owns the `block_on`.
-/// - With no ambient runtime at all it parks a temporary one.
-///
-/// The whole module is `#[cfg]`-gated off `wasm32-unknown-unknown`, so the
-/// temporary-runtime `enable_all()` (whose time driver reads
-/// `std::time::Instant`) is never reachable on the browser profile — that panic
-/// is exactly the disease this change cures on the async path.
-fn block_on_audit<F>(f: F) -> F::Output
-where
-    F: std::future::Future + Send,
-    F::Output: Send,
-{
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => {
-            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
-                tokio::task::block_in_place(|| handle.block_on(f))
-            } else {
-                std::thread::scope(|s| {
-                    s.spawn(|| handle.block_on(f))
-                        .join()
-                        .expect("audit sink thread panicked")
-                })
-            }
-        },
-        Err(_) => tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("failed to create tokio runtime for audit sink")
-            .block_on(f),
-    }
-}
-
 impl HostAuditSink for KernelAuditSink {
     fn record(
         &self,
@@ -248,6 +464,52 @@ mod tests {
         PrincipalId::new("alice").expect("valid principal")
     }
 
+    fn record_event_kinds(sink: &KernelAuditSink, principal: &PrincipalId) {
+        sink.record(
+            principal,
+            HostAuditEvent::FileRead { path: "/w/r" },
+            HostAuditOutcome::Allowed,
+        );
+        sink.record(
+            principal,
+            HostAuditEvent::FileWrite { path: "/w/w" },
+            HostAuditOutcome::Failed("disk full"),
+        );
+        sink.record(
+            principal,
+            HostAuditEvent::FileDelete { path: "/w/d" },
+            HostAuditOutcome::Allowed,
+        );
+        sink.record(
+            principal,
+            HostAuditEvent::NetConnect {
+                host: "example.com",
+                port: 443,
+            },
+            HostAuditOutcome::Allowed,
+        );
+        sink.record(
+            principal,
+            HostAuditEvent::NetBind {
+                addr: "127.0.0.1:0",
+            },
+            HostAuditOutcome::Allowed,
+        );
+        sink.record(
+            principal,
+            HostAuditEvent::NetAccept {
+                local_addr: "127.0.0.1:8788",
+                peer_addr: "127.0.0.1:49152",
+            },
+            HostAuditOutcome::Allowed,
+        );
+        sink.record(
+            principal,
+            HostAuditEvent::ProcessSpawn { command: "ls" },
+            HostAuditOutcome::Denied("not in host_process allowlist"),
+        );
+    }
+
     /// Every event kind, including a denial, lands a principal-stamped,
     /// correctly-mapped entry, and the resulting chain still verifies.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -259,49 +521,8 @@ mod tests {
         let sink = KernelAuditSink::new(Arc::clone(&log), session.clone());
         let p = principal();
 
-        sink.record(
-            &p,
-            HostAuditEvent::FileRead { path: "/w/r" },
-            HostAuditOutcome::Allowed,
-        );
-        sink.record(
-            &p,
-            HostAuditEvent::FileWrite { path: "/w/w" },
-            HostAuditOutcome::Failed("disk full"),
-        );
-        sink.record(
-            &p,
-            HostAuditEvent::FileDelete { path: "/w/d" },
-            HostAuditOutcome::Allowed,
-        );
-        sink.record(
-            &p,
-            HostAuditEvent::NetConnect {
-                host: "example.com",
-                port: 443,
-            },
-            HostAuditOutcome::Allowed,
-        );
-        sink.record(
-            &p,
-            HostAuditEvent::NetBind {
-                addr: "127.0.0.1:0",
-            },
-            HostAuditOutcome::Allowed,
-        );
-        sink.record(
-            &p,
-            HostAuditEvent::NetAccept {
-                local_addr: "127.0.0.1:8788",
-                peer_addr: "127.0.0.1:49152",
-            },
-            HostAuditOutcome::Allowed,
-        );
-        sink.record(
-            &p,
-            HostAuditEvent::ProcessSpawn { command: "ls" },
-            HostAuditOutcome::Denied("not in host_process allowlist"),
-        );
+        record_event_kinds(&sink, &p);
+        sink.shutdown();
 
         let entries = log
             .get_principal_entries(&session, Some(&p))
@@ -397,6 +618,7 @@ mod tests {
             HostAuditEvent::FileRead { path: &huge },
             HostAuditOutcome::Allowed,
         );
+        sink.shutdown();
 
         let entries = log
             .get_principal_entries(&session, Some(&p))
@@ -431,6 +653,28 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_record_is_enqueue_only_and_shutdown_is_the_durable_barrier() {
+        let log = Arc::new(AuditLog::in_memory(KeyPair::generate()));
+        let session = SessionId::from_uuid(uuid::Uuid::from_u128(0x0997));
+        let sink = KernelAuditSink::new(Arc::clone(&log), session.clone());
+        let p = principal();
+        let started = std::time::Instant::now();
+        sink.record(
+            &p,
+            HostAuditEvent::FileRead { path: "/enqueue" },
+            HostAuditOutcome::Allowed,
+        );
+        // This call must not wait for the writer's append/fync path. The
+        // bounded queue records acceptance immediately; shutdown below is the
+        // explicit point at which a caller asks for durable completion.
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
+        assert_eq!(sink.health().accepted, 1);
+        sink.shutdown();
+        assert_eq!(sink.health().persisted, 1);
+        assert_eq!(log.count_session(&session).await.unwrap_or_default(), 1);
+    }
+
     /// The truncation helper snaps to a char boundary and is a no-op under the
     /// cap.
     #[test]
@@ -445,5 +689,38 @@ mod tests {
         assert!(out.len() <= MAX_AUDIT_STR_BYTES);
         assert!(out.is_char_boundary(out.len()));
         assert!(out.chars().all(|c| c == 'é'));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bounded_writer_durably_acks_concurrent_reports() {
+        let log = Arc::new(AuditLog::in_memory(KeyPair::generate()));
+        let session = SessionId::from_uuid(uuid::Uuid::from_u128(0x0996));
+        let sink = Arc::new(KernelAuditSink::new(Arc::clone(&log), session.clone()));
+        let p = principal();
+        let mut threads = Vec::new();
+        for worker in 0..4 {
+            let sink = Arc::clone(&sink);
+            let p = p.clone();
+            threads.push(std::thread::spawn(move || {
+                for index in 0..64 {
+                    let path = format!("/bounded/{worker}/{index}");
+                    sink.record(
+                        &p,
+                        HostAuditEvent::FileRead { path: &path },
+                        HostAuditOutcome::Allowed,
+                    );
+                }
+            }));
+        }
+        for thread in threads {
+            thread.join().expect("reporting thread");
+        }
+        sink.shutdown();
+        let health = sink.health();
+        assert_eq!(health.accepted, 256);
+        assert_eq!(health.persisted, 256);
+        assert_eq!(health.failed, 0);
+        assert_eq!(log.count_session(&session).await.unwrap(), 256);
+        assert!(log.verify_chain(&session).await.unwrap().valid);
     }
 }

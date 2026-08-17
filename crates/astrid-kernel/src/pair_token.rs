@@ -4,27 +4,17 @@
 //! to an EXISTING principal (the "pair device" flow) instead of
 //! minting a fresh principal.
 //!
-//! ## On-disk layout
-//!
-//! `$ASTRID_HOME/etc/pair-tokens.toml`:
-//!
-//! ```toml
-//! schema_version = 1
-//!
-//! [[pair_token]]
-//! token_hash = "blake3:..."    # domain-separated BLAKE3 identifier
-//! principal = "alice"          # the principal the new key will bind to
-//! expires_at_epoch = 1234567890
-//! issued_at_epoch = 1234560000
-//! label = "alice's phone"      # optional
-//! ```
+//! Durable records live in the fixed `system:control:pair-tokens` namespace,
+//! bound to immutable principal UIDs. `$ASTRID_HOME/etc/pair-tokens.toml` is
+//! accepted only by the bounded boot migration and is retired after verified
+//! readback.
 //!
 //! ## Threat model
 //!
-//! Same posture as the invite store: hashes on disk, Unix write-then-rename,
-//! 0600 perms, constant-time hash comparison on
-//! redeem. Pair-tokens are single-use only (no `remaining_uses`
-//! field) — a redeemed token is removed immediately.
+//! Same posture as the invite store: only domain-separated hashes are stored,
+//! redemption compares hashes in constant time, and mutation uses atomic
+//! system-owner KV batches. Pair-tokens are single-use only (no
+//! `remaining_uses` field) — redemption consumes the token atomically.
 //!
 //! Lifetime is capped at one hour (`MAX_EXPIRY_SECS`) — pair-tokens
 //! are meant for immediate use on a neighbouring device. Longer
@@ -33,10 +23,12 @@
 //! (different principal) instead.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use astrid_core::DeviceScope;
 use astrid_core::PrincipalId;
 use astrid_core::dirs::AstridHome;
+use astrid_core::identity::PrincipalUid;
 use astrid_crypto::IdentifierHash;
 use base64::Engine;
 use rand::{TryRng, rngs::SysRng};
@@ -44,6 +36,10 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use tracing::warn;
+
+#[path = "pair_token_storage_migration.rs"]
+mod storage_migration;
+use storage_migration::{read_legacy_source, retire_legacy_file};
 
 const STORE_SCHEMA_VERSION: u32 = 1;
 const TOKEN_HASH_CONTEXT: &str = "astrid.runtime.pair-device-token.identifier.v1";
@@ -85,6 +81,425 @@ pub struct PairToken {
     /// preserving the prior behaviour.
     #[serde(default = "default_full_scope")]
     pub scope: DeviceScope,
+}
+
+/// Fixed host-only namespace for pair-device authority.  Records are keyed by
+/// token identifier and bind the immutable principal UID, never a mutable
+/// alias or alias-derived namespace.
+pub const SYSTEM_KV_NAMESPACE: &str = "system:control:pair-tokens";
+const LEGACY_RECEIPT_KEY: &str = "migration:legacy-v1";
+const RECORD_PREFIX: &str = "record:";
+const MAX_RECORDS: usize = 4096;
+const MAX_RECORD_BYTES: usize = 16 * 1024;
+const MAX_LEGACY_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Durable UID-bound pair-token record.  The public [`PairToken`] remains the
+/// legacy-file compatibility type; runtime handlers use this record so alias
+/// renames cannot retarget an outstanding pairing authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DurablePairToken {
+    /// Canonical BLAKE3 identifier of the raw bearer token.
+    pub token_hash: String,
+    /// Immutable principal identity receiving the paired key.
+    pub principal_uid: PrincipalUid,
+    /// Wall-clock expiration.
+    pub expires_at_epoch: u64,
+    /// Wall-clock issuance time.
+    pub issued_at_epoch: u64,
+    /// Optional operator label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Capability scope stamped onto the paired device.
+    pub scope: DeviceScope,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyImportReceipt {
+    schema: u32,
+    source_digest: String,
+    record_count: u64,
+}
+
+/// Storage-backed pair-token state with atomic conditional issue/consume/
+/// revoke operations and strict one-time legacy import.
+#[derive(Clone)]
+pub struct DurablePairTokenStore {
+    backend: Arc<dyn astrid_storage::KvStore>,
+}
+
+impl DurablePairTokenStore {
+    /// Bind the fixed system-control projection.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error if the backend rejects the fixed pair-token
+    /// namespace.
+    pub fn new(backend: Arc<dyn astrid_storage::KvStore>) -> astrid_storage::StorageResult<Self> {
+        astrid_storage::ScopedKvStore::new(Arc::clone(&backend), SYSTEM_KV_NAMESPACE)?;
+        Ok(Self { backend })
+    }
+
+    fn key(hash: &str) -> String {
+        format!("{RECORD_PREFIX}{hash}")
+    }
+
+    fn validate_record(token: &DurablePairToken) -> astrid_storage::StorageResult<()> {
+        if canonical_fingerprint(&token.token_hash).as_deref() != Some(token.token_hash.as_str()) {
+            return Err(astrid_storage::StorageError::Serialization(
+                "pair-token record has a non-canonical token identifier".to_owned(),
+            ));
+        }
+        if token.expires_at_epoch <= token.issued_at_epoch
+            || token.expires_at_epoch.saturating_sub(token.issued_at_epoch) > MAX_EXPIRY_SECS
+            || token.label.as_ref().is_some_and(|label| label.len() > 4096)
+        {
+            return Err(astrid_storage::StorageError::Serialization(
+                "pair-token record is outside its bounded schema".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn encode(token: &DurablePairToken) -> astrid_storage::StorageResult<Vec<u8>> {
+        Self::validate_record(token)?;
+        let value = serde_json::to_vec(token)
+            .map_err(|error| astrid_storage::StorageError::Serialization(error.to_string()))?;
+        if value.len() > MAX_RECORD_BYTES {
+            return Err(astrid_storage::StorageError::Serialization(
+                "pair-token record exceeds its bounded size".to_owned(),
+            ));
+        }
+        Ok(value)
+    }
+
+    fn decode(bytes: &[u8]) -> astrid_storage::StorageResult<DurablePairToken> {
+        if bytes.len() > MAX_RECORD_BYTES {
+            return Err(astrid_storage::StorageError::Serialization(
+                "pair-token record exceeds its bounded size".to_owned(),
+            ));
+        }
+        let token: DurablePairToken = serde_json::from_slice(bytes).map_err(|_| {
+            astrid_storage::StorageError::Serialization("invalid pair-token record".to_owned())
+        })?;
+        Self::validate_record(&token)?;
+        Ok(token)
+    }
+
+    async fn apply(
+        &self,
+        conditions: Vec<astrid_storage::KvBatchCondition>,
+        mutations: Vec<astrid_storage::KvBatchMutation>,
+    ) -> astrid_storage::StorageResult<bool> {
+        if !self.backend.supports_atomic_batch() {
+            return Err(astrid_storage::StorageError::Internal(
+                "pair-token storage requires an atomic KV backend".to_owned(),
+            ));
+        }
+        let batch = astrid_storage::KvMutationBatch::new(conditions, mutations)?;
+        Ok(self.backend.apply_batch(&batch).await?.applied)
+    }
+
+    /// Import the released alias-bearing TOML exactly once, resolving each
+    /// alias through the live immutable principal directory before mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error if the legacy source is unsafe or malformed,
+    /// contains an unknown alias, conflicts with durable state, or cannot be
+    /// durably imported.
+    pub async fn ensure_legacy_import(
+        &self,
+        home: &AstridHome,
+        principals: &astrid_storage::PrincipalDirectory,
+    ) -> astrid_storage::StorageResult<()> {
+        let path = PairTokenStore::path_for(home);
+        let source = read_legacy_source(&path, principals)?;
+        let receipt = self
+            .backend
+            .get(SYSTEM_KV_NAMESPACE, LEGACY_RECEIPT_KEY)
+            .await?;
+        if let Some(bytes) = receipt {
+            let receipt: LegacyImportReceipt = serde_json::from_slice(&bytes).map_err(|_| {
+                astrid_storage::StorageError::Internal(
+                    "pair-token migration receipt is invalid".to_owned(),
+                )
+            })?;
+            if receipt.schema != 1 {
+                return Err(astrid_storage::StorageError::Internal(
+                    "pair-token migration receipt schema is unsupported".to_owned(),
+                ));
+            }
+            if let Some((source_bytes, _)) = &source {
+                let digest = format!("blake3:{}", blake3::hash(source_bytes).to_hex());
+                if digest != receipt.source_digest {
+                    return Err(astrid_storage::StorageError::Internal(
+                        "legacy pair-token source conflicts with durable migration state"
+                            .to_owned(),
+                    ));
+                }
+            }
+            self.verify_count(receipt.record_count).await?;
+            if source.is_some() {
+                retire_legacy_file(&path, &receipt.source_digest)?;
+            }
+            return Ok(());
+        }
+
+        let Some((source_bytes, tokens)) = source else {
+            return Ok(());
+        };
+        if tokens.len() > MAX_RECORDS || tokens.len() > 500 {
+            return Err(astrid_storage::StorageError::Serialization(
+                "legacy pair-token store exceeds the bounded migration limit".to_owned(),
+            ));
+        }
+        let existing = self
+            .backend
+            .list_keys_with_prefix(SYSTEM_KV_NAMESPACE, RECORD_PREFIX)
+            .await?;
+        if !existing.is_empty() {
+            return Err(astrid_storage::StorageError::Internal(
+                "legacy pair-token source conflicts with existing durable state".to_owned(),
+            ));
+        }
+        let digest = format!("blake3:{}", blake3::hash(&source_bytes).to_hex());
+        let receipt = LegacyImportReceipt {
+            schema: 1,
+            source_digest: digest.clone(),
+            record_count: tokens.len() as u64,
+        };
+        let receipt_bytes = serde_json::to_vec(&receipt)
+            .map_err(|error| astrid_storage::StorageError::Serialization(error.to_string()))?;
+        let mut conditions = vec![astrid_storage::KvBatchCondition::ValueEquals {
+            key: astrid_storage::KvEntryKey::new(SYSTEM_KV_NAMESPACE, LEGACY_RECEIPT_KEY)?,
+            expected: None,
+        }];
+        let mut mutations = vec![astrid_storage::KvBatchMutation::Set {
+            key: astrid_storage::KvEntryKey::new(SYSTEM_KV_NAMESPACE, LEGACY_RECEIPT_KEY)?,
+            value: receipt_bytes,
+        }];
+        for token in &tokens {
+            let durable = DurablePairToken {
+                token_hash: token.token_hash.clone(),
+                principal_uid: principals.uid_for(&token.principal).map_err(|_| {
+                    astrid_storage::StorageError::Internal(
+                        "legacy pair-token principal is not an admitted immutable identity"
+                            .to_owned(),
+                    )
+                })?,
+                expires_at_epoch: token.expires_at_epoch,
+                issued_at_epoch: token.issued_at_epoch,
+                label: token.label.clone(),
+                scope: token.scope.clone(),
+            };
+            let value = Self::encode(&durable)?;
+            let key = Self::key(&durable.token_hash);
+            conditions.push(astrid_storage::KvBatchCondition::ValueEquals {
+                key: astrid_storage::KvEntryKey::new(SYSTEM_KV_NAMESPACE, &key)?,
+                expected: None,
+            });
+            mutations.push(astrid_storage::KvBatchMutation::Set {
+                key: astrid_storage::KvEntryKey::new(SYSTEM_KV_NAMESPACE, key)?,
+                value,
+            });
+        }
+        if !self.apply(conditions, mutations).await? {
+            return Err(astrid_storage::StorageError::Internal(
+                "legacy pair-token migration raced with another durable writer".to_owned(),
+            ));
+        }
+        self.verify_count(tokens.len() as u64).await?;
+        retire_legacy_file(&path, &digest)?;
+        Ok(())
+    }
+
+    async fn verify_count(&self, expected: u64) -> astrid_storage::StorageResult<()> {
+        let keys = self
+            .backend
+            .list_keys_with_prefix(SYSTEM_KV_NAMESPACE, RECORD_PREFIX)
+            .await?;
+        if keys.len() as u64 != expected || keys.len() > MAX_RECORDS {
+            return Err(astrid_storage::StorageError::Internal(
+                "durable pair-token migration read-back count mismatch".to_owned(),
+            ));
+        }
+        for key in keys {
+            let Some(value) = self.backend.get(SYSTEM_KV_NAMESPACE, &key).await? else {
+                return Err(astrid_storage::StorageError::Internal(
+                    "durable pair-token migration read-back was incomplete".to_owned(),
+                ));
+            };
+            Self::decode(&value)?;
+        }
+        Ok(())
+    }
+
+    /// List current UID-bound records in deterministic order.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error if records cannot be listed or decoded.
+    pub async fn list(&self) -> astrid_storage::StorageResult<Vec<DurablePairToken>> {
+        let mut keys = self
+            .backend
+            .list_keys_with_prefix(SYSTEM_KV_NAMESPACE, RECORD_PREFIX)
+            .await?;
+        if keys.len() > MAX_RECORDS {
+            return Err(astrid_storage::StorageError::Internal(
+                "pair-token storage exceeds its bounded record limit".to_owned(),
+            ));
+        }
+        keys.sort_unstable();
+        let mut records = Vec::with_capacity(keys.len());
+        for key in keys {
+            let Some(value) = self.backend.get(SYSTEM_KV_NAMESPACE, &key).await? else {
+                return Err(astrid_storage::StorageError::Internal(
+                    "pair-token record disappeared during read".to_owned(),
+                ));
+            };
+            records.push(Self::decode(&value)?);
+        }
+        records.sort_by(|left, right| left.token_hash.cmp(&right.token_hash));
+        Ok(records)
+    }
+
+    /// Insert a UID-bound token iff its identifier is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error if the conditional batch cannot be applied.
+    pub async fn issue(&self, token: &DurablePairToken) -> astrid_storage::StorageResult<bool> {
+        let value = Self::encode(token)?;
+        let key = Self::key(&token.token_hash);
+        self.apply(
+            vec![astrid_storage::KvBatchCondition::ValueEquals {
+                key: astrid_storage::KvEntryKey::new(SYSTEM_KV_NAMESPACE, &key)?,
+                expected: None,
+            }],
+            vec![astrid_storage::KvBatchMutation::Set {
+                key: astrid_storage::KvEntryKey::new(SYSTEM_KV_NAMESPACE, key)?,
+                value,
+            }],
+        )
+        .await
+    }
+
+    /// Atomically consume one token; only one concurrent redeemer wins.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error if the record cannot be read, decoded, or
+    /// conditionally removed.
+    pub async fn redeem(
+        &self,
+        token_hash: &str,
+    ) -> astrid_storage::StorageResult<Option<DurablePairToken>> {
+        let key = Self::key(token_hash);
+        let Some(value) = self.backend.get(SYSTEM_KV_NAMESPACE, &key).await? else {
+            return Ok(None);
+        };
+        let token = Self::decode(&value)?;
+        if token.expires_at_epoch <= now_epoch() {
+            let _ = self
+                .apply(
+                    vec![astrid_storage::KvBatchCondition::ValueEquals {
+                        key: astrid_storage::KvEntryKey::new(SYSTEM_KV_NAMESPACE, &key)?,
+                        expected: Some(value),
+                    }],
+                    vec![astrid_storage::KvBatchMutation::Delete {
+                        key: astrid_storage::KvEntryKey::new(SYSTEM_KV_NAMESPACE, key)?,
+                    }],
+                )
+                .await?;
+            return Ok(None);
+        }
+        if self
+            .apply(
+                vec![astrid_storage::KvBatchCondition::ValueEquals {
+                    key: astrid_storage::KvEntryKey::new(SYSTEM_KV_NAMESPACE, &key)?,
+                    expected: Some(value),
+                }],
+                vec![astrid_storage::KvBatchMutation::Delete {
+                    key: astrid_storage::KvEntryKey::new(SYSTEM_KV_NAMESPACE, key)?,
+                }],
+            )
+            .await?
+        {
+            Ok(Some(token))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Remove one token by canonical fingerprint.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error if the conditional delete cannot be applied.
+    pub async fn revoke(&self, token_hash: &str) -> astrid_storage::StorageResult<bool> {
+        let key = Self::key(token_hash);
+        let Some(value) = self.backend.get(SYSTEM_KV_NAMESPACE, &key).await? else {
+            return Ok(false);
+        };
+        Self::decode(&value)?;
+        self.apply(
+            vec![astrid_storage::KvBatchCondition::ValueEquals {
+                key: astrid_storage::KvEntryKey::new(SYSTEM_KV_NAMESPACE, &key)?,
+                expected: Some(value),
+            }],
+            vec![astrid_storage::KvBatchMutation::Delete {
+                key: astrid_storage::KvEntryKey::new(SYSTEM_KV_NAMESPACE, key)?,
+            }],
+        )
+        .await
+    }
+
+    /// Prune expired tokens with conditional deletes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error if records cannot be read or a conditional
+    /// delete cannot be applied.
+    pub async fn prune(&self) -> astrid_storage::StorageResult<usize> {
+        let records = self.list().await?;
+        let now = now_epoch();
+        let mut removed = 0usize;
+        for token in records {
+            if token.expires_at_epoch > now {
+                continue;
+            }
+            let key = Self::key(&token.token_hash);
+            let Some(value) = self.backend.get(SYSTEM_KV_NAMESPACE, &key).await? else {
+                continue;
+            };
+            if self
+                .apply(
+                    vec![astrid_storage::KvBatchCondition::ValueEquals {
+                        key: astrid_storage::KvEntryKey::new(SYSTEM_KV_NAMESPACE, &key)?,
+                        expected: Some(value),
+                    }],
+                    vec![astrid_storage::KvBatchMutation::Delete {
+                        key: astrid_storage::KvEntryKey::new(SYSTEM_KV_NAMESPACE, key)?,
+                    }],
+                )
+                .await?
+            {
+                removed = removed.saturating_add(1);
+            }
+        }
+        Ok(removed)
+    }
+}
+
+fn canonical_fingerprint(value: &str) -> Option<String> {
+    let (algorithm, digest) = value.split_once(':')?;
+    (algorithm == "blake3"
+        && digest.len() == 64
+        && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && digest == digest.to_ascii_lowercase())
+    .then(|| value.to_owned())
 }
 
 /// Serde default for [`PairToken::scope`] — `Full`, so an on-disk record

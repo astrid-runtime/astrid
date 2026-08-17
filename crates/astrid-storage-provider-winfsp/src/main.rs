@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 const PROVIDER_NAME: &str = "astrid-storage-provider-winfsp";
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 const DAEMON_ARGUMENT: &str = "--astrid-provider-winfsp-daemon-v1";
+const SERVICE_ARGUMENT: &str = "--astrid-provider-winfsp-service-v1";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct MountRecord {
@@ -50,6 +51,16 @@ async fn main() {
         {
             if let Err(error) = win::daemon_main() {
                 eprintln!("{PROVIDER_NAME}: {error:#}");
+                std::process::exit(2);
+            }
+            return;
+        }
+    }
+    if arguments.as_slice() == [std::ffi::OsStr::new(SERVICE_ARGUMENT)] {
+        #[cfg(windows)]
+        {
+            if let Err(error) = win::service_main() {
+                eprintln!("{PROVIDER_NAME}: private service failed: {error:#}");
                 std::process::exit(2);
             }
             return;

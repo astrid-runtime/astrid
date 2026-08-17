@@ -309,8 +309,8 @@ fn finish_onboarding(app: &mut App) {
     } = &app.state
     {
         if let Some(request_id) = app.elicit_request_id.take() {
-            // Lifecycle elicit mode: publish ElicitResponse via IPC
-            // instead of writing .env.json.
+            // Lifecycle elicit mode: publish ElicitResponse via IPC rather
+            // than persisting a local file.
             let field = fields.first();
             let is_array = field.is_some_and(|f| {
                 matches!(f.field_type, astrid_types::ipc::OnboardingFieldType::Array)
@@ -332,9 +332,24 @@ fn finish_onboarding(app: &mut App) {
         } else {
             let cid = capsule_id.clone();
             let final_answers = answers.clone();
+            let field_kinds = fields
+                .iter()
+                .map(|field| {
+                    let kind = if matches!(
+                        field.field_type,
+                        astrid_types::ipc::OnboardingFieldType::Secret
+                    ) {
+                        astrid_core::kernel_api::EnvValueKind::Secret
+                    } else {
+                        astrid_core::kernel_api::EnvValueKind::Text
+                    };
+                    (field.key.clone(), kind)
+                })
+                .collect();
             app.pending_actions.push(PendingAction::SubmitOnboarding {
                 capsule_id: cid,
                 answers: final_answers,
+                field_kinds,
             });
         }
     }

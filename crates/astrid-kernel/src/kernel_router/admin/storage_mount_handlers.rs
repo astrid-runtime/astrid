@@ -45,6 +45,7 @@ pub(super) async fn dispatch(
                 allow_cross_owner_read
             },
             view,
+            astrid_core::storage_filesystem::StorageFilesystemTargetV1::OwnerRoot,
             access,
             provider,
             mountpoint,
@@ -120,6 +121,7 @@ mod tests {
             owner.clone(),
             true,
             astrid_core::storage_provider::StorageProviderViewV1::Admin,
+            astrid_core::storage_filesystem::StorageFilesystemTargetV1::OwnerRoot,
             astrid_core::storage_provider::StorageProviderAccessV1::ReadOnly,
             "read-capability-test".to_owned(),
             temporary.path().join("mount"),

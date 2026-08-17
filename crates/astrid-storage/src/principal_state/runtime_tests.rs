@@ -330,7 +330,7 @@ fn format_specification_has_a_tagged_metadata_identity() {
     assert!(record.references().is_empty());
     assert_eq!(
         object_id_hex(id),
-        "f9b17fa5e6b4ac4562c7e4ab2da1f0c756da07945d808794ad75544a132b0d91"
+        "58726b3c243c30ebc0941f656427520094a6bb10e7b2190be732b5a61300144d"
     );
     assert_eq!(
         object_id_hex(catalog_id),
@@ -341,7 +341,7 @@ fn format_specification_has_a_tagged_metadata_identity() {
         "format=astrid-principal-store-v1\n\
          identity=blake3-object-identity-v1\n\
          identity-wire=tagged-identity-v1\n\
-         format-spec-object=1:1:32:f9b17fa5e6b4ac4562c7e4ab2da1f0c756da07945d808794ad75544a132b0d91\n\
+         format-spec-object=1:1:32:58726b3c243c30ebc0941f656427520094a6bb10e7b2190be732b5a61300144d\n\
          content-catalog-spec-object=1:1:32:8f3999b066b666396259c4a92f9de7c5b8e67df9d38a69fb4fb824968b56ecdb\n\
          representations=authoritative-direct-v1\n\
          principal-codec=state-owner-v2\n\
@@ -505,7 +505,7 @@ async fn new_store_persists_and_verifies_the_in_band_specification() {
     let id = Blake3ObjectIdentityV1.identify(&record);
     assert_eq!(store.engine.object(id).unwrap(), Some(record.clone()));
     assert!(home.storage_volume_path().is_file());
-    assert!(!home.principal_store_path().exists());
+    assert!(home.principal_store_path().is_dir());
     store.engine.close().unwrap();
     drop(store);
 
@@ -513,6 +513,11 @@ async fn new_store_persists_and_verifies_the_in_band_specification() {
         .await
         .unwrap();
     assert_eq!(reopened.engine.object(id).unwrap(), Some(record));
+    assert!(home.principal_store_path().is_dir());
+    reopened
+        .retire_verified_legacy_directory_store(&home)
+        .unwrap();
+    assert!(!home.principal_store_path().exists());
 }
 
 #[tokio::test]
@@ -556,7 +561,7 @@ async fn volume_without_its_cutover_receipt_fails_closed() {
 }
 
 #[tokio::test]
-async fn changed_surviving_directory_store_is_retained_after_cutover() {
+async fn changed_surviving_directory_store_is_rejected_by_post_barrier_retirement() {
     let directory = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(directory.path());
     super::format_migration_tests::seed_current_directory_store(&home);
@@ -565,9 +570,7 @@ async fn changed_surviving_directory_store_is_retained_after_cutover() {
         .unwrap();
     migrated.engine.close().unwrap();
     drop(migrated);
-    assert!(!home.principal_store_path().exists());
-
-    super::format_migration_tests::seed_current_directory_store(&home);
+    assert!(home.principal_store_path().is_dir());
     let source = Arc::new(
         RuntimeEngine::open(
             home.principal_store_path(),
@@ -589,9 +592,12 @@ async fn changed_surviving_directory_store_is_retained_after_cutover() {
     drop(changed);
     drop(source);
 
-    let Err(error) = open_runtime_principal_store(&home, unlimited_quota()).await else {
-        panic!("changed surviving directory store was retired and served");
-    };
+    let reopened = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let error = reopened
+        .retire_verified_legacy_directory_store(&home)
+        .expect_err("changed surviving source must not be retired");
     assert!(error.to_string().contains("cutover receipt"), "{error}");
     assert!(home.principal_store_path().exists());
 }
@@ -887,7 +893,7 @@ async fn flat_content_catalog_migration_resumes_and_is_idempotent() {
     migrated.engine.close().unwrap();
     drop(migrated);
     assert!(home.storage_volume_path().is_file());
-    assert!(!home.principal_store_path().exists());
+    assert!(home.principal_store_path().is_dir());
 
     let reopened = open_runtime_principal_store(&home, unlimited_quota())
         .await
@@ -1436,6 +1442,52 @@ fn namespace_owner_fails_closed_at_the_host_stamped_boundary() {
     ));
 }
 
+#[test]
+fn control_namespaces_require_admitted_immutable_uids() {
+    let directory = test_directory(&["alice"]);
+    let resolver = StateOwnerResolver::new(directory.clone());
+    let uid = test_uid("alice");
+    let namespace = format!("principal-uid:{uid}:control:env:runner");
+    assert_eq!(
+        resolver.resolve(&namespace).unwrap(),
+        StateOwner::Principal(uid)
+    );
+    assert_eq!(
+        resolver
+            .resolve(&format!("principal-uid:{uid}:control:secret:runner"))
+            .unwrap(),
+        StateOwner::Principal(uid)
+    );
+    assert!(matches!(
+        resolver.resolve("alice:control:env:runner"),
+        Err(StorageError::InvalidKey(message))
+            if message.contains("immutable principal-uid")
+    ));
+    let unknown = PrincipalUid::from_bytes([0xa5; 32]);
+    assert!(matches!(
+        resolver.resolve(&format!("principal-uid:{unknown}:control:env:runner")),
+        Err(StorageError::InvalidKey(message))
+            if message.contains("not an admitted durable identity")
+    ));
+    assert_eq!(
+        resolver.resolve("system:control:audit").unwrap(),
+        StateOwner::System
+    );
+    assert_eq!(
+        resolver.resolve("system:control:invites").unwrap(),
+        StateOwner::System
+    );
+    assert_eq!(
+        resolver.resolve("system:control:pair-tokens").unwrap(),
+        StateOwner::System
+    );
+    assert!(matches!(
+        resolver.resolve("system:control:unknown"),
+        Err(StorageError::InvalidKey(message))
+            if message.contains("env or secret")
+    ));
+}
+
 #[cfg(feature = "legacy-surrealkv")]
 #[tokio::test]
 async fn first_boot_migrates_verifies_and_preserves_legacy_state() {
@@ -1494,7 +1546,7 @@ async fn first_boot_migrates_verifies_and_preserves_legacy_state() {
         Some(b"rust".to_vec())
     );
     assert!(home.storage_volume_path().is_file());
-    assert!(!home.principal_store_path().exists());
+    assert!(home.principal_store_path().is_dir());
     store.close().await.unwrap();
     drop(store);
 
@@ -1677,7 +1729,7 @@ async fn incomplete_destination_is_quarantined_before_reimport() {
             .exists()
     );
     assert!(home.storage_volume_path().is_file());
-    assert!(!home.principal_store_path().exists());
+    assert!(home.principal_store_path().is_dir());
     drop(store);
 }
 

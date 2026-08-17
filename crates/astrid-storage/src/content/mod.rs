@@ -13,6 +13,7 @@ mod store;
 #[cfg(test)]
 mod tests;
 
+use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::time::Duration;
 use std::{fmt, io};
@@ -20,6 +21,8 @@ use std::{fmt, io};
 use crate::engine::PrincipalProjectionError;
 use crate::storage_model::{ObjectId, RootState};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+pub use astrid_core::PrincipalUid;
 
 pub use crate::content_dag::{ChunkingProfile, ContentDescriptor};
 pub use change_detection::{
@@ -34,7 +37,12 @@ pub use projection_names::{
     ProjectionNamePlan, ProjectionNamePolicy, ProjectionNameSyntax, ProjectionReservationOutcome,
     plan_projection_names,
 };
-pub use store::{PrincipalContentReadHandle, PrincipalContentStore};
+pub use store::{
+    PrincipalContentReadHandle, PrincipalContentStore, WorkspaceBindingLifecycle,
+    WorkspaceBranchBinding, WorkspaceBranchDescriptor, WorkspaceBranchError, WorkspaceBranchStore,
+    WorkspaceFilesystem, WorkspaceUid,
+};
+pub(crate) use store::{is_workspace_branch_label, workspace_branch_quota_from_loader};
 
 use crate::content_dag::ContentError;
 
@@ -178,6 +186,27 @@ pub struct ContentEntry {
     logical_bytes: u64,
 }
 
+/// One byte-verified value captured from a single owner-root snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContentReadBatchEntry {
+    descriptor: ContentDescriptor,
+    bytes: Vec<u8>,
+}
+
+impl ContentReadBatchEntry {
+    /// Return the immutable object descriptor captured by the snapshot.
+    #[must_use]
+    pub const fn descriptor(&self) -> ContentDescriptor {
+        self.descriptor
+    }
+
+    /// Borrow the byte-verified value.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
 impl ContentEntry {
     pub(crate) const fn new(name: ContentName, file: ObjectId, logical_bytes: u64) -> Self {
         Self {
@@ -220,6 +249,30 @@ pub struct ContentIngest<R> {
     source: R,
     profile: ChunkingProfile,
     observation: Option<SourceObservation>,
+}
+
+/// Preconditions for a multi-name content publication or deletion.
+///
+/// `Any` preserves the ordinary last-writer-wins API. `Exact` records the
+/// expected object identity for every admitted name (`None` means absent).
+/// The expectation is checked against each fresh owner-root snapshot before
+/// a root CAS, including after every root-conflict retry, so a concurrent
+/// update cannot be overwritten by a stale caller.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ContentBatchExpectation {
+    /// Do not constrain the current names.
+    Any,
+    /// Require each named entry to have the supplied immutable object ID, or
+    /// to be absent when the value is `None`.
+    Exact(BTreeMap<ContentName, Option<ObjectId>>),
+}
+
+impl ContentBatchExpectation {
+    /// Construct an exact name/object expectation.
+    #[must_use]
+    pub fn exact(entries: impl IntoIterator<Item = (ContentName, Option<ObjectId>)>) -> Self {
+        Self::Exact(entries.into_iter().collect())
+    }
 }
 
 /// Operator-selectable CPU parallelism for bulk content construction.
@@ -574,6 +627,8 @@ pub enum PrincipalContentError {
         /// Effective principal limit.
         limit: u64,
     },
+    /// The current catalog no longer satisfies an atomic batch precondition.
+    BatchPreconditionFailed,
     /// Live quota resolution failed.
     QuotaPolicy(StorageError),
 }
@@ -603,6 +658,9 @@ impl fmt::Display for PrincipalContentError {
                     formatter,
                     "principal content quota exceeded: {used} > {limit}"
                 )
+            },
+            Self::BatchPreconditionFailed => {
+                formatter.write_str("principal content batch precondition failed")
             },
             Self::QuotaPolicy(error) => {
                 write!(formatter, "resolve principal content quota: {error}")

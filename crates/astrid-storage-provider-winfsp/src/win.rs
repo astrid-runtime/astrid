@@ -5,16 +5,27 @@ use std::os::windows::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, bail};
 use astrid_core::local_transport;
-use astrid_core::storage_filesystem::StorageMountLeaseV1;
+use astrid_core::platform_fs;
+use astrid_core::storage_filesystem::{
+    STORAGE_FILESYSTEM_PROTOCOL_V2, STORAGE_FILESYSTEM_SERVICE_LAUNCH_SCHEMA_V1,
+    STORAGE_FILESYSTEM_SERVICE_READY_SCHEMA_V1, StorageFilesystemFailureV1,
+    StorageFilesystemOperationV2, StorageFilesystemOutcomeV2, StorageFilesystemRequestV2,
+    StorageFilesystemResponseV2, StorageMountLeaseV1, StorageProviderServiceLaunchV1,
+    StorageProviderServiceReadyV1, storage_provider_service_ready_challenge,
+};
 use astrid_core::storage_provider::StorageProviderAccessV1;
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
 use widestring::U16CString;
+use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::System::LibraryLoader::LoadLibraryW;
-use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS};
+use windows_sys::Win32::System::Threading::{
+    CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS, GetExitCodeProcess, OpenProcess,
+    PROCESS_QUERY_LIMITED_INFORMATION,
+};
 use winfsp_wrs::{FileSystem, OperationGuardStrategy, Params, VolumeParams};
 
 use crate::callback::endpoint_is_present;
@@ -117,6 +128,374 @@ fn wait_for_mountpoint_ready(mountpoint: &Path) -> Result<()> {
         }
         std::thread::sleep(Duration::from_millis(25));
     }
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "kebab-case", tag = "operation", deny_unknown_fields)]
+enum ServiceControlRequest {
+    /// Probe service state with the broker bearer.
+    Status { token: String },
+    /// Stop and unmount the private service.
+    Stop { token: String },
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "kebab-case", tag = "status", deny_unknown_fields)]
+enum ServiceControlResponse {
+    /// Service remains mounted.
+    Ready,
+    /// Service accepted a stop request.
+    Stopped,
+    /// Request was rejected.
+    Failure { code: String, message: String },
+}
+
+const SERVICE_MAX_LAUNCH_BYTES: u64 = 64 * 1024;
+const SERVICE_MAX_CONTROL_BYTES: usize = 64 * 1024;
+const SERVICE_MAX_CALLBACK_BYTES: usize = 8 * 1024 * 1024;
+const SERVICE_POLL: Duration = Duration::from_secs(1);
+
+/// Run the hidden kernel-created `WinFsp` service mode.
+pub(crate) fn service_main() -> Result<()> {
+    let mut bytes = Vec::new();
+    std::io::stdin()
+        .lock()
+        .take(SERVICE_MAX_LAUNCH_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .context("read WinFsp service launch")?;
+    if bytes.len() as u64 > SERVICE_MAX_LAUNCH_BYTES {
+        bail!("WinFsp service launch exceeds limit");
+    }
+    let launch: StorageProviderServiceLaunchV1 =
+        serde_json::from_slice(&bytes).context("decode WinFsp service launch")?;
+    validate_service_launch(&launch)?;
+    let challenge = storage_provider_service_ready_challenge(
+        &launch.parent.token,
+        STORAGE_FILESYSTEM_SERVICE_READY_SCHEMA_V1,
+        crate::PROVIDER_NAME,
+        launch.lease.mount_id.as_uuid(),
+        &launch.control_path,
+        &launch.lease.resource_path,
+        &launch.lease.callback_path,
+    )
+    .map_err(anyhow::Error::msg)?;
+    let runtime = Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .context("start WinFsp service runtime")?,
+    );
+    runtime.block_on(run_private_service(launch, challenge, runtime.clone()))
+}
+
+async fn run_private_service(
+    launch: StorageProviderServiceLaunchV1,
+    challenge: String,
+    runtime: Arc<tokio::runtime::Runtime>,
+) -> Result<()> {
+    if !parent_is_alive(&launch.parent) {
+        bail!("WinFsp service parent process is not alive");
+    }
+    probe_callback(&launch).await?;
+    let listener = local_transport::bind(&launch.control_path).with_context(|| {
+        format!(
+            "bind WinFsp service control {}",
+            launch.control_path.display()
+        )
+    })?;
+    let callback = CallbackFs::new(launch.lease.clone(), runtime)
+        .map_err(|failure| anyhow::anyhow!("build WinFsp callback filesystem: {failure:?}"))?;
+    initialize_winfsp()?;
+    let mountpoint = U16CString::from_os_str(launch.mountpoint.as_os_str())
+        .map_err(|_| anyhow::anyhow!("WinFsp mountpoint is not valid UTF-16"))?;
+    let filesystem = FileSystem::start(
+        volume_params(launch.lease.access),
+        Some(&mountpoint),
+        callback,
+    )
+    .map_err(|status| anyhow::anyhow!("WinFsp failed to start private mount: {status:#x}"))?;
+    let ready = StorageProviderServiceReadyV1 {
+        schema: STORAGE_FILESYSTEM_SERVICE_READY_SCHEMA_V1,
+        provider: crate::PROVIDER_NAME.to_owned(),
+        mount_id: launch.lease.mount_id.as_uuid(),
+        control_path: launch.control_path.clone(),
+        challenge,
+    };
+    let mut stdout = std::io::stdout().lock();
+    serde_json::to_writer(&mut stdout, &ready).context("encode WinFsp readiness")?;
+    stdout
+        .write_all(b"\n")
+        .context("terminate WinFsp readiness response")?;
+    stdout.flush().context("flush WinFsp readiness")?;
+
+    let result = private_service_loop(filesystem, listener, &launch).await;
+    let _ = local_transport::remove_endpoint(&launch.control_path);
+    result
+}
+
+fn validate_service_launch(launch: &StorageProviderServiceLaunchV1) -> Result<()> {
+    if launch.schema != STORAGE_FILESYSTEM_SERVICE_LAUNCH_SCHEMA_V1 {
+        bail!("unsupported WinFsp service launch schema {}", launch.schema);
+    }
+    if launch.parent.pid <= 1 || launch.parent.pid == std::process::id() {
+        bail!("WinFsp service parent PID is invalid");
+    }
+    if launch.parent.token.len() < 16
+        || launch.parent.token.len() > 512
+        || launch.parent.token.chars().any(char::is_control)
+    {
+        bail!("WinFsp service parent token is invalid");
+    }
+    if let Some(identity) = launch.parent.start_identity.as_deref()
+        && (identity.is_empty() || identity.len() > 512 || identity.chars().any(char::is_control))
+    {
+        bail!("WinFsp service parent start identity is invalid");
+    }
+    if launch.parent.start_identity.is_none() {
+        bail!("WinFsp service parent start identity is required on Windows");
+    }
+    let lease = &launch.lease;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("read system clock")?
+        .as_secs();
+    if lease.expires_at_epoch_secs < now {
+        bail!("WinFsp lease is expired");
+    }
+    if lease.lease_token.len() < 16 || lease.lease_token.len() > 4096 {
+        bail!("WinFsp lease callback token is invalid");
+    }
+    if !lease.resource_path.is_absolute()
+        || !lease.callback_path.is_absolute()
+        || lease.callback_path != lease.resource_path.join("control.endpoint")
+    {
+        bail!("WinFsp lease paths are malformed");
+    }
+    platform_fs::validate_private_directory(&lease.resource_path)
+        .context("validate private WinFsp lease resource")?;
+    platform_fs::verify_no_redirects(&lease.resource_path)
+        .context("reject redirected WinFsp lease resource")?;
+    let manifest_path = lease.resource_path.join("lease.json");
+    platform_fs::validate_private_file(&manifest_path)
+        .context("validate private WinFsp lease manifest")?;
+    let manifest = std::fs::read(&manifest_path).context("read WinFsp lease manifest")?;
+    if manifest.len() > 64 * 1024 {
+        bail!("WinFsp lease manifest exceeds the bounded size");
+    }
+    let admitted: StorageMountLeaseV1 =
+        serde_json::from_slice(&manifest).context("decode WinFsp lease manifest")?;
+    if admitted != *lease {
+        bail!("WinFsp launch lease does not match the kernel manifest");
+    }
+    if !launch.mountpoint.is_absolute()
+        || launch
+            .mountpoint
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        bail!("WinFsp service mountpoint is malformed");
+    }
+    if is_public_mountpoint(&launch.mountpoint)
+        || launch.mountpoint.parent().is_none()
+        || launch.mountpoint == lease.resource_path
+        || launch.mountpoint.starts_with(&lease.resource_path)
+        || lease.resource_path.starts_with(&launch.mountpoint)
+    {
+        bail!("WinFsp service mountpoint is public or overlaps the lease resource");
+    }
+    platform_fs::validate_private_directory(&launch.mountpoint)
+        .context("validate private WinFsp mountpoint")?;
+    platform_fs::verify_no_redirects(&launch.mountpoint)
+        .context("reject redirected WinFsp mountpoint")?;
+    if std::fs::read_dir(&launch.mountpoint)?.next().is_some() {
+        bail!("WinFsp service mountpoint is not empty");
+    }
+    if !launch.control_path.is_absolute()
+        || launch
+            .control_path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        || launch.control_path != lease.resource_path.join("process-control.sock")
+    {
+        bail!("WinFsp service control path is malformed");
+    }
+    let control_parent = launch
+        .control_path
+        .parent()
+        .context("WinFsp service control path has no parent")?;
+    platform_fs::validate_private_directory(control_parent)
+        .context("validate private WinFsp control parent")?;
+    platform_fs::verify_no_redirects(&launch.control_path)
+        .context("reject redirected WinFsp control path")?;
+    if local_transport::endpoint_is_present(&launch.control_path)
+        .context("inspect WinFsp service control endpoint")?
+    {
+        bail!("WinFsp service control endpoint is already present");
+    }
+    Ok(())
+}
+
+async fn probe_callback(launch: &StorageProviderServiceLaunchV1) -> Result<()> {
+    let mut stream = local_transport::connect(&launch.lease.callback_path)
+        .await
+        .context("connect WinFsp lease callback")?;
+    let request = StorageFilesystemRequestV2 {
+        protocol_version: STORAGE_FILESYSTEM_PROTOCOL_V2,
+        request_id: format!("winfsp-service-{}", launch.lease.mount_id),
+        lease_token: launch.lease.lease_token.clone(),
+        operation: StorageFilesystemOperationV2::Stat {
+            path: String::new(),
+        },
+    };
+    let bytes = serde_json::to_vec(&request).context("encode WinFsp callback probe")?;
+    let length = u32::try_from(bytes.len()).context("WinFsp callback probe is too large")?;
+    stream.write_all(&length.to_be_bytes()).await?;
+    stream.write_all(&bytes).await?;
+    stream.flush().await?;
+    let mut response_length = [0_u8; 4];
+    stream.read_exact(&mut response_length).await?;
+    let length = u32::from_be_bytes(response_length) as usize;
+    if length == 0 || length > SERVICE_MAX_CALLBACK_BYTES {
+        bail!("WinFsp callback response exceeds limit");
+    }
+    let mut response_bytes = vec![0_u8; length];
+    stream.read_exact(&mut response_bytes).await?;
+    let response: StorageFilesystemResponseV2 =
+        serde_json::from_slice(&response_bytes).context("decode WinFsp callback probe")?;
+    if response.protocol_version != STORAGE_FILESYSTEM_PROTOCOL_V2 {
+        bail!("WinFsp callback probe protocol mismatch");
+    }
+    if response.request_id != request.request_id {
+        bail!("WinFsp callback probe correlation mismatch");
+    }
+    match response.outcome {
+        StorageFilesystemOutcomeV2::Success(_) => Ok(()),
+        StorageFilesystemOutcomeV2::Failure(StorageFilesystemFailureV1 { code, message }) => {
+            bail!("WinFsp callback probe failed [{code}]: {message}")
+        },
+    }
+}
+
+async fn private_service_loop(
+    filesystem: FileSystem,
+    listener: local_transport::LocalListener,
+    launch: &StorageProviderServiceLaunchV1,
+) -> Result<()> {
+    let mut filesystem = Some(filesystem);
+    let mut poll = tokio::time::interval(SERVICE_POLL);
+    loop {
+        tokio::select! {
+            accepted = local_transport::accept(&listener) => {
+                let mut stream = accepted.context("accept WinFsp service control")?;
+                let request = read_service_control(&mut stream).await?;
+                let (response, stop) = match request {
+                    ServiceControlRequest::Status { token } if token == launch.parent.token => {
+                        (ServiceControlResponse::Ready, false)
+                    },
+                    ServiceControlRequest::Stop { token } if token == launch.parent.token => {
+                        (ServiceControlResponse::Stopped, true)
+                    },
+                    ServiceControlRequest::Status { .. } | ServiceControlRequest::Stop { .. } => (
+                        ServiceControlResponse::Failure {
+                            code: "unauthorized".to_owned(),
+                            message: "invalid parent service token".to_owned(),
+                        },
+                        false,
+                    ),
+                };
+                if stop {
+                    if let Some(filesystem) = filesystem.take() { filesystem.stop(); }
+                    let _ = local_transport::remove_endpoint(&launch.control_path);
+                }
+                write_service_control(&mut stream, &response).await?;
+                if stop { return Ok(()); }
+            },
+            _ = poll.tick() => {
+                if !parent_is_alive(&launch.parent) || probe_callback(launch).await.is_err() {
+                    if let Some(filesystem) = filesystem.take() { filesystem.stop(); }
+                    return Ok(());
+                }
+            },
+        }
+    }
+}
+
+async fn read_service_control(
+    stream: &mut local_transport::LocalStream,
+) -> Result<ServiceControlRequest> {
+    let mut line = String::new();
+    let reader = tokio::io::BufReader::new(stream);
+    let read = reader
+        .take((SERVICE_MAX_CONTROL_BYTES + 1) as u64)
+        .read_line(&mut line)
+        .await
+        .context("read WinFsp service control request")?;
+    if read == 0 || line.len() > SERVICE_MAX_CONTROL_BYTES {
+        bail!("WinFsp service control request exceeds limit");
+    }
+    serde_json::from_str(&line).context("decode WinFsp service control request")
+}
+
+async fn write_service_control(
+    stream: &mut local_transport::LocalStream,
+    response: &ServiceControlResponse,
+) -> Result<()> {
+    let bytes = serde_json::to_vec(response)?;
+    stream.write_all(&bytes).await?;
+    stream.write_all(b"\n").await?;
+    stream.flush().await.context("flush WinFsp service control")
+}
+
+fn parent_is_alive(
+    parent: &astrid_core::storage_filesystem::StorageProviderParentLifetimeV1,
+) -> bool {
+    // SAFETY: OpenProcess/GetExitCodeProcess/CloseHandle are called with a
+    // validated PID and the returned handle is closed on every path.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, parent.pid) };
+    if handle.is_null() {
+        return false;
+    }
+    let mut exit_code = 0_u32;
+    let alive = unsafe { GetExitCodeProcess(handle, &raw mut exit_code) != 0 } && exit_code == 259;
+    unsafe { CloseHandle(handle) };
+    if !alive {
+        return false;
+    }
+    parent
+        .start_identity
+        .as_deref()
+        .is_none_or(|identity| process_start_identity(parent.pid).as_deref() == Some(identity))
+}
+
+fn process_start_identity(pid: u32) -> Option<String> {
+    use std::mem::MaybeUninit;
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::GetProcessTimes;
+
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return None;
+    }
+    let mut creation = MaybeUninit::<FILETIME>::uninit();
+    let mut exit = MaybeUninit::<FILETIME>::uninit();
+    let mut kernel = MaybeUninit::<FILETIME>::uninit();
+    let mut user = MaybeUninit::<FILETIME>::uninit();
+    let ok = unsafe {
+        GetProcessTimes(
+            handle,
+            creation.as_mut_ptr(),
+            exit.as_mut_ptr(),
+            kernel.as_mut_ptr(),
+            user.as_mut_ptr(),
+        ) != 0
+    };
+    unsafe { CloseHandle(handle) };
+    if !ok {
+        return None;
+    }
+    let creation = unsafe { creation.assume_init() };
+    let value = (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
+    Some(value.to_string())
 }
 
 async fn daemon_loop(
@@ -241,6 +620,19 @@ fn is_drive_designator(path: &Path) -> bool {
     path.to_str().is_some_and(|text| {
         let bytes = text.as_bytes();
         bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+    })
+}
+
+fn is_public_mountpoint(path: &Path) -> bool {
+    if is_drive_designator(path) {
+        return true;
+    }
+    path.to_str().is_some_and(|text| {
+        let bytes = text.as_bytes();
+        bytes.len() == 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'\\' | b'/')
     })
 }
 

@@ -17,7 +17,7 @@ use astrid_core::profile::{AuthConfig, AuthMethod, DeviceKey, DeviceScope, Princ
 use astrid_crypto::{IdentifierHash, PublicKeyFingerprint};
 use tracing::{info, warn};
 
-use crate::invite::{self, Invite, InviteStore, MAX_EXPIRY_SECS};
+use crate::invite::{self, DurableInviteStore, Invite, MAX_EXPIRY_SECS};
 
 /// Domain-separated BLAKE3 fingerprint of an Ed25519 public key. Surfaced as
 /// the `public_key_fingerprint` field on
@@ -63,31 +63,39 @@ pub(crate) async fn invite_issue(
     }
 
     let _guard = kernel.admin_write_lock.lock().await;
-    let store = InviteStore::new(InviteStore::path_for(&kernel.astrid_home));
-    let mut invites = match store.load() {
-        Ok(v) => v,
-        Err(e) => return err_internal(format!("invites.toml load failed: {e}")),
+    let store = match invite_store(kernel) {
+        Ok(store) => store,
+        Err(response) => return response,
     };
-    // Lazy prune on every mutating op — cheap, bounded by store size,
-    // keeps `invite.list` clean without a background sweeper.
-    let _ = invite::prune_expired(&mut invites);
+    if store
+        .ensure_legacy_import(&kernel.astrid_home)
+        .await
+        .is_err()
+    {
+        return err_internal("invite durable storage is unavailable".into());
+    }
+    if store.prune().await.is_err() {
+        return err_internal("invite durable storage could not be pruned".into());
+    }
 
     let now = invite::now_epoch();
     let expires_at_epoch = expires_secs.map(|s| now.saturating_add(s));
     let token = invite::generate_token();
     let token_hash = invite::hash_token(&token);
 
-    invites.push(Invite {
+    let record = Invite {
         token_hash: token_hash.clone(),
         group: group.clone(),
         remaining_uses: max_uses,
         expires_at_epoch,
         issued_at_epoch: now,
         metadata: metadata.clone(),
-    });
+    };
 
-    if let Err(e) = store.save(&invites) {
-        return err_internal(format!("invites.toml save failed: {e}"));
+    match store.issue(&record).await {
+        Ok(true) => {},
+        Ok(false) => return err_internal("invite identifier collision".into()),
+        Err(_) => return err_internal("invite durable storage write failed".into()),
     }
 
     info!(
@@ -124,18 +132,24 @@ pub(crate) async fn invite_redeem(
     };
 
     let _guard = kernel.admin_write_lock.lock().await;
-    let store = InviteStore::new(InviteStore::path_for(&kernel.astrid_home));
-    let mut invites = match store.load() {
-        Ok(v) => v,
-        Err(e) => return err_internal(format!("invites.toml load failed: {e}")),
+    let store = match invite_store(kernel) {
+        Ok(store) => store,
+        Err(response) => return response,
     };
-    let _ = invite::prune_expired(&mut invites);
-
-    let Some(idx) = find_live_invite_index(&invites, &token) else {
+    if store
+        .ensure_legacy_import(&kernel.astrid_home)
+        .await
+        .is_err()
+    {
+        return err_internal("invite durable storage is unavailable".into());
+    }
+    let token_hash = invite::hash_token(&token);
+    let Some(chosen) = (match store.redeem(&token_hash).await {
+        Ok(value) => value,
+        Err(_) => return err_internal("invite durable storage read failed".into()),
+    }) else {
         return err_unauthorized("invite token invalid, expired, or already consumed".into());
     };
-
-    let chosen = invites[idx].clone();
 
     // Mint the principal id. `display_name` is treated as a soft
     // suggestion: slugify and dedupe; on hard collision fall back to a
@@ -187,25 +201,6 @@ pub(crate) async fn invite_redeem(
         return err_internal(error);
     }
 
-    // Decrement / remove the invite. Saturating sub guards against
-    // an externally-edited `remaining_uses = 0` slipping past the
-    // live-check above.
-    invites[idx].remaining_uses = invites[idx].remaining_uses.saturating_sub(1);
-    if invites[idx].remaining_uses == 0 {
-        invites.remove(idx);
-    }
-    if let Err(e) = store.save(&invites) {
-        // We could roll back the principal but that would leave the
-        // redeemer in a worse position than "your token is consumed
-        // and your principal exists" — log loudly instead.
-        warn!(
-            error = %e,
-            security_event = true,
-            principal = %principal,
-            "invite.redeem: invites.toml save failed AFTER principal mint; manual reconciliation may be required"
-        );
-    }
-
     let fingerprint = fingerprint_public_key(&format!("ed25519:{normalised_key}"));
     info!(
         %principal,
@@ -253,56 +248,31 @@ async fn provision_invited_principal(
         let _ = kernel.identity_store.delete_user(user.id).await;
         return Err(format!("profile save failed: {error}"));
     }
-    if let Err(error) = kernel.astrid_home.principal_home(principal).ensure() {
-        let _ = kernel
-            .identity_store
-            .unlink("cli", principal.as_str())
-            .await;
-        let _ = kernel.identity_store.delete_user(user.id).await;
-        let _ = std::fs::remove_file(&profile_path);
-        return Err(format!("principal home tree provisioning failed: {error}"));
-    }
+    // Principal state is UID-bound in the runtime store and is provisioned
+    // lazily on first durable write. The released native home tree is only a
+    // migration source and must not be recreated by invite redemption.
     Ok(())
-}
-
-/// Find the index of the first live invite whose token hashes to `token`.
-///
-/// Constant-time scan over all invites: we avoid `Iterator::find`'s
-/// short-circuit because timing on its early return would leak
-/// partial-match length information. The hash compare runs for every entry
-/// (including malformed / expired / consumed ones) so all entries take the
-/// same time, and only the first live hit is recorded. Returns `None` when
-/// no live invite matches.
-fn find_live_invite_index(invites: &[Invite], token: &str) -> Option<usize> {
-    let token_hash = invite::hash_token(token);
-    let now = invite::now_epoch();
-
-    let mut matched_index: Option<usize> = None;
-    for (i, inv) in invites.iter().enumerate() {
-        let live = inv.remaining_uses > 0 && inv.expires_at_epoch.is_none_or(|e| e > now);
-        let hit = invite::ct_hash_eq(&inv.token_hash, &token_hash) && live;
-        if hit && matched_index.is_none() {
-            matched_index = Some(i);
-        }
-    }
-    matched_index
 }
 
 // ── invite.list ───────────────────────────────────────────────────────
 
 pub(crate) async fn invite_list(kernel: &Arc<crate::Kernel>) -> AdminResponseBody {
     let _guard = kernel.admin_write_lock.lock().await;
-    let store = InviteStore::new(InviteStore::path_for(&kernel.astrid_home));
-    let mut invites = match store.load() {
-        Ok(v) => v,
-        Err(e) => return err_internal(format!("invites.toml load failed: {e}")),
+    let store = match invite_store(kernel) {
+        Ok(store) => store,
+        Err(response) => return response,
     };
-    if invite::prune_expired(&mut invites) > 0 {
-        // Best-effort: a failed save just means the next prune retries.
-        if let Err(e) = store.save(&invites) {
-            warn!(error = %e, "invite.list: lazy prune save failed");
-        }
+    if store
+        .ensure_legacy_import(&kernel.astrid_home)
+        .await
+        .is_err()
+        || store.prune().await.is_err()
+    {
+        return err_internal("invite durable storage is unavailable".into());
     }
+    let Ok(invites) = store.list().await else {
+        return err_internal("invite durable storage read failed".into());
+    };
     let summaries: Vec<InviteSummary> = invites
         .into_iter()
         .map(|i| InviteSummary {
@@ -321,11 +291,17 @@ pub(crate) async fn invite_list(kernel: &Arc<crate::Kernel>) -> AdminResponseBod
 
 pub(crate) async fn invite_revoke(kernel: &Arc<crate::Kernel>, token: String) -> AdminResponseBody {
     let _guard = kernel.admin_write_lock.lock().await;
-    let store = InviteStore::new(InviteStore::path_for(&kernel.astrid_home));
-    let mut invites = match store.load() {
-        Ok(v) => v,
-        Err(e) => return err_internal(format!("invites.toml load failed: {e}")),
+    let store = match invite_store(kernel) {
+        Ok(store) => store,
+        Err(response) => return response,
     };
+    if store
+        .ensure_legacy_import(&kernel.astrid_home)
+        .await
+        .is_err()
+    {
+        return err_internal("invite durable storage is unavailable".into());
+    }
     // `token` here may be either the raw token (operator paste) or the
     // `blake3:<hex>` fingerprint (operator copy from `invite.list`). Hash the
     // input as raw token first; if no match, also try the input verbatim
@@ -334,23 +310,23 @@ pub(crate) async fn invite_revoke(kernel: &Arc<crate::Kernel>, token: String) ->
     // success/failure shape.
     let from_raw = invite::hash_token(&token);
     let from_fingerprint = invite::canonical_token_fingerprint(&token);
-    let pre_len = invites.len();
-    invites.retain(|i| {
-        let raw_match = invite::ct_hash_eq(&i.token_hash, &from_raw);
-        let fingerprint_match = from_fingerprint
-            .as_deref()
-            .is_some_and(|fingerprint| invite::ct_hash_eq(&i.token_hash, fingerprint));
-        !(raw_match | fingerprint_match)
-    });
-    if invites.len() == pre_len {
+    let fingerprint = from_fingerprint.as_deref().unwrap_or(&from_raw);
+    let Ok(removed) = store.revoke(fingerprint).await else {
+        return err_internal("invite durable storage write failed".into());
+    };
+    if !removed {
         return err_bad_input("no invite matches the supplied token or fingerprint".into());
     }
-    if let Err(e) = store.save(&invites) {
-        return err_internal(format!("invites.toml save failed: {e}"));
-    }
-    let removed = pre_len.saturating_sub(invites.len());
-    info!(removed, "Layer 6 invite.revoke");
+    info!(removed = 1, "Layer 6 invite.revoke");
     AdminResponseBody::Success(serde_json::json!({ "removed": removed }))
+}
+
+fn invite_store(kernel: &Arc<crate::Kernel>) -> Result<DurableInviteStore, AdminResponseBody> {
+    let Some(store) = kernel.principal_store.as_ref() else {
+        return Err(err_internal("invite durable storage is unavailable".into()));
+    };
+    DurableInviteStore::new(store.kv())
+        .map_err(|_| err_internal("invite durable storage is unavailable".into()))
 }
 
 // ── helpers ───────────────────────────────────────────────────────────
@@ -572,18 +548,30 @@ mod tests {
         let token = issue_token(&kernel).await;
         assert!(token.starts_with(invite::TOKEN_PREFIX));
 
-        let store = InviteStore::new(InviteStore::path_for(&kernel.astrid_home));
-        let persisted = store.load().expect("reload issued invite");
+        let store = invite_store(&kernel).expect("open invite storage");
+        let persisted = store.list().await.expect("reload issued invite");
         assert_eq!(persisted.len(), 1);
         assert_eq!(persisted[0].token_hash, invite::hash_token(&token));
-        let body = std::fs::read_to_string(InviteStore::path_for(&kernel.astrid_home))
-            .expect("read invite store");
-        assert!(body.contains("schema_version = 1"));
+        assert!(!invite::InviteStore::path_for(&kernel.astrid_home).exists());
 
         let response =
             invite_redeem(&kernel, token, "ab".repeat(32), Some("BLAKE3 Test".into())).await;
         assert!(matches!(response, AdminResponseBody::InviteRedeemed(_)));
-        assert!(store.load().expect("reload consumed store").is_empty());
+        assert!(
+            !kernel
+                .astrid_home
+                .principal_home(&PrincipalId::new("agent").unwrap())
+                .root()
+                .exists(),
+            "invite redemption must not recreate the released native home tree"
+        );
+        assert!(
+            store
+                .list()
+                .await
+                .expect("reload consumed store")
+                .is_empty()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -603,7 +591,7 @@ mod tests {
             AdminResponseBody::Success(_)
         ));
 
-        let store = InviteStore::new(InviteStore::path_for(&kernel.astrid_home));
-        assert!(store.load().expect("reload revoked store").is_empty());
+        let store = invite_store(&kernel).expect("open invite storage");
+        assert!(store.list().await.expect("reload revoked store").is_empty());
     }
 }

@@ -408,12 +408,10 @@ pub struct EnvDef {
     ///
     /// `"secret"` is the load-bearing case: the operator-facing surface
     /// elicits with a masked prompt at install time and stores the value
-    /// through [`astrid_storage::FileSecretStore`]
-    /// (`~/.astrid/secrets/<scope>/<capsule>/<key>`, 0600) instead of
-    /// the plaintext
-    /// `<principal_home>/.config/env/<capsule>.env.json` path that
-    /// non-secret keys use. `"text"`, `"select"`, and `"array"` all land
-    /// in the env JSON; `"select"` elicits with `enum_values` choices,
+    /// through the host-only typed SecretStore control namespace instead of
+    /// any native file path. `"text"`, `"select"`, and `"array"` use the
+    /// host-only typed environment namespace; `"select"` elicits with
+    /// `enum_values` choices,
     /// `"array"` accepts a comma-separated list.
     #[serde(rename = "type")]
     pub env_type: String,

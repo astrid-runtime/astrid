@@ -70,6 +70,7 @@ fn fresh_state_with_distro(distro: Option<&str>) -> Arc<GatewayState> {
     };
     Arc::new(GatewayState {
         config: GatewayConfig::default(),
+        storage_kv: None,
         signing: SigningMaterial::fresh(),
         distribution: Arc::new(distribution),
         onboarding: Arc::new(onboarding),
@@ -94,6 +95,7 @@ fn fresh_state_with_audit_log() -> (Arc<GatewayState>, Arc<AuditLog>, SessionId)
     let audit_log = Arc::new(AuditLog::in_memory(KeyPair::generate()));
     let state = Arc::new(GatewayState {
         config: GatewayConfig::default(),
+        storage_kv: None,
         signing: SigningMaterial::fresh(),
         distribution: Arc::new(DistributionInfo::single_tenant()),
         onboarding: Arc::new(OnboardingFields::default()),

@@ -749,6 +749,40 @@ fn live_files_mut(files: &mut Option<DurableFiles>) -> Result<&mut DurableFiles,
 }
 
 impl<P: Ord, I, C> DurableEngine<P, I, C> {
+    /// Return backend-reported free capacity and the active arena length.
+    ///
+    /// The result is media-native: volume-backed engines ask the
+    /// [`AstridVolume`] implementation, while legacy hosted-directory engines
+    /// inspect their private arena directory. A `None` result means the media
+    /// provider cannot report capacity and destructive compaction must fail
+    /// closed rather than infer it from an unrelated host path.
+    ///
+    /// # Errors
+    ///
+    /// Returns a durable I/O or invalid-media error when capacity cannot be
+    /// read from the selected backend.
+    pub fn compaction_capacity(&self) -> Result<Option<(u64, u64)>, DurableError> {
+        if let Some(volume) = self.volume.read().as_ref().cloned() {
+            let region = VolumeRegion::new(ARENA_FILE)
+                .map_err(|source| io_error("validate compaction arena region", source))?;
+            let arena_bytes = volume
+                .region_len(&region)
+                .map_err(|source| io_error("read compaction arena length", source))?;
+            return volume
+                .available_space()
+                .map(|available| available.map(|available| (available, arena_bytes)))
+                .map_err(|source| io_error("read volume compaction capacity", source));
+        }
+        let directory = self.hosted_path()?;
+        let arena = directory.join(ARENA_FILE);
+        let arena_bytes = std::fs::metadata(&arena)
+            .map_err(|source| io_error("read hosted compaction arena length", source))?
+            .len();
+        fs2::available_space(directory)
+            .map(|available| Some((available, arena_bytes)))
+            .map_err(|source| io_error("read hosted compaction capacity", source))
+    }
+
     fn hosted_directory(&self) -> Result<&cap_std::fs::Dir, DurableError> {
         self.directory_capability
             .as_deref()
@@ -793,7 +827,8 @@ pub use cache::{
 use compaction::recover_interrupted_compaction;
 pub use compaction::{
     CompactionEvidenceBundle, CompactionFacts, CompactionProofVerifier, CompactionReport,
-    CompactionRetainedRoot, CompactionRetention, CompactionRootKind, VerifiedCompactionPlan,
+    CompactionRetainedRoot, CompactionRetention, CompactionRootKind,
+    DeterministicCompactionProofVerifier, VerifiedCompactionPlan, deterministic_compaction_proof,
 };
 pub use faults::{FaultInjector, FaultPoint, NoFaults};
 use format::{

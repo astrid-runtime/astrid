@@ -2,7 +2,7 @@
 //!
 //! No daemon round-trip — logs are written to the filesystem under
 //! `~/.astrid/log/` (kernel-level) and
-//! `<principal_home>/.local/log/<capsule>/` (per-capsule). This command
+//! `~/.astrid/log/principals/<principal>/<capsule>/` (per-capsule). This command
 //! locates the most-recent log file by date and either prints it or
 //! follows it (`--follow`).
 
@@ -14,6 +14,8 @@ use std::process::ExitCode;
 use anyhow::{Context, Result};
 use astrid_core::PrincipalId;
 use astrid_core::dirs::AstridHome;
+use astrid_core::identity::PrincipalUid;
+use astrid_core::kernel_api::{AdminRequestKind, AdminResponseBody};
 use clap::Args;
 
 use crate::context;
@@ -54,14 +56,30 @@ fn most_recent_log(dir: &Path) -> Result<Option<PathBuf>> {
     Ok(newest.map(|(_, p)| p))
 }
 
-fn resolve_log_dir(principal: &PrincipalId, capsule: Option<&str>) -> Result<PathBuf> {
+async fn resolve_principal_uid(principal: &PrincipalId) -> Result<PrincipalUid> {
+    let mut client = crate::admin_client::connect_as_active_agent().await?;
+    let body = client.request(AdminRequestKind::AgentList).await?;
+    let body = crate::admin_client::into_result(body)?;
+    let AdminResponseBody::AgentList(entries) = body else {
+        anyhow::bail!("unexpected response while resolving principal UID: {body:?}");
+    };
+    entries
+        .into_iter()
+        .find(|entry| entry.principal == *principal)
+        .and_then(|entry| entry.owner_uid)
+        .ok_or_else(|| anyhow::anyhow!("principal '{principal}' has no admitted durable UID"))
+}
+
+async fn resolve_log_dir(principal: &PrincipalId, capsule: Option<&str>) -> Result<PathBuf> {
     let home = AstridHome::resolve().context("Failed to resolve Astrid home directory")?;
     Ok(match capsule {
+        // Capsule runtime logs are operational state, not home content. The
+        // daemon's immutable-UID projection owns the canonical path; resolve
+        // the UID through the authenticated admin roster before reading it.
         Some(name) => home
-            .principal_home(principal)
-            .root()
-            .join(".local")
-            .join("log")
+            .log_dir()
+            .join("principals")
+            .join(resolve_principal_uid(principal).await?.to_string())
             .join(name),
         None => home.log_dir(),
     })
@@ -122,9 +140,9 @@ fn follow_tail(path: &Path, n: usize) -> Result<()> {
 }
 
 /// Entry point for `astrid logs`.
-pub(crate) fn run(args: &LogsArgs) -> Result<ExitCode> {
+pub(crate) async fn run(args: &LogsArgs) -> Result<ExitCode> {
     let principal = context::resolve_agent(args.agent.as_deref())?;
-    let dir = resolve_log_dir(&principal, args.capsule.as_deref())?;
+    let dir = resolve_log_dir(&principal, args.capsule.as_deref()).await?;
     let Some(path) = most_recent_log(&dir)? else {
         eprintln!(
             "{}",

@@ -1,5 +1,11 @@
 use super::*;
-
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "quota resolver trait requires a fallible callback"
+)]
+fn no_quota(_: &astrid_storage::StateOwner) -> astrid_storage::StorageResult<Option<u64>> {
+    Ok(None)
+}
 /// Append `count` test entries to the log, returning their IDs.
 async fn append_test_entries(
     log: &AuditLog,
@@ -27,7 +33,6 @@ async fn append_test_entries(
     }
     ids
 }
-
 /// Regression: `AuditLog::close` releases the persistent surrealkv `LOCK` so
 /// the same directory can be re-opened afterwards.
 ///
@@ -45,10 +50,11 @@ async fn close_releases_lock_so_same_dir_reopens() {
 
     // Sanity: while a handle is open and NOT closed, a second open of the same
     // path is rejected — this is the lock the fix must release.
-    let log = AuditLog::open(&path, Arc::clone(&keypair)).expect("first open succeeds");
+    let log =
+        AuditLog::open_legacy_source(&path, Arc::clone(&keypair)).expect("first open succeeds");
     append_test_entries(&log, &SessionId::new(), 2).await;
     assert!(
-        AuditLog::open(&path, Arc::clone(&keypair)).is_err(),
+        AuditLog::open_legacy_source(&path, Arc::clone(&keypair)).is_err(),
         "a still-open persistent audit log must hold the surrealkv LOCK"
     );
 
@@ -56,12 +62,11 @@ async fn close_releases_lock_so_same_dir_reopens() {
     log.close()
         .await
         .expect("close releases the surrealkv LOCK");
-    let reopened =
-        AuditLog::open(&path, keypair).expect("re-open after close must succeed (lock released)");
+    let reopened = AuditLog::open_legacy_source(&path, keypair)
+        .expect("re-open after close must succeed (lock released)");
     // The re-opened handle is usable (chain head resolves from storage).
     assert_eq!(reopened.count().await.unwrap(), 2);
 }
-
 #[tokio::test]
 async fn test_append_and_retrieve() {
     let keypair = KeyPair::generate();
@@ -86,6 +91,76 @@ async fn test_append_and_retrieve() {
 
     let entry = log.get(&entry_id).await.unwrap().unwrap();
     assert_eq!(entry.id, entry_id);
+}
+
+#[tokio::test]
+async fn runtime_principal_store_system_audit_projection_reopens_durably() {
+    let directory = tempfile::tempdir().expect("temporary home");
+    let home = astrid_core::dirs::AstridHome::from_path(directory.path().join(".astrid"));
+    home.ensure().expect("home layout");
+    let quota: std::sync::Arc<dyn astrid_storage::KvQuotaResolver<astrid_storage::StateOwner>> =
+        std::sync::Arc::new(no_quota);
+    let store = astrid_storage::open_runtime_principal_store(&home, quota)
+        .await
+        .expect("runtime principal store");
+    let backend = store
+        .system_control_kv("audit")
+        .expect("system audit projection")
+        .backend();
+    let key = std::sync::Arc::new(KeyPair::generate());
+    let session = SessionId::new();
+    let first = AuditLog::open_with_kv_store(backend.clone(), key.clone());
+    let first = first.expect("open system audit log");
+    first
+        .append(
+            session.clone(),
+            AuditAction::ConfigReloaded,
+            AuthorizationProof::System {
+                reason: "runtime-store".into(),
+            },
+            AuditOutcome::success(),
+        )
+        .await
+        .expect("append system audit entry");
+    let reopened = AuditLog::open_with_kv_store(backend, key).expect("reopen system audit log");
+    assert_eq!(reopened.count_session(&session).await.unwrap(), 1);
+    assert!(reopened.verify_chain(&session).await.unwrap().valid);
+}
+
+#[tokio::test]
+async fn sealed_segment_rolls_forward_with_bounded_stats() {
+    let key = KeyPair::generate();
+    let log = AuditLog::in_memory(key);
+    let session = SessionId::new();
+    append_test_entries(&log, &session, 2).await;
+
+    let before = log
+        .chain_stats(&session, None)
+        .await
+        .unwrap()
+        .expect("metadata after append");
+    assert_eq!(before.segment, 0);
+    assert_eq!(before.count, 2);
+    assert!(!before.sealed);
+    log.seal_chain(&session, None).await.unwrap();
+    assert!(
+        log.chain_stats(&session, None)
+            .await
+            .unwrap()
+            .unwrap()
+            .sealed
+    );
+
+    append_test_entries(&log, &session, 1).await;
+    let after = log
+        .chain_stats(&session, None)
+        .await
+        .unwrap()
+        .expect("metadata after rollover");
+    assert_eq!(after.segment, 1);
+    assert_eq!(after.count, 3);
+    assert!(!after.sealed);
+    assert!(log.verify_chain(&session).await.unwrap().valid);
 }
 
 #[tokio::test]
@@ -607,14 +682,14 @@ async fn test_concurrent_same_chain_appends_do_not_fork() {
 }
 
 struct BlockingPrincipalStorage {
-    inner: SurrealKvAuditStorage,
+    inner: KvAuditStorage,
     blocked_principal: astrid_core::PrincipalId,
     entered: Arc<tokio::sync::Notify>,
     release: Arc<tokio::sync::Notify>,
 }
 
 struct BlockAfterCommitStorage {
-    inner: SurrealKvAuditStorage,
+    inner: KvAuditStorage,
     block_next: Arc<std::sync::atomic::AtomicBool>,
     committed: Arc<tokio::sync::Notify>,
 }
@@ -725,7 +800,7 @@ async fn blocked_principal_store_does_not_block_another_principal() {
     let entered = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     let storage = BlockingPrincipalStorage {
-        inner: SurrealKvAuditStorage::in_memory(),
+        inner: KvAuditStorage::in_memory(),
         blocked_principal: alice.clone(),
         entered: Arc::clone(&entered),
         release: Arc::clone(&release),
@@ -734,6 +809,8 @@ async fn blocked_principal_store_does_not_block_another_principal() {
         storage: Box::new(storage),
         runtime_key: Arc::new(KeyPair::generate()),
         chain_heads: std::sync::Mutex::new(std::collections::HashMap::new()),
+        append_coordinator: Arc::new(Mutex::new(())),
+        migration_capacity: None,
     });
     let session_id = SessionId::new();
 
@@ -827,13 +904,15 @@ async fn verification_uses_append_order_when_wall_clock_moves_backward() {
     );
     second.signature = keypair.sign(&second.signing_data());
 
-    let storage = SurrealKvAuditStorage::in_memory();
+    let storage = KvAuditStorage::in_memory();
     storage.store(&first).await.unwrap();
     storage.store(&second).await.unwrap();
     let log = AuditLog {
         storage: Box::new(storage),
         runtime_key: keypair,
         chain_heads: std::sync::Mutex::new(std::collections::HashMap::new()),
+        append_coordinator: Arc::new(Mutex::new(())),
+        migration_capacity: None,
     };
 
     let result = log.verify_chain(&session_id).await.unwrap();
@@ -847,7 +926,7 @@ async fn cancellation_after_durable_commit_recovers_head_without_fork() {
     let committed = Arc::new(tokio::sync::Notify::new());
     let log = Arc::new(AuditLog::with_test_storage(
         Box::new(BlockAfterCommitStorage {
-            inner: SurrealKvAuditStorage::in_memory(),
+            inner: KvAuditStorage::in_memory(),
             block_next: Arc::clone(&block_next),
             committed: Arc::clone(&committed),
         }),

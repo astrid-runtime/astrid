@@ -29,6 +29,7 @@ fn stable_object_codes_round_trip_and_reject_unknown_values() {
         (ObjectKind::NamespaceMap, 7),
         (ObjectKind::PrincipalState, 8),
         (ObjectKind::Commit, 9),
+        (ObjectKind::WorkspaceBranch, 17),
         (ObjectKind::Evidence, 10),
         (ObjectKind::Derived, 11),
         (ObjectKind::RuntimeSemanticProfile, 12),

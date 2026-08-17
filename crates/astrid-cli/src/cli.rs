@@ -185,7 +185,7 @@ pub(crate) enum Commands {
         command: TrustCommand,
     },
 
-    /// Audit trail inspection (deferred — see #675).
+    /// Inspect system audit accounting, ingestion health, and retention.
     Audit(AuditArgs),
 
     /// Per-agent budget allocation and accounting (deferred — see #653/#656).

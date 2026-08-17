@@ -27,7 +27,9 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
 use astrid_core::kernel_api::{AdminRequestKind, AdminResponseBody};
-use astrid_core::storage_filesystem::StorageMountLeaseV1;
+use astrid_core::storage_filesystem::{
+    StorageMountLeaseV1,
+};
 use astrid_core::storage_provider::{
     STORAGE_PROVIDER_PROTOCOL_V1, StorageMountId, StorageMountSelectorV1, StorageProviderAccessV1,
     StorageProviderCapabilityV1, StorageProviderFailureV1, StorageProviderIdentityV1,
@@ -48,10 +50,12 @@ mod control;
 mod filesystem;
 mod mountpoint;
 mod registry;
+mod service;
 
 const PROVIDER_NAME: &str = "astrid-storage-provider-fuse";
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 const SERVICE_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+const PUBLIC_SERVICE_ARGUMENT: &str = "--astrid-provider-fuse-public-service-v1";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -59,7 +63,9 @@ async fn main() -> ExitCode {
     let result = if arguments.as_slice() == ["--astrid-provider-stdio-v1"] {
         run_stdio().await
     } else if arguments.as_slice() == ["--astrid-provider-fuse-service-v1"] {
-        run_service().await
+        service::run().await
+    } else if arguments.as_slice() == [PUBLIC_SERVICE_ARGUMENT] {
+        run_public_service().await
     } else {
         Err(anyhow::anyhow!(
             "this executable is an Astrid provider companion, not an interactive command"
@@ -314,7 +320,7 @@ async fn unmount(
     })
 }
 
-async fn run_service() -> Result<()> {
+async fn run_public_service() -> Result<()> {
     let mut bytes = Vec::new();
     std::io::stdin()
         .lock()
@@ -445,7 +451,7 @@ async fn launch_service(launch: &ServiceLaunch, control_path: &Path) -> Result<C
     let executable = std::env::current_exe()?;
     let mut command = tokio::process::Command::new(executable);
     command
-        .arg("--astrid-provider-fuse-service-v1")
+        .arg(PUBLIC_SERVICE_ARGUMENT)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
@@ -703,4 +709,5 @@ fn into_success(body: AdminResponseBody) -> Result<serde_json::Value> {
         _ => bail!("kernel returned an unexpected storage lifecycle response"),
     }
 }
+
 }

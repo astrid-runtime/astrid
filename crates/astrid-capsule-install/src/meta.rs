@@ -15,10 +15,11 @@ use std::path::Path;
 
 use anyhow::Context;
 use astrid_core::dirs::{AstridHome, WorkspaceLayout};
+use astrid_storage::{RuntimePrincipalStore, StateOwner};
 use serde::{Deserialize, Serialize};
 
 /// Capsule installation metadata, persisted as `meta.json` alongside `Capsule.toml`.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CapsuleMeta {
     /// The currently installed version.
     pub version: String,
@@ -59,6 +60,14 @@ pub struct CapsuleMeta {
     /// The concrete ref (tag/branch/commit) this capsule resolved to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_ref: Option<String>,
+    /// Bounded distro identifier supplied by an authenticated install
+    /// request. This is descriptive provenance retained in the durable
+    /// package metadata; it is not an authority grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance_distro: Option<String>,
+    /// Canonical source-artifact digest supplied and verified by the kernel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance_source_digest: Option<String>,
 }
 
 /// Read existing `meta.json` from a capsule's install directory (if present).
@@ -131,6 +140,33 @@ pub struct InstalledCapsule {
     pub meta: Option<CapsuleMeta>,
     /// Where this capsule was found.
     pub location: CapsuleLocation,
+}
+
+/// Enumerate authoritative packages for one owner-root content projection.
+///
+/// This is the steady-state discovery API. It never scans native home or
+/// workspace capsule directories; those paths are migration/cache inputs only.
+pub fn scan_durable_capsules(
+    store: &RuntimePrincipalStore,
+    owner: &StateOwner,
+    location: CapsuleLocation,
+) -> anyhow::Result<Vec<InstalledCapsule>> {
+    let registry = store.capsules();
+    let mut capsules = Vec::new();
+    for summary in registry.list(owner)? {
+        let Some(snapshot) = registry.get_snapshot(owner, summary.id())? else {
+            anyhow::bail!("capsule {} disappeared during durable scan", summary.id());
+        };
+        let meta = serde_json::from_slice(&snapshot.package().metadata)
+            .with_context(|| format!("decode durable metadata for capsule {}", summary.id()))?;
+        capsules.push(InstalledCapsule {
+            name: summary.id().to_owned(),
+            meta: Some(meta),
+            location,
+        });
+    }
+    capsules.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(capsules)
 }
 
 /// Scan user-level and workspace capsule directories, returning all installed

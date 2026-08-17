@@ -15,8 +15,8 @@ use super::{
     TreeValidation,
 };
 use crate::content::{
-    CONTENT_COMPONENT_LABEL, CatalogValidation, PrincipalContentError, root_from_record,
-    validate_catalog,
+    CONTENT_COMPONENT_LABEL, CatalogValidation, PrincipalContentError, is_workspace_branch_label,
+    root_from_record, validate_catalog, workspace_branch_quota_from_loader,
 };
 use crate::error::{StorageError, StorageResult};
 use crate::kv::tree_error::{invalid, map_engine};
@@ -205,6 +205,30 @@ where
                     reference,
                     validated_content,
                 )?)
+                .ok_or_else(|| {
+                    StorageError::Internal("principal quota total overflow".to_owned())
+                })?;
+        } else if is_workspace_branch_label(reference.label().as_bytes()) {
+            quota_bytes = quota_bytes
+                .checked_add(
+                    workspace_branch_quota_from_loader(reference, &mut |object| {
+                        engine
+                            .load_kv_object_for(owner, object)
+                            .map_err(|error| {
+                                PrincipalContentError::Projection(PrincipalProjectionError::Engine(
+                                    error.to_string(),
+                                ))
+                            })
+                            .and_then(|record| {
+                                record.ok_or(PrincipalContentError::Projection(
+                                    PrincipalProjectionError::Model(ModelError::MissingObject(
+                                        object,
+                                    )),
+                                ))
+                            })
+                    })
+                    .map_err(|error| StorageError::Serialization(error.to_string()))?,
+                )
                 .ok_or_else(|| {
                     StorageError::Internal("principal quota total overflow".to_owned())
                 })?;

@@ -6,10 +6,8 @@ use std::sync::Arc;
 
 use crate::content_dag::{
     BuiltContent, ChunkingProfile, ContentDescriptor, ContentError, ContentObjectSink,
-    ContentReadError, ContentSource, ContentStreamError, ContentVerificationState, OpenedContent,
     VerifiedContent, build_content, build_content_streaming, describe_content, open_content,
-    read_opened_content_and_verify, read_opened_content_range_with_verification,
-    read_verified_content, read_verified_content_range,
+    read_opened_content_and_verify,
 };
 use crate::engine::{
     PrincipalProjectionEngine, PrincipalProjectionError, ProjectionCacheEntry, ProjectionCacheKey,
@@ -23,11 +21,14 @@ use parking_lot::Mutex;
 
 use super::catalog::{
     CONTENT_COMPONENT_LABEL, CatalogRoot, CatalogSummary, CatalogValidation, CatalogValue,
-    build_catalog, decode_legacy_catalog, delete, insert, list, lookup, root_from_record,
-    validate_catalog,
+    build_catalog, decode_legacy_catalog, delete, insert, list, list_prefix as catalog_list_prefix,
+    lookup, root_from_record, validate_catalog,
 };
 use super::kv_projection::PrincipalKvAdapter;
-use super::{ContentEntry, ContentName, ContentWriteOutcome, PrincipalContentError};
+use super::{
+    ContentBatchExpectation, ContentEntry, ContentName, ContentReadBatchEntry, ContentWriteOutcome,
+    PrincipalContentError,
+};
 use crate::kv::{KvQuotaResolver, KvValidationCache, validated_projection_quota};
 use crate::principal_graph::{LEGACY_PRINCIPAL_GRAPH_VERSION, PRINCIPAL_GRAPH_VERSION};
 
@@ -36,8 +37,8 @@ const PARENT_LABEL: &[u8] = b"parent";
 const STATE_LABEL: &[u8] = b"state";
 // Soft write-coalescing target, not a record, file, or deployment limit.
 pub(super) const STAGING_BATCH_TARGET_BYTES: usize = 4 * 1024 * 1024;
-const VERIFIED_CONTENT_CACHE_KEY: ProjectionCacheKey = ProjectionCacheKey::new(1);
-const PARTIAL_VERIFICATION_CACHE_KEY: ProjectionCacheKey = ProjectionCacheKey::new(2);
+pub(super) const VERIFIED_CONTENT_CACHE_KEY: ProjectionCacheKey = ProjectionCacheKey::new(1);
+pub(super) const PARTIAL_VERIFICATION_CACHE_KEY: ProjectionCacheKey = ProjectionCacheKey::new(2);
 const DECODED_HEADER_CACHE_KEY: ProjectionCacheKey = ProjectionCacheKey::new(3);
 
 fn validated_rename_sets<'a>(
@@ -65,175 +66,7 @@ pub struct PrincipalContentStore<P: Ord, E> {
     quota: Option<Arc<dyn KvQuotaResolver<P>>>,
     validated_catalogs: Arc<Mutex<BTreeMap<P, CatalogValidation>>>,
     validated_kv: Arc<KvValidationCache<P>>,
-}
-
-/// Principal-scoped immutable content handle for repeated verified reads.
-///
-/// The handle captures the root generation and decoded file descriptor that
-/// authorized the open. Later catalog changes do not retarget an existing
-/// handle. A compaction caller must retain the descriptor's closure as a
-/// `ReadHandle` root while it promises continued readability. Without that
-/// lease, collecting the closure makes later reads fail with
-/// [`ContentError::MissingObject`]; a handle never retargets to newer bytes.
-pub struct PrincipalContentReadHandle<P: Ord, E> {
-    engine: Arc<E>,
-    opened: OpenedContent,
-    principal: P,
-    principal_root: RootState,
-}
-
-impl<P: Ord, E> fmt::Debug for PrincipalContentReadHandle<P, E> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("PrincipalContentReadHandle")
-            .field("descriptor", &self.opened.descriptor())
-            .field("principal_root", &self.principal_root)
-            .finish_non_exhaustive()
-    }
-}
-
-impl<P, E> PrincipalContentReadHandle<P, E>
-where
-    P: Clone + Ord,
-    E: PrincipalProjectionEngine<P>,
-{
-    /// Return the immutable descriptor validated when the handle was opened.
-    #[must_use]
-    pub const fn descriptor(&self) -> ContentDescriptor {
-        self.opened.descriptor()
-    }
-
-    /// Return the principal root generation that authorized this handle.
-    #[must_use]
-    pub const fn principal_root(&self) -> RootState {
-        self.principal_root
-    }
-
-    /// Reconstruct the complete opened value.
-    ///
-    /// # Errors
-    ///
-    /// Returns a content or projection error when verification or allocation
-    /// fails. This includes [`ContentError::MissingObject`] if a compaction
-    /// caller allowed the opened closure to be collected.
-    pub fn read(&self) -> Result<Vec<u8>, PrincipalContentError> {
-        let source = EngineSource::<P, E>::new(self.engine.as_ref(), &self.principal);
-        if let Some(verified) = self.verified() {
-            return read_verified_content(&source, verified).map_err(map_read_error);
-        }
-        let (bytes, verified) =
-            read_opened_content_and_verify(&source, self.opened).map_err(map_read_error)?;
-        self.mark_verified(verified);
-        Ok(bytes)
-    }
-
-    /// Reconstruct an exact range of the opened value.
-    ///
-    /// # Errors
-    ///
-    /// Returns a content, projection, range, or allocation error when the
-    /// requested bytes cannot be reconstructed exactly. This includes
-    /// [`ContentError::MissingObject`] if a compaction caller allowed the
-    /// opened closure to be collected.
-    pub fn read_range(&self, offset: u64, length: u64) -> Result<Vec<u8>, PrincipalContentError> {
-        let source = EngineSource::<P, E>::new(self.engine.as_ref(), &self.principal);
-        if let Some(verified) = self.verified() {
-            return read_verified_content_range(&source, verified, offset, length)
-                .map_err(map_read_error);
-        }
-        let file = self.opened.descriptor().file();
-        let known = self
-            .engine
-            .load_projection_cache(&self.principal, file, PARTIAL_VERIFICATION_CACHE_KEY)
-            .and_then(|entry| entry.downcast::<CachedPartialVerification>());
-        let empty = ContentVerificationState::default();
-        let (bytes, delta) = read_opened_content_range_with_verification(
-            &source,
-            self.opened,
-            known.as_deref().map_or(&empty, |known| &known.0),
-            offset,
-            length,
-        )
-        .map_err(map_read_error)?;
-        if !delta.is_empty() {
-            let mut next = known
-                .as_deref()
-                .map_or_else(ContentVerificationState::default, |known| known.0.clone());
-            next.merge(delta);
-            let _ = self.engine.retain_projection_cache(
-                &self.principal,
-                file,
-                PARTIAL_VERIFICATION_CACHE_KEY,
-                ProjectionCacheEntry::new(CachedPartialVerification(next)),
-            );
-        }
-        Ok(bytes)
-    }
-
-    fn verified(&self) -> Option<VerifiedContent> {
-        self.engine
-            .load_projection_cache(
-                &self.principal,
-                self.opened.descriptor().file(),
-                VERIFIED_CONTENT_CACHE_KEY,
-            )
-            .and_then(|entry| entry.downcast::<CachedVerifiedContent>())
-            .map(|verified| verified.0)
-    }
-
-    fn mark_verified(&self, verified: VerifiedContent) {
-        let file = verified.descriptor().file();
-        let _ = self.engine.discard_projection_cache(
-            &self.principal,
-            file,
-            PARTIAL_VERIFICATION_CACHE_KEY,
-        );
-        let _ = self.engine.retain_projection_cache(
-            &self.principal,
-            file,
-            VERIFIED_CONTENT_CACHE_KEY,
-            ProjectionCacheEntry::new(CachedVerifiedContent(verified)),
-        );
-    }
-}
-
-impl<P: Ord, E> PrincipalContentStore<P, E> {
-    /// Construct with live principal quota resolution.
-    #[must_use]
-    pub fn from_engine_with_quota(engine: Arc<E>, quota: Arc<dyn KvQuotaResolver<P>>) -> Self {
-        Self {
-            engine,
-            quota: Some(quota),
-            validated_catalogs: Arc::new(Mutex::new(BTreeMap::new())),
-            validated_kv: Arc::new(KvValidationCache::default()),
-        }
-    }
-
-    pub(crate) fn from_engine_with_quota_and_validation(
-        engine: Arc<E>,
-        quota: Arc<dyn KvQuotaResolver<P>>,
-        validated_catalogs: Arc<Mutex<BTreeMap<P, CatalogValidation>>>,
-        validated_kv: Arc<KvValidationCache<P>>,
-    ) -> Self {
-        Self {
-            engine,
-            quota: Some(quota),
-            validated_catalogs,
-            validated_kv,
-        }
-    }
-
-    pub(crate) fn from_engine_with_validation(
-        engine: Arc<E>,
-        validated_catalogs: Arc<Mutex<BTreeMap<P, CatalogValidation>>>,
-    ) -> Self {
-        Self {
-            engine,
-            quota: None,
-            validated_catalogs,
-            validated_kv: Arc::new(KvValidationCache::default()),
-        }
-    }
+    read_leases: Arc<ContentReadLeaseRegistry<P>>,
 }
 
 impl<P: Ord, E> fmt::Debug for PrincipalContentStore<P, E> {
@@ -648,6 +481,93 @@ where
         }
     }
 
+    /// Atomically remove several named content values under one owner-root
+    /// compare-and-swap.
+    ///
+    /// Missing names are ignored. The return value is `true` when at least one
+    /// name was removed. Duplicate names are rejected before any root
+    /// mutation is attempted. This primitive is intentionally narrow: callers
+    /// that need prefix semantics must first resolve the exact canonical names
+    /// they own, then pass those names here.
+    ///
+    /// # Errors
+    ///
+    /// Returns a principal-graph or projection error without publishing a
+    /// partial deletion.
+    pub fn delete_batch(
+        &self,
+        principal: &P,
+        names: &[ContentName],
+    ) -> Result<bool, PrincipalContentError> {
+        self.delete_batch_if(principal, names, &ContentBatchExpectation::Any)
+    }
+
+    /// Atomically remove several names only when their current object IDs
+    /// satisfy `expectation`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a duplicate-name, precondition, graph, or projection error
+    /// without publishing a partial deletion.
+    pub fn delete_batch_if(
+        &self,
+        principal: &P,
+        names: &[ContentName],
+        expectation: &ContentBatchExpectation,
+    ) -> Result<bool, PrincipalContentError> {
+        if names.is_empty() {
+            return Ok(false);
+        }
+        let mut unique = BTreeSet::new();
+        for name in names {
+            if !unique.insert(name) {
+                return Err(PrincipalContentError::DuplicateBatchName(name.clone()));
+            }
+        }
+        loop {
+            let mut header = self.header(principal)?.as_ref().clone();
+            self.check_batch_expectation(principal, &header, Some(expectation))?;
+            let mut records = BTreeMap::<ObjectId, ObjectRecord>::new();
+            let mut changed = false;
+            for name in names {
+                let mutation = delete(
+                    header.catalog,
+                    name,
+                    &mut |object| match records.get(&object) {
+                        Some(record) => Ok(record.clone()),
+                        None => self.load_required_for(principal, object),
+                    },
+                    &|record| self.engine.identify_object(record),
+                )?;
+                let Some(_) = mutation.previous else {
+                    continue;
+                };
+                changed = true;
+                header.catalog = mutation.root;
+                records.extend(mutation.records);
+            }
+            if !changed {
+                return Ok(false);
+            }
+            let catalog = header.catalog;
+            let transaction = self.encode_transaction(principal.clone(), header, None, records)?;
+            match self.engine.commit_root(transaction) {
+                Ok(_) => {
+                    self.validated_catalogs.lock().insert(
+                        principal.clone(),
+                        CatalogValidation {
+                            root: catalog.map(|root| root.object),
+                            summary: catalog.map_or(CatalogSummary::default(), |root| root.summary),
+                        },
+                    );
+                    return Ok(true);
+                },
+                Err(PrincipalProjectionError::Model(ModelError::RootConflict { .. })) => {},
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
     /// Atomically rename exact catalog names without reconstructing file bytes.
     ///
     /// Every source must exist, destinations must be unique, and a destination
@@ -793,6 +713,33 @@ where
         })
     }
 
+    /// List names beginning with an explicit catalog prefix.
+    ///
+    /// Prefix matching is performed on canonical catalog names and does not
+    /// interpret path traversal or host separators. Callers that own a
+    /// reserved component (such as `capsules/`) should use this method instead
+    /// of exposing the entire owner catalog to discovery code.
+    ///
+    /// # Errors
+    ///
+    /// Returns a principal graph or projection error when the owner catalog
+    /// cannot be decoded.
+    pub fn list_prefix(
+        &self,
+        principal: &P,
+        prefix: &str,
+    ) -> Result<Vec<ContentEntry>, PrincipalContentError> {
+        if prefix.is_empty() {
+            return self.list(principal);
+        }
+        let prefix =
+            ContentName::new(prefix.to_owned()).map_err(PrincipalContentError::InvalidName)?;
+        let header = self.header(principal)?;
+        catalog_list_prefix(header.catalog, &prefix, &mut |object| {
+            self.load_required_for(principal, object)
+        })
+    }
+
     /// Describe one named value without reading its chunks.
     ///
     /// # Errors
@@ -853,12 +800,23 @@ where
                 "catalog and file logical lengths disagree",
             ));
         }
+        let lease = self.read_leases.register(principal.clone(), entry.file);
         Ok(Some(PrincipalContentReadHandle {
             engine: Arc::clone(&self.engine),
             opened,
             principal: principal.clone(),
             principal_root: root,
+            _lease: lease,
         }))
+    }
+
+    /// Return immutable file roots held by currently open read handles.
+    ///
+    /// The returned roots are a point-in-time snapshot for a compaction
+    /// retention plan. Handles opened or dropped after capture are covered by
+    /// the engine fence recheck; a stale plan fails closed.
+    pub(crate) fn compaction_read_handle_roots(&self) -> Vec<(P, ObjectId)> {
+        self.read_leases.roots()
     }
 
     /// Reconstruct one complete named value.
@@ -876,6 +834,45 @@ where
             return Ok(None);
         };
         handle.read().map(Some)
+    }
+
+    /// Read several names from one immutable owner-root snapshot.
+    ///
+    /// Each returned descriptor and byte vector is tied to the same decoded
+    /// catalog header. Callers can use the descriptors as a conditional batch
+    /// expectation without a preflight race between separate reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns a content, graph, projection, or verification error without
+    /// returning partial results.
+    pub fn read_batch(
+        &self,
+        principal: &P,
+        names: &[ContentName],
+    ) -> Result<Vec<Option<ContentReadBatchEntry>>, PrincipalContentError> {
+        let header = self.header(principal)?;
+        let source = EngineSource::<P, E>::new(self.engine.as_ref(), principal);
+        let mut result = Vec::with_capacity(names.len());
+        for name in names {
+            let Some(entry) = self.catalog_lookup(principal, header.catalog, name)? else {
+                result.push(None);
+                continue;
+            };
+            let opened = open_content(&source, entry.file).map_err(map_read_error)?;
+            let descriptor = opened.descriptor();
+            if descriptor.logical_bytes() != entry.logical_bytes {
+                return Err(invalid(
+                    entry.file,
+                    "catalog and file logical lengths disagree",
+                ));
+            }
+            let (bytes, verified) =
+                read_opened_content_and_verify(&source, opened).map_err(map_read_error)?;
+            self.mark_verified(principal, verified);
+            result.push(Some(ContentReadBatchEntry { descriptor, bytes }));
+        }
+        Ok(result)
     }
 
     /// Reconstruct an exact range of one named value.
@@ -952,12 +949,23 @@ where
 }
 
 mod bulk;
+mod constructors;
 mod internals;
 mod native;
 mod projection;
+mod read_handle;
+mod workspace;
+
+use read_handle::ContentReadLeaseRegistry;
+pub use read_handle::PrincipalContentReadHandle;
 
 use projection::{
-    CachedPartialVerification, CachedVerifiedContent, ContentHeader, DeferredAdmission,
-    EngineIdentity, EngineSink, EngineSource, invalid, map_read_error, map_stream_error,
-    owned_target, require_structural,
+    CachedVerifiedContent, ContentHeader, DeferredAdmission, EngineIdentity, EngineSink,
+    EngineSource, invalid, map_read_error, map_stream_error, owned_target, require_structural,
 };
+
+pub use workspace::{
+    WorkspaceBindingLifecycle, WorkspaceBranchBinding, WorkspaceBranchDescriptor,
+    WorkspaceBranchError, WorkspaceBranchStore, WorkspaceFilesystem, WorkspaceUid,
+};
+pub(crate) use workspace::{is_workspace_branch_label, workspace_branch_quota_from_loader};

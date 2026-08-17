@@ -697,7 +697,7 @@ mod tests {
             identity.genesis.created_at_seconds,
             user.created_at.timestamp()
         );
-        assert!(!store_path.exists());
+        assert!(store_path.is_dir());
         assert!(home.storage_volume_path().is_file());
 
         let format_spec = bootstrap::format_specification().unwrap();

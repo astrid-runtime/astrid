@@ -297,18 +297,40 @@ pub async fn run() -> Result<()> {
     // wait on every agent's capsule view.
     kernel.load_boot_capsules().await;
 
-    // Refresh the daemon-canonical contracts baseline (#1165). The daemon is
-    // authoritative for `wit/astrid-contracts.wit`: rewrite it from the
-    // daemon's own system fleet so an already-installed fleet gets
-    // contracts-skew visibility immediately at boot — no install required and
-    // no dependence on which capsule installed first. Best-effort: a failure
-    // only degrades warn-only skew reporting, it must never break boot.
-    if let Err(e) = astrid_capsule_install::refresh_canonical_contracts(&astrid_home) {
-        tracing::warn!(
-            error = %format!("{e:#}"),
-            "failed to refresh canonical astrid-contracts.wit at boot; \
-             contracts skew checks may lack a current baseline"
-        );
+    // Refresh the daemon-canonical contracts baseline (#1165) from the
+    // authenticated UID-owned package registry. The extracted native cache is
+    // disposable and cannot supply authority. Best-effort: a failure only
+    // degrades warn-only skew reporting, it must never break boot.
+    let install_principal = astrid_capsule_install::paths::install_principal();
+    match (
+        kernel.principal_store(),
+        kernel.principal_directory().uid_for(&install_principal),
+    ) {
+        (Some(store), Ok(owner)) => {
+            if let Err(error) = astrid_capsule_install::refresh_canonical_contracts_from_registry(
+                &astrid_home,
+                store,
+                owner,
+            ) {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "failed to refresh canonical astrid-contracts.wit from durable registry; \
+                     contracts skew checks may lack a current baseline"
+                );
+            }
+        },
+        (None, _) => {
+            tracing::warn!(
+                "durable principal store unavailable; canonical astrid-contracts.wit was not refreshed"
+            );
+        },
+        (_, Err(error)) => {
+            tracing::warn!(
+                error = %error,
+                principal = %install_principal,
+                "install principal is not admitted; canonical astrid-contracts.wit was not refreshed"
+            );
+        },
     }
 
     // Signal readiness AFTER the default CLI/system view is loaded and
@@ -474,12 +496,14 @@ fn spawn_gateway(
     let audit_log = std::sync::Arc::clone(&kernel.audit_log);
     let session_id = kernel.session_id.clone();
     let capability_kernel = std::sync::Arc::clone(kernel);
+    let storage_kv = std::sync::Arc::clone(&kernel.kv);
     let readiness_probe = kernel.agent_readiness_probe();
     let topic_probe = kernel.capsule_topic_probe_with_warm();
     let workspace_root = kernel.workspace_root.clone();
     let workspace_layout = kernel.workspace_layout().clone();
     let state = astrid_gateway::GatewayState::new(
         cfg,
+        Some(storage_kv),
         Some(bus),
         Some(audit_log),
         Some(session_id),

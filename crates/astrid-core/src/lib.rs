@@ -36,9 +36,11 @@ pub mod platform_fs;
 pub mod principal;
 pub mod profile;
 pub mod retry;
+mod runtime_scratch;
 pub mod session_token;
 pub mod storage_filesystem;
 pub mod storage_provider;
+pub mod storage_workspace;
 pub mod types;
 pub mod uplink;
 pub(crate) mod utils;
@@ -66,6 +68,7 @@ pub use profile::{
     TIMEOUT_SECS_UPPER_BOUND, ValidatedProfileFields, device_key_id_fingerprint,
 };
 pub use retry::RetryConfig;
+pub use storage_workspace::{WorkspaceUid, WorkspaceUidParseError};
 pub use types::{
     AgentId, ApprovalDecision, ApprovalOption, ApprovalRequest, Permission, SessionId, Timestamp,
     TokenId,

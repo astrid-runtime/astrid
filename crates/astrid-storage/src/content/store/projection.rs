@@ -1,9 +1,11 @@
 use super::{
-    Arc, BTreeMap, CatalogRoot, ContentObjectSink, ContentReadError, ContentSource,
-    ContentStreamError, ContentVerificationState, InsertOutcome, ModelError, ObjectClass, ObjectId,
-    ObjectRecord, ObjectReference, PhantomData, PrincipalContentError, PrincipalProjectionEngine,
-    PrincipalProjectionError, ProjectionCachePayload, ReferenceKind, ReferenceLabel, RootState,
-    STAGING_BATCH_TARGET_BYTES, VerifiedContent,
+    Arc, BTreeMap, CatalogRoot, ContentObjectSink, InsertOutcome, ModelError, ObjectClass,
+    ObjectId, ObjectRecord, ObjectReference, PhantomData, PrincipalContentError,
+    PrincipalProjectionEngine, PrincipalProjectionError, ProjectionCachePayload, ReferenceKind,
+    ReferenceLabel, RootState, STAGING_BATCH_TARGET_BYTES, VerifiedContent,
+};
+use crate::content_dag::{
+    ContentReadError, ContentSource, ContentStreamError, ContentVerificationState,
 };
 #[cfg(not(target_family = "wasm"))]
 use crate::engine::PreparedProjectionBatch;

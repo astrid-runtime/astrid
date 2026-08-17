@@ -54,6 +54,7 @@ fn state_with_bus_timeout(
 ) -> Arc<GatewayState> {
     Arc::new(GatewayState {
         config: GatewayConfig::default(),
+        storage_kv: None,
         signing: SigningMaterial::fresh(),
         distribution: Arc::new(DistributionInfo::single_tenant()),
         onboarding: Arc::new(OnboardingFields::default()),

@@ -15,8 +15,8 @@
 //!
 //! - GC is admin-only (no automatic sweeps on uninstall)
 //! - Dry-run by default; `--force` required to actually delete
-//! - Mark set is derived from every `meta.json` found under every principal's
-//!   capsules directory plus workspace-level capsules
+//! - Mark set is derived from the authenticated daemon's capsule registry
+//!   metadata plus workspace-level capsules
 //! - A blob is deleted only if no currently installed capsule references
 //!   its hash via `wit_files`
 
@@ -27,7 +27,6 @@ use anyhow::Context;
 use astrid_core::dirs::AstridHome;
 use colored::Colorize;
 
-use super::capsule::meta::{CapsuleMeta, read_meta};
 use crate::theme::Theme;
 
 /// Garbage-collect unreferenced WIT blobs from the content store.
@@ -49,7 +48,8 @@ pub(crate) fn gc(force: bool) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Build the mark set: every WIT hash referenced by any installed capsule.
+    // Build the mark set from the daemon-owned registry.  A running daemon is
+    // required so a stale native home tree can never become GC authority.
     let marks = collect_marks(&home, crate::workspace_layout::current())?;
 
     // Scan the store and identify orphans.
@@ -146,8 +146,39 @@ fn collect_marks(
     home: &AstridHome,
     workspace_layout: &astrid_core::dirs::WorkspaceLayout,
 ) -> anyhow::Result<HashSet<String>> {
+    let mut marks = query_daemon_marks()?;
     let workspace_root = std::env::current_dir().ok();
-    collect_marks_in_workspace(home, workspace_root.as_deref(), workspace_layout)
+    marks.extend(collect_marks_in_workspace(
+        home,
+        workspace_root.as_deref(),
+        workspace_layout,
+    )?);
+    Ok(marks)
+}
+
+fn query_daemon_marks() -> anyhow::Result<HashSet<String>> {
+    let request = async {
+        let mut client = crate::socket_client::connect_kernel_for_workspace(None).await?;
+        let response = client
+            .request(astrid_core::kernel_api::KernelRequest::GetCapsuleMetadata)
+            .await?;
+        let astrid_core::kernel_api::KernelResponse::CapsuleMetadata(entries) = response else {
+            anyhow::bail!("daemon did not return capsule metadata for WIT GC")
+        };
+        Ok(entries
+            .into_iter()
+            .flat_map(|entry| entry.wit_hashes)
+            .collect())
+    };
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        tokio::task::block_in_place(|| handle.block_on(request))
+    } else {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("build runtime for daemon WIT metadata")?;
+        runtime.block_on(request)
+    }
 }
 
 fn collect_marks_in_workspace(
@@ -157,26 +188,9 @@ fn collect_marks_in_workspace(
 ) -> anyhow::Result<HashSet<String>> {
     let mut marks = HashSet::new();
 
-    // Walk every principal home under ~/.astrid/home/
-    let home_root = home.home_dir();
-    if home_root.is_dir() {
-        for entry in std::fs::read_dir(&home_root)
-            .with_context(|| format!("failed to read {}", home_root.display()))?
-        {
-            let Ok(entry) = entry else {
-                continue;
-            };
-            let principal_root = entry.path();
-            if !principal_root.is_dir() {
-                continue;
-            }
-            // Each principal home's capsules directory
-            let capsules_dir = principal_root.join(".local").join("capsules");
-            if capsules_dir.is_dir() {
-                collect_from_capsules_dir(&capsules_dir, &mut marks);
-            }
-        }
-    }
+    // Principal capsule marks come from the daemon registry in
+    // `collect_marks`; never inspect `~/.astrid/home/<alias>` here.
+    let _ = home;
 
     // Workspace-level capsules (if running from a workspace)
     if let Some(workspace_root) = workspace_root {
@@ -185,7 +199,7 @@ fn collect_marks_in_workspace(
             .with_context(|| format!("unsafe workspace at {}", workspace_root.display()))?;
         let ws_caps = workspace.verify_tree("capsules")?;
         if ws_caps.is_dir() {
-            collect_from_capsules_dir(&ws_caps, &mut marks);
+            collect_from_capsules_dir(&ws_caps, &mut marks)?;
         }
         workspace.verify_tree("capsules")?;
     }
@@ -193,32 +207,40 @@ fn collect_marks_in_workspace(
     Ok(marks)
 }
 
-/// For every capsule subdirectory under `dir`, load `meta.json` and add its
-/// `wit_files` hash values to `marks`.
-fn collect_from_capsules_dir(dir: &Path, marks: &mut HashSet<String>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
+/// Read WIT marks from explicitly selected workspace capsule metadata.
+/// Principal installs are intentionally absent: their hashes come from the
+/// authenticated daemon registry query above.
+fn collect_from_capsules_dir(dir: &Path, marks: &mut HashSet<String>) -> anyhow::Result<()> {
+    for entry in std::fs::read_dir(dir)
+        .with_context(|| format!("failed to read workspace capsules: {}", dir.display()))?
+    {
+        let entry = entry?;
         let capsule_dir = entry.path();
-        if !capsule_dir.is_dir() {
+        let metadata = std::fs::symlink_metadata(&capsule_dir)?;
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!(
+                "workspace capsule directory is redirected: {}",
+                capsule_dir.display()
+            );
+        }
+        if !metadata.is_dir() {
             continue;
         }
-        if let Some(meta) = read_meta(&capsule_dir) {
-            add_meta_marks(&meta, marks);
+        astrid_core::platform_fs::verify_no_redirects(&capsule_dir)?;
+        let meta_path = capsule_dir.join("meta.json");
+        if std::fs::symlink_metadata(&meta_path).is_ok() {
+            astrid_core::platform_fs::verify_no_redirects(&meta_path)?;
+            if let Some(meta) = crate::commands::capsule::meta::read_meta(&capsule_dir) {
+                marks.extend(meta.wit_files.into_values());
+            }
         }
     }
-}
-
-/// Add every hash from a capsule's `wit_files` map to `marks`.
-fn add_meta_marks(meta: &CapsuleMeta, marks: &mut HashSet<String>) {
-    for hash in meta.wit_files.values() {
-        marks.insert(hash.clone());
-    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::capsule::meta::CapsuleMeta;
     use super::*;
 
     #[test]

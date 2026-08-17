@@ -68,6 +68,7 @@ fn params(
         idle_timeout_ms: None,
         exit_retention_ms: None,
         injection_guard: None,
+        process_storage_mount: None,
     }
 }
 
@@ -329,6 +330,7 @@ async fn write_stdin_delivers_survives_reset_and_close_eofs() {
         idle_timeout_ms: None,
         exit_retention_ms: None,
         injection_guard: None,
+        process_storage_mount: None,
     };
     let id = reg
         .spawn(spawn_params)

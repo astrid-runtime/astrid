@@ -1,75 +1,60 @@
-//! Auto-provisioning of per-principal home directories at dispatch.
+//! Admission caching for principals observed by the event dispatcher.
 //!
-//! When an IPC message arrives stamped with a principal the dispatcher has
-//! not seen, the principal's home directory tree is created so downstream
-//! capsule invocations find their per-principal scope in place. The home
-//! under which provisioning happens is **injected** — the kernel passes its
-//! already-booted [`AstridHome`], tests pass a tempdir home — and when no
-//! home is injected, provisioning is disabled entirely (fail-closed): no
-//! filesystem writes and no process-environment resolution, ever. Library
-//! dispatch code resolving `$ASTRID_HOME`/`$HOME` at the point of use is
-//! how `cargo test` once scaffolded a thousand fixture principals into a
-//! developer's real `~/.astrid` (#1145).
+//! Principal home state is durable storage owned by the kernel. Dispatch is
+//! deliberately not a provisioning boundary: an IPC event must never create,
+//! inspect, or otherwise derive a native principal-home path. The kernel has
+//! already authenticated/stamped the principal before an event reaches this
+//! loop; this module only validates its wire spelling, applies the existing
+//! default-principal gate, and keeps a bounded in-memory seen set.
 
 use std::collections::HashSet;
 
-use astrid_core::dirs::AstridHome;
 use tracing::{debug, warn};
 
 /// Maximum number of principals tracked before the set stops growing.
 /// 10K principals = ~640KB of memory (64-byte strings). Beyond this,
-/// new principals are still dispatched but not cached — they'll hit
-/// the filesystem check on every event instead of the O(1) HashSet.
+/// new principals are still dispatched but not cached, avoiding unbounded
+/// in-memory growth under a principal storm.
 const MAX_KNOWN_PRINCIPALS: usize = 10_000;
 
-/// Per-dispatcher gate that provisions home directories for newly seen
-/// principals under an injected [`AstridHome`].
+/// Per-dispatcher gate that admits newly seen principals without filesystem
+/// side effects.
 ///
 /// Owned by [`EventDispatcher::run`](super::EventDispatcher::run); one
 /// instance per dispatch loop, carrying the seen-principal cache across
 /// events.
 pub(super) struct PrincipalProvisioner {
-    /// The injected home root. `None` disables provisioning entirely —
-    /// the dispatcher never consults the process environment and never
-    /// writes to the filesystem (fail-closed, #1145).
-    home: Option<AstridHome>,
     /// When an identity store is configured, only the "default"
-    /// principal is auto-provisioned. Other principals must be
+    /// principal is admitted by this legacy gate. Other principals must be
     /// explicitly created via the identity flow (uplink calls
     /// create_user → AstridUserId with principal → uplink sets
     /// principal on IPC). This prevents unauthenticated directory
     /// creation from arbitrary IPC principal strings.
     gate_to_default: bool,
-    /// Principals whose homes are known to exist (provisioned by this
-    /// loop, or "default", which the kernel boot sequence provisions).
+    /// Principals already admitted by this loop, or "default", which the
+    /// kernel boot sequence authenticates for single-tenant operation.
     known: HashSet<String>,
 }
 
 impl PrincipalProvisioner {
     /// Create a provisioner for one dispatch loop.
-    pub(super) fn new(home: Option<AstridHome>, gate_to_default: bool) -> Self {
+    pub(super) fn new(gate_to_default: bool) -> Self {
         let mut known = HashSet::new();
-        // The "default" principal is always provisioned by the kernel
-        // boot sequence.
+        // The "default" principal is always admitted by the kernel boot
+        // sequence.
         known.insert("default".to_string());
         Self {
-            home,
             gate_to_default,
             known,
         }
     }
 
-    /// Observe the principal stamped on an incoming IPC message and
-    /// provision its home directory if it is newly seen.
+    /// Observe the principal stamped on an incoming IPC message and admit it
+    /// to this loop's bounded in-memory cache.
     ///
-    /// A no-op when no home was injected, when the message carries no
-    /// principal, or when the principal is already known.
+    /// This function is intentionally filesystem-free. Durable home
+    /// provisioning is performed by the kernel's UID-bound storage path.
     pub(super) fn observe(&mut self, principal: Option<&str>) {
-        // Fail-closed: without an injected home there is nothing to
-        // provision under — never fall back to env resolution (#1145).
-        let Some(home) = self.home.as_ref() else {
-            return;
-        };
         let Some(principal_str) = principal else {
             return;
         };
@@ -86,24 +71,9 @@ impl PrincipalProvisioner {
         if self.gate_to_default && pid != astrid_core::PrincipalId::default() {
             return;
         }
-        let ph = home.principal_home(&pid);
-        if let Err(e) = ph.ensure() {
-            // Don't cache — allow retry on next event (#544).
-            warn!(
-                principal = %pid,
-                error = %e,
-                "Failed to auto-provision principal home"
-            );
-        } else {
-            debug!(
-                principal = %pid,
-                "Auto-provisioned principal home directory"
-            );
-            // Only cache on success so transient failures can retry on
-            // the next event (#544).
-            if self.known.len() < MAX_KNOWN_PRINCIPALS {
-                self.known.insert(principal_str.to_string());
-            }
+        debug!(principal = %pid, "Admitted principal to dispatcher cache");
+        if self.known.len() < MAX_KNOWN_PRINCIPALS {
+            self.known.insert(principal_str.to_string());
         }
     }
 }
@@ -112,62 +82,52 @@ impl PrincipalProvisioner {
 mod tests {
     use super::*;
 
-    /// Fail-closed floor for #1145: with no injected home the provisioner
-    /// must never touch the filesystem or the process environment, even
-    /// for a brand-new principal.
+    /// Dispatch admission must never touch the filesystem or process
+    /// environment, even for a brand-new principal.
     #[test]
-    fn no_injected_home_never_provisions() {
-        let mut p = PrincipalProvisioner::new(None, false);
+    fn admission_never_provisions_native_home() {
+        let mut p = PrincipalProvisioner::new(false);
+        p.observe(Some("alice"));
+        assert!(
+            p.known.contains("alice"),
+            "valid principals are admitted in memory"
+        );
+    }
+
+    /// The old injected-home API was removed from dispatch admission. A
+    /// temporary/native path therefore remains untouched while a principal
+    /// is admitted.
+    #[test]
+    fn admission_does_not_create_native_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = PrincipalProvisioner::new(false);
+        p.observe(Some("alice"));
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().next().is_none(),
+            "dispatch admission must not create native home state"
+        );
+        assert!(p.known.contains("alice"), "admitted after validation");
+    }
+
+    /// The identity-store gate restricts admission to "default".
+    #[test]
+    fn identity_gate_restricts_to_default() {
+        let mut p = PrincipalProvisioner::new(true);
         p.observe(Some("alice"));
         assert!(
             !p.known.contains("alice"),
-            "nothing may be recorded as provisioned when no home is injected"
-        );
-    }
-
-    /// With an injected home, a newly seen principal's home tree is
-    /// created under that root — and only that root.
-    #[test]
-    fn injected_home_provisions_under_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = AstridHome::from_path(dir.path());
-        let alice = astrid_core::PrincipalId::new("alice").unwrap();
-        let alice_home = home.principal_home(&alice).root().to_path_buf();
-        let mut p = PrincipalProvisioner::new(Some(home), false);
-        p.observe(Some("alice"));
-        assert!(
-            alice_home.is_dir(),
-            "alice's principal home must be created under the injected root"
-        );
-        assert!(p.known.contains("alice"), "cached after success");
-    }
-
-    /// The identity-store gate restricts auto-provisioning to "default".
-    #[test]
-    fn identity_gate_restricts_to_default() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = AstridHome::from_path(dir.path());
-        let alice = astrid_core::PrincipalId::new("alice").unwrap();
-        let alice_home = home.principal_home(&alice).root().to_path_buf();
-        let mut p = PrincipalProvisioner::new(Some(home), true);
-        p.observe(Some("alice"));
-        assert!(
-            !alice_home.exists(),
-            "non-default principals are not auto-provisioned when gated"
+            "non-default principals are not admitted when gated"
         );
     }
 
     /// An invalid principal string is ignored without any writes.
     #[test]
     fn invalid_principal_is_ignored() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = AstridHome::from_path(dir.path());
-        let home_dir = home.home_dir();
-        let mut p = PrincipalProvisioner::new(Some(home), false);
+        let mut p = PrincipalProvisioner::new(false);
         p.observe(Some("../escape"));
         assert!(
-            !home_dir.exists(),
-            "an invalid principal must provision nothing"
+            !p.known.contains("../escape"),
+            "an invalid principal must be admitted nowhere"
         );
     }
 }

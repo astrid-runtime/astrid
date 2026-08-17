@@ -54,14 +54,14 @@ impl FilesystemPath {
         &self.0
     }
 
-    fn file_name(&self) -> Result<ContentName, FilesystemError> {
+    pub(crate) fn file_name(&self) -> Result<ContentName, FilesystemError> {
         if self.0.is_empty() {
             return Err(FilesystemError::IsDirectory(self.clone()));
         }
         ContentName::new(self.0.clone()).map_err(|_| FilesystemError::InvalidPath(self.0.clone()))
     }
 
-    fn directory_marker(&self) -> Result<ContentName, FilesystemError> {
+    pub(crate) fn directory_marker(&self) -> Result<ContentName, FilesystemError> {
         if self.0.is_empty() {
             return Err(FilesystemError::IsDirectory(self.clone()));
         }
@@ -69,7 +69,7 @@ impl FilesystemPath {
             .map_err(|_| FilesystemError::InvalidPath(self.0.clone()))
     }
 
-    fn directory_prefix(&self) -> String {
+    pub(crate) fn directory_prefix(&self) -> String {
         if self.0.is_empty() {
             String::new()
         } else {
@@ -77,7 +77,7 @@ impl FilesystemPath {
         }
     }
 
-    fn parent(&self) -> Self {
+    pub(crate) fn parent(&self) -> Self {
         self.0
             .rsplit_once('/')
             .map_or_else(Self::root, |(parent, _)| Self(parent.to_owned()))
@@ -102,6 +102,14 @@ pub struct FilesystemEntry {
 }
 
 impl FilesystemEntry {
+    pub(crate) const fn new(name: String, kind: FilesystemEntryKind, logical_bytes: u64) -> Self {
+        Self {
+            name,
+            kind,
+            logical_bytes,
+        }
+    }
+
     /// Borrow the final path segment.
     #[must_use]
     pub fn name(&self) -> &str {
@@ -165,6 +173,201 @@ impl<P: Ord, E> AstridFilesystem<P, E> {
     #[must_use]
     pub const fn new(content: Arc<PrincipalContentStore<P, E>>, owner: P) -> Self {
         Self { content, owner }
+    }
+
+    /// Bind the kernel-fixed Fleet shared subtree (`shared/`).
+    ///
+    /// The returned view exposes paths relative to `shared/`; callers cannot
+    /// choose another prefix or reach unrelated owner content. Authorization
+    /// that the owner is a Fleet belongs to the kernel lease resolver.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the fixed canonical `shared` prefix is rejected by the
+    /// validated [`FilesystemPath`] parser.
+    #[must_use]
+    pub fn new_fleet_shared(
+        content: Arc<PrincipalContentStore<P, E>>,
+        owner: P,
+    ) -> OwnerSubtreeFilesystem<P, E> {
+        OwnerSubtreeFilesystem {
+            inner: Self::new(content, owner),
+            prefix: FilesystemPath::new("shared").expect("canonical Fleet shared prefix"),
+        }
+    }
+
+    /// Bind the kernel-fixed principal home subtree (`home/`).
+    ///
+    /// This is deliberately separate from [`Self::new`], which remains an
+    /// owner-root diagnostic primitive. Principal capsule mounts must use this
+    /// constructor so registry, system-control, and other owner components are
+    /// not exposed as ordinary home paths.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the fixed canonical `home` prefix is rejected by the
+    /// validated [`FilesystemPath`] parser.
+    #[must_use]
+    pub fn new_principal_home(
+        content: Arc<PrincipalContentStore<P, E>>,
+        owner: P,
+    ) -> OwnerSubtreeFilesystem<P, E> {
+        OwnerSubtreeFilesystem {
+            inner: Self::new(content, owner),
+            prefix: FilesystemPath::new("home").expect("canonical principal home prefix"),
+        }
+    }
+}
+
+/// Filesystem view rooted at one kernel-admitted owner-local directory.
+///
+/// The prefix is private to the constructor so a provider callback cannot
+/// retarget an existing mount. `new_fleet_shared` is the public constructor;
+/// other fixed-prefix constructors may be added by the kernel as lease types
+/// are admitted.
+#[derive(Clone)]
+pub struct OwnerSubtreeFilesystem<P: Ord, E> {
+    inner: AstridFilesystem<P, E>,
+    prefix: FilesystemPath,
+}
+
+impl<P: Ord, E> OwnerSubtreeFilesystem<P, E> {
+    fn path(&self, path: &FilesystemPath) -> Result<FilesystemPath, FilesystemError> {
+        if path.as_str().is_empty() {
+            return Ok(self.prefix.clone());
+        }
+        FilesystemPath::new(format!("{}/{}", self.prefix.as_str(), path.as_str()))
+    }
+}
+
+impl<P, E> OwnerSubtreeFilesystem<P, E>
+where
+    P: Clone + Ord + Send + Sync,
+    E: PrincipalProjectionEngine<P>,
+{
+    /// Inspect one path relative to the fixed subtree root.
+    ///
+    /// # Errors
+    ///
+    /// Returns a namespace or authoritative content error when the path cannot
+    /// be resolved.
+    pub fn stat(&self, path: &FilesystemPath) -> Result<FilesystemEntry, FilesystemError> {
+        let mut entry = self.inner.stat(&self.path(path)?)?;
+        if path.as_str().is_empty() {
+            entry.name = String::new();
+        }
+        Ok(entry)
+    }
+
+    /// Enumerate direct children relative to the fixed subtree root.
+    ///
+    /// # Errors
+    ///
+    /// Returns a namespace or authoritative content error when the directory
+    /// cannot be enumerated.
+    pub fn read_dir(&self, path: &FilesystemPath) -> Result<Vec<FilesystemEntry>, FilesystemError> {
+        self.inner.read_dir(&self.path(path)?)
+    }
+
+    /// Read a verified file range relative to the fixed subtree root.
+    ///
+    /// # Errors
+    ///
+    /// Returns a namespace or authoritative content error when the path or
+    /// requested range is invalid.
+    pub fn read(
+        &self,
+        path: &FilesystemPath,
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<u8>, FilesystemError> {
+        self.inner.read(&self.path(path)?, offset, length)
+    }
+
+    /// Publish complete file bytes relative to the fixed subtree root.
+    ///
+    /// # Errors
+    ///
+    /// Returns a namespace or authoritative content error when publication is
+    /// rejected.
+    pub fn write(&self, path: &FilesystemPath, bytes: &[u8]) -> Result<(), FilesystemError> {
+        self.inner.write(&self.path(path)?, bytes)
+    }
+
+    /// Publish streamed file bytes relative to the fixed subtree root.
+    ///
+    /// # Errors
+    ///
+    /// Returns a namespace or authoritative content error when streaming or
+    /// publication is rejected.
+    pub fn write_streaming<R: Read>(
+        &self,
+        path: &FilesystemPath,
+        source: R,
+    ) -> Result<(), FilesystemError> {
+        self.inner.write_streaming(&self.path(path)?, source)
+    }
+
+    /// Create a directory relative to the fixed subtree root.
+    ///
+    /// # Errors
+    ///
+    /// Returns a namespace or authoritative content error when creation is
+    /// rejected.
+    pub fn create_dir(&self, path: &FilesystemPath) -> Result<(), FilesystemError> {
+        self.inner.create_dir(&self.path(path)?)
+    }
+
+    /// Remove a file or empty directory relative to the fixed subtree root.
+    ///
+    /// # Errors
+    ///
+    /// Returns a namespace or authoritative content error when removal is
+    /// rejected.
+    pub fn remove(&self, path: &FilesystemPath) -> Result<(), FilesystemError> {
+        if path.as_str().is_empty() {
+            return Err(FilesystemError::AlreadyExists(path.clone()));
+        }
+        self.inner.remove(&self.path(path)?)
+    }
+
+    /// Rename within the fixed subtree root without replacement.
+    ///
+    /// # Errors
+    ///
+    /// Returns a namespace or authoritative content error when either path is
+    /// invalid or the rename cannot be applied.
+    pub fn rename(
+        &self,
+        from: &FilesystemPath,
+        to: &FilesystemPath,
+    ) -> Result<(), FilesystemError> {
+        self.inner.rename(&self.path(from)?, &self.path(to)?)
+    }
+
+    /// Rename within the fixed subtree root, replacing a compatible target.
+    ///
+    /// # Errors
+    ///
+    /// Returns a namespace or authoritative content error when either path is
+    /// invalid or replacement cannot be applied.
+    pub fn rename_replacing(
+        &self,
+        from: &FilesystemPath,
+        to: &FilesystemPath,
+    ) -> Result<(), FilesystemError> {
+        self.inner
+            .rename_replacing(&self.path(from)?, &self.path(to)?)
+    }
+
+    /// Flush authoritative objects and roots.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying content-store error when the flush cannot be
+    /// completed.
+    pub fn sync(&self) -> Result<(), FilesystemError> {
+        self.inner.sync()
     }
 }
 
@@ -608,6 +811,38 @@ mod tests {
 
         assert_eq!(first.read(&path, 0, 5).unwrap(), b"first");
         assert_eq!(second.read(&path, 0, 6).unwrap(), b"second");
+    }
+
+    #[tokio::test]
+    async fn fleet_shared_view_cannot_escape_fixed_prefix() {
+        let (_directory, filesystem) = filesystem().await;
+        let shared = FilesystemPath::new("shared").unwrap();
+        let inside = FilesystemPath::new("shared/inside.txt").unwrap();
+        let outside = FilesystemPath::new("private.txt").unwrap();
+        filesystem.create_dir(&shared).unwrap();
+        filesystem.write(&inside, b"shared bytes").unwrap();
+        filesystem.write(&outside, b"private bytes").unwrap();
+
+        let scoped =
+            AstridFilesystem::new_fleet_shared(Arc::clone(&filesystem.content), filesystem.owner);
+        assert_eq!(
+            scoped.read_dir(&FilesystemPath::root()).unwrap()[0].name(),
+            "inside.txt"
+        );
+        assert_eq!(
+            scoped
+                .read(&FilesystemPath::new("inside.txt").unwrap(), 0, 12)
+                .unwrap(),
+            b"shared bytes"
+        );
+        assert!(matches!(
+            scoped.stat(&FilesystemPath::new("private.txt").unwrap()),
+            Err(FilesystemError::NotFound(_))
+        ));
+        assert!(matches!(
+            scoped.remove(&FilesystemPath::root()),
+            Err(FilesystemError::AlreadyExists(_))
+        ));
     }
 
     #[tokio::test]

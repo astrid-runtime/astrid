@@ -374,6 +374,13 @@ impl FileSecretStore {
         Self { root: root.into() }
     }
 
+    /// Return the legacy root path for an explicit migration or diagnostic.
+    /// Runtime secret resolution must use [`KvSecretStore`] instead.
+    #[must_use]
+    pub fn root_path(&self) -> &std::path::Path {
+        &self.root
+    }
+
     /// Resolve a key to its on-disk path. Rejects keys that contain
     /// path separators, null bytes, or otherwise escape the root —
     /// defense in depth against caller bugs since `validate_key`

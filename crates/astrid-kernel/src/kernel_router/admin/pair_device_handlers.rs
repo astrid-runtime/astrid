@@ -12,10 +12,9 @@
 //!   bound principal's `AuthConfig.public_keys`, and removes the
 //!   token (single-use).
 //!
-//! The store at `etc/pair-tokens.toml` persists only domain-separated BLAKE3
-//! hashes — same posture as `etc/invites.toml`. Audit redaction
-//! lives in `admin::mod::sanitize_admin_audit_params` so neither
-//! the raw token nor the ed25519 key ever reaches the audit log.
+//! The system-owner durable store persists only domain-separated BLAKE3
+//! hashes. Audit redaction lives in `admin::mod::sanitize_admin_audit_params`
+//! so neither the raw token nor the ed25519 key ever reaches the audit log.
 
 use std::sync::Arc;
 
@@ -32,7 +31,7 @@ use astrid_core::profile::{
 use tracing::{info, warn};
 
 use crate::kernel_router::AuthorizedRequest;
-use crate::pair_token::{self, MAX_EXPIRY_SECS, PairToken, PairTokenStore};
+use crate::pair_token::{self, DurablePairToken, DurablePairTokenStore, MAX_EXPIRY_SECS};
 
 /// Default token lifetime when the issuer doesn't specify. Matches
 /// the QR-scan window — a few minutes is plenty for the pairing
@@ -40,6 +39,18 @@ use crate::pair_token::{self, MAX_EXPIRY_SECS, PairToken, PairTokenStore};
 const DEFAULT_EXPIRY_SECS: u64 = 5 * 60;
 
 type PairIssuerAuthority = (Arc<PrincipalProfile>, Arc<GroupConfig>, Option<DeviceScope>);
+
+fn pair_token_store(
+    kernel: &Arc<crate::Kernel>,
+) -> Result<DurablePairTokenStore, AdminResponseBody> {
+    let Some(store) = kernel.principal_store.as_ref() else {
+        return Err(err_internal(
+            "pair-token durable storage is unavailable".into(),
+        ));
+    };
+    DurablePairTokenStore::new(store.kv())
+        .map_err(|_| err_internal("pair-token durable storage is unavailable".into()))
+}
 
 fn resolve_pair_issuer_authority(
     kernel: &Arc<crate::Kernel>,
@@ -109,29 +120,41 @@ pub(super) async fn pair_device_issue(
     drop(groups);
 
     let _guard = kernel.admin_write_lock.lock().await;
-    let store = PairTokenStore::new(PairTokenStore::path_for(&kernel.astrid_home));
-    let mut tokens = match store.load() {
-        Ok(v) => v,
-        Err(e) => return err_internal(format!("pair-tokens.toml load failed: {e}")),
+    let store = match pair_token_store(kernel) {
+        Ok(store) => store,
+        Err(response) => return response,
     };
-    let _ = pair_token::prune_expired(&mut tokens);
+    if store
+        .ensure_legacy_import(&kernel.astrid_home, &kernel.principal_directory)
+        .await
+        .is_err()
+    {
+        return err_internal("pair-token durable storage is unavailable".into());
+    }
+    if store.prune().await.is_err() {
+        return err_internal("pair-token durable storage could not be pruned".into());
+    }
+    let Ok(principal_uid) = kernel.principal_directory.uid_for(caller) else {
+        return err_internal("caller has no durable principal identity".into());
+    };
 
     let now = pair_token::now_epoch();
     let expires_at_epoch = now.saturating_add(lifetime);
     let token = pair_token::generate_token();
     let token_hash = pair_token::hash_token(&token);
 
-    tokens.push(PairToken {
+    let record = DurablePairToken {
         token_hash: token_hash.clone(),
-        principal: caller.clone(),
+        principal_uid,
         expires_at_epoch,
         issued_at_epoch: now,
         label: label.clone(),
         scope: stored_scope.clone(),
-    });
-
-    if let Err(e) = store.save(&tokens) {
-        return err_internal(format!("pair-tokens.toml save failed: {e}"));
+    };
+    match store.issue(&record).await {
+        Ok(true) => {},
+        Ok(false) => return err_internal("pair-token identifier collision".into()),
+        Err(_) => return err_internal("pair-token durable storage write failed".into()),
     }
 
     info!(
@@ -325,40 +348,34 @@ pub(crate) async fn pair_device_redeem(
     };
 
     let _guard = kernel.admin_write_lock.lock().await;
-    let store = PairTokenStore::new(PairTokenStore::path_for(&kernel.astrid_home));
-    let mut tokens = match store.load() {
-        Ok(v) => v,
-        Err(e) => return err_internal(format!("pair-tokens.toml load failed: {e}")),
+    let store = match pair_token_store(kernel) {
+        Ok(store) => store,
+        Err(response) => return response,
     };
-    let _ = pair_token::prune_expired(&mut tokens);
-
-    let token_hash = pair_token::hash_token(&token);
-    let now = pair_token::now_epoch();
-
-    // Constant-time scan over live tokens — no early-return on
-    // partial match.
-    let mut matched_index: Option<usize> = None;
-    for (i, t) in tokens.iter().enumerate() {
-        let live = t.expires_at_epoch > now;
-        let hit = pair_token::ct_hash_eq(&t.token_hash, &token_hash) && live;
-        if hit && matched_index.is_none() {
-            matched_index = Some(i);
-        }
+    if store
+        .ensure_legacy_import(&kernel.astrid_home, &kernel.principal_directory)
+        .await
+        .is_err()
+    {
+        return err_internal("pair-token durable storage is unavailable".into());
     }
 
-    let Some(idx) = matched_index else {
+    let token_hash = pair_token::hash_token(&token);
+    let Some(chosen) = (match store.redeem(&token_hash).await {
+        Ok(value) => value,
+        Err(_) => return err_internal("pair-token durable storage read failed".into()),
+    }) else {
         return err_unauthorized("pair-device token invalid or expired".into());
     };
-
-    let chosen = tokens[idx].clone();
+    let Ok(principal) = kernel.principal_directory.alias_for(chosen.principal_uid) else {
+        return err_internal("paired principal identity is no longer admitted".into());
+    };
+    let now = pair_token::now_epoch();
 
     // Load the bound principal's profile and append the key.
-    let profile_path = kernel.astrid_home.profile_path(&chosen.principal);
+    let profile_path = kernel.astrid_home.profile_path(&principal);
     if !profile_path.exists() {
-        return err_internal(format!(
-            "bound principal {} disappeared between issue and redeem",
-            chosen.principal
-        ));
+        return err_internal("bound principal disappeared between issue and redeem".into());
     }
     let mut profile = match PrincipalProfile::load_from_path(&profile_path) {
         Ok(p) => p,
@@ -393,24 +410,13 @@ pub(crate) async fn pair_device_redeem(
     if let Err(e) = profile.save_to_path(&profile_path) {
         return err_internal(format!("profile save failed: {e}"));
     }
-    kernel.profile_cache.invalidate(&chosen.principal);
-
-    // Single-use: remove the token.
-    tokens.remove(idx);
-    if let Err(e) = store.save(&tokens) {
-        warn!(
-            error = %e,
-            principal = %chosen.principal,
-            security_event = true,
-            "auth.pair.redeem: pair-tokens.toml save failed AFTER key append; manual reconciliation may be required"
-        );
-    }
+    kernel.profile_cache.invalidate(&principal);
 
     let fingerprint =
         super::invite_handlers::fingerprint_public_key(&format!("ed25519:{normalised_key}"));
     let key_id = DeviceKeyId::for_pubkey(&normalised_key);
     info!(
-        principal = %chosen.principal,
+        principal = %principal,
         public_key_fingerprint = %fingerprint,
         key_id = %key_id,
         label = ?chosen.label,
@@ -418,7 +424,7 @@ pub(crate) async fn pair_device_redeem(
     );
 
     AdminResponseBody::PairTokenRedeemed(PairTokenRedeemed {
-        principal: chosen.principal,
+        principal,
         public_key_fingerprint: fingerprint,
         key_id: key_id.into_inner(),
     })

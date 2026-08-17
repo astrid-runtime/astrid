@@ -20,6 +20,9 @@ fs2 = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+libproc = "0.14.11"
+
 [dev-dependencies]
 tempfile = { workspace = true }
 

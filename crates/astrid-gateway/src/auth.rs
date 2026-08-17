@@ -311,6 +311,7 @@ mod tests {
         let cfg = crate::config::GatewayConfig::default();
         Arc::new(GatewayState {
             config: cfg,
+            storage_kv: None,
             signing: SigningMaterial::fresh(),
             distribution: Arc::new(crate::routes::distribution::DistributionInfo::single_tenant()),
             onboarding: Arc::new(crate::routes::distribution::OnboardingFields::default()),

@@ -1,28 +1,7 @@
-//! `astrid capsule install` — source resolution, then hand off to the install lib.
+//! `astrid capsule install` source resolution and daemon hand-off.
 //!
-//! This file owns the **source-resolution** side of installing a capsule:
-//! GitHub release-asset download with clone-and-build fallback, archive
-//! (`*.capsule`) detection, local Cargo-source auto-build, and the
-//! dispatcher that routes `@org/repo`, `github.com/…`, and `./local`
-//! shapes to the right pathway.
-//!
-//! The **post-resolution** install machinery (file layout, content
-//! addressing of WASM/WIT into `bin/<hash>.wasm` / `wit/<hash>.wit`,
-//! lifecycle hooks, topic baking, `meta.json` writes) lives in the
-//! [`astrid_capsule_install`] crate so the kernel-side admin install
-//! handler reaches disk through the same code path the CLI does.
-//!
-//! ## What the lib changed (versus the previous CLI-inline version)
-//!
-//! The previous install copied the entire capsule tree into the target
-//! directory, then read the `.wasm` back out, BLAKE3-hashed it, wrote
-//! `bin/<hash>.wasm`, and deleted the per-capsule copy. Same dance for
-//! `wit/`. The new lib hashes from the **source** directly, writes to
-//! the content store once, and the per-capsule directory copy excludes
-//! `*.wasm` and the top-level `wit/` by construction — no transient
-//! staging copy. The runtime contract is unchanged (loader still reads
-//! by hash via `resolve_content_addressed_wasm`); only the install
-//! path is cleaner.
+//! Shared post-resolution layout and lifecycle work lives in
+//! [`astrid_capsule_install`].
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -57,6 +36,8 @@ struct ExpectedCapsule<'a> {
 #[derive(Clone, Copy)]
 struct InstallContext<'a> {
     workspace: bool,
+    /// Route non-workspace installs through the authenticated daemon writer.
+    daemon: bool,
     home: &'a AstridHome,
     original_source: Option<&'a str>,
     principal: &'a astrid_core::PrincipalId,
@@ -118,12 +99,7 @@ pub(crate) use super::install_update::update_capsule;
 /// distro handles env config and all capsules are installed together.
 pub(super) static BATCH_MODE: AtomicBool = AtomicBool::new(false);
 
-// ---------------------------------------------------------------------------
-// Top-level install dispatch
-// ---------------------------------------------------------------------------
-
 /// Split a trailing `@version` suffix off a `@org/repo@version` source.
-///
 /// Returns `(base_source, Some(version))` when a version pin is present,
 /// `(source, None)` otherwise. The pin is the substring after the
 /// **second** `@` (the first introduces the `@org/repo` alias). Only
@@ -146,7 +122,6 @@ pub(super) fn split_version_suffix(source: &str) -> (&str, Option<&str>) {
 }
 
 /// Install a capsule from `source` (the manual `astrid capsule install` path).
-///
 /// `capsule` is the optional `--capsule <name>` selector. When `Some`, a
 /// multi-capsule release installs only `<name>.capsule`; when `None` (the
 /// default), a release ships every `.capsule` asset and all of them are
@@ -168,6 +143,15 @@ pub(crate) async fn install_capsule_with_options(
     approve_untrusted: bool,
     vars: &[String],
 ) -> anyhow::Result<()> {
+    // The daemon owns the durable principal registry. For direct local
+    // archives/directories, send the authenticated install intent to it
+    // instead of opening a second writer in this CLI process. Workspace
+    // installs remain explicit project-local operations.
+    if !workspace && super::install_daemon::is_local_source(source) {
+        super::install_daemon::install_local_via_daemon(source, vars).await?;
+        return Ok(());
+    }
+
     let principal = crate::principal::current();
     let prompt = ManualInstallOptions::from_cli(yes, approve_untrusted, vars)?;
     let (installed, _resolved) = install_capsule_inner(
@@ -193,7 +177,6 @@ pub(crate) async fn install_capsule_with_options(
 }
 
 /// Install dispatch shared by the CLI and distro-batch paths.
-///
 /// `name_hint` is the `--capsule <name>` / distro capsule `name` selector
 /// used to pick the right archive when a release ships several. Returns
 /// `(installed_capsule_ids, resolved_ref)`: the ids of every capsule
@@ -228,6 +211,11 @@ pub(super) async fn install_capsule_inner(
     //    canonical reference for a locally-sourced capsule). No remote
     //    ref to resolve.
     if base.starts_with('.') || base.starts_with('/') {
+        if !workspace {
+            let outcome =
+                super::install_daemon::install_local_via_daemon_outcome(base, &[]).await?;
+            return Ok((vec![outcome], None));
+        }
         let ids = install_from_local(
             base,
             workspace,
@@ -250,6 +238,7 @@ pub(super) async fn install_capsule_inner(
             tag.as_deref(),
             InstallContext {
                 workspace,
+                daemon: !workspace,
                 home: &home,
                 original_source: Some(base),
                 principal,
@@ -269,6 +258,7 @@ pub(super) async fn install_capsule_inner(
             tag.as_deref(),
             InstallContext {
                 workspace,
+                daemon: !workspace,
                 home: &home,
                 original_source: Some(base),
                 principal,
@@ -280,6 +270,10 @@ pub(super) async fn install_capsule_inner(
     }
 
     // 4. Fallback: assume local folder. No remote ref to resolve.
+    if !workspace {
+        let outcome = super::install_daemon::install_local_via_daemon_outcome(base, &[]).await?;
+        return Ok((vec![outcome], None));
+    }
     let ids = install_from_local(
         base,
         workspace,
@@ -411,26 +405,23 @@ async fn install_from_github(
 
     // Priority 2: clone + build from source via astrid-build — reached only
     // when nothing was pinned (a pin would have bailed above).
-    let id = clone_and_build(url, repo, name_hint, context)?;
+    let id = clone_and_build(url, repo, name_hint, context).await?;
     Ok((vec![id], None))
 }
 
 /// Download a `.capsule` file to `dest_path` WITHOUT installing it,
 /// returning the concrete git ref that was actually resolved.
-///
 /// This is the seal pipeline's source-resolution primitive: it mirrors
 /// the release-asset download half of [`install_from_github`] but stops
 /// before handing off to the install lib. Clone-and-build is *not* a
 /// fallback here — a sealable distro must ship pre-built `.capsule`
 /// release assets, so a missing asset is a hard error the maintainer
 /// must resolve.
-///
 /// `name_hint` is the distro capsule `name`, used to pick the right
 /// archive when one source ships several (a monorepo builds/releases one
 /// `.capsule` per capsule crate) — the same `capsule_assets`/`pick_capsule`
 /// selection [`install_from_github`] uses. A single-asset release installs
 /// that one regardless of the hint.
-///
 /// The returned ref is the single source of truth the seal records in
 /// the lock's `resolved_ref`: it is whatever GitHub reported as the
 /// release `tag_name`, never an optimistic guess from the manifest.
@@ -511,6 +502,15 @@ async fn download_and_unpack(
         );
     }
     std::fs::write(&download_path, &bytes)?;
+    if context.daemon {
+        return super::install_daemon::install_local_via_daemon_outcome(
+            download_path
+                .to_str()
+                .context("invalid downloaded archive path")?,
+            &[],
+        )
+        .await;
+    }
     unpack_via_lib(
         &download_path,
         context.workspace,
@@ -523,7 +523,6 @@ async fn download_and_unpack(
 }
 
 /// Install every `.capsule` asset in a release (the manual-install default).
-///
 /// Best-effort: each failure is reported with the asset name, but the loop
 /// continues so one bad archive doesn't block the rest. Returns an error if
 /// **any** asset failed, naming all that did — failures are surfaced, never
@@ -565,7 +564,7 @@ async fn install_all_capsules(
 
 /// Clone a GitHub repository and build the capsule from source using
 /// `astrid-build`. Returns the installed capsule id.
-fn clone_and_build(
+async fn clone_and_build(
     url: &str,
     repo: &str,
     name_hint: Option<&str>,
@@ -623,6 +622,15 @@ fn clone_and_build(
         .map(|p| p.file_name().and_then(|n| n.to_str()).unwrap_or(""))
         .collect();
     if let Some(idx) = pick_capsule(&names, name_hint)? {
+        if context.daemon {
+            return super::install_daemon::install_local_via_daemon_outcome(
+                produced[idx]
+                    .to_str()
+                    .context("invalid built archive path")?,
+                &[],
+            )
+            .await;
+        }
         return unpack_via_lib(
             &produced[idx],
             context.workspace,
@@ -725,7 +733,6 @@ fn install_from_local(
 // ---------------------------------------------------------------------------
 
 /// Install a capsule from a directory containing `Capsule.toml`.
-///
 /// CLI-facing wrapper that wires up an in-process event bus with a
 /// stdin elicit handler subscribed (so capsules can prompt for
 /// `[env]` values during their install lifecycle hook), runs the
@@ -777,6 +784,9 @@ fn install_from_local_path_for_principal(
         original_source: original_source.map(String::from),
         skip_import_check: BATCH_MODE.load(Ordering::Relaxed),
         lifecycle_bus: None,
+        storage: None,
+        provenance_distro: None,
+        provenance_source_digest: None,
     };
     let output = run_with_elicit(opts, prompt, |opts, bus| {
         let opts = InstallOptions {
@@ -812,7 +822,6 @@ fn install_from_local_path_for_principal(
 /// Install a capsule from a local `.capsule` file in batch (offline)
 /// mode, recording `original_source` and signing provenance in
 /// `meta.json`.
-///
 /// Used by the `.shuttle` offline-install path: the file already lives
 /// in the verified mirror, so no network is touched. `original_source`
 /// is the distro's canonical `@org/repo` (NOT the mirror path) so a
@@ -888,6 +897,9 @@ fn unpack_via_lib(
         original_source: original_source.map(String::from),
         skip_import_check: BATCH_MODE.load(Ordering::Relaxed),
         lifecycle_bus: None,
+        storage: None,
+        provenance_distro: None,
+        provenance_source_digest: None,
     };
     let output = run_with_elicit(opts, prompt, |opts, bus| {
         let opts = InstallOptions {
@@ -985,12 +997,8 @@ fn authority_decision(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests — source-resolution helpers only. Install-machinery tests live
-// in `astrid-capsule-install`; `update`/`check_remote_version` tests
-// live in `install_update`.
-// ---------------------------------------------------------------------------
-
+// Tests cover source-resolution helpers only; install machinery lives in
+// `astrid-capsule-install`, update tests in `install_update`.
 #[cfg(test)]
 #[path = "install_tests.rs"]
 mod tests;

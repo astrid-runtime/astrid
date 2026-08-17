@@ -294,6 +294,7 @@ async fn session_mgmt_gate_warms_caller_session_before_501() {
     let warmed_probe = Arc::clone(&warmed);
     let state = GatewayState {
         config: crate::config::GatewayConfig::default(),
+        storage_kv: None,
         signing: SigningMaterial::fresh(),
         distribution: Arc::new(crate::routes::distribution::DistributionInfo::single_tenant()),
         onboarding: Arc::new(crate::routes::distribution::OnboardingFields::default()),

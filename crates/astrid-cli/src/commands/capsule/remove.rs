@@ -25,6 +25,9 @@ pub(crate) fn remove_capsule(
     force: bool,
     purge: bool,
 ) -> anyhow::Result<()> {
+    if !workspace {
+        bail!("principal capsule removal must go through the authenticated daemon");
+    }
     let home = AstridHome::resolve()?;
     let principal = crate::principal::current();
     remove_capsule_from_home_for(&home, &principal, name, workspace, force, purge)
@@ -68,19 +71,17 @@ fn remove_capsule_from_home_for(
     astrid_capsule_install::remove_installed_authority(home, &target_dir)
         .context("failed to remove capsule authority receipt")?;
 
-    // Only delete user configuration (API keys, env vars) with --purge.
-    // By default, env.json is preserved so reinstall skips prompting.
+    // Delete principal-scoped configuration through the daemon with
+    // --purge. Native env files are never consulted or removed here.
     if purge {
-        let env_path = home
-            .principal_home(principal)
-            .env_dir()
-            .join(format!("{name}.env.json"));
-        if env_path.exists() {
-            std::fs::remove_file(&env_path).with_context(|| {
-                format!("failed to purge configuration at {}", env_path.display())
-            })?;
-            eprintln!("Purged configuration for '{name}'.");
+        let entries = super::install_headless::list_env_entries(principal, name)?;
+        for entry in entries {
+            if !matches!(entry.scope, astrid_core::kernel_api::EnvStorageScope::Agent) {
+                continue;
+            }
+            super::install_headless::delete_env_entry(principal, name, &entry.key, entry.kind)?;
         }
+        eprintln!("Purged configuration for '{name}'.");
     }
 
     if force {
@@ -101,6 +102,12 @@ pub(crate) fn validate_capsule_removal(
     workspace: bool,
     force: bool,
 ) -> anyhow::Result<()> {
+    if !workspace {
+        // Durable owner-scoped removal is validated and authorized by the
+        // daemon's CapsuleRegistry request. Never inspect a native principal
+        // home from this CLI preflight.
+        return Ok(());
+    }
     let home = AstridHome::resolve()?;
     let principal = crate::principal::current();
     validate_capsule_removal_from_home_for(&home, &principal, name, workspace, force)
@@ -466,57 +473,5 @@ mod tests {
         remove_capsule_from_home(&home, "target", false, false, false)
             .expect("delete path must trust the caller's single preflight validation");
         assert!(!target.exists());
-    }
-
-    #[test]
-    fn remove_without_purge_preserves_env() {
-        let tmp = tempfile::tempdir().unwrap();
-        let env_dir = tmp.path().join("env");
-        std::fs::create_dir_all(&env_dir).unwrap();
-        let env_path = env_dir.join("test-capsule.env.json");
-        std::fs::write(&env_path, r#"{"api_key":"secret"}"#).unwrap();
-
-        // Simulate the purge=false path: env file should not be touched.
-        let purge = false;
-        if purge {
-            let _ = std::fs::remove_file(&env_path);
-        }
-        assert!(
-            env_path.exists(),
-            "env.json should be preserved when purge=false"
-        );
-    }
-
-    #[test]
-    fn remove_with_purge_deletes_env() {
-        let tmp = tempfile::tempdir().unwrap();
-        let env_dir = tmp.path().join("env");
-        std::fs::create_dir_all(&env_dir).unwrap();
-        let env_path = env_dir.join("test-capsule.env.json");
-        std::fs::write(&env_path, r#"{"api_key":"secret"}"#).unwrap();
-
-        // Simulate the purge=true path: env file should be deleted.
-        let purge = true;
-        if purge && env_path.exists() {
-            std::fs::remove_file(&env_path).unwrap();
-        }
-        assert!(
-            !env_path.exists(),
-            "env.json should be deleted when purge=true"
-        );
-    }
-
-    #[test]
-    fn purge_with_no_env_file_is_noop() {
-        let tmp = tempfile::tempdir().unwrap();
-        let env_path = tmp.path().join("nonexistent.env.json");
-
-        // Simulate purge on a capsule that has no env config.
-        let purge = true;
-        if purge && env_path.exists() {
-            std::fs::remove_file(&env_path).unwrap();
-        }
-        // Should not error — just a no-op.
-        assert!(!env_path.exists());
     }
 }

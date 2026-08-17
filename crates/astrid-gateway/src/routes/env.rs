@@ -6,10 +6,10 @@
 //!   in the capsule's `Capsule.toml` so the dashboard can render
 //!   the right input widget per field.
 //! * `POST /api/capsules/{id}/env/{field}` — write a value for the
-//!   caller's principal. Routes to `FileSecretStore` (when the
-//!   field's `env_type = "secret"`) or to the per-principal env
-//!   JSON (text / select / array). The caller's verified principal
-//!   is the only source of scoping — request bodies can't redirect.
+//!   caller's principal. Secret values use the KV-backed `SecretStore`
+//!   primitive and non-secret values use typed `__env:` keys in the same
+//!   owner-scoped KV namespace. The caller's verified principal is the only
+//!   source of scoping — request bodies can't redirect.
 //!
 //! ## Trust shape
 //!
@@ -17,10 +17,10 @@
 //! gates the parent path). The verified principal determines the
 //! storage scope:
 //!
-//! * Secrets land at
-//!   `$ASTRID_HOME/secrets/<principal>/<capsule>/<field>` (0600).
-//! * Non-secrets land in
-//!   `$ASTRID_HOME/home/<principal>/.config/env/<capsule>.env.json`.
+//! * Secrets land in a host-only principal control scope under the
+//!   `SecretStore`'s `__secret:` namespace.
+//! * Non-secrets land in a separate host-only principal control scope under
+//!   typed `__env:` keys; the guest capsule namespace is never used.
 //!
 //! No principal can write into another's slot — the path is built
 //! from `caller.principal`, never the request body. Field names are
@@ -39,13 +39,18 @@
 //! the gateway to publish to so the kernel can persist the trail).
 
 use std::collections::HashMap;
+#[cfg(test)]
 use std::path::Path as FsPath;
 use std::sync::Arc;
 
+#[cfg(test)]
 use astrid_core::PrincipalId;
+#[cfg(test)]
 use astrid_core::dirs::{AstridHome, WorkspaceLayout};
-use astrid_core::kernel_api::{KernelRequest, KernelResponse};
-use astrid_storage::{FileSecretStore, SecretStore};
+use astrid_core::kernel_api::{
+    AdminRequestKind, AdminResponseBody, CapsuleMetadataEntry, EnvStorageScope, EnvValueKind,
+    KernelRequest, KernelResponse,
+};
 use axum::Extension;
 use axum::Json;
 use axum::extract::{Path, State};
@@ -54,7 +59,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::error::{ErrorBody, GatewayError, GatewayResult};
-use crate::routes::principals::caller_from;
+use crate::routes::principals::{caller_from, daemon_internal, unexpected};
 use crate::routes::{WorkspaceContext, daemon_kernel_error};
 use crate::state::GatewayState;
 
@@ -124,13 +129,14 @@ pub(crate) async fn get_env_schema_with_workspace(
 
 async fn get_env_schema_inner(
     state: Arc<GatewayState>,
-    workspace: &WorkspaceContext,
+    _workspace: &WorkspaceContext,
     capsule_id: String,
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<EnvSchemaResponse>> {
     let caller = caller_from(&req)?.clone();
-    ensure_capsule_visible(&state, &caller, &capsule_id).await?;
-    let schema = load_env_schema(&caller.principal, &capsule_id, workspace)?;
+    let metadata = capsule_metadata_for(&state, &caller).await?;
+    let entry = metadata_entry(&metadata, &capsule_id, caller.principal.as_str())?;
+    let schema = env_schema_from_metadata(&entry);
     Ok(Json(EnvSchemaResponse {
         capsule_id,
         fields: schema,
@@ -174,77 +180,50 @@ pub(crate) async fn write_env_with_workspace(
 
 async fn write_env_inner(
     state: Arc<GatewayState>,
-    workspace: &WorkspaceContext,
+    _workspace: &WorkspaceContext,
     capsule_id: String,
     field: String,
     req: Request<axum::body::Body>,
 ) -> GatewayResult<StatusCode> {
     let caller = caller_from(&req)?.clone();
-    ensure_capsule_visible(&state, &caller, &capsule_id).await?;
+    let metadata = capsule_metadata_for(&state, &caller).await?;
+    let entry = metadata_entry(&metadata, &capsule_id, caller.principal.as_str())?;
     if !is_safe_field_name(&field) {
         return Err(GatewayError::BadRequest(format!(
             "invalid env field name {field:?}"
         )));
     }
     let body: EnvWriteRequest = crate::routes::principals::read_json_body(req).await?;
-    let schema = load_env_schema(&caller.principal, &capsule_id, workspace)?;
+    let schema = env_schema_from_metadata(&entry);
     let def = schema.get(&field).ok_or(GatewayError::NotFound)?;
-
-    let home = AstridHome::resolve()
-        .map_err(|e| GatewayError::Internal(anyhow::anyhow!("resolve ASTRID_HOME: {e}")))?;
-
-    // The disk writes below (`FileSecretStore::set`, `write_env_string`,
-    // `append_env_array`) are synchronous `std::fs` calls that fsync
-    // through a temp-and-rename. Running them on the tokio worker
-    // thread blocks the runtime — at the gateway's measured 5,400
-    // RPS read throughput, a single slow fsync would stall every
-    // other in-flight HTTP request. `spawn_blocking` parks the
-    // syscall on the blocking-IO threadpool instead.
-    let env_type = def.env_type.clone();
-    let principal_str = caller.principal.clone();
-    let capsule_id_for_blocking = capsule_id.clone();
-    let field_for_blocking = field.clone();
-    let value = body.value.clone();
-    tokio::task::spawn_blocking(move || -> GatewayResult<()> {
-        match env_type.as_str() {
-            "secret" => {
-                let root = home
-                    .secrets_dir()
-                    .join(principal_str.as_str())
-                    .join(&capsule_id_for_blocking);
-                let store = FileSecretStore::new(root);
-                store
-                    .set(&field_for_blocking, &value)
-                    .map_err(|e| GatewayError::Internal(anyhow::anyhow!("secret write: {e}")))?;
-            },
-            "text" | "select" => {
-                write_env_string(
-                    &home,
-                    &principal_str,
-                    &capsule_id_for_blocking,
-                    &field_for_blocking,
-                    &value,
-                )?;
-            },
-            "array" => {
-                append_env_array(
-                    &home,
-                    &principal_str,
-                    &capsule_id_for_blocking,
-                    &field_for_blocking,
-                    &value,
-                )?;
-            },
-            other => {
-                return Err(GatewayError::BadRequest(format!(
-                    "unsupported env type {other:?} for field {field_for_blocking:?}"
-                )));
-            },
-        }
-        Ok(())
-    })
-    .await
-    .map_err(|e| GatewayError::Internal(anyhow::anyhow!("env-write task panicked: {e}")))??;
+    let (kind, append) = match def.env_type.as_str() {
+        "secret" => (EnvValueKind::Secret, false),
+        "text" | "select" => (EnvValueKind::Text, false),
+        "array" => (EnvValueKind::Text, true),
+        other => {
+            return Err(GatewayError::BadRequest(format!(
+                "unsupported env type {other:?} for field {field:?}"
+            )));
+        },
+    };
+    let client = state.admin_client_for(&caller)?;
+    let response = client
+        .request(AdminRequestKind::EnvSet {
+            principal: caller.principal.clone(),
+            capsule: capsule_id.clone(),
+            key: field.clone(),
+            value: body.value,
+            kind,
+            scope: EnvStorageScope::Agent,
+            append,
+        })
+        .await
+        .map_err(daemon_internal)?;
+    match response {
+        AdminResponseBody::Success(_) => {},
+        AdminResponseBody::Error(message) => return Err(GatewayError::BadRequest(message)),
+        other => return Err(unexpected(other)),
+    }
 
     tracing::info!(
         principal = %caller.principal,
@@ -259,19 +238,53 @@ async fn write_env_inner(
 
 // ── helpers ──────────────────────────────────────────────────────
 
-async fn ensure_capsule_visible(
+async fn capsule_metadata_for(
     state: &GatewayState,
     caller: &crate::auth::CallerContext,
-    capsule_id: &str,
-) -> GatewayResult<()> {
+) -> GatewayResult<Vec<CapsuleMetadataEntry>> {
     let client = state.kernel_client_for(caller)?;
     let resp = client
         .request(KernelRequest::GetCapsuleMetadata)
         .await
         .map_err(daemon_kernel_error)?;
-    ensure_capsule_visible_from_response(resp, caller.principal.as_str(), capsule_id)
+    match resp {
+        KernelResponse::CapsuleMetadata(entries) => Ok(entries),
+        KernelResponse::Error(msg) => {
+            tracing::warn!(
+                security_event = true,
+                principal = %caller.principal,
+                reason = %msg,
+                "capsule env visibility probe denied; returning hidden not-found"
+            );
+            Err(GatewayError::NotFound)
+        },
+        other => Err(GatewayError::Internal(anyhow::anyhow!(
+            "unexpected response shape for GetCapsuleMetadata: {other:?}"
+        ))),
+    }
 }
 
+fn metadata_entry(
+    entries: &[CapsuleMetadataEntry],
+    capsule_id: &str,
+    caller: &str,
+) -> GatewayResult<CapsuleMetadataEntry> {
+    entries
+        .iter()
+        .find(|entry| entry.name == capsule_id)
+        .cloned()
+        .ok_or_else(|| {
+            tracing::debug!(
+                security_event = true,
+                principal = %caller,
+                capsule = %capsule_id,
+                "capsule env visibility probe returned no matching entry"
+            );
+            GatewayError::NotFound
+        })
+}
+
+#[cfg(test)]
 fn ensure_capsule_visible_from_response(
     resp: KernelResponse,
     caller: &str,
@@ -299,12 +312,33 @@ fn ensure_capsule_visible_from_response(
     }
 }
 
+fn env_schema_from_metadata(entry: &CapsuleMetadataEntry) -> HashMap<String, EnvFieldSchema> {
+    entry
+        .env
+        .iter()
+        .map(|(name, def)| {
+            (
+                name.clone(),
+                EnvFieldSchema {
+                    env_type: def.env_type.clone(),
+                    description: def.description.clone(),
+                    request: def.request.clone(),
+                    default: def.default.clone(),
+                    enum_values: def.enum_values.clone(),
+                    placeholder: def.placeholder.clone(),
+                },
+            )
+        })
+        .collect()
+}
+
 /// Parse `[env]` from the caller's principal install or verified workspace
 /// `Capsule.toml`, in runtime discovery precedence.
 ///
 /// The gateway intentionally does NOT take a dep on
 /// `astrid-capsule` (which would drag in wasmtime); a minimal TOML
 /// read of just the `[env]` subtable is enough.
+#[cfg(test)]
 fn load_env_schema(
     principal: &PrincipalId,
     capsule_id: &str,
@@ -327,6 +361,7 @@ fn load_env_schema(
 }
 
 #[cfg(test)]
+#[cfg(test)]
 fn load_env_schema_from_home(
     home: &AstridHome,
     principal: &PrincipalId,
@@ -341,6 +376,7 @@ fn load_env_schema_from_home(
     )
 }
 
+#[cfg(test)]
 fn load_env_schema_from_home_in_workspace(
     home: &AstridHome,
     principal: &PrincipalId,
@@ -384,6 +420,7 @@ fn load_env_schema_from_home_in_workspace(
     Ok(schema)
 }
 
+#[cfg(test)]
 fn parse_env_schema(manifest_path: &FsPath) -> GatewayResult<HashMap<String, EnvFieldSchema>> {
     let text = match std::fs::read_to_string(manifest_path) {
         Ok(t) => t,
@@ -447,6 +484,7 @@ fn parse_env_schema(manifest_path: &FsPath) -> GatewayResult<HashMap<String, Env
     Ok(fields)
 }
 
+#[cfg(test)]
 fn env_type_from_manifest_table(tbl: &toml::map::Map<String, toml::Value>) -> String {
     let raw = tbl
         .get("env_type")
@@ -474,100 +512,6 @@ fn is_safe_field_name(name: &str) -> bool {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
         && !name.contains("..")
-}
-
-/// Write or replace a single string field in
-/// `$ASTRID_HOME/home/<principal>/.config/env/<capsule>.env.json`.
-/// Atomic write-then-rename; existing fields are preserved.
-fn write_env_string(
-    home: &AstridHome,
-    principal: &astrid_core::PrincipalId,
-    capsule_id: &str,
-    field: &str,
-    value: &str,
-) -> GatewayResult<()> {
-    let env_dir = home.principal_home(principal).env_dir();
-    std::fs::create_dir_all(&env_dir).map_err(|e| {
-        GatewayError::Internal(anyhow::anyhow!("create env dir {}: {e}", env_dir.display()))
-    })?;
-    let path = env_dir.join(format!("{capsule_id}.env.json"));
-
-    let mut map: HashMap<String, serde_json::Value> = if path.exists() {
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| GatewayError::Internal(anyhow::anyhow!("read env JSON: {e}")))?;
-        serde_json::from_str(&text)
-            .map_err(|e| GatewayError::Internal(anyhow::anyhow!("parse env JSON: {e}")))?
-    } else {
-        HashMap::new()
-    };
-    map.insert(field.to_string(), serde_json::Value::String(value.into()));
-
-    write_json_atomic(&path, &map)
-}
-
-/// Append `value` to the array field, preserving prior entries.
-fn append_env_array(
-    home: &AstridHome,
-    principal: &astrid_core::PrincipalId,
-    capsule_id: &str,
-    field: &str,
-    value: &str,
-) -> GatewayResult<()> {
-    let env_dir = home.principal_home(principal).env_dir();
-    std::fs::create_dir_all(&env_dir).map_err(|e| {
-        GatewayError::Internal(anyhow::anyhow!("create env dir {}: {e}", env_dir.display()))
-    })?;
-    let path = env_dir.join(format!("{capsule_id}.env.json"));
-
-    let mut map: HashMap<String, serde_json::Value> = if path.exists() {
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| GatewayError::Internal(anyhow::anyhow!("read env JSON: {e}")))?;
-        serde_json::from_str(&text)
-            .map_err(|e| GatewayError::Internal(anyhow::anyhow!("parse env JSON: {e}")))?
-    } else {
-        HashMap::new()
-    };
-    let entry = map
-        .entry(field.to_string())
-        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
-    if let serde_json::Value::Array(arr) = entry {
-        arr.push(serde_json::Value::String(value.into()));
-    } else {
-        // Field exists but isn't an array — replace with a fresh
-        // singleton. Surface the divergence in logs rather than
-        // silently growing JSON state of unexpected shape.
-        tracing::warn!(
-            field = %field,
-            capsule = %capsule_id,
-            "env field declared as array but on-disk shape was scalar; resetting"
-        );
-        *entry = serde_json::Value::Array(vec![serde_json::Value::String(value.into())]);
-    }
-
-    write_json_atomic(&path, &map)
-}
-
-fn write_json_atomic(
-    path: &std::path::Path,
-    map: &HashMap<String, serde_json::Value>,
-) -> GatewayResult<()> {
-    let body = serde_json::to_vec_pretty(map)
-        .map_err(|e| GatewayError::Internal(anyhow::anyhow!("serialise env JSON: {e}")))?;
-    // UUID, not process::id() — two concurrent env-writes from the
-    // same principal would otherwise race on the same temp name in
-    // the multi-threaded gateway runtime and clobber each other.
-    let tmp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4().simple()));
-    std::fs::write(&tmp, &body)
-        .map_err(|e| GatewayError::Internal(anyhow::anyhow!("write env JSON: {e}")))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
-    }
-    std::fs::rename(&tmp, path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        GatewayError::Internal(anyhow::anyhow!("rename env JSON: {e}"))
-    })
 }
 
 #[cfg(test)]

@@ -174,6 +174,7 @@ pub const fn topic_suffix(req: &KernelRequest) -> &'static str {
         KernelRequest::ReloadCapsules => "reload_capsules",
         KernelRequest::ReloadCapsule { .. } => "reload_capsule",
         KernelRequest::UnloadCapsule { .. } => "unload_capsule",
+        KernelRequest::RemoveCapsule { .. } => "remove_capsule",
         KernelRequest::PromoteWorkspace { .. } => "promote_workspace",
         KernelRequest::RollbackWorkspace { .. } => "rollback_workspace",
         KernelRequest::GetCommands => "get_commands",

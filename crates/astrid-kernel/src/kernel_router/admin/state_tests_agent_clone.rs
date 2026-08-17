@@ -48,6 +48,40 @@ fn pid(name: &str) -> PrincipalId {
     PrincipalId::new(name).unwrap()
 }
 
+fn publish_source_capsule(kernel: &Arc<Kernel>, source: &PrincipalId, name: &str) {
+    let dir = kernel
+        .astrid_home
+        .run_dir()
+        .join("test-install-sources")
+        .join(name);
+    std::fs::create_dir_all(&dir).expect("source capsule directory");
+    std::fs::write(
+        dir.join("Capsule.toml"),
+        format!("[package]\nname = \"{name}\"\nversion = \"1.0.0\"\n"),
+    )
+    .expect("source capsule manifest");
+    let home = kernel.astrid_home.clone();
+    let storage = kernel
+        .principal_store
+        .as_ref()
+        .map(|store| Arc::new(store.clone()));
+    let source = source.clone();
+    std::thread::spawn(move || {
+        astrid_capsule_install::install_from_local_path_for_principal(
+            &dir,
+            &home,
+            astrid_capsule_install::InstallOptions {
+                storage,
+                ..Default::default()
+            },
+            &source,
+        )
+    })
+    .join()
+    .expect("publish source capsule thread")
+    .expect("publish source capsule to durable registry");
+}
+
 fn assert_success(res: &AdminResponseBody) {
     if let AdminResponseBody::Error(msg) = res {
         panic!("expected success, got Error: {msg}");
@@ -92,26 +126,13 @@ async fn agent_create_clone_copies_capability_profile() {
         &pid("src"),
     ))
     .unwrap();
-    let source_capsules = kernel
-        .astrid_home
-        .principal_home(&pid("src"))
-        .capsules_dir();
-    let source_registry = source_capsules.join("astrid-capsule-registry");
-    let source_openai = source_capsules.join("astrid-capsule-openai-compat");
-    std::fs::create_dir_all(&source_registry).expect("source registry capsule dir");
-    std::fs::create_dir_all(&source_openai).expect("source openai capsule dir");
-    std::fs::write(
-        source_registry.join("Capsule.toml"),
-        "[package]\nname = \"astrid-capsule-registry\"\nversion = \"0.1.0\"\n",
-    )
-    .expect("seed registry manifest");
-    std::fs::write(
-        source_openai.join("Capsule.toml"),
-        "[package]\nname = \"astrid-capsule-openai-compat\"\nversion = \"0.1.0\"\n",
-    )
-    .expect("seed openai manifest");
-    std::fs::write(source_openai.join(".env.json"), br#"{"api_key":"src"}"#)
-        .expect("seed env that must not cross clone boundary");
+    kernel
+        .identity_store
+        .create_principal(pid("src"), [8; 32])
+        .await
+        .expect("register clone source durable identity");
+    publish_source_capsule(&kernel, &pid("src"), "astrid-capsule-registry");
+    publish_source_capsule(&kernel, &pid("src"), "astrid-capsule-openai-compat");
     kernel.profile_cache.invalidate(&pid("src"));
 
     let res = handlers::dispatch(
@@ -148,30 +169,22 @@ async fn agent_create_clone_copies_capability_profile() {
     // A fresh clone is enabled even though the source was disabled.
     assert!(twin.enabled, "clone must be enabled regardless of source");
 
-    let target_capsules = kernel
-        .astrid_home
-        .principal_home(&pid("twin"))
-        .capsules_dir();
+    let twin_uid = kernel.principal_directory.uid_for(&pid("twin")).unwrap();
+    let owner = astrid_storage::StateOwner::Principal(twin_uid);
+    let registry = kernel.principal_store.as_ref().unwrap().capsules();
+    for capsule in ["astrid-capsule-registry", "astrid-capsule-openai-compat"] {
+        assert!(
+            registry.get(&owner, capsule).unwrap().is_some(),
+            "clone did not publish durable {capsule} package"
+        );
+    }
     assert!(
-        target_capsules
-            .join("astrid-capsule-registry")
-            .join("Capsule.toml")
+        !kernel
+            .astrid_home
+            .principal_home(&pid("twin"))
+            .root()
             .exists(),
-        "clone copied capsule grant but did not materialize registry install"
-    );
-    assert!(
-        target_capsules
-            .join("astrid-capsule-openai-compat")
-            .join("Capsule.toml")
-            .exists(),
-        "clone copied capsule grant but did not materialize openai install"
-    );
-    assert!(
-        !target_capsules
-            .join("astrid-capsule-openai-compat")
-            .join(".env.json")
-            .exists(),
-        "clone must not copy per-principal capsule env"
+        "clone must not recreate a legacy principal home"
     );
 }
 

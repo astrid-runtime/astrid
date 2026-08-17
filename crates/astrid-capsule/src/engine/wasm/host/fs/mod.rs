@@ -18,10 +18,9 @@
 //!   fs-remove-dir-all, fs-canonicalize, fs-read-link, fs-hard-link
 //!
 //! Audit: every path-based op emits `astrid.audit.fs` per call
-//! (capsule + principal + op + path). Both the allowed and the denied paths
-//! record the RESOLVED PHYSICAL path (the exact path the security gate
-//! evaluated), not the guest-supplied logical path — so a `home://x` allow and
-//! a `home://x` deny name the same on-disk target on the chain.
+//! (capsule + principal + op + path). Workspace/tmp operations record their
+//! resolved physical path; durable home operations record the canonical
+//! logical `home://<relative>` spelling because no host path exists.
 
 mod file_handle;
 mod resolve;
@@ -202,27 +201,30 @@ fn gate_read(
     state: &HostState,
     physical: &std::path::Path,
 ) -> Result<Option<crate::engine::wasm::PrincipalInvocationGuard>, ErrorCode> {
+    gate_read_path(state, &physical.to_string_lossy())
+}
+
+fn gate_read_path(
+    state: &HostState,
+    gate_path: &str,
+) -> Result<Option<crate::engine::wasm::PrincipalInvocationGuard>, ErrorCode> {
     let operation = state
         .begin_host_operation()
         .map_err(|()| ErrorCode::CapabilityDenied)?;
     if let Some(gate) = state.security.clone() {
         let capsule_id = state.capsule_id.as_str().to_owned();
-        let p = physical.to_string_lossy().to_string();
-        let home = state.effective_home_root_buf();
+        let p = gate_path.to_owned();
+        let home = (!gate_path.starts_with(resolve::HOME_SCHEME))
+            .then(|| state.effective_home_root_buf())
+            .flatten();
         let check = util::bounded_block_on(
             &state.runtime_handle,
             &state.blocking_semaphore,
             async move { gate.check_file_read(&capsule_id, &p, home.as_deref()).await },
         );
         if let Err(reason) = check {
-            let path = physical.to_string_lossy();
-            record_fs_denied(
-                state,
-                HostAuditEvent::FileRead {
-                    path: path.as_ref(),
-                },
-                &reason,
-            );
+            let path = gate_path;
+            record_fs_denied(state, HostAuditEvent::FileRead { path }, &reason);
             return Err(ErrorCode::CapabilityDenied);
         }
     }
@@ -252,13 +254,23 @@ fn gate_write(
     physical: &std::path::Path,
     kind: WriteKind,
 ) -> Result<Option<crate::engine::wasm::PrincipalInvocationGuard>, ErrorCode> {
+    gate_write_path(state, &physical.to_string_lossy(), kind)
+}
+
+fn gate_write_path(
+    state: &HostState,
+    gate_path: &str,
+    kind: WriteKind,
+) -> Result<Option<crate::engine::wasm::PrincipalInvocationGuard>, ErrorCode> {
     let operation = state
         .begin_host_operation()
         .map_err(|()| ErrorCode::CapabilityDenied)?;
     if let Some(gate) = state.security.clone() {
         let capsule_id = state.capsule_id.as_str().to_owned();
-        let p = physical.to_string_lossy().to_string();
-        let home = state.effective_home_root_buf();
+        let p = gate_path.to_owned();
+        let home = (!gate_path.starts_with(resolve::HOME_SCHEME))
+            .then(|| state.effective_home_root_buf())
+            .flatten();
         let check = util::bounded_block_on(
             &state.runtime_handle,
             &state.blocking_semaphore,
@@ -268,14 +280,10 @@ fn gate_write(
             },
         );
         if let Err(reason) = check {
-            let path = physical.to_string_lossy();
+            let path = gate_path;
             let event = match kind {
-                WriteKind::Write => HostAuditEvent::FileWrite {
-                    path: path.as_ref(),
-                },
-                WriteKind::Delete => HostAuditEvent::FileDelete {
-                    path: path.as_ref(),
-                },
+                WriteKind::Write => HostAuditEvent::FileWrite { path },
+                WriteKind::Delete => HostAuditEvent::FileDelete { path },
             };
             record_fs_denied(state, event, &reason);
             return Err(ErrorCode::CapabilityDenied);
@@ -290,8 +298,11 @@ pub(super) fn authorize_process_read_path(
     raw_path: &str,
 ) -> Result<std::path::PathBuf, ErrorCode> {
     let resolved = resolve_path(state, raw_path).map_err(map_resolve_err)?;
-    let _operation = gate_read(state, &resolved.physical)?;
-    Ok(resolved.physical)
+    let Some(physical) = resolved.physical else {
+        return Err(ErrorCode::CapabilityDenied);
+    };
+    let _operation = gate_read(state, &physical)?;
+    Ok(physical)
 }
 
 /// Write-authorize an already-resolved physical process path before adding it
@@ -346,7 +357,7 @@ impl fs::Host for HostState {
 
     fn fs_exists(&mut self, path: String) -> Result<bool, ErrorCode> {
         let resolved = resolve_path(self, &path).map_err(map_resolve_err)?;
-        let _operation = gate_read(self, &resolved.physical)?;
+        let _operation = gate_read_path(self, &resolved.gate_path)?;
         let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
         let exists =
             util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {
@@ -363,7 +374,7 @@ impl fs::Host for HostState {
         audit_fs(
             self,
             "astrid:fs/host.fs-exists",
-            &resolved.physical.to_string_lossy(),
+            &resolved.gate_path,
             &result,
         );
         result
@@ -371,7 +382,7 @@ impl fs::Host for HostState {
 
     fn fs_mkdir(&mut self, path: String) -> Result<(), ErrorCode> {
         let resolved = resolve_path(self, &path).map_err(map_resolve_err)?;
-        let _operation = gate_write(self, &resolved.physical, WriteKind::Write)?;
+        let _operation = gate_write_path(self, &resolved.gate_path, WriteKind::Write)?;
         let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
 
         // Strict-create semantics per `astrid:fs@1.0.0` (fs-mkdir
@@ -399,7 +410,7 @@ impl fs::Host for HostState {
                 audit_fs(
                     self,
                     "astrid:fs/host.fs-mkdir",
-                    &resolved.physical.to_string_lossy(),
+                    &resolved.gate_path,
                     &result,
                 );
                 return result;
@@ -414,7 +425,7 @@ impl fs::Host for HostState {
         audit_fs(
             self,
             "astrid:fs/host.fs-mkdir",
-            &resolved.physical.to_string_lossy(),
+            &resolved.gate_path,
             &result,
         );
         result
@@ -431,7 +442,7 @@ impl fs::Host for HostState {
         // unstubs the idempotent variant the capsule contract
         // promises.
         let resolved = resolve_path(self, &path).map_err(map_resolve_err)?;
-        let _operation = gate_write(self, &resolved.physical, WriteKind::Write)?;
+        let _operation = gate_write_path(self, &resolved.gate_path, WriteKind::Write)?;
         let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
         let result =
             util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {
@@ -447,7 +458,7 @@ impl fs::Host for HostState {
         audit_fs(
             self,
             "astrid:fs/host.fs-mkdir-all",
-            &resolved.physical.to_string_lossy(),
+            &resolved.gate_path,
             &result,
         );
         result
@@ -455,7 +466,7 @@ impl fs::Host for HostState {
 
     fn fs_readdir(&mut self, path: String) -> Result<Vec<String>, ErrorCode> {
         let resolved = resolve_path(self, &path).map_err(map_resolve_err)?;
-        let _operation = gate_read(self, &resolved.physical)?;
+        let _operation = gate_read_path(self, &resolved.gate_path)?;
         let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
         let result =
             util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {
@@ -472,7 +483,7 @@ impl fs::Host for HostState {
         audit_fs(
             self,
             "astrid:fs/host.fs-readdir",
-            &resolved.physical.to_string_lossy(),
+            &resolved.gate_path,
             &result,
         );
         result
@@ -480,7 +491,7 @@ impl fs::Host for HostState {
 
     fn fs_stat(&mut self, path: String) -> Result<FileStat, ErrorCode> {
         let resolved = resolve_path(self, &path).map_err(map_resolve_err)?;
-        let _operation = gate_read(self, &resolved.physical)?;
+        let _operation = gate_read_path(self, &resolved.gate_path)?;
         let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
         let result =
             util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {
@@ -494,12 +505,7 @@ impl fs::Host for HostState {
             })
             .map(|m| to_file_stat(&m))
             .map_err(map_vfs_err);
-        audit_fs(
-            self,
-            "astrid:fs/host.fs-stat",
-            &resolved.physical.to_string_lossy(),
-            &result,
-        );
+        audit_fs(self, "astrid:fs/host.fs-stat", &resolved.gate_path, &result);
         result
     }
 
@@ -511,7 +517,7 @@ impl fs::Host for HostState {
 
     fn fs_unlink(&mut self, path: String) -> Result<(), ErrorCode> {
         let resolved = resolve_path(self, &path).map_err(map_resolve_err)?;
-        let _operation = gate_write(self, &resolved.physical, WriteKind::Delete)?;
+        let _operation = gate_write_path(self, &resolved.gate_path, WriteKind::Delete)?;
         let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
         let result =
             util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {
@@ -527,7 +533,7 @@ impl fs::Host for HostState {
         audit_fs(
             self,
             "astrid:fs/host.fs-unlink",
-            &resolved.physical.to_string_lossy(),
+            &resolved.gate_path,
             &result,
         );
         result
@@ -535,7 +541,7 @@ impl fs::Host for HostState {
 
     fn read_file(&mut self, path: String) -> Result<Vec<u8>, ErrorCode> {
         let resolved = resolve_path(self, &path).map_err(map_resolve_err)?;
-        let _operation = gate_read(self, &resolved.physical)?;
+        let _operation = gate_read_path(self, &resolved.gate_path)?;
         let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
         // Sentinel string used to encode the "too large at stat time"
         // case as a `PermissionDenied` payload so we can re-raise it
@@ -595,7 +601,7 @@ impl fs::Host for HostState {
         audit_fs(
             self,
             "astrid:fs/host.read-file",
-            &resolved.physical.to_string_lossy(),
+            &resolved.gate_path,
             &result,
         );
         result
@@ -606,7 +612,7 @@ impl fs::Host for HostState {
             return Err(ErrorCode::TooLarge);
         }
         let resolved = resolve_path(self, &path).map_err(map_resolve_err)?;
-        let _operation = gate_write(self, &resolved.physical, WriteKind::Write)?;
+        let _operation = gate_write_path(self, &resolved.gate_path, WriteKind::Write)?;
         let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
         let result =
             util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {
@@ -627,7 +633,7 @@ impl fs::Host for HostState {
         audit_fs(
             self,
             "astrid:fs/host.write-file",
-            &resolved.physical.to_string_lossy(),
+            &resolved.gate_path,
             &result,
         );
         result

@@ -105,7 +105,7 @@ async fn published_v0104_home_imports_verifies_and_retires_legacy_store() {
             .is_some()
     );
     assert!(home.storage_volume_path().is_file());
-    assert!(!home.principal_store_path().exists());
+    assert!(home.principal_store_path().is_dir());
     home.complete_layout_v2(&migration_target).unwrap();
     assert!(!home.state_db_path().exists());
     assert!(!home.root().join("srv").exists());

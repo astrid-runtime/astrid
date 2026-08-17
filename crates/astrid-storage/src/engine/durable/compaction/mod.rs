@@ -34,12 +34,14 @@ mod evidence;
 mod facts;
 mod outbox;
 mod policy;
+mod proof;
 mod recovery;
 mod volume;
 
 pub use evidence::CompactionEvidenceBundle;
 use facts::{encode_current_roots, encode_retained_roots};
 pub use policy::{CompactionRetainedRoot, CompactionRetention, CompactionRootKind};
+pub use proof::{DeterministicCompactionProofVerifier, deterministic_compaction_proof};
 use recovery::{
     backup_active, cleanup_without_intent, prepare_finish_compaction, promote_compacting,
     remove_compaction_intent, write_compaction_intent,

@@ -52,6 +52,12 @@ impl StorageMountId {
     pub const fn from_uuid(value: Uuid) -> Self {
         Self(value)
     }
+
+    /// Return the underlying UUID for cross-provider challenge binding.
+    #[must_use]
+    pub const fn as_uuid(self) -> Uuid {
+        self.0
+    }
 }
 
 impl Default for StorageMountId {
@@ -108,7 +114,7 @@ pub enum StorageMountSelectorV1 {
 
 /// One typed operation in provider protocol version one.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "kebab-case", tag = "operation")]
+#[serde(rename_all = "kebab-case", tag = "operation", deny_unknown_fields)]
 pub enum StorageProviderOperationV1 {
     /// Acquire a lease and attach one native filesystem projection.
     Mount {
@@ -299,6 +305,25 @@ mod tests {
             "ambient_authority".to_owned(),
             serde_json::Value::Bool(true),
         );
+
+        assert!(serde_json::from_value::<StorageProviderRequestV1>(value).is_err());
+    }
+
+    #[test]
+    fn v1_rejects_a_branch_target_instead_of_downgrading_to_owner_root() {
+        let request = StorageProviderRequestV1::new(
+            PrincipalId::new("operator").unwrap(),
+            StorageProviderOperationV1::Mount {
+                view: StorageProviderViewV1::Admin,
+                access: StorageProviderAccessV1::ReadWrite,
+                mountpoint: Some(PathBuf::from("/mnt/astrid")),
+            },
+        );
+        let mut value = serde_json::to_value(request).unwrap();
+        value["operation"]["target"] = serde_json::json!({
+            "kind": "workspace-branch",
+            "workspace": "00112233445566778899aabbccddeeff",
+        });
 
         assert!(serde_json::from_value::<StorageProviderRequestV1>(value).is_err());
     }

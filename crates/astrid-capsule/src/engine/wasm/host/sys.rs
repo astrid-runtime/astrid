@@ -25,28 +25,19 @@ impl sys::Host for HostState {
         let _operation = self
             .begin_host_operation()
             .map_err(|()| ErrorCode::CapabilityDenied)?;
-        // Manifest-declared secrets route through the file-per-secret
-        // store at invocation time, never through `self.config`. This
-        // keeps plaintext secret material off disk and out of long-lived
-        // host memory.
-        //
-        // Lookup precedence: per-invocation principal first, then host-
-        // wide fall-through. Scope is operator-decided at
-        // `astrid secret set --scope` time (not a manifest declaration),
-        // so the kernel-side read path always tries both slots.
+        // Manifest-declared secrets route through the host-only SecretStore
+        // projections at invocation time, never through `self.config` or the
+        // guest's ordinary KV namespace. Lookup precedence is the effective
+        // principal scope followed by the host/system scope.
         if self.secret_env.contains(&key) {
             let value = resolve_secret(self, &key);
             return Ok(if value.is_empty() { None } else { Some(value) });
         }
 
         // Per-invocation env overlay: operator-written values for the
-        // invoking principal, sourced from
-        // `<home>/.config/env/<capsule>.env.json`. Installed by
-        // `WasmEngine::invoke_interceptor` and the recv-context installer
-        // for owner and non-owner invocations. Wins over `self.config`
-        // (manifest/load-time defaults) so the gateway's
-        // `POST /api/capsules/{id}/env/{field}` route takes effect without
-        // requiring a capsule reload.
+        // invoking principal, loaded from the host-only typed KV projection.
+        // Wins over `self.config` (manifest/load-time defaults) so the
+        // gateway's env route takes effect without requiring a capsule reload.
         if let Some(overlay) = self.invocation_env_overlay.as_ref()
             && let Some(value) = overlay.get(&key)
         {
@@ -255,61 +246,55 @@ impl sys::Host for HostState {
     }
 }
 
-/// Resolve a secret-typed env value through the file-per-secret store.
+/// Resolve a secret-typed env value through host-only KV SecretStore scopes.
 ///
 /// Precedence (operator-controlled at `astrid secret set --scope` time;
 /// the kernel just follows the chain):
 ///
-/// 1. **Per-agent** — `~/.astrid/secrets/<effective_principal>/<capsule>/<key>`.
-/// 2. **Host-wide** — `~/.astrid/secrets/__host__/<capsule>/<key>`.
+/// 1. Principal control scope for the effective principal.
+/// 2. Host/system control scope for the capsule.
 fn resolve_secret(state: &HostState, key: &str) -> String {
-    use astrid_storage::{FileSecretStore, SecretStore};
+    use astrid_storage::{KvSecretStore, ScopedKvStore, SecretStore};
 
     let capsule = state.capsule_id.as_str();
     let principal = state.effective_principal();
+    if let Some(store) = Some(state.effective_secret_store()) {
+        match store.get(key) {
+            Ok(Some(value)) => return value,
+            Ok(None) => {},
+            Err(error) => tracing::warn!(
+                security_event = true,
+                %principal,
+                capsule,
+                key,
+                error = %error,
+                "principal secret-store read failed for secret-typed env key"
+            ),
+        }
+    }
 
-    let secrets_dir = if let Some(root) = state.file_secret_root.as_ref() {
-        root.clone()
-    } else {
-        let Ok(home) = astrid_core::dirs::AstridHome::resolve() else {
+    let Ok(scope) = ScopedKvStore::new(
+        state.kv_backend.clone(),
+        astrid_storage::env::system_secret_namespace(capsule),
+    ) else {
+        return String::new();
+    };
+    let host_store = KvSecretStore::new(scope, state.runtime_handle.clone());
+    match host_store.get(key) {
+        Ok(Some(value)) => value,
+        Ok(None) => String::new(),
+        Err(error) => {
             tracing::warn!(
                 security_event = true,
                 %principal,
                 capsule,
                 key,
-                "AstridHome::resolve failed during secret lookup"
+                error = %error,
+                "system secret-store read failed for secret-typed env key"
             );
-            return String::new();
-        };
-        home.secrets_dir()
-    };
-
-    let try_get = |scope: &str| -> Option<String> {
-        let store = FileSecretStore::new(secrets_dir.join(scope).join(capsule));
-        match store.get(key) {
-            Ok(value) => value,
-            Err(e) => {
-                tracing::warn!(
-                    security_event = true,
-                    %principal,
-                    capsule,
-                    key,
-                    scope,
-                    error = %e,
-                    "file secret-store read failed for secret-typed env key"
-                );
-                None
-            },
-        }
-    };
-
-    if let Some(v) = try_get(principal.as_str()) {
-        return v;
+            String::new()
+        },
     }
-    if let Some(v) = try_get("__host__") {
-        return v;
-    }
-    String::new()
 }
 
 /// Whether a guest log line should ALSO be emitted to the daemon's tracing
@@ -525,8 +510,9 @@ mod capability_introspection_tests {
 #[cfg(test)]
 mod get_config_tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
 
-    use astrid_storage::{FileSecretStore, SecretStore};
+    use astrid_storage::build_secret_store;
 
     use crate::engine::wasm::bindings::astrid::sys::host::Host as SysHost;
     use crate::engine::wasm::test_fixtures::minimal_host_state;
@@ -537,7 +523,7 @@ mod get_config_tests {
 
     /// Regression for the v0.7 smoke-test gap: the gateway's
     /// `POST /api/capsules/{id}/env/{field}` route writes overrides
-    /// to `<home>/.config/env/<capsule>.env.json`, but the kernel's
+    /// to the host-only typed control namespace, but the kernel's
     /// `get_config` host-fn used to only consult the manifest
     /// defaults loaded into `self.config` at capsule boot — so the
     /// route was effectively write-only for any principal other
@@ -595,20 +581,28 @@ mod get_config_tests {
     }
 
     #[tokio::test]
-    async fn secret_env_uses_injected_root_for_custom_home() {
-        let root = tempfile::tempdir().unwrap();
+    async fn secret_env_uses_principal_control_scope() {
         let principal = astrid_core::PrincipalId::new("agent-alice").unwrap();
-        let store = FileSecretStore::new(root.path().join(principal.as_str()).join("test"));
-        store.set("API_KEY", "custom-home-secret").unwrap();
+        let principal_uid = astrid_core::PrincipalUid::from_bytes([0xA1; 32]);
+        let backend = Arc::new(astrid_storage::MemoryKvStore::new());
+        let scope = astrid_storage::ScopedKvStore::new(
+            backend,
+            astrid_storage::env::principal_secret_namespace(principal_uid, "test"),
+        )
+        .unwrap();
+        let store = build_secret_store("test", scope, tokio::runtime::Handle::current());
+        store.set("API_KEY", "control-scope-secret").unwrap();
 
         let mut state = make_host_state();
         state.principal = principal;
+        state.capsule_id = crate::capsule::CapsuleId::new("test").unwrap();
         state.secret_env.insert("API_KEY".into());
-        state.file_secret_root = Some(root.path().to_path_buf());
+        state.secret_store = store;
 
         assert_eq!(
             state.get_config("API_KEY".into()).expect("host call"),
-            Some("custom-home-secret".into())
+            Some("control-scope-secret".into())
         );
+        assert!(state.file_secret_root.is_none());
     }
 }

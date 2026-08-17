@@ -12,6 +12,13 @@ use serde::{Deserialize, Serialize};
 
 use super::{AstridHome, LAYOUT_VERSION, LEGACY_LAYOUT_VERSION};
 
+#[path = "dirs_layout_retirement.rs"]
+mod retirement;
+use retirement::{
+    delete_legacy_tree, legacy_tree_device, sync_directory, validate_legacy_retirement_candidate,
+    validate_legacy_tree,
+};
+
 const LAYOUT_MIGRATION_INTENT: &str = "layout-v1-to-v2.intent";
 const LAYOUT_MIGRATION_RECEIPT: &str = "layout-v1-to-v2.complete";
 const LAYOUT_MIGRATION_SCHEMA: u32 = 1;
@@ -192,8 +199,10 @@ impl AstridHome {
     /// The caller must hold the daemon singleton lock and must have completed
     /// the principal-store migration. This method first records an intent,
     /// writes a completion receipt, replaces the layout sentinel, and only
-    /// then removes the verified legacy source. Re-entry finishes an
-    /// interrupted retirement without exposing a physical projection.
+    /// then removes the verified legacy state database. The kernel invokes
+    /// this only after its global component ledger is durable. The released
+    /// `CoW` tree is retired separately against that ledger's exact source
+    /// identity.
     ///
     /// # Errors
     ///
@@ -263,12 +272,22 @@ impl AstridHome {
     }
 
     pub(super) fn ensure_layout_v2_dirs(&self) -> io::Result<()> {
-        for path in [
-            self.content_staging_path(),
-            self.migrations_dir(),
-            self.cow_dir(),
-        ] {
+        for path in [self.content_staging_path(), self.migrations_dir()] {
             Self::ensure_private_dir(&path)?;
+        }
+        Ok(())
+    }
+
+    /// Validate released directory-backed sources without retiring them.
+    ///
+    /// `AstridHome::ensure` runs before the kernel's singleton-owned global
+    /// migration barrier. It can therefore establish the no-follow,
+    /// same-device, mount, and special-entry boundary, but source deletion is
+    /// reserved for [`Self::complete_layout_v2`] after the barrier has
+    /// published every component receipt.
+    pub(super) fn validate_layout_v2_legacy_sources(&self) -> io::Result<()> {
+        for path in [self.state_db_path(), self.cow_dir()] {
+            validate_legacy_retirement_candidate(&path)?;
         }
         Ok(())
     }
@@ -280,12 +299,17 @@ impl AstridHome {
             self.migrations_dir(),
             self.principal_store_path(),
             self.content_staging_path(),
+            // `cow/` was part of the pre-volume workspace implementation. It
+            // is checked here so a redirected legacy tree fails before an
+            // upgrade intent is admitted, but it is never created by layout
+            // v2.
             self.cow_dir(),
             self.state_db_path(),
         ];
         for path in paths {
             verify_existing_ancestor(&path)?;
         }
+        validate_legacy_retirement_candidate(&self.cow_dir())?;
         Ok(())
     }
 
@@ -294,10 +318,13 @@ impl AstridHome {
         let intent_path = self.migrations_dir().join(LAYOUT_MIGRATION_INTENT);
         match std::fs::symlink_metadata(&receipt_path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                if self.state_db_path().exists() || intent_path.exists() {
+                if path_entry_present(&self.state_db_path())?
+                    || path_entry_present(&self.cow_dir())?
+                    || path_entry_present(&intent_path)?
+                {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "layout-two home contains migration state without a completion receipt",
+                        "layout-two home contains legacy state without a completion receipt",
                     ));
                 }
                 return Ok(());
@@ -361,7 +388,7 @@ impl AstridHome {
                         ),
                     ));
                 }
-                retire_legacy_source(&self.state_db_path())
+                retire_legacy_source_tree(&self.state_db_path())
             },
         }
     }
@@ -426,6 +453,14 @@ fn verify_existing_ancestor(path: &Path) -> io::Result<()> {
             },
             Err(error) => return Err(error),
         }
+    }
+}
+
+fn path_entry_present(path: &Path) -> io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
     }
 }
 
@@ -885,7 +920,17 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     }
 }
 
-fn retire_legacy_source(path: &Path) -> io::Result<()> {
+/// Validate and retire a legacy directory tree without following redirects.
+///
+/// The complete tree is checked for symlinks, special entries, filesystem
+/// boundaries, and active mounts before bottom-up deletion. Directory fsyncs
+/// make successful removal durable on hosted Unix filesystems.
+///
+/// # Errors
+///
+/// Returns an I/O error and leaves the tree untouched when validation finds a
+/// redirect, special entry, filesystem boundary, or active mount.
+pub fn retire_legacy_source_tree(path: &Path) -> io::Result<()> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -903,31 +948,26 @@ fn retire_legacy_source(path: &Path) -> io::Result<()> {
             format!("legacy state source is not a directory: {}", path.display()),
         ));
     }
-    crate::platform_fs::verify_no_redirects(path)?;
-    std::fs::remove_dir_all(path)?;
+
+    // Validate the complete tree before removing anything. In particular,
+    // `remove_dir_all` is intentionally not used: it can walk into a mount
+    // boundary and its path-based recursion has no type check for special
+    // entries. A failed validation leaves every legacy byte available for a
+    // later operator repair or an idempotent restart.
+    let root_device = legacy_tree_device(&metadata);
+    validate_legacy_tree(path, root_device)?;
+    delete_legacy_tree(path, root_device)?;
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::other("legacy state source has no parent"))?;
     sync_directory(parent)
 }
 
-#[cfg(unix)]
-fn sync_directory(path: &Path) -> io::Result<()> {
-    File::open(path)?.sync_all()
-}
-
-#[cfg(not(unix))]
-// Keep the fallible contract shared with Unix callers. These platforms do not
-// expose a portable directory-fsync operation, so retirement ends after the
-// successful directory removal.
-#[allow(clippy::unnecessary_wraps)]
-fn sync_directory(_path: &Path) -> io::Result<()> {
-    Ok(())
-}
-
 #[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use retirement::is_active_mountpoint;
 
     #[test]
     fn migration_capacity_refuses_one_byte_below_the_required_boundary() {
@@ -960,5 +1000,22 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::Other);
         assert!(error.to_string().contains("requirement overflow"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn legacy_retirement_rejects_an_active_mount_boundary() {
+        let mountpoint = Path::new("/proc");
+        if !is_active_mountpoint(mountpoint).expect("read Linux mount table") {
+            // Some minimal test containers do not mount procfs. There is no
+            // safe local mount fixture without CAP_SYS_ADMIN, so leave this
+            // boundary test inert in that environment.
+            return;
+        }
+
+        let error = retire_legacy_source_tree(mountpoint).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("active mount"), "{error}");
     }
 }

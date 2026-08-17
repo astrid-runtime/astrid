@@ -763,17 +763,12 @@ async fn sync_distro_and_capsules() -> anyhow::Result<()> {
     println!();
     println!("{}", Theme::info("Checking distro and capsule updates..."));
 
-    let home = astrid_core::dirs::AstridHome::resolve()?;
-    let principal = astrid_core::PrincipalId::default();
-    let lock_path = home
-        .principal_home(&principal)
-        .config_dir()
-        .join("distro.lock");
+    let principal = crate::principal::current();
 
     // A lock records the installed distro identity, not its canonical source.
     // Do not turn that identity into an organization-qualified network fetch:
     // the runtime has no product source default and must not invent provenance.
-    let lock = super::distro::lock::load_lock(&lock_path)?;
+    let lock = super::distro::lock::load_lock_from_daemon(&principal).await?;
     match distro_refresh_action(lock.is_some()) {
         DistroRefreshAction::SkipNoProvenance => {
             println!(

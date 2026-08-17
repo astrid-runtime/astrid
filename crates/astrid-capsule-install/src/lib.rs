@@ -70,6 +70,7 @@ pub mod manifest_check;
 pub mod meta;
 pub mod paths;
 pub mod principal_introspection;
+pub mod storage;
 pub mod wasm;
 pub mod wit;
 
@@ -84,15 +85,17 @@ pub use archive::{
 };
 pub use authority::{
     ArtifactProvenance, AuthorityDecision, AuthoritySource, InstallInspection, InstalledAuthority,
-    authorize_install, inspect_archive_for_principal_in_workspace,
+    LegacyAuthorityReceiptStatus, authorize_install, inspect_archive_for_principal_in_workspace,
     inspect_archive_for_principal_with_layout, inspect_directory_for_principal_in_workspace,
-    inspect_directory_for_principal_with_layout, read_installed_authority,
+    inspect_directory_for_principal_with_layout, read_archive_manifest, read_installed_authority,
     remove_installed_authority, verify_installed_authority,
 };
+#[cfg(test)]
+pub use contracts::refresh_canonical_contracts;
 pub use contracts::{
     CONTRACTS_WIT_BASENAME, ContractsSkew, canonical_contracts_b3, canonical_contracts_path,
-    contracts_pin, contracts_skew, mismatching_contracts, refresh_canonical_contracts,
-    seed_canonical_contracts_if_absent, short_hash,
+    contracts_pin, contracts_skew, durable_contracts_pin, mismatching_contracts,
+    refresh_canonical_contracts_from_registry, seed_canonical_contracts_if_absent, short_hash,
 };
 pub use copy::copy_capsule_dir;
 pub use local::{
@@ -107,23 +110,34 @@ pub use local::{
     install_from_local_path_for_principal_with_layout, install_from_local_path_with_layout,
 };
 pub use manifest_check::{
-    ExportConflict, MissingImport, check_export_conflicts, check_export_conflicts_in_workspace,
-    check_export_conflicts_with_layout, validate_imports, validate_imports_in_workspace,
-    validate_imports_with_layout,
+    ExportConflict, MissingImport, check_export_conflicts, check_export_conflicts_in_storage,
+    check_export_conflicts_in_workspace, check_export_conflicts_with_layout, validate_imports,
+    validate_imports_in_storage, validate_imports_in_workspace, validate_imports_with_layout,
 };
 pub use meta::{
-    CapsuleLocation, CapsuleMeta, InstalledCapsule, read_meta, scan_installed_capsules,
-    scan_installed_capsules_in_home_for, scan_installed_capsules_in_home_for_in_workspace,
+    CapsuleLocation, CapsuleMeta, InstalledCapsule, read_meta, scan_durable_capsules,
+    scan_installed_capsules, scan_installed_capsules_in_home_for,
+    scan_installed_capsules_in_home_for_in_workspace,
     scan_installed_capsules_in_home_for_with_layout, scan_installed_capsules_in_home_with_layout,
     scan_installed_capsules_with_layout, write_meta,
 };
 pub use paths::{
-    resolve_env_path, resolve_env_path_for, resolve_target_dir, resolve_target_dir_for,
-    resolve_target_dir_for_in_workspace, resolve_target_dir_for_with_layout,
-    resolve_target_dir_with_layout, restore_env_from_backup, restore_env_from_backup_for,
+    clear_capsule_materialization_cache, resolve_cache_target_dir, resolve_target_dir,
+    resolve_target_dir_for, resolve_target_dir_for_in_workspace,
+    resolve_target_dir_for_with_layout, resolve_target_dir_with_layout,
 };
-pub use principal_introspection::materialize_principal_introspection;
-pub use wit::{content_address_wit, materialize_wit_mirror};
+pub use principal_introspection::{
+    DurableCapsuleIntrospection, list_durable_capsule_packages, read_durable_capsule_package,
+};
+pub use storage::{
+    LegacyCapsuleAuthorityReceipt, LegacyCapsuleMigrationReport, LegacyEnvSecretImportStatus,
+    VerifiedDurableCapsulePackage, canonical_capsule_archive, legacy_capsule_authority_status,
+    legacy_env_secret_import_status, materialize_capsule_package, migrate_all_native_capsules,
+    migrate_all_native_capsules_with_report, migrate_native_capsules,
+    migrate_native_capsules_with_report, publish_directory_package, publish_package,
+    read_durable_meta, read_verified_durable_package, read_verified_durable_package_for_owner,
+};
+pub use wit::content_address_wit;
 
 #[cfg(test)]
 mod authority_tests;

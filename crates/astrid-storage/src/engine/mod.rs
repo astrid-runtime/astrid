@@ -36,12 +36,13 @@ mod refinery;
 #[cfg(not(target_family = "wasm"))]
 pub use durable::{
     CompactionEvidenceBundle, CompactionFacts, CompactionProofVerifier, CompactionReport,
-    CompactionRetainedRoot, CompactionRetention, CompactionRootKind, DurableEngine,
-    DurableEnginePolicy, DurableError, FaultInjector, FaultPoint, GroupCommitPolicy,
-    IdentityScheme, NoFaults, ObjectCacheCapacity, ObjectCacheConfig, ObjectCacheController,
-    ObjectCacheMemoryBudget, ObjectCacheStats, PersistentObjectIdentity, PreparedContiguousFile,
-    PrincipalCodec, PrincipalObjectCacheBudget, PublishedContiguousFile, RecoveryLimits,
-    RecoveryRetryPolicy, VerifiedCompactionPlan,
+    CompactionRetainedRoot, CompactionRetention, CompactionRootKind,
+    DeterministicCompactionProofVerifier, DurableEngine, DurableEnginePolicy, DurableError,
+    FaultInjector, FaultPoint, GroupCommitPolicy, IdentityScheme, NoFaults, ObjectCacheCapacity,
+    ObjectCacheConfig, ObjectCacheController, ObjectCacheMemoryBudget, ObjectCacheStats,
+    PersistentObjectIdentity, PreparedContiguousFile, PrincipalCodec, PrincipalObjectCacheBudget,
+    PublishedContiguousFile, RecoveryLimits, RecoveryRetryPolicy, VerifiedCompactionPlan,
+    deterministic_compaction_proof,
 };
 pub use kv::{
     KvProjectionEngine, KvProjectionError, KvState, KvStateSnapshot, commit_kv_with_engine,

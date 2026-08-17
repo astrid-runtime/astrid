@@ -1,20 +1,47 @@
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::info;
 use wasmtime::Store;
 use wasmtime::component::{Component, Linker};
 
-use crate::context::CapsuleContext;
+use crate::context::{CapsuleContext, WorkspaceCommitOp};
 use crate::engine::ExecutionEngine;
 use crate::engine::wasm::host_state::{
     ConnectionIdentity, HostState, LifecyclePhase, PrincipalCancelTokens, PrincipalMount,
+    PrincipalMountLocation, WorkspaceMountResolver,
 };
 use crate::engine::wasm::limits::CapsuleRuntimeLimitsExt;
 use crate::error::{CapsuleError, CapsuleResult};
 use crate::manifest::CapsuleManifest;
+
+#[cfg(not(target_family = "wasm"))]
+struct WorkspaceBranchResolver(Arc<crate::context::WorkspaceBranchService>);
+
+#[cfg(not(target_family = "wasm"))]
+#[async_trait::async_trait]
+impl WorkspaceMountResolver for WorkspaceBranchResolver {
+    async fn resolve(
+        &self,
+        principal: &astrid_core::PrincipalId,
+    ) -> Result<PrincipalMount, String> {
+        let binding = self.0.bind(principal).await?;
+        let handle = astrid_capabilities::DirHandle::new();
+        let vfs = storage_vfs::AstridStorageVfs::workspace(
+            &self.0.store(),
+            binding.owner,
+            binding.branch,
+            handle.clone(),
+        );
+        Ok(PrincipalMount {
+            location: PrincipalMountLocation::AstridFilesystem,
+            vfs: Arc::new(vfs),
+            handle,
+        })
+    }
+}
 
 #[allow(unreachable_pub)]
 pub(crate) mod bindings;
@@ -22,6 +49,7 @@ pub mod host;
 pub mod host_state;
 pub mod limits;
 mod pool;
+mod storage_vfs;
 #[cfg(test)]
 mod test_fixtures;
 
@@ -311,17 +339,23 @@ pub struct WasmEngine {
     /// snapshotted onto every pooled `HostState` at load. `Default` (the host's
     /// historical constants) in tests.
     http_limits: limits::HttpLimits,
-    /// OS-level copy-on-write backend for a non-git workspace (Fix #2).
+    /// OS-level copy-on-write backend for an explicitly hosted non-git portal.
     ///
-    /// Set at load for the non-git branch (`Some(ApfsCow)`/`Some(OverlayfsCow)`,
-    /// or `Some(NoCow)` when the clone/mount failed and it degraded); `None` for
-    /// git-managed workspaces and tests. Held here — not on the pooled
+    /// Set at load only when a supported backend is available
+    /// (`Some(ApfsCow)`/`Some(OverlayfsCow)`). An unsupported `NoCow` result is
+    /// rejected before the portal is exposed; it is never used as a direct-write
+    /// fallback. `None` for canonical Astrid, git-managed portals, and tests.
+    /// Held here — not on the pooled
     /// `HostState` — because promote/rollback/teardown are per-capsule-load
     /// operations, not per-invocation. [`unload`](WasmEngine::unload) tears it
     /// down (RAII backstop in the backend's `Drop`); a kernel admin IPC drives
     /// [`promote_workspace`](WasmEngine::promote_workspace) /
     /// [`rollback_workspace`](WasmEngine::rollback_workspace).
     workspace_cow: Option<Arc<dyn astrid_vfs::WorkspaceCow>>,
+    /// Durable path-free workspace branch registry for canonical Astrid
+    /// runtimes. One branch is selected per authenticated principal.
+    #[cfg(not(target_family = "wasm"))]
+    workspace_branches: Option<Arc<crate::context::WorkspaceBranchService>>,
     /// Live-process tracker (foreground + background spawns), cloned at load.
     /// The workspace CoW promote/rollback interlock consults it to REFUSE
     /// mutating the merged tree while a spawned process may still be running in
@@ -521,6 +555,8 @@ impl WasmEngine {
             runtime_limits,
             http_limits,
             workspace_cow: None,
+            #[cfg(not(target_family = "wasm"))]
+            workspace_branches: None,
             process_tracker: None,
             persistent_processes: None,
         }
@@ -557,9 +593,58 @@ impl WasmEngine {
     /// INTERLOCK, so the merged tree is never swapped/deleted under a running
     /// invocation or spawned child (which would corrupt or destroy its work —
     /// e.g. a `cargo` with `cwd == merged`). Returns `Ok(false)` when there is
-    /// no copy-on-write workspace (git-managed / No-CoW). Backend-agnostic, so
-    /// it guards the APFS and overlayfs paths alike.
-    async fn commit_workspace(&self, op: CowOp) -> CapsuleResult<bool> {
+    /// no hosted copy-on-write workspace (for example, a git-managed portal).
+    /// A `NoCow` compatibility result is rejected during hosted load and never
+    /// reaches this lifecycle path. Backend-agnostic, so it guards the APFS and
+    /// overlayfs paths alike.
+    async fn commit_workspace(
+        &self,
+        op: CowOp,
+        caller: &astrid_core::PrincipalId,
+    ) -> CapsuleResult<bool> {
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(branches) = self.workspace_branches.clone() {
+            let caller = caller.clone();
+            // Apply the same quiescence/process interlocks as hosted portal
+            // commits before touching the durable branch root.
+            let _exclusive = match &self.pool {
+                Some(pool) => match pool.try_acquire_exclusive() {
+                    Some(guard) => Some(guard),
+                    None => {
+                        return Err(CapsuleError::ExecutionFailed(
+                            "workspace commit refused: an invocation is in flight; retry when the capsule is idle".into(),
+                        ));
+                    },
+                },
+                None => None,
+            };
+            let live_processes = self
+                .process_tracker
+                .as_ref()
+                .is_some_and(|tracker| tracker.has_active())
+                || self
+                    .persistent_processes
+                    .as_ref()
+                    .is_some_and(|registry| registry.total_live() > 0);
+            if live_processes {
+                return Err(CapsuleError::ExecutionFailed(
+                    "workspace commit refused: a spawned child process is still running; retry when the capsule is idle".into(),
+                ));
+            }
+            let binding = branches
+                .binding_for(&caller)
+                .await
+                .map_err(CapsuleError::ExecutionFailed)?;
+            let operation = match op {
+                CowOp::Promote => WorkspaceCommitOp::Promote,
+                CowOp::Rollback => WorkspaceCommitOp::Rollback,
+            };
+            return branches
+                .finish(&caller, binding, operation)
+                .await
+                .map(|()| true)
+                .map_err(CapsuleError::ExecutionFailed);
+        }
         let Some(backend) = self.workspace_cow.clone() else {
             return Ok(false);
         };
@@ -617,11 +702,25 @@ enum CowOp {
     Rollback,
 }
 
+/// Reject a hosted portal when the platform could not provide real
+/// copy-on-write isolation. `NoCow` intentionally points at the pristine
+/// directory and is therefore a compatibility result for callers that only
+/// need direct writes; it is not an admissible workspace runtime backend.
+fn require_isolated_workspace_cow(backend: &dyn astrid_vfs::WorkspaceCow) -> CapsuleResult<()> {
+    if backend.capability() == astrid_vfs::CowCapability::None {
+        return Err(CapsuleError::UnsupportedEntryPoint(
+            "hosted workspace has no supported copy-on-write backend".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Run a blocking `WorkspaceCow` promote/rollback off the async runtime
 /// (`spawn_blocking`, since a large promote copies files). The caller
-/// ([`WasmEngine::commit_workspace`]) holds the quiescence interlock. A No-CoW
-/// backend's own promote/rollback returns `Unsupported`, surfaced here as an
-/// `ExecutionFailed` error.
+/// ([`WasmEngine::commit_workspace`]) holds the quiescence interlock. A
+/// non-isolated backend's own promote/rollback returns `Unsupported`, surfaced
+/// here as an `ExecutionFailed` error; hosted load rejects that backend before
+/// any guest access is available.
 async fn run_workspace_cow_op(
     backend: Arc<dyn astrid_vfs::WorkspaceCow>,
     op: CowOp,
@@ -1132,70 +1231,88 @@ fn build_wasi_ctx() -> wasmtime_wasi::WasiCtx {
 /// Populated by [`build_principal_vfs_bundle`] and installed on
 /// [`HostState`] by `WasmEngine::invoke_interceptor` when the invocation
 /// principal differs from the capsule's owning principal. Either field may
-/// be `None`: a missing home directory yields a clean denial instead of a
-/// panic; the host-side fs functions treat `None` as "no VFS available"
-/// and return an error to the guest.
+/// be `None`: a principal without an admitted durable UID yields a clean
+/// denial instead of a panic; the host-side fs functions treat `None` as
+/// "no VFS available" and return an error to the guest.
 #[derive(Clone, Default)]
 pub(crate) struct PrincipalVfsBundle {
     home: Option<PrincipalMount>,
     tmp: Option<PrincipalMount>,
 }
 
-/// Register `root` as a new [`HostVfs`](astrid_vfs::HostVfs) with a fresh
-/// [`DirHandle`](astrid_capabilities::DirHandle), returning the triple as a
-/// [`PrincipalMount`]. Returns `None` if `root` does not exist or the VFS
-/// registration fails.
+/// Build a home/tmp VFS bundle for `principal`.
 ///
-/// The stored `PrincipalMount.root` is canonicalized so it matches the
-/// symlink-resolved paths that `host/fs.rs::resolve_physical_absolute`
-/// produces for security-gate checks. On macOS this matters: tempdirs under
-/// `/tmp/...` canonicalize to `/private/tmp/...`, and a non-canonical mount
-/// root would cause `Path::starts_with` comparisons in the gate to fail.
-///
-/// Async: `register_dir` is awaited directly so no tokio worker is pinned
-/// via `block_in_place`/`block_on` (issue #816). Must be called from an
-/// async context (load path and per-invocation SET phase both are).
-pub(crate) async fn mount_dir(root: &std::path::Path) -> Option<PrincipalMount> {
-    if !root.exists() {
-        return None;
-    }
-    let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let vfs = astrid_vfs::HostVfs::new();
+/// `home://` is always an authoritative AstridFilesystem view.  The mutable
+/// alias is resolved through the kernel-owned directory and only the resulting
+/// immutable UID is passed to the storage provider.  No host directory is
+/// created, opened, canonicalized, or consulted for home access.
+pub(crate) fn build_principal_vfs_bundle(
+    store: &astrid_storage::RuntimePrincipalStore,
+    directory: &astrid_storage::PrincipalDirectory,
+    principal: &astrid_core::PrincipalId,
+) -> PrincipalVfsBundle {
+    let Ok(uid) = directory.uid_for(principal) else {
+        tracing::warn!(%principal, "principal has no durable UID; denying home:// access");
+        return PrincipalVfsBundle::default();
+    };
     let handle = astrid_capabilities::DirHandle::new();
-    match vfs.register_dir(handle.clone(), canonical.clone()).await {
-        Ok(()) => Some(PrincipalMount {
-            root: canonical,
-            vfs: Arc::new(vfs) as Arc<dyn astrid_vfs::Vfs>,
+    let home = match storage_vfs::AstridStorageVfs::home(
+        store,
+        astrid_storage::StateOwner::Principal(uid),
+        principal,
+        handle.clone(),
+    ) {
+        Ok(vfs) => Some(PrincipalMount {
+            location: PrincipalMountLocation::AstridFilesystem,
+            vfs: Arc::new(vfs),
             handle,
         }),
-        Err(e) => {
+        Err(error) => {
             tracing::warn!(
-                root = %canonical.display(),
-                error = %e,
-                "failed to register principal VFS; denying scheme access",
+                %principal,
+                error = %error,
+                "failed to initialize logical home prefix; denying home:// access"
             );
             None
         },
-    }
+    };
+
+    // `/tmp` remains an explicitly ephemeral native scratch mount.  It is
+    // intentionally independent from the durable `home://` namespace.
+    let tmp = astrid_core::dirs::AstridHome::resolve()
+        .ok()
+        .and_then(|home| {
+            let path = home
+                .run_dir()
+                .join("principals")
+                .join(uid.to_string())
+                .join("tmp");
+            if astrid_core::platform_fs::ensure_private_directory(&path).is_ok() {
+                mount_dir_sync(&path)
+            } else {
+                None
+            }
+        });
+    PrincipalVfsBundle { home, tmp }
 }
 
-/// Build a home/tmp VFS bundle for `principal`.
-///
-/// Only mounts a home VFS if `~/.astrid/home/{principal}/` already exists
-/// on disk. This is the registration gate: an invocation for an unknown
-/// principal returns an empty bundle and the host fs layer denies
-/// `home://` access. The tmp directory (`~/.astrid/home/{principal}/.local/tmp/`)
-/// is auto-created under an already-existing principal root.
-///
-/// Async: awaits the underlying `mount_dir` calls rather than pinning a
-/// worker (issue #816).
-pub(crate) async fn build_principal_vfs_bundle(
-    principal: &astrid_core::PrincipalId,
-) -> PrincipalVfsBundle {
-    let Ok(astrid_home) = astrid_core::dirs::AstridHome::resolve() else {
-        return PrincipalVfsBundle::default();
-    };
-    build_principal_vfs_bundle_at(&astrid_home.principal_home(principal)).await
+fn mount_dir_sync(root: &std::path::Path) -> Option<PrincipalMount> {
+    if !root.exists() {
+        return None;
+    }
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let handle = astrid_capabilities::DirHandle::new();
+    match astrid_vfs::HostVfs::with_registered_dir(handle.clone(), &root) {
+        Ok(vfs) => Some(PrincipalMount {
+            location: PrincipalMountLocation::Native(root),
+            vfs: Arc::new(vfs),
+            handle,
+        }),
+        Err(error) => {
+            tracing::warn!(%error, "failed to mount ephemeral tmp VFS");
+            None
+        },
+    }
 }
 
 /// Install (or clear) the per-invocation host-state overlays for the caller.
@@ -1230,14 +1347,32 @@ async fn install_principal_overlays(
     // in which case the async VFS bundle must NOT be built.
     if !install_principal_overlays_sync(state, principal) {
         state.invocation_home = None;
+        state.invocation_workspace = None;
         state.invocation_tmp = None;
         return;
     }
     // Safe to unwrap: `install_principal_overlays_sync` returned `true` only for
     // a present, parseable principal.
     let p = principal.expect("overlays installed only for a present principal");
-    let bundle = build_principal_vfs_bundle(p).await;
+    let Some(store) = state.principal_store.as_ref() else {
+        state.invocation_home = None;
+        state.invocation_workspace = None;
+        state.invocation_tmp = None;
+        return;
+    };
+    let bundle = build_principal_vfs_bundle(store, &state.principal_directory, p);
     state.invocation_home = bundle.home;
+    state.invocation_workspace = if let Some(resolver) = state.workspace_mount_resolver.as_ref() {
+        match resolver.resolve(p).await {
+            Ok(mount) => Some(mount),
+            Err(error) => {
+                tracing::warn!(%p, %error, "failed to resolve Astrid workspace branch; denying workspace access");
+                None
+            },
+        }
+    } else {
+        None
+    };
     state.invocation_tmp = bundle.tmp;
 }
 
@@ -1293,17 +1428,52 @@ fn install_principal_overlays_sync(
         },
     };
 
-    // Per-invocation secret store, built over the invocation KV scope so both KV
-    // and keychain backends are principal-isolated. The keychain service name
-    // combines capsule id + principal so keychain entries stay scoped when the
-    // same capsule serves multiple principals.
+    // Secrets use a separate host-only control namespace. Never build the
+    // SecretStore over the guest's ordinary `{principal}:capsule:*` view:
+    // that would let a capsule enumerate or forge its own control keys.
+    let principal_uid = match state.principal_directory.uid_for(p) {
+        Ok(uid) => uid,
+        Err(error) => {
+            tracing::warn!(
+                principal = %p,
+                error = %error,
+                "principal has no immutable UID for secret control scope; failing closed"
+            );
+            state.invocation_kv = None;
+            state.invocation_secret_store = None;
+            state.invocation_capsule_log = None;
+            return false;
+        },
+    };
+    let secret_scope = match astrid_storage::ScopedKvStore::new(
+        state.kv_backend.clone(),
+        astrid_storage::env::principal_secret_namespace(principal_uid, state.capsule_id.as_str()),
+    ) {
+        Ok(scope) => scope,
+        Err(error) => {
+            tracing::warn!(
+                principal = %p,
+                error = %error,
+                "failed to create principal secret control scope; failing closed"
+            );
+            state.invocation_kv = None;
+            state.invocation_secret_store = None;
+            state.invocation_capsule_log = None;
+            return false;
+        },
+    };
     state.invocation_secret_store = Some(astrid_storage::build_secret_store(
         &format!("{}:{}", state.capsule_id, p),
-        kv.clone(),
+        secret_scope,
         state.runtime_handle.clone(),
     ));
     state.invocation_kv = Some(kv);
-    state.invocation_capsule_log = open_capsule_log(p, state.capsule_id.as_str(), false);
+    state.invocation_capsule_log = open_capsule_log(
+        &state.principal_directory,
+        p,
+        state.capsule_id.as_str(),
+        false,
+    );
     true
 }
 
@@ -1343,9 +1513,11 @@ fn resume_principal_token(
 }
 
 /// Open (creating the log dir if needed) the daily-rotated log file for
-/// `capsule_name` under `principal`'s home. Returns `None` if the astrid home
-/// can't be resolved, the principal's home directory doesn't exist, or the
-/// file can't be opened.
+/// `capsule_name` under an admitted principal's immutable UID. Logs are an
+/// operational native projection at `log/principals/<uid>/<capsule>/`; they
+/// are not part of the durable `home://` VFS and never use `PrincipalHome`.
+/// Returns `None` if the Astrid log root cannot be resolved, the principal is
+/// not admitted in `directory`, or the file cannot be opened safely.
 ///
 /// When `prune` is true, deletes rotated logs older than 7 days before
 /// opening. Pruning is an O(N) directory scan and must only be requested on
@@ -1354,118 +1526,92 @@ fn resume_principal_token(
 ///
 /// Mirrors the registration gate from [`build_principal_vfs_bundle`]: an
 /// invocation for an unregistered principal yields `None` instead of
-/// auto-creating the attacker's home tree.
+/// creating any native principal state.
 pub(crate) fn open_capsule_log(
+    directory: &astrid_storage::PrincipalDirectory,
     principal: &astrid_core::PrincipalId,
     capsule_name: &str,
     prune: bool,
 ) -> Option<Arc<Mutex<std::fs::File>>> {
     let astrid_home = astrid_core::dirs::AstridHome::resolve().ok()?;
-    open_capsule_log_at(&astrid_home.principal_home(principal), capsule_name, prune)
+    open_capsule_log_at(
+        &astrid_home.log_dir(),
+        directory,
+        principal,
+        capsule_name,
+        prune,
+    )
 }
 
-/// Read the per-principal env overlay for a capsule.
-///
-/// Returns `Some(map)` only when the JSON file at
-/// `$ASTRID_HOME/home/{principal}/.config/env/{capsule_id}.env.json`
-/// exists and parses as a flat `HashMap<String, String>` (matching the
-/// shape the gateway's
-/// [`crate::routes::env::write_env`](../../gateway/src/routes/env.rs)
-/// writes through `text` / `select` / `array` fields and the kernel's
-/// own boot-time loader expects). Anything else — file missing,
-/// permission denied, malformed JSON, oversized file — returns `None`
-/// and lets [`HostState::get_config`] fall back to the manifest
-/// defaults in `self.config`.
-///
-/// Called from `WasmEngine::invoke_interceptor` (on dispatch) and from
-/// `HostState::install_recv_invocation_context` (on each fresh inbound
-/// principal in a run-loop subscription). Reading on every dispatch
-/// adds one `stat` + `read_to_string` per call — cheap relative to the
-/// surrounding wasmtime invocation, and the alternative (caching with
-/// invalidation on the gateway env-write path) would couple the host
-/// to a routing surface that's optional at boot. If profiling later
-/// shows this matters, swap in an LRU keyed by `(principal, capsule)`.
-///
-/// Defensive size cap: env files larger than 1 MiB are skipped. The
-/// gateway env-write path doesn't impose its own ceiling today;
-/// guarding against a runaway file keeps a misconfigured operator
-/// from blocking every interceptor dispatch on a slow read.
-pub(crate) fn load_invocation_env_overlay(
-    principal: &astrid_core::PrincipalId,
+/// Read one principal's typed environment overlay from the host-only KV
+/// projection. Runtime lookup never consults native env JSON paths.
+pub(crate) async fn load_invocation_env_overlay_from_backend(
+    backend: Arc<dyn astrid_storage::KvStore>,
+    principal_uid: astrid_core::PrincipalUid,
     capsule_id: &str,
 ) -> Option<std::collections::HashMap<String, String>> {
-    let astrid_home = astrid_core::dirs::AstridHome::resolve().ok()?;
-    load_invocation_env_overlay_at(&astrid_home.principal_home(principal), capsule_id)
-}
-
-/// Testable core of [`load_invocation_env_overlay`] for an already-authorized
-/// principal home. Load-time owner setup uses the exact home supplied by the
-/// kernel instead of re-resolving process-global state.
-fn load_invocation_env_overlay_at(
-    principal_home: &astrid_core::dirs::PrincipalHome,
-    capsule_id: &str,
-) -> Option<std::collections::HashMap<String, String>> {
-    const MAX_ENV_FILE_BYTES: u64 = 1 << 20;
-    let env_path = principal_home
-        .env_dir()
-        .join(format!("{capsule_id}.env.json"));
-
-    let meta = std::fs::metadata(&env_path).ok()?;
-    if !meta.is_file() || meta.len() > MAX_ENV_FILE_BYTES {
-        return None;
+    let scope =
+        astrid_storage::env::principal_env_store(backend, principal_uid, capsule_id).ok()?;
+    match astrid_storage::env::read_env(&scope).await {
+        Ok(values) if !values.is_empty() => Some(values),
+        Ok(_) => None,
+        Err(error) => {
+            tracing::warn!(
+                principal_uid = %principal_uid,
+                capsule = capsule_id,
+                error = %error,
+                "failed to read typed environment overlay"
+            );
+            None
+        },
     }
-    let contents = std::fs::read_to_string(&env_path).ok()?;
-    serde_json::from_str::<std::collections::HashMap<String, String>>(&contents).ok()
 }
 
 /// Test-friendly core of [`open_capsule_log`]: open a log file under a
-/// fully-resolved [`PrincipalHome`], without touching any environment.
+/// supplied top-level log root after resolving the principal's immutable UID.
+/// No alias is ever used as a physical path component.
 fn open_capsule_log_at(
-    ph: &astrid_core::dirs::PrincipalHome,
+    log_root: &Path,
+    directory: &astrid_storage::PrincipalDirectory,
+    principal: &astrid_core::PrincipalId,
     capsule_name: &str,
     prune: bool,
 ) -> Option<Arc<Mutex<std::fs::File>>> {
-    // Registration gate: don't auto-create a principal home directory for
-    // an unregistered principal.
-    if !ph.root().exists() {
+    let uid = directory.uid_for(principal).ok()?;
+    let mut capsule_components = Path::new(capsule_name).components();
+    if capsule_name.is_empty()
+        || !matches!(
+            capsule_components.next(),
+            Some(std::path::Component::Normal(_))
+        )
+        || capsule_components.next().is_some()
+    {
         return None;
     }
-    let log_dir = ph.log_dir().join(capsule_name);
-    std::fs::create_dir_all(&log_dir).ok()?;
+    astrid_core::platform_fs::ensure_private_directory(log_root).ok()?;
+    let principals_root = log_root.join("principals");
+    astrid_core::platform_fs::ensure_private_directory(&principals_root).ok()?;
+    let uid_root = principals_root.join(uid.to_string());
+    astrid_core::platform_fs::ensure_private_directory(&uid_root).ok()?;
+    let log_dir = uid_root.join(capsule_name);
+    astrid_core::platform_fs::ensure_private_directory(&log_dir).ok()?;
     if prune {
         prune_old_logs(&log_dir, 7);
     }
     let today = today_date_string();
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_dir.join(format!("{today}.log")))
-        .ok()
-        .map(|f| Arc::new(Mutex::new(f)))
-}
-
-/// Test-friendly core of [`build_principal_vfs_bundle`]: build a bundle from
-/// a fully-resolved [`PrincipalHome`], without touching any environment.
-///
-/// Tests construct a [`PrincipalHome`] pointing at a tempdir; production
-/// code resolves the principal home through [`astrid_core::dirs::AstridHome`].
-async fn build_principal_vfs_bundle_at(
-    ph: &astrid_core::dirs::PrincipalHome,
-) -> PrincipalVfsBundle {
-    let home = mount_dir(ph.root()).await;
-    // Tmp is only mounted when home is — they live under the same principal
-    // root and follow its lifetime. Tmp subdirs may be auto-created.
-    let tmp = if home.is_some() {
-        let t = ph.tmp_dir();
-        if t.exists() || std::fs::create_dir_all(&t).is_ok() {
-            mount_dir(&t).await
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    PrincipalVfsBundle { home, tmp }
+    let path = log_dir.join(format!("{today}.log"));
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
+    }
+    let file = options.open(&path).ok()?;
+    astrid_core::platform_fs::restrict_private_file(&path).ok()?;
+    Some(Arc::new(Mutex::new(file)))
 }
 
 /// Refuse the invocation if the invoking principal's profile has
@@ -1764,7 +1910,12 @@ impl ExecutionEngine for WasmEngine {
         };
 
         // Clone context components to move into block_in_place
-        let workspace_root = ctx.workspace_root.clone();
+        // Canonical Astrid runtimes are path-free.  Retain a host path only
+        // for an explicitly selected HostedPortal compatibility source.
+        let workspace_root = match &ctx.workspace_source {
+            crate::context::WorkspaceSource::Astrid => PathBuf::new(),
+            crate::context::WorkspaceSource::HostedPortal(root) => root.clone(),
+        };
         let kv = ctx.kv.clone();
         let event_bus = astrid_events::EventBus::clone(&ctx.event_bus);
         let manifest = self.manifest.clone();
@@ -1851,6 +2002,34 @@ impl ExecutionEngine for WasmEngine {
         // missing identity is a compatibility/test path and fails closed to a
         // principal runtime; context shape must never grant system authority.
         let system_runtime = runtime_id_is_system(self.runtime_id.as_ref());
+        #[cfg(not(target_family = "wasm"))]
+        let workspace_branches = if matches!(
+            ctx.workspace_source,
+            crate::context::WorkspaceSource::Astrid
+        ) {
+            let service = ctx.workspace_branches.clone().ok_or_else(|| {
+                CapsuleError::UnsupportedEntryPoint(
+                    "canonical Astrid workspace requires the kernel workspace branch service"
+                        .into(),
+                )
+            })?;
+            Some(service)
+        } else {
+            None
+        };
+        #[cfg(target_family = "wasm")]
+        if matches!(
+            ctx.workspace_source,
+            crate::context::WorkspaceSource::Astrid
+        ) {
+            return Err(CapsuleError::NotSupported(
+                "canonical Astrid workspace requires a native storage provider".into(),
+            ));
+        }
+        #[cfg(target_family = "wasm")]
+        let workspace_branches: Option<()> = None;
+        #[cfg(not(target_family = "wasm"))]
+        let workspace_branches_for_engine = workspace_branches.clone();
         // Inlined async block — was previously wrapped in
         // `block_in_place` to permit nested `block_on` for the VFS
         // `register_dir` calls. Component-model async lets us `.await`
@@ -1910,15 +2089,31 @@ impl ExecutionEngine for WasmEngine {
             //     to land on the real workspace so spawned processes (`cargo`)
             //     and the user see them, with git providing the rollback. No
             //     upper tempdir is created in this branch.
-            //   * non-git      → today's `OverlayVfs`: writes divert into a
-            //     per-capsule tempdir upper, sandboxed until explicitly
-            //     committed (a separate later change replaces this branch with
-            //     real OS-level CoW).
+            //   * hosted non-git → an OS-level CoW portal. If no supported
+            //     backend can be prepared, load aborts before any direct-write
+            //     VFS is exposed.
             //
             // Detection is automatic (no config flag) via gitoxide work-tree
             // discovery (see `workspace_is_git_managed`).
-            let root_handle = astrid_capabilities::DirHandle::new();
-            let git_managed = workspace_is_git_managed(&workspace_root);
+            #[cfg(not(target_family = "wasm"))]
+            let owner_workspace_mount = if let Some(branches) = workspace_branches.as_ref()
+                && !system_runtime
+            {
+                Some(
+                    WorkspaceBranchResolver(branches.clone())
+                        .resolve(&ctx.principal)
+                        .await
+                        .map_err(CapsuleError::UnsupportedEntryPoint)?,
+                )
+            } else {
+                None
+            };
+            #[cfg(target_family = "wasm")]
+            let owner_workspace_mount: Option<PrincipalMount> = None;
+            let root_handle = owner_workspace_mount
+                .as_ref()
+                .map_or_else(astrid_capabilities::DirHandle::new, |mount| mount.handle.clone());
+            let git_managed = workspace_branches.is_none() && workspace_is_git_managed(&workspace_root);
 
             // The workspace VFS, the OS-sandbox writable root, and the fs-host
             // path-confinement all resolve against ONE path: `effective_workspace_root`.
@@ -1946,7 +2141,25 @@ impl ExecutionEngine for WasmEngine {
                 PathBuf,
                 Option<Arc<dyn astrid_vfs::WorkspaceCow>>,
                 Vec<PathBuf>,
-            ) = if git_managed {
+            ) = if let Some(mount) = owner_workspace_mount.clone() {
+                (
+                    mount.vfs.clone(),
+                    PathBuf::new(),
+                    None,
+                    Vec::new(),
+                )
+            } else if workspace_branches.is_some() {
+                // A shared SystemResident runtime has no load-time principal;
+                // its authenticated invocation installs a branch mount. Keep
+                // this neutral VFS unregistered so principal-less access fails
+                // closed instead of exposing a shared owner root.
+                (
+                    Arc::new(astrid_vfs::HostVfs::new()),
+                    PathBuf::new(),
+                    None,
+                    Vec::new(),
+                )
+            } else if git_managed {
                 let host_vfs = astrid_vfs::HostVfs::new();
                 host_vfs
                     .register_dir(root_handle.clone(), workspace_root.clone())
@@ -1969,33 +2182,30 @@ impl ExecutionEngine for WasmEngine {
                     Vec::new(),
                 )
             } else {
-                // Establish the OS-level copy-on-write over the pristine
-                // workspace. Fails CLOSED to No-CoW (direct writes, no
-                // rollback) with a warn if the clone/mount cannot be built —
-                // never a silently faked CoW.
+                // Establish the OS-level copy-on-write over an explicit hosted
+                // portal. A missing real backend is unsupported: direct writes
+                // would make rollback/promote an authority fiction.
                 //
-                // If the Astrid home (and thus the `~/.astrid/cow` root) can't
-                // be resolved we do NOT fall back to a world-writable temp dir:
+                // If the Astrid home cannot be resolved we do NOT fall back to
+                // a world-writable temp dir:
                 // `/var/folders`/`/private/tmp` are broadly writable by the OS
                 // sandbox, so a sibling child could reach another workspace's
-                // clone there and smuggle changes past its promote gate. Fail
-                // CLOSED to No-CoW (direct writes on the real workspace, no
-                // clone scattered anywhere) instead.
-                let (backend, prepared) = match astrid_core::dirs::AstridHome::resolve() {
-                    Ok(home) => {
-                        astrid_vfs::prepare_workspace_cow(&home.cow_dir(), &workspace_root)
-                    },
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            workspace = %workspace_root.display(),
-                            "workspace CoW: cannot resolve Astrid home for the CoW root; \
-                             failing closed to No-CoW (writes go direct to the workspace, \
-                             no rollback) rather than cloning into a world-writable temp dir"
-                        );
-                        astrid_vfs::no_cow_workspace(&workspace_root)
-                    },
-                };
+                // clone there and smuggle changes past its promote gate. Abort
+                // the hosted portal load instead of exposing direct writes on
+                // the real workspace.
+                let home = astrid_core::dirs::AstridHome::resolve().map_err(|error| {
+                    CapsuleError::UnsupportedEntryPoint(format!(
+                        "hosted workspace isolation requires Astrid home: {error}"
+                    ))
+                })?;
+                // Hosted portals are an explicit compatibility accelerator,
+                // not canonical Astrid state.  Keep disposable CoW material
+                // under the boot-cleaned run tree; never recreate the retired
+                // top-level `home/cow` layout.
+                let hosted_cow_root = home.run_dir().join("hosted-workspace-cow");
+                let (backend, prepared) =
+                    astrid_vfs::prepare_workspace_cow(&hosted_cow_root, &workspace_root);
+                require_isolated_workspace_cow(backend.as_ref())?;
                 let merged_root = prepared.merged_path.clone();
                 let host_vfs = astrid_vfs::HostVfs::new();
                 host_vfs
@@ -2029,11 +2239,18 @@ impl ExecutionEngine for WasmEngine {
             // use — `effective_workspace_root` (the CoW merged path for non-git,
             // the pristine workspace for git-managed) — so a write the fs host
             // makes into `merged` is not rejected as out-of-workspace.
-            let security_gate = Arc::new(crate::security::ManifestSecurityGate::new(
+            let security_gate = crate::security::ManifestSecurityGate::new(
                 manifest.clone(),
                 effective_workspace_root.clone(),
                 None,
-            ));
+            );
+            #[cfg(not(target_family = "wasm"))]
+            let security_gate = if workspace_branches.is_some() {
+                security_gate.with_logical_workspace()
+            } else {
+                security_gate
+            };
+            let security_gate = Arc::new(security_gate);
 
             // Manifest-derived data + shared services, built once and cloned
             // into each pooled Store's HostState by `make_state` below.
@@ -2198,32 +2415,52 @@ impl ExecutionEngine for WasmEngine {
             // autonomous `run()` can use KV/home/secrets before its first
             // recv. Explicit system runtimes retain the neutral deny-all
             // fallback and are never aliases for the default human principal.
-            let owner_principal_home = (!system_runtime)
-                .then(|| {
-                    ctx.home_root
-                        .as_ref()
-                        .map(astrid_core::dirs::PrincipalHome::from_path)
-                })
-                .flatten();
-            let owner_vfs = match owner_principal_home.as_ref() {
-                Some(principal_home) => build_principal_vfs_bundle_at(principal_home).await,
-                None => PrincipalVfsBundle::default(),
+            let owner_vfs = if !system_runtime {
+                ctx.principal_store.as_ref().map_or_else(
+                    || {
+                        tracing::warn!(
+                            principal = %ctx.principal,
+                            "principal storage is unavailable; denying home:// access"
+                        );
+                        PrincipalVfsBundle::default()
+                    },
+                    |store| build_principal_vfs_bundle(store, &ctx.principal_directory, &ctx.principal),
+                )
+            } else {
+                PrincipalVfsBundle::default()
             };
-            let owner_secret_store = Some(astrid_storage::build_secret_store(
-                &if system_runtime {
+            let kv_backend = kv.backend();
+            let owner_uid = (!system_runtime)
+                .then(|| ctx.principal_directory.uid_for(&ctx.principal).ok())
+                .flatten();
+            let owner_secret_namespace = if system_runtime {
+                Some(astrid_storage::env::system_secret_namespace(capsule_id_val.as_str()))
+            } else {
+                owner_uid.map(|uid| {
+                    astrid_storage::env::principal_secret_namespace(uid, capsule_id_val.as_str())
+                })
+            };
+            let owner_secret_store = owner_secret_namespace.and_then(|namespace| {
+                let identity = if system_runtime {
                     format!("{}:system", capsule_id_val)
                 } else {
-                    format!("{}:{}", capsule_id_val, ctx.principal)
-                },
-                kv.clone(),
-                tokio::runtime::Handle::current(),
-            ));
-            let owner_capsule_log = owner_principal_home.as_ref().and_then(|principal_home| {
-                open_capsule_log_at(principal_home, capsule_id_val.as_str(), true)
+                    owner_uid.map(|uid| format!("{}:{uid}", capsule_id_val))?
+                };
+                let scope = astrid_storage::ScopedKvStore::new(kv_backend.clone(), namespace).ok()?;
+                Some(astrid_storage::build_secret_store(
+                    &identity,
+                    scope,
+                    tokio::runtime::Handle::current(),
+                ))
             });
-            let owner_file_secret_root = (!system_runtime)
-                .then(|| astrid_core::dirs::AstridHome::resolve().ok().map(|home| home.secrets_dir()))
-                .flatten();
+            let owner_capsule_log = (!system_runtime).then(|| {
+                open_capsule_log(
+                    &ctx.principal_directory,
+                    &ctx.principal,
+                    capsule_id_val.as_str(),
+                    true,
+                )
+            }).flatten();
             let owner_kv = Some(kv.clone());
 
             // Per-instance `HostState` factory. Shared services clone (Arc or
@@ -2259,10 +2496,14 @@ impl ExecutionEngine for WasmEngine {
             let st_audit_sink = ctx.audit_sink.clone();
             let st_owner_home = owner_vfs.home.clone();
             let st_owner_tmp = owner_vfs.tmp.clone();
+            let st_principal_directory = ctx.principal_directory.clone();
+            let st_principal_store = ctx.principal_store.clone();
+            #[cfg(not(target_family = "wasm"))]
+            let st_process_storage_mount_broker = ctx.process_storage_mount_broker.clone();
             let st_owner_kv = owner_kv.clone();
             let st_owner_secret_store = owner_secret_store.clone();
             let st_owner_capsule_log = owner_capsule_log.clone();
-            let st_owner_file_secret_root = owner_file_secret_root.clone();
+            let kv_backend_for_state = kv_backend.clone();
             // Shared across the whole pool so a verified per-connection
             // principal (issue #45/#852) bound on the accepting instance is
             // visible to whichever pooled instance later serves that
@@ -2312,9 +2553,30 @@ impl ExecutionEngine for WasmEngine {
                 spawn_mask_paths: spawn_mask_paths.clone(),
                 vfs: Arc::clone(&workspace_vfs),
                 vfs_root_handle: root_handle.clone(),
+                workspace: owner_workspace_mount.clone(),
+                workspace_mount_resolver: {
+                    #[cfg(not(target_family = "wasm"))]
+                    {
+                        workspace_branches
+                            .clone()
+                            .map(|service| {
+                                Arc::new(WorkspaceBranchResolver(service))
+                                    as Arc<dyn WorkspaceMountResolver>
+                            })
+                    }
+                    #[cfg(target_family = "wasm")]
+                    {
+                        None
+                    }
+                },
+                #[cfg(not(target_family = "wasm"))]
+                process_storage_mount_broker: st_process_storage_mount_broker.clone(),
                 home: st_owner_home.clone(),
+                principal_directory: st_principal_directory.clone(),
+                principal_store: st_principal_store.clone(),
                 tmp: st_owner_tmp.clone(),
                 invocation_home: None,
+                invocation_workspace: None,
                 invocation_tmp: None,
                 invocation_secret_store: None,
                 invocation_capsule_log: None,
@@ -2326,13 +2588,15 @@ impl ExecutionEngine for WasmEngine {
                 // Concrete owner/system KV in production; neutral only in
                 // deliberately authority-free test/lifecycle contexts.
                 kv: st_owner_kv.clone().unwrap_or_else(HostState::neutral_kv),
-                kv_backend: kv.backend(),
+                kv_backend: kv_backend_for_state.clone(),
                 event_bus: event_bus.clone(),
                 route_admission_gate: st_route_admission_gate.clone(),
                 ipc_limiter: Arc::clone(&ipc_limiter),
                 config: wasm_config.clone(),
                 secret_env: secret_env_set.clone(),
-                file_secret_root: st_owner_file_secret_root.clone(),
+                // Kept only for explicit legacy-migration fixtures; runtime
+                // secret resolution never consults a native path.
+                file_secret_root: None,
                 ipc_publish_patterns: ipc_publish_v.clone(),
                 ipc_subscribe_patterns: ipc_subscribe_v.clone(),
                 cli_socket_listener: cli_listener.clone(),
@@ -2674,9 +2938,18 @@ impl ExecutionEngine for WasmEngine {
                     ))
                 })?;
                 let runtime_id = principal_runtime_id.expect("typed principal run has runtime id");
-                let owner_env = owner_principal_home.as_ref().and_then(|principal_home| {
-                    load_invocation_env_overlay_at(principal_home, manifest.package.name.as_str())
-                });
+                let owner_uid = ctx.principal_directory.uid_for(&ctx.principal).ok();
+                let owner_env = match owner_uid {
+                    Some(owner_uid) => {
+                        load_invocation_env_overlay_from_backend(
+                            kv_backend.clone(),
+                            owner_uid,
+                            manifest.package.name.as_str(),
+                        )
+                        .await
+                    },
+                    None => None,
+                };
                 let mut store = store_arc.as_ref().expect("run-loop has store").lock().await;
                 store
                     .data_mut()
@@ -2874,6 +3147,10 @@ impl ExecutionEngine for WasmEngine {
         // Keep the OS-level CoW backend alive for promote/rollback and for
         // teardown on unload (`None` for git-managed workspaces).
         self.workspace_cow = workspace_cow_backend;
+        #[cfg(not(target_family = "wasm"))]
+        {
+            self.workspace_branches = workspace_branches_for_engine;
+        }
         // Held for the promote/rollback quiescence interlock (refuse to mutate
         // the merged tree while a live child process may be running in it).
         self.process_tracker = Some(process_tracker_for_engine);
@@ -2935,15 +3212,24 @@ impl ExecutionEngine for WasmEngine {
         if let Some(cow) = self.workspace_cow.take() {
             cow.teardown();
         }
+        // Canonical Astrid branch state is kernel-owned and shared across all
+        // capsule engines.  Do not roll back the service on one engine's
+        // unload: another capsule (or a SystemResident invocation) may still
+        // hold the same authenticated branch.  The service rolls back any
+        // uncommitted bindings when the kernel-wide `Arc` is finally dropped.
+        #[cfg(not(target_family = "wasm"))]
+        {
+            self.workspace_branches = None;
+        }
         Ok(())
     }
 
-    async fn promote_workspace(&self) -> CapsuleResult<bool> {
-        self.commit_workspace(CowOp::Promote).await
+    async fn promote_workspace(&self, caller: &astrid_core::PrincipalId) -> CapsuleResult<bool> {
+        self.commit_workspace(CowOp::Promote, caller).await
     }
 
-    async fn rollback_workspace(&self) -> CapsuleResult<bool> {
-        self.commit_workspace(CowOp::Rollback).await
+    async fn rollback_workspace(&self, caller: &astrid_core::PrincipalId) -> CapsuleResult<bool> {
+        self.commit_workspace(CowOp::Rollback, caller).await
     }
 
     fn request_cancel(&self) {
@@ -3312,7 +3598,17 @@ impl ExecutionEngine for WasmEngine {
                 state.invocation_profile = invocation_profile.clone();
                 state.invocation_profile_authorized = true;
                 state.invocation_env_overlay =
-                    load_invocation_env_overlay(&invoking_principal, state.capsule_id.as_str());
+                    match state.principal_directory.uid_for(&invoking_principal) {
+                        Ok(principal_uid) => {
+                            load_invocation_env_overlay_from_backend(
+                                state.kv_backend.clone(),
+                                principal_uid,
+                                state.capsule_id.as_str(),
+                            )
+                            .await
+                        },
+                        Err(_) => None,
+                    };
 
                 // Refine the invocation context. Principal runtimes reject peer
                 // callers before checkout; SystemResident runtimes may install
@@ -3430,8 +3726,9 @@ pub struct LifecycleConfig {
     pub capsule_id: crate::capsule::CapsuleId,
     /// Workspace root directory for VFS.
     pub workspace_root: PathBuf,
-    /// Principal home root for `home://` VFS scheme. Optional — when set,
-    /// lifecycle hooks can access principal-scoped configuration and assets.
+    /// Legacy native home root retained for source compatibility. It is not
+    /// mounted; lifecycle `home://` requires [`LifecyclePrincipalContext`] to
+    /// carry the authorized UID-bound principal store.
     pub home_root: Option<PathBuf>,
     /// Scoped KV store for the capsule.
     pub kv: astrid_storage::ScopedKvStore,
@@ -3462,11 +3759,13 @@ pub struct LifecycleConfig {
 /// public config retain source compatibility. Lifecycle execution is a
 /// one-shot context: this carries identity and filesystem lookup roots, not a
 /// kernel profile, quota ledger, or persistent runtime accounting handle.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct LifecyclePrincipalContext {
     principal: astrid_core::PrincipalId,
     secret_env: std::collections::HashSet<String>,
     file_secret_root: Option<PathBuf>,
+    principal_directory: astrid_storage::PrincipalDirectory,
+    principal_store: Option<astrid_storage::RuntimePrincipalStore>,
 }
 
 impl LifecyclePrincipalContext {
@@ -3478,6 +3777,8 @@ impl LifecyclePrincipalContext {
             principal,
             secret_env: std::collections::HashSet::new(),
             file_secret_root: None,
+            principal_directory: astrid_storage::PrincipalDirectory::default(),
+            principal_store: None,
         }
     }
 
@@ -3494,6 +3795,20 @@ impl LifecyclePrincipalContext {
         self.file_secret_root = Some(root);
         self
     }
+
+    /// Bind the authorized UID directory and durable principal store used by
+    /// lifecycle `home://` operations. Without this binding, any configured
+    /// native `home_root` is ignored and the home scheme remains unavailable.
+    #[must_use]
+    pub fn with_principal_storage(
+        mut self,
+        principal_store: astrid_storage::RuntimePrincipalStore,
+        principal_directory: astrid_storage::PrincipalDirectory,
+    ) -> Self {
+        self.principal_store = Some(principal_store);
+        self.principal_directory = principal_directory;
+        self
+    }
 }
 
 async fn build_lifecycle_host_state(
@@ -3506,6 +3821,8 @@ async fn build_lifecycle_host_state(
         principal,
         secret_env,
         file_secret_root,
+        principal_directory,
+        principal_store,
     } = context;
 
     let vfs = astrid_vfs::HostVfs::new();
@@ -3518,15 +3835,12 @@ async fn build_lifecycle_host_state(
             ))
         })?;
 
-    // Mount home VFS if a home root was provided. Canonicalize first so the
-    // stored mount root matches paths the security gate checks against.
-    let home_mount: Option<PrincipalMount> = match cfg.home_root.as_ref() {
-        Some(h_root) => {
-            let canonical = h_root.canonicalize().unwrap_or_else(|_| h_root.clone());
-            mount_dir(&canonical).await
-        },
-        None => None,
-    };
+    // Lifecycle home access is the same UID-bound logical projection as the
+    // steady-state load/recv paths. A legacy native `home_root` is retained
+    // in the public config for source compatibility but is never mounted.
+    let home_mount = principal_store
+        .as_ref()
+        .and_then(|store| build_principal_vfs_bundle(store, &principal_directory, &principal).home);
 
     Ok(HostState {
         wasi_ctx: build_wasi_ctx(),
@@ -3553,9 +3867,16 @@ async fn build_lifecycle_host_state(
         spawn_mask_paths: Vec::new(),
         vfs: Arc::new(vfs),
         vfs_root_handle: root_handle,
+        workspace: None,
+        workspace_mount_resolver: None,
+        #[cfg(not(target_family = "wasm"))]
+        process_storage_mount_broker: None,
         home: home_mount,
+        principal_directory,
+        principal_store,
         tmp: None,
         invocation_home: None,
+        invocation_workspace: None,
         invocation_tmp: None,
         invocation_secret_store: None,
         invocation_capsule_log: None,
@@ -3795,49 +4116,92 @@ mod lifecycle_context_tests {
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
-    use astrid_storage::{DenySecretStore, FileSecretStore, SecretStore};
+    use astrid_storage::{StateOwner, build_secret_store};
     use wasmtime::ResourceLimiter;
 
     use super::*;
     use crate::engine::wasm::bindings::astrid::fs::host::Host as FsHost;
     use crate::engine::wasm::bindings::astrid::sys::host::Host as SysHost;
 
+    #[test]
+    fn hosted_portal_rejects_nonisolated_nocow_backend() {
+        let (backend, prepared) =
+            astrid_vfs::no_cow_workspace(std::path::Path::new("/pristine-hosted-portal"));
+        assert_eq!(backend.capability(), astrid_vfs::CowCapability::None);
+        assert_eq!(
+            prepared.merged_path,
+            std::path::PathBuf::from("/pristine-hosted-portal")
+        );
+        let error = require_isolated_workspace_cow(backend.as_ref()).expect_err(
+            "a direct-write NoCow backend must not be exposed as an isolated hosted portal",
+        );
+        assert!(matches!(
+            error,
+            CapsuleError::UnsupportedEntryPoint(message)
+                if message.contains("copy-on-write backend")
+        ));
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn nondefault_lifecycle_context_reaches_real_host_operations() {
         let workspace = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        let secret_root = tempfile::tempdir().unwrap();
+        let home_root = tempfile::tempdir().unwrap();
+        let astrid_home = astrid_core::dirs::AstridHome::from_path(home_root.path());
+        astrid_home.ensure().unwrap();
         let principal = astrid_core::PrincipalId::new("agent-alice").unwrap();
+        let principal_uid = astrid_core::PrincipalUid::from_bytes([0x91; 32]);
+        let principals = astrid_storage::PrincipalDirectory::default();
+        let quota: Arc<dyn astrid_storage::KvQuotaResolver<astrid_storage::StateOwner>> =
+            Arc::new(|owner: &StateOwner| {
+                Ok(match owner {
+                    astrid_storage::StateOwner::System => None,
+                    astrid_storage::StateOwner::Principal(_)
+                    | astrid_storage::StateOwner::Fleet(_) => Some(u64::MAX),
+                })
+            });
+        let principal_store = astrid_storage::open_runtime_principal_store_with_directory(
+            &astrid_home,
+            quota,
+            principals.clone(),
+        )
+        .await
+        .unwrap();
+        principals
+            .register(principal.clone(), principal_uid)
+            .unwrap();
         let capsule_id = crate::capsule::CapsuleId::new("test").unwrap();
-        let kv = astrid_storage::ScopedKvStore::new(
-            Arc::new(astrid_storage::MemoryKvStore::new()),
-            "agent-alice:capsule:test",
+        let backend = Arc::new(astrid_storage::MemoryKvStore::new());
+        let kv = astrid_storage::ScopedKvStore::new(backend.clone(), "agent-alice:capsule:test")
+            .unwrap();
+        let secret_scope = astrid_storage::ScopedKvStore::new(
+            backend,
+            astrid_storage::env::principal_secret_namespace(principal_uid, capsule_id.as_str()),
         )
         .unwrap();
-
-        let file_secrets = FileSecretStore::new(
-            secret_root
-                .path()
-                .join(principal.as_str())
-                .join(capsule_id.as_str()),
+        let secret_store = build_secret_store(
+            capsule_id.as_str(),
+            secret_scope,
+            tokio::runtime::Handle::current(),
         );
-        file_secrets.set("API_KEY", "alice-secret").unwrap();
+        secret_store.set("API_KEY", "alice-secret").unwrap();
 
         let cfg = LifecycleConfig {
             wasm_bytes: Vec::new(),
             capsule_id,
             workspace_root: workspace.path().to_path_buf(),
-            home_root: Some(home.path().to_path_buf()),
+            // Retained only as a compatibility field; lifecycle home access
+            // must come from the UID-bound store below.
+            home_root: Some(home_root.path().join("legacy-home")),
             kv,
             event_bus: astrid_events::EventBus::with_capacity(16),
             config: HashMap::new(),
-            secret_store: Arc::new(DenySecretStore::new()),
+            secret_store,
             http_limits: limits::HttpLimits::default(),
             audit_sink: None,
         };
         let context = LifecyclePrincipalContext::new(principal.clone())
             .with_secret_env(HashSet::from(["API_KEY".to_owned()]))
-            .with_file_secret_root(secret_root.path().to_path_buf());
+            .with_principal_storage(principal_store.clone(), principals.clone());
         let ledger = crate::MemoryLedger::default();
 
         let mut state =
@@ -3847,12 +4211,11 @@ mod lifecycle_context_tests {
 
         assert_eq!(state.principal, principal);
         assert_eq!(state.effective_principal(), principal);
-        assert_eq!(state.file_secret_root.as_deref(), Some(secret_root.path()));
-        let canonical_home = home.path().canonicalize().unwrap();
-        assert_eq!(
-            state.effective_home().map(|mount| mount.root.as_path()),
-            Some(canonical_home.as_path())
-        );
+        assert!(state.file_secret_root.is_none());
+        assert!(matches!(
+            state.effective_home().map(|mount| &mount.location),
+            Some(PrincipalMountLocation::AstridFilesystem)
+        ));
 
         assert!(state.store_meter.memory_growing(0, 4096, None).unwrap());
         assert_eq!(ledger.peak(&principal), 4096);
@@ -3864,12 +4227,54 @@ mod lifecycle_context_tests {
             state.read_file("home://lifecycle-mounted".into()).unwrap(),
             b"alice-home"
         );
+        assert!(
+            !home_root
+                .path()
+                .join("legacy-home/lifecycle-mounted")
+                .exists()
+        );
+        drop(state);
+
+        // Rebuilding the one-shot lifecycle state sees the same durable bytes.
+        let mut reopened = build_lifecycle_host_state(
+            &cfg,
+            LifecyclePhase::Install,
+            LifecyclePrincipalContext::new(principal.clone())
+                .with_secret_env(HashSet::from(["API_KEY".to_owned()]))
+                .with_principal_storage(principal_store.clone(), principals.clone()),
+            ledger.clone(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
-            std::fs::read(home.path().join("lifecycle-mounted")).unwrap(),
+            reopened
+                .read_file("home://lifecycle-mounted".into())
+                .unwrap(),
             b"alice-home"
         );
+
+        let bob = astrid_core::PrincipalId::new("agent-bob").unwrap();
+        let bob_uid = astrid_core::PrincipalUid::from_bytes([0x92; 32]);
+        principals.register(bob.clone(), bob_uid).unwrap();
+        let mut bob_state = build_lifecycle_host_state(
+            &cfg,
+            LifecyclePhase::Install,
+            LifecyclePrincipalContext::new(bob).with_principal_storage(principal_store, principals),
+            ledger.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            bob_state
+                .read_file("home://lifecycle-mounted".into())
+                .is_err()
+        );
         assert_eq!(
-            state.get_config("API_KEY".into()).unwrap().as_deref(),
+            bob_state.get_config("API_KEY".into()).unwrap().as_deref(),
+            None
+        );
+        assert_eq!(
+            reopened.get_config("API_KEY".into()).unwrap().as_deref(),
             Some("alice-secret")
         );
     }
@@ -4030,6 +4435,8 @@ fn wasm_exports_contain(name: &str, wasm_bytes: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use astrid_events::ipc::Topic;
 
@@ -4048,34 +4455,49 @@ mod tests {
         assert!(runtime_id_is_system(Some(&system)));
     }
 
-    #[test]
-    fn owner_env_loader_reads_only_the_supplied_principal_home() {
-        let alice_dir = tempfile::tempdir().unwrap();
-        let bob_dir = tempfile::tempdir().unwrap();
-        let alice = astrid_core::dirs::PrincipalHome::from_path(alice_dir.path());
-        let bob = astrid_core::dirs::PrincipalHome::from_path(bob_dir.path());
-        std::fs::create_dir_all(alice.env_dir()).unwrap();
-        std::fs::create_dir_all(bob.env_dir()).unwrap();
-        std::fs::write(
-            alice.env_dir().join("runner.env.json"),
-            r#"{"OWNER":"alice"}"#,
-        )
-        .unwrap();
-        std::fs::write(bob.env_dir().join("runner.env.json"), r#"{"OWNER":"bob"}"#).unwrap();
+    #[tokio::test]
+    async fn owner_env_loader_reads_typed_control_scope_only() {
+        let backend = Arc::new(astrid_storage::MemoryKvStore::new());
+        let alice = astrid_core::PrincipalUid::from_bytes([0xA1; 32]);
+        let bob = astrid_core::PrincipalUid::from_bytes([0xB2; 32]);
+        let alice_scope =
+            astrid_storage::env::principal_env_store(backend.clone(), alice, "runner").unwrap();
+        let bob_scope =
+            astrid_storage::env::principal_env_store(backend.clone(), bob, "runner").unwrap();
+        astrid_storage::env::set_env(&alice_scope, "OWNER", "alice")
+            .await
+            .unwrap();
+        astrid_storage::env::set_env(&bob_scope, "OWNER", "bob")
+            .await
+            .unwrap();
 
-        assert_eq!(
-            load_invocation_env_overlay_at(&alice, "runner")
+        let alice_values =
+            load_invocation_env_overlay_from_backend(backend.clone(), alice, "runner")
+                .await
+                .unwrap();
+        let bob_values = load_invocation_env_overlay_from_backend(backend.clone(), bob, "runner")
+            .await
+            .unwrap();
+        assert_eq!(alice_values.get("OWNER").map(String::as_str), Some("alice"));
+        assert_eq!(bob_values.get("OWNER").map(String::as_str), Some("bob"));
+
+        // A guest receives only its ordinary capsule namespace and cannot
+        // enumerate or read the host-only control projection.
+        let guest =
+            astrid_storage::ScopedKvStore::new(backend, "agent-alice:capsule:runner").unwrap();
+        assert!(
+            guest
+                .list_keys_with_prefix(astrid_storage::env::ENV_KEY_PREFIX)
+                .await
                 .unwrap()
-                .get("OWNER")
-                .map(String::as_str),
-            Some("alice")
+                .is_empty()
         );
-        assert_eq!(
-            load_invocation_env_overlay_at(&bob, "runner")
+        assert!(
+            guest
+                .get(&astrid_storage::env::env_key("OWNER"))
+                .await
                 .unwrap()
-                .get("OWNER")
-                .map(String::as_str),
-            Some("bob")
+                .is_none()
         );
     }
 
@@ -5475,108 +5897,47 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // build_principal_vfs_bundle_at: per-invocation VFS scoping (#549)
-    // ---------------------------------------------------------------------
-
-    /// Build a bundle, awaiting the now-async `build_principal_vfs_bundle_at`
-    /// directly. `register_dir` is awaited internally (issue #816), so the
-    /// old `spawn_blocking` sync/async bridge is no longer needed.
-    async fn build_bundle_async_safe(ph: astrid_core::dirs::PrincipalHome) -> PrincipalVfsBundle {
-        build_principal_vfs_bundle_at(&ph).await
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn build_bundle_returns_empty_for_unregistered_principal() {
-        // No principal home directory exists on disk — fail-closed: bundle empty,
-        // no auto-mkdir of a `home/{principal}/` tree.
-        let tmp = tempfile::tempdir().unwrap();
-        let ph = astrid_core::dirs::PrincipalHome::from_path(tmp.path().join("home/mallory"));
-        let bundle = build_bundle_async_safe(ph).await;
-        assert!(bundle.home.is_none(), "unknown principal: no home mount");
-        assert!(bundle.tmp.is_none());
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn build_bundle_populated_for_registered_principal() {
-        let tmp = tempfile::tempdir().unwrap();
-        let alice_root = tmp.path().join("home/alice");
-        let ph = astrid_core::dirs::PrincipalHome::from_path(&alice_root);
-        ph.ensure().unwrap();
-        // `mount_dir` canonicalizes (resolves /tmp -> /private/tmp on macOS),
-        // so compare against the canonical form.
-        let alice_canonical = alice_root.canonicalize().unwrap();
-
-        let bundle = build_bundle_async_safe(ph).await;
-        let home = bundle.home.as_ref().expect("home mount present");
-        assert_eq!(home.root, alice_canonical);
-        let tmp_mount = bundle.tmp.as_ref().expect("tmp mount present");
-        assert_eq!(tmp_mount.root, alice_canonical.join(".local").join("tmp"));
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn build_bundle_isolates_distinct_principals() {
-        let tmp = tempfile::tempdir().unwrap();
-        let alice_root = tmp.path().join("home/alice");
-        let bob_root = tmp.path().join("home/bob");
-        let alice_ph = astrid_core::dirs::PrincipalHome::from_path(&alice_root);
-        let bob_ph = astrid_core::dirs::PrincipalHome::from_path(&bob_root);
-        alice_ph.ensure().unwrap();
-        bob_ph.ensure().unwrap();
-        let alice_canonical = alice_root.canonicalize().unwrap();
-        let bob_canonical = bob_root.canonicalize().unwrap();
-
-        let alice_bundle = build_bundle_async_safe(alice_ph).await;
-        let bob_bundle = build_bundle_async_safe(bob_ph).await;
-
-        let alice_home = &alice_bundle.home.as_ref().unwrap().root;
-        let bob_home = &bob_bundle.home.as_ref().unwrap().root;
-        assert_ne!(
-            alice_home, bob_home,
-            "distinct principals, distinct home roots"
-        );
-        assert_eq!(alice_home, &alice_canonical);
-        assert_eq!(bob_home, &bob_canonical);
-
-        // Each principal's `home://note.txt` must land under their own root.
-        std::fs::write(alice_home.join("note.txt"), b"alice").unwrap();
-        std::fs::write(bob_home.join("note.txt"), b"bob").unwrap();
-        assert_eq!(
-            std::fs::read(alice_home.join("note.txt")).unwrap(),
-            b"alice"
-        );
-        assert_eq!(std::fs::read(bob_home.join("note.txt")).unwrap(), b"bob");
-    }
-
-    // ---------------------------------------------------------------------
     // open_capsule_log_at: per-invocation log re-scoping (#661)
     // ---------------------------------------------------------------------
 
     #[test]
     fn open_capsule_log_returns_none_for_unregistered_principal() {
-        // No principal home directory exists on disk — fail-closed: return
-        // `None` instead of auto-creating the attacker's home tree.
+        // No directory binding exists — fail-closed: return `None` instead
+        // of creating native principal log state.
         let tmp = tempfile::tempdir().unwrap();
-        let ph = astrid_core::dirs::PrincipalHome::from_path(tmp.path().join("home/mallory"));
-        assert!(open_capsule_log_at(&ph, "some-capsule", false).is_none());
-        assert!(open_capsule_log_at(&ph, "some-capsule", true).is_none());
+        let log_root = tmp.path().join("log");
+        let directory = astrid_storage::PrincipalDirectory::default();
+        let mallory = astrid_core::PrincipalId::new("mallory").unwrap();
         assert!(
-            !ph.root().exists(),
-            "must not auto-mkdir an unregistered principal's home"
+            open_capsule_log_at(&log_root, &directory, &mallory, "some-capsule", false).is_none()
+        );
+        assert!(
+            open_capsule_log_at(&log_root, &directory, &mallory, "some-capsule", true).is_none()
+        );
+        assert!(
+            !log_root.exists(),
+            "must not create native log state for an unregistered principal"
         );
     }
 
     #[test]
     fn open_capsule_log_opens_file_under_principal_tree() {
         let tmp = tempfile::tempdir().unwrap();
-        let alice_root = tmp.path().join("home/alice");
-        let ph = astrid_core::dirs::PrincipalHome::from_path(&alice_root);
-        ph.ensure().unwrap();
+        let log_root = tmp.path().join("log");
+        let directory = astrid_storage::PrincipalDirectory::default();
+        let alice = astrid_core::PrincipalId::new("alice").unwrap();
+        let alice_uid = astrid_core::PrincipalUid::from_bytes([1; 32]);
+        directory.register(alice.clone(), alice_uid).unwrap();
 
-        let file = open_capsule_log_at(&ph, "my-capsule", false).expect("open ok");
+        let file = open_capsule_log_at(&log_root, &directory, &alice, "my-capsule", false)
+            .expect("open ok");
 
-        // Physical file must live under `ph.log_dir()/my-capsule/{today}.log`.
-        let log_dir = ph.log_dir().join("my-capsule");
-        assert!(log_dir.is_dir(), "log dir auto-created under alice's tree");
+        // Physical file must live under `log/principals/<uid>/my-capsule`.
+        let log_dir = log_root
+            .join("principals")
+            .join(alice_uid.to_string())
+            .join("my-capsule");
+        assert!(log_dir.is_dir(), "log dir auto-created under alice's UID");
         let today = today_date_string();
         let expected = log_dir.join(format!("{today}.log"));
         assert!(
@@ -5598,27 +5959,33 @@ mod tests {
     #[test]
     fn open_capsule_log_isolates_distinct_principals() {
         let tmp = tempfile::tempdir().unwrap();
-        let alice_root = tmp.path().join("home/alice");
-        let bob_root = tmp.path().join("home/bob");
-        let alice_ph = astrid_core::dirs::PrincipalHome::from_path(&alice_root);
-        let bob_ph = astrid_core::dirs::PrincipalHome::from_path(&bob_root);
-        alice_ph.ensure().unwrap();
-        bob_ph.ensure().unwrap();
+        let log_root = tmp.path().join("log");
+        let directory = astrid_storage::PrincipalDirectory::default();
+        let alice = astrid_core::PrincipalId::new("alice").unwrap();
+        let bob = astrid_core::PrincipalId::new("bob").unwrap();
+        let alice_uid = astrid_core::PrincipalUid::from_bytes([2; 32]);
+        let bob_uid = astrid_core::PrincipalUid::from_bytes([3; 32]);
+        directory.register(alice.clone(), alice_uid).unwrap();
+        directory.register(bob.clone(), bob_uid).unwrap();
 
-        let alice_log = open_capsule_log_at(&alice_ph, "shared-capsule", false).unwrap();
-        let bob_log = open_capsule_log_at(&bob_ph, "shared-capsule", false).unwrap();
+        let alice_log =
+            open_capsule_log_at(&log_root, &directory, &alice, "shared-capsule", false).unwrap();
+        let bob_log =
+            open_capsule_log_at(&log_root, &directory, &bob, "shared-capsule", false).unwrap();
 
         use std::io::Write;
         writeln!(alice_log.lock().unwrap(), "alice-line").unwrap();
         writeln!(bob_log.lock().unwrap(), "bob-line").unwrap();
 
         let today = today_date_string();
-        let alice_file = alice_ph
-            .log_dir()
+        let alice_file = log_root
+            .join("principals")
+            .join(alice_uid.to_string())
             .join("shared-capsule")
             .join(format!("{today}.log"));
-        let bob_file = bob_ph
-            .log_dir()
+        let bob_file = log_root
+            .join("principals")
+            .join(bob_uid.to_string())
             .join("shared-capsule")
             .join(format!("{today}.log"));
 
@@ -5635,24 +6002,58 @@ mod tests {
         // Sanity: pruning is on a 7-day cutoff, so today's freshly-written
         // file survives. Guards against regressions that'd rotate too aggressively.
         let tmp = tempfile::tempdir().unwrap();
-        let alice_root = tmp.path().join("home/alice");
-        let ph = astrid_core::dirs::PrincipalHome::from_path(&alice_root);
-        ph.ensure().unwrap();
+        let log_root = tmp.path().join("log");
+        let directory = astrid_storage::PrincipalDirectory::default();
+        let alice = astrid_core::PrincipalId::new("alice").unwrap();
+        let alice_uid = astrid_core::PrincipalUid::from_bytes([4; 32]);
+        directory.register(alice.clone(), alice_uid).unwrap();
 
         // First call prunes and opens (load-time path).
-        let f1 = open_capsule_log_at(&ph, "c", true).unwrap();
+        let f1 = open_capsule_log_at(&log_root, &directory, &alice, "c", true).unwrap();
         use std::io::Write;
         writeln!(f1.lock().unwrap(), "pre-prune line").unwrap();
         f1.lock().unwrap().flush().unwrap();
         drop(f1);
 
         // Second call also prunes — should not unlink today's file.
-        let f2 = open_capsule_log_at(&ph, "c", true).unwrap();
+        let f2 = open_capsule_log_at(&log_root, &directory, &alice, "c", true).unwrap();
         drop(f2);
         let today = today_date_string();
-        let path = ph.log_dir().join("c").join(format!("{today}.log"));
+        let path = log_root
+            .join("principals")
+            .join(alice_uid.to_string())
+            .join("c")
+            .join(format!("{today}.log"));
         let contents = std::fs::read_to_string(&path).unwrap();
         assert!(contents.contains("pre-prune line"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_capsule_log_rejects_redirected_log_root_and_capsule_path() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let log_root = tmp.path().join("log");
+        let directory = astrid_storage::PrincipalDirectory::default();
+        let alice = astrid_core::PrincipalId::new("alice").unwrap();
+        let alice_uid = astrid_core::PrincipalUid::from_bytes([5; 32]);
+        directory.register(alice.clone(), alice_uid).unwrap();
+
+        // A redirect in the top-level log path must fail closed before any
+        // UID/capsule directory is created under the outside target.
+        symlink(outside.path(), &log_root).unwrap();
+        assert!(open_capsule_log_at(&log_root, &directory, &alice, "capsule", false).is_none());
+        assert!(!outside.path().join("principals").exists());
+
+        // Even with a private root, capsule IDs are one path component only;
+        // separators and traversal are never accepted as log subdirectories.
+        std::fs::remove_file(&log_root).unwrap();
+        assert!(
+            open_capsule_log_at(&log_root, &directory, &alice, "nested/capsule", false).is_none()
+        );
+        assert!(open_capsule_log_at(&log_root, &directory, &alice, "../escape", false).is_none());
     }
 
     // ---------------------------------------------------------------------

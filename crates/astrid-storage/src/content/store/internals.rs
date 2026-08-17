@@ -1,11 +1,13 @@
+use super::workspace::{is_workspace_branch_label, workspace_branch_quota};
 use super::{
-    BTreeMap, BuiltContent, CONTENT_COMPONENT_LABEL, CatalogRoot, CatalogValue, ContentError,
-    ContentHeader, ContentName, KV_COMPONENT_LABEL, LEGACY_PRINCIPAL_GRAPH_VERSION, ModelError,
-    ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord, ObjectReference,
-    PARENT_LABEL, PRINCIPAL_GRAPH_VERSION, PrincipalContentError, PrincipalContentStore,
-    PrincipalKvAdapter, PrincipalProjectionEngine, PrincipalProjectionError, ReferenceKind,
-    ReferenceLabel, RootState, RootTransaction, STATE_LABEL, invalid, lookup, owned_target,
-    require_structural, root_from_record, validate_catalog, validated_projection_quota,
+    BTreeMap, BuiltContent, CONTENT_COMPONENT_LABEL, CatalogRoot, CatalogValue,
+    ContentBatchExpectation, ContentError, ContentHeader, ContentName, KV_COMPONENT_LABEL,
+    LEGACY_PRINCIPAL_GRAPH_VERSION, ModelError, ObjectClass, ObjectFormatVersion, ObjectId,
+    ObjectKind, ObjectRecord, ObjectReference, PARENT_LABEL, PRINCIPAL_GRAPH_VERSION,
+    PrincipalContentError, PrincipalContentStore, PrincipalKvAdapter, PrincipalProjectionEngine,
+    PrincipalProjectionError, ReferenceKind, ReferenceLabel, RootState, RootTransaction,
+    STATE_LABEL, invalid, lookup, owned_target, require_structural, root_from_record,
+    validate_catalog, validated_projection_quota,
 };
 
 impl<P, E> PrincipalContentStore<P, E>
@@ -79,6 +81,12 @@ where
                 KV_COMPONENT_LABEL => {
                     other_quota_bytes = other_quota_bytes
                         .checked_add(self.kv_quota(principal, reference.target())?)
+                        .ok_or(PrincipalContentError::AccountingOverflow)?;
+                    preserved_state.push(reference.clone());
+                },
+                label if is_workspace_branch_label(label) => {
+                    other_quota_bytes = other_quota_bytes
+                        .checked_add(workspace_branch_quota(self, principal, reference)?)
                         .ok_or(PrincipalContentError::AccountingOverflow)?;
                     preserved_state.push(reference.clone());
                 },
@@ -185,6 +193,25 @@ where
             .ok_or(PrincipalContentError::AccountingOverflow)?;
         if used > limit && used > previous {
             return Err(PrincipalContentError::QuotaExceeded { used, limit });
+        }
+        Ok(())
+    }
+
+    pub(super) fn check_batch_expectation(
+        &self,
+        principal: &P,
+        header: &ContentHeader,
+        expectation: Option<&ContentBatchExpectation>,
+    ) -> Result<(), PrincipalContentError> {
+        let Some(ContentBatchExpectation::Exact(entries)) = expectation else {
+            return Ok(());
+        };
+        for (name, expected) in entries {
+            let actual = self.catalog_lookup(principal, header.catalog, name)?;
+            let actual = actual.map(|value| value.file);
+            if &actual != expected {
+                return Err(PrincipalContentError::BatchPreconditionFailed);
+            }
         }
         Ok(())
     }

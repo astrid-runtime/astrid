@@ -182,6 +182,33 @@ async fn test_scheme_resolution_workspace() {
 }
 
 #[tokio::test]
+async fn logical_workspace_gate_never_consults_a_host_path() {
+    let manifest = make_manifest(vec![], vec!["cwd://src"], vec!["cwd://src"]);
+    let gate = ManifestSecurityGate::new(manifest, workspace_root(), None).with_logical_workspace();
+
+    assert!(
+        gate.check_file_read("test", "workspace://src/main.rs", None)
+            .await
+            .is_ok()
+    );
+    assert!(
+        gate.check_file_write("test", "workspace://src/main.rs", None)
+            .await
+            .is_ok()
+    );
+    assert!(
+        gate.check_file_read("test", "workspace://src/../secret", None)
+            .await
+            .is_err()
+    );
+    assert!(
+        gate.check_file_read("test", "workspace://other/main.rs", None)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn test_scheme_resolution_home_default_root() {
     let manifest = make_manifest(vec![], vec!["home://"], vec![]);
     let gate = ManifestSecurityGate::new(manifest, workspace_root(), Some(home_root()));
@@ -271,6 +298,38 @@ async fn test_scheme_resolution_home_without_default_root() {
 
     assert!(
         gate.check_file_read("test", "/home/user/.astrid/documents/project/note.md", None,)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn test_logical_home_namespace_does_not_require_a_host_root() {
+    let manifest = make_manifest(vec![], vec!["home://notes"], vec!["home://notes"]);
+    let gate = ManifestSecurityGate::new(manifest, workspace_root(), None);
+
+    assert!(
+        gate.check_file_read("test", "home://notes/today", None)
+            .await
+            .is_ok()
+    );
+    assert!(
+        gate.check_file_write("test", "home://notes/today", None)
+            .await
+            .is_ok()
+    );
+    assert!(
+        gate.check_file_read("test", "home://other/today", None)
+            .await
+            .is_err()
+    );
+    assert!(
+        gate.check_file_read("test", "home://notes/../other", None)
+            .await
+            .is_err()
+    );
+    assert!(
+        gate.check_file_read("test", "home://notes//today", None)
             .await
             .is_err()
     );

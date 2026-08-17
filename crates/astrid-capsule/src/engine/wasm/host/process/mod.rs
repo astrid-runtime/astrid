@@ -41,13 +41,14 @@ use tokio::process::Command as TokioCommand;
 use tracing::warn;
 use wasmtime::component::Resource;
 
+use crate::context::ProcessStorageMount;
 use crate::engine::wasm::bindings::astrid::process1_1_0::host::{
     self as process, EnvVar, ErrorCode, ExitInfo, LogChunk, LogCursor, LogStream, ProcessHandle,
     ProcessInfo, ProcessResult, ProcessSignal, ReadLogsResult, SpawnRequest,
 };
 use crate::engine::wasm::host::util;
 use crate::engine::wasm::host_state::HostState;
-use context::{PreparedSpawnContext, prepare_spawn_context};
+use context::{PreparedSpawnContext, prepare_spawn_context_with_roots};
 use managed::{ManagedProcess, attach_pipes, configure_piped, prepare_sandboxed_command};
 
 pub(crate) use audit::{
@@ -100,6 +101,43 @@ fn authenticated_principal(state: &HostState) -> Option<astrid_core::principal::
         .and_then(|p| astrid_core::principal::PrincipalId::new(p).ok())
 }
 
+fn prepare_process_storage_mount(
+    state: &HostState,
+    op: &str,
+    command: &str,
+) -> Result<Option<ProcessStorageMount>, ErrorCode> {
+    let pathless = state.effective_workspace().is_some_and(|mount| {
+        matches!(
+            &mount.location,
+            crate::engine::wasm::host_state::PrincipalMountLocation::AstridFilesystem
+        )
+    }) || state.effective_home().is_some_and(|mount| {
+        matches!(
+            &mount.location,
+            crate::engine::wasm::host_state::PrincipalMountLocation::AstridFilesystem
+        )
+    });
+    if !pathless {
+        return Ok(None);
+    }
+    let Some(broker) = state.process_storage_mount_broker.as_ref() else {
+        let reason = "kernel process-storage projection broker is unavailable";
+        record_process_denied(state, op, command, reason);
+        return Err(ErrorCode::CapabilityDenied);
+    };
+    let principal = state.effective_principal();
+    util::bounded_block_on(
+        &state.runtime_handle,
+        &state.io_semaphore,
+        broker.mount(&principal),
+    )
+    .map(Some)
+    .map_err(|error| {
+        record_process_denied(state, op, command, &error);
+        ErrorCode::CapabilityDenied
+    })
+}
+
 /// Build the sandboxed `Child` for a persistent spawn: stdout/stderr piped,
 /// stdin piped only when a prelude or `keep-stdin-open` needs it, own process
 /// group (so signals reach descendants), `kill_on_drop` as the reap backstop.
@@ -136,9 +174,10 @@ fn build_persistent_child(
         .map_err(|e| ErrorCode::Unknown(format!("spawn-persistent failed: {e}")))
 }
 
+include!("host_ops_methods.rs");
+
 impl process::Host for HostState {
     fn spawn(&mut self, request: SpawnRequest) -> Result<ProcessResult, ErrorCode> {
-        let workspace_root = self.workspace_root.clone();
         let security = self.security.clone();
         let capsule_id = self.capsule_id.as_str().to_owned();
         let handle = self.runtime_handle.clone();
@@ -182,7 +221,25 @@ impl process::Host for HostState {
             return Err(ErrorCode::CapabilityDenied);
         }
 
-        let spawn_context = match prepare_spawn_context(self, &request) {
+        let process_mount =
+            prepare_process_storage_mount(self, "astrid:process/host.spawn", request.cmd.as_str())?;
+        let workspace_root = process_mount.as_ref().map_or_else(
+            || self.workspace_root.clone(),
+            |mount| mount.workspace_root.clone(),
+        );
+        let mut spawn_context = match prepare_spawn_context_with_roots(
+            self,
+            &request,
+            process_mount
+                .as_ref()
+                .map(|mount| mount.workspace_root.as_path()),
+            process_mount
+                .as_ref()
+                .map(|mount| mount.home_root.as_path()),
+            process_mount
+                .as_ref()
+                .and_then(|mount| mount.fleet_shared_root.as_deref()),
+        ) {
             Ok(context) => context,
             Err(error) => {
                 let result: Result<ProcessResult, ErrorCode> = Err(error);
@@ -190,6 +247,14 @@ impl process::Host for HostState {
                 return result;
             },
         };
+        if let Some(mount) = process_mount.as_ref()
+            && !request.env.iter().any(|entry| entry.key == "HOME")
+        {
+            spawn_context.env.push((
+                "HOME".to_owned(),
+                mount.home_root.to_string_lossy().into_owned(),
+            ));
+        }
 
         // Snapshot + verify any read-only file injections before building the
         // command. `_injection_guard` is held to the end of this fn so the
@@ -324,7 +389,6 @@ impl process::Host for HostState {
             return Err(ErrorCode::Quota);
         }
 
-        let workspace_root = self.workspace_root.clone();
         let security = self.security.clone();
         let capsule_id = self.capsule_id.as_str().to_owned();
         let handle = self.runtime_handle.clone();
@@ -375,7 +439,28 @@ impl process::Host for HostState {
             return Err(ErrorCode::Cancelled);
         }
 
-        let spawn_context = match prepare_spawn_context(self, &request) {
+        let process_mount = prepare_process_storage_mount(
+            self,
+            "astrid:process/host.spawn-background",
+            request.cmd.as_str(),
+        )?;
+        let workspace_root = process_mount.as_ref().map_or_else(
+            || self.workspace_root.clone(),
+            |mount| mount.workspace_root.clone(),
+        );
+        let mut spawn_context = match prepare_spawn_context_with_roots(
+            self,
+            &request,
+            process_mount
+                .as_ref()
+                .map(|mount| mount.workspace_root.as_path()),
+            process_mount
+                .as_ref()
+                .map(|mount| mount.home_root.as_path()),
+            process_mount
+                .as_ref()
+                .and_then(|mount| mount.fleet_shared_root.as_deref()),
+        ) {
             Ok(context) => context,
             Err(error) => {
                 let result: Result<Resource<ProcessHandle>, ErrorCode> = Err(error);
@@ -388,6 +473,14 @@ impl process::Host for HostState {
                 return result;
             },
         };
+        if let Some(mount) = process_mount.as_ref()
+            && !request.env.iter().any(|entry| entry.key == "HOME")
+        {
+            spawn_context.env.push((
+                "HOME".to_owned(),
+                mount.home_root.to_string_lossy().into_owned(),
+            ));
+        }
 
         // Snapshot + verify any read-only file injections. The guard is stored
         // on the `ManagedProcess` below so it lives as long as the handle and
@@ -472,6 +565,7 @@ impl process::Host for HostState {
             command: command_str,
             creator: principal.clone(),
             injection_guard: Some(prepared.guard),
+            process_storage_mount: process_mount,
         };
 
         let pid = managed
@@ -624,7 +718,28 @@ impl process::Host for HostState {
             return Err(ErrorCode::Cancelled);
         }
 
-        let spawn_context = match prepare_spawn_context(self, &request) {
+        let process_mount = prepare_process_storage_mount(
+            self,
+            "astrid:process/host.spawn-persistent",
+            request.cmd.as_str(),
+        )?;
+        let workspace_root = process_mount.as_ref().map_or_else(
+            || self.workspace_root.clone(),
+            |mount| mount.workspace_root.clone(),
+        );
+        let mut spawn_context = match prepare_spawn_context_with_roots(
+            self,
+            &request,
+            process_mount
+                .as_ref()
+                .map(|mount| mount.workspace_root.as_path()),
+            process_mount
+                .as_ref()
+                .map(|mount| mount.home_root.as_path()),
+            process_mount
+                .as_ref()
+                .and_then(|mount| mount.fleet_shared_root.as_deref()),
+        ) {
             Ok(context) => context,
             Err(error) => {
                 let result: Result<String, ErrorCode> = Err(error);
@@ -637,6 +752,14 @@ impl process::Host for HostState {
                 return result;
             },
         };
+        if let Some(mount) = process_mount.as_ref()
+            && !request.env.iter().any(|entry| entry.key == "HOME")
+        {
+            spawn_context.env.push((
+                "HOME".to_owned(),
+                mount.home_root.to_string_lossy().into_owned(),
+            ));
+        }
 
         // Snapshot + verify any read-only file injections. The guard is threaded
         // into the registry entry below so it lives as long as the persistent
@@ -657,7 +780,6 @@ impl process::Host for HostState {
         };
 
         let capsule_id_arc: Arc<str> = Arc::from(self.capsule_id.as_str());
-        let workspace_root = self.workspace_root.clone();
         // Per-principal concurrent cap, SHARED with `spawn-background`: subtract
         // this instance's live ephemeral handles so the registry's own check
         // (`registry-live < effective`) bounds the COMBINED count to the cap.
@@ -781,6 +903,7 @@ impl process::Host for HostState {
             idle_timeout_ms: request.idle_timeout_ms,
             exit_retention_ms: request.exit_retention_ms,
             injection_guard: Some(prepared.guard),
+            process_storage_mount: process_mount,
         });
         if !injection_audit.is_empty() {
             audit_process_injections(
@@ -801,198 +924,5 @@ impl process::Host for HostState {
         result
     }
 
-    fn attach(&mut self, id: String) -> Result<Resource<ProcessHandle>, ErrorCode> {
-        if !self.invocation_authority_active() {
-            return Err(ErrorCode::CapabilityDenied);
-        }
-        // Deferred: materialising a `process-handle` resource over a registry
-        // entry needs dual-typed dispatch in the resource table. The id-keyed
-        // free functions below ARE the documented `attach(id)?.method()`
-        // equivalents, so the persistent tier is fully usable without it.
-        let result: Result<Resource<ProcessHandle>, ErrorCode> = Err(ErrorCode::Unknown(
-            "attach: resource-handle materialisation pending — use the id-keyed ops".to_string(),
-        ));
-        audit_process_id(self, "astrid:process/host.attach", &id, &result);
-        result
-    }
-
-    fn list_processes(
-        &mut self,
-        label_filter: Option<String>,
-    ) -> Result<Vec<ProcessInfo>, ErrorCode> {
-        let principal = self.effective_principal();
-        let capsule_id = self.capsule_id.as_str().to_owned();
-        let result =
-            Ok(self
-                .persistent_processes
-                .list(&principal, &capsule_id, label_filter.as_deref()));
-        // Not id-keyed: audit the op + (non-secret) label filter, no id.
-        audit_process(
-            self,
-            "astrid:process/host.list-processes",
-            label_filter.as_deref().unwrap_or("*"),
-            &result,
-        );
-        result
-    }
-
-    fn status(&mut self, id: String) -> Result<ProcessInfo, ErrorCode> {
-        let principal = self.effective_principal();
-        let capsule_id = self.capsule_id.as_str().to_owned();
-        let result = self
-            .persistent_processes
-            .status(&id, &principal, &capsule_id);
-        audit_process_id(self, "astrid:process/host.status", &id, &result);
-        result
-    }
-
-    fn status_many(&mut self, ids: Vec<String>) -> Result<Vec<ProcessInfo>, ErrorCode> {
-        let principal = self.effective_principal();
-        let capsule_id = self.capsule_id.as_str().to_owned();
-        let result = Ok(self
-            .persistent_processes
-            .status_many(&ids, &principal, &capsule_id));
-        audit_process(
-            self,
-            "astrid:process/host.status-many",
-            &format!("{} ids", ids.len()),
-            &result,
-        );
-        result
-    }
-
-    fn read_logs(&mut self, id: String) -> Result<ReadLogsResult, ErrorCode> {
-        let principal = self.effective_principal();
-        let capsule_id = self.capsule_id.as_str().to_owned();
-        let result = self
-            .persistent_processes
-            .read_logs(&id, &principal, &capsule_id);
-        audit_process_id(self, "astrid:process/host.read-logs", &id, &result);
-        result
-    }
-
-    fn read_since(
-        &mut self,
-        id: String,
-        which_stream: LogStream,
-        cursor: LogCursor,
-        max_bytes: u32,
-    ) -> Result<LogChunk, ErrorCode> {
-        let principal = self.effective_principal();
-        let capsule_id = self.capsule_id.as_str().to_owned();
-        let result = self.persistent_processes.read_since(
-            &id,
-            &principal,
-            &capsule_id,
-            which_stream,
-            &cursor,
-            max_bytes,
-        );
-        audit_process_id(self, "astrid:process/host.read-since", &id, &result);
-        result
-    }
-
-    fn write_stdin(&mut self, id: String, data: Vec<u8>) -> Result<u32, ErrorCode> {
-        let principal = self.effective_principal();
-        let capsule_id = self.capsule_id.as_str().to_owned();
-        let handle = self.runtime_handle.clone();
-        let semaphore = self.io_semaphore.clone();
-        let registry = self.persistent_processes.clone();
-        let id_for_audit = id.clone();
-        let result = util::bounded_block_on(&handle, &semaphore, async move {
-            registry
-                .write_stdin(&id, &principal, &capsule_id, &data)
-                .await
-        });
-        audit_process_id(
-            self,
-            "astrid:process/host.write-stdin",
-            &id_for_audit,
-            &result,
-        );
-        result
-    }
-
-    fn close_stdin(&mut self, id: String) -> Result<(), ErrorCode> {
-        let principal = self.effective_principal();
-        let capsule_id = self.capsule_id.as_str().to_owned();
-        let result = self
-            .persistent_processes
-            .close_stdin(&id, &principal, &capsule_id);
-        audit_process_id(self, "astrid:process/host.close-stdin", &id, &result);
-        result
-    }
-
-    fn signal(&mut self, id: String, sig: ProcessSignal) -> Result<(), ErrorCode> {
-        let principal = self.effective_principal();
-        let capsule_id = self.capsule_id.as_str().to_owned();
-        let result = self
-            .persistent_processes
-            .signal(&id, &principal, &capsule_id, sig);
-        audit_process_id(self, "astrid:process/host.signal", &id, &result);
-        result
-    }
-
-    fn wait(&mut self, id: String, timeout_ms: u64) -> Result<ExitInfo, ErrorCode> {
-        let principal = self.effective_principal();
-        let capsule_id = self.capsule_id.as_str().to_owned();
-        let handle = self.runtime_handle.clone();
-        let semaphore = self.blocking_semaphore.clone();
-        let cancel = self.effective_cancel_token();
-        let registry = self.persistent_processes.clone();
-        let timeout = std::time::Duration::from_millis(timeout_ms);
-        let id_for_audit = id.clone();
-        let result = util::bounded_block_on_cancellable(&handle, &semaphore, &cancel, async move {
-            registry.wait(&id, &principal, &capsule_id, timeout).await
-        })
-        .unwrap_or(Err(ErrorCode::Cancelled));
-        audit_process_id(self, "astrid:process/host.wait", &id_for_audit, &result);
-        result
-    }
-
-    fn stop(&mut self, id: String, grace_ms: Option<u64>) -> Result<ExitInfo, ErrorCode> {
-        let principal = self.effective_principal();
-        let capsule_id = self.capsule_id.as_str().to_owned();
-        let handle = self.runtime_handle.clone();
-        let semaphore = self.blocking_semaphore.clone();
-        let cancel = self.effective_cancel_token();
-        let registry = self.persistent_processes.clone();
-        let grace = grace_ms.map(std::time::Duration::from_millis);
-        let id_for_audit = id.clone();
-        let result = util::bounded_block_on_cancellable(&handle, &semaphore, &cancel, async move {
-            registry.stop(&id, &principal, &capsule_id, grace).await
-        })
-        .unwrap_or(Err(ErrorCode::Cancelled));
-        audit_process_id(self, "astrid:process/host.stop", &id_for_audit, &result);
-        result
-    }
-
-    fn release_process(&mut self, id: String) -> Result<(), ErrorCode> {
-        let principal = self.effective_principal();
-        let capsule_id = self.capsule_id.as_str().to_owned();
-        let result = self
-            .persistent_processes
-            .release(&id, &principal, &capsule_id);
-        audit_process_id(self, "astrid:process/host.release-process", &id, &result);
-        result
-    }
-
-    fn watch(&mut self, id: String, _suffix: Option<String>) -> Result<(), ErrorCode> {
-        // Deferred by design: host-published lifecycle events raise an OPEN
-        // publish-authority question (manifest `[publish]` vs kernel-authored
-        // topic class) tracked in RFC host_abi. `status` + bounded `wait` is
-        // the working polling alternative until that resolves.
-        let result: Result<(), ErrorCode> = Err(ErrorCode::Unknown(
-            "watch: host lifecycle events deferred (publish-authority — RFC host_abi)".to_string(),
-        ));
-        audit_process_id(self, "astrid:process/host.watch", &id, &result);
-        result
-    }
-
-    fn unwatch(&mut self, id: String) -> Result<(), ErrorCode> {
-        // Idempotent: nothing is armed while `watch` is deferred.
-        let result: Result<(), ErrorCode> = Ok(());
-        audit_process_id(self, "astrid:process/host.unwatch", &id, &result);
-        result
-    }
+    host_ops_methods!();
 }

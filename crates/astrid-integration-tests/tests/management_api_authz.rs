@@ -59,6 +59,9 @@ fn all_requests() -> Vec<KernelRequest> {
         KernelRequest::InstallCapsule {
             source: "x".to_string(),
             workspace: false,
+            target_principal: None,
+            provenance: None,
+            env: Vec::new(),
         },
         KernelRequest::ListCapsules,
         KernelRequest::GetCommands,
@@ -129,6 +132,9 @@ fn agent_group_allows_self_scoped_capsule_surface() {
         KernelRequest::InstallCapsule {
             source: String::new(),
             workspace: true,
+            target_principal: None,
+            provenance: None,
+            env: Vec::new(),
         },
         KernelRequest::ReloadCapsule {
             id: "astrid-capsule-registry".to_string(),
@@ -157,6 +163,9 @@ fn agent_group_allows_self_scoped_capsule_surface() {
             &KernelRequest::InstallCapsule {
                 source: String::new(),
                 workspace: false,
+                target_principal: None,
+                provenance: None,
+                env: Vec::new(),
             }
         )
         .is_err(),
@@ -289,6 +298,9 @@ fn custom_group_capabilities_gate_admin_surface() {
         &KernelRequest::InstallCapsule {
             source: String::new(),
             workspace: false,
+            target_principal: None,
+            provenance: None,
+            env: Vec::new(),
         },
     )
     .unwrap();
@@ -302,7 +314,10 @@ fn custom_group_capabilities_gate_admin_surface() {
             &caller,
             &KernelRequest::InstallCapsule {
                 source: String::new(),
-                workspace: true
+                workspace: true,
+                target_principal: None,
+                provenance: None,
+                env: Vec::new()
             }
         )
         .is_err()
@@ -315,6 +330,9 @@ fn custom_group_capabilities_gate_admin_surface() {
         &KernelRequest::InstallCapsule {
             source: String::new(),
             workspace: true,
+            target_principal: None,
+            provenance: None,
+            env: Vec::new(),
         },
     )
     .unwrap();

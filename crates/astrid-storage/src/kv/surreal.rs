@@ -289,6 +289,38 @@ impl KvStore for SurrealKvStore {
         Ok(keys)
     }
 
+    async fn list_keys_with_prefix_page(
+        &self,
+        namespace: &str,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> StorageResult<Vec<String>> {
+        validate_namespace(namespace)?;
+        validate_prefix(prefix)?;
+        let start = composite_key(namespace, prefix);
+        let end = prefix_range_end(namespace, prefix);
+        let prefix_len = namespace.len().saturating_add(1);
+        let tx = self
+            .tree
+            .begin_with_mode(surrealkv::Mode::ReadOnly)
+            .map_err(|ref e| map_kv_err(e))?;
+        let mut iter = tx.range(&start, &end).map_err(|ref e| map_kv_err(e))?;
+        iter.seek_first().map_err(|ref e| map_kv_err(e))?;
+        let mut keys = Vec::with_capacity(limit.min(1024));
+        while iter.valid() && keys.len() < limit {
+            let raw_key = iter.key().user_key();
+            if raw_key.len() > prefix_len
+                && let Ok(key_str) = std::str::from_utf8(&raw_key[prefix_len..])
+                && after.is_none_or(|cursor| key_str > cursor)
+            {
+                keys.push(key_str.to_owned());
+            }
+            iter.next().map_err(|ref e| map_kv_err(e))?;
+        }
+        Ok(keys)
+    }
+
     async fn compare_and_swap(
         &self,
         namespace: &str,

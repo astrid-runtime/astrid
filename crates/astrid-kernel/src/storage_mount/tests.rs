@@ -192,6 +192,254 @@ async fn private_mount_manifest_and_callback_endpoint_are_owner_scoped() {
     drop(listener);
 }
 
+#[tokio::test]
+async fn principal_home_subtree_cannot_reach_capsule_catalog() {
+    let temporary = tempfile::tempdir().unwrap();
+    let home = astrid_core::dirs::AstridHome::from_path(temporary.path().join(".astrid"));
+    let kernel = crate::test_kernel_with_home(home).await;
+    let uid = astrid_core::PrincipalUid::from_bytes([0xD0; 32]);
+    let store = kernel.principal_store.clone().unwrap();
+    let root = AstridFilesystem::new(store.content(), StateOwner::Principal(uid));
+    root.create_dir(&FilesystemPath::new("home").unwrap())
+        .unwrap();
+    root.create_dir(&FilesystemPath::new("capsules").unwrap())
+        .unwrap();
+    root.write(
+        &FilesystemPath::new("capsules/secret").unwrap(),
+        b"package-authority",
+    )
+    .unwrap();
+
+    let scoped = PrefixedFilesystem {
+        inner: root,
+        prefix: "home".to_owned(),
+    };
+    let listing = execute_blocking(
+        &scoped,
+        StorageFilesystemOperationV1::ReadDirectory {
+            path: String::new(),
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(listing, StorageFilesystemSuccessV1::Entries(entries) if entries
+        .iter()
+        .all(|entry| entry.name != "capsules"))
+    );
+    assert!(matches!(
+        execute_blocking(
+            &scoped,
+            StorageFilesystemOperationV1::Read {
+                path: "capsules/secret".to_owned(),
+                offset: 0,
+                length: 64,
+            },
+        ),
+        Err(FilesystemError::NotFound(_))
+    ));
+}
+
+#[tokio::test]
+async fn fleet_shared_subtree_cannot_reach_workspace_or_siblings() {
+    let temporary = tempfile::tempdir().unwrap();
+    let home = astrid_core::dirs::AstridHome::from_path(temporary.path().join(".astrid"));
+    let kernel = crate::test_kernel_with_home(home).await;
+    let store = kernel.principal_store.clone().unwrap();
+    let fleet = astrid_core::FleetUid::from_bytes([0xF1; 32]);
+    let root = AstridFilesystem::new(store.content(), StateOwner::Fleet(fleet));
+    root.create_dir(&FilesystemPath::new("shared").unwrap())
+        .unwrap();
+    root.write(
+        &FilesystemPath::new("shared/cookie").unwrap(),
+        b"fleet-cookie",
+    )
+    .unwrap();
+    root.create_dir(&FilesystemPath::new("workspace").unwrap())
+        .unwrap();
+    root.create_dir(&FilesystemPath::new("workspace/default").unwrap())
+        .unwrap();
+    root.write(
+        &FilesystemPath::new("workspace/default/private").unwrap(),
+        b"branch-only",
+    )
+    .unwrap();
+    let scoped = AstridFilesystem::new_fleet_shared(store.content(), StateOwner::Fleet(fleet));
+    let listing = scoped.read_dir(&FilesystemPath::root()).unwrap();
+    assert_eq!(listing.len(), 1);
+    assert_eq!(listing[0].name(), "cookie");
+    assert_eq!(
+        scoped
+            .read(&FilesystemPath::new("cookie").unwrap(), 0, 12)
+            .unwrap(),
+        b"fleet-cookie"
+    );
+    assert!(matches!(
+        scoped.read(
+            &FilesystemPath::new("workspace/default/private").unwrap(),
+            0,
+            64,
+        ),
+        Err(FilesystemError::NotFound(_))
+    ));
+}
+
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn process_projection_cache_reuses_one_pair_until_last_close() {
+    let cleanup_count = Arc::new(AtomicU64::new(0));
+    let cleanup_count_for_projection = Arc::clone(&cleanup_count);
+    let projection = Arc::new(CachedProcessProjection {
+        workspace_mountpoint: PathBuf::from("/private/workspace"),
+        home_mountpoint: PathBuf::from("/private/home"),
+        fleet_shared_mountpoint: None,
+        refs: AtomicU64::new(0),
+        cleanup_failed: AtomicBool::new(false),
+        cleanup: Arc::new(move || {
+            let cleanup_count = Arc::clone(&cleanup_count_for_projection);
+            Box::pin(async move {
+                cleanup_count.fetch_add(1, Ordering::AcqRel);
+                true
+            })
+        }),
+    });
+    let cache = Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let key = ProcessProjectionKey {
+        principal_uid: astrid_core::PrincipalUid::from_bytes([0xA1; 32]),
+        owner: StateOwner::Principal(astrid_core::PrincipalUid::from_bytes([0xA1; 32])),
+        branch: astrid_core::WorkspaceUid::from_bytes([0xB2; 16]),
+        read_write: true,
+    };
+    cache.lock().await.insert(key, Arc::clone(&projection));
+
+    let mut tasks = Vec::new();
+    for _ in 0..100 {
+        let projection = Arc::clone(&projection);
+        let cache = Arc::clone(&cache);
+        tasks.push(tokio::spawn(async move {
+            cached_projection_mount(projection, cache, key)
+        }));
+    }
+    let mut mounts = Vec::new();
+    for task in tasks {
+        mounts.push(task.await.expect("projection task"));
+    }
+    assert_eq!(projection.refs.load(Ordering::Acquire), 100);
+    assert!(
+        mounts
+            .iter()
+            .all(|mount| mount.workspace_root.as_path() == Path::new("/private/workspace"))
+    );
+    assert!(
+        mounts
+            .iter()
+            .all(|mount| mount.home_root.as_path() == Path::new("/private/home"))
+    );
+
+    let closes = mounts
+        .into_iter()
+        .map(|mount| tokio::spawn(mount.close_async()))
+        .collect::<Vec<_>>();
+    for close in closes {
+        close.await.expect("projection close task");
+    }
+    assert_eq!(cleanup_count.load(Ordering::Acquire), 1);
+    assert!(cache.lock().await.is_empty());
+}
+
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn failed_projection_cleanup_retries_before_new_mount() {
+    let attempts = Arc::new(AtomicU64::new(0));
+    let attempts_for_projection = Arc::clone(&attempts);
+    let projection = Arc::new(CachedProcessProjection {
+        workspace_mountpoint: PathBuf::from("/private/workspace-retry"),
+        home_mountpoint: PathBuf::from("/private/home-retry"),
+        fleet_shared_mountpoint: None,
+        refs: AtomicU64::new(0),
+        cleanup_failed: AtomicBool::new(false),
+        cleanup: Arc::new(move || {
+            let attempts = Arc::clone(&attempts_for_projection);
+            Box::pin(async move { attempts.fetch_add(1, Ordering::AcqRel) >= 1 })
+        }),
+    });
+    let cache = Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let key = ProcessProjectionKey {
+        principal_uid: astrid_core::PrincipalUid::from_bytes([0xA2; 32]),
+        owner: StateOwner::Principal(astrid_core::PrincipalUid::from_bytes([0xA2; 32])),
+        branch: astrid_core::WorkspaceUid::from_bytes([0xB3; 16]),
+        read_write: true,
+    };
+    cache.lock().await.insert(key, Arc::clone(&projection));
+
+    let mount = cached_projection_mount(Arc::clone(&projection), Arc::clone(&cache), key);
+    mount.close_async().await;
+    assert!(projection.cleanup_failed.load(Ordering::Acquire));
+    assert!(cache.lock().await.contains_key(&key));
+
+    assert!(retry_failed_projection(&projection, &cache, key).await);
+    assert_eq!(attempts.load(Ordering::Acquire), 2);
+    assert!(cache.lock().await.is_empty());
+}
+
+#[cfg(any(unix, windows))]
+fn ready_test_launch() -> StorageProviderServiceLaunchV1 {
+    let lease_token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x11_u8; 32]);
+    let parent_token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x22_u8; 32]);
+    let resource_path = PathBuf::from("/private/run/astrid/lease");
+    let control_path = resource_path.join("process-control.sock");
+    StorageProviderServiceLaunchV1 {
+        schema: STORAGE_FILESYSTEM_SERVICE_LAUNCH_SCHEMA_V1,
+        lease: StorageMountLeaseV1 {
+            mount_id: StorageMountId::new(),
+            view: StorageProviderViewV1::Principal(PrincipalId::default()),
+            access: StorageProviderAccessV1::ReadOnly,
+            resource_path: resource_path.clone(),
+            callback_path: resource_path.join("callback.sock"),
+            lease_token,
+            expires_at_epoch_secs: u64::MAX,
+        },
+        mountpoint: PathBuf::from("/private/run/astrid/mount"),
+        control_path: control_path.clone(),
+        parent: StorageProviderParentLifetimeV1 {
+            pid: 1_234,
+            start_identity: Some("123:456".to_owned()),
+            token: parent_token,
+        },
+    }
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn process_provider_ready_requires_exact_bound_identity_and_challenge() {
+    let launch = ready_test_launch();
+    let challenge = storage_provider_service_ready_challenge(
+        &launch.parent.token,
+        STORAGE_FILESYSTEM_SERVICE_READY_SCHEMA_V1,
+        platform_process_provider_name(),
+        launch.lease.mount_id.as_uuid(),
+        &launch.control_path,
+        &launch.lease.resource_path,
+        &launch.lease.callback_path,
+    )
+    .expect("ready challenge");
+    let ready = StorageProviderServiceReadyV1 {
+        schema: STORAGE_FILESYSTEM_SERVICE_READY_SCHEMA_V1,
+        provider: platform_process_provider_name().to_owned(),
+        mount_id: launch.lease.mount_id.as_uuid(),
+        control_path: launch.control_path.clone(),
+        challenge,
+    };
+    let canonical = serde_json::to_string(&ready).expect("canonical ready");
+    validate_process_provider_ready(&launch, &canonical).expect("valid ready frame");
+
+    let wrong = canonical.replace("\"challenge\":\"", "\"challenge\":\"deadbeef");
+    assert!(validate_process_provider_ready(&launch, &wrong).is_err());
+    let unknown = format!("{},\"extra\":true}}", canonical.trim_end_matches('}'));
+    assert!(validate_process_provider_ready(&launch, &unknown).is_err());
+    let oversized = format!("{}{}", canonical, "x".repeat(64 * 1024));
+    assert!(validate_process_provider_ready(&launch, &oversized).is_err());
+}
+
 async fn root_fleet(kernel: &Kernel) -> astrid_core::FleetUid {
     kernel
         .ownership_store()
@@ -231,6 +479,7 @@ async fn private_callbacks_bind_authority_and_isolate_principal_and_fleet_views(
         caller.clone(),
         false,
         StorageProviderViewV1::Principal(caller.clone()),
+        astrid_core::storage_filesystem::StorageFilesystemTargetV1::OwnerRoot,
         StorageProviderAccessV1::ReadWrite,
         "test-provider".to_owned(),
         temporary.path().join("principal-mount"),
@@ -401,6 +650,7 @@ async fn private_callbacks_bind_authority_and_isolate_principal_and_fleet_views(
         caller.clone(),
         false,
         StorageProviderViewV1::Fleet(fleet),
+        astrid_core::storage_filesystem::StorageFilesystemTargetV1::OwnerRoot,
         StorageProviderAccessV1::ReadWrite,
         "test-provider".to_owned(),
         temporary.path().join("fleet-mount"),
@@ -443,6 +693,7 @@ async fn private_callbacks_bind_authority_and_isolate_principal_and_fleet_views(
         caller.clone(),
         true,
         StorageProviderViewV1::Admin,
+        astrid_core::storage_filesystem::StorageFilesystemTargetV1::OwnerRoot,
         StorageProviderAccessV1::ReadWrite,
         "test-provider".to_owned(),
         temporary.path().join("system-mount"),
@@ -471,6 +722,7 @@ async fn private_callbacks_bind_authority_and_isolate_principal_and_fleet_views(
         caller.clone(),
         false,
         StorageProviderViewV1::Principal(caller.clone()),
+        astrid_core::storage_filesystem::StorageFilesystemTargetV1::OwnerRoot,
         StorageProviderAccessV1::ReadOnly,
         "test-provider".to_owned(),
         temporary.path().join("read-only-mount"),
@@ -499,6 +751,151 @@ async fn private_callbacks_bind_authority_and_isolate_principal_and_fleet_views(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
+async fn synced_owner_mounts_reopen_without_cross_view_aliasing() {
+    let temporary = tempfile::tempdir().unwrap();
+    let home = astrid_core::dirs::AstridHome::from_path(temporary.path().join(".astrid"));
+    let kernel = crate::test_kernel_with_home(home.clone()).await;
+    let caller = PrincipalId::default();
+    let (user, identity) = crate::bootstrap_cli_root_user(&kernel.identity_store, &home)
+        .await
+        .unwrap();
+    crate::bootstrap_cli_root_ownership(
+        kernel.ownership_store().as_ref(),
+        &kernel.principal_directory,
+        user,
+        identity,
+        false,
+    )
+    .await
+    .unwrap();
+    let fleet = root_fleet(&kernel).await;
+
+    let principal = issue_lease(
+        &kernel,
+        caller.clone(),
+        false,
+        StorageProviderViewV1::Principal(caller.clone()),
+        astrid_core::storage_filesystem::StorageFilesystemTargetV1::OwnerRoot,
+        StorageProviderAccessV1::ReadWrite,
+        "reopen-principal".to_owned(),
+        temporary.path().join("principal-first"),
+    )
+    .await
+    .unwrap();
+    let fleet_lease = issue_lease(
+        &kernel,
+        caller.clone(),
+        false,
+        StorageProviderViewV1::Fleet(fleet),
+        astrid_core::storage_filesystem::StorageFilesystemTargetV1::OwnerRoot,
+        StorageProviderAccessV1::ReadWrite,
+        "reopen-fleet".to_owned(),
+        temporary.path().join("fleet-first"),
+    )
+    .await
+    .unwrap();
+
+    for (lease, bytes) in [
+        (&principal, b"principal-bytes".as_slice()),
+        (&fleet_lease, b"fleet-bytes".as_slice()),
+    ] {
+        assert_eq!(
+            callback(lease, &lease.lease_token, create("same-name.txt")).await,
+            StorageFilesystemOutcomeV1::Success(StorageFilesystemSuccessV1::Done)
+        );
+        assert_eq!(
+            callback(
+                lease,
+                &lease.lease_token,
+                StorageFilesystemOperationV1::Write {
+                    path: "same-name.txt".to_owned(),
+                    offset: 0,
+                    data: bytes.to_vec(),
+                },
+            )
+            .await,
+            StorageFilesystemOutcomeV1::Success(StorageFilesystemSuccessV1::Written(
+                bytes.len() as u64
+            ))
+        );
+        assert_eq!(
+            callback(
+                lease,
+                &lease.lease_token,
+                StorageFilesystemOperationV1::Sync,
+            )
+            .await,
+            StorageFilesystemOutcomeV1::Success(StorageFilesystemSuccessV1::Done)
+        );
+    }
+    revoke_lease(&kernel, &caller, false, principal.mount_id)
+        .await
+        .unwrap();
+    revoke_lease(&kernel, &caller, false, fleet_lease.mount_id)
+        .await
+        .unwrap();
+
+    let principal_reopened = issue_lease(
+        &kernel,
+        caller.clone(),
+        false,
+        StorageProviderViewV1::Principal(caller.clone()),
+        astrid_core::storage_filesystem::StorageFilesystemTargetV1::OwnerRoot,
+        StorageProviderAccessV1::ReadOnly,
+        "reopen-principal".to_owned(),
+        temporary.path().join("principal-second"),
+    )
+    .await
+    .unwrap();
+    let fleet_reopened = issue_lease(
+        &kernel,
+        caller.clone(),
+        false,
+        StorageProviderViewV1::Fleet(fleet),
+        astrid_core::storage_filesystem::StorageFilesystemTargetV1::OwnerRoot,
+        StorageProviderAccessV1::ReadOnly,
+        "reopen-fleet".to_owned(),
+        temporary.path().join("fleet-second"),
+    )
+    .await
+    .unwrap();
+
+    for (lease, expected) in [
+        (&principal_reopened, b"principal-bytes".as_slice()),
+        (&fleet_reopened, b"fleet-bytes".as_slice()),
+    ] {
+        assert_eq!(
+            callback(
+                lease,
+                &lease.lease_token,
+                StorageFilesystemOperationV1::Read {
+                    path: "same-name.txt".to_owned(),
+                    offset: 0,
+                    length: 64,
+                },
+            )
+            .await,
+            StorageFilesystemOutcomeV1::Success(StorageFilesystemSuccessV1::Data(
+                expected.to_vec()
+            ))
+        );
+        assert!(matches!(
+            callback(lease, &lease.lease_token, create("denied.txt")).await,
+            StorageFilesystemOutcomeV1::Failure(StorageFilesystemFailureV1 { code, .. })
+                if code == "read-only"
+        ));
+    }
+
+    revoke_lease(&kernel, &caller, false, principal_reopened.mount_id)
+        .await
+        .unwrap();
+    revoke_lease(&kernel, &caller, false, fleet_reopened.mount_id)
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn version_one_callback_round_trips_small_binary_io() {
     let temporary = tempfile::tempdir().unwrap();
     let home = astrid_core::dirs::AstridHome::from_path(temporary.path().join(".astrid"));
@@ -508,6 +905,7 @@ async fn version_one_callback_round_trips_small_binary_io() {
         PrincipalId::default(),
         true,
         StorageProviderViewV1::Admin,
+        astrid_core::storage_filesystem::StorageFilesystemTargetV1::OwnerRoot,
         StorageProviderAccessV1::ReadWrite,
         "v1-test-provider".to_owned(),
         temporary.path().join("mount"),
@@ -558,6 +956,7 @@ async fn version_two_framing_transports_maximum_file_io() {
         PrincipalId::default(),
         true,
         StorageProviderViewV1::Admin,
+        astrid_core::storage_filesystem::StorageFilesystemTargetV1::OwnerRoot,
         StorageProviderAccessV1::ReadWrite,
         "test-provider".to_owned(),
         temporary.path().join("mount"),
@@ -613,6 +1012,7 @@ async fn dirty_tracks_only_successfully_acknowledged_unsynced_mutations() {
         caller.clone(),
         true,
         StorageProviderViewV1::Admin,
+        astrid_core::storage_filesystem::StorageFilesystemTargetV1::OwnerRoot,
         StorageProviderAccessV1::ReadWrite,
         "test-provider".to_owned(),
         temporary.path().join("mount"),
@@ -690,6 +1090,7 @@ async fn revoke_drains_an_in_flight_mutation_and_fences_new_mutation() {
         caller.clone(),
         true,
         StorageProviderViewV1::Admin,
+        astrid_core::storage_filesystem::StorageFilesystemTargetV1::OwnerRoot,
         StorageProviderAccessV1::ReadWrite,
         "test-provider".to_owned(),
         temporary.path().join("mount"),
@@ -754,4 +1155,191 @@ async fn revoke_drains_an_in_flight_mutation_and_fences_new_mutation() {
         StorageFilesystemOutcomeV1::Failure(StorageFilesystemFailureV1 { code, .. })
             if code == "stale-lease"
     ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
+async fn internal_workspace_branch_lease_fixes_branch_target() {
+    let temporary = tempfile::tempdir().unwrap();
+    let home = astrid_core::dirs::AstridHome::from_path(temporary.path().join(".astrid"));
+    let kernel = crate::test_kernel_with_home(home.clone()).await;
+    let caller = PrincipalId::default();
+    let (user, identity) = crate::bootstrap_cli_root_user(&kernel.identity_store, &home)
+        .await
+        .unwrap();
+    crate::bootstrap_cli_root_ownership(
+        kernel.ownership_store().as_ref(),
+        &kernel.principal_directory,
+        user,
+        identity,
+        false,
+    )
+    .await
+    .unwrap();
+    let uid = kernel.principal_directory.uid_for(&caller).unwrap();
+    let owner = astrid_storage::StateOwner::Principal(uid);
+    let store = kernel.principal_store.clone().unwrap();
+    let branches = astrid_storage::WorkspaceBranchStore::new(store.content());
+    let workspace = astrid_core::WorkspaceUid::random();
+    branches
+        .begin_for_uid_at(
+            &owner,
+            uid,
+            workspace,
+            astrid_storage::ContentName::new("workspace/default").unwrap(),
+        )
+        .unwrap();
+
+    let foreign_workspace = astrid_core::WorkspaceUid::random();
+    branches
+        .begin_for_uid_at(
+            &owner,
+            astrid_core::PrincipalUid::from_bytes([0x99; 32]),
+            foreign_workspace,
+            astrid_storage::ContentName::new("workspace/default").unwrap(),
+        )
+        .unwrap();
+    let foreign_error = issue_lease(
+        &kernel,
+        caller.clone(),
+        false,
+        StorageProviderViewV1::Principal(caller.clone()),
+        astrid_core::storage_filesystem::StorageFilesystemTargetV1::WorkspaceBranch {
+            workspace: foreign_workspace,
+        },
+        StorageProviderAccessV1::ReadWrite,
+        "foreign-branch-test".to_owned(),
+        temporary.path().join("foreign-branch-mount"),
+    )
+    .await
+    .expect_err("caller-scoped branch lease must reject another UID's branch");
+    assert!(foreign_error.contains("not bound to the authenticated principal"));
+
+    let lease = issue_lease(
+        &kernel,
+        caller.clone(),
+        false,
+        StorageProviderViewV1::Principal(caller.clone()),
+        astrid_core::storage_filesystem::StorageFilesystemTargetV1::WorkspaceBranch { workspace },
+        StorageProviderAccessV1::ReadWrite,
+        "internal-branch-test".to_owned(),
+        temporary.path().join("branch-mount"),
+    )
+    .await
+    .unwrap();
+    let target = kernel
+        .storage_mounts
+        .get(&lease.mount_id)
+        .expect("internal branch lease is registered")
+        .target
+        .clone();
+    assert!(matches!(
+        target,
+        astrid_core::storage_filesystem::StorageFilesystemTargetV1::WorkspaceBranch {
+            workspace: actual
+        } if actual == workspace
+    ));
+    assert_eq!(
+        callback(&lease, &lease.lease_token, create("branch.txt")).await,
+        StorageFilesystemOutcomeV1::Success(StorageFilesystemSuccessV1::Done)
+    );
+    assert_eq!(
+        callback(
+            &lease,
+            &lease.lease_token,
+            StorageFilesystemOperationV1::Write {
+                path: "branch.txt".to_owned(),
+                offset: 0,
+                data: b"promoted branch bytes".to_vec(),
+            },
+        )
+        .await,
+        StorageFilesystemOutcomeV1::Success(StorageFilesystemSuccessV1::Written(21))
+    );
+    assert_eq!(
+        callback(
+            &lease,
+            &lease.lease_token,
+            StorageFilesystemOperationV1::Sync,
+        )
+        .await,
+        StorageFilesystemOutcomeV1::Success(StorageFilesystemSuccessV1::Done)
+    );
+    assert!(
+        branches
+            .read(
+                &owner,
+                workspace,
+                &astrid_storage::content::ContentName::new("branch.txt".to_owned()).unwrap(),
+            )
+            .unwrap()
+            .is_some()
+    );
+    revoke_lease(&kernel, &caller, false, lease.mount_id)
+        .await
+        .unwrap();
+    branches.promote(&owner, workspace).unwrap();
+    assert_eq!(
+        store
+            .content()
+            .read(
+                &owner,
+                &astrid_storage::content::ContentName::new(
+                    "workspace/default/branch.txt".to_owned()
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        Some(b"promoted branch bytes".to_vec())
+    );
+
+    let rollback_workspace = astrid_core::WorkspaceUid::random();
+    branches
+        .begin_for_uid_at(
+            &owner,
+            uid,
+            rollback_workspace,
+            astrid_storage::ContentName::new("workspace/default").unwrap(),
+        )
+        .unwrap();
+    let rollback_lease = issue_lease(
+        &kernel,
+        caller.clone(),
+        false,
+        StorageProviderViewV1::Principal(caller.clone()),
+        astrid_core::storage_filesystem::StorageFilesystemTargetV1::WorkspaceBranch {
+            workspace: rollback_workspace,
+        },
+        StorageProviderAccessV1::ReadWrite,
+        "rollback-branch-test".to_owned(),
+        temporary.path().join("rollback-branch-mount"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        callback(
+            &rollback_lease,
+            &rollback_lease.lease_token,
+            create("rolled-back.txt"),
+        )
+        .await,
+        StorageFilesystemOutcomeV1::Success(StorageFilesystemSuccessV1::Done)
+    );
+    revoke_lease(&kernel, &caller, false, rollback_lease.mount_id)
+        .await
+        .unwrap();
+    branches.rollback(&owner, rollback_workspace).unwrap();
+    assert_eq!(
+        store
+            .content()
+            .read(
+                &owner,
+                &astrid_storage::content::ContentName::new(
+                    "workspace/default/rolled-back.txt".to_owned()
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        None
+    );
 }

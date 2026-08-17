@@ -68,11 +68,18 @@ impl HostState {
             spawn_mask_paths: Vec::new(),
             vfs,
             vfs_root_handle,
+            workspace: None,
+            workspace_mount_resolver: None,
+            #[cfg(not(target_family = "wasm"))]
+            process_storage_mount_broker: None,
             // Hooks intentionally do not support home:// or /tmp access — they run
             // outside the full capsule manifest/security-gate lifecycle.
             home: None,
+            principal_directory: astrid_storage::PrincipalDirectory::default(),
+            principal_store: None,
             tmp: None,
             invocation_home: None,
+            invocation_workspace: None,
             invocation_tmp: None,
             invocation_secret_store: None,
             invocation_capsule_log: None,

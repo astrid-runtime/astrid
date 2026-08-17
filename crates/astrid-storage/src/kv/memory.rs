@@ -6,7 +6,10 @@
 
 use async_trait::async_trait;
 
-use super::{KvStore, validate_key, validate_namespace, validate_prefix};
+use super::{
+    KvBatchCondition, KvBatchMutation, KvBatchOutcome, KvConditionResult, KvMutationBatch, KvStore,
+    validate_key, validate_namespace, validate_prefix,
+};
 use crate::error::{StorageError, StorageResult};
 
 /// In-memory key-value store for tests and ephemeral data.
@@ -31,6 +34,10 @@ impl MemoryKvStore {
 
 #[async_trait]
 impl KvStore for MemoryKvStore {
+    fn supports_atomic_batch(&self) -> bool {
+        true
+    }
+
     async fn get(&self, namespace: &str, key: &str) -> StorageResult<Option<Vec<u8>>> {
         validate_namespace(namespace)?;
         validate_key(key)?;
@@ -129,6 +136,50 @@ impl KvStore for MemoryKvStore {
         } else {
             Ok(false)
         }
+    }
+
+    async fn apply_batch(&self, batch: &KvMutationBatch) -> StorageResult<KvBatchOutcome> {
+        // Keep condition evaluation and every mutation under this one write
+        // lock. No observer can interleave a set/delete/CAS between the
+        // snapshot and the commit, and a failed condition leaves the map
+        // untouched.
+        let mut data = self
+            .data
+            .write()
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        let mut conditions = Vec::with_capacity(batch.conditions().len());
+        let mut all_match = true;
+        for condition in batch.conditions() {
+            let KvBatchCondition::ValueEquals { key, expected } = condition;
+            let full = Self::full_key(key.namespace(), key.key());
+            let matched = data.get(&full).map(Vec::as_slice) == expected.as_deref();
+            all_match &= matched;
+            conditions.push(KvConditionResult {
+                key: key.clone(),
+                matched,
+            });
+        }
+        if !all_match {
+            return Ok(KvBatchOutcome {
+                applied: false,
+                conditions,
+            });
+        }
+
+        for mutation in batch.mutations() {
+            match mutation {
+                KvBatchMutation::Set { key, value } => {
+                    data.insert(Self::full_key(key.namespace(), key.key()), value.clone());
+                },
+                KvBatchMutation::Delete { key } => {
+                    data.remove(&Self::full_key(key.namespace(), key.key()));
+                },
+            }
+        }
+        Ok(KvBatchOutcome {
+            applied: true,
+            conditions,
+        })
     }
 
     async fn clear_namespace(&self, namespace: &str) -> StorageResult<u64> {

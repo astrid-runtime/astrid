@@ -197,6 +197,47 @@ pub(crate) fn list(
     Ok(entries)
 }
 
+/// List a canonical byte-prefix without descending catalog branches that are
+/// known to disagree before the prefix ends. The catalog's Patricia branches
+/// split on the first differing byte bit, so an unrelated top-level subtree
+/// can be skipped without materializing its leaves.
+pub(crate) fn list_prefix(
+    root: Option<CatalogRoot>,
+    prefix: &ContentName,
+    load: &mut impl FnMut(ObjectId) -> Result<ObjectRecord, PrincipalContentError>,
+) -> Result<Vec<ContentEntry>, PrincipalContentError> {
+    let Some(root) = root else {
+        return Ok(Vec::new());
+    };
+    let prefix_bits = u64::try_from(prefix.as_str().len())
+        .map_err(|_| PrincipalContentError::AccountingOverflow)?
+        .checked_mul(8)
+        .ok_or(PrincipalContentError::AccountingOverflow)?;
+    let mut entries = Vec::new();
+    let mut stack = vec![root];
+    while let Some(current) = stack.pop() {
+        match decode_node(current.object, &load(current.object)?)? {
+            Node::Leaf { name, value } => {
+                if name.as_str().starts_with(prefix.as_str()) {
+                    entries.push(ContentEntry::new(name, value.file, value.logical_bytes));
+                }
+            },
+            Node::Branch { bit, left, right } if bit < prefix_bits => {
+                if key_bit(prefix, bit)? {
+                    stack.push(right);
+                } else {
+                    stack.push(left);
+                }
+            },
+            Node::Branch { left, right, .. } => {
+                stack.push(right);
+                stack.push(left);
+            },
+        }
+    }
+    Ok(entries)
+}
+
 pub(crate) fn insert(
     root: Option<CatalogRoot>,
     name: &ContentName,

@@ -126,19 +126,24 @@ where
 }
 
 /// Owner-private, non-blocking lock serializing distro provisioning for one
-/// `(AstridHome, target principal)` pair. The file remains in place after
-/// unlock so concurrent processes always contend on the same inode.
+/// target principal. This is disposable coordination state, not principal
+/// content: it lives under `run/principals`, which the daemon clears on boot,
+/// and never creates the legacy `home/<principal>/.config` tree.
 pub(super) struct ProvisioningLock {
     _file: File,
 }
 
 impl ProvisioningLock {
     pub(super) fn acquire(home: &AstridHome, target: &PrincipalId) -> anyhow::Result<Self> {
-        let config_dir = home.principal_home(target).config_dir();
-        astrid_core::platform_fs::ensure_private_directory(&config_dir)
-            .with_context(|| format!("failed to secure {}", config_dir.display()))?;
+        let lock_dir = home
+            .run_dir()
+            .join("principals")
+            .join(target.as_str())
+            .join("locks");
+        astrid_core::platform_fs::ensure_private_directory(&lock_dir)
+            .with_context(|| format!("failed to secure {}", lock_dir.display()))?;
 
-        let path = config_dir.join("distro.init.lock");
+        let path = lock_dir.join("distro.init.lock");
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true);
         #[cfg(unix)]
@@ -700,10 +705,14 @@ mod tests {
         let home = AstridHome::from_path(dir.path());
         let target = PrincipalId::new("alice").unwrap();
         let _lock = ProvisioningLock::acquire(&home, &target).unwrap();
-        let config_dir = home.principal_home(&target).config_dir();
-        let lock_path = config_dir.join("distro.init.lock");
+        let lock_dir = home
+            .run_dir()
+            .join("principals")
+            .join(target.as_str())
+            .join("locks");
+        let lock_path = lock_dir.join("distro.init.lock");
         assert_eq!(
-            std::fs::metadata(config_dir).unwrap().permissions().mode() & 0o777,
+            std::fs::metadata(lock_dir).unwrap().permissions().mode() & 0o777,
             0o700
         );
         assert_eq!(

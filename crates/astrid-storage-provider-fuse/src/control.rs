@@ -64,6 +64,41 @@ pub(crate) enum ControlRequest {
     },
 }
 
+/// One authenticated request accepted only by the kernel-created service
+/// mode.  The public provider lifecycle keeps the principal-bound protocol
+/// above so existing stdio clients remain compatible.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case", tag = "operation", deny_unknown_fields)]
+pub(crate) enum KernelControlRequest {
+    /// Confirm the service is live with the broker bearer.
+    Status {
+        /// Parent-lifetime bearer.
+        token: String,
+    },
+    /// Unmount and terminate the service with the broker bearer.
+    Stop {
+        /// Parent-lifetime bearer.
+        token: String,
+    },
+}
+
+/// Response from the kernel-created service control endpoint.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case", tag = "status", deny_unknown_fields)]
+pub(crate) enum KernelControlResponse {
+    /// The service remains mounted.
+    Ready,
+    /// The service accepted a stop request and has unmounted.
+    Stopped,
+    /// The request was rejected.
+    Failure {
+        /// Stable local error code.
+        code: String,
+        /// Bounded diagnostic.
+        message: String,
+    },
+}
+
 /// One detached mount-service response.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "status", rename_all = "kebab-case")]

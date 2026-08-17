@@ -33,6 +33,7 @@
 //! * `GET  /api/capsules/{id}` — manifest excerpt (env defs, etc.)
 //! * `GET  /api/capsules/{id}/topics` — declared `TopicDef` entries
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -48,6 +49,7 @@ use utoipa::ToSchema;
 
 use crate::error::{ErrorBody, GatewayError, GatewayResult};
 use crate::routes::daemon_kernel_error;
+use crate::routes::env::EnvFieldSchema;
 use crate::routes::principals::caller_from;
 use crate::state::GatewayState;
 
@@ -63,6 +65,10 @@ pub struct CapsuleDetail {
     pub interceptor_events: Vec<String>,
     /// Human-facing permission cards derived from the manifest.
     pub permissions: Vec<CapsulePermissionView>,
+    /// Non-secret environment schema returned by the kernel metadata API.
+    pub env: HashMap<String, EnvFieldSchema>,
+    /// Kernel-stamped source identity, when the runtime is loaded.
+    pub source_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -224,7 +230,13 @@ pub async fn install_capsule(
 
     let client = state.kernel_client_for(&caller)?;
     let resp = client
-        .request(KernelRequest::InstallCapsule { source, workspace })
+        .request(KernelRequest::InstallCapsule {
+            source,
+            workspace,
+            target_principal: None,
+            provenance: None,
+            env: Vec::new(),
+        })
         .await
         .map_err(daemon_kernel_error)?;
     match resp {
@@ -434,6 +446,24 @@ pub async fn get_capsule(
                 id: m.name,
                 interceptor_events: m.interceptor_events,
                 permissions,
+                env: m
+                    .env
+                    .into_iter()
+                    .map(|(name, def)| {
+                        (
+                            name,
+                            EnvFieldSchema {
+                                env_type: def.env_type,
+                                description: def.description,
+                                request: def.request,
+                                default: def.default,
+                                enum_values: def.enum_values,
+                                placeholder: def.placeholder,
+                            },
+                        )
+                    })
+                    .collect(),
+                source_id: m.source_id.map(|id| id.to_string()),
             }))
         },
         KernelResponse::Error(msg) => hidden_capsule_detail_denial(&caller.principal, &id, &msg),

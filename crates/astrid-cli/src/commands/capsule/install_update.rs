@@ -1,4 +1,4 @@
-//! `astrid capsule update` and post-update Distro.lock regeneration.
+//! `astrid capsule update` and post-update daemon distro-provenance refresh.
 //!
 //! Update flow: read every installed capsule's recorded `source`,
 //! ask the source's host (GitHub releases today) for the latest
@@ -6,9 +6,9 @@
 //! reinstall when strictly newer. Local-path sources are reported as
 //! "skipped" rather than treated as errors.
 //!
-//! `regenerate_distro_lock` re-emits `Distro.lock` from the current
-//! on-disk state after a successful update batch so the lockfile
-//! never drifts from reality.
+//! `regenerate_distro_lock` re-emits the authenticated daemon-owned distro
+//! record from the current installed state after a successful update batch so
+//! provenance never drifts from reality.
 
 use anyhow::{Context, bail};
 use astrid_capsule_install::github_source::{parse_github_source, strip_version_prefix};
@@ -265,7 +265,7 @@ async fn update_all_capsules(
     );
 
     if updated > 0 {
-        regenerate_distro_lock(home, principal)?;
+        regenerate_distro_lock(home, principal).await?;
     }
 
     Ok(())
@@ -283,23 +283,20 @@ fn filter_update_scope(capsules: Vec<InstalledCapsule>, workspace: bool) -> Vec<
         .collect()
 }
 
-/// Regenerate the Distro.lock from currently installed capsules.
+/// Regenerate the daemon-owned distro provenance from currently installed capsules.
 ///
 /// Scans all installed capsules, reads their `meta.json`, and writes
-/// a new lockfile with current versions and BLAKE3 hashes. Called
-/// after `update` to keep the lock in sync.
-fn regenerate_distro_lock(
+/// a new record with current versions and BLAKE3 hashes. Called after
+/// `update` to keep the authenticated record in sync.
+async fn regenerate_distro_lock(
     home: &AstridHome,
     principal: &astrid_core::PrincipalId,
 ) -> anyhow::Result<()> {
-    use crate::commands::distro::lock::{DistroLock, DistroLockMeta, LockedCapsule, write_lock};
+    use crate::commands::distro::lock::{
+        DistroLock, DistroLockMeta, LockedCapsule, load_lock_from_daemon, write_lock_to_daemon,
+    };
 
-    let lock_path = home
-        .principal_home(principal)
-        .config_dir()
-        .join("distro.lock");
-
-    let Some(existing) = crate::commands::distro::lock::load_lock(&lock_path)? else {
+    let Some(existing) = load_lock_from_daemon(principal).await? else {
         return Ok(());
     };
 
@@ -354,8 +351,8 @@ fn regenerate_distro_lock(
         manifest_hash: existing.manifest_hash,
     };
 
-    write_lock(&lock_path, &lock)?;
-    eprintln!("Distro.lock updated.");
+    write_lock_to_daemon(principal, &lock).await?;
+    eprintln!("Distro provenance updated in the daemon.");
     Ok(())
 }
 

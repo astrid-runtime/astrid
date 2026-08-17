@@ -169,6 +169,40 @@ pub trait AstridVolume: fmt::Debug + Send + Sync {
     /// Returns an underlying media error.
     fn list_regions(&self, prefix: &str) -> io::Result<Vec<VolumeRegion>>;
 
+    /// Return currently available physical bytes for a replacement rewrite.
+    ///
+    /// Hosted adapters derive this from the containing filesystem. Bare-metal
+    /// adapters should report the media allocator's native free-byte value;
+    /// returning `None` means capacity is not observable and callers must fail
+    /// closed before a destructive rewrite rather than guessing from a host
+    /// path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an underlying media-capacity error.
+    fn available_space(&self) -> io::Result<Option<u64>> {
+        Ok(None)
+    }
+
+    /// Physically reclaim obsolete container extents after a logical rewrite.
+    ///
+    /// The operation is invoked only after the replacement namespace and its
+    /// evidence are durable. Implementations must use their own crash-safe
+    /// media transaction; the default rejects backends that cannot provide a
+    /// reclaim boundary, so callers never mistake logical reachability for
+    /// physical reclamation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::Unsupported`] when the backend has no safe
+    /// reclaim primitive, or an underlying media error.
+    fn reclaim(&self) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "volume backend does not provide physical reclamation",
+        ))
+    }
+
     /// Flush all preceding volume mutations to durable media.
     ///
     /// # Errors

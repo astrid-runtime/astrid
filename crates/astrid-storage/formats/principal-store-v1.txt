@@ -213,6 +213,7 @@ Stable object_kind codes:
   14  DerivationEvidence
   15  GcPlanEvidence
   16  GcCommitEvidence
+ 17  WorkspaceBranch
 
 Only Owns references enter a principal's default reconstruction closure.
 Evidence, Lineage, and Derived targets survive only when independently rooted,

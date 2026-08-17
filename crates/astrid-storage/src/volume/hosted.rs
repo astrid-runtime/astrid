@@ -12,6 +12,9 @@ use parking_lot::Mutex;
 
 use super::{AstridVolume, MAX_REGION_NAME_BYTES, VolumeMetadataMutation, VolumeRegion};
 
+#[path = "hosted_reclaim.rs"]
+mod reclaim;
+
 const VOLUME_MAGIC: [u8; 8] = *b"ASTVOL2\0";
 const RECORD_MAGIC: [u8; 8] = *b"ASTREG2\0";
 const RECORD_FIXED_BYTES: usize = 8 + 8 + 8 + 1 + 2 + 8 + 8 + 32;
@@ -44,15 +47,10 @@ struct ContainerState {
 }
 
 /// Hosted realization of an Astrid volume in one container file.
-///
-/// The container is an append-only, checksummed region log. It is deliberately
-/// a block-media adapter: no authoritative store component is represented by
-/// a host directory or a separately named host file.
 pub struct HostedFileVolume {
     path: PathBuf,
     state: Mutex<ContainerState>,
 }
-
 impl fmt::Debug for HostedFileVolume {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -61,7 +59,6 @@ impl fmt::Debug for HostedFileVolume {
             .finish_non_exhaustive()
     }
 }
-
 impl HostedFileVolume {
     /// Open or create one hosted Astrid volume container.
     ///
@@ -75,6 +72,7 @@ impl HostedFileVolume {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        reclaim::recover_artifacts(&path)?;
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true);
         #[cfg(unix)]
@@ -203,7 +201,6 @@ impl HostedFileVolume {
         Ok(())
     }
 }
-
 impl Drop for HostedFileVolume {
     fn drop(&mut self) {
         let state = self.state.get_mut();
@@ -421,6 +418,14 @@ impl AstridVolume for HostedFileVolume {
             .filter(|region| region.as_str().starts_with(prefix))
             .cloned()
             .collect())
+    }
+
+    fn available_space(&self) -> io::Result<Option<u64>> {
+        fs2::available_space(&self.path).map(Some)
+    }
+
+    fn reclaim(&self) -> io::Result<()> {
+        reclaim::reclaim(self)
     }
 
     fn sync(&self) -> io::Result<()> {

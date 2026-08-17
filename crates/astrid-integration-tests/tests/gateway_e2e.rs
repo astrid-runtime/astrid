@@ -608,6 +608,7 @@ async fn kernel_and_gateway_boot_against_shared_home() {
     };
     let state = GatewayState::new(
         gateway_config,
+        None,
         Some(Arc::clone(&kernel.event_bus)),
         Some(Arc::clone(&kernel.audit_log)),
         Some(kernel.session_id.clone()),

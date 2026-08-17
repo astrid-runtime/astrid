@@ -6,43 +6,26 @@
 //! bearer string (`astrid_inv_` plus its URL-safe base64 secret). Redemption
 //! hashes the incoming token and compares against the persisted set.
 //!
-//! ## On-disk layout
-//!
-//! `$ASTRID_HOME/etc/invites.toml`:
-//!
-//! ```toml
-//! schema_version = 1
-//!
-//! [[invite]]
-//! token_hash = "blake3:..."  # domain-separated BLAKE3 identifier
-//! group = "agent"
-//! remaining_uses = 1
-//! expires_at_epoch = 1234567890
-//! issued_at_epoch = 1234560000
-//! metadata = "alice's tablet"
-//! ```
-//!
-//! Unix writes use write-then-rename. The file is owned by the
-//! daemon UID and chmod 0600 — same posture as
-//! `~/.astrid/run/system.token`.
+//! Durable records live in the fixed `system:control:invites` namespace.
+//! Issuance, redemption, revocation, and pruning use one-owner atomic KV
+//! batches. `$ASTRID_HOME/etc/invites.toml` is accepted only by the bounded
+//! boot migration and is retired after receipt-bound readback.
 //!
 //! ## Threat model
 //!
-//! * **Read-only leak**: an attacker who reads `invites.toml` sees
+//! * **Read-only leak**: an attacker who reads the durable namespace sees
 //!   token *hashes*, not tokens. They cannot redeem.
-//! * **Write leak**: an attacker who can write `invites.toml` wins
-//!   anyway — they can plant a hash whose pre-image they know. This
-//!   matches the existing `groups.toml` / `profile.toml` threat model
-//!   (operator-trusted system files; file-system perms gate access).
+//! * **Write authority**: only the kernel's system-owner control projection
+//!   can mutate records; a host file is never live token authority.
 //! * **Replay**: each redemption decrements `remaining_uses`; reaching
 //!   zero removes the entry under the kernel's `admin_write_lock`.
 //! * **Wall-clock expiry**: enforced at redeem time. Expired entries
-//!   are removed lazily (next `prune`) — no background sweeper is
-//!   spun up for what is at most a few-hundred-entry file.
+//!   are removed lazily on the next bounded `prune`.
 //! * **Side-channel on lookup**: the redeem path uses
 //!   constant-time comparison on the hash bytes.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use astrid_core::dirs::AstridHome;
 use astrid_crypto::IdentifierHash;
@@ -51,6 +34,10 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use tracing::warn;
+
+#[path = "invite_storage_migration.rs"]
+mod storage_migration;
+use storage_migration::{read_legacy_source, retire_legacy_file};
 
 const STORE_SCHEMA_VERSION: u32 = 1;
 const TOKEN_HASH_CONTEXT: &str = "astrid.runtime.invite-token.identifier.v1";
@@ -88,6 +75,404 @@ pub struct Invite {
     /// Operator-supplied label (e.g. "alice's tablet").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<String>,
+}
+
+/// Fixed host-only namespace used for invite state.  This is deliberately a
+/// constant rather than an alias-derived namespace: invite records are daemon
+/// control state, not principal state.
+pub const SYSTEM_KV_NAMESPACE: &str = "system:control:invites";
+const LEGACY_RECEIPT_KEY: &str = "migration:legacy-v1";
+const RECORD_PREFIX: &str = "record:";
+const MAX_RECORDS: usize = 4096;
+const MAX_RECORD_BYTES: usize = 16 * 1024;
+const MAX_LEGACY_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Storage-backed invite state.  Every mutating operation is one conditional
+/// KV batch, so two daemons cannot consume the same token even if an outer
+/// process lock is lost.
+#[derive(Clone)]
+pub struct DurableInviteStore {
+    backend: Arc<dyn astrid_storage::KvStore>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyImportReceipt {
+    schema: u32,
+    source_digest: String,
+    record_count: u64,
+}
+
+impl DurableInviteStore {
+    /// Bind the fixed system-control projection.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error if the backend rejects the fixed invite
+    /// namespace.
+    pub fn new(backend: Arc<dyn astrid_storage::KvStore>) -> astrid_storage::StorageResult<Self> {
+        // Validate the fixed namespace at construction time so a future edit
+        // cannot accidentally widen this helper to an arbitrary scope.
+        astrid_storage::kv::ScopedKvStore::new(Arc::clone(&backend), SYSTEM_KV_NAMESPACE)?;
+        Ok(Self { backend })
+    }
+
+    fn key(hash: &str) -> String {
+        format!("{RECORD_PREFIX}{hash}")
+    }
+
+    fn validate_record(invite: &Invite) -> astrid_storage::StorageResult<()> {
+        if canonical_token_fingerprint(&invite.token_hash).as_deref() != Some(&invite.token_hash) {
+            return Err(astrid_storage::StorageError::Serialization(
+                "invite record has a non-canonical token identifier".to_owned(),
+            ));
+        }
+        if invite.group.is_empty() || invite.group.len() > 256 || invite.remaining_uses == 0 {
+            return Err(astrid_storage::StorageError::Serialization(
+                "invite record is outside its bounded schema".to_owned(),
+            ));
+        }
+        if invite
+            .metadata
+            .as_ref()
+            .is_some_and(|value| value.len() > 4096)
+        {
+            return Err(astrid_storage::StorageError::Serialization(
+                "invite metadata exceeds its bounded schema".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn encode(invite: &Invite) -> astrid_storage::StorageResult<Vec<u8>> {
+        Self::validate_record(invite)?;
+        let value = serde_json::to_vec(invite)
+            .map_err(|error| astrid_storage::StorageError::Serialization(error.to_string()))?;
+        if value.len() > MAX_RECORD_BYTES {
+            return Err(astrid_storage::StorageError::Serialization(
+                "invite record exceeds its bounded size".to_owned(),
+            ));
+        }
+        Ok(value)
+    }
+
+    fn decode(bytes: &[u8]) -> astrid_storage::StorageResult<Invite> {
+        if bytes.len() > MAX_RECORD_BYTES {
+            return Err(astrid_storage::StorageError::Serialization(
+                "invite record exceeds its bounded size".to_owned(),
+            ));
+        }
+        let invite: Invite = serde_json::from_slice(bytes).map_err(|_| {
+            astrid_storage::StorageError::Serialization("invalid invite record".to_owned())
+        })?;
+        Self::validate_record(&invite)?;
+        Ok(invite)
+    }
+
+    async fn apply(
+        &self,
+        conditions: Vec<astrid_storage::KvBatchCondition>,
+        mutations: Vec<astrid_storage::KvBatchMutation>,
+    ) -> astrid_storage::StorageResult<bool> {
+        if !self.backend.supports_atomic_batch() {
+            return Err(astrid_storage::StorageError::Internal(
+                "invite storage requires an atomic KV backend".to_owned(),
+            ));
+        }
+        let batch = astrid_storage::KvMutationBatch::new(conditions, mutations)?;
+        Ok(self.backend.apply_batch(&batch).await?.applied)
+    }
+
+    /// Ensure a released native invite file has been imported exactly once.
+    /// The source is validated and parsed before any durable mutation.  A
+    /// durable receipt makes restart idempotent; retirement happens only after
+    /// record and receipt read-back succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error if the legacy source is unsafe or malformed,
+    /// conflicts with durable state, or cannot be durably imported.
+    pub async fn ensure_legacy_import(
+        &self,
+        home: &AstridHome,
+    ) -> astrid_storage::StorageResult<()> {
+        let path = InviteStore::path_for(home);
+        let source = read_legacy_source(&path)?;
+        let receipt = self
+            .backend
+            .get(SYSTEM_KV_NAMESPACE, LEGACY_RECEIPT_KEY)
+            .await?;
+        if let Some(bytes) = receipt {
+            let receipt: LegacyImportReceipt = serde_json::from_slice(&bytes).map_err(|_| {
+                astrid_storage::StorageError::Internal(
+                    "invite migration receipt is invalid".to_owned(),
+                )
+            })?;
+            if receipt.schema != 1 {
+                return Err(astrid_storage::StorageError::Internal(
+                    "invite migration receipt schema is unsupported".to_owned(),
+                ));
+            }
+            if let Some((source_bytes, _)) = &source {
+                let digest = format!("blake3:{}", blake3::hash(source_bytes).to_hex());
+                if digest != receipt.source_digest {
+                    return Err(astrid_storage::StorageError::Internal(
+                        "legacy invite source conflicts with durable migration state".to_owned(),
+                    ));
+                }
+            }
+            self.verify_count(receipt.record_count).await?;
+            if source.is_some() {
+                retire_legacy_file(&path, &receipt.source_digest)?;
+            }
+            return Ok(());
+        }
+
+        let Some((source_bytes, invites)) = source else {
+            return Ok(());
+        };
+        if invites.len() > MAX_RECORDS || invites.len() > 500 {
+            return Err(astrid_storage::StorageError::Serialization(
+                "legacy invite store exceeds the bounded migration limit".to_owned(),
+            ));
+        }
+        let existing = self
+            .backend
+            .list_keys_with_prefix(SYSTEM_KV_NAMESPACE, RECORD_PREFIX)
+            .await?;
+        if !existing.is_empty() {
+            return Err(astrid_storage::StorageError::Internal(
+                "legacy invite source conflicts with existing durable state".to_owned(),
+            ));
+        }
+        let digest = format!("blake3:{}", blake3::hash(&source_bytes).to_hex());
+        let receipt = LegacyImportReceipt {
+            schema: 1,
+            source_digest: digest.clone(),
+            record_count: invites.len() as u64,
+        };
+        let receipt_bytes = serde_json::to_vec(&receipt)
+            .map_err(|error| astrid_storage::StorageError::Serialization(error.to_string()))?;
+        let mut conditions = vec![astrid_storage::KvBatchCondition::ValueEquals {
+            key: astrid_storage::KvEntryKey::new(SYSTEM_KV_NAMESPACE, LEGACY_RECEIPT_KEY)?,
+            expected: None,
+        }];
+        let mut mutations = vec![astrid_storage::KvBatchMutation::Set {
+            key: astrid_storage::KvEntryKey::new(SYSTEM_KV_NAMESPACE, LEGACY_RECEIPT_KEY)?,
+            value: receipt_bytes,
+        }];
+        for invite in &invites {
+            let value = Self::encode(invite)?;
+            let key = Self::key(&invite.token_hash);
+            conditions.push(astrid_storage::KvBatchCondition::ValueEquals {
+                key: astrid_storage::KvEntryKey::new(SYSTEM_KV_NAMESPACE, &key)?,
+                expected: None,
+            });
+            mutations.push(astrid_storage::KvBatchMutation::Set {
+                key: astrid_storage::KvEntryKey::new(SYSTEM_KV_NAMESPACE, &key)?,
+                value,
+            });
+        }
+        if !self.apply(conditions, mutations).await? {
+            return Err(astrid_storage::StorageError::Internal(
+                "legacy invite migration raced with another durable writer".to_owned(),
+            ));
+        }
+        self.verify_count(invites.len() as u64).await?;
+        retire_legacy_file(&path, &digest)?;
+        Ok(())
+    }
+
+    async fn verify_count(&self, expected: u64) -> astrid_storage::StorageResult<()> {
+        let keys = self
+            .backend
+            .list_keys_with_prefix(SYSTEM_KV_NAMESPACE, RECORD_PREFIX)
+            .await?;
+        if keys.len() as u64 != expected || keys.len() > MAX_RECORDS {
+            return Err(astrid_storage::StorageError::Internal(
+                "durable invite migration read-back count mismatch".to_owned(),
+            ));
+        }
+        for key in keys {
+            let Some(value) = self.backend.get(SYSTEM_KV_NAMESPACE, &key).await? else {
+                return Err(astrid_storage::StorageError::Internal(
+                    "durable invite migration read-back was incomplete".to_owned(),
+                ));
+            };
+            Self::decode(&value)?;
+        }
+        Ok(())
+    }
+
+    /// Load all current records in deterministic token-identifier order.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error if records cannot be listed or decoded.
+    pub async fn list(&self) -> astrid_storage::StorageResult<Vec<Invite>> {
+        let mut keys = self
+            .backend
+            .list_keys_with_prefix(SYSTEM_KV_NAMESPACE, RECORD_PREFIX)
+            .await?;
+        if keys.len() > MAX_RECORDS {
+            return Err(astrid_storage::StorageError::Internal(
+                "invite storage exceeds its bounded record limit".to_owned(),
+            ));
+        }
+        keys.sort_unstable();
+        let mut records = Vec::with_capacity(keys.len());
+        for key in keys {
+            let Some(value) = self.backend.get(SYSTEM_KV_NAMESPACE, &key).await? else {
+                return Err(astrid_storage::StorageError::Internal(
+                    "invite record disappeared during read".to_owned(),
+                ));
+            };
+            records.push(Self::decode(&value)?);
+        }
+        records.sort_by(|left, right| left.token_hash.cmp(&right.token_hash));
+        Ok(records)
+    }
+
+    /// Insert one invite iff its identifier is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error if the conditional batch cannot be applied.
+    pub async fn issue(&self, invite: &Invite) -> astrid_storage::StorageResult<bool> {
+        let value = Self::encode(invite)?;
+        let key = Self::key(&invite.token_hash);
+        self.apply(
+            vec![astrid_storage::KvBatchCondition::ValueEquals {
+                key: astrid_storage::KvEntryKey::new(SYSTEM_KV_NAMESPACE, &key)?,
+                expected: None,
+            }],
+            vec![astrid_storage::KvBatchMutation::Set {
+                key: astrid_storage::KvEntryKey::new(SYSTEM_KV_NAMESPACE, &key)?,
+                value,
+            }],
+        )
+        .await
+    }
+
+    /// Atomically consume one invite.  Only one concurrent caller can win.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error if the record cannot be read, decoded, or
+    /// conditionally removed.
+    pub async fn redeem(&self, token_hash: &str) -> astrid_storage::StorageResult<Option<Invite>> {
+        let key = Self::key(token_hash);
+        let Some(value) = self.backend.get(SYSTEM_KV_NAMESPACE, &key).await? else {
+            return Ok(None);
+        };
+        let invite = Self::decode(&value)?;
+        let now = now_epoch();
+        if invite.remaining_uses == 0
+            || invite
+                .expires_at_epoch
+                .is_some_and(|expires| expires <= now)
+        {
+            let _ = self
+                .apply(
+                    vec![astrid_storage::KvBatchCondition::ValueEquals {
+                        key: astrid_storage::KvEntryKey::new(SYSTEM_KV_NAMESPACE, &key)?,
+                        expected: Some(value),
+                    }],
+                    vec![astrid_storage::KvBatchMutation::Delete {
+                        key: astrid_storage::KvEntryKey::new(SYSTEM_KV_NAMESPACE, &key)?,
+                    }],
+                )
+                .await?;
+            return Ok(None);
+        }
+        let mut consumed = invite.clone();
+        consumed.remaining_uses = consumed.remaining_uses.saturating_sub(1);
+        let mutation = if consumed.remaining_uses == 0 {
+            astrid_storage::KvBatchMutation::Delete {
+                key: astrid_storage::KvEntryKey::new(SYSTEM_KV_NAMESPACE, &key)?,
+            }
+        } else {
+            astrid_storage::KvBatchMutation::Set {
+                key: astrid_storage::KvEntryKey::new(SYSTEM_KV_NAMESPACE, &key)?,
+                value: Self::encode(&consumed)?,
+            }
+        };
+        if self
+            .apply(
+                vec![astrid_storage::KvBatchCondition::ValueEquals {
+                    key: astrid_storage::KvEntryKey::new(SYSTEM_KV_NAMESPACE, &key)?,
+                    expected: Some(value),
+                }],
+                vec![mutation],
+            )
+            .await?
+        {
+            Ok(Some(invite))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Remove one invite by its canonical fingerprint.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error if the conditional delete cannot be applied.
+    pub async fn revoke(&self, token_hash: &str) -> astrid_storage::StorageResult<bool> {
+        let key = Self::key(token_hash);
+        let Some(value) = self.backend.get(SYSTEM_KV_NAMESPACE, &key).await? else {
+            return Ok(false);
+        };
+        Self::decode(&value)?;
+        self.apply(
+            vec![astrid_storage::KvBatchCondition::ValueEquals {
+                key: astrid_storage::KvEntryKey::new(SYSTEM_KV_NAMESPACE, &key)?,
+                expected: Some(value),
+            }],
+            vec![astrid_storage::KvBatchMutation::Delete {
+                key: astrid_storage::KvEntryKey::new(SYSTEM_KV_NAMESPACE, &key)?,
+            }],
+        )
+        .await
+    }
+
+    /// Prune expired and exhausted records using conditional deletes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error if records cannot be read or a conditional
+    /// delete cannot be applied.
+    pub async fn prune(&self) -> astrid_storage::StorageResult<usize> {
+        let records = self.list().await?;
+        let now = now_epoch();
+        let mut removed = 0usize;
+        for invite in records {
+            if invite.remaining_uses > 0
+                && invite.expires_at_epoch.is_none_or(|expires| expires > now)
+            {
+                continue;
+            }
+            let key = Self::key(&invite.token_hash);
+            let Some(value) = self.backend.get(SYSTEM_KV_NAMESPACE, &key).await? else {
+                continue;
+            };
+            if self
+                .apply(
+                    vec![astrid_storage::KvBatchCondition::ValueEquals {
+                        key: astrid_storage::KvEntryKey::new(SYSTEM_KV_NAMESPACE, &key)?,
+                        expected: Some(value),
+                    }],
+                    vec![astrid_storage::KvBatchMutation::Delete {
+                        key: astrid_storage::KvEntryKey::new(SYSTEM_KV_NAMESPACE, &key)?,
+                    }],
+                )
+                .await?
+            {
+                removed = removed.saturating_add(1);
+            }
+        }
+        Ok(removed)
+    }
 }
 
 /// File-backed invite store. Read-modify-write uses atomic rename on Unix; all

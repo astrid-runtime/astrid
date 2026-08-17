@@ -1,6 +1,5 @@
 //! Verified cutover from the released directory store to Astrid volume media.
 
-use std::path::Path;
 use std::sync::Arc;
 
 use crate::engine::{DurableEnginePolicy, PrincipalCodec, RecoveryLimits, RootSnapshot};
@@ -16,7 +15,7 @@ const MAX_CUTOVER_RECEIPT_BYTES: u64 = 256;
 pub(super) fn open_existing(
     home: &AstridHome,
     policy: DurableEnginePolicy<StateOwner>,
-) -> StorageResult<Option<RuntimeEngine>> {
+) -> StorageResult<Option<(RuntimeEngine, String)>> {
     let path = home.storage_volume_path();
     match std::fs::symlink_metadata(&path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -51,15 +50,15 @@ pub(super) fn open_existing(
     // The receipt binds the one-time directory-store cutover. Live roots are
     // expected to advance after that boundary, so ordinary reopen validates
     // the durable marker without comparing it to the current mutable roots.
-    require_cutover_receipt(volume.as_ref(), None)?;
-    Ok(Some(engine))
+    let receipt = require_cutover_receipt(volume.as_ref(), None)?;
+    Ok(Some((engine, receipt)))
 }
 
 pub(super) fn migrate_directory_store(
     home: &AstridHome,
     source: Arc<RuntimeEngine>,
     policy: DurableEnginePolicy<StateOwner>,
-) -> StorageResult<RuntimeEngine> {
+) -> StorageResult<(RuntimeEngine, String)> {
     let snapshots = snapshots(&source)?;
     let destination = home.storage_volume_path();
     let temporary = destination.with_extension("volume.migrating");
@@ -124,19 +123,18 @@ pub(super) fn migrate_directory_store(
     )
     .map_err(|error| connection(format!("verify promoted Astrid volume: {error}")))?;
     verify_snapshots(&engine, &snapshots)?;
-    require_cutover_receipt(volume.as_ref(), Some(&snapshots))?;
+    let receipt = require_cutover_receipt(volume.as_ref(), Some(&snapshots))?;
 
     source
         .close()
         .map_err(|error| connection(format!("close retired directory store: {error}")))?;
     drop(source);
-    retire_directory_store(home.principal_store_path().as_path())?;
-    Ok(engine)
+    Ok((engine, receipt))
 }
 
 pub(super) fn retire_verified_directory_if_present(
     home: &AstridHome,
-    destination: &RuntimeEngine,
+    expected_receipt: &str,
 ) -> StorageResult<()> {
     let path = home.principal_store_path();
     match std::fs::symlink_metadata(&path) {
@@ -156,16 +154,21 @@ pub(super) fn retire_verified_directory_if_present(
             )
             .map_err(|error| connection(format!("reopen surviving directory store: {error}")))?;
             let source_snapshots = snapshots(&source)?;
-            let volume = HostedFileVolume::open(home.storage_volume_path()).map_err(|error| {
-                connection(format!("reopen Astrid volume cutover receipt: {error}"))
-            })?;
-            require_cutover_receipt(volume.as_ref(), Some(&source_snapshots))?;
-            verify_snapshots(destination, &source_snapshots)?;
+            if cutover_receipt(&source_snapshots) != expected_receipt {
+                return Err(connection(
+                    "Astrid volume cutover receipt does not match its independently recomputed roots",
+                ));
+            }
             source.close().map_err(|error| {
                 connection(format!("close verified surviving directory store: {error}"))
             })?;
             drop(source);
-            retire_directory_store(&path)?;
+            astrid_core::dirs::retire_legacy_source_tree(&path).map_err(|error| {
+                connection(format!(
+                    "retire verified directory store {}: {error}",
+                    path.display()
+                ))
+            })?;
         },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
         Err(error) => {
@@ -230,7 +233,7 @@ fn write_cutover_receipt(
 fn require_cutover_receipt(
     volume: &dyn AstridVolume,
     expected_snapshots: Option<&[(StateOwner, RootSnapshot)]>,
-) -> StorageResult<()> {
+) -> StorageResult<String> {
     let region = VolumeRegion::new(CUTOVER_RECEIPT_REGION)
         .map_err(|error| connection(format!("validate cutover receipt region: {error}")))?;
     if !volume
@@ -282,7 +285,7 @@ fn require_cutover_receipt(
             "Astrid volume cutover receipt does not match its independently recomputed roots",
         ));
     }
-    Ok(())
+    Ok(text.to_owned())
 }
 
 fn cutover_receipt(snapshots: &[(StateOwner, RootSnapshot)]) -> String {
@@ -302,22 +305,6 @@ fn cutover_receipt(snapshots: &[(StateOwner, RootSnapshot)]) -> String {
         snapshots.len(),
         hex::encode(digest)
     )
-}
-
-fn retire_directory_store(path: &Path) -> StorageResult<()> {
-    astrid_core::platform_fs::verify_no_redirects(path)
-        .map_err(|error| connection(format!("verify retired directory store: {error}")))?;
-    let retired = super::native_io::quarantine_directory(path, "volume-retired")?;
-    std::fs::remove_dir_all(&retired).map_err(|error| {
-        connection(format!(
-            "delete verified directory store {}: {error}",
-            retired.display()
-        ))
-    })?;
-    let parent = retired
-        .parent()
-        .ok_or_else(|| connection("retired directory store has no parent"))?;
-    super::native_io::sync_directory(parent)
 }
 
 fn connection(message: impl Into<String>) -> StorageError {

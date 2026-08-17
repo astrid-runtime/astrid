@@ -286,7 +286,7 @@ pub(crate) fn handle_daemon_event(app: &mut App, message: &IpcMessage) {
             app.status_message = Some((msg, Instant::now()));
 
             // Store the elicit request ID so the input handler knows to
-            // publish an ElicitResponse instead of writing .env.json.
+            // publish an ElicitResponse instead of writing a local file.
             app.elicit_request_id = Some(*request_id);
 
             let is_enum = matches!(
@@ -618,29 +618,40 @@ async fn handle_pending_actions(
             PendingAction::SubmitOnboarding {
                 capsule_id,
                 answers,
+                field_kinds,
             } => {
-                if let Ok(home) = astrid_core::dirs::AstridHome::resolve() {
-                    let principal = crate::principal::current();
-                    let ph = home.principal_home(&principal);
-                    let env_path = ph.env_dir().join(format!("{capsule_id}.env.json"));
-                    if let Ok(json) = serde_json::to_string_pretty(&answers) {
-                        if let Err(e) = write_env_file(&env_path, &json) {
-                            app.push_notice(&format!("Failed to save configuration: {e}"));
-                        } else {
-                            let msg = "Configuration saved. Refreshing Kernel...";
-                            app.push_notice(msg);
-                            app.status_message = Some((msg.to_string(), Instant::now()));
+                let principal = crate::principal::current();
+                let mut failed = false;
+                for (key, value) in &answers {
+                    let kind = field_kinds
+                        .get(key)
+                        .copied()
+                        .unwrap_or(astrid_core::kernel_api::EnvValueKind::Text);
+                    if let Err(error) = crate::commands::capsule::install_headless::set_env_entry(
+                        &principal,
+                        &capsule_id,
+                        key,
+                        value,
+                        kind,
+                        astrid_core::kernel_api::EnvStorageScope::Agent,
+                    ) {
+                        failed = true;
+                        app.push_notice(&format!("Failed to save configuration: {error}"));
+                    }
+                }
+                if !failed {
+                    let msg = "Configuration saved. Refreshing Kernel...";
+                    app.push_notice(msg);
+                    app.status_message = Some((msg.to_string(), Instant::now()));
 
-                            let req = astrid_core::kernel_api::KernelRequest::ReloadCapsules;
-                            if let Ok(val) = serde_json::to_value(req) {
-                                let ipc_msg = astrid_types::ipc::IpcMessage::new(
-                                    Topic::kernel_request("reload_capsules"),
-                                    astrid_types::ipc::IpcPayload::RawJson(val),
-                                    session_id.0,
-                                );
-                                let _ = client.send_message(ipc_msg).await;
-                            }
-                        }
+                    let req = astrid_core::kernel_api::KernelRequest::ReloadCapsules;
+                    if let Ok(val) = serde_json::to_value(req) {
+                        let ipc_msg = astrid_types::ipc::IpcMessage::new(
+                            Topic::kernel_request("reload_capsules"),
+                            astrid_types::ipc::IpcPayload::RawJson(val),
+                            session_id.0,
+                        );
+                        let _ = client.send_message(ipc_msg).await;
                     }
                 }
             },
@@ -823,31 +834,5 @@ async fn handle_slash_command(
                 };
             }
         },
-    }
-}
-
-/// Write `.env.json` with restricted permissions (0o600 on Unix).
-fn write_env_file(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
-    // Ensure parent directory exists (capsule dir may not have been written to yet).
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    #[cfg(unix)]
-    {
-        use std::io::Write as _;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        file.write_all(contents.as_bytes())?;
-        file.flush()?;
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, contents)
     }
 }
