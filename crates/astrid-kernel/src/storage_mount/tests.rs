@@ -385,7 +385,10 @@ async fn failed_projection_cleanup_retries_before_new_mount() {
 fn ready_test_launch() -> StorageProviderServiceLaunchV1 {
     let lease_token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x11_u8; 32]);
     let parent_token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x22_u8; 32]);
+    #[cfg(unix)]
     let resource_path = PathBuf::from("/private/run/astrid/lease");
+    #[cfg(windows)]
+    let resource_path = PathBuf::from(r"C:\private\run\astrid\lease");
     let control_path = resource_path.join("process-control.sock");
     StorageProviderServiceLaunchV1 {
         schema: STORAGE_FILESYSTEM_SERVICE_LAUNCH_SCHEMA_V1,
@@ -398,7 +401,13 @@ fn ready_test_launch() -> StorageProviderServiceLaunchV1 {
             lease_token,
             expires_at_epoch_secs: u64::MAX,
         },
-        mountpoint: PathBuf::from("/private/run/astrid/mount"),
+        mountpoint: {
+            #[cfg(unix)]
+            let path = PathBuf::from("/private/run/astrid/mount");
+            #[cfg(windows)]
+            let path = PathBuf::from(r"C:\private\run\astrid\mount");
+            path
+        },
         control_path: control_path.clone(),
         parent: StorageProviderParentLifetimeV1 {
             pid: 1_234,
