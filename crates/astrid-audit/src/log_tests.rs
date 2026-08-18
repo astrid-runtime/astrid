@@ -694,6 +694,265 @@ struct BlockAfterCommitStorage {
     committed: Arc<tokio::sync::Notify>,
 }
 
+/// Gate the first archive-receipt read after the retention scan.  The gate is
+/// deliberately placed after `scan_retention` and before `persist_prune`
+/// acquires the durable append lock, so a test can append a successor in the
+/// exact window in which the old planner used a stale head/count snapshot.
+struct PruneScanGateStorage {
+    inner: KvAuditStorage,
+    scan_finished: Arc<tokio::sync::Notify>,
+    append_started: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+    gate_once: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl AuditStorage for PruneScanGateStorage {
+    async fn store(&self, entry: &AuditEntry) -> AuditResult<()> {
+        self.inner.store(entry).await
+    }
+
+    async fn append_if_head(
+        &self,
+        entry: &AuditEntry,
+        expected: Option<&AuditEntryId>,
+    ) -> AuditResult<bool> {
+        self.inner.append_if_head(entry, expected).await
+    }
+
+    async fn append_batch_if_heads(
+        &self,
+        entries: &[(&AuditEntry, Option<&AuditEntryId>)],
+    ) -> AuditResult<Vec<bool>> {
+        self.append_started.notify_one();
+        self.inner.append_batch_if_heads(entries).await
+    }
+
+    async fn seal_chain(
+        &self,
+        session_id: &SessionId,
+        principal: Option<&astrid_core::PrincipalId>,
+    ) -> AuditResult<()> {
+        self.inner.seal_chain(session_id, principal).await
+    }
+
+    async fn chain_metadata(
+        &self,
+        session_id: &SessionId,
+        principal: Option<&astrid_core::PrincipalId>,
+    ) -> AuditResult<Option<crate::storage::TestChainMetadata>> {
+        self.inner.chain_metadata(session_id, principal).await
+    }
+
+    async fn global_metadata(&self) -> AuditResult<crate::storage::TestGlobalMetadata> {
+        self.inner.global_metadata().await
+    }
+
+    async fn oldest_sealed_segment(
+        &self,
+    ) -> AuditResult<
+        Option<(
+            SessionId,
+            Option<astrid_core::PrincipalId>,
+            crate::storage::TestChainMetadata,
+        )>,
+    > {
+        self.inner.oldest_sealed_segment().await
+    }
+
+    async fn prune_chain(
+        &self,
+        session_id: &SessionId,
+        principal: Option<&astrid_core::PrincipalId>,
+        keep_entries: usize,
+        receipt: Vec<u8>,
+    ) -> AuditResult<()> {
+        self.inner
+            .prune_chain(session_id, principal, keep_entries, receipt)
+            .await
+    }
+
+    async fn prune_receipt(
+        &self,
+        session_id: &SessionId,
+        principal: Option<&astrid_core::PrincipalId>,
+    ) -> AuditResult<Option<Vec<u8>>> {
+        if self
+            .gate_once
+            .compare_exchange(
+                true,
+                false,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            self.scan_finished.notify_one();
+            self.release.notified().await;
+        }
+        self.inner.prune_receipt(session_id, principal).await
+    }
+
+    async fn get(&self, id: &AuditEntryId) -> AuditResult<Option<AuditEntry>> {
+        self.inner.get(id).await
+    }
+
+    async fn get_chain_head(
+        &self,
+        session_id: &SessionId,
+        principal: Option<&astrid_core::PrincipalId>,
+    ) -> AuditResult<Option<AuditEntryId>> {
+        self.inner.get_chain_head(session_id, principal).await
+    }
+
+    async fn get_session_entries(&self, session_id: &SessionId) -> AuditResult<Vec<AuditEntry>> {
+        self.inner.get_session_entries(session_id).await
+    }
+
+    async fn get_session_entries_page(
+        &self,
+        session_id: &SessionId,
+        after: Option<&str>,
+        limit: usize,
+    ) -> AuditResult<Vec<(String, AuditEntry)>> {
+        self.inner
+            .get_session_entries_page(session_id, after, limit)
+            .await
+    }
+
+    async fn count(&self) -> AuditResult<usize> {
+        self.inner.count().await
+    }
+
+    async fn count_session(&self, session_id: &SessionId) -> AuditResult<usize> {
+        self.inner.count_session(session_id).await
+    }
+
+    async fn list_sessions(&self) -> AuditResult<Vec<SessionId>> {
+        self.inner.list_sessions().await
+    }
+
+    async fn flush(&self) -> AuditResult<()> {
+        self.inner.flush().await
+    }
+
+    async fn close(&self) -> AuditResult<()> {
+        self.inner.close().await
+    }
+}
+
+/// A concurrent append that starts after the retention scan must survive the
+/// prune and remain the durable chain head.  The storage gate makes the race
+/// deterministic: prune has completed its scan, then an append is admitted,
+/// and only then is prune allowed to enter its durable commit phase.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_append_after_prune_scan_preserves_head_and_accounting() {
+    const SEALED_ENTRIES: u32 = 1_024;
+
+    let backing = Arc::new(astrid_storage::MemoryKvStore::new());
+    let keypair = Arc::new(KeyPair::generate());
+    let session_id = SessionId::new();
+    let setup = AuditLog::with_test_storage(
+        Box::new(KvAuditStorage::from_test_store(
+            Arc::clone(&backing) as Arc<dyn astrid_storage::KvStore>
+        )),
+        Arc::clone(&keypair),
+    );
+    append_test_entries(&setup, &session_id, SEALED_ENTRIES).await;
+
+    let scan_finished = Arc::new(tokio::sync::Notify::new());
+    let append_started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let gated = Arc::new(AuditLog::with_test_storage(
+        Box::new(PruneScanGateStorage {
+            inner: KvAuditStorage::from_test_store(
+                Arc::clone(&backing) as Arc<dyn astrid_storage::KvStore>
+            ),
+            scan_finished: Arc::clone(&scan_finished),
+            append_started: Arc::clone(&append_started),
+            release: Arc::clone(&release),
+            gate_once: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        }),
+        Arc::clone(&keypair),
+    ));
+
+    let prune_task = {
+        let gated = Arc::clone(&gated);
+        tokio::spawn(async move {
+            gated
+                .prune_oldest(AuditRetentionPolicy {
+                    retain_entries: 1,
+                    retain_bytes: None,
+                })
+                .await
+        })
+    };
+    scan_finished.notified().await;
+
+    let append_task = {
+        let gated = Arc::clone(&gated);
+        let session_id = session_id.clone();
+        tokio::spawn(async move {
+            gated
+                .append(
+                    session_id,
+                    AuditAction::ConfigReloaded,
+                    AuthorizationProof::System {
+                        reason: "append during prune scan".into(),
+                    },
+                    AuditOutcome::success(),
+                )
+                .await
+        })
+    };
+    append_started.notified().await;
+    // If prune already owns the durable lock, the append waits here; if the
+    // pre-fix planner has not acquired it yet, the append commits before this
+    // release.  Either schedule must produce the same canonical projection.
+    release.notify_one();
+
+    let appended = append_task
+        .await
+        .expect("append task must not panic")
+        .expect("append during prune must succeed");
+    prune_task
+        .await
+        .expect("prune task must not panic")
+        .expect("prune must complete");
+
+    let entries = gated
+        .get_session_entries(&session_id)
+        .await
+        .expect("read retained session entries");
+    assert_eq!(entries.len(), 2, "retained suffix plus concurrent append");
+    assert_eq!(entries.last().map(|entry| &entry.id), Some(&appended));
+
+    let chain = gated
+        .chain_stats(&session_id, None)
+        .await
+        .expect("read chain stats")
+        .expect("chain metadata must remain present");
+    assert_eq!(chain.count, 2, "prune must not roll back the append count");
+    assert_eq!(chain.head, Some(appended.clone()));
+    assert!(!chain.sealed, "the concurrent append is the active tail");
+
+    let global = gated.global_stats().await.expect("read global stats");
+    assert_eq!(
+        global.total_count, 2,
+        "global count must include the append"
+    );
+    assert_eq!(global.segments, 1, "only the active tail segment remains");
+    assert_eq!(global.sealed_segments, 0);
+    assert!(
+        gated
+            .verify_chain(&session_id)
+            .await
+            .expect("verify retained chain")
+            .valid,
+        "concurrent append must not fork or lose the archive anchor"
+    );
+}
+
 #[async_trait::async_trait]
 impl AuditStorage for BlockAfterCommitStorage {
     async fn store(&self, entry: &AuditEntry) -> AuditResult<()> {

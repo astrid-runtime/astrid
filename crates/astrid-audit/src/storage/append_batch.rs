@@ -1,8 +1,8 @@
 use super::{
-    ChainMetadata, DEFAULT_SEGMENT_MAX_BYTES, DEFAULT_SEGMENT_MAX_ENTRIES, GlobalMetadata,
-    KvAuditStorage, NS_CHAIN_HEADS, NS_CHAIN_METADATA, NS_COMMITTED_ENTRIES, NS_ENTRIES,
-    NS_GLOBAL_METADATA, NS_SEGMENT_INDEX, NS_SESSION_ENTRIES, NS_SESSION_SEQUENCE, chain_head_key,
-    parse_sequence,
+    ChainMetadata, DEFAULT_SEGMENT_MAX_BYTES, DEFAULT_SEGMENT_MAX_ENTRIES, DURABLE_APPEND_LOCK,
+    GlobalMetadata, KvAuditStorage, NS_CHAIN_HEADS, NS_CHAIN_METADATA, NS_COMMITTED_ENTRIES,
+    NS_ENTRIES, NS_GLOBAL_METADATA, NS_SEGMENT_INDEX, NS_SESSION_ENTRIES, NS_SESSION_SEQUENCE,
+    chain_head_key, parse_sequence,
 };
 use crate::entry::AuditEntry;
 use crate::error::{AuditError, AuditResult};
@@ -83,15 +83,23 @@ impl KvAuditStorage {
         // Keep one root commit comfortably below the backend's 1,024-operation
         // limit. Larger caller batches still use the per-entry CAS fallback.
         if entries.len() > MAX_ATOMIC_BATCH_ENTRIES {
+            let guard = DURABLE_APPEND_LOCK.lock().await;
+            self.recover_append_intents().await?;
+            drop(guard);
             return self.append_batch_with_cas(entries).await;
         }
+        if !self.store.supports_atomic_batch() {
+            let guard = DURABLE_APPEND_LOCK.lock().await;
+            self.recover_append_intents().await?;
+            drop(guard);
+            return self.append_batch_with_cas(entries).await;
+        }
+        let _guard = DURABLE_APPEND_LOCK.lock().await;
+        self.recover_append_intents().await?;
         let Some(prepared) = self.prepare_batch(entries).await? else {
             return Ok(vec![false; entries.len()]);
         };
         let batch = prepared.into_mutation_batch()?;
-        if !self.store.supports_atomic_batch() {
-            return self.append_batch_with_cas(entries).await;
-        }
         let outcome = self
             .store
             .apply_batch(&batch)

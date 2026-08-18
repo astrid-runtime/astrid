@@ -2,13 +2,12 @@ use super::{
     AuditError, AuditResult, AuditStorage, GlobalMetadata, KvAuditStorage, NS_GLOBAL_METADATA,
     NS_PRUNE_PLANS, NS_PRUNE_RECEIPTS, NS_SEGMENT_INDEX, PrunePlan, helpers::chain_head_key,
 };
+use crate::entry::AuditEntry;
 use astrid_capabilities::AuditEntryId;
 use astrid_core::{PrincipalId, SessionId};
 use astrid_storage::{KvBatchCondition, KvBatchMutation, KvEntryKey, KvMutationBatch};
 
 struct ReceiptAccounting {
-    retained_count: u64,
-    retained_bytes: u64,
     omitted_count: u64,
     omitted_bytes: u64,
     retained_head: Option<AuditEntryId>,
@@ -26,8 +25,6 @@ impl ReceiptAccounting {
             .map_err(|error| AuditError::StorageError(error.to_string()))?
             .map(AuditEntryId);
         Ok(Self {
-            retained_count: count_field(&value, "retained_count"),
-            retained_bytes: count_field(&value, "retained_bytes"),
             omitted_count: count_field(&value, "omitted_count"),
             omitted_bytes: count_field(&value, "omitted_bytes"),
             retained_head,
@@ -66,24 +63,47 @@ impl KvAuditStorage {
         principal: Option<&PrincipalId>,
         accounting: &ReceiptAccounting,
     ) -> AuditResult<()> {
-        let head_hash = if let Some(head) = accounting.retained_head.as_ref() {
-            match self.get(head).await? {
-                Some(entry) => entry.content_hash(),
-                None => astrid_crypto::ContentHash::zero(),
-            }
-        } else {
-            astrid_crypto::ContentHash::zero()
-        };
+        // The retention receipt was planned before the bounded durable delete
+        // pages ran.  Another append may have committed in that window, so
+        // applying the receipt's planned head/count verbatim would roll the
+        // chain back over the new successor.  Re-read the surviving projection
+        // and derive the canonical head/accounting from it instead.
+        let survivors = self
+            .get_session_entries(session_id)
+            .await?
+            .into_iter()
+            .filter(|entry| entry.principal.as_ref() == principal)
+            .collect::<Vec<_>>();
+        let retained_count = u64::try_from(survivors.len()).unwrap_or(u64::MAX);
+        let retained_bytes = survivors.iter().try_fold(0_u64, |total, entry| {
+            let encoded = serde_json::to_vec(entry)
+                .map_err(|error| AuditError::SerializationError(error.to_string()))?;
+            Ok::<_, AuditError>(
+                total.saturating_add(u64::try_from(encoded.len()).unwrap_or(u64::MAX)),
+            )
+        })?;
+        let retained_head = survivors.last().map(|entry| entry.id.clone());
+        let head_hash = survivors
+            .last()
+            .map_or_else(astrid_crypto::ContentHash::zero, AuditEntry::content_hash);
         let (metadata_bytes, Some(mut metadata)) =
             self.load_chain_metadata(session_id, principal).await?
         else {
             return Ok(());
         };
-        metadata.count = accounting.retained_count;
-        metadata.bytes = accounting.retained_bytes;
-        metadata.head.clone_from(&accounting.retained_head);
+        let planned_head_still_current = metadata.head == accounting.retained_head;
+        metadata.count = retained_count;
+        metadata.bytes = retained_bytes;
+        metadata.head = retained_head;
         metadata.head_hash = head_hash;
-        metadata.sealed = true;
+        if planned_head_still_current {
+            // With no concurrent successor, the retained suffix is the active
+            // durable tail of the selected sealed segment.
+            metadata.sealed = true;
+            metadata.segment_count = retained_count;
+            metadata.segment_bytes = retained_bytes;
+            metadata.segment_first = survivors.first().map(|entry| entry.id.clone());
+        }
         if self
             .persist_chain_metadata(session_id, principal, metadata_bytes.as_deref(), &metadata)
             .await?

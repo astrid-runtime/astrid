@@ -24,8 +24,12 @@ mod prune_chain;
 mod prune_finish;
 mod system;
 use global::GlobalMetadata;
+#[cfg(test)]
+pub(crate) use global::GlobalMetadata as TestGlobalMetadata;
 use helpers::{chain_head_key, parse_sequence};
 use metadata::ChainMetadata;
+#[cfg(test)]
+pub(crate) use metadata::ChainMetadata as TestChainMetadata;
 use system::AuditSystemNamespace;
 #[async_trait]
 pub(crate) trait AuditStorage: Send + Sync {
@@ -250,6 +254,7 @@ const NS_SESSION_SEQUENCE: &str = "audit:session_sequence";
 const NS_CHAIN_HEADS: &str = "audit:chain_heads";
 const NS_CHAIN_METADATA: &str = "audit:chain_metadata";
 const NS_COMMITTED_ENTRIES: &str = "audit:committed_entries";
+const NS_APPEND_INTENTS: &str = "audit:append_intents";
 const NS_MIGRATION: &str = "audit:migrations";
 const LEGACY_MIGRATION_KEY: &str = "legacy-principal-home-v1";
 const NS_PRUNE_RECEIPTS: &str = "audit:prune_receipts";
@@ -267,10 +272,6 @@ pub(crate) struct PrunePlan {
     complete: bool,
     #[serde(default)]
     segment_key: Option<String>,
-    #[serde(default)]
-    segment_count: u64,
-    #[serde(default)]
-    segment_bytes: u64,
     #[serde(default)]
     segment_accounted: bool,
 }
@@ -295,6 +296,11 @@ impl KvAuditStorage {
         Self {
             store: Arc::new(MemoryKvStore::new()),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_store(store: Arc<dyn KvStore>) -> Self {
+        Self { store }
     }
 
     pub(crate) fn from_kv_store(store: Arc<dyn KvStore>) -> AuditResult<Self> {

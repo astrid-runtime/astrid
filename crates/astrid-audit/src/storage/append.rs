@@ -1,7 +1,8 @@
 use super::{
     AuditStorage, ChainMetadata, DEFAULT_SEGMENT_MAX_BYTES, DEFAULT_SEGMENT_MAX_ENTRIES,
-    DURABLE_APPEND_LOCK, GlobalMetadata, KvAuditStorage, NS_CHAIN_HEADS, NS_COMMITTED_ENTRIES,
-    NS_SEGMENT_INDEX, chain_head_key,
+    DURABLE_APPEND_LOCK, GlobalMetadata, KvAuditStorage, NS_APPEND_INTENTS, NS_CHAIN_HEADS,
+    NS_CHAIN_METADATA, NS_COMMITTED_ENTRIES, NS_ENTRIES, NS_GLOBAL_METADATA, NS_SEGMENT_INDEX,
+    NS_SESSION_ENTRIES, NS_SESSION_SEQUENCE, chain_head_key,
 };
 use crate::entry::AuditEntry;
 use crate::error::{AuditError, AuditResult};
@@ -25,28 +26,232 @@ struct ChainTransition {
     next: ChainMetadata,
 }
 
+#[derive(serde::Deserialize, serde::Serialize)]
+struct AppendIntent {
+    entry: AuditEntry,
+    head_key: String,
+    session_sequence_key: String,
+    expected_session_sequence: Option<Vec<u8>>,
+    next_session_sequence: Vec<u8>,
+    session_index_key: String,
+    expected_head: Option<Vec<u8>>,
+    expected_metadata: Option<Vec<u8>>,
+    next_metadata: ChainMetadata,
+    expected_global: Option<Vec<u8>>,
+    next_global: GlobalMetadata,
+    segment_key: Option<String>,
+}
+
+struct SessionSequenceWrite {
+    sequence_key: String,
+    expected: Option<Vec<u8>>,
+    next_sequence: Vec<u8>,
+    index_key: String,
+}
+
+const APPEND_INTENT_KEY: &str = "current";
+
 impl KvAuditStorage {
     pub(super) async fn append_if_head_durable(
         &self,
         entry: &AuditEntry,
         expected: Option<&AuditEntryId>,
     ) -> AuditResult<bool> {
-        let _guard = DURABLE_APPEND_LOCK.lock().await;
+        let guard = DURABLE_APPEND_LOCK.lock().await;
+        let result = self.append_if_head_durable_locked(entry, expected).await;
+        drop(guard);
+        result
+    }
+
+    async fn append_if_head_durable_locked(
+        &self,
+        entry: &AuditEntry,
+        expected: Option<&AuditEntryId>,
+    ) -> AuditResult<bool> {
+        self.recover_append_intents().await?;
         let Some(prepared) = self.prepare_append(entry, expected).await? else {
             return Ok(false);
         };
         let entry_bytes = serialized_len(entry)?;
         let mut global = self.admit_append(entry_bytes).await?;
-
-        self.commit_entry_and_head(entry, &prepared).await?;
         let transition = advance_chain(entry, &prepared.prior, entry_bytes, &mut global.metadata);
+        account_global_append(&mut global.metadata, &transition, entry_bytes);
+        let segment_key =
+            sealed_segment_key(&prepared.head_key, &transition.next, &global.metadata);
+        let sequence = self
+            .prepare_session_sequence(&entry.session_id, &entry.id)
+            .await?;
+        let intent = self
+            .install_append_intent(
+                entry,
+                &prepared,
+                &transition.next,
+                &global,
+                segment_key.as_deref(),
+                &sequence,
+            )
+            .await?;
+
+        self.commit_entry_and_head(&prepared, &intent).await?;
         self.persist_chain_transition(entry, &prepared, &transition.next)
             .await?;
-        self.persist_sealed_segment(&prepared.head_key, &transition.next, &global.metadata)
+        self.persist_sealed_segment(segment_key.as_deref(), &transition.next)
             .await?;
-        account_global_append(&mut global.metadata, &transition, entry_bytes);
         self.persist_append_global(&global).await?;
+        self.remove_append_intent().await?;
         Ok(true)
+    }
+
+    pub(super) async fn recover_append_intents(&self) -> AuditResult<()> {
+        let bytes = self
+            .store
+            .get(NS_APPEND_INTENTS, APPEND_INTENT_KEY)
+            .await
+            .map_err(|error| AuditError::StorageError(error.to_string()))?;
+        let Some(bytes) = bytes else {
+            return Ok(());
+        };
+        let intent: AppendIntent = serde_json::from_slice(&bytes)
+            .map_err(|error| AuditError::SerializationError(error.to_string()))?;
+        self.commit_entry_projection(&intent).await?;
+
+        self.store
+            .set(
+                NS_COMMITTED_ENTRIES,
+                &intent.entry.id.0.to_string(),
+                vec![1],
+            )
+            .await
+            .map_err(|error| AuditError::StorageError(error.to_string()))?;
+        let next_head = intent
+            .next_metadata
+            .head
+            .as_ref()
+            .map(|head| head.0.to_string().into_bytes())
+            .ok_or_else(|| {
+                AuditError::StorageError("audit append intent lacks a head".to_owned())
+            })?;
+        self.recover_cas(
+            NS_CHAIN_HEADS,
+            &intent.head_key,
+            intent.expected_head.as_deref(),
+            &next_head,
+        )
+        .await?;
+        let next_metadata = serde_json::to_vec(&intent.next_metadata)
+            .map_err(|error| AuditError::SerializationError(error.to_string()))?;
+        self.recover_cas(
+            NS_CHAIN_METADATA,
+            &intent.head_key,
+            intent.expected_metadata.as_deref(),
+            &next_metadata,
+        )
+        .await?;
+        self.persist_sealed_segment(intent.segment_key.as_deref(), &intent.next_metadata)
+            .await?;
+        let next_global = serde_json::to_vec(&intent.next_global)
+            .map_err(|error| AuditError::SerializationError(error.to_string()))?;
+        self.recover_cas(
+            NS_GLOBAL_METADATA,
+            "current",
+            intent.expected_global.as_deref(),
+            &next_global,
+        )
+        .await?;
+        self.remove_append_intent().await?;
+        Ok(())
+    }
+
+    async fn recover_cas(
+        &self,
+        namespace: &str,
+        key: &str,
+        expected: Option<&[u8]>,
+        next: &[u8],
+    ) -> AuditResult<()> {
+        if self
+            .store
+            .compare_and_swap(namespace, key, expected, next.to_vec())
+            .await
+            .map_err(|error| AuditError::StorageError(error.to_string()))?
+        {
+            return Ok(());
+        }
+        let current = self
+            .store
+            .get(namespace, key)
+            .await
+            .map_err(|error| AuditError::StorageError(error.to_string()))?;
+        if current.as_deref() == Some(next) {
+            return Ok(());
+        }
+        Err(AuditError::StorageError(
+            "durable audit append intent conflicts with canonical state".to_owned(),
+        ))
+    }
+
+    async fn install_append_intent(
+        &self,
+        entry: &AuditEntry,
+        prepared: &Preparation,
+        next_metadata: &ChainMetadata,
+        global: &GlobalState,
+        segment_key: Option<&str>,
+        sequence: &SessionSequenceWrite,
+    ) -> AuditResult<AppendIntent> {
+        let intent = AppendIntent {
+            entry: entry.clone(),
+            head_key: prepared.head_key.clone(),
+            session_sequence_key: sequence.sequence_key.clone(),
+            expected_session_sequence: sequence.expected.clone(),
+            next_session_sequence: sequence.next_sequence.clone(),
+            session_index_key: sequence.index_key.clone(),
+            expected_head: prepared.expected_head_bytes.clone(),
+            expected_metadata: prepared.metadata_bytes.clone(),
+            next_metadata: next_metadata.clone(),
+            expected_global: global.expected_bytes.clone(),
+            next_global: global.metadata.clone(),
+            segment_key: segment_key.map(str::to_owned),
+        };
+        let bytes = serde_json::to_vec(&intent)
+            .map_err(|error| AuditError::SerializationError(error.to_string()))?;
+        self.store
+            .set(NS_APPEND_INTENTS, APPEND_INTENT_KEY, bytes)
+            .await
+            .map_err(|error| AuditError::StorageError(error.to_string()))?;
+        Ok(intent)
+    }
+
+    async fn prepare_session_sequence(
+        &self,
+        session_id: &astrid_core::SessionId,
+        id: &AuditEntryId,
+    ) -> AuditResult<SessionSequenceWrite> {
+        let sequence_key = session_id.0.to_string();
+        let expected = self
+            .store
+            .get(NS_SESSION_SEQUENCE, &sequence_key)
+            .await
+            .map_err(|error| AuditError::StorageError(error.to_string()))?;
+        let current = expected.as_deref().map_or(Ok(0), super::parse_sequence)?;
+        let next = current.checked_add(1).ok_or_else(|| {
+            AuditError::StorageError("audit session sequence exhausted".to_owned())
+        })?;
+        let index_key = format!("{sequence_key}:{next:020}:{}", id.0);
+        Ok(SessionSequenceWrite {
+            sequence_key,
+            expected,
+            next_sequence: next.to_be_bytes().to_vec(),
+            index_key,
+        })
+    }
+
+    async fn remove_append_intent(&self) -> AuditResult<()> {
+        self.store
+            .delete(NS_APPEND_INTENTS, APPEND_INTENT_KEY)
+            .await
+            .map_err(|error| AuditError::StorageError(error.to_string()))
+            .map(|_| ())
     }
 
     async fn prepare_append(
@@ -134,17 +339,17 @@ impl KvAuditStorage {
 
     async fn commit_entry_and_head(
         &self,
-        entry: &AuditEntry,
         prepared: &Preparation,
+        intent: &AppendIntent,
     ) -> AuditResult<()> {
-        self.store(entry).await?;
+        self.commit_entry_projection(intent).await?;
         let committed = self
             .store
             .compare_and_swap(
                 NS_CHAIN_HEADS,
                 &prepared.head_key,
                 prepared.expected_head_bytes.as_deref(),
-                entry.id.0.to_string().into_bytes(),
+                intent.entry.id.0.to_string().into_bytes(),
             )
             .await
             .map_err(|error| AuditError::StorageError(error.to_string()))?;
@@ -154,7 +359,52 @@ impl KvAuditStorage {
             ));
         }
         self.store
-            .set(NS_COMMITTED_ENTRIES, &entry.id.0.to_string(), vec![1])
+            .set(
+                NS_COMMITTED_ENTRIES,
+                &intent.entry.id.0.to_string(),
+                vec![1],
+            )
+            .await
+            .map_err(|error| AuditError::StorageError(error.to_string()))
+    }
+
+    async fn commit_entry_projection(&self, intent: &AppendIntent) -> AuditResult<()> {
+        let entry_data = serde_json::to_vec(&intent.entry)
+            .map_err(|error| AuditError::SerializationError(error.to_string()))?;
+        self.store
+            .set(NS_ENTRIES, &intent.entry.id.0.to_string(), entry_data)
+            .await
+            .map_err(|error| AuditError::StorageError(error.to_string()))?;
+
+        let sequence_swapped = self
+            .store
+            .compare_and_swap(
+                NS_SESSION_SEQUENCE,
+                &intent.session_sequence_key,
+                intent.expected_session_sequence.as_deref(),
+                intent.next_session_sequence.clone(),
+            )
+            .await
+            .map_err(|error| AuditError::StorageError(error.to_string()))?;
+        if sequence_swapped {
+            return self.write_session_index(intent).await;
+        }
+        let current = self
+            .store
+            .get(NS_SESSION_SEQUENCE, &intent.session_sequence_key)
+            .await
+            .map_err(|error| AuditError::StorageError(error.to_string()))?;
+        if current.as_deref() == Some(intent.next_session_sequence.as_slice()) {
+            return self.write_session_index(intent).await;
+        }
+        Err(AuditError::StorageError(
+            "audit append intent conflicts with session sequence".to_owned(),
+        ))
+    }
+
+    async fn write_session_index(&self, intent: &AppendIntent) -> AuditResult<()> {
+        self.store
+            .set(NS_SESSION_ENTRIES, &intent.session_index_key, vec![1])
             .await
             .map_err(|error| AuditError::StorageError(error.to_string()))
     }
@@ -183,21 +433,16 @@ impl KvAuditStorage {
 
     async fn persist_sealed_segment(
         &self,
-        head_key: &str,
+        segment_key: Option<&str>,
         next: &ChainMetadata,
-        global: &GlobalMetadata,
     ) -> AuditResult<()> {
-        if !next.sealed {
+        let Some(segment_key) = segment_key else {
             return Ok(());
-        }
-        let segment_key = format!(
-            "{:020}:{head_key}:{:020}",
-            global.next_seal_ordinal, next.segment
-        );
+        };
         let segment_bytes = serde_json::to_vec(next)
             .map_err(|error| AuditError::SerializationError(error.to_string()))?;
         self.store
-            .set(NS_SEGMENT_INDEX, &segment_key, segment_bytes)
+            .set(NS_SEGMENT_INDEX, segment_key, segment_bytes)
             .await
             .map_err(|error| AuditError::StorageError(error.to_string()))
     }
@@ -308,4 +553,17 @@ fn account_global_append(
     if !global.degraded {
         global.last_error = None;
     }
+}
+
+fn sealed_segment_key(
+    head_key: &str,
+    next: &ChainMetadata,
+    global: &GlobalMetadata,
+) -> Option<String> {
+    next.sealed.then(|| {
+        format!(
+            "{:020}:{head_key}:{:020}",
+            global.next_seal_ordinal, next.segment
+        )
+    })
 }

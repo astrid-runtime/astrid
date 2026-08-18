@@ -8,8 +8,8 @@ use astrid_core::{PrincipalId, SessionId};
 struct ReceiptDetails {
     cutoff: Option<String>,
     omitted_count: u64,
-    omitted_bytes: u64,
-    omitted_terminal_hash: String,
+    segment: Option<u64>,
+    seal_ordinal: Option<u64>,
 }
 
 impl ReceiptDetails {
@@ -25,15 +25,10 @@ impl ReceiptDetails {
                 .get("omitted_count")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0),
-            omitted_bytes: value
-                .get("omitted_bytes")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0),
-            omitted_terminal_hash: value
-                .get("omitted_terminal_hash")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .to_owned(),
+            segment: value.get("segment").and_then(serde_json::Value::as_u64),
+            seal_ordinal: value
+                .get("seal_ordinal")
+                .and_then(serde_json::Value::as_u64),
         })
     }
 }
@@ -124,8 +119,6 @@ impl KvAuditStorage {
             after: None,
             complete: false,
             segment_key,
-            segment_count: details.omitted_count,
-            segment_bytes: details.omitted_bytes,
             segment_accounted: false,
         };
         let encoded = serde_json::to_vec(&plan)
@@ -220,9 +213,8 @@ impl KvAuditStorage {
         let metadata: ChainMetadata = serde_json::from_slice(&bytes)
             .map_err(|error| AuditError::SerializationError(error.to_string()))?;
         Ok(metadata.sealed
-            && metadata.segment_count == details.omitted_count
-            && metadata.segment_bytes == details.omitted_bytes
-            && metadata.head_hash.to_hex() == details.omitted_terminal_hash)
+            && Some(metadata.segment) == details.segment
+            && metadata.seal_ordinal == details.seal_ordinal)
     }
 
     async fn delete_prune_page(
