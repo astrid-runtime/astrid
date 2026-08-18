@@ -102,6 +102,8 @@ Astrid must support:
 
 This specification does not:
 
+- define, ship, or privilege one canonical agent, reasoning loop, model
+  provider, memory strategy, tool broker, prompt format, or harness;
 - place Linux, POSIX, Python, Hermes, package management, or user policy in ring
   0;
 - require existing applications to be rewritten as WASM;
@@ -135,6 +137,11 @@ This specification does not:
   independently authorized Astrid resource.
 - **Projection:** a consumer-specific view of an authoritative Astrid resource,
   such as a POSIX filesystem mount or a Linux block device.
+- **Agent composition:** an ordinary distribution/application composition of
+  Capsules, providers, state, tools, ingress, and policy. Astrid does not
+  interpret an agent role: a loop Capsule, model connector, memory service, or
+  tool provider is simply a component with typed resources and explicit
+  authority.
 
 ## 3. System invariant
 
@@ -551,11 +558,35 @@ only when its required semantics are a subset of those supplied by the selected
 provider. Provider names such as `linux`, `posix`, `filesystem`, or `std` are not
 sufficient evidence; executable conformance cases establish the claim.
 
-## 11. Hermes as the reference universal application
+## 11. Agents are applications; Hermes is one reference workload
+
+Astrid does not make the agent. An agent may run inside Astrid as:
+
+- an existing harness such as Hermes inside a compatibility Realm;
+- a native Capsule composition whose replaceable parts provide a loop, model
+  access, memory, tools, ingress, and presentation; or
+- another application graph selected by a distribution or user.
+
+The composition mechanism stays small: verified component identities, typed
+links, resource attachments, state roots, authority requests, and lifecycle
+selection. Astrid does not assign special kernel meaning to “agent”, “ReAct”,
+“model”, “memory”, “tool”, or “prompt”.
+
+A distribution may expose a composition as maximally inspectable and hackable:
+parts can be replaced, rewired, or developed locally, with each executable
+change producing a new application generation and fresh admission. It may
+instead publish a frozen, reproducible, signed closure whose parts change only
+through reviewed generation replacement. Hackable and frozen are policies over
+the same composition format; neither requires a second runtime or authority
+model. Mutable principal state remains separate in both cases.
 
 Hermes is the first forcing workload because it combines Python, native wheels,
 HTTP model access, MCP, subprocesses, skills, persistent memory, SQLite,
 long-lived gateway operation, messaging ingress, and human terminal UX.
+
+Hermes is not the Astrid agent, a mandatory system service, or the template every
+native agent must copy. It is one compatibility and economics conformance
+workload.
 
 ### 11.1 Sharing and isolation
 
@@ -814,6 +845,13 @@ Reprovisioning a distro must transactionally reconcile the installed set.
 Artifacts removed from the new signed closure cannot continue loading merely
 because old directories remain. Side-loaded artifacts have separately recorded
 provenance and are not silently pruned as if they belonged to the distro.
+
+A distribution decides which compositions are editable, which inputs may be
+overridden, and which closures are frozen. Astrid supplies one transparent
+generation mechanism for both: edits never mutate an already identified
+closure; they derive a new candidate, make its authority delta visible, and
+switch only after admission. A frozen distribution may disable local
+derivation entirely.
 
 ## 14. Standalone and hosted deployments
 
