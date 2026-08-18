@@ -489,3 +489,35 @@ fn source_preflight_rejects_symlink_and_fifo() {
     let _socket = UnixListener::bind(&socket_path).expect("socket");
     assert!(snapshot_path(root.path()).is_err());
 }
+
+#[cfg(unix)]
+#[test]
+fn released_state_db_accepts_historical_read_only_modes() {
+    let root = tempfile::tempdir().expect("temporary root");
+    make_private_dir(root.path());
+    let state_db = root.path().join("state.db");
+    let wal = state_db.join("wal");
+    fs::create_dir_all(&wal).expect("legacy WAL directory");
+    fs::set_permissions(&state_db, fs::Permissions::from_mode(0o755))
+        .expect("released database mode");
+    fs::set_permissions(&wal, fs::Permissions::from_mode(0o755)).expect("released WAL mode");
+    let segment = wal.join("00000000000000000000.wal");
+    fs::write(&segment, b"released WAL bytes").expect("legacy WAL segment");
+    fs::set_permissions(&segment, fs::Permissions::from_mode(0o644))
+        .expect("released WAL segment mode");
+
+    assert!(
+        snapshot_path(&state_db).is_err(),
+        "ordinary component sources retain the owner-only contract"
+    );
+    let snapshot = snapshot_released_state_db(&state_db)
+        .expect("released read-only permissions are migration-compatible");
+    assert!(snapshot.present);
+    assert_eq!(snapshot.entries, 2);
+
+    fs::set_permissions(&segment, fs::Permissions::from_mode(0o666))
+        .expect("make legacy segment writable");
+    let error = snapshot_released_state_db(&state_db)
+        .expect_err("externally writable database bytes must fail closed");
+    assert!(error.to_string().contains("group/world writable"));
+}

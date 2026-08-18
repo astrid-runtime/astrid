@@ -525,6 +525,25 @@ fn device_id(metadata: &fs::Metadata) -> u64 {
 }
 
 pub(super) fn snapshot_path(path: &Path) -> io::Result<SourceIdentity> {
+    snapshot_path_with_access(path, SourceAccess::Private)
+}
+
+/// Snapshot the released `SurrealKV` tree without requiring permissions that
+/// the released binary never set. Historical database children were commonly
+/// `0755` directories and `0644` files. They remain admissible only when the
+/// current user owns every entry, nobody else can modify it, and no extended
+/// ACL, redirect, mount, device boundary, or special entry is present.
+pub(super) fn snapshot_released_state_db(path: &Path) -> io::Result<SourceIdentity> {
+    snapshot_path_with_access(path, SourceAccess::ReleasedDatabase)
+}
+
+#[derive(Clone, Copy)]
+enum SourceAccess {
+    Private,
+    ReleasedDatabase,
+}
+
+fn snapshot_path_with_access(path: &Path, access: SourceAccess) -> io::Result<SourceIdentity> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -533,7 +552,7 @@ pub(super) fn snapshot_path(path: &Path) -> io::Result<SourceIdentity> {
         Err(error) => return Err(error),
     };
     astrid_core::platform_fs::verify_no_redirects(path)?;
-    validate_private_entry(path, &metadata)?;
+    validate_source_entry(path, &metadata, access)?;
     if active_mountpoint(path)? {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -556,7 +575,7 @@ pub(super) fn snapshot_path(path: &Path) -> io::Result<SourceIdentity> {
         identity.entries = 1;
         read_regular_file(path, &mut hasher, &mut identity)?;
     } else if metadata.is_dir() {
-        snapshot_dir(path, path, device, &mut hasher, &mut identity)?;
+        snapshot_dir(path, path, device, access, &mut hasher, &mut identity)?;
     } else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -606,6 +625,7 @@ fn snapshot_dir(
     root: &Path,
     dir: &Path,
     device: u64,
+    access: SourceAccess,
     hasher: &mut blake3::Hasher,
     identity: &mut SourceIdentity,
 ) -> io::Result<()> {
@@ -624,7 +644,7 @@ fn snapshot_dir(
                 format!("legacy source contains redirect: {}", path.display()),
             ));
         }
-        validate_private_entry(&path, &metadata)?;
+        validate_source_entry(&path, &metadata, access)?;
         if device_id(&metadata) != device {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -651,7 +671,7 @@ fn snapshot_dir(
         }
         if metadata.is_dir() {
             hasher.update(b"dir");
-            snapshot_dir(root, &path, device, hasher, identity)?;
+            snapshot_dir(root, &path, device, access, hasher, identity)?;
         } else if metadata.is_file() {
             hasher.update(b"file");
             read_regular_file(&path, hasher, identity)?;
@@ -663,6 +683,58 @@ fn snapshot_dir(
         }
     }
     Ok(())
+}
+
+fn validate_source_entry(
+    path: &Path,
+    metadata: &fs::Metadata,
+    access: SourceAccess,
+) -> io::Result<()> {
+    match access {
+        SourceAccess::Private => validate_private_entry(path, metadata),
+        SourceAccess::ReleasedDatabase => validate_released_database_entry(path, metadata),
+    }
+}
+
+fn validate_released_database_entry(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
+    if !metadata.is_dir() && !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "legacy database contains a special entry: {}",
+                path.display()
+            ),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        if metadata.uid() != nix::unistd::getuid().as_raw() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "legacy database entry is not owned by the current user: {}",
+                    path.display()
+                ),
+            ));
+        }
+        if metadata.mode() & 0o022 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "legacy database entry is group/world writable: {}",
+                    path.display()
+                ),
+            ));
+        }
+        astrid_core::platform_fs::validate_no_extended_acl(path)?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        validate_private_entry(path, metadata)
+    }
 }
 
 fn read_regular_file(
