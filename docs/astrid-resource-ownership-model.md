@@ -882,7 +882,7 @@ and source material, not merge instructions.
 | User/fleet/principal ownership | Astrid PR #1470 | Retain current mainline model |
 | Standalone local administration | Astrid PR #1473 | Retain as admin-provider seed |
 | Host-independent storage and mounts | Astrid PR #1535 / `origin/codex/storage-mounted-filesystem` | Land first after its own CI/correctness gates |
-| Actual principal Linux Realm | AOS draft PR #77 / preserved `b64d8d9` bundle | Forward-port after storage and execution-provider contracts |
+| Actual principal Linux Realm | Preserved draft PR #77 / `b64d8d9` bundle in its source repository | Forward-port after storage and execution-provider contracts |
 | Distro compatibility validation | Astrid PR #1024 | Retain as validation floor, not generation architecture |
 | Package `supersedes` | Closed Astrid PR #583 and issue #1184 | Reject as system-generation mechanism |
 | Remote CLI/contexts | Astrid issues #658 and #688 | Defer as consumers of stamped sessions |
@@ -916,7 +916,7 @@ the proof a production kernel.
 
 **Decision: preserve the working Realm; forward-port by contract.**
 
-The authoritative preserved source/artifact work remains in its owning AOS
+The authoritative preserved source/artifact work remains in its owning
 repository/bundle. The core branch contains useful principal-affine runtime,
 memory, filesystem, and service work but is substantially behind main; harvest
 tests and mechanisms after re-evaluating them against current runtime identity,

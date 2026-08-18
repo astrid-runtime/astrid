@@ -609,11 +609,11 @@ accounting, restart, and revocation tests pass.
 ### 12.1 Higher-layer experience enabled by Astrid
 
 Astrid does not own or render a graphical desktop, Home, component tree, or
-personal interface. AOS and other hosts may build those experiences over the
+personal interface. Higher-layer hosts may build those experiences over the
 substrate defined here. This section describes a forcing consumer experience,
 not an Astrid-owned product surface or kernel service.
 
-A graphical AOS Home may present a small number of immediately legible
+A graphical host may present a small number of immediately legible
 concepts:
 
 - **Spaces:** personal or collaborative compositions of work, people, agents,
@@ -645,7 +645,7 @@ delegation operation; it does not itself transfer authority.
 ### 12.2 Host-facing semantic state and action boundary
 
 Astrid exposes principal-scoped typed objects, relationships, current state,
-and proposed actions through a host-neutral boundary. AOS or another host may
+and proposed actions through a host-neutral boundary. A consuming host may
 translate that boundary into A2UI, graphical, terminal, accessibility, or other
 native experiences. Astrid does not own layout, components, rendering,
 personalization, or the visual metaphor.
@@ -666,7 +666,7 @@ The architecture separates three concerns:
 
 Astrid's boundary contains no HTML, JavaScript, CSS, webviews, layout tree, or
 executable presentation instructions. Any A2UI-like component grammar and its
-rendering limits belong to AOS or the consuming host.
+rendering limits belong to the consuming host.
 
 Every actionable element carries only an opaque host-issued action reference.
 Its table entry binds the canonical action-descriptor digest, view revision,
@@ -692,8 +692,8 @@ collisions reject rather than overwrite. WIT descriptions and agent prose are
 untrusted descriptive content, not security language.
 
 The earlier in-runtime agent-owned A2UI/TUI design in issues #629 and #630 is
-not revived. Build internal Rust projection/action domain types first. AOS or
-another presentation owner may separately prove an A2UI-like protocol and
+not revived. Build internal Rust projection/action domain types first. A
+presentation owner may separately prove an A2UI-like protocol and
 multiple renderers without making Astrid itself the UI framework.
 
 ### 12.3 Authentication and principal selection
@@ -896,7 +896,7 @@ provider seam.
 ### 17.2 Linux Realm
 
 Recover the preserved Linux Realm source and installable artifact from its
-owning AOS repository/branch. Inventory each capability and test against the
+owning repository/branch. Inventory each capability and test against the
 execution-provider and portal contracts above. Preserve its principal-resident,
 no-`host_process`, bounded `realm_shell`, durable home, workspace, signed worker,
 and intersection-authority properties.
@@ -961,7 +961,7 @@ layout, and no dependent design invents a second persistence authority.
 - Define internal host-neutral object, action, attachment, and
   pending-confirmation types without freezing public WIT or adopting a UI
   grammar.
-- Prove the projection/action boundary with non-graphical fixtures. AOS may
+- Prove the projection/action boundary with non-graphical fixtures. A host may
   build a disposable graphical consumer separately over ephemeral state;
   durable Spaces and preferences wait for authoritative storage.
 - Define lifecycle, streams, cancellation, health, checkpoint, and receipt
@@ -989,8 +989,8 @@ runs on Astrid” claim.
 
 - Add Hermes namespace/tool mapping and approval propagation.
 - Expose Hermes through the host-neutral object/action boundary and prove that
-  any AOS/host projection cannot widen its authority.
-- Let AOS or another host persist Space composition and presentation
+  any host projection cannot widen its authority.
+- Let a consuming host persist Space composition and presentation
   preferences separately from Astrid application data and authority.
 - Add supervised long-lived services and scale-to-zero lifecycle.
 - Complete remote CLI authentication and host contexts.
@@ -1102,8 +1102,8 @@ The following decisions require prototypes or measurements:
 9. whether an Astrid Rust `std` target provides enough value after the native
    ABI stabilizes; and
 10. which Hermes feature subset constitutes the first released closure; and
-11. the minimum host-neutral object/action projection contract needed by AOS
-    and other presentation owners without adopting their component grammar.
+11. the minimum host-neutral object/action projection contract needed by
+    presentation owners without adopting their component grammar.
 
 An open decision does not authorize an ambient host fallback.
 
@@ -1121,7 +1121,7 @@ This programme succeeds when all of the following are true:
 - hosted and native Astrid pass the same semantic conformance suite;
 - a human can authenticate, enter, administer, mount, recover, and leave a
   principal computer with familiar tools;
-- AOS or another host can safely project Astrid's typed state and admitted
+- a consuming host can safely project Astrid's typed state and admitted
   actions without making Astrid own the graphical interface;
 - the native kernel remains `no_std`, small, and free of application/POSIX
   policy;
