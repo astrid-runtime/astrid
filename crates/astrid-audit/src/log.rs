@@ -9,7 +9,6 @@ use astrid_capabilities::AuditEntryId;
 use astrid_core::SessionId;
 use astrid_crypto::{ContentHash, KeyPair};
 use astrid_storage::KvStore;
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -37,12 +36,21 @@ pub use types::{AuditGlobalStats, ChainIssue, ChainVerificationResult};
 #[path = "prune.rs"]
 mod prune;
 pub use prune::{AuditPruneReceipt, AuditRetentionPolicy};
-#[path = "log/migration.rs"]
+#[path = "log/append_batch.rs"]
+mod append_batch;
+#[path = "log/import_legacy.rs"]
+mod import_legacy;
+#[path = "migration.rs"]
 mod migration;
+#[path = "log/prune_oldest.rs"]
+mod prune_oldest_impl;
+#[path = "log/verify_chain.rs"]
+mod verify_chain_impl;
+#[path = "log/verify_legacy_chain.rs"]
+mod verify_legacy_chain_impl;
 use migration::{
     LegacyAuditChainReceipt, LegacyAuditReceipt, ReceiptAccumulator, chain_fragment_summary,
-    decode_receipt, digest_legacy_source, estimated_migration_bytes, import_legacy_chains,
-    scan_legacy_source, validate_destination, validate_legacy_source_path,
+    digest_legacy_source, estimated_migration_bytes, validate_legacy_source_path,
 };
 #[cfg(test)]
 #[path = "builder.rs"]
@@ -289,7 +297,8 @@ impl AuditLog {
         legacy_path: impl AsRef<Path>,
         destination_identity: &str,
     ) -> AuditResult<LegacyAuditImportReport> {
-        include!("log/import_legacy_body.rs")
+        self.import_legacy_audit_impl(legacy_path, destination_identity)
+            .await
     }
 
     /// Re-read and verify the legacy source digest immediately before source
@@ -459,7 +468,7 @@ impl AuditLog {
             AuditOutcome,
         )>,
     ) -> Vec<AuditResult<AuditEntryId>> {
-        include!("log/append_batch_body.rs")
+        self.append_batch_with_principal_impl(entries).await
     }
 
     /// Seal the current durable segment for one session/principal chain.
@@ -548,7 +557,7 @@ impl AuditLog {
         &self,
         policy: AuditRetentionPolicy,
     ) -> AuditResult<Option<AuditPruneReceipt>> {
-        include!("log/prune_oldest_body.rs")
+        self.prune_oldest_impl(policy).await
     }
 
     /// Prune a verified prefix while retaining a bounded suffix and writing a
@@ -767,14 +776,7 @@ impl AuditLog {
         &self,
         session_id: &SessionId,
     ) -> AuditResult<ChainVerificationResult> {
-        include!("log/verify_chain_body.rs")
-    }
-
-    async fn verify_legacy_chain(
-        &self,
-        session_id: &SessionId,
-    ) -> AuditResult<ChainVerificationResult> {
-        include!("log/verify_legacy_chain_body.rs")
+        self.verify_chain_impl(session_id).await
     }
 
     /// Verify the integrity of a single principal's chain within a session.

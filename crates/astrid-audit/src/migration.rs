@@ -103,9 +103,7 @@ pub(crate) const LEGACY_MIGRATION_ENTRY_OVERHEAD_BYTES: u64 = 768;
 /// failure to represent it is a capacity refusal, never permission to write.
 pub(crate) fn estimated_migration_bytes(source_bytes: u64, source_entries: u64) -> Option<u64> {
     source_bytes
-        .checked_add(
-            source_entries.checked_mul(LEGACY_MIGRATION_ENTRY_OVERHEAD_BYTES)?,
-        )?
+        .checked_add(source_entries.checked_mul(LEGACY_MIGRATION_ENTRY_OVERHEAD_BYTES)?)?
         .checked_add(LEGACY_MIGRATION_FIXED_OVERHEAD_BYTES)
 }
 

@@ -4,17 +4,24 @@ use crate::entry::AuditEntry;
 use crate::error::{AuditError, AuditResult};
 use astrid_capabilities::AuditEntryId;
 use astrid_core::SessionId;
-use astrid_storage::{
-    KvBatchCondition, KvBatchMutation, KvEntryKey, KvMutationBatch, KvStore, MemoryKvStore,
-    SurrealKvStore,
-};
+use astrid_storage::{KvStore, MemoryKvStore, SurrealKvStore};
 use async_trait::async_trait;
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
+mod append;
+mod append_batch;
 mod global;
 mod helpers;
 mod metadata;
+mod migration_cas;
+mod migration_marker;
+mod paging_all;
+mod paging_chains;
+mod paging_principal;
+mod paging_session;
+mod prune_chain;
+mod prune_finish;
 mod system;
 use global::GlobalMetadata;
 use helpers::{chain_head_key, parse_sequence};
@@ -84,18 +91,6 @@ pub(crate) trait AuditStorage: Send + Sync {
         _principal: Option<&astrid_core::PrincipalId>,
         _keep_entries: usize,
         _receipt: Vec<u8>,
-    ) -> AuditResult<()> {
-        Err(AuditError::StorageError(
-            "audit backend does not support archive pruning".to_owned(),
-        ))
-    }
-
-    async fn finish_prune_plan(
-        &self,
-        _session_id: &SessionId,
-        _principal: Option<&astrid_core::PrincipalId>,
-        _plan_key: &str,
-        _plan: &PrunePlan,
     ) -> AuditResult<()> {
         Err(AuditError::StorageError(
             "audit backend does not support archive pruning".to_owned(),
@@ -548,7 +543,7 @@ impl AuditStorage for KvAuditStorage {
         after: Option<&str>,
         limit: usize,
     ) -> AuditResult<Vec<(String, AuditEntry)>> {
-        include!("storage/all_entries_page_body.rs")
+        self.load_all_entries_page(after, limit).await
     }
 
     async fn session_chains_page(
@@ -557,7 +552,8 @@ impl AuditStorage for KvAuditStorage {
         after: Option<&str>,
         limit: usize,
     ) -> AuditResult<Vec<(String, Option<astrid_core::PrincipalId>)>> {
-        include!("storage/chains_page_body.rs")
+        self.load_session_chains_page(session_id, after, limit)
+            .await
     }
 
     async fn principal_entries_page(
@@ -567,7 +563,8 @@ impl AuditStorage for KvAuditStorage {
         after: Option<&str>,
         limit: usize,
     ) -> AuditResult<Vec<(String, AuditEntry)>> {
-        include!("storage/principal_page_body.rs")
+        self.load_principal_entries_page(session_id, principal, after, limit)
+            .await
     }
 
     async fn is_entry_committed(&self, id: &AuditEntryId) -> AuditResult<bool> {
@@ -607,11 +604,12 @@ impl AuditStorage for KvAuditStorage {
         after: Option<&str>,
         limit: usize,
     ) -> AuditResult<Vec<(String, AuditEntry)>> {
-        include!("storage/session_page_body.rs")
+        self.load_session_entries_page(session_id, after, limit)
+            .await
     }
 
     async fn migration_marker(&self) -> AuditResult<Option<Vec<u8>>> {
-        include!("storage/migration_marker_body.rs")
+        self.load_migration_marker().await
     }
 
     async fn compare_and_swap_migration_marker(
@@ -619,7 +617,8 @@ impl AuditStorage for KvAuditStorage {
         expected: Option<&[u8]>,
         marker: Vec<u8>,
     ) -> AuditResult<bool> {
-        include!("storage/migration_cas_body.rs")
+        self.compare_and_swap_stored_migration_marker(expected, marker)
+            .await
     }
 
     async fn append_if_head(
@@ -627,14 +626,14 @@ impl AuditStorage for KvAuditStorage {
         entry: &AuditEntry,
         expected: Option<&AuditEntryId>,
     ) -> AuditResult<bool> {
-        include!("storage/append_body.rs")
+        self.append_if_head_durable(entry, expected).await
     }
 
     async fn append_batch_if_heads(
         &self,
         entries: &[(&AuditEntry, Option<&AuditEntryId>)],
     ) -> AuditResult<Vec<bool>> {
-        include!("storage/append_batch_body.rs")
+        self.append_batch_if_heads_durable(entries).await
     }
 
     async fn seal_chain(
@@ -756,17 +755,8 @@ impl AuditStorage for KvAuditStorage {
         keep_entries: usize,
         receipt: Vec<u8>,
     ) -> AuditResult<()> {
-        include!("storage/prune_chain_body.rs")
-    }
-
-    async fn finish_prune_plan(
-        &self,
-        session_id: &SessionId,
-        principal: Option<&astrid_core::PrincipalId>,
-        plan_key: &str,
-        plan: &PrunePlan,
-    ) -> AuditResult<()> {
-        include!("storage/prune_finish_body.rs")
+        self.prune_chain_durable(session_id, principal, keep_entries, receipt)
+            .await
     }
 
     async fn prune_receipt(
