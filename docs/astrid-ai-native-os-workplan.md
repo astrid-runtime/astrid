@@ -2,13 +2,14 @@
 
 Status: active architecture workplan
 
-Last reviewed: 2026-07-18
+Last reviewed: 2026-08-18
 
 Baselines:
 
 - [Astrid Native Component Kernel](astrid-native-kernel.md)
 - [Astrid Tensor Logic Composition](astrid-tensor-logic-composition.md)
 - [Astrid Driver Domain Contract](astrid-driver-domain-contract.md)
+- [Astrid Universal Application Substrate](astrid-universal-application-substrate.md)
 - [AOS Principal Linux Realm](https://github.com/unicity-aos/aos-ce/blob/main/docs/principal-linux-realm.md)
 
 ## 1. Answer and purpose
@@ -17,11 +18,20 @@ There is enough architecture to begin methodically. There is not enough evidence
 claim that the kernel, driver, composition, graphical application, or Tensor Logic
 designs are complete.
 
-The first executable OS artifact is now the principal-owned AOS Realm workbench in
-`unicity-aos/aos-ce`. Its nested-process seed is implemented, but it is not yet a
-Linux environment: persistence, process semantics, a shell, and a toolchain remain
-open. This workbench precedes the native kernel because it is useful on today's
-runtime and becomes a concrete compatibility workload for every later host.
+The first executable compatibility artifact is the principal-owned AOS Realm
+workbench in `unicity-aos/aos-ce`. Preserved implementation work has advanced it
+from the original nested-process seed to a measured Linux guest with a shell,
+principal home, invocation workspace, Python, and compiler tooling. Its broader
+network, PTY, package, service-supervision, filesystem-conformance, and production
+integration claims remain gated. The workbench precedes the native kernel because
+it is useful on today's runtime and becomes a concrete compatibility workload for
+every later host.
+
+The universal-application specification now defines how an existing program keeps
+its familiar ABI while storage, compute, network, secrets, devices, lifecycle, and
+administration map onto Astrid-owned, principal-scoped resources. This workplan
+retains the subsystem evidence order; the universal-application specification is
+the joining product and compatibility contract.
 
 The existing documents capture the intended system and its major deployment
 scenarios. This workplan converts them into dependency-ordered work with explicit
