@@ -367,7 +367,9 @@ file = "missing.wasm"
 "#,
     )
     .unwrap();
-    publish_capsule_source(&kernel, &source, &install);
+    std::fs::write(install.join("missing.wasm"), b"not-a-wasm-component").unwrap();
+    crate::capsule_adversarial_tests::publish_without_running_lifecycle(&kernel, &source, &install)
+        .expect("publish broken capsule fixture without lifecycle execution");
 
     let response = super::agent_derive::agent_derive_from_req(
         &kernel,

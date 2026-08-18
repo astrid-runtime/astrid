@@ -16,8 +16,9 @@ use astrid_storage::{
 use crate::{
     ArtifactProvenance, AuthorityDecision, AuthoritySource, InstallOptions, authorize_install,
     inspect_archive_for_principal_in_workspace, inspect_archive_for_principal_with_layout,
-    read_installed_authority, resolve_target_dir_for,
-    unpack_and_install_authorized_for_principal_in_workspace,
+    inspect_directory_for_principal_with_layout,
+    install_from_local_path_authorized_for_principal_with_layout, read_installed_authority,
+    resolve_target_dir_for, unpack_and_install_authorized_for_principal_in_workspace,
     unpack_and_install_authorized_for_principal_with_layout, verify_installed_authority,
 };
 
@@ -248,6 +249,60 @@ fn installed_wasm_cannot_be_repointed_after_authority_approval() {
     assert!(
         error.to_string().contains("WASM executable differs"),
         "unexpected authority error: {error:#}"
+    );
+}
+
+#[test]
+fn unsigned_directory_mutated_after_explicit_approval_is_rejected() {
+    let temp = tempfile::tempdir().unwrap();
+    let key = KeyPair::generate();
+    let home = install_home(&temp.path().join("runtime"), &key);
+    let principal = PrincipalId::new("alice").unwrap();
+    let storage = install_store(&home, &principal);
+    let source = temp.path().join("mutable-unsigned");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(
+        source.join("Capsule.toml"),
+        "[package]\nname = \"mutable-unsigned\"\nversion = \"1.0.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(source.join("payload.txt"), b"approved bytes").unwrap();
+
+    let layout = WorkspaceLayout::default();
+    let inspection =
+        inspect_directory_for_principal_with_layout(&source, &home, &principal, false, &layout)
+            .unwrap();
+    assert!(matches!(
+        inspection.provenance,
+        ArtifactProvenance::Unsigned
+    ));
+    let decision = AuthorityDecision::ExplicitApproval {
+        content_digest: inspection.content_digest.clone(),
+    };
+
+    // This hook runs after the installer's immediate pre-mutation authority
+    // re-check. A secure transaction must detect the changed unsigned tree
+    // before copying or publishing it; the baseline currently proceeds and
+    // silently rebinds the durable receipt to the changed source.
+    crate::local::set_post_authority_test_hook(|source_dir| {
+        std::fs::write(source_dir.join("payload.txt"), b"changed after approval").unwrap();
+    });
+    let result = install_from_local_path_authorized_for_principal_with_layout(
+        &source,
+        &home,
+        InstallOptions {
+            storage: Some(Arc::clone(&storage)),
+            ..Default::default()
+        },
+        &principal,
+        &decision,
+        &layout,
+    );
+
+    let error = result.expect_err("an approved unsigned source changed before install");
+    assert!(
+        !error.to_string().is_empty(),
+        "mutable-source rejection should explain the authority failure"
     );
 }
 

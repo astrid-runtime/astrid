@@ -316,7 +316,9 @@ mod tests {
     use crate::meta::CapsuleMeta;
 
     fn package_with_export(id: &str) -> CapsulePackage {
-        let manifest = format!("[package]\nname = \"{id}\"\nversion = \"1.0.0\"\n\n");
+        let manifest = format!(
+            "[package]\nname = \"{id}\"\nversion = \"1.0.0\"\n\n[exports.astrid]\nsession = \"1.2.0\"\n"
+        );
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         {
             let mut archive = Builder::new(&mut encoder);

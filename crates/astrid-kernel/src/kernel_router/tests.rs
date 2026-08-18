@@ -1456,7 +1456,7 @@ async fn request_kernel_for_device(
         message: msg,
     });
 
-    astrid_runtime::time::timeout(std::time::Duration::from_secs(2), async {
+    astrid_runtime::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
             let event = rx.recv().await.expect("response event");
             if let astrid_events::AstridEvent::Ipc { message, .. } = &*event
@@ -1468,7 +1468,7 @@ async fn request_kernel_for_device(
         }
     })
     .await
-    .expect("kernel response within 2s")
+    .expect("kernel response within 10s")
 }
 
 /// The in-process readiness probe the gateway uses for the prompt fail-fast

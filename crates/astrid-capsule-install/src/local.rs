@@ -37,6 +37,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+#[cfg(test)]
+use std::cell::RefCell;
+
 use anyhow::{Context, bail};
 use astrid_capsule::capsule::CapsuleId;
 use astrid_capsule::discovery::load_manifest;
@@ -62,6 +65,38 @@ use crate::paths::{resolve_cache_target_dir, resolve_target_dir_for_in_workspace
 use crate::storage::read_durable_meta;
 use crate::wasm::{WasmAddressed, content_address_wasm};
 use crate::wit::{content_address_wit, version_map_to_strings};
+
+// Test-only seam used by the red TOCTOU regression below. It lets a test
+// mutate an unsigned source immediately after the authority re-check and
+// before any install-side source reads. Production builds contain no hook or
+// mutable global state.
+#[cfg(test)]
+type PostAuthorityTestHook = Box<dyn FnOnce(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    static POST_AUTHORITY_TEST_HOOK: RefCell<Option<PostAuthorityTestHook>> =
+        const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_post_authority_test_hook(hook: impl FnOnce(&Path) + 'static) {
+    POST_AUTHORITY_TEST_HOOK.with(|slot| {
+        let previous = slot.borrow_mut().replace(Box::new(hook));
+        assert!(
+            previous.is_none(),
+            "post-authority test hook already installed"
+        );
+    });
+}
+
+#[cfg(test)]
+fn run_post_authority_test_hook(source_dir: &Path) {
+    let hook = POST_AUTHORITY_TEST_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook(source_dir);
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct InstallWorkspace<'a> {
@@ -555,8 +590,16 @@ pub(crate) fn install_from_local_path_internal(
     // Re-verify the exact source immediately before any target mutation. This
     // closes the gap between pre-install approval and the transactional copy,
     // including provenance-envelope swaps that leave content bytes unchanged.
-    let mut installed_authority =
+    let installed_authority =
         authority_for_install_source(source_dir, &manifest, installed_authority)?;
+
+    #[cfg(test)]
+    run_post_authority_test_hook(source_dir);
+
+    // An approval may have been captured by an earlier inspection. Recheck the
+    // decision-bound source digest before any install read or target mutation.
+    let mut installed_authority =
+        authority_for_install_source(source_dir, &manifest, Some(installed_authority))?;
 
     // Pre-flight checks — pure reads, no target mutation.
     let export_conflicts = if let Some(store) = options.storage.as_ref() {

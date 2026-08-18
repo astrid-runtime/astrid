@@ -40,6 +40,7 @@ pub struct VerifiedDurableCapsulePackage {
     manifest_bytes: Vec<u8>,
     archive_files: std::collections::BTreeMap<String, Vec<u8>>,
     metadata: CapsuleMeta,
+    metadata_bytes: Vec<u8>,
     authority: InstalledAuthority,
 }
 
@@ -92,6 +93,18 @@ impl VerifiedDurableCapsulePackage {
         self.archive_files
             .get(&format!("wit/{relative}"))
             .map(Vec::as_slice)
+    }
+
+    /// Return one verified file from the durable archive.
+    #[must_use]
+    pub fn archive_file(&self, relative: &str) -> Option<&[u8]> {
+        self.archive_files.get(relative).map(Vec::as_slice)
+    }
+
+    /// Return the exact durable metadata bytes.
+    #[must_use]
+    pub fn metadata_bytes(&self) -> &[u8] {
+        &self.metadata_bytes
     }
 
     /// Return all verified WIT blobs as `(relative_path, bytes)` pairs.
@@ -148,6 +161,7 @@ pub fn read_verified_durable_package_for_owner(
         .with_context(|| format!("decode durable capsule {id} metadata"))?;
     let authority: InstalledAuthority = serde_json::from_slice(&package.authority)
         .with_context(|| format!("decode durable capsule {id} authority"))?;
+    let metadata_bytes = package.metadata.clone();
     verify_package_identity(
         id,
         &manifest,
@@ -155,6 +169,7 @@ pub fn read_verified_durable_package_for_owner(
         &authority,
         &manifest_bytes,
         &verification,
+        &files,
     )?;
     verify_wit_files(id, &metadata, &files)?;
     Ok(Some(VerifiedDurableCapsulePackage {
@@ -164,6 +179,7 @@ pub fn read_verified_durable_package_for_owner(
         manifest_bytes,
         archive_files: files,
         metadata,
+        metadata_bytes,
         authority,
     }))
 }
@@ -224,6 +240,7 @@ fn verify_package_identity(
     authority: &InstalledAuthority,
     manifest_bytes: &[u8],
     verification: &ArtifactVerification,
+    archive_files: &std::collections::BTreeMap<String, Vec<u8>>,
 ) -> anyhow::Result<()> {
     if authority.schema_version != 1 {
         bail!(
@@ -243,6 +260,47 @@ fn verify_package_identity(
     }
     if authority.content_digest != verification.content_digest() {
         bail!("durable capsule {id} content digest differs from authority receipt");
+    }
+    let expected_imports = crate::wit::version_map_to_strings(&manifest.imports, |definition| {
+        definition.version.to_string()
+    });
+    if metadata.imports != expected_imports {
+        bail!("durable capsule {id} imports differ between metadata and archive");
+    }
+    let expected_exports = crate::wit::version_map_to_strings(&manifest.exports, |definition| {
+        definition.version.to_string()
+    });
+    if metadata.exports != expected_exports {
+        bail!("durable capsule {id} exports differ between metadata and archive");
+    }
+    if authority.wasm_hash_pinned && metadata.wasm_hash != authority.approved_wasm_hash {
+        bail!("durable capsule {id} metadata executable hash differs from authority receipt");
+    }
+    if let Some(component) = manifest.components.first() {
+        let Some(relative) = component.path.to_str() else {
+            bail!("durable capsule {id} component path is not UTF-8");
+        };
+        let Some(bytes) = archive_files.get(relative) else {
+            bail!("durable capsule {id} component is missing from its archive");
+        };
+        if Path::new(relative)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("wasm"))
+        {
+            let archive_hash = blake3::hash(bytes).to_hex().to_string();
+            if authority.wasm_hash_pinned
+                && authority.approved_wasm_hash.as_deref() != Some(archive_hash.as_str())
+            {
+                bail!("durable capsule {id} WASM hash differs between authority and archive");
+            }
+            if metadata.wasm_hash.as_deref() != Some(archive_hash.as_str()) {
+                bail!("durable capsule {id} WASM hash differs between metadata and archive");
+            }
+        } else if metadata.wasm_hash.is_some() {
+            bail!("durable capsule {id} metadata names a hash for a non-WASM component");
+        }
+    } else if metadata.wasm_hash.is_some() {
+        bail!("durable capsule {id} metadata names a component absent from its archive");
     }
     let mut effective_capabilities = manifest.capabilities.clone();
     for component in &manifest.components {
@@ -862,3 +920,6 @@ mod tests {
         assert!(materialize_capsule_package(&package, &destination).is_err());
     }
 }
+
+#[cfg(test)]
+mod durable_metadata_tests;

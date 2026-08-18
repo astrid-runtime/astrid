@@ -25,6 +25,8 @@ mod audit_retirement_tests;
 pub mod audit_sink;
 /// Passive event-bus storm diagnostics (publish-rate monitor).
 mod bus_monitor;
+#[cfg(test)]
+mod capsule_adversarial_tests;
 /// `astrid.v1.capsules_loaded` payload assembly (opaque per-capsule metadata).
 mod capsules_loaded;
 #[cfg(test)]
@@ -1426,6 +1428,28 @@ impl Kernel {
         if manifest_bytes != verified.manifest_bytes() {
             anyhow::bail!("durable capsule manifest bytes do not match materialization");
         }
+        let metadata_bytes = std::fs::read(dir.join("meta.json"))
+            .map_err(|error| anyhow::anyhow!("read materialized capsule metadata: {error}"))?;
+        if metadata_bytes != verified.metadata_bytes() {
+            anyhow::bail!("durable capsule metadata does not match materialization");
+        }
+        for component in &verified.manifest().components {
+            if component.path.is_absolute() {
+                anyhow::bail!("materialized capsule component path is absolute");
+            }
+            let relative = component.path.to_str().ok_or_else(|| {
+                anyhow::anyhow!("materialized capsule component path is not UTF-8")
+            })?;
+            let Some(expected) = verified.archive_file(relative) else {
+                anyhow::bail!("materialized capsule component is absent from durable archive");
+            };
+            let materialized = std::fs::read(dir.join(relative)).map_err(|error| {
+                anyhow::anyhow!("read materialized capsule component {relative}: {error}")
+            })?;
+            if materialized != expected {
+                anyhow::bail!("materialized capsule component differs from durable archive");
+            }
+        }
         let expansions = manifest
             .capabilities
             .expansions_from(&verified.authority().approved_capabilities);
@@ -1674,7 +1698,7 @@ impl Kernel {
         let capsule_listener = (!self.native_uplink_owns_listener.load(Ordering::Acquire))
             .then(|| self.cli_socket_listener.clone())
             .flatten();
-        let ctx = astrid_capsule::context::CapsuleContext::new(
+        let mut ctx = astrid_capsule::context::CapsuleContext::new(
             load_principal,
             self.workspace_root.clone(),
             // Durable home VFS authority is threaded separately through the
@@ -1724,6 +1748,11 @@ impl Kernel {
         // kernel's durable, hash-chained audit log — not just the
         // off-by-default observability tracing targets.
         .with_audit_sink(self.audit_sink.as_ref().clone());
+        if let Some(project_root) = explicit_workspace_portal_root(dir) {
+            ctx = ctx.with_hosted_portal(project_root);
+        }
+        #[cfg(test)]
+        capsule_adversarial_tests::record_workspace_source(&capsule_name, &ctx.workspace_source);
         capsule.load(&ctx).await?;
         Ok(capsule)
     }
@@ -3402,6 +3431,15 @@ impl Kernel {
             }
         }
     }
+}
+
+fn explicit_workspace_portal_root(installed_dir: &Path) -> Option<PathBuf> {
+    let capsules_dir = installed_dir.parent()?;
+    let state_dir = capsules_dir.parent()?;
+    let project_root = state_dir.parent()?;
+    let expected = WorkspaceLayout::default().capsules_dir(project_root);
+    (std::fs::canonicalize(capsules_dir).ok()? == std::fs::canonicalize(expected).ok()?)
+        .then(|| project_root.to_path_buf())
 }
 
 async fn unload_loaded_capsule_after_source_disappeared(
