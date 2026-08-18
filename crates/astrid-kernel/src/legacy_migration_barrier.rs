@@ -35,7 +35,7 @@ use fs_support::retire_tree;
 use fs_support::{
     add_source, collect_workspace_targets, ensure_legacy_secret_aliases, path_exists,
     read_bounded_file, require_layout_provenance, retire_empty_directory, snapshot_path,
-    snapshot_released_state_db, storage_io, sync_parent, validate_source_path,
+    snapshot_released_surrealkv, storage_io, sync_parent, validate_source_path,
 };
 #[cfg(not(unix))]
 use fs_support::{preflight_legacy_audit_sources, retire_legacy_audit_dir};
@@ -691,7 +691,7 @@ fn preflight_sources(
     let mut sources = BTreeMap::new();
     sources.insert(
         "system:state-db".to_owned(),
-        snapshot_released_state_db(&home.state_db_path())?,
+        snapshot_released_surrealkv(&home.state_db_path())?,
     );
     add_source(&mut sources, "system:cow".to_owned(), home.cow_dir())?;
     add_source(
@@ -765,11 +765,10 @@ fn preflight_sources(
                 present: distro_init.present,
             },
         );
-        add_source(
-            &mut sources,
+        sources.insert(
             format!("principal:{uid}:audit"),
-            home.principal_home(alias).audit_dir(),
-        )?;
+            snapshot_released_surrealkv(&home.principal_home(alias).audit_dir())?,
+        );
         add_source(
             &mut sources,
             format!("principal:{uid}:logs"),

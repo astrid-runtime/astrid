@@ -510,14 +510,14 @@ fn released_state_db_accepts_historical_read_only_modes() {
         snapshot_path(&state_db).is_err(),
         "ordinary component sources retain the owner-only contract"
     );
-    let snapshot = snapshot_released_state_db(&state_db)
+    let snapshot = snapshot_released_surrealkv(&state_db)
         .expect("released read-only permissions are migration-compatible");
     assert!(snapshot.present);
     assert_eq!(snapshot.entries, 2);
 
     fs::set_permissions(&segment, fs::Permissions::from_mode(0o666))
         .expect("make legacy segment writable");
-    let error = snapshot_released_state_db(&state_db)
+    let error = snapshot_released_surrealkv(&state_db)
         .expect_err("externally writable database bytes must fail closed");
     assert!(error.to_string().contains("group/world writable"));
 }

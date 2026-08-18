@@ -533,7 +533,7 @@ pub(super) fn snapshot_path(path: &Path) -> io::Result<SourceIdentity> {
 /// `0755` directories and `0644` files. They remain admissible only when the
 /// current user owns every entry, nobody else can modify it, and no extended
 /// ACL, redirect, mount, device boundary, or special entry is present.
-pub(super) fn snapshot_released_state_db(path: &Path) -> io::Result<SourceIdentity> {
+pub(super) fn snapshot_released_surrealkv(path: &Path) -> io::Result<SourceIdentity> {
     snapshot_path_with_access(path, SourceAccess::ReleasedDatabase)
 }
 
