@@ -59,6 +59,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 . "$SCRIPT_DIR/runtime-json-asserts.sh"
+. "$SCRIPT_DIR/runtime-storage-asserts.sh"
 . "$SCRIPT_DIR/runtime-gateway-smoke.sh"
 . "$SCRIPT_DIR/runtime-cli-smoke.sh"
 . "$SCRIPT_DIR/runtime-multi-home-smoke.sh"
