@@ -1,11 +1,15 @@
 //! No-follow inventory and retirement primitives for the layout barrier.
 
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+#[cfg(unix)]
+use std::fs::File;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Read};
 use std::path::Path;
 use std::path::PathBuf;
 
+#[cfg(not(unix))]
+use super::{AstridHome, PrincipalId};
 use super::{MAX_BYTES, MAX_ENTRIES, SourceIdentity};
 
 pub(super) fn add_source(
@@ -276,6 +280,230 @@ pub(super) fn retire_tree(
                     ),
                 ));
             }
+            fs::remove_file(&child).map_err(io::Error::other)?;
+        }
+    }
+    sync_directory(path)?;
+    fs::remove_dir(path).map_err(io::Error::other)
+}
+
+/// Validate the released audit-source boundary on every native host.  Unix
+/// adds device and mount checks; all hosts retain no-follow, regular-entry,
+/// and default-principal-only checks before the audit importer opens a source.
+#[cfg(not(unix))]
+pub(super) fn preflight_legacy_audit_sources(
+    home: &AstridHome,
+    default_source: &Path,
+) -> io::Result<bool> {
+    let root = home.home_dir();
+    let metadata = match fs::symlink_metadata(&root) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "legacy principal-home root is not a directory: {}",
+                    root.display()
+                ),
+            ));
+        },
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let root_device = device_id(&metadata);
+    let mut default_source_present = false;
+    astrid_core::platform_fs::verify_no_redirects(&root)?;
+    for entry in fs::read_dir(&root).map_err(io::Error::other)? {
+        let principal_root = entry.map_err(io::Error::other)?.path();
+        let principal_metadata = fs::symlink_metadata(&principal_root).map_err(io::Error::other)?;
+        if principal_metadata.file_type().is_symlink() || !principal_metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "legacy principal-home entry is not a regular directory: {}",
+                    principal_root.display()
+                ),
+            ));
+        }
+        if device_id(&principal_metadata) != root_device {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "legacy principal-home entry crosses a filesystem boundary: {}",
+                    principal_root.display()
+                ),
+            ));
+        }
+        astrid_core::platform_fs::verify_no_redirects(&principal_root)?;
+        let local_root = principal_root.join(".local");
+        match fs::symlink_metadata(&local_root) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "legacy principal .local path is not a directory: {}",
+                        local_root.display()
+                    ),
+                ));
+            },
+            Ok(_) => astrid_core::platform_fs::verify_no_redirects(&local_root)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        }
+        let audit_source = local_root.join("audit");
+        let audit_metadata = match fs::symlink_metadata(&audit_source) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if audit_source == default_source {
+            default_source_present = true;
+            validate_audit_tree(&audit_source, device_id(&audit_metadata))?;
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "unsupported legacy audit source {}; only the default principal source is admitted",
+                    audit_source.display()
+                ),
+            ));
+        }
+    }
+    Ok(default_source_present)
+}
+
+/// Retire the imported default audit tree through a private staging rename.
+/// The rename makes interrupted deletion resumable, while every pre/post
+/// traversal revalidates no-follow, regular-entry, device, and mount bounds.
+#[cfg(not(unix))]
+pub(super) fn retire_legacy_audit_dir(home: &AstridHome, source: &Path) -> io::Result<()> {
+    let retired = home.migrations_dir().join("audit-principal-home.retired");
+    let expected = home.principal_home(&PrincipalId::default()).audit_dir();
+    if source != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "legacy audit retirement source is outside the default principal audit path",
+        ));
+    }
+    astrid_core::platform_fs::verify_no_redirects(source.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "legacy audit source has no parent",
+        )
+    })?)?;
+    astrid_core::platform_fs::ensure_private_directory(&home.migrations_dir())?;
+    astrid_core::platform_fs::verify_no_redirects(&home.migrations_dir())?;
+    match fs::symlink_metadata(source) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "legacy audit source is not a regular directory: {}",
+                    source.display()
+                ),
+            ));
+        },
+        Ok(_) => {
+            if fs::symlink_metadata(&retired).is_ok() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "legacy audit retirement is ambiguous: {}",
+                        retired.display()
+                    ),
+                ));
+            }
+            let root_device = device_id(&fs::symlink_metadata(source)?);
+            validate_audit_tree(source, root_device)?;
+            astrid_core::platform_fs::rename_with_write_through(source, &retired)?;
+            sync_directory(source.parent().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "legacy audit source has no parent",
+                )
+            })?)?;
+            sync_directory(&home.migrations_dir())?;
+            validate_audit_tree(&retired, root_device)?;
+            delete_audit_tree(&retired, root_device)?;
+            sync_directory(&home.migrations_dir())?;
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if fs::symlink_metadata(&retired).is_ok() {
+                let root_device = device_id(&fs::symlink_metadata(&retired)?);
+                validate_audit_tree(&retired, root_device)?;
+                delete_audit_tree(&retired, root_device)?;
+                sync_directory(&home.migrations_dir())?;
+            }
+        },
+        Err(error) => return Err(error),
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_audit_tree(path: &Path, root_device: u64) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "legacy audit tree is redirected or not a directory: {}",
+                path.display()
+            ),
+        ));
+    }
+    if device_id(&metadata) != root_device || active_mountpoint(path)? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "legacy audit tree crosses a filesystem or mount boundary: {}",
+                path.display()
+            ),
+        ));
+    }
+    astrid_core::platform_fs::verify_no_redirects(path)?;
+    for entry in fs::read_dir(path).map_err(io::Error::other)? {
+        let child = entry.map_err(io::Error::other)?.path();
+        let child_metadata = fs::symlink_metadata(&child).map_err(io::Error::other)?;
+        if child_metadata.file_type().is_symlink()
+            || device_id(&child_metadata) != root_device
+            || active_mountpoint(&child)?
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "legacy audit tree contains a redirect or boundary: {}",
+                    child.display()
+                ),
+            ));
+        }
+        if child_metadata.is_dir() {
+            validate_audit_tree(&child, root_device)?;
+        } else if child_metadata.is_file() {
+            astrid_core::platform_fs::verify_no_redirects(&child)?;
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "legacy audit tree contains a special file: {}",
+                    child.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn delete_audit_tree(path: &Path, root_device: u64) -> io::Result<()> {
+    validate_audit_tree(path, root_device)?;
+    for entry in fs::read_dir(path).map_err(io::Error::other)? {
+        let child = entry.map_err(io::Error::other)?.path();
+        let metadata = fs::symlink_metadata(&child).map_err(io::Error::other)?;
+        if metadata.is_dir() {
+            delete_audit_tree(&child, root_device)?;
+        } else {
+            astrid_core::platform_fs::verify_no_redirects(&child)?;
             fs::remove_file(&child).map_err(io::Error::other)?;
         }
     }
@@ -594,6 +822,8 @@ pub(super) fn sync_directory(path: &Path) -> io::Result<()> {
     {
         File::open(path)?.sync_all()?;
     }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 

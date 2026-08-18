@@ -212,6 +212,32 @@ fn build_secret_store_returns_arc() {
     let kv = ScopedKvStore::new(store, "plugin:test").unwrap();
     let secret_store = build_secret_store("test", kv, rt.handle().clone());
     assert!(!secret_store.exists("nonexistent").unwrap());
+    let debug = format!("{secret_store:?}");
+    assert!(debug.contains("KvSecretStore"));
+    assert!(!debug.contains("FallbackSecretStore"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn kv_secret_store_works_inside_tokio_runtime() {
+    let backing = Arc::new(MemoryKvStore::new());
+    let kv = ScopedKvStore::new(backing, "plugin:nested-runtime").unwrap();
+    let store = build_secret_store("nested-runtime", kv, tokio::runtime::Handle::current());
+
+    store.set("api_key", "nested-value").unwrap();
+    assert!(store.exists("api_key").unwrap());
+    assert_eq!(
+        store.get("api_key").unwrap().as_deref(),
+        Some("nested-value")
+    );
+    assert!(store.delete("api_key").unwrap());
+    assert!(!store.exists("api_key").unwrap());
+}
+
+#[cfg(feature = "keychain")]
+#[test]
+fn keychain_builder_is_explicit_compile_time_api() {
+    const _: fn(&str, ScopedKvStore, tokio::runtime::Handle) -> Arc<dyn SecretStore> =
+        super::build_keychain_secret_store;
 }
 
 // -----------------------------------------------------------------------

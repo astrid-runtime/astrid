@@ -12,6 +12,7 @@ readonly CAPSULE_BUILD_TARGET="wasm32-unknown-unknown"
 REPOSITORY_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly REPOSITORY_ROOT
 readonly CURRENT_BIN_DIR="${ASTRID_CURRENT_BIN_DIR:-${REPOSITORY_ROOT}/target/debug}"
+readonly CAPSULE_SOURCE="${REPOSITORY_ROOT}/e2e/fixtures/astrid-capsule-adversarial"
 TEST_ROOT="$(mktemp -d "${RUNNER_TEMP:-/tmp}/astrid-v0104-linux-upgrade.XXXXXX")"
 readonly TEST_ROOT
 readonly RELEASE_ROOT="${TEST_ROOT}/release"
@@ -51,14 +52,32 @@ fail() {
 }
 
 ensure_capsule_build_target() {
+  local active_toolchain target_libdir toolchain
   command -v rustup >/dev/null 2>&1 \
     || fail "rustup is required to install ${CAPSULE_BUILD_TARGET}"
-  if ! rustup target list --installed | grep -Fqx -- "${CAPSULE_BUILD_TARGET}"; then
-    rustup target add "${CAPSULE_BUILD_TARGET}" \
-      || fail "could not install Rust target ${CAPSULE_BUILD_TARGET}"
+
+  # The published astrid-build runs Cargo with the capsule source as its
+  # current directory. Resolve the toolchain from that exact directory rather
+  # than mutating rustup's default toolchain, which can be different in CI.
+  active_toolchain="$(cd -- "${CAPSULE_SOURCE}" && rustup show active-toolchain)" \
+    || fail "could not resolve the Rust toolchain used by the capsule fixture"
+  read -r toolchain _ <<<"${active_toolchain}"
+  [[ -n "${toolchain}" ]] \
+    || fail "rustup returned no active toolchain for the capsule fixture"
+
+  if ! rustup target list --toolchain "${toolchain}" --installed \
+    | grep -Fqx -- "${CAPSULE_BUILD_TARGET}"; then
+    rustup target add --toolchain "${toolchain}" "${CAPSULE_BUILD_TARGET}" \
+      || fail "could not install Rust target ${CAPSULE_BUILD_TARGET} for ${toolchain}"
   fi
-  rustup target list --installed | grep -Fqx -- "${CAPSULE_BUILD_TARGET}" \
-    || fail "Rust target ${CAPSULE_BUILD_TARGET} is unavailable after installation"
+  rustup target list --toolchain "${toolchain}" --installed \
+    | grep -Fqx -- "${CAPSULE_BUILD_TARGET}" \
+    || fail "Rust target ${CAPSULE_BUILD_TARGET} is unavailable for ${toolchain} after installation"
+  target_libdir="$(rustup run "${toolchain}" rustc \
+    --print target-libdir --target "${CAPSULE_BUILD_TARGET}")" \
+    || fail "could not resolve ${CAPSULE_BUILD_TARGET} libraries for ${toolchain}"
+  compgen -G "${target_libdir}/libcore-*.rlib" >/dev/null \
+    || fail "Rust core library for ${CAPSULE_BUILD_TARGET} is missing from ${toolchain}"
 }
 
 run_old() {
@@ -222,7 +241,7 @@ compgen -G "${ASTRID_HOME}/var/state.db/wal/*.wal" >/dev/null \
 ensure_capsule_build_target
 if ! run_old_bounded 180s capsule install --yes \
   --var adversarial_lifecycle_probe=runtime-lifecycle-ok \
-  "${REPOSITORY_ROOT}/e2e/fixtures/astrid-capsule-adversarial" \
+  "${CAPSULE_SOURCE}" \
   >"${TEST_ROOT}/v0104-capsule-install.log" 2>&1; then
   cat "${TEST_ROOT}/v0104-capsule-install.log" >&2
   fail "published v0.10.4 CLI could not create the capsule migration fixture"

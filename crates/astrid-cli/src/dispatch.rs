@@ -205,7 +205,6 @@ async fn dispatch_subcommand(
         Some(Commands::Config { command }) => dispatch_config(command),
         Some(Commands::Session { command }) => dispatch_session(command),
         Some(Commands::Start) => {
-            bootstrap::ensure_global_config().await?;
             commands::daemon::handle_start().await?;
             Ok(ExitCode::SUCCESS)
         },

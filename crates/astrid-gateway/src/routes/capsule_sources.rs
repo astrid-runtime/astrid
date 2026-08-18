@@ -65,18 +65,7 @@ fn installed_content_hash(capsule_id: &str, dir: &Path) -> Option<String> {
 #[cfg(test)]
 fn read_meta_wasm_hash(dir: &Path) -> Option<String> {
     let meta_path = dir.join("meta.json");
-    let data = match std::fs::read_to_string(&meta_path) {
-        Ok(data) => data,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(e) => {
-            tracing::warn!(
-                path = %meta_path.display(),
-                error = %e,
-                "failed to read meta.json for capsule source-id derivation"
-            );
-            return None;
-        },
-    };
+    let data = read_regular_file(&meta_path, "meta.json")?;
     match serde_json::from_str::<serde_json::Value>(&data) {
         Ok(meta) => meta
             .get("wasm_hash")
@@ -120,18 +109,7 @@ struct CapsuleManifestPackage {
 #[cfg(test)]
 fn read_manifest_package(dir: &Path) -> Option<CapsuleManifestPackage> {
     let manifest_path = dir.join("Capsule.toml");
-    let data = match std::fs::read_to_string(&manifest_path) {
-        Ok(data) => data,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(e) => {
-            tracing::warn!(
-                path = %manifest_path.display(),
-                error = %e,
-                "failed to read Capsule.toml for capsule source-id derivation"
-            );
-            return None;
-        },
-    };
+    let data = read_regular_file(&manifest_path, "Capsule.toml")?;
     match toml::from_str::<CapsuleManifestPackageOnly>(&data) {
         Ok(manifest) => Some(manifest.package),
         Err(e) => {
@@ -139,6 +117,52 @@ fn read_manifest_package(dir: &Path) -> Option<CapsuleManifestPackage> {
                 path = %manifest_path.display(),
                 error = %e,
                 "failed to parse Capsule.toml for capsule source-id derivation"
+            );
+            None
+        },
+    }
+}
+
+/// Test-only source discovery must retain the production workspace boundary:
+/// metadata and manifests are trusted only when they are regular, non-
+/// redirected files.  `read_to_string` alone follows a symlink, so make the
+/// no-follow check explicit before parsing either identity source.
+#[cfg(test)]
+fn read_regular_file(path: &Path, label: &str) -> Option<String> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "failed to inspect {label} for capsule source-id derivation"
+            );
+            return None;
+        },
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        tracing::warn!(
+            path = %path.display(),
+            "refusing redirected or non-regular {label} for capsule source-id derivation"
+        );
+        return None;
+    }
+    if let Err(error) = astrid_core::platform_fs::verify_no_redirects(path) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %error,
+            "refusing redirected {label} for capsule source-id derivation"
+        );
+        return None;
+    }
+    match std::fs::read_to_string(path) {
+        Ok(data) => Some(data),
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "failed to read {label} for capsule source-id derivation"
             );
             None
         },

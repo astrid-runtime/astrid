@@ -532,6 +532,8 @@ fn sync_parent(path: &Path) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         File::open(parent)?.sync_all()?;
     }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 

@@ -307,48 +307,77 @@ fn should_emit_to_daemon_log(wrote_to_file: bool, level: LogLevel) -> bool {
     !wrote_to_file || matches!(level, LogLevel::Error)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod retirement_secret_tests {
-    use std::io::Write;
+    use std::fmt;
     use std::sync::Arc;
+    use std::sync::mpsc::{Receiver, Sender};
 
     use super::*;
     use crate::engine::wasm::PrincipalInvocationTracker;
     use crate::engine::wasm::test_fixtures::minimal_host_state;
+    use astrid_storage::secret::{SecretStore, SecretStoreError};
+
+    /// Synchronous secret backend used to hold one admitted host read at the
+    /// authority boundary. This deliberately models the SecretStore contract
+    /// rather than the retired native FIFO fallback.
+    struct BlockingSecretStore {
+        entered: Sender<()>,
+        release: std::sync::Mutex<Receiver<()>>,
+    }
+
+    impl fmt::Debug for BlockingSecretStore {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("BlockingSecretStore")
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl SecretStore for BlockingSecretStore {
+        fn set(&self, _key: &str, _value: &str) -> Result<(), SecretStoreError> {
+            Err(SecretStoreError::Internal(
+                "test backend is read-only".into(),
+            ))
+        }
+
+        fn exists(&self, _key: &str) -> Result<bool, SecretStoreError> {
+            Ok(true)
+        }
+
+        fn get(&self, _key: &str) -> Result<Option<String>, SecretStoreError> {
+            self.entered.send(()).expect("reader observer is alive");
+            self.release
+                .lock()
+                .expect("release lock")
+                .recv()
+                .expect("reader release");
+            Ok(Some("secret-value".to_owned()))
+        }
+
+        fn delete(&self, _key: &str) -> Result<bool, SecretStoreError> {
+            Ok(false)
+        }
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn retirement_waits_for_inflight_secret_config_read_and_rejects_late_read() {
-        let temp = tempfile::tempdir().unwrap();
         let principal = astrid_core::PrincipalId::new("secret-reader").unwrap();
-        let secret_dir = temp.path().join(principal.as_str()).join("test");
-        std::fs::create_dir_all(&secret_dir).unwrap();
-        let fifo = secret_dir.join("API_KEY");
-        assert!(
-            std::process::Command::new("mkfifo")
-                .arg(&fifo)
-                .status()
-                .unwrap()
-                .success()
-        );
 
         let tracker = Arc::new(PrincipalInvocationTracker::default());
         let mut state = minimal_host_state(tokio::runtime::Handle::current());
         state.principal = principal.clone();
         state.principal_invocations = Some(Arc::clone(&tracker));
-        state.file_secret_root = Some(temp.path().to_path_buf());
         state.secret_env.insert("API_KEY".to_string());
 
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        state.secret_store = Arc::new(BlockingSecretStore {
+            entered: entered_tx,
+            release: std::sync::Mutex::new(release_rx),
+        });
         let reader = std::thread::spawn(move || {
             let result = sys::Host::get_config(&mut state, "API_KEY".to_string());
             (state, result)
-        });
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let writer = std::thread::spawn(move || {
-            let mut file = std::fs::OpenOptions::new().write(true).open(fifo).unwrap();
-            entered_tx.send(()).unwrap();
-            release_rx.recv().unwrap();
-            file.write_all(b"secret-value").unwrap();
         });
         entered_rx.recv().unwrap();
 
@@ -365,7 +394,6 @@ mod retirement_secret_tests {
         );
 
         release_tx.send(()).unwrap();
-        writer.join().unwrap();
         let (mut state, result) = reader.join().unwrap();
         assert_eq!(result.unwrap().as_deref(), Some("secret-value"));
         draining.await.unwrap();

@@ -30,16 +30,18 @@ fn log_hint() -> String {
         .unwrap_or_default()
 }
 
-/// Open the daemon boot log (`log/daemon-boot.log`) for append, creating the
-/// log directory if needed, so the spawned daemon's stderr is captured.
+/// Open the daemon boot log (`log/daemon-boot.log`) for append in an already
+/// initialized Astrid home, so the spawned daemon's stderr is captured.
 ///
 /// A lock-acquisition failure (or any panic) before the kernel's own tracing
 /// subscriber initializes prints to stderr and is otherwise lost when stderr
-/// is `Stdio::null()`. Capturing it here is the only record of why a daemon
-/// died on boot. Returns `None` on any IO error, in which case the caller
-/// falls back to `Stdio::null()` rather than failing the spawn.
-fn boot_log_stderr() -> Option<std::process::Stdio> {
-    let home = astrid_core::dirs::AstridHome::resolve().ok()?;
+/// is detached. A fresh home must remain untouched until the kernel captures
+/// its layout origin and durably admits it, so callers inherit stderr when no
+/// layout sentinel exists instead of creating `log/` prematurely.
+fn boot_log_stderr_for_home(home: &astrid_core::dirs::AstridHome) -> Option<std::process::Stdio> {
+    if !matches!(home.layout_version(), Ok(Some(_))) {
+        return None;
+    }
     let log_dir = home.log_dir();
     std::fs::create_dir_all(&log_dir).ok()?;
     let path = log_dir.join("daemon-boot.log");
@@ -54,6 +56,13 @@ fn boot_log_stderr() -> Option<std::process::Stdio> {
     }
     let file = opts.open(path).ok()?;
     Some(std::process::Stdio::from(file))
+}
+
+fn boot_log_stderr() -> std::process::Stdio {
+    astrid_core::dirs::AstridHome::resolve()
+        .ok()
+        .and_then(|home| boot_log_stderr_for_home(&home))
+        .unwrap_or_else(std::process::Stdio::inherit)
 }
 
 /// Spawn the daemon process and wait for it to signal readiness.
@@ -89,8 +98,9 @@ async fn spawn_daemon_inner(
     // Capture the daemon's stderr to an append log so a boot failure (lock
     // contention, panic before tracing init) leaves a record instead of
     // vanishing into /dev/null. Stdout stays null — the daemon logs through
-    // tracing, not stdout. Fall back to null if the log file can't be opened.
-    let stderr = boot_log_stderr().unwrap_or_else(std::process::Stdio::null);
+    // tracing, not stdout. A fresh home inherits stderr so opening the boot log
+    // cannot preempt the kernel's durable fresh-layout admission.
+    let stderr = boot_log_stderr();
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(stderr);
@@ -261,8 +271,9 @@ pub(crate) async fn spawn_persistent_daemon() -> Result<()> {
     // Capture the daemon's stderr to an append log so a boot failure (lock
     // contention, panic before tracing init) leaves a record instead of
     // vanishing into /dev/null. Stdout stays null — the daemon logs through
-    // tracing, not stdout. Fall back to null if the log file can't be opened.
-    let stderr = boot_log_stderr().unwrap_or_else(std::process::Stdio::null);
+    // tracing, not stdout. A fresh home inherits stderr so opening the boot log
+    // cannot preempt the kernel's durable fresh-layout admission.
+    let stderr = boot_log_stderr();
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(stderr);
@@ -680,6 +691,19 @@ pub(crate) fn format_uptime(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fresh_home_boot_log_does_not_preinitialize_layout() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().join("astrid-home");
+        let home = astrid_core::dirs::AstridHome::from_path(&root);
+
+        assert!(boot_log_stderr_for_home(&home).is_none());
+        assert!(
+            !root.exists(),
+            "boot-log capture must not create content before kernel admission"
+        );
+    }
 
     #[test]
     fn daemon_ready_attempts_match_timeout_window() {

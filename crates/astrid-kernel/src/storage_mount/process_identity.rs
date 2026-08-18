@@ -1,6 +1,12 @@
 //! Parent-process creation identity used to bind provider lifetime to the
 //! exact kernel process instance rather than a reusable PID.
 
+// Windows has no safe standard-library API for querying another process's
+// creation time. The narrowly-scoped implementation below uses the Win32
+// handles only to read that immutable identity and closes every handle before
+// returning; the rest of the kernel remains `#![deny(unsafe_code)]`.
+#![cfg_attr(windows, allow(unsafe_code))]
+
 #[cfg(target_os = "linux")]
 pub(super) fn parent_start_identity(pid: u32) -> Option<String> {
     let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;

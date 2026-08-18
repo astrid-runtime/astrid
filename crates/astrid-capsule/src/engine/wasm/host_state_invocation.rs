@@ -413,33 +413,38 @@ mod recv_vfs_tests {
 
     #[tokio::test]
     async fn recv_vfs_switches_principals_and_clears_without_one() {
-        use astrid_core::PrincipalUid;
         use astrid_storage::{
-            KvQuotaResolver, StateOwner, open_runtime_principal_store_with_directory,
+            IdentityStore, KvIdentityStore, KvQuotaResolver, ScopedKvStore, StateOwner,
+            open_runtime_principal_store,
         };
 
         let root = tempfile::tempdir().expect("runtime store");
         let astrid_home = astrid_core::dirs::AstridHome::from_path(root.path());
         astrid_home.ensure().expect("runtime layout");
-        let directory = astrid_storage::PrincipalDirectory::default();
         let alice = astrid_core::PrincipalId::new("alice").expect("alice");
         let bob = astrid_core::PrincipalId::new("bob").expect("bob");
-        directory
-            .register(alice.clone(), PrincipalUid::from_bytes([0xA1; 32]))
-            .expect("Alice identity");
-        directory
-            .register(bob.clone(), PrincipalUid::from_bytes([0xB2; 32]))
-            .expect("Bob identity");
         let quota: Arc<dyn KvQuotaResolver<StateOwner>> = Arc::new(|owner: &StateOwner| {
             Ok(match owner {
                 StateOwner::System => None,
                 StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(u64::MAX),
             })
         });
-        let store =
-            open_runtime_principal_store_with_directory(&astrid_home, quota, directory.clone())
-                .await
-                .expect("runtime store");
+        let store = open_runtime_principal_store(&astrid_home, quota)
+            .await
+            .expect("runtime store");
+        let directory = store.principal_directory();
+        let identities = KvIdentityStore::with_principal_directory(
+            ScopedKvStore::new(store.kv(), "system:identity").expect("identity scope"),
+            directory.clone(),
+        );
+        identities
+            .create_principal(alice.clone(), [0xA1; 32])
+            .await
+            .expect("Alice identity");
+        identities
+            .create_principal(bob.clone(), [0xB2; 32])
+            .await
+            .expect("Bob identity");
 
         let mut state = crate::engine::wasm::test_fixtures::minimal_host_state(
             tokio::runtime::Handle::current(),

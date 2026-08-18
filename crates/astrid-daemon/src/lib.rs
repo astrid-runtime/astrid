@@ -112,18 +112,24 @@ fn daemon_log_config(
 }
 
 #[cfg(unix)]
-fn init_logging(
-    verbose: bool,
-    unified_cfg: Option<&astrid_config::Config>,
-    astrid_home: &astrid_core::dirs::AstridHome,
-    target_override: Option<&std::ffi::OsStr>,
-) -> Result<()> {
-    let log_config = daemon_log_config(verbose, unified_cfg, astrid_home, target_override)?;
-
-    if let Err(e) = astrid_telemetry::setup_logging(&log_config) {
+fn init_logging(log_config: &astrid_telemetry::LogConfig) {
+    if let Err(e) = astrid_telemetry::setup_logging(log_config) {
         eprintln!("Failed to initialize logging: {e}");
     }
-    Ok(())
+}
+
+#[cfg(unix)]
+fn defer_file_logging_until_kernel_admission(
+    astrid_home: &astrid_core::dirs::AstridHome,
+    log_config: &astrid_telemetry::LogConfig,
+) -> Result<bool> {
+    Ok(
+        matches!(log_config.target, astrid_telemetry::LogTarget::File(_))
+            && astrid_home
+                .layout_version()
+                .context("failed to inspect Astrid home layout before logging")?
+                .is_none(),
+    )
 }
 
 /// Resolve the capsule host-call concurrency ceilings from CLI flags, the
@@ -224,12 +230,16 @@ pub async fn run() -> Result<()> {
     .map(|r| r.config);
 
     let daemon_log_target = std::env::var_os(DAEMON_LOG_TARGET_ENV);
-    init_logging(
+    let log_config = daemon_log_config(
         args.verbose,
         unified_cfg.as_ref(),
         &astrid_home,
         daemon_log_target.as_deref(),
     )?;
+    let defer_logging = defer_file_logging_until_kernel_admission(&astrid_home, &log_config)?;
+    if !defer_logging {
+        init_logging(&log_config);
+    }
 
     let session_id = astrid_core::SessionId::from_uuid(
         uuid::Uuid::parse_str(&args.session)
@@ -262,6 +272,9 @@ pub async fn run() -> Result<()> {
     )
     .await
     .map_err(|e| anyhow::anyhow!("Failed to boot Kernel: {e}"))?;
+    if defer_logging {
+        init_logging(&log_config);
+    }
     kernel
         .set_system_capsules(
             unified_cfg
@@ -539,7 +552,10 @@ fn spawn_gateway(
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{DAEMON_LOG_TARGET_ENV, daemon_log_config, write_readiness_then_arm_ephemeral};
+    use super::{
+        DAEMON_LOG_TARGET_ENV, daemon_log_config, defer_file_logging_until_kernel_admission,
+        write_readiness_then_arm_ephemeral,
+    };
     use std::sync::Mutex;
 
     #[test]
@@ -593,6 +609,37 @@ mod tests {
                 "{DAEMON_LOG_TARGET_ENV} must be exactly 'file' or 'stderr'"
             )),
             "unexpected target error: {error}"
+        );
+    }
+
+    #[test]
+    fn fresh_home_defers_file_logging_until_kernel_admission() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "astrid-daemon-fresh-home-{}-{unique}",
+            std::process::id()
+        ));
+        assert!(!root.exists(), "test path must start absent");
+        let home = astrid_core::dirs::AstridHome::from_path(&root);
+        let file_config = daemon_log_config(false, None, &home, None).expect("file config");
+        let stderr_config =
+            daemon_log_config(false, None, &home, Some(std::ffi::OsStr::new("stderr")))
+                .expect("stderr config");
+
+        assert!(
+            defer_file_logging_until_kernel_admission(&home, &file_config)
+                .expect("fresh layout inspection")
+        );
+        assert!(
+            !defer_file_logging_until_kernel_admission(&home, &stderr_config)
+                .expect("fresh layout inspection")
+        );
+        assert!(
+            !root.exists(),
+            "logging selection must not create content before kernel admission"
         );
     }
 

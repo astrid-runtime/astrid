@@ -6,6 +6,7 @@
 //! up only if no other installed capsule references the same hash.
 
 use std::collections::HashSet;
+use std::path::Path;
 
 use anyhow::{Context, bail};
 use astrid_core::PrincipalId;
@@ -52,11 +53,33 @@ fn remove_capsule_from_home_for(
     force: bool,
     purge: bool,
 ) -> anyhow::Result<()> {
-    let target_dir = astrid_capsule_install::resolve_target_dir_for_with_layout(
+    let workspace_root = workspace.then(std::env::current_dir).transpose()?;
+    remove_capsule_from_home_for_in_workspace(
         home,
         principal,
         name,
         workspace,
+        workspace_root.as_deref(),
+        force,
+        purge,
+    )
+}
+
+fn remove_capsule_from_home_for_in_workspace(
+    home: &AstridHome,
+    principal: &PrincipalId,
+    name: &str,
+    workspace: bool,
+    workspace_root: Option<&Path>,
+    force: bool,
+    purge: bool,
+) -> anyhow::Result<()> {
+    let target_dir = astrid_capsule_install::paths::resolve_target_dir_for_in_workspace(
+        home,
+        principal,
+        name,
+        workspace,
+        workspace_root,
         crate::workspace_layout::current(),
     )?;
 
@@ -130,11 +153,31 @@ fn validate_capsule_removal_from_home_for(
     workspace: bool,
     force: bool,
 ) -> anyhow::Result<()> {
-    let target_dir = astrid_capsule_install::resolve_target_dir_for_with_layout(
+    let workspace_root = workspace.then(std::env::current_dir).transpose()?;
+    validate_capsule_removal_from_home_for_in_workspace(
         home,
         principal,
         name,
         workspace,
+        workspace_root.as_deref(),
+        force,
+    )
+}
+
+fn validate_capsule_removal_from_home_for_in_workspace(
+    home: &AstridHome,
+    principal: &PrincipalId,
+    name: &str,
+    workspace: bool,
+    workspace_root: Option<&Path>,
+    force: bool,
+) -> anyhow::Result<()> {
+    let target_dir = astrid_capsule_install::paths::resolve_target_dir_for_in_workspace(
+        home,
+        principal,
+        name,
+        workspace,
+        workspace_root,
         crate::workspace_layout::current(),
     )?;
 
@@ -145,11 +188,13 @@ fn validate_capsule_removal_from_home_for(
     let target_meta = super::meta::read_meta(&target_dir);
 
     // Scan once, reuse for both dependency check and binary cleanup
-    let all_capsules = super::meta::scan_installed_capsules_in_home_for_with_layout(
-        home,
-        principal,
-        crate::workspace_layout::current(),
-    )?;
+    let all_capsules =
+        astrid_capsule_install::meta::scan_installed_capsules_in_home_for_in_workspace(
+            home,
+            principal,
+            workspace_root,
+            crate::workspace_layout::current(),
+        )?;
 
     // Dependency safety check (skip with --force)
     if !force && let Some(block) = check_removal_safety(name, target_meta.as_ref(), &all_capsules) {
@@ -388,29 +433,38 @@ mod tests {
     fn remove_capsule_cleans_directory() {
         let home_dir = tempfile::tempdir().unwrap();
         let home = AstridHome::from_path(home_dir.path());
+        let workspace_root = tempfile::tempdir().unwrap();
+        let principal = astrid_capsule_install::paths::install_principal();
 
-        // Install a minimal capsule
-        let capsule_dir = tempfile::tempdir().unwrap();
+        // Workspace removal is intentionally a filesystem operation. Durable
+        // non-workspace removal is daemon-owned and covered by typed request
+        // tests, so this fixture must use an explicit workspace root.
+        let target = astrid_capsule_install::paths::resolve_target_dir_for_in_workspace(
+            &home,
+            &principal,
+            "remove-test",
+            true,
+            Some(workspace_root.path()),
+            crate::workspace_layout::current(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(&target).unwrap();
         std::fs::write(
-            capsule_dir.path().join("Capsule.toml"),
+            target.join("Capsule.toml"),
             "[package]\nname = \"remove-test\"\nversion = \"1.0.0\"\n",
         )
         .unwrap();
 
-        super::super::install::install_from_local_path(
-            capsule_dir.path(),
-            false,
+        remove_capsule_from_home_for_in_workspace(
             &home,
-            None,
+            &principal,
+            "remove-test",
             true,
+            Some(workspace_root.path()),
+            false,
+            false,
         )
-        .expect("install should succeed");
-
-        let target =
-            astrid_capsule_install::resolve_target_dir(&home, "remove-test", false).unwrap();
-        assert!(target.exists());
-
-        remove_capsule_from_home(&home, "remove-test", false, true, false).unwrap();
+        .unwrap();
         assert!(!target.exists());
         assert!(
             astrid_capsule_install::read_installed_authority(&home, &target)
@@ -423,35 +477,90 @@ mod tests {
     fn remove_capsule_from_home_for_targets_principal_install() {
         let home_dir = tempfile::tempdir().unwrap();
         let home = AstridHome::from_path(home_dir.path());
+        let workspace_root = tempfile::tempdir().unwrap();
         let default = astrid_capsule_install::paths::install_principal();
         let user = PrincipalId::new("regular-user").unwrap();
-        let default_target =
-            astrid_capsule_install::resolve_target_dir_for(&home, &default, "shared", false)
-                .unwrap();
-        let user_target =
-            astrid_capsule_install::resolve_target_dir_for(&home, &user, "shared", false).unwrap();
+        let default_target = astrid_capsule_install::paths::resolve_target_dir_for_in_workspace(
+            &home,
+            &default,
+            "shared",
+            false,
+            None,
+            crate::workspace_layout::current(),
+        )
+        .unwrap();
+        let user_target = astrid_capsule_install::paths::resolve_target_dir_for_in_workspace(
+            &home,
+            &user,
+            "shared",
+            false,
+            None,
+            crate::workspace_layout::current(),
+        )
+        .unwrap();
+        let workspace_target = astrid_capsule_install::paths::resolve_target_dir_for_in_workspace(
+            &home,
+            &user,
+            "shared",
+            true,
+            Some(workspace_root.path()),
+            crate::workspace_layout::current(),
+        )
+        .unwrap();
 
         std::fs::create_dir_all(&default_target).unwrap();
         std::fs::create_dir_all(&user_target).unwrap();
+        std::fs::create_dir_all(&workspace_target).unwrap();
 
-        remove_capsule_from_home_for(&home, &user, "shared", false, true, false).unwrap();
+        remove_capsule_from_home_for_in_workspace(
+            &home,
+            &user,
+            "shared",
+            true,
+            Some(workspace_root.path()),
+            true,
+            false,
+        )
+        .unwrap();
         assert!(
             default_target.exists(),
-            "default install must not be removed by a principal-scoped remove"
+            "workspace removal must not remove the bootstrap principal install"
         );
-        assert!(!user_target.exists(), "principal install should be removed");
+        assert!(
+            user_target.exists(),
+            "workspace removal must not remove a principal install"
+        );
+        assert!(
+            !workspace_target.exists(),
+            "workspace install should be removed"
+        );
     }
 
     #[test]
     fn remove_capsule_does_not_repeat_dependency_validation() {
         let home_dir = tempfile::tempdir().unwrap();
         let home = AstridHome::from_path(home_dir.path());
-        let capsules_dir = home
-            .principal_home(&astrid_capsule_install::paths::install_principal())
-            .capsules_dir();
+        let workspace_root = tempfile::tempdir().unwrap();
+        let principal = astrid_capsule_install::paths::install_principal();
 
-        let target = capsules_dir.join("target");
-        let dependent = capsules_dir.join("dependent");
+        let target = astrid_capsule_install::paths::resolve_target_dir_for_in_workspace(
+            &home,
+            &principal,
+            "target",
+            true,
+            Some(workspace_root.path()),
+            crate::workspace_layout::current(),
+        )
+        .unwrap();
+        let dependent = astrid_capsule_install::paths::resolve_target_dir_for_in_workspace(
+            &home,
+            &principal,
+            "dependent",
+            true,
+            Some(workspace_root.path()),
+            crate::workspace_layout::current(),
+        )
+        .unwrap();
         std::fs::create_dir_all(&target).unwrap();
         std::fs::create_dir_all(&dependent).unwrap();
         write_meta(&target, &meta_ie(&[("astrid", "llm", "1.0.0")], &[], None)).unwrap();
@@ -461,8 +570,15 @@ mod tests {
         )
         .unwrap();
 
-        let validation_err = validate_capsule_removal_from_home(&home, "target", false, false)
-            .expect_err("fixture should make preflight validation fail");
+        let validation_err = validate_capsule_removal_from_home_for_in_workspace(
+            &home,
+            &principal,
+            "target",
+            true,
+            Some(workspace_root.path()),
+            false,
+        )
+        .expect_err("fixture should make preflight validation fail");
         assert!(
             validation_err
                 .to_string()
@@ -470,8 +586,16 @@ mod tests {
             "got: {validation_err}"
         );
 
-        remove_capsule_from_home(&home, "target", false, false, false)
-            .expect("delete path must trust the caller's single preflight validation");
+        remove_capsule_from_home_for_in_workspace(
+            &home,
+            &principal,
+            "target",
+            true,
+            Some(workspace_root.path()),
+            false,
+            false,
+        )
+        .expect("delete path must trust the caller's single preflight validation");
         assert!(!target.exists());
     }
 }

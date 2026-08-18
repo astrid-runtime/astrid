@@ -126,8 +126,8 @@ fn agent_group_allows_self_scoped_capsule_surface() {
     let caller = agent_principal();
 
     // Self-scoped: agent can inspect and mutate their own capsule surface and
-    // request a future caller-workspace install target. Daemon-wide lifecycle
-    // remains global because it mutates the loaded capsule set for every caller.
+    // request a caller-workspace install target. Daemon-wide lifecycle remains
+    // global because it mutates the loaded capsule set for every caller.
     for req in [
         KernelRequest::InstallCapsule {
             source: String::new(),
@@ -163,13 +163,13 @@ fn agent_group_allows_self_scoped_capsule_surface() {
             &KernelRequest::InstallCapsule {
                 source: String::new(),
                 workspace: false,
-                target_principal: None,
+                target_principal: Some(admin_principal()),
                 provenance: None,
                 env: Vec::new(),
             }
         )
         .is_err(),
-        "agent self:* must not authorize daemon install-target mutation",
+        "agent self:* must not authorize cross-principal install-target mutation",
     );
     let req = KernelRequest::ReloadCapsules;
     let method = kernel_request_method(&req);
@@ -290,7 +290,9 @@ fn custom_group_capabilities_gate_admin_surface() {
     };
     let caller = PrincipalId::new("ops_user").unwrap();
 
-    // Ops group gets daemon-wide capsule:install, so shared installs pass.
+    // Ops group gets daemon-wide capsule:install, so an explicitly
+    // cross-principal install passes. A missing target defaults to the caller
+    // and is therefore self-scoped, requiring self:capsule:install instead.
     authorize(
         &profile,
         &groups,
@@ -298,7 +300,7 @@ fn custom_group_capabilities_gate_admin_surface() {
         &KernelRequest::InstallCapsule {
             source: String::new(),
             workspace: false,
-            target_principal: None,
+            target_principal: Some(agent_principal()),
             provenance: None,
             env: Vec::new(),
         },
@@ -349,8 +351,8 @@ fn admin_vs_agent_cross_tenant_matrix() {
         authorize(&admin, &groups, &admin_principal(), &req).unwrap();
     }
 
-    // Agent self:* covers caller capsule inventory/lifecycle and future
-    // caller-workspace install; system:* and daemon-wide lifecycle stay denied.
+    // Agent self:* covers caller capsule inventory/lifecycle and caller-scoped
+    // installs; system:* and daemon-wide lifecycle stay denied.
     for req in all_requests() {
         let method = kernel_request_method(&req);
         let result = authorize(&agent, &groups, &agent_principal(), &req);
@@ -359,7 +361,9 @@ fn admin_vs_agent_cross_tenant_matrix() {
             | KernelRequest::GetStatus
             | KernelRequest::ReloadCapsules
             | KernelRequest::InstallCapsule {
-                workspace: false, ..
+                workspace: false,
+                target_principal: Some(_),
+                ..
             } => {
                 assert!(result.is_err(), "{method} should be denied for agent");
             },
@@ -368,6 +372,18 @@ fn admin_vs_agent_cross_tenant_matrix() {
             },
         }
     }
+
+    let cross_target_install = KernelRequest::InstallCapsule {
+        source: String::new(),
+        workspace: false,
+        target_principal: Some(admin_principal()),
+        provenance: None,
+        env: Vec::new(),
+    };
+    assert!(
+        authorize(&agent, &groups, &agent_principal(), &cross_target_install,).is_err(),
+        "agent self:* must not authorize cross-principal install",
+    );
 }
 
 #[test]

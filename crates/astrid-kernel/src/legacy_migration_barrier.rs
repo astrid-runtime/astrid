@@ -29,12 +29,16 @@ use astrid_storage::{KvStore, PrincipalDirectory, RuntimePrincipalStore};
 mod fs_support;
 #[path = "legacy_migration_barrier_ledger.rs"]
 mod ledger;
+#[cfg(unix)]
+use crate::{preflight_legacy_audit_sources, retire_legacy_audit_dir};
 use fs_support::retire_tree;
 use fs_support::{
     add_source, collect_workspace_targets, ensure_legacy_secret_aliases, path_exists,
     read_bounded_file, require_layout_provenance, retire_empty_directory, snapshot_path,
     storage_io, sync_parent, validate_source_path,
 };
+#[cfg(not(unix))]
+use fs_support::{preflight_legacy_audit_sources, retire_legacy_audit_dir};
 #[cfg(test)]
 use ledger::{MigrationComponent, canonical_json};
 use ledger::{
@@ -413,7 +417,7 @@ async fn import_legacy_control_state(
 
 async fn migrate_legacy_audit(home: &AstridHome, audit: &Arc<AuditLog>) -> io::Result<()> {
     let default_audit = home.principal_home(&PrincipalId::default()).audit_dir();
-    let source_present = crate::preflight_legacy_audit_sources(home, &default_audit)?;
+    let source_present = preflight_legacy_audit_sources(home, &default_audit)?;
     if !source_present {
         return Ok(());
     }
@@ -428,7 +432,7 @@ async fn migrate_legacy_audit(home: &AstridHome, audit: &Arc<AuditLog>) -> io::R
     crate::require_audit_integrity(&audit_results)?;
     match fs::symlink_metadata(&default_audit) {
         Ok(_) => {
-            crate::preflight_legacy_audit_sources(home, &default_audit)?;
+            preflight_legacy_audit_sources(home, &default_audit)?;
             audit
                 .verify_legacy_source_digest(
                     &default_audit,
@@ -441,7 +445,7 @@ async fn migrate_legacy_audit(home: &AstridHome, audit: &Arc<AuditLog>) -> io::R
                         "legacy audit source changed before digest-bound retirement: {error}"
                     ))
                 })?;
-            crate::retire_legacy_audit_dir(home, &default_audit)?;
+            retire_legacy_audit_dir(home, &default_audit)?;
         },
         Err(error) if error.kind() == io::ErrorKind::NotFound && source_present => {
             return Err(io::Error::other(

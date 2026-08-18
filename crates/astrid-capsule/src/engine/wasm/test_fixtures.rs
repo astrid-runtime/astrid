@@ -67,12 +67,32 @@ pub(crate) fn open_log(path: &std::path::Path) -> Arc<std::sync::Mutex<std::fs::
 /// can run inside a `#[tokio::test]` or own their own `Builder`-created
 /// runtime (sync `#[test]`s do the latter).
 pub(crate) fn minimal_host_state(rt: tokio::runtime::Handle) -> HostState {
-    // Deliberately authority-free test context. Production principal and
-    // SystemResident runtimes receive concrete owner/system namespaces.
+    // Deliberately storage-light test context. Production principal and
+    // SystemResident runtimes receive concrete owner/system namespaces. The
+    // synthetic directory bindings let overlay tests exercise the same
+    // immutable-UID admission gate as production without opening a durable
+    // volume for every small host-state fixture.
     let kv_backend: Arc<dyn astrid_storage::KvStore> =
         Arc::new(astrid_storage::MemoryKvStore::new());
     let kv = HostState::neutral_kv();
     let secret_store: Arc<dyn SecretStore> = HostState::neutral_secret_store();
+    let principal_directory = astrid_storage::PrincipalDirectory::default();
+    for alias in [
+        "default",
+        "alice",
+        "bob",
+        "agent-alice",
+        "agent-bob",
+        "agent-bob-barrier",
+        "retired-worker",
+        "secret-reader",
+    ] {
+        let principal = astrid_core::PrincipalId::new(alias).expect("fixture principal");
+        let uid = astrid_core::PrincipalUid::from_bytes(*blake3::hash(alias.as_bytes()).as_bytes());
+        principal_directory
+            .register(principal, uid)
+            .expect("fixture identity binding");
+    }
 
     HostState {
         wasi_ctx: wasmtime_wasi::WasiCtxBuilder::new().build(),
@@ -99,7 +119,7 @@ pub(crate) fn minimal_host_state(rt: tokio::runtime::Handle) -> HostState {
         #[cfg(not(target_family = "wasm"))]
         process_storage_mount_broker: None,
         home: None,
-        principal_directory: astrid_storage::PrincipalDirectory::default(),
+        principal_directory,
         principal_store: None,
         tmp: None,
         invocation_home: None,

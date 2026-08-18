@@ -100,6 +100,8 @@ pub use ownership::{
     FleetRecord, OwnershipError, OwnershipSnapshot, OwnershipStore, PrincipalDeletionGuard,
 };
 pub use principal_directory::PrincipalDirectory;
+#[cfg(feature = "keychain")]
+pub use secret::build_keychain_secret_store;
 pub use secret::{
     DenySecretStore, FileSecretStore, KvSecretStore, ReadThroughSecretStore, SecretStore,
     SecretStoreError, build_secret_store,

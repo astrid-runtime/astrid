@@ -542,11 +542,16 @@ fn open_nofollow(path: &Path) -> io::Result<File> {
     options.open(path)
 }
 
+#[cfg(unix)]
 fn sync_parent(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
     if let Some(parent) = path.parent() {
         File::open(parent)?.sync_all()?;
     }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
