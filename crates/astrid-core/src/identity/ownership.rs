@@ -9,6 +9,7 @@
 use std::fmt;
 use std::str::FromStr;
 
+use astrid_resource_types::OwnerId;
 use chrono::{DateTime, Timelike, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
@@ -101,6 +102,24 @@ macro_rules! opaque_uid {
 
 opaque_uid!(UserUid, "user");
 opaque_uid!(FleetUid, "fleet");
+
+impl From<FleetUid> for OwnerId {
+    fn from(uid: FleetUid) -> Self {
+        Self::fleet(*uid.as_bytes())
+    }
+}
+
+impl TryFrom<OwnerId> for FleetUid {
+    type Error = OwnerId;
+
+    fn try_from(owner: OwnerId) -> Result<Self, Self::Error> {
+        if let OwnerId::Fleet(bytes) = owner {
+            Ok(Self::from_bytes(bytes))
+        } else {
+            Err(owner)
+        }
+    }
+}
 
 /// Immutable creation record from which a [`UserUid`] is derived.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -508,6 +527,10 @@ mod tests {
             altered.validate(),
             Err(OwnershipIdentityError::FleetUidMismatch { .. })
         ));
+
+        let owner = OwnerId::from(identity.uid);
+        assert_eq!(FleetUid::try_from(owner), Ok(identity.uid));
+        assert!(FleetUid::try_from(OwnerId::System).is_err());
     }
 
     #[test]
