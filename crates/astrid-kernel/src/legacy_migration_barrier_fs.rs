@@ -8,9 +8,7 @@ use std::io::{self, Read};
 use std::path::Path;
 use std::path::PathBuf;
 
-#[cfg(not(unix))]
-use super::{AstridHome, PrincipalId};
-use super::{MAX_BYTES, MAX_ENTRIES, SourceIdentity};
+use super::{AstridHome, MAX_BYTES, MAX_ENTRIES, PrincipalId, PrincipalUid, SourceIdentity};
 
 pub(super) fn add_source(
     sources: &mut BTreeMap<String, SourceIdentity>,
@@ -18,6 +16,30 @@ pub(super) fn add_source(
     path: impl AsRef<Path>,
 ) -> io::Result<()> {
     sources.insert(name, snapshot_path(path.as_ref())?);
+    Ok(())
+}
+
+pub(super) fn add_principal_scope_sources(
+    sources: &mut BTreeMap<String, SourceIdentity>,
+    home: &AstridHome,
+    alias: &PrincipalId,
+    uid: PrincipalUid,
+    capsule_ids: &[String],
+) -> io::Result<()> {
+    for capsule in capsule_ids {
+        add_source(
+            sources,
+            format!("principal:{uid}:env:{capsule}"),
+            home.principal_home(alias)
+                .env_dir()
+                .join(format!("{capsule}.env.json")),
+        )?;
+        add_source(
+            sources,
+            format!("principal:{uid}:secret:{capsule}"),
+            home.secrets_dir().join(alias.as_str()).join(capsule),
+        )?;
+    }
     Ok(())
 }
 

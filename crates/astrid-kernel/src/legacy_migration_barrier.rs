@@ -33,9 +33,10 @@ mod ledger;
 use crate::{preflight_legacy_audit_sources, retire_legacy_audit_dir};
 use fs_support::retire_tree;
 use fs_support::{
-    add_source, collect_workspace_targets, ensure_legacy_secret_aliases, path_exists,
-    read_bounded_file, require_layout_provenance, retire_empty_directory,
-    snapshot_owner_controlled_path, snapshot_path, storage_io, sync_parent, validate_source_path,
+    add_principal_scope_sources, add_source, collect_workspace_targets,
+    ensure_legacy_secret_aliases, path_exists, read_bounded_file, require_layout_provenance,
+    retire_empty_directory, snapshot_owner_controlled_path, snapshot_path, storage_io, sync_parent,
+    validate_source_path,
 };
 #[cfg(not(unix))]
 use fs_support::{preflight_legacy_audit_sources, retire_legacy_audit_dir};
@@ -315,7 +316,7 @@ async fn migrate_legacy_layout(
     directory: &PrincipalDirectory,
     audit: &Arc<AuditLog>,
     bindings: Vec<(PrincipalId, PrincipalUid)>,
-    snapshots: BTreeMap<String, SourceIdentity>,
+    mut snapshots: BTreeMap<String, SourceIdentity>,
     workspace_root: &Path,
     workspace_layout: &WorkspaceLayout,
 ) -> io::Result<()> {
@@ -338,6 +339,17 @@ async fn migrate_legacy_layout(
             .map_err(|error| {
                 io::Error::other(format!("legacy capsule migration failed: {error}"))
             })?;
+    for (alias, uid) in &bindings {
+        let owner = astrid_storage::StateOwner::Principal(*uid);
+        let capsule_ids = store
+            .capsules()
+            .list(&owner)
+            .map_err(storage_io)?
+            .into_iter()
+            .map(|summary| summary.id().to_owned())
+            .collect::<Vec<_>>();
+        add_principal_scope_sources(&mut snapshots, home, alias, *uid, &capsule_ids)?;
+    }
     let authority_source = snapshots.get("system:capsule-authority").ok_or_else(|| {
         io::Error::other("migration source inventory is missing capsule authority")
     })?;
@@ -784,21 +796,14 @@ fn preflight_sources(
             snapshot_owner_controlled_path(&home.principal_home(alias).capsules_dir())?,
         );
         let owner = astrid_storage::StateOwner::Principal(*uid);
-        for summary in store.capsules().list(&owner).map_err(storage_io)? {
-            let id = summary.id();
-            add_source(
-                &mut sources,
-                format!("principal:{uid}:env:{id}"),
-                home.principal_home(alias)
-                    .env_dir()
-                    .join(format!("{id}.env.json")),
-            )?;
-            add_source(
-                &mut sources,
-                format!("principal:{uid}:secret:{id}"),
-                home.secrets_dir().join(alias.as_str()).join(id),
-            )?;
-        }
+        let capsule_ids = store
+            .capsules()
+            .list(&owner)
+            .map_err(storage_io)?
+            .into_iter()
+            .map(|summary| summary.id().to_owned())
+            .collect::<Vec<_>>();
+        add_principal_scope_sources(&mut sources, home, alias, *uid, &capsule_ids)?;
         sources.insert(
             home_name,
             SourceIdentity {

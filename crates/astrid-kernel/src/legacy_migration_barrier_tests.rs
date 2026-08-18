@@ -422,6 +422,32 @@ fn empty_secret_root_requires_an_exact_source_bound_proof() {
     assert!(validate_ledger_shape(&ledger).is_err());
 }
 
+#[test]
+fn migrated_capsule_scopes_are_added_to_the_frozen_source_inventory() {
+    let (_root, home) = test_home();
+    let alias = PrincipalId::default();
+    let uid = PrincipalUid::from_bytes([0x62; 32]);
+    let capsule = "legacy-provider".to_owned();
+    let principal_home = home.principal_home(&alias);
+    astrid_core::platform_fs::ensure_private_directory(&principal_home.env_dir())
+        .expect("legacy env root");
+    let env = principal_home.env_dir().join("legacy-provider.env.json");
+    fs::write(&env, b"{}\n").expect("legacy env");
+    make_private_file(&env);
+    let secret = home.secrets_dir().join(alias.as_str()).join(&capsule);
+    astrid_core::platform_fs::ensure_private_directory(&secret).expect("legacy secret scope");
+    let secret_value = secret.join("api-key");
+    fs::write(&secret_value, b"secret\n").expect("legacy secret");
+    make_private_file(&secret_value);
+
+    let mut sources = BTreeMap::new();
+    add_principal_scope_sources(&mut sources, &home, &alias, uid, &[capsule])
+        .expect("scope inventory");
+
+    assert!(sources[&format!("principal:{uid}:env:legacy-provider")].present);
+    assert!(sources[&format!("principal:{uid}:secret:legacy-provider")].present);
+}
+
 #[tokio::test]
 async fn post_barrier_retirement_resumes_after_crash_and_rejects_reappeared_cow() {
     let root = tempfile::tempdir().expect("temporary home");
