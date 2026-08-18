@@ -34,8 +34,8 @@ use crate::{preflight_legacy_audit_sources, retire_legacy_audit_dir};
 use fs_support::retire_tree;
 use fs_support::{
     add_source, collect_workspace_targets, ensure_legacy_secret_aliases, path_exists,
-    read_bounded_file, require_layout_provenance, retire_empty_directory, snapshot_path,
-    snapshot_released_surrealkv, storage_io, sync_parent, validate_source_path,
+    read_bounded_file, require_layout_provenance, retire_empty_directory,
+    snapshot_owner_controlled_path, snapshot_path, storage_io, sync_parent, validate_source_path,
 };
 #[cfg(not(unix))]
 use fs_support::{preflight_legacy_audit_sources, retire_legacy_audit_dir};
@@ -691,7 +691,7 @@ fn preflight_sources(
     let mut sources = BTreeMap::new();
     sources.insert(
         "system:state-db".to_owned(),
-        snapshot_released_surrealkv(&home.state_db_path())?,
+        snapshot_owner_controlled_path(&home.state_db_path())?,
     );
     add_source(&mut sources, "system:cow".to_owned(), home.cow_dir())?;
     add_source(
@@ -767,7 +767,7 @@ fn preflight_sources(
         );
         sources.insert(
             format!("principal:{uid}:audit"),
-            snapshot_released_surrealkv(&home.principal_home(alias).audit_dir())?,
+            snapshot_owner_controlled_path(&home.principal_home(alias).audit_dir())?,
         );
         add_source(
             &mut sources,
@@ -779,11 +779,10 @@ fn preflight_sources(
             format!("principal:{uid}:tmp"),
             home.principal_home(alias).tmp_dir(),
         )?;
-        add_source(
-            &mut sources,
+        sources.insert(
             format!("principal:{uid}:capsules"),
-            home.principal_home(alias).capsules_dir(),
-        )?;
+            snapshot_owner_controlled_path(&home.principal_home(alias).capsules_dir())?,
+        );
         let owner = astrid_storage::StateOwner::Principal(*uid);
         for summary in store.capsules().list(&owner).map_err(storage_io)? {
             let id = summary.id();

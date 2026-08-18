@@ -528,19 +528,19 @@ pub(super) fn snapshot_path(path: &Path) -> io::Result<SourceIdentity> {
     snapshot_path_with_access(path, SourceAccess::Private)
 }
 
-/// Snapshot the released `SurrealKV` tree without requiring permissions that
-/// the released binary never set. Historical database children were commonly
-/// `0755` directories and `0644` files. They remain admissible only when the
-/// current user owns every entry, nobody else can modify it, and no extended
-/// ACL, redirect, mount, device boundary, or special entry is present.
-pub(super) fn snapshot_released_surrealkv(path: &Path) -> io::Result<SourceIdentity> {
-    snapshot_path_with_access(path, SourceAccess::ReleasedDatabase)
+/// Snapshot a released non-secret tree without requiring permissions that the
+/// released binary never set. Historical database and capsule-package children
+/// were commonly `0755` directories and `0644` files. They remain admissible
+/// only when the current user owns every entry, nobody else can modify it, and
+/// no extended ACL, redirect, mount, device boundary, or special entry exists.
+pub(super) fn snapshot_owner_controlled_path(path: &Path) -> io::Result<SourceIdentity> {
+    snapshot_path_with_access(path, SourceAccess::OwnerControlled)
 }
 
 #[derive(Clone, Copy)]
 enum SourceAccess {
     Private,
-    ReleasedDatabase,
+    OwnerControlled,
 }
 
 fn snapshot_path_with_access(path: &Path, access: SourceAccess) -> io::Result<SourceIdentity> {
@@ -692,18 +692,15 @@ fn validate_source_entry(
 ) -> io::Result<()> {
     match access {
         SourceAccess::Private => validate_private_entry(path, metadata),
-        SourceAccess::ReleasedDatabase => validate_released_database_entry(path, metadata),
+        SourceAccess::OwnerControlled => validate_owner_controlled_entry(path, metadata),
     }
 }
 
-fn validate_released_database_entry(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
+fn validate_owner_controlled_entry(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
     if !metadata.is_dir() && !metadata.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "legacy database contains a special entry: {}",
-                path.display()
-            ),
+            format!("legacy source contains a special entry: {}", path.display()),
         ));
     }
     #[cfg(unix)]
@@ -714,7 +711,7 @@ fn validate_released_database_entry(path: &Path, metadata: &fs::Metadata) -> io:
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!(
-                    "legacy database entry is not owned by the current user: {}",
+                    "legacy source entry is not owned by the current user: {}",
                     path.display()
                 ),
             ));
@@ -723,7 +720,7 @@ fn validate_released_database_entry(path: &Path, metadata: &fs::Metadata) -> io:
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!(
-                    "legacy database entry is group/world writable: {}",
+                    "legacy source entry is group/world writable: {}",
                     path.display()
                 ),
             ));

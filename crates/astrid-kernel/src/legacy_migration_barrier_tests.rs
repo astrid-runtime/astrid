@@ -492,7 +492,7 @@ fn source_preflight_rejects_symlink_and_fifo() {
 
 #[cfg(unix)]
 #[test]
-fn released_state_db_accepts_historical_read_only_modes() {
+fn owner_controlled_snapshot_accepts_historical_read_only_modes() {
     let root = tempfile::tempdir().expect("temporary root");
     make_private_dir(root.path());
     let state_db = root.path().join("state.db");
@@ -510,14 +510,14 @@ fn released_state_db_accepts_historical_read_only_modes() {
         snapshot_path(&state_db).is_err(),
         "ordinary component sources retain the owner-only contract"
     );
-    let snapshot = snapshot_released_surrealkv(&state_db)
+    let snapshot = snapshot_owner_controlled_path(&state_db)
         .expect("released read-only permissions are migration-compatible");
     assert!(snapshot.present);
     assert_eq!(snapshot.entries, 2);
 
     fs::set_permissions(&segment, fs::Permissions::from_mode(0o666))
         .expect("make legacy segment writable");
-    let error = snapshot_released_surrealkv(&state_db)
+    let error = snapshot_owner_controlled_path(&state_db)
         .expect_err("externally writable database bytes must fail closed");
     assert!(error.to_string().contains("group/world writable"));
 }
