@@ -115,8 +115,28 @@ pub(super) async fn collect_destination_proofs(
             |bytes| format!("blake3:{}", blake3::hash(&bytes).to_hex()),
         );
     for (alias, uid) in directory.bindings() {
+        let home_component = format!("principal:{uid}:home");
+        if !sources.contains_key(&home_component) {
+            // The ledger records only principals that existed at cut-over.
+            // Principals admitted later are ordinary v2 state and must not be
+            // mistaken for missing legacy-source inventory on every restart.
+            // A surviving ordinary-home receipt proves the UID did participate
+            // in migration, so omitting its ledger component still fails closed.
+            let receipt = home
+                .migrations_dir()
+                .join(format!("principal-home-{uid}.json"));
+            if path_exists(&receipt)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "principal migration ledger is missing the ordinary-home component for {alias}/{uid}"
+                    ),
+                ));
+            }
+            continue;
+        }
         proofs.insert(
-            format!("principal:{uid}:home"),
+            home_component,
             destination_file_proof(
                 &home
                     .migrations_dir()
@@ -158,20 +178,7 @@ pub(super) async fn collect_destination_proofs(
         );
         proofs.insert(
             format!("principal:{uid}:secrets"),
-            if summaries.is_empty() {
-                let source = sources
-                    .get(&format!("principal:{uid}:secrets"))
-                    .ok_or_else(|| {
-                        io::Error::other("migration source inventory is missing secrets")
-                    })?;
-                if source.present {
-                    format!("verified-empty-v1:source-digest={}", source.digest)
-                } else {
-                    "absent".to_owned()
-                }
-            } else {
-                format!("blake3:{}", blake3::hash(summary_bytes.as_bytes()).to_hex())
-            },
+            principal_secret_migration_proof(store, uid, sources).await?,
         );
         for summary in &summaries {
             let marker = astrid_storage::env::principal_env_store(store.kv(), uid, summary.id())
@@ -291,25 +298,7 @@ pub(super) async fn collect_destination_proofs(
                     |bytes| format!("blake3:{}", blake3::hash(&bytes).to_hex()),
                 )
             },
-            ("secrets", None) => {
-                let summaries = store
-                    .capsules()
-                    .list(&astrid_storage::StateOwner::Principal(uid))
-                    .map_err(storage_io)?;
-                let source = sources.get(name).ok_or_else(|| {
-                    io::Error::other("migration source inventory is missing secrets")
-                })?;
-                if summaries.is_empty() {
-                    if source.present {
-                        format!("verified-empty-v1:source-digest={}", source.digest)
-                    } else {
-                        "absent".to_owned()
-                    }
-                } else {
-                    let summary_bytes = capsule_summary_bytes(&summaries);
-                    format!("blake3:{}", blake3::hash(summary_bytes.as_bytes()).to_hex())
-                }
-            },
+            ("secrets", None) => principal_secret_migration_proof(store, uid, sources).await?,
             _ => continue,
         };
         proofs.insert(name.clone(), proof);
@@ -331,22 +320,53 @@ fn principal_component_parts(name: &str) -> Option<(PrincipalUid, &str, Option<&
     Some((uid, kind, capsule))
 }
 
-fn capsule_summary_bytes(summaries: &[astrid_storage::CapsulePackageSummary]) -> String {
-    summaries
-        .iter()
-        .map(|summary| {
-            format!(
-                "{}:{}:{}:{}:{}:{}",
-                summary.id(),
-                hex::encode(summary.archive_digest()),
-                hex::encode(summary.metadata_digest()),
-                hex::encode(summary.authority_digest()),
-                summary.archive_bytes(),
-                summary.metadata_bytes(),
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+async fn principal_secret_migration_proof(
+    store: &RuntimePrincipalStore,
+    uid: PrincipalUid,
+    sources: &BTreeMap<String, SourceIdentity>,
+) -> io::Result<String> {
+    let aggregate_name = format!("principal:{uid}:secrets");
+    let source = sources.get(&aggregate_name).ok_or_else(|| {
+        io::Error::other(format!(
+            "migration source inventory is missing secrets for principal {uid}"
+        ))
+    })?;
+    if !source.present {
+        return Ok("absent".to_owned());
+    }
+
+    // This proof describes the frozen legacy import, not the mutable capsule
+    // registry. Capsules installed after cut-over must not invalidate the
+    // migration ledger on restart. Each imported legacy secret scope has an
+    // immutable marker, and the source inventory fixes the exact capsule set.
+    let prefix = format!("principal:{uid}:secret:");
+    let mut rows = Vec::new();
+    for name in sources.keys().filter(|name| name.starts_with(&prefix)) {
+        let capsule = name
+            .strip_prefix(&prefix)
+            .ok_or_else(|| io::Error::other("invalid secret migration component"))?;
+        let marker = astrid_storage::env::principal_env_store(store.kv(), uid, capsule)
+            .map_err(storage_io)?
+            .get(astrid_storage::env::LEGACY_IMPORT_MARKER_KEY)
+            .await
+            .map_err(storage_io)?
+            .ok_or_else(|| {
+                io::Error::other(format!(
+                    "secret destination receipt is missing for principal {uid}/{capsule}"
+                ))
+            })?;
+        rows.push(format!("{capsule}:{}", hex::encode(marker)));
+    }
+    if rows.is_empty() {
+        return Err(io::Error::other(format!(
+            "present legacy secret source has no imported capsule scopes for principal {uid}"
+        )));
+    }
+    let marker_digest = blake3::hash(rows.join("\n").as_bytes()).to_hex();
+    Ok(format!(
+        "verified-secret-import-v1:source-digest={}:markers-digest={marker_digest}",
+        source.digest
+    ))
 }
 
 pub(super) fn mutable_component(name: &str) -> bool {
@@ -634,6 +654,9 @@ pub(super) fn validate_ledger_shape(ledger: &MigrationLedger) -> io::Result<()> 
             || component
                 .destination_proof
                 .starts_with("verified-system-env-v1:")
+            || component
+                .destination_proof
+                .starts_with("verified-secret-import-v1:")
             || component.destination_proof.starts_with("fresh-layout-v1:");
         if !valid_proof || component.destination_proof.contains('\n') {
             return Err(io::Error::new(
@@ -668,6 +691,23 @@ pub(super) fn validate_ledger_shape(ledger: &MigrationLedger) -> io::Result<()> 
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "capsule-authority ledger component is not source-bound",
+                ));
+            }
+        }
+        if component.name.ends_with(":secrets") && component.source.present {
+            let expected = format!("source-digest={}", component.source.digest);
+            if !component
+                .destination_proof
+                .starts_with("verified-secret-import-v1:")
+                || !component.destination_proof.contains(&expected)
+                || !component.destination_proof.contains(":markers-digest=")
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "principal secrets component is not bound to imported source receipts: {}",
+                        component.name
+                    ),
                 ));
             }
         }

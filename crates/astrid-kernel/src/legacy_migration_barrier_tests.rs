@@ -266,6 +266,55 @@ fn existing_layout_requires_receipts_for_live_immutable_components() {
     );
 }
 
+#[tokio::test]
+async fn existing_ledger_allows_principal_admitted_after_cutover() {
+    let root = tempfile::tempdir().expect("temporary home");
+    make_private_dir(root.path());
+    let home = AstridHome::from_path(root.path());
+    home.ensure().expect("fresh home");
+    let directory = PrincipalDirectory::default();
+    let default_uid = PrincipalUid::from_bytes([0x31; 32]);
+    directory
+        .register(PrincipalId::default(), default_uid)
+        .expect("default binding");
+    let quota: std::sync::Arc<dyn astrid_storage::KvQuotaResolver<astrid_storage::StateOwner>> =
+        std::sync::Arc::new(|_: &astrid_storage::StateOwner| Ok(None));
+    let store = astrid_storage::open_runtime_principal_store_with_directory(
+        &home,
+        quota,
+        directory.clone(),
+    )
+    .await
+    .expect("runtime store");
+
+    let mut sources = BTreeMap::new();
+    sources.insert("system:cow".to_owned(), SourceIdentity::absent());
+    for kind in ["home", "secrets", "audit", "tmp"] {
+        sources.insert(
+            format!("principal:{default_uid}:{kind}"),
+            SourceIdentity::absent(),
+        );
+    }
+
+    let later_uid = PrincipalUid::from_bytes([0x52; 32]);
+    directory
+        .register(
+            PrincipalId::new("later-agent").expect("later alias"),
+            later_uid,
+        )
+        .expect("post-cutover binding");
+    let proofs = collect_destination_proofs(&home, &store, &directory, &sources, false)
+        .await
+        .expect("post-cutover principal is not legacy inventory");
+
+    assert!(
+        proofs
+            .keys()
+            .all(|name| !name.starts_with(&format!("principal:{later_uid}:")))
+    );
+    assert!(proofs.contains_key(&format!("principal:{default_uid}:home")));
+}
+
 #[test]
 fn existing_layout_rejects_reappeared_secret_alias_without_current_binding() {
     let (_root, home) = test_home();

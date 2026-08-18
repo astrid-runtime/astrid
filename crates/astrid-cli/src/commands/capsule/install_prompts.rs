@@ -25,6 +25,7 @@ use astrid_types::ipc::{IpcMessage, IpcPayload, OnboardingFieldType};
 use std::collections::HashMap;
 use std::path::Path;
 
+use super::install_headless::{headless_env_key, json_value_string};
 use super::model_discovery::fetch_options_blocking;
 
 /// Order `[env]` keys so that fields are prompted after any field listed
@@ -136,6 +137,77 @@ fn set_env_entry(
         crate::admin_client::into_result(response)?;
         Ok(())
     })
+}
+
+/// Collect declared configuration before a daemon-owned install transaction.
+///
+/// The returned `KEY=VALUE` records are sent in the typed install request so
+/// the kernel can stage them before invoking the lifecycle hook and roll them
+/// back if installation fails. Existing daemon values are left untouched
+/// unless the operator supplied an explicit replacement.
+pub(super) fn collect_install_env_fields(
+    env_defs: &HashMap<String, EnvDef>,
+    capsule_id: &str,
+    existing_keys: &std::collections::HashSet<String>,
+    supplied: &HashMap<String, String>,
+    headless: bool,
+    config_path: &Path,
+) -> anyhow::Result<Vec<String>> {
+    for key in supplied.keys() {
+        if !env_defs.contains_key(key) {
+            anyhow::bail!("--var names no [env] field in {capsule_id}: {key}");
+        }
+    }
+
+    let mut collected = serde_json::Map::new();
+    for key in existing_keys {
+        collected.insert(key.clone(), serde_json::Value::String(String::new()));
+    }
+
+    let mut prompted = false;
+    let mut values = Vec::new();
+    for key in order_env_keys(env_defs) {
+        let def = &env_defs[&key];
+        let value = if let Some(value) = supplied.get(&key) {
+            value.clone()
+        } else if existing_keys.contains(&key) {
+            continue;
+        } else if headless {
+            let env_key = headless_env_key(&key);
+            std::env::var(&env_key)
+                .ok()
+                .or_else(|| def.default.as_ref().map(json_value_string))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "required value is missing for {capsule_id}.{key} \
+                         (use --var {key}=… or set {env_key})"
+                    )
+                })?
+        } else {
+            if !prompted {
+                eprintln!("\nThis capsule requires configuration:");
+                prompted = true;
+            }
+            prompt_single_field(&key, def, &collected)
+        };
+
+        if !def.enum_values.is_empty() && !def.enum_values.iter().any(|item| item == &value) {
+            anyhow::bail!(
+                "invalid value for {capsule_id}.{key}: expected one of {}, got {value:?}",
+                def.enum_values.join(", ")
+            );
+        }
+        if def.env_type != "secret" && !value.is_empty() {
+            super::local_egress::maybe_prompt_local_egress(capsule_id, &value, config_path);
+        }
+        collected.insert(key.clone(), serde_json::Value::String(value.clone()));
+        values.push(format!("{key}={value}"));
+    }
+
+    if prompted {
+        eprintln!("  Configuration will be applied by the daemon.\n");
+    }
+    Ok(values)
 }
 
 /// Prompt the user for missing environment-variable values defined in `[env]`.
@@ -627,6 +699,82 @@ type = "text"
         let pos = |k: &str| order.iter().position(|x| x == k).unwrap();
         assert!(pos("a") < pos("b"));
         assert!(pos("b") < pos("c"));
+    }
+
+    #[test]
+    fn install_collection_replaces_explicit_existing_and_preserves_other_existing() {
+        let defs = env(r#"
+[api_key]
+type = "secret"
+
+[base_url]
+type = "text"
+
+[model]
+type = "text"
+default = "fallback-model"
+"#);
+        let existing = ["api_key".to_string(), "base_url".to_string()]
+            .into_iter()
+            .collect();
+        let supplied = [("base_url".to_string(), "https://example.com".to_string())]
+            .into_iter()
+            .collect();
+
+        let values = collect_install_env_fields(
+            &defs,
+            "provider",
+            &existing,
+            &supplied,
+            true,
+            Path::new("unused.toml"),
+        )
+        .expect("declared values collect");
+
+        assert_eq!(
+            values,
+            vec![
+                "base_url=https://example.com".to_string(),
+                "model=fallback-model".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn install_collection_rejects_undeclared_and_invalid_enum_values() {
+        let defs = env(r#"
+[model]
+type = "select"
+enum_values = ["small", "large"]
+"#);
+        let empty = std::collections::HashSet::new();
+        let unknown = [("spoof".to_string(), "value".to_string())]
+            .into_iter()
+            .collect();
+        let error = collect_install_env_fields(
+            &defs,
+            "provider",
+            &empty,
+            &unknown,
+            true,
+            Path::new("unused.toml"),
+        )
+        .expect_err("undeclared field must fail");
+        assert!(error.to_string().contains("names no [env] field"));
+
+        let invalid = [("model".to_string(), "medium".to_string())]
+            .into_iter()
+            .collect();
+        let error = collect_install_env_fields(
+            &defs,
+            "provider",
+            &empty,
+            &invalid,
+            true,
+            Path::new("unused.toml"),
+        )
+        .expect_err("invalid enum must fail");
+        assert!(error.to_string().contains("expected one of small, large"));
     }
 
     /// REGRESSION: the in-process install answerer must echo the request's

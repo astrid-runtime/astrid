@@ -10,10 +10,15 @@
 
 mod agent;
 mod impls;
+mod install;
 mod projection_names;
 mod readiness;
 mod response_types;
 pub use agent::{AgentDeriveKernelRequest, AgentDeriveRequest};
+pub use install::{
+    CapsuleInstallAuthority, CapsuleInstallEnv, CapsuleInstallProvenance, EnvEntry,
+    EnvStorageScope, EnvValueKind,
+};
 pub use projection_names::{
     PROJECTION_NAME_DIAGNOSTIC_METHOD, PROJECTION_NAME_DIAGNOSTIC_TOPIC,
     ProjectionNameCollisionDiagnostic, ProjectionNameDiagnostic, ProjectionNameEscapeDiagnostic,
@@ -31,55 +36,6 @@ use crate::profile::Quotas;
 use crate::storage_filesystem::StorageMountLeaseV1;
 use crate::storage_provider::{StorageMountId, StorageProviderAccessV1, StorageProviderViewV1};
 use serde::{Deserialize, Serialize};
-
-/// Host-owned projection selected by an env/secret admin request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub enum EnvStorageScope {
-    /// Principal-scoped control namespace.
-    Agent,
-    /// System/host-scoped control namespace.
-    Shared,
-}
-
-/// Typed values managed by the env admin API.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub enum EnvValueKind {
-    /// Non-secret environment configuration.
-    Text,
-    /// Secret-typed environment configuration.
-    Secret,
-}
-
-/// A redacted env/secret key returned by the admin list API.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EnvEntry {
-    /// Capsule whose host-owned projection contains the key.
-    pub capsule: String,
-    /// Manifest env/secret key.
-    pub key: String,
-    /// Whether this row is secret-typed.
-    pub kind: EnvValueKind,
-    /// Principal or host scope containing the value.
-    pub scope: EnvStorageScope,
-}
-
-/// Bounded provenance supplied with a daemon-owned capsule install.
-///
-/// Provenance is descriptive input to the kernel's integrity gate, never an
-/// authority grant.  The kernel validates the fields against the local source
-/// before publishing the durable package and rejects overlong or malformed
-/// values.  Keeping this as a small typed object avoids allowing a caller to
-/// smuggle an unbounded distro manifest or arbitrary metadata through the
-/// management wire.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CapsuleInstallProvenance {
-    /// Stable distro identifier, when the source came from a sealed distro.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub distro: Option<String>,
-    /// Canonical BLAKE3 digest of the source artifact, when available.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_digest: Option<String>,
-}
 
 /// The well-known system session UUID string used by the background daemon.
 ///
@@ -108,6 +64,10 @@ pub enum KernelRequest {
         /// evidence only; it never widens install authority.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provenance: Option<CapsuleInstallProvenance>,
+        /// Authenticated one-install authority decision. The kernel binds it
+        /// to the source digest it computes before publication.
+        #[serde(default)]
+        authority: CapsuleInstallAuthority,
         /// Typed owner-scoped values staged by the daemon before lifecycle.
         /// Values are redacted from audit payloads and are bounded by the
         /// kernel's environment limits.
@@ -184,21 +144,6 @@ pub enum KernelRequest {
     /// Request agent-loop readiness: whether the loaded capsule set can serve
     /// an agent chat turn. Read-only, name-agnostic — see [`AgentLoopReadiness`].
     GetAgentReadiness,
-}
-
-/// One bounded, typed environment value accompanying a daemon capsule install.
-///
-/// This wire shape is intentionally separate from [`AdminRequestKind::EnvSet`]
-/// so the kernel can snapshot and roll back the previous value if an install
-/// lifecycle fails. Secret bytes never appear in kernel errors or audit rows.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CapsuleInstallEnv {
-    /// Manifest-declared field name.
-    pub key: String,
-    /// Value to stage in the owner's host-only control namespace.
-    pub value: String,
-    /// Secret or non-secret projection.
-    pub kind: EnvValueKind,
 }
 
 /// Management API responses from the core daemon.
@@ -288,6 +233,12 @@ pub struct CapsuleMetadataEntry {
     pub description: Option<String>,
     /// Interceptor event patterns declared by this capsule.
     pub interceptor_events: Vec<String>,
+    /// Namespaced interface imports declared by the verified package.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub imports: std::collections::HashMap<String, std::collections::HashMap<String, String>>,
+    /// Namespaced interface exports declared by the verified package.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub exports: std::collections::HashMap<String, std::collections::HashMap<String, String>>,
     /// Serialized `CapabilitiesDef`. The kernel remains engine-agnostic; the
     /// gateway translates this into semantic permission cards for UI.
     #[serde(default)]
@@ -300,6 +251,14 @@ pub struct CapsuleMetadataEntry {
     /// This lets admin clients perform GC without reading install paths.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub wit_hashes: Vec<String>,
+    /// Content-addressed WASM hash from the verified durable package.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wasm_hash: Option<String>,
+    /// Remote source accepted by the CLI update path. The kernel exposes only
+    /// verified GitHub sources from durable package metadata; native paths are
+    /// never returned to an authenticated client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_source: Option<String>,
     /// Kernel-stamped source identity for the loaded runtime, when one is
     /// available. Gateways use this instead of inspecting install paths.
     #[serde(default, skip_serializing_if = "Option::is_none")]

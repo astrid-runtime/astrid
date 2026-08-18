@@ -343,13 +343,24 @@ pub fn publish_directory_package(
         bail!("capsule metadata/authority does not match source manifest");
     }
     let archive = canonical_capsule_archive(source_dir)?;
+    let verification = artifact::verify_archive_bytes(&archive)
+        .context("verify canonical durable capsule archive")?;
+    let mut durable_authority = authority.clone();
+    // Directory approval binds the complete checked source tree, while the
+    // durable package intentionally omits build/VCS/cache material. Rebind the
+    // receipt to the deterministic package produced by that trusted transform;
+    // the manifest/capability/WASM pins remain unchanged and are verified
+    // again below before publication succeeds.
+    verification
+        .content_digest()
+        .clone_into(&mut durable_authority.content_digest);
     let metadata = fs::read(target_dir.join("meta.json")).with_context(|| {
         format!(
             "read generated capsule metadata from {}",
             target_dir.display()
         )
     })?;
-    let authority = serde_json::to_vec_pretty(authority)
+    let authority = serde_json::to_vec_pretty(&durable_authority)
         .context("serialize installed capsule authority receipt")?;
     let registry = store.capsules();
     let owner = StateOwner::Principal(uid);

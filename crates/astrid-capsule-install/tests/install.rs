@@ -223,6 +223,10 @@ fn install_preserves_node_modules() {
     assert!(installed.join("node_modules/got/index.js").exists());
     assert!(installed.join("package.json").exists());
     assert!(installed.join("src/index.js").exists());
+    assert!(
+        !home.etc_dir().join("capsule-authority").exists(),
+        "storage-backed installs keep authority only in the durable package"
+    );
 }
 
 #[test]

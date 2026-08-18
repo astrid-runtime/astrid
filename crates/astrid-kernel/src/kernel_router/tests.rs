@@ -212,6 +212,7 @@ fn required_capability_mapping_per_variant_self_scope() {
                 workspace: false,
                 target_principal: None,
                 provenance: None,
+                authority: astrid_core::kernel_api::CapsuleInstallAuthority::default(),
                 env: Vec::new(),
             },
             AuthorityScope::Self_
@@ -268,6 +269,7 @@ fn required_capability_mapping_global_scope() {
                 workspace: false,
                 target_principal: None,
                 provenance: None,
+                authority: astrid_core::kernel_api::CapsuleInstallAuthority::default(),
                 env: Vec::new(),
             },
             AuthorityScope::Global
@@ -319,6 +321,7 @@ fn resolve_scope_requires_global_authority_only_for_cross_principal_install() {
         workspace: false,
         target_principal: None,
         provenance: None,
+        authority: astrid_core::kernel_api::CapsuleInstallAuthority::default(),
         env: Vec::new(),
     };
     assert_eq!(resolve_scope(&self_install, &caller), AuthorityScope::Self_);
@@ -327,6 +330,7 @@ fn resolve_scope_requires_global_authority_only_for_cross_principal_install() {
         workspace: false,
         target_principal: Some(PrincipalId::new("bob").unwrap()),
         provenance: None,
+        authority: astrid_core::kernel_api::CapsuleInstallAuthority::default(),
         env: Vec::new(),
     };
     assert_eq!(
@@ -382,6 +386,7 @@ fn resolve_scope_treats_workspace_capsule_install_as_self() {
                 workspace: true,
                 target_principal: None,
                 provenance: None,
+                authority: astrid_core::kernel_api::CapsuleInstallAuthority::default(),
                 env: Vec::new(),
             },
             &caller,

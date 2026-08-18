@@ -196,15 +196,11 @@ async fn write_env_inner(
     let body: EnvWriteRequest = crate::routes::principals::read_json_body(req).await?;
     let schema = env_schema_from_metadata(&entry);
     let def = schema.get(&field).ok_or(GatewayError::NotFound)?;
-    let (kind, append) = match def.env_type.as_str() {
-        "secret" => (EnvValueKind::Secret, false),
-        "text" | "select" => (EnvValueKind::Text, false),
-        "array" => (EnvValueKind::Text, true),
-        other => {
-            return Err(GatewayError::BadRequest(format!(
-                "unsupported env type {other:?} for field {field:?}"
-            )));
-        },
+    let Some((kind, append)) = env_write_semantics(&def.env_type) else {
+        return Err(GatewayError::BadRequest(format!(
+            "unsupported env type {:?} for field {field:?}",
+            def.env_type
+        )));
     };
     let client = state.admin_client_for(&caller)?;
     let response = client
@@ -234,6 +230,15 @@ async fn write_env_inner(
     );
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn env_write_semantics(env_type: &str) -> Option<(EnvValueKind, bool)> {
+    match env_type {
+        "secret" => Some((EnvValueKind::Secret, false)),
+        "text" | "string" | "integer" | "select" => Some((EnvValueKind::Text, false)),
+        "array" => Some((EnvValueKind::Text, true)),
+        _ => None,
+    }
 }
 
 // ── helpers ──────────────────────────────────────────────────────
@@ -532,6 +537,14 @@ mod tests {
         assert_eq!(field_type("model"), "select");
         assert_eq!(field_type("context_window"), "text");
         assert_eq!(field_type("legacy"), "array");
+    }
+
+    #[test]
+    fn released_scalar_env_types_are_writable_text_values() {
+        for env_type in ["text", "string", "integer", "select"] {
+            let semantics = env_write_semantics(env_type).expect("released type is supported");
+            assert_eq!(semantics, (EnvValueKind::Text, false), "{env_type}");
+        }
     }
 
     #[test]

@@ -16,10 +16,11 @@ use astrid_capsule::capsule::CapsuleId;
 use astrid_capsule::manifest::CapsuleManifest;
 use astrid_core::PrincipalId;
 use astrid_core::kernel_api::{
-    AdminRequestKind, CapsuleInstallEnv, CapsuleInstallProvenance, EnvStorageScope, EnvValueKind,
-    KernelRequest, KernelResponse,
+    AdminRequestKind, AdminResponseBody, CapsuleInstallAuthority, CapsuleInstallEnv,
+    CapsuleInstallProvenance, EnvStorageScope, EnvValueKind, KernelRequest, KernelResponse,
 };
 
+use super::install::ManualInstallOptions;
 use super::install_batch::InstalledCapsuleOutcome;
 
 /// A validated operator value ready for the typed daemon API.
@@ -30,27 +31,56 @@ struct DaemonEnvValue {
     kind: EnvValueKind,
 }
 
-/// Install a local directory/archive through the authenticated kernel API.
-///
-/// `--var` values are checked against the source manifest before any daemon
-/// mutation.  They are staged by the kernel's rollback-aware install
-/// transaction before the lifecycle hook and replayed through `EnvSet` after
-/// success to make the post-install projection explicit and idempotent.
-pub(super) async fn install_local_via_daemon(source: &str, vars: &[String]) -> anyhow::Result<()> {
-    install_local_via_daemon_outcome(source, vars)
-        .await
-        .map(|_| ())
-}
-
 /// Install through the daemon and decode the bounded outcome used by distro
 /// provisioning. The daemon remains the only durable writer; this helper only
 /// turns its response into the CLI's display record.
 pub(super) async fn install_local_via_daemon_outcome(
     source: &str,
-    vars: &[String],
+    prompt: &ManualInstallOptions,
+    authority: CapsuleInstallAuthority,
 ) -> anyhow::Result<InstalledCapsuleOutcome> {
     let principal = crate::principal::current();
-    install_local_via_daemon_for_target(source, vars, &principal, None).await
+    crate::commands::daemon::ensure_persistent_daemon("capsule install")
+        .await
+        .context("capsule install could not ensure the runtime daemon")?;
+    let manifest = load_source_manifest(source)?;
+    let capsule_id = CapsuleId::new(manifest.package.name.clone())?;
+    let existing_keys = list_existing_keys(&principal, capsule_id.as_str()).await?;
+    let vars = if super::install::BATCH_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+        prompt
+            .vars
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect()
+    } else {
+        super::install_prompts::collect_install_env_fields(
+            &manifest.env,
+            capsule_id.as_str(),
+            &existing_keys,
+            &prompt.vars,
+            prompt.yes,
+            &astrid_core::dirs::AstridHome::resolve()?.config_path(),
+        )?
+    };
+    install_local_via_daemon_for_target(source, &vars, &principal, None, authority).await
+}
+
+async fn list_existing_keys(
+    principal: &PrincipalId,
+    capsule: &str,
+) -> anyhow::Result<std::collections::HashSet<String>> {
+    let mut client = crate::admin_client::connect_as_active_agent().await?;
+    let response = client
+        .request(AdminRequestKind::EnvList {
+            principal: principal.clone(),
+            capsule: Some(capsule.to_owned()),
+        })
+        .await?;
+    let response = crate::admin_client::into_result(response)?;
+    let AdminResponseBody::EnvList(entries) = response else {
+        bail!("unexpected env list response: {response:?}");
+    };
+    Ok(entries.into_iter().map(|entry| entry.key).collect())
 }
 
 /// Install a local artifact into an explicit authenticated principal's
@@ -61,7 +91,11 @@ pub(crate) async fn install_local_via_daemon_for_target(
     vars: &[String],
     target: &PrincipalId,
     provenance: Option<CapsuleInstallProvenance>,
+    authority: CapsuleInstallAuthority,
 ) -> anyhow::Result<InstalledCapsuleOutcome> {
+    crate::commands::daemon::ensure_persistent_daemon("capsule install")
+        .await
+        .context("capsule install could not ensure the runtime daemon")?;
     let manifest = load_source_manifest(source)?;
     let capsule_id = CapsuleId::new(manifest.package.name.clone())?;
     let values = validate_values(&manifest, vars)?;
@@ -73,6 +107,7 @@ pub(crate) async fn install_local_via_daemon_for_target(
             workspace: false,
             target_principal: Some(target.clone()),
             provenance,
+            authority,
             env: values
                 .iter()
                 .map(|value| CapsuleInstallEnv {
@@ -107,13 +142,6 @@ pub(crate) async fn install_local_via_daemon_for_target(
         KernelResponse::Error(message) => bail!("daemon rejected capsule install: {message}"),
         other => bail!("unexpected daemon response: {other:?}"),
     }
-}
-
-pub(super) fn is_local_source(source: &str) -> bool {
-    source.starts_with('.')
-        || source.starts_with('/')
-        || source.ends_with(".capsule")
-        || Path::new(source.strip_prefix("file://").unwrap_or(source)).exists()
 }
 
 async fn apply_values(

@@ -1421,11 +1421,8 @@ impl Kernel {
         }
         let manifest_bytes = std::fs::read(dir.join("Capsule.toml"))
             .map_err(|error| anyhow::anyhow!("read materialized capsule manifest: {error}"))?;
-        let manifest_digest = blake3::hash(&manifest_bytes).to_hex().to_string();
-        if verified.authority().manifest_digest != manifest_digest {
-            anyhow::bail!(
-                "durable capsule authority manifest digest does not match materialization"
-            );
+        if manifest_bytes != verified.manifest_bytes() {
+            anyhow::bail!("durable capsule manifest bytes do not match materialization");
         }
         let expansions = manifest
             .capabilities

@@ -4,41 +4,39 @@ use tracing::warn;
 
 use super::CapsuleVisibility;
 
-pub(super) fn durable_wit_hashes(
+pub(super) fn durable_package_details(
     kernel: &crate::Kernel,
     owner_uid: Option<astrid_core::identity::PrincipalUid>,
     capsule: &str,
-) -> Vec<String> {
+) -> (Vec<String>, Option<String>, Option<String>) {
     let Some(uid) = owner_uid else {
-        return Vec::new();
+        return (Vec::new(), None, None);
     };
     let Some(store) = kernel.principal_store.as_ref() else {
-        return Vec::new();
+        return (Vec::new(), None, None);
     };
     let Ok(id) = astrid_capsule_types::CapsuleId::new(capsule.to_owned()) else {
-        return Vec::new();
+        return (Vec::new(), None, None);
     };
     let owner = astrid_storage::StateOwner::Principal(uid);
-    let Ok(Some(package)) = store.capsules().get(&owner, id.as_str()) else {
-        return Vec::new();
-    };
-    let Ok(metadata) = serde_json::from_slice::<serde_json::Value>(&package.metadata) else {
-        return Vec::new();
-    };
-    let Some(files) = metadata
-        .get("wit_files")
-        .and_then(serde_json::Value::as_object)
+    let Ok(Some(package)) =
+        astrid_capsule_install::read_verified_durable_package_for_owner(store, &owner, id.as_str())
     else {
-        return Vec::new();
+        return (Vec::new(), None, None);
     };
-    let mut hashes: Vec<String> = files
-        .values()
-        .filter_map(serde_json::Value::as_str)
-        .map(str::to_owned)
-        .collect();
+    let mut hashes: Vec<String> = package.metadata().wit_files.values().cloned().collect();
     hashes.sort();
     hashes.dedup();
-    hashes
+    let update_source = verified_remote_update_source(package.metadata().source.as_deref());
+    (hashes, package.metadata().wasm_hash.clone(), update_source)
+}
+
+fn verified_remote_update_source(source: Option<&str>) -> Option<String> {
+    source
+        .filter(|source| {
+            astrid_capsule_install::github_source::parse_github_source(source).is_some()
+        })
+        .map(str::to_owned)
 }
 
 pub(super) async fn inventory_manifest_map(
@@ -96,4 +94,31 @@ pub(super) async fn visible_inventory_manifests(
         }
     }
     manifests.into_values().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::verified_remote_update_source;
+
+    #[test]
+    fn update_source_exposes_remote_github_but_never_native_paths() {
+        assert_eq!(
+            verified_remote_update_source(Some("@astrid-runtime/capsule-registry")),
+            Some("@astrid-runtime/capsule-registry".to_owned())
+        );
+        assert_eq!(
+            verified_remote_update_source(Some(
+                "https://github.com/astrid-runtime/capsule-registry"
+            )),
+            Some("https://github.com/astrid-runtime/capsule-registry".to_owned())
+        );
+        assert_eq!(
+            verified_remote_update_source(Some("/tmp/registry.capsule")),
+            None
+        );
+        assert_eq!(
+            verified_remote_update_source(Some("./registry.capsule")),
+            None
+        );
+    }
 }

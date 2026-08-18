@@ -40,7 +40,9 @@ use std::time::Duration;
 use astrid_capsule_install::github_source;
 use astrid_capsule_types::capability_presentation::{SemanticCapability, semantic_capabilities};
 use astrid_capsule_types::manifest::CapabilitiesDef;
-use astrid_core::kernel_api::{CapsuleMetadataEntry, KernelRequest, KernelResponse};
+use astrid_core::kernel_api::{
+    CapsuleInstallAuthority, CapsuleMetadataEntry, KernelRequest, KernelResponse,
+};
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::Request;
@@ -235,6 +237,7 @@ pub async fn install_capsule(
             workspace,
             target_principal: None,
             provenance: None,
+            authority: CapsuleInstallAuthority::default(),
             env: Vec::new(),
         })
         .await

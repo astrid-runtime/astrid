@@ -12,6 +12,7 @@ const SESSION_LIST_RESPONSE_PREFIX: &str = "session.v1.response.list.";
 const CLI_RUN_COMMAND: &str = "adversarial";
 const CLI_SLOW_COMMAND: &str = "adversarial-slow";
 const CLI_READY_COMMAND: &str = "adversarial-ready";
+const CLI_HOME_READY_COMMAND: &str = "adversarial-home-ready";
 const CLI_APPROVAL_COMMAND: &str = "adversarial-approval";
 const CLI_ELICIT_COMMAND: &str = "adversarial-elicit";
 const MAX_REQ_ID_LEN: usize = 64;
@@ -35,11 +36,7 @@ struct ProbeReport {
 impl Adversarial {
     #[astrid::install]
     fn install(&self) -> Result<(), SysError> {
-        let answer = elicit::text_with_default(
-            "adversarial_lifecycle_probe",
-            "Enter the runtime E2E lifecycle probe value",
-            "runtime-lifecycle-default",
-        )?;
+        let answer = env::var("adversarial_lifecycle_probe")?;
         if answer != LIFECYCLE_EXPECTED_ANSWER {
             return Err(SysError::ApiError(
                 "unexpected adversarial lifecycle probe answer".into(),
@@ -81,7 +78,8 @@ fn dispatch_cli_runs(result: &ipc::PollResult) {
         match payload.get("command").and_then(|v| v.as_str()) {
             Some(CLI_RUN_COMMAND) => publish_probe_report(req_id),
             Some(CLI_SLOW_COMMAND) => run_slow_command(req_id, command_marker(&payload)),
-            Some(CLI_READY_COMMAND) => publish_ready(req_id),
+            Some(CLI_READY_COMMAND) => publish_ready(req_id, false),
+            Some(CLI_HOME_READY_COMMAND) => publish_ready(req_id, true),
             Some(CLI_APPROVAL_COMMAND) => run_approval_command(req_id),
             Some(CLI_ELICIT_COMMAND) => run_elicit_command(req_id),
             _ => {},
@@ -98,14 +96,28 @@ fn command_marker(payload: &serde_json::Value) -> Option<&str> {
         .filter(|marker| is_valid_req_id(marker))
 }
 
-fn publish_ready(req_id: &str) {
+fn publish_ready(req_id: &str, require_home_marker: bool) {
     let topic = format!("{CLI_RESULT_TOPIC_PREFIX}{req_id}");
+    let home_mounted = !require_home_marker
+        || fs::read(LIFECYCLE_HOME_MARKER)
+            .map(|bytes| bytes == b"mounted")
+            .unwrap_or(false);
     let _ = ipc::publish_json(
         &topic,
         &serde_json::json!({
-            "exit_code": 0,
-            "output": "adversarial command route ready",
-            "error": "",
+            "exit_code": if home_mounted { 0 } else { 1 },
+            "output": if home_mounted && require_home_marker {
+                "adversarial lifecycle home mounted"
+            } else if home_mounted {
+                "adversarial command route ready"
+            } else {
+                ""
+            },
+            "error": if home_mounted {
+                ""
+            } else {
+                "lifecycle home marker is unavailable"
+            },
         }),
     );
 }

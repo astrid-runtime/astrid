@@ -18,7 +18,7 @@
 #![allow(clippy::arithmetic_side_effects)]
 
 use astrid_capabilities::{CapabilityCheck, PermissionError};
-use astrid_core::kernel_api::KernelRequest;
+use astrid_core::kernel_api::{CapsuleInstallAuthority, KernelRequest};
 use astrid_core::principal::PrincipalId;
 use astrid_core::{GroupConfig, PrincipalProfile};
 use astrid_kernel::kernel_router::{kernel_request_method, required_capability, resolve_scope};
@@ -61,6 +61,7 @@ fn all_requests() -> Vec<KernelRequest> {
             workspace: false,
             target_principal: None,
             provenance: None,
+            authority: CapsuleInstallAuthority::default(),
             env: Vec::new(),
         },
         KernelRequest::ListCapsules,
@@ -134,6 +135,7 @@ fn agent_group_allows_self_scoped_capsule_surface() {
             workspace: true,
             target_principal: None,
             provenance: None,
+            authority: CapsuleInstallAuthority::default(),
             env: Vec::new(),
         },
         KernelRequest::ReloadCapsule {
@@ -165,6 +167,7 @@ fn agent_group_allows_self_scoped_capsule_surface() {
                 workspace: false,
                 target_principal: Some(admin_principal()),
                 provenance: None,
+                authority: CapsuleInstallAuthority::default(),
                 env: Vec::new(),
             }
         )
@@ -302,6 +305,7 @@ fn custom_group_capabilities_gate_admin_surface() {
             workspace: false,
             target_principal: Some(agent_principal()),
             provenance: None,
+            authority: CapsuleInstallAuthority::default(),
             env: Vec::new(),
         },
     )
@@ -319,6 +323,7 @@ fn custom_group_capabilities_gate_admin_surface() {
                 workspace: true,
                 target_principal: None,
                 provenance: None,
+                authority: CapsuleInstallAuthority::default(),
                 env: Vec::new()
             }
         )
@@ -334,6 +339,7 @@ fn custom_group_capabilities_gate_admin_surface() {
             workspace: true,
             target_principal: None,
             provenance: None,
+            authority: CapsuleInstallAuthority::default(),
             env: Vec::new(),
         },
     )
@@ -378,6 +384,7 @@ fn admin_vs_agent_cross_tenant_matrix() {
         workspace: false,
         target_principal: Some(admin_principal()),
         provenance: None,
+        authority: CapsuleInstallAuthority::default(),
         env: Vec::new(),
     };
     assert!(

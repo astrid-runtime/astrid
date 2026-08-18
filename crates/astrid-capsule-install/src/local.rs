@@ -682,11 +682,16 @@ pub(crate) fn install_from_local_path_internal(
     let wit_files =
         content_address_wit(home, source_dir).context("failed to content-address WIT files")?;
 
-    // The pending marker lives outside capsule-writable VFS roots. If the
-    // process dies during target replacement, load fails closed until the
-    // interrupted authority transaction is inspected and repaired.
-    let authority_transaction =
-        AuthorityReceiptTransaction::stage(home, &target_dir, &installed_authority)?;
+    // Workspace/native installs still need a host receipt while their files
+    // are authoritative. A storage-backed install publishes the exact receipt
+    // inside the durable package atomically; its target directory is only a
+    // disposable cache, so emitting a legacy global receipt would make the
+    // migration barrier reject an otherwise valid post-cutover restart.
+    let authority_transaction = options
+        .storage
+        .is_none()
+        .then(|| AuthorityReceiptTransaction::stage(home, &target_dir, &installed_authority))
+        .transpose()?;
 
     // Backup the existing install (rename to .bak). Any failure from
     // this point onward must restore the backup over target_dir.
@@ -828,7 +833,9 @@ pub(crate) fn install_from_local_path_internal(
             return Err(error);
         }
     }
-    if let Err(e) = authority_transaction.commit() {
+    if let Some(authority_transaction) = authority_transaction
+        && let Err(e) = authority_transaction.commit()
+    {
         rollback(&target_dir, backup_dir.as_deref());
         return Err(e);
     }

@@ -625,9 +625,10 @@ impl fs::Host for HostState {
                         true,
                     )
                     .await?;
-                let res = vfs_path.vfs.write(&handle, &content).await;
-                let _ = vfs_path.vfs.close(&handle).await;
-                res
+                let write_result = vfs_path.vfs.write(&handle, &content).await;
+                let close_result = vfs_path.vfs.close(&handle).await;
+                write_result?;
+                close_result
             })
             .map_err(map_vfs_err);
         audit_fs(

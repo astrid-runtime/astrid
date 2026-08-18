@@ -102,7 +102,7 @@ pub(crate) async fn run(args: &ShowArgs) -> Result<ExitCode> {
         source: entry
             .source_id
             .map_or_else(|| "unloaded".to_owned(), |id| id.to_string()),
-        wasm_hash: String::new(),
+        wasm_hash: entry.wasm_hash.unwrap_or_default(),
         installed_at: String::new(),
         updated_at: String::new(),
         contracts_pin: None,

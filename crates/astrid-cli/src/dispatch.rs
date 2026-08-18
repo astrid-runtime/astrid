@@ -378,7 +378,7 @@ async fn dispatch_capsule(command: crate::cli::CapsuleCommands) -> Result<ExitCo
             purge,
         } => dispatch_capsule_remove(name, workspace, force, purge).await,
         CapsuleCommands::Tree | CapsuleCommands::Deps => {
-            commands::capsule::deps::show_tree()?;
+            commands::capsule::deps::show_tree().await?;
             Ok(ExitCode::SUCCESS)
         },
         CapsuleCommands::Build {

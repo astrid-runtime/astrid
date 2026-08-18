@@ -167,7 +167,7 @@ pub(crate) fn delete_env_entry(
     })
 }
 
-fn headless_env_key(key: &str) -> String {
+pub(super) fn headless_env_key(key: &str) -> String {
     format!(
         "ASTRID_VAR_{}",
         key.chars()
@@ -180,7 +180,7 @@ fn headless_env_key(key: &str) -> String {
     )
 }
 
-fn json_value_string(value: &serde_json::Value) -> String {
+pub(super) fn json_value_string(value: &serde_json::Value) -> String {
     value
         .as_str()
         .map_or_else(|| value.to_string(), str::to_string)

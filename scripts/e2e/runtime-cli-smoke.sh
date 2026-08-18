@@ -101,7 +101,19 @@ run_cli_semantic_smoke() {
   assert_cli_deferred "cli-trust-add" "cross-host trust management" trust add example.invalid --future-flag
   assert_cli_deferred "cli-trust-list" "cross-host trust management" trust list --future-flag
   assert_cli_deferred "cli-trust-remove" "cross-host trust management" trust remove example.invalid --future-flag
-  assert_cli_deferred "cli-audit" "audit trail inspection" audit "$user_principal" --future-filter
+  run_cli audit stats --format json > "$ARTIFACTS/cli-audit-stats.json"
+  "$PYTHON" - "$ARTIFACTS/cli-audit-stats.json" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+stats = data.get("stats", {})
+health = data.get("health", {})
+if not isinstance(stats.get("total_count"), int) or stats.get("total_count", 0) <= 0:
+    raise SystemExit(f"audit stats missed durable entries: {data!r}")
+if stats.get("degraded") is not False or health.get("degraded") is not False:
+    raise SystemExit(f"audit stats reported degraded state: {data!r}")
+PY
 
   local invite_token redeem_key pair_token pair_pubkey pair_key_id
   invite_token="$("$CORE_DIR/target/debug/astrid" invite issue --group agent --max-uses 1 \
@@ -135,12 +147,16 @@ run_cli_semantic_smoke() {
   json_assert_cli_quota "$ARTIFACTS/cli-quota-show-user.json" "$user_principal" 4
   run_cli secret list --agent "$user_principal" --format json > "$ARTIFACTS/cli-secret-list-user.json"
   json_assert_secret_list_metadata "$ARTIFACTS/cli-secret-list-user.json" astrid-capsule-openai-compat api_key
-  run_cli secret set e2e_cli_delete_marker e2e-value --agent "$user_principal"
+  run_cli secret set e2e_cli_delete_marker e2e-value --agent "$user_principal" \
+    --capsule astrid-capsule-openai-compat
   run_cli secret list --agent "$user_principal" --format json > "$ARTIFACTS/cli-secret-list-with-delete-marker.json"
-  json_assert_secret_present "$ARTIFACTS/cli-secret-list-with-delete-marker.json" default e2e_cli_delete_marker
-  run_cli secret delete e2e_cli_delete_marker --agent "$user_principal"
+  json_assert_secret_present "$ARTIFACTS/cli-secret-list-with-delete-marker.json" \
+    astrid-capsule-openai-compat e2e_cli_delete_marker
+  run_cli secret delete e2e_cli_delete_marker --agent "$user_principal" \
+    --capsule astrid-capsule-openai-compat
   run_cli secret list --agent "$user_principal" --format json > "$ARTIFACTS/cli-secret-list-after-delete.json"
-  json_assert_secret_absent "$ARTIFACTS/cli-secret-list-after-delete.json" default e2e_cli_delete_marker
+  json_assert_secret_absent "$ARTIFACTS/cli-secret-list-after-delete.json" \
+    astrid-capsule-openai-compat e2e_cli_delete_marker
   local capsule_new_parent="$ARTIFACTS/capsule-new"
   mkdir -p "$capsule_new_parent"
   run_cli capsule new e2e-capsule-smoke --path "$capsule_new_parent" < /dev/null
@@ -203,7 +219,7 @@ PY
   grep -q "astrid-capsule-openai-compat" "$ARTIFACTS/cli-capsule-list.txt" || fail "capsule list missed openai-compat"
   run_cli capsule config astrid-capsule-openai-compat --agent "$user_principal" --show --format json \
     > "$ARTIFACTS/cli-capsule-config-openai-user.json"
-  json_assert_cli_capsule_config "$ARTIFACTS/cli-capsule-config-openai-user.json" fake-slow
+  json_assert_cli_capsule_config "$ARTIFACTS/cli-capsule-config-openai-user.json"
   run_cli logs --lines 1 > "$ARTIFACTS/cli-logs.txt"
   [[ -s "$ARTIFACTS/cli-logs.txt" ]] || fail "logs did not emit daemon log tail"
   run_cli ps --format json > "$ARTIFACTS/cli-ps.json"
@@ -302,9 +318,20 @@ EOF
     > "$ARTIFACTS/cli-init-offline.txt" 2>&1
   grep -Eq "Installation complete|Installed [0-9]+ capsule" "$ARTIFACTS/cli-init-offline.txt" \
     || fail "offline init did not complete"
-  [[ -f "$home/home/default/.config/distro.lock" ]] || fail "offline init did not write Distro.lock"
-  [[ -f "$home/home/default/.local/capsules/astrid-capsule-registry/meta.json" ]] \
-    || fail "offline init did not install registry capsule metadata"
+  run_isolated_cli "$home" "$cwd" capsule show astrid-capsule-registry \
+    > "$ARTIFACTS/cli-init-capsule-show.txt"
+  grep -q "astrid-capsule-registry" "$ARTIFACTS/cli-init-capsule-show.txt" \
+    || fail "offline init did not publish registry capsule metadata"
+  run_isolated_cli "$home" "$cwd" init --distro "$distro" --offline --yes --allow-unsigned \
+    > "$ARTIFACTS/cli-init-reopen.txt" 2>&1
+  grep -q "Distro.lock is up to date" "$ARTIFACTS/cli-init-reopen.txt" \
+    || fail "offline init did not persist daemon-owned distro provenance"
+  if [[ -d "$home/home" ]] && find "$home/home" \
+    \( -path '*/.config/distro.lock' -o -path '*/.local/capsules/*' \) \
+    -print -quit | grep -q .; then
+    fail "offline init recreated legacy native distro or capsule authority"
+  fi
+  run_isolated_cli "$home" "$cwd" stop >/dev/null
 }
 
 run_cli_distro_seal_smoke() {
@@ -760,23 +787,24 @@ import sys
 data = json.load(open(sys.argv[1], encoding="utf-8"))
 if data.get("name") != sys.argv[2]:
     raise SystemExit(f"unexpected capsule: {data!r}")
-manifest = data.get("manifest", "")
-if 'name = "astrid-capsule-openai-compat"' not in manifest:
+manifest = json.loads(data.get("manifest", "{}"))
+if manifest.get("package", {}).get("name") != sys.argv[2]:
     raise SystemExit("capsule manifest body missing package identity")
 PY
 }
 
 json_assert_cli_capsule_config() {
-  local file=$1 model=$2
-  "$PYTHON" - "$file" "$model" <<'PY'
+  local file=$1
+  "$PYTHON" - "$file" <<'PY'
 import json
 import sys
 
 data = json.load(open(sys.argv[1], encoding="utf-8"))
-if data.get("model") != sys.argv[2]:
-    raise SystemExit(f"unexpected capsule model config: {data!r}")
-if "api_key" in data:
-    raise SystemExit(f"capsule config leaked secret key metadata/value: {data!r}")
+for key in ("model", "api_key"):
+    if data.get(key) != "<redacted>":
+        raise SystemExit(f"capsule config missed redacted {key!r} metadata: {data!r}")
+if any(value != "<redacted>" for value in data.values()):
+    raise SystemExit(f"capsule config leaked a stored value: {data!r}")
 PY
 }
 

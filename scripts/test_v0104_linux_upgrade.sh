@@ -13,6 +13,7 @@ REPOSITORY_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly REPOSITORY_ROOT
 readonly CURRENT_BIN_DIR="${ASTRID_CURRENT_BIN_DIR:-${REPOSITORY_ROOT}/target/debug}"
 readonly CAPSULE_SOURCE="${REPOSITORY_ROOT}/e2e/fixtures/astrid-capsule-adversarial"
+CAPSULE_RUSTUP_HOME=""
 TEST_ROOT="$(mktemp -d "${RUNNER_TEMP:-/tmp}/astrid-v0104-linux-upgrade.XXXXXX")"
 readonly TEST_ROOT
 readonly RELEASE_ROOT="${TEST_ROOT}/release"
@@ -55,6 +56,10 @@ ensure_capsule_build_target() {
   local active_toolchain target_libdir toolchain
   command -v rustup >/dev/null 2>&1 \
     || fail "rustup is required to install ${CAPSULE_BUILD_TARGET}"
+  CAPSULE_RUSTUP_HOME="$(rustup show home)" \
+    || fail "could not resolve the Rustup home used by the capsule fixture"
+  [[ -d "${CAPSULE_RUSTUP_HOME}" ]] \
+    || fail "Rustup home is not a directory: ${CAPSULE_RUSTUP_HOME}"
 
   # The published astrid-build runs Cargo with the capsule source as its
   # current directory. Resolve the toolchain from that exact directory rather
@@ -78,6 +83,18 @@ ensure_capsule_build_target() {
     || fail "could not resolve ${CAPSULE_BUILD_TARGET} libraries for ${toolchain}"
   compgen -G "${target_libdir}/libcore-*.rlib" >/dev/null \
     || fail "Rust core library for ${CAPSULE_BUILD_TARGET} is missing from ${toolchain}"
+}
+
+run_old_capsule_build_bounded() {
+  local limit="$1"
+  shift
+  [[ -n "${CAPSULE_RUSTUP_HOME}" ]] \
+    || fail "capsule build toolchain was not initialized"
+  (
+    cd -- "${WORKSPACE}"
+    timeout "${limit}" env ASTRID_HOME="${ASTRID_HOME}" HOME="${POISON_HOME}" \
+      RUSTUP_HOME="${CAPSULE_RUSTUP_HOME}" "${OLD_BIN_DIR}/astrid" "$@"
+  )
 }
 
 run_old() {
@@ -239,7 +256,7 @@ compgen -G "${ASTRID_HOME}/var/state.db/wal/*.wal" >/dev/null \
 # silently skip package/authority/WIT coverage when the published CLI loses
 # this capability: that is a release-fixture failure, not an optional branch.
 ensure_capsule_build_target
-if ! run_old_bounded 180s capsule install --yes \
+if ! run_old_capsule_build_bounded 180s capsule install --yes \
   --var adversarial_lifecycle_probe=runtime-lifecycle-ok \
   "${CAPSULE_SOURCE}" \
   >"${TEST_ROOT}/v0104-capsule-install.log" 2>&1; then

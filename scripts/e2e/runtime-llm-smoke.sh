@@ -190,6 +190,8 @@ import sys
 log_file = sys.argv[1]
 prompt_text = sys.argv[2]
 expected_model = sys.argv[3]
+if ":" not in expected_model:
+    expected_model = f"openai-compat:{expected_model}"
 matches = []
 
 with open(log_file, encoding="utf-8") as handle:

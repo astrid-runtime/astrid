@@ -53,6 +53,12 @@ start_daemon() {
     tail_daemon_diagnostics
     fail "daemon did not become healthy"
   }
+  if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
+    wait "$DAEMON_PID" 2>/dev/null || true
+    DAEMON_PID=""
+    tail_daemon_diagnostics
+    fail "launched daemon exited while another process answered health checks"
+  fi
 }
 
 stop_daemon() {

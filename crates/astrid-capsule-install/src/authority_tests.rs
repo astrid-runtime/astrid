@@ -127,7 +127,7 @@ fn same_runtime_build_installs_automatically_and_records_authority() {
         &archive,
         &home,
         InstallOptions {
-            storage: Some(storage),
+            storage: Some(Arc::clone(&storage)),
             ..Default::default()
         },
         &principal,
@@ -135,9 +135,11 @@ fn same_runtime_build_installs_automatically_and_records_authority() {
         &WorkspaceLayout::default(),
     )
     .unwrap();
-    let authority = read_installed_authority(&home, &output.target_dir)
+    let uid = storage.principal_directory().uid_for(&principal).unwrap();
+    let package = crate::storage::read_verified_durable_package(&storage, uid, "example")
         .unwrap()
         .unwrap();
+    let authority = package.authority();
     assert_eq!(authority.source, AuthoritySource::LocalRuntimeBuild);
     assert_eq!(authority.capsule_id, "example");
     assert_eq!(authority.version, "1.0.0");
@@ -161,10 +163,15 @@ fn same_runtime_build_installs_automatically_and_records_authority() {
          [capabilities]\nnet_connect = [\"api.example:443\"]\n# changed after install\n",
     )
     .unwrap();
-    let changed =
-        astrid_capsule::discovery::load_manifest(&output.target_dir.join("Capsule.toml")).unwrap();
-    let error = verify_installed_authority(&home, &output.target_dir, &changed).unwrap_err();
-    assert!(error.to_string().contains("exact manifest approved"));
+    let changed_bytes = std::fs::read(output.target_dir.join("Capsule.toml")).unwrap();
+    let durable = crate::storage::read_verified_durable_package(&storage, uid, "example")
+        .unwrap()
+        .unwrap();
+    assert_ne!(durable.manifest_bytes(), changed_bytes);
+    assert_eq!(
+        durable.manifest().capabilities.net_connect,
+        vec!["api.example:443"]
+    );
 
     std::fs::write(
         output.target_dir.join("Capsule.toml"),
@@ -172,10 +179,15 @@ fn same_runtime_build_installs_automatically_and_records_authority() {
          [capabilities]\nnet_connect = [\"api.example:443\", \"db.example:5432\"]\n",
     )
     .unwrap();
-    let expanded =
-        astrid_capsule::discovery::load_manifest(&output.target_dir.join("Capsule.toml")).unwrap();
-    let error = verify_installed_authority(&home, &output.target_dir, &expanded).unwrap_err();
-    assert!(error.to_string().contains("net_connect=[db.example:5432]"));
+    let expanded_bytes = std::fs::read(output.target_dir.join("Capsule.toml")).unwrap();
+    let durable = crate::storage::read_verified_durable_package(&storage, uid, "example")
+        .unwrap()
+        .unwrap();
+    assert_ne!(durable.manifest_bytes(), expanded_bytes);
+    assert_eq!(
+        durable.manifest().capabilities.net_connect,
+        vec!["api.example:443"]
+    );
 }
 
 #[test]
@@ -194,7 +206,7 @@ fn installed_wasm_cannot_be_repointed_after_authority_approval() {
         &archive,
         &home,
         InstallOptions {
-            storage: Some(storage),
+            storage: Some(Arc::clone(&storage)),
             ..Default::default()
         },
         &principal,
@@ -274,11 +286,11 @@ fn foreign_runtime_signature_needs_digest_bound_approval() {
         )
         .is_err()
     );
-    let output = unpack_and_install_authorized_for_principal_with_layout(
+    unpack_and_install_authorized_for_principal_with_layout(
         &archive,
         &home,
         InstallOptions {
-            storage: Some(storage),
+            storage: Some(Arc::clone(&storage)),
             ..Default::default()
         },
         &principal,
@@ -288,11 +300,12 @@ fn foreign_runtime_signature_needs_digest_bound_approval() {
         &layout,
     )
     .unwrap();
+    let uid = storage.principal_directory().uid_for(&principal).unwrap();
+    let package = crate::storage::read_verified_durable_package(&storage, uid, "example")
+        .unwrap()
+        .unwrap();
     assert_eq!(
-        read_installed_authority(&home, &output.target_dir)
-            .unwrap()
-            .unwrap()
-            .source,
+        package.authority().source,
         AuthoritySource::ExplicitApproval
     );
 }

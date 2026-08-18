@@ -106,34 +106,46 @@ data = json.load(open(sys.argv[1], encoding="utf-8"))
 expected_phase = sys.argv[2]
 if data.get("phase") != expected_phase:
     raise SystemExit(f"expected install phase {expected_phase!r}, got {data!r}")
-for field in ("target_dir", "installed_version", "wasm_hash", "env_path"):
+for field in ("target_dir", "installed_version", "wasm_hash"):
     if not data.get(field):
         raise SystemExit(f"install output missed {field!r}: {data!r}")
-if not str(data.get("target_dir", "")).endswith("/astrid-capsule-registry"):
-    raise SystemExit(f"install target was not registry capsule: {data!r}")
+if data.get("env_path") != "":
+    raise SystemExit(f"storage-backed install exposed a native env path: {data!r}")
+target_parts = str(data.get("target_dir", "")).replace("\\", "/").rstrip("/").split("/")
+if len(target_parts) < 2 or target_parts[-2] != "astrid-capsule-registry":
+    raise SystemExit(f"install target was not a digest-qualified registry cache: {data!r}")
+digest = target_parts[-1]
+if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
+    raise SystemExit(f"install target cache generation was not a canonical digest: {data!r}")
 PY
 }
 
-json_assert_capsule_show_archive_source() {
+json_assert_capsule_show_durable_source() {
   local file=$1
   local capsule=$2
-  local archive=$3
-  "$PYTHON" - "$file" "$capsule" "$archive" <<'PY'
+  "$PYTHON" - "$file" "$capsule" <<'PY'
 import json
 import sys
+import uuid
 
 data = json.load(open(sys.argv[1], encoding="utf-8"))
 capsule = sys.argv[2]
-archive = sys.argv[3]
 if data.get("name") != capsule:
     raise SystemExit(f"expected capsule {capsule!r}, got {data!r}")
-if data.get("source") != archive:
-    raise SystemExit(f"expected source {archive!r}, got {data!r}")
-if not data.get("wasm_hash"):
+try:
+    source_id = uuid.UUID(str(data.get("source", "")))
+except ValueError as exc:
+    raise SystemExit(f"capsule show exposed a non-canonical runtime source ID: {data!r}") from exc
+if source_id.int == 0:
+    raise SystemExit(f"capsule show exposed the reserved nil runtime source ID: {data!r}")
+wasm_hash = str(data.get("wasm_hash", ""))
+if len(wasm_hash) != 64 or any(ch not in "0123456789abcdef" for ch in wasm_hash):
     raise SystemExit(f"capsule show missed wasm_hash: {data!r}")
-manifest = data.get("manifest", "")
-if f'name = "{capsule}"' not in manifest:
+manifest = json.loads(data.get("manifest", ""))
+if manifest.get("package", {}).get("name") != capsule:
     raise SystemExit(f"capsule manifest did not name {capsule!r}: {manifest!r}")
+if data.get("contracts_status") != "daemon-registry":
+    raise SystemExit(f"capsule show did not identify daemon registry authority: {data!r}")
 PY
 }
 
@@ -268,6 +280,22 @@ if forbidden in ids:
 PY
 }
 
+assert_session_management_unavailable() {
+  local label=$1 status=$2 out=$3
+  LAST_HTTP_OUT="$out"
+  assert_status "$label" "$status" 501
+  "$PYTHON" - "$out" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+if data.get("error") != "not_implemented":
+    raise SystemExit(f"session management missed not_implemented contract: {data!r}")
+if "conversation-management verbs" not in data.get("reason", ""):
+    raise SystemExit(f"session management missed bounded feature reason: {data!r}")
+PY
+}
+
 json_assert_deleted_flag() {
   local file=$1 expected=$2
   "$PYTHON" - "$file" "$expected" <<'PY'
@@ -281,17 +309,13 @@ if data.get("deleted") is not expected:
 PY
 }
 
-json_assert_capsule_env_models() {
+json_assert_no_native_capsule_env() {
   local home=$1
   local capsule=$2
   local default_principal=$3
   local user_principal=$4
   local ops_principal=$5
-  local default_model=$6
-  local user_model=$7
-  local ops_model=$8
-  "$PYTHON" - "$home" "$capsule" "$default_principal" "$user_principal" "$ops_principal" "$default_model" "$user_model" "$ops_model" <<'PY'
-import json
+  "$PYTHON" - "$home" "$capsule" "$default_principal" "$user_principal" "$ops_principal" <<'PY'
 import sys
 from pathlib import Path
 
@@ -300,28 +324,10 @@ capsule = sys.argv[2]
 default_principal = sys.argv[3]
 user_principal = sys.argv[4]
 ops_principal = sys.argv[5]
-default_model = sys.argv[6]
-user_model = sys.argv[7]
-ops_model = sys.argv[8]
-
-def read_env(principal: str) -> dict:
+for principal in (default_principal, user_principal, ops_principal):
     path = home / "home" / principal / ".config" / "env" / f"{capsule}.env.json"
-    if not path.exists():
-        raise SystemExit(f"missing env file for {principal}: {path}")
-    return json.loads(path.read_text(encoding="utf-8"))
-
-default_env = read_env(default_principal)
-user_env = read_env(user_principal)
-ops_env = read_env(ops_principal)
-
-if default_env.get("model") != default_model:
-    raise SystemExit(f"default model drifted: {default_env!r}")
-if user_env.get("model") != user_model:
-    raise SystemExit(f"user model write missed or leaked: {user_env!r}")
-if ops_env.get("model") != ops_model:
-    raise SystemExit(f"ops model write missed or leaked: {ops_env!r}")
-if user_env.get("model") == ops_env.get("model"):
-    raise SystemExit(f"user and ops env models unexpectedly match: {user_env!r} / {ops_env!r}")
+    if path.exists():
+        raise SystemExit(f"environment escaped governed storage into native alias path: {path}")
 PY
 }
 
@@ -343,8 +349,8 @@ matches = [
 if len(matches) != 1:
     raise SystemExit(f"expected one secret metadata entry for {capsule}/{key}, got {matches!r}")
 entry = matches[0]
-if entry.get("storage") != "file":
-    raise SystemExit(f"secret metadata did not report file storage: {entry!r}")
+if entry.get("storage") != "secret-store":
+    raise SystemExit(f"secret metadata did not report governed secret storage: {entry!r}")
 if entry.get("scope") != "agent":
     raise SystemExit(f"secret metadata did not report agent scope: {entry!r}")
 for forbidden in ("value", "secret"):
@@ -353,7 +359,7 @@ for forbidden in ("value", "secret"):
 PY
 }
 
-json_assert_secret_files_isolated() {
+json_assert_secret_store_isolated() {
   local home=$1
   local capsule=$2
   local default_secret=$3
@@ -362,7 +368,6 @@ json_assert_secret_files_isolated() {
   local ops_principal=$6
   local ops_secret=$7
   "$PYTHON" - "$home" "$capsule" "$default_secret" "$user_principal" "$user_secret" "$ops_principal" "$ops_secret" <<'PY'
-import stat
 import sys
 from pathlib import Path
 
@@ -374,24 +379,18 @@ user_secret = sys.argv[5]
 ops_principal = sys.argv[6]
 ops_secret = sys.argv[7]
 
-expected = {
+sentinels = {
     "default": default_secret,
     user_principal: user_secret,
     ops_principal: ops_secret,
 }
 
-for principal, value in expected.items():
+for principal in sentinels:
     path = home / "secrets" / principal / capsule / "api_key"
-    if not path.exists():
-        raise SystemExit(f"missing secret file for {principal}: {path}")
-    found = path.read_text(encoding="utf-8")
-    if found != value:
-        raise SystemExit(f"secret value for {principal} did not match its own sentinel")
-    mode = stat.S_IMODE(path.stat().st_mode)
-    if mode != 0o600:
-        raise SystemExit(f"secret file for {principal} has mode {mode:o}, expected 600")
+    if path.exists():
+        raise SystemExit(f"secret escaped governed storage into native alias path: {path}")
 
-if len(set(expected.values())) != len(expected):
+if len(set(sentinels.values())) != len(sentinels):
     raise SystemExit("test sentinels must be distinct")
 PY
 }

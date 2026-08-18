@@ -26,10 +26,13 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use astrid_capsule_install::{
-    AuthorityDecision, InstallOptions, InstallOutput, InstallPhase, read_archive_manifest,
+    AuthorityDecision, InstallOptions, InstallOutput, InstallPhase,
+    inspect_archive_for_principal_with_layout, inspect_directory_for_principal_with_layout,
+    read_archive_manifest,
 };
 use astrid_core::kernel_api::{
-    CapsuleInstallEnv, CapsuleInstallProvenance, EnvStorageScope, EnvValueKind,
+    CapsuleInstallAuthority, CapsuleInstallEnv, CapsuleInstallProvenance, EnvStorageScope,
+    EnvValueKind,
 };
 use astrid_events::kernel_api::KernelResponse;
 use astrid_storage::{KvBatchCondition, KvBatchMutation, KvEntryKey, KvMutationBatch};
@@ -98,15 +101,29 @@ impl EnvTransaction {
 
 /// Handle `KernelRequest::InstallCapsule` by delegating to the shared
 /// install library.
+pub(super) struct InstallCapsuleRequest<'a> {
+    pub(super) caller: &'a astrid_core::principal::PrincipalId,
+    pub(super) requested_target: Option<&'a astrid_core::principal::PrincipalId>,
+    pub(super) source: &'a str,
+    pub(super) workspace: bool,
+    pub(super) provenance: Option<&'a CapsuleInstallProvenance>,
+    pub(super) authority: CapsuleInstallAuthority,
+    pub(super) env: &'a [CapsuleInstallEnv],
+}
+
 pub(super) async fn handle_install_capsule(
     kernel: &Arc<crate::Kernel>,
-    caller: &astrid_core::principal::PrincipalId,
-    requested_target: Option<&astrid_core::principal::PrincipalId>,
-    source: &str,
-    workspace: bool,
-    provenance: Option<&CapsuleInstallProvenance>,
-    env: &[CapsuleInstallEnv],
+    request: InstallCapsuleRequest<'_>,
 ) -> KernelResponse {
+    let InstallCapsuleRequest {
+        caller,
+        requested_target,
+        source,
+        workspace,
+        provenance,
+        authority,
+        env,
+    } = request;
     if workspace {
         return KernelResponse::Error(
             "workspace installs are CLI-only — the daemon has no meaningful CWD; \
@@ -159,7 +176,8 @@ pub(super) async fn handle_install_capsule(
         provenance_source_digest: provenance.and_then(|value| value.source_digest.clone()),
     };
 
-    let output = match run_authorized_install(kernel, target, path, home, options).await {
+    let output = match run_authorized_install(kernel, target, path, home, options, authority).await
+    {
         Ok(output) => output,
         Err(error) => {
             if let Some(transaction) = env_transaction {
@@ -209,6 +227,7 @@ async fn run_authorized_install(
     path: std::path::PathBuf,
     home: astrid_core::dirs::AstridHome,
     options: InstallOptions,
+    authority: CapsuleInstallAuthority,
 ) -> Result<InstallOutput, String> {
     let workspace_layout = kernel.workspace_layout.clone();
     let workspace_root = kernel.workspace_root.clone();
@@ -219,6 +238,8 @@ async fn run_authorized_install(
             .and_then(|extension| extension.to_str())
             .is_some_and(|extension| extension.eq_ignore_ascii_case("capsule"));
     let source_display = path.display().to_string();
+    let authority =
+        daemon_authority_decision(&path, &home, &principal, &workspace_layout, authority)?;
     let task = if is_archive {
         tokio::task::spawn_blocking(move || {
             astrid_capsule_install::unpack_and_install_authorized_for_principal_in_workspace(
@@ -227,7 +248,7 @@ async fn run_authorized_install(
                 options,
                 &principal,
                 Some(&workspace_root),
-                &AuthorityDecision::Automatic,
+                &authority,
                 &workspace_layout,
             )
         })
@@ -239,7 +260,7 @@ async fn run_authorized_install(
                 options,
                 &principal,
                 Some(&workspace_root),
-                &AuthorityDecision::Automatic,
+                &authority,
                 &workspace_layout,
             )
         })
@@ -252,6 +273,33 @@ async fn run_authorized_install(
     task.await
         .map_err(|error| format!("install task panicked: {error}"))?
         .map_err(|error| format!("install failed: {error:#}"))
+}
+
+fn daemon_authority_decision(
+    path: &std::path::Path,
+    home: &astrid_core::dirs::AstridHome,
+    principal: &astrid_core::principal::PrincipalId,
+    workspace_layout: &astrid_core::dirs::WorkspaceLayout,
+    authority: CapsuleInstallAuthority,
+) -> Result<AuthorityDecision, String> {
+    if authority == CapsuleInstallAuthority::Automatic {
+        return Ok(AuthorityDecision::Automatic);
+    }
+    let inspection = if path.is_file() {
+        inspect_archive_for_principal_with_layout(path, home, principal, false, workspace_layout)
+    } else {
+        inspect_directory_for_principal_with_layout(path, home, principal, false, workspace_layout)
+    }
+    .map_err(|error| format!("inspect capsule install authority: {error:#}"))?;
+    Ok(match authority {
+        CapsuleInstallAuthority::Automatic => AuthorityDecision::Automatic,
+        CapsuleInstallAuthority::ExplicitApproval => AuthorityDecision::ExplicitApproval {
+            content_digest: inspection.content_digest,
+        },
+        CapsuleInstallAuthority::OperatorDistribution => AuthorityDecision::OperatorDistribution {
+            content_digest: inspection.content_digest,
+        },
+    })
 }
 
 const MAX_PROVENANCE_TEXT_BYTES: usize = 128;

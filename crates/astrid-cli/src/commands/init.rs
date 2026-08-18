@@ -83,29 +83,36 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
     // the flag can never be silently honoured without a distro.
     grant::validate_grant_capsules(opts.grant_capsules, !distro_source.is_empty())?;
 
+    let shuttle_install = distro_source.ends_with(".shuttle");
     // Offline, signed, self-contained install path. `--grant-capsules` is not
     // wired for `.shuttle` archives (the installed set isn't threaded back
     // here); fail loud rather than silently skip the grant the operator asked
     // for, pointing at the manual path.
-    if distro_source.ends_with(".shuttle") {
-        if opts.grant_capsules {
-            bail!(
-                "--grant-capsules is not supported for .shuttle installs yet — \
-                 install first, then grant with `astrid --principal {operator} \
-                 agent modify {target} \
-                 --add-capsule <name>` for each installed capsule."
-            );
-        }
+    if shuttle_install && opts.grant_capsules {
+        bail!(
+            "--grant-capsules is not supported for .shuttle installs yet — \
+             install first, then grant with `astrid --principal {operator} \
+             agent modify {target} \
+             --add-capsule <name>` for each installed capsule."
+        );
+    }
+
+    // The kernel must admit a fresh home and publish its migration ledger
+    // before the CLI creates any v2 layout state. Init spans multiple admin
+    // connections, so its daemon must remain alive between those requests.
+    crate::commands::daemon::ensure_persistent_daemon("init")
+        .await
+        .context("init could not ensure the runtime daemon")?;
+
+    if opts.grant_capsules {
+        grant::preflight_grants(&operator, &target).await?;
+    }
+
+    if shuttle_install {
         home.ensure()?;
         let _provisioning_lock = grant::ProvisioningLock::acquire(&home, &target)?;
         init_workspace()?;
         return run_init_from_shuttle(distro_source, opts).await;
-    }
-
-    // Refuse an unauthorized or nonexistent grant target before creating any
-    // local workspace, principal-home, env, capsule, or lock state.
-    if opts.grant_capsules {
-        grant::preflight_grants(&operator, &target).await?;
     }
 
     home.ensure()?;
@@ -130,7 +137,7 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
     if let Some(existing_lock) = load_lock_from_daemon(&target).await?
         && is_lock_fresh(&existing_lock, &manifest)
         && let Some(installed) =
-            grant::validated_grant_set_for_reuse(&home, &target, &existing_lock.capsules)
+            grant::validated_grant_set_for_reuse(&target, &existing_lock.capsules).await
     {
         eprintln!(
             "{}",

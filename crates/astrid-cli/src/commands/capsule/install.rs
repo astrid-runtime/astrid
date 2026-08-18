@@ -9,15 +9,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, bail};
 use astrid_capsule::capsule::CapsuleId;
+#[cfg(test)]
+use astrid_capsule_install::AuthorityDecision;
 use astrid_capsule_install::github_source::{
     capsule_assets, extract_github_org_repo, parse_github_source, pick_capsule,
 };
 use astrid_capsule_install::{
-    ArtifactProvenance, AuthorityDecision, InstallInspection, InstallOptions,
-    inspect_archive_for_principal_with_layout, inspect_directory_for_principal_with_layout,
-    resolve_target_dir_for_with_layout,
+    InstallOptions, inspect_archive_for_principal_with_layout,
+    inspect_directory_for_principal_with_layout, resolve_target_dir_for_with_layout,
 };
-use astrid_capsule_types::capability_presentation::semantic_expansion;
 use astrid_core::dirs::AstridHome;
 
 use super::install_finish::{finish_install, run_with_elicit};
@@ -26,6 +26,10 @@ pub(crate) use super::install_batch::{
     BatchInstallOutcome, InstalledCapsuleOutcome, RefSpec, install_capsule_batch,
 };
 use super::install_github::{github_api_client, release_tag_url, resolve_github_ref};
+
+mod authority;
+
+use authority::{authority_decision, daemon_install_authority};
 
 #[derive(Clone, Copy)]
 struct ExpectedCapsule<'a> {
@@ -83,11 +87,8 @@ pub(crate) struct OfflineCapsuleProvenance<'a> {
     pub(crate) signature: Option<&'a str>,
 }
 
-/// Re-exported so sibling CLI modules (`init.rs`, `shuttle_install.rs`)
-/// keep the `super::install::resolve_target_dir_for` import path. The
-/// `_for` variant scopes the target to a specific principal — the
-/// init/distro path uses it to read back a capsule it installed under a
-/// non-`default` principal's home.
+/// Legacy native-layout test fixture helper.
+#[cfg(test)]
 pub(crate) use astrid_capsule_install::resolve_target_dir_for;
 
 /// Re-exported so the `update` subcommand in [`super::install_update`]
@@ -143,17 +144,8 @@ pub(crate) async fn install_capsule_with_options(
     approve_untrusted: bool,
     vars: &[String],
 ) -> anyhow::Result<()> {
-    // The daemon owns the durable principal registry. For direct local
-    // archives/directories, send the authenticated install intent to it
-    // instead of opening a second writer in this CLI process. Workspace
-    // installs remain explicit project-local operations.
-    if !workspace && super::install_daemon::is_local_source(source) {
-        super::install_daemon::install_local_via_daemon(source, vars).await?;
-        return Ok(());
-    }
-
-    let principal = crate::principal::current();
     let prompt = ManualInstallOptions::from_cli(yes, approve_untrusted, vars)?;
+    let principal = crate::principal::current();
     let (installed, _resolved) = install_capsule_inner(
         source,
         capsule,
@@ -211,11 +203,6 @@ pub(super) async fn install_capsule_inner(
     //    canonical reference for a locally-sourced capsule). No remote
     //    ref to resolve.
     if base.starts_with('.') || base.starts_with('/') {
-        if !workspace {
-            let outcome =
-                super::install_daemon::install_local_via_daemon_outcome(base, &[]).await?;
-            return Ok((vec![outcome], None));
-        }
         let ids = install_from_local(
             base,
             workspace,
@@ -224,7 +211,8 @@ pub(super) async fn install_capsule_inner(
             principal,
             expected,
             prompt,
-        )?;
+        )
+        .await?;
         return Ok((ids, None));
     }
 
@@ -270,10 +258,6 @@ pub(super) async fn install_capsule_inner(
     }
 
     // 4. Fallback: assume local folder. No remote ref to resolve.
-    if !workspace {
-        let outcome = super::install_daemon::install_local_via_daemon_outcome(base, &[]).await?;
-        return Ok((vec![outcome], None));
-    }
     let ids = install_from_local(
         base,
         workspace,
@@ -282,7 +266,8 @@ pub(super) async fn install_capsule_inner(
         principal,
         expected,
         prompt,
-    )?;
+    )
+    .await?;
     Ok((ids, None))
 }
 
@@ -507,7 +492,14 @@ async fn download_and_unpack(
             download_path
                 .to_str()
                 .context("invalid downloaded archive path")?,
-            &[],
+            context.prompt,
+            daemon_install_authority(
+                download_path
+                    .to_str()
+                    .context("invalid downloaded archive path")?,
+                context.principal,
+                context.prompt,
+            )?,
         )
         .await;
     }
@@ -627,7 +619,14 @@ async fn clone_and_build(
                 produced[idx]
                     .to_str()
                     .context("invalid built archive path")?,
-                &[],
+                context.prompt,
+                daemon_install_authority(
+                    produced[idx]
+                        .to_str()
+                        .context("invalid built archive path")?,
+                    context.principal,
+                    context.prompt,
+                )?,
             )
             .await;
         }
@@ -645,7 +644,7 @@ async fn clone_and_build(
     bail!("astrid-build produced no .capsule archive.");
 }
 
-fn install_from_local(
+async fn install_from_local(
     source: &str,
     workspace: bool,
     home: &AstridHome,
@@ -661,6 +660,15 @@ fn install_from_local(
 
     // Unpack `.capsule` archive when source is a file.
     if source_path.is_file() && source.ends_with(".capsule") {
+        if !workspace {
+            let installed = super::install_daemon::install_local_via_daemon_outcome(
+                source,
+                prompt,
+                daemon_install_authority(source, principal, prompt)?,
+            )
+            .await?;
+            return Ok(vec![installed]);
+        }
         return unpack_via_lib(
             source_path,
             workspace,
@@ -697,6 +705,19 @@ fn install_from_local(
         for entry in std::fs::read_dir(&output_dir)? {
             let entry = entry?;
             if entry.path().extension().and_then(|s| s.to_str()) == Some("capsule") {
+                if !workspace {
+                    let archive = entry.path();
+                    let archive = archive
+                        .to_str()
+                        .context("built capsule archive path is not UTF-8")?;
+                    let installed = super::install_daemon::install_local_via_daemon_outcome(
+                        archive,
+                        prompt,
+                        daemon_install_authority(archive, principal, prompt)?,
+                    )
+                    .await?;
+                    return Ok(vec![installed]);
+                }
                 return unpack_via_lib(
                     &entry.path(),
                     workspace,
@@ -710,6 +731,16 @@ fn install_from_local(
             }
         }
         bail!("Failed to auto-build capsule from Cargo project.");
+    }
+
+    if !workspace {
+        let installed = super::install_daemon::install_local_via_daemon_outcome(
+            source,
+            prompt,
+            daemon_install_authority(source, principal, prompt)?,
+        )
+        .await?;
+        return Ok(vec![installed]);
     }
 
     install_from_local_path_for_principal(
@@ -922,71 +953,6 @@ fn unpack_via_lib(
         }
     })?;
     finish_install(&output, home, principal, prompt)
-}
-
-fn authority_decision(
-    inspection: &InstallInspection,
-    prompt: &ManualInstallOptions,
-) -> anyhow::Result<AuthorityDecision> {
-    if matches!(
-        inspection.provenance,
-        ArtifactProvenance::LocalRuntime { .. }
-    ) {
-        return Ok(AuthorityDecision::Automatic);
-    }
-    if BATCH_MODE.load(Ordering::Relaxed) {
-        return Ok(AuthorityDecision::OperatorDistribution {
-            content_digest: inspection.content_digest.clone(),
-        });
-    }
-    if prompt.approve_untrusted {
-        return Ok(AuthorityDecision::ExplicitApproval {
-            content_digest: inspection.content_digest.clone(),
-        });
-    }
-    if prompt.yes {
-        bail!(
-            "capsule '{}' is {}; --yes configures values but does not approve install authority. Re-run with --approve-untrusted after reviewing the artifact",
-            inspection.capsule_id,
-            inspection.provenance.label()
-        );
-    }
-
-    eprintln!();
-    eprintln!(
-        "Capsule {} {} is {}.",
-        inspection.capsule_id,
-        inspection.version,
-        inspection.provenance.label()
-    );
-    if let Some(signer) = inspection.provenance.signer() {
-        eprintln!("  Signer: {signer}");
-    }
-    eprintln!("  Content: {}", inspection.content_digest);
-    if inspection.capability_expansions.is_empty() {
-        eprintln!("  New authority beyond the current install: none");
-    } else {
-        eprintln!("  NEW AUTHORITY REQUESTED");
-        for expansion in &inspection.capability_expansions {
-            let semantic = semantic_expansion(expansion);
-            eprintln!("    - {}", semantic.action);
-            if !semantic.scope.is_empty() {
-                eprintln!("      Scope: {}", semantic.scope.join("; "));
-            }
-            eprintln!("      Impact: {}", semantic.impact);
-        }
-    }
-    eprint!("Approve this exact install once? [y/N] ");
-    std::io::Write::flush(&mut std::io::stderr())?;
-    let mut answer = String::new();
-    std::io::stdin().read_line(&mut answer)?;
-    if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-        Ok(AuthorityDecision::ExplicitApproval {
-            content_digest: inspection.content_digest.clone(),
-        })
-    } else {
-        bail!("capsule install authority was not approved")
-    }
 }
 
 // Source-resolution tests live here; install machinery is tested in
