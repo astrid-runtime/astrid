@@ -6,6 +6,7 @@ Last reviewed: 2026-08-18
 
 Related documents:
 
+- [Astrid Resource Ownership Model](astrid-resource-ownership-model.md)
 - [Astrid AI-Native OS Workplan](astrid-ai-native-os-workplan.md)
 - [Astrid Kernel Charter](astrid-kernel-charter.md)
 - [Astrid Native Component Kernel](astrid-native-kernel.md)
@@ -51,6 +52,11 @@ The system therefore follows this rule:
 This specification is the joining contract for the hosted runtime, Principal
 Store, Linux Realm, native component kernel, remote administration, distros,
 and the first universal-application proof using Hermes Agent.
+
+The resource ownership model defines the locked native semantics beneath this
+product architecture. Where this document describes an application-facing
+resource, the ownership model controls its authority, lifecycle, transfer,
+accounting, and recovery behavior.
 
 ## 2. Scope and claim boundary
 
@@ -115,22 +121,28 @@ This specification does not:
 ## 3. System invariant
 
 For every effect `E` requested by workload `W` on behalf of principal `P`, the
-effective authority is intersection-only:
+effective authority is intersection-only. The initiating authority is exactly
+one host-stamped authenticated invocation or one durable, revocable service
+lease; scheduled/background services do not fabricate a human session:
 
 ```text
 effective(E) =
-    authenticated session authority
+    (authenticated invocation authority OR admitted service-lease authority)
   ∩ principal P authority
   ∩ calling application/capsule authority
   ∩ execution-provider authority
+  ∩ Realm-instance authority, when applicable
+  ∩ guest job/process/descriptor authority, when applicable
   ∩ selected portal authority
   ∩ per-job resource and policy ceilings
 ```
 
 No layer may union rights, infer authority from a name, or fall back to an
 ambient host operation when an Astrid provider is unavailable. Failure to
-resolve, authenticate, bind, meter, or audit the required resource fails
-closed.
+resolve, authenticate, bind, meter, or establish required admission/receipt
+evidence fails closed for the effect. Loss of observability-only telemetry
+follows its declared continue-and-alert policy and is never represented as a
+durable receipt.
 
 The host or kernel stamps the effective principal. A guest payload cannot name
 another principal, owner, fleet, workspace, secret set, or network policy to
@@ -272,8 +284,8 @@ The first internal execution-provider contract must be Linux-neutral even when
 Linux Realm is its first consumer. It requires at least:
 
 ```text
-inspect(provider, principal) -> capabilities and limits
-admit(application, generation, principal, resource_request, portals) -> instance
+inspect(provider, stamped_context) -> capabilities and limits
+admit(stamped_context, application, generation, resource_request, portals) -> instance
 start(instance) -> lifecycle generation
 execute(instance, job, stdin, workdir, limits) -> streams and result
 attach(instance, stream_or_terminal) -> bounded attachment
@@ -721,7 +733,8 @@ The same corpus must run against hosted and native providers:
 - network destination/listener policy and revocation;
 - secret isolation and rotation;
 - checkpoint authority refresh;
-- audit and receipt completeness; and
+- receipt completeness for receipt-required effects plus declared behavior for
+  observability loss; and
 - concurrent hostile principals.
 
 Provider-specific performance is reported separately from semantic conformance.

@@ -9,6 +9,7 @@ Baselines:
 - [Astrid Native Component Kernel](astrid-native-kernel.md)
 - [Astrid Tensor Logic Composition](astrid-tensor-logic-composition.md)
 - [Astrid Driver Domain Contract](astrid-driver-domain-contract.md)
+- [Astrid Resource Ownership Model](astrid-resource-ownership-model.md)
 - [Astrid Universal Application Substrate](astrid-universal-application-substrate.md)
 - [AOS Principal Linux Realm](https://github.com/unicity-aos/aos-ce/blob/main/docs/principal-linux-realm.md)
 
