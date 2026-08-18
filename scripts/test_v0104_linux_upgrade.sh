@@ -52,6 +52,15 @@ fail() {
   exit 1
 }
 
+dump_daemon_logs() {
+  local log
+  [[ -d "${ASTRID_HOME}/log" ]] || return 0
+  while IFS= read -r -d '' log; do
+    printf '\n--- %s ---\n' "${log}" >&2
+    tail -n 200 -- "${log}" >&2
+  done < <(find "${ASTRID_HOME}/log" -type f -print0)
+}
+
 ensure_capsule_build_target() {
   local active_toolchain target_libdir toolchain
   command -v rustup >/dev/null 2>&1 \
@@ -131,6 +140,42 @@ run_current_bounded() {
     timeout "${limit}" env ASTRID_HOME="${ASTRID_HOME}" HOME="${POISON_HOME}" \
       "${CURRENT_BIN_DIR}/astrid" "$@"
   )
+}
+
+validate_published_capsule_fixture() {
+  python3 - "${ASTRID_HOME}" <<'PY'
+import json
+import pathlib
+import sys
+
+home = pathlib.Path(sys.argv[1])
+capsule = home / "home/default/.local/capsules/astrid-capsule-adversarial"
+manifest = capsule / "Capsule.toml"
+meta_path = capsule / "meta.json"
+for required in (manifest, meta_path):
+    if not required.is_file():
+        raise SystemExit(f"published capsule install did not publish {required}")
+if 'name = "astrid-capsule-adversarial"' not in manifest.read_text():
+    raise SystemExit("published capsule install wrote the wrong manifest")
+
+meta = json.loads(meta_path.read_text())
+wasm_hash = meta.get("wasm_hash")
+if not isinstance(wasm_hash, str) or len(wasm_hash) != 64:
+    raise SystemExit("published capsule metadata has no canonical WASM hash")
+wasm = home / "bin" / f"{wasm_hash}.wasm"
+if not wasm.is_file() or wasm.stat().st_size == 0:
+    raise SystemExit(f"published capsule install did not publish {wasm}")
+
+wit_files = meta.get("wit_files")
+if not isinstance(wit_files, dict) or not wit_files:
+    raise SystemExit("published capsule metadata has no WIT content-addresses")
+for relative, wit_hash in wit_files.items():
+    if not isinstance(relative, str) or not isinstance(wit_hash, str) or len(wit_hash) != 64:
+        raise SystemExit("published capsule metadata contains an invalid WIT record")
+    blob = home / "wit/store" / f"{wit_hash}.wit"
+    if not blob.is_file() or blob.stat().st_size == 0:
+        raise SystemExit(f"published capsule install did not publish {blob}")
+PY
 }
 
 # Seed only released-home shapes that the component-owned importers can parse.
@@ -263,6 +308,7 @@ if ! run_old_capsule_build_bounded 180s capsule install --yes \
   cat "${TEST_ROOT}/v0104-capsule-install.log" >&2
   fail "published v0.10.4 CLI could not create the capsule migration fixture"
 fi
+validate_published_capsule_fixture
 printf 'astrid-capsule-adversarial\n' >"${TEST_ROOT}/legacy-capsules"
 
 # Exercise the system-file importers with valid released schemas. Empty
@@ -306,7 +352,10 @@ printf '%s\n' 'disposable legacy CoW bytes' \
   >"${ASTRID_HOME}/cow/legacy-workspace/merged/file"
 run_old_bounded 20s stop >/dev/null 2>&1 || true
 
-run_current_bounded 90s start
+if ! run_current_bounded 90s start; then
+  dump_daemon_logs
+  fail "current daemon could not start after migrating the published v0.10.4 home"
+fi
 
 # Write through the live upgraded daemon, stop it, then prove the write and the
 # imported v0.10.4 identity both survive a second boot from the Astrid volume.
