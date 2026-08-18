@@ -871,7 +871,7 @@ fn active_mountpoint(path: &Path) -> io::Result<bool> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 pub(super) fn test_active_mountpoint(path: &Path) -> io::Result<bool> {
     active_mountpoint(path)
 }

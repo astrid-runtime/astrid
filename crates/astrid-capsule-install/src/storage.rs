@@ -429,6 +429,30 @@ pub fn publish_directory_package(
             CapsuleInstallExpectation::Generation(snapshot.generation())
         });
     let package = CapsulePackage::new(archive, metadata, authority);
+    let materialization = tempfile::Builder::new()
+        .prefix(".capsule-materialization-")
+        .tempdir_in(
+            target_dir
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("capsule target has no parent"))?,
+        )
+        .context("stage verified durable capsule materialization")?;
+    let staged_target = materialization.path().join("package");
+    materialize_capsule_package(&package, &staged_target)
+        .context("stage verified durable capsule package")?;
+
+    // Storage-backed installs initially assemble a lifecycle workspace that
+    // intentionally omits the WASM component. Replace it with the complete
+    // verified package before publication so an immediately triggered live
+    // reload sees the same bytes that a restart would rematerialize.
+    let previous_target = materialization.path().join("previous");
+    fs::rename(target_dir, &previous_target)
+        .context("stage incomplete capsule install cache for replacement")?;
+    if let Err(error) = fs::rename(&staged_target, target_dir) {
+        let _ = fs::rename(&previous_target, target_dir);
+        return Err(error).context("publish verified capsule materialization");
+    }
+
     registry
         .install(&owner, &id, &package, expected)
         .with_context(|| format!("publish durable capsule package {id} for {principal}"))?;

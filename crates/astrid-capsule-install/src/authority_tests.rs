@@ -149,13 +149,10 @@ fn same_runtime_build_installs_automatically_and_records_authority() {
         authority.approved_capabilities.net_connect,
         vec!["api.example:443"]
     );
-    assert!(
-        output.target_dir.read_dir().unwrap().all(|entry| !entry
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .contains("authority")),
-        "kernel authority metadata must stay outside capsule-writable storage"
+    assert_eq!(
+        std::fs::read(output.target_dir.join("authority.json")).unwrap(),
+        package.snapshot().package().authority,
+        "the disposable cache must exactly mirror durable authority bytes"
     );
 
     std::fs::write(
@@ -216,6 +213,12 @@ fn installed_wasm_cannot_be_repointed_after_authority_approval() {
     )
     .unwrap();
 
+    assert_eq!(
+        std::fs::read(output.target_dir.join("module.wasm")).unwrap(),
+        original_wasm,
+        "an immediately activated durable install needs the verified component in its cache"
+    );
+
     let manifest =
         astrid_capsule::discovery::load_manifest(&output.target_dir.join("Capsule.toml")).unwrap();
     verify_installed_authority(&home, &output.target_dir, &manifest).unwrap();
@@ -247,7 +250,7 @@ fn installed_wasm_cannot_be_repointed_after_authority_approval() {
 
     let error = verify_installed_authority(&home, &output.target_dir, &manifest).unwrap_err();
     assert!(
-        error.to_string().contains("WASM executable differs"),
+        error.to_string().contains("WASM integrity check failed"),
         "unexpected authority error: {error:#}"
     );
 }
