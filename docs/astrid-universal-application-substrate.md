@@ -2,6 +2,8 @@
 
 Status: proposed architecture specification and implementation programme
 
+Implementation epic: [astrid#1564](https://github.com/astrid-runtime/astrid/issues/1564)
+
 Last reviewed: 2026-08-18
 
 Related documents:
@@ -604,7 +606,95 @@ accounting, restart, and revocation tests pass.
 
 ## 12. Human and operator access
 
-### 12.1 Authentication and principal selection
+### 12.1 Astrid Home
+
+The default human interface is a graphical Astrid Home, not a launcher,
+terminal, infrastructure dashboard, capability editor, or conventional desktop
+shell. It presents a small number of immediately legible concepts:
+
+- **Spaces:** personal or collaborative compositions of work, people, agents,
+  services, and explicitly attached resources;
+- **ongoing work:** durable activities that can be resumed where they were
+  left;
+- **collaborators:** humans and agents such as Hermes acting inside the current
+  admitted context;
+- **owned things:** semantic objects the person can inspect or use directly;
+  and
+- **changes:** an attributable timeline of consequential effects, receipts,
+  and available compensating or rollback operations.
+
+The default experience answers “where am I?”, “what is happening?”, “what can I
+continue?”, and “what can I ask?” without exposing principals, capabilities,
+mounts, Realms, providers, or generations as normal product vocabulary. Those
+mechanisms remain available through progressive disclosure for administration,
+recovery, and exact authority inspection.
+
+A Space is presentation and navigation composition with explicit attachments.
+It is not a principal, owner, capability set, policy realm, filesystem
+namespace, or ambient context switch. Entering or sharing a Space never changes
+the kernel-stamped principal or widens the accessible resource set. Missing or
+stale attachments become non-enumerating unavailable placeholders and never
+silently retarget. Cross-Space drag/drop proposes a typed copy, move, share, or
+delegation operation; it does not itself transfer authority.
+
+### 12.2 Semantic scene and action projection
+
+Applications and services may publish a bounded semantic scene: typed objects,
+relationships, state, presentation hints, and proposed actions. Astrid and
+host-appropriate renderers project that scene into graphical, terminal,
+accessibility, or other native experiences. The person owns presentation
+preferences; applications do not dictate fixed pixels.
+
+The normative invariant is:
+
+> Semantic UI output is an untrusted projection of already-authorized state and
+> proposed actions. It is never identity, authority, consent, policy, or trusted
+> system chrome. Personalization is presentation, not policy.
+
+The contract separates three concerns:
+
+1. a **semantic scene** with closed, versioned, bounded component and data
+   types;
+2. a **personal renderer** controlling layout, density, modality,
+   accessibility, theme, and non-security content ordering; and
+3. a **trusted Astrid interaction boundary** controlling authenticated context,
+   current Space, authority changes, secrets, payments, destructive actions,
+   dispatch, and receipts.
+
+The semantic grammar forbids arbitrary HTML, JavaScript, CSS, webviews, inline
+handlers, executable URLs, hidden fields, and overlays over trusted chrome.
+Unknown components or properties fail closed to inert structured data. Node,
+depth, text, list, payload, and update-rate limits are explicit.
+
+Every actionable element carries only an opaque host-issued action reference.
+Its table entry binds the canonical action-descriptor digest, view revision,
+target semantic-object identities, typed arguments, authority delta,
+confirmation policy, expiry, and relevant principal/session/application/
+provider/lifecycle/attachment epochs. Renderer labels, icons, ordering, and
+component state never participate in authority resolution. Every invocation
+revalidates current authority through the ordinary admission path.
+
+Authority expansion is confirmed only in host-owned trusted chrome constructed
+from typed pending-operation state. An agent-provided explanation is separately
+labelled untrusted rationale. Generic semantic `Confirm`, clicks, drag/drop, or
+elicitation responses are not consent. Affirmative authority-expanding choices
+are never preselected, and applications or personalization cannot rewrite,
+hide, reorder, recolor, or visually subordinate security-critical facts and
+controls.
+
+Type metadata may be cached globally, but the visible semantic catalog is
+filtered by the current stamped principal, admitted application/Space
+attachments, and exact generations. Knowing a schema, topic, name, or receipt
+grants no right to enumerate, subscribe, publish, invoke, or view data. Schema
+collisions reject rather than overwrite. WIT descriptions and agent prose are
+untrusted descriptive content, not security language.
+
+The earlier in-runtime agent-owned A2UI/TUI design in issues #629 and #630 is
+not revived. Build internal Rust domain types first and prove the model through
+at least two structurally different renderers before proposing public WIT or an
+external frontend protocol.
+
+### 12.3 Authentication and principal selection
 
 Remote access authenticates a user/device or machine credential first. The
 session then requests a principal view. The authority service verifies that the
@@ -624,7 +714,7 @@ The selected principal cannot be changed by a later command argument. An admin
 record. User identity, fleet role, principal ownership, and operator authority
 remain distinct.
 
-### 12.2 Native administration
+### 12.4 Native administration
 
 The primary interface is the Astrid CLI/API, with context switching across
 hosts. It should provide at least:
@@ -645,7 +735,7 @@ astrid system generations|switch|rollback|doctor
 
 The API returns typed state. Terminal rendering is a client concern.
 
-### 12.3 SSH compatibility gateway
+### 12.5 SSH compatibility gateway
 
 An optional SSH gateway may preserve familiar `ssh`, terminal forwarding, and
 SFTP ergonomics. It is a protocol adapter to the same authenticated Astrid
@@ -866,6 +956,11 @@ layout, and no dependent design invents a second persistence authority.
 ### Stage B: universal application control plane on the hosted runtime
 
 - Define the internal application-generation and execution-provider types.
+- Define internal semantic scene, object, action, view-revision, Space
+  attachment, and trusted-confirmation types without freezing public WIT.
+- Build a disposable graphical Home and a structurally different renderer over
+  ephemeral state; durable Spaces and preferences wait for authoritative
+  storage.
 - Define lifecycle, streams, cancellation, health, checkpoint, and receipt
   types.
 - Implement principal namespace publication and stale-handle invalidation.
@@ -890,14 +985,19 @@ runs on Astrid” claim.
 ### Stage D: services, tools, remote administration, and SSH
 
 - Add Hermes namespace/tool mapping and approval propagation.
+- Run Hermes as a collaborator inside Astrid Home and prove that renderer,
+  scene, and personalization state cannot widen its authority.
+- Persist user-owned Space composition and presentation preferences separately
+  from application data and authority.
 - Add supervised long-lived services and scale-to-zero lifecycle.
 - Complete remote CLI authentication and host contexts.
 - Add explicit principal shell/attach and storage mount commands.
 - Implement SSH/SFTP only as adapters to these native operations.
 
 Exit gate: an authorized human can enter a principal computer, administer its
-Hermes service, mount its storage, and disconnect without leaving ambient
-authority or stale attachments.
+Hermes service, use the same semantic objects/actions through graphical Home
+and a second renderer, mount its storage, and disconnect without leaving
+ambient authority or stale attachments.
 
 ### Stage E: portable `no_std` substrate and freestanding service host
 
@@ -998,7 +1098,9 @@ The following decisions require prototypes or measurements:
    schemas change;
 9. whether an Astrid Rust `std` target provides enough value after the native
    ABI stabilizes; and
-10. which Hermes feature subset constitutes the first released closure.
+10. which Hermes feature subset constitutes the first released closure; and
+11. the minimum closed semantic component grammar and renderer negotiation
+    surface proven by the first two internal renderers.
 
 An open decision does not authorize an ambient host fallback.
 
@@ -1016,6 +1118,8 @@ This programme succeeds when all of the following are true:
 - hosted and native Astrid pass the same semantic conformance suite;
 - a human can authenticate, enter, administer, mount, recover, and leave a
   principal computer with familiar tools;
+- graphical Home and a structurally different renderer safely project the same
+  semantic state and admitted actions without becoming authority;
 - the native kernel remains `no_std`, small, and free of application/POSIX
   policy;
 - compatibility providers supply only the semantics they can prove; and

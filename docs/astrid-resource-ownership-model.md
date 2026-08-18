@@ -2,6 +2,8 @@
 
 Status: locked architectural direction and code-grounded implementation plan
 
+Implementation epic: [astrid#1564](https://github.com/astrid-runtime/astrid/issues/1564)
+
 Last reviewed: 2026-08-18
 
 Related documents:
@@ -334,10 +336,14 @@ by supplying an alias, path, mount name, service name, or principal string.
 
 ## 4. Existing code: retain, extend, or replace
 
-This plan starts from current `origin/main` at `0452b6a0` and the fetched
-storage branch `origin/codex/storage-mounted-filesystem` at `915d63c9` (79
-commits ahead, zero behind at review time). Paths and symbols are code anchors,
-not claims that every intended semantic is already complete.
+This plan was originally grounded on `origin/main` at `0452b6a0` and an
+earlier snapshot of `origin/codex/storage-mounted-filesystem`. Those hashes and
+historical green runs are archaeological evidence, not merge evidence. Before
+implementation or merge, re-read the exact heads and required checks of storage
+PR #1535 and performance PR #1562. Land and certify #1535 first; then rebase and
+forward-port only the still-required #1562 WAL/cache semantics. Do not merge or
+cherry-pick the divergent storage stacks wholesale. Paths and symbols below are
+code anchors, not claims that every intended semantic is already complete.
 
 ### 4.1 Identity and ownership: retain
 
