@@ -88,6 +88,7 @@ utoipa = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+async-trait = { workspace = true }
 astrid-crypto = { workspace = true }
 tempfile = { workspace = true }
 

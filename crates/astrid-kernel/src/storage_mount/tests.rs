@@ -134,6 +134,168 @@ fn create(path: &str) -> StorageFilesystemOperationV1 {
     }
 }
 
+/// Callback adapter that makes any attempted full-file read or replacement
+/// write observable. The oversized-operation test below returns sentinel
+/// errors from both seams so a correct preflight cannot accidentally pass.
+struct ReadBoundarySpy<F> {
+    inner: F,
+    reads: Arc<AtomicU64>,
+    writes: Arc<AtomicU64>,
+}
+
+impl<F: CallbackFilesystem> CallbackFilesystem for ReadBoundarySpy<F> {
+    fn stat(&self, path: &FilesystemPath) -> Result<FilesystemEntry, FilesystemError> {
+        self.inner.stat(path)
+    }
+
+    fn read_dir(&self, path: &FilesystemPath) -> Result<Vec<FilesystemEntry>, FilesystemError> {
+        self.inner.read_dir(path)
+    }
+
+    fn read(
+        &self,
+        _path: &FilesystemPath,
+        _offset: u64,
+        _length: u64,
+    ) -> Result<Vec<u8>, FilesystemError> {
+        self.reads.fetch_add(1, Ordering::AcqRel);
+        Err(FilesystemError::Staging(
+            "full-file read reached before size preflight".to_owned(),
+        ))
+    }
+
+    fn write(&self, _path: &FilesystemPath, _bytes: &[u8]) -> Result<(), FilesystemError> {
+        self.writes.fetch_add(1, Ordering::AcqRel);
+        Err(FilesystemError::Staging(
+            "replacement write reached before size preflight".to_owned(),
+        ))
+    }
+
+    fn create_dir(&self, path: &FilesystemPath) -> Result<(), FilesystemError> {
+        self.inner.create_dir(path)
+    }
+
+    fn remove(&self, path: &FilesystemPath) -> Result<(), FilesystemError> {
+        self.inner.remove(path)
+    }
+
+    fn rename(
+        &self,
+        from: &FilesystemPath,
+        to: &FilesystemPath,
+        replace: bool,
+    ) -> Result<(), FilesystemError> {
+        self.inner.rename(from, to, replace)
+    }
+
+    fn sync(&self) -> Result<(), FilesystemError> {
+        self.inner.sync()
+    }
+}
+
+#[tokio::test]
+async fn oversized_set_length_and_random_write_preflight_before_full_read() {
+    let temporary = tempfile::tempdir().unwrap();
+    let home = astrid_core::dirs::AstridHome::from_path(temporary.path().join(".astrid"));
+    let kernel = crate::test_kernel_with_home(home).await;
+    let store = kernel.principal_store.clone().unwrap();
+    let filesystem = AstridFilesystem::new(
+        store.content(),
+        StateOwner::Principal(astrid_core::PrincipalUid::from_bytes([0xA4; 32])),
+    );
+    let path = FilesystemPath::new("probe.bin").unwrap();
+    filesystem.write(&path, b"seed").unwrap();
+    let oversized_path = FilesystemPath::new("oversized.bin").unwrap();
+    filesystem
+        .write(
+            &oversized_path,
+            &vec![
+                0_u8;
+                usize::try_from(STORAGE_FILESYSTEM_MAX_IO_BYTES.saturating_add(1)).unwrap()
+            ],
+        )
+        .unwrap();
+    let reads = Arc::new(AtomicU64::new(0));
+    let writes = Arc::new(AtomicU64::new(0));
+    let spy = ReadBoundarySpy {
+        inner: filesystem,
+        reads: Arc::clone(&reads),
+        writes: Arc::clone(&writes),
+    };
+
+    let set_length = execute_blocking(
+        &spy,
+        StorageFilesystemOperationV1::SetLength {
+            path: "probe.bin".to_owned(),
+            length: STORAGE_FILESYSTEM_MAX_IO_BYTES.saturating_add(1),
+        },
+    );
+    let set_length_preflighted =
+        matches!(set_length, Err(FilesystemError::InvalidPath(path)) if path == "probe.bin");
+    let set_length_reads = reads.load(Ordering::Acquire);
+    let set_length_writes = writes.load(Ordering::Acquire);
+
+    let random_write = execute_blocking(
+        &spy,
+        StorageFilesystemOperationV1::Write {
+            path: "probe.bin".to_owned(),
+            offset: STORAGE_FILESYSTEM_MAX_IO_BYTES,
+            data: vec![0x5A],
+        },
+    );
+    let random_write_preflighted =
+        matches!(random_write, Err(FilesystemError::InvalidPath(path)) if path == "probe.bin");
+    let random_write_reads = reads.load(Ordering::Acquire);
+    let random_write_writes = writes.load(Ordering::Acquire);
+
+    assert!(
+        set_length_preflighted,
+        "SetLength above the callback/quota ceiling must fail during preflight"
+    );
+    assert_eq!(
+        set_length_reads, 0,
+        "SetLength must reject before reading/rebuilding the current file"
+    );
+    assert_eq!(
+        set_length_writes, 0,
+        "SetLength must reject before publishing replacement bytes"
+    );
+    assert!(
+        random_write_preflighted,
+        "random writes whose resulting length exceeds the ceiling must fail during preflight"
+    );
+    assert_eq!(
+        random_write_reads, 0,
+        "random write must reject before reading/rebuilding the current file"
+    );
+    assert_eq!(
+        random_write_writes, 0,
+        "random write must reject before publishing replacement bytes"
+    );
+
+    let truncation = execute_blocking(
+        &spy,
+        StorageFilesystemOperationV1::SetLength {
+            path: "oversized.bin".to_owned(),
+            length: 0,
+        },
+    );
+    assert!(
+        matches!(truncation, Err(FilesystemError::InvalidPath(path)) if path == "oversized.bin"),
+        "truncating an already oversized file must fail before rebuilding its contents"
+    );
+    assert_eq!(
+        reads.load(Ordering::Acquire),
+        0,
+        "oversized truncation must not read the legacy file"
+    );
+    assert_eq!(
+        writes.load(Ordering::Acquire),
+        0,
+        "oversized truncation must not publish replacement bytes"
+    );
+}
+
 #[tokio::test]
 async fn private_mount_manifest_and_callback_endpoint_are_owner_scoped() {
     let temporary = tempfile::tempdir().unwrap();

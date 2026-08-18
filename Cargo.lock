@@ -607,6 +607,7 @@ dependencies = [
  "astrid-types",
  "astrid-uplink",
  "async-stream",
+ "async-trait",
  "axum",
  "axum-server",
  "base64 0.23.1",

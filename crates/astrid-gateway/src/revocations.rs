@@ -129,7 +129,7 @@ pub async fn record_principal_max(
         if current_epoch == Some(wanted) {
             return Ok(wanted);
         }
-        if store
+        match store
             .compare_and_swap(
                 REVOCATION_NAMESPACE,
                 &key,
@@ -137,9 +137,27 @@ pub async fn record_principal_max(
                 encode_epoch(wanted),
             )
             .await
-            .map_err(|error| anyhow::anyhow!("write principal revocation {principal}: {error}"))?
         {
-            return Ok(wanted);
+            Ok(true) => return Ok(wanted),
+            Ok(false) => {},
+            Err(cas_error) => {
+                // A successful delete must never become reversible merely
+                // because the monotonic CAS path is unavailable. Persist an
+                // unconditional maximum-epoch tombstone: this intentionally
+                // sacrifices alias reuse until operator repair, but it is
+                // monotonic under every concurrent writer and survives a
+                // restart. If the fallback write also fails, propagate the
+                // durability loss to the watcher as before.
+                store
+                    .set(REVOCATION_NAMESPACE, &key, encode_epoch(u64::MAX))
+                    .await
+                    .map_err(|fallback_error| {
+                        anyhow::anyhow!(
+                            "write principal revocation {principal}: CAS failed: {cas_error}; fail-closed tombstone failed: {fallback_error}"
+                        )
+                    })?;
+                return Ok(u64::MAX);
+            },
         }
     }
 }
@@ -168,7 +186,7 @@ pub async fn record_device_max(
         if current_epoch == Some(wanted) {
             return Ok(wanted);
         }
-        if store
+        match store
             .compare_and_swap(
                 REVOCATION_NAMESPACE,
                 &key,
@@ -176,9 +194,24 @@ pub async fn record_device_max(
                 encode_epoch(wanted),
             )
             .await
-            .map_err(|error| anyhow::anyhow!("write device revocation {key_id}: {error}"))?
         {
-            return Ok(wanted);
+            Ok(true) => return Ok(wanted),
+            Ok(false) => {},
+            Err(cas_error) => {
+                // Same fail-closed durability rule as principal deletion.
+                // MAX cannot be moved backward by a later CAS writer, so a
+                // persistence-path fault cannot resurrect this device bearer
+                // after restart.
+                store
+                    .set(REVOCATION_NAMESPACE, &key, encode_epoch(u64::MAX))
+                    .await
+                    .map_err(|fallback_error| {
+                        anyhow::anyhow!(
+                            "write device revocation {key_id}: CAS failed: {cas_error}; fail-closed tombstone failed: {fallback_error}"
+                        )
+                    })?;
+                return Ok(u64::MAX);
+            },
         }
     }
 }
@@ -394,15 +427,16 @@ pub fn spawn_watcher(
                 match record_principal_max(storage, &principal, ts_epoch).await {
                     Ok(epoch) => epoch,
                     Err(error) => {
-                        // Preserve the immediate in-memory revocation while
-                        // making the durability loss explicit. A later audit
-                        // event/restart migration can repair the KV record.
+                        // Preserve a fail-closed in-memory fence even when
+                        // both CAS and tombstone writes fail. A restart with
+                        // the same unavailable backend fails hydration rather
+                        // than exposing the listener without the fence.
                         tracing::error!(
                             error = %error,
                             principal = %principal,
                             "gateway revocation KV write failed; running in degraded in-memory mode"
                         );
-                        ts_epoch
+                        u64::MAX
                     },
                 }
             } else {
@@ -410,7 +444,7 @@ pub fn spawn_watcher(
                     principal = %principal,
                     "gateway revocation storage is unavailable; running in degraded in-memory mode"
                 );
-                ts_epoch
+                u64::MAX
             };
 
             {
@@ -509,7 +543,7 @@ pub fn spawn_key_revocation_watcher(
                             key_id = %key_id,
                             "device revocation KV write failed; running in degraded in-memory mode"
                         );
-                        ts_epoch
+                        u64::MAX
                     },
                 }
             } else {
@@ -517,7 +551,7 @@ pub fn spawn_key_revocation_watcher(
                     key_id = %key_id,
                     "device revocation storage is unavailable; running in degraded in-memory mode"
                 );
-                ts_epoch
+                u64::MAX
             };
             {
                 let mut guard = revoked_key_ids

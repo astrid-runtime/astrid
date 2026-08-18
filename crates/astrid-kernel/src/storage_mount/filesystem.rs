@@ -279,8 +279,14 @@ pub(super) fn execute_blocking(
             write_range(filesystem, path, offset, &data)
         },
         StorageFilesystemOperationV1::SetLength { path, length } => {
+            if length > STORAGE_FILESYSTEM_MAX_IO_BYTES {
+                return Err(FilesystemError::InvalidPath(path));
+            }
             let path = FilesystemPath::new(path)?;
             let current_length = require_file(filesystem, &path)?;
+            if current_length > STORAGE_FILESYSTEM_MAX_IO_BYTES {
+                return Err(FilesystemError::InvalidPath(path.as_str().to_owned()));
+            }
             if current_length == length {
                 return Ok(StorageFilesystemSuccessV1::Written(length));
             }
@@ -341,6 +347,9 @@ fn write_range(
     let end_offset = offset
         .checked_add(data_length)
         .ok_or_else(|| FilesystemError::InvalidPath(path.as_str().to_owned()))?;
+    if current_length.max(end_offset) > STORAGE_FILESYSTEM_MAX_IO_BYTES {
+        return Err(FilesystemError::InvalidPath(path.as_str().to_owned()));
+    }
     let mut bytes = filesystem.read(&path, 0, current_length)?;
     let start = usize::try_from(offset)
         .map_err(|_| FilesystemError::InvalidPath(path.as_str().to_owned()))?;
