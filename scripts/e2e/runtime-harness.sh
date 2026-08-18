@@ -753,8 +753,9 @@ PY
 
   status="$(http_status GET "/api/agent/sessions?include_archived=true&limit=20" "$user_bearer" "" \
     "$ARTIFACTS/agent-sessions.json")"
-  assert_session_management_unavailable "agent session list" "$status" \
-    "$ARTIFACTS/agent-sessions.json"
+  assert_status "agent session list" "$status" 200
+  json_assert_session_list_scope "$ARTIFACTS/agent-sessions.json" \
+    "$user_session" "$ops_session"
   status="$(http_status GET "/api/agent/sessions/$user_session/messages" "$user_bearer" "" \
     "$ARTIFACTS/agent-session-messages.json")"
   assert_status "agent session transcript" "$status" 200
@@ -828,8 +829,9 @@ PY
     astrid-capsule-openai-compat api_key
   status="$(http_status GET "/api/agent/sessions?include_archived=true&limit=20" "$restart_user_bearer" "" \
     "$ARTIFACTS/restart-agent-sessions.json")"
-  assert_session_management_unavailable "restart agent session list" "$status" \
-    "$ARTIFACTS/restart-agent-sessions.json"
+  assert_status "restart agent session list" "$status" 200
+  json_assert_session_list_scope "$ARTIFACTS/restart-agent-sessions.json" \
+    "$user_session" "$ops_session"
   status="$(http_status GET "/api/agent/sessions/$user_session/messages" "$restart_user_bearer" "" \
     "$ARTIFACTS/restart-agent-session-messages.json")"
   assert_status "restart agent session transcript" "$status" 200
@@ -840,7 +842,7 @@ PY
   assert_status "restart agent cross-principal session transcript empty" "$status" 200
   json_assert_session_messages_empty "$ARTIFACTS/restart-agent-cross-session-messages-empty.json" "$ops_session"
   run_crash_recovery_smoke "$restart_user_bearer" "$ops_bearer" "$user_principal" \
-    "$user_session"
+    "$user_session" "$ops_session"
   run_live_approval_cancel_smoke "$restart_user_bearer" "$user_principal"
   # Use the independently provisioned operator package for the second unload
   # cancellation. Reinstalling into the same principal between probes would

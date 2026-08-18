@@ -310,6 +310,7 @@ run_crash_recovery_smoke() {
   local ops_bearer=$2
   local user_principal=$3
   local user_session=$4
+  local ops_session=$5
 
   run_inflight_prompt_crash_smoke "$user_principal" "$user_session"
   start_daemon "restarting daemon after abrupt process death"
@@ -347,8 +348,9 @@ run_crash_recovery_smoke() {
 
   status="$(http_status GET "/api/agent/sessions?include_archived=true&limit=20" "$user_bearer" "" \
     "$ARTIFACTS/crash-restart-agent-sessions.json")"
-  assert_session_management_unavailable "crash restart agent session list" "$status" \
-    "$ARTIFACTS/crash-restart-agent-sessions.json"
+  assert_status "crash restart agent session list" "$status" 200
+  json_assert_session_list_scope "$ARTIFACTS/crash-restart-agent-sessions.json" \
+    "$user_session" "$ops_session"
 
   assert_no_stale_control_requests_after_crashes "$user_bearer"
 }

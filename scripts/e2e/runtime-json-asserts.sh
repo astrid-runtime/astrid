@@ -280,22 +280,6 @@ if forbidden in ids:
 PY
 }
 
-assert_session_management_unavailable() {
-  local label=$1 status=$2 out=$3
-  LAST_HTTP_OUT="$out"
-  assert_status "$label" "$status" 501
-  "$PYTHON" - "$out" <<'PY'
-import json
-import sys
-
-data = json.load(open(sys.argv[1], encoding="utf-8"))
-if data.get("error") != "not_implemented":
-    raise SystemExit(f"session management missed not_implemented contract: {data!r}")
-if "conversation-management verbs" not in data.get("reason", ""):
-    raise SystemExit(f"session management missed bounded feature reason: {data!r}")
-PY
-}
-
 json_assert_deleted_flag() {
   local file=$1 expected=$2
   "$PYTHON" - "$file" "$expected" <<'PY'
