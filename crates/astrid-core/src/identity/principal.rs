@@ -9,6 +9,7 @@
 use std::fmt;
 use std::str::FromStr;
 
+use astrid_resource_types::OwnerId;
 use chrono::{DateTime, Timelike, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
@@ -37,6 +38,24 @@ impl PrincipalUid {
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+}
+
+impl From<PrincipalUid> for OwnerId {
+    fn from(uid: PrincipalUid) -> Self {
+        Self::principal(*uid.as_bytes())
+    }
+}
+
+impl TryFrom<OwnerId> for PrincipalUid {
+    type Error = OwnerId;
+
+    fn try_from(owner: OwnerId) -> Result<Self, Self::Error> {
+        if let OwnerId::Principal(bytes) = owner {
+            Ok(Self::from_bytes(bytes))
+        } else {
+            Err(owner)
+        }
     }
 }
 
@@ -308,6 +327,14 @@ mod tests {
                 .is_err()
         );
         assert!(format!("0{uid}").parse::<PrincipalUid>().is_err());
+    }
+
+    #[test]
+    fn uid_round_trips_through_portable_owner_reference() {
+        let uid = PrincipalIdentity::from_genesis(genesis()).unwrap().uid;
+        let owner = OwnerId::from(uid);
+        assert_eq!(PrincipalUid::try_from(owner), Ok(uid));
+        assert!(PrincipalUid::try_from(OwnerId::System).is_err());
     }
 
     #[test]

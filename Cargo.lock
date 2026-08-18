@@ -493,6 +493,7 @@ dependencies = [
 name = "astrid-core"
 version = "0.10.4"
 dependencies = [
+ "astrid-resource-types",
  "async-trait",
  "base64 0.23.1",
  "blake3",
@@ -774,6 +775,13 @@ dependencies = [
  "astrid-mcp",
  "astrid-telemetry",
  "astrid-workspace",
+]
+
+[[package]]
+name = "astrid-resource-types"
+version = "0.10.4"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
