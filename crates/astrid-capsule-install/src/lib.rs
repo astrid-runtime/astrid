@@ -112,8 +112,9 @@ pub use manifest_check::{
     validate_imports_with_layout,
 };
 pub use meta::{
-    CapsuleLocation, CapsuleMeta, InstalledCapsule, read_meta, scan_installed_capsules,
-    scan_installed_capsules_in_home_for, scan_installed_capsules_in_home_for_in_workspace,
+    CapsuleLocation, CapsuleMeta, IndexInstallProvenance, InstalledCapsule, read_meta,
+    scan_installed_capsules, scan_installed_capsules_in_home_for,
+    scan_installed_capsules_in_home_for_in_workspace,
     scan_installed_capsules_in_home_for_with_layout, scan_installed_capsules_in_home_with_layout,
     scan_installed_capsules_with_layout, write_meta,
 };

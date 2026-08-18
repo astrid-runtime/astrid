@@ -1,0 +1,9 @@
+# Replace these placeholders with the actual human/team handles before
+# enabling branch protection.  CODEOWNERS is review routing, not authority to
+# bypass the signed event/TUF checks.
+* @REPLACE_INDEX_MAINTAINERS
+/records/ @REPLACE_INDEX_RELEASE_REVIEWERS
+/events/ @REPLACE_INDEX_SECURITY_REVIEWERS
+/namespaces/ @REPLACE_INDEX_NAMESPACE_REVIEWERS
+/config/ @REPLACE_INDEX_TRUST_REVIEWERS
+/.github/workflows/ @REPLACE_INDEX_OPERATIONS_REVIEWERS

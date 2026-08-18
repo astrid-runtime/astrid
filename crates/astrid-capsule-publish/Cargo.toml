@@ -1,0 +1,29 @@
+[package]
+name = "astrid-capsule-publish"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Offline, deterministic Capsule Index publication preparation"
+
+[dependencies]
+astrid-build = { workspace = true }
+astrid-capsule-index = { workspace = true }
+astrid-capsule-types = { workspace = true }
+blake3 = { workspace = true }
+flate2 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tar = { workspace = true }
+thiserror = { workspace = true }
+toml = { workspace = true }
+tempfile = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

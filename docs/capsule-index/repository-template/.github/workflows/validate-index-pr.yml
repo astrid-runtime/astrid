@@ -1,0 +1,72 @@
+name: Validate Capsule Index PR
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: index-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Append-only and typed-wire checks
+    runs-on: ubuntu-24.04
+    env:
+      # Replace both values with the repository and immutable commit SHA for
+      # the reviewed index tool.  Tags and floating branches are forbidden.
+      INDEX_TOOL_REPOSITORY: https://github.com/REPLACE_OWNER/REPLACE_INDEX_TOOL.git
+      INDEX_TOOL_SHA: REPLACE_WITH_40_HEX_INDEX_TOOL_COMMIT
+      INDEX_ID: REPLACE_INDEX_ID
+    steps:
+      - name: Checkout the complete PR graph
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Fetch the pinned index tool
+        run: |
+          set -euo pipefail
+          printf '%s' "${INDEX_TOOL_SHA}" | grep -Eq '^[0-9a-f]{40}$'
+          test "${INDEX_TOOL_REPOSITORY}" != "https://github.com/REPLACE_OWNER/REPLACE_INDEX_TOOL.git"
+          git clone --no-checkout --filter=blob:none "${INDEX_TOOL_REPOSITORY}" "${RUNNER_TEMP}/index-tool"
+          git -C "${RUNNER_TEMP}/index-tool" cat-file -e "${INDEX_TOOL_SHA}^{commit}"
+          git -C "${RUNNER_TEMP}/index-tool" checkout --detach "${INDEX_TOOL_SHA}"
+          cargo build --locked --release -p astrid-index-tool \
+            --manifest-path "${RUNNER_TEMP}/index-tool/Cargo.toml"
+          test -x "${RUNNER_TEMP}/index-tool/target/release/astrid-index-tool"
+
+      - name: Materialize base and head trees and run validators
+        run: |
+          set -euo pipefail
+          test "${INDEX_ID}" != "REPLACE_INDEX_ID"
+          base_dir="$(mktemp -d "${RUNNER_TEMP}/index-base.XXXXXX")"
+          head_dir="$(mktemp -d "${RUNNER_TEMP}/index-head.XXXXXX")"
+          trap 'rm -rf -- "${base_dir}" "${head_dir}"' EXIT
+          base_sha="${{ github.event.pull_request.base.sha }}"
+          head_sha="${{ github.event.pull_request.head.sha }}"
+          printf '%s\n%s\n' "${base_sha}" "${head_sha}" | grep -Eq '^[0-9a-f]{40}$'
+
+          # Archive extraction gives the validator independent, immutable
+          # trees.  Do not use the mutable checkout as either side of the
+          # comparison.  Git archive does not dereference symlinks; the
+          # repository validator rejects symlinks and traversal explicitly.
+          git archive --format=tar "${base_sha}" | tar --extract \
+            --no-same-owner --no-same-permissions --file=- --directory="${base_dir}"
+          git archive --format=tar "${head_sha}" | tar --extract \
+            --no-same-owner --no-same-permissions --file=- --directory="${head_dir}"
+
+          python3 scripts/index_repository_validate.py \
+            --root "${head_dir}" \
+            --json
+          "${RUNNER_TEMP}/index-tool/target/release/astrid-index-tool" validate \
+            --base "${base_dir}" \
+            --candidate "${head_dir}" \
+            --index-id "${INDEX_ID}" \
+            --event-authorization curator-review \
+            --json

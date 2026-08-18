@@ -49,9 +49,35 @@ fn capsule_update_parses_one_shot_untrusted_approval() {
         Some(Commands::Capsule {
             command: CapsuleCommands::Update {
                 target: Some(ref target),
+                index: None,
                 workspace: false,
                 approve_untrusted: true,
             },
         }) if target == "example"
+    ));
+}
+
+#[test]
+fn capsule_install_index_is_explicitly_selected() {
+    let cli = Cli::try_parse_from([
+        "astrid",
+        "capsule",
+        "install",
+        "@scope/demo@1.2.3",
+        "--index",
+        "community",
+    ])
+    .expect("install should accept an explicit Index source");
+
+    assert!(matches!(
+        cli.command,
+        Some(Commands::Capsule {
+            command: CapsuleCommands::Install {
+                source,
+                index: Some(index),
+                capsule: None,
+                ..
+            },
+        }) if source == "@scope/demo@1.2.3" && index == "community"
     ));
 }

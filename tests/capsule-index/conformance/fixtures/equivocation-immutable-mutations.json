@@ -1,0 +1,312 @@
+{
+  "schema": "astrid.capsule-index.conformance/v1",
+  "case_id": "equivocation-immutable-mutations",
+  "kind": "equivocation",
+  "input": {
+    "base": {
+      "schema": "publication-v1",
+      "index_id": "astrid",
+      "coordinate": {
+        "namespace": "astrid",
+        "name": "hello"
+      },
+      "version": "1.2.3",
+      "artifact": {
+        "digests": [
+          "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+          "blake3:1111111111111111111111111111111111111111111111111111111111111111"
+        ],
+        "locations": [
+          "https://github.com/astrid-runtime/hello/releases/download/v1.2.3/hello.capsule"
+        ],
+        "media_type": "application/vnd.astrid.capsule",
+        "size": 4096
+      },
+      "package": {
+        "embedded_identity": {
+          "coordinate": {
+            "namespace": "astrid",
+            "name": "hello"
+          },
+          "version": "1.2.3",
+          "package_digest": "blake3:3333333333333333333333333333333333333333333333333333333333333333"
+        },
+        "manifest_digest": "blake3:4444444444444444444444444444444444444444444444444444444444444444",
+        "component_digest": "blake3:5555555555555555555555555555555555555555555555555555555555555555",
+        "wit_digest": "blake3:6666666666666666666666666666666666666666666666666666666666666666",
+        "capability_digest": "blake3:7777777777777777777777777777777777777777777777777777777777777777",
+        "ipc_digest": "blake3:8888888888888888888888888888888888888888888888888888888888888888",
+        "runtime_abi_digest": "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "dependency_digest": "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "capabilities": [
+          "astrid:net",
+          "astrid:read"
+        ],
+        "dependencies": [
+          {
+            "coordinate": {
+              "namespace": "astrid",
+              "name": "dep"
+            },
+            "requirement": "*",
+            "optional": false
+          }
+        ],
+        "runtime": {
+          "runtime": "wasmtime",
+          "abi": "component-model-0.2",
+          "digest": "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+      },
+      "publisher": {
+        "identity": "github:astrid-runtime/hello",
+        "signing_key": "blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "source": {
+        "repository_url": "https://github.com/astrid-runtime/hello",
+        "github_owner_id": 123456,
+        "github_repository_id": 987654,
+        "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "tree": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "tag": "v1.2.3",
+        "subdirectory": "capsules/hello",
+        "source_digest": "blake3:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      },
+      "provenance": {
+        "predicate_type": "https://slsa.dev/provenance/v1",
+        "statement_digest": "blake3:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "builder_identity": "https://github.com/astrid-runtime/hello/actions",
+        "attestation_identity": "sigstore:rekor:entry-1"
+      },
+      "metadata": {
+        "channel": "stable",
+        "license": "MIT"
+      },
+      "publication_digest": "blake3:12520d71415e6be6e9b6b2d9ba3b032cc44663571961724fa7c309109c0d6618"
+    },
+    "mutations": [
+      {
+        "id": "mutation-01",
+        "field": "schema",
+        "value": "publication-v2"
+      },
+      {
+        "id": "mutation-02",
+        "field": "index_id",
+        "value": "aos"
+      },
+      {
+        "id": "mutation-03",
+        "field": "coordinate.namespace",
+        "value": "other"
+      },
+      {
+        "id": "mutation-04",
+        "field": "coordinate.name",
+        "value": "world"
+      },
+      {
+        "id": "mutation-05",
+        "field": "version",
+        "value": "1.2.4"
+      },
+      {
+        "id": "mutation-06",
+        "field": "artifact.digests",
+        "value": [
+          "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+          "blake3:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        ]
+      },
+      {
+        "id": "mutation-07",
+        "field": "artifact.size",
+        "value": 4097
+      },
+      {
+        "id": "mutation-08",
+        "field": "artifact.media_type",
+        "value": "application/vnd.astrid.capsule.v2"
+      },
+      {
+        "id": "mutation-09",
+        "field": "artifact.locations",
+        "value": [
+          "https://mirror.astrid.example/hello.capsule"
+        ]
+      },
+      {
+        "id": "mutation-10",
+        "field": "package.embedded_identity.package_digest",
+        "value": "blake3:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      },
+      {
+        "id": "mutation-10a",
+        "field": "package.embedded_identity.coordinate.namespace",
+        "value": "other"
+      },
+      {
+        "id": "mutation-10b",
+        "field": "package.embedded_identity.coordinate.name",
+        "value": "world"
+      },
+      {
+        "id": "mutation-10c",
+        "field": "package.embedded_identity.version",
+        "value": "1.2.4"
+      },
+      {
+        "id": "mutation-11",
+        "field": "package.manifest_digest",
+        "value": "blake3:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      },
+      {
+        "id": "mutation-12",
+        "field": "package.component_digest",
+        "value": "blake3:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      },
+      {
+        "id": "mutation-13",
+        "field": "package.wit_digest",
+        "value": "blake3:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      },
+      {
+        "id": "mutation-14",
+        "field": "package.capability_digest",
+        "value": "blake3:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      },
+      {
+        "id": "mutation-15",
+        "field": "package.ipc_digest",
+        "value": "blake3:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      },
+      {
+        "id": "mutation-16",
+        "field": "package.runtime_abi_digest",
+        "value": "blake3:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      },
+      {
+        "id": "mutation-17",
+        "field": "package.dependency_digest",
+        "value": "blake3:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      },
+      {
+        "id": "mutation-18",
+        "field": "package.capabilities",
+        "value": [
+          "astrid:net",
+          "astrid:write"
+        ]
+      },
+      {
+        "id": "mutation-19",
+        "field": "package.dependencies",
+        "value": [
+          {
+            "coordinate": {
+              "namespace": "astrid",
+              "name": "dep"
+            },
+            "requirement": "^2.0.0",
+            "optional": false
+          }
+        ]
+      },
+      {
+        "id": "mutation-20",
+        "field": "package.runtime.runtime",
+        "value": "wasmtime-2"
+      },
+      {
+        "id": "mutation-21",
+        "field": "package.runtime.abi",
+        "value": "component-model-0.3"
+      },
+      {
+        "id": "mutation-22",
+        "field": "publisher.identity",
+        "value": "github:other/hello"
+      },
+      {
+        "id": "mutation-23",
+        "field": "publisher.signing_key",
+        "value": "blake3:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      },
+      {
+        "id": "mutation-24",
+        "field": "source.repository_url",
+        "value": "https://github.com/other/hello"
+      },
+      {
+        "id": "mutation-25",
+        "field": "source.github_owner_id",
+        "value": 123457
+      },
+      {
+        "id": "mutation-26",
+        "field": "source.github_repository_id",
+        "value": 987655
+      },
+      {
+        "id": "mutation-27",
+        "field": "source.commit",
+        "value": "ffffffffffffffffffffffffffffffffffffffff"
+      },
+      {
+        "id": "mutation-28",
+        "field": "source.tree",
+        "value": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      },
+      {
+        "id": "mutation-29",
+        "field": "source.tag",
+        "value": "v1.2.4"
+      },
+      {
+        "id": "mutation-30",
+        "field": "source.subdirectory",
+        "value": "capsules/world"
+      },
+      {
+        "id": "mutation-31",
+        "field": "source.source_digest",
+        "value": "blake3:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      },
+      {
+        "id": "mutation-32",
+        "field": "provenance.predicate_type",
+        "value": "https://slsa.dev/provenance/v0"
+      },
+      {
+        "id": "mutation-33",
+        "field": "provenance.statement_digest",
+        "value": "blake3:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      },
+      {
+        "id": "mutation-34",
+        "field": "provenance.builder_identity",
+        "value": "https://github.com/other/hello/actions"
+      },
+      {
+        "id": "mutation-35",
+        "field": "provenance.attestation_identity",
+        "value": "sigstore:rekor:entry-2"
+      },
+      {
+        "id": "mutation-36",
+        "field": "metadata.channel",
+        "value": "beta"
+      }
+    ]
+  },
+  "expected": {
+    "accepted": false,
+    "outcome": "equivocation",
+    "error_codes": [
+      "embedded_identity_mismatch",
+      "equivocation",
+      "invalid_publication_schema",
+      "runtime_digest_mismatch"
+    ]
+  }
+}

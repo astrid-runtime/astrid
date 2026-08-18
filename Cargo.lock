@@ -245,7 +245,11 @@ dependencies = [
  "arboard",
  "astrid-build",
  "astrid-capsule",
+ "astrid-capsule-index",
+ "astrid-capsule-index-client",
+ "astrid-capsule-index-tuf",
  "astrid-capsule-install",
+ "astrid-capsule-publish",
  "astrid-capsule-types",
  "astrid-config",
  "astrid-core",
@@ -257,8 +261,10 @@ dependencies = [
  "astrid-telemetry",
  "astrid-types",
  "astrid-uplink",
+ "async-trait",
  "base64 0.23.1",
  "blake3",
+ "bytes",
  "chrono",
  "clap",
  "clap_complete",
@@ -284,6 +290,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2 0.11.0",
  "sigstore-verify",
  "syn 3.0.3",
  "syntect",
@@ -293,6 +300,7 @@ dependencies = [
  "tokio",
  "toml",
  "toml_edit",
+ "tough",
  "tracing",
  "unicode-width",
  "url",
@@ -433,12 +441,69 @@ dependencies = [
 ]
 
 [[package]]
+name = "astrid-capsule-index"
+version = "0.10.4"
+dependencies = [
+ "blake3",
+ "semver",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "url",
+]
+
+[[package]]
+name = "astrid-capsule-index-client"
+version = "0.10.4"
+dependencies = [
+ "astrid-capsule-index",
+ "astrid-capsule-index-tuf",
+ "blake3",
+ "ed25519-dalek",
+ "hex",
+ "olpc-cjson",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tough",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "astrid-capsule-index-tuf"
+version = "0.10.4"
+dependencies = [
+ "astrid-capsule-index",
+ "bytes",
+ "ed25519-dalek",
+ "fs2",
+ "futures",
+ "hex",
+ "olpc-cjson",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tough",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "astrid-capsule-install"
 version = "0.10.4"
 dependencies = [
  "anyhow",
  "astrid-build",
  "astrid-capsule",
+ "astrid-capsule-index",
  "astrid-config",
  "astrid-core",
  "astrid-crypto",
@@ -457,6 +522,24 @@ dependencies = [
  "tracing",
  "uuid",
  "wat",
+]
+
+[[package]]
+name = "astrid-capsule-publish"
+version = "0.10.4"
+dependencies = [
+ "astrid-build",
+ "astrid-capsule-index",
+ "astrid-capsule-types",
+ "blake3",
+ "flate2",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tar",
+ "tempfile",
+ "thiserror 2.0.20",
+ "toml",
 ]
 
 [[package]]
@@ -660,6 +743,28 @@ dependencies = [
  "uuid",
  "wasmtime",
  "wasmtime-wasi",
+]
+
+[[package]]
+name = "astrid-index-tool"
+version = "0.10.4"
+dependencies = [
+ "astrid-capsule-index",
+ "astrid-capsule-index-tuf",
+ "blake3",
+ "clap",
+ "ed25519-dalek",
+ "hex",
+ "jiff",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tough",
+ "url",
 ]
 
 [[package]]
@@ -4732,6 +4837,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "olpc-cjson"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "696183c9b5fe81a7715d074fd632e8bd46f4ccc0231a3ed7fc580a80de5f7083"
+dependencies = [
+ "serde",
+ "serde_json",
+ "unicode-normalization",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4970,6 +5086,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67eabc2ef2a60eb7faa00097bd1ffdb5bd28e62bf39990626a582201b7a754e5"
 dependencies = [
  "siphasher",
+]
+
+[[package]]
+name = "pin-project"
+version = "1.1.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2466b2336ed02bcdca6b294417127b90ec92038d1d5c4fbeac971a922e0e0924"
+dependencies = [
+ "pin-project-internal",
+]
+
+[[package]]
+name = "pin-project-internal"
+version = "1.1.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c96395f0a926bc13b1c17622aaddda1ecb55d49c8f1bf9777e4d877800a43f8b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.118",
 ]
 
 [[package]]
@@ -6154,6 +6290,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_plain"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ce1fc6db65a611022b23a0dec6975d63fb80a302cb3388835ff02c097258d50"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "serde_repr"
 version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6574,6 +6719,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "snafu"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e84b3f4eacbf3a1ce05eac6763b4d629d60cbc94d632e4092c54ade71f1e1a2"
+dependencies = [
+ "futures-core",
+ "pin-project",
+ "snafu-derive",
+]
+
+[[package]]
+name = "snafu-derive"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
+dependencies = [
+ "heck",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.118",
 ]
 
 [[package]]
@@ -7135,6 +7303,40 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
 
 [[package]]
+name = "tough"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "35b378d98765c2ae9cdc3e9963ea7e670da8cdd9ee39611b8d722083c7f1ac11"
+dependencies = [
+ "async-recursion",
+ "async-trait",
+ "aws-lc-rs",
+ "bytes",
+ "dyn-clone",
+ "futures",
+ "futures-core",
+ "globset",
+ "hex",
+ "jiff",
+ "log",
+ "olpc-cjson",
+ "pem",
+ "percent-encoding",
+ "rustls",
+ "serde",
+ "serde_json",
+ "serde_plain",
+ "snafu",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "typed-path",
+ "untrusted 0.7.1",
+ "url",
+ "walkdir",
+]
+
+[[package]]
 name = "tower"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7300,6 +7502,12 @@ name = "twox-hash"
 version = "2.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9ea3136b675547379c4bd395ca6b938e5ad3c3d20fad76e7fe85f9e0d011419c"
+
+[[package]]
+name = "typed-path"
+version = "0.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "82205ffd44a9697e34fc145491aa47310f9871540bb7909eaa9365e0a9a46607"
 
 [[package]]
 name = "typenum"

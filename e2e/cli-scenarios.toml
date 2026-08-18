@@ -416,6 +416,72 @@ status = "covered"
 mode = "mutating"
 principal = "admin"
 
+[commands."capsule publish"]
+scenario = "capsule_index_publication"
+status = "mapped"
+mode = "filesystem"
+principal = "local_cli"
+
+[commands."capsule event yank"]
+scenario = "capsule_index_publication"
+status = "mapped"
+mode = "filesystem"
+principal = "local_cli"
+
+[commands."capsule event unyank"]
+scenario = "capsule_index_publication"
+status = "mapped"
+mode = "filesystem"
+principal = "local_cli"
+
+[commands."capsule event deprecate"]
+scenario = "capsule_index_publication"
+status = "mapped"
+mode = "filesystem"
+principal = "local_cli"
+
+[commands."capsule event revoke"]
+scenario = "capsule_index_publication"
+status = "mapped"
+mode = "filesystem"
+principal = "local_cli"
+
+[commands."capsule event tombstone"]
+scenario = "capsule_index_publication"
+status = "mapped"
+mode = "filesystem"
+principal = "local_cli"
+
+[commands."capsule event add-mirror"]
+scenario = "capsule_index_publication"
+status = "mapped"
+mode = "filesystem"
+principal = "local_cli"
+
+[commands."index add"]
+scenario = "capsule_index_sources"
+status = "mapped"
+mode = "filesystem"
+principal = "local_cli"
+
+[commands."index list"]
+scenario = "capsule_index_sources"
+status = "mapped"
+mode = "read"
+principal = "local_cli"
+
+[commands."index remove"]
+scenario = "capsule_index_sources"
+status = "mapped"
+mode = "filesystem"
+principal = "local_cli"
+
+[commands."index update"]
+scenario = "capsule_index_sources"
+status = "mapped"
+mode = "network"
+principal = "local_cli"
+
 [commands."capsule update"]
 scenario = "capsule_live_load_lifecycle"
 status = "covered"

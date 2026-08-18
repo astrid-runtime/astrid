@@ -1,0 +1,41 @@
+[package]
+name = "astrid-index-tool"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Host-only Capsule Index repository validator and deterministic Pages generator"
+publish = false
+
+[lib]
+name = "astrid_index_tool"
+path = "src/lib.rs"
+
+[[bin]]
+name = "astrid-index-tool"
+path = "src/main.rs"
+
+[dependencies]
+astrid-capsule-index = { workspace = true }
+astrid-capsule-index-tuf = { workspace = true }
+blake3 = { workspace = true }
+clap = { workspace = true }
+hex = { workspace = true }
+jiff = { workspace = true }
+semver = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["fs", "macros", "rt", "rt-multi-thread", "time"] }
+tough = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+ed25519-dalek = { workspace = true }
+sha2 = { workspace = true }
+
+[lints]
+workspace = true

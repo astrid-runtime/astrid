@@ -1,0 +1,95 @@
+{
+  "schema": "astrid.capsule-index.conformance/v1",
+  "case_id": "invalid-name",
+  "kind": "syntax",
+  "input": {
+    "publication": {
+      "schema": "publication-v1",
+      "index_id": "astrid",
+      "coordinate": {
+        "namespace": "astrid",
+        "name": "Hello"
+      },
+      "version": "1.2.3",
+      "artifact": {
+        "digests": [
+          "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+          "blake3:1111111111111111111111111111111111111111111111111111111111111111"
+        ],
+        "locations": [
+          "https://github.com/astrid-runtime/hello/releases/download/v1.2.3/hello.capsule"
+        ],
+        "media_type": "application/vnd.astrid.capsule",
+        "size": 4096
+      },
+      "package": {
+        "embedded_identity": {
+          "coordinate": {
+            "namespace": "astrid",
+            "name": "Hello"
+          },
+          "version": "1.2.3",
+          "package_digest": "blake3:3333333333333333333333333333333333333333333333333333333333333333"
+        },
+        "manifest_digest": "blake3:4444444444444444444444444444444444444444444444444444444444444444",
+        "component_digest": "blake3:5555555555555555555555555555555555555555555555555555555555555555",
+        "wit_digest": "blake3:6666666666666666666666666666666666666666666666666666666666666666",
+        "capability_digest": "blake3:7777777777777777777777777777777777777777777777777777777777777777",
+        "ipc_digest": "blake3:8888888888888888888888888888888888888888888888888888888888888888",
+        "runtime_abi_digest": "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "dependency_digest": "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "capabilities": [
+          "astrid:net",
+          "astrid:read"
+        ],
+        "dependencies": [
+          {
+            "coordinate": {
+              "namespace": "astrid",
+              "name": "dep"
+            },
+            "requirement": "*",
+            "optional": false
+          }
+        ],
+        "runtime": {
+          "runtime": "wasmtime",
+          "abi": "component-model-0.2",
+          "digest": "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+      },
+      "publisher": {
+        "identity": "github:astrid-runtime/hello",
+        "signing_key": "blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "source": {
+        "repository_url": "https://github.com/astrid-runtime/hello",
+        "github_owner_id": 123456,
+        "github_repository_id": 987654,
+        "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "tree": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "tag": "v1.2.3",
+        "subdirectory": "capsules/hello",
+        "source_digest": "blake3:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      },
+      "provenance": {
+        "predicate_type": "https://slsa.dev/provenance/v1",
+        "statement_digest": "blake3:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "builder_identity": "https://github.com/astrid-runtime/hello/actions",
+        "attestation_identity": "sigstore:rekor:entry-1"
+      },
+      "metadata": {
+        "channel": "stable",
+        "license": "MIT"
+      },
+      "publication_digest": "blake3:12520d71415e6be6e9b6b2d9ba3b032cc44663571961724fa7c309109c0d6618"
+    }
+  },
+  "expected": {
+    "accepted": false,
+    "outcome": "reject",
+    "error_codes": [
+      "invalid_name"
+    ]
+  }
+}

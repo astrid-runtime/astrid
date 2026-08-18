@@ -1,0 +1,33 @@
+[package]
+name = "astrid-capsule-index-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Anonymous static read client for the Astrid Capsule Index"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+astrid-capsule-index = { workspace = true }
+astrid-capsule-index-tuf = { workspace = true }
+blake3 = { workspace = true }
+semver = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["fs"] }
+tough = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+ed25519-dalek = { workspace = true }
+olpc-cjson = "0.1.4"
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["fs", "rt-multi-thread", "test-util"] }
+
+[lints]
+workspace = true

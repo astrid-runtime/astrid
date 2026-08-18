@@ -12,11 +12,14 @@ use clap::{Parser, Subcommand};
 use crate::commands::UpdateChannel;
 use crate::commands::{
     agent::AgentCommand, audit::AuditArgs, budget::BudgetCommand, caps::CapsCommand,
-    capsule::config::ConfigArgs as CapsuleConfigArgs, capsule::show::ShowArgs as CapsuleShowArgs,
-    completions::CompletionsArgs, doctor::DoctorArgs, gc::GcArgs, group::GroupCommand,
-    invite::InviteCommand, keypair::KeypairCommand, logs::LogsArgs, pair_device::PairDeviceCommand,
-    ps::PsArgs, quota::QuotaCommand, run::RunArgs, secret::SecretCommand, setup::SetupArgs,
-    top::TopArgs, trust::TrustCommand, version::VersionArgs, voucher::VoucherCommand, who::WhoArgs,
+    capsule::config::ConfigArgs as CapsuleConfigArgs,
+    capsule::event::EventArgs as CapsuleEventArgs,
+    capsule::publish::PublishArgs as CapsulePublishArgs,
+    capsule::show::ShowArgs as CapsuleShowArgs, completions::CompletionsArgs, doctor::DoctorArgs,
+    gc::GcArgs, group::GroupCommand, invite::InviteCommand, keypair::KeypairCommand,
+    logs::LogsArgs, pair_device::PairDeviceCommand, ps::PsArgs, quota::QuotaCommand, run::RunArgs,
+    secret::SecretCommand, setup::SetupArgs, top::TopArgs, trust::TrustCommand,
+    version::VersionArgs, voucher::VoucherCommand, who::WhoArgs,
 };
 
 /// Astrid - Secure Agent Runtime
@@ -205,6 +208,12 @@ pub(crate) enum Commands {
         command: CapsuleCommands,
     },
 
+    /// Manage trusted Capsule Index sources.
+    Index {
+        #[command(subcommand)]
+        command: IndexCommands,
+    },
+
     /// Expose Astrid capsule tools over the Model Context Protocol.
     Mcp {
         #[command(subcommand)]
@@ -232,7 +241,6 @@ pub(crate) enum Commands {
         #[arg(long)]
         from_mcp_json: Option<String>,
     },
-
     /// Initialize a workspace and install a distro
     Init {
         /// Distro source to install. Required unless an embedding launcher sets
@@ -366,6 +374,10 @@ pub(crate) enum CapsuleCommands {
     Install {
         /// Capsule source (local path or package name)
         source: String,
+        /// Resolve an `@namespace/name` source through this configured Index
+        /// instead of the legacy GitHub compatibility path.
+        #[arg(long, value_name = "INDEX_ID")]
+        index: Option<String>,
         /// Install only this capsule from a multi-capsule release (default: install all)
         #[arg(long)]
         capsule: Option<String>,
@@ -387,6 +399,9 @@ pub(crate) enum CapsuleCommands {
     Update {
         /// Capsule name to update (omit to update all)
         target: Option<String>,
+        /// Restrict update resolution to this configured Capsule Index.
+        #[arg(long, value_name = "INDEX_ID")]
+        index: Option<String>,
         /// Update workspace capsules instead of user-level
         #[arg(long)]
         workspace: bool,
@@ -434,6 +449,10 @@ pub(crate) enum CapsuleCommands {
         #[arg(long)]
         from_mcp_json: Option<String>,
     },
+    /// Prepare a typed Capsule Index publication offline.
+    Publish(CapsulePublishArgs),
+    /// Prepare one sealed lifecycle event offline.
+    Event(CapsuleEventArgs),
     /// Statically lint a capsule project's tool wiring (CI-friendly).
     ///
     /// Cross-checks `#[astrid::tool]` annotations against the `Capsule.toml`
@@ -469,6 +488,42 @@ pub(crate) enum CapsuleCommands {
     /// lands here and is resolved against the daemon's command registry.
     #[command(external_subcommand)]
     External(Vec<String>),
+}
+
+/// Trusted Capsule Index source management.
+#[derive(Subcommand)]
+pub(crate) enum IndexCommands {
+    /// Add a source with an explicitly pinned TUF root.
+    Add {
+        /// Stable local source identifier.
+        id: String,
+        /// Static GitHub Pages-compatible base URL.
+        base_url: String,
+        /// Path to the trusted TUF root JSON.
+        #[arg(long, value_name = "ROOT_JSON")]
+        root: PathBuf,
+        /// Tagged SHA-256 fingerprint of the exact root bytes.
+        #[arg(long, value_name = "sha256:HEX")]
+        fingerprint: String,
+        /// Add the source without using it for resolution.
+        #[arg(long)]
+        disabled: bool,
+        /// Explicit source priority; lower values win.
+        #[arg(long, default_value_t = 100)]
+        priority: i32,
+    },
+    /// List configured sources and their pinned trust roots.
+    List,
+    /// Remove a source that is not referenced by installed or distro state.
+    Remove {
+        /// Stable source identifier.
+        id: String,
+    },
+    /// Refresh and verify a source's signed TUF metadata.
+    Update {
+        /// Stable source identifier.
+        id: String,
+    },
 }
 
 /// Model Context Protocol surfaces — expose Astrid's capsule tools to an

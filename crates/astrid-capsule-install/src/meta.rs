@@ -14,8 +14,23 @@ use std::fmt;
 use std::path::Path;
 
 use anyhow::Context;
+use astrid_capsule_index::LockRecord;
 use astrid_core::dirs::{AstridHome, WorkspaceLayout};
 use serde::{Deserialize, Serialize};
+
+/// Provenance bound to an artifact resolved from an Astrid Capsule Index.
+///
+/// The lock is the complete protocol [`LockRecord`], not a display-only
+/// version/digest projection. Keeping the source base URL alongside it makes
+/// the selected mirror/index identity auditable while the lock's trust-root
+/// fingerprint remains the authority for update resolution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexInstallProvenance {
+    /// Canonical configured Index Pages base URL.
+    pub base_url: String,
+    /// Complete protocol lock binding index/root, publication, and artifact.
+    pub lock: LockRecord,
+}
 
 /// Capsule installation metadata, persisted as `meta.json` alongside `Capsule.toml`.
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -59,6 +74,10 @@ pub struct CapsuleMeta {
     /// The concrete ref (tag/branch/commit) this capsule resolved to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_ref: Option<String>,
+    /// Optional Index provenance. Missing in pre-Index metadata is supported
+    /// for backward compatibility with existing installations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_provenance: Option<IndexInstallProvenance>,
 }
 
 /// Read existing `meta.json` from a capsule's install directory (if present).
@@ -343,6 +362,52 @@ mod tests {
             results[0].meta.is_none(),
             "corrupt meta.json should be treated as missing"
         );
+    }
+
+    #[test]
+    fn legacy_meta_defaults_index_provenance_to_none() {
+        let meta: CapsuleMeta = serde_json::from_str(
+            r#"{
+                "version": "1.0.0",
+                "installed_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z"
+            }"#,
+        )
+        .expect("legacy metadata should remain readable");
+        assert!(meta.index_provenance.is_none());
+    }
+
+    #[test]
+    fn index_provenance_round_trips_complete_lock_record() {
+        use astrid_capsule_index::{
+            IndexId, IndexIdentity, PublicationRecord, TrustRootFingerprint,
+        };
+
+        let record: PublicationRecord = serde_json::from_str(include_str!(
+            "../../astrid-capsule-index/tests/fixtures/valid-publication.json"
+        ))
+        .expect("fixture publication");
+        let identity = IndexIdentity::new(
+            IndexId::new("astrid").expect("index id"),
+            TrustRootFingerprint::parse(
+                "sha256:a836a77851078745efd3b1bb6fbb439126757f924f2e3b86b824be04d5f1ca13",
+            )
+            .expect("sha256 fingerprint"),
+        );
+        let lock = LockRecord::from_publication(&identity, &record);
+        let meta = CapsuleMeta {
+            version: "1.0.0".to_owned(),
+            index_provenance: Some(IndexInstallProvenance {
+                base_url: "https://index.example/".to_owned(),
+                lock: lock.clone(),
+            }),
+            ..Default::default()
+        };
+        let encoded = serde_json::to_string(&meta).expect("serialize metadata");
+        let decoded: CapsuleMeta = serde_json::from_str(&encoded).expect("deserialize metadata");
+        let provenance = decoded.index_provenance.expect("index provenance");
+        assert_eq!(provenance.base_url, "https://index.example/");
+        assert_eq!(provenance.lock, lock);
     }
 
     #[test]

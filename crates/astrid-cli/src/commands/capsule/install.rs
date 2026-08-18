@@ -49,9 +49,9 @@ pub(crate) use super::install_batch::{
 use super::install_github::{github_api_client, release_tag_url, resolve_github_ref};
 
 #[derive(Clone, Copy)]
-struct ExpectedCapsule<'a> {
-    id: &'a CapsuleId,
-    version: Option<&'a str>,
+pub(super) struct ExpectedCapsule<'a> {
+    pub(super) id: &'a CapsuleId,
+    pub(super) version: Option<&'a str>,
 }
 
 #[derive(Clone, Copy)]
@@ -189,6 +189,49 @@ pub(crate) async fn install_capsule_with_options(
     // on-disk install above already succeeded standalone. The `update` and TUI
     // install paths route through here too, so they inherit live hot-swap.
     super::live_load::nudge_daemon_reload(&installed_ids).await;
+    Ok(())
+}
+
+/// Manual install entry point with an optional explicit Capsule Index.
+///
+/// An explicit `--index` is a hard routing decision: the source must be an
+/// Index coordinate and the injected client must resolve it. We intentionally
+/// do not fall back to the legacy GitHub resolver when the Index path fails.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn install_capsule_with_index_options<
+    C: super::install_index::IndexClient + ?Sized,
+>(
+    source: &str,
+    capsule: Option<&str>,
+    workspace: bool,
+    yes: bool,
+    approve_untrusted: bool,
+    vars: &[String],
+    index_id: Option<&str>,
+    client: &C,
+) -> anyhow::Result<()> {
+    let Some(index_id) = index_id else {
+        return install_capsule_with_options(
+            source,
+            capsule,
+            workspace,
+            yes,
+            approve_untrusted,
+            vars,
+        )
+        .await;
+    };
+    if capsule.is_some() {
+        bail!("--capsule cannot be combined with --index; pass an Index coordinate as the source");
+    }
+
+    let prompt = ManualInstallOptions::from_cli(yes, approve_untrusted, vars)?;
+    let installed =
+        super::install_index::install_from_index(source, index_id, workspace, &prompt, client)
+            .await?;
+    super::live_load::nudge_daemon_reload(&[installed.id.as_str().to_string()]).await;
+    // Keep the result shape aligned with the ordinary manual install command:
+    // one successful Index resolution installs exactly one selected capsule.
     Ok(())
 }
 
@@ -866,7 +909,7 @@ pub(crate) fn install_offline_capsule(
 
 /// Unpack a `.capsule` archive and install from it. Returns the installed
 /// capsule id.
-fn unpack_via_lib(
+pub(super) fn unpack_via_lib(
     archive: &Path,
     workspace: bool,
     home: &AstridHome,

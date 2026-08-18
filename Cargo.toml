@@ -7,6 +7,10 @@ members = [
     "crates/astrid-build",
     "crates/astrid-capsule",
     "crates/astrid-capsule-install",
+    "crates/astrid-capsule-index",
+    "crates/astrid-capsule-index-client",
+    "crates/astrid-capsule-index-tuf",
+    "crates/astrid-capsule-publish",
     "crates/astrid-capsule-types",
     "crates/astrid-cli",
     "crates/astrid-config",
@@ -19,6 +23,7 @@ members = [
     "crates/astrid-gateway",
     "crates/astrid-hooks",
     "crates/astrid-integration-tests",
+    "crates/astrid-index-tool",
     "crates/astrid-kernel",
     "crates/astrid-mcp",
     "crates/astrid-prelude",
@@ -47,6 +52,10 @@ astrid-capabilities = { path = "crates/astrid-capabilities", version = "0.10.4" 
 astrid-build = { path = "crates/astrid-build", version = "0.10.4" }
 astrid-capsule = { path = "crates/astrid-capsule", version = "0.10.4" }
 astrid-capsule-install = { path = "crates/astrid-capsule-install", version = "0.10.4" }
+astrid-capsule-index = { path = "crates/astrid-capsule-index", version = "0.10.4" }
+astrid-capsule-index-client = { path = "crates/astrid-capsule-index-client", version = "0.10.4" }
+astrid-capsule-index-tuf = { path = "crates/astrid-capsule-index-tuf", version = "0.10.4" }
+astrid-capsule-publish = { path = "crates/astrid-capsule-publish", version = "0.10.4" }
 astrid-capsule-types = { path = "crates/astrid-capsule-types", version = "0.10.4" }
 astrid-config = { path = "crates/astrid-config", version = "0.10.4" }
 astrid-daemon = { path = "crates/astrid-daemon", version = "0.10.4" }
@@ -94,6 +103,7 @@ axum-server = { version = "0.8", features = ["tls-rustls"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 base64 = { version = "0.23", default-features = false, features = ["std"] }
 blake3 = "1.5"
+bytes = "1"
 caseless = "=0.2.2"
 # `default-features = false` strips chrono's `clock` feature, which on
 # `wasm32-unknown-unknown` would pull in `wasm-bindgen` + `js-sys` and
@@ -124,6 +134,7 @@ ignore = "0.4"
 indicatif = "0.18"
 insta = { version = "1.40", features = ["yaml", "json"] }
 jsonrpsee = { version = "0.24", features = ["server", "client", "macros"] }
+jiff = "0.2"
 # Enable platform-native backends for every supported OS. Without
 # these features the keyring crate falls back to a process-local
 # `MockCredential` that "succeeds" without persisting — values vanish
@@ -236,6 +247,9 @@ tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7", features = ["cors", "trace", "limit", "set-header"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# Security-sensitive verifier for the Capsule Index trust boundary. Keep this
+# exact-pinned; upgrades require the rollback, freeze, and root-rotation suite.
+tough = { version = "=0.24.0", default-features = false }
 url = "2"
 # `default-features = false` strips the `js` auto-feature that uuid
 # enables on `wasm32-unknown-unknown`, which would pull `wasm-bindgen`.

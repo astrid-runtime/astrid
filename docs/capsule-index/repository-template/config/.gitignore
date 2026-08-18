@@ -1,0 +1,9 @@
+# Public trust-root.json is intentionally tracked after the offline ceremony.
+*.key
+*.pem
+*.p12
+*.pfx
+*.jwk
+*private*
+*secret*
+root-keys/

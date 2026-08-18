@@ -17,8 +17,13 @@ use astrid_capsule_install::{
 };
 use astrid_core::dirs::AstridHome;
 
-use super::install::install_capsule_with_options;
+use super::install::{ManualInstallOptions, install_capsule_with_options};
+use super::install_index::{
+    IndexClient, ProductionIndexClient, install_from_index_with_home,
+    validate_existing_index_provenance,
+};
 use super::meta::{CapsuleMeta, read_meta};
+use crate::commands::index::{IndexSource, IndexStore};
 
 /// Result of checking a remote source for a newer capsule version.
 pub(super) enum UpdateCheck {
@@ -118,6 +123,130 @@ pub(crate) async fn update_capsule(
     approve_untrusted: bool,
 ) -> anyhow::Result<()> {
     let home = AstridHome::resolve()?;
+    let client = ProductionIndexClient::for_home(home.root())?;
+    update_capsule_with_index(target, workspace, approve_untrusted, None, &client).await
+}
+
+/// Update capsules with an optional explicit Capsule Index client.
+///
+/// Capsules carrying [`CapsuleMeta::index_provenance`] are always refreshed
+/// through that exact configured Index identity. They are never passed to the
+/// GitHub resolver, even when the recorded source happens to look like a
+/// GitHub coordinate. An explicit `index_id` is likewise fail-closed when the
+/// selected capsule has no matching provenance.
+pub(crate) async fn update_capsule_with_index<C: IndexClient + ?Sized>(
+    target: Option<&str>,
+    workspace: bool,
+    approve_untrusted: bool,
+    index_id: Option<&str>,
+    client: &C,
+) -> anyhow::Result<()> {
+    let home = AstridHome::resolve()?;
+    let principal = crate::principal::current();
+
+    if let Some(name) = target {
+        let target_dir = astrid_capsule_install::resolve_target_dir_for_with_layout(
+            &home,
+            &principal,
+            name,
+            workspace,
+            crate::workspace_layout::current(),
+        )?;
+        if !target_dir.exists() {
+            bail!("Capsule '{name}' is not installed.");
+        }
+        let meta = read_meta(&target_dir).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Capsule '{name}' has no meta.json - cannot determine original source. \
+                 Re-install it manually."
+            )
+        })?;
+
+        if let Some(provenance) = meta.index_provenance.as_ref() {
+            let selected = index_id.unwrap_or_else(|| provenance.lock.index_id().as_str());
+            anyhow::ensure!(
+                selected == provenance.lock.index_id().as_str(),
+                "Capsule '{name}' is bound to Index '{}', not '{}'; refusing a different Index",
+                provenance.lock.index_id(),
+                selected
+            );
+            let index = configured_index(&home, selected)?;
+            validate_existing_index_provenance(&index, provenance)?;
+            eprintln!(
+                "Updating {name} from Index {} ({})...",
+                provenance.lock.index_id(),
+                index.base_url
+            );
+            let prompt = ManualInstallOptions {
+                approve_untrusted,
+                ..Default::default()
+            };
+            let coordinate = provenance.lock.coordinate().to_string();
+            let installed = install_from_index_with_home(
+                &coordinate,
+                selected,
+                workspace,
+                &home,
+                &principal,
+                &prompt,
+                client,
+            )
+            .await?;
+            super::live_load::nudge_daemon_reload(&[installed.id.as_str().to_string()]).await;
+            regenerate_distro_lock(&home, &principal)?;
+            return Ok(());
+        }
+
+        if let Some(selected) = index_id {
+            bail!(
+                "Capsule '{name}' has no Index provenance; refusing explicit Index '{selected}' update"
+            );
+        }
+
+        // Legacy GitHub/local update path remains unchanged for metadata that
+        // predates Index provenance.
+        return update_capsule_legacy(Some(name), workspace, approve_untrusted).await;
+    }
+
+    if index_id.is_some() {
+        let updated = update_index_capsules(
+            &home,
+            &principal,
+            workspace,
+            approve_untrusted,
+            index_id,
+            client,
+        )
+        .await?;
+        if updated > 0 {
+            regenerate_distro_lock(&home, &principal)?;
+        }
+        return Ok(());
+    }
+
+    // Refresh Index-provenanced capsules first, then let the legacy scanner
+    // handle only non-Index installations. `update_all_capsules` explicitly
+    // skips Index provenance so no GitHub request can be made for them.
+    let _ = update_index_capsules(
+        &home,
+        &principal,
+        workspace,
+        approve_untrusted,
+        None,
+        client,
+    )
+    .await?;
+    update_capsule_legacy(None, workspace, approve_untrusted).await
+}
+
+/// The pre-Index update implementation, retained for backward-compatible
+/// GitHub and local-path installations.
+async fn update_capsule_legacy(
+    target: Option<&str>,
+    workspace: bool,
+    approve_untrusted: bool,
+) -> anyhow::Result<()> {
+    let home = AstridHome::resolve()?;
     let principal = crate::principal::current();
 
     if let Some(name) = target {
@@ -165,6 +294,90 @@ pub(crate) async fn update_capsule(
     }
 }
 
+fn configured_index(home: &AstridHome, index_id: &str) -> anyhow::Result<IndexSource> {
+    let index = IndexStore::from_home(home.root(), None)
+        .load()?
+        .into_iter()
+        .find(|index| index.id == index_id)
+        .ok_or_else(|| anyhow::anyhow!("Index source not found: {index_id}"))?;
+    anyhow::ensure!(
+        index.enabled,
+        "Index source '{}' is disabled; enable it before resolution",
+        index.id
+    );
+    Ok(index)
+}
+
+/// Refresh all installed capsules carrying Index provenance through their
+/// bound source. Returns the number of successful installs. When `index_id`
+/// is supplied, capsules bound to other sources are ignored and a missing
+/// match is an error rather than a silent GitHub fallback.
+async fn update_index_capsules<C: IndexClient + ?Sized>(
+    home: &AstridHome,
+    principal: &astrid_core::PrincipalId,
+    workspace: bool,
+    approve_untrusted: bool,
+    index_id: Option<&str>,
+    client: &C,
+) -> anyhow::Result<usize> {
+    let capsules = filter_update_scope(
+        scan_installed_capsules_in_home_for_with_layout(
+            home,
+            principal,
+            crate::workspace_layout::current(),
+        )?,
+        workspace,
+    );
+    let mut matched = 0usize;
+    let mut updated = 0usize;
+    for capsule in capsules {
+        let Some(meta) = capsule.meta else {
+            continue;
+        };
+        let Some(provenance) = meta.index_provenance else {
+            continue;
+        };
+        let bound_id = provenance.lock.index_id().as_str();
+        if let Some(selected) = index_id
+            && selected != bound_id
+        {
+            continue;
+        }
+        matched = matched.saturating_add(1);
+        let index = configured_index(home, bound_id)?;
+        validate_existing_index_provenance(&index, &provenance)?;
+        let coordinate = provenance.lock.coordinate().to_string();
+        eprintln!(
+            "Updating {} from Index {} ({})...",
+            capsule.name, bound_id, index.base_url
+        );
+        let prompt = ManualInstallOptions {
+            approve_untrusted,
+            ..Default::default()
+        };
+        let installed = install_from_index_with_home(
+            &coordinate,
+            bound_id,
+            workspace,
+            home,
+            principal,
+            &prompt,
+            client,
+        )
+        .await
+        .with_context(|| format!("update Index capsule {}", capsule.name))?;
+        super::live_load::nudge_daemon_reload(&[installed.id.as_str().to_string()]).await;
+        updated = updated.saturating_add(1);
+    }
+    if index_id.is_some() && matched == 0 {
+        bail!(
+            "No installed capsules are bound to Index '{}'",
+            index_id.unwrap_or_default()
+        );
+    }
+    Ok(updated)
+}
+
 /// Check all installed capsules for updates and install those with newer versions.
 async fn update_all_capsules(
     home: &AstridHome,
@@ -210,6 +423,13 @@ async fn update_all_capsules(
             skipped = skipped.saturating_add(1);
             continue;
         };
+        if meta.index_provenance.is_some() {
+            // Index provenance is handled by `update_index_capsules`; never
+            // send its recorded source through the GitHub API path.
+            eprintln!("  {name}: skipped (Capsule Index source)");
+            skipped = skipped.saturating_add(1);
+            continue;
+        }
         let Some(ref source) = meta.source else {
             eprintln!("  {name}: skipped (no source recorded)");
             skipped = skipped.saturating_add(1);

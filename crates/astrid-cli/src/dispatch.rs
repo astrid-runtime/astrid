@@ -12,7 +12,8 @@ use anyhow::Result;
 
 use crate::bootstrap;
 use crate::cli::{
-    Cli, Commands, ConfigCommands, DistroCommands, McpCommands, SessionCommands, WitCommands,
+    Cli, Commands, ConfigCommands, DistroCommands, IndexCommands, McpCommands, SessionCommands,
+    WitCommands,
 };
 use crate::commands;
 use crate::commands::stub::TrackingIssue;
@@ -198,6 +199,7 @@ async fn dispatch_subcommand(
             Ok(ExitCode::SUCCESS)
         },
         Some(Commands::Capsule { command }) => dispatch_capsule(command).await,
+        Some(Commands::Index { command }) => dispatch_index(command, output_format).await,
         Some(Commands::Mcp { command }) => dispatch_mcp(command).await,
         Some(Commands::Distro { command }) => dispatch_distro(command).await,
         Some(Commands::Wit { command }) => dispatch_wit(&command),
@@ -232,6 +234,116 @@ async fn dispatch_subcommand(
         },
         Some(Commands::External(tokens)) => dispatch_root_shorthand(tokens).await,
     }
+}
+
+async fn dispatch_index(command: IndexCommands, output_format: OutputFormat) -> Result<ExitCode> {
+    use commands::index::{
+        AddArgs, DEFAULT_MAX_RESPONSE_BYTES, IndexListFormat, IndexStore, LockUsageScanner,
+        RemoveArgs, RemoveOutcome, RootInput, TufIndexAdapter, TufStatePaths, UpdateArgs,
+    };
+
+    let home = astrid_core::dirs::AstridHome::resolve()?;
+    let store = IndexStore::from_home(home.root(), None);
+    match command {
+        IndexCommands::Add {
+            id,
+            base_url,
+            root,
+            fingerprint,
+            disabled,
+            priority,
+        } => {
+            let outcome = store.add(AddArgs {
+                id,
+                base_url,
+                root: RootInput::Path(root),
+                fingerprint,
+                enabled: !disabled,
+                priority,
+            })?;
+            print_added_index_source(&outcome.source, output_format)?;
+        },
+        IndexCommands::List => {
+            let format = match output_format {
+                OutputFormat::Pretty => IndexListFormat::Pretty,
+                OutputFormat::Json => IndexListFormat::Json,
+            };
+            print!("{}", store.list(commands::index::ListArgs { format })?);
+        },
+        IndexCommands::Remove { id } => {
+            let scanner = LockUsageScanner::new([
+                home.home_dir(),
+                std::env::current_dir()?.join("Distro.lock"),
+                std::env::current_dir()?.join("distro.lock"),
+            ]);
+            let outcome = store.remove(RemoveArgs { id }, &scanner)?;
+            match (&output_format, &outcome) {
+                (OutputFormat::Json, _) => println!("{}", serde_json::to_string_pretty(&outcome)?),
+                (OutputFormat::Pretty, RemoveOutcome::Removed { source }) => {
+                    println!("Removed Index source {}", source.id);
+                },
+                (OutputFormat::Pretty, RemoveOutcome::Blocked { id, references }) => {
+                    anyhow::bail!(
+                        "Index source {id} is still referenced by: {}",
+                        references.join(", ")
+                    );
+                },
+            }
+        },
+        IndexCommands::Update { id } => {
+            let source = store
+                .load()?
+                .into_iter()
+                .find(|source| source.id == id)
+                .ok_or_else(|| anyhow::anyhow!("Index source not found: {id}"))?;
+            let base_url = url::Url::parse(&source.base_url)?;
+            let state_dir = home.var_dir().join("capsule-index").join(&source.id);
+            let adapter = TufIndexAdapter::new(DEFAULT_MAX_RESPONSE_BYTES)?;
+            let outcome = adapter
+                .update_store(
+                    &store,
+                    UpdateArgs {
+                        id: source.id.clone(),
+                    },
+                    base_url.clone(),
+                    base_url,
+                    TufStatePaths {
+                        state_path: state_dir.join("trusted-state.json"),
+                        datastore_path: state_dir.join("metadata"),
+                    },
+                )
+                .await?;
+            match output_format {
+                OutputFormat::Json => println!(
+                    "{}",
+                    serde_json::json!({
+                        "id": outcome.id,
+                        "snapshot-version": outcome.snapshot.version,
+                        "snapshot-digest": outcome.snapshot.digest,
+                    })
+                ),
+                OutputFormat::Pretty => println!(
+                    "Updated Index source {} to signed snapshot {} ({})",
+                    outcome.id, outcome.snapshot.version, outcome.snapshot.digest
+                ),
+            }
+        },
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn print_added_index_source(
+    source: &commands::index::IndexSource,
+    output_format: OutputFormat,
+) -> Result<()> {
+    match output_format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(source)?),
+        OutputFormat::Pretty => println!(
+            "Added Index source {} ({}) pinned to {}",
+            source.id, source.base_url, source.root.fingerprint
+        ),
+    }
+    Ok(())
 }
 
 fn resolve_init_distro(requested: Option<String>) -> Result<String> {
@@ -337,32 +449,44 @@ async fn dispatch_capsule(command: crate::cli::CapsuleCommands) -> Result<ExitCo
         CapsuleCommands::New(args) => commands::capsule::new::run(&args),
         CapsuleCommands::Install {
             source,
+            index,
             capsule,
             workspace,
             yes,
             approve_untrusted,
             vars,
         } => {
-            commands::capsule::install::install_capsule_with_options(
+            let home = astrid_core::dirs::AstridHome::resolve()?;
+            let client =
+                commands::capsule::install_index::ProductionIndexClient::for_home(home.root())?;
+            commands::capsule::install::install_capsule_with_index_options(
                 &source,
                 capsule.as_deref(),
                 workspace,
                 yes,
                 approve_untrusted,
                 &vars,
+                index.as_deref(),
+                &client,
             )
             .await?;
             Ok(ExitCode::SUCCESS)
         },
         CapsuleCommands::Update {
             target,
+            index,
             workspace,
             approve_untrusted,
         } => {
-            commands::capsule::install::update_capsule(
+            let home = astrid_core::dirs::AstridHome::resolve()?;
+            let client =
+                commands::capsule::install_index::ProductionIndexClient::for_home(home.root())?;
+            commands::capsule::install_update::update_capsule_with_index(
                 target.as_deref(),
                 workspace,
                 approve_untrusted,
+                index.as_deref(),
+                &client,
             )
             .await?;
             Ok(ExitCode::SUCCESS)
@@ -400,6 +524,8 @@ async fn dispatch_capsule(command: crate::cli::CapsuleCommands) -> Result<ExitCo
             project_type.as_deref(),
             from_mcp_json.as_deref(),
         ),
+        CapsuleCommands::Publish(args) => commands::capsule::publish::run(&args),
+        CapsuleCommands::Event(args) => commands::capsule::event::run(&args),
         CapsuleCommands::Check { path } => commands::capsule::check::run(path.as_deref()),
         CapsuleCommands::Config(args) => commands::capsule::config::run(&args),
         CapsuleCommands::Show(args) => commands::capsule::show::run(&args),

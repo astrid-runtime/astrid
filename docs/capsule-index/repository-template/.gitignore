@@ -1,0 +1,14 @@
+# Generated Pages output and local tool worktrees are never source inputs.
+dist/
+.index-tool/
+
+# Defense in depth for accidental key material; the validator is authoritative.
+*.key
+*.pem
+*.p12
+*.pfx
+*.jwk
+*private*
+*secret*
+root-keys/
+.secrets/

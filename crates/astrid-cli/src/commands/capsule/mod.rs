@@ -4,11 +4,13 @@ pub(crate) mod build;
 pub(crate) mod check;
 pub(crate) mod config;
 pub(crate) mod deps;
+pub(crate) mod event;
 pub(crate) mod install;
 mod install_batch;
 mod install_finish;
 mod install_github;
 mod install_headless;
+pub(crate) mod install_index;
 pub(crate) mod install_prompts;
 pub(crate) mod install_update;
 pub(crate) mod list;
@@ -18,5 +20,11 @@ pub(crate) mod meta;
 pub(crate) mod model_discovery;
 pub(crate) mod new;
 pub(crate) mod new_templates;
+pub(crate) mod publish;
 pub(crate) mod remove;
 pub(crate) mod show;
+
+#[cfg(test)]
+mod event_tests;
+#[cfg(test)]
+mod publish_tests;

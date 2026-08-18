@@ -124,6 +124,32 @@ denial = ["regular agent cannot install daemon-wide capsules"]
 state = ["installed capsule registry contains the artifact once"]
 evidence = ["capsule build/install transcript and metadata artifacts"]
 
+[scenarios.capsule_index_sources]
+status = "mapped"
+surfaces = ["cli"]
+auth = ["local filesystem plus explicitly pinned Index trust root"]
+success = ["add, list, update, and remove preserve the exact Index identity and trust-root fingerprint"]
+denial = ["invalid roots, rollback, equivocation, in-use removal, and implicit source fallback are rejected"]
+state = ["only the selected Index source and its monotonic trusted metadata state change"]
+evidence = ["CLI transcript, source configuration, and verified TUF high-water state"]
+remaining = "Add a live Pages fixture to exercise anonymous refresh and in-use removal through the runtime e2e harness."
+
+[scenarios.capsule_index_publication]
+status = "mapped"
+surfaces = ["cli"]
+auth = ["local CLI with an explicit Index identity and detached authorization evidence"]
+success = [
+    "offline capsule publish hashes the exact installable artifact and writes a canonical records/<namespace>/<name>/<version>.json submission",
+    "yank, unyank, deprecate, revoke, tombstone, and add-mirror each produce one sealed events/<sequence>-<digest>.json envelope with a contiguous digest chain",
+]
+denial = [
+    "missing publisher, source, provenance, or authorization evidence is rejected without fallback",
+    "package.publish=false, tampered artifacts, same-coordinate equivocation, event sequence gaps, and terminal lifecycle transitions are rejected",
+]
+state = ["only the explicitly selected temporary Index repository/output tree changes; no network or GitHub state is mutated"]
+evidence = ["CLI JSON/transcript, canonical publication record and digests, and sealed event files validated by the Index tool"]
+remaining = ["wire the offline publication and lifecycle-event flows into the dedicated runtime e2e harness"]
+
 [scenarios.capsule_live_load_lifecycle]
 status = "covered"
 surfaces = ["cli", "http", "capability"]

@@ -156,6 +156,7 @@ mod tests {
         "budget",
         "session",
         "capsule",
+        "index",
         "mcp",
         "distro",
         "build",

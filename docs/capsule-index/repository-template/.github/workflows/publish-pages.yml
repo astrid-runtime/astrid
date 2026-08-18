@@ -1,0 +1,295 @@
+name: Generate and publish Capsule Index Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: index-pages
+  cancel-in-progress: false
+
+env:
+  # Replace these values before enabling the workflow.  The tool repository
+  # and commit are deliberately repeated in the generated and signing jobs so
+  # each job independently verifies the same immutable implementation.
+  INDEX_TOOL_REPOSITORY: https://github.com/REPLACE_OWNER/REPLACE_INDEX_TOOL.git
+  INDEX_TOOL_SHA: REPLACE_WITH_40_HEX_INDEX_TOOL_COMMIT
+  INDEX_ID: REPLACE_INDEX_ID
+  TARGETS_VERSION: REPLACE_TARGETS_VERSION
+  SNAPSHOT_VERSION: REPLACE_SNAPSHOT_VERSION
+  TIMESTAMP_VERSION: REPLACE_TIMESTAMP_VERSION
+  TARGETS_EXPIRES: REPLACE_TARGETS_EXPIRES_RFC3339
+  SNAPSHOT_EXPIRES: REPLACE_SNAPSHOT_EXPIRES_RFC3339
+  TIMESTAMP_EXPIRES: REPLACE_TIMESTAMP_EXPIRES_RFC3339
+
+jobs:
+  generate:
+    name: Build deterministic unsigned Pages input
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout protected main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          ref: ${{ github.sha }}
+
+      - name: Reject key material and validate source history
+        run: |
+          set -euo pipefail
+          test "${GITHUB_REF_NAME}" = "main"
+          test "${INDEX_ID}" != "REPLACE_INDEX_ID"
+          python3 scripts/index_repository_validate.py --root . --json
+
+      - name: Fetch and build the pinned index tool
+        run: |
+          set -euo pipefail
+          printf '%s' "${INDEX_TOOL_SHA}" | grep -Eq '^[0-9a-f]{40}$'
+          test "${INDEX_TOOL_REPOSITORY}" != "https://github.com/REPLACE_OWNER/REPLACE_INDEX_TOOL.git"
+          git clone --no-checkout --filter=blob:none "${INDEX_TOOL_REPOSITORY}" "${RUNNER_TEMP}/index-tool"
+          git -C "${RUNNER_TEMP}/index-tool" cat-file -e "${INDEX_TOOL_SHA}^{commit}"
+          git -C "${RUNNER_TEMP}/index-tool" checkout --detach "${INDEX_TOOL_SHA}"
+          cargo build --locked --release -p astrid-index-tool \
+            --manifest-path "${RUNNER_TEMP}/index-tool/Cargo.toml"
+          test -x "${RUNNER_TEMP}/index-tool/target/release/astrid-index-tool"
+
+      - name: Generate canonical records and unsigned TUF input
+        run: |
+          set -euo pipefail
+          first_dir="${RUNNER_TEMP}/index-generated-first"
+          second_dir="${RUNNER_TEMP}/index-generated-second"
+          output_dir="${RUNNER_TEMP}/index-generated"
+          rm -rf -- "${first_dir}" "${second_dir}" "${output_dir}"
+          "${RUNNER_TEMP}/index-tool/target/release/astrid-index-tool" generate \
+            --input "${GITHUB_WORKSPACE}" \
+            --output "${first_dir}" \
+            --index-id "${INDEX_ID}" \
+            --event-authorization curator-review \
+            --json > "${RUNNER_TEMP}/generate-report-first.json"
+          "${RUNNER_TEMP}/index-tool/target/release/astrid-index-tool" generate \
+            --input "${GITHUB_WORKSPACE}" \
+            --output "${second_dir}" \
+            --index-id "${INDEX_ID}" \
+            --event-authorization curator-review \
+            --json > "${RUNNER_TEMP}/generate-report-second.json"
+          cat "${RUNNER_TEMP}/generate-report-first.json"
+          cat "${RUNNER_TEMP}/generate-report-second.json"
+          python3 - "${RUNNER_TEMP}/generate-report-first.json" \
+            "${RUNNER_TEMP}/generate-report-second.json" "${first_dir}" "${second_dir}" <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          import sys
+
+          first_report = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          second_report = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+          first = Path(sys.argv[3])
+          second = Path(sys.argv[4])
+
+          if first_report.get("deployment_ready") is not False or second_report.get("deployment_ready") is not False:
+              raise SystemExit("generate must not claim deployment readiness")
+
+          def manifest(root: Path) -> list[tuple[str, int, str]]:
+              entries = []
+              for path in sorted(root.rglob("*")):
+                  relative = path.relative_to(root).as_posix()
+                  stat = path.lstat()
+                  if path.is_symlink() or not path.is_file():
+                      raise SystemExit(f"generated tree contains non-regular file: {relative}")
+                  digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                  entries.append((relative, stat.st_size, digest))
+              return entries
+
+          first_manifest = manifest(first)
+          second_manifest = manifest(second)
+          if first_manifest != second_manifest:
+              raise SystemExit("independent clean generation manifests differ")
+          for output in (first, second):
+              if not (output / "_tuf-input" / "targets.json").is_file():
+                  raise SystemExit("generate did not emit _tuf-input/targets.json")
+              if not (output / "_tuf-input" / "snapshot.json").is_file():
+                  raise SystemExit("generate did not emit _tuf-input/snapshot.json")
+              if (output / "metadata").exists():
+                  raise SystemExit("generate emitted an unsigned metadata directory")
+          PY
+          mv -- "${first_dir}" "${output_dir}"
+          rm -rf -- "${second_dir}"
+
+      - name: Upload unsigned generation input
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: index-pages-input
+          path: ${{ runner.temp }}/index-generated
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
+  sign-pages:
+    name: Sign and cryptographically verify Pages tree
+    needs: generate
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pages: write
+    environment:
+      name: tuf-signing
+    steps:
+      - name: Checkout protected main and public trust root
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          ref: ${{ github.sha }}
+
+      - name: Download unsigned generation input
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: index-pages-input
+          path: ${{ runner.temp }}/index-generated
+
+      - name: Fetch and build the pinned index tool
+        run: |
+          set -euo pipefail
+          printf '%s' "${INDEX_TOOL_SHA}" | grep -Eq '^[0-9a-f]{40}$'
+          test "${INDEX_TOOL_REPOSITORY}" != "https://github.com/REPLACE_OWNER/REPLACE_INDEX_TOOL.git"
+          git clone --no-checkout --filter=blob:none "${INDEX_TOOL_REPOSITORY}" "${RUNNER_TEMP}/index-tool"
+          git -C "${RUNNER_TEMP}/index-tool" cat-file -e "${INDEX_TOOL_SHA}^{commit}"
+          git -C "${RUNNER_TEMP}/index-tool" checkout --detach "${INDEX_TOOL_SHA}"
+          cargo build --locked --release -p astrid-index-tool \
+            --manifest-path "${RUNNER_TEMP}/index-tool/Cargo.toml"
+          test -x "${RUNNER_TEMP}/index-tool/target/release/astrid-index-tool"
+
+      - name: Materialize approved role keys
+        env:
+          # Each secret contains one unwrapped base64-encoded DER key per line.
+          # Multiple lines satisfy a root role threshold without committing
+          # key material or assuming threshold=1.
+          TUF_TARGETS_SIGNING_KEYS_B64: ${{ secrets.TUF_TARGETS_SIGNING_KEYS_B64 }}
+          TUF_SNAPSHOT_SIGNING_KEYS_B64: ${{ secrets.TUF_SNAPSHOT_SIGNING_KEYS_B64 }}
+          TUF_TIMESTAMP_SIGNING_KEYS_B64: ${{ secrets.TUF_TIMESTAMP_SIGNING_KEYS_B64 }}
+        run: |
+          set -euo pipefail
+          test -f "${GITHUB_WORKSPACE}/config/trust-root.json"
+          key_dir="${RUNNER_TEMP}/tuf-keys"
+          mkdir -m 700 "${key_dir}"
+          umask 077
+          decode_keys() {
+            local encoded="$1"
+            local role="$2"
+            local count=0 line
+            while IFS= read -r line || [ -n "${line}" ]; do
+              [ -z "${line}" ] && continue
+              count=$((count + 1))
+              printf '%s' "${line}" | base64 --decode > "${key_dir}/${role}-${count}.der"
+              test -s "${key_dir}/${role}-${count}.der"
+            done <<< "${encoded}"
+            test "${count}" -gt 0
+          }
+          decode_keys "${TUF_TARGETS_SIGNING_KEYS_B64}" targets
+          decode_keys "${TUF_SNAPSHOT_SIGNING_KEYS_B64}" snapshot
+          decode_keys "${TUF_TIMESTAMP_SIGNING_KEYS_B64}" timestamp
+
+      - name: Sign with explicit approved keys and require deployment readiness
+        run: |
+          set -euo pipefail
+          test "${INDEX_ID}" != "REPLACE_INDEX_ID"
+          printf '%s' "${TARGETS_VERSION}" | grep -Eq '^[1-9][0-9]*$'
+          printf '%s' "${SNAPSHOT_VERSION}" | grep -Eq '^[1-9][0-9]*$'
+          printf '%s' "${TIMESTAMP_VERSION}" | grep -Eq '^[1-9][0-9]*$'
+          test "${TARGETS_EXPIRES}" != "REPLACE_TARGETS_EXPIRES_RFC3339"
+          test "${SNAPSHOT_EXPIRES}" != "REPLACE_SNAPSHOT_EXPIRES_RFC3339"
+          test "${TIMESTAMP_EXPIRES}" != "REPLACE_TIMESTAMP_EXPIRES_RFC3339"
+          input_dir="${RUNNER_TEMP}/index-generated"
+          output_dir="${RUNNER_TEMP}/index-signed"
+          rm -rf -- "${output_dir}"
+          shopt -s nullglob
+          targets_keys=("${RUNNER_TEMP}/tuf-keys/targets-"*.der)
+          snapshot_keys=("${RUNNER_TEMP}/tuf-keys/snapshot-"*.der)
+          timestamp_keys=("${RUNNER_TEMP}/tuf-keys/timestamp-"*.der)
+          test "${#targets_keys[@]}" -gt 0
+          test "${#snapshot_keys[@]}" -gt 0
+          test "${#timestamp_keys[@]}" -gt 0
+          role_key_args=()
+          declare -A canonical_keys=()
+          append_role_keys() {
+            local flag="$1"
+            shift
+            local key digest canonical
+            for key in "$@"; do
+              digest="$(sha256sum "${key}" | awk '{print $1}')"
+              if [[ -n "${canonical_keys[${digest}]+set}" ]]; then
+                canonical="${canonical_keys[${digest}]}"
+              else
+                canonical="${key}"
+                canonical_keys["${digest}"]="${canonical}"
+              fi
+              role_key_args+=("${flag}" "${canonical}")
+            done
+          }
+          # Reuse one path when a deployment intentionally authorizes the same
+          # key for multiple roles; astrid-index-tool rejects duplicate IDs
+          # supplied through different paths.
+          append_role_keys --targets-key "${targets_keys[@]}"
+          append_role_keys --snapshot-key "${snapshot_keys[@]}"
+          append_role_keys --timestamp-key "${timestamp_keys[@]}"
+          "${RUNNER_TEMP}/index-tool/target/release/astrid-index-tool" sign-pages \
+            --input "${input_dir}" \
+            --output "${output_dir}" \
+            --index-id "${INDEX_ID}" \
+            --event-authorization curator-review \
+            --root "${GITHUB_WORKSPACE}/config/trust-root.json" \
+            "${role_key_args[@]}" \
+            --targets-version "${TARGETS_VERSION}" \
+            --snapshot-version "${SNAPSHOT_VERSION}" \
+            --timestamp-version "${TIMESTAMP_VERSION}" \
+            --targets-expires "${TARGETS_EXPIRES}" \
+            --snapshot-expires "${SNAPSHOT_EXPIRES}" \
+            --timestamp-expires "${TIMESTAMP_EXPIRES}" \
+            --json > "${RUNNER_TEMP}/sign-report.json"
+          cat "${RUNNER_TEMP}/sign-report.json"
+          python3 - "${RUNNER_TEMP}/sign-report.json" "${output_dir}" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          report = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          output = Path(sys.argv[2])
+          if report.get("deployment_ready") is not True:
+              raise SystemExit("sign-pages did not report deployment_ready=true")
+          v1 = output / "v1"
+          if not any(v1.glob("*.root.json")):
+              raise SystemExit("signed output is missing the versioned root role")
+          if not any(v1.glob("*.targets.json")):
+              raise SystemExit("signed output is missing the versioned targets role")
+          if not any(v1.glob("*.snapshot.json")):
+              raise SystemExit("signed output is missing the versioned snapshot role")
+          if not (v1 / "timestamp.json").is_file():
+              raise SystemExit("signed output is missing timestamp.json")
+          if (output / "_tuf-input").exists():
+              raise SystemExit("unsigned _tuf-input leaked into deployable output")
+          PY
+
+      - name: Configure Pages
+        uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5.0.0
+
+      - name: Stage cryptographically verified Pages artifact
+        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3.0.1
+        with:
+          path: ${{ runner.temp }}/index-signed
+
+  deploy:
+    name: Deploy verified generation
+    needs: sign-pages
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy Pages artifact
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5

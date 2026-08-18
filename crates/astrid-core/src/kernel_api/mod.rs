@@ -254,7 +254,7 @@ impl CommandKind {
 /// built-in `astrid capsule` subcommand, add its name here too.
 pub const RESERVED_CAPSULE_VERBS: &[&str] = &[
     "new", "install", "update", "list", "remove", "tree", "deps", "build", "check", "config",
-    "show", "run", "help",
+    "show", "publish", "event", "run", "help",
 ];
 
 /// Information about a registered capsule command.

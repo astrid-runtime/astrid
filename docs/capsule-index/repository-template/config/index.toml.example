@@ -1,0 +1,15 @@
+# Copy to config/index.toml and replace every REPLACE_* value before enabling
+# Actions.  This file contains public routing/configuration only.
+schema = "index-config-v1"
+index_id = "REPLACE_INDEX_ID"
+pages_base_url = "https://REPLACE_OWNER.github.io/REPLACE_REPOSITORY/v1"
+release_base_url = "https://github.com/REPLACE_OWNER/REPLACE_REPOSITORY/releases"
+
+[trust]
+# This is the public SHA-256 fingerprint of config/trust-root.json.
+root_fingerprint = "sha256:REPLACE_WITH_64_LOWERCASE_HEX"
+root_threshold = 2
+
+[tool]
+repository = "https://github.com/REPLACE_OWNER/REPLACE_INDEX_TOOL.git"
+commit = "REPLACE_WITH_40_HEX_INDEX_TOOL_COMMIT"
