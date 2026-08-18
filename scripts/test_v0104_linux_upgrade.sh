@@ -365,7 +365,10 @@ grep -Fq 'default' "${TEST_ROOT}/agents-after-upgrade.json" \
 run_current agent create upgrade-restart-probe --yes
 run_current agent create upgrade-second-alias --yes
 run_current_bounded 20s stop
-run_current_bounded 90s start
+if ! run_current_bounded 90s start; then
+  dump_daemon_logs
+  fail "current daemon could not restart after post-upgrade writes"
+fi
 run_current agent list --format json >"${TEST_ROOT}/agents-after-restart.json"
 grep -Fq 'upgrade-restart-probe' "${TEST_ROOT}/agents-after-restart.json" \
   || fail "post-upgrade write did not survive restart"
