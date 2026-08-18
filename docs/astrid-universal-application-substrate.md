@@ -24,6 +24,22 @@ Astrid is the operating system. Existing operating systems, language runtimes,
 frameworks, agent harnesses, and applications are compatibility payloads or
 service providers inside Astrid; they are not the authority beneath Astrid.
 
+Astrid is a standalone, independently bootable operating-system substrate.
+Astrid machine authority begins at verified firmware/loader handoff and the
+native kernel. A distribution selects a signed Astrid System Generation:
+system and provider Capsules, compatibility Realms, policy inputs, defaults,
+applications, and update/recovery policy. The distribution does not replace or
+sit beneath Astrid's machine authority.
+
+Astrid also supports a hosted deployment on Linux, macOS, or Windows. Hosted
+Astrid exposes the same principal, Capsule, storage, authority, generation, and
+application contracts while explicitly inheriting firmware, kernel, process,
+device, and physical-isolation guarantees from its host. It is a valid
+deployment and development/conformance environment, but hosted evidence cannot
+satisfy a standalone-machine, native boot, DMA-containment, or physical-device
+claim. When hosted behavior and the portable Astrid contract disagree, the
+contract and standalone executable evidence win.
+
 An existing program should retain the ABI and ergonomics it expects while its
 consequential effects map onto Astrid-owned resources:
 
@@ -77,8 +93,8 @@ Astrid must support:
    compatibility distribution without replacement of principal state;
 6. familiar human administration through authenticated remote CLI, mounted
    filesystems, terminal sessions, and an optional SSH compatibility gateway;
-7. the same public application, storage, authority, and receipt semantics on a
-   hosted daemon and a future freestanding Astrid kernel; and
+7. a bootable native Astrid system whose application, storage, authority, and
+   receipt contracts are also provided by hosted Astrid deployments; and
 8. measured economic evidence for artifact reuse, dormant-state cost, startup,
    execution overhead, storage amplification, and operational density.
 
@@ -97,8 +113,8 @@ This specification does not:
 - expose the host root filesystem, host process table, Docker socket, or host
   network namespace as a compatibility shortcut;
 - claim binary compatibility before a conformance workload has run; or
-- make the native kernel a prerequisite for proving the application model on
-  the current hosted runtime.
+- treat hosted success as evidence that Astrid itself boots, owns the machine,
+  contains hardware effects, or satisfies a product release gate.
 
 ### 2.3 Terminology
 
@@ -179,10 +195,14 @@ flowchart TB
     Devices --> Audit
 ```
 
-The hosted daemon and the future native kernel are alternate providers for the
-lower boundary. They must expose the same semantic resources and run the same
-conformance suite. Host implementation details must not enter application
-identity or durable principal state.
+Astrid has two deployment modes. Standalone Astrid begins at firmware handoff
+and owns the machine through its native kernel and system-service domains.
+Hosted Astrid begins at an authenticated adapter boundary above an existing
+host OS and inherits that host's lower-level guarantees. Both expose the same
+portable semantic resources and run the same conformance suite, but only
+standalone evidence establishes Astrid-owned machine authority. Hosted
+implementation details must not enter application identity or durable principal
+state.
 
 ## 5. Principal computers and shared applications
 
@@ -409,9 +429,14 @@ rebuilding the immutable application closure.
 Clock and entropy providers state their guarantees. Checkpoints cannot restore
 stale authority, secrets, wall clocks, nonces, or live handles.
 
-Hardware is exposed through typed device-class services. A guest never receives
-arbitrary MMIO, DMA, interrupts, or physical addresses. Driver domains and
-virtualizers follow the separate driver-domain contract.
+Hardware is exposed through typed resource services. A guest never receives
+arbitrary MMIO, DMA, interrupts, or physical addresses. Astrid has no
+privileged driver subsystem. Device-specific behavior lives in restartable
+provider Capsules or isolated compatibility/device Realms. Ring 0 owns only
+discovery facts, protection, interrupt routing, IOMMU/DMA mediation and
+revocation, reset, quarantine, and capability transfer. It contains no
+device-class policy, vendor protocol, filesystem, network stack, dynamically
+loaded module, or conventional driver stack.
 
 Normal application output remains ergonomic. Detailed principal, generation,
 authority, accounting, and causal evidence belongs in structured operator
@@ -436,8 +461,10 @@ The required sequence is:
    paths into requests;
 5. make the same volume and storage protocols available to native user-space
    storage domains; and
-6. boot the native system with only a minimal block transport in ring 0 while
-   keeping filesystems, databases, placement, and GC in restartable user space.
+6. preload the authenticated kernel, recovery, and initial provider bundle
+   before kernel handoff, then give an isolated storage provider mediated
+   device resources while keeping device protocol, filesystems, databases,
+   placement, and GC outside ring 0.
 
 Host independence does not mean that the hosted deployment stops using files.
 It means host filesystem objects no longer define Astrid identity, ownership,
@@ -459,8 +486,8 @@ Astrid must own the semantics that form its security and recovery boundary:
 - scheduling and resource accounting;
 - interrupt, DMA, and device admission;
 - boot, measurement, recovery, and monotonic epochs; and
-- minimal block, clock, entropy, and console primitives needed to start
-  user-space services.
+- device-independent clock, entropy, bounded debug, and resource mediation
+  needed to start preloaded user-space services.
 
 Filesystems, sockets, TLS, package management, SQLite, shells, process models,
 and broad language-runtime behavior belong outside ring 0.
@@ -600,9 +627,10 @@ image derivation rather than bypassed with an unsupported interpreter.
 ### 11.4 Hermes claim gate
 
 Astrid may claim “Hermes runs on Astrid” only when H1 passes on a released
-artifact. It may claim “Hermes is an Astrid service” only when H3 passes. It may
-claim “multi-principal Hermes” only after concurrent hostile isolation,
-accounting, restart, and revocation tests pass.
+standalone Astrid System Generation. It may claim “Hermes is an Astrid service”
+only when H3 passes natively. It may claim “multi-principal Hermes” only after
+the concurrent hostile isolation, accounting, restart, and revocation corpus
+passes on standalone Astrid. Hosted results remain differential evidence.
 
 ## 12. Human and operator access
 
@@ -772,9 +800,13 @@ authority model:
 
 Two meanings of “distro” must remain explicit:
 
-1. An **Astrid distro** is a signed composition of capsules, applications,
+1. An **Astrid distribution** is a signed composition of capsules, applications,
    services, compatibility Realms, configuration schemas, and authority
-   requests.
+   requests. It is a distribution built on Astrid, analogous to a Linux
+   distribution rather than an operating system beneath Astrid. It owns product
+   selection, defaults, channels, installer policy, and presentation; Astrid
+   owns the boot, authority, resource, storage, Capsule, generation, and
+   recovery contracts it must satisfy.
 2. A **Linux distribution generation** is an optional compatibility image
    selected by an Astrid application or system generation.
 
@@ -783,26 +815,26 @@ Artifacts removed from the new signed closure cannot continue loading merely
 because old directories remain. Side-loaded artifacts have separately recorded
 provenance and are not silently pruned as if they belonged to the distro.
 
-## 14. Hosted and native implementations
+## 14. Standalone and hosted deployments
 
 ### 14.1 Hosted Astrid
 
-The current daemon remains the first production host. It may use Tokio,
-Wasmtime, host files, sockets, platform mounts, and OS sandboxes internally.
-Those dependencies live behind provider traits and do not define public
-resource identity.
+The current daemon is a supported hosted deployment and remains useful for
+incremental adoption, development, migration, CI, and differential conformance.
+It may use Tokio, Wasmtime, host files, sockets, platform mounts, and OS
+sandboxes internally. Those dependencies live behind provider traits and do not
+define Astrid resource identity. Its security statement names the inherited
+host boundary explicitly. A hosted result can complete a hosted claim, but not
+a standalone boot, machine-authority, DMA, recovery-independence, or physical
+hardware claim.
 
-Hosted conformance is not a temporary mock. It is one supported implementation
-of the same Astrid contracts and remains useful for laptops, servers, CI, and
-incremental adoption.
-
-### 14.2 Native Astrid
+### 14.2 Standalone Astrid
 
 The freestanding system uses:
 
 - a minimal `no_std` capability kernel in ring 0;
-- restartable ring-3 init, runtime, storage, network, audit, driver, and
-  application domains;
+- restartable ring-3 init/recovery, runtime, storage, identity, admission,
+  network, audit, update, hardware-provider, and application domains;
 - a `no_std`/`alloc` component host using verified AOT or Pulley artifacts;
 - the same Principal Store formats and logical protocols over a native block
   provider;
@@ -830,6 +862,32 @@ The same corpus must run against hosted and native providers:
 - concurrent hostile principals.
 
 Provider-specific performance is reported separately from semantic conformance.
+
+### 14.4 Mandatory boot and recovery chain
+
+```text
+firmware / UEFI
+  -> firmware authenticates the Astrid loader
+  -> loader separately verifies the Astrid kernel/bootstrap closure and the
+     distribution-supplied immutable System Generation, then preloads both
+  -> ring 0 establishes CPU, memory, protection, scheduling, IPC, discovery
+     facts, interrupt routing, IOMMU/DMA mediation, reset, and capabilities
+  -> plan-bounded init/recovery realizes the selected A/B system generation
+  -> hardware claims are transferred to isolated provider Capsules or dedicated
+     compatibility/device Realms
+  -> audit, storage, Principal Store, identity/key, time/entropy, component-host,
+     admission, network/uplink, update, and administration services become ready
+  -> principals, Capsules, compatibility Realms, and applications may start
+```
+
+The sealed boot bundle contains enough authenticated provider artifacts to
+reach storage and recovery without conventional device-specific code in ring
+0. The initial experimental machine contract is x86-64 QEMU/KVM with UEFI,
+fixed memory, one CPU, serial diagnostics, APIC timer, and an explicit
+virtio/IOMMU topology. It becomes a supported machine only after install,
+interrupted-update, rollback, recovery, isolation, and hardware-provider gates
+pass on its exact contract. Physical-hardware support requires a separately
+named board, firmware, and device contract with continuous hardware evidence.
 
 ## 15. Security invariants
 
@@ -922,6 +980,13 @@ memory protection, domains, capabilities, IPC, legibility, and audit ordering.
 Keep it isolated until the current draft's failures, determinism, supervisor
 fault delivery, and reclaim behavior are resolved.
 
+The older `astrid-native-kernel.md` implementation programme is retained as a
+historical research record, not a normative milestone plan. Its conventional
+driver-host, ring-0 virtio bootstrap, System Distro, and Dock milestones are
+superseded by this specification, the kernel charter, and the hardware-provider
+model. Reclaim mechanisms and tests individually; do not inherit its product or
+distribution ownership.
+
 Do not add filesystems, Linux, Hermes, policy engines, or application semantics
 to ring 0. The next reclaim increment should connect a small native block/IPC
 ABI and a restartable user-space service, then run the hosted/native conformance
@@ -955,91 +1020,100 @@ for related contracts with different TCBs and evidence.
 Exit gate: authoritative Astrid state no longer depends on host directory
 layout, and no dependent design invents a second persistence authority.
 
-### Stage B: universal application control plane on the hosted runtime
+### Stage B: standalone boot and machine authority
 
-- Define the internal application-generation and execution-provider types.
-- Define internal host-neutral object, action, attachment, and
-  pending-confirmation types without freezing public WIT or adopting a UI
-  grammar.
-- Prove the projection/action boundary with non-graphical fixtures. A host may
-  build a disposable graphical consumer separately over ephemeral state;
-  durable Spaces and preferences wait for authoritative storage.
-- Define lifecycle, streams, cancellation, health, checkpoint, and receipt
-  types.
-- Implement principal namespace publication and stale-handle invalidation.
-- Implement typed storage, workspace, network, configuration, secret, and
-  ingress portal bindings.
-- Add one trivial unmodified Linux application fixture before Hermes.
+- Freeze one experimental machine contract and its canonical firmware/loader
+  handoff.
+- Build deterministic signed boot images containing the kernel, plan-bounded
+  init/recovery, and the initial provider bundle.
+- Bring up memory protection, domains, scheduling, IPC, timers, interrupt
+  routing, IOMMU/DMA mediation, reset/quarantine, capability tables, fault
+  delivery, and recovery reserves.
+- Prove that no device-specific protocol or conventional driver stack exists in
+  ring 0.
+- Start one preloaded provider Capsule or isolated device Realm from the signed
+  boot plan and publish only its typed service.
 
-Exit gate: two principals run the same immutable application closure with
-isolated state and resources; revocation and replacement fail closed.
+Exit gate: an Astrid image boots without a host operating system, establishes
+machine authority, contains a hostile native domain, and reaches authenticated
+recovery using only the sealed bundle.
 
-### Stage C: Hermes H0 and H1
+### Stage C: native system services and Capsule host
 
-- Produce the hermetic Hermes closure and compatible Realm image.
-- Prove its dependency and filesystem behavior.
-- Execute one governed turn through a single model provider.
-- Store and recover the resulting principal state.
-- Record exact cost and receipt evidence.
-
-Exit gate: released artifacts and a reproducible test prove the narrow “Hermes
-runs on Astrid” claim.
-
-### Stage D: services, tools, remote administration, and SSH
-
-- Add Hermes namespace/tool mapping and approval propagation.
-- Expose Hermes through the host-neutral object/action boundary and prove that
-  any host projection cannot widen its authority.
-- Let a consuming host persist Space composition and presentation
-  preferences separately from Astrid application data and authority.
-- Add supervised long-lived services and scale-to-zero lifecycle.
-- Complete remote CLI authentication and host contexts.
-- Add explicit principal shell/attach and storage mount commands.
-- Implement SSH/SFTP only as adapters to these native operations.
-
-Exit gate: an authorized human or host can enter a principal computer,
-administer its Hermes service, consume the same typed objects/actions through
-independent projections, mount its storage, and disconnect without leaving
-ambient authority or stale attachments. Astrid itself need not render them.
-
-### Stage E: portable `no_std` substrate and freestanding service host
-
-- Make ABI, identifiers, bounded codecs, authority, and storage format crates
+- Make ABI, identifiers, bounded codecs, authority, and storage-format crates
   compile under their declared `no_std`/`alloc` profiles.
-- Freeze the Astrid native ABI and conformance harness.
-- Recover and harden the native-kernel skeleton.
-- Start a restartable native user-space service over IPC.
-- Run Principal Store over a native volume provider.
-- Start one existing capsule through the freestanding component host.
+- Bootstrap and supervise distribution-selected implementations of the required
+  init/recovery, audit, identity/key, admission, resource-table, time/entropy,
+  storage, update, administration, and component-host service classes.
+- Run Principal Store through an isolated storage provider over mediated device
+  resources.
+- Start one existing Capsule through the freestanding component host.
+- Run the hosted deployment as a supported adapter and differential oracle for
+  the same portable contracts.
 
-Exit gate: the native machine boots, recovers durable state, and serves one
-principal operation with the same observable contract as the hosted runtime.
+Exit gate: the standalone machine recovers durable state and serves one
+principal Capsule operation without relying on a host daemon.
 
-### Stage F: Linux Realm on native Astrid
+### Stage D: native universal-application control plane
+
+- Define and implement application generations, execution providers,
+  lifecycle, streams, cancellation, health, checkpoint, receipt, projection,
+  action, attachment, and pending-confirmation types.
+- Implement principal namespace publication, stale-handle invalidation, and
+  typed storage, workspace, network, configuration, secret, and ingress portal
+  bindings.
+- Prove the projection/action boundary with non-graphical fixtures; graphical
+  presentation remains distribution/consumer-owned.
+- Run one trivial unmodified compatibility application before Hermes.
+
+Exit gate: two principals run one immutable application closure on standalone
+Astrid with isolated state and resources; revocation and replacement fail
+closed.
+
+### Stage E: Linux Realm and Hermes on standalone Astrid
 
 - Supply compute, storage, clock, entropy, and portal providers from native
   domains.
-- Boot the same Realm generation and refresh all principal authority after
-  restore.
-- Run the application conformance corpus.
-- Select interpreted, translated, or virtualized execution by measured policy,
-  never by changing application authority.
+- Boot the Linux Realm as a principal-owned compatibility provider.
+- Produce the hermetic Hermes closure and execute H0/H1 through that Realm.
+- Store, crash, recover, and receipt the resulting principal state.
+- Run the application conformance corpus and record exact cost evidence.
 
-Exit gate: the same Hermes application generation and principal state move
-between hosted and native Astrid without semantic or authority drift.
+Exit gate: released native artifacts and a reproducible standalone test prove
+the narrow “Hermes runs on standalone Astrid” claim. Hosted Hermes may
+separately satisfy an explicitly hosted-Astrid claim.
 
-### Stage G: broader platform and application ecosystem
+### Stage F: services, administration, distribution, and recovery
 
-- Add architecture and hardware providers behind the frozen contracts.
-- Add additional compatibility personalities only for demonstrated workloads.
-- Add graphical, audio, accelerator, and device services through typed driver
-  domains.
-- Establish third-party application packaging, certification, and update
-  tooling.
+- Add Hermes tools, supervision, scale-to-zero, attachment, reconnect, and
+  current-authority refresh.
+- Complete authenticated CLI contexts, principal shell/attach, storage mounts,
+  and optional SSH/SFTP adapters.
+- Let distributions and consuming hosts select product composition and
+  presentation without widening Astrid authority.
+- Build and test distribution-neutral bootstrap, slot activation,
+  System-Generation selection, interrupted-update, rollback, state-migration,
+  authenticated-recovery, and destructive-reset primitives and contracts. A
+  distribution-owned installer supplies workflow, policy, and presentation.
 
-Exit gate: application authors can target Astrid-native services or bring an
-existing application closure, while operators retain one coherent authority,
-storage, lifecycle, and recovery model.
+Exit gate: an authorized operator can install, provision, update, roll back,
+recover, administer, and leave a standalone Astrid machine without ambient or
+stale authority.
+
+### Stage G: broader machine and application ecosystem
+
+- Qualify additional machine contracts and hardware providers behind the frozen
+  resource interfaces.
+- Add compatibility personalities only for demonstrated workloads.
+- Add graphics, audio, accelerator, input, and other device services through
+  typed provider Capsules or isolated device Realms.
+- Establish third-party distribution, application, provider, certification,
+  and update tooling.
+
+Exit gate: distributions and application authors can target Astrid-native
+services or bring existing application closures while Astrid retains one
+coherent boot, authority, storage, lifecycle, hardware-resource, and recovery
+model.
 
 ## 19. Contract and RFC ownership
 
@@ -1111,6 +1185,12 @@ An open decision does not authorize an ambient host fallback.
 
 This programme succeeds when all of the following are true:
 
+- a signed Astrid image independently boots an authenticated System Generation
+  on at least one qualified machine contract without a host operating system or
+  conventional privileged driver stack;
+- distribution-neutral Astrid primitives let a distribution-owned installer
+  provision, update, roll back, and recover that machine while preserving
+  ownership, revocation, audit, and principal state;
 - an existing non-WASM program runs without treating the host OS as its
   authority;
 - every external effect maps to an authenticated, principal-scoped Astrid
@@ -1118,7 +1198,8 @@ This programme succeeds when all of the following are true:
 - one immutable application closure safely serves many isolated principals;
 - principal state survives application, Linux distribution, host OS, and
   machine replacement;
-- hosted and native Astrid pass the same semantic conformance suite;
+- hosted and standalone Astrid pass the same portable semantic conformance
+  suite, with deployment-specific claims naming their actual lower boundary;
 - a human can authenticate, enter, administer, mount, recover, and leave a
   principal computer with familiar tools;
 - a consuming host can safely project Astrid's typed state and admitted
@@ -1129,7 +1210,9 @@ This programme succeeds when all of the following are true:
 - measured density, startup, storage, recovery, and operational cost establish
   the economic claim against conventional containers and VMs.
 
-The product result is not “Linux inside a WASM capsule.” It is a portable,
-principal-owned computer whose applications may believe they are running on
-Linux while Astrid owns the identity, authority, storage, compute, devices,
-network, lifecycle, and evidence beneath them.
+The result is not “Linux inside a WASM capsule.” Astrid is the independently
+bootable kernel and universal operating substrate. Distributions select the
+signed system composition and product experience above it. Applications may
+believe they are running on Linux while Astrid owns the identity, authority,
+storage, compute, hardware resources, network, lifecycle, and evidence beneath
+them.

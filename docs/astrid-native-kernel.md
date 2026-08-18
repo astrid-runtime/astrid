@@ -1,6 +1,6 @@
 # Astrid Native Component Kernel
 
-Status: exploratory architecture and execution plan
+Status: historical exploratory design record; non-normative
 
 Last reviewed: 2026-07-18
 
@@ -8,19 +8,32 @@ Code baseline: Astrid Runtime `v0.10.1` (`4771bab3`)
 
 Decision state: scope an Astrid-owned kernel; implementation choices remain open
 
+This document is retained for mechanism archaeology and is not the current
+milestone or product-ownership plan. Its conventional driver-host, ring-0 virtio
+bootstrap, System Distro, Dock, and hosted-first milestones are superseded by
+the Astrid Kernel Charter and Universal Application Substrate specification.
+Reclaim individual mechanisms and tests only after checking those authorities.
+
+Current architecture: Astrid is an independently bootable operating substrate,
+and the native kernel is required for every Astrid OS product claim. The hosted
+daemon is a development and differential-reference adapter only. Astrid has no
+privileged driver subsystem: device-specific behavior runs in isolated provider
+Capsules or dedicated compatibility/device Realms preloaded by the authenticated
+boot bundle. Any older allowance below for ring-0 virtio queues, device protocol,
+or hosted completion is superseded by this amendment and the Universal
+Application Substrate specification.
+
 Execution and evidence are tracked in the
 [AI-Native OS Workplan](astrid-ai-native-os-workplan.md). The precise driver-role
 boundary is in the [Driver Domain Contract](astrid-driver-domain-contract.md).
 
 ## 1. Executive conclusion
 
-Build an actual Astrid kernel.
-
-Do not make that kernel a prerequisite for the first agent OS. The immediate
-workbench is the principal-owned `AOS Realm` capsule in `unicity-aos/aos-ce`: a
-Linux-shaped environment hosted by today's daemon and, later, unchanged by the
-native host. It gives the kernel programme a real workload while keeping Linux
-syscall emulation, filesystems, shells, compilers, and package policy out of ring 0.
+Build an actual Astrid kernel. It is the mandatory machine-authority boundary
+for Astrid as a standalone operating substrate. Hosted Realms remain useful
+workbenches, but cannot satisfy an Astrid OS, machine-security, or release claim.
+Linux syscall emulation, filesystems, shells, compilers, and package policy stay
+outside ring 0 in compatibility Realms selected by a distribution.
 
 The target is not Astrid statically linked into somebody else's library OS. It is
 an Astrid-owned capability microkernel that boots on hardware or a microVM, creates
@@ -39,8 +52,8 @@ single-address-space unikernel, Astrid should retain hardware fault boundaries:
   watchdogs, and minimal key/measurement primitives.
 - **Ring 3 runtime domains:** small native `no_std` component hosts containing
   Wasmtime and narrowly selected Astrid host adapters.
-- **WASM components:** driver, system, application, tool, and agent capsules with
-  typed imports and per-invocation identity.
+- **WASM components:** hardware-provider, system, application, tool, and agent
+  Capsules with typed imports and per-invocation identity.
 
 Wasmtime must not be part of the ring-0 trusted computing base. A runtime memory-
 safety or code-generation defect should terminate a runtime domain, not compromise
@@ -147,18 +160,21 @@ native ABI, so native-kernel mechanics never leak into portable capsule contract
 ### 2.3 Trusted computing base and recovery
 
 The ring-0 trusted computing base includes architecture code, allocators and page
-tables, the scheduler, capability and IPC machinery, interrupt/IOMMU code, the image
-verifier, and only the native device code required to reach the first user domain.
-It excludes Wasmtime, network protocols, filesystems, application routing, and
-device-class policy.
+tables, the scheduler, capability and IPC machinery, interrupt/IOMMU mediation, the
+image verifier, reset/quarantine, and capability transfer. It excludes Wasmtime,
+network protocols, filesystems, application routing, device-class policy, vendor
+protocol, queue implementations, firmware loaders, and conventional device
+drivers.
 
-The initial system may still need native virtio queue code for console, block, RNG,
-and the system bundle. That is bootstrap code, not a concession that all drivers
-belong in ring 0. Once a driver host is alive, the kernel can expose mediated queue
-resources and retire optional bootstrap paths. A runtime trap, invalid instruction,
-page fault, or exhausted deadline must destroy the offending domain, revoke its
-handles and DMA maps, notify its supervisor, and leave ring 0 available for restart
-or rollback.
+Firmware and the measured loader preload the complete authenticated kernel,
+init/recovery, and initial provider bundle before handoff. Ring 0 then grants exact
+hardware claims to isolated provider Capsules or dedicated compatibility/device
+Realms named by the boot plan. A platform that cannot reach those providers without
+device-specific ring-0 code is unsupported until its machine contract supplies a
+firmware-preload path or isolated bootstrap Realm. A runtime trap, invalid
+instruction, page fault, or exhausted deadline must destroy the offending domain,
+revoke its handles and DMA maps, notify its supervisor, and leave ring 0 available
+for restart or rollback.
 
 Fault containment and authority containment are different. A small native
 init/recovery program belongs to the system trusted computing base even though it
@@ -1015,10 +1031,8 @@ security model while becoming operationally smaller and more local.
 
 ## 12. Recommended next native-kernel artifact
 
-The product-wide immediate implementation is the AOS Realm's principal-scoped
-durable VFS and process environment. Within the independent native-kernel track,
-the next implementation should be a bounded native-kernel skeleton, not a Hermit
-host:
+The immediate implementation is a bounded standalone native-kernel skeleton,
+not a hosted Realm or Hermit host:
 
 1. Add the isolated `native-kernel/` workspace with pinned toolchain, loader,
    x86-64 architecture crate, deterministic image builder, QEMU runner, and serial
@@ -1047,11 +1061,13 @@ sound.
   kernel owns only native mechanisms and domain-level enforcement.
 - Hardware authority is a kernel-enforced capability, never a prompt or
   self-declared manifest privilege.
-- Driver and Dock contracts that alter WIT require an Astrid RFC before adoption.
+- Hardware-provider and application contracts that alter WIT require an Astrid
+  RFC before adoption.
 - Public capsule and wire shapes remain stable; host profiles are additive.
-- The current native daemon remains supported while the image path matures.
-- The AOS Realm is a system capsule, not a second authority kernel. Its Linux guest
-  ABI remains above the stable Astrid capsule boundary and runs unchanged on daemon
-  and native hosts.
-- A signed single-purpose machine image is an additional deployment surface, not a
-  release-channel alias and not an implicit promotion of experimental code.
+- The current daemon remains a development and differential-reference adapter
+  while the standalone image matures; it is not an Astrid OS deployment.
+- A distribution may include a Linux compatibility Realm as a system Capsule,
+  never as a second authority kernel. Its guest ABI remains above the stable
+  Astrid Capsule boundary.
+- A signed System Generation is the distribution composition booted by Astrid,
+  not a release-channel alias or an implicit promotion of experimental code.

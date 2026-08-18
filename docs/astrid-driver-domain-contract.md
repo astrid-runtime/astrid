@@ -4,6 +4,16 @@ Status: pre-RFC architecture contract and first research result
 
 Last reviewed: 2026-07-18
 
+Normative terminology amendment: Astrid has no privileged driver subsystem.
+This document's historical term “driver domain” means an isolated hardware
+provider Capsule or dedicated compatibility/device Realm, never a kernel driver
+class. Ring 0 supplies only discovery facts, protection, interrupt routing,
+IOMMU/DMA mediation and revocation, reset/quarantine, and capability transfer.
+Device-specific protocol, queues, firmware policy, and class behavior remain in
+restartable provider domains preloaded by the authenticated System Generation.
+Where later text suggests ring-0 device protocol or a conventional driver stack,
+this amendment and the Universal Application Substrate specification prevail.
+
 Related:
 
 - [Astrid AI-Native OS Workplan](astrid-ai-native-os-workplan.md)
