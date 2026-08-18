@@ -14,7 +14,9 @@
 //! Same posture as the invite store: only domain-separated hashes are stored,
 //! redemption compares hashes in constant time, and mutation uses atomic
 //! system-owner KV batches. Pair-tokens are single-use only (no
-//! `remaining_uses` field) — redemption consumes the token atomically.
+//! `remaining_uses` field). Redemption first claims an exact record with a
+//! durable reservation, performs the profile update, and then commits the
+//! deletion; a preparation failure releases only that reservation.
 //!
 //! Lifetime is capped at one hour (`MAX_EXPIRY_SECS`) — pair-tokens
 //! are meant for immediate use on a neighbouring device. Longer
@@ -40,6 +42,8 @@ use tracing::warn;
 #[path = "pair_token_storage_migration.rs"]
 mod storage_migration;
 use storage_migration::{read_legacy_source, retire_legacy_file};
+
+mod durable_reservation;
 
 const STORE_SCHEMA_VERSION: u32 = 1;
 const TOKEN_HASH_CONTEXT: &str = "astrid.runtime.pair-device-token.identifier.v1";
@@ -431,65 +435,6 @@ impl DurablePairTokenStore {
         } else {
             Ok(None)
         }
-    }
-
-    /// Remove one token by canonical fingerprint.
-    ///
-    /// # Errors
-    ///
-    /// Returns a storage error if the conditional delete cannot be applied.
-    pub async fn revoke(&self, token_hash: &str) -> astrid_storage::StorageResult<bool> {
-        let key = Self::key(token_hash);
-        let Some(value) = self.backend.get(SYSTEM_KV_NAMESPACE, &key).await? else {
-            return Ok(false);
-        };
-        Self::decode(&value)?;
-        self.apply(
-            vec![astrid_storage::KvBatchCondition::ValueEquals {
-                key: astrid_storage::KvEntryKey::new(SYSTEM_KV_NAMESPACE, &key)?,
-                expected: Some(value),
-            }],
-            vec![astrid_storage::KvBatchMutation::Delete {
-                key: astrid_storage::KvEntryKey::new(SYSTEM_KV_NAMESPACE, key)?,
-            }],
-        )
-        .await
-    }
-
-    /// Prune expired tokens with conditional deletes.
-    ///
-    /// # Errors
-    ///
-    /// Returns a storage error if records cannot be read or a conditional
-    /// delete cannot be applied.
-    pub async fn prune(&self) -> astrid_storage::StorageResult<usize> {
-        let records = self.list().await?;
-        let now = now_epoch();
-        let mut removed = 0usize;
-        for token in records {
-            if token.expires_at_epoch > now {
-                continue;
-            }
-            let key = Self::key(&token.token_hash);
-            let Some(value) = self.backend.get(SYSTEM_KV_NAMESPACE, &key).await? else {
-                continue;
-            };
-            if self
-                .apply(
-                    vec![astrid_storage::KvBatchCondition::ValueEquals {
-                        key: astrid_storage::KvEntryKey::new(SYSTEM_KV_NAMESPACE, &key)?,
-                        expected: Some(value),
-                    }],
-                    vec![astrid_storage::KvBatchMutation::Delete {
-                        key: astrid_storage::KvEntryKey::new(SYSTEM_KV_NAMESPACE, key)?,
-                    }],
-                )
-                .await?
-            {
-                removed = removed.saturating_add(1);
-            }
-        }
-        Ok(removed)
     }
 }
 

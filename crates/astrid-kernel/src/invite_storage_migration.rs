@@ -138,6 +138,44 @@ mod tests {
         assert_eq!(winners, 1);
     }
 
+    #[tokio::test]
+    async fn exact_invite_commit_has_one_winner_and_ignores_stale_records() {
+        let backend: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+        let store = DurableInviteStore::new(backend).unwrap();
+        let record = Invite {
+            token_hash: hash_token("exact invite commit"),
+            group: "agent".to_owned(),
+            remaining_uses: 2,
+            expires_at_epoch: Some(super::super::now_epoch().saturating_add(300)),
+            issued_at_epoch: super::super::now_epoch(),
+            metadata: None,
+        };
+        assert!(store.issue(&record).await.unwrap());
+
+        let left = store.clone();
+        let right = store.clone();
+        let (a, b) = tokio::join!(
+            left.consume_if_unchanged(&record),
+            right.consume_if_unchanged(&record)
+        );
+        assert_eq!(
+            [a.unwrap(), b.unwrap()]
+                .into_iter()
+                .filter(|committed| *committed)
+                .count(),
+            1
+        );
+
+        let persisted = store.list().await.unwrap();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].remaining_uses, 1);
+        assert!(!store.consume_if_unchanged(&record).await.unwrap());
+        assert_eq!(store.list().await.unwrap(), persisted);
+
+        assert!(store.consume_if_unchanged(&persisted[0]).await.unwrap());
+        assert!(store.list().await.unwrap().is_empty());
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn legacy_import_is_receipted_retired_and_restart_idempotent() {

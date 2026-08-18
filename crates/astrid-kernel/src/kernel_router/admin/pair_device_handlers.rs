@@ -361,26 +361,56 @@ pub(crate) async fn pair_device_redeem(
     }
 
     let token_hash = pair_token::hash_token(&token);
-    let Some(chosen) = (match store.redeem(&token_hash).await {
+    let Some(chosen) = (match store.redeemable(&token_hash).await {
         Ok(value) => value,
         Err(_) => return err_internal("pair-token durable storage read failed".into()),
     }) else {
         return err_unauthorized("pair-device token invalid or expired".into());
     };
+
+    // Claim the exact durable record before touching the profile. Concurrent
+    // daemons cannot prepare competing writes, while a failed preparation can
+    // restore this exact record rather than blindly reissuing at the same key.
+    match store.reserve_if_unchanged(&chosen).await {
+        Ok(true) => {},
+        Ok(false) => return err_unauthorized("pair-device token invalid or expired".into()),
+        Err(_) => return err_internal("pair-token durable storage write failed".into()),
+    }
+
+    match pair_device_redeem_reserved(kernel, &store, chosen.clone(), normalised_key).await {
+        Ok(response) => response,
+        Err(response) => match store.release_reservation(&chosen).await {
+            Ok(_) => response,
+            Err(_) => err_internal("pair-token reservation rollback failed".into()),
+        },
+    }
+}
+
+async fn pair_device_redeem_reserved(
+    kernel: &Arc<crate::Kernel>,
+    store: &DurablePairTokenStore,
+    chosen: DurablePairToken,
+    normalised_key: DevicePubkey,
+) -> Result<AdminResponseBody, AdminResponseBody> {
     let Ok(principal) = kernel.principal_directory.alias_for(chosen.principal_uid) else {
-        return err_internal("paired principal identity is no longer admitted".into());
+        return Err(err_internal(
+            "paired principal identity is no longer admitted".into(),
+        ));
     };
     let now = pair_token::now_epoch();
 
     // Load the bound principal's profile and append the key.
     let profile_path = kernel.astrid_home.profile_path(&principal);
     if !profile_path.exists() {
-        return err_internal("bound principal disappeared between issue and redeem".into());
+        return Err(err_internal(
+            "bound principal disappeared between issue and redeem".into(),
+        ));
     }
     let mut profile = match PrincipalProfile::load_from_path(&profile_path) {
         Ok(p) => p,
-        Err(e) => return err_internal(format!("profile load failed: {e}")),
+        Err(e) => return Err(err_internal(format!("profile load failed: {e}"))),
     };
+    let original_profile = profile.clone();
 
     // Dedup by canonical pubkey so re-redeeming the same key is idempotent
     // (the deterministic key_id makes the device handle stable). The redeemed
@@ -405,10 +435,51 @@ pub(crate) async fn pair_device_redeem(
     }
 
     if let Err(e) = profile.validate() {
-        return err_internal(format!("profile rejected after key append: {e}"));
+        return Err(err_internal(format!(
+            "profile rejected after key append: {e}"
+        )));
     }
+
+    // Save while the exact reservation is still owned. A failed atomic
+    // replacement leaves the old profile intact and permits token release.
     if let Err(e) = profile.save_to_path(&profile_path) {
-        return err_internal(format!("profile save failed: {e}"));
+        return Err(err_internal(format!("profile save failed: {e}")));
+    }
+
+    // Deleting the reservation is the token commit. A definite loss means the
+    // reservation was revoked or replaced; restore the profile only if this
+    // attempt's prepared value is still current, so another writer is never
+    // clobbered. The reservation is already single-use; if cleanup reports an
+    // ambiguous storage error, keep it unredeemable and let expiry prune it.
+    match store.consume_reservation(&chosen).await {
+        Ok(true) => {},
+        Ok(false) => {
+            match PrincipalProfile::load_from_path(&profile_path) {
+                Ok(current) if current == profile => {
+                    if let Err(error) = original_profile.save_to_path(&profile_path) {
+                        return Ok(err_internal(format!(
+                            "profile rollback failed after pair-token loss: {error}"
+                        )));
+                    }
+                    kernel.profile_cache.invalidate(&principal);
+                },
+                Ok(_) => {},
+                Err(error) => {
+                    return Ok(err_internal(format!(
+                        "profile rollback read failed after pair-token loss: {error}"
+                    )));
+                },
+            }
+            return Ok(err_unauthorized(
+                "pair-device token invalid or expired".into(),
+            ));
+        },
+        Err(error) => {
+            warn!(
+                error = %error,
+                "pair-token reservation cleanup failed; expiry will prune it"
+            );
+        },
     }
     kernel.profile_cache.invalidate(&principal);
 
@@ -423,11 +494,11 @@ pub(crate) async fn pair_device_redeem(
         "Layer 6 auth.pair.redeem"
     );
 
-    AdminResponseBody::PairTokenRedeemed(PairTokenRedeemed {
+    Ok(AdminResponseBody::PairTokenRedeemed(PairTokenRedeemed {
         principal,
         public_key_fingerprint: fingerprint,
         key_id: key_id.into_inner(),
-    })
+    }))
 }
 
 /// List the paired devices on `principal`'s profile as fingerprint-level

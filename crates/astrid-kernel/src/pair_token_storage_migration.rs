@@ -159,6 +159,60 @@ mod tests {
         assert_eq!(winners, 1);
     }
 
+    #[tokio::test]
+    async fn reservation_has_one_exact_owner_and_releases_redeemably() {
+        let backend: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+        let store = DurablePairTokenStore::new(backend).unwrap();
+        let record = DurablePairToken {
+            token_hash: hash_token("reservation owner"),
+            principal_uid: PrincipalUid::from_bytes([8; 32]),
+            expires_at_epoch: now_epoch().saturating_add(300),
+            issued_at_epoch: now_epoch(),
+            label: Some("owner".to_owned()),
+            scope: DeviceScope::Full,
+        };
+        assert!(store.issue(&record).await.unwrap());
+        assert!(store.reserve_if_unchanged(&record).await.unwrap());
+        assert_eq!(store.redeemable(&record.token_hash).await.unwrap(), None);
+        assert!(!store.reserve_if_unchanged(&record).await.unwrap());
+        assert!(store.release_reservation(&record).await.unwrap());
+        assert_eq!(
+            store.redeemable(&record.token_hash).await.unwrap(),
+            Some(record)
+        );
+    }
+
+    #[tokio::test]
+    async fn reservation_commit_and_rollback_do_not_clobber_replacement() {
+        let backend: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+        let store = DurablePairTokenStore::new(backend).unwrap();
+        let record = DurablePairToken {
+            token_hash: hash_token("reservation replacement"),
+            principal_uid: PrincipalUid::from_bytes([9; 32]),
+            expires_at_epoch: now_epoch().saturating_add(300),
+            issued_at_epoch: now_epoch(),
+            label: Some("original".to_owned()),
+            scope: DeviceScope::Full,
+        };
+        assert!(store.issue(&record).await.unwrap());
+
+        // Remove the reserved record and issue a replacement at the same key.
+        // A stale owner must not restore its original over the replacement.
+        assert!(store.reserve_if_unchanged(&record).await.unwrap());
+        assert!(store.revoke(&record.token_hash).await.unwrap());
+        let mut replacement = record.clone();
+        replacement.label = Some("replacement".to_owned());
+        assert!(store.issue(&replacement).await.unwrap());
+        assert!(!store.release_reservation(&record).await.unwrap());
+        assert!(!store.consume_reservation(&record).await.unwrap());
+        assert_eq!(store.list().await.unwrap(), vec![replacement.clone()]);
+
+        // A still-owned reservation commits by deleting exactly that value.
+        assert!(store.reserve_if_unchanged(&replacement).await.unwrap());
+        assert!(store.consume_reservation(&replacement).await.unwrap());
+        assert!(store.list().await.unwrap().is_empty());
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn legacy_import_binds_uid_retires_and_restarts() {

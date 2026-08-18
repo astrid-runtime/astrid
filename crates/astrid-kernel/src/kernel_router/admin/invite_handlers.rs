@@ -144,7 +144,7 @@ pub(crate) async fn invite_redeem(
         return err_internal("invite durable storage is unavailable".into());
     }
     let token_hash = invite::hash_token(&token);
-    let Some(chosen) = (match store.redeem(&token_hash).await {
+    let Some(chosen) = (match store.redeemable(&token_hash).await {
         Ok(value) => value,
         Err(_) => return err_internal("invite durable storage read failed".into()),
     }) else {
@@ -195,10 +195,28 @@ pub(crate) async fn invite_redeem(
     // because the redeem path needs the pre-built `AuthConfig`, but
     // the responsibility split is identical: identity store first,
     // profile second, home tree third — with rollback at every step.
-    if let Err(error) =
-        provision_invited_principal(kernel, &principal, &normalised_key, &profile).await
-    {
-        return err_internal(error);
+    let provisioned =
+        match provision_invited_principal(kernel, &principal, &normalised_key, &profile).await {
+            Ok(provisioned) => provisioned,
+            Err(error) => return err_internal(error),
+        };
+
+    // Provisioning is deliberately completed before consuming the bearer so
+    // ordinary identity/profile failures remain retryable. `Ok(false)` is a
+    // definite commit loss, so only then is this attempt's exact UID rolled
+    // back. A storage error leaves the provisioned identity in place because
+    // the commit may have succeeded and deleting it could invalidate a winner.
+    match store.consume_if_unchanged(&chosen).await {
+        Ok(true) => {},
+        Ok(false) => {
+            if let Err(error) = rollback_invited_principal(kernel, &principal, provisioned).await {
+                return err_internal(format!("invite principal rollback failed: {error}"));
+            }
+            return err_unauthorized("invite token invalid, expired, or already consumed".into());
+        },
+        Err(_) => {
+            return err_internal("invite durable storage write failed".into());
+        },
     }
 
     let fingerprint = fingerprint_public_key(&format!("ed25519:{normalised_key}"));
@@ -221,7 +239,7 @@ async fn provision_invited_principal(
     principal: &PrincipalId,
     normalised_key: &str,
     profile: &PrincipalProfile,
-) -> Result<(), String> {
+) -> Result<uuid::Uuid, String> {
     let initial_public_key = astrid_crypto::PublicKey::from_hex(normalised_key)
         .map(<[u8; 32]>::from)
         .map_err(|error| format!("validated invite key decode failed: {error}"))?;
@@ -251,7 +269,38 @@ async fn provision_invited_principal(
     // Principal state is UID-bound in the runtime store and is provisioned
     // lazily on first durable write. The released native home tree is only a
     // migration source and must not be recreated by invite redemption.
-    Ok(())
+    Ok(user.id)
+}
+
+async fn rollback_invited_principal(
+    kernel: &Arc<crate::Kernel>,
+    principal: &PrincipalId,
+    user_id: uuid::Uuid,
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+    if let Err(error) = kernel
+        .identity_store
+        .unlink("cli", principal.as_str())
+        .await
+    {
+        errors.push(format!("identity link removal failed: {error}"));
+    }
+    match kernel.identity_store.delete_user(user_id).await {
+        Ok(true) => {},
+        Ok(false) => errors.push(format!("identity {user_id} was not deleted")),
+        Err(error) => errors.push(format!("identity deletion failed: {error}")),
+    }
+    if let Err(error) = std::fs::remove_file(kernel.astrid_home.profile_path(principal))
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        errors.push(format!("profile removal failed: {error}"));
+    }
+    kernel.profile_cache.invalidate(principal);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 // ── invite.list ───────────────────────────────────────────────────────
@@ -571,6 +620,69 @@ mod tests {
                 .await
                 .expect("reload consumed store")
                 .is_empty()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_invite_provisioning_does_not_burn_the_token() {
+        let (_dir, kernel) = fixture().await;
+        let token = issue_token(&kernel).await;
+        let principal = PrincipalId::new("retryable-invite").expect("principal id");
+
+        // Occupy the durable identity alias without creating its profile. The
+        // first redeem therefore fails after token selection but before
+        // provisioning can complete, deterministically exercising the failure
+        // window without filesystem timing or permissions.
+        let existing = kernel
+            .identity_store
+            .create_principal(principal.clone(), [9; 32])
+            .await
+            .expect("seed identity collision");
+        let failed = invite_redeem(
+            &kernel,
+            token.clone(),
+            "ab".repeat(32),
+            Some(principal.as_str().to_owned()),
+        )
+        .await;
+        assert!(
+            matches!(failed, AdminResponseBody::Error(_)),
+            "identity provisioning collision must fail the first redeem: {failed:?}"
+        );
+
+        let store = invite_store(&kernel).expect("open invite store");
+        assert_eq!(
+            store
+                .list()
+                .await
+                .expect("read invite after failed redeem")
+                .len(),
+            1,
+            "a provisioning failure must leave the invite available for retry"
+        );
+
+        // Remove only the injected conflict, then retry with the exact same
+        // bearer. A consumed-before-provisioning implementation rejects this
+        // second attempt; the durable invariant requires it to succeed.
+        kernel
+            .identity_store
+            .delete_user(existing.id)
+            .await
+            .expect("remove injected identity collision");
+        let retried = invite_redeem(
+            &kernel,
+            token,
+            "ab".repeat(32),
+            Some(principal.as_str().to_owned()),
+        )
+        .await;
+        assert!(
+            matches!(retried, AdminResponseBody::InviteRedeemed(_)),
+            "the same invite must remain retryable after provisioning failure: {retried:?}"
+        );
+        assert!(
+            store.list().await.expect("read consumed invite").is_empty(),
+            "successful retry consumes the invite exactly once"
         );
     }
 
