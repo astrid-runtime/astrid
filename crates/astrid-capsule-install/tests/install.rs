@@ -96,10 +96,8 @@ impl FreshWindowsHome {
             .parent()
             .and_then(std::path::Path::parent)
             .expect("Astrid runtime root is below Windows LocalAppData");
-        let path = local_app_data.join(format!(
-            "AstridCapsuleInstallTest-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let path = local_app_data.join(format!("AstTest-{}", &suffix[..16]));
         assert!(!path.exists(), "fresh test home must not exist");
         Self { path }
     }

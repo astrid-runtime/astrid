@@ -265,10 +265,10 @@ run_concurrent_http_prompt_correlation_smoke() {
     fail "operator concurrent session update failed before HTTP status"
   }
 
-  assert_session_management_unavailable "agent concurrent session update" \
-    "$(<"$user_update_status")" "$user_update_out"
-  assert_session_management_unavailable "operator concurrent session update" \
-    "$(<"$ops_update_status")" "$ops_update_out"
+  assert_status "agent concurrent session update" "$(<"$user_update_status")" 200
+  json_assert_session_summary "$user_update_out" "$user_session" "$user_title"
+  assert_status "operator concurrent session update" "$(<"$ops_update_status")" 200
+  json_assert_session_summary "$ops_update_out" "$ops_session" "$ops_title"
 
   note "checking unsupported cross-principal session mutation leaks no identity"
   local forbidden_title="forbidden concurrent session title"
@@ -297,11 +297,12 @@ run_concurrent_http_prompt_correlation_smoke() {
     fail "operator owner concurrent session update failed before HTTP status"
   }
 
-  assert_session_management_unavailable "agent cross-principal concurrent session update" \
-    "$(<"$cross_update_status")" "$cross_update_out"
+  assert_status "agent cross-principal concurrent session update hidden" \
+    "$(<"$cross_update_status")" 404
   assert_artifact_lacks_text "$cross_update_out" "$ops_session"
-  assert_session_management_unavailable "operator owner concurrent session update" \
-    "$(<"$ops_final_update_status")" "$ops_final_update_out"
+  assert_status "operator owner concurrent session update" \
+    "$(<"$ops_final_update_status")" 200
+  json_assert_session_summary "$ops_final_update_out" "$ops_session" "$ops_final_title"
 }
 
 run_same_session_http_prompt_collision_smoke() {

@@ -327,6 +327,27 @@ fn existing_layout_rejects_reappeared_secret_alias_without_current_binding() {
     assert!(legacy_alias.is_dir(), "reappeared source must be preserved");
 }
 
+#[test]
+fn first_migration_retires_empty_unsupported_kv_and_token_directories() {
+    let (_root, home) = test_home();
+    let alias = PrincipalId::default();
+    let directory = PrincipalDirectory::default();
+    directory
+        .register(alias.clone(), PrincipalUid::from_bytes([0x51; 32]))
+        .expect("default binding");
+    let principal_home = home.principal_home(&alias);
+    astrid_core::platform_fs::ensure_private_directory(&principal_home.kv_dir())
+        .expect("empty legacy KV directory");
+    astrid_core::platform_fs::ensure_private_directory(&principal_home.tokens_dir())
+        .expect("empty legacy token directory");
+
+    ensure_no_unretired_component_sources(&home, &directory, true)
+        .expect("empty unsupported directories are safe to retire before ordinary home cleanup");
+
+    assert!(!principal_home.kv_dir().exists());
+    assert!(!principal_home.tokens_dir().exists());
+}
+
 fn fresh_retirement_ledger(cow: SourceIdentity) -> MigrationLedger {
     let mut components = vec![
         MigrationComponent {

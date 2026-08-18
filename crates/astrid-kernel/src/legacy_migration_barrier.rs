@@ -853,11 +853,25 @@ fn ensure_no_unretired_component_sources(
             ("tokens", home.principal_home(&alias).tokens_dir()),
         ];
         for (name, path) in unsupported {
-            if path_exists(&path)? && snapshot_path(&path)?.entries != 0 {
+            if !path_exists(&path)? {
+                continue;
+            }
+            if snapshot_path(&path)?.entries != 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
                     format!(
                         "legacy principal {alias} (uid {uid}) retains unsupported {name} state; no authoritative migration API exists: {}",
+                        path.display()
+                    ),
+                ));
+            }
+            if allow_empty_cleanup {
+                retire_empty_directory(&path)?;
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "legacy {name} source reappeared after cut-over: {}",
                         path.display()
                     ),
                 ));

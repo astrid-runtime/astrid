@@ -4,7 +4,9 @@ use super::migration::{
     LegacyAuditReceipt, decode_receipt, digest_legacy_source, import_legacy_chains,
     scan_legacy_source, validate_destination, validate_legacy_source_path,
 };
-use super::{AuditError, AuditLog, AuditResult, KvAuditStorage, LegacyAuditImportReport};
+use super::{
+    AuditError, AuditLog, AuditResult, AuditStorage, KvAuditStorage, LegacyAuditImportReport,
+};
 use std::path::Path;
 
 impl AuditLog {
@@ -53,6 +55,7 @@ impl AuditLog {
             &final_receipt,
             "legacy audit source changed during forward import",
         )?;
+        source.close().await?;
         self.storage.clear_migration_temp().await?;
 
         self.verify_receipted_destination(&receipt).await?;

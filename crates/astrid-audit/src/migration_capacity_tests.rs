@@ -29,6 +29,40 @@ async fn append_test_entries(log: &AuditLog, session_id: &SessionId, count: u32)
 }
 
 #[tokio::test]
+async fn empty_released_audit_database_has_canonical_zero_chain_receipt() {
+    let directory = tempfile::tempdir().expect("temporary legacy directory");
+    let path = directory.path().join("audit-db");
+    let key = Arc::new(KeyPair::generate());
+    AuditLog::open_legacy_source(&path, Arc::clone(&key))
+        .expect("open empty legacy source")
+        .close()
+        .await
+        .expect("close empty legacy source");
+
+    let destination_backend: Arc<dyn KvStore> = Arc::new(astrid_storage::MemoryKvStore::new());
+    let destination = AuditLog::open_with_kv_store_and_capacity(
+        destination_backend,
+        key,
+        Some(Arc::new(FixedAuditCapacity(Some(u64::MAX)))),
+    )
+    .expect("open system destination");
+
+    let report = destination
+        .import_legacy_audit(&path, "test-system-audit")
+        .await
+        .expect("empty released audit migration");
+
+    assert_eq!(report.source_entries, 0);
+    assert_eq!(report.imported_entries, 0);
+    assert!(report.marker_installed);
+    assert!(destination.verify_all().await.unwrap().is_empty());
+    destination
+        .verify_legacy_source_digest(&path, "test-system-audit", &report.source_digest)
+        .await
+        .expect("source lock is released for the retirement read-back");
+}
+
+#[tokio::test]
 async fn legacy_import_ignores_unusable_oversized_session_index() {
     let directory = tempfile::tempdir().expect("temporary legacy directory");
     let path = directory.path().join("audit-db");

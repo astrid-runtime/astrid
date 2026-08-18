@@ -222,7 +222,12 @@ pub(crate) async fn chain_fragment_summary(
         }
         after = next_after;
     }
-    Ok((count, digest.finalize().to_hex().to_string()))
+    let digest = if count == 0 {
+        String::new()
+    } else {
+        digest.finalize().to_hex().to_string()
+    };
+    Ok((count, digest))
 }
 
 pub(crate) async fn finalize_chain_fragments(

@@ -106,8 +106,7 @@ pub(super) async fn collect_destination_proofs(
 
     let audit = store.system_control_kv("audit").map_err(storage_io)?;
     let audit_proof = audit
-        .backend()
-        .get("audit:migrations", "legacy-principal-home-v1")
+        .get("audit:migrations:legacy-principal-home-v1")
         .await
         .map_err(storage_io)?
         .map_or_else(

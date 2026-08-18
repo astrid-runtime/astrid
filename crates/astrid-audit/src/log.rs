@@ -393,9 +393,19 @@ impl AuditLog {
             chain_fragment_summary(self.storage.as_ref(), "chain:").await?;
         let actual = accumulator.finish(&receipt.destination, chain_count, chain_digest);
         if actual != *receipt {
-            return Err(AuditError::StorageError(
-                "system audit read-back does not match migration receipt".to_owned(),
-            ));
+            return Err(AuditError::StorageError(format!(
+                "system audit read-back does not match migration receipt: expected entries={} bytes={} digest={} chains={} chain_digest={}, found entries={} bytes={} digest={} chains={} chain_digest={}",
+                receipt.source_entries,
+                receipt.source_bytes,
+                receipt.source_digest,
+                receipt.chain_count,
+                receipt.chain_digest,
+                actual.source_entries,
+                actual.source_bytes,
+                actual.source_digest,
+                actual.chain_count,
+                actual.chain_digest,
+            )));
         }
         for (session, chain) in &self.verify_all().await? {
             if !chain.valid {
