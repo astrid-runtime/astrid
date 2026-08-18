@@ -1,3 +1,4 @@
+use super::reclaim::set_test_unlock_hook;
 use super::*;
 use crate::volume::VolumeFile;
 
@@ -93,6 +94,70 @@ fn hosted_volume_reclaim_shrinks_and_recovers_swap_artifacts() {
     let volume = HostedFileVolume::open(&path).unwrap();
     assert!(!temporary_path.exists());
     drop(volume);
+}
+
+#[test]
+fn reclaim_blocks_concurrent_open_during_unlock_swap_and_preserves_active_path() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("astrid.volume");
+    let region = VolumeRegion::new("objects").unwrap();
+    let volume = HostedFileVolume::open(&path).unwrap();
+    volume.create_region(&region, true).unwrap();
+    volume
+        .write_region_at(&region, 0, &vec![0xCD; 256 * 1024])
+        .unwrap();
+    volume.sync().unwrap();
+
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    set_test_unlock_hook(
+        path.clone(),
+        Box::new(move || {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        }),
+    );
+
+    let reclaiming = Arc::clone(&volume);
+    let reclaim_thread = std::thread::spawn(move || reclaiming.reclaim());
+    entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("reclaim reached the unlock/swap boundary");
+
+    // Opening during the unlock/swap window must not acquire the retired
+    // inode or clean up the in-flight compacting artifact. A correct opener
+    // may fail fast or wait for the swap; either way, it must not report a
+    // successful open before the reclaiming writer is released.
+    let (open_tx, open_rx) = mpsc::channel();
+    let open_path = path.clone();
+    let open_thread = std::thread::spawn(move || {
+        let opened = HostedFileVolume::open(&open_path).is_ok();
+        open_tx.send(opened).unwrap();
+    });
+    let opened_during_window = open_rx
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap_or(false);
+    release_tx.send(()).unwrap();
+    open_thread.join().unwrap();
+    let reclaim_result = reclaim_thread.join().unwrap();
+    drop(volume);
+
+    assert!(
+        !opened_during_window,
+        "concurrent open acquired the retired active inode"
+    );
+    reclaim_result.expect("reclaim must complete as one single-writer swap");
+    let reopened = HostedFileVolume::open(&path).unwrap();
+    let mut bytes = vec![0_u8; 256 * 1024];
+    reopened
+        .read_region_at(&region, 0, &mut bytes)
+        .expect("active path remains readable");
+    assert!(bytes.iter().all(|byte| *byte == 0xCD));
+    assert!(!reclaim::temp_path(&path).exists());
+    assert!(!reclaim::previous_path(&path).exists());
 }
 
 #[test]

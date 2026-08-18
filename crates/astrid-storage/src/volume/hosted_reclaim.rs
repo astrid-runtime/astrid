@@ -4,12 +4,48 @@ use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 
 use fs2::FileExt as _;
 
 use super::{
     ContainerState, HostedFileVolume, Operation, RegionState, VOLUME_MAGIC, overlay_extent,
 };
+
+// Reclaim closes the old inode before swapping the active path. Tests pause
+// at that narrow boundary to prove a concurrent opener cannot acquire the
+// retired inode while the swap is in flight. This hook is test-only.
+#[cfg(test)]
+type UnlockHook = Box<dyn FnOnce() + Send + 'static>;
+
+#[cfg(test)]
+static UNLOCK_HOOK: OnceLock<Mutex<Option<(PathBuf, UnlockHook)>>> = OnceLock::new();
+
+#[cfg(test)]
+pub(super) fn set_test_unlock_hook(path: PathBuf, hook: UnlockHook) {
+    *UNLOCK_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("hosted reclaim test hook lock") = Some((path, hook));
+}
+
+#[cfg(test)]
+fn run_test_unlock_hook(path: &Path) {
+    let mut hook = UNLOCK_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("hosted reclaim test hook lock");
+    if hook.as_ref().is_some_and(|(target, _)| target == path)
+        && let Some((_, hook)) = hook.take()
+    {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+#[inline]
+fn run_test_unlock_hook(_path: &Path) {}
 
 pub(super) fn temp_path(path: &Path) -> PathBuf {
     PathBuf::from(format!("{}.compacting", path.display()))
@@ -100,6 +136,7 @@ fn read_region(
 }
 
 pub(super) fn reclaim(volume: &HostedFileVolume) -> io::Result<()> {
+    let _open_guard = volume.open_lock.lock();
     let mut state = volume.state.lock();
     let temporary = temp_path(&volume.path);
     let previous = previous_path(&volume.path);
@@ -167,6 +204,7 @@ pub(super) fn reclaim(volume: &HostedFileVolume) -> io::Result<()> {
     let old_file = std::mem::replace(&mut state.file, placeholder);
     old_file.unlock()?;
     drop(old_file);
+    run_test_unlock_hook(&volume.path);
     std::fs::rename(&volume.path, &previous)?;
     if let Err(error) = std::fs::rename(&temporary, &volume.path) {
         let _ = std::fs::rename(&previous, &volume.path);

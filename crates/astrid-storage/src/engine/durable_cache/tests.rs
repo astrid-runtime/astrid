@@ -1,6 +1,6 @@
 use std::num::NonZeroU64;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::engine::ProjectionCachePayload;
 use crate::storage_model::{
@@ -36,6 +36,58 @@ fn cache(controller: ObjectCacheController, principal_bytes: u64) -> ObjectCache
 
 struct ShrinksAfterReservation {
     shrunk: AtomicBool,
+}
+
+#[derive(Default)]
+struct RecordingPhysicalBudget {
+    reconciled: AtomicU64,
+    reconcile_calls: AtomicU64,
+}
+
+impl ObjectCacheMemoryBudget for RecordingPhysicalBudget {
+    fn capacity(&self) -> ObjectCacheCapacity {
+        ObjectCacheCapacity::Unbounded
+    }
+
+    fn ensure_capacity(&self, _required: u64) -> ObjectCacheCapacity {
+        ObjectCacheCapacity::Unbounded
+    }
+
+    fn reconcile(&self, resident_bytes: u64) {
+        self.reconciled.store(resident_bytes, Ordering::SeqCst);
+        self.reconcile_calls.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[derive(Default)]
+struct RecordingPrincipalBudget {
+    reconciled: AtomicU64,
+    reconcile_calls: AtomicU64,
+}
+
+impl PrincipalObjectCacheBudget<String> for RecordingPrincipalBudget {
+    fn capacity(&self, _principal: &String) -> ObjectCacheCapacity {
+        ObjectCacheCapacity::Unbounded
+    }
+
+    fn ensure_capacity(&self, _principal: &String, _required: u64) -> ObjectCacheCapacity {
+        ObjectCacheCapacity::Unbounded
+    }
+
+    fn reconcile(&self, _principal: &String, charged_bytes: u64) {
+        self.reconciled.store(charged_bytes, Ordering::SeqCst);
+        self.reconcile_calls.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn reset_recording_budgets(
+    physical: &RecordingPhysicalBudget,
+    principal: &RecordingPrincipalBudget,
+) {
+    physical.reconciled.store(0, Ordering::SeqCst);
+    physical.reconcile_calls.store(0, Ordering::SeqCst);
+    principal.reconciled.store(0, Ordering::SeqCst);
+    principal.reconcile_calls.store(0, Ordering::SeqCst);
 }
 
 impl ObjectCacheMemoryBudget for ShrinksAfterReservation {
@@ -163,6 +215,82 @@ fn admission_revalidates_capacity_after_reservation() {
     assert_eq!(returned.as_ref(), &record(1));
     assert_eq!(cache.stats().resident_objects, 0);
     assert_eq!(cache.stats().resident_bytes, 0);
+}
+
+#[test]
+fn compaction_reconciles_external_physical_and_principal_reservations() {
+    let physical = Arc::new(RecordingPhysicalBudget::default());
+    let principal = Arc::new(RecordingPrincipalBudget::default());
+    let cache = ObjectCache::new(ObjectCacheConfig::new(
+        ObjectCacheController::governed(physical.clone()),
+        principal.clone(),
+    ));
+    let owner = "alice".to_owned();
+    let keep = object(21);
+    cache.insert(&owner, keep, record(21));
+    cache.insert(&owner, object(22), record(22));
+    reset_recording_budgets(&physical, &principal);
+
+    cache.retain_objects(|object| object == keep);
+
+    let stats = cache.stats();
+    assert_eq!(
+        physical.reconciled.load(Ordering::SeqCst),
+        stats.resident_bytes
+    );
+    assert_eq!(
+        principal.reconciled.load(Ordering::SeqCst),
+        cache.principal_charge(&owner)
+    );
+    assert!(
+        physical.reconcile_calls.load(Ordering::SeqCst) > 0,
+        "compaction must acknowledge the new physical reservation immediately"
+    );
+    assert!(
+        principal.reconcile_calls.load(Ordering::SeqCst) > 0,
+        "compaction must acknowledge each principal reservation immediately"
+    );
+}
+
+#[test]
+fn projection_discard_reconciles_external_physical_and_principal_reservations() {
+    let physical = Arc::new(RecordingPhysicalBudget::default());
+    let principal = Arc::new(RecordingPrincipalBudget::default());
+    let cache = ObjectCache::new(ObjectCacheConfig::new(
+        ObjectCacheController::governed(physical.clone()),
+        principal.clone(),
+    ));
+    let owner = "alice".to_owned();
+    let id = object(23);
+    let key = ProjectionCacheKey::new(23);
+    cache.insert(&owner, id, record(23));
+    assert!(cache.retain_projection(
+        &owner,
+        id,
+        key,
+        ProjectionCacheEntry::new(TestProjection(vec![0x23; 1024])),
+    ));
+    reset_recording_budgets(&physical, &principal);
+
+    assert!(cache.discard_projection(&owner, id, key));
+
+    let stats = cache.stats();
+    assert_eq!(
+        physical.reconciled.load(Ordering::SeqCst),
+        stats.resident_bytes
+    );
+    assert_eq!(
+        principal.reconciled.load(Ordering::SeqCst),
+        cache.principal_charge(&owner)
+    );
+    assert!(
+        physical.reconcile_calls.load(Ordering::SeqCst) > 0,
+        "discard must acknowledge released physical bytes immediately"
+    );
+    assert!(
+        principal.reconcile_calls.load(Ordering::SeqCst) > 0,
+        "discard must acknowledge released principal bytes immediately"
+    );
 }
 
 #[test]

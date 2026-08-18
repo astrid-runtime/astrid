@@ -2,16 +2,20 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+#[cfg(test)]
+use std::fs::OpenOptions;
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+#[cfg(test)]
 use std::sync::Arc;
 
-use fs2::FileExt as _;
 use parking_lot::Mutex;
 
 use super::{AstridVolume, MAX_REGION_NAME_BYTES, VolumeMetadataMutation, VolumeRegion};
 
+#[path = "hosted_open.rs"]
+mod open;
 #[path = "hosted_reclaim.rs"]
 mod reclaim;
 
@@ -49,8 +53,10 @@ struct ContainerState {
 /// Hosted realization of an Astrid volume in one container file.
 pub struct HostedFileVolume {
     path: PathBuf,
+    open_lock: open::OpenReclaimLock,
     state: Mutex<ContainerState>,
 }
+
 impl fmt::Debug for HostedFileVolume {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -60,79 +66,6 @@ impl fmt::Debug for HostedFileVolume {
     }
 }
 impl HostedFileVolume {
-    /// Open or create one hosted Astrid volume container.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for a lock conflict, invalid header, interior corrupt
-    /// record, invalid region name, or host I/O failure. An incomplete final
-    /// record is treated as an uncommitted tail and truncated.
-    pub fn open(path: impl AsRef<Path>) -> io::Result<Arc<Self>> {
-        let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        reclaim::recover_artifacts(&path)?;
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt as _;
-            use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
-            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-        }
-        let mut file = options.open(&path)?;
-        let metadata = file.metadata()?;
-        if !metadata.is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Astrid volume is not a regular file",
-            ));
-        }
-        file.try_lock_exclusive().map_err(|error| {
-            if error.kind() == io::ErrorKind::WouldBlock {
-                io::Error::new(io::ErrorKind::WouldBlock, "Astrid volume is already open")
-            } else {
-                error
-            }
-        })?;
-        let length = file.metadata()?.len();
-        if length == 0 {
-            file.write_all(&VOLUME_MAGIC)?;
-            file.sync_all()?;
-        } else {
-            let mut magic = [0_u8; VOLUME_MAGIC.len()];
-            file.read_exact(&mut magic)?;
-            if magic != VOLUME_MAGIC {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid Astrid volume header",
-                ));
-            }
-        }
-        let (regions, sequence, valid_len, durable_len) = recover_container(&mut file)?;
-        if file.metadata()?.len() != valid_len {
-            file.set_len(valid_len)?;
-            file.sync_all()?;
-        }
-        Ok(Arc::new(Self {
-            path,
-            state: Mutex::new(ContainerState {
-                file,
-                sequence,
-                valid_len,
-                durable_len,
-                boundary_pending: false,
-                regions,
-            }),
-        }))
-    }
-
     fn append(
         state: &mut ContainerState,
         operation: Operation,
@@ -205,7 +138,7 @@ impl Drop for HostedFileVolume {
     fn drop(&mut self) {
         let state = self.state.get_mut();
         let _ = Self::make_durable(state);
-        let _ = state.file.unlock();
+        let _ = fs2::FileExt::unlock(&state.file);
     }
 }
 

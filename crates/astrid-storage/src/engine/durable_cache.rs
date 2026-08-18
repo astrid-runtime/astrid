@@ -439,7 +439,17 @@ where
         object: ObjectId,
         key: ProjectionCacheKey,
     ) -> bool {
-        self.state.lock().remove_projection(principal, object, key)
+        let _accounting = self.accounting.lock();
+        let removed = {
+            let mut state = self.state.lock();
+            let removed = state.remove_projection(principal, object, key);
+            let resident = state.resident_bytes();
+            let charged = state.principal_charge(principal);
+            (removed, resident, charged)
+        };
+        self.controller.reconcile(removed.1);
+        self.principal_budget.reconcile(principal, removed.2);
+        removed.0
     }
 
     /// Discard cached objects absent from a newly installed authoritative
@@ -450,6 +460,7 @@ where
     /// to uncached index lookups while preserving entries whose immutable
     /// identities remain live at their new physical locations.
     pub(super) fn retain_objects(&self, mut retain: impl FnMut(ObjectId) -> bool) {
+        let _accounting = self.accounting.lock();
         let mut state = self.state.lock();
         let discarded = state
             .entries
@@ -459,6 +470,17 @@ where
             .collect::<Vec<_>>();
         for object in discarded {
             state.remove_physical(object);
+        }
+        let resident = state.resident_bytes();
+        let charges = state
+            .principals
+            .iter()
+            .map(|(principal, partition)| (principal.clone(), partition.charged_bytes))
+            .collect::<Vec<_>>();
+        drop(state);
+        self.controller.reconcile(resident);
+        for (principal, charged) in charges {
+            self.principal_budget.reconcile(&principal, charged);
         }
     }
 
