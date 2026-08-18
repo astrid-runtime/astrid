@@ -66,7 +66,11 @@ pub(crate) fn migrate_legacy_principal_logs(
     Ok(())
 }
 
-/// Return a deterministic receipt proof for one UID's imported log tree.
+/// Return a deterministic proof of one UID's canonical import receipt.
+///
+/// The migration verifies every destination byte before publishing this
+/// receipt. Runtime logs are appendable operational state, so later proof
+/// checks bind the immutable receipt rather than re-hashing the live log tree.
 ///
 /// # Errors
 ///
@@ -87,7 +91,6 @@ pub(crate) fn legacy_log_destination_proof(
             format!("legacy log receipt identity mismatch: {}", path.display()),
         ));
     }
-    verify_destination(home, uid, &receipt)?;
     Ok(format!("blake3:{}", blake3::hash(&bytes).to_hex()))
 }
 
@@ -601,6 +604,33 @@ mod tests {
                 .starts_with("blake3:")
         );
         migrate_legacy_principal_logs(&home, &directory).unwrap();
+    }
+
+    #[test]
+    fn live_log_growth_does_not_invalidate_the_import_receipt() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(temp.path().join("astrid"));
+        let principal = PrincipalId::new("alice").unwrap();
+        let uid = PrincipalUid::from_bytes([0x95; 32]);
+        let directory = PrincipalDirectory::default();
+        directory.register(principal.clone(), uid).unwrap();
+        let source = home.principal_home(&principal).log_dir();
+        astrid_core::platform_fs::ensure_private_directory(&source).unwrap();
+        astrid_core::platform_fs::atomic_write_private_file(
+            &source.join("capsule.log"),
+            b"legacy log\n",
+        )
+        .unwrap();
+
+        migrate_legacy_principal_logs(&home, &directory).unwrap();
+        let proof = legacy_log_destination_proof(&home, uid).unwrap();
+        astrid_core::platform_fs::atomic_write_private_file(
+            &destination_root(&home, uid).join("current-runtime.log"),
+            b"current runtime log\n",
+        )
+        .unwrap();
+
+        assert_eq!(legacy_log_destination_proof(&home, uid).unwrap(), proof);
     }
 
     #[test]
