@@ -1089,10 +1089,8 @@ impl Kernel {
         let groups = Arc::new(ArcSwap::from_pointee(groups_loaded));
 
         // Bootstrap the CLI root user and apply config-file identity links.
-        // Native-only: both are CLI/disk concepts (the root-user seed writes
-        // the default principal's profile under `etc/`, and identity links
-        // come from on-disk config); the browser host establishes identity
-        // through its own uplink instead.
+        // Native-only: both are CLI/disk concepts; the browser host
+        // establishes identity through its own uplink instead.
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         {
             let adopt_released_layout_principals = matches!(
@@ -1104,9 +1102,35 @@ impl Kernel {
                     "layout-one migration requires the daemon singleton lock",
                 ));
             }
-            // Bootstrap the CLI root user (idempotent). Also seeds the
-            // default principal's profile with `groups = ["admin"]` so
-            // single-tenant deployments get full management-API access.
+            // All released native state crosses the same singleton-protected
+            // barrier before identity bootstrap can mutate the default
+            // profile. The durable directory loaded above already contains
+            // every released principal needed by the importers.
+            if let Some(layout_origin) = layout_origin {
+                legacy_migration_barrier::run(
+                    &home,
+                    principal_store.as_ref().ok_or_else(|| {
+                        std::io::Error::other(
+                            "legacy migration barrier requires an authoritative principal store",
+                        )
+                    })?,
+                    &principal_directory,
+                    &audit_log,
+                    layout_origin,
+                    &workspace_root,
+                    &workspace_layout,
+                )
+                .await?;
+            }
+
+            // The released profile, when present, is now represented by the
+            // completed migration ledger. Apply the normal idempotent admin
+            // seed before deriving the root principal identity from its key.
+            seed_default_principal_admin_profile(&home).map_err(|error| {
+                std::io::Error::other(format!("default admin profile bootstrap failed: {error}"))
+            })?;
+
+            // Bootstrap the CLI root user (idempotent).
             let (root_user, root_principal_identity) =
                 bootstrap_cli_root_user(&identity_store, &home)
                     .await
@@ -1127,28 +1151,6 @@ impl Kernel {
 
             // Apply pre-configured identity links from config.
             apply_identity_config(&identity_store, &workspace_root, &workspace_layout).await;
-
-            // All released native state crosses the same singleton-protected
-            // barrier. The ledger is written only after every component has
-            // read back its durable destination; ledger-authorized disposable
-            // sources are retired immediately afterward and are safely
-            // resumed from that same ledger after a crash.
-            if let Some(layout_origin) = layout_origin {
-                legacy_migration_barrier::run(
-                    &home,
-                    principal_store.as_ref().ok_or_else(|| {
-                        std::io::Error::other(
-                            "legacy migration barrier requires an authoritative principal store",
-                        )
-                    })?,
-                    &principal_directory,
-                    &audit_log,
-                    layout_origin,
-                    &workspace_root,
-                    &workspace_layout,
-                )
-                .await?;
-            }
 
             // Import ordinary user files from the released principal-home
             // tree before the layout receipt allows the daemon to serve the
@@ -4986,13 +4988,6 @@ fn warn_agent_loop_readiness(manifests: &[&astrid_capsule_types::manifest::Capsu
 /// on subsequent boots. Auto-links with `platform="cli"`,
 /// `platform_user_id="local"`, `method="system"`.
 ///
-/// Also seeds the default principal's profile on disk with
-/// `groups = ["admin"]` (issue #670) so single-tenant deployments reach
-/// the management API with full capabilities. The profile write is
-/// **idempotent** — if the default principal already has a profile with
-/// an `admin` group, any explicit `grants` / `revokes`, or non-empty
-/// `groups`, we leave it untouched.
-///
 /// Idempotent: skips creation if the root user already exists.
 async fn bootstrap_cli_root_user(
     store: &Arc<dyn astrid_storage::IdentityStore>,
@@ -5001,15 +4996,6 @@ async fn bootstrap_cli_root_user(
     (astrid_core::AstridUserId, astrid_core::PrincipalIdentity),
     astrid_storage::IdentityError,
 > {
-    // Seed the default principal profile with the admin group. Runs
-    // before the identity-link short-circuit below so a deleted profile
-    // between boots is restored even when the identity record persists.
-    seed_default_principal_admin_profile(home).map_err(|error| {
-        astrid_storage::IdentityError::Storage(format!(
-            "default admin profile bootstrap failed: {error}"
-        ))
-    })?;
-
     let principal = astrid_core::PrincipalId::default();
     let initial_public_key = principal_initial_public_key(home, &principal)?;
 
@@ -7033,8 +7019,7 @@ mod tests {
     fn assert_bootstrap_error(error: &std::io::Error) {
         let message = error.to_string();
         assert!(
-            message.contains("Failed to bootstrap CLI root user")
-                && message.contains("default admin profile bootstrap failed"),
+            message.contains("default admin profile bootstrap failed"),
             "unexpected boot error: {message}"
         );
     }
