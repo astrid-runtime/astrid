@@ -1,3 +1,4 @@
+use super::key_types::SessionSequence;
 use super::{
     ChainMetadata, DEFAULT_SEGMENT_MAX_BYTES, DEFAULT_SEGMENT_MAX_ENTRIES, DURABLE_APPEND_LOCK,
     GlobalMetadata, KvAuditStorage, NS_CHAIN_HEADS, NS_CHAIN_METADATA, NS_COMMITTED_ENTRIES,
@@ -23,7 +24,7 @@ struct ChainState {
 
 struct SequenceState {
     expected: Option<Vec<u8>>,
-    next: u64,
+    next: SessionSequence,
 }
 
 struct PreparedBatch {
@@ -207,7 +208,7 @@ impl KvAuditStorage {
             .allocate_session_sequence(&mut prepared.sequences, &session_key)
             .await?;
         prepared.session_indexes.push((
-            format!("{session_key}:{sequence:020}:{}", entry.id.0),
+            format!("{session_key}:{:020}:{}", sequence.value(), entry.id.0),
             vec![1],
         ));
         prepared
@@ -223,10 +224,12 @@ impl KvAuditStorage {
         &self,
         sequences: &mut HashMap<String, SequenceState>,
         session_key: &str,
-    ) -> AuditResult<u64> {
+    ) -> AuditResult<SessionSequence> {
         if let Some(state) = sequences.get_mut(session_key) {
             let sequence = state.next;
-            state.next = sequence.saturating_add(1);
+            state.next = sequence.checked_next().map_err(|error| {
+                AuditError::StorageError(format!("{error} for session index key {session_key}"))
+            })?;
             return Ok(sequence);
         }
         let expected = self
@@ -234,14 +237,15 @@ impl KvAuditStorage {
             .get(NS_SESSION_SEQUENCE, session_key)
             .await
             .map_err(|error| AuditError::StorageError(error.to_string()))?;
-        let sequence = expected.as_deref().map_or(Ok(0), parse_sequence)?;
-        sequences.insert(
-            session_key.to_owned(),
-            SequenceState {
-                expected,
-                next: sequence.saturating_add(1),
-            },
-        );
+        let sequence = expected
+            .as_deref()
+            .map(parse_sequence)
+            .transpose()?
+            .unwrap_or(SessionSequence::ZERO);
+        let next = sequence.checked_next().map_err(|error| {
+            AuditError::StorageError(format!("{error} for session index key {session_key}"))
+        })?;
+        sequences.insert(session_key.to_owned(), SequenceState { expected, next });
         Ok(sequence)
     }
 }
@@ -423,7 +427,7 @@ fn append_sequence_changes(
         });
         mutations.push(KvBatchMutation::Set {
             key: kv_key(NS_SESSION_SEQUENCE, &session_key)?,
-            value: sequence.next.to_be_bytes().to_vec(),
+            value: sequence.next.bytes().to_vec(),
         });
     }
     Ok(())

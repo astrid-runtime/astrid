@@ -5,13 +5,34 @@
 //! record that was inspected, then either release that reservation after a
 //! preparation failure or consume it after the profile update succeeds.
 
-use super::{DurablePairToken, DurablePairTokenStore, SYSTEM_KV_NAMESPACE, now_epoch};
+use super::{
+    DurablePairToken, DurablePairTokenStore, RECORD_PREFIX, SYSTEM_KV_NAMESPACE, TokenHash,
+    now_epoch,
+};
 
 const RESERVATION_PREFIX: &str = "reservation:";
 
+/// Durable locations for one pair token. The only legal movements are
+/// `Redeemable -> Reserved` while provisioning and `Reserved -> Redeemable`
+/// on preparation failure, or `Reserved -> Absent` on successful consume.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReservationState {
+    Redeemable,
+    Reserved,
+}
+
+impl ReservationState {
+    fn key(self, hash: &TokenHash) -> String {
+        match self {
+            Self::Redeemable => format!("{RECORD_PREFIX}{}", hash.as_str()),
+            Self::Reserved => format!("{RESERVATION_PREFIX}{}", hash.as_str()),
+        }
+    }
+}
+
 impl DurablePairTokenStore {
-    fn reservation_key(hash: &str) -> String {
-        format!("{RESERVATION_PREFIX}{hash}")
+    fn reservation_key(hash: &TokenHash) -> String {
+        ReservationState::Reserved.key(hash)
     }
 
     /// Read one unexpired token without consuming it.
@@ -27,7 +48,8 @@ impl DurablePairTokenStore {
         &self,
         token_hash: &str,
     ) -> astrid_storage::StorageResult<Option<DurablePairToken>> {
-        let key = Self::key(token_hash);
+        let hash = TokenHash::parse(token_hash)?;
+        let key = ReservationState::Redeemable.key(&hash);
         let Some(value) = self.backend.get(SYSTEM_KV_NAMESPACE, &key).await? else {
             return Ok(None);
         };
@@ -55,8 +77,9 @@ impl DurablePairTokenStore {
             return Ok(false);
         }
         let expected_value = Self::encode(expected)?;
-        let key = Self::key(&expected.token_hash);
-        let reservation_key = Self::reservation_key(&expected.token_hash);
+        let hash = TokenHash::parse(&expected.token_hash)?;
+        let key = ReservationState::Redeemable.key(&hash);
+        let reservation_key = Self::reservation_key(&hash);
         self.apply(
             vec![
                 astrid_storage::KvBatchCondition::ValueEquals {
@@ -86,8 +109,9 @@ impl DurablePairTokenStore {
         &self,
         token_hash: &str,
     ) -> astrid_storage::StorageResult<Option<Vec<u8>>> {
+        let hash = TokenHash::parse(token_hash)?;
         self.backend
-            .get(SYSTEM_KV_NAMESPACE, &Self::reservation_key(token_hash))
+            .get(SYSTEM_KV_NAMESPACE, &Self::reservation_key(&hash))
             .await
     }
 
@@ -108,8 +132,9 @@ impl DurablePairTokenStore {
             return Ok(false);
         }
         let expected_value = Self::encode(expected)?;
-        let key = Self::key(&expected.token_hash);
-        let reservation_key = Self::reservation_key(&expected.token_hash);
+        let hash = TokenHash::parse(&expected.token_hash)?;
+        let key = ReservationState::Redeemable.key(&hash);
+        let reservation_key = Self::reservation_key(&hash);
         self.apply(
             vec![
                 astrid_storage::KvBatchCondition::ValueEquals {
@@ -147,7 +172,8 @@ impl DurablePairTokenStore {
             return Ok(false);
         }
         let expected_value = Self::encode(expected)?;
-        let reservation_key = Self::reservation_key(&expected.token_hash);
+        let hash = TokenHash::parse(&expected.token_hash)?;
+        let reservation_key = Self::reservation_key(&hash);
         self.apply(
             vec![astrid_storage::KvBatchCondition::ValueEquals {
                 key: astrid_storage::KvEntryKey::new(SYSTEM_KV_NAMESPACE, &reservation_key)?,
@@ -169,7 +195,8 @@ impl DurablePairTokenStore {
     ///
     /// Returns a storage error if the conditional delete cannot be applied.
     pub async fn revoke(&self, token_hash: &str) -> astrid_storage::StorageResult<bool> {
-        let key = Self::key(token_hash);
+        let hash = TokenHash::parse(token_hash)?;
+        let key = ReservationState::Redeemable.key(&hash);
         if let Some(value) = self.backend.get(SYSTEM_KV_NAMESPACE, &key).await? {
             Self::decode(&value)?;
             return self
@@ -185,7 +212,7 @@ impl DurablePairTokenStore {
                 .await;
         }
 
-        let reservation_key = Self::reservation_key(token_hash);
+        let reservation_key = Self::reservation_key(&hash);
         let Some(value) = self.reservation(token_hash).await? else {
             return Ok(false);
         };
@@ -245,7 +272,8 @@ impl DurablePairTokenStore {
             if token.expires_at_epoch > now {
                 continue;
             }
-            let key = Self::key(&token.token_hash);
+            let hash = TokenHash::parse(&token.token_hash)?;
+            let key = ReservationState::Redeemable.key(&hash);
             let Some(value) = self.backend.get(SYSTEM_KV_NAMESPACE, &key).await? else {
                 continue;
             };
@@ -265,5 +293,27 @@ impl DurablePairTokenStore {
             }
         }
         Ok(removed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reservation_state_keys_are_distinct_and_canonical() {
+        let hash = TokenHash::parse(&crate::pair_token::hash_token("reservation key"))
+            .expect("hash_token emits a canonical fingerprint");
+        let redeemable = ReservationState::Redeemable.key(&hash);
+        let reserved = ReservationState::Reserved.key(&hash);
+        assert_ne!(redeemable, reserved);
+        assert!(redeemable.starts_with(RECORD_PREFIX));
+        assert!(reserved.starts_with(RESERVATION_PREFIX));
+    }
+
+    #[test]
+    fn token_hash_rejects_noncanonical_identifiers_before_key_derivation() {
+        assert!(TokenHash::parse("sha256:deadbeef").is_err());
+        assert!(TokenHash::parse("blake3:ABCDEF").is_err());
     }
 }

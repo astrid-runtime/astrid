@@ -1,3 +1,4 @@
+use super::key_types::SessionSequence;
 use astrid_core::SessionId;
 
 use crate::error::{AuditError, AuditResult};
@@ -12,9 +13,6 @@ pub(super) fn chain_head_key(
     }
 }
 
-pub(super) fn parse_sequence(bytes: &[u8]) -> AuditResult<u64> {
-    let encoded: [u8; 8] = bytes.try_into().map_err(|_| {
-        AuditError::StorageError("invalid audit session sequence encoding".to_string())
-    })?;
-    Ok(u64::from_be_bytes(encoded))
+pub(super) fn parse_sequence(bytes: &[u8]) -> AuditResult<SessionSequence> {
+    SessionSequence::from_bytes(bytes).map_err(|error| AuditError::StorageError(error.to_owned()))
 }

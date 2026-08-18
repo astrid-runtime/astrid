@@ -43,6 +43,10 @@ use tracing::warn;
 mod storage_migration;
 use storage_migration::{read_legacy_source, retire_legacy_file};
 
+#[path = "pair_token/token_hash.rs"]
+mod token_hash;
+use token_hash::TokenHash;
+
 mod durable_reservation;
 
 const STORE_SCHEMA_VERSION: u32 = 1;
@@ -145,16 +149,12 @@ impl DurablePairTokenStore {
         Ok(Self { backend })
     }
 
-    fn key(hash: &str) -> String {
-        format!("{RECORD_PREFIX}{hash}")
+    fn key(hash: &TokenHash) -> String {
+        format!("{RECORD_PREFIX}{}", hash.as_str())
     }
 
     fn validate_record(token: &DurablePairToken) -> astrid_storage::StorageResult<()> {
-        if canonical_fingerprint(&token.token_hash).as_deref() != Some(token.token_hash.as_str()) {
-            return Err(astrid_storage::StorageError::Serialization(
-                "pair-token record has a non-canonical token identifier".to_owned(),
-            ));
-        }
+        let _ = TokenHash::parse(&token.token_hash)?;
         if token.expires_at_epoch <= token.issued_at_epoch
             || token.expires_at_epoch.saturating_sub(token.issued_at_epoch) > MAX_EXPIRY_SECS
             || token.label.as_ref().is_some_and(|label| label.len() > 4096)
@@ -299,7 +299,7 @@ impl DurablePairTokenStore {
                 scope: token.scope.clone(),
             };
             let value = Self::encode(&durable)?;
-            let key = Self::key(&durable.token_hash);
+            let key = Self::key(&TokenHash::parse(&durable.token_hash)?);
             conditions.push(astrid_storage::KvBatchCondition::ValueEquals {
                 key: astrid_storage::KvEntryKey::new(SYSTEM_KV_NAMESPACE, &key)?,
                 expected: None,
@@ -376,7 +376,8 @@ impl DurablePairTokenStore {
     /// Returns a storage error if the conditional batch cannot be applied.
     pub async fn issue(&self, token: &DurablePairToken) -> astrid_storage::StorageResult<bool> {
         let value = Self::encode(token)?;
-        let key = Self::key(&token.token_hash);
+        let hash = TokenHash::parse(&token.token_hash)?;
+        let key = Self::key(&hash);
         self.apply(
             vec![astrid_storage::KvBatchCondition::ValueEquals {
                 key: astrid_storage::KvEntryKey::new(SYSTEM_KV_NAMESPACE, &key)?,
@@ -400,7 +401,8 @@ impl DurablePairTokenStore {
         &self,
         token_hash: &str,
     ) -> astrid_storage::StorageResult<Option<DurablePairToken>> {
-        let key = Self::key(token_hash);
+        let hash = TokenHash::parse(token_hash)?;
+        let key = Self::key(&hash);
         let Some(value) = self.backend.get(SYSTEM_KV_NAMESPACE, &key).await? else {
             return Ok(None);
         };

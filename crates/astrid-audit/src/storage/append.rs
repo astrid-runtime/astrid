@@ -1,3 +1,6 @@
+use super::key_types::{
+    ChainKey, SegmentIndexKey, SessionIndexKey, SessionKey, SessionSequence, SessionSequenceBytes,
+};
 use super::{
     AuditStorage, ChainMetadata, DEFAULT_SEGMENT_MAX_BYTES, DEFAULT_SEGMENT_MAX_ENTRIES,
     DURABLE_APPEND_LOCK, GlobalMetadata, KvAuditStorage, NS_APPEND_INTENTS, NS_CHAIN_HEADS,
@@ -9,7 +12,7 @@ use crate::error::{AuditError, AuditResult};
 use astrid_capabilities::AuditEntryId;
 
 struct Preparation {
-    head_key: String,
+    head_key: ChainKey,
     expected_head_bytes: Option<Vec<u8>>,
     metadata_bytes: Option<Vec<u8>>,
     prior: ChainMetadata,
@@ -29,24 +32,24 @@ struct ChainTransition {
 #[derive(serde::Deserialize, serde::Serialize)]
 struct AppendIntent {
     entry: AuditEntry,
-    head_key: String,
-    session_sequence_key: String,
-    expected_session_sequence: Option<Vec<u8>>,
-    next_session_sequence: Vec<u8>,
-    session_index_key: String,
+    head_key: ChainKey,
+    session_sequence_key: SessionKey,
+    expected_session_sequence: Option<SessionSequenceBytes>,
+    next_session_sequence: SessionSequenceBytes,
+    session_index_key: SessionIndexKey,
     expected_head: Option<Vec<u8>>,
     expected_metadata: Option<Vec<u8>>,
     next_metadata: ChainMetadata,
     expected_global: Option<Vec<u8>>,
     next_global: GlobalMetadata,
-    segment_key: Option<String>,
+    segment_key: Option<SegmentIndexKey>,
 }
 
 struct SessionSequenceWrite {
-    sequence_key: String,
-    expected: Option<Vec<u8>>,
-    next_sequence: Vec<u8>,
-    index_key: String,
+    sequence_key: SessionKey,
+    expected: Option<SessionSequenceBytes>,
+    next_sequence: SessionSequenceBytes,
+    index_key: SessionIndexKey,
 }
 
 const APPEND_INTENT_KEY: &str = "current";
@@ -77,7 +80,7 @@ impl KvAuditStorage {
         let transition = advance_chain(entry, &prepared.prior, entry_bytes, &mut global.metadata);
         account_global_append(&mut global.metadata, &transition, entry_bytes);
         let segment_key =
-            sealed_segment_key(&prepared.head_key, &transition.next, &global.metadata);
+            sealed_segment_key(&prepared.head_key, &transition.next, &global.metadata)?;
         let sequence = self
             .prepare_session_sequence(&entry.session_id, &entry.id)
             .await?;
@@ -87,7 +90,7 @@ impl KvAuditStorage {
                 &prepared,
                 &transition.next,
                 &global,
-                segment_key.as_deref(),
+                segment_key.as_ref(),
                 &sequence,
             )
             .await?;
@@ -95,7 +98,7 @@ impl KvAuditStorage {
         self.commit_entry_and_head(&prepared, &intent).await?;
         self.persist_chain_transition(entry, &prepared, &transition.next)
             .await?;
-        self.persist_sealed_segment(segment_key.as_deref(), &transition.next)
+        self.persist_sealed_segment(segment_key.as_ref(), &transition.next)
             .await?;
         self.persist_append_global(&global).await?;
         self.remove_append_intent().await?;
@@ -133,7 +136,7 @@ impl KvAuditStorage {
             })?;
         self.recover_cas(
             NS_CHAIN_HEADS,
-            &intent.head_key,
+            intent.head_key.as_str(),
             intent.expected_head.as_deref(),
             &next_head,
         )
@@ -142,12 +145,12 @@ impl KvAuditStorage {
             .map_err(|error| AuditError::SerializationError(error.to_string()))?;
         self.recover_cas(
             NS_CHAIN_METADATA,
-            &intent.head_key,
+            intent.head_key.as_str(),
             intent.expected_metadata.as_deref(),
             &next_metadata,
         )
         .await?;
-        self.persist_sealed_segment(intent.segment_key.as_deref(), &intent.next_metadata)
+        self.persist_sealed_segment(intent.segment_key.as_ref(), &intent.next_metadata)
             .await?;
         let next_global = serde_json::to_vec(&intent.next_global)
             .map_err(|error| AuditError::SerializationError(error.to_string()))?;
@@ -196,22 +199,22 @@ impl KvAuditStorage {
         prepared: &Preparation,
         next_metadata: &ChainMetadata,
         global: &GlobalState,
-        segment_key: Option<&str>,
+        segment_key: Option<&SegmentIndexKey>,
         sequence: &SessionSequenceWrite,
     ) -> AuditResult<AppendIntent> {
         let intent = AppendIntent {
             entry: entry.clone(),
             head_key: prepared.head_key.clone(),
             session_sequence_key: sequence.sequence_key.clone(),
-            expected_session_sequence: sequence.expected.clone(),
-            next_session_sequence: sequence.next_sequence.clone(),
+            expected_session_sequence: sequence.expected,
+            next_session_sequence: sequence.next_sequence,
             session_index_key: sequence.index_key.clone(),
             expected_head: prepared.expected_head_bytes.clone(),
             expected_metadata: prepared.metadata_bytes.clone(),
             next_metadata: next_metadata.clone(),
             expected_global: global.expected_bytes.clone(),
             next_global: global.metadata.clone(),
-            segment_key: segment_key.map(str::to_owned),
+            segment_key: segment_key.cloned(),
         };
         let bytes = serde_json::to_vec(&intent)
             .map_err(|error| AuditError::SerializationError(error.to_string()))?;
@@ -227,21 +230,36 @@ impl KvAuditStorage {
         session_id: &astrid_core::SessionId,
         id: &AuditEntryId,
     ) -> AuditResult<SessionSequenceWrite> {
-        let sequence_key = session_id.0.to_string();
+        let sequence_key = SessionKey::new(session_id.0.to_string())
+            .map_err(|error| AuditError::StorageError(error.to_owned()))?;
         let expected = self
             .store
-            .get(NS_SESSION_SEQUENCE, &sequence_key)
+            .get(NS_SESSION_SEQUENCE, sequence_key.as_str())
             .await
             .map_err(|error| AuditError::StorageError(error.to_string()))?;
-        let current = expected.as_deref().map_or(Ok(0), super::parse_sequence)?;
-        let next = current.checked_add(1).ok_or_else(|| {
-            AuditError::StorageError("audit session sequence exhausted".to_owned())
-        })?;
-        let index_key = format!("{sequence_key}:{next:020}:{}", id.0);
+        let current = expected
+            .as_deref()
+            .map(super::parse_sequence)
+            .transpose()?
+            .unwrap_or(SessionSequence::ZERO);
+        let next = current
+            .checked_next()
+            .map_err(|error| AuditError::StorageError(error.to_owned()))?;
+        let index_key = SessionIndexKey::new(format!(
+            "{}:{:020}:{}",
+            sequence_key.as_str(),
+            next.value(),
+            id.0
+        ))
+        .map_err(|error| AuditError::StorageError(error.to_owned()))?;
         Ok(SessionSequenceWrite {
             sequence_key,
-            expected,
-            next_sequence: next.to_be_bytes().to_vec(),
+            expected: expected
+                .as_deref()
+                .map(SessionSequenceBytes::from_bytes)
+                .transpose()
+                .map_err(|error| AuditError::StorageError(error.to_owned()))?,
+            next_sequence: SessionSequenceBytes::from_sequence(next),
             index_key,
         })
     }
@@ -265,10 +283,11 @@ impl KvAuditStorage {
         if current.as_ref() != expected {
             return Ok(None);
         }
-        let head_key = chain_head_key(&entry.session_id, entry.principal.as_ref());
+        let head_key = ChainKey::new(chain_head_key(&entry.session_id, entry.principal.as_ref()))
+            .map_err(|error| AuditError::StorageError(error.to_owned()))?;
         let stored_head = self
             .store
-            .get(NS_CHAIN_HEADS, &head_key)
+            .get(NS_CHAIN_HEADS, head_key.as_str())
             .await
             .map_err(|error| AuditError::StorageError(error.to_string()))?;
         let (metadata_bytes, metadata) = self
@@ -302,7 +321,7 @@ impl KvAuditStorage {
 
     async fn reconcile_stored_head(
         &self,
-        head_key: &str,
+        head_key: &ChainKey,
         stored: Option<&[u8]>,
         expected: Option<&[u8]>,
     ) -> AuditResult<bool> {
@@ -313,7 +332,7 @@ impl KvAuditStorage {
             return Ok(false);
         };
         self.store
-            .compare_and_swap(NS_CHAIN_HEADS, head_key, stored, expected.to_vec())
+            .compare_and_swap(NS_CHAIN_HEADS, head_key.as_str(), stored, expected.to_vec())
             .await
             .map_err(|error| AuditError::StorageError(error.to_string()))
     }
@@ -347,7 +366,7 @@ impl KvAuditStorage {
             .store
             .compare_and_swap(
                 NS_CHAIN_HEADS,
-                &prepared.head_key,
+                prepared.head_key.as_str(),
                 prepared.expected_head_bytes.as_deref(),
                 intent.entry.id.0.to_string().into_bytes(),
             )
@@ -380,9 +399,12 @@ impl KvAuditStorage {
             .store
             .compare_and_swap(
                 NS_SESSION_SEQUENCE,
-                &intent.session_sequence_key,
-                intent.expected_session_sequence.as_deref(),
-                intent.next_session_sequence.clone(),
+                intent.session_sequence_key.as_str(),
+                intent
+                    .expected_session_sequence
+                    .as_ref()
+                    .map(SessionSequenceBytes::as_bytes),
+                intent.next_session_sequence.as_bytes().to_vec(),
             )
             .await
             .map_err(|error| AuditError::StorageError(error.to_string()))?;
@@ -391,10 +413,10 @@ impl KvAuditStorage {
         }
         let current = self
             .store
-            .get(NS_SESSION_SEQUENCE, &intent.session_sequence_key)
+            .get(NS_SESSION_SEQUENCE, intent.session_sequence_key.as_str())
             .await
             .map_err(|error| AuditError::StorageError(error.to_string()))?;
-        if current.as_deref() == Some(intent.next_session_sequence.as_slice()) {
+        if current.as_deref() == Some(intent.next_session_sequence.as_bytes()) {
             return self.write_session_index(intent).await;
         }
         Err(AuditError::StorageError(
@@ -404,7 +426,11 @@ impl KvAuditStorage {
 
     async fn write_session_index(&self, intent: &AppendIntent) -> AuditResult<()> {
         self.store
-            .set(NS_SESSION_ENTRIES, &intent.session_index_key, vec![1])
+            .set(
+                NS_SESSION_ENTRIES,
+                intent.session_index_key.as_str(),
+                vec![1],
+            )
             .await
             .map_err(|error| AuditError::StorageError(error.to_string()))
     }
@@ -433,7 +459,7 @@ impl KvAuditStorage {
 
     async fn persist_sealed_segment(
         &self,
-        segment_key: Option<&str>,
+        segment_key: Option<&SegmentIndexKey>,
         next: &ChainMetadata,
     ) -> AuditResult<()> {
         let Some(segment_key) = segment_key else {
@@ -442,7 +468,7 @@ impl KvAuditStorage {
         let segment_bytes = serde_json::to_vec(next)
             .map_err(|error| AuditError::SerializationError(error.to_string()))?;
         self.store
-            .set(NS_SEGMENT_INDEX, segment_key, segment_bytes)
+            .set(NS_SEGMENT_INDEX, segment_key.as_str(), segment_bytes)
             .await
             .map_err(|error| AuditError::StorageError(error.to_string()))
     }
@@ -556,14 +582,19 @@ fn account_global_append(
 }
 
 fn sealed_segment_key(
-    head_key: &str,
+    head_key: &ChainKey,
     next: &ChainMetadata,
     global: &GlobalMetadata,
-) -> Option<String> {
-    next.sealed.then(|| {
-        format!(
-            "{:020}:{head_key}:{:020}",
-            global.next_seal_ordinal, next.segment
-        )
-    })
+) -> AuditResult<Option<SegmentIndexKey>> {
+    next.sealed
+        .then(|| {
+            SegmentIndexKey::new(format!(
+                "{:020}:{}:{:020}",
+                global.next_seal_ordinal,
+                head_key.as_str(),
+                next.segment
+            ))
+            .map_err(|error| AuditError::StorageError(error.to_owned()))
+        })
+        .transpose()
 }

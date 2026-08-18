@@ -13,6 +13,7 @@ mod append;
 mod append_batch;
 mod global;
 mod helpers;
+mod key_types;
 mod metadata;
 mod migration_cas;
 mod migration_marker;
@@ -27,6 +28,7 @@ use global::GlobalMetadata;
 #[cfg(test)]
 pub(crate) use global::GlobalMetadata as TestGlobalMetadata;
 use helpers::{chain_head_key, parse_sequence};
+use key_types::SessionSequence;
 use metadata::ChainMetadata;
 #[cfg(test)]
 pub(crate) use metadata::ChainMetadata as TestChainMetadata;
@@ -386,9 +388,13 @@ impl KvAuditStorage {
                 .get(NS_SESSION_SEQUENCE, &key)
                 .await
                 .map_err(|e| AuditError::StorageError(e.to_string()))?;
-            let sequence = current.as_deref().map_or(Ok(0), parse_sequence)?;
-            let next = sequence.checked_add(1).ok_or_else(|| {
-                AuditError::StorageError(format!("session index sequence exhausted for {key}"))
+            let sequence = current
+                .as_deref()
+                .map(parse_sequence)
+                .transpose()?
+                .unwrap_or(SessionSequence::ZERO);
+            let next = sequence.checked_next().map_err(|error| {
+                AuditError::StorageError(format!("{error} for session index key {key}"))
             })?;
             if self
                 .store
@@ -396,12 +402,12 @@ impl KvAuditStorage {
                     NS_SESSION_SEQUENCE,
                     &key,
                     current.as_deref(),
-                    next.to_be_bytes().to_vec(),
+                    next.bytes().to_vec(),
                 )
                 .await
                 .map_err(|e| AuditError::StorageError(e.to_string()))?
             {
-                return Ok(sequence);
+                return Ok(sequence.value());
             }
         }
     }
