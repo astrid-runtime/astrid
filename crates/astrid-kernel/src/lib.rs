@@ -66,7 +66,7 @@ mod storage_mount;
 
 use arc_swap::ArcSwap;
 use astrid_audit::AuditLog;
-#[cfg(not(target_family = "wasm"))]
+#[cfg(unix)]
 use astrid_audit::{AuditCapacityProvider, AuditError};
 use astrid_capabilities::{CapabilityStore, DirHandle};
 use astrid_capsule::profile_cache::PrincipalProfileCache;
@@ -456,7 +456,7 @@ impl KernelResources {
         }
     }
 
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[cfg(unix)]
     fn with_layout_origin(mut self, origin: legacy_migration_barrier::LayoutOrigin) -> Self {
         self.layout_origin = Some(origin);
         self
@@ -3741,12 +3741,12 @@ fn seed_test_migration_ledger(home: &astrid_core::dirs::AstridHome) {
     .expect("test kernel: write migration ledger");
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(unix)]
 struct RuntimeAuditCapacityProvider {
     store: astrid_storage::RuntimePrincipalStore,
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(unix)]
 impl AuditCapacityProvider for RuntimeAuditCapacityProvider {
     fn available_bytes(&self) -> astrid_audit::AuditResult<Option<u64>> {
         self.store

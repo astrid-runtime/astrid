@@ -527,6 +527,9 @@ fn device_id(metadata: &fs::Metadata) -> u64 {
     }
 }
 
+// Windows retirement uses write-through platform helpers; retain the common
+// fallible signature for the cross-platform migration flow.
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 fn sync_parent(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     if let Some(parent) = path.parent() {

@@ -817,6 +817,9 @@ pub(super) fn sync_parent(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+// Windows publication uses write-through replacement APIs; retain one
+// fallible signature for shared retirement call sites.
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 pub(super) fn sync_directory(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {

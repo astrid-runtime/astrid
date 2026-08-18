@@ -62,12 +62,14 @@ const CAPSULE_AUTHORITY_RECEIPT_NAME: &str = "capsule-authority-v1.receipt";
 /// sentinel.  A bool cannot distinguish a brand-new home from a cut-over
 /// home that lost its completion ledger.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) enum LayoutOrigin {
     Fresh,
     Legacy,
     ExistingV2,
 }
 
+#[cfg(unix)]
 pub(crate) fn capture_layout_origin(home: &AstridHome) -> io::Result<LayoutOrigin> {
     match home.layout_version()?.as_deref() {
         None => Ok(LayoutOrigin::Fresh),

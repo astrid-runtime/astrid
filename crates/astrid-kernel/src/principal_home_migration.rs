@@ -337,6 +337,9 @@ fn retire_empty_tree(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+// Windows retirement uses write-through platform helpers; retain the common
+// fallible signature for the cross-platform migration flow.
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 fn sync_parent(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     if let Some(parent) = path.parent() {

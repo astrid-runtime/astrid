@@ -551,6 +551,9 @@ fn sync_parent(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
+// Windows publication is already write-through; keep the shared fallible
+// signature so migration call sites remain platform-independent.
+#[allow(clippy::unnecessary_wraps)]
 fn sync_parent(_path: &Path) -> io::Result<()> {
     Ok(())
 }
