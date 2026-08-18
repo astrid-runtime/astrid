@@ -10,6 +10,12 @@ use std::path::PathBuf;
 
 use super::{AstridHome, MAX_BYTES, MAX_ENTRIES, PrincipalId, PrincipalUid, SourceIdentity};
 
+#[path = "legacy_migration_barrier_fs_hooks.rs"]
+mod hooks;
+use hooks::run_test_retire_leaf_hook;
+#[cfg(test)]
+pub(super) use hooks::set_test_retire_leaf_hook;
+
 pub(super) fn add_source(
     sources: &mut BTreeMap<String, SourceIdentity>,
     name: String,
@@ -302,11 +308,37 @@ pub(super) fn retire_tree(
                     ),
                 ));
             }
-            fs::remove_file(&child).map_err(io::Error::other)?;
+            retire_leaf(&child, child_meta.len(), &leaf_snapshot)?;
         }
     }
     sync_directory(path)?;
     fs::remove_dir(path).map_err(io::Error::other)
+}
+
+fn retire_leaf(child: &Path, expected_len: u64, leaf_snapshot: &SourceIdentity) -> io::Result<()> {
+    run_test_retire_leaf_hook(child);
+    let replacement_meta = fs::symlink_metadata(child).map_err(io::Error::other)?;
+    if replacement_meta.file_type().is_symlink()
+        || (!replacement_meta.is_file() && !replacement_meta.is_dir())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "legacy source contains redirect or special entry: {}",
+                child.display()
+            ),
+        ));
+    }
+    if replacement_meta.len() != expected_len || snapshot_path(child)? != *leaf_snapshot {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "legacy source changed before retirement: {}",
+                child.display()
+            ),
+        ));
+    }
+    fs::remove_file(child).map_err(io::Error::other)
 }
 
 /// Validate the released audit-source boundary on every native host.  Unix
@@ -819,11 +851,29 @@ fn active_mountpoint(path: &Path) -> io::Result<bool> {
                 .is_some_and(|mount| mount == canonical)
         }))
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        let parent_path = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(path);
+        if parent_path == path {
+            return Ok(true);
+        }
+        let target_stats = nix::sys::statfs::statfs(path).map_err(io::Error::from)?;
+        let parent_stats = nix::sys::statfs::statfs(parent_path).map_err(io::Error::from)?;
+        Ok(target_stats.filesystem_id() != parent_stats.filesystem_id())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = path;
         Ok(false)
     }
+}
+
+#[cfg(test)]
+pub(super) fn test_active_mountpoint(path: &Path) -> io::Result<bool> {
+    active_mountpoint(path)
 }
 
 #[cfg(target_os = "linux")]

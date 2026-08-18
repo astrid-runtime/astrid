@@ -137,6 +137,68 @@ async fn agent_delete_closes_authz_before_reclaiming() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn agent_delete_rejects_reappeared_legacy_secret_after_completed_ledger() {
+    let (_dir, kernel) = fixture().await;
+    let principal = PrincipalId::new("reappeared-secret").unwrap();
+    create(&kernel, &principal).await;
+    let principal_uid = kernel
+        .principal_directory
+        .uid_for(&principal)
+        .expect("principal UID");
+    crate::legacy_migration_barrier::record_absent_legacy_secret_for_test(
+        &kernel.astrid_home,
+        principal_uid,
+    )
+    .expect("absent legacy-secret ledger component");
+
+    // The completion ledger records that this participating alias had no
+    // legacy secret source. Recreating one after cut-over models a stale
+    // operator copy before deletion, not ordinary post-cutover state.
+    let secret_root = kernel.astrid_home.secrets_dir();
+    astrid_core::platform_fs::ensure_private_directory(&secret_root).expect("legacy secrets root");
+    let reappeared = secret_root.join(principal.as_str());
+    astrid_core::platform_fs::ensure_private_directory(&reappeared)
+        .expect("reappeared legacy secret scope");
+    let secret = reappeared.join("api_key");
+    std::fs::write(&secret, b"must-survive").expect("reappeared secret");
+
+    let retried = handlers::dispatch(
+        &kernel,
+        &PrincipalId::default(),
+        AdminRequestKind::AgentDelete {
+            principal: principal.clone(),
+        },
+    )
+    .await;
+
+    assert!(
+        matches!(retried, AdminResponseBody::Error(_)),
+        "agent.delete must fail closed when a completed-ledger secret source reappears"
+    );
+    assert!(
+        kernel
+            .identity_store
+            .resolve("cli", principal.as_str())
+            .await
+            .expect("identity lookup")
+            .is_some(),
+        "a blocked deletion must not unlink the principal identity"
+    );
+    assert!(
+        PrincipalProfile::path_for(&kernel.astrid_home, &principal).exists(),
+        "a blocked deletion must preserve the principal profile"
+    );
+    assert!(
+        secret.exists(),
+        "reappeared legacy secret must be preserved"
+    );
+    assert!(
+        reappeared.is_dir(),
+        "reappeared legacy scope must be preserved"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn agent_delete_purges_every_token_and_allowance_scope() {
     use astrid_approval::{Allowance, AllowanceId, AllowancePattern};
     use astrid_capabilities::{AuditEntryId, CapabilityToken, ResourcePattern, TokenScope};

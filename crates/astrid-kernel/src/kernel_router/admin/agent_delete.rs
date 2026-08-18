@@ -32,6 +32,17 @@ pub(super) async fn agent_delete(
             "principal deletion blocked by legacy migration barrier: {error}"
         ));
     }
+    if let Ok(uid) = kernel.principal_directory().uid_for(&principal)
+        && let Err(error) = crate::legacy_migration_barrier::ensure_legacy_secret_deletion_allowed(
+            &kernel.astrid_home,
+            &principal,
+            uid,
+        )
+    {
+        return err_internal(format!(
+            "principal deletion blocked by legacy secret provenance: {error}"
+        ));
+    }
     let pending = match prepare_identity_removal(kernel, &principal).await {
         Ok(pending) => pending,
         Err(response) => return response,
@@ -308,6 +319,14 @@ async fn retire_and_reclaim(
         .keys_dir()
         .join(format!("{principal}.key"));
     let secrets = kernel.astrid_home.secrets_dir().join(principal.as_str());
+    let secret_source_must_be_absent = match principal_uid {
+        Some(uid) => crate::legacy_migration_barrier::legacy_secret_source_must_be_absent(
+            &kernel.astrid_home,
+            uid,
+        )
+        .map_err(|error| format!("legacy secret migration provenance: {error}"))?,
+        None => false,
+    };
     let outcomes = tokio::task::spawn_blocking(move || {
         [
             ("home", reclaim_empty_dir(&home)),
@@ -315,7 +334,10 @@ async fn retire_and_reclaim(
             // Legacy file-secrets are no longer authoritative.  Retire only
             // the caller-owned, verified root; never recursively follow a
             // symlink or delete an arbitrary home tree.
-            ("secrets", reclaim_legacy_secret_root(&secrets)),
+            (
+                "secrets",
+                reclaim_legacy_secret_root(&secrets, secret_source_must_be_absent),
+            ),
         ]
     })
     .await
@@ -381,12 +403,21 @@ fn reclaim_file(path: &Path) -> Result<(), String> {
     }
 }
 
-pub(super) fn reclaim_legacy_secret_root(path: &Path) -> Result<(), String> {
+pub(super) fn reclaim_legacy_secret_root(
+    path: &Path,
+    secret_source_must_be_absent: bool,
+) -> Result<(), String> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(format!("{}: {error}", path.display())),
     };
+    if secret_source_must_be_absent {
+        return Err(format!(
+            "{}: legacy secret source reappeared after completed migration",
+            path.display()
+        ));
+    }
     if !metadata.is_dir() {
         return Err(format!(
             "{}: legacy secret root is not a directory",

@@ -332,6 +332,7 @@ async fn rollback_derived_principal(
         principal,
     )
     .map_err(|error| format!("legacy migration barrier blocked rollback: {error}"))?;
+    ensure_legacy_secret_rollback_allowed(kernel, principal)?;
     let pending = super::agent_delete::prepare_identity_removal(kernel, principal)
         .await
         .map_err(|response| format!("identity removal preparation returned {response:?}"))?;
@@ -397,7 +398,18 @@ async fn rollback_derived_principal(
         &mut cleanup_errors,
     );
     let legacy_secrets = kernel.astrid_home.secrets_dir().join(principal.as_str());
-    if let Err(error) = super::agent_delete::reclaim_legacy_secret_root(&legacy_secrets) {
+    let secret_source_must_be_absent = match pending.principal_uid() {
+        Some(uid) => crate::legacy_migration_barrier::legacy_secret_source_must_be_absent(
+            &kernel.astrid_home,
+            uid,
+        )
+        .map_err(|error| format!("legacy secret migration provenance: {error}"))?,
+        None => false,
+    };
+    if let Err(error) = super::agent_delete::reclaim_legacy_secret_root(
+        &legacy_secrets,
+        secret_source_must_be_absent,
+    ) {
         cleanup_errors.push(format!(
             "principal secrets {}: {error}",
             legacy_secrets.display()
@@ -414,6 +426,24 @@ async fn rollback_derived_principal(
     super::agent_delete::finish_identity_removal(kernel, principal, pending)
         .await
         .map_err(|response| format!("identity removal completion returned {response:?}"))
+}
+
+fn ensure_legacy_secret_rollback_allowed(
+    kernel: &crate::Kernel,
+    principal: &PrincipalId,
+) -> Result<(), String> {
+    if let Ok(uid) = kernel.principal_directory().uid_for(principal)
+        && let Err(error) = crate::legacy_migration_barrier::ensure_legacy_secret_deletion_allowed(
+            &kernel.astrid_home,
+            principal,
+            uid,
+        )
+    {
+        return Err(format!(
+            "legacy secret provenance blocked rollback: {error}"
+        ));
+    }
+    Ok(())
 }
 
 fn collect_remove_file(path: &Path, label: &str, errors: &mut Vec<String>) {

@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
+#[cfg(target_os = "macos")]
+use std::path::Path;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -74,15 +76,47 @@ fn layout_v2_incomplete_ledger_is_rejected() {
         complete: false,
         components: Vec::new(),
     };
-    fs::write(
-        ledger_path(&home),
-        canonical_json(&ledger).expect("canonical ledger"),
-    )
-    .expect("ledger");
+    let ledger_path = ledger_path(&home);
+    let bytes = canonical_json(&ledger).expect("canonical ledger");
+    fs::write(&ledger_path, bytes).expect("ledger");
+    make_private_file(&ledger_path);
 
     let error = reject_incomplete_layout_v2(&home).expect_err("incomplete ledger must fail closed");
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     assert!(error.to_string().contains("ledger is incomplete"));
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn completion_ledger_redirect_is_rejected_without_following_or_mutating_target() {
+    let (_root, home) = test_home();
+    fs::write(home.layout_version_path(), b"2").expect("layout sentinel");
+    let outside = tempfile::tempdir().expect("outside target");
+    let outside_ledger = outside.path().join("ledger.json");
+    let ledger = fresh_retirement_ledger(SourceIdentity::absent());
+    let bytes = canonical_json(&ledger).expect("canonical ledger");
+    fs::write(&outside_ledger, &bytes).expect("outside ledger");
+    let completion = ledger_path(&home);
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside_ledger, &completion).expect("ledger symlink");
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(&outside_ledger, &completion).expect("ledger reparse point");
+
+    let error = reject_incomplete_layout_v2(&home)
+        .expect_err("completion ledger redirects must fail closed");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(
+        fs::read(&outside_ledger).expect("outside ledger remains"),
+        bytes
+    );
+    assert!(
+        fs::symlink_metadata(&completion)
+            .expect("completion entry remains")
+            .file_type()
+            .is_symlink(),
+        "the redirected completion entry must not be replaced or followed"
+    );
 }
 
 #[test]
@@ -141,11 +175,10 @@ fn canonical_complete_ledger_is_admitted() {
     ledger
         .components
         .sort_by(|left, right| left.name.cmp(&right.name));
-    fs::write(
-        ledger_path(&home),
-        canonical_json(&ledger).expect("canonical ledger"),
-    )
-    .expect("ledger");
+    let ledger_path = ledger_path(&home);
+    let bytes = canonical_json(&ledger).expect("canonical ledger");
+    fs::write(&ledger_path, bytes).expect("ledger");
+    make_private_file(&ledger_path);
     reject_incomplete_layout_v2(&home).expect("complete canonical ledger is valid");
 }
 
@@ -497,6 +530,66 @@ async fn post_barrier_retirement_resumes_after_crash_and_rejects_reappeared_cow(
 }
 
 #[test]
+fn tmp_retirement_interruption_preserves_source_or_durable_component_proof() {
+    let (_root, home) = test_home();
+    fs::write(home.layout_version_path(), b"2").expect("layout sentinel");
+    home.ensure().expect("fresh home");
+    let alias = PrincipalId::default();
+    let uid = PrincipalUid::from_bytes([0x73; 32]);
+    let directory = PrincipalDirectory::default();
+    directory.register(alias.clone(), uid).expect("binding");
+    let source = home.principal_home(&alias).tmp_dir();
+    astrid_core::platform_fs::ensure_private_directory(&source).expect("tmp root");
+    let entry = source.join("leftover");
+    fs::write(&entry, b"disposable bytes").expect("tmp source");
+    make_private_file(&entry);
+    let expected = snapshot_path(&source).expect("tmp identity");
+    let name = format!("principal:{uid}:tmp");
+    let mut snapshots = BTreeMap::new();
+    snapshots.insert(name.clone(), expected.clone());
+    let mut ledger = fresh_retirement_ledger(SourceIdentity::absent());
+    ledger.components.push(MigrationComponent {
+        name: name.clone(),
+        source: expected.clone(),
+        destination_proof: format!(
+            "verified-discard-v1:source-digest={}:disposable=tmp",
+            expected.digest
+        ),
+    });
+    ledger
+        .components
+        .sort_by(|left, right| left.name.cmp(&right.name));
+    let ledger_bytes = canonical_json(&ledger).expect("canonical durable tmp proof");
+    astrid_core::platform_fs::atomic_write_private_file(&ledger_path(&home), &ledger_bytes)
+        .expect("durable tmp proof");
+
+    inject_tmp_retirement_interruption_once(&home);
+    retire_disposable_tmp_sources(&home, &directory, &snapshots).expect("tmp source retirement");
+    let error = interrupt_after_tmp_retirement_if_requested(&home)
+        .expect_err("injected crash must stop before the global ledger write");
+    assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+
+    let source_preserved =
+        source.exists() && snapshot_path(&source).is_ok_and(|actual| actual == expected);
+    let durable_proof = fs::read(ledger_path(&home))
+        .ok()
+        .and_then(|bytes| decode_canonical::<MigrationLedger>(&bytes, &ledger_path(&home)).ok())
+        .is_some_and(|ledger| {
+            ledger.components.iter().any(|component| {
+                component.name == name
+                    && component.source == expected
+                    && component
+                        .destination_proof
+                        .starts_with("verified-discard-v1:")
+            })
+        });
+    assert!(
+        source_preserved || durable_proof,
+        "an interrupted tmp retirement must retain the exact source or a canonical proof"
+    );
+}
+
+#[test]
 fn retirement_rejects_source_mutation_and_preserves_data() {
     let root = tempfile::tempdir().expect("temporary root");
     make_private_dir(root.path());
@@ -553,6 +646,117 @@ fn ordinary_tree_retirement_is_bottom_up_and_idempotent_at_call_site() {
     assert_eq!(
         snapshot_path(root.path()).expect("absent snapshot"),
         SourceIdentity::absent()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn retirement_rejects_same_uid_symlink_swap_before_unlink() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().expect("temporary root");
+    make_private_dir(root.path());
+    let source = root.path().join("entry");
+    fs::write(&source, b"source").expect("source");
+    make_private_file(&source);
+    let expected = snapshot_path(root.path()).expect("source identity");
+    let outside = tempfile::tempdir().expect("outside target");
+    let outside_file = outside.path().join("outside");
+    fs::write(&outside_file, b"outside").expect("outside file");
+    let outside_target = outside_file.clone();
+    fs_support::set_test_retire_leaf_hook(
+        source.clone(),
+        Box::new(move |path| {
+            fs::remove_file(path).expect("replace source");
+            symlink(&outside_target, path).expect("same-uid symlink replacement");
+        }),
+    );
+
+    let error = retire_tree(root.path(), &expected, &[])
+        .expect_err("a symlink replacement must fail closed");
+
+    assert!(error.to_string().contains("redirect") || error.to_string().contains("regular"));
+    assert!(
+        fs::symlink_metadata(&source)
+            .expect("replacement remains")
+            .file_type()
+            .is_symlink(),
+        "retirement must not unlink a replacement symlink"
+    );
+    assert_eq!(
+        fs::read(&outside_file).expect("outside survives"),
+        b"outside"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn retirement_rejects_same_uid_fifo_swap_before_unlink() {
+    use std::os::unix::fs::FileTypeExt;
+
+    use nix::sys::stat::Mode;
+    use nix::unistd::mkfifo;
+
+    let root = tempfile::tempdir().expect("temporary root");
+    make_private_dir(root.path());
+    let source = root.path().join("entry");
+    fs::write(&source, b"source").expect("source");
+    make_private_file(&source);
+    let expected = snapshot_path(root.path()).expect("source identity");
+    fs_support::set_test_retire_leaf_hook(
+        source.clone(),
+        Box::new(move |path| {
+            fs::remove_file(path).expect("replace source");
+            mkfifo(path, Mode::from_bits_truncate(0o600)).expect("same-uid fifo replacement");
+        }),
+    );
+
+    let error =
+        retire_tree(root.path(), &expected, &[]).expect_err("a FIFO replacement must fail closed");
+
+    assert!(error.to_string().contains("special") || error.to_string().contains("regular"));
+    assert!(
+        fs::symlink_metadata(&source)
+            .expect("replacement remains")
+            .file_type()
+            .is_fifo(),
+        "retirement must not unlink a replacement FIFO"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn retirement_rejects_same_uid_reparse_swap_before_unlink() {
+    let root = tempfile::tempdir().expect("temporary root");
+    make_private_dir(root.path());
+    let source = root.path().join("entry");
+    fs::write(&source, b"source").expect("source");
+    let expected = snapshot_path(root.path()).expect("source identity");
+    let outside = tempfile::tempdir().expect("outside target");
+    let outside_file = outside.path().join("outside");
+    fs::write(&outside_file, b"outside").expect("outside file");
+    fs_support::set_test_retire_leaf_hook(
+        source.clone(),
+        Box::new(move |path| {
+            fs::remove_file(path).expect("replace source");
+            std::os::windows::fs::symlink_file(&outside_file, path)
+                .expect("same-uid reparse replacement");
+        }),
+    );
+
+    let error = retire_tree(root.path(), &expected, &[])
+        .expect_err("a reparse replacement must fail closed");
+
+    assert!(error.to_string().contains("redirect") || error.to_string().contains("regular"));
+    assert!(fs::symlink_metadata(&source).is_ok(), "replacement remains");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_source_root_is_recognized_as_a_mounted_volume() {
+    assert!(
+        fs_support::test_active_mountpoint(Path::new("/")).expect("inspect macOS mount table"),
+        "the source-root mount must be treated as an active volume boundary"
     );
 }
 

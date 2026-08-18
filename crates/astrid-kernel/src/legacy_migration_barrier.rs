@@ -27,8 +27,12 @@ use astrid_storage::{KvStore, PrincipalDirectory, RuntimePrincipalStore};
 
 #[path = "legacy_migration_barrier_fs.rs"]
 mod fs_support;
+#[path = "legacy_migration_barrier_hooks.rs"]
+mod hooks;
 #[path = "legacy_migration_barrier_ledger.rs"]
 mod ledger;
+#[path = "legacy_migration_barrier_secret.rs"]
+mod secret;
 #[cfg(unix)]
 use crate::{preflight_legacy_audit_sources, retire_legacy_audit_dir};
 use fs_support::retire_tree;
@@ -41,11 +45,20 @@ use fs_support::{
 #[cfg(not(unix))]
 use fs_support::{preflight_legacy_audit_sources, retire_legacy_audit_dir};
 #[cfg(test)]
+pub(crate) use hooks::inject_tmp_retirement_interruption_once;
+pub(crate) use hooks::interrupt_after_tmp_retirement_if_requested;
+#[cfg(test)]
 use ledger::{MigrationComponent, canonical_json};
 use ledger::{
     MigrationLedger, SourceIdentity, collect_destination_proofs, decode_canonical,
     import_legacy_system_secrets, reject_unsupported_sources, validate_existing_proofs,
     validate_ledger_shape, write_ledger,
+};
+
+#[cfg(test)]
+pub(crate) use secret::record_absent_legacy_secret_for_test;
+pub(crate) use secret::{
+    ensure_legacy_secret_deletion_allowed, legacy_secret_source_must_be_absent,
 };
 
 const LEDGER_NAME: &str = "layout-v2-components.complete";
@@ -97,18 +110,14 @@ pub(crate) fn reject_incomplete_layout_v2(home: &AstridHome) -> io::Result<()> {
         return Ok(());
     }
     let path = ledger_path(home);
-    let bytes = fs::read(&path).map_err(|error| {
-        if error.kind() == io::ErrorKind::NotFound {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "Astrid layout sentinel is v2 but the component migration ledger is missing: {}",
-                    path.display()
-                ),
-            )
-        } else {
-            error
-        }
+    let bytes = read_bounded_file(&path, MAX_BYTES)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Astrid layout sentinel is v2 but the component migration ledger is missing: {}",
+                path.display()
+            ),
+        )
     })?;
     let ledger: MigrationLedger = decode_canonical(&bytes, &path)?;
     if ledger.schema != LEDGER_SCHEMA || !ledger.complete || ledger.components.is_empty() {
@@ -368,6 +377,7 @@ async fn migrate_legacy_layout(
     import_legacy_control_state(home, store, directory).await?;
     migrate_legacy_audit(home, audit).await?;
     retire_disposable_tmp_sources(home, directory, &snapshots)?;
+    interrupt_after_tmp_retirement_if_requested(home)?;
     ensure_no_unretired_component_sources(home, directory, true)?;
     crate::principal_home_migration::retire_migrated_legacy_principal_homes(home, directory)?;
     let proofs = collect_destination_proofs(home, store, directory, &snapshots, true).await?;
