@@ -70,7 +70,7 @@ pub(crate) enum LayoutOrigin {
     ExistingV2,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, test))]
 pub(crate) fn capture_layout_origin(home: &AstridHome) -> io::Result<LayoutOrigin> {
     match home.layout_version()?.as_deref() {
         None => Ok(LayoutOrigin::Fresh),
