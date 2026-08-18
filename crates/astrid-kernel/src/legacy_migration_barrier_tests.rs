@@ -386,6 +386,42 @@ fn fresh_retirement_ledger(cow: SourceIdentity) -> MigrationLedger {
     }
 }
 
+#[test]
+fn empty_secret_root_requires_an_exact_source_bound_proof() {
+    let uid = PrincipalUid::from_bytes([0x61; 32]);
+    let source = SourceIdentity {
+        digest: "a".repeat(64),
+        entries: 0,
+        bytes: 0,
+        present: true,
+    };
+    let mut ledger = fresh_retirement_ledger(SourceIdentity::absent());
+    ledger.components.extend([
+        MigrationComponent {
+            name: format!("principal:{uid}:home"),
+            source: SourceIdentity::absent(),
+            destination_proof: "absent".to_owned(),
+        },
+        MigrationComponent {
+            name: format!("principal:{uid}:secrets"),
+            destination_proof: format!("verified-empty-v1:source-digest={}", source.digest),
+            source,
+        },
+    ]);
+    ledger
+        .components
+        .sort_by(|left, right| left.name.cmp(&right.name));
+
+    validate_ledger_shape(&ledger).expect("empty secret proof is source-bound");
+    let secret = ledger
+        .components
+        .iter_mut()
+        .find(|component| component.name.ends_with(":secrets"))
+        .expect("secret component");
+    secret.source.entries = 1;
+    assert!(validate_ledger_shape(&ledger).is_err());
+}
+
 #[tokio::test]
 async fn post_barrier_retirement_resumes_after_crash_and_rejects_reappeared_cow() {
     let root = tempfile::tempdir().expect("temporary home");

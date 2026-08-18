@@ -333,6 +333,9 @@ async fn principal_secret_migration_proof(
     if !source.present {
         return Ok("absent".to_owned());
     }
+    if source.entries == 0 && source.bytes == 0 {
+        return Ok(format!("verified-empty-v1:source-digest={}", source.digest));
+    }
 
     // This proof describes the frozen legacy import, not the mutable capsule
     // registry. Capsules installed after cut-over must not invalidate the
@@ -695,12 +698,15 @@ pub(super) fn validate_ledger_shape(ledger: &MigrationLedger) -> io::Result<()> 
         }
         if component.name.ends_with(":secrets") && component.source.present {
             let expected = format!("source-digest={}", component.source.digest);
-            if !component
+            let empty_source = component.source.entries == 0 && component.source.bytes == 0;
+            let verified_empty = empty_source
+                && component.destination_proof == format!("verified-empty-v1:{expected}");
+            let verified_import = component
                 .destination_proof
                 .starts_with("verified-secret-import-v1:")
-                || !component.destination_proof.contains(&expected)
-                || !component.destination_proof.contains(":markers-digest=")
-            {
+                && component.destination_proof.contains(&expected)
+                && component.destination_proof.contains(":markers-digest=");
+            if !verified_empty && !verified_import {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
