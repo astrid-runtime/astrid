@@ -6,6 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, bail};
+use astrid_build::artifact;
 use astrid_core::PrincipalId;
 use astrid_storage::{
     CapsuleInstallExpectation, CapsulePackage, RuntimePrincipalStore, StateOwner,
@@ -13,7 +14,7 @@ use astrid_storage::{
 
 use crate::authority::{
     LegacyAuthorityReceiptStatus, legacy_authority_receipt_status, read_installed_authority,
-    read_installed_authority_bytes, retire_legacy_authority_receipt,
+    read_installed_authority_bytes, retire_legacy_authority_receipt, verify_installed_authority,
 };
 use crate::meta::CapsuleMeta;
 
@@ -137,15 +138,29 @@ pub fn migrate_native_capsules_with_report(
         if meta.version != manifest.package.version {
             bail!("legacy capsule metadata version differs for {id}");
         }
-        let authority = read_installed_authority(home, &target)?
-            .ok_or_else(|| anyhow::anyhow!("legacy capsule {id} has no authority receipt"))?;
+        // Released pre-authority installs are admitted only through the
+        // existing one-time verifier. It pins their exact manifest,
+        // capabilities, and executable before any durable publication.
+        verify_installed_authority(home, &target, &manifest)
+            .with_context(|| format!("verify legacy capsule authority {id}"))?;
+        let authority = read_installed_authority(home, &target)?.ok_or_else(|| {
+            anyhow::anyhow!("legacy capsule {id} authority verification produced no receipt")
+        })?;
         if authority.capsule_id != id || authority.version != manifest.package.version {
             bail!("legacy capsule authority identity differs for {id}");
         }
-        let authority_bytes = read_installed_authority_bytes(home, &target)?
+        let source_authority_bytes = read_installed_authority_bytes(home, &target)?
             .ok_or_else(|| anyhow::anyhow!("legacy capsule {id} authority receipt disappeared"))?;
         let archive = canonical_legacy_archive(home, &target, &meta, &manifest)?;
-        let package = CapsulePackage::new(archive, meta_bytes, authority_bytes);
+        let verification = artifact::verify_archive_bytes(&archive)
+            .with_context(|| format!("verify canonical legacy capsule archive {id}"))?;
+        let mut durable_authority = authority;
+        verification
+            .content_digest()
+            .clone_into(&mut durable_authority.content_digest);
+        let durable_authority_bytes = serde_json::to_vec_pretty(&durable_authority)
+            .with_context(|| format!("serialize durable legacy capsule authority {id}"))?;
+        let package = CapsulePackage::new(archive, meta_bytes, durable_authority_bytes);
         let expectation = match registry.get_snapshot(&owner, id)? {
             None => CapsuleInstallExpectation::Absent,
             Some(snapshot) if snapshot.package() == &package => {
@@ -173,7 +188,7 @@ pub fn migrate_native_capsules_with_report(
             bail!("legacy capsule {id} metadata changed before retirement");
         }
         if read_installed_authority_bytes(home, &target)?.as_deref()
-            != Some(package.authority.as_slice())
+            != Some(source_authority_bytes.as_slice())
         {
             bail!("legacy capsule {id} authority changed before retirement");
         }
@@ -181,7 +196,7 @@ pub fn migrate_native_capsules_with_report(
             .with_context(|| format!("verify legacy capsule {id} retirement boundary"))?;
         astrid_core::dirs::retire_legacy_source_tree(&target)
             .with_context(|| format!("retire migrated legacy capsule {id}"))?;
-        retire_legacy_authority_receipt(home, &target, &package.authority)
+        retire_legacy_authority_receipt(home, &target, &source_authority_bytes)
             .with_context(|| format!("retire migrated legacy capsule {id} authority"))?;
         report
             .retired_authorities
@@ -323,4 +338,85 @@ fn legacy_entries_present(path: &Path) -> anyhow::Result<bool> {
     }
     let mut entries = fs::read_dir(path).with_context(|| format!("read {}", path.display()))?;
     Ok(entries.next().transpose()?.is_some())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use astrid_core::identity::PrincipalUid;
+    use astrid_storage::{
+        KvQuotaResolver, PrincipalDirectory, StateOwner,
+        open_runtime_principal_store_with_directory,
+    };
+
+    use super::*;
+
+    #[test]
+    fn migrates_released_capsule_without_authority_receipt() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = astrid_core::dirs::AstridHome::from_path(temp.path().join("home"));
+        home.ensure().unwrap();
+        let principal = PrincipalId::default();
+        let uid = PrincipalUid::from_bytes([0x31; 32]);
+        let directory = PrincipalDirectory::default();
+        directory.register(principal.clone(), uid).unwrap();
+        let quota: Arc<dyn KvQuotaResolver<StateOwner>> = Arc::new(|owner: &StateOwner| {
+            Ok(match owner {
+                StateOwner::System => None,
+                StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(u64::MAX),
+            })
+        });
+        let store = Arc::new(
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(open_runtime_principal_store_with_directory(
+                    &home, quota, directory,
+                ))
+                .unwrap(),
+        );
+        store
+            .principal_directory()
+            .register(principal.clone(), uid)
+            .unwrap();
+        let target = home
+            .principal_home(&principal)
+            .capsules_dir()
+            .join("released-capsule");
+        astrid_core::platform_fs::ensure_private_directory(&target).unwrap();
+        fs::write(
+            target.join("Capsule.toml"),
+            "[package]\nname = \"released-capsule\"\nversion = \"1.0.0\"\n",
+        )
+        .unwrap();
+        let metadata = CapsuleMeta {
+            version: "1.0.0".to_owned(),
+            ..CapsuleMeta::default()
+        };
+        fs::write(
+            target.join("meta.json"),
+            serde_json::to_vec_pretty(&metadata).unwrap(),
+        )
+        .unwrap();
+        assert!(read_installed_authority(&home, &target).unwrap().is_none());
+
+        let report = migrate_native_capsules_with_report(&store, &home, &principal).unwrap();
+
+        assert_eq!(report.retired_authorities.len(), 1);
+        assert_eq!(report.retired_authorities[0].uid, uid);
+        assert_eq!(report.retired_authorities[0].capsule_id, "released-capsule");
+        assert!(!target.exists());
+        assert!(read_installed_authority(&home, &target).unwrap().is_none());
+        let durable = read_verified_durable_package_for_owner(
+            &store,
+            &StateOwner::Principal(uid),
+            "released-capsule",
+        )
+        .unwrap()
+        .expect("released capsule should be durable after migration");
+        assert_eq!(
+            durable.authority().source,
+            crate::authority::AuthoritySource::LegacyMigration
+        );
+    }
 }

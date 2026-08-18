@@ -114,15 +114,17 @@ impl Drop for FreshWindowsHome {
 
 #[cfg(windows)]
 #[test]
-fn user_install_provisions_fresh_private_windows_home() {
+fn user_install_uses_initialized_fresh_private_windows_home() {
     let capsule_dir = tempfile::tempdir().unwrap();
     write_minimal_capsule(capsule_dir.path(), "fresh-windows-home-test", "1.0.0");
     let fresh = FreshWindowsHome::new();
     let home = AstridHome::from_path(&fresh.path);
+    home.ensure()
+        .expect("fresh Windows install home should be initialized before storage opens");
     let storage = install_store(&home);
 
     let output = install_from_local_path(capsule_dir.path(), &home, install_options(&storage))
-        .expect("fresh Windows user install should provision its private home");
+        .expect("fresh Windows user install should use its private home");
 
     assert!(output.target_dir.join("Capsule.toml").is_file());
     assert!(
@@ -136,7 +138,7 @@ fn user_install_provisions_fresh_private_windows_home() {
 
 #[cfg(windows)]
 #[test]
-fn inspected_user_install_provisions_fresh_private_windows_home() {
+fn inspected_user_install_uses_initialized_fresh_private_windows_home() {
     let capsule_dir = tempfile::tempdir().unwrap();
     std::fs::write(
         capsule_dir.path().join("Capsule.toml"),
@@ -146,6 +148,8 @@ fn inspected_user_install_provisions_fresh_private_windows_home() {
     .unwrap();
     let fresh = FreshWindowsHome::new();
     let home = AstridHome::from_path(&fresh.path);
+    home.ensure()
+        .expect("fresh Windows inspection home should be initialized before storage opens");
     let storage = install_store(&home);
     let principal = PrincipalId::default();
     let layout = WorkspaceLayout::default();
@@ -161,7 +165,7 @@ fn inspected_user_install_provisions_fresh_private_windows_home() {
         workspace_root,
         &layout,
     )
-    .expect("inspection should provision the private runtime identity");
+    .expect("inspection should use the private runtime identity");
     let decision = AuthorityDecision::ExplicitApproval {
         content_digest: inspection.content_digest,
     };
