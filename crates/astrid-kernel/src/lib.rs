@@ -3555,6 +3555,9 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
     // Admin tests exercise the real UID-bound storage path. Seed the default
     // principal through the authoritative identity store rather than merely
     // writing a profile; handlers must be able to resolve its immutable UID.
+    // Production seeds the admitted profile immediately after the migration
+    // barrier and before root identity bootstrap; mirror that ordering here.
+    seed_default_principal_admin_profile(&home).expect("test kernel: seed default profile");
     let (identity_store, ownership_store) =
         open_test_identity_stores(&kv, principal_directory.clone());
     identity_store
