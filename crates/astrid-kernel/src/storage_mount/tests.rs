@@ -455,6 +455,7 @@ async fn process_projection_cache_reuses_one_pair_until_last_close() {
         home_mountpoint: PathBuf::from("/private/home"),
         fleet_shared_mountpoint: None,
         refs: AtomicU64::new(0),
+        closing: AtomicBool::new(false),
         cleanup_failed: AtomicBool::new(false),
         cleanup: Arc::new(move || {
             let cleanup_count = Arc::clone(&cleanup_count_for_projection);
@@ -479,6 +480,8 @@ async fn process_projection_cache_reuses_one_pair_until_last_close() {
         let cache = Arc::clone(&cache);
         tasks.push(tokio::spawn(async move {
             cached_projection_mount(projection, cache, key)
+                .await
+                .expect("cached projection mount")
         }));
     }
     let mut mounts = Vec::new();
@@ -510,6 +513,58 @@ async fn process_projection_cache_reuses_one_pair_until_last_close() {
 
 #[cfg(any(unix, windows))]
 #[tokio::test]
+async fn last_close_refuses_remount_while_projection_is_closing() {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let projection = Arc::new(CachedProcessProjection {
+        workspace_mountpoint: PathBuf::from("/private/workspace-close"),
+        home_mountpoint: PathBuf::from("/private/home-close"),
+        fleet_shared_mountpoint: None,
+        refs: AtomicU64::new(0),
+        closing: AtomicBool::new(false),
+        cleanup_failed: AtomicBool::new(false),
+        cleanup: {
+            let release = Arc::clone(&release);
+            let entered = Arc::clone(&entered);
+            Arc::new(move || {
+                let release = Arc::clone(&release);
+                let entered = Arc::clone(&entered);
+                Box::pin(async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    true
+                })
+            })
+        },
+    });
+    let cache = Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let key = ProcessProjectionKey {
+        principal_uid: astrid_core::PrincipalUid::from_bytes([0xA3; 32]),
+        owner: StateOwner::Principal(astrid_core::PrincipalUid::from_bytes([0xA3; 32])),
+        branch: astrid_core::WorkspaceUid::from_bytes([0xB4; 16]),
+        read_write: true,
+    };
+    cache.lock().await.insert(key, Arc::clone(&projection));
+
+    let mount = cached_projection_mount(Arc::clone(&projection), Arc::clone(&cache), key)
+        .await
+        .expect("initial mount");
+    let close = tokio::spawn(mount.close_async());
+    entered.notified().await;
+    assert!(projection.closing.load(Ordering::Acquire));
+    let Err(error) =
+        cached_projection_mount(Arc::clone(&projection), Arc::clone(&cache), key).await
+    else {
+        panic!("remount during last-close must fail closed");
+    };
+    assert!(error.contains("closing"));
+    release.notify_one();
+    close.await.expect("projection close task");
+    assert!(cache.lock().await.is_empty());
+}
+
+#[cfg(any(unix, windows))]
+#[tokio::test]
 async fn failed_projection_cleanup_retries_before_new_mount() {
     let attempts = Arc::new(AtomicU64::new(0));
     let attempts_for_projection = Arc::clone(&attempts);
@@ -518,6 +573,7 @@ async fn failed_projection_cleanup_retries_before_new_mount() {
         home_mountpoint: PathBuf::from("/private/home-retry"),
         fleet_shared_mountpoint: None,
         refs: AtomicU64::new(0),
+        closing: AtomicBool::new(false),
         cleanup_failed: AtomicBool::new(false),
         cleanup: Arc::new(move || {
             let attempts = Arc::clone(&attempts_for_projection);
@@ -533,7 +589,9 @@ async fn failed_projection_cleanup_retries_before_new_mount() {
     };
     cache.lock().await.insert(key, Arc::clone(&projection));
 
-    let mount = cached_projection_mount(Arc::clone(&projection), Arc::clone(&cache), key);
+    let mount = cached_projection_mount(Arc::clone(&projection), Arc::clone(&cache), key)
+        .await
+        .expect("cached projection mount");
     mount.close_async().await;
     assert!(projection.cleanup_failed.load(Ordering::Acquire));
     assert!(cache.lock().await.contains_key(&key));

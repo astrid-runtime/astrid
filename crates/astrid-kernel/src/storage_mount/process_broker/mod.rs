@@ -4,6 +4,10 @@ use super::*;
 mod process_identity;
 #[cfg(any(unix, windows))]
 use process_identity::parent_start_identity;
+#[cfg(any(unix, windows))]
+mod process_stop;
+#[cfg(any(unix, windows))]
+use process_stop::stop_process_provider;
 
 pub(crate) type ProjectionCleanup =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync + 'static>;
@@ -41,6 +45,7 @@ pub(crate) struct CachedProcessProjection {
     pub(crate) home_mountpoint: PathBuf,
     pub(crate) fleet_shared_mountpoint: Option<PathBuf>,
     pub(crate) refs: AtomicU64,
+    pub(crate) closing: AtomicBool,
     pub(crate) cleanup_failed: AtomicBool,
     pub(super) cleanup: ProjectionCleanup,
 }
@@ -131,11 +136,12 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
                 false
             };
             if !retried {
-                return Ok(cached_projection_mount(
+                return retain_locked_projection(
                     projection,
+                    projections,
                     Arc::clone(&self.projections),
                     key,
-                ));
+                );
             }
         }
         // A durable branch is an authority target, not a host mount identity.
@@ -403,12 +409,14 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
             home_mountpoint,
             fleet_shared_mountpoint,
             refs: AtomicU64::new(0),
+            closing: AtomicBool::new(false),
             cleanup_failed: AtomicBool::new(false),
             cleanup,
         });
         projections.insert(key, Arc::clone(&projection));
+        retain_cached_projection(&projection)?;
         drop(projections);
-        Ok(cached_projection_mount(
+        Ok(projection_mount(
             projection,
             Arc::clone(&self.projections),
             key,
@@ -517,8 +525,36 @@ pub(crate) async fn retry_failed_projection(
 }
 
 #[cfg(any(unix, windows))]
+fn retain_cached_projection(projection: &CachedProcessProjection) -> Result<(), String> {
+    if projection.closing.load(Ordering::Acquire) {
+        return Err("native process storage projection is closing".to_owned());
+    }
+    projection.refs.fetch_add(1, Ordering::AcqRel);
+    Ok(())
+}
+
+#[cfg(any(unix, windows))]
+fn retain_locked_projection(
+    projection: Arc<CachedProcessProjection>,
+    projections: tokio::sync::MutexGuard<
+        '_,
+        std::collections::BTreeMap<ProcessProjectionKey, Arc<CachedProcessProjection>>,
+    >,
+    cache: Arc<
+        tokio::sync::Mutex<
+            std::collections::BTreeMap<ProcessProjectionKey, Arc<CachedProcessProjection>>,
+        >,
+    >,
+    key: ProcessProjectionKey,
+) -> Result<astrid_capsule::context::ProcessStorageMount, String> {
+    retain_cached_projection(&projection)?;
+    drop(projections);
+    Ok(projection_mount(projection, cache, key))
+}
+
+#[cfg(any(unix, windows))]
 #[allow(clippy::needless_pass_by_value)]
-pub(crate) fn cached_projection_mount(
+pub(crate) fn projection_mount(
     projection: Arc<CachedProcessProjection>,
     projections: Arc<
         tokio::sync::Mutex<
@@ -527,15 +563,24 @@ pub(crate) fn cached_projection_mount(
     >,
     key: ProcessProjectionKey,
 ) -> astrid_capsule::context::ProcessStorageMount {
-    projection.refs.fetch_add(1, Ordering::AcqRel);
     let workspace_mountpoint = projection.workspace_mountpoint.clone();
     let home_mountpoint = projection.home_mountpoint.clone();
     let fleet_shared_mountpoint = projection.fleet_shared_mountpoint.clone();
     let cleanup_projection = Arc::clone(&projection);
     let cleanup = move || -> Pin<Box<dyn Future<Output = ()> + Send>> {
         Box::pin(async move {
-            if cleanup_projection.refs.fetch_sub(1, Ordering::AcqRel) != 1 {
-                return;
+            {
+                let projections = projections.lock().await;
+                if cleanup_projection.refs.fetch_sub(1, Ordering::AcqRel) != 1 {
+                    return;
+                }
+                if !projections
+                    .get(&key)
+                    .is_some_and(|current| Arc::ptr_eq(current, &cleanup_projection))
+                {
+                    return;
+                }
+                cleanup_projection.closing.store(true, Ordering::Release);
             }
             let cleanup_ok = (cleanup_projection.cleanup)().await;
             if !cleanup_ok {
@@ -560,6 +605,23 @@ pub(crate) fn cached_projection_mount(
     );
     mount.fleet_shared_root = fleet_shared_mountpoint;
     mount
+}
+
+#[cfg(all(test, any(unix, windows)))]
+pub(crate) async fn cached_projection_mount(
+    projection: Arc<CachedProcessProjection>,
+    projections: Arc<
+        tokio::sync::Mutex<
+            std::collections::BTreeMap<ProcessProjectionKey, Arc<CachedProcessProjection>>,
+        >,
+    >,
+    key: ProcessProjectionKey,
+) -> Result<astrid_capsule::context::ProcessStorageMount, String> {
+    {
+        let _guard = projections.lock().await;
+        retain_cached_projection(&projection)?;
+    }
+    Ok(projection_mount(projection, projections, key))
 }
 
 #[cfg(any(unix, windows))]
@@ -816,80 +878,6 @@ pub(crate) fn validate_process_provider_ready(
         return Err("native storage provider readiness challenge mismatch".to_owned());
     }
     Ok(())
-}
-
-#[cfg(any(unix, windows))]
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "kebab-case", tag = "status", deny_unknown_fields)]
-enum ProcessProviderStopResponse {
-    Stopped,
-    Ready,
-    Failure { code: String, message: String },
-}
-
-#[cfg(any(unix, windows))]
-async fn stop_process_provider(
-    child: &mut tokio::process::Child,
-    control_path: PathBuf,
-    token: String,
-) -> bool {
-    let request = serde_json::json!({"operation": "stop", "token": token});
-    let stop = async {
-        let mut stream = local_transport::connect(&control_path)
-            .await
-            .map_err(|error| format!("connect provider stop endpoint: {error}"))?;
-        let bytes = serde_json::to_vec(&request)
-            .map_err(|error| format!("encode provider stop request: {error}"))?;
-        stream
-            .write_all(&bytes)
-            .await
-            .map_err(|error| format!("write provider stop request: {error}"))?;
-        stream
-            .write_all(b"\n")
-            .await
-            .map_err(|error| format!("write provider stop frame: {error}"))?;
-        stream
-            .flush()
-            .await
-            .map_err(|error| format!("flush provider stop request: {error}"))?;
-        let mut line = String::new();
-        let reader = tokio::io::BufReader::new(stream);
-        let read = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            reader.take((64 * 1024 + 1) as u64).read_line(&mut line),
-        )
-        .await
-        .map_err(|_| "timed out waiting for provider stop acknowledgement".to_owned())?
-        .map_err(|error| format!("read provider stop acknowledgement: {error}"))?;
-        if read == 0 || read > 64 * 1024 || !line.ends_with('\n') {
-            return Err("provider stop acknowledgement frame is malformed or oversized".to_owned());
-        }
-        let response: ProcessProviderStopResponse = serde_json::from_str(&line)
-            .map_err(|error| format!("decode provider stop acknowledgement: {error}"))?;
-        match response {
-            ProcessProviderStopResponse::Stopped => {},
-            ProcessProviderStopResponse::Ready => {
-                return Err("provider remained mounted after stop request".to_owned());
-            },
-            ProcessProviderStopResponse::Failure { code, message } => {
-                return Err(format!("provider refused stop ({code}): {message}"));
-            },
-        }
-        Ok::<(), String>(())
-    }
-    .await;
-    let mut stopped = stop.is_ok();
-    if stop.is_err() {
-        let _ = child.start_kill();
-    }
-    if let Ok(Ok(_)) = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait()).await
-    {
-    } else {
-        stopped = false;
-        let _ = child.start_kill();
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait()).await;
-    }
-    stopped
 }
 
 async fn ensure_owner_home(

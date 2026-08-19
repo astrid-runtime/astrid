@@ -17,14 +17,14 @@ use std::sync::Arc;
 
 use astrid_audit::AuditLog;
 use astrid_capsule_install::{
-    legacy_capsule_authority_status, legacy_env_secret_import_status,
-    migrate_all_native_capsules_with_report,
+    legacy_capsule_authority_status, migrate_all_native_capsules_with_report,
 };
 use astrid_core::dirs::{AstridHome, LAYOUT_VERSION, WorkspaceLayout};
 use astrid_core::identity::PrincipalUid;
 use astrid_core::principal::PrincipalId;
 use astrid_storage::{KvStore, PrincipalDirectory, RuntimePrincipalStore};
 
+mod env_import;
 mod fs_hooks;
 mod hooks;
 mod host_fs;
@@ -34,6 +34,7 @@ mod secret;
 mod source;
 #[cfg(unix)]
 use crate::{preflight_legacy_audit_sources, retire_legacy_audit_dir};
+use env_import::import_env_and_secrets;
 #[cfg(test)]
 pub(crate) use hooks::inject_tmp_retirement_interruption_once;
 pub(crate) use hooks::interrupt_after_tmp_retirement_if_requested;
@@ -46,13 +47,13 @@ use host_fs::{
 };
 #[cfg(not(unix))]
 use host_fs::{preflight_legacy_audit_sources, retire_legacy_audit_dir};
-#[cfg(test)]
-use ledger::{MigrationComponent, canonical_json};
 use ledger::{
     DestinationProof, MigrationLedger, SourceCount, SourceDigest, SourceIdentity,
-    collect_destination_proofs, decode_canonical, import_legacy_system_secrets,
-    reject_unsupported_sources, validate_existing_proofs, validate_ledger_shape, write_ledger,
+    collect_destination_proofs, decode_canonical, reject_unsupported_sources,
+    validate_existing_proofs, validate_ledger_shape, write_ledger,
 };
+#[cfg(test)]
+use ledger::{MigrationComponent, canonical_json};
 
 #[cfg(test)]
 pub(crate) use secret::record_absent_legacy_secret_for_test;
@@ -372,7 +373,7 @@ async fn migrate_legacy_layout(
     let host_secret_source = snapshots
         .get("system:host-secrets")
         .ok_or_else(|| io::Error::other("migration source inventory is missing host secrets"))?;
-    import_env_and_secrets(home, store, &bindings, host_secret_source).await?;
+    import_env_and_secrets(home, store, &bindings, &snapshots, host_secret_source).await?;
     import_legacy_control_state(home, store, directory).await?;
     migrate_legacy_audit(home, audit).await?;
     retire_disposable_tmp_sources(home, directory, &snapshots)?;
@@ -548,71 +549,6 @@ pub(crate) fn ensure_principal_delete_allowed(
                 profile.display()
             ),
         ));
-    }
-    Ok(())
-}
-
-async fn import_env_and_secrets(
-    home: &AstridHome,
-    store: &RuntimePrincipalStore,
-    bindings: &[(PrincipalId, PrincipalUid)],
-    host_secret_source: &SourceIdentity,
-) -> io::Result<()> {
-    let handle = tokio::runtime::Handle::current();
-    for (alias, uid) in bindings {
-        let owner = astrid_storage::StateOwner::Principal(*uid);
-        let summaries = store.capsules().list(&owner).map_err(storage_io)?;
-        let env_root = home.principal_home(alias).env_dir();
-        let secret_root = home.secrets_dir().join(alias.as_str());
-        // Unknown capsule-specific files cannot be assigned safely.  This is
-        // deliberately a hard dependency rather than an alias-based guess.
-        if path_exists(&env_root)? {
-            let mut entries = fs::read_dir(&env_root).map_err(io::Error::other)?;
-            while let Some(entry) = entries.next().transpose().map_err(io::Error::other)? {
-                let metadata = fs::symlink_metadata(entry.path()).map_err(io::Error::other)?;
-                if !metadata.is_file() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "legacy env source is not a regular file: {}",
-                            entry.path().display()
-                        ),
-                    ));
-                }
-            }
-        }
-        for summary in summaries {
-            let capsule = summary.id();
-            let env = env_root.join(format!("{capsule}.env.json"));
-            let secret = secret_root.join(capsule);
-            let env_arg = path_exists(&env)?.then_some(env);
-            let secret_arg = path_exists(&secret)?.then_some(secret);
-            astrid_storage::env::import_legacy_scope(
-                store.kv(),
-                *uid,
-                capsule,
-                env_arg,
-                secret_arg,
-                true,
-                handle.clone(),
-            )
-            .await
-            .map_err(storage_io)?;
-        }
-    }
-    import_legacy_system_secrets(home, store, handle.clone(), host_secret_source).await?;
-    let statuses = legacy_env_secret_import_status(store, home, &store.principal_directory())
-        .await
-        .map_err(|error| io::Error::other(format!("legacy env/secret status failed: {error}")))?;
-    if let Some(status) = statuses.into_iter().find(|status| {
-        status.native_env_present
-            || status.native_secret_present
-            || !status.unreceipted_capsules.is_empty()
-    }) {
-        return Err(io::Error::other(format!(
-            "legacy env/secret sources remain for {} (uid {}); migration API did not retire every scope",
-            status.alias, status.uid
-        )));
     }
     Ok(())
 }
