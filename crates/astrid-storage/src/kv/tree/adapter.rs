@@ -7,6 +7,7 @@
 use crate::engine::KvProjectionEngine;
 use async_trait::async_trait;
 
+use super::hot_cache::HotRead;
 use super::{BlockingTreeStore, TreeKvStore, map_engine};
 use crate::error::{StorageError, StorageResult};
 use crate::kv::principal::KvPrincipalResolver;
@@ -29,6 +30,7 @@ where
     }
 
     async fn close(&self) -> StorageResult<()> {
+        self.reclaim_read_cache();
         let blocking = self.blocking_store();
         run_blocking(move || {
             blocking
@@ -44,11 +46,27 @@ where
         validate_key(key)?;
         let owner = self.resolver.resolve(namespace)?;
         let composite = composite_key(namespace, key);
+        if let (Some(cache), Some(root)) = (
+            self.hot_cache.as_ref(),
+            self.engine.current_kv_root_if_ready(&owner),
+        ) && let HotRead::Hit(value) = cache.get(&owner, root.get(), &composite)
+        {
+            return Ok(value);
+        }
         let blocking = self.blocking_store();
+        let cache = self.hot_cache.clone();
+        let cache_owner = owner.clone();
+        let cache_key = composite.clone();
         run_blocking(move || {
-            blocking.read(owner, |context, header| {
-                context.projected_get(header, &composite)
-            })
+            let (read_root, value) = blocking.read(owner, |context, header| {
+                context
+                    .projected_get(header, &composite)
+                    .map(|value| (header.root, value))
+            })?;
+            if let Some(cache) = cache {
+                cache.insert(&cache_owner, read_root, cache_key, value.as_deref());
+            }
+            Ok(value)
         })
         .await
     }

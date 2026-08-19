@@ -16,6 +16,7 @@ use parking_lot::Mutex;
 use self::context::TreeContext;
 use self::delta::Projection;
 use self::header::{TreeHeader, decode_header};
+use self::hot_cache::KvHotCache;
 #[cfg(all(feature = "legacy-surrealkv", not(target_family = "wasm")))]
 use super::KvEntry;
 #[cfg(all(feature = "legacy-surrealkv", not(target_family = "wasm")))]
@@ -29,12 +30,18 @@ mod adapter;
 mod context;
 mod delta;
 mod header;
+mod hot_cache;
+#[cfg(test)]
+mod hot_cache_integration_tests;
 mod legacy_avl;
 mod node;
 mod overlay;
+#[cfg(all(test, feature = "legacy-surrealkv"))]
+mod performance_tests;
 mod validation;
 
 pub(crate) use self::header::validated_projection_quota;
+pub use self::hot_cache::{KvReadCacheBudget, KvReadCacheCapacity, KvReadCacheConfig};
 pub(crate) use self::legacy_avl::migrate_principal as migrate_legacy_avl;
 pub(super) use self::validation::TreeValidation;
 
@@ -70,6 +77,7 @@ pub struct TreeKvStore<P: Ord, I, R, E> {
     validation: Arc<KvValidationCache<P>>,
     validated_content: Arc<Mutex<BTreeMap<P, crate::content::CatalogValidation>>>,
     checkpointing: Arc<Mutex<BTreeSet<P>>>,
+    hot_cache: Option<Arc<KvHotCache<P>>>,
     marker: PhantomData<fn() -> (P, I)>,
 }
 
@@ -79,6 +87,7 @@ struct BlockingTreeStore<P: Ord, E> {
     validation: Arc<KvValidationCache<P>>,
     validated_content: Arc<Mutex<BTreeMap<P, crate::content::CatalogValidation>>>,
     checkpointing: Arc<Mutex<BTreeSet<P>>>,
+    hot_cache: Option<Arc<KvHotCache<P>>>,
 }
 
 impl<P: Ord, E> Clone for BlockingTreeStore<P, E> {
@@ -89,6 +98,7 @@ impl<P: Ord, E> Clone for BlockingTreeStore<P, E> {
             validation: Arc::clone(&self.validation),
             validated_content: Arc::clone(&self.validated_content),
             checkpointing: Arc::clone(&self.checkpointing),
+            hot_cache: self.hot_cache.clone(),
         }
     }
 }
@@ -104,6 +114,7 @@ impl<P: Ord, I, R, E> TreeKvStore<P, I, R, E> {
             validation: Arc::new(KvValidationCache::default()),
             validated_content: Arc::new(Mutex::new(BTreeMap::new())),
             checkpointing: Arc::new(Mutex::new(BTreeSet::new())),
+            hot_cache: None,
             marker: PhantomData,
         }
     }
@@ -122,6 +133,7 @@ impl<P: Ord, I, R, E> TreeKvStore<P, I, R, E> {
             validation: Arc::new(KvValidationCache::default()),
             validated_content: Arc::new(Mutex::new(BTreeMap::new())),
             checkpointing: Arc::new(Mutex::new(BTreeSet::new())),
+            hot_cache: None,
             marker: PhantomData,
         }
     }
@@ -140,6 +152,7 @@ impl<P: Ord, I, R, E> TreeKvStore<P, I, R, E> {
             validation,
             validated_content,
             checkpointing: Arc::new(Mutex::new(BTreeSet::new())),
+            hot_cache: None,
             marker: PhantomData,
         }
     }
@@ -151,6 +164,24 @@ impl<P: Ord, I, R, E> TreeKvStore<P, I, R, E> {
             validation: Arc::clone(&self.validation),
             validated_content: Arc::clone(&self.validated_content),
             checkpointing: Arc::clone(&self.checkpointing),
+            hot_cache: self.hot_cache.clone(),
+        }
+    }
+
+    /// Enable bounded, disposable point-read acceleration.
+    #[must_use]
+    pub fn with_read_cache(mut self, config: KvReadCacheConfig<P>) -> Self {
+        self.hot_cache = Some(Arc::new(KvHotCache::new(config)));
+        self
+    }
+
+    /// Drop every disposable point-read entry and reconcile its memory charge.
+    pub fn reclaim_read_cache(&self)
+    where
+        P: Clone,
+    {
+        if let Some(cache) = &self.hot_cache {
+            cache.clear();
         }
     }
 }
@@ -429,7 +460,7 @@ where
     /// Returns a storage error if the owner's authoritative KV state cannot be
     /// read or the clearing mutation cannot be committed.
     pub fn clear_owner(&self, owner: &P) -> StorageResult<u64> {
-        self.blocking_store().mutate(owner, |context, header| {
+        let removed = self.blocking_store().mutate(owner, |context, header| {
             let mut entries = BTreeMap::<Vec<u8>, Option<Vec<u8>>>::new();
             context.visit_entries(header.tree, |composite, value| {
                 entries.insert(composite.to_vec(), Some(value.to_vec()));
@@ -444,7 +475,11 @@ where
                 .collect::<Vec<_>>();
             let count = u64::try_from(mutations.len()).unwrap_or(u64::MAX);
             Ok((count, mutations, count != 0))
-        })
+        })?;
+        if let Some(cache) = &self.hot_cache {
+            cache.remove_owner(owner);
+        }
+        Ok(removed)
     }
 
     #[cfg(all(feature = "legacy-surrealkv", not(target_family = "wasm")))]

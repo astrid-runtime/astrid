@@ -389,15 +389,17 @@ where
             files,
             index,
             representations,
+            pending_wal,
             ..
         } = inner;
         let files = live_files_mut(files)?;
         for root in roots {
             let closure = materialize_closure(
-                &mut super::ClosureObjects {
+                &mut super::ClosureObjects::<_, P> {
                     arena: &mut files.arena,
                     index,
                     incoming: &BTreeMap::new(),
+                    pending: Some(pending_wal),
                     representations: representations.as_ref(),
                     identity: &self.identity,
                     limits: self.limits,

@@ -93,8 +93,9 @@ pub use filesystem::{
 pub use identity::{IdentityError, IdentityStore, KvIdentityStore};
 pub use kv::{
     KvBatchCondition, KvBatchMutation, KvBatchOutcome, KvConditionResult, KvEntry, KvEntryKey,
-    KvMutationBatch, KvPrincipalResolver, KvQuotaResolver, KvStore, MAX_KV_BATCH_OPERATIONS,
-    MAX_KV_BATCH_PAYLOAD_BYTES, MemoryKvStore, PrincipalKvStore, ScopedKvStore, TreeKvStore,
+    KvMutationBatch, KvPrincipalResolver, KvQuotaResolver, KvReadCacheBudget, KvReadCacheCapacity,
+    KvReadCacheConfig, KvStore, MAX_KV_BATCH_OPERATIONS, MAX_KV_BATCH_PAYLOAD_BYTES, MemoryKvStore,
+    PrincipalKvStore, ScopedKvStore, TreeKvStore,
 };
 pub use ownership::{
     FleetRecord, OwnershipError, OwnershipSnapshot, OwnershipStore, PrincipalDeletionGuard,
@@ -114,7 +115,7 @@ pub use secret::{FallbackSecretStore, KeychainSecretStore};
 pub use engine::{
     DurableEnginePolicy, GroupCommitPolicy, ObjectCacheCapacity, ObjectCacheConfig,
     ObjectCacheController, ObjectCacheMemoryBudget, ObjectCacheStats, PrincipalObjectCacheBudget,
-    RecoveryRetryPolicy,
+    RecoveryRetryPolicy, TransactionWalPolicy,
 };
 #[cfg(feature = "legacy-surrealkv")]
 pub use kv::SurrealKvStore;

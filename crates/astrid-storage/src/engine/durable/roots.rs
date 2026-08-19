@@ -15,6 +15,26 @@ const SNAPSHOT_SENTINEL: u64 = u64::MAX;
 const SNAPSHOT_RECORD: u8 = 1;
 const CURRENT_DIGEST_BYTES: u32 = 32;
 
+pub(super) fn recover_root_history<P, C, R>(
+    roots: &mut R,
+    codec: &C,
+    scheme: IdentityScheme,
+    limits: RecoveryLimits,
+) -> Result<BTreeMap<P, (RootState, u64)>, DurableError>
+where
+    P: Ord,
+    C: PrincipalCodec<P>,
+    R: DurableIo,
+{
+    let mut recovered = BTreeMap::<P, (RootState, u64)>::new();
+    scan_frames(roots, ROOT_FILE, ROOT_MAGIC, limits, |offset, payload| {
+        let record = decode_root_journal_record(payload, scheme)
+            .map_err(|detail| corrupt(ROOT_FILE, offset, detail))?;
+        apply_root_journal_record(&mut recovered, codec, scheme, offset, payload, record)
+    })?;
+    Ok(recovered)
+}
+
 pub(super) fn recover_roots<P, I, C, R>(
     roots: &mut R,
     arena: &mut File,
@@ -30,14 +50,7 @@ where
     C: PrincipalCodec<P>,
     R: DurableIo,
 {
-    let scheme = identity.scheme();
-    let mut recovered = BTreeMap::<P, (RootState, u64)>::new();
-    scan_frames(roots, ROOT_FILE, ROOT_MAGIC, limits, |offset, payload| {
-        let record = decode_root_journal_record(payload, scheme)
-            .map_err(|detail| corrupt(ROOT_FILE, offset, detail))?;
-        apply_root_journal_record(&mut recovered, codec, scheme, offset, payload, record)
-    })?;
-
+    let recovered = recover_root_history(roots, codec, identity.scheme(), limits)?;
     validate_recovered_roots(recovered, arena, index, representations, identity, limits)
 }
 
@@ -56,10 +69,11 @@ where
     let mut validated = BTreeSet::new();
     for (root, offset) in recovered.values().copied() {
         let records = materialize_closure(
-            &mut super::ClosureObjects {
+            &mut super::ClosureObjects::<_, P> {
                 arena,
                 index,
                 incoming: &BTreeMap::new(),
+                pending: None,
                 representations,
                 identity,
                 limits,

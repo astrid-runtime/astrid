@@ -22,6 +22,24 @@ const KV_LABEL: &[u8] = b"kv";
 const PARENT_LABEL: &[u8] = b"parent";
 const STATE_LABEL: &[u8] = b"state";
 
+/// A root that is already resident without taking the engine writer lock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadyKvRoot(Option<RootState>);
+
+impl ReadyKvRoot {
+    /// Wrap a resident root, including the valid empty-store state.
+    #[must_use]
+    pub const fn new(root: Option<RootState>) -> Self {
+        Self(root)
+    }
+
+    /// Return the resident root.
+    #[must_use]
+    pub const fn get(self) -> Option<RootState> {
+        self.0
+    }
+}
+
 /// Complete logical key/value state owned by one principal.
 ///
 /// Namespaces and keys are maintained in bytewise UTF-8 order. Empty
@@ -304,6 +322,12 @@ pub trait KvProjectionEngine<P>: Send + Sync {
     /// Returns an engine error when the root index is unavailable.
     fn current_kv_root(&self, principal: &P) -> Result<Option<RootState>, KvProjectionError>;
 
+    /// Return the current root only when it is already available without I/O
+    /// or waiting for an engine writer.
+    fn current_kv_root_if_ready(&self, _principal: &P) -> Option<ReadyKvRoot> {
+        None
+    }
+
     /// Load one immutable object by identity.
     ///
     /// # Errors
@@ -379,6 +403,12 @@ where
         Ok(self.root(principal))
     }
 
+    fn current_kv_root_if_ready(&self, principal: &P) -> Option<ReadyKvRoot> {
+        self.world
+            .try_read()
+            .map(|world| ReadyKvRoot::new(world.root(principal)))
+    }
+
     fn load_kv_object(&self, id: ObjectId) -> Result<Option<ObjectRecord>, KvProjectionError> {
         Ok(self.object(id))
     }
@@ -412,6 +442,10 @@ where
 
     fn current_kv_root(&self, principal: &P) -> Result<Option<RootState>, KvProjectionError> {
         self.root(principal).map_err(map_durable_error)
+    }
+
+    fn current_kv_root_if_ready(&self, principal: &P) -> Option<ReadyKvRoot> {
+        self.root_if_ready(principal)
     }
 
     fn load_kv_object(&self, id: ObjectId) -> Result<Option<ObjectRecord>, KvProjectionError> {

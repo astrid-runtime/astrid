@@ -180,7 +180,15 @@ where
         limits: RecoveryLimits,
         policy: DurableEnginePolicy<P>,
     ) -> Result<Self, DurableError> {
-        let recovered = recover_volume(&volume, &principal_codec, &identity, limits)?;
+        let identity = super::SharedIdentity::new(identity);
+        let principal_codec = super::SharedPrincipalCodec::new(principal_codec);
+        let (recovered, wal) = recover_volume(
+            &volume,
+            &principal_codec,
+            &identity,
+            limits,
+            policy.transaction_wal.is_enabled(),
+        )?;
         Ok(Self::from_recovered(
             None,
             None,
@@ -194,6 +202,7 @@ where
                 faults: Arc::new(NoFaults),
             },
             recovered,
+            wal,
         ))
     }
 
@@ -246,12 +255,15 @@ where
             return Err(io_error("lock principal store", source));
         }
 
-        let recovered = recover_store(
+        let identity = super::SharedIdentity::new(identity);
+        let principal_codec = super::SharedPrincipalCodec::new(principal_codec);
+        let (recovered, wal) = recover_store(
             &path,
             &directory_capability,
             &principal_codec,
             &identity,
             limits,
+            options.policy.transaction_wal.is_enabled(),
         )?;
 
         Ok(Self::from_recovered(
@@ -264,6 +276,7 @@ where
             limits,
             options,
             recovered,
+            wal,
         ))
     }
 
@@ -273,11 +286,12 @@ where
         directory_capability: Option<Arc<cap_std::fs::Dir>>,
         volume: Option<Arc<dyn AstridVolume>>,
         lock: StoreLock,
-        identity: I,
-        principal_codec: C,
+        identity: super::SharedIdentity<I>,
+        principal_codec: super::SharedPrincipalCodec<C>,
         limits: RecoveryLimits,
         options: EngineOpenOptions<P>,
         recovered: super::RecoveredStore<P>,
+        wal: Option<super::DurableWal<P, I, C>>,
     ) -> Self {
         Self {
             directory,
@@ -297,9 +311,13 @@ where
             preparation_authority: Arc::new(()),
             group_policy: options.policy.group_commit,
             commit_group: Mutex::new(CommitGroup::default()),
+            transaction_wal: options.policy.transaction_wal,
+            wal: Mutex::new(wal),
+            published_roots: super::PublishedRoots::new(&recovered.roots_by_principal),
             inner: Mutex::new(DurableInner {
                 roots_by_principal: recovered.roots_by_principal,
                 index: recovered.index,
+                pending_wal: super::wal::PendingWalOverlay::default(),
                 pending_index_locations: Vec::new(),
                 pending_direct_objects: BTreeMap::new(),
                 validated: recovered.validated,

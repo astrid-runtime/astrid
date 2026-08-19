@@ -59,6 +59,8 @@ pub enum FaultPoint {
     AfterCompactionRepresentationRebase,
     /// Retired loose blobs are gone while the durable compaction intent remains.
     AfterCompactionBlobRetirement,
+    /// The transaction WAL has been published but canonical files are not folded.
+    AfterWalPublication,
 }
 
 /// Injectable crash decision used by recovery tests and harnesses.
