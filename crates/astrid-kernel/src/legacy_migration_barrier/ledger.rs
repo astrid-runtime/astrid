@@ -1,5 +1,6 @@
 //! Canonical migration ledger, source proofs, and component import receipts.
 
+pub(super) use super::proof::DestinationProof;
 pub(super) use super::source::{SourceCount, SourceDigest, SourceIdentity};
 use super::{
     AstridHome, BTreeMap, CAPSULE_AUTHORITY_RECEIPT_NAME, HOST_SECRET_RECEIPT_NAME, LEDGER_SCHEMA,
@@ -22,7 +23,7 @@ pub(super) async fn collect_destination_proofs(
     directory: &PrincipalDirectory,
     sources: &BTreeMap<String, SourceIdentity>,
     strict_env_markers: bool,
-) -> io::Result<BTreeMap<String, String>> {
+) -> io::Result<BTreeMap<String, DestinationProof>> {
     let mut proofs = BTreeMap::new();
     proofs.insert(
         "system:state-db".to_owned(),
@@ -33,10 +34,10 @@ pub(super) async fn collect_destination_proofs(
     })?;
     proofs.insert(
         "system:cow".to_owned(),
-        format!(
+        DestinationProof::from_stored(format!(
             "verified-discard-v1:source-digest={}:layout-receipt=layout-v1-to-v2.complete",
             cow_source.digest
-        ),
+        ))?,
     );
 
     for (name, namespace, key) in [
@@ -61,10 +62,9 @@ pub(super) async fn collect_destination_proofs(
             .get(namespace, key)
             .await
             .map_err(storage_io)?
-            .map_or_else(
-                || "absent".to_owned(),
-                |bytes| format!("blake3:{}", blake3::hash(&bytes).to_hex()),
-            );
+            .map_or_else(DestinationProof::absent, |bytes| {
+                DestinationProof::from_hashed_bytes(&bytes)
+            });
         proofs.insert(name.to_owned(), proof);
     }
     if let Some(host_source) = sources.get("system:host-secrets") {
@@ -73,23 +73,24 @@ pub(super) async fn collect_destination_proofs(
             if host_source.present {
                 let receipt = fs::read(home.migrations_dir().join(HOST_SECRET_RECEIPT_NAME))
                     .map_err(io::Error::other)?;
-                format!(
+                DestinationProof::from_stored(format!(
                     "verified-system-env-v1:source-digest={}:markers=blake3:{}",
                     host_source.digest,
                     blake3::hash(&receipt).to_hex()
-                )
+                ))?
             } else {
-                "absent".to_owned()
+                DestinationProof::absent()
             },
         );
     }
     if let Some(authority_source) = sources.get("system:capsule-authority") {
         let proof = if authority_source.present {
             let path = home.migrations_dir().join(CAPSULE_AUTHORITY_RECEIPT_NAME);
-            let proof = fs::read_to_string(&path).map_err(io::Error::other)?;
+            let proof = DestinationProof::from_stored(
+                fs::read_to_string(&path).map_err(io::Error::other)?,
+            )?;
             if !proof.starts_with("verified-capsule-authority-v1:")
                 || !proof.contains(&format!("source-digest={}", authority_source.digest))
-                || proof.contains('\n')
             {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -101,7 +102,7 @@ pub(super) async fn collect_destination_proofs(
             }
             proof
         } else {
-            "absent".to_owned()
+            DestinationProof::absent()
         };
         proofs.insert("system:capsule-authority".to_owned(), proof);
     }
@@ -111,10 +112,9 @@ pub(super) async fn collect_destination_proofs(
         .get("audit:migrations:legacy-principal-home-v1")
         .await
         .map_err(storage_io)?
-        .map_or_else(
-            || "absent".to_owned(),
-            |bytes| format!("blake3:{}", blake3::hash(&bytes).to_hex()),
-        );
+        .map_or_else(DestinationProof::absent, |bytes| {
+            DestinationProof::from_hashed_bytes(&bytes)
+        });
     for (alias, uid) in directory.bindings() {
         let home_component = format!("principal:{uid}:home");
         if !sources.contains_key(&home_component) {
@@ -150,11 +150,15 @@ pub(super) async fn collect_destination_proofs(
         );
         proofs.insert(
             format!("principal:{uid}:distro-lock"),
-            crate::principal_distro_migration::legacy_distro_destination_proof(home, uid)?,
+            DestinationProof::from_stored(
+                crate::principal_distro_migration::legacy_distro_destination_proof(home, uid)?,
+            )?,
         );
         proofs.insert(
             format!("principal:{uid}:distro-init"),
-            crate::principal_distro_migration::legacy_distro_init_destination_proof(home, uid)?,
+            DestinationProof::from_stored(
+                crate::principal_distro_migration::legacy_distro_init_destination_proof(home, uid)?,
+            )?,
         );
         let owner = astrid_storage::StateOwner::Principal(uid);
         let summaries = store.capsules().list(&owner).map_err(storage_io)?;
@@ -175,7 +179,7 @@ pub(super) async fn collect_destination_proofs(
             .join("\n");
         proofs.insert(
             format!("principal:{uid}:capsules"),
-            format!("blake3:{}", blake3::hash(summary_bytes.as_bytes()).to_hex()),
+            DestinationProof::from_hashed_bytes(summary_bytes.as_bytes()),
         );
         proofs.insert(
             format!("principal:{uid}:secrets"),
@@ -196,7 +200,7 @@ pub(super) async fn collect_destination_proofs(
                 }
                 continue;
             };
-            let proof = format!("blake3:{}", blake3::hash(&marker).to_hex());
+            let proof = DestinationProof::from_hashed_bytes(&marker);
             proofs.insert(
                 format!("principal:{uid}:env:{}", summary.id()),
                 proof.clone(),
@@ -209,16 +213,19 @@ pub(super) async fn collect_destination_proofs(
                 audit_proof.clone()
             } else {
                 match sources.get(&format!("principal:{uid}:audit")) {
-                    Some(source) if source.present => {
-                        format!("verified-empty-v1:source-digest={}", source.digest)
-                    },
-                    _ => "absent".to_owned(),
+                    Some(source) if source.present => DestinationProof::from_stored(format!(
+                        "verified-empty-v1:source-digest={}",
+                        source.digest
+                    ))?,
+                    _ => DestinationProof::absent(),
                 }
             },
         );
         proofs.insert(
             format!("principal:{uid}:logs"),
-            crate::principal_log_migration::legacy_log_destination_proof(home, uid)?,
+            DestinationProof::from_stored(
+                crate::principal_log_migration::legacy_log_destination_proof(home, uid)?,
+            )?,
         );
         let tmp = sources
             .get(&format!("principal:{uid}:tmp"))
@@ -226,12 +233,12 @@ pub(super) async fn collect_destination_proofs(
         proofs.insert(
             format!("principal:{uid}:tmp"),
             if tmp.present {
-                format!(
+                DestinationProof::from_stored(format!(
                     "verified-discard-v1:source-digest={}:disposable=tmp",
                     tmp.digest
-                )
+                ))?
             } else {
-                "absent".to_owned()
+                DestinationProof::absent()
             },
         );
     }
@@ -252,26 +259,26 @@ pub(super) async fn collect_destination_proofs(
                     .migrations_dir()
                     .join(format!("principal-home-{uid}.json")),
             )?,
-            ("logs", None) => {
-                crate::principal_log_migration::legacy_log_destination_proof(home, uid)?
-            },
-            ("distro-lock", None) => {
-                crate::principal_distro_migration::legacy_distro_destination_proof(home, uid)?
-            },
-            ("distro-init", None) => {
-                crate::principal_distro_migration::legacy_distro_init_destination_proof(home, uid)?
-            },
+            ("logs", None) => DestinationProof::from_stored(
+                crate::principal_log_migration::legacy_log_destination_proof(home, uid)?,
+            )?,
+            ("distro-lock", None) => DestinationProof::from_stored(
+                crate::principal_distro_migration::legacy_distro_destination_proof(home, uid)?,
+            )?,
+            ("distro-init", None) => DestinationProof::from_stored(
+                crate::principal_distro_migration::legacy_distro_init_destination_proof(home, uid)?,
+            )?,
             ("tmp", None) => {
                 let source = sources
                     .get(name)
                     .ok_or_else(|| io::Error::other("migration source inventory is missing tmp"))?;
                 if source.present {
-                    format!(
+                    DestinationProof::from_stored(format!(
                         "verified-discard-v1:source-digest={}:disposable=tmp",
                         source.digest
-                    )
+                    ))?
                 } else {
-                    "absent".to_owned()
+                    DestinationProof::absent()
                 }
             },
             ("audit", None) => {
@@ -285,7 +292,7 @@ pub(super) async fn collect_destination_proofs(
                     // durable audit receipt proof.
                     audit_proof.clone()
                 } else {
-                    "absent".to_owned()
+                    DestinationProof::absent()
                 }
             },
             ("env" | "secret", Some(capsule)) => {
@@ -294,10 +301,9 @@ pub(super) async fn collect_destination_proofs(
                     .get(astrid_storage::env::LEGACY_IMPORT_MARKER_KEY)
                     .await
                     .map_err(storage_io)?;
-                marker.map_or_else(
-                    || "absent".to_owned(),
-                    |bytes| format!("blake3:{}", blake3::hash(&bytes).to_hex()),
-                )
+                marker.map_or_else(DestinationProof::absent, |bytes| {
+                    DestinationProof::from_hashed_bytes(&bytes)
+                })
             },
             ("secrets", None) => principal_secret_migration_proof(store, uid, sources).await?,
             _ => continue,
@@ -325,7 +331,7 @@ async fn principal_secret_migration_proof(
     store: &RuntimePrincipalStore,
     uid: PrincipalUid,
     sources: &BTreeMap<String, SourceIdentity>,
-) -> io::Result<String> {
+) -> io::Result<DestinationProof> {
     let aggregate_name = format!("principal:{uid}:secrets");
     let source = sources.get(&aggregate_name).ok_or_else(|| {
         io::Error::other(format!(
@@ -333,10 +339,13 @@ async fn principal_secret_migration_proof(
         ))
     })?;
     if !source.present {
-        return Ok("absent".to_owned());
+        return Ok(DestinationProof::absent());
     }
     if source.entries == 0 && source.bytes == 0 {
-        return Ok(format!("verified-empty-v1:source-digest={}", source.digest));
+        return DestinationProof::from_stored(format!(
+            "verified-empty-v1:source-digest={}",
+            source.digest
+        ));
     }
 
     // This proof describes the frozen legacy import, not the mutable capsule
@@ -367,7 +376,7 @@ async fn principal_secret_migration_proof(
         )));
     }
     let marker_digest = blake3::hash(rows.join("\n").as_bytes()).to_hex();
-    Ok(format!(
+    DestinationProof::from_stored(format!(
         "verified-secret-import-v1:source-digest={}:markers-digest={marker_digest}",
         source.digest
     ))
@@ -380,7 +389,7 @@ pub(super) fn mutable_component(name: &str) -> bool {
 pub(super) fn validate_existing_proofs(
     home: &AstridHome,
     existing: &MigrationLedger,
-    proofs: &BTreeMap<String, String>,
+    proofs: &BTreeMap<String, DestinationProof>,
     directory: &PrincipalDirectory,
 ) -> io::Result<()> {
     // The ledger is historical: mutable profile/package summaries and deleted
@@ -434,7 +443,7 @@ pub(super) fn validate_existing_proofs(
         // projection, and an originally absent component remains absent when
         // its ledger proof was explicitly recorded as such.
         if is_live_principal_component(&component.name, directory)
-            && (component.source.present || component.destination_proof != "absent")
+            && (component.source.present || !component.destination_proof.is_absent())
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -552,21 +561,10 @@ fn validate_component_name(name: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn valid_source_digest(digest: &str) -> bool {
-    if digest == "absent" {
-        return true;
-    }
-    let hex = digest.strip_prefix("blake3:").unwrap_or(digest);
-    hex.len() == 64
-        && hex
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-}
-
-pub(super) fn destination_file_proof(path: &Path) -> io::Result<String> {
+pub(super) fn destination_file_proof(path: &Path) -> io::Result<DestinationProof> {
     Ok(match read_bounded_file(path, MAX_BYTES)? {
-        Some(bytes) => format!("blake3:{}", blake3::hash(&bytes).to_hex()),
-        None => "absent".to_owned(),
+        Some(bytes) => DestinationProof::from_hashed_bytes(&bytes),
+        None => DestinationProof::absent(),
     })
 }
 
@@ -623,12 +621,6 @@ pub(super) fn validate_ledger_shape(ledger: &MigrationLedger) -> io::Result<()> 
             ));
         }
         previous = Some(component.name.clone());
-        if !valid_source_digest(component.source.digest.as_str()) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("invalid migration source digest: {}", component.name),
-            ));
-        }
         if component.source.present && component.source.digest == "absent" {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -644,25 +636,7 @@ pub(super) fn validate_ledger_shape(ledger: &MigrationLedger) -> io::Result<()> 
                 format!("absent migration source has a digest: {}", component.name),
             ));
         }
-        let valid_proof = (component.destination_proof == "absent" && !component.source.present)
-            || component.destination_proof.starts_with("blake3:")
-            || component
-                .destination_proof
-                .starts_with("verified-empty-v1:")
-            || component
-                .destination_proof
-                .starts_with("verified-discard-v1:")
-            || component
-                .destination_proof
-                .starts_with("verified-capsule-authority-v1:")
-            || component
-                .destination_proof
-                .starts_with("verified-system-env-v1:")
-            || component
-                .destination_proof
-                .starts_with("verified-secret-import-v1:")
-            || component.destination_proof.starts_with("fresh-layout-v1:");
-        if !valid_proof || component.destination_proof.contains('\n') {
+        if component.destination_proof.is_absent() && component.source.present {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("invalid destination proof for component {}", component.name),
@@ -765,8 +739,7 @@ pub(super) fn validate_ledger_shape(ledger: &MigrationLedger) -> io::Result<()> 
         }
         if component.name == "system:fresh-layout"
             && (component.source.present
-                || component.destination_proof
-                    != "fresh-layout-v1:initialized-without-legacy-sources")
+                || component.destination_proof != DestinationProof::FRESH_LAYOUT)
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -797,7 +770,7 @@ pub(super) fn validate_ledger_shape(ledger: &MigrationLedger) -> io::Result<()> 
 pub(super) struct MigrationComponent {
     pub(super) name: String,
     pub(super) source: SourceIdentity,
-    pub(super) destination_proof: String,
+    pub(super) destination_proof: DestinationProof,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -811,7 +784,7 @@ pub(super) struct MigrationLedger {
 pub(super) fn write_ledger(
     home: &AstridHome,
     snapshots: BTreeMap<String, SourceIdentity>,
-    proofs: &BTreeMap<String, String>,
+    proofs: &BTreeMap<String, DestinationProof>,
 ) -> io::Result<()> {
     let mut components = Vec::with_capacity(snapshots.len());
     for (name, source) in snapshots {
@@ -820,7 +793,7 @@ pub(super) fn write_ledger(
                 "migration component has no verified destination proof: {name}"
             ))
         })?;
-        if source.present && !matches!(name.as_str(), "system:cow") && destination_proof == "absent"
+        if source.present && !matches!(name.as_str(), "system:cow") && destination_proof.is_absent()
         {
             return Err(io::Error::other(format!(
                 "migration component {name} has a source but no destination receipt"

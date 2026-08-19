@@ -67,9 +67,8 @@ where
         self.create_branch(owner, id, Some(binding_uid), target_prefix.as_ref())
     }
 
-    /// Deterministic whole-catalog helper, restricted to this crate.
-    #[doc(hidden)]
-    #[allow(dead_code)]
+    /// Deterministic whole-catalog helper, restricted to tests in this crate.
+    #[cfg(test)]
     pub(crate) fn begin_root_with_uid(
         &self,
         owner: &P,

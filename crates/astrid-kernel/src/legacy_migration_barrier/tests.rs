@@ -130,45 +130,42 @@ fn canonical_complete_ledger_is_admitted() {
             MigrationComponent {
                 name: "system:cow".to_owned(),
                 source: SourceIdentity::absent(),
-                destination_proof:
-                    "verified-discard-v1:source-digest=absent:layout-receipt=layout-v1-to-v2.complete"
-                        .to_owned(),
+                destination_proof: DestinationProof::parse("verified-discard-v1:source-digest=absent:layout-receipt=layout-v1-to-v2.complete").expect("proof"),
             },
             MigrationComponent {
                 name: "system:state-db".to_owned(),
                 source: SourceIdentity::absent(),
-                destination_proof: "absent".to_owned(),
+                destination_proof: DestinationProof::absent(),
             },
             MigrationComponent {
                 name: "system:capsule-authority".to_owned(),
                 source: SourceIdentity::absent(),
-                destination_proof: "absent".to_owned(),
+                destination_proof: DestinationProof::absent(),
             },
             MigrationComponent {
                 name: "system:fresh-layout".to_owned(),
                 source: SourceIdentity::absent(),
-                destination_proof:
-                    "fresh-layout-v1:initialized-without-legacy-sources".to_owned(),
+                destination_proof: DestinationProof::fresh_layout(),
             },
             MigrationComponent {
                 name: "system:gateway-revocations".to_owned(),
                 source: SourceIdentity::absent(),
-                destination_proof: "absent".to_owned(),
+                destination_proof: DestinationProof::absent(),
             },
             MigrationComponent {
                 name: "system:host-secrets".to_owned(),
                 source: SourceIdentity::absent(),
-                destination_proof: "absent".to_owned(),
+                destination_proof: DestinationProof::absent(),
             },
             MigrationComponent {
                 name: "system:invites".to_owned(),
                 source: SourceIdentity::absent(),
-                destination_proof: "absent".to_owned(),
+                destination_proof: DestinationProof::absent(),
             },
             MigrationComponent {
                 name: "system:pair-tokens".to_owned(),
                 source: SourceIdentity::absent(),
-                destination_proof: "absent".to_owned(),
+                destination_proof: DestinationProof::absent(),
             },
         ],
     };
@@ -193,39 +190,37 @@ fn canonical_ledger_without_layout_provenance_is_rejected() {
             MigrationComponent {
                 name: "system:cow".to_owned(),
                 source: SourceIdentity::absent(),
-                destination_proof:
-                    "verified-discard-v1:source-digest=absent:layout-receipt=layout-v1-to-v2.complete"
-                        .to_owned(),
+                destination_proof: DestinationProof::parse("verified-discard-v1:source-digest=absent:layout-receipt=layout-v1-to-v2.complete").expect("proof"),
             },
             MigrationComponent {
                 name: "system:state-db".to_owned(),
                 source: SourceIdentity::absent(),
-                destination_proof: "absent".to_owned(),
+                destination_proof: DestinationProof::absent(),
             },
             MigrationComponent {
                 name: "system:capsule-authority".to_owned(),
                 source: SourceIdentity::absent(),
-                destination_proof: "absent".to_owned(),
+                destination_proof: DestinationProof::absent(),
             },
             MigrationComponent {
                 name: "system:gateway-revocations".to_owned(),
                 source: SourceIdentity::absent(),
-                destination_proof: "absent".to_owned(),
+                destination_proof: DestinationProof::absent(),
             },
             MigrationComponent {
                 name: "system:host-secrets".to_owned(),
                 source: SourceIdentity::absent(),
-                destination_proof: "absent".to_owned(),
+                destination_proof: DestinationProof::absent(),
             },
             MigrationComponent {
                 name: "system:invites".to_owned(),
                 source: SourceIdentity::absent(),
-                destination_proof: "absent".to_owned(),
+                destination_proof: DestinationProof::absent(),
             },
             MigrationComponent {
                 name: "system:pair-tokens".to_owned(),
                 source: SourceIdentity::absent(),
-                destination_proof: "absent".to_owned(),
+                destination_proof: DestinationProof::absent(),
             },
         ],
     };
@@ -250,9 +245,7 @@ fn ledger_rejects_tampered_or_incomplete_component_sets() {
         components: vec![MigrationComponent {
             name: "system:cow".to_owned(),
             source: SourceIdentity::absent(),
-            destination_proof:
-                "verified-discard-v1:source-digest=not-absent:layout-receipt=layout-v1-to-v2.complete"
-                    .to_owned(),
+            destination_proof: DestinationProof::parse("verified-discard-v1:source-digest=not-absent:layout-receipt=layout-v1-to-v2.complete").expect("proof"),
         }],
     };
     fs::write(
@@ -272,7 +265,7 @@ fn existing_layout_requires_receipts_for_live_immutable_components() {
     let home_component = MigrationComponent {
         name: format!("principal:{uid}:home"),
         source: SourceIdentity::absent(),
-        destination_proof: "absent".to_owned(),
+        destination_proof: DestinationProof::absent(),
     };
     let component = MigrationComponent {
         name: format!("principal:{uid}:logs"),
@@ -282,7 +275,7 @@ fn existing_layout_requires_receipts_for_live_immutable_components() {
             super::source::SourceCount::new(1),
         )
         .expect("present source"),
-        destination_proof: format!("blake3:{}", "b".repeat(64)),
+        destination_proof: DestinationProof::parse(format!("blake3:{}", "b".repeat(64))).expect("proof"),
     };
     let ledger = MigrationLedger {
         schema: LEDGER_SCHEMA,
@@ -385,16 +378,17 @@ fn fresh_retirement_ledger(cow: SourceIdentity) -> MigrationLedger {
     let mut components = vec![
         MigrationComponent {
             name: "system:cow".to_owned(),
-            destination_proof: format!(
+            destination_proof: DestinationProof::parse(format!(
                 "verified-discard-v1:source-digest={}:layout-receipt=layout-v1-to-v2.complete",
                 cow.digest
-            ),
+            ))
+            .expect("proof"),
             source: cow,
         },
         MigrationComponent {
             name: "system:fresh-layout".to_owned(),
             source: SourceIdentity::absent(),
-            destination_proof: "fresh-layout-v1:initialized-without-legacy-sources".to_owned(),
+            destination_proof: DestinationProof::fresh_layout(),
         },
     ];
     for name in [
@@ -408,7 +402,7 @@ fn fresh_retirement_ledger(cow: SourceIdentity) -> MigrationLedger {
         components.push(MigrationComponent {
             name: name.to_owned(),
             source: SourceIdentity::absent(),
-            destination_proof: "absent".to_owned(),
+            destination_proof: DestinationProof::absent(),
         });
     }
     components.sort_by(|left, right| left.name.cmp(&right.name));
@@ -433,11 +427,11 @@ fn empty_secret_root_requires_an_exact_source_bound_proof() {
         MigrationComponent {
             name: format!("principal:{uid}:home"),
             source: SourceIdentity::absent(),
-            destination_proof: "absent".to_owned(),
+            destination_proof: DestinationProof::absent(),
         },
         MigrationComponent {
             name: format!("principal:{uid}:secrets"),
-            destination_proof: format!("verified-empty-v1:source-digest={}", source.digest),
+            destination_proof: DestinationProof::parse(format!("verified-empty-v1:source-digest={}", source.digest)).expect("proof"),
             source,
         },
     ]);
@@ -467,7 +461,7 @@ fn migrated_capsule_scopes_are_added_to_the_frozen_source_inventory() {
     let env = principal_home.env_dir().join("legacy-provider.env.json");
     fs::write(&env, b"{}\n").expect("legacy env");
     make_private_file(&env);
-    let secret = home.secrets_dir().join(alias.as_str()).join(&capsule);
+    let secret = home.secrets_dir().join(alias.as_ref()).join(&capsule);
     astrid_core::platform_fs::ensure_private_directory(&secret).expect("legacy secret scope");
     let secret_value = secret.join("api-key");
     fs::write(&secret_value, b"secret\n").expect("legacy secret");
@@ -551,10 +545,11 @@ fn tmp_retirement_interruption_preserves_source_or_durable_component_proof() {
     ledger.components.push(MigrationComponent {
         name: name.clone(),
         source: expected.clone(),
-        destination_proof: format!(
+        destination_proof: DestinationProof::parse(format!(
             "verified-discard-v1:source-digest={}:disposable=tmp",
             expected.digest
-        ),
+        ))
+        .expect("proof"),
     });
     ledger
         .components
@@ -815,20 +810,72 @@ fn prefixed_distro_init_digest_still_binds_discard_proof() {
     let digest = format!("blake3:{}", "c".repeat(64));
     let source =
         SourceIdentity::from_snapshot_fields(&digest, 1, 8, true).expect("prefixed source");
-    assert_eq!(source.digest.as_str(), digest);
+    assert_eq!(source.digest.as_ref(), digest);
     let mut ledger = fresh_retirement_ledger(SourceIdentity::absent());
     ledger.components.push(MigrationComponent {
         name: format!("principal:{uid}:home"),
         source: SourceIdentity::absent(),
-        destination_proof: "absent".to_owned(),
+        destination_proof: DestinationProof::absent(),
     });
     ledger.components.push(MigrationComponent {
         name: format!("principal:{uid}:distro-init"),
         source,
-        destination_proof: format!("verified-discard-v1:source-digest={digest}"),
+        destination_proof: DestinationProof::parse(format!("verified-discard-v1:source-digest={digest}")).expect("proof"),
     });
     ledger
         .components
         .sort_by(|left, right| left.name.cmp(&right.name));
     validate_ledger_shape(&ledger).expect("prefixed distro-init digest binds the discard proof");
+}
+
+#[test]
+fn destination_proof_rejects_unknown_prefix() {
+    assert!(DestinationProof::parse("not-a-proof").is_err());
+    assert!(
+        serde_json::from_str::<DestinationProof>(r#""mystery:value""#)
+            .is_err()
+    );
+}
+
+#[test]
+fn destination_proof_rejects_newline() {
+    assert!(DestinationProof::parse("absent\n").is_err());
+    assert!(DestinationProof::parse("verified-discard-v1:source-digest=absent\n").is_err());
+}
+
+#[test]
+fn destination_proof_accepts_absent_and_canonical_blake3() {
+    let absent = DestinationProof::parse("absent").expect("absent");
+    assert_eq!(absent.as_ref(), "absent");
+    assert_eq!(
+        serde_json::to_string(&absent).expect("json"),
+        r#""absent""#
+    );
+    assert_eq!(
+        serde_json::from_str::<DestinationProof>(r#""absent""#).expect("parse"),
+        absent
+    );
+
+    let hex = "b".repeat(64);
+    let stored = format!("blake3:{hex}");
+    let proof = DestinationProof::parse(stored.clone()).expect("blake3 proof");
+    assert_eq!(proof.as_ref(), stored);
+    assert_eq!(
+        serde_json::to_string(&proof).expect("json"),
+        serde_json::to_string(&stored).expect("string json")
+    );
+}
+
+#[test]
+fn destination_proof_rejects_uppercase_blake3_hex() {
+    assert!(DestinationProof::parse(format!("blake3:{}", "B".repeat(64))).is_err());
+}
+
+#[test]
+fn destination_proof_keeps_prefixed_source_digest_in_verified_discard() {
+    let digest = format!("blake3:{}", "c".repeat(64));
+    let stored = format!("verified-discard-v1:source-digest={digest}");
+    let proof = DestinationProof::parse(stored.clone()).expect("prefixed discard");
+    assert_eq!(proof.as_ref(), stored);
+    assert!(proof.contains(&format!("source-digest={digest}")));
 }

@@ -29,6 +29,7 @@ mod fs_hooks;
 mod hooks;
 mod host_fs;
 mod ledger;
+mod proof;
 mod secret;
 mod source;
 #[cfg(unix)]
@@ -48,9 +49,9 @@ use host_fs::{preflight_legacy_audit_sources, retire_legacy_audit_dir};
 #[cfg(test)]
 use ledger::{MigrationComponent, canonical_json};
 use ledger::{
-    MigrationLedger, SourceCount, SourceDigest, SourceIdentity, collect_destination_proofs,
-    decode_canonical, import_legacy_system_secrets, reject_unsupported_sources,
-    validate_existing_proofs, validate_ledger_shape, write_ledger,
+    DestinationProof, MigrationLedger, SourceCount, SourceDigest, SourceIdentity,
+    collect_destination_proofs, decode_canonical, import_legacy_system_secrets,
+    reject_unsupported_sources, validate_existing_proofs, validate_ledger_shape, write_ledger,
 };
 
 #[cfg(test)]
@@ -268,7 +269,7 @@ async fn resume_existing_layout(
     {
         proofs.insert(
             "system:fresh-layout".to_owned(),
-            "fresh-layout-v1:initialized-without-legacy-sources".to_owned(),
+            DestinationProof::fresh_layout(),
         );
     }
     validate_existing_proofs(home, &existing, &proofs, directory)?;
@@ -308,7 +309,7 @@ async fn initialize_fresh_layout(
     let mut proofs = collect_destination_proofs(home, store, directory, &snapshots, true).await?;
     proofs.insert(
         "system:fresh-layout".to_owned(),
-        "fresh-layout-v1:initialized-without-legacy-sources".to_owned(),
+        DestinationProof::fresh_layout(),
     );
     write_ledger(home, snapshots, &proofs)
 }

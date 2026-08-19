@@ -44,31 +44,19 @@ const MAX_WORKSPACE_BRANCHES: usize = 128;
 const UID_BYTES: usize = 16;
 
 // Private imports so child modules can keep using `super::Name`.
-#[allow(unused_imports)]
 use super::{
     CatalogRoot, CatalogSummary, CatalogValue, ContentHeader, EngineIdentity, EngineSource,
     build_catalog, delete, insert, list, lookup,
 };
-#[allow(unused_imports)]
-use crate::content::{ContentEntry, ContentName};
-#[allow(unused_imports)]
-use crate::content_dag::{
-    ContentReadError, build_content, open_content, read_opened_content, read_opened_content_range,
-};
-#[allow(unused_imports)]
+use crate::content::ContentName;
 use crate::engine::PrincipalProjectionError;
-#[allow(unused_imports)]
 use crate::filesystem::{FilesystemEntry, FilesystemEntryKind, FilesystemError, FilesystemPath};
-#[allow(unused_imports)]
 use crate::storage_model::{ModelError, ObjectClass, ObjectKind, ReferenceLabel};
-#[allow(unused_imports)]
 use astrid_core::PrincipalUid;
-#[allow(unused_imports)]
 use codec::{
     decode_branch_record, decode_promotion_receipt, make_branch_record, make_branch_record_for_uid,
     make_promotion_receipt_for_uid,
 };
-#[allow(unused_imports)]
 use helpers::{
     BranchState, hydrate_root, is_workspace_receipt_label, map_read_error,
     parse_workspace_receipt_uid, parse_workspace_uid, qualify_name, selected_catalog,

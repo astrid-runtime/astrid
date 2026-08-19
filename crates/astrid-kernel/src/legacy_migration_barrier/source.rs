@@ -90,14 +90,18 @@ impl<'de> Deserialize<'de> for SourceDigest {
     }
 }
 
+pub(super) fn is_canonical_blake3_hex(value: &str) -> bool {
+    value.len() == BLAKE3_HEX_LEN
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 fn validate_blake3_hex(value: &str) -> Result<(), &'static str> {
     if value.len() != BLAKE3_HEX_LEN {
         return Err("source digest must be 64 lowercase hex characters");
     }
-    if !value
-        .bytes()
-        .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-    {
+    if !is_canonical_blake3_hex(value) {
         return Err("source digest is not canonical lowercase hex");
     }
     Ok(())

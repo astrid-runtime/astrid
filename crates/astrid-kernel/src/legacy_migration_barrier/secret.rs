@@ -12,7 +12,7 @@ use super::ledger::{MigrationLedger, decode_canonical};
 use super::{MAX_BYTES, ledger_path, reject_incomplete_layout_v2};
 
 #[cfg(test)]
-use super::ledger::{MigrationComponent, SourceIdentity, canonical_json};
+use super::ledger::{DestinationProof, MigrationComponent, SourceIdentity, canonical_json};
 
 /// Return whether migration provenance forbids a legacy secret source for a
 /// principal that participated in migration.
@@ -77,7 +77,7 @@ pub(crate) fn record_absent_legacy_secret_for_test(
     ledger.components.push(MigrationComponent {
         name: format!("principal:{uid}:secrets"),
         source: SourceIdentity::absent(),
-        destination_proof: "absent".to_owned(),
+        destination_proof: DestinationProof::absent(),
     });
     ledger
         .components
