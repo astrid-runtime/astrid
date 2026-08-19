@@ -4556,6 +4556,18 @@ async fn attempt_capsule_restart(
     }
 }
 
+/// Return the logical restart-tracker identity for one runtime generation.
+///
+/// A restart publishes a fresh [`astrid_capsule::registry::RuntimeId`] for the
+/// same logical slot. The retry budget must therefore follow the generation-
+/// independent [`astrid_capsule::registry::RuntimeKey`], or every restart
+/// would reset the tracker to attempt one.
+fn restart_tracker_key(
+    runtime_id: &astrid_capsule::registry::RuntimeId,
+) -> astrid_capsule::registry::RuntimeKey {
+    runtime_id.key().clone()
+}
+
 /// Spawns a background task that periodically probes capsule health.
 ///
 /// Every 10 seconds, reads the capsule registry and calls `check_health()` on
@@ -4569,7 +4581,7 @@ fn spawn_capsule_health_monitor(kernel: Arc<Kernel>) -> astrid_runtime::JoinHand
         interval.tick().await; // Skip the first immediate tick.
 
         let mut restart_trackers: std::collections::HashMap<
-            astrid_capsule::registry::RuntimeId,
+            astrid_capsule::registry::RuntimeKey,
             RestartTracker,
         > = std::collections::HashMap::new();
 
@@ -4635,15 +4647,15 @@ fn spawn_capsule_health_monitor(kernel: Arc<Kernel>) -> astrid_runtime::JoinHand
             // obtain exclusive access for calling unload().
             drop(ready_capsules);
 
-            let failed_this_tick: std::collections::HashSet<astrid_capsule::registry::RuntimeId> =
+            let failed_this_tick: std::collections::HashSet<astrid_capsule::registry::RuntimeKey> =
                 failures
                     .iter()
-                    .map(|(_principal, _id, runtime_id, _)| runtime_id.clone())
+                    .map(|(_principal, _id, runtime_id, _)| restart_tracker_key(runtime_id))
                     .collect();
 
             for (principal, id_str, runtime_id, _reason) in &failures {
                 let tracker = restart_trackers
-                    .entry(runtime_id.clone())
+                    .entry(restart_tracker_key(runtime_id))
                     .or_insert_with(RestartTracker::new);
 
                 attempt_capsule_restart(&kernel, id_str, principal, runtime_id, tracker).await;
@@ -6974,6 +6986,54 @@ mod tests {
             "persistent failures must stop at the cap, not thrash forever"
         );
         assert!(disabled, "a persistently-failing capsule ends up capped");
+    }
+
+    #[test]
+    fn retry_budget_survives_runtime_generation_replacement() {
+        // Every restart publishes a new RuntimeId generation for the same
+        // logical runtime slot. The health monitor must retain one tracker
+        // across those replacements, or a crash loop starts at attempt 1 on
+        // every tick and never reaches the five-attempt cap.
+        let id = CapsuleId::new("generation-tracker").expect("valid capsule id");
+        let artifact = astrid_capsule::registry::WasmHash::from_raw("generation-tracker-hash");
+        let mut registry = CapsuleRegistry::new();
+        let mut trackers = std::collections::HashMap::new();
+        let mut attempts = 0;
+
+        for _ in 0..20 {
+            let runtime_id = registry
+                .reserve_runtime_id(
+                    id.clone(),
+                    artifact.clone(),
+                    astrid_capsule::registry::RuntimeScope::SystemResident,
+                )
+                .expect("reserve replacement generation");
+            let tracker = trackers
+                .entry(restart_tracker_key(&runtime_id))
+                .or_insert_with(RestartTracker::new);
+            tracker.last_attempt = astrid_runtime::time::Instant::now()
+                .checked_sub(RestartTracker::MAX_BACKOFF)
+                .expect("backdate tracker");
+            if tracker.should_restart() {
+                tracker.record_attempt();
+                attempts += 1;
+            }
+            let failed_keys = [restart_tracker_key(&runtime_id)]
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>();
+            trackers.retain(|key, tracker| {
+                tracker_should_be_retained(tracker, failed_keys.contains(key))
+            });
+        }
+
+        assert_eq!(attempts, RestartTracker::MAX_ATTEMPTS);
+        assert_eq!(trackers.len(), 1, "one logical slot must keep one tracker");
+        assert!(
+            trackers
+                .values()
+                .next()
+                .is_some_and(RestartTracker::exhausted)
+        );
     }
 
     #[test]

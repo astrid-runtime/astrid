@@ -9,6 +9,13 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Capsule restart budget now survives runtime generation replacement.**
+  Health-monitor restart trackers are keyed by generation-independent runtime
+  identity so a persistently failing run loop reaches the five-attempt cap
+  instead of resetting on every replacement. Refs #1541.
+
 ### Changed
 
 - **Adversarial regression coverage now pins public runtime boundaries.**
