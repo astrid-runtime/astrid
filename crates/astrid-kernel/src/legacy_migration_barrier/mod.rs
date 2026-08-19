@@ -30,6 +30,7 @@ mod hooks;
 mod host_fs;
 mod ledger;
 mod secret;
+mod source;
 #[cfg(unix)]
 use crate::{preflight_legacy_audit_sources, retire_legacy_audit_dir};
 #[cfg(test)]
@@ -47,9 +48,9 @@ use host_fs::{preflight_legacy_audit_sources, retire_legacy_audit_dir};
 #[cfg(test)]
 use ledger::{MigrationComponent, canonical_json};
 use ledger::{
-    MigrationLedger, SourceIdentity, collect_destination_proofs, decode_canonical,
-    import_legacy_system_secrets, reject_unsupported_sources, validate_existing_proofs,
-    validate_ledger_shape, write_ledger,
+    MigrationLedger, SourceCount, SourceDigest, SourceIdentity, collect_destination_proofs,
+    decode_canonical, import_legacy_system_secrets, reject_unsupported_sources,
+    validate_existing_proofs, validate_ledger_shape, write_ledger,
 };
 
 #[cfg(test)]
@@ -359,7 +360,7 @@ async fn migrate_legacy_layout(
     let authority_source = snapshots.get("system:capsule-authority").ok_or_else(|| {
         io::Error::other("migration source inventory is missing capsule authority")
     })?;
-    let authority_proof = capsule_report.canonical_proof(&authority_source.digest);
+    let authority_proof = capsule_report.canonical_proof(authority_source.digest.as_str());
     astrid_core::platform_fs::ensure_private_directory(&home.migrations_dir())?;
     astrid_core::platform_fs::atomic_write_private_file(
         &home.migrations_dir().join(CAPSULE_AUTHORITY_RECEIPT_NAME),
@@ -768,21 +769,21 @@ fn preflight_sources(
         )?;
         sources.insert(
             format!("principal:{uid}:distro-lock"),
-            SourceIdentity {
-                digest: distro.digest,
-                entries: distro.entries,
-                bytes: distro.bytes,
-                present: distro.present,
-            },
+            source_identity_from_snapshot(
+                &distro.digest,
+                distro.entries,
+                distro.bytes,
+                distro.present,
+            )?,
         );
         sources.insert(
             format!("principal:{uid}:distro-init"),
-            SourceIdentity {
-                digest: distro_init.digest,
-                entries: distro_init.entries,
-                bytes: distro_init.bytes,
-                present: distro_init.present,
-            },
+            source_identity_from_snapshot(
+                &distro_init.digest,
+                distro_init.entries,
+                distro_init.bytes,
+                distro_init.present,
+            )?,
         );
         sources.insert(
             format!("principal:{uid}:audit"),
@@ -813,12 +814,12 @@ fn preflight_sources(
         add_principal_scope_sources(&mut sources, home, alias, *uid, &capsule_ids)?;
         sources.insert(
             home_name,
-            SourceIdentity {
-                digest: ordinary.digest,
-                entries: ordinary.entries,
-                bytes: ordinary.bytes,
-                present: ordinary.present,
-            },
+            source_identity_from_snapshot(
+                &ordinary.digest,
+                ordinary.entries,
+                ordinary.bytes,
+                ordinary.present,
+            )?,
         );
     }
     Ok(sources)
@@ -988,3 +989,21 @@ fn ensure_no_unretired_component_sources(
 
 #[cfg(test)]
 mod tests;
+
+fn source_identity_from_snapshot(
+    digest: &str,
+    entries: u64,
+    bytes: u64,
+    present: bool,
+) -> io::Result<SourceIdentity> {
+    if !present {
+        return Ok(SourceIdentity::absent());
+    }
+    SourceIdentity::present(
+        SourceDigest::parse(digest.to_owned())
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+        SourceCount::new(entries),
+        SourceCount::new(bytes),
+    )
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}

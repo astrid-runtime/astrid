@@ -276,12 +276,12 @@ fn existing_layout_requires_receipts_for_live_immutable_components() {
     };
     let component = MigrationComponent {
         name: format!("principal:{uid}:logs"),
-        source: SourceIdentity {
-            digest: "a".repeat(64),
-            entries: 1,
-            bytes: 1,
-            present: true,
-        },
+        source: SourceIdentity::present(
+            super::source::SourceDigest::from_hex("a".repeat(64)).expect("digest"),
+            super::source::SourceCount::new(1),
+            super::source::SourceCount::new(1),
+        )
+        .expect("present source"),
         destination_proof: format!("blake3:{}", "b".repeat(64)),
     };
     let ledger = MigrationLedger {
@@ -422,12 +422,12 @@ fn fresh_retirement_ledger(cow: SourceIdentity) -> MigrationLedger {
 #[test]
 fn empty_secret_root_requires_an_exact_source_bound_proof() {
     let uid = PrincipalUid::from_bytes([0x61; 32]);
-    let source = SourceIdentity {
-        digest: "a".repeat(64),
-        entries: 0,
-        bytes: 0,
-        present: true,
-    };
+    let source = SourceIdentity::present(
+        super::source::SourceDigest::from_hex("a".repeat(64)).expect("digest"),
+        super::source::SourceCount::ZERO,
+        super::source::SourceCount::ZERO,
+    )
+    .expect("present empty source");
     let mut ledger = fresh_retirement_ledger(SourceIdentity::absent());
     ledger.components.extend([
         MigrationComponent {
@@ -451,7 +451,7 @@ fn empty_secret_root_requires_an_exact_source_bound_proof() {
         .iter_mut()
         .find(|component| component.name.ends_with(":secrets"))
         .expect("secret component");
-    secret.source.entries = 1;
+    secret.source.entries = super::source::SourceCount::new(1);
     assert!(validate_ledger_shape(&ledger).is_err());
 }
 

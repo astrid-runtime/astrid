@@ -1,5 +1,6 @@
 //! Canonical migration ledger, source proofs, and component import receipts.
 
+pub(super) use super::source::{SourceCount, SourceDigest, SourceIdentity};
 use super::{
     AstridHome, BTreeMap, CAPSULE_AUTHORITY_RECEIPT_NAME, HOST_SECRET_RECEIPT_NAME, LEDGER_SCHEMA,
     MAX_BYTES, PrincipalDirectory, PrincipalId, PrincipalUid, REVOCATION_NAMESPACE,
@@ -622,7 +623,7 @@ pub(super) fn validate_ledger_shape(ledger: &MigrationLedger) -> io::Result<()> 
             ));
         }
         previous = Some(component.name.clone());
-        if !valid_source_digest(&component.source.digest) {
+        if !valid_source_digest(component.source.digest.as_str()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("invalid migration source digest: {}", component.name),
@@ -789,26 +790,6 @@ pub(super) fn validate_ledger_shape(ledger: &MigrationLedger) -> io::Result<()> 
         ));
     }
     Ok(())
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct SourceIdentity {
-    pub(super) digest: String,
-    pub(super) entries: u64,
-    pub(super) bytes: u64,
-    pub(super) present: bool,
-}
-
-impl SourceIdentity {
-    pub(super) fn absent() -> Self {
-        Self {
-            digest: "absent".to_owned(),
-            entries: 0,
-            bytes: 0,
-            present: false,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

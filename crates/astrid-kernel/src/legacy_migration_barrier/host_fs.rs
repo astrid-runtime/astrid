@@ -8,7 +8,16 @@ use std::io::{self, Read};
 use std::path::Path;
 use std::path::PathBuf;
 
-use super::{AstridHome, MAX_BYTES, MAX_ENTRIES, PrincipalId, PrincipalUid, SourceIdentity};
+use super::{
+    AstridHome, MAX_BYTES, MAX_ENTRIES, PrincipalId, PrincipalUid, SourceCount, SourceDigest,
+    SourceIdentity,
+};
+
+#[derive(Default)]
+struct SourceInventory {
+    entries: SourceCount,
+    bytes: SourceCount,
+}
 
 use super::fs_hooks::run_test_retire_leaf_hook;
 #[cfg(test)]
@@ -613,18 +622,13 @@ fn snapshot_path_with_access(path: &Path, access: SourceAccess) -> io::Result<So
     }
     let device = device_id(&metadata);
     let mut hasher = blake3::Hasher::new_derive_key("astrid layout component source v1");
-    let mut identity = SourceIdentity {
-        digest: String::new(),
-        entries: 0,
-        bytes: 0,
-        present: true,
-    };
+    let mut identity = SourceInventory::default();
     if metadata.is_file() {
         // A top-level regular file is itself one source entry.  Directory
         // snapshots count children in `snapshot_dir`; keeping the same
         // cardinality here lets retirement bind a single-file source to the
         // exact preflight manifest as well.
-        identity.entries = 1;
+        identity.entries = SourceCount::new(1);
         read_regular_file(path, &mut hasher, &mut identity)?;
     } else if metadata.is_dir() {
         snapshot_dir(path, path, device, access, &mut hasher, &mut identity)?;
@@ -634,8 +638,12 @@ fn snapshot_path_with_access(path: &Path, access: SourceAccess) -> io::Result<So
             format!("legacy source contains a special entry: {}", path.display()),
         ));
     }
-    identity.digest = hasher.finalize().to_hex().to_string();
-    Ok(identity)
+    SourceIdentity::present(
+        SourceDigest::from_blake3(hasher.finalize()),
+        identity.entries,
+        identity.bytes,
+    )
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 /// Validate one regular-file source using the same no-follow, private,
@@ -679,7 +687,7 @@ fn snapshot_dir(
     device: u64,
     access: SourceAccess,
     hasher: &mut blake3::Hasher,
-    identity: &mut SourceIdentity,
+    identity: &mut SourceInventory,
 ) -> io::Result<()> {
     let mut children = fs::read_dir(dir)
         .map_err(io::Error::other)?
@@ -718,7 +726,7 @@ fn snapshot_dir(
             .entries
             .checked_add(1)
             .ok_or_else(|| io::Error::other("legacy source entry limit exceeded"))?;
-        if identity.entries > MAX_ENTRIES {
+        if identity.entries.get() > MAX_ENTRIES {
             return Err(io::Error::other("legacy source entry limit exceeded"));
         }
         if metadata.is_dir() {
@@ -789,7 +797,7 @@ fn validate_owner_controlled_entry(path: &Path, metadata: &fs::Metadata) -> io::
 fn read_regular_file(
     path: &Path,
     hasher: &mut blake3::Hasher,
-    identity: &mut SourceIdentity,
+    identity: &mut SourceInventory,
 ) -> io::Result<()> {
     let mut options = OpenOptions::new();
     options.read(true);
@@ -815,7 +823,7 @@ fn read_regular_file(
             .bytes
             .checked_add(read as u64)
             .ok_or_else(|| io::Error::other("legacy source byte limit exceeded"))?;
-        if identity.bytes > MAX_BYTES {
+        if identity.bytes.get() > MAX_BYTES {
             return Err(io::Error::other("legacy source byte limit exceeded"));
         }
         hasher.update(&buffer[..read]);
