@@ -39,15 +39,11 @@ use subtle::ConstantTimeEq;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use tracing::warn;
 
-#[path = "pair_token_storage_migration.rs"]
-mod storage_migration;
-use storage_migration::{read_legacy_source, retire_legacy_file};
-
-#[path = "pair_token/token_hash.rs"]
-mod token_hash;
-use token_hash::TokenHash;
-
 mod durable_reservation;
+mod storage_migration;
+mod token_hash;
+use storage_migration::{read_legacy_source, retire_legacy_file};
+use token_hash::TokenHash;
 
 const STORE_SCHEMA_VERSION: u32 = 1;
 const TOKEN_HASH_CONTEXT: &str = "astrid.runtime.pair-device-token.identifier.v1";

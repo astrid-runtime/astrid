@@ -35,12 +35,9 @@ use subtle::ConstantTimeEq;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use tracing::warn;
 
-#[path = "invite_storage_migration.rs"]
+mod durable_reservation;
 mod storage_migration;
 use storage_migration::{read_legacy_source, retire_legacy_file};
-
-#[path = "invite/durable_reservation.rs"]
-mod durable_reservation;
 
 const STORE_SCHEMA_VERSION: u32 = 1;
 const TOKEN_HASH_CONTEXT: &str = "astrid.runtime.invite-token.identifier.v1";
