@@ -18,7 +18,6 @@ use astrid_storage::{
     AstridFilesystem, FilesystemEntryKind, FilesystemError, FilesystemPath, PrincipalDirectory,
     RuntimePrincipalStore, StateOwner,
 };
-const RECEIPT_SCHEMA: u32 = 2;
 const RECEIPT_PREFIX: &str = "principal-home-";
 const RECEIPT_SUFFIX: &str = ".json";
 const RECEIPT_PAGE_MARKER: &str = ".page-";
@@ -36,6 +35,7 @@ const MAX_RELATIVE_PATH_BYTES: usize = 4096;
 
 mod paths;
 mod receipts;
+mod types;
 use paths::{
     append_relative, conflict_fs, conflict_path, destination_name, invalid_source,
     is_dedicated_path, logical_relative, receipt_path_for_display, receipt_uid_for_alias,
@@ -47,6 +47,7 @@ use receipts::{
     EntryKind, MigrationEntry, MigrationReceipt, PageWriter, read_page, read_receipt, receipt_path,
     remove_stale_pages, validate_receipt_pages, write_receipt,
 };
+use types::{ByteCount, ContentDigest, EntryCount, InventoryDigest, PageCount, ReceiptSchema};
 
 /// Copy ordinary files for every admitted legacy principal.
 pub(crate) fn migrate_legacy_principal_homes(
@@ -150,9 +151,9 @@ pub(crate) fn legacy_ordinary_source_snapshot(
     }
     let summary = summarize_inventory(source)?;
     Ok(PrincipalHomeSourceIdentity {
-        digest: summary.digest,
-        entries: summary.count,
-        bytes: summary.bytes,
+        digest: summary.digest.as_str().to_owned(),
+        entries: summary.count.get(),
+        bytes: summary.bytes.get(),
         present: true,
     })
 }
@@ -263,7 +264,7 @@ fn retire_one_receipted_source(
         ));
     }
     validate_receipt_pages(home, uid, &receipt)?;
-    for page_number in (0..receipt.page_count).rev() {
+    for page_number in (0..receipt.page_count.get()).rev() {
         let page = read_page(home, uid, page_number)?;
         for entry in page.entries.into_iter().rev() {
             let relative = Path::new(&entry.source);
@@ -360,7 +361,7 @@ fn migrate_one_principal(
         // The alias is retained as migration provenance only.  PrincipalId
         // aliases are mutable, so a rename must not hide an already migrated
         // owner-local home tree.
-        if receipt.schema != RECEIPT_SCHEMA || receipt.uid != uid {
+        if receipt.schema != ReceiptSchema::V2 || receipt.uid != uid {
             return Err(conflict_path(
                 &receipt_path,
                 "receipt identity does not match the live principal mapping",
@@ -427,13 +428,13 @@ fn migrate_one_principal(
     }
 
     let receipt = MigrationReceipt {
-        schema: RECEIPT_SCHEMA,
+        schema: ReceiptSchema::V2,
         uid,
         alias: alias.clone(),
         inventory_digest: published.digest,
         entry_count: published.count,
         bytes: published.bytes,
-        page_count,
+        page_count: PageCount::new(page_count),
     };
     verify_destinations(home, store, uid, &receipt)?;
     write_receipt(&receipt_path, &receipt)?;
@@ -447,13 +448,13 @@ fn write_empty_receipt(
     inventory: InventorySummaryFinal,
 ) -> io::Result<()> {
     let receipt = MigrationReceipt {
-        schema: RECEIPT_SCHEMA,
+        schema: ReceiptSchema::V2,
         uid,
         alias: alias.clone(),
         inventory_digest: inventory.digest,
         entry_count: inventory.count,
         bytes: inventory.bytes,
-        page_count: 0,
+        page_count: PageCount::ZERO,
     };
     write_receipt(&receipt_path(home, uid), &receipt)
 }
@@ -520,8 +521,8 @@ fn walk_directory(
                 source: relative_text.clone(),
                 destination: destination_name(&relative_text),
                 kind: EntryKind::Directory,
-                bytes: 0,
-                digest: String::new(),
+                bytes: ByteCount::ZERO,
+                digest: ContentDigest::empty(),
             })?;
             walk_directory(root, &child_relative, callback)?;
         } else if metadata.is_file() {
@@ -543,15 +544,15 @@ fn walk_directory(
 #[derive(Default)]
 struct InventorySummary {
     hasher: blake3::Hasher,
-    count: u64,
-    bytes: u64,
+    count: EntryCount,
+    bytes: ByteCount,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct InventorySummaryFinal {
-    digest: String,
-    count: u64,
-    bytes: u64,
+    digest: InventoryDigest,
+    count: EntryCount,
+    bytes: ByteCount,
 }
 
 impl InventorySummary {
@@ -563,7 +564,7 @@ impl InventorySummary {
         self.hasher.update(&bytes);
         self.count = self
             .count
-            .checked_add(1)
+            .checked_add(EntryCount::new(1))
             .ok_or_else(|| io::Error::other("legacy inventory entry count overflow"))?;
         self.bytes = self
             .bytes
@@ -574,7 +575,7 @@ impl InventorySummary {
 
     fn finish(self) -> InventorySummaryFinal {
         InventorySummaryFinal {
-            digest: self.hasher.finalize().to_hex().to_string(),
+            digest: InventoryDigest::from_blake3(self.hasher.finalize()),
             count: self.count,
             bytes: self.bytes,
         }
@@ -762,7 +763,7 @@ fn verify_destinations(
     let filesystem = AstridFilesystem::new(store.content(), StateOwner::Principal(uid));
     let mut summary = InventorySummary::default();
     let mut count = 0_u64;
-    for page_number in 0..receipt.page_count {
+    for page_number in 0..receipt.page_count.get() {
         let page = read_page(home, uid, page_number)?;
         if page.page != page_number {
             return Err(conflict_path(
@@ -826,7 +827,8 @@ fn verify_file_content(
     let actual = filesystem
         .stat(destination)
         .map_err(|error| storage_error(&error))?;
-    if actual.kind() != FilesystemEntryKind::File || actual.logical_bytes() != expected.bytes {
+    if actual.kind() != FilesystemEntryKind::File || actual.logical_bytes() != expected.bytes.get()
+    {
         return Err(conflict_fs(
             destination,
             "destination metadata differs from receipt",
@@ -834,9 +836,10 @@ fn verify_file_content(
     }
     let mut hasher = blake3::Hasher::new();
     let mut offset = 0_u64;
-    while offset < expected.bytes {
+    while offset < expected.bytes.get() {
         let length = expected
             .bytes
+            .get()
             .saturating_sub(offset)
             .min(READBACK_CHUNK_BYTES);
         let content = filesystem
@@ -853,7 +856,7 @@ fn verify_file_content(
             .checked_add(length)
             .ok_or_else(|| io::Error::other("destination read-back length overflow"))?;
     }
-    let digest = hasher.finalize().to_hex().to_string();
+    let digest = ContentDigest::from_blake3(hasher.finalize());
     if digest != expected.digest {
         return Err(conflict_fs(
             destination,
@@ -863,7 +866,7 @@ fn verify_file_content(
     Ok(())
 }
 
-fn digest_file(path: &Path) -> io::Result<(u64, String)> {
+fn digest_file(path: &Path) -> io::Result<(ByteCount, ContentDigest)> {
     validate_regular_file(path)?;
     astrid_core::platform_fs::verify_no_redirects(path)?;
     let before = fs::metadata(path)?.len();
@@ -889,7 +892,10 @@ fn digest_file(path: &Path) -> io::Result<(u64, String)> {
             "legacy file changed while being inventoried",
         ));
     }
-    Ok((bytes, hasher.finalize().to_hex().to_string()))
+    Ok((
+        ByteCount::new(bytes),
+        ContentDigest::from_blake3(hasher.finalize()),
+    ))
 }
 
 fn validate_regular_file(path: &Path) -> io::Result<()> {

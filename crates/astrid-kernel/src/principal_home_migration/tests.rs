@@ -278,3 +278,53 @@ async fn interrupted_page_publication_restarts_and_receipt_tampering_fails_close
     fs::write(&page, bytes).expect("tamper page");
     assert!(migrate_legacy_principal_homes(&home, &store, &principals).is_err());
 }
+
+#[test]
+fn receipt_json_rejects_noncanonical_digest_and_schema() {
+    let uid = PrincipalUid::from_bytes([0x71; 32]);
+    let alias = PrincipalId::new("default").expect("alias");
+    let hex = "ab".repeat(32);
+    let valid = serde_json::json!({
+        "schema": 2,
+        "uid": uid,
+        "alias": alias,
+        "inventory_digest": hex,
+        "entry_count": 1,
+        "bytes": 4,
+        "page_count": 1
+    });
+    serde_json::from_value::<MigrationReceipt>(valid).expect("canonical receipt");
+
+    let empty_digest = serde_json::json!({
+        "schema": 2,
+        "uid": uid,
+        "alias": alias,
+        "inventory_digest": "",
+        "entry_count": 0,
+        "bytes": 0,
+        "page_count": 0
+    });
+    assert!(serde_json::from_value::<MigrationReceipt>(empty_digest).is_err());
+
+    let uppercase = serde_json::json!({
+        "schema": 2,
+        "uid": uid,
+        "alias": alias,
+        "inventory_digest": "AB".repeat(32),
+        "entry_count": 1,
+        "bytes": 4,
+        "page_count": 1
+    });
+    assert!(serde_json::from_value::<MigrationReceipt>(uppercase).is_err());
+
+    let old_schema = serde_json::json!({
+        "schema": 1,
+        "uid": uid,
+        "alias": alias,
+        "inventory_digest": hex,
+        "entry_count": 1,
+        "bytes": 4,
+        "page_count": 1
+    });
+    assert!(serde_json::from_value::<MigrationReceipt>(old_schema).is_err());
+}

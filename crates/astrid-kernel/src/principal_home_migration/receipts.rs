@@ -9,27 +9,30 @@ use astrid_core::identity::PrincipalUid;
 use serde::{Deserialize, Serialize};
 
 use super::paths::{invalid_source, page_path_in};
+use super::types::{
+    ByteCount, ContentDigest, EntryCount, InventoryDigest, PageCount, ReceiptSchema,
+};
 use super::{
     MAX_RECEIPT_INDEX_BYTES, MAX_RECEIPT_PAGE_BYTES, PAGE_ENTRY_LIMIT, RECEIPT_PAGE_MARKER,
-    RECEIPT_PREFIX, RECEIPT_SCHEMA, RECEIPT_SUFFIX,
+    RECEIPT_PREFIX, RECEIPT_SUFFIX,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct MigrationReceipt {
-    pub(super) schema: u32,
+    pub(super) schema: ReceiptSchema,
     pub(super) uid: PrincipalUid,
     pub(super) alias: astrid_core::PrincipalId,
-    pub(super) inventory_digest: String,
-    pub(super) entry_count: u64,
-    pub(super) bytes: u64,
-    pub(super) page_count: u64,
+    pub(super) inventory_digest: InventoryDigest,
+    pub(super) entry_count: EntryCount,
+    pub(super) bytes: ByteCount,
+    pub(super) page_count: PageCount,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct MigrationPage {
-    pub(super) schema: u32,
+    pub(super) schema: ReceiptSchema,
     pub(super) uid: PrincipalUid,
     pub(super) page: u64,
     pub(super) entries: Vec<MigrationEntry>,
@@ -41,8 +44,8 @@ pub(super) struct MigrationEntry {
     pub(super) source: String,
     pub(super) destination: String,
     pub(super) kind: EntryKind,
-    pub(super) bytes: u64,
-    pub(super) digest: String,
+    pub(super) bytes: ByteCount,
+    pub(super) digest: ContentDigest,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,7 +90,7 @@ impl PageWriter {
             return Ok(());
         }
         let page = MigrationPage {
-            schema: RECEIPT_SCHEMA,
+            schema: ReceiptSchema::V2,
             uid: self.uid,
             page: self.page,
             entries: std::mem::take(&mut self.entries),
@@ -121,7 +124,7 @@ pub(super) fn validate_receipt_pages(
     // no pages; validating the bounded pages must fail closed without an
     // attacker-controlled allocation.
     let mut count = 0_u64;
-    for page_number in 0..receipt.page_count {
+    for page_number in 0..receipt.page_count.get() {
         let page = read_page(home, uid, page_number)?;
         count = count
             .checked_add(u64::try_from(page.entries.len()).map_err(|_| {
@@ -130,14 +133,14 @@ pub(super) fn validate_receipt_pages(
             .ok_or_else(|| {
                 invalid_source(&receipt_path(home, uid), "receipt entry count overflow")
             })?;
-        if count > receipt.entry_count {
+        if count > receipt.entry_count.get() {
             return Err(invalid_source(
                 &receipt_path(home, uid),
                 "receipt entry count exceeds its index",
             ));
         }
     }
-    if count != receipt.entry_count {
+    if count != receipt.entry_count.get() {
         return Err(invalid_source(
             &receipt_path(home, uid),
             "receipt entry count does not match its pages",
@@ -170,8 +173,9 @@ pub(super) fn read_receipt(path: &Path) -> io::Result<Option<MigrationReceipt>> 
                     format!("invalid principal-home migration receipt: {error}"),
                 )
             })?;
-            if receipt.page_count > receipt.entry_count
-                || (receipt.entry_count == 0 && receipt.page_count != 0)
+            if receipt.page_count.get() > receipt.entry_count.get()
+                || (receipt.entry_count == EntryCount::ZERO
+                    && receipt.page_count != PageCount::ZERO)
             {
                 return Err(invalid_source(path, "receipt page count is not canonical"));
             }
@@ -221,7 +225,9 @@ pub(super) fn read_page(
                     format!("invalid principal-home migration page: {error}"),
                 )
             })?;
-            if page.schema != RECEIPT_SCHEMA || page.uid != uid || page.page != page_number(&path)?
+            if page.schema != ReceiptSchema::V2
+                || page.uid != uid
+                || page.page != page_number(&path)?
             {
                 return Err(invalid_source(
                     &path,
