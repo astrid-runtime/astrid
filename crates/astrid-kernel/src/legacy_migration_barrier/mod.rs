@@ -769,7 +769,7 @@ fn preflight_sources(
         )?;
         sources.insert(
             format!("principal:{uid}:distro-lock"),
-            source_identity_from_snapshot(
+            SourceIdentity::from_snapshot_fields(
                 &distro.digest,
                 distro.entries,
                 distro.bytes,
@@ -778,7 +778,7 @@ fn preflight_sources(
         );
         sources.insert(
             format!("principal:{uid}:distro-init"),
-            source_identity_from_snapshot(
+            SourceIdentity::from_snapshot_fields(
                 &distro_init.digest,
                 distro_init.entries,
                 distro_init.bytes,
@@ -814,7 +814,7 @@ fn preflight_sources(
         add_principal_scope_sources(&mut sources, home, alias, *uid, &capsule_ids)?;
         sources.insert(
             home_name,
-            source_identity_from_snapshot(
+            SourceIdentity::from_snapshot_fields(
                 &ordinary.digest,
                 ordinary.entries,
                 ordinary.bytes,
@@ -989,21 +989,3 @@ fn ensure_no_unretired_component_sources(
 
 #[cfg(test)]
 mod tests;
-
-fn source_identity_from_snapshot(
-    digest: &str,
-    entries: u64,
-    bytes: u64,
-    present: bool,
-) -> io::Result<SourceIdentity> {
-    if !present {
-        return Ok(SourceIdentity::absent());
-    }
-    SourceIdentity::present(
-        SourceDigest::parse(digest.to_owned())
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
-        SourceCount::new(entries),
-        SourceCount::new(bytes),
-    )
-    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
-}

@@ -808,3 +808,27 @@ fn owner_controlled_snapshot_accepts_historical_read_only_modes() {
         .expect_err("externally writable database bytes must fail closed");
     assert!(error.to_string().contains("group/world writable"));
 }
+
+#[test]
+fn prefixed_distro_init_digest_still_binds_discard_proof() {
+    let uid = PrincipalUid::from_bytes([0x44; 32]);
+    let digest = format!("blake3:{}", "c".repeat(64));
+    let source =
+        SourceIdentity::from_snapshot_fields(&digest, 1, 8, true).expect("prefixed source");
+    assert_eq!(source.digest.as_str(), digest);
+    let mut ledger = fresh_retirement_ledger(SourceIdentity::absent());
+    ledger.components.push(MigrationComponent {
+        name: format!("principal:{uid}:home"),
+        source: SourceIdentity::absent(),
+        destination_proof: "absent".to_owned(),
+    });
+    ledger.components.push(MigrationComponent {
+        name: format!("principal:{uid}:distro-init"),
+        source,
+        destination_proof: format!("verified-discard-v1:source-digest={digest}"),
+    });
+    ledger
+        .components
+        .sort_by(|left, right| left.name.cmp(&right.name));
+    validate_ledger_shape(&ledger).expect("prefixed distro-init digest binds the discard proof");
+}

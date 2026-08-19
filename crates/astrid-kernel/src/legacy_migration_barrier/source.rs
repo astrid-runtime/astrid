@@ -6,6 +6,7 @@
 //! real digest, or a digest that is neither `absent` nor canonical hex.
 
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
+use std::io;
 
 const BLAKE3_HEX_LEN: usize = 64;
 
@@ -36,8 +37,14 @@ impl SourceDigest {
         if value == Self::ABSENT {
             return Ok(Self::absent());
         }
-        let hex = value.strip_prefix("blake3:").unwrap_or(&value);
-        Self::from_hex(hex.to_owned())
+        // Distro and lock receipts store `blake3:<hex>`. Host-path snapshots
+        // store bare hex. Keep whichever canonical form arrived; stripping
+        // the prefix would break source-bound destination proofs.
+        if let Some(hex) = value.strip_prefix("blake3:") {
+            validate_blake3_hex(hex)?;
+            return Ok(Self(value));
+        }
+        Self::from_hex(value)
     }
 
     pub(super) fn as_str(&self) -> &str {
@@ -179,6 +186,24 @@ impl SourceIdentity {
             _ => Ok(self),
         }
     }
+
+    pub(super) fn from_snapshot_fields(
+        digest: &str,
+        entries: u64,
+        bytes: u64,
+        present: bool,
+    ) -> io::Result<Self> {
+        if !present {
+            return Ok(Self::absent());
+        }
+        Self::present(
+            SourceDigest::parse(digest.to_owned())
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+            SourceCount::new(entries),
+            SourceCount::new(bytes),
+        )
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    }
 }
 
 impl<'de> Deserialize<'de> for SourceIdentity {
@@ -262,7 +287,7 @@ mod tests {
             SourceDigest::parse(format!("blake3:{hex}"))
                 .expect("prefixed")
                 .as_str(),
-            hex
+            format!("blake3:{hex}")
         );
         assert!(SourceDigest::parse("AB".repeat(32)).is_err());
         assert!(SourceDigest::parse("").is_err());
