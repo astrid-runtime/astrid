@@ -5,6 +5,7 @@ use crate::engine::InMemoryEngine;
 use crate::kv::{KvStore, TreeKvStore};
 use crate::principal_state::Blake3ObjectIdentityV1;
 use astrid_core::PrincipalUid;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 fn owner() -> StateOwner {

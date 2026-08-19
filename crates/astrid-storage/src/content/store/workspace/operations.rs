@@ -1,110 +1,23 @@
-//! Durable copy-on-write workspace branches over one principal content root.
-//!
-//! A branch is an owner-internal component of the principal graph.  It is not
-//! represented by a synthetic principal and it never uses a host directory as
-//! a backing store.  The branch record owns two immutable content-catalog roots
-//! (the base and the current working view); catalog path-copy operations then
-//! share every unchanged file and chunk object with the owner and other
-//! branches.
+//! Public workspace branch store operations.
 
-use astrid_core::PrincipalUid;
-pub use astrid_core::WorkspaceUid;
 use std::collections::BTreeMap;
 
-use crate::content::{ContentEntry, ContentName, PrincipalContentError, PrincipalContentStore};
+use astrid_core::PrincipalUid;
+
+use crate::content::{ContentEntry, ContentName};
 use crate::content_dag::{
-    ContentReadError, build_content, open_content, read_opened_content, read_opened_content_range,
+    build_content, open_content, read_opened_content, read_opened_content_range,
 };
 use crate::engine::{PrincipalProjectionEngine, PrincipalProjectionError};
-use crate::filesystem::{FilesystemEntry, FilesystemEntryKind, FilesystemError, FilesystemPath};
-use crate::storage_model::{
-    ModelError, ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord,
-    ObjectReference, ReferenceKind, ReferenceLabel,
-};
+use crate::storage_model::{ModelError, ObjectReference};
 
 use super::{
-    CatalogRoot, CatalogSummary, CatalogValue, ContentHeader, EngineIdentity, EngineSource,
-    build_catalog, list, lookup, root_from_record, validate_catalog,
-};
-
-const BRANCH_REF_PREFIX_BYTES: &[u8] = b"workspace/";
-const BRANCH_RECEIPT_PREFIX_BYTES: &[u8] = b"workspace-promoted/";
-const BRANCH_BASE_LABEL: &[u8] = b"base";
-const BRANCH_WORKING_LABEL: &[u8] = b"working";
-const BRANCH_MAGIC: &[u8] = b"astrid-workspace-branch-v1\0";
-const BRANCH_RECEIPT_MAGIC: &[u8] = b"astrid-workspace-promoted-v1\0";
-const BRANCH_FORMAT: ObjectFormatVersion = ObjectFormatVersion::V1;
-const MAX_WORKSPACE_BRANCHES: usize = 128;
-const UID_BYTES: usize = 16;
-
-pub(crate) fn is_workspace_branch_label(label: &[u8]) -> bool {
-    label.starts_with(BRANCH_REF_PREFIX_BYTES)
-}
-
-fn is_workspace_receipt_label(label: &[u8]) -> bool {
-    label.starts_with(BRANCH_RECEIPT_PREFIX_BYTES)
-}
-
-pub(crate) fn workspace_branch_quota<P, E>(
-    store: &PrincipalContentStore<P, E>,
-    owner: &P,
-    reference: &ObjectReference,
-) -> Result<u64, PrincipalContentError>
-where
-    P: Clone + Ord + Send + Sync,
-    E: PrincipalProjectionEngine<P>,
-{
-    workspace_branch_quota_from_loader(reference, &mut |object| {
-        store.load_required_for(owner, object)
-    })
-}
-
-pub(crate) fn workspace_branch_quota_from_loader(
-    reference: &ObjectReference,
-    load: &mut impl FnMut(ObjectId) -> Result<ObjectRecord, PrincipalContentError>,
-) -> Result<u64, PrincipalContentError> {
-    let Some(id) = parse_workspace_uid(reference.label().as_bytes()) else {
-        return Err(PrincipalContentError::InvalidGraph {
-            object: reference.target(),
-            detail: "workspace branch label is malformed",
-        });
-    };
-    if reference.kind() != ReferenceKind::Owns {
-        return Err(PrincipalContentError::InvalidGraph {
-            object: reference.target(),
-            detail: "workspace branch reference is not owning",
-        });
-    }
-    let record = load(reference.target())?;
-    let branch =
-        decode_branch_record(reference.target(), &record, id).map_err(|error| match error {
-            WorkspaceBranchError::InvalidGraph { object, detail } => {
-                PrincipalContentError::InvalidGraph { object, detail }
-            },
-            _ => PrincipalContentError::InvalidGraph {
-                object: reference.target(),
-                detail: "workspace branch record could not be decoded",
-            },
-        })?;
-    let base = validate_catalog(hydrate_root(branch.base, load)?, load)?;
-    let working = validate_catalog(hydrate_root(branch.working, load)?, load)?;
-    if base.root != branch.base.map(|root| root.object)
-        || working.root != branch.working.map(|root| root.object)
-    {
-        return Err(PrincipalContentError::InvalidGraph {
-            object: reference.target(),
-            detail: "workspace branch catalog validation root disagrees",
-        });
-    }
-    Ok(working.summary.quota_bytes)
-}
-
-#[path = "workspace_model.rs"]
-mod model;
-
-pub use model::{
-    WorkspaceBindingLifecycle, WorkspaceBranchBinding, WorkspaceBranchDescriptor,
-    WorkspaceBranchError, WorkspaceBranchStore,
+    EngineIdentity, EngineSource, MAX_WORKSPACE_BRANCHES, WorkspaceBindingLifecycle,
+    WorkspaceBranchBinding, WorkspaceBranchDescriptor, WorkspaceBranchError, WorkspaceBranchStore,
+    WorkspaceFilesystem, WorkspaceUid, list, lookup, make_branch_record,
+    make_branch_record_for_uid, make_promotion_receipt_for_uid, map_read_error,
+    parse_workspace_receipt_uid, parse_workspace_uid, selected_catalog, validate_target_prefix,
+    workspace_receipt_label, workspace_ref_label,
 };
 
 impl<P: Ord, E> WorkspaceBranchStore<P, E> {
@@ -169,7 +82,7 @@ where
     // they are deliberately private so external runtime code cannot create an
     // unscoped whole-catalog mount.
     #[cfg(test)]
-    fn begin_with_uid(
+    pub(super) fn begin_with_uid(
         &self,
         owner: &P,
         id: WorkspaceUid,
@@ -846,154 +759,3 @@ where
         }
     }
 }
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct BranchState {
-    id: WorkspaceUid,
-    binding_uid: Option<PrincipalUid>,
-    target_prefix: Option<ContentName>,
-    base: Option<CatalogRoot>,
-    working: Option<CatalogRoot>,
-}
-
-fn branch_label(id: WorkspaceUid) -> String {
-    id.to_string()
-}
-
-fn validate_target_prefix(
-    target_prefix: Option<ContentName>,
-) -> Result<Option<ContentName>, WorkspaceBranchError> {
-    let Some(prefix) = target_prefix else {
-        return Ok(None);
-    };
-    let value = prefix.as_str();
-    if value.is_empty() || value.starts_with('/') || value.ends_with('/') || value.contains("//") {
-        return Err(WorkspaceBranchError::InvalidTargetPrefix {
-            detail: "prefix must be a non-empty canonical slash-separated path",
-        });
-    }
-    if value
-        .split('/')
-        .any(|segment| segment == "." || segment == "..")
-    {
-        return Err(WorkspaceBranchError::InvalidTargetPrefix {
-            detail: "prefix cannot contain dot path segments",
-        });
-    }
-    Ok(Some(prefix))
-}
-
-fn workspace_ref_label(id: WorkspaceUid) -> ReferenceLabel<Vec<u8>> {
-    ReferenceLabel::new(branch_label(id).into_bytes())
-}
-
-fn workspace_receipt_label(id: WorkspaceUid) -> ReferenceLabel<Vec<u8>> {
-    ReferenceLabel::new(format!("workspace-promoted/{id}").into_bytes())
-}
-
-fn parse_workspace_uid(label: &[u8]) -> Option<WorkspaceUid> {
-    std::str::from_utf8(label).ok()?.parse().ok()
-}
-
-fn parse_workspace_receipt_uid(label: &[u8]) -> Option<WorkspaceUid> {
-    let suffix = label.strip_prefix(BRANCH_RECEIPT_PREFIX_BYTES)?;
-    std::str::from_utf8(suffix).ok()?.parse().ok()
-}
-
-fn hydrate_root(
-    root: Option<CatalogRoot>,
-    load: &mut impl FnMut(ObjectId) -> Result<ObjectRecord, PrincipalContentError>,
-) -> Result<Option<CatalogRoot>, PrincipalContentError> {
-    root.map(|root| load(root.object).and_then(|record| root_from_record(root.object, &record)))
-        .transpose()
-}
-
-fn selected_catalog(
-    root: Option<CatalogRoot>,
-    target_prefix: Option<&ContentName>,
-    load: &mut impl FnMut(ObjectId) -> Result<ObjectRecord, PrincipalContentError>,
-    identify: &impl Fn(&ObjectRecord) -> ObjectId,
-) -> Result<(Option<CatalogRoot>, BTreeMap<ObjectId, ObjectRecord>), WorkspaceBranchError> {
-    let Some(prefix) = target_prefix else {
-        return Ok((root, BTreeMap::new()));
-    };
-    let mut entries = BTreeMap::new();
-    for entry in list(root, load)? {
-        let full = entry.name().as_str();
-        if full == prefix.as_str() {
-            return Err(WorkspaceBranchError::InvalidTargetPrefix {
-                detail: "prefix cannot attach over an existing file",
-            });
-        }
-        let Some(relative) = full
-            .strip_prefix(prefix.as_str())
-            .and_then(|suffix| suffix.strip_prefix('/'))
-        else {
-            continue;
-        };
-        if relative.is_empty() {
-            continue;
-        }
-        let name =
-            ContentName::new(relative.to_owned()).map_err(PrincipalContentError::InvalidName)?;
-        entries.insert(
-            name,
-            CatalogValue {
-                file: entry.file(),
-                logical_bytes: entry.logical_bytes(),
-            },
-        );
-    }
-    build_catalog(&entries, identify).map_err(WorkspaceBranchError::Content)
-}
-
-fn selected_name(full: &ContentName, target_prefix: Option<&ContentName>) -> bool {
-    target_prefix.is_none_or(|prefix| {
-        full.as_str() == prefix.as_str()
-            || full
-                .as_str()
-                .strip_prefix(prefix.as_str())
-                .is_some_and(|suffix| suffix.starts_with('/'))
-    })
-}
-
-fn qualify_name(
-    relative: &ContentName,
-    target_prefix: Option<&ContentName>,
-) -> Result<ContentName, WorkspaceBranchError> {
-    target_prefix.map_or_else(
-        || Ok(relative.clone()),
-        |prefix| {
-            ContentName::new(format!("{}/{}", prefix.as_str(), relative.as_str()))
-                .map_err(PrincipalContentError::InvalidName)
-                .map_err(WorkspaceBranchError::Content)
-        },
-    )
-}
-
-#[path = "workspace_lifecycle.rs"]
-mod lifecycle;
-
-#[path = "workspace_codec.rs"]
-mod codec;
-
-use codec::{
-    decode_branch_record, decode_promotion_receipt, make_branch_record, make_branch_record_for_uid,
-    make_promotion_receipt_for_uid,
-};
-
-fn map_read_error(error: ContentReadError<PrincipalProjectionError>) -> WorkspaceBranchError {
-    match error {
-        ContentReadError::Content(error) => WorkspaceBranchError::Content(error.into()),
-        ContentReadError::Source(error) => WorkspaceBranchError::Projection(error),
-    }
-}
-
-#[path = "workspace_filesystem.rs"]
-mod filesystem;
-
-pub use filesystem::WorkspaceFilesystem;
-
-#[cfg(test)]
-#[path = "workspace_tests.rs"]
-mod tests;
