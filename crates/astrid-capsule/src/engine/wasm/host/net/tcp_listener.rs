@@ -337,6 +337,7 @@ mod tests {
                 listener: Arc::clone(&listener),
                 pending: Arc::clone(&pending),
                 cancel_token: tokio_util::sync::CancellationToken::new(),
+                share: None,
                 listener_count: Some(Arc::clone(&listener_count)),
             })
             .unwrap();

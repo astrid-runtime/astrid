@@ -32,8 +32,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   load-balances. Previously a single Store served every connection serially, so
   a client fanning out parallel requests queued behind itself. `N = 1` is
   unchanged behaviour, and a capsule declaring interceptors is held at one
-  worker because N subscriptions would double-process every event. Closes
-  #1231.
+  worker because N subscriptions would double-process every event. Last slot
+  drop evicts the shared listener so the OS socket actually closes and quota
+  tracks the live socket rather than the binder slot; interceptor pool
+  instances do not share that registry. Closes #1231.
 
 ### Changed
 

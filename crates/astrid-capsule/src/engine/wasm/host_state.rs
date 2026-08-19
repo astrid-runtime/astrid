@@ -57,6 +57,14 @@ pub struct TcpStreamSlot {
     pub write_timeout: Option<std::time::Duration>,
 }
 
+/// One bound loopback TCP listener plus the number of live guest slots
+/// holding it. The last slot drop evicts the registry entry so the OS
+/// socket actually closes.
+pub struct SharedTcpListener {
+    pub listener: Arc<tokio::net::TcpListener>,
+    pub holders: std::sync::atomic::AtomicUsize,
+}
+
 /// The lifecycle phase a capsule is currently executing in.
 ///
 /// Set on [`HostState`] during `#[install]` or `#[upgrade]` dispatch.
@@ -748,13 +756,12 @@ pub struct HostState {
     /// Stores, keyed by `(host, port)`. When `bind_workers > 1`, each of the N
     /// worker Stores runs `run()` and calls `bind_tcp` for the same address;
     /// the first worker binds the socket and the rest dedupe onto its
-    /// `Arc<TcpListener>` here, so all N block on `accept()` against ONE OS
-    /// accept queue (which load-balances). `Arc<DashMap>` so the binding is
-    /// shared across the worker Stores, exactly like
-    /// [`connection_principals`](Self::connection_principals). Empty for the
-    /// single-worker default and for non-run-loop pools (each pooled instance
-    /// still binds independently, matching today's behavior).
-    pub shared_listeners: Arc<dashmap::DashMap<(String, u16), Arc<tokio::net::TcpListener>>>,
+    /// listener here, so all N block on `accept()` against ONE OS accept
+    /// queue. Holder count lives on the entry: last slot drop evicts it so
+    /// the OS socket closes. Cloned into worker Stores only when
+    /// `bind_workers > 1`; interceptor / non-worker pool instances each get
+    /// a fresh map so a concrete-port bind is not accidentally shared.
+    pub shared_listeners: Arc<dashmap::DashMap<(String, u16), SharedTcpListener>>,
     /// Bound run-loop CPU-bound signal: set `true` by the ipc `recv` host fn
     /// each time the guest blocks on recv, read + cleared by the run-loop's
     /// epoch-deadline callback once per window.

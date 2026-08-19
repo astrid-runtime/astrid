@@ -31,14 +31,14 @@ impl HostState {
 
     /// Build a fresh, empty shared-listener registry.
     ///
-    /// The pooled/run-loop path clones ONE registry into every worker Store so
-    /// `bind_workers > 1` capsules dedupe onto a single bound `TcpListener`
-    /// (Approach B). Out-of-pool constructors (lifecycle hooks, the hook
-    /// handler, tests) use this so they do not have to name the `dashmap` type;
-    /// they never bind a listener, so the registry stays empty.
+    /// Run-loop worker Stores (`bind_workers > 1`) clone ONE registry so they
+    /// dedupe onto a single bound `TcpListener`. Interceptor / non-worker pool
+    /// instances each get a fresh map so a concrete-port bind stays private.
+    /// Out-of-pool constructors use this so they do not have to name the
+    /// `dashmap` type.
     #[must_use]
-    pub fn new_shared_listeners()
-    -> Arc<dashmap::DashMap<(String, u16), Arc<tokio::net::TcpListener>>> {
+    pub fn new_shared_listeners() -> Arc<dashmap::DashMap<(String, u16), super::SharedTcpListener>>
+    {
         Arc::new(dashmap::DashMap::new())
     }
 

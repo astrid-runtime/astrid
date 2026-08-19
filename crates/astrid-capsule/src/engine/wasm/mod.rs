@@ -2570,15 +2570,38 @@ impl ExecutionEngine for WasmEngine {
             let client_connections: Arc<
                 dashmap::DashMap<u32, astrid_core::principal::PrincipalId>,
             > = Arc::new(dashmap::DashMap::new());
-            // Bound loopback TCP listeners shared across a run-loop capsule's
-            // worker Stores. The first worker to `bind_tcp` an address binds the
-            // socket and inserts here; the rest dedupe onto its Arc so all N
-            // accept on ONE OS accept queue (Approach B). Cloned into every
-            // HostState below like `connection_principals`; starts empty and
-            // stays empty for the single-worker default and non-run-loop pools.
-            let shared_listeners: Arc<
-                dashmap::DashMap<(String, u16), Arc<tokio::net::TcpListener>>,
-            > = Arc::new(dashmap::DashMap::new());
+            // Concurrent run-loop workers (Approach B, shared listener). Only a
+            // loopback TCP server capsule (run-loop + `net_bind`, no
+            // `host_process`) is eligible; everyone else stays single-instance.
+            // Clamp to [1, instance_pool_size]. `None`/1 ⇒ today's
+            // single-worker behavior. Interceptors + workers>1 is forced to 1:
+            // N auto-subscribed interceptor sets would double-process events.
+            let worker_count = if has_run_export
+                && manifest.capabilities.host_process.is_empty()
+                && !manifest.capabilities.net_bind.is_empty()
+            {
+                let requested = manifest
+                    .capabilities
+                    .bind_workers
+                    .unwrap_or(1)
+                    .clamp(1, self.runtime_limits.instance_pool_size);
+                if requested > 1 && !manifest.effective_interceptors().is_empty() {
+                    tracing::warn!(
+                        capsule = %manifest.package.name,
+                        requested,
+                        "bind_workers > 1 ignored: capsule declares interceptors (N subscriptions would double-process events); using 1 worker"
+                    );
+                    1
+                } else {
+                    requested
+                }
+            } else {
+                1
+            };
+            // Share the listener registry only across run-loop worker Stores.
+            // Interceptor / non-worker pool instances each get a fresh map so a
+            // concrete-port bind is not cloned across pooled HostStates.
+            let shared_listeners = (worker_count > 1).then(HostState::new_shared_listeners);
             let tcp_listener_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let capsule_net_stream_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let st_route_admission_gate = self.route_admission_gate.clone();
@@ -2702,7 +2725,9 @@ impl ExecutionEngine for WasmEngine {
                 process_count_by_principal: std::collections::HashMap::new(),
                 connection_principals: connection_principals.clone(),
                 client_connections: client_connections.clone(),
-                shared_listeners: shared_listeners.clone(),
+                shared_listeners: shared_listeners
+                    .clone()
+                    .unwrap_or_else(HostState::new_shared_listeners),
                 // No frame in flight at construction; both the ingress
                 // principal and its authenticating device key_id are set per
                 // framed read.
@@ -2777,36 +2802,8 @@ impl ExecutionEngine for WasmEngine {
                 )
             };
 
-            // Concurrent run-loop workers (Approach B, shared listener). Only a
-            // loopback TCP server capsule (run-loop + `net_bind`, no
-            // `host_process`) is eligible; everyone else stays single-instance.
-            // Clamp to [1, instance_pool_size] so an operator misconfiguration
-            // can't spawn unbounded Stores. `None`/1 ⇒ today's single-worker
-            // behavior, byte-for-byte. A capsule that ALSO declares interceptors
-            // is forced back to 1: N auto-subscribed interceptor sets would
-            // double-process every matching event.
-            let worker_count = if has_run_export
-                && manifest.capabilities.host_process.is_empty()
-                && !manifest.capabilities.net_bind.is_empty()
-            {
-                let requested = manifest
-                    .capabilities
-                    .bind_workers
-                    .unwrap_or(1)
-                    .clamp(1, self.runtime_limits.instance_pool_size);
-                if requested > 1 && !manifest.effective_interceptors().is_empty() {
-                    tracing::warn!(
-                        capsule = %manifest.package.name,
-                        requested,
-                        "bind_workers > 1 ignored: capsule declares interceptors                          (N subscriptions would double-process events); using 1 worker"
-                    );
-                    1
-                } else {
-                    requested
-                }
-            } else {
-                1
-            };
+            // `worker_count` was computed before `make_state` so only N>1
+            // worker Stores share a listener registry.
 
             // On-demand instance factory. The eager warm-start instances are
             // built through it too, so an eagerly-built and a lazily-grown
@@ -3269,6 +3266,9 @@ impl ExecutionEngine for WasmEngine {
         }
         for handle in self.run_handles.drain(..) {
             handle.abort();
+            // Join so unload does not return while worker Stores still hold
+            // the shared listener (N=1 must actually close the OS socket).
+            let _ = handle.await;
         }
         // Drop the pool — releases every pooled Store's WASM memory. (Run-loop
         // capsules have `pool == None`; their worker Stores are owned by the
