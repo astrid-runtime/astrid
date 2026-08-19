@@ -21,6 +21,12 @@ impl ReceiptSchema {
     }
 }
 
+impl std::fmt::Display for ReceiptSchema {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.get())
+    }
+}
+
 impl<'de> Deserialize<'de> for ReceiptSchema {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -61,6 +67,12 @@ impl ContentDigest {
     }
 }
 
+impl std::fmt::Display for ContentDigest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 impl<'de> Deserialize<'de> for ContentDigest {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -92,6 +104,12 @@ impl InventoryDigest {
     }
 }
 
+impl std::fmt::Display for InventoryDigest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 impl<'de> Deserialize<'de> for InventoryDigest {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -119,10 +137,6 @@ macro_rules! count_type {
 
             pub(super) const fn get(self) -> u64 {
                 self.0
-            }
-
-            pub(super) fn checked_add(self, other: Self) -> Option<Self> {
-                self.0.checked_add(other.0).map(Self)
             }
         }
 
@@ -161,6 +175,18 @@ macro_rules! count_type {
 count_type!(ByteCount);
 count_type!(EntryCount);
 count_type!(PageCount);
+
+impl ByteCount {
+    pub(super) fn checked_add(self, other: Self) -> Option<Self> {
+        self.0.checked_add(other.0).map(Self)
+    }
+}
+
+impl EntryCount {
+    pub(super) fn checked_add(self, other: Self) -> Option<Self> {
+        self.0.checked_add(other.0).map(Self)
+    }
+}
 
 fn validate_optional_blake3_hex(value: &str) -> Result<(), &'static str> {
     if value.is_empty() {
@@ -253,9 +279,7 @@ mod tests {
             EntryCount::ZERO.checked_add(EntryCount::new(1)),
             Some(EntryCount::new(1))
         );
-        assert_eq!(
-            PageCount::ZERO.checked_add(PageCount::new(1)),
-            Some(PageCount::new(1))
-        );
+        assert_eq!(PageCount::new(1).get(), 1);
+        assert!(PageCount::new(1) > PageCount::ZERO);
     }
 }
